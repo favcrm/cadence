@@ -222,7 +222,10 @@ export default function AppShell({
   const rawSection = query.get("crm");
   const crmSection: CrmSection =
     rawSection === "segments" || rawSection === "campaigns" ? rawSection : "customers";
-  const [chatOpen, setChatOpen] = useState(false);
+  // Narrow widths: one full-width panel at a time (the approved mock's
+  // Assistant | Workspace switch). Both stay mounted — only CSS hides the
+  // other — so draft, stream and workspace state survive switching.
+  const [panel, setPanel] = useState<"chat" | "work">("chat");
   // CAD-1051: desktop rail. Narrow widths keep the drawer above.
   // CAD-1098: collapse state is per app installation.
   const [chatCollapsed, setChatCollapsed] = useChatCollapsed(installId);
@@ -230,8 +233,6 @@ export default function AppShell({
   // keyed by `contract-preview` in the URL — it never mounts in a
   // production bundle and never replaces the trusted outlet by default.
   const previewKey = isDev ? contractPreviewKey(query) : null;
-  const chatPaneRef = useRef<HTMLDivElement | null>(null);
-  const chatOpenRef = useRef<HTMLButtonElement | null>(null);
   // Installation switches reset outlet state but keep the chat: the
   // first mount preserves direct links, later switches strip them.
   const firstInstall = useRef(installId);
@@ -543,47 +544,6 @@ export default function AppShell({
   // The context picker is removed (operator review): context follows
   // the URL, not a selector.
 
-  // Narrow drawer focus: opening moves into the pane, closing returns
-  // to the trigger. The closed drawer is `visibility: hidden`, so it
-  // stays out of the tab order with the draft intact.
-  //
-  // Observed defect (baseline in d379ae54, real Chrome): a synchronous
-  // commit-phase `.focus()` ran before the open activation's own focus
-  // (the toggle is focused on mousedown / Enter) was applied, so the
-  // composer never received focus. A single rAF still fired too early —
-  // before `data-open` propagated. Deferring two frames clears the open
-  // commit in both real and synthesized input; the `data-open` guard
-  // means the callback never focuses a still-hidden pane. Both frame
-  // ids are tracked so cleanup cancels whichever is still pending — a
-  // rapid close can never refocus once the user has moved on. A
-  // disabled (read-only) composer yields to the enabled Close control.
-  useEffect(() => {
-    if (!chatOpen) return;
-    let inner = 0;
-    const focusComposer = () => {
-      const pane = chatPaneRef.current;
-      if (!pane || !pane.hasAttribute("data-open")) return;
-      const composer = pane.querySelector<HTMLElement>("textarea");
-      const target = composer && !composer.hasAttribute("disabled")
-        ? composer
-        : pane.querySelector<HTMLElement>(".app-shell-chat-close") ?? composer;
-      target?.focus();
-    };
-    const outer = requestAnimationFrame(() => {
-      inner = requestAnimationFrame(focusComposer);
-    });
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setChatOpen(false);
-    };
-    addEventListener("keydown", onKey);
-    return () => {
-      cancelAnimationFrame(outer);
-      cancelAnimationFrame(inner);
-      removeEventListener("keydown", onKey);
-      chatOpenRef.current?.focus();
-    };
-  }, [chatOpen]);
-
   // The App binding for chat sends: install plus the concrete context
   // the shell owns (generic outlet) or the workspace screen owns
   // (social, observed live via subscription). Empty context sends
@@ -705,36 +665,25 @@ export default function AppShell({
             {previewKey === null ? "Contract preview (dev)" : "Exit contract preview"}
           </a>
         )}
-        <button
-          ref={chatOpenRef}
-          type="button"
-          className="btn btn-secondary btn-sm app-shell-chat-toggle"
-          aria-expanded={chatOpen}
-          aria-controls="app-shell-chat"
-          onClick={() => setChatOpen((o) => !o)}
-        >
-          Assistant chat
-        </button>
       </div>
 
-      <div className="app-shell-grid" data-chat-collapsed={chatCollapsed || undefined}>
-        <div
-          id="app-shell-chat"
-          ref={chatPaneRef}
-          className="app-shell-chat"
-          aria-label="Assistant chat"
-          data-open={chatOpen || undefined}
-        >
-          <div className="app-shell-chat-head">
-            <strong className="text-cardtitle text-ink-100">Assistant</strong>
-            <button
-              type="button"
-              className="btn btn-secondary btn-sm app-shell-chat-close"
-              onClick={() => setChatOpen(false)}
-            >
-              Close chat
-            </button>
-          </div>
+      <div className="app-shell-panels" role="group" aria-label="Panel">
+        {(["chat", "work"] as const).map((p) => (
+          <button
+            key={p}
+            type="button"
+            className="app-shell-panel-tab"
+            aria-pressed={panel === p}
+            aria-controls={p === "chat" ? "app-shell-chat" : "app-shell-workspace"}
+            onClick={() => setPanel(p)}
+          >
+            {p === "chat" ? "Assistant" : "Workspace"}
+          </button>
+        ))}
+      </div>
+
+      <div className="app-shell-grid" data-chat-collapsed={chatCollapsed || undefined} data-shell-panel={panel}>
+        <div id="app-shell-chat" className="app-shell-chat" aria-label="Assistant chat">
           <Conversation
             mode={{
               kind: "app",
@@ -743,6 +692,7 @@ export default function AppShell({
               screen: chatScreen,
               recordOpen: recordId !== null,
               contextName: singleScope ? null : contextLabel(activeContexts, contextId),
+              scopeLabel: (singleScope ? null : contextLabel(activeContexts, contextId)) || title,
               descriptor: chatDescriptor,
               promptLayout: isSocial ? "list" : "chips",
               conversationRequest,
@@ -759,7 +709,7 @@ export default function AppShell({
             onOpenView={openView}
           />
         </div>
-        <section className="app-shell-outlet" aria-label={`${title} workspace`}>
+        <section id="app-shell-workspace" className="app-shell-outlet" aria-label={`${title} workspace`}>
           {loading && (
             <p className="card px-4 py-5 text-secondary text-ink-400" role="status">
               Loading this app…
@@ -911,10 +861,6 @@ export default function AppShell({
           )}
         </section>
       </div>
-
-      {chatOpen && (
-        <div className="app-shell-scrim" onClick={() => setChatOpen(false)} aria-hidden="true" />
-      )}
     </div>
   );
 }

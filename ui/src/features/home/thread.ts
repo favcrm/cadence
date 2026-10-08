@@ -79,7 +79,13 @@ export function asEntry(value: unknown): ThreadEntry | null {
     payload:
       v.payload && typeof v.payload === "object" ? (v.payload as Record<string, unknown>) : null,
     message: typeof v.message === "string" ? v.message : null,
-    created: typeof v.created === "string" ? v.created : null,
+    // The daemon sends epoch seconds (f64); the UI keeps an ISO string.
+    created:
+      typeof v.created === "string"
+        ? v.created
+        : typeof v.created === "number" && Number.isFinite(v.created)
+          ? new Date(v.created * 1000).toISOString()
+          : null,
   };
 }
 

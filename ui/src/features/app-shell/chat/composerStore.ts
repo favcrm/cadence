@@ -31,7 +31,15 @@
  */
 import { api, ApiError, type ChatFileDestination, type ChatFileRow } from "../../../lib/api";
 import type { ThreadRef } from "../../../lib/types";
-import { attachFits, attachRefusal, sameAttachDestination, type AttachDestination, type AttachItem } from "./attach";
+import {
+  attachFits,
+  attachRefusal,
+  isPermanentUploadFailure,
+  sameAttachDestination,
+  userUploadError,
+  type AttachDestination,
+  type AttachItem,
+} from "./attach";
 
 const EMPTY: AttachItem[] = [];
 const EMPTY_REFS: ThreadRef[] = [];
@@ -574,7 +582,8 @@ function startUpload(
       }
       patch(itemKey, generation, {
         status: "failed",
-        error: e instanceof Error ? e.message : String(e),
+        error: userUploadError(e instanceof Error ? e.message : String(e)),
+        permanent: e instanceof ApiError && isPermanentUploadFailure(e.status),
       });
     }
   })();
@@ -600,6 +609,7 @@ export function addFiles(key: string, files: Iterable<File>, destination?: Attac
         status: "failed",
         file,
         error: problem,
+        permanent: true,
         generation: 0,
         destination: cloneDestination(destination),
       });
@@ -642,10 +652,18 @@ export function retryAttach(key: string, itemKey: string): void {
   const q = queues.get(cell.id);
   if (!q) return;
   const item = q.items.find((a) => a.key === itemKey);
-  if (!item || item.status !== "failed") return;
+  if (!item || item.status !== "failed" || item.permanent) return;
+  // The same pre-flight checks as a fresh pick: a retry never admits a
+  // file addition would have refused (kind, size, count).
+  const problem = attachRefusal(item.name, item.size) ?? attachFits(q.items.length - 1, 1);
+  if (problem !== null) {
+    q.items = q.items.map((a) => (a.key === itemKey ? { ...a, error: problem, permanent: true } : a));
+    publish(cell);
+    return;
+  }
   const generation = ++nextGeneration;
   q.items = q.items.map((a) =>
-    a.key === itemKey ? { ...a, status: "uploading" as const, error: undefined, generation } : a,
+    a.key === itemKey ? { ...a, status: "uploading" as const, error: undefined, permanent: undefined, generation } : a,
   );
   publish(cell);
   startUpload(itemKey, item.file, generation, item.destination);
@@ -699,12 +717,6 @@ export function subscribeSavedIntents(listener: () => void): () => void {
 export function savedIntentsFor(key: string): SavedIntent[] {
   const family = families.get(key);
   return family ? family.savedSnapshot : EMPTY_SAVED;
-}
-
-/** The first saved bundle reachable from `key`, or null when there is
- *  none. */
-export function savedIntentFor(key: string): SavedIntent | null {
-  return savedIntentsFor(key)[0] ?? null;
 }
 
 /** Move every unsent bundle of `from` to `to` — an unsaved subject
@@ -871,23 +883,9 @@ export function composerScope(key: string, slot?: number): ComposerScope | null 
   return slotOf(key, slot)?.binding;
 }
 
-/** The frame the family's visible slot is registered under: `undefined`
- *  while unknown, `null` for a registered absence. */
-export function composerFrame(key: string): ComposerScope | null | undefined {
-  const family = families.get(key);
-  return family ? activeOf(family).frame : undefined;
-}
-
 /** The typed draft, keyed like the queue: Home ⇄ Apps ⇄ conversation
  *  switches restore their own text; another scope never receives it.
  *  With `slot`, reads one parked bundle named by `savedIntentsFor(key)`. */
 export function composerDraft(key: string, slot?: number): string {
   return slotOf(key, slot)?.text ?? "";
-}
-
-/** The draft's citation refs — restored with the same original key, so
- *  a remount never drops a cited row the operator attached. With `slot`,
- *  reads one parked bundle named by `savedIntentsFor(key)`. */
-export function composerRefs(key: string, slot?: number): ThreadRef[] {
-  return slotOf(key, slot)?.refs ?? EMPTY_REFS;
 }

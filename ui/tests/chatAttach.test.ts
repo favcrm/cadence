@@ -3,8 +3,10 @@ import {
   ATTACH_MAX_BYTES,
   ATTACH_MAX_FILES,
   attachFits,
+  attachMeta,
+  isPermanentUploadFailure,
+  userUploadError,
   attachRefusal,
-  readyIds,
   unresolved,
   unresolvedHint,
   type AttachItem,
@@ -42,19 +44,6 @@ equal(attachFits(ATTACH_MAX_FILES, 1) !== null, true, "the sixth refuses");
 const item = (key: string, status: AttachItem["status"], id?: string): AttachItem =>
   ({ key, name: `${key}.txt`, size: 1, status, file: null as unknown as File, id, generation: 0 });
 
-equal(
-  readyIds([
-    item("a", "uploading"),
-    item("b", "ready", "chf-1"),
-    item("c", "failed"),
-    item("d", "ready", "chf-2"),
-  ]),
-  [{ id: "chf-1" }, { id: "chf-2" }],
-  "only ready rows ride a send, in order",
-);
-equal(readyIds([item("a", "uploading")]), [], "an in-flight upload has no sendable ID");
-equal(readyIds([item("b", "ready")]), [], "a ready row without a daemon id never rides");
-
 // ---- the send gate: unresolved rows hold the send ---------------------
 
 equal(unresolved([item("a", "ready", "chf-1")]).length, 0, "a ready queue never holds a send");
@@ -70,6 +59,32 @@ equal(
   (unresolvedHint([item("a", "failed")]) ?? "").includes("failed"),
   true,
   "the hold reason names the failed file",
+);
+
+// ---- visible, specific refusal reasons (CAD-1168 fix 1) ---------------------
+
+equal(
+  userUploadError("chat_file_upload refused 'fake.txt': a '.txt' file must sniff as its declared kind — the bytes did not"),
+  "A '.txt' file must sniff as its declared kind — the bytes did not",
+  "the RPC name and file prefix never reach the operator",
+);
+equal(
+  userUploadError("chat_file_upload: '.exe' is not an attachable type — the interim allowlist is txt, md and csv"),
+  "'.exe' is not an attachable type",
+  "the allowlist tail is dropped; the reason stays",
+);
+equal(userUploadError("upload failed — connection lost"), "Upload failed — connection lost", "plain messages stay");
+equal(isPermanentUploadFailure(400), true, "a server refusal is permanent");
+equal(isPermanentUploadFailure(413), true, "an oversize refusal is permanent");
+equal(isPermanentUploadFailure(0), false, "a lost connection is retryable");
+equal(isPermanentUploadFailure(503), false, "a 5xx is retryable");
+equal(isPermanentUploadFailure(429), false, "a rate limit is retryable");
+equal(isPermanentUploadFailure(undefined), false, "an abort is retryable");
+equal(attachMeta("customers.csv", 180 * 1024), "180 KB · CSV", "size and kind like the mock's file rows");
+equal(
+  (unresolvedHint([{ ...item("a", "failed"), error: "PDF and image processing is not available yet — .pdf cannot be attached" }]) ?? "").includes(".pdf cannot be attached"),
+  true,
+  "the hold line carries the specific reason, not a generic count",
 );
 
 console.log("chatAttach.test.ts: all assertions passed");

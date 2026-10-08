@@ -102,11 +102,11 @@ export function useAppChatProjection(
     const operation = ++operationRef.current;
     setLoaded((previous) => {
       if (ownerRef.current !== owner || operationRef.current !== operation) return previous;
-      return {
-        key,
-        projection: previous?.key === key ? previous.projection : null,
-        loading: true,
-      };
+      // A re-proof keeps the last proven projection live (loading stays
+      // false) so Attach never flickers off after an upload; only the
+      // first load, or a real negative in the refreshed result, closes it.
+      const held = previous?.key === key && previous.projection !== null;
+      return { key, projection: held ? previous.projection : null, loading: !held };
     });
     const projection = await loadAppChatProjection(installId, digest, kind, true);
     if (ownerRef.current === owner && operationRef.current === operation) {
@@ -126,11 +126,6 @@ export function useAppChatProjection(
     loading: key !== null && (current === null || current.loading),
     refresh,
   };
-}
-
-/** Descriptor-only hook retained for existing callers. */
-export function useAppChat(installId: string, digest: string | null, kind: string | null): AppChat | null {
-  return useAppChatProjection(installId, digest, kind).projection?.chat ?? null;
 }
 
 /** Test seam: forget every cached descriptor. */

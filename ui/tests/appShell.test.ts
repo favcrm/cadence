@@ -283,73 +283,24 @@ equal(boxes(), 1, "exactly one chat draft box id in the document");
 equal(eventSources, 1, "exactly one SSE subscription for the shell");
 assert(!host.querySelector('[aria-label="App context"]'), "context selector removed — context follows URL only");
 
-// Drawer keyboard: toggle opens into the pane, Escape closes back to
-// the trigger, the closed drawer keeps no tab stop yet keeps the draft.
-const toggle = host.querySelector(".app-shell-chat-toggle") as HTMLButtonElement;
-assert(toggle && toggle.getAttribute("aria-controls") === "app-shell-chat", "toggle controls the single chat node");
-equal(toggle.getAttribute("aria-expanded"), "false", "drawer starts closed");
-assert(!host.querySelector("#app-shell-chat")?.hasAttribute("data-open"), "closed drawer carries no open marker");
-await click(toggle);
-equal(toggle.getAttribute("aria-expanded"), "true", "drawer opens with accessible state");
-// Focus is deferred two frames so it lands after the pointer/keyboard
-// activation's own focus; flush lets each queued frame run.
-await flush(); await flush(); await flush();
-assert(document.activeElement?.id === "app-shell-chat-box", "opening moves focus into the pane");
+// Narrow switch (approved mock): a full-width Assistant | Workspace
+// segmented control replaces the overlay drawer. The assistant is shown
+// by default; both panels stay mounted so the draft and the single SSE
+// subscription survive switching.
+const tabs = Array.from(host.querySelectorAll<HTMLButtonElement>(".app-shell-panel-tab"));
+equal(tabs.map((t) => t.textContent), ["Assistant", "Workspace"], "segmented Assistant | Workspace switch");
+assert(!host.querySelector(".app-shell-chat-toggle") && !host.querySelector(".app-shell-scrim"), "no overlay drawer toggle or scrim remains");
+const grid = host.querySelector(".app-shell-grid") as HTMLElement;
+equal(grid.getAttribute("data-shell-panel"), "chat", "the assistant is the default narrow panel");
+equal(tabs[0].getAttribute("aria-pressed"), "true", "Assistant tab is pressed by default");
 await fill("#app-shell-chat-box", "unsent shell draft");
-await React.act(async () => {
-  document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
-});
-await flush();
-equal(toggle.getAttribute("aria-expanded"), "false", "Escape closes the drawer");
-assert(document.activeElement === toggle, "closing returns focus to the trigger");
-equal(eventSources, 1, "drawer cycles open no second stream");
-// Controlled-frame proof that closing mid-deferral cancels the queued
-// composer focus instead of stealing it back. Capture the rAF queue so
-// we can run the outer frame (which schedules the inner focus frame),
-// close before the inner frame fires, then prove the pending inner
-// frame was cancelled — the composer is never focused after close.
-const rafQueue = new Map<number, FrameRequestCallback>();
-let rafNext = 0;
-const cancelled = new Set<number>();
-const realRaf = globalThis.requestAnimationFrame;
-const realCaf = globalThis.cancelAnimationFrame;
-globalThis.requestAnimationFrame = ((cb: FrameRequestCallback) => {
-  const id = ++rafNext;
-  rafQueue.set(id, cb);
-  return id;
-}) as typeof requestAnimationFrame;
-globalThis.cancelAnimationFrame = ((id: number) => {
-  cancelled.add(id);
-  rafQueue.delete(id);
-}) as typeof cancelAnimationFrame;
-try {
-  await React.act(async () => {
-    toggle.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-  });
-  await flush();
-  equal(toggle.getAttribute("aria-expanded"), "true", "drawer open before the deferred frame runs");
-  // The outer rAF is queued; run it so it schedules the inner focus frame.
-  equal(rafQueue.size, 1, "one outer frame queued");
-  const outerCb = rafQueue.get(1)!;
-  rafQueue.delete(1);
-  await React.act(async () => { outerCb(performance.now()); });
-  equal(rafQueue.size, 1, "outer frame queued the inner focus frame");
-  // Close before the inner focus frame fires.
-  await React.act(async () => {
-    toggle.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-  });
-  await flush();
-  equal(toggle.getAttribute("aria-expanded"), "false", "closed before the focus frame");
-  assert(cancelled.has(2), "the pending inner focus frame was cancelled on close");
-  equal(rafQueue.size, 0, "no frame survives to refocus after close");
-  assert(document.activeElement === toggle, "focus returned to the trigger, never the composer");
-} finally {
-  globalThis.requestAnimationFrame = realRaf;
-  globalThis.cancelAnimationFrame = realCaf;
-}
-await click(toggle);
-equal((host.querySelector("#app-shell-chat-box") as HTMLTextAreaElement)?.value, "unsent shell draft", "one pane keeps one draft across close/open");
-await click(toggle);
+await click(tabs[1]);
+equal(grid.getAttribute("data-shell-panel"), "work", "Workspace tab shows the workspace");
+equal(tabs[1].getAttribute("aria-pressed"), "true", "Workspace tab pressed");
+await click(tabs[0]);
+equal((host.querySelector("#app-shell-chat-box") as HTMLTextAreaElement)?.value, "unsent shell draft", "one pane keeps one draft across switching");
+equal(panes(), 1, "switching never mounts a second chat pane");
+equal(eventSources, 1, "switching opens no second stream");
 
 // Chat sends carry the verified-scope request; refusal would surface.
 // Context is adopted from the URL — no selector needed.
@@ -808,7 +759,8 @@ async function mountCrm(url: string) {
   // page is the company's records (CAD-1008). Wait for the outlet to
   // paint any CRM section as the mount signal instead of a scope label.
   await settle(() => assert(hostEl.querySelector("[data-outlet-heading]"), `crm mount binds ctx-a: ${url}`));
-  assert(!(hostEl.textContent ?? "").match(/Workspace|No context ·/), "bound CRM shows no scope/context subtitle");
+  // The Assistant | Workspace switch is chrome, not a subtitle: judge the outlet.
+  assert(!(hostEl.querySelector(".app-shell-outlet")?.textContent ?? "").match(/Workspace|No context ·/), "bound CRM shows no scope/context subtitle");
   await flush(); await flush();
   return { hostEl, cold };
 }

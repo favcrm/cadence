@@ -105,6 +105,8 @@ export type ConversationMode =
       recordOpen: boolean;
       /** The route context's display name, shown only when the descriptor asks. */
       contextName: string | null;
+      /** The scope line's text: the real context, else the installed app's name. */
+      scopeLabel: string;
       /** The validated descriptor for this install, or null (plain chat). */
       descriptor: AppChat | null;
       /** `list` lays the screen's static prompts out as suggestion rows and
@@ -321,6 +323,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   // sendError alert; cleared by the next successful send.
   const [composerNotice, setComposerNotice] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
   // CAD-1168: like Home's WINDOW — the pane renders a bounded window of
   // the newest items and pages older entries of the SAME conversation
   // via `before`, instead of silently clipping to the newest eight.
@@ -585,7 +588,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const turnOwned =
     turnMessage !== undefined &&
     ((thread.data?.entries ?? []).some((e) => e.message === turnMessage) ||
-      (thread.data?.pending ?? []).some((p) => p.message === turnMessage));
+      (thread.data?.pending ?? []).some((p) => p.message === turnMessage && p.state !== "failed"));
   const working = masterState.data?.turn?.state === "working" && turnOwned;
   const onStop = () => {
     const origin = { key: composerKey, visit: visitRef.current, frame: frameToken };
@@ -957,19 +960,56 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         <span className="app-chat-rail-label text-micro text-ink-400">ASSISTANT</span>
       </button>
       <div className="app-chat-head">
-        <p className="app-chat-label slabel">
-          Assistant{descriptor?.presentation.showContext && mode.contextName ? ` · ${mode.contextName}` : ""}
-        </p>
-        <button
-          type="button"
-          className="btn btn-ghost btn-sm app-chat-collapse"
-          aria-label="Collapse assistant chat"
-          aria-expanded={!collapsed}
-          onClick={() => onCollapsed(true)}
-        >
-          ⇤
-        </button>
+        <div className="app-chat-title">
+          <span className="app-chat-mark" aria-hidden>✳</span>
+          <strong>Assistant</strong>
+        </div>
+        <div className="app-chat-head-tools">
+          {active.state !== "legacy" && (
+            <button
+              type="button"
+              className="app-chat-iconbtn"
+              aria-label="Conversation history"
+              title="Conversation history"
+              aria-expanded={historyOpen}
+              disabled={active.state !== "ready" || active.conversations.length === 0}
+              onClick={() => setHistoryOpen((o) => !o)}
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M3 11a9 9 0 1 1 3 8M3 4v7h7M12 7v6l4 2" />
+              </svg>
+            </button>
+          )}
+          <button
+            type="button"
+            className="app-chat-iconbtn app-chat-collapse"
+            aria-label="Collapse assistant chat"
+            title="Collapse assistant chat"
+            aria-expanded={!collapsed}
+            onClick={() => onCollapsed(true)}
+          >
+            ⇤
+          </button>
+        </div>
       </div>
+      {historyOpen && active.state === "ready" && (
+        <div className="app-chat-history" role="group" aria-label="Conversation history" data-chat-history>
+          {active.conversations.map((c, i) => (
+            <button
+              key={c.id}
+              type="button"
+              className="app-chat-history-row"
+              aria-current={c.id === convId ? "true" : undefined}
+              onClick={() => {
+                selectConversation(installId, c.id);
+                setHistoryOpen(false);
+              }}
+            >
+              {conversationLabel(c, i, subjects)}
+            </button>
+          ))}
+        </div>
+      )}
       {active.state !== "legacy" && (
         <div className="app-chat-conv" data-chat-conversations>
           <select
@@ -998,43 +1038,55 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           </select>
           <button
             type="button"
-            className="btn btn-secondary btn-sm"
+            className="app-chat-iconbtn"
             data-chat-new
+            aria-label="New conversation"
+            title="New conversation"
             disabled={!canCreate || creating}
             onClick={startNew}
           >
-            + New
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 5v14M5 12h14" />
+            </svg>
           </button>
-          {active.state === "ready" &&
-            active.selected !== null &&
-            !active.selected.isGeneral &&
-            binding.scope !== null &&
-            binding.error === null &&
-            binding.scope.install_id === installId &&
-            binding.scope.context_id !== "" &&
-            mode.contextProof?.status === "ready" &&
-            mode.contextProof.contextId === binding.scope.context_id && (
-              <Link
-                href={`/app-installations/${encodeURIComponent(installId)}?ctx=${encodeURIComponent(binding.scope.context_id)}&conversation=${encodeURIComponent(active.selected.id)}`}
-                className="lnk text-micro"
-                aria-label="Link to this conversation"
-                title="Shareable link to this conversation"
-                data-chat-conversation-link
-              >
-                Link
-              </Link>
-            )}
-          {active.state === "ready" &&
-            active.selected !== null &&
-            !active.selected.isGeneral &&
-            mode.contextProof?.status === "ready" &&
-            (binding.scope === null || binding.scope.context_id === "") && (
-              <span className="text-micro text-ink-500" data-chat-link-unavailable>
-                Link unavailable without a verified context
-              </span>
-            )}
         </div>
       )}
+      <div className="app-chat-scope" data-chat-scope>
+        <span className="app-chat-scope-dot" aria-hidden />
+        <span className="truncate">{mode.scopeLabel}</span>
+        {active.state === "ready" &&
+          active.selected !== null &&
+          !active.selected.isGeneral &&
+          binding.scope !== null &&
+          binding.error === null &&
+          binding.scope.install_id === installId &&
+          binding.scope.context_id !== "" &&
+          mode.contextProof?.status === "ready" &&
+          mode.contextProof.contextId === binding.scope.context_id && (
+            <Link
+              href={`/app-installations/${encodeURIComponent(installId)}?ctx=${encodeURIComponent(binding.scope.context_id)}&conversation=${encodeURIComponent(active.selected.id)}`}
+              className="lnk app-chat-scope-link"
+              aria-label="Link to this conversation"
+              title="Shareable link to this conversation"
+              data-chat-conversation-link
+            >
+              Link
+            </Link>
+          )}
+        {active.state === "ready" &&
+          active.selected !== null &&
+          !active.selected.isGeneral &&
+          mode.contextProof?.status === "ready" &&
+          (binding.scope === null || binding.scope.context_id === "") && (
+            <span
+              className="app-chat-scope-link text-ink-500"
+              title="A shareable link needs a verified context"
+              data-chat-link-unavailable
+            >
+              Link unavailable
+            </span>
+          )}
+      </div>
       {active.requestPending && (
         <p className="text-label text-ink-500" role="status" data-chat-link-pending>
           Checking the linked conversation and its context…
@@ -1064,19 +1116,20 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         </p>
       )}
       {working && viewer.operator && !viewer.readOnly && (
-        <p className="text-micro text-ink-500 app-chat-working" role="status">
-          Working…{" "}
+        <div className="app-chat-working" role="status">
+          <span className="app-chat-pulse" aria-hidden />
+          <span>Working…</span>
           <button
             type="button"
-            className="lnk"
+            className="app-chat-stop"
             onClick={onStop}
             data-chat-stop
-            title="Stops the master's running turn. The board command is global, not scoped to this conversation, and cancels the turn only — it cannot undo a committed effect."
+            aria-label="Stop the current turn (applies to the whole assistant, not only this conversation)"
+            title="Stops the assistant's running turn. The board command is global, not scoped to this conversation, and cancels the turn only — it cannot undo a committed effect."
           >
             Stop
-          </button>{" "}
-          <span className="text-ink-500">(global — stops the master's current turn, not scoped to this conversation)</span>
-        </p>
+          </button>
+        </div>
       )}
       {thread.status === "failed" && (
         <p className="text-label text-fail" role="alert">
@@ -1261,8 +1314,8 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         originalUnresolved={originalUnresolved !== null}
         onResolveOriginal={() => outboxRef.current?.scrollIntoView?.({ block: "nearest" })}
         textareaId="app-shell-chat-box"
-        ariaLabel="Message to the master"
-        placeholder="Ask the assistant… (Enter sends)"
+        ariaLabel="Message to Assistant"
+        placeholder="Message Assistant…"
         className="app-chat-form"
       />
     </div>

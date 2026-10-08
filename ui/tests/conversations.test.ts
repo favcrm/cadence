@@ -125,7 +125,7 @@ await mount("install-crm");
 
 // Picker: General, the campaign conversation, and + New; only the selected conversation's entries show.
 equal(optionLabels(), ["General", "Spring launch"], "picker lists General and the campaign conversation");
-assert(newButton() && newButton().textContent === "+ New", "+ New sits beside the picker");
+assert(newButton() && newButton().getAttribute("aria-label") === "New conversation", "the + icon (New conversation) sits beside the picker");
 equal(picker().value, "c-gen", "General is the default");
 assert(pane().includes("general answer") && !pane().includes("campaign brief"), "General shows only its own thread");
 await pick("c-camp");

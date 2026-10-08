@@ -39,8 +39,8 @@ export default function Composer({
       refocusAfterSend
       attach
       className="card p-2.5 relative"
-      placeholder="Ask Master about your team or plan the next job…"
-      ariaLabel="message to the master"
+      placeholder="Message Assistant…"
+      ariaLabel="Message to Assistant"
       // Home's `data-composer` hook — tests and the dock find the form by it.
       formProps={{ "data-composer": "" }}
     />

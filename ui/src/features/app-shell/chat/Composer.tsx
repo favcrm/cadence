@@ -8,7 +8,7 @@ import {
 } from "react";
 import type { ThreadRef } from "../../../lib/types";
 import { parseSlash, SLASH_COMMANDS, slashMatches, type SlashCommand } from "../../home/master";
-import { ATTACH_ACCEPT, unresolvedHint, type AttachDestination, type AttachItem } from "./attach";
+import { ATTACH_ACCEPT, attachMeta, unresolvedHint, type AttachDestination, type AttachItem } from "./attach";
 import {
   addFiles,
   attachHold,
@@ -353,32 +353,45 @@ export default function Composer({
     attachItems.length > 0 ? (
       <div className="app-chat-attachrow" data-composer-attachments>
         {attachItems.map((a) => (
-          <span
+          <div
             key={a.key}
-            className={`app-chat-attachchip text-micro${a.status === "failed" ? " failed" : ""}`}
+            role="group"
+            className={`app-chat-filerow${a.status === "failed" ? " failed" : ""}`}
             data-attach-status={a.status}
-            title={a.error ?? a.name}
             aria-label={`${a.name}: ${a.status}${a.error ? ` — ${a.error}` : ""}`}
           >
-            {a.name}
-            {a.status === "uploading" && <span className="text-ink-500">…</span>}
-            {a.status === "failed" && (
-              <>
-                {" "}
-                <button type="button" className="lnk" onClick={() => retryAttach(key, a.key)}>
-                  Retry
-                </button>
-              </>
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M5 3h9l5 5v13H5zM14 3v6h5M8 13h8M8 17h5" />
+            </svg>
+            <div className="app-chat-filename">
+              <span>{a.name}</span>
+              <small>
+                {attachMeta(a.name, a.size)}
+                {a.status === "uploading" ? " · Uploading…" : ""}
+              </small>
+              {a.status === "failed" && a.error && (
+                <small className="app-chat-upload-error" role="alert">
+                  {a.error}
+                </small>
+              )}
+            </div>
+            {a.status === "failed" && !a.permanent && (
+              <button type="button" className="lnk" onClick={() => retryAttach(key, a.key)}>
+                Retry
+              </button>
             )}
             <button
               type="button"
-              className="lnk"
+              className="app-chat-remove"
               aria-label={`Remove ${a.name}`}
+              title={`Remove ${a.name}`}
               onClick={() => removeAttach(key, a.key)}
             >
-              ×
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M6 6l12 12M18 6L6 18" />
+              </svg>
             </button>
-          </span>
+          </div>
         ))}
       </div>
     ) : null;
@@ -397,8 +410,8 @@ export default function Composer({
       aria-expanded={matches.length > 0 || undefined}
       className={
         compact
-          ? "app-chat-box"
-          : "w-full resize-none bg-transparent text-body text-ink-100 placeholder:text-ink-500 outline-none disabled:opacity-50 min-h-[2.75rem] max-h-40 overflow-y-auto"
+          ? "app-chat-box app-chat-textarea"
+          : "app-chat-textarea w-full resize-none bg-transparent text-body text-ink-100 placeholder:text-ink-500 outline-none disabled:opacity-50 min-h-[2.75rem] max-h-40 overflow-y-auto"
       }
     />
   );
@@ -563,12 +576,11 @@ export default function Composer({
       <div className="flex items-center gap-2 mt-1.5">
         {attachInput}
         {attachButton}
-        {/* The hold reason stays visible while it applies (a specific
-            error, not a hint); with nothing to say the row is the
-            controls alone — no persistent Enter/format copy. */}
-        {block || sendHeld ? (
-          <p className="text-micro text-ink-500 min-w-0 flex-1 break-words" data-composer-block={block ? "" : undefined}>
-            {block ?? sendHeld}
+        {/* A held send's reason is on the failed file's own row; this
+            line is only for a blocked (read-only) composer. */}
+        {block ? (
+          <p className="text-micro text-ink-500 min-w-0 flex-1 break-words" data-composer-block="">
+            {block}
           </p>
         ) : (
           <span className="flex-1" />

@@ -82,11 +82,14 @@ const reducedMotion = () =>
 function appOriginHref(origin: MasterAppOrigin | null): string | null {
   if (!origin || typeof origin !== "object") return null;
   const { install_id, context_id, conversation_id } = origin;
-  const ids = [install_id, context_id, conversation_id];
-  if (ids.some((id) => typeof id !== "string" || id.length === 0 || id.trim() !== id)) {
-    return null;
-  }
-  return `/app-installations/${encodeURIComponent(install_id)}?ctx=${encodeURIComponent(context_id)}&conversation=${encodeURIComponent(conversation_id)}`;
+  // Strict, fail-closed ids: malformed or foreign shapes give no link. An
+  // empty context is a real destination (a no-context app conversation),
+  // so it only omits the `ctx` selector.
+  const strict = (id: unknown): id is string => typeof id === "string" && id.length > 0 && id.trim() === id;
+  if (!strict(install_id) || !strict(conversation_id)) return null;
+  if (context_id !== "" && !strict(context_id)) return null;
+  const ctx = context_id === "" ? "" : `ctx=${encodeURIComponent(context_id)}&`;
+  return `/app-installations/${encodeURIComponent(install_id)}?${ctx}conversation=${encodeURIComponent(conversation_id)}`;
 }
 
 function WorkingRow({
@@ -142,7 +145,7 @@ function WorkingRow({
       <span className="flex-1" />
       {appHref && (turn.kind === "working" || turn.kind === "queued") && (
         <Link href={appHref} className="lnk text-micro shrink-0">
-          Open app conversation
+          Open its conversation <span aria-hidden>↗</span>
         </Link>
       )}
       {turn.kind === "working" && (
@@ -800,7 +803,8 @@ export default function Home({
             itself never scrolls for the chat. */}
         <div className="relative flex-1 min-h-0 flex flex-col" data-chat-panel>
           <div className="master-heading flex items-center gap-2 flex-wrap pb-2.5 border-b border-ink-700/70">
-            <h1 className="text-section font-semibold text-ink-100">Master</h1>
+            <span className="text-accent text-section" aria-hidden>✳</span>
+            <h1 className="text-section font-semibold text-ink-100">Assistant</h1>
             <span
               className={`chip ${
                 status.kind === "running"
@@ -818,7 +822,10 @@ export default function Home({
             )}
           </div>
 
-          <p className="text-label text-ink-500 pt-2 pb-1">Plan work, check in with your agents, and discuss what comes next. <span className="text-ink-400">All projects</span></p>
+          <p className="text-micro text-ink-400 pt-2 pb-1 flex items-center gap-1.5" data-chat-scope>
+            <span className="inline-block w-[5px] h-[5px] rounded-full bg-accent" aria-hidden />
+            All projects
+          </p>
 
           {thread.status === "failed" && (
             <div className="card px-3.5 py-3 mt-3 text-label text-fail break-words" role="alert">

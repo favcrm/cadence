@@ -39,7 +39,6 @@ import type {
   WorkflowsPayload,
 } from "./types";
 
-/** `GET /api/threads/<alias>` — `thread` is null until the first message. */
 /** The daemon-minted retained-file row `POST /api/chat/upload` answers
  *  (CAD-1168): the id is the only handle; metadata is server-derived. */
 export interface ChatFileRow {
@@ -92,6 +91,7 @@ export interface AppFileUploadProjection {
   available: boolean;
 }
 
+/** `GET /api/threads/<alias>` — `thread` is null until the first message. */
 export interface ThreadPage {
   alias?: string;
   thread: { id: string; alias: string; created: string; updated: string } | null;
