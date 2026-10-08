@@ -30,6 +30,14 @@
 set -eu
 
 ROOT=${CADENCE_E2E_ROOT:-$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)}
+BIN=${CADENCE_E2E_BINARY:-}
+# CAD-1210: drop every CADENCE_* routing variable before cargo runs, except
+# an allowlist, so a pane's production CADENCE_PM_DIR/CADENCE_STATE_DIR never
+# reaches the test binaries (same approach as scripts/run-result-tests, CAD-1197).
+cadence_env_allow=" CADENCE_SUITE_LOCK "
+for v in $(env | sed -n 's/^\(CADENCE_[A-Za-z0-9_]*\)=.*/\1/p'); do
+    case $cadence_env_allow in *" $v "*) ;; *) unset "$v" ;; esac
+done
 BUILD=1
 for arg in "$@"; do
     case "$arg" in
@@ -53,7 +61,7 @@ if [ "$BUILD" = 1 ]; then
     (cd "$ROOT/ui" && pnpm install --frozen-lockfile && pnpm build)
     (cd "$ROOT" && cargo build --release --locked --features ui)
 fi
-BIN=${CADENCE_E2E_BINARY:-$ROOT/target/release/cadence}
+BIN=${BIN:-$ROOT/target/release/cadence}
 [ -x "$BIN" ] || { echo "mvp.sh: no $BIN — run without --no-build" >&2; exit 1; }
 
 # The local release, laid out like GitHub Releases: <dl>/<tag>/<asset>.

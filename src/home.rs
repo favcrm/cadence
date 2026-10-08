@@ -106,9 +106,9 @@ pub fn home() -> Result<PathBuf> {
 /// `<home>/tracker` under the new layout, else `~/pm`.
 pub fn tracker_dir() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("CADENCE_PM_DIR") {
-        return Ok(PathBuf::from(dir));
+        return test_guard(PathBuf::from(dir), ".", "pm");
     }
-    tracker_default()
+    test_guard(tracker_default()?, ".", "pm")
 }
 
 /// `tracker_dir` with `CADENCE_PM_DIR` unset — the production
@@ -127,9 +127,9 @@ pub fn tracker_default() -> Result<PathBuf> {
 /// the new layout, else the legacy default.
 pub fn state_dir() -> Result<PathBuf> {
     if let Ok(dir) = std::env::var("CADENCE_STATE_DIR") {
-        return Ok(PathBuf::from(dir));
+        return test_guard(PathBuf::from(dir), ".local/state", "cadence");
     }
-    state_default()
+    test_guard(state_default()?, ".local/state", "cadence")
 }
 
 /// `state_dir` with `CADENCE_STATE_DIR` unset — the production
@@ -232,4 +232,74 @@ fn legacy_state_dir() -> Result<PathBuf> {
         return Ok(PathBuf::from(dir).join("cadence"));
     }
     local_state_dir()
+}
+
+/// CAD-1210: a test process must never reach the invoking user's real
+/// tracker (`~/pm`) or state dir (`~/.local/state/cadence`). Armed
+/// only under `cfg(test)` and the `test-seam` feature (integration
+/// targets build the lib without `cfg(test)`); a release build is a
+/// no-op. Allowlist-shaped: only those two production roots refuse.
+#[cfg(not(any(test, feature = "test-seam")))]
+fn test_guard(dir: PathBuf, _rel: &str, _leaf: &str) -> Result<PathBuf> {
+    Ok(dir)
+}
+
+#[cfg(any(test, feature = "test-seam"))]
+fn test_guard(dir: PathBuf, rel: &str, leaf: &str) -> Result<PathBuf> {
+    match real_home() {
+        Some(real) => refuse_under(dir, &real.join(rel).join(leaf)),
+        None => Ok(dir),
+    }
+}
+
+#[cfg(any(test, feature = "test-seam"))]
+fn refuse_under(dir: PathBuf, root: &Path) -> Result<PathBuf> {
+    let norm = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    if dir.starts_with(root) || norm(&dir).starts_with(norm(root)) {
+        return Err(Error::rejected(format!(
+            "refusing to resolve {}: a test process must not touch the real {} \
+             (CAD-1210); point CADENCE_PM_DIR/CADENCE_STATE_DIR at a temp dir",
+            dir.display(),
+            root.display()
+        )));
+    }
+    Ok(dir)
+}
+
+/// The invoking user's home from the passwd database (never `$HOME`,
+/// which tests isolate). `CADENCE_TEST_REAL_HOME` substitutes a fake
+/// stand-in; it is read only in these test builds.
+#[cfg(any(test, feature = "test-seam"))]
+fn real_home() -> Option<PathBuf> {
+    if let Some(h) = std::env::var_os("CADENCE_TEST_REAL_HOME") {
+        return Some(PathBuf::from(h));
+    }
+    use std::os::unix::ffi::OsStrExt;
+    // SAFETY: getpwuid returns null or a pointer to a static passwd
+    // record whose pw_dir is a NUL-terminated string; copied at once.
+    unsafe {
+        let pw = libc::getpwuid(libc::getuid());
+        if pw.is_null() || (*pw).pw_dir.is_null() {
+            return None;
+        }
+        let dir = std::ffi::CStr::from_ptr((*pw).pw_dir);
+        Some(PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes())))
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+
+    #[test]
+    fn production_roots_refuse_and_other_dirs_pass() {
+        let fake = PathBuf::from("/tmp/c1210-fakehome");
+        let pm = fake.join("pm");
+        let st = fake.join(".local/state/cadence");
+        let err = refuse_under(pm.join("sub"), &pm).unwrap_err().to_string();
+        assert!(err.contains("CAD-1210"), "{err}");
+        assert!(refuse_under(st.clone(), &st).is_err());
+        assert!(refuse_under(fake.join("pm-other"), &pm).is_ok());
+        assert!(refuse_under(fake.join("tmp-state"), &st).is_ok());
+    }
 }
