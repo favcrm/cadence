@@ -41,6 +41,17 @@ pub struct Job {
     pub updated: f64,
 }
 
+/// A non-terminal task assigned to an alias with its job's binding:
+/// `issue` is the job's issue (`None` when unbound); `job_title` and
+/// `job_state` are `None` only if the job row is missing.
+#[derive(Debug, Clone)]
+pub struct AssigneeTask {
+    pub task: Task,
+    pub issue: Option<String>,
+    pub job_title: Option<String>,
+    pub job_state: Option<String>,
+}
+
 /// A task: the dispatch/QA unit inside a job. `revision` counts
 /// attempts; each attempt is one kickoff message (`dispatch_message`).
 #[derive(Debug, Clone)]
@@ -349,6 +360,30 @@ impl Store {
                 .query_vec(stmt_sql, [alias], row_task)
                 .map(|rows| rows.into_iter().map(Ok::<_, rusqlite::Error>))?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+    }
+
+    /// An alias's non-terminal task assignments (the same rows as
+    /// [`Self::tasks_for_assignee`], same order) each with its job's issue
+    /// and job title/state, in one join over this alias's tasks. The
+    /// agent-scoped binding `agent show` serves, so a detail read never
+    /// lists the fleet's tasks or jobs. `issue` is `None` for an unbound job.
+    pub fn assignee_tasks_bound(&self, alias: &str) -> Result<Vec<AssigneeTask>> {
+        self.read_tx(|conn| {
+            let stmt_sql = "SELECT t.*, NULLIF(j.issue_id,'') AS bound_issue,
+                         j.title AS job_title, j.state AS job_state
+                         FROM tasks t LEFT JOIN jobs j ON j.id = t.job_id
+                         WHERE t.assignee=? AND t.state NOT IN
+                         ('verified','done','cancelled','failed')
+                         ORDER BY t.updated";
+            Ok(conn.query_vec(stmt_sql, [alias], |row| {
+                Ok(AssigneeTask {
+                    task: row_task(row)?,
+                    issue: row.get("bound_issue")?,
+                    job_title: row.get("job_title")?,
+                    job_state: row.get("job_state")?,
+                })
+            })?)
         })
     }
 

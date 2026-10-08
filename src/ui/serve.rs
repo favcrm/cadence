@@ -751,9 +751,19 @@ pub(crate) fn agents_payload_from(
 /// `/api/agents/<alias>` — the drawer detail: the daemon's own
 /// `agent_show` plus the last 20 events and the recovery/resume
 /// commands the row chips hinted at.
+///
+/// CAD-1221: agent-local work only. `active_only` brings the rows the
+/// drawer shows (running ones), never the full message history, and
+/// `task_bindings` brings this alias's tasks with their issues from one
+/// join on this alias's rows. The fleet's `agent_list` and `job_list`
+/// are read only for a daemon that predates `task_bindings`.
 pub(crate) fn agent_detail(state_dir: &Path, alias: &str) -> std::result::Result<Value, String> {
-    let show =
-        client::rpc(state_dir, "agent_show", json!({"alias": alias})).map_err(|e| e.to_string())?;
+    let show = client::rpc(
+        state_dir,
+        "agent_show",
+        json!({"alias": alias, "active_only": true}),
+    )
+    .map_err(|e| e.to_string())?;
     let agent = &show["agent"];
     let cursor = show["event_cursor"].as_i64().unwrap_or(0);
     let events = agent_events_tail(state_dir, alias, cursor, 20);
@@ -769,29 +779,10 @@ pub(crate) fn agent_detail(state_dir: &Path, alias: &str) -> std::result::Result
         .collect();
     let fenced =
         show["unknown"].as_i64().unwrap_or(0) > 0 || agent["state"].as_str() == Some("attention");
-    // `tasks` lives on the agent_list row, not the show payload.
-    let tasks = client::rpc(state_dir, "agent_list", json!({}))
-        .ok()
-        .and_then(|l| {
-            l["agents"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .find(|a| a["alias"].as_str() == Some(alias))
-        })
-        .map(|a| a["tasks"].clone())
-        .unwrap_or(json!([]));
-    // Bound issues through the same tasks × jobs.issue_id join.
-    let task_map = task_issue_map(state_dir);
-    let mut issues: Vec<&str> = Vec::new();
-    for t in tasks.as_array().cloned().unwrap_or_default() {
-        if let Some(binding) = t.as_str().and_then(|tid| task_map.get(tid)) {
-            if !issues.contains(&binding.issue.as_str()) {
-                issues.push(&binding.issue);
-            }
-        }
-    }
+    let (tasks, issues) = match show["task_bindings"].as_array() {
+        Some(rows) => task_binding_view(rows),
+        None => legacy_task_view(state_dir, alias),
+    };
     Ok(json!({
         "agent": agent,
         "queued": show["queued"],
@@ -809,6 +800,53 @@ pub(crate) fn agent_detail(state_dir: &Path, alias: &str) -> std::result::Result
         "tasks": tasks,
         "on": issues,
     }))
+}
+
+/// The drawer's `tasks` (the alias's non-terminal task ids, as
+/// `agent_list` lists them) and `on` (distinct issues its tasks bind to,
+/// first-seen order) from an `agent show` `task_bindings` array.
+fn task_binding_view(rows: &[Value]) -> (Value, Vec<String>) {
+    let mut tasks: Vec<Value> = Vec::new();
+    let mut issues: Vec<String> = Vec::new();
+    for row in rows {
+        if let Some(id) = row["id"].as_str() {
+            tasks.push(json!(id));
+        }
+        if let Some(issue) = row["issue"].as_str().filter(|i| !i.is_empty()) {
+            if !issues.iter().any(|known| known == issue) {
+                issues.push(issue.to_string());
+            }
+        }
+    }
+    (Value::Array(tasks), issues)
+}
+
+/// Pre-CAD-1221 daemons answer `agent show` without `task_bindings`: the
+/// alias's ids come from the fleet's `agent_list` row and the issues from
+/// the fleet's `job_list`. Only that daemon pays for the fleet reads.
+fn legacy_task_view(state_dir: &Path, alias: &str) -> (Value, Vec<String>) {
+    let tasks = client::rpc(state_dir, "agent_list", json!({}))
+        .ok()
+        .and_then(|l| {
+            l["agents"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|a| a["alias"].as_str() == Some(alias))
+        })
+        .map(|a| a["tasks"].clone())
+        .unwrap_or(json!([]));
+    let task_map = task_issue_map(state_dir);
+    let mut issues: Vec<String> = Vec::new();
+    for t in tasks.as_array().cloned().unwrap_or_default() {
+        if let Some(binding) = t.as_str().and_then(|tid| task_map.get(tid)) {
+            if !issues.contains(&binding.issue) {
+                issues.push(binding.issue.clone());
+            }
+        }
+    }
+    (tasks, issues)
 }
 
 fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) {

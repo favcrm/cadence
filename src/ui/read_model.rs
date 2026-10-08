@@ -33,7 +33,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{json, Value};
@@ -47,8 +47,12 @@ use crate::overview;
 
 /// The shared stream watcher's poll period.
 const WATCH_EVERY: Duration = Duration::from_secs(1);
-/// While the watcher runs, a daemon snapshot this young is served as is.
-const DAEMON_FRESH: Duration = Duration::from_secs(3);
+/// While the watcher runs, reads serve its last kept daemon snapshot
+/// whatever its age (`snapshot_age_secs` says how old) — the watcher's
+/// next fetch replaces it, and a read never waits on a slow fetch. Past
+/// this age a read joins or starts a fetch instead, so an unreachable
+/// watcher cannot leave reads on data from long ago.
+const DAEMON_MAX_STALE: Duration = Duration::from_secs(120);
 /// An overview this young is served without a rebuild; an older one is
 /// served while a background pass refreshes it.
 const OVERVIEW_FRESH: Duration = Duration::from_secs(2);
@@ -67,6 +71,10 @@ type Entities = HashMap<String, (u64, Value)>;
 
 static MODELS: LazyLock<Mutex<Models>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// How one daemon snapshot is fetched. The board uses [`fetch_daemon`];
+/// tests substitute a counting fake.
+type Fetch = Box<dyn Fn(&Path) -> DaemonSnap + Send + Sync>;
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -76,21 +84,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 pub(super) fn get(state_dir: &Path, pm_dir: &Path) -> Arc<Model> {
     lock(&MODELS)
         .entry((state_dir.to_path_buf(), pm_dir.to_path_buf()))
-        .or_insert_with(|| {
-            Arc::new(Model {
-                state_dir: state_dir.to_path_buf(),
-                pm_dir: pm_dir.to_path_buf(),
-                tracker: Mutex::default(),
-                daemon: Mutex::default(),
-                overview: Mutex::default(),
-                hub: Mutex::default(),
-                changed_at: Mutex::default(),
-                build_lock: Mutex::default(),
-                overview_builds: AtomicU64::new(0),
-                request_builds: AtomicU64::new(0),
-                collection_parses: AtomicU64::new(0),
-            })
-        })
+        .or_insert_with(|| Arc::new(Model::new(state_dir, pm_dir, Box::new(fetch_daemon))))
         .clone()
 }
 
@@ -98,7 +92,8 @@ pub(super) struct Model {
     state_dir: PathBuf,
     pm_dir: PathBuf,
     tracker: Mutex<Tracker>,
-    daemon: Mutex<Option<Arc<DaemonSnap>>>,
+    daemon: Mutex<DaemonSlot>,
+    fetch: Fetch,
     overview: Mutex<OverviewState>,
     hub: Mutex<Hub>,
     /// When the daemon side last moved — a change the watcher saw, or a
@@ -115,6 +110,10 @@ pub(super) struct Model {
     /// Issue folders [`board::load_all`] parsed on the watcher thread.
     /// The incremental `parses` counter does not see that scan.
     collection_parses: AtomicU64,
+    /// Daemon fetches started, and callers that waited on one in flight
+    /// instead of starting their own (CAD-1221).
+    daemon_builds: AtomicU64,
+    daemon_joins: AtomicU64,
 }
 
 /// Runs its closure on drop — resets a flag even when a panic unwinds.
@@ -123,6 +122,27 @@ struct OnDrop<F: FnMut()>(F);
 impl<F: FnMut()> Drop for OnDrop<F> {
     fn drop(&mut self) {
         (self.0)()
+    }
+}
+
+impl Model {
+    fn new(state_dir: &Path, pm_dir: &Path, fetch: Fetch) -> Self {
+        Model {
+            state_dir: state_dir.to_path_buf(),
+            pm_dir: pm_dir.to_path_buf(),
+            tracker: Mutex::default(),
+            daemon: Mutex::default(),
+            fetch,
+            overview: Mutex::default(),
+            hub: Mutex::default(),
+            changed_at: Mutex::default(),
+            build_lock: Mutex::default(),
+            overview_builds: AtomicU64::new(0),
+            request_builds: AtomicU64::new(0),
+            collection_parses: AtomicU64::new(0),
+            daemon_builds: AtomicU64::new(0),
+            daemon_joins: AtomicU64::new(0),
+        }
     }
 }
 
@@ -483,8 +503,95 @@ impl BoardRead {
 
 // ---------- daemon snapshot ----------
 
+/// The daemon side of a model: the kept snapshot and the fetch running
+/// now, if any. Held only for a field swap, never across an RPC.
+#[derive(Default)]
+struct DaemonSlot {
+    /// The last snapshot kept. Always fetched after the last change mark:
+    /// an invalidation clears it, and a fetch that started before the mark
+    /// is never kept.
+    kept: Option<Arc<DaemonSnap>>,
+    /// The fetch in flight. Callers that need a snapshot join it while it
+    /// started after the last change mark.
+    building: Option<Arc<Build>>,
+}
+
+/// One daemon fetch shared by its callers. Ends `Done` with the snapshot,
+/// or `Abandoned` when its builder unwound, so waiters retry.
+struct Build {
+    started: Instant,
+    outcome: Mutex<Outcome>,
+    finished: Condvar,
+}
+
+enum Outcome {
+    Running,
+    Done(Arc<DaemonSnap>),
+    Abandoned,
+}
+
+impl Build {
+    fn new() -> Self {
+        Build {
+            started: Instant::now(),
+            outcome: Mutex::new(Outcome::Running),
+            finished: Condvar::new(),
+        }
+    }
+
+    /// Waits for the fetch to end. `None` when its builder abandoned it.
+    fn wait(&self) -> Option<Arc<DaemonSnap>> {
+        let mut outcome = lock(&self.outcome);
+        loop {
+            match &*outcome {
+                Outcome::Running => {
+                    outcome = self
+                        .finished
+                        .wait(outcome)
+                        .unwrap_or_else(|e| e.into_inner());
+                }
+                Outcome::Done(snap) => return Some(snap.clone()),
+                Outcome::Abandoned => return None,
+            }
+        }
+    }
+
+    fn end(&self, outcome: Outcome) {
+        *lock(&self.outcome) = outcome;
+        self.finished.notify_all();
+    }
+}
+
+/// Ends a fetch that unwinds before [`Model::fetch_shared`] completes it:
+/// waiters wake to retry, and the slot forgets the build.
+struct BuildGuard<'a> {
+    model: &'a Model,
+    build: Arc<Build>,
+    done: bool,
+}
+
+impl Drop for BuildGuard<'_> {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        {
+            let mut slot = lock(&self.model.daemon);
+            if slot
+                .building
+                .as_ref()
+                .is_some_and(|b| Arc::ptr_eq(b, &self.build))
+            {
+                slot.building = None;
+            }
+        }
+        self.build.end(Outcome::Abandoned);
+    }
+}
+
 pub(super) struct DaemonSnap {
-    /// When the fetch started — a slower, older fetch never replaces it.
+    /// When the fetch started. The data is at least this old, and a
+    /// slower, older fetch never replaces a newer one.
     at: Instant,
     outcomes: board::JobOutcomes,
     /// `None` when `job_list` failed.
@@ -757,31 +864,87 @@ fn fps(map: &Entities) -> HashMap<String, u64> {
 }
 
 impl Model {
-    /// The daemon snapshot a read serves: the watcher's, while it runs
-    /// and is fresh; otherwise a fetch now.
+    /// The daemon snapshot a read serves. While the watcher runs, its kept
+    /// snapshot, however old up to [`DAEMON_MAX_STALE`]: the watcher's next
+    /// fetch replaces it, and a read never waits on a slow one. Otherwise a
+    /// fetch shared with every caller that needs one now.
     fn daemon_snap(&self) -> Arc<DaemonSnap> {
         let watched = lock(&self.hub).running;
-        if watched {
-            if let Some(snap) = lock(&self.daemon).as_ref() {
-                if snap.at.elapsed() < DAEMON_FRESH {
-                    return snap.clone();
-                }
-            }
+        let kept = lock(&self.daemon).kept.clone();
+        if let Some(snap) = kept.filter(|snap| watched && snap.at.elapsed() < DAEMON_MAX_STALE) {
+            return snap;
         }
-        let snap = Arc::new(fetch_daemon(&self.state_dir));
-        self.keep_snap(snap.clone());
-        snap
+        self.fetch_shared()
+    }
+
+    /// The snapshot from the fetch in flight when it started after the
+    /// last change mark, else from a fetch started now. Concurrent callers
+    /// share one fetch. A waiter whose fetch was abandoned retries. The
+    /// fetch runs outside the slot lock, which is held only to swap fields.
+    fn fetch_shared(&self) -> Arc<DaemonSnap> {
+        loop {
+            let (build, leader) = {
+                let mut slot = lock(&self.daemon);
+                match slot.building.clone() {
+                    Some(build) if self.after_change(build.started) => (build, false),
+                    _ => {
+                        let build = Arc::new(Build::new());
+                        slot.building = Some(build.clone());
+                        (build, true)
+                    }
+                }
+            };
+            if !leader {
+                self.daemon_joins.fetch_add(1, Ordering::Relaxed);
+                if let Some(snap) = build.wait() {
+                    return snap;
+                }
+                continue;
+            }
+            self.daemon_builds.fetch_add(1, Ordering::Relaxed);
+            let mut guard = BuildGuard {
+                model: self,
+                build: build.clone(),
+                done: false,
+            };
+            // The snapshot is as old as the fetch's start, whatever the
+            // fetcher stamped: the change marks compare against that start.
+            let mut fetched = (self.fetch)(&self.state_dir);
+            fetched.at = build.started;
+            let snap = Arc::new(fetched);
+            {
+                let mut slot = lock(&self.daemon);
+                if slot
+                    .building
+                    .as_ref()
+                    .is_some_and(|b| Arc::ptr_eq(b, &build))
+                {
+                    slot.building = None;
+                }
+                self.keep_in(&mut slot, snap.clone());
+            }
+            build.end(Outcome::Done(snap.clone()));
+            guard.done = true;
+            return snap;
+        }
+    }
+
+    /// Keep `snap` now (a stream baseline fetched outside the shared fetch).
+    fn keep_snap(&self, snap: Arc<DaemonSnap>) {
+        self.keep_in(&mut lock(&self.daemon), snap);
     }
 
     /// Keep `snap` unless a newer one is kept or it started before the
     /// last change mark (a fetch racing a write may predate the write).
-    fn keep_snap(&self, snap: Arc<DaemonSnap>) {
+    /// The mark is read under the slot lock: [`Self::invalidate`] marks
+    /// first and clears the slot after, so either this keep sees the mark
+    /// or the clear lands after it.
+    fn keep_in(&self, slot: &mut DaemonSlot, snap: Arc<DaemonSnap>) {
         if !self.after_change(snap.at) {
             return;
         }
-        let mut slot = lock(&self.daemon);
-        if slot.as_ref().is_none_or(|old| old.at <= snap.at) {
-            *slot = Some(snap);
+        if slot.kept.as_ref().is_none_or(|old| old.at <= snap.at) {
+            slot.kept = Some(snap);
         }
     }
 
@@ -806,6 +969,8 @@ impl Model {
             "overview_builds": self.overview_builds.load(Ordering::Relaxed),
             "request_builds": self.request_builds.load(Ordering::Relaxed),
             "collection_parses": self.collection_parses.load(Ordering::Relaxed),
+            "daemon_builds": self.daemon_builds.load(Ordering::Relaxed),
+            "daemon_joins": self.daemon_joins.load(Ordering::Relaxed),
         })
     }
 
@@ -832,8 +997,13 @@ impl Model {
     }
 
     /// `/api/agents`.
+    /// `snapshot_age_secs` is the served snapshot's age since its fetch
+    /// started: the data is at least that old.
     pub(super) fn agents(&self) -> Value {
-        self.daemon_snap().agents.clone()
+        let snap = self.daemon_snap();
+        let mut agents = snap.agents.clone();
+        agents["snapshot_age_secs"] = json!(snap.at.elapsed().as_secs_f64());
+        agents
     }
 
     /// A board write is about to answer — drop what the daemon side
@@ -842,7 +1012,9 @@ impl Model {
     /// next read re-stamps the folders.
     pub(super) fn invalidate(&self) {
         self.mark_changed(Instant::now());
-        *lock(&self.daemon) = None;
+        // A fetch in flight may predate the write: its build is dropped
+        // here, so no reader joins it, and its keep is refused by the mark.
+        *lock(&self.daemon) = DaemonSlot::default();
         let mut st = lock(&self.overview);
         st.value = None;
         st.sources = None;
@@ -1085,7 +1257,7 @@ impl Model {
             !std::mem::replace(&mut hub.running, true)
         };
         if start {
-            let snap = Arc::new(fetch_daemon(&self.state_dir));
+            let snap = Arc::new((self.fetch)(&self.state_dir));
             self.keep_snap(snap.clone());
             let (cards, plans) = self.entities(&snap);
             let (projects, overview) = self.aggregate_fps();
@@ -1200,8 +1372,7 @@ impl Model {
                 frames.push(legacy_frame("issues"));
             }
         }
-        let snap = Arc::new(fetch_daemon(&self.state_dir));
-        self.keep_snap(snap.clone());
+        let snap = self.fetch_shared();
         let jobs = snap.jobs_fp != w.jobs;
         if jobs {
             w.jobs = snap.jobs_fp;
@@ -1326,6 +1497,138 @@ mod tests {
             frames.is_empty(),
             "stable delivery state must not cause a refetch loop"
         );
+    }
+
+    /// A model whose daemon fetch counts its calls, answers with the call
+    /// number as `agents.v`, sleeps `delay(call)` and panics on `panic_on`.
+    fn fake_daemon(
+        delay: impl Fn(u64) -> Duration + Send + Sync + 'static,
+        panic_on: Option<u64>,
+    ) -> (Arc<Model>, Arc<AtomicU64>) {
+        let calls = Arc::new(AtomicU64::new(0));
+        let seen = calls.clone();
+        let fetch: Fetch = Box::new(move |_| {
+            let n = seen.fetch_add(1, Ordering::SeqCst) + 1;
+            std::thread::sleep(delay(n));
+            if panic_on == Some(n) {
+                panic!("fetch {n} unwound");
+            }
+            DaemonSnap {
+                at: Instant::now(),
+                outcomes: Default::default(),
+                jobs_fp: None,
+                agents: json!({"daemon": "reachable", "agents": [], "v": n}),
+                agents_fp: None,
+                approvals: Arc::new(Default::default()),
+            }
+        });
+        (
+            Arc::new(Model::new(
+                Path::new("/nonexistent/state"),
+                Path::new("/nonexistent/pm"),
+                fetch,
+            )),
+            calls,
+        )
+    }
+
+    #[test]
+    fn concurrent_cold_reads_share_one_daemon_fetch() {
+        let (model, calls) = fake_daemon(|_| Duration::from_millis(400), None);
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let readers: Vec<_> = (0..8)
+            .map(|_| {
+                let (m, b) = (model.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    b.wait();
+                    m.agents()["v"].clone()
+                })
+            })
+            .collect();
+        for reader in readers {
+            assert_eq!(reader.join().unwrap(), 1);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(model.stats()["daemon_builds"], 1);
+        assert_eq!(model.stats()["daemon_joins"], 7);
+    }
+
+    #[test]
+    fn a_watched_read_serves_the_kept_snapshot_while_a_refresh_is_slow() {
+        let (model, calls) = fake_daemon(
+            |n| {
+                if n == 1 {
+                    Duration::ZERO
+                } else {
+                    Duration::from_millis(1500)
+                }
+            },
+            None,
+        );
+        lock(&model.hub).running = true;
+        assert_eq!(model.agents()["v"], 1);
+        let refresh = {
+            let m = model.clone();
+            std::thread::spawn(move || m.fetch_shared())
+        };
+        std::thread::sleep(Duration::from_millis(150));
+        let asked = Instant::now();
+        let served = model.agents();
+        assert!(
+            asked.elapsed() < Duration::from_millis(500),
+            "a read waited on the slow refresh"
+        );
+        assert_eq!(served["v"], 1);
+        assert!(served["snapshot_age_secs"].as_f64().unwrap() > 0.0);
+        assert_eq!(refresh.join().unwrap().agents["v"], 2);
+        assert_eq!(model.agents()["v"], 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_fetch_started_before_a_write_never_overwrites_the_post_write_view() {
+        let (model, calls) = fake_daemon(
+            |n| {
+                if n == 1 {
+                    Duration::from_millis(400)
+                } else {
+                    Duration::ZERO
+                }
+            },
+            None,
+        );
+        lock(&model.hub).running = true;
+        let before_write = {
+            let m = model.clone();
+            std::thread::spawn(move || m.agents()["v"].clone())
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        model.invalidate();
+        assert_eq!(
+            model.agents()["v"],
+            2,
+            "the write must not join the older fetch"
+        );
+        assert_eq!(before_write.join().unwrap(), 1);
+        assert_eq!(
+            model.agents()["v"],
+            2,
+            "the late older fetch must not be kept"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_waiter_retries_when_the_fetch_it_joined_unwinds() {
+        let (model, calls) = fake_daemon(|_| Duration::from_millis(300), Some(1));
+        let crashing = {
+            let m = model.clone();
+            std::thread::spawn(move || m.agents())
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(model.agents()["v"], 2);
+        assert!(crashing.join().is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
