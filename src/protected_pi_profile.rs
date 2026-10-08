@@ -8,6 +8,7 @@ pub(crate) const NODE_PATH: &str = "/opt/cadence/pi/node";
 pub(crate) const NODE_DIGEST: Option<[u8; 32]> = None;
 
 #[derive(Debug)]
+#[allow(dead_code)] // Used by the cadence-agent-exec helper (#[path] include), not by the lib.
 pub(crate) struct Profile {
     alias_sha256: String,
     generation: String,
@@ -23,6 +24,7 @@ fn text(value: &OsStr) -> Result<&str, String> {
         .to_str()
         .ok_or_else(|| "protected tokens must be UTF-8".into())
 }
+#[allow(dead_code)] // Used by the cadence-agent-exec helper (#[path] include), not by the lib.
 fn hex_token(value: &OsStr, prefix: &str, length: usize) -> Result<String, String> {
     let token = text(value)?
         .strip_prefix(prefix)
@@ -36,6 +38,7 @@ fn hex_token(value: &OsStr, prefix: &str, length: usize) -> Result<String, Strin
     }
     Ok(token.to_owned())
 }
+#[allow(dead_code)] // Used by the cadence-agent-exec helper (#[path] include), not by the lib.
 impl Profile {
     /// `rest` follows the legacy verb `exec`; order is fixed and no --env is accepted.
     pub(crate) fn parse(rest: &[OsString]) -> Result<Self, String> {
@@ -119,9 +122,11 @@ impl Routing {
         }
         args
     }
+    #[allow(dead_code)] // Used by the cadence-agent-exec helper (#[path] include), not by the lib.
     pub(crate) fn no_session(&self) -> bool {
         self.no_session
     }
+    #[allow(dead_code)] // Used by the cadence-agent-exec helper (#[path] include), not by the lib.
     pub(crate) fn model(&self) -> Option<&str> {
         self.model.as_deref()
     }
