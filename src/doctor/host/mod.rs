@@ -159,13 +159,20 @@ pub struct HostOverrides {
     /// CAD-113 build slots — read by the daemon's slot service, not by
     /// `Thresholds`. `build_slots` bounds concurrent build+test grants
     /// (default 3), `suite_slots` the full-suite pool (default 1),
+    /// `total_slots` (CAD-1268) caps grants across ALL pools combined
+    /// (default 2, clamped to 1) — the per-pool limits still apply —
     /// `jobs_per_lane` is the `CARGO_BUILD_JOBS` dispatch injects
-    /// (default 4), `starve_secs` is the never-starve bound (default
+    /// (default 2), `starve_secs` is the never-starve bound (default
     /// 900), `priority_lanes` are aliases whose test/suite requests
     /// outrank ordinary ones (the reviewer lane), `max_hold_secs`
     /// reaps a forgotten hold (default 7200).
     pub build_slots: Option<u64>,
     pub suite_slots: Option<u64>,
+    /// CAD-1268: combined grants this daemon's slot registry admits at
+    /// once (default 2, minimum 1) — bounds one registry's shared
+    /// budget, not the whole host (independent daemons and the test
+    /// queue are outside it).
+    pub total_slots: Option<u64>,
     /// CAD-1021: concurrent `check` grants (default 2) — the lane's
     /// pre-push pool, admitted only via a kind=check recipe.
     pub check_slots: Option<u64>,

@@ -76,8 +76,15 @@ pub struct SlotConfig {
     pub build_slots: usize,
     /// Concurrent `suite` grants (default 1, minimum 1).
     pub suite_slots: usize,
-    /// `CARGO_BUILD_JOBS` value dispatch injects (default 4).
+    /// `CARGO_BUILD_JOBS` value dispatch injects (default 2).
     pub jobs_per_lane: usize,
+    /// CAD-1268: combined cap on grants across ALL pools (default 2,
+    /// minimum 1). Per-pool limits still apply — a grant needs both —
+    /// so `build`/`test`, `suite` and `check` can never cumulatively
+    /// overcommit one host beyond this budget. This registry's
+    /// aggregate only; coordination across separate daemon
+    /// registries is a follow-up.
+    pub total_slots: usize,
     /// A `(lane, kind)` waiting continuously longer than this outranks
     /// even priority lanes (default 900) — the never-starve bound.
     pub starve_secs: u64,
@@ -114,7 +121,8 @@ impl Default for SlotConfig {
         Self {
             build_slots: 3,
             suite_slots: 1,
-            jobs_per_lane: 4,
+            jobs_per_lane: 2,
+            total_slots: 2,
             starve_secs: 900,
             priority_lanes: Vec::new(),
             max_hold_secs: 7200,
@@ -150,7 +158,7 @@ pub enum SlotKind {
     Test,
     Suite,
     /// CAD-1021: the light pre-push class — fmt, split-map, clippy
-    /// and `check` under `CARGO_BUILD_JOBS=4`. Its own pool so a full
+    /// and `check` under `CARGO_BUILD_JOBS=2`. Its own pool so a full
     /// `build`/`test` wave never starves a lane's pre-push gate.
     Check,
 }
@@ -190,10 +198,11 @@ impl SlotKind {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
 enum Pool {
-    Build,
-    Suite,
-    Check,
+    Build = 0,
+    Suite = 1,
+    Check = 2,
 }
 
 impl Pool {
@@ -206,17 +215,15 @@ impl Pool {
     }
 }
 
-/// The pool a hold blocks queueing into — `holds_other_pool`'s name.
-fn other_pool(pool: Pool) -> Pool {
-    match pool {
-        Pool::Build => Pool::Suite,
-        Pool::Suite => Pool::Build,
-        // A `check` hold blocks no other pool: it is the lane's own
-        // pre-push gate, and must never keep a build off the pool a
-        // suite request waits on (or vice-versa) — so it reports as
-        // having no other pool.
-        Pool::Check => Pool::Check,
-    }
+/// CAD-1268: one reason string for a refused nested acquire — the
+/// message names the held pool and the refused one; they may match.
+fn hold_and_wait_refusal(held: Pool, waiting: Pool) -> Error {
+    Error::rejected(format!(
+        "A caller holding a {} slot cannot queue for {} — \
+         release that hold first (hold-and-wait deadlock guard)",
+        held.as_str(),
+        waiting.as_str(),
+    ))
 }
 
 struct SlotWait {
@@ -579,6 +586,30 @@ impl Slots {
         self.held.iter().filter(|h| h.kind.pool() == pool).count()
     }
 
+    /// CAD-1268: the aggregate cap — combined grants across every
+    /// pool. `0` clamps to 1, matching the per-pool capacities.
+    fn total_capacity(&self) -> usize {
+        self.config.total_slots.max(1)
+    }
+
+    /// Grants admitted need `held_total() < total_capacity()` AND the
+    /// per-pool room — both are checked together at the probe and the
+    /// real grant.
+    fn held_total(&self) -> usize {
+        self.held.len()
+    }
+
+    /// Whether a request for `kind` could be served right now: its
+    /// pool has free capacity, the aggregate has room and its kind's
+    /// resource floors hold. Shared by the probe, the real grant and
+    /// cross-pool ranking so eligibility reads identically
+    /// everywhere.
+    fn grantable(&self, kind: SlotKind, resource: Option<WaitReason>) -> bool {
+        resource.is_none()
+            && self.held_in(kind.pool()) < self.capacity(kind.pool())
+            && self.held_total() < self.total_capacity()
+    }
+
     /// Grant-order rank: starved `(lane, kind)`s first, then priority
     /// lanes on test/suite, then plain FIFO — the key is
     /// (rank, queued_at). Stamps were clamped at ENQUEUE time
@@ -611,7 +642,9 @@ impl Slots {
         self.waiting.iter().map(|w| self.rank(w, now)).collect()
     }
 
-    /// How many same-pool waiters outrank entry `idx`.
+    /// How many same-pool waiters outrank entry `idx` — the `position`
+    /// the queue reports (same-pool ordering is unchanged by the
+    /// aggregate cap).
     fn outranked(&self, ranks: &[(u8, f64)], idx: usize) -> usize {
         let pool = self.waiting[idx].kind.pool();
         ranks
@@ -620,6 +653,44 @@ impl Slots {
             .filter(|(i, _)| *i != idx && self.waiting[*i].kind.pool() == pool)
             .filter(|(_, r)| **r < ranks[idx])
             .count()
+    }
+
+    /// CAD-1268: how many grant-eligible waiters outrank entry `idx`
+    /// GLOBALLY. A waiter is eligible when its own pool has free
+    /// capacity and its kind's resource floors hold — a front waiter
+    /// behind a saturated pool cannot head-of-line block a rival
+    /// pool's claim on the shared budget. Priority/starvation rank
+    /// still decides which eligible waiter leads, and a queue of only
+    /// same-pool waiters reduces to `outranked`.
+    fn grant_outranked(
+        &self,
+        ranks: &[(u8, f64)],
+        idx: usize,
+        floors: &[Option<WaitReason>; 3],
+    ) -> usize {
+        ranks
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| {
+                *i != idx && {
+                    let w = &self.waiting[*i];
+                    floors[w.kind.pool() as usize].is_none()
+                        && self.held_in(w.kind.pool()) < self.capacity(w.kind.pool())
+                }
+            })
+            .filter(|(_, r)| **r < ranks[idx])
+            .count()
+    }
+
+    /// The resource floor per pool, probed once per call so ranking
+    /// eligibility is evaluated against one consistent host reading.
+    fn pool_floors(&self, kind: SlotKind) -> ([Option<WaitReason>; 3], Option<WaitReason>) {
+        let floors = [
+            self.resource_floor(SlotKind::Build),
+            self.resource_floor(SlotKind::Suite),
+            self.resource_floor(SlotKind::Check),
+        ];
+        (floors, floors[kind.pool() as usize])
     }
 
     /// Drop dead/recycled/expired holders and dead or silent waiters.
@@ -1365,18 +1436,22 @@ impl Slots {
                "kind": req.kind.as_str(), "wait_secs": wait_secs}))
     }
 
-    /// Cross-pool deadlock guard: a caller may never QUEUE for one
-    /// pool while holding a slot in the other — otherwise A(holds
-    /// build, waits suite) vs B(holds suite, waits build) is a
-    /// classic hold-and-wait deadlock. The guard keys on `(lane,
-    /// pid)` — the holding *process*: two unrelated shells sharing a
-    /// lane name (e.g. `$USER` when no `CADENCE_ALIAS` is set) never
-    /// block each other. Granting without waiting is always fine: a
-    /// caller that never waits holds no wait-edge.
-    fn holds_other_pool(&self, pool: Pool, lane: &str, pid: u32) -> bool {
+    /// Cross-pool deadlock guard: a caller may never QUEUE while its
+    /// process already holds a slot — the CAD-113 other-pool cycle
+    /// (A holds build and waits on suite while B holds suite and
+    /// waits on build) and, under CAD-1268's shared budget, the
+    /// same-pool cycle too (each holder waiting on a seat the other
+    /// occupies). The guard keys on `(lane, pid)` — the holding
+    /// *process*: two unrelated shells sharing a lane name (e.g.
+    /// `$USER` when no `CADENCE_ALIAS` is set) never block each
+    /// other. Granting without waiting is always fine: a caller that
+    /// never waits holds no wait-edge, and a re-poll of the hold it
+    /// already owns returns the same token before this runs.
+    fn holds_any_slot(&self, lane: &str, pid: u32) -> Option<Pool> {
         self.held
             .iter()
-            .any(|h| h.lane == lane && h.pid == pid && h.kind.pool() != pool)
+            .find(|h| h.lane == lane && h.pid == pid)
+            .map(|h| h.kind.pool())
     }
 
     /// Non-blocking acquire: grants a minted token when the pool has
@@ -1458,17 +1533,19 @@ impl Slots {
                     json!({"granted": false, "position": self.outranked(&ranks, idx) + 1,
                            "wait_secs": (now - self.waiting[idx].queued_at).max(0.0),
                            "held": self.held_in(pool),
-                           "capacity": self.capacity(pool)}),
+                           "capacity": self.capacity(pool),
+                           "total_held": self.held_total(),
+                           "total_capacity": self.total_capacity()}),
                     events,
                 ));
             }
             // A fresh probe grants exactly when an enqueue would —
-            // capacity free and the request next — but never joins
-            // the queue and never touches seniority (`peek_stamp`
-            // only reads).
+            // per-pool AND aggregate capacity free and no eligible
+            // waiter ahead — but never joins the queue and never
+            // touches seniority (`peek_stamp` only reads).
             // A fresh probe grants when it leads AND the floors hold —
             // below floor it reports the resource reason, not a grant.
-            let resource = self.resource_floor(kind);
+            let (floors, resource) = self.pool_floors(kind);
             let senior = self.peek_stamp(lane, kind, now);
             let w = SlotWait {
                 request_id: request_id.to_string(),
@@ -1484,28 +1561,24 @@ impl Slots {
             self.waiting.push(w);
             let ranks = self.ranks(now);
             let idx = self.waiting.len() - 1;
-            let next = self.held_in(pool) < self.capacity(pool)
-                && self.outranked(&ranks, idx) == 0
-                && resource.is_none();
+            let next =
+                self.grantable(kind, resource) && self.grant_outranked(&ranks, idx, &floors) == 0;
             let position = self.outranked(&ranks, idx) + 1;
             self.waiting.pop();
             self.prune_seniority(now);
             if next {
                 return Ok((self.grant(req, 0.0, clk, &mut events)?, events));
             }
-            if self.holds_other_pool(pool, lane, pid) {
-                return Err(Error::rejected(format!(
-                    "A caller holding a {} slot cannot queue for {} — \
-                     release that hold first (hold-and-wait deadlock guard)",
-                    other_pool(pool).as_str(),
-                    pool.as_str(),
-                )));
+            if let Some(held) = self.holds_any_slot(lane, pid) {
+                return Err(hold_and_wait_refusal(held, pool));
             }
             return Ok((
                 json!({"granted": false, "position": position,
                        "wait_reason": resource.unwrap_or(WaitReason::Capacity).as_str(),
                        "held": self.held_in(pool),
-                       "capacity": self.capacity(pool)}),
+                       "capacity": self.capacity(pool),
+                       "total_held": self.held_total(),
+                       "total_capacity": self.total_capacity()}),
                 events,
             ));
         }
@@ -1550,18 +1623,16 @@ impl Slots {
         }
 
         let ranks = self.ranks(now);
-        // A grant needs capacity AND the resource floors — a host low on
-        // memory or disk holds the caller in the queue with a reason,
-        // never refuses it for being low.
-        let resource = self.resource_floor(kind);
+        // A grant needs per-pool AND aggregate capacity plus the
+        // resource floors — a host low on memory or disk, or a budget
+        // already fully granted, holds the caller in the queue with a
+        // reason, never refuses it for being low.
+        let (floors, resource) = self.pool_floors(kind);
         // Refresh the waiter's reason each poll — a grant that ran
         // into a floor updates it to memory/disk; a resource that
         // recovered flips it back to capacity.
         self.waiting[idx].wait_reason = resource.unwrap_or(WaitReason::Capacity);
-        if self.held_in(pool) < self.capacity(pool)
-            && self.outranked(&ranks, idx) == 0
-            && resource.is_none()
-        {
+        if self.grantable(kind, resource) && self.grant_outranked(&ranks, idx, &floors) == 0 {
             let wait_secs = (now - self.waiting[idx].queued_at).max(0.0);
             // Grant first: a strict grant whose write fails leaves the
             // caller queued exactly where it was.
@@ -1570,18 +1641,14 @@ impl Slots {
             self.prune_seniority(now);
             return Ok((granted, events));
         }
-        // It must wait — but a caller holding the other pool may not
-        // queue at all (the deadlock guard). The forbidden waiter
-        // is removed, never registered.
-        if self.holds_other_pool(pool, lane, pid) {
+        // It must wait — but a process already holding a slot may not
+        // queue at all (the hold-and-wait deadlock guard — CAD-1268
+        // widened it to same-pool holds under the shared budget). The
+        // forbidden waiter is removed, never registered.
+        if let Some(held) = self.holds_any_slot(lane, pid) {
             self.waiting.remove(idx);
             self.prune_seniority(now);
-            return Err(Error::rejected(format!(
-                "A caller holding a {} slot cannot queue for {} — \
-                 release that hold first (hold-and-wait deadlock guard)",
-                other_pool(pool).as_str(),
-                pool.as_str(),
-            )));
+            return Err(hold_and_wait_refusal(held, pool));
         }
         let position = self.outranked(&ranks, idx) + 1;
         let wait_secs = (now - self.waiting[idx].queued_at).max(0.0);
@@ -1600,7 +1667,9 @@ impl Slots {
         Ok((
             json!({"granted": false, "position": position,
                    "wait_secs": wait_secs, "wait_reason": reason,
-                   "held": self.held_in(pool), "capacity": self.capacity(pool)}),
+                   "held": self.held_in(pool), "capacity": self.capacity(pool),
+                   "total_held": self.held_total(),
+                   "total_capacity": self.total_capacity()}),
             events,
         ))
     }
@@ -1748,10 +1817,13 @@ impl Slots {
                        "starved": rank == 0, "priority": rank == 1,
                        "unregistered": is_unregistered_lane(&w.lane)})
             }).collect::<Vec<_>>(),
+            "total_capacity": self.total_capacity(),
+            "total_held": self.held_total(),
             "config": {
                 "build_slots": self.config.build_slots,
                 "suite_slots": self.config.suite_slots,
                 "check_slots": self.config.check_slots,
+                "total_slots": self.config.total_slots,
                 "jobs_per_lane": self.config.jobs_per_lane,
                 "starve_secs": self.config.starve_secs,
                 "priority_lanes": self.config.priority_lanes,
@@ -2729,12 +2801,16 @@ mod probe {
 mod tests {
     use super::*;
 
+    /// These tests exercise the per-pool machinery in isolation, so
+    /// they opt out of CAD-1268's aggregate cap explicitly. Tests for
+    /// the shared budget itself build their own `SlotConfig` below.
     fn slots(build: usize, suite: usize, starve: u64, priority: &[&str]) -> Slots {
         Slots::new(SlotConfig {
             build_slots: build,
             suite_slots: suite,
             starve_secs: starve,
             priority_lanes: priority.iter().map(|s| s.to_string()).collect(),
+            total_slots: 64,
             ..Default::default()
         })
     }
@@ -2794,11 +2870,13 @@ mod tests {
     }
 
     /// Release the current hold whichever lane owns it — the
-    /// contention tests hand the slot between lanes.
+    /// contention tests hand the slot between lanes. The release
+    /// names the hold's recorded lane AND pid: requester children
+    /// own these holds, so `me()` would be a foreign caller.
     fn release_any(s: &mut Slots, now: f64) -> Value {
         let h = &s.held[0];
-        let (token, lane) = (h.token.clone(), h.lane.clone());
-        release(s, &token, &lane, now)
+        let (token, lane, pid) = (h.token.clone(), h.lane.clone(), h.pid);
+        s.release(&token, &lane, pid, now).unwrap().0
     }
 
     /// A real child pid distinct from the test process — killed on drop.
@@ -3142,6 +3220,7 @@ mod tests {
         let mut s = Slots::new(SlotConfig {
             build_slots: 1,
             max_hold_secs: 100,
+            total_slots: 64,
             ..Default::default()
         });
         acquire(&mut s, SlotKind::Build, "dev-1", "h1", 0.0);
@@ -3334,7 +3413,11 @@ mod tests {
     fn suite_pool_is_independent() {
         let mut s = slots(1, 1, 900, &[]);
         acquire(&mut s, SlotKind::Suite, "qa-1", "s1", 0.0);
-        let q = acquire(&mut s, SlotKind::Suite, "qa-1", "s2", 0.0);
+        // The second suite request comes from another lane: qa-1's
+        // own process already holds, and under the shared-budget
+        // hold-and-wait guard it could never queue (refused, not
+        // queued) — the queueing caller here is qa-2.
+        let q = acquire(&mut s, SlotKind::Suite, "qa-2", "s2", 0.0);
         assert_eq!(q["granted"], false);
         // Build pool unaffected by a full suite pool.
         let b = acquire(&mut s, SlotKind::Build, "dev-1", "b1", 0.0);
@@ -3402,26 +3485,39 @@ mod tests {
     fn continuous_requeue_cannot_monopolize_a_pool() {
         let mut s = slots(1, 1, 900, &[]);
         // Lane A holds the only build slot and already keeps two
-        // waiters in flight riding the t=0 anchor.
-        acquire(&mut s, SlotKind::Build, "A", "h", 0.0);
-        acquire(&mut s, SlotKind::Build, "A", "w1", 0.0);
-        acquire(&mut s, SlotKind::Build, "A", "w2", 0.0);
-        // Lane B requests once, a second later.
+        // waiters in flight riding the t=0 anchor. Every lane-A
+        // requester is a DISTINCT live pid: under the hold-and-wait
+        // guard one process may hold OR wait, never both — the holder
+        // and the two waiters are separate children of this test.
+        let holder = Child::spawn();
+        let waiter_a = Child::spawn();
+        let waiter_b = Child::spawn();
+        acquire_pid(&mut s, SlotKind::Build, "A", holder.pid(), "h", 0.0);
+        acquire_pid(&mut s, SlotKind::Build, "A", waiter_a.pid(), "w1", 0.0);
+        acquire_pid(&mut s, SlotKind::Build, "A", waiter_b.pid(), "w2", 0.0);
+        // Lane B requests once, a second later, as this test process.
         acquire(&mut s, SlotKind::Build, "B", "b1", 1.0);
-        let mut a_waiters = vec!["w1".to_string(), "w2".to_string()];
+        let mut a_waiters = vec![
+            ("w1".to_string(), waiter_a.pid()),
+            ("w2".to_string(), waiter_b.pid()),
+        ];
         let mut next = 3u32;
         let mut b_granted_at = None;
         // Every 20s the holder releases; A's waiters poll first
         // (adversarial), B polls once, and A tops back up to two
-        // in-flight requests — the monopolization pattern.
+        // in-flight requests — the monopolization pattern. A granted
+        // waiter's request flips to the holder's pid (the seat is now
+        // its own), so each request's pid stays stable: no pid ever
+        // holds and waits at once, and the three children bound the
+        // live processes the whole run.
         for tick in 1..=45 {
             let t = tick as f64 * 20.0;
             release_any(&mut s, t);
             let mut still = Vec::new();
-            for r in &a_waiters {
-                let g = acquire(&mut s, SlotKind::Build, "A", r, t);
+            for (r, pid) in &a_waiters {
+                let g = acquire_pid(&mut s, SlotKind::Build, "A", *pid, r, t);
                 if !g["granted"].as_bool().unwrap_or(false) {
-                    still.push(r.clone());
+                    still.push((r.clone(), *pid));
                 }
             }
             a_waiters = still;
@@ -3433,8 +3529,20 @@ mod tests {
             while a_waiters.len() < 2 {
                 let r = format!("w{next}");
                 next += 1;
-                acquire(&mut s, SlotKind::Build, "A", &r, t);
-                a_waiters.push(r);
+                // A topped-up request queues under a child that now
+                // neither waits nor holds — a granted waiter's pid
+                // took the hold this tick, so it is busy.
+                let busy: Vec<u32> = a_waiters
+                    .iter()
+                    .map(|(_, p)| *p)
+                    .chain(s.held.iter().map(|h| h.pid))
+                    .collect();
+                let pid = [holder.pid(), waiter_a.pid(), waiter_b.pid()]
+                    .into_iter()
+                    .find(|p| !busy.contains(p))
+                    .unwrap();
+                acquire_pid(&mut s, SlotKind::Build, "A", pid, &r, t);
+                a_waiters.push((r, pid));
             }
         }
         let t = b_granted_at.expect("B never granted — A owned the pool");
@@ -3695,5 +3803,138 @@ mod tests {
         for w in st["waiting"].as_array().unwrap() {
             assert_eq!(w["wait_reason"], "disk", "{w}");
         }
+    }
+
+    // ---------- CAD-1268: aggregate budget ----------
+
+    /// One scheduler under the shared cap with roomy per-pool limits
+    /// and no resource floors — the aggregate is the only binder.
+    fn budgeted(total: usize) -> Slots {
+        let mut s = Slots::new(SlotConfig {
+            total_slots: total,
+            build_slots: 8,
+            suite_slots: 8,
+            check_slots: 8,
+            ..Default::default()
+        });
+        s.use_resources(Some(generous()));
+        s
+    }
+
+    /// The combined cap binds every pool and the probe alike: with one
+    /// grant held, no second grant lands — a full suite pool does not
+    /// head-of-line block a build waiter either.
+    #[test]
+    fn aggregate_cap_binds_every_pool_and_probe() {
+        let mut s = budgeted(2);
+        let a = acquire(&mut s, SlotKind::Build, "dev-1", "b1", 0.0);
+        let b = acquire(&mut s, SlotKind::Build, "dev-2", "b2", 0.0);
+        assert_eq!(a["granted"], true);
+        assert_eq!(b["granted"], true);
+        // Third grant — any pool — exceeds the shared budget even
+        // though suite and check have per-pool room.
+        let p = probe(&mut s, SlotKind::Check, "dev-3", "c1", 1.0);
+        assert_eq!(p["granted"], false, "probe obeys the combined cap: {p}");
+        assert_eq!(p["total_held"], 2);
+        assert_eq!(p["total_capacity"], 2);
+        let q = acquire(&mut s, SlotKind::Suite, "dev-3", "s1", 1.0);
+        assert_eq!(q["granted"], false, "acquire obeys the combined cap: {q}");
+        // Saturated suite is irrelevant once a seat frees: release one
+        // build hold and the suite waiter drains into it — a FULL
+        // pool's waiters never block an eligible rival's claim.
+        let mut s = budgeted(1);
+        acquire(&mut s, SlotKind::Suite, "dev-1", "s0", 0.0);
+        acquire(&mut s, SlotKind::Suite, "dev-2", "s1", 0.0); // own pool full
+        let q = acquire(&mut s, SlotKind::Build, "dev-3", "b1", 0.0);
+        assert_eq!(q["granted"], false, "aggregate full: {q}");
+        release_any(&mut s, 1.0);
+        let g = acquire(&mut s, SlotKind::Build, "dev-3", "b1", 2.0);
+        assert_eq!(g["granted"], true, "saturated suite pool cannot block: {g}");
+    }
+
+    /// Zero configured clamps to one, matching the per-pool floors.
+    #[test]
+    fn aggregate_cap_zero_clamps_to_one() {
+        let mut s = budgeted(0);
+        let g = acquire(&mut s, SlotKind::Build, "dev-1", "b1", 0.0);
+        assert_eq!(g["granted"], true, "clamped to one: {g}");
+        let g = acquire(&mut s, SlotKind::Build, "dev-2", "b2", 0.0);
+        assert_eq!(g["granted"], false);
+    }
+
+    /// The hold-and-wait guard reaches a SAME-POOL hold under the
+    /// shared budget, and re-polling the identical request still
+    /// returns the same minted token.
+    #[test]
+    fn holding_process_cannot_queue_anywhere_but_repolling_is_idempotent() {
+        let mut s = budgeted(2);
+        let g = acquire(&mut s, SlotKind::Build, "dev-1", "r1", 0.0);
+        assert_eq!(g["granted"], true);
+        // Same full identity — the original token back, never queued.
+        let again = acquire(&mut s, SlotKind::Build, "dev-1", "r1", 1.0);
+        assert_eq!(again["token"], g["token"]);
+        // Same process, different request, same pool: queued would be
+        // hold-and-wait once the aggregate binds — refused outright.
+        acquire(&mut s, SlotKind::Build, "dev-2", "r2", 1.0); // cap full
+        let err = s
+            .acquire(
+                SlotKind::Build,
+                "dev-1",
+                me(),
+                "r3",
+                false,
+                SlotClock::at(2.0, 0.0),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("deadlock guard"), "{err}");
+        assert!(s.waiting.is_empty(), "the refused request never queued");
+    }
+
+    /// Status exposes the aggregate next to the pools, and the
+    /// resolved config carries `total_slots` — no token escapes into
+    /// either block.
+    #[test]
+    fn status_reports_aggregate_capacity_without_tokens() {
+        let mut s = budgeted(2);
+        acquire(&mut s, SlotKind::Build, "dev-1", "b1", 0.0);
+        let st = s.status(sc("stranger", &[]), 0.0).0;
+        assert_eq!(st["total_capacity"], 2);
+        assert_eq!(st["total_held"], 1);
+        assert_eq!(st["config"]["total_slots"], 2);
+        assert_eq!(st["config"]["jobs_per_lane"], 2);
+        assert!(!st.to_string().contains("slot-"), "no token leaked: {st}");
+    }
+
+    /// Slots restored over a reduced cap keep their holds — they drain
+    /// on release, never revoked — while new work waits.
+    #[test]
+    fn restored_overcap_holds_drain_without_revocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("slots.json");
+        std::fs::write(
+            &file,
+            json!({"holds": [
+                {"token": "slot-a", "request_id": "ra", "kind": "build",
+                 "lane": "dev-1", "pid": me(), "pid_start": null,
+                 "acquired_epoch": 0.0},
+                {"token": "slot-b", "request_id": "rb", "kind": "suite",
+                 "lane": "dev-2", "pid": me(), "pid_start": null,
+                 "acquired_epoch": 0.0},
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        let mut s = budgeted(1);
+        s.persist_to(file);
+        s.restore(SlotClock::at(10.0, 10.0));
+        assert_eq!(s.held.len(), 2, "over-capacity holds are retained");
+        let q = acquire(&mut s, SlotKind::Check, "dev-3", "c1", 11.0);
+        assert_eq!(q["granted"], false, "new work waits while over cap");
+        release(&mut s, "slot-a", "dev-1", 12.0);
+        let q = acquire(&mut s, SlotKind::Check, "dev-3", "c1", 13.0);
+        assert_eq!(q["granted"], false, "still over the reduced cap");
+        release(&mut s, "slot-b", "dev-2", 14.0);
+        let q = acquire(&mut s, SlotKind::Check, "dev-3", "c1", 15.0);
+        assert_eq!(q["granted"], true, "drained to the cap: {q}");
     }
 }

@@ -1063,7 +1063,7 @@ pub fn run(pm: &Pm, id: &str, args: &StartArgs, actor: &str, state_dir: &Path) -
 }
 
 /// CAD-113: the worktree's build-slot environment — `CARGO_BUILD_JOBS`
-/// from `[host] jobs_per_lane` (default 4) and the `build-slot` helper
+/// from `[host] jobs_per_lane` (default 2) and the `build-slot` helper
 /// path, so a worker never has to remember flags. Idempotent: lines we
 /// own are rewritten, everything else in an existing `.env` survives.
 /// Atomic (tmp + rename — a reader never sees a torn file), refuses to
@@ -1117,7 +1117,7 @@ fn write_slot_env(wt_dir: &Path, pm_dir: &Path) -> Result<PathBuf> {
     }
     let jobs = crate::doctor::host::host_overrides(pm_dir)
         .and_then(|o| o.jobs_per_lane)
-        .unwrap_or(4);
+        .unwrap_or(2);
     let helper = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("cadence"));
     let file = wt_dir.join(".env");
     let owned = ["CARGO_BUILD_JOBS=", "CADENCE_BUILD_SLOT="];

@@ -43,7 +43,7 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             build_slots: 3,
-            jobs_per_lane: 4,
+            jobs_per_lane: 2,
         }
     }
 }

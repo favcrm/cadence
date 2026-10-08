@@ -79,6 +79,9 @@ fn strict_slots(proc: &FakeProc, build: usize) -> Slots {
     let mut s = Slots::new(SlotConfig {
         build_slots: build,
         suite_slots: 1,
+        // These tests exercise strict admission and per-pool caps in
+        // isolation — opt out of CAD-1268's aggregate cap explicitly.
+        total_slots: 64,
         ..Default::default()
     });
     s.use_proc(proc.root(), UID);
@@ -723,7 +726,11 @@ fn restart_validates_enrollments_before_holds() {
     // Unknown stays accounted: one slot of three is free, not two.
     let q = acquire_as(&mut s, 400, 400, "r9", 2.0).unwrap();
     assert_eq!(q["granted"], true);
-    let q = acquire_as(&mut s, 400, 400, "r10", 2.0).unwrap();
+    // The next claimant is ANOTHER verified descendant — pid 400 now
+    // holds, and a process already holding may not queue (the
+    // hold-and-wait guard would refuse it outright, not queue it).
+    p.spawn(410, 300, 71);
+    let q = acquire_as(&mut s, 410, 410, "r10", 2.0).unwrap();
     assert_eq!(q["granted"], false, "the unknown hold still counts");
 }
 
@@ -1065,7 +1072,8 @@ fn strict_holders_exclude_the_provider_root() {
 /// hold (release runs as the root's enrollment whose id matches the
 /// hold). The exact-holder rule still binds, and nothing is granted
 /// twice: while the E1 hold occupies the only slot, the same process
-/// re-asking under E2 queues.
+/// re-asking under E2 is refused by the hold-and-wait deadlock guard
+/// (a holder may not queue) rather than queued.
 #[test]
 fn old_holder_releases_after_same_root_supersession() {
     let p = tree();
@@ -1077,10 +1085,13 @@ fn old_holder_releases_after_same_root_supersession() {
     assert_ne!(e1, e2);
     let caller = s.strict_caller(300, 200).unwrap();
     assert_eq!(caller.enrollment_id, e2, "the live enrollment is preferred");
-    // No double grant: the same process and request under E2 queues.
-    let q = acquire_as(&mut s, 300, 300, "r1", 1.0).unwrap();
-    assert_eq!(q["granted"], false, "{q}");
+    // No double grant — and no queue either: the same process asking
+    // again under E2 while still holding under E1 is hold-and-wait,
+    // refused outright, never registered as a waiter.
+    let err = acquire_as(&mut s, 300, 300, "r1", 1.0).unwrap_err();
+    assert!(err.to_string().contains("deadlock guard"), "{err}");
     assert_eq!(s.held.len(), 1);
+    assert!(s.waiting.is_empty(), "the refused request never queued");
     // Another process of the agent is still not the holder.
     let other = s.strict_caller(400, 200).unwrap();
     let err = s.release_strict(&token, &other, 400, 1.0).unwrap_err();
@@ -1090,7 +1101,7 @@ fn old_holder_releases_after_same_root_supersession() {
     assert_eq!(r["released"], true, "{r}");
     assert!(events.iter().any(|e| e.2["reason"] == "released"));
     assert!(s.held.is_empty());
-    // The queued E2 request is served next — exactly one hold.
+    // A fresh ask under E2 is granted next — exactly one hold.
     let g = acquire_as(&mut s, 300, 300, "r1", 3.0).unwrap();
     assert_eq!(g["granted"], true, "{g}");
     assert_eq!(s.held.len(), 1);
