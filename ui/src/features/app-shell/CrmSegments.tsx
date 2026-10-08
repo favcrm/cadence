@@ -229,7 +229,7 @@ export default function CrmSegments({
           scope={scope}
           segmentId={recordId}
           viewer={viewer}
-          canWrite={viewer.operator && !viewer.readOnly}
+          canWrite={viewer.operator === true && !viewer.readOnly}
           onClose={() => onSelect(null)}
           onOpen={onSelect}
         />
@@ -249,7 +249,7 @@ function SegmentList({
   onSelect: (segmentId: string) => void;
   onNew: () => void;
 }) {
-  const canWrite = viewer.operator && !viewer.readOnly;
+  const canWrite = viewer.operator === true && !viewer.readOnly;
   const [segments, setSegments] = useState<SegmentDoc[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -308,7 +308,12 @@ function SegmentList({
           </Button>
         )}
       </div>
-      {!viewer.operator && (
+      {viewer.operator === null && (
+        <p className="card px-4 py-3 text-label text-ink-400" role="status">
+          Checking whether this session may inspect saved segments…
+        </p>
+      )}
+      {viewer.operator === false && (
         <p className="card px-4 py-3 text-label text-ink-400">
           Sign in as the operator to inspect saved segments.
         </p>
@@ -506,7 +511,7 @@ function SegmentNew({
   onCreated: (segmentId: string) => void;
   onCancel: () => void;
 }) {
-  const canWrite = viewer.operator && !viewer.readOnly;
+  const canWrite = viewer.operator === true && !viewer.readOnly;
   const headRef = useRef<HTMLHeadingElement | null>(null);
   const [name, setName] = useState("");
   const [rules, setRules] = useState<RuleDraft[]>([{ field: "tag", op: "eq", value: "" }]);

@@ -66,7 +66,7 @@ function outcome(
 export default function Update({
   viewer,
 }: {
-  viewer: { readOnly: boolean; operator: boolean };
+  viewer: { readOnly: boolean; operator: boolean | null };
 }) {
   const [status, setStatus] = useState<UpdateStatus | null>(null);
   const [readError, setReadError] = useState<string | null>(null);

@@ -280,11 +280,50 @@ export default function App() {
   // page load and keep the answer across the 30 s polls.
   // The proof belongs to one credential/session and board mode. Switching
   // accounts must clear it even when both sessions report signed_in=true.
+  // CAD-1193: the meta read itself is bounded — an overlapping 30 s poll
+  // or an aborted fetch joins the in-flight request instead of stacking
+  // a second one, and a timed-out or failed probe is `unknown`, never a
+  // sign-out and never a resolved non-operator.
   const operatorKnown = useRef(false);
   const metaIdentity = useRef<string | null>(null);
   const metaKey = useRef<string | null>(null);
   const metaRequest = useRef(0);
+  const metaInFlight = useRef<{ scope: string; promise: Promise<Meta | null> } | null>(null);
   const [credentialGeneration, setCredentialGeneration] = useState(0);
+
+  /** One bounded meta read. The same tab key shares one in-flight
+   *  request; a different key (sign-in/sign-out) starts a fresh probe
+   *  and supersedes the old one's answer. A fetch that aborts or a
+   *  server that cannot answer yields `null` — unknown — which the
+   *  caller turns into an honest unavailable state, never false. */
+  const metaProbe = useCallback((withOperator: boolean, key: string | null): Promise<Meta | null> => {
+    // The credential scopes the cache: a probe under another key must
+    // never answer this one. The operator flag is part of the scope —
+    // a bare poll cannot satisfy a proof request.
+    const scope = `${key ?? ""}${withOperator ? "|operator" : ""}`;
+    const inFlight = metaInFlight.current;
+    if (inFlight && inFlight.scope === scope) return inFlight.promise;
+    const controller = new AbortController();
+    // The server bounds its own dependency reads at ~5 s; the client
+    // bound sits just above so a wedged connection cannot hold the
+    // access state open indefinitely.
+    const timeout = window.setTimeout(() => controller.abort(), 8_000);
+    const promise = api
+      .meta(withOperator, controller.signal)
+      .then((next) => {
+        window.clearTimeout(timeout);
+        if (metaInFlight.current?.promise === promise) metaInFlight.current = null;
+        return next;
+      })
+      .catch(() => {
+        window.clearTimeout(timeout);
+        if (metaInFlight.current?.promise === promise) metaInFlight.current = null;
+        return null;
+      });
+    metaInFlight.current = { scope, promise };
+    return promise;
+  }, []);
+
   const refresh = useCallback(() => {
     api.health().then(setHealth).catch(() => setHealth(null));
     const request = ++metaRequest.current;
@@ -293,57 +332,59 @@ export default function App() {
       metaKey.current = sentKey;
       metaIdentity.current = null;
       operatorKnown.current = false;
+      metaInFlight.current = null;
       setCredentialGeneration((generation) => generation + 1);
       setMeta(null);
     }
     const asked = !operatorKnown.current;
     let expectedKey = sentKey;
     const current = () => request === metaRequest.current && sessionKey() === expectedKey;
-    api
-      .meta(asked)
-      .then((next) => {
-        if (!current()) return;
-        const identity = JSON.stringify([next.signed_in ?? null, next.session?.id ?? null, next.read_only]);
-        const changed = metaIdentity.current !== null && identity !== metaIdentity.current;
-        metaIdentity.current = identity;
-        // A key the server refused (expired, revoked) is dropped — only
-        // the very key this request carried: a sign-in that finished
-        // while it was in flight stored a newer one.
-        if (next.signed_in === false && sentKey) {
-          setSessionKey(null);
-          metaKey.current = null;
-          expectedKey = null;
-          setCredentialGeneration((generation) => generation + 1);
-        }
-        if (changed && !asked) {
+    metaProbe(asked, sentKey).then((next) => {
+      if (!current() || next === null) {
+        if (next === null && current()) {
+          // The probe could not answer — access drops to unknown:
+          // write controls gate while the board re-checks, and the
+          // operator role is re-asked next refresh. The tab key itself
+          // is NOT cleared — only a server-proven `signed_in: false`
+          // below does that.
           operatorKnown.current = false;
-          setMeta({ ...next, operator: undefined });
-          api
-            .meta(true)
-            .then((fresh) => {
-              if (!current()) return;
-              metaIdentity.current = JSON.stringify([fresh.signed_in ?? null, fresh.session?.id ?? null, fresh.read_only]);
-              operatorKnown.current = typeof fresh.operator === "boolean";
-              setMeta(fresh);
-            })
-            .catch(() => undefined);
-          return;
+          setMeta(null);
         }
-        if (typeof next.operator === "boolean") operatorKnown.current = true;
-        setMeta((prev) => ({ ...next, operator: next.operator ?? (!asked && !changed ? prev?.operator : undefined) }));
-      })
-      .catch(() => {
-        if (!current()) return;
-        // Lost meta loses the answer too: ask again on the next refresh.
+        return;
+      }
+      const identity = JSON.stringify([next.signed_in ?? null, next.session?.id ?? null, next.read_only]);
+      const changed = metaIdentity.current !== null && identity !== metaIdentity.current;
+      metaIdentity.current = identity;
+      // A key the server refused (expired, revoked) is dropped — only
+      // the very key this request carried, and only on a proven
+      // `signed_in: false`, never on a null or a failed probe.
+      if (next.signed_in === false && sentKey) {
+        setSessionKey(null);
+        metaKey.current = null;
+        metaInFlight.current = null;
+        expectedKey = null;
+        setCredentialGeneration((generation) => generation + 1);
+      }
+      if (changed && !asked) {
         operatorKnown.current = false;
-        setMeta(null);
-      });
+        setMeta({ ...next, operator: undefined });
+        metaProbe(true, sentKey).then((fresh) => {
+          if (!current() || fresh === null) return;
+          metaIdentity.current = JSON.stringify([fresh.signed_in ?? null, fresh.session?.id ?? null, fresh.read_only]);
+          operatorKnown.current = typeof fresh.operator === "boolean";
+          setMeta(fresh);
+        });
+        return;
+      }
+      if (typeof next.operator === "boolean") operatorKnown.current = true;
+      setMeta((prev) => ({ ...next, operator: next.operator ?? (!asked && !changed ? prev?.operator : undefined) }));
+    });
     void resources.projects.refresh();
     void resources.issues.refresh();
     void resources.agents.refresh();
     if (overviewWantedRef.current) void resources.overview.refresh();
     loadDetail();
-  }, [loadDetail]);
+  }, [loadDetail, metaProbe]);
 
   useEffect(() => {
     refresh();
@@ -1002,7 +1043,7 @@ export default function App() {
           <Epics
             project={route.slug}
             issues={issuesState}
-            viewer={{ readOnly, operator: meta?.operator === true }}
+            viewer={{ readOnly, operator: meta?.operator ?? null }}
             onOpenIssue={openIssue}
             onRetry={() => void resources.issues.refresh()}
           />
@@ -1013,7 +1054,7 @@ export default function App() {
         {route.screen === "projects" && route.slug && route.section === "workflows" && (
           <Workflows
             project={route.slug}
-            viewer={{ readOnly, operator: meta?.operator === true }}
+            viewer={{ readOnly, operator: meta?.operator ?? null }}
             onOpenIssue={openIssue}
             onHome={() => goRoute({ screen: "home" })}
           />
@@ -1028,7 +1069,7 @@ export default function App() {
           />
         )}
         {route.screen === "apps" && !route.project && (
-          <Apps project={project} viewer={{ readOnly, operator: meta?.operator === true }} />
+          <Apps project={project} viewer={{ readOnly, operator: meta?.operator ?? null }} />
         )}
         {route.screen === "appsExplore" && (
           <Explorer viewer={{ readOnly, operator: meta?.operator === true }} />
@@ -1040,8 +1081,8 @@ export default function App() {
           <ManageApp key={route.installId} installId={route.installId} viewer={{ readOnly, operator: meta?.operator === true }} />
         )}
         {route.screen === "workspaceApp" && (
-          <AppShell installId={route.installId} viewer={{ readOnly, operator: meta?.operator === true }} onInstallation={reportInstallation}>
-            <WorkspaceApp installId={route.installId} viewer={{ readOnly, operator: meta?.operator === true }} onBack={() => goRoute({ screen: "apps", project: null, name: null })} />
+          <AppShell installId={route.installId} viewer={{ readOnly, operator: meta?.operator ?? null }} onInstallation={reportInstallation}>
+            <WorkspaceApp installId={route.installId} viewer={{ readOnly, operator: meta?.operator ?? null }} onBack={() => goRoute({ screen: "apps", project: null, name: null })} />
           </AppShell>
         )}
         {route.screen === "workspaceAppKey" && (
@@ -1057,7 +1098,7 @@ export default function App() {
           <AppDetail
             project={route.project}
             name={route.name}
-            viewer={{ readOnly, operator: meta?.operator === true }}
+            viewer={{ readOnly, operator: meta?.operator ?? null }}
             onOpenIssue={openIssue}
             onHome={() => goRoute({ screen: "home" })}
           />
@@ -1111,16 +1152,16 @@ export default function App() {
         )}
         {route.screen === "settings" && route.section === "models" && <ModelDefaults />}
         {route.screen === "settings" && route.section === "connections" && (
-          <Connections viewer={{ readOnly, operator: meta?.operator === true }} />
+          <Connections viewer={{ readOnly, operator: meta?.operator ?? null }} />
         )}
         {route.screen === "settings" && route.section === "email" && (
-          <EmailSending viewer={{ readOnly, operator: meta?.operator === true }} />
+          <EmailSending viewer={{ readOnly, operator: meta?.operator ?? null }} />
         )}
         {route.screen === "settings" && route.section === "account" && <PlatformAccount />}
         {route.screen === "settings" && route.section === "update" && (
-          <Update viewer={{ readOnly, operator: meta?.operator === true }} />
+          <Update viewer={{ readOnly, operator: meta?.operator ?? null }} />
         )}
-        {route.screen === "settings" && route.section === "permissions" && <MasterPermissions viewer={{ readOnly, operator: meta?.operator === true, boardReadOnly, signedIn: meta?.signed_in === true, sessionId: meta?.session?.id ?? null }} />}
+        {route.screen === "settings" && route.section === "permissions" && <MasterPermissions viewer={{ readOnly, operator: meta?.operator ?? null, boardReadOnly, signedIn: meta?.signed_in === true, sessionId: meta?.session?.id ?? null }} />}
         {screen === "login" && (
           <Login
             onSignedIn={() => {

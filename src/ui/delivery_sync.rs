@@ -386,7 +386,9 @@ impl DeliverySync {
                         super::home::board_is_operator(
                             &state_dir,
                             self.seam_armed.load(Ordering::Relaxed),
+                            None,
                         )
+                        .unwrap_or(false)
                     })
                 };
                 // CAD-482: an armed board's daemon calls assert the

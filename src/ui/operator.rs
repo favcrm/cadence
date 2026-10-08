@@ -615,7 +615,7 @@ pub(super) fn admit(
         "application/json"
     };
     write_guard(request, ct, opts)?;
-    let caller = board_caller(request, state_dir, opts, true)?;
+    let caller = board_caller(request, state_dir, opts, true, None)?;
     if class == RouteClass::OperatorOnly {
         match &caller {
             Caller::Agent(alias) => {
@@ -649,6 +649,7 @@ pub(super) fn admit(
                 state_dir,
                 opts,
                 &format!("{method} {path}"),
+                None,
             )?,
         }
     }
@@ -676,7 +677,7 @@ pub(super) fn admit_operator_read_caller(
     state_dir: &std::path::Path,
     opts: &ServeOpts,
 ) -> Result<Caller, HttpResp> {
-    let caller = board_caller(request, state_dir, opts, false)?;
+    let caller = board_caller(request, state_dir, opts, false, None)?;
     let what = format!(
         "GET {}",
         request.url().split('?').next().unwrap_or_default()
@@ -699,7 +700,7 @@ pub(super) fn admit_operator_read_caller(
         )),
         Caller::Named(_) => Ok(caller),
         Caller::Operator(_) => {
-            super::home::prove_operator_peer(request, state_dir, opts, &what)?;
+            super::home::prove_operator_peer(request, state_dir, opts, &what, None)?;
             Ok(caller)
         }
     }
@@ -938,12 +939,16 @@ fn session_key(request: &Request) -> String {
 /// Ask the daemon whether the cookie's `token` and the page's `key`
 /// together are a live session on `origin`. A `public` request is
 /// answered by `board_session_check` — the cookie alone — and can only
-/// ever name a `public` session row.
+/// ever name a `public` session row. `budget` bounds the daemon's
+/// answer for courtesy metadata (CAD-1193): a transport failure inside
+/// it is `daemon_unavailable`, which `/api/meta` reports as
+/// `signed_in: null` — never a manufactured `false`.
 fn check_session(
     state_dir: &std::path::Path,
     token: &str,
     key: &str,
     origin: Origin,
+    budget: Option<&client::MetaBudget>,
 ) -> Result<Option<Value>, HttpResp> {
     let (method, params) = if origin == Origin::Public {
         ("board_session_check", json!({"token": token}))
@@ -953,7 +958,11 @@ fn check_session(
             json!({"token": token, "key": key, "origin": origin.as_str()}),
         )
     };
-    match client::rpc(state_dir, method, params) {
+    let answered = match budget {
+        Some(b) => b.read(state_dir, method, params),
+        None => client::rpc(state_dir, method, params),
+    };
+    match answered {
         Ok(v) if v["valid"] == true => Ok(Some(v["session"].clone())),
         Ok(_) => Ok(None),
         Err(e) if e.to_string().contains("Unknown method") => Err(coded_response(
@@ -982,7 +991,7 @@ pub(super) fn public_session(
 ) -> Result<Option<Value>, HttpResp> {
     match request_origin(request, opts) {
         ReqOrigin::Known(Origin::Public) => match session_cookie(request, opts, Origin::Public) {
-            Some(token) => check_session(state_dir, &token, "", Origin::Public),
+            Some(token) => check_session(state_dir, &token, "", Origin::Public, None),
             None => Ok(None),
         },
         _ => Ok(None),
@@ -1009,6 +1018,10 @@ pub(super) enum Attribution {
     /// this uid's with no visible owner (a sender that closed its end
     /// early to escape attribution).
     Unknown(String),
+    /// CAD-1193: a required identity read could not answer inside the
+    /// metadata budget — distinct from `Unknown`, which is evidence
+    /// against the caller. Only ever produced on a bounded read.
+    Unavailable(String),
     /// The proven `tailscale serve` proxy, with its login (or why none).
     Proxy(Result<String, String>),
 }
@@ -1103,6 +1116,12 @@ pub(super) fn decide(
                  it is tied to; the operator writes with a session (`cadence ui login`)."
             ),
         ),
+        // A bounded metadata read whose identity dependency did not
+        // answer: not a caller's fault, not a grant — unknown.
+        (_, Attribution::Unavailable(why)) => Verdict::Refuse(
+            "identity_unavailable",
+            format!("caller identity could not be read: {why}"),
+        ),
     }
 }
 
@@ -1170,22 +1189,36 @@ fn attribute(
     state_dir: &std::path::Path,
     opts: &ServeOpts,
     origin: &ReqOrigin,
+    budget: Option<&client::MetaBudget>,
 ) -> Attribution {
+    // CAD-1193: a bounded metadata read reports a failed dependency or
+    // board fact as `Unavailable` (unknown); the same failures keep
+    // `Unknown` — the caller-side refusal — for every guarded route.
+    let bounded = budget.is_some();
+    let dep_fail = |why: String| {
+        if bounded {
+            Attribution::Unavailable(why)
+        } else {
+            Attribution::Unknown(why)
+        }
+    };
     let configured = match crate::agent_uid::config::configured_uid(state_dir) {
         Ok(uid) => uid,
-        Err(error) => return Attribution::Unknown(format!("agent UID config refused: {error}")),
+        Err(error) => {
+            return dep_fail(format!("agent UID config refused: {error}"));
+        }
     };
     // `serve` captured the daemon's UID once before opening the port.
     // Keep comparing the private record on every request so removal or
     // replacement cannot downgrade a board with an active agent UID.
     let agent_uid = match pinned_agent_uid(configured, opts.agent_uid) {
         Ok(uid) => uid,
-        Err(error) => return Attribution::Unknown(error),
+        Err(error) => return dep_fail(error),
     };
     if agent_uid.is_some() {
         let server = match concrete_board_server(opts) {
             Ok(server) => server,
-            Err(error) => return Attribution::Unknown(error),
+            Err(error) => return dep_fail(error),
         };
         let socket_uid = request
             .remote_addr()
@@ -1196,8 +1229,11 @@ fn attribute(
             })
             .map(|(_, uid)| uid);
         let classified = agent_uid_attribution(socket_uid, agent_uid, Attribution::NoAgent);
-        if matches!(classified, Attribution::AgentUid | Attribution::Unknown(_)) {
+        if matches!(classified, Attribution::AgentUid) {
             return classified;
+        }
+        if let Attribution::Unknown(why) = classified {
+            return dep_fail(why);
         }
     }
     if let Some(asserted) = crate::test_seam::asserted() {
@@ -1214,7 +1250,26 @@ fn attribute(
             header_value(request, "Tailscale-User-Login").as_deref(),
         ));
     }
-    let found = agent_roots(state_dir).and_then(|roots| {
+    // CAD-1193: under a metadata budget the required `agent_list` read
+    // is itself a dependency — its failure is `Unavailable` (unknown),
+    // distinct from a caller the board could attribute-fail on its own
+    // evidence (a vanished socket is still the caller's `Unknown`).
+    // Unbounded callers keep the exact `Unknown` they had.
+    let roots = match agent_roots(state_dir, budget.copied()) {
+        Ok(roots) => roots,
+        Err(why) if budget.is_some() => return Attribution::Unavailable(why),
+        Err(why) => {
+            let why = match origin {
+                ReqOrigin::NoSession(p) => format!("{why}. {p}"),
+                ReqOrigin::Known(_) => why,
+            };
+            return match foreign_socket(request, opts) {
+                Some(uid) => Attribution::Foreign(format!("{why} (its socket is uid {uid}'s)")),
+                None => Attribution::Unknown(why),
+            };
+        }
+    };
+    let found = Ok::<crate::peer::AgentRoots, String>(roots).and_then(|roots| {
         let peer = request
             .remote_addr()
             .ok_or_else(|| "the request has no peer address".to_string())?;
@@ -1238,25 +1293,29 @@ fn attribute(
         Ok(Some(alias)) => Attribution::Agent(alias),
         Ok(None) => Attribution::NoAgent,
         Err(why) => {
-            // Only a live client socket of another uid excuses it.
-            // SAFETY: geteuid has no preconditions and cannot fail.
-            let euid = unsafe { libc::geteuid() };
-            let foreign = request
-                .remote_addr()
-                .and_then(|peer| crate::peer::client_socket(opts.port, *peer).ok().flatten())
-                .filter(|(_, uid)| *uid != euid);
             let why = match origin {
                 ReqOrigin::NoSession(p) => format!("{why}. {p}"),
                 ReqOrigin::Known(_) => why,
             };
-            match foreign {
-                Some((_, uid)) => {
-                    Attribution::Foreign(format!("{why} (its socket is uid {uid}'s)"))
-                }
+            // Only a live client socket of another uid excuses it.
+            match foreign_socket(request, opts) {
+                Some(uid) => Attribution::Foreign(format!("{why} (its socket is uid {uid}'s)")),
                 None => Attribution::Unknown(why),
             }
         }
     }
+}
+
+/// The uid owning the peer's still-open client socket when it is not
+/// this process's — a privilege-separated proxy (tailscaled, sshd).
+fn foreign_socket(request: &Request, opts: &ServeOpts) -> Option<u32> {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    request
+        .remote_addr()
+        .and_then(|peer| crate::peer::client_socket(opts.port, *peer).ok().flatten())
+        .map(|(_, uid)| uid)
+        .filter(|uid| *uid != euid)
 }
 
 /// What a live session row means for [`decide`]: the operator's on
@@ -1283,12 +1342,16 @@ fn held_of(origin: Origin, session: &Value) -> Option<Held> {
 /// The caller of a board request (module doc). `write` requires a
 /// cookie-bearing request to carry its own `Origin` (browsers send none
 /// on a same-origin GET, so `/api/meta` passes `false`). `Err` is the
-/// refusal to send.
+/// refusal to send. `budget` bounds the dependent reads of a courtesy
+/// metadata answer (CAD-1193); `None` — every guarded route — keeps the
+/// full RPC bound. A dependency that cannot answer fails closed either
+/// way; the bounded caller turns the refusal into `unknown`.
 pub(super) fn board_caller(
     request: &Request,
     state_dir: &std::path::Path,
     opts: &ServeOpts,
     write: bool,
+    budget: Option<&client::MetaBudget>,
 ) -> Result<Caller, HttpResp> {
     let origin = request_origin(request, opts);
     let (held, token) = match &origin {
@@ -1297,7 +1360,7 @@ pub(super) fn board_caller(
                 if write {
                     require_own_origin(request, *o)?;
                 }
-                match check_session(state_dir, &token, &session_key(request), *o)? {
+                match check_session(state_dir, &token, &session_key(request), *o, budget)? {
                     Some(session) => (held_of(*o, &session), Some(token)),
                     None => (None, None),
                 }
@@ -1310,7 +1373,7 @@ pub(super) fn board_caller(
         ReqOrigin::Known(Origin::Public) => ("board_session_required", BOARD_SESSION_REQUIRED),
         _ => ("operator_session_required", SESSION_REQUIRED),
     };
-    let attribution = attribute(request, state_dir, opts, &origin);
+    let attribution = attribute(request, state_dir, opts, &origin, budget);
     match decide(held, attribution, required) {
         Verdict::Operator(actor) => Ok(Caller::Operator(actor)),
         Verdict::Named(named) => Ok(Caller::Named(named)),
@@ -1330,6 +1393,13 @@ pub(super) fn board_caller(
                 ),
             ))
         }
+        // CAD-1193: a bounded read's unavailable dependency answers
+        // 503 — `operator_viewer` reports it as `unknown`, never as a
+        // resolved non-operator; every unbounded caller still gets the
+        // plain 403 refusal.
+        Verdict::Refuse("identity_unavailable", msg) => {
+            Err(coded_response(503, "identity_unavailable", &msg, None))
+        }
         Verdict::Refuse(check, msg) => Err(guard_fail(check, &msg)),
     }
 }
@@ -1340,18 +1410,34 @@ pub(super) fn board_caller(
 /// `None` → the flow is off (or the daemon is unreachable — the mint
 /// would refuse anyway), and the routes answer the same `device_off`
 /// as before.
-fn device_config(state_dir: &std::path::Path) -> Option<crate::device_login::DeviceConfig> {
-    let out = client::rpc(state_dir, "device_login_config", json!({})).ok()?;
+fn device_config(
+    state_dir: &std::path::Path,
+    budget: Option<&client::MetaBudget>,
+) -> Option<crate::device_login::DeviceConfig> {
+    let out = match budget {
+        Some(b) => b.read(state_dir, "device_login_config", json!({})).ok()?,
+        None => client::rpc(state_dir, "device_login_config", json!({})).ok()?,
+    };
     if out["configured"].as_bool() != Some(true) {
         return None;
     }
     crate::device_login::DeviceConfig::new(out["issuer"].as_str()?, out["org"].as_str()?).ok()
 }
 
-/// `/api/meta`'s session fields: `operator` (this request holds a live
-/// session), `session` (its display id and expiries, never the token)
-/// and `login_hint` (the command that signs this origin in).
-pub(super) fn meta(request: &Request, state_dir: &std::path::Path, opts: &ServeOpts) -> Value {
+/// `/api/meta`'s session fields under `budget` (CAD-1193):
+/// `signed_in` is `true` for a live session, `false` when the daemon
+/// positively answered that the presented credentials are not one, and
+/// `null` when the session check itself could not answer in budget —
+/// an unknown, never a manufactured sign-out. `tab_signed_out` is
+/// reported only for the proven case (cookie present, daemon answered
+/// not-valid): an unanswered check can never claim this tab is signed
+/// out, and no answer here ever clears the request's credentials.
+pub(super) fn meta(
+    request: &Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+    budget: &client::MetaBudget,
+) -> Value {
     let hosted = matches!(
         request_origin(request, opts),
         ReqOrigin::Known(Origin::Public)
@@ -1364,10 +1450,11 @@ pub(super) fn meta(request: &Request, state_dir: &std::path::Path, opts: &ServeO
                 Origin::Public => "sign in through your company's AgenticOS workspace",
             };
             let token = session_cookie(request, opts, o);
+            // Three answers: `Some(Some)` live session, `Some(None)`
+            // proven not valid, `None` unanswerable in budget — an
+            // error is NOT a proven invalid.
             let session = token.as_deref().and_then(|token| {
-                check_session(state_dir, token, &session_key(request), o)
-                    .ok()
-                    .flatten()
+                check_session(state_dir, token, &session_key(request), o, Some(budget)).ok()
             });
             (hint, token.is_some(), session)
         }
@@ -1375,21 +1462,26 @@ pub(super) fn meta(request: &Request, state_dir: &std::path::Path, opts: &ServeO
     };
     // CAD-777/CAD-841: device sign-in is advertised on the operator
     // surface only — never to the public host or an unattributable
-    // request — and only while the daemon's store says configured.
+    // request — and only while the daemon's store says configured. On
+    // an unanswerable check it stays silent rather than mislead.
     let device_login = matches!(
         request_origin(request, opts),
         ReqOrigin::Known(Origin::Loopback | Origin::Tailnet)
-    ) && device_config(state_dir).is_some();
+    ) && device_config(state_dir, Some(budget)).is_some();
+    // `None` (unanswerable) reports `signed_in: null`; `Some(None)`
+    // (proven not valid) reports `false`; `Some(Some)` reports `true`.
+    let proven_signed_out = session == Some(None);
     json!({
-        "signed_in": session.is_some(),
+        "signed_in": session.as_ref().map(|s| s.is_some()),
         "hosted": hosted,
-        "session": session,
+        "session": session.flatten(),
         "login_hint": hint,
         "device_login": device_login,
         // A cookie but no live session for this page: typically a new
         // tab — the key lives in the signing-in tab's `sessionStorage`.
         // Public sessions have no page key, so the cookie alone answers.
-        "tab_signed_out": cookie && session.is_none(),
+        // An unanswerable check is NOT this state.
+        "tab_signed_out": cookie && proven_signed_out,
     })
 }
 
@@ -1473,7 +1565,8 @@ pub(super) fn open(
         Err(resp) => return resp,
     };
     let user_agent = header_value(request, "User-Agent").unwrap_or_default();
-    let refusal = match attribute(request, state_dir, opts, &ReqOrigin::Known(origin)) {
+    let refusal =
+        match attribute(request, state_dir, opts, &ReqOrigin::Known(origin), None) {
         Attribution::Agent(alias) => Some((
             "session_from_agent",
             alias.clone(),
@@ -1485,7 +1578,10 @@ pub(super) fn open(
             "sign-in refused: this request comes from the agent UID — the link is spent"
                 .to_string(),
         )),
-        Attribution::Unknown(why) => Some((
+        // `Unavailable` cannot occur here — this caller passes no
+        // budget; it maps to the same refusal as `Unknown` if ever
+        // reached so the exchange stays fail-closed.
+        Attribution::Unknown(why) | Attribution::Unavailable(why) => Some((
             "caller_identity",
             "unattributable".to_string(),
             format!("sign-in refused: the board cannot attribute this caller — {why}; the link is spent"),
@@ -1640,7 +1736,7 @@ fn device_attribution(
     opts: &ServeOpts,
     origin: Origin,
 ) -> Option<HttpResp> {
-    match attribute(request, state_dir, opts, &ReqOrigin::Known(origin)) {
+    match attribute(request, state_dir, opts, &ReqOrigin::Known(origin), None) {
         Attribution::Agent(alias) => Some(guard_fail(
             "session_from_agent",
             &format!(
@@ -1653,7 +1749,9 @@ fn device_attribution(
             "sign-in refused: this request comes from the agent UID — \
              device sign-in is never minted for a pane",
         )),
-        Attribution::Unknown(why) => Some(guard_fail(
+        // `Unavailable` is unreachable on this unbounded path; it
+        // refuses exactly like `Unknown` so the route stays fail-closed.
+        Attribution::Unknown(why) | Attribution::Unavailable(why) => Some(guard_fail(
             "caller_identity",
             &format!("sign-in refused: the board cannot attribute this caller — {why}"),
         )),
@@ -1673,7 +1771,7 @@ pub(super) fn device_code(
     let login = &opts.device_login;
     // CAD-841: the daemon's store decides whether the route serves at
     // all — `clear` on a running board closes it on this very request.
-    let Some(config) = device_config(state_dir) else {
+    let Some(config) = device_config(state_dir, None) else {
         return device_off();
     };
     if opts.read_only {
@@ -1767,7 +1865,7 @@ pub(super) fn device_poll(
     opts: &ServeOpts,
 ) -> HttpResp {
     let login = &opts.device_login;
-    let Some(config) = device_config(state_dir) else {
+    let Some(config) = device_config(state_dir, None) else {
         return device_off();
     };
     if opts.read_only {

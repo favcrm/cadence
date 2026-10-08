@@ -860,8 +860,10 @@ export interface Meta {
   platform_account_configured?: boolean;
   read_only: boolean;
   /** CAD-313: this browser holds a live operator session. Absent on a
-   *  server that predates sessions. */
-  signed_in?: boolean;
+   *  server that predates sessions. CAD-1193: `null` when the session
+   *  check could not answer inside the metadata budget — an unknown,
+   *  never a sign-out. */
+  signed_in?: boolean | null;
   session?: {
     id: string;
     origin: "loopback" | "tailnet" | "public";
@@ -877,16 +879,20 @@ export interface Meta {
   /** CAD-777: remote device-grant sign-in is configured on this board
    *  (and this origin may use it — loopback/tailnet only). */
   device_login?: boolean;
-  /** This browser holds the session cookie but this tab has no live
-   *  session key — a new tab: each tab signs in on its own. */
+  /** This browser holds the session cookie but the daemon positively
+   *  answered this tab's key is not a live session — a new tab: each
+   *  tab signs in on its own. Never true on an unanswered check. */
   tab_signed_out?: boolean;
   actor: string;
   /** Served through a configured public board name, not inferred from URL. */
   hosted?: boolean;
   /** CAD-432 (only with `?operator=1`): this client may make the
    *  operator's decisions — a live session (CAD-313) plus the board's
-   *  operator proof on the peer and on the board process. */
-  operator?: boolean;
+   *  operator proof on the peer and on the board process. CAD-1193:
+   *  `null` when the proof's dependencies could not answer inside the
+   *  metadata budget — access is being checked/unavailable, never a
+   *  resolved non-operator. */
+  operator?: boolean | null;
   tailnet_url: string | null;
   version: string;
   build_commit: string;

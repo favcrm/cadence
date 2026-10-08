@@ -9,7 +9,10 @@ import { IconLock } from "../../ui/icons";
  * Nothing on a read-only board (the read-only chip says it all).
  */
 export default function SignIn({ meta, onChange }: { meta: Meta | null; onChange: () => void }) {
-  if (!meta || meta.read_only || meta.signed_in === undefined) return null;
+  // CAD-1193: `signed_in === null` is an unanswerable check —
+  // unavailable, never a sign-out. Nothing is shown until the daemon
+  // answers for real.
+  if (!meta || meta.read_only || meta.signed_in === undefined || meta.signed_in === null) return null;
   if (!meta.signed_in) {
     const cmd = meta.login_hint ?? SIGN_IN_COMMAND;
     const device = meta.device_login === true;

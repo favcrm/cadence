@@ -317,10 +317,13 @@ export default function WorkspaceApp({
     setOutbox(null); setSelectedEffectId(""); setCreating(false); setAccessDenied(true);
   }, [installId]);
   const refused = (error: unknown) => error instanceof ApiError && [401, 403].includes(error.status);
-  const canWrite = viewer.operator && !viewer.readOnly && !accessDenied;
+  const canWrite = viewer.operator === true && !viewer.readOnly && !accessDenied;
   /** `fresh`: a write just landed, so a read already in flight may predate it: retire it and read again. */
   const refresh = useCallback(async (fresh = false) => {
-    if (!viewer.operator) {
+    // CAD-1193: an unresolved role (null) waits — it is neither a
+    // proven operator nor a refusal; no protected read runs before
+    // `operator === true`.
+    if (viewer.operator !== true) {
       setLoading(false);
       return;
     }
@@ -644,7 +647,7 @@ export default function WorkspaceApp({
   );
   // CAD-1123 HP1: the board reads behind the screen.v2 projection.
   const screenExtras = useScreenExtras({
-    enabled: !!screenInstall && screenInstall === installId && !accessDenied && viewer.operator,
+    enabled: !!screenInstall && screenInstall === installId && !accessDenied && viewer.operator === true,
     installation: data?.installation ?? null, installId, contextId,
     runs: data?.runs ?? [], bindings: data?.bindings ?? [], workers: data ? workers.length : null,
     onDenied: clearPrivate,
@@ -954,6 +957,14 @@ export default function WorkspaceApp({
       ),
     },
   ];
+  if (viewer.operator === null) {
+    return (
+      <main className="workspace-app" aria-label="Workspace app" role="status">
+        <h1>Workspace app</h1>
+        <p className="wa-alert">Checking whether this session may inspect this installation…</p>
+      </main>
+    );
+  }
   if (!viewer.operator) return <main className="workspace-app" aria-label="Workspace app"><h1>Workspace app</h1><p className="wa-alert">Sign in as the operator to inspect this installation.</p><Button href="/apps">All apps</Button></main>;
   const tag = data && screenTag(data.installation);
   let projection = null;

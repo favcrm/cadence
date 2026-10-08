@@ -605,14 +605,24 @@ pub(crate) fn tailnet_proxy(
 ///
 /// No store file means no agent was ever registered here: provably no
 /// agents. A store the daemon cannot answer for is an error.
+///
+/// `budget` bounds this one required identity read when the caller is a
+/// courtesy metadata read (CAD-1193); every guard caller passes
+/// `None` and keeps the full RPC bound. Either way the answer comes
+/// only from the daemon — a failed read maps nothing, so a stalled
+/// `agent_list` denies attribution, it never skips the check.
 pub(crate) fn agent_roots(
     state_dir: &Path,
+    budget: Option<client::MetaBudget>,
 ) -> std::result::Result<crate::peer::AgentRoots, String> {
     if !state_dir.join("cadence.sqlite3").exists() {
         return Ok(crate::peer::AgentRoots::default());
     }
-    let list = client::rpc(state_dir, "agent_list", json!({}))
-        .map_err(|e| format!("the daemon cannot list registered agents ({e})"))?;
+    let listed = match budget {
+        Some(b) => b.read(state_dir, "agent_list", json!({})),
+        None => client::rpc(state_dir, "agent_list", json!({})),
+    };
+    let list = listed.map_err(|e| format!("the daemon cannot list registered agents ({e})"))?;
     let agents = list["agents"]
         .as_array()
         .ok_or_else(|| "the daemon's agent list is malformed".to_string())?;

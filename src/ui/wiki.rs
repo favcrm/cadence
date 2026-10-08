@@ -52,7 +52,7 @@ fn board_caller(
     state_dir: &Path,
     opts: &ServeOpts,
 ) -> Result<operator::Caller, HttpResp> {
-    operator::board_caller(request, state_dir, opts, false)
+    operator::board_caller(request, state_dir, opts, false, None)
 }
 
 // ---------- GET /api/wiki/{ls,file,search,history} ----------

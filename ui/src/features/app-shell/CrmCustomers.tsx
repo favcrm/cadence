@@ -68,7 +68,7 @@ export default function CrmShell({
   onSelect: (recordId: string | null) => void;
   onRecordCreated?: (recordId: string) => void;
 }) {
-  const canWrite = viewer.operator && !viewer.readOnly;
+  const canWrite = viewer.operator === true && !viewer.readOnly;
   // The CSV import page is component-local page state under
   // Customers — it never enters the route URL (no customer content
   // or bulk bytes in history), so `record`/`view` still own the URL
@@ -186,7 +186,7 @@ function CustomerList({
   onNew: () => void;
   onImport: () => void;
 }) {
-  const canWrite = viewer.operator && !viewer.readOnly;
+  const canWrite = viewer.operator === true && !viewer.readOnly;
   const [query, setQuery] = useState("");
   const [committed, setCommitted] = useState("");
   const [cursors, setCursors] = useState<string[]>([]);
@@ -292,7 +292,10 @@ function CustomerList({
           </>
         )}
       </div>
-      {!viewer.operator && (
+      {viewer.operator === null && (
+        <Notice>Checking whether this session may inspect customer records…</Notice>
+      )}
+      {viewer.operator === false && (
         <Notice>Sign in as the operator to inspect customer records.</Notice>
       )}
       {viewer.operator && viewer.readOnly && (
@@ -791,7 +794,7 @@ function CustomerNew({
   onCreated: (recordId: string) => void;
   onCancel: () => void;
 }) {
-  const canWrite = viewer.operator && !viewer.readOnly;
+  const canWrite = viewer.operator === true && !viewer.readOnly;
   const headRef = useRef<HTMLHeadingElement | null>(null);
   const [pending, setPending] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);

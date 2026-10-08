@@ -175,7 +175,7 @@ function CampaignList({
   onSelect: (campaignId: string) => void;
   onNew: () => void;
 }) {
-  const canWrite = viewer.operator && !viewer.readOnly;
+  const canWrite = viewer.operator === true && !viewer.readOnly;
   const [campaigns, setCampaigns] = useState<ContentDoc[]>([]);
   const [sends, setSends] = useState<SendListEntry[]>([]);
   const [pendingDrafts, setPendingDrafts] = useState<ProposalDoc[]>([]);
@@ -266,7 +266,12 @@ function CampaignList({
           </Button>
         )}
       </div>
-      {!viewer.operator && (
+      {viewer.operator === null && (
+        <p className="card px-4 py-3 text-label text-ink-400" role="status">
+          Checking whether this session may inspect campaigns…
+        </p>
+      )}
+      {viewer.operator === false && (
         <p className="card px-4 py-3 text-label text-ink-400">
           Sign in as the operator to inspect campaigns.
         </p>
@@ -486,7 +491,7 @@ function AudienceSection({
    *  suppressions behind an Advanced disclosure. */
   layout?: "full" | "detail";
 }) {
-  const canWrite = viewer.operator && !viewer.readOnly;
+  const canWrite = viewer.operator === true && !viewer.readOnly;
   const [segments, setSegments] = useState<{ id: string; name: string }[]>([]);
   const [exclusions, setExclusions] = useState<{ id: string; name: string }[]>([]);
   const [customIds, setCustomIds] = useState("");
@@ -1143,7 +1148,7 @@ function DeliveryRows({
   view: SendView;
   onResolved: () => void;
 }) {
-  const canWrite = viewer.operator && !viewer.readOnly;
+  const canWrite = viewer.operator === true && !viewer.readOnly;
   const [confirm, setConfirm] = useState<{
     customerId: string;
     resolution: "accepted" | "failed";
@@ -1411,7 +1416,7 @@ function FinalSendPanel({
   binding: SmtpBinding | null | undefined;
   testEvidence: TestSendReceipt | null;
 }) {
-  const canWrite = viewer.operator && !viewer.readOnly;
+  const canWrite = viewer.operator === true && !viewer.readOnly;
   const [prepared, setPrepared] = useState<PreparedSend | null>(null);
   const [preparePending, setPreparePending] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -1676,7 +1681,7 @@ function CampaignWorkspace({
   tab?: CampaignTab;
   onTab?: (tab: CampaignTab) => void;
 }) {
-  const canWrite = viewer.operator && !viewer.readOnly;
+  const canWrite = viewer.operator === true && !viewer.readOnly;
   const emailDraft = useEmailDraft(scope, campaignId, doc, onDoc);
   const [contentBindings, setContentBindings] = useState<{ id: string; name: string; address: string }[]>([]);
   const [contentBindingError, setContentBindingError] = useState<string | null>(null);
@@ -2852,7 +2857,7 @@ function CampaignDetail({
   onBack: () => void;
   onCloned: (campaignId: string) => void;
 }) {
-  const canWrite = viewer.operator && !viewer.readOnly;
+  const canWrite = viewer.operator === true && !viewer.readOnly;
   const headRef = useRef<HTMLHeadingElement | null>(null);
   const [doc, setDoc] = useState<ContentDoc | null>(null);
   const [unsaved, setUnsaved] = useState(false);

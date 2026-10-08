@@ -1202,7 +1202,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           </li>
         ))}
       </ol>
-      <AssistantOperations key={`${installId}\u0000${mode.contextId}`} installId={installId} contextId={mode.contextId} canDecide={viewer.operator && !viewer.readOnly} />
+      <AssistantOperations key={`${installId}\u0000${mode.contextId}`} installId={installId} contextId={mode.contextId} canDecide={viewer.operator === true && !viewer.readOnly} />
       {jump && (
         <button type="button" className="lnk text-label app-chat-jump" onClick={jumpToLatest} data-jump-to-latest>
           ↓ New messages

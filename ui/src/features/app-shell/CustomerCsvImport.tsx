@@ -63,7 +63,7 @@ export default function CustomerCsvImport({
   onDone: () => void;
   onCancel: () => void;
 }) {
-  const canWrite = viewer.operator && !viewer.readOnly;
+  const canWrite = viewer.operator === true && !viewer.readOnly;
   const headRef = useRef<HTMLHeadingElement | null>(null);
   const fileRef = useRef<HTMLInputElement | null>(null);
   const [csvText, setCsvText] = useState("");

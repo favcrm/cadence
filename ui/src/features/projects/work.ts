@@ -110,8 +110,11 @@ export function progressView(p: WorkProgress | null | undefined): ProgressView {
 /** Who may move stages here. */
 export interface Viewer {
   readOnly: boolean;
-  /** Passed the board's operator proof (`/api/meta` → `operator`). */
-  operator: boolean;
+  /** Passed the board's operator proof (`/api/meta` → `operator`).
+   *  CAD-1193: `null` means the proof could not answer — access is
+   *  still being checked. Unknown is never shown as signed out and
+   *  grants nothing: every consumer reads `=== true` as the only yes. */
+  operator: boolean | null;
 }
 
 /**
@@ -146,6 +149,9 @@ export function noMoveReason(stage: WorkStage | null | undefined, viewer: Viewer
     return stage.source === "plan" ? "The plan decides this stage until it is approved." : "No stage move is open.";
   }
   if (viewer.readOnly) return "The board is read-only.";
+  if (viewer.operator === null) {
+    return "Checking whether this session may move stages…";
+  }
   if (!viewer.operator) {
     return "Stage moves on the board are the operator's. Agents move a stage with `cadence issue epic stage`.";
   }

@@ -6,7 +6,7 @@ export class ConditionalGet {
   private readonly entries = new Map<string, { etag: string; value: unknown }>();
   constructor(private readonly request: typeof fetch = fetch, private readonly identity: () => string | null = () => null) {}
 
-  async get<T>(path: string, headers: Record<string, string>): Promise<{ response: Response; value?: T }> {
+  async get<T>(path: string, headers: Record<string, string>, signal?: AbortSignal): Promise<{ response: Response; value?: T }> {
     const scope = this.identity();
     if (scope !== this.scope) {
       this.entries.clear();
@@ -16,6 +16,7 @@ export class ConditionalGet {
     const response = await this.request(path, {
       headers: { ...headers, ...(previous ? { "If-None-Match": previous.etag } : {}) },
       cache: "no-store",
+      signal: signal ?? null,
     });
     if (scope !== this.identity()) {
       throw new Error("Session changed during request; retry with the current session");

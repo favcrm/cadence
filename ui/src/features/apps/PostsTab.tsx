@@ -90,6 +90,8 @@ export default function PostsTab({
             ? "Complete setup in Settings before starting a post."
             : viewer.readOnly && viewer.operator
               ? "New posts cannot be started on this read-only board."
+            : viewer.operator === null
+              ? "Checking whether this session may start a post…"
             : !viewer.operator
               ? "Sign in as the operator to start a post."
               : "Start a post when you’re ready. You’ll review the plan before any work runs."}</p>

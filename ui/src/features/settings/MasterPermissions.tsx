@@ -14,7 +14,7 @@ import { useWriteBlock } from "../auth/WriteGate";
 import "./permissions.css";
 
 type Viewer = {
-  operator: boolean;
+  operator: boolean | null;
   readOnly: boolean;
   boardReadOnly: boolean;
   signedIn: boolean;

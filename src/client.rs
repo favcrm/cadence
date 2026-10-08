@@ -371,6 +371,72 @@ pub fn rpc_timeout(
     proto::unwrap(rpc_frame(state_dir, method, params, timeout)?)
 }
 
+/// CAD-1193: the shared deadline for the read-only dependency RPCs one
+/// `/api/meta` response chains — session validation, the board/agent
+/// identity facts behind the operator proof, daemon build info. Those
+/// reads inform a courtesy answer only: a stalled or missing
+/// dependency must cost the request seconds, not the default 700 s
+/// call bound, and must produce an explicit unknown/unavailable
+/// answer, never a granted authority or a manufactured sign-out.
+///
+/// This is purely a transport bound for existing RPCs: it supplies no
+/// answer, no identity and no authority of its own, changes no rule
+/// the daemon enforces, and is never applied to a write. One `Meta`
+/// request shares one budget across every dependent read, so a slow
+/// daemon cannot consume the bound serially call after call.
+#[derive(Clone, Copy, Debug)]
+pub struct MetaBudget {
+    deadline: Instant,
+}
+
+impl MetaBudget {
+    /// The bound `/api/meta` works under end to end — the ticket's
+    /// five-second target.
+    pub const LIMIT: Duration = Duration::from_secs(5);
+    /// The most one dependent read may wait: the whole remaining
+    /// budget, capped so a stalled call cannot consume it all while
+    /// earlier facts are still unproven.
+    pub const READ_CAP: Duration = Duration::from_secs(2);
+
+    /// A budget whose deadline is `limit` from now.
+    pub fn fresh(limit: Duration) -> Self {
+        Self {
+            deadline: Instant::now() + limit,
+        }
+    }
+
+    /// A budget that allows no further RPC time — the request's bound
+    /// is already spent before the first dependent read.
+    pub fn exhausted() -> Self {
+        Self {
+            deadline: Instant::now(),
+        }
+    }
+
+    /// The remaining share of the overall bound, capped at `cap` per
+    /// call so one dependency cannot hold the whole budget.
+    fn window(&self, cap: Duration) -> Duration {
+        self.deadline
+            .saturating_duration_since(Instant::now())
+            .min(cap)
+    }
+
+    /// One bounded required read for courtesy metadata. Returns the
+    /// daemon's real answer, or `Err` on transport failure, refusal or
+    /// an exhausted budget — callers turn that into unknown, never a
+    /// fabricated `true`/`false`.
+    pub fn read(&self, state_dir: &Path, method: &str, params: Value) -> Result<Value> {
+        rpc_timeout(state_dir, method, params, self.window(Self::READ_CAP))
+    }
+
+    /// The same bounded read pinned to the private socket — the boot
+    /// UID authority, which must never honor an inherited
+    /// `CADENCE_SOCKET`.
+    pub fn read_private(&self, state_dir: &Path, method: &str, params: Value) -> Result<Value> {
+        rpc_private_timeout(state_dir, method, params, self.window(Self::READ_CAP))
+    }
+}
+
 /// Query the daemon bound to this private state directory, ignoring
 /// `CADENCE_SOCKET`. The board uses this for boot-pinned UID authority;
 /// an inherited agent socket override must never choose that source.

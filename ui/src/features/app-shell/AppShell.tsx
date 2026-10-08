@@ -308,7 +308,11 @@ export default function AppShell({
       current &&
       !controller.signal.aborted &&
       currentReceiptKeyRef.current === receiptKey;
-    if (!viewer.operator) {
+    // CAD-1193: `null` (still checking/unavailable) is not a refusal —
+    // wait for the resolved role rather than painting a sign-in, and
+    // never issue the protected detail/context reads before
+    // `operator === true`.
+    if (viewer.operator !== true) {
       setRequestLoading(false);
       return () => {
         current = false;
@@ -723,7 +727,19 @@ export default function AppShell({
               </Button>
             </p>
           )}
-          {!loading && !installation && !loadError && !viewer.operator && (
+          {!loading && !installation && !loadError && viewer.operator === null && (
+            <main className="card px-4 py-5" aria-label="App" role="status">
+              <h2 className="text-cardtitle font-medium text-ink-100">
+                {title}
+              </h2>
+              <p className="text-secondary text-ink-400 mt-1">
+                Checking whether this session may inspect this
+                installation… If access was denied, the board will say so
+                here.
+              </p>
+            </main>
+          )}
+          {!loading && !installation && !loadError && viewer.operator === false && (
             <main className="card px-4 py-5" aria-label="App">
               <h2 className="text-cardtitle font-medium text-ink-100">
                 {title}

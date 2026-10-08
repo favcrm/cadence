@@ -98,7 +98,7 @@ function enrollErrorMessage(e: unknown): string {
 export default function Connections({
   viewer,
 }: {
-  viewer: { operator: boolean; readOnly: boolean };
+  viewer: { operator: boolean | null; readOnly: boolean };
 }) {
   const listRes = viewer.operator ? resources.connections : null;
   const providersRes = viewer.operator ? resources.connectionProviders : null;
@@ -114,7 +114,7 @@ export default function Connections({
   // The provider an open Add flow is pinned to, or "" for the pick list;
   // null = closed.
   const [adding, setAdding] = useState<string | null>(null);
-  const canWrite = viewer.operator && !viewer.readOnly;
+  const canWrite = viewer.operator === true && !viewer.readOnly;
   const rows = listState?.data ?? [];
   const providers = providersState?.data ?? [];
   const refresh = () => {
@@ -162,7 +162,13 @@ export default function Connections({
         )}
       </div>
 
-      {!viewer.operator ? (
+      {viewer.operator === null ? (
+        // CAD-1193: unresolved role — still proving this session, not
+        // a refusal. No connection reads or writes run below.
+        <PageState title="Checking access…">
+          Connections are available to the operator; the board is still proving this session.
+        </PageState>
+      ) : !viewer.operator ? (
         <PageState title="Operator access required">
           Connections are available to the operator. Use Sign in in the status bar if you
           have operator access.

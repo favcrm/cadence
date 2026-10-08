@@ -16,6 +16,13 @@ export const READ_ONLY_REASON = "The board is read-only — the server refuses e
 export function writeBlock(meta: Meta | null): string | null {
   if (!meta) return null;
   if (meta.read_only) return READ_ONLY_REASON;
+  // CAD-1193: `signed_in: null` — the daemon could not answer the
+  // session check inside the metadata bound. Writes stay gated with an
+  // honest unavailable reason: unknown is not signed-out, and it is
+  // never a silent pass.
+  if (meta.signed_in === null) {
+    return "The board could not confirm this session — retry in a moment.";
+  }
   // An older server that reports no `operator` field predates sessions.
   if (meta.signed_in === false) {
     const cmd = meta.login_hint ?? SIGN_IN_COMMAND;
@@ -33,6 +40,9 @@ export function writeBlock(meta: Meta | null): string | null {
 export function kickoffBlock(meta: Meta | null): string | null {
   const writes = writeBlock(meta);
   if (writes) return writes;
+  if (meta?.operator === null) {
+    return "Kick off is the operator's decision — the board is still checking whether this session may dispatch.";
+  }
   if (meta?.operator !== true) {
     return "Kick off is the operator's decision — this session is not the operator's.";
   }
