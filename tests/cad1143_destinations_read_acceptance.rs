@@ -1,3 +1,6 @@
+//! Independent acceptance repairs: acc-sol-1143, successor to cc13-pi-acc793.
+//! The implementer may not edit or weaken these checks.
+//!
 //! CAD-1143 destinations-read acceptance — written by the independent
 //! acceptance author (cc13-pi-acc793), never the host implementer
 //! (social-host-ca8ff), who may not edit or weaken this file.
@@ -26,16 +29,12 @@
 //!     `scoped(Asserted::Operator)` and drops it before any guarded
 //!     call. It is never the caller proof under test.
 //!
-//!   * LITERAL negative caller: the test process itself connects to the
-//!     daemon socket with NO seam assertion (`client::rpc` unscoped). `SO_PEERCRED` records its real pid and the daemon
-//!     walks its `/proc` ancestry — on this host the process is a
-//!     managed worker's tool under an enrolled endpoint, so the literal
-//!     derivation is `Caller::Agent(<enrolled runner>)` (a real agent);
-//!     on a host with no enrolled runner it derives an unproven caller.
-//!     Either way the refusal lands on the real caller-identity path —
-//!     resolved identity, never an asserted one, never ambient-dependent
-//!     for the refusal itself (the refusal holds for ANY non-operator
-//!     derivation).
+//!   * LITERAL negative caller: an owned child process is registered in
+//!     this fixture's isolated store and enrolled with Slots::enroll using
+//!     its live kernel pid/starttime/uid. The daemon restores that record.
+//!     The child uses NO seam assertion and must be refused as that exact
+//!     registered agent, independent of the parent runner's ancestry.
+//!     This proves the real connection gate, not a real provider session.
 //!
 //!   * POLICY-regression negatives: `scoped(Asserted::Agent/Unproven)`
 //!     RPC calls and seam-header HTTP requests exercise the daemon's
@@ -238,7 +237,7 @@ impl Fx {
         );
         install
     }
-    fn install_with_two_publication_slots(&self) -> String {
+    fn install_with_two_publication_slots(&self) -> cadence_agent::Result<Value> {
         let source = self.root.path().join("app-src-two-publish-slots");
         std::fs::create_dir_all(source.join("workflows")).unwrap();
         std::fs::write(
@@ -272,13 +271,11 @@ needs:
         )
         .unwrap();
         std::fs::write(source.join("workflows/brief.md"), WORKFLOW).unwrap();
-        self.setup_rpc(
+        client::rpc(
+            &self.dir(),
             "app_workspace_install",
             json!({"source":source.to_str().unwrap()}),
-        )["install_id"]
-            .as_str()
-            .unwrap()
-            .to_owned()
+        )
     }
     fn local_connection(&self) -> String {
         let rows = self.setup_rpc("connection_list", json!({}))["connections"].clone();
@@ -356,20 +353,23 @@ fn destination_discovery_does_not_claim_read_workspace_or_binding_authority() {
 fn multiple_publication_slots_refuse_before_a_destinations_read() {
     let mut fx = Fx::new();
     fx.start();
-    let install = scoped(Asserted::Operator, || {
-        fx.install_with_two_publication_slots()
-    });
     let reads_before = fx.reads.load(SeqCst);
-    let error = scoped(Asserted::Operator, || {
-        client::rpc(
-            &fx.dir(),
-            "app_publish_destinations_list",
-            json!({"install_id":install}),
-        )
-    })
-    .unwrap_err();
+    let catalog_path = fx.pm().join(".apps/catalog.yaml");
     assert!(
-        format!("{error}").contains("exactly one publication slot"),
+        !catalog_path.exists(),
+        "fixture begins without an installation catalog"
+    );
+    let runs_before = fx.store.app_run_list_filtered(None, None).unwrap();
+    let queue_before = fx.store.social_publish_list(None, None).unwrap();
+    // Main now refuses ambiguity at installation, earlier than discovery.
+    // Exercise that reachable guard; never forge a normally impossible install
+    // or relax the single-send manifest rule to reach a later read.
+    let error = scoped(Asserted::Operator, || {
+        fx.install_with_two_publication_slots()
+    })
+    .expect_err("multiple publication slots must not install");
+    assert!(
+        format!("{error}").contains("at most one publication capability slot"),
         "multiple publication declarations must refuse, not select one: {error}"
     );
     assert_eq!(
@@ -377,7 +377,18 @@ fn multiple_publication_slots_refuse_before_a_destinations_read() {
         reads_before,
         "ambiguous manifest reached the READ credential"
     );
-    assert_eq!(fx.intent_and_run_count(&install), 0);
+    assert!(
+        !catalog_path.exists(),
+        "refused manifest added an installation catalog"
+    );
+    assert_eq!(
+        fx.store.app_run_list_filtered(None, None).unwrap(),
+        runs_before
+    );
+    assert_eq!(
+        fx.store.social_publish_list(None, None).unwrap(),
+        queue_before
+    );
 }
 
 const WORKFLOW: &str = r#"---
@@ -424,55 +435,57 @@ const PATH_CTX: &str = "/api/app-installations/{install}/contexts/{ctx}/publish-
 /// guard path. The seam is scoped to `setup()` only and dropped before
 /// any guarded call.
 ///
-/// Literal vs asserted (see header): the negative RPC case runs through
-/// `client::rpc` unscoped — this test process connects with NO seam
-/// so the daemon derives its caller from `SO_PEERCRED` + `/proc`
-/// ancestry. On this host the test process is a managed worker's tool
-/// under an enrolled endpoint, so the literal derivation is
-/// `Caller::Agent(<enrolled runner>)` — a real agent, refused by the
-/// operator gate; on a host with no enrolled runner the same call
-/// derives an unproven caller, still refused. Either way the refusal
-/// lands on the real caller-identity path, not the seam. The HTTP
-/// seam-header requests are POLICY regression only, and the
-/// no-seam-header `http_get_literal` request is the literal HTTP bad
-/// case. The positive control is the external `operator-control.sh`
-/// harness, never an in-band `Asserted::Operator`.
+/// Literal vs asserted: the owned registered child below uses SO_PEERCRED
+/// and restored strict enrollment, without a seam; HTTP no-session requests
+/// exercise the literal unauthenticated read path. Other negative cases are
+/// explicitly policy-seam checks. No real operator-origin positive is claimed.
 #[test]
 fn destinations_read_refuses_non_operator_and_forged_fields_with_zero_upstream_reads() {
+    // Re-enter only this exact test in an owned subprocess. Its stdin is a
+    // setup barrier: no guarded call occurs until enrollment and install exist.
+    if let Some(dir) = std::env::var_os("ACC1143_REGISTERED_CHILD") {
+        let mut install = String::new();
+        std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut install).unwrap();
+        for params in [
+            json!({"install_id":install.trim()}),
+            json!({"install_id":install.trim(),"context_id":"ctx-any"}),
+        ] {
+            let err = client::rpc(Path::new(&dir), "app_publish_destinations_list", params)
+                .expect_err("registered agent must not reach destination discovery");
+            assert!(
+                err.to_string().contains("operator action")
+                    && err
+                        .to_string()
+                        .contains("agent 'registered-destinations-reader'"),
+                "literal enrolled caller refused by wrong guard: {err}"
+            );
+        }
+        return;
+    }
     let mut fx = Fx::new();
+    let mut caller = RegisteredCaller::new(&fx);
     fx.start();
     let install = fx.setup();
     let before = fx.reads.load(SeqCst);
-
-    // LITERAL negative caller: this test process connects to the daemon
-    // socket with NO seam assertion. `SO_PEERCRED` records our real pid;
-    // the daemon walks /proc ancestry and derives a literal non-operator
-    // identity — `Caller::Agent(<enrolled runner>)` here (this process
-    // is a managed worker's tool), unproven where no runner is enrolled.
-    // Refused by the real operator gate, not an asserted identity.
-    let err = client::rpc(
-        &fx.dir(),
-        "app_publish_destinations_list",
-        json!({"install_id": install}),
-    )
-    .map(|_| ())
-    .unwrap_err();
-    assert!(
-        format!("{err}").contains("operator"),
-        "literal non-operator caller refused by the wrong guard: {err}"
-    );
-    // Literal refusal with an explicit context id.
-    let err = client::rpc(
-        &fx.dir(),
-        "app_publish_destinations_list",
-        json!({"install_id": install, "context_id": "ctx-any"}),
-    )
-    .map(|_| ())
-    .unwrap_err();
-    assert!(
-        format!("{err}").contains("operator"),
-        "context-scoped literal call refused by the wrong guard: {err}"
-    );
+    caller.check(&install);
+    // Registered policy identities as well: these names are fixture rows,
+    // not assumed to exist in the invoking runner's production registry.
+    for alias in ["writer", "lead"] {
+        fx.store
+            .register_agent(&cadence_agent::store::NewAgent {
+                alias,
+                provider: "claude",
+                endpoint_kind: "managed",
+                role: "worker",
+                cwd: "/tmp",
+                sandbox: "read-only",
+                instructions: None,
+                params: None,
+                team_role: None,
+                model_policy: None,
+            })
+            .unwrap();
+    }
 
     // POLICY-regression negatives (seam-asserted identities — the
     // daemon's scope_frame + operator_connection seam branch): agent and
@@ -589,6 +602,107 @@ fn destinations_read_refuses_non_operator_and_forged_fields_with_zero_upstream_r
         0,
         "a refused read wrote state"
     );
+}
+
+// Real isolated registered process; no ancestry/env scrubbing or positive
+// operator impersonation. Slots uses the live /proc identity for enrollment.
+struct RegisteredCaller(Option<std::process::Child>);
+impl RegisteredCaller {
+    fn new(fx: &Fx) -> Self {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "destinations_read_refuses_non_operator_and_forged_fields_with_zero_upstream_reads",
+                "--nocapture",
+                "--test-threads",
+                "2",
+            ])
+            .env("ACC1143_REGISTERED_CHILD", fx.dir())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let owned = Self(Some(child));
+        let pid = owned.0.as_ref().unwrap().id();
+        let alias = "registered-destinations-reader";
+        fx.store
+            .register_agent(&cadence_agent::store::NewAgent {
+                alias,
+                provider: "claude",
+                endpoint_kind: "managed",
+                role: "worker",
+                cwd: "/tmp",
+                sandbox: "read-only",
+                instructions: None,
+                params: None,
+                team_role: None,
+                model_policy: None,
+            })
+            .unwrap();
+        fx.store
+            .set_identity(
+                alias,
+                &cadence_agent::adapter::Identity {
+                    thread_id: "fixture".into(),
+                    session_id: "fixture".into(),
+                    model: None,
+                    effort: None,
+                    pid,
+                    endpoint: None,
+                    generation: Some("fixture-g1".into()),
+                    attach: None,
+                },
+            )
+            .unwrap();
+        let row = fx.store.agent(alias).unwrap();
+        assert_eq!(row.pid, Some(i64::from(pid)));
+        assert!(row.pid_start.is_some());
+        let generation = format!(
+            "{:016x}:{}:{pid}",
+            row.created.to_bits(),
+            row.generation.as_deref().unwrap()
+        );
+        let mut slots = cadence_agent::slots::Slots::new(Default::default());
+        slots.persist_to(fx.dir().join("slots.json"));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        slots
+            .enroll(
+                alias,
+                &generation,
+                pid,
+                cadence_agent::slots::SlotClock::at(now, now),
+            )
+            .unwrap();
+        owned
+    }
+    fn check(&mut self, install: &str) {
+        let mut child = self.0.take().unwrap();
+        std::io::Write::write_all(
+            child.stdin.as_mut().unwrap(),
+            format!("{install}\n").as_bytes(),
+        )
+        .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "registered caller exit {:?}: {} {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+impl Drop for RegisteredCaller {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 impl Fx {

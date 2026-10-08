@@ -1,3 +1,6 @@
+//! Independent acceptance repairs: acc-sol-1143, successor to cc13-pi-acc793.
+//! The implementer may not edit or weaken these checks.
+//!
 //! CAD-1143 owner-intent read verifier acceptance — independently authored
 //! by cc13-pi-acc793, separate from the host implementation and the existing
 //! prepared-intent/attach acceptance files.
@@ -691,6 +694,7 @@ fn jti_hashes(state_dir: &Path) -> HashSet<String> {
 #[derive(Debug, PartialEq, Eq)]
 struct PublishEffects {
     prepared: Vec<(String, String, String, Option<String>)>,
+    frozen: Vec<(String, String, Option<String>, Option<String>)>,
     staged_effects: Vec<(String, String)>,
     queued: usize,
     prepared_events: usize,
@@ -714,6 +718,16 @@ fn publish_effects(fx: &Fx, install: &str) -> PublishEffects {
         })
         .expect("prepared row iterator")
         .map(|row| row.expect("prepared row"))
+        .collect();
+    let mut frozen_statement = conn
+        .prepare("SELECT descriptor, descriptor_digest, image_digest, media_key FROM social_publish_prepared WHERE install_id = ?1 ORDER BY prepared_id")
+        .unwrap();
+    let frozen = frozen_statement
+        .query_map([install], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .unwrap()
+        .map(Result::unwrap)
         .collect();
     let mut effect_statement = conn
         .prepare(
@@ -750,6 +764,7 @@ fn publish_effects(fx: &Fx, install: &str) -> PublishEffects {
         .count();
     PublishEffects {
         prepared,
+        frozen,
         staged_effects,
         queued,
         prepared_events,
@@ -772,11 +787,11 @@ fn set_staged_effect_state(fx: &Fx, effect_id: &str, state: &str) {
 fn persist_prepared_descriptor(
     fx: &Fx,
     prepared_id: &str,
-    mut descriptor: Value,
+    descriptor: Value,
+    owner_descriptor: &Value,
     media_key: Option<&str>,
 ) -> String {
-    let intent_digest = independent_intent_digest(&descriptor);
-    descriptor["intent_digest"] = json!(intent_digest);
+    let intent_digest = independent_intent_digest(owner_descriptor);
     let descriptor_digest = cadence_agent::store::app_runs::material_digest(&descriptor);
     let image_digest = descriptor
         .get("image_digest")
@@ -792,6 +807,17 @@ fn persist_prepared_descriptor(
         .expect("persist prepared descriptor refusal fixture");
     assert_eq!(changed, 1, "fixture prepared intent exists");
     intent_digest
+}
+
+// Restore byte-exact PRIVATE custody, including columns that the corruption
+// fixture changed. The public owner projection is not this stored descriptor.
+fn restore_prepared_descriptor(fx: &Fx, prepared_id: &str, before: &PublishEffects) {
+    let (descriptor, digest, image_digest, media_key) = &before.frozen[0];
+    let conn = Connection::open(fx.state_dir().join("cadence.sqlite3")).unwrap();
+    assert_eq!(conn.execute(
+        "UPDATE social_publish_prepared SET descriptor = ?1, descriptor_digest = ?2, image_digest = ?3, media_key = ?4 WHERE prepared_id = ?5",
+        rusqlite::params![descriptor, digest, image_digest, media_key, prepared_id],
+    ).unwrap(), 1);
 }
 
 fn independent_intent_digest(descriptor: &Value) -> String {
@@ -858,6 +884,7 @@ fn signed_owner_read_checks_exact_scope_and_durable_one_use_jti_without_publish_
         .expect("intent digest")
         .to_owned();
     let before = publish_effects(&fx, &install);
+    let frozen_descriptor: Value = serde_json::from_str(&before.frozen[0].0).unwrap();
     assert_eq!(before.prepared.len(), 1);
     assert_eq!(before.prepared[0].0, intent_id);
     assert_eq!(before.prepared[0].1, "prepared");
@@ -1094,6 +1121,7 @@ fn signed_owner_read_checks_exact_scope_and_durable_one_use_jti_without_publish_
     // A self-consistent prepared descriptor cannot override the staged
     // effect's receipt for the current reviewed run material.
     let mut changed_material = expected_descriptor.clone();
+    let mut changed_frozen_material = frozen_descriptor.clone();
     let changed_snapshot_digest =
         if changed_material["run_snapshot_digest"] == json!("a".repeat(64)) {
             "b".repeat(64)
@@ -1101,8 +1129,15 @@ fn signed_owner_read_checks_exact_scope_and_durable_one_use_jti_without_publish_
             "a".repeat(64)
         };
     changed_material["run_snapshot_digest"] = json!(changed_snapshot_digest);
-    let changed_material_digest =
-        persist_prepared_descriptor(&fx, &intent_id, changed_material, None);
+    changed_frozen_material["run_snapshot_digest"] =
+        changed_material["run_snapshot_digest"].clone();
+    let changed_material_digest = persist_prepared_descriptor(
+        &fx,
+        &intent_id,
+        changed_frozen_material,
+        &changed_material,
+        None,
+    );
     let changed_material_effects = publish_effects(&fx, &install);
     let material_jti = fresh_jti();
     let material_jws = signer.compact(&base_claims(
@@ -1122,17 +1157,17 @@ fn signed_owner_read_checks_exact_scope_and_durable_one_use_jti_without_publish_
         jti_hashes(&fx.state_dir()).contains(&cadence_agent::operator_auth::digest(&material_jti))
     );
     reproof_jtis.push(material_jti);
-    assert_eq!(
-        persist_prepared_descriptor(&fx, &intent_id, expected_descriptor.clone(), None),
-        expected_digest
-    );
+    restore_prepared_descriptor(&fx, &intent_id, &before);
     assert_eq!(publish_effects(&fx, &install), before);
 
     // The manifest in the currently completed bundle, not a caller-selected
     // descriptor field, owns the app identity returned by the read.
     let mut changed_app = expected_descriptor.clone();
+    let mut changed_frozen_app = frozen_descriptor.clone();
     changed_app["app_id"] = json!("different-current-app");
-    let changed_app_digest = persist_prepared_descriptor(&fx, &intent_id, changed_app, None);
+    changed_frozen_app["app_id"] = changed_app["app_id"].clone();
+    let changed_app_digest =
+        persist_prepared_descriptor(&fx, &intent_id, changed_frozen_app, &changed_app, None);
     let changed_app_effects = publish_effects(&fx, &install);
     let app_jti = fresh_jti();
     let app_jws = signer.compact(&base_claims(
@@ -1150,10 +1185,7 @@ fn signed_owner_read_checks_exact_scope_and_durable_one_use_jti_without_publish_
     assert_eq!(publish_effects(&fx, &install), changed_app_effects);
     assert!(jti_hashes(&fx.state_dir()).contains(&cadence_agent::operator_auth::digest(&app_jti)));
     reproof_jtis.push(app_jti);
-    assert_eq!(
-        persist_prepared_descriptor(&fx, &intent_id, expected_descriptor.clone(), None),
-        expected_digest
-    );
+    restore_prepared_descriptor(&fx, &intent_id, &before);
     assert_eq!(publish_effects(&fx, &install), before);
 
     // Structurally plausible persisted media keys are still bound to the
@@ -1173,10 +1205,14 @@ fn signed_owner_read_checks_exact_scope_and_durable_one_use_jti_without_publish_
     );
     let mut foreign_media_descriptor = expected_descriptor.clone();
     foreign_media_descriptor["image_digest"] = json!(image_digest);
+    let mut foreign_frozen = frozen_descriptor.clone();
+    foreign_frozen["image_digest"] = json!(image_digest);
+    foreign_frozen["media_key"] = json!(foreign_key);
     let foreign_media_digest = persist_prepared_descriptor(
         &fx,
         &intent_id,
-        foreign_media_descriptor,
+        foreign_frozen,
+        &foreign_media_descriptor,
         Some(&foreign_key),
     );
     let foreign_media_effects = publish_effects(&fx, &install);
@@ -1198,19 +1234,20 @@ fn signed_owner_read_checks_exact_scope_and_durable_one_use_jti_without_publish_
     assert!(jti_hashes(&fx.state_dir())
         .contains(&cadence_agent::operator_auth::digest(&foreign_media_jti)));
     reproof_jtis.push(foreign_media_jti);
-    assert_eq!(
-        persist_prepared_descriptor(&fx, &intent_id, expected_descriptor.clone(), None),
-        expected_digest
-    );
+    restore_prepared_descriptor(&fx, &intent_id, &before);
     assert_eq!(publish_effects(&fx, &install), before);
 
     let mismatched_digest_key = format!("dp1.test_workspace.{aos_connection}.{}", "b".repeat(32));
     let mut mismatched_digest_descriptor = expected_descriptor.clone();
     mismatched_digest_descriptor["image_digest"] = json!(image_digest);
+    let mut mismatched_digest_frozen = frozen_descriptor.clone();
+    mismatched_digest_frozen["image_digest"] = json!(image_digest);
+    mismatched_digest_frozen["media_key"] = json!(mismatched_digest_key);
     let mismatched_media_digest = persist_prepared_descriptor(
         &fx,
         &intent_id,
-        mismatched_digest_descriptor,
+        mismatched_digest_frozen,
+        &mismatched_digest_descriptor,
         Some(&mismatched_digest_key),
     );
     let mismatched_media_effects = publish_effects(&fx, &install);
@@ -1232,10 +1269,7 @@ fn signed_owner_read_checks_exact_scope_and_durable_one_use_jti_without_publish_
     assert!(jti_hashes(&fx.state_dir())
         .contains(&cadence_agent::operator_auth::digest(&mismatched_media_jti)));
     reproof_jtis.push(mismatched_media_jti);
-    assert_eq!(
-        persist_prepared_descriptor(&fx, &intent_id, expected_descriptor.clone(), None),
-        expected_digest
-    );
+    restore_prepared_descriptor(&fx, &intent_id, &before);
     assert_eq!(publish_effects(&fx, &install), before);
 
     // No cookie or X-Cadence-Session is sent. The actual public-host route
@@ -1255,13 +1289,15 @@ fn signed_owner_read_checks_exact_scope_and_durable_one_use_jti_without_publish_
         .headers
         .get("vary")
         .is_some_and(|value| value.to_ascii_lowercase().contains("authorization")));
-    assert_eq!(
-        valid_http
-            .headers
-            .get("x-content-type-options")
-            .map(String::as_str),
-        Some("nosniff")
-    );
+    let content_type_options = valid_http
+        .headers
+        .get("x-content-type-options")
+        .expect("owner read must retain MIME-sniffing protection");
+    // The route and common response wrapper may each emit the same header.
+    // Our parser joins duplicates; require every value to retain nosniff.
+    assert!(content_type_options
+        .split(',')
+        .all(|value| value.trim() == "nosniff"));
     let returned: Value = serde_json::from_str(&valid_http.body).expect("bare descriptor JSON");
     assert_eq!(returned, expected_descriptor);
     assert!(

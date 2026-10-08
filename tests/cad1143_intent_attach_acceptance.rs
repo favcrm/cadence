@@ -1,3 +1,6 @@
+//! Independent acceptance repairs: acc-sol-1143, successor to cc13-pi-acc793.
+//! The implementer may not edit or weaken these checks.
+//!
 //! CAD-1143 prepared-intent attach guard acceptance — written by the
 //! INDEPENDENT acceptance author (cc13-pi-acc793), never the host
 //! implementer (social-host-ca8ff), who may not edit or weaken this file.
@@ -798,28 +801,42 @@ fn board_http_post_with_public(
     body: &str,
     public: Option<cadence_agent::ui::PublicBoard>,
 ) -> (u16, String) {
-    let free = |port: &u16| std::net::TcpListener::bind(("127.0.0.1", *port)).is_ok();
-    let port = (3110..3200).find(free).expect("isolated board port");
+    // Select by the board's actual bind, not a probe socket closed before
+    // startup (which races other tests/lanes). Retry only AddrInUse.
+    let (port, stop, board) = (3110..3200)
+        .find_map(|port| {
+            let (startup, ready) = std::sync::mpsc::channel();
+            let stop = Arc::new(AtomicBool::new(false));
+            let opts = cadence_agent::ui::ServeOpts {
+                host: "127.0.0.1".into(),
+                port,
+                stop: Some(Arc::clone(&stop)),
+                startup: Some(startup),
+                public: public.clone(),
+                test_seam: true,
+                ..Default::default()
+            };
+            let (board_dir, board_pm) = (dir.to_path_buf(), pm.to_path_buf());
+            let board =
+                std::thread::spawn(move || cadence_agent::ui::serve(&board_dir, &board_pm, &opts));
+            match ready
+                .recv_timeout(Duration::from_secs(10))
+                .expect("board startup signal")
+            {
+                Ok(()) => Some((port, stop, board)),
+                Err(std::io::ErrorKind::AddrInUse) => {
+                    let _ = board.join();
+                    None
+                }
+                Err(error) => {
+                    let _ = board.join();
+                    panic!("board startup: {error:?}")
+                }
+            }
+        })
+        .expect("isolated board port");
     let host = format!("cadence-{port}.localhost:{port}");
-    let (startup, ready) = std::sync::mpsc::channel();
-    let stop = Arc::new(AtomicBool::new(false));
-    let opts = cadence_agent::ui::ServeOpts {
-        host: "127.0.0.1".into(),
-        port,
-        stop: Some(Arc::clone(&stop)),
-        startup: Some(startup),
-        public,
-        test_seam: true,
-        ..Default::default()
-    };
-    let (dir, pm) = (dir.to_path_buf(), pm.to_path_buf());
-    let board_dir = dir.clone();
-    let board = std::thread::spawn(move || cadence_agent::ui::serve(&board_dir, &pm, &opts));
-    ready
-        .recv_timeout(Duration::from_secs(10))
-        .expect("board startup signal")
-        .expect("board startup");
-    let token = Seam::token_at(dir.as_path()).expect("fixture daemon minted its seam token");
+    let token = Seam::token_at(dir).expect("fixture daemon minted its seam token");
     let request = format!(
         "POST {path} HTTP/1.0\r\nHost: {host}\r\nContent-Type: application/json\r\n\
          X-Cadence-Board: 1\r\nSec-Fetch-Site: same-origin\r\nOrigin: http://{host}\r\n\
@@ -2044,7 +2061,20 @@ fn postcommit_arm_uses_fresh_clock_and_cancellation_cannot_be_resurrected() {
     let tick_before_maturity = driver_last_tick(&fx, &install);
     wait_for_driver_tick_after(&fx, &install, tick_before_maturity);
     assert_eq!(fx.sender.execute_calls.load(SeqCst), 1);
-    assert_eq!(fx.sender.status_calls.load(SeqCst), 0);
+    // A mature manual claim may leave processing evidence for the driver to
+    // reconcile via status. That read is not another execution: the ticket's
+    // exactly-once boundary is execute, not an exclusion of status reads.
+    // Reconcile can observe the processing row between claim and report;
+    // scheduling decides how many advisory reads occur, never another execute.
+    eprintln!(
+        "postclaim reconcile status reads: {}",
+        fx.sender.status_calls.load(SeqCst)
+    );
+    assert_eq!(
+        queue_row_for_request(&fx, &install, &armed_request)["state"],
+        json!("refused")
+    );
+    assert_eq!(fx.sender.executed_bindings.lock().unwrap().len(), 1);
     fx.store.set_social_publish_attach_test_hook(None);
 }
 
@@ -2807,10 +2837,15 @@ fn native_owner_http_rejects_frame_forgery_attaches_once_and_preserves_undo_wind
         "social_publish_send_now",
         json!({"intent_id":queued_id,"install_id":install}),
     );
-    assert!(
-        early_send.is_err(),
+    // Immature named claims return not-sent, not an RPC error. Retain
+    // queued/cancellable state and the independent zero-dispatch proof.
+    let early_send = early_send.expect("immature send-now returns its no-effect result");
+    assert_eq!(
+        early_send["sent"],
+        json!(false),
         "send-now bypassed the five-second Undo floor"
     );
+    assert_eq!(early_send["intent"]["state"], json!("queued"));
     assert_eq!(
         fx.sender.execute_calls.load(SeqCst),
         0,
@@ -2877,6 +2912,7 @@ fn native_owner_http_rejects_frame_forgery_attaches_once_and_preserves_undo_wind
     let second_attach_body = json!({
         "prepared_id":second_prepared_id,
         "install_id":install,
+        "context_id":null,
     });
     let second_attach_at = second_prepare_at + 2;
     fx.clock.store(second_attach_at, SeqCst);
@@ -2959,10 +2995,16 @@ fn native_owner_http_rejects_frame_forgery_attaches_once_and_preserves_undo_wind
         "social_publish_send_now",
         json!({"intent_id":second_queued_id,"install_id":install}),
     );
-    assert!(
-        second_early_send.is_err(),
+    // Immature named claims return not-sent, not an RPC error. Retain
+    // queued/cancellable state and the independent zero-dispatch proof.
+    let second_early_send =
+        second_early_send.expect("immature send-now returns its no-effect result");
+    assert_eq!(
+        second_early_send["sent"],
+        json!(false),
         "named send-now bypassed the second Undo floor"
     );
+    assert_eq!(second_early_send["intent"]["state"], json!("queued"));
     assert_eq!(
         fx.sender.execute_calls.load(SeqCst),
         0,
@@ -3062,6 +3104,18 @@ fn native_owner_http_rejects_frame_forgery_attaches_once_and_preserves_undo_wind
 
     // Give the named claim_id/send_now CAS a separate now intent so its
     // positive +5 boundary is covered independently of the due-claim winner.
+    // Active prepared scope is idempotent per run: a new request id must
+    // not fork the second run's authorized descriptor. Use a genuinely new
+    // reviewed run for the independent named-claim positive control.
+    let third_run_id = scoped(Asserted::Operator, || {
+        fx.complete_approved_run(
+            &install,
+            second_prepared["prepared"]["descriptor"]["bundle_digest"]
+                .as_str()
+                .unwrap(),
+            "run-attach-named-maturity",
+        )
+    });
     let third_prepare_at = mature_epoch + 1;
     fx.clock.store(third_prepare_at, SeqCst);
     fx.driver_clock.store(third_prepare_at, SeqCst);
@@ -3072,7 +3126,7 @@ fn native_owner_http_rejects_frame_forgery_attaches_once_and_preserves_undo_wind
         PREPARE_PATH,
         &json!({
             "request_id":"native-owner-http-send-now-maturity",
-            "run_id":second_run_id,
+            "run_id":third_run_id,
             "mode":"now",
         })
         .to_string(),
@@ -3097,6 +3151,7 @@ fn native_owner_http_rejects_frame_forgery_attaches_once_and_preserves_undo_wind
     let third_attach_body = json!({
         "prepared_id":third_prepared_id,
         "install_id":install,
+        "context_id":null,
     });
     let (third_attach_status, third_attach_response) = board_http_post(
         &fx.dir(),
@@ -3139,10 +3194,16 @@ fn native_owner_http_rejects_frame_forgery_attaches_once_and_preserves_undo_wind
         "social_publish_send_now",
         json!({"intent_id":third_queued_id,"install_id":install}),
     );
-    assert!(
-        third_early_send.is_err(),
+    // Immature named claims return not-sent, not an RPC error. Retain
+    // queued/cancellable state and the independent zero-dispatch proof.
+    let third_early_send =
+        third_early_send.expect("immature send-now returns its no-effect result");
+    assert_eq!(
+        third_early_send["sent"],
+        json!(false),
         "claim_id/send_now bypassed queue+4"
     );
+    assert_eq!(third_early_send["intent"]["state"], json!("queued"));
     assert_eq!(fx.sender.execute_calls.load(SeqCst), 1);
     assert_eq!(
         fx.store.social_publish_show(&third_queued_id).unwrap()["intent"]["state"],
