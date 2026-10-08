@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { Agent } from "../../lib/types";
+import { navigate, useHref } from "../../lib/useLocation";
 import type { Viewer } from "../projects/work";
 import { ApiError } from "../../lib/api";
 import { StoredDraftCard } from "./StoredDraftCard";
@@ -41,6 +42,7 @@ import {
 import { retainedRequest, completeRequest } from "./requests";
 import PublishPanel, { type PublishCandidate } from "./PublishPanel";
 import ScheduleCalendar from "./ScheduleCalendar";
+import { conversationList } from "../app-shell/conversationClient";
 import { forgetContext, initialContext, rememberedContext, rememberContext, screenContext, subscribeContext } from "./contextSelection";
 import { promptError } from "./promptFields";
 import "./workspace-apps.css";
@@ -75,6 +77,110 @@ const message = (error: unknown) =>
     ? error.message
     : "Could not complete this action. Refresh and try again.";
 
+type SocialDestination = { contextId: string; conversationId: string };
+type DestinationProof = {
+  visitKey: string;
+  selectionEpoch: number;
+  installId: string;
+  contextId: string;
+  conversationId: string;
+  ownerSignature: string;
+  conversationAsOf: number;
+};
+type ReadyOwnerSnapshot = { snapshot: Snapshot; signature: string; context: AppContext };
+type SavedContextInvocation = {
+  action: ActionContext;
+  visitKey: string | null;
+  href: string;
+  selectionEpoch: number;
+};
+
+function sameInstallation(left: Installation, right: Installation): boolean {
+  return left.install_id === right.install_id && left.version === right.version && left.digest === right.digest;
+}
+
+function rawQueryValues(rawQuery: string, parameter: string): (string | null)[] {
+  const values: (string | null)[] = [];
+  for (const part of rawQuery.split("&")) {
+    const separator = part.indexOf("=");
+    const rawName = separator < 0 ? part : part.slice(0, separator);
+    let name: string;
+    try {
+      name = decodeURIComponent(rawName.replace(/\+/g, " "));
+    } catch {
+      continue;
+    }
+    if (name !== parameter) continue;
+    const rawValue = separator < 0 ? "" : part.slice(separator + 1);
+    try {
+      values.push(decodeURIComponent(rawValue.replace(/\+/g, " ")));
+    } catch {
+      values.push(null);
+    }
+  }
+  return values;
+}
+
+function parseSocialDestination(href: string, installId: string): SocialDestination | null {
+  const queryStart = href.indexOf("?");
+  const path = queryStart < 0 ? href : href.slice(0, queryStart);
+  const prefix = "/app-installations/";
+  if (!path.startsWith(prefix) || path.slice(prefix.length).includes("/")) return null;
+  try {
+    if (decodeURIComponent(path.slice(prefix.length)) !== installId) return null;
+  } catch {
+    return null;
+  }
+  if (queryStart < 0) return null;
+  const rawQuery = href.slice(queryStart + 1).split("#", 1)[0];
+  const params = new URLSearchParams(rawQuery);
+  const contextIds = params.getAll("ctx");
+  const rawContextIds = rawQueryValues(rawQuery, "ctx");
+  const conversationIds = params.getAll("conversation");
+  const rawConversationIds = rawQueryValues(rawQuery, "conversation");
+  if (
+    contextIds.length !== 1 || rawContextIds.length !== 1 ||
+    conversationIds.length !== 1 || rawConversationIds.length !== 1 ||
+    rawContextIds[0] === null || rawConversationIds[0] === null ||
+    contextIds[0] === "" || conversationIds[0] === "" ||
+    contextIds[0] !== rawContextIds[0] || conversationIds[0] !== rawConversationIds[0]
+  ) return null;
+  return { contextId: contextIds[0], conversationId: conversationIds[0] };
+}
+
+function withoutSocialDestination(href: string, installId: string): string | null {
+  const hashStart = href.indexOf("#");
+  const withoutHash = hashStart < 0 ? href : href.slice(0, hashStart);
+  const hash = hashStart < 0 ? "" : href.slice(hashStart);
+  const queryStart = withoutHash.indexOf("?");
+  const path = queryStart < 0 ? withoutHash : withoutHash.slice(0, queryStart);
+  const prefix = "/app-installations/";
+  if (!path.startsWith(prefix) || path.slice(prefix.length).includes("/")) return null;
+  try {
+    if (decodeURIComponent(path.slice(prefix.length)) !== installId) return null;
+  } catch {
+    return null;
+  }
+  if (queryStart < 0) return null;
+  let removed = false;
+  const kept = withoutHash.slice(queryStart + 1).split("&").filter(part => {
+    const separator = part.indexOf("=");
+    const rawName = separator < 0 ? part : part.slice(0, separator);
+    let name: string;
+    try {
+      name = decodeURIComponent(rawName.replace(/\+/g, " "));
+    } catch {
+      return true;
+    }
+    if (name !== "ctx" && name !== "conversation") return true;
+    removed = true;
+    return false;
+  });
+  if (!removed) return null;
+  const query = kept.filter(part => part !== "").join("&");
+  return `${withoutHash.slice(0, queryStart)}${query ? `?${query}` : ""}${hash}`;
+}
+
 export default function WorkspaceApp({
   installId,
   viewer,
@@ -99,8 +205,51 @@ export default function WorkspaceApp({
   const [busy, setBusy] = useState(false);
   const mutationLock = useRef(false);
   const activeRead = useRef<AbortController | null>(null);
+  const ownerReadReceipt = useRef<{ visitKey: string | null; installId: string } | null>(null);
+  const ownerRefreshRequestedVisit = useRef<string | null>(null);
   const identity = useRef(installId);
   identity.current = installId;
+  const href = useHref();
+  const hrefRef = useRef(href);
+  hrefRef.current = href;
+  const destination = useMemo(() => parseSocialDestination(href, installId), [href, installId]);
+  const linkSignature = destination
+    ? JSON.stringify([installId, destination.contextId, destination.conversationId])
+    : null;
+  const currentLinkRef = useRef<{ signature: string | null; sequence: number }>({ signature: null, sequence: 0 });
+  if (currentLinkRef.current.signature !== linkSignature) {
+    currentLinkRef.current = { signature: linkSignature, sequence: currentLinkRef.current.sequence + 1 };
+  }
+  const destinationVisitKey = destination && linkSignature
+    ? JSON.stringify([linkSignature, currentLinkRef.current.sequence])
+    : null;
+  const destinationVisitRef = useRef<string | null>(destinationVisitKey);
+  destinationVisitRef.current = destinationVisitKey;
+  const userContextIntentEpoch = useRef(0);
+  const mountedOwner = useRef(false);
+  useLayoutEffect(() => {
+    mountedOwner.current = true;
+    return () => {
+      mountedOwner.current = false;
+      userContextIntentEpoch.current += 1;
+    };
+  }, []);
+  const consumedDestinationVisit = useRef<string | null>(null);
+  const conversationRefreshStarted = useRef<string | null>(null);
+  const conversationInFlightSeen = useRef<string | null>(null);
+  const [destinationProof, setDestinationProof] = useState<DestinationProof | null>(null);
+  const supersedeDestinationWithUserChoice = useCallback((expected?: { visitKey: string | null; selectionEpoch: number }) => {
+    if (expected && (
+      destinationVisitRef.current !== expected.visitKey ||
+      userContextIntentEpoch.current !== expected.selectionEpoch
+    )) return false;
+    userContextIntentEpoch.current += 1;
+    consumedDestinationVisit.current = destinationVisitRef.current;
+    setDestinationProof(null);
+    const nextHref = withoutSocialDestination(hrefRef.current, installId);
+    if (nextHref && nextHref !== hrefRef.current) navigate(nextHref, { replace: true });
+    return true;
+  }, [installId]);
   const [artifact, setArtifact] = useState<TextArtifact | null>(null);
   const [artifactError, setArtifactError] = useState<string | null>(null);
   const [artifactLoading, setArtifactLoading] = useState(false);
@@ -132,6 +281,26 @@ export default function WorkspaceApp({
     const timer = window.setTimeout(() => setConnectToastMsg(null), 6000);
     return () => window.clearTimeout(timer);
   }, [installId]);
+  const destinationContexts = destination && data
+    ? data.contexts.filter(value => value.id === destination.contextId && value.install_id === installId && value.state === "active")
+    : [];
+  const destinationContext = destinationContexts.length === 1 ? destinationContexts[0] : null;
+  const ownerApprovalCurrent = data?.installation.approved === true || data?.installation.approval?.state === "approved";
+  const destinationOwnerSignature = destination && destinationContext && data &&
+      data.installation.install_id === installId && ownerApprovalCurrent
+    ? JSON.stringify([
+      installId, data.installation.digest, data.installation.approved, data.installation.approval?.state,
+      destinationContext.id, destinationContext.revision, destinationContext.digest,
+    ])
+    : null;
+  const readReceipt = ownerReadReceipt.current;
+  const ownerReady = viewer.operator && !!destinationOwnerSignature &&
+    readReceipt?.visitKey === destinationVisitKey && readReceipt.installId === installId &&
+    !loading && !loadError && !accessDenied;
+  const readyOwnerSnapshot = useRef<ReadyOwnerSnapshot | null>(null);
+  readyOwnerSnapshot.current = ownerReady && data && destinationContext && destinationOwnerSignature
+    ? { snapshot: data, signature: destinationOwnerSignature, context: destinationContext }
+    : null;
   const clearPrivate = useCallback(() => {
     activeRead.current?.abort();
     activeRead.current = null;
@@ -159,6 +328,7 @@ export default function WorkspaceApp({
     }
     const controller = new AbortController();
     activeRead.current = controller;
+    const readFor = { visitKey: destinationVisitRef.current, installId };
     setLoading(true);
     try {
       const [
@@ -179,6 +349,7 @@ export default function WorkspaceApp({
         workspaceApps.effects(installId, undefined, controller.signal),
       ]);
       if (!controller.signal.aborted) {
+        ownerReadReceipt.current = readFor;
         setAccessDenied(false);
         setData({
           installation,
@@ -243,6 +414,115 @@ export default function WorkspaceApp({
       : initialContext(installId, active);
     if (selected !== contextId) setContextId(selected);
   }, [data, contextId, installId]);
+  useEffect(() => {
+    const visitKey = destinationVisitKey;
+    if (!visitKey || !destination || !viewer.operator || busy || mutationLock.current || loading || accessDenied) return;
+    const receipt = ownerReadReceipt.current;
+    if (receipt?.visitKey === visitKey && receipt.installId === installId) return;
+    if (ownerRefreshRequestedVisit.current === visitKey || (activeRead.current && !activeRead.current.signal.aborted)) return;
+    ownerRefreshRequestedVisit.current = visitKey;
+    void refresh();
+  }, [destinationVisitKey, destination, installId, viewer.operator, data, loading, busy, loadError, accessDenied, refresh]);
+  useEffect(() => {
+    const visitKey = destinationVisitKey;
+    const target = destination;
+    const owner = readyOwnerSnapshot.current;
+    if (
+      !visitKey || !target || !owner || !viewer.operator || loading || loadError || accessDenied || busy ||
+      mutationLock.current || consumedDestinationVisit.current === visitKey || destinationProof?.visitKey === visitKey
+    ) return;
+    const selectionEpoch = userContextIntentEpoch.current;
+    const proofKey = JSON.stringify([visitKey, owner.signature, selectionEpoch]);
+    let active = true;
+    let sawInFlight = conversationInFlightSeen.current === proofKey;
+    const resource = conversationList(installId);
+    const observe = () => {
+      if (!active) return;
+      const state = resource.get();
+      if (state.inFlight) {
+        sawInFlight = true;
+        conversationInFlightSeen.current = proofKey;
+        return;
+      }
+      if (!sawInFlight) return;
+      const latestOwner = readyOwnerSnapshot.current;
+      if (
+        destinationVisitRef.current !== visitKey || identity.current !== installId ||
+        userContextIntentEpoch.current !== selectionEpoch || !latestOwner || latestOwner.signature !== owner.signature
+      ) return;
+      const matches = state.data?.conversations.filter(value => value.id === target.conversationId) ?? [];
+      if (
+        state.status !== "ok" || state.error !== null || state.asOf === null ||
+        !state.data || state.data.legacy || matches.length !== 1
+      ) return;
+      setDestinationProof({
+        visitKey,
+        selectionEpoch,
+        installId,
+        contextId: target.contextId,
+        conversationId: target.conversationId,
+        ownerSignature: latestOwner.signature,
+        conversationAsOf: state.asOf,
+      });
+    };
+    const unsubscribe = resource.subscribe(observe);
+    observe();
+    if (conversationRefreshStarted.current !== proofKey) {
+      conversationRefreshStarted.current = proofKey;
+      void resource.refresh().then(observe).catch(() => {});
+    }
+    return () => {
+      active = false;
+      unsubscribe();
+    };
+  }, [
+    destinationVisitKey, destination, destinationOwnerSignature, installId, viewer.operator,
+    loading, loadError, accessDenied, busy, destinationProof?.visitKey,
+  ]);
+  useLayoutEffect(() => {
+    const proof = destinationProof;
+    if (
+      !proof || proof.visitKey !== destinationVisitKey || proof.installId !== installId ||
+      consumedDestinationVisit.current === proof.visitKey || !viewer.operator || loading || loadError ||
+      accessDenied || busy || mutationLock.current || userContextIntentEpoch.current !== proof.selectionEpoch ||
+      destinationVisitRef.current !== proof.visitKey || identity.current !== installId
+    ) return;
+    const owner = readyOwnerSnapshot.current;
+    if (!owner || owner.snapshot !== data || owner.signature !== proof.ownerSignature) return;
+    const installation = owner.snapshot.installation;
+    if (
+      installation.install_id !== installId ||
+      !(installation.approved === true || installation.approval?.state === "approved") ||
+      installation.digest === ""
+    ) return;
+    const contexts = owner.snapshot.contexts.filter(value =>
+      value.id === proof.contextId && value.install_id === installId && value.state === "active");
+    if (contexts.length !== 1) return;
+    const resourceState = conversationList(installId).get();
+    const conversationMatches = resourceState.data?.conversations.filter(value => value.id === proof.conversationId) ?? [];
+    if (
+      resourceState.status !== "ok" || resourceState.inFlight || resourceState.error !== null ||
+      resourceState.asOf !== proof.conversationAsOf || !resourceState.data || resourceState.data.legacy ||
+      conversationMatches.length !== 1
+    ) return;
+
+    consumedDestinationVisit.current = proof.visitKey;
+    setDestinationProof(null);
+    if (contextId !== proof.contextId) {
+      setContextId(proof.contextId);
+      setEditingContextId("");
+      setBrandName(""); setBrandVoice(""); setProtectedTerms("");
+      setContentPrompt(""); setImagePrompt("");
+      setSelectedSource(null);
+      setSelectedRun(null);
+      setSelectedArtifact("");
+      setActionError(null);
+    }
+    rememberContext(installId, proof.contextId);
+  }, [
+    destinationProof, destinationVisitKey, destinationOwnerSignature, installId, viewer.operator,
+    loading, loadError, accessDenied, busy, data, contextId,
+  ]);
   // Candidates re-check on every Settings visit — including the return
   // from Settings → Connections — on top of the background poll below.
   useEffect(() => {
@@ -373,10 +653,53 @@ export default function WorkspaceApp({
   const actionCtx = useRef<ActionContext | null>(null);
   actionCtx.current = data && data.installation.install_id === installId && !accessDenied
     ? { installation: data.installation, installId, contextId, runs: data.runs, onChanged: () => refresh(true) } : null;
+  const savedContextHandler = useRef<((saved: AppContext, invocation: SavedContextInvocation) => void) | null>(null);
+  savedContextHandler.current = (saved, invocation) => {
+    const activeAction = actionCtx.current;
+    const action = invocation.action;
+    if (
+      !mountedOwner.current || !activeAction || !viewer.operator || viewer.readOnly || accessDenied ||
+      installId !== action.installId || identity.current !== action.installId ||
+      action.installation.install_id !== action.installId || activeAction.installId !== action.installId ||
+      !sameInstallation(action.installation, activeAction.installation) || activeAction.contextId !== action.contextId ||
+      destinationVisitRef.current !== invocation.visitKey || hrefRef.current !== invocation.href ||
+      userContextIntentEpoch.current !== invocation.selectionEpoch ||
+      saved.install_id !== action.installId || saved.state !== "active" ||
+      typeof saved.id !== "string" || saved.id.length === 0
+    ) return;
+
+    userContextIntentEpoch.current += 1;
+    const nextHref = withoutSocialDestination(hrefRef.current, action.installId);
+    if (invocation.visitKey) consumedDestinationVisit.current = invocation.visitKey;
+    setDestinationProof(null);
+    if (contextId !== saved.id) {
+      setEditingContextId("");
+      setBrandName(""); setBrandVoice(""); setProtectedTerms("");
+      setContentPrompt(""); setImagePrompt("");
+      setSelectedSource(null);
+      setSelectedRun(null);
+      setSelectedArtifact("");
+      setActionError(null);
+    }
+    setContextId(saved.id);
+    rememberContext(action.installId, saved.id);
+    if (nextHref && nextHref !== hrefRef.current) navigate(nextHref, { replace: true });
+  };
   const screenActions = useMemo(() => viewer.operator && !viewer.readOnly ? {
-    call: (verb: Parameters<typeof runCall>[1], args: Record<string, unknown>, ui: Parameters<typeof runCall>[3]) =>
-      actionCtx.current ? runCall(actionCtx.current, verb, args, ui)
-        : Promise.resolve({ ok: false as const, refusal: { code: "denied", text: "Only the operator can do that." } }),
+    call: (verb: Parameters<typeof runCall>[1], args: Record<string, unknown>, ui: Parameters<typeof runCall>[3]) => {
+      const action = actionCtx.current;
+      if (!action) return Promise.resolve({ ok: false as const, refusal: { code: "denied", text: "Only the operator can do that." } });
+      const invocation: SavedContextInvocation = {
+        action,
+        visitKey: destinationVisitRef.current,
+        href: hrefRef.current,
+        selectionEpoch: userContextIntentEpoch.current,
+      };
+      return runCall({ ...action,
+        onChanged: () => (mountedOwner.current ? actionCtx.current?.onChanged() : undefined),
+        onSavedContext: saved => savedContextHandler.current?.(saved, invocation),
+      }, verb, args, ui);
+    },
     planner: makePlanner(() => {
       if (!actionCtx.current) throw new Error("no scope");
       return actionCtx.current;
@@ -640,6 +963,7 @@ export default function WorkspaceApp({
     <Select
       value={contextId}
       onChange={(value) => {
+        supersedeDestinationWithUserChoice();
         setContextId(value);
         rememberContext(installId, value);
         setEditingContextId("");
@@ -1013,6 +1337,10 @@ export default function WorkspaceApp({
                         );
                         return;
                       }
+                      const selectionAtSubmit = {
+                        visitKey: destinationVisitRef.current,
+                        selectionEpoch: userContextIntentEpoch.current,
+                      };
                       void mutate(async () => {
                         const editing = editingContextId === selectedContext?.id ? selectedContext : undefined;
                         const inputDefaults: Record<string, string> = { ...(editing?.config.input_defaults ?? {}) };
@@ -1027,7 +1355,10 @@ export default function WorkspaceApp({
                             label, input_defaults: inputDefaults,
                             request_id: retainedRequest(JSON.stringify({ installId, label, inputDefaults })),
                           });
-                        if (identity.current === installId) {
+                        if (
+                          mountedOwner.current && identity.current === installId &&
+                          supersedeDestinationWithUserChoice(selectionAtSubmit)
+                        ) {
                           setContextId(context.id);
                           rememberContext(installId, context.id);
                           setEditingContextId("");

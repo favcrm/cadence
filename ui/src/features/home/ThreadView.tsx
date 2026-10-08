@@ -135,7 +135,12 @@ export function ThreadItemView({
   density?: Density;
   readOnly: boolean;
   onOpenIssue: (id: string) => void;
-  onRetry: (message: string, text: string, refs?: ThreadRef[]) => void;
+  onRetry: (
+    message: string,
+    text: string,
+    refs?: ThreadRef[],
+    attachments?: { id: string }[],
+  ) => void;
   onDiscard: (message: string) => void;
 }) {
   const compact = density === "compact";
@@ -148,6 +153,7 @@ export function ThreadItemView({
             {item.entry.text}
           </div>
           <RefChips refs={entryRefs(item.entry.payload)} />
+          <AttachmentRows files={entryAttachments(item.entry.payload)} />
         </Bubble>
       );
     case "pending":
@@ -172,7 +178,14 @@ export function ThreadItemView({
               {item.pending.error}{" "}
               <button
                 className="lnk"
-                onClick={() => onRetry(item.pending.message, item.pending.text, item.pending.refs)}
+                onClick={() =>
+                  onRetry(
+                    item.pending.message,
+                    item.pending.text,
+                    item.pending.refs,
+                    item.pending.attachments,
+                  )
+                }
               >
                 Retry
               </button>{" "}
@@ -284,6 +297,45 @@ function RefChips({ refs }: { refs: ThreadRef[] }) {
         </span>
       ))}
     </span>
+  );
+}
+
+/** CAD-1168: `payload.attachments` as typed rows — a malformed value
+ *  reads as none. The stored row carries only daemon-resolved metadata
+ *  ({id,name,size,mime,sha256}); the UI never makes a path or URL of it. */
+export interface EntryAttachment {
+  id: string;
+  name: string;
+  size: number;
+  mime: string;
+}
+
+export function entryAttachments(payload: unknown): EntryAttachment[] {
+  const arr = (payload as { attachments?: unknown } | null)?.attachments;
+  if (!Array.isArray(arr)) return [];
+  return arr.filter(
+    (a): a is EntryAttachment =>
+      !!a &&
+      typeof a === "object" &&
+      typeof (a as EntryAttachment).id === "string" &&
+      typeof (a as EntryAttachment).name === "string" &&
+      typeof (a as EntryAttachment).size === "number" &&
+      typeof (a as EntryAttachment).mime === "string",
+  );
+}
+
+/** The operator bubble's retained-file rows — names, sizes, MIMEs only:
+ *  a chip is never a link and never carries a token or path. */
+function AttachmentRows({ files }: { files: EntryAttachment[] }) {
+  if (files.length === 0) return null;
+  return (
+    <div className="flex flex-wrap gap-1 mt-1 justify-end" data-entry-attachments>
+      {files.map((f) => (
+        <span key={f.id} className="chip text-micro" title={`${f.mime} · ${f.size} B`}>
+          {f.name} · {(f.size / 1024).toFixed(f.size > 1024 ? 0 : 1)} KB
+        </span>
+      ))}
+    </div>
   );
 }
 

@@ -113,6 +113,7 @@ impl Shared {
                 "state": "working",
                 "message": m.id,
                 "conversation": conversation_of(&m.id),
+                "app_origin": self.master_turn_app_origin(&m.id),
                 "summary": m.body,
                 "since": m.started.unwrap_or(m.created),
             }),
@@ -121,6 +122,7 @@ impl Shared {
                     "state": "queued",
                     "message": m.id,
                     "conversation": conversation_of(&m.id),
+                    "app_origin": self.master_turn_app_origin(&m.id),
                     "summary": m.body,
                     "since": m.created,
                 }),
@@ -141,6 +143,107 @@ impl Shared {
             "turn": turn,
             "queued": self.store.queued_count(alias)?,
         }))
+    }
+
+    /// Best-effort navigation metadata for the exact persisted master turn.
+    /// This projection proves the current app and conversation while the
+    /// runtime snapshot is held; it is not an authorization or revocation-atomic grant.
+    fn master_turn_app_origin(&self, message_id: &str) -> Value {
+        let alias = crate::master::ALIAS;
+        let Some(thread) = self
+            .store
+            .message_conversation(alias, message_id)
+            .ok()
+            .flatten()
+        else {
+            return Value::Null;
+        };
+        let Some(install) = thread
+            .install_id
+            .as_deref()
+            .filter(|install| !install.is_empty())
+        else {
+            return Value::Null;
+        };
+        if thread.alias != alias
+            || thread.archived
+            || thread.is_home()
+            || thread.id.is_empty()
+            || thread.subject.is_some()
+        {
+            return Value::Null;
+        }
+
+        let Ok(pm_dir) = self.pm_dir() else {
+            return Value::Null;
+        };
+        let Ok(pm) = self.pm_at(&pm_dir) else {
+            return Value::Null;
+        };
+        let conversation_id = thread.id.clone();
+        crate::issue::app_catalog::workspace::with_runtime_snapshot(&pm, install, |row, _files| {
+            let Some(digest) = row.get("digest").and_then(Value::as_str) else {
+                return Ok(None);
+            };
+            if row.get("install_id").and_then(Value::as_str) != Some(install) {
+                return Ok(None);
+            }
+            let status = self.store.app_capability_status(install, digest)?;
+            if status.get("state").and_then(Value::as_str) != Some("approved") {
+                return Ok(None);
+            }
+
+            // Re-read both edges under the held runtime snapshot. The
+            // first lookup binds this exact message to the same live
+            // master conversation. Subject/campaign conversations were
+            // refused above: this selector reaches RecordStore::open for
+            // those, which may initialize or migrate persistent storage.
+            let current_turn = match self.store.running_message(alias)? {
+                Some(message) => Some(message),
+                None => self.store.queued_head(alias)?,
+            };
+            if current_turn.as_ref().map(|message| message.id.as_str()) != Some(message_id) {
+                return Ok(None);
+            }
+            let Some(current_thread) = self.store.message_conversation(alias, message_id)? else {
+                return Ok(None);
+            };
+            if current_thread.id != conversation_id
+                || current_thread.alias != alias
+                || current_thread.archived
+                || current_thread.is_home()
+                || current_thread.subject.is_some()
+                || current_thread.install_id.as_deref() != Some(install)
+            {
+                return Ok(None);
+            }
+            let Some(app) = self.store.message_app(message_id)? else {
+                return Ok(None);
+            };
+            let Some(context) = app
+                .get("context_id")
+                .and_then(Value::as_str)
+                .filter(|context| !context.is_empty())
+            else {
+                return Ok(None);
+            };
+            if app.get("install_id").and_then(Value::as_str) != Some(install)
+                || (current_thread.context_id.as_deref() != Some(context)
+                    && !(current_thread.is_general && current_thread.context_id.is_none()))
+            {
+                return Ok(None);
+            }
+            self.store.app_context_proof(install, context)?;
+            self.verify_conversation_selector(alias, &app, &conversation_id)?;
+            Ok(Some(json!({
+                "install_id": install,
+                "context_id": context,
+                "conversation_id": conversation_id,
+            })))
+        })
+        .ok()
+        .flatten()
+        .unwrap_or(Value::Null)
     }
 
     /// `master_models` (CAD-575) — the operator's per-role read of the

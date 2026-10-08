@@ -492,7 +492,10 @@ mod tests {
         ] {
             let out = clean(vector);
             assert_inert(&out);
-            assert!(out.contains("ok") || out.contains('x') || out.contains("<a"), "{vector} -> {out}");
+            assert!(
+                out.contains("ok") || out.contains('x') || out.contains("<a"),
+                "{vector} -> {out}"
+            );
         }
     }
 
@@ -641,7 +644,9 @@ mod tests {
 
     #[test]
     fn structure_cannot_escape_the_host_wrapper() {
-        let out = clean("<p>a</p></td></tr></table><div>b</div></body></html><table><tr><td>c</td></tr></table>");
+        let out = clean(
+            "<p>a</p></td></tr></table><div>b</div></body></html><table><tr><td>c</td></tr></table>",
+        );
         for open in ["table", "tr", "td", "div", "p"] {
             assert_eq!(
                 out.matches(&format!("<{open}")).count(),

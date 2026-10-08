@@ -146,6 +146,19 @@ pub struct Manifest {
     pub guide: String,
 }
 
+impl Manifest {
+    /// The installation's reserved `file.upload` declaration, if any
+    /// (CAD-1168/CAD-1114 subset). Declared is not available: the host
+    /// upload service is not implemented, and a later scoped integration
+    /// must re-prove the current exact-digest consent and this declaration
+    /// at upload/reference/read rather than trust a browser projection.
+    pub fn file_upload(&self) -> Option<&CapabilityNeed> {
+        self.capabilities
+            .values()
+            .find(|need| need.is_file_upload())
+    }
+}
+
 /// The app names the result it needs. Reviewed providers own exact tools,
 /// scopes and preparation; none of those are selected by bundle bytes.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -159,12 +172,42 @@ pub struct CapabilityNeed {
     pub effect: String,
 }
 impl CapabilityNeed {
+    /// The reserved `file.upload` capability name (CAD-1168/CAD-1114
+    /// subset): the host may stage a source for that approved
+    /// installation's chat. It grants no provider connection, import,
+    /// release, publish, send or worker dispatch action, and host custody
+    /// is local draft material, not external-send authority. There is
+    /// exactly one accepted tuple for this name — see `is_file_upload`.
+    pub const FILE_UPLOAD: &'static str = "file.upload";
+
+    /// Exactly the reserved `file.upload` declaration: schema 1, version 1,
+    /// action `attach`, resource_kind `installation`, effect `draft`. The
+    /// name alone is not the declaration — a variant tuple of the same name
+    /// is refused by `validate` and is not this predicate. Later runtime
+    /// reference checks must re-prove this declaration against the exact
+    /// consented digest; this predicate is not itself an authority.
+    pub fn is_file_upload(&self) -> bool {
+        self.schema == 1
+            && self.capability == Self::FILE_UPLOAD
+            && self.version == 1
+            && self.action == "attach"
+            && self.resource_kind == "installation"
+            && self.effect == "draft"
+    }
+
     pub fn validate(&self) -> Result<()> {
+        // The reserved `file.upload` name is exact-tuple-only: it never
+        // falls through to the generic read/draft `connection_account`
+        // broker slot, so a wrong effect/resource/action/schema/version
+        // refuses instead of being accepted as a different capability.
+        let file_upload = self.is_file_upload();
         let publication = self.capability == "text.publish"
             && self.version == 1
             && self.action == "publish"
-            && self.effect == "send";
+            && self.effect == "send"
+            && self.resource_kind == "connection_account";
         let bounded_read_or_draft = self.capability != "text.publish"
+            && self.capability != Self::FILE_UPLOAD
             && matches!(self.effect.as_str(), "read" | "draft")
             && self.version == 1
             && self.capability.len() <= 64
@@ -175,11 +218,9 @@ impl CapabilityNeed {
             && self
                 .action
                 .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
-        if self.schema != 1
-            || self.resource_kind != "connection_account"
-            || !(publication || bounded_read_or_draft)
-        {
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            && self.resource_kind == "connection_account";
+        if self.schema != 1 || !(file_upload || publication || bounded_read_or_draft) {
             return Err(Error::rejected("unsupported app capability contract"));
         }
         Ok(())

@@ -1,16 +1,27 @@
 import { chatContext } from "../chatScreen";
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type ReactNode,
+} from "react";
 import { api, ApiError } from "../../../lib/api";
-import { resources } from "../../../lib/resources";
+import { resources, threadReader } from "../../../lib/resources";
 import { streamInto } from "../../../lib/sse";
 import { useQuery, useResource } from "../../../lib/useResource";
-import Button from "../../../ui/Button";
+import Link from "../../../ui/Link";
 import type { ThreadRef } from "../../../lib/types";
 import { MASTER } from "../../home/master";
 import { ThreadItemView, type Density } from "../../home/ThreadView";
 import {
   addPending,
+  applyEarlier,
   discardPending,
+  fetchEarlier,
   lastSeq,
   newMessageId,
   reduceFrame,
@@ -18,30 +29,53 @@ import {
   stepSummary,
   threadItems,
   toolSteps,
+  visibleWindow,
   type ThreadItem,
 } from "../../home/thread";
 import type { Viewer } from "../../projects/work";
 import {
   QUEUED_NOTICE,
   conversationLabel,
+  conversationReader,
   conversationStreamUrl,
   conversationThread,
   createConversation,
   hasUnansweredOperator,
   idleThread,
+  invalidateConversationSelection,
   isQueuedBehindOther,
+  outboxFor,
   parseSlash,
+  putOutbox,
+  removeOutbox,
   selectConversation,
+  subscribeOutbox,
   useActiveConversation,
+  type ConversationContextProof,
+  type ConversationLinkRequest,
+  type OutboxEnvelope,
 } from "../conversationClient";
+import {
+  composerScope,
+  moveComposerScope,
+  restoreSavedIntent,
+  savedIntentsFor,
+  setComposerDraft,
+  setComposerScope,
+  subscribeSavedIntents,
+  type ComposerScope,
+} from "./composerStore";
 import type { ActionContext } from "./actions";
 import { renderCapability } from "./capabilities";
+import Composer from "./Composer";
 import type { AppChat } from "./contract";
 import ChatFrame from "./ChatFrame";
 import DirectiveCard, { ConfirmationCard } from "./DirectiveCard";
 import AssistantOperations from "./AssistantOperations";
 import { hideIds, matchDirective, type Directive } from "./directive";
 import { planFrames, type FrameRow } from "./frames";
+import type { FileUploadProjection } from "./descriptorClient";
+import type { AttachDestination } from "./attach";
 import type { ChatBinding } from "./types";
 
 /**
@@ -76,8 +110,19 @@ export type ConversationMode =
       /** `list` lays the screen's static prompts out as suggestion rows and
        *  drops the context chip; default is the compact chip row. */
       promptLayout?: "chips" | "list";
+      /** A one-shot host URL selector; native list membership proves it. */
+      conversationRequest: ConversationLinkRequest | null;
+      /** The current host context receipt, compared with a URL scope selector. */
+      contextProof?: ConversationContextProof;
+      /** Separate live native capability projection, not app-chat schema data. */
+      fileUpload: FileUploadProjection;
+      fileUploadLoading: boolean;
     };
 type AppMode = Extract<ConversationMode, { kind: "app" }>;
+
+/** Items rendered at most in a pane before "Load earlier" pages more —
+ *  a compact window under Home's 300-item one. */
+const APP_WINDOW = 120;
 
 export interface HomeListProps {
   mode: { kind: "home" };
@@ -85,7 +130,12 @@ export interface HomeListProps {
   readOnly: boolean;
   liveAfter: number;
   onOpenIssue: (id: string) => void;
-  onRetry: (message: string, text: string, refs?: ThreadRef[]) => void;
+  onRetry: (
+    message: string,
+    text: string,
+    refs?: ThreadRef[],
+    attachments?: { id: string }[],
+  ) => void;
   onDiscard: (message: string) => void;
   /** Extra content under a row (Home's plan cards). */
   after?: (item: ThreadItem) => ReactNode;
@@ -95,6 +145,8 @@ export interface AppPaneProps {
   density: Density;
   viewer: Viewer;
   binding: ChatBinding;
+  /** Refresh the live projection after the native endpoint refuses upload. */
+  onFileUploadUnavailable: () => void;
   collapsed: boolean;
   onCollapsed: (next: boolean) => void;
   /** The shell's own navigation for the `open-view` card action. */
@@ -145,6 +197,36 @@ function hidden(item: ThreadItem): ThreadItem {
   }
 }
 
+/** The reader's anchor: the first list row still visible at the scroller's
+ *  top, by item key and its offset inside the viewport. */
+function captureAnchor(el: HTMLElement): { key: string; top: number } | null {
+  const listTop = el.getBoundingClientRect().top;
+  const rows = el.querySelectorAll<HTMLElement>("[data-item-key]");
+  for (let i = 0; i < rows.length; i++) {
+    const rect = rows[i].getBoundingClientRect();
+    if (rect.bottom > listTop) return { key: rows[i].dataset.itemKey ?? "", top: rect.top - listTop };
+  }
+  return null;
+}
+
+/** Put the captured row back at the same viewport offset after content
+ *  above it grew. Scroll geometry only — never offsetTop/offsetParent. */
+function restoreAnchor(el: HTMLElement, anchor: { key: string; top: number } | null): void {
+  if (!anchor || anchor.key === "") return;
+  const rows = el.querySelectorAll<HTMLElement>("[data-item-key]");
+  let target: HTMLElement | null = null;
+  for (let i = 0; i < rows.length; i++) {
+    if (rows[i].dataset.itemKey === anchor.key) {
+      target = rows[i];
+      break;
+    }
+  }
+  if (!target) return;
+  const listTop = el.getBoundingClientRect().top;
+  const now = target.getBoundingClientRect().top - listTop;
+  if (now !== anchor.top) el.scrollTop += now - anchor.top;
+}
+
 function AppRow({
   item,
   directive,
@@ -165,7 +247,12 @@ function AppRow({
   readOnly: boolean;
   actions: ActionContext;
   onFail: (tag: string) => void;
-  onRetry: (message: string, text: string, refs?: ThreadRef[]) => void;
+  onRetry: (
+    message: string,
+    text: string,
+    refs?: ThreadRef[],
+    attachments?: { id: string }[],
+  ) => void;
   onDiscard: (message: string) => void;
 }) {
   if (directive?.kind === "card") return <DirectiveCard card={directive.card} fields={directive.fields} actions={actions} />;
@@ -216,27 +303,142 @@ function AppRow({
  * carry the route's installation and context; the daemon proves both and
  * stamps the verified binding on the entry.
  */
-function AppPane({ mode, density, viewer, binding, collapsed, onCollapsed, onOpenView }: AppPaneProps) {
+function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, collapsed, onCollapsed, onOpenView }: AppPaneProps) {
   const { installId, descriptor } = mode;
-  const active = useActiveConversation(installId);
+  const fileUpload = mode.fileUpload ?? { declared: false, available: false };
+  const fileUploadLoading = mode.fileUploadLoading ?? true;
+  const active = useActiveConversation(installId, mode.conversationRequest, mode.contextProof);
   const store = active.store ?? idleThread;
   const convId = active.state === "ready" ? (active.selected?.id ?? null) : null;
   const thread = useResource(store);
   const masterState = useQuery(resources.masterState);
-  const [draft, setDraft] = useState("");
+  // One draft per conversation: the composer remounts per store, so
+  // switching conversations keeps each one's typed text (the stores and
+  // their drafts are per-conversation cache entries, never shared).
   const [sendError, setSendError] = useState<string | null>(null);
+  // The composer's in-place notices (unsupported slash verb, an
+  // unresolved attachment holding the send) — information, not the
+  // sendError alert; cleared by the next successful send.
+  const [composerNotice, setComposerNotice] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+  // CAD-1168: like Home's WINDOW — the pane renders a bounded window of
+  // the newest items and pages older entries of the SAME conversation
+  // via `before`, instead of silently clipping to the newest eight.
+  const [limit, setLimit] = useState(APP_WINDOW);
+  const [loadingEarlier, setLoadingEarlier] = useState(false);
+  // Scroll-follow (mock behaviour 5): new content is followed only while
+  // the reader sits at the tail; scrolled up, a jump-to-latest pill
+  // appears instead of dragging them down.
+  const listRef = useRef<HTMLOListElement>(null);
+  const atTail = useRef(true);
+  const [jump, setJump] = useState(false);
+  // The last tail item seen: the jump pill is driven by a new tail
+  // identity — history prepending above the window never raises it.
+  const tailKey = useRef<string | null>(null);
+  // The reader's anchor for a prepend: captured before older rows are
+  // inserted, restored in the layout pass after they render.
+  const anchorRef = useRef<{ key: string; top: number } | null>(null);
+  // The conversation the pane is showing, as a monotonically increasing
+  // visit id: returning to the same conversation (A→B→A) is a NEW visit,
+  // so a page that lands from an earlier visit cannot move this one's
+  // window, anchor or loading flag.
+  const visitRef = useRef(0);
   const [failedFrames, setFailedFrames] = useState<ReadonlySet<string>>(new Set());
   const loaded = thread.data !== null;
   const draftSubject = active.draftSubject;
+  const composerKey = `app|${installId}|${convId ?? draftSubject ?? ""}`;
+  // The store the pane is showing: a late send error paints only while
+  // its own destination is the visible one, never an unrelated pane.
+  const storeRef = useRef(store);
+  storeRef.current = store;
+  // The scope the pane is showing right now, read at callback time: a
+  // create failure paints only while the pane still shows the scope the
+  // send left from, never a conversation the operator moved to.
+  const composerKeyRef = useRef(composerKey);
+  composerKeyRef.current = composerKey;
+  // CAD-1168: the displayed frame (install, context or a registered
+  // absence) is a second identity beside the native conversation key. A
+  // frame change invalidates stale selection/alert callbacks exactly like
+  // a conversation change: A→B→A is a new frame visit, and a late result
+  // from the earlier visit never paints the pane that is showing now.
+  let frameScope: ComposerScope | null | undefined = binding.scope;
+  if (frameScope === null) {
+    if (binding.error !== null || active.state === "loading" || active.state === "failed") {
+      frameScope = undefined;
+    } else if (active.state === "legacy") {
+      frameScope = null;
+    } else {
+      frameScope = { install_id: installId };
+    }
+  }
+  const frameToken =
+    frameScope === undefined
+      ? "?"
+      : frameScope === null
+        ? "-"
+        : `${frameScope.install_id}|${frameScope.context_id ?? ""}`;
+  const frameRef = useRef(frameToken);
+  // The submitted-envelope outbox for THIS key (CAD-1168): one immutable
+  // entry per original submission, held until its destination's pending
+  // store owns it. A failed create keeps the exact original request here
+  // for explicit Retry/Discard, beside any later unsent draft.
+  const readOutbox = useCallback(() => outboxFor(composerKey), [composerKey]);
+  const outbox = useSyncExternalStore(subscribeOutbox, readOutbox);
+  const failedOutbox = outbox !== null && outbox.state === "failed" ? outbox : null;
+  // "failed" blocks a new ordinary submission until Retry/Discard;
+  // "sending" blocks it until the original settles. The newer text,
+  // refs and files stay editable either way.
+  const originalUnresolved: "sending" | "failed" | null =
+    outbox === null ? null : outbox.state === "failed" ? "failed" : "sending";
+  // Newer unsent bundles kept whole because this destination already
+  // owned intent: every displaced owner stays reachable here, never
+  // hidden behind an unreachable key and never overwritten by a later
+  // park.
+  const readSaved = useCallback(() => savedIntentsFor(composerKey), [composerKey]);
+  const savedIntents = useSyncExternalStore(subscribeSavedIntents, readSaved);
+  const outboxRef = useRef<HTMLDivElement>(null);
   // With no context selected the send still carries the installation, so it
   // lands in the app's conversation (the context is only a per-turn hint).
   const sendApp = binding.scope ?? (active.state === "ready" ? { install_id: installId } : undefined);
+  // CAD-1168: register this pane's frame for the composer key. The store
+  // captures the frame at the intent's first edit (text, refs or a chosen
+  // file) and keeps it as the intent's origin, so a restored or moved
+  // intent is submitted to the frame that owned it — never to the frame
+  // that happens to be current at send time. A displayed frame owns its
+  // own live slot: entering a different registered frame parks the old
+  // whole bundle under its original owner and exposes a fresh slot, so a
+  // new frame's question can never inherit the earlier frame's captured
+  // absence. A frame with no app binding registers an explicit absence;
+  // a not-yet-resolved frame (loading/failed) is not registered at all,
+  // so it can never capture an absence it did not display.
+  useLayoutEffect(() => {
+    setComposerScope(composerKey, frameScope);
+    // Register before the committed composer can accept input. The token
+    // captures the whole identity; frameScope is read only inside.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [composerKey, frameToken]);
   const usable =
-    active.state === "legacy" || (active.state === "ready" && (convId !== null || draftSubject !== null));
+    (active.state === "legacy" && mode.conversationRequest === null) ||
+    (active.state === "ready" && (convId !== null || draftSubject !== null));
   const subjects = descriptor?.subjects ?? [];
 
   useEffect(() => setFailedFrames(new Set()), [installId, convId]);
+  // Switching conversations resets the render window and paging state —
+  // the new conversation starts at its own tail.
+  useLayoutEffect(() => {
+    visitRef.current += 1;
+    frameRef.current = frameToken;
+    invalidateConversationSelection();
+    setSendError(null);
+    setComposerNotice(null);
+    setCreating(false);
+    setLimit(APP_WINDOW);
+    setLoadingEarlier(false);
+    atTail.current = true;
+    setJump(false);
+    tailKey.current = null;
+    anchorRef.current = null;
+  }, [installId, convId, frameToken]);
   useEffect(() => {
     if (usable && !loaded) void store.refresh();
   }, [usable, loaded, store]);
@@ -252,9 +454,111 @@ function AppPane({ mode, density, viewer, binding, collapsed, onCollapsed, onOpe
   }, [store, usable, convId, loaded, thread.data?.missing, draftSubject]);
 
   const items = threadItems(thread.data);
-  const tail = items.slice(-8);
+  const { shown, hidden } = visibleWindow(items, limit);
+  // A prepend (widened window or a fetched page) keeps the reader's row
+  // at the same viewport offset, measured after the DOM updated.
+  useLayoutEffect(() => {
+    const el = listRef.current;
+    const anchor = anchorRef.current;
+    anchorRef.current = null;
+    if (el && anchor) restoreAnchor(el, anchor);
+  }, [items, limit]);
+  // `moreBefore` unknown (an old daemon) still lets the button try one
+  // backward read; a false answers the listing is complete.
+  const moreBefore = thread.data?.moreBefore !== false;
+  const onListScroll = () => {
+    const el = listRef.current;
+    if (!el) return;
+    atTail.current = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+    if (atTail.current) setJump(false);
+  };
+  // Older history does not change the tail identity and must not be
+  // advertised as a new message. Reader-anchor restoration remains a
+  // separate installed-app QA requirement.
+  useEffect(() => {
+    const el = listRef.current;
+    if (!el) return;
+    const tail = items[items.length - 1]?.key ?? null;
+    if (tail === tailKey.current) return;
+    if (atTail.current || tailKey.current === null) {
+      el.scrollTop = el.scrollHeight;
+    } else {
+      setJump(true);
+    }
+    tailKey.current = tail;
+  }, [items]);
+  const jumpToLatest = () => {
+    const el = listRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+    atTail.current = true;
+    setJump(false);
+  };
   const canSend = viewer.operator && !viewer.readOnly && usable;
-  const canCreate = viewer.operator && !viewer.readOnly && active.state === "ready";
+  const canCreate =
+    viewer.operator &&
+    !viewer.readOnly &&
+    active.state === "ready" &&
+    active.requestError === null &&
+    !active.requestPending &&
+    binding.error === null;
+  const capturedBinding = composerScope(composerKey);
+  const uploadScope = capturedBinding === undefined ? frameScope : capturedBinding;
+  const attachEnabled =
+    viewer.operator &&
+    !viewer.readOnly &&
+    active.state === "ready" &&
+    (convId !== null || draftSubject !== null) &&
+    binding.error === null &&
+    frameScope !== undefined &&
+    frameScope !== null &&
+    uploadScope !== undefined &&
+    uploadScope !== null &&
+    fileUpload.declared &&
+    fileUpload.available &&
+    !fileUploadLoading;
+  const uploadOrigin = { key: composerKey, visit: visitRef.current, frame: frameToken };
+  const isCurrentUploadOrigin = () =>
+    composerKeyRef.current === uploadOrigin.key &&
+    visitRef.current === uploadOrigin.visit &&
+    frameRef.current === uploadOrigin.frame;
+  let attachDestination: AttachDestination | undefined;
+  if (attachEnabled && uploadScope !== undefined && uploadScope !== null) {
+    const app = {
+      install_id: uploadScope.install_id,
+      ...(uploadScope.context_id ? { context_id: uploadScope.context_id } : {}),
+    };
+    if (convId !== null) {
+      attachDestination = {
+        app,
+        conversation: convId,
+        refreshCapability: onFileUploadUnavailable,
+      };
+    } else if (draftSubject !== null) {
+      attachDestination = {
+        app,
+        subject: draftSubject,
+        prepareConversation: async (stillOwned) => {
+          const created = await createConversation(app.install_id, app.context_id ?? "", draftSubject, {
+            shouldSelect: () => stillOwned() && isCurrentUploadOrigin(),
+          });
+          return created.id;
+        },
+        refreshCapability: onFileUploadUnavailable,
+      };
+    }
+  }
+  const canAttach = attachEnabled && attachDestination !== undefined;
+  const attachReason = fileUploadLoading
+    ? "Checking this app's file-upload capability…"
+    : !fileUpload.declared
+      ? "This app has not declared the approved text-file upload capability."
+      : !fileUpload.available
+        ? "This app's text-file upload capability is currently unavailable."
+        : capturedBinding === null
+          ? "This saved draft has no app binding; start a new app-scoped draft before attaching."
+          : binding.error !== null
+            ? binding.error
+            : "Attach is available only in a writable, resolved app conversation.";
   // Why the composer is disabled — always a plain reason, never a fake reply.
   const sendBlockedReason = !viewer.operator
     ? "Sign in as the operator to message the assistant"
@@ -263,14 +567,39 @@ function AppPane({ mode, density, viewer, binding, collapsed, onCollapsed, onOpe
       : active.state === "failed"
         ? "The conversations could not be read — retry above"
         : "No conversation yet — start one with + New";
+  const ctx = chatContext(descriptor, mode.screen, mode.recordOpen);
   // Waiting dot: the selected conversation grew while the rail was collapsed.
   const seen = useRef(items.length);
   if (!collapsed) seen.current = items.length;
   const waiting = collapsed && items.length > seen.current;
-  const ctx = chatContext(descriptor, mode.screen, mode.recordOpen);
   const queued = isQueuedBehindOther(masterState.data?.turn, thread.data?.entries ?? [], thread.data?.pending ?? []);
   // The notice needs a live turn read while a reply is awaited.
   const awaiting = queued || (thread.data?.pending ?? []).some((p) => p.state === "sent");
+  // Stop (mock behaviour 5): the same masterState poll that drives the
+  // queued notice reports a working turn; `stop` is the board's existing
+  // allowlisted command — it cancels the turn, never a committed effect.
+  // The board's `stop` is global, so it is offered only when the running
+  // turn's message is provably this conversation's own; an unattributable
+  // turn keeps the control off the surface rather than mislabeling it.
+  const turnMessage = masterState.data?.turn?.message;
+  const turnOwned =
+    turnMessage !== undefined &&
+    ((thread.data?.entries ?? []).some((e) => e.message === turnMessage) ||
+      (thread.data?.pending ?? []).some((p) => p.message === turnMessage));
+  const working = masterState.data?.turn?.state === "working" && turnOwned;
+  const onStop = () => {
+    const origin = { key: composerKey, visit: visitRef.current, frame: frameToken };
+    const isCurrent = () =>
+      composerKeyRef.current === origin.key &&
+      visitRef.current === origin.visit &&
+      frameRef.current === origin.frame;
+    void api
+      .masterCommand("stop")
+      .catch((e: unknown) => {
+        if (isCurrent()) setSendError(e instanceof ApiError ? e.message : String(e));
+      })
+      .finally(() => void resources.masterState.refresh());
+  };
   // After a reload or navigation the selected conversation may still be
   // waiting on another conversation's turn: read the master's state once
   // (the poll below then keeps the notice live while it is queued).
@@ -287,72 +616,322 @@ function AppPane({ mode, density, viewer, binding, collapsed, onCollapsed, onOpe
   // "+ New", `/new` and `/clear` are one call: a fresh conversation.
   const startNew = () => {
     if (!canCreate || creating) return;
+    const origin = { key: composerKey, visit: visitRef.current, frame: frameToken };
+    const isCurrent = () =>
+      composerKeyRef.current === origin.key &&
+      visitRef.current === origin.visit &&
+      frameRef.current === origin.frame;
     setCreating(true);
     setSendError(null);
-    createConversation(installId, binding.scope?.context_id ?? "")
-      .catch((e: unknown) => setSendError(e instanceof ApiError ? e.message : String(e)))
-      .finally(() => setCreating(false));
+    createConversation(installId, binding.scope?.context_id ?? "", undefined, { shouldSelect: isCurrent })
+      .catch((e: unknown) => {
+        if (isCurrent()) setSendError(e instanceof ApiError ? e.message : String(e));
+      })
+      .finally(() => {
+        if (isCurrent()) setCreating(false);
+      });
   };
 
-  /** One delivery of a message to a conversation's store: pending, send, settle. */
+  /** One delivery of a message to a conversation's store: pending, send,
+   *  settle. `app` is the verified binding the send carried — a retry
+   *  resends the original destination, never the current route's scope.
+   *  A late failure paints the pane alert only while its own destination
+   *  store is the visible one AND the pane is still the visit that sent
+   *  it (A→B→A is a new visit). */
   const deliver = useCallback(
-    (dest: typeof store, id: string | null, message: string, body: string, refs?: ThreadRef[]) =>
-      api
-        .threadSend(MASTER, body, message, refs, sendApp, id ?? undefined)
+    (
+      dest: typeof store,
+      id: string | null,
+      message: string,
+      body: string,
+      refs?: ThreadRef[],
+      attachments?: { id: string }[],
+      app?: { install_id: string; context_id?: string },
+    ) => {
+      const origin = { key: composerKeyRef.current, visit: visitRef.current, frame: frameRef.current };
+      return api
+        .threadSend(MASTER, body, message, refs, app, id ?? undefined, attachments)
         .then(() => {
           dest.write((s) => settlePending(s, message, { ok: true }));
           void resources.masterState.refresh();
         })
         .catch((e: ApiError) => {
-          setSendError(e.message ?? String(e));
+          if (
+            storeRef.current === dest &&
+            composerKeyRef.current === origin.key &&
+            visitRef.current === origin.visit &&
+            frameRef.current === origin.frame
+          ) {
+            setSendError(e.message ?? String(e));
+          }
           dest.write((s) => settlePending(s, message, { ok: false, error: e.message ?? String(e) }));
-        }),
-    [sendApp],
+        });
+    },
+    [],
   );
 
-  const send = () => {
-    const body = draft.trim();
-    if (!body || !canSend) return;
+  /** Adopt one immutable submitted envelope into its destination store:
+   *  the pending row carries the same message id, body, refs, file ids
+   *  and captured destination, and the send goes to the captured
+   *  conversation — never the route's current selection. */
+  const adopt = useCallback(
+    (dest: typeof store, id: string | null, envelope: OutboxEnvelope) => {
+      dest.write((s) =>
+        addPending(
+          s,
+          envelope.message,
+          envelope.text,
+          envelope.at,
+          envelope.refs,
+          envelope.attachments,
+          envelope.app,
+        ),
+      );
+      void deliver(
+        dest,
+        id,
+        envelope.message,
+        envelope.text,
+        envelope.refs,
+        envelope.attachments,
+        envelope.app,
+      );
+    },
+    [deliver],
+  );
+
+  /** Create (or open) the subject conversation, then adopt `envelope`
+   *  into the returned conversation's own store. Creation uses the
+   *  binding CAPTURED on the envelope — installation, context and
+   *  subject, including a captured absence — never the route's current
+   *  selection. The unsaved-subject scope becomes that conversation, so
+   *  newer unsent intent moves with it when the whole bundle fits;
+   *  otherwise it stays whole and stays reachable (never newer source
+   *  files beside a different destination draft). A failure leaves the
+   *  exact envelope recoverable under the original key, and paints this
+   *  pane's alert only while this pane is still the visit that sent it. */
+  const createAndAdopt = (
+    originKey: string,
+    create: string,
+    envelope: OutboxEnvelope,
+    origin: { install: string; visit: number; frame: string },
+  ): Promise<void> => {
+    const capturedInstall = envelope.app?.install_id ?? origin.install;
+    const capturedContext = envelope.app?.context_id ?? "";
+    const alert = (text: string) => {
+      if (
+        composerKeyRef.current === originKey &&
+        installId === origin.install &&
+        visitRef.current === origin.visit &&
+        frameRef.current === origin.frame
+      ) {
+        setSendError(text);
+      }
+    };
+    /** Record the failure on the original envelope — but only while the
+     *  outbox still owns this exact message. A discarded envelope is
+     *  never resurrected by its late callback. */
+    const recordFailure = (text: string) => {
+      const held = outboxFor(originKey);
+      if (held === null || held.message !== envelope.message) return;
+      putOutbox(originKey, { ...envelope, state: "failed", error: text });
+    };
+    let creation: ReturnType<typeof createConversation>;
+    try {
+      creation = createConversation(capturedInstall, capturedContext, create, {
+        shouldSelect: () =>
+          composerKeyRef.current === originKey &&
+          visitRef.current === origin.visit &&
+          frameRef.current === origin.frame,
+      });
+    } catch (e) {
+      const text = e instanceof ApiError ? e.message : String(e);
+      alert(text);
+      recordFailure(text);
+      return Promise.reject(e);
+    }
+    return creation.then(
+      (c) => {
+        // The operator may have discarded the envelope while creation was
+        // in flight: a request with no remaining owner is never adopted
+        // or sent.
+        const held = outboxFor(originKey);
+        if (held === null || held.message !== envelope.message) return;
+        const key = `app|${capturedInstall}|${c.id}`;
+        moveComposerScope(originKey, key, create);
+        adopt(conversationThread(c.id), c.id, envelope);
+        // The destination's pending row now owns this exact message;
+        // remove only this message's entry, never a different owner's.
+        removeOutbox(originKey, envelope.message);
+      },
+      (e: unknown) => {
+        const text = e instanceof ApiError ? e.message : String(e);
+        alert(text);
+        recordFailure(text);
+        throw e;
+      },
+    );
+  };
+
+  const send = (body: string, refs: ThreadRef[], attachments?: { id: string }[]): Promise<void> => {
+    if (!canSend) return Promise.reject(new Error("sending is unavailable"));
     if (parseSlash(body) === "new") {
       // A command, never a message: nothing is sent to the assistant.
-      setDraft("");
       startNew();
-      return;
+      return Promise.resolve();
     }
     if (binding.error !== null) {
       setSendError(binding.error);
-      return;
+      return Promise.reject(new Error(binding.error));
+    }
+    // Handler-side gate, beside the composer's own: an unresolved
+    // submitted owner is never replaced by minting a new message.
+    const held = outboxFor(composerKey);
+    if (held !== null) {
+      const text =
+        held.state === "failed"
+          ? "The previous message was not sent — retry or discard it before sending again"
+          : "Still sending the previous message — wait for it to settle";
+      setComposerNotice(text);
+      return Promise.reject(new Error(text));
     }
     const message = newMessageId();
     setSendError(null);
-    // Create-on-first-send: an unsaved subject conversation is made
-    // (idempotently) right before its first message, then the message
-    // goes to the returned id.
-    const target: Promise<{ id: string | null; store: typeof store }> =
-      draftSubject !== null
-        ? createConversation(installId, binding.scope?.context_id ?? "", draftSubject).then((c) => ({
-            id: c.id,
-            store: conversationThread(c.id),
-          }))
-        : Promise.resolve({ id: convId, store });
-    setDraft("");
-    void target.then(
-      ({ id, store: dest }) => {
-        dest.write((s) => addPending(s, message, body, Date.now()));
-        return deliver(dest, id, message, body);
-      },
-      (e: unknown) => setSendError(e instanceof ApiError ? e.message : String(e)),
-    );
+    setComposerNotice(null);
+    const originKey = composerKey;
+    // The envelope carries the intent's captured origin: the binding the
+    // first edit was made under, including a captured absence. Only an
+    // intent with no captured origin at all falls back to the current
+    // frame (the narrow window before the pane's registration effect).
+    const captured = composerScope(originKey);
+    const envelope: OutboxEnvelope = {
+      message,
+      text: body,
+      refs,
+      attachments,
+      app: captured === undefined ? sendApp : (captured ?? undefined),
+      subject: draftSubject ?? undefined,
+      at: Date.now(),
+      state: "sending",
+    };
+    // The immutable submitted envelope is owned by this original key
+    // BEFORE any asynchronous creation: a failed create leaves this
+    // exact request — message id, body, refs, file ids and captured
+    // destination — recoverable beside any later unsent draft. The
+    // local handoff is accepted at this point: creation runs
+    // independently and a future failure is retained by the outbox, not
+    // by pretending local ownership failed.
+    if (!putOutbox(originKey, envelope)) {
+      const text = "The previous message was not sent — retry or discard it before sending again";
+      setComposerNotice(text);
+      return Promise.reject(new Error(text));
+    }
+    const create = draftSubject;
+    if (create === null) {
+      // The destination conversation is already known: its pending row
+      // owns the envelope at once, so the outbox is only a transient
+      // owner.
+      adopt(store, convId, envelope);
+      removeOutbox(originKey, message);
+      return Promise.resolve();
+    }
+    const origin = { install: installId, visit: visitRef.current, frame: frameToken };
+    void createAndAdopt(originKey, create, envelope, origin).catch(() => undefined);
+    return Promise.resolve();
   };
-  const retry = (message: string, body: string, refs?: ThreadRef[]) => {
+
+  /** Retry one failed submitted envelope: the same message id, body,
+   *  refs, file ids and captured destination — never the current draft
+   *  or route. */
+  const retryOutbox = (envelope: OutboxEnvelope) => {
     if (!canSend) return;
-    store.write((s) => addPending(s, message, body, Date.now(), refs));
-    void deliver(store, convId, message, body, refs);
+    const originKey = composerKey;
+    setSendError(null);
+    if (!putOutbox(originKey, { ...envelope, state: "sending", error: undefined })) return;
+    // The captured subject wins over the route's current one: a retry
+    // opens the conversation this envelope was submitted for, never a
+    // later selection.
+    const create = envelope.subject ?? draftSubject;
+    if (create === null) {
+      adopt(store, convId, envelope);
+      removeOutbox(originKey, envelope.message);
+      return;
+    }
+    const origin = { install: installId, visit: visitRef.current, frame: frameToken };
+    void createAndAdopt(originKey, create, envelope, origin).catch(() => undefined);
+  };
+  const discardOutbox = (envelope: OutboxEnvelope) => removeOutbox(composerKey, envelope.message);
+
+  // A retry resends the pending row's immutable envelope — same
+  // message id, text, refs and attachment ids — to the same
+  // conversation's store. It never reads the composer's current
+  // selection or the route's current conversation: the envelope the
+  // first send carried is the only legal resend (the daemon's
+  // content check refuses anything else).
+  const retry = (message: string, body: string, refs?: ThreadRef[], attachments?: { id: string }[]) => {
+    if (!canSend) return;
+    // The row is rendered by the active store, so `store` is its own.
+    const original = store.get().data?.pending.find((p) => p.message === message);
+    // A missing pending row means there is no captured envelope to
+    // resend: fabricating one from the current route would invent a
+    // destination the operator never sent to.
+    if (!original) {
+      setSendError("This message is no longer pending — it cannot be retried.");
+      return;
+    }
+    // The binding captured on the pending row wins over the current
+    // route; a captured ABSENCE (a legacy/no-binding send) stays absent
+    // rather than being silently replaced by a later scope.
+    const bindingForRetry = original.app;
+    store.write((s) => addPending(s, message, body, Date.now(), refs, attachments, bindingForRetry));
+    void deliver(store, convId, message, body, refs, attachments, bindingForRetry);
   };
   const discard = (message: string) => store.write((s) => discardPending(s, message));
 
+  // Page older entries of the SAME conversation, like Home's
+  // onEarlier: first widen the window over items already held, then
+  // fetch the page below the oldest seq and merge it.
+  const onEarlier = useCallback(() => {
+    const data = store.get().data;
+    if (!data) return;
+    const hiddenNow = Math.max(0, threadItems(data).length - limit);
+    if (hiddenNow > 0) {
+      const el = listRef.current;
+      if (el) anchorRef.current = captureAnchor(el);
+      setLimit((l) => l + APP_WINDOW);
+      return;
+    }
+    const reader =
+      active.state === "legacy" ? threadReader(MASTER) : convId !== null ? conversationReader(convId) : null;
+    if (reader === null) return;
+    const page = fetchEarlier(reader, data);
+    if (!page) {
+      store.write((cur) => ({ ...(cur ?? data), moreBefore: false }));
+      return;
+    }
+    const token = visitRef.current;
+    setLoadingEarlier(true);
+    page
+      .then((older) => {
+        // A page that lands after a switch (or after returning to this
+        // same conversation) belongs to an earlier visit: merge it into
+        // its own store, but never move the current pane's window,
+        // loading flag or anchor.
+        if (visitRef.current === token) {
+          const el = listRef.current;
+          if (el) anchorRef.current = captureAnchor(el);
+        }
+        store.write((cur) => applyEarlier(cur, older));
+        if (visitRef.current === token) setLimit((l) => l + APP_WINDOW);
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        if (visitRef.current === token) setLoadingEarlier(false);
+      });
+  }, [limit, store, active.state, convId]);
+
   const actions = useMemo<ActionContext>(() => ({ openView: onOpenView }), [onOpenView]);
-  const directives = tail.map((item) => {
+  const directives = shown.map((item) => {
     const text = itemText(item);
     return { key: item.key, directive: text === null ? null : matchDirective(text, descriptor) };
   });
@@ -397,10 +976,17 @@ function AppPane({ mode, density, viewer, binding, collapsed, onCollapsed, onOpe
             className="app-chat-conv-select text-secondary"
             aria-label="Conversation"
             value={convId ?? ""}
-            disabled={active.state !== "ready" || (active.conversations.length === 0 && draftSubject === null)}
+            disabled={
+              active.state !== "ready" ||
+              active.requestPending ||
+              active.requestError !== null ||
+              (active.conversations.length === 0 && draftSubject === null)
+            }
             onChange={(e) => e.target.value !== "" && selectConversation(installId, e.target.value)}
           >
-            {active.conversations.length === 0 && draftSubject === null && <option value="">General</option>}
+            {active.conversations.length === 0 && draftSubject === null && mode.conversationRequest === null && (
+              <option value="">General</option>
+            )}
             {draftSubject !== null && (
               <option value="">{draftLabel ? `New ${draftLabel} conversation (unsaved)` : "New conversation (unsaved)"}</option>
             )}
@@ -419,7 +1005,45 @@ function AppPane({ mode, density, viewer, binding, collapsed, onCollapsed, onOpe
           >
             + New
           </button>
+          {active.state === "ready" &&
+            active.selected !== null &&
+            !active.selected.isGeneral &&
+            binding.scope !== null &&
+            binding.error === null &&
+            binding.scope.install_id === installId &&
+            binding.scope.context_id !== "" &&
+            mode.contextProof?.status === "ready" &&
+            mode.contextProof.contextId === binding.scope.context_id && (
+              <Link
+                href={`/app-installations/${encodeURIComponent(installId)}?ctx=${encodeURIComponent(binding.scope.context_id)}&conversation=${encodeURIComponent(active.selected.id)}`}
+                className="lnk text-micro"
+                aria-label="Link to this conversation"
+                title="Shareable link to this conversation"
+                data-chat-conversation-link
+              >
+                Link
+              </Link>
+            )}
+          {active.state === "ready" &&
+            active.selected !== null &&
+            !active.selected.isGeneral &&
+            mode.contextProof?.status === "ready" &&
+            (binding.scope === null || binding.scope.context_id === "") && (
+              <span className="text-micro text-ink-500" data-chat-link-unavailable>
+                Link unavailable without a verified context
+              </span>
+            )}
         </div>
+      )}
+      {active.requestPending && (
+        <p className="text-label text-ink-500" role="status" data-chat-link-pending>
+          Checking the linked conversation and its context…
+        </p>
+      )}
+      {active.requestError !== null && (
+        <p className="text-label text-fail" role="alert" data-chat-link-error>
+          {active.requestError}
+        </p>
       )}
       {active.state === "failed" && (
         <p className="text-label text-fail" role="alert">
@@ -439,6 +1063,21 @@ function AppPane({ mode, density, viewer, binding, collapsed, onCollapsed, onOpe
           {QUEUED_NOTICE}
         </p>
       )}
+      {working && viewer.operator && !viewer.readOnly && (
+        <p className="text-micro text-ink-500 app-chat-working" role="status">
+          Working…{" "}
+          <button
+            type="button"
+            className="lnk"
+            onClick={onStop}
+            data-chat-stop
+            title="Stops the master's running turn. The board command is global, not scoped to this conversation, and cancels the turn only — it cannot undo a committed effect."
+          >
+            Stop
+          </button>{" "}
+          <span className="text-ink-500">(global — stops the master's current turn, not scoped to this conversation)</span>
+        </p>
+      )}
       {thread.status === "failed" && (
         <p className="text-label text-fail" role="alert">
           The thread could not be read — {thread.error}{" "}
@@ -452,14 +1091,32 @@ function AppPane({ mode, density, viewer, binding, collapsed, onCollapsed, onOpe
           Reading the thread…
         </p>
       )}
-      {usable && loaded && tail.length === 0 && (
+      {usable && loaded && items.length === 0 && (
         <p className="text-label text-ink-500" data-empty="chat">
           Nothing here yet. Send the first message.
         </p>
       )}
-      <ol className="app-chat-list" aria-label="Recent master messages">
-        {tail.map((item, i) => (
-          <li key={item.key} className="text-secondary text-ink-300 break-words" data-chat-item>
+      {usable && loaded && items.length > 0 && (hidden > 0 || moreBefore) && (
+        <div className="flex justify-center">
+          <button
+            type="button"
+            className="lnk text-label disabled:opacity-50"
+            disabled={loadingEarlier}
+            onClick={onEarlier}
+            data-chat-earlier
+          >
+            {loadingEarlier ? "Loading…" : "Load earlier messages ↑"}
+          </button>
+        </div>
+      )}
+      <ol className="app-chat-list" ref={listRef} onScroll={onListScroll} aria-label="Conversation messages">
+        {shown.map((item, i) => (
+          <li
+            key={item.key}
+            className="text-secondary text-ink-300 break-words"
+            data-chat-item
+            data-item-key={item.key}
+          >
             <AppRow
               item={item}
               directive={directives[i].directive}
@@ -476,10 +1133,66 @@ function AppPane({ mode, density, viewer, binding, collapsed, onCollapsed, onOpe
         ))}
       </ol>
       <AssistantOperations key={`${installId}\u0000${mode.contextId}`} installId={installId} contextId={mode.contextId} canDecide={viewer.operator && !viewer.readOnly} />
+      {jump && (
+        <button type="button" className="lnk text-label app-chat-jump" onClick={jumpToLatest} data-jump-to-latest>
+          ↓ New messages
+        </button>
+      )}
       {sendError && (
         <p className="text-label text-fail" role="alert">
           {sendError}
         </p>
+      )}
+      {binding.error !== null && binding.error !== sendError && (
+        <p className="text-label text-fail" role="alert" data-chat-binding-error>
+          {binding.error}
+        </p>
+      )}
+      {composerNotice && (
+        <p className="text-micro text-ink-400" role="status" data-chat-notice>
+          {composerNotice}
+        </p>
+      )}
+      {failedOutbox !== null && (
+        <div className="app-chat-outbox" data-chat-outbox ref={outboxRef}>
+          <p className="text-micro text-ink-400">Not sent — the conversation could not be created.</p>
+          <p className="text-secondary text-ink-300 break-words">{failedOutbox.text}</p>
+          {failedOutbox.error && <p className="text-micro text-ink-500 break-words">{failedOutbox.error}</p>}
+          <p className="text-micro">
+            <button type="button" className="lnk" onClick={() => retryOutbox(failedOutbox)}>
+              Retry
+            </button>{" "}
+            ·{" "}
+            <button type="button" className="lnk" onClick={() => discardOutbox(failedOutbox)}>
+              Discard
+            </button>
+          </p>
+        </div>
+      )}
+      {savedIntents.length > 0 && (
+        <div className="app-chat-outbox" data-chat-saved-intent>
+          <p className="text-micro text-ink-400">
+            {savedIntents.length === 1
+              ? "An unsent draft is kept — this conversation already had its own."
+              : `${savedIntents.length} unsent drafts are kept — this conversation already had its own.`}
+          </p>
+          <p className="text-micro">
+            {savedIntents.map((record, i) => (
+              <span key={record.slot}>
+                {i > 0 && " · "}
+                <button
+                  type="button"
+                  className="lnk"
+                  onClick={() => {
+                    restoreSavedIntent(composerKey, record.slot);
+                  }}
+                >
+                  {savedIntents.length === 1 ? "Restore saved draft" : `Restore saved draft ${i + 1}`}
+                </button>
+              </span>
+            ))}
+          </p>
+        </div>
       )}
       {canSend &&
         binding.scope !== null &&
@@ -491,7 +1204,14 @@ function AppPane({ mode, density, viewer, binding, collapsed, onCollapsed, onOpe
               sendIntent: async (intent) => {
                 const message = newMessageId();
                 try {
-                  await api.threadSend(MASTER, JSON.stringify(intent), message, undefined, sendApp, convId ?? undefined);
+                  await api.threadSend(
+                    MASTER,
+                    JSON.stringify(intent),
+                    message,
+                    undefined,
+                    sendApp,
+                    convId ?? undefined,
+                  );
                   void store.refresh();
                   void resources.masterState.refresh();
                   return null;
@@ -502,70 +1222,49 @@ function AppPane({ mode, density, viewer, binding, collapsed, onCollapsed, onOpe
             })}
           </div>
         ))}
-      <form
-        className="app-chat-form"
-        onSubmit={(e) => {
-          e.preventDefault();
-          send();
+      {/* CAD-1168: the shared composer at compact density. The key
+          remounts it per conversation, so each conversation's draft and
+          its citation refs (persisted with the same key) are restored and
+          no other's leaks in. CAD-1174 keeps the context concept off the
+          surface: no default chip or prompt row, and a record chip waits
+          for a server-proven reference rather than the route's
+          `recordOpen` flag. */}
+      {ctx !== null && mode.promptLayout === "list" && (
+        <div className="app-chat-sugg" data-chat-context data-chat-prompts>
+          {ctx.prompts.map((p) => (
+            <button
+              key={p}
+              type="button"
+              className="app-chat-sugg-row"
+              disabled={!canSend}
+              onClick={() => setComposerDraft(composerKey, p)}
+            >
+              <span>{p}</span>
+              <span aria-hidden="true">→</span>
+            </button>
+          ))}
+        </div>
+      )}
+      <Composer
+        key={composerKey}
+        density="compact"
+        block={canSend && binding.error === null ? null : "read-only"}
+        blockedPlaceholder={binding.error ?? sendBlockedReason}
+        storeKey={composerKey}
+        onSend={({ body, refs, attachments }) => send(body, refs, attachments)}
+        onCommand={(name) => {
+          if (name === "new" || name === "clear") startNew();
+          else setComposerNotice(`Unsupported command "/${name}" — it was not sent`);
         }}
-      >
-        {ctx !== null && mode.promptLayout === "list" && (
-          <div className="app-chat-sugg" data-chat-context data-chat-prompts>
-            {ctx.prompts.map((p) => (
-              <button
-                key={p}
-                type="button"
-                className="app-chat-sugg-row"
-                disabled={!canSend}
-                onClick={() => setDraft(p)}
-              >
-                <span>{p}</span>
-                <span aria-hidden="true">→</span>
-              </button>
-            ))}
-          </div>
-        )}
-        {ctx !== null && mode.promptLayout !== "list" && (
-          <div className="app-chat-ctx" data-chat-context>
-            <span className="app-chat-chip text-micro text-ink-300">
-              Context <b className="font-medium text-ink-100">{ctx.label}</b>
-            </span>
-            {ctx.prompts.map((p) => (
-              <button
-                key={p}
-                type="button"
-                className="app-chat-prompt text-micro"
-                disabled={!canSend}
-                onClick={() => setDraft(p)}
-              >
-                {p}
-              </button>
-            ))}
-          </div>
-        )}
-        <label className="sr-only" htmlFor="app-shell-chat-box">
-          Message to the master
-        </label>
-        <textarea
-          id="app-shell-chat-box"
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
-              e.preventDefault();
-              send();
-            }
-          }}
-          rows={2}
-          disabled={!canSend}
-          placeholder={canSend ? "Ask the assistant… (Enter sends)" : sendBlockedReason}
-          aria-label="Message to the master"
-          className="app-chat-box"
-        />
-        <Button type="submit" variant="primary" size="sm" disabled={!canSend || !draft.trim()}>
-          Send
-        </Button>
-      </form>
+        onNotice={setComposerNotice}
+        attach={{ enabled: canAttach, reason: attachReason, destination: attachDestination }}
+        originalUnresolved={originalUnresolved !== null}
+        onResolveOriginal={() => outboxRef.current?.scrollIntoView?.({ block: "nearest" })}
+        textareaId="app-shell-chat-box"
+        ariaLabel="Message to the master"
+        placeholder="Ask the assistant… (Enter sends)"
+        className="app-chat-form"
+      />
     </div>
   );
 }

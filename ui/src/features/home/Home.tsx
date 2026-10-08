@@ -5,7 +5,8 @@ import type { ResourceState } from "../../lib/cache";
 import { resources, threadReader } from "../../lib/resources";
 import { streamInto, type SseErrorState } from "../../lib/sse";
 import { useQuery, useResource } from "../../lib/useResource";
-import type { MasterCommandResult, Overview, ThreadRef } from "../../lib/types";
+import type { MasterAppOrigin, MasterCommandResult, Overview, ThreadRef } from "../../lib/types";
+import Link from "../../ui/Link";
 import Md from "../../ui/Md";
 import {
   composerBlock,
@@ -78,15 +79,28 @@ const reducedMotion = () =>
  * badges, and Stop → `/stop`. `queued`/`submitting` give the operator
  * the honest "behind a turn"/"still sending" states instead of silence.
  */
+function appOriginHref(origin: MasterAppOrigin | null): string | null {
+  if (!origin || typeof origin !== "object") return null;
+  const { install_id, context_id, conversation_id } = origin;
+  const ids = [install_id, context_id, conversation_id];
+  if (ids.some((id) => typeof id !== "string" || id.length === 0 || id.trim() !== id)) {
+    return null;
+  }
+  return `/app-installations/${encodeURIComponent(install_id)}?ctx=${encodeURIComponent(context_id)}&conversation=${encodeURIComponent(conversation_id)}`;
+}
+
 function WorkingRow({
   turn,
+  appOrigin,
   step,
   onStop,
 }: {
   turn: TurnState;
+  appOrigin: MasterAppOrigin | null;
   step: ThreadEntry | null;
   onStop: () => void;
 }) {
+  const appHref = appOriginHref(appOrigin);
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     if (turn.kind !== "working") return;
@@ -126,6 +140,11 @@ function WorkingRow({
         <span className="chip bg-ink-800 text-ink-400 shrink-0">{turn.queued} queued</span>
       )}
       <span className="flex-1" />
+      {appHref && (turn.kind === "working" || turn.kind === "queued") && (
+        <Link href={appHref} className="lnk text-micro shrink-0">
+          Open app conversation
+        </Link>
+      )}
       {turn.kind === "working" && (
         <button
           type="button"
@@ -295,7 +314,8 @@ function Examples({ onPick, disabled }: { onPick: (text: string) => void; disabl
   );
 }
 
-const retry = (message: string, text: string, refs?: ThreadRef[]) => sendToMaster(text, message, refs);
+const retry = (message: string, text: string, refs?: ThreadRef[], attachments?: { id: string }[]) =>
+  sendToMaster(text, message, refs, attachments);
 const discard = (message: string) => resources.masterThread.write((s) => discardPending(s, message));
 
 /**
@@ -425,6 +445,30 @@ export default function Home({
   const masterRow = agents.data?.agents.find((a) => a.alias === MASTER);
   const submitting = (thread.data?.pending ?? []).some((p) => p.state !== "failed");
   const turn = turnState(master.data, masterRow, submitting);
+  const serverTurn = master.data?.turn;
+  // `turnState` retains the message id for working turns. For queued turns
+  // it drops that id, so recover it only when its server-derived display
+  // fields still match the same queued master turn (before its row fallback).
+  const displayedTurnMessage =
+    turn.kind === "working"
+      ? turn.message
+      : turn.kind === "queued" &&
+          serverTurn?.state === "queued" &&
+          turn.summary === serverTurn.summary &&
+          turn.since === serverTurn.since
+        ? serverTurn.message
+        : undefined;
+  const turnOrigin =
+    master.status === "ok" &&
+    !master.inFlight &&
+    serverTurn !== undefined &&
+    serverTurn !== null &&
+    displayedTurnMessage !== undefined &&
+    displayedTurnMessage === serverTurn.message &&
+    serverTurn.app_origin != null &&
+    serverTurn.conversation === serverTurn.app_origin.conversation_id
+      ? serverTurn.app_origin
+      : null;
   const step = useMemo(() => openStep(thread.data?.entries ?? []), [thread.data]);
 
   // Live entries: the store opened on the newest page, so the stream
@@ -508,9 +552,9 @@ export default function Home({
     setGlideTick((n) => n + 1);
   }, []);
   const onRetrySend = useCallback(
-    (message: string, text: string, refs?: ThreadRef[]) => {
+    (message: string, text: string, refs?: ThreadRef[], attachments?: { id: string }[]) => {
       engage();
-      retry(message, text, refs);
+      retry(message, text, refs, attachments);
     },
     [engage],
   );
@@ -819,7 +863,7 @@ export default function Home({
             {cmds.map((c) => (
               <CmdCard key={c.id} cmd={c} onOpenIssue={onOpenIssue} />
             ))}
-            <WorkingRow turn={turn} step={step} onStop={() => runCommand("stop", "")} />
+            <WorkingRow turn={turn} appOrigin={turnOrigin} step={step} onStop={() => runCommand("stop", "")} />
           </div>
 
           {unseen > 0 && (

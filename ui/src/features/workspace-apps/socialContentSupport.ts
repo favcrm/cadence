@@ -7,6 +7,7 @@ const socialContentWorkflows = new Map<string, readonly string[]>([
   ["0.3.0", ["instagram", "facebook", "source-instagram"]],
   ["0.4.0", ["instagram", "facebook", "source-instagram", "image-instagram"]],
   ["0.5.0", fiveWorkflows],
+  ["0.5.1", fiveWorkflows],
   // CAD-1038: the independent package (cadence-app-social-content) ships the 0.5.0
   // workflows byte-identical; 0.5.2 is live and 0.5.3 is next.
   ["0.5.2", fiveWorkflows],

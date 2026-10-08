@@ -711,6 +711,14 @@ export interface AgentsPayload {
   by_issue?: Record<string, CardAgent[]>;
 }
 
+/** Best-effort destination for a verified app-scoped master turn. This is
+ * navigation metadata only; the app route proves its binding independently. */
+export interface MasterAppOrigin {
+  install_id: string;
+  context_id: string;
+  conversation_id: string;
+}
+
 /** `GET /api/master/state` (CAD-551) — the master's provider session for
  * the header chips and the working row. `null`/`undefined` fields are
  * "the provider could not say", never a fabricated value; a daemon that
@@ -743,6 +751,10 @@ export interface MasterState {
   turn?: {
     state: "working" | "queued";
     message: string;
+    /** The persisted message's conversation, when its enqueue entry exists. */
+    conversation?: string | null;
+    /** Current verified app scope; null when no origin can be re-proved. */
+    app_origin?: MasterAppOrigin | null;
     summary?: string | null;
     /** Epoch seconds the message started (working) or was created (queued). */
     since?: number | null;

@@ -111,6 +111,9 @@ pub const MASTER_ALLOWED: &[&str] = &[
     "app_assistant_actions",
     "app_assistant_invoke",
     "app_assistant_operation_show",
+    // CAD-1168: read a retained chat attachment — the daemon still
+    // checks the turn is the master's live one inside the handler.
+    "chat_file_read",
 ];
 
 /// Most reports one router pass queues to the master; the rest wait for
@@ -214,6 +217,8 @@ pub(crate) fn master_may_call(method: &str) -> bool {
 /// CAD-1098 Gate 2: the daemon methods a master turn whose running
 /// message is in an APP conversation (or whose running message cannot be
 /// resolved — fail closed) may call: the twelve scoped assistant verbs,
+/// `chat_file_read` for the retained file the turn was sent (CAD-1168 —
+/// the handler binds the call to the live assigned turn),
 /// `message_report` (own running message only — it finishes the turn) and
 /// `thread_read` (only the running message's own conversation). Nothing
 /// else: no `health` (fleet metadata), no permission verbs (so
@@ -234,6 +239,11 @@ pub const MASTER_APP_ALLOWED: &[&str] = &[
     "app_content_assistant_draft",
     "app_content_assistant_proposals",
     "app_content_assistant_proposal_show",
+    // CAD-1168: the attachment an app conversation's turn was sent is
+    // readable by it — the handler still binds the call to the live
+    // assigned turn (message + current token), and an id is only ever
+    // learned from that turn's own envelope.
+    "chat_file_read",
     "message_report",
     "thread_read",
 ];

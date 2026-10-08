@@ -37,6 +37,8 @@
 //! for the web UI.
 
 use std::io::Write;
+use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -44,7 +46,8 @@ use serde_json::{json, Value};
 use tiny_http::Request;
 
 use super::{
-    busy_response, err_response, header_value, json_response, parse_json, read_body, HttpResp,
+    busy_response, err_response, header_value, json_response, parse_json, read_body, write_err,
+    HttpResp,
 };
 use crate::client;
 use crate::error::Error;
@@ -53,6 +56,41 @@ use crate::error::Error;
 const MESSAGE_CAP: u64 = 64 * 1024;
 /// Seconds one stream long-poll waits on the daemon before a keepalive.
 const STREAM_WAIT: u64 = 15;
+
+/// Maximum simultaneous multipart bodies held by this board process.
+/// This bounds this HTTP ingress only; it is not a host-wide job limit.
+const CHAT_UPLOAD_INGRESS_MAX: usize = 2;
+static CHAT_UPLOAD_INGRESS: AtomicUsize = AtomicUsize::new(0);
+
+/// RAII admission for a board upload body. Acquired before `read_body` and
+/// retained until the request has removed its owned staging file.
+pub(crate) struct ChatUploadIngressPermit;
+
+impl ChatUploadIngressPermit {
+    pub(crate) fn try_acquire() -> Option<Self> {
+        let mut active = CHAT_UPLOAD_INGRESS.load(Ordering::Acquire);
+        loop {
+            if active >= CHAT_UPLOAD_INGRESS_MAX {
+                return None;
+            }
+            match CHAT_UPLOAD_INGRESS.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self),
+                Err(observed) => active = observed,
+            }
+        }
+    }
+}
+
+impl Drop for ChatUploadIngressPermit {
+    fn drop(&mut self) {
+        CHAT_UPLOAD_INGRESS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -72,6 +110,18 @@ struct ThreadMessageReq {
     /// CAD-1098: a selector among the conversations of `app`'s
     /// installation — never authority; the daemon checks it.
     conversation: Option<String>,
+    /// CAD-1168: retained chat-file ids from `/api/chat/upload`. The
+    /// daemon's `thread_attachments` resolves them — this relay only
+    /// carries `{id}` handles through, never names or paths.
+    attachments: Option<Vec<ThreadAttachment>>,
+}
+
+/// A retained chat-file handle — the daemon re-validates the grammar
+/// and existence; the board never dereferences it to a path.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ThreadAttachment {
+    id: String,
 }
 
 #[derive(Deserialize)]
@@ -178,7 +228,7 @@ pub(super) fn read(
                 return err_response(
                     400,
                     &format!("limit must be 1-{}", crate::store::THREAD_PAGE_MAX),
-                )
+                );
             }
         },
     };
@@ -345,9 +395,189 @@ pub(super) fn post_message(
     if let Some(conversation) = req.conversation {
         params["conversation"] = Value::String(conversation);
     }
+    if let Some(attachments) = req.attachments {
+        params["attachments"] = json!(attachments
+            .iter()
+            .map(|a| json!({"id": a.id}))
+            .collect::<Vec<_>>());
+    }
     match client::rpc(state_dir, "thread_send", params) {
         Ok(receipt) => json_response(receipt),
         Err(e) => rpc_err(&e),
+    }
+}
+
+/// The multipart selector fields the chat upload admits beside `file`:
+/// the display hint `name`/`filename` and the explicit app scope
+/// `install_id`, `context_id`, `conversation`. Anything else — a
+/// caller-supplied `scope`, `sha256`, `path`, actor or digest field —
+/// refuses the whole request; the daemon re-proves every value, and a
+/// partial app selector (install without conversation, or the reverse)
+/// is refused here before any staging.
+fn valid_app_selector(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+}
+
+const UPLOAD_SELECTOR_FIELDS: &[&str] = &[
+    "name",
+    "filename",
+    "install_id",
+    "context_id",
+    "conversation",
+];
+
+/// `POST /api/chat/upload` — CAD-1168: the composer's retained-file
+/// upload. The board admits it OperatorOnly (WRITE_ROUTES), streams the
+/// multipart `file` part into the daemon's upload-staging dir under an
+/// exclusively created canonical name and relays `chat_file_upload` —
+/// the daemon re-hashes, caps, sniffs and retains. The caller's
+/// filename is a display hint only; no scope, digest or path field is
+/// forwarded. An explicit app selector (`install_id`, `conversation`,
+/// optional `context_id`) rides through as the daemon's `app` +
+/// `conversation` params — never as authority: the daemon proves the
+/// installation, the context, the conversation and the current
+/// exact-approved declaration again. The minted name is created with
+/// `create_new` before it is written or claimed: an occupied name is
+/// refused, never truncated or deleted, and only a path this request
+/// created is cleaned up. The response carries the daemon's stored
+/// row — no filesystem path, cookie or raw URL.
+pub(super) fn post_upload(request: &mut Request, state_dir: &Path) -> HttpResp {
+    let Some(_ingress) = ChatUploadIngressPermit::try_acquire() else {
+        return err_response(429, "chat upload ingress is busy; retry shortly");
+    };
+    let ct = header_value(request, "Content-Type").unwrap_or_default();
+    let Some(boundary) = ct
+        .trim()
+        .strip_prefix("multipart/form-data; boundary=")
+        .map(str::trim)
+        .map(|b| b.trim_matches('"'))
+    else {
+        return err_response(400, "chat upload needs a multipart/form-data boundary");
+    };
+    if boundary.is_empty() || boundary.len() > 100 {
+        return err_response(400, "bad multipart boundary");
+    }
+    // The cap is the daemon's own plus the multipart envelope — refuse
+    // here before any daemon call.
+    let cap = crate::store::CHAT_FILE_MAX_BYTES.saturating_add(64 * 1024);
+    let body = match read_body(request, cap) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let (fields, file) = match super::parse_multipart(&body, boundary) {
+        Ok(v) => v,
+        Err(why) => return err_response(400, &why),
+    };
+    let Some(bytes) = file else {
+        return err_response(400, "chat upload needs a 'file' part");
+    };
+    if bytes.is_empty() {
+        return err_response(400, "chat upload: the file part is empty");
+    }
+    // Unknown selector fields refuse whole, never silently dropped: a
+    // browser-supplied scope, digest, path or actor field is not a
+    // transport field here.
+    if let Some(field) = fields
+        .keys()
+        .find(|k| !UPLOAD_SELECTOR_FIELDS.contains(&k.as_str()))
+    {
+        return err_response(400, &format!("chat upload field '{field}' is not accepted"));
+    }
+    // Selector presence is meaningful: only genuinely absent fields
+    // select legacy Home. Present-empty, malformed, or partial app
+    // intent is refused before staging rather than normalized to Home.
+    let install = match fields.get("install_id") {
+        None => None,
+        Some(value) if valid_app_selector(value) => Some(value),
+        Some(_) => return err_response(400, "bad chat upload install_id"),
+    };
+    let conversation = match fields.get("conversation") {
+        None => None,
+        Some(value) if crate::proto::identifier(value, "conversation ID").is_ok() => Some(value),
+        Some(_) => return err_response(400, "bad chat upload conversation"),
+    };
+    let context = match fields.get("context_id") {
+        None => None,
+        Some(value) if valid_app_selector(value) => Some(value),
+        Some(_) => return err_response(400, "bad chat upload context_id"),
+    };
+    if context.is_some() && install.is_none() {
+        return err_response(400, "chat upload context_id needs an install_id");
+    }
+    match (install, conversation) {
+        (None, None) => {}
+        (Some(_), Some(_)) => {}
+        (Some(_), None) => {
+            return err_response(400, "chat upload install_id needs its conversation");
+        }
+        (None, Some(_)) => {
+            return err_response(400, "chat upload conversation needs an install_id");
+        }
+    }
+    // The name is the part's declared filename, or a `name` field — a
+    // display hint the daemon sanitizes (basename, no control chars).
+    let name = fields
+        .get("filename")
+        .or_else(|| fields.get("name"))
+        .cloned()
+        .unwrap_or_else(|| "attachment.txt".to_string());
+    let uploads = state_dir.join(crate::wiki::UPLOAD_DIR);
+    if let Err(e) = std::fs::create_dir_all(&uploads) {
+        return err_response(500, &format!("upload staging failed: {e}"));
+    }
+    let tmp = uploads.join(format!("upload-{}", uuid::Uuid::new_v4().simple()));
+    // Exclusive create is the ownership proof: a minted UUID alone does
+    // not prove this request created the path, so an occupied name is
+    // refused without truncating or deleting it. Only after the create
+    // succeeds may this request clean up — including a partial write.
+    let mut staged = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+    {
+        Ok(f) => f,
+        Err(e) => return err_response(500, &format!("upload staging failed: {e}")),
+    };
+    if let Err(e) = staged.write_all(&bytes) {
+        drop(staged);
+        let _ = std::fs::remove_file(&tmp);
+        return err_response(500, &format!("upload staging failed: {e}"));
+    }
+    if let Err(e) = staged.sync_all() {
+        drop(staged);
+        let _ = std::fs::remove_file(&tmp);
+        return err_response(500, &format!("upload staging failed: {e}"));
+    }
+    drop(staged);
+    // The daemon copies the staged bytes into its own custody before it
+    // answers, so this request's staging is removed on every path —
+    // success, refusal or an unreachable daemon. Only the tmp this
+    // request created is touched. The selector travels as the daemon's
+    // own `app`/`conversation` shape; the daemon re-proves all of it.
+    let mut params = json!({"name": name, "tmp": tmp});
+    if let (Some(install), Some(conversation)) = (install, conversation) {
+        let mut app = json!({"install_id": install});
+        if let Some(context) = context {
+            app["context_id"] = json!(context);
+        }
+        params["app"] = app;
+        params["conversation"] = json!(conversation);
+    }
+    let outcome = client::rpc(state_dir, "chat_file_upload", params);
+    let _ = std::fs::remove_file(&tmp);
+    match outcome {
+        Ok(v) => json_response(v),
+        Err(Error::Structured(details)) if details.kind == "busy" => {
+            err_response(429, &details.message)
+        }
+        Err(Error::Rejected(message)) if message.contains("quota reached") => {
+            err_response(413, &message)
+        }
+        Err(e) => write_err(&e),
     }
 }
 

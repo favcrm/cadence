@@ -141,6 +141,17 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         "thread_send",
         Rule::Handler("rpc_thread_send: agents refused, operator on proof (CAD-384)"),
     ),
+    // CAD-1168: retained chat attachments. Upload is the operator's
+    // chat (`operator_chat` — the `thread_send` proof); read is the
+    // operator or the master under its live assigned turn.
+    (
+        "chat_file_upload",
+        Rule::Handler("operator_chat: agents refused, operator on proof (CAD-1168)"),
+    ),
+    (
+        "chat_file_read",
+        Rule::Handler("operator or the master's live assigned turn (CAD-1168)"),
+    ),
     // CAD-1098: the app conversations are the operator's chat, like
     // `thread_send` — one proof (`operator_chat`), identical on the board.
     (

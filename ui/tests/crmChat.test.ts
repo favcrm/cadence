@@ -1,5 +1,5 @@
 /** CAD-1051 / CAD-1046: the shell chat — rail, markdown, folded steps,
- *  directive cards, context chip and quick prompts. */
+ *  directive cards and the one shared compact composer. */
 declare function require(name: string): any;
 declare const process: { cwd(): string };
 export {};
@@ -36,7 +36,6 @@ const AppShell = require("../src/features/app-shell/AppShell").default;
 const { navigate } = require("../src/lib/useLocation") as typeof import("../src/lib/useLocation");
 const { matchDirective, hideIds } = require("../src/features/app-shell/chat/directive") as typeof import("../src/features/app-shell/chat/directive");
 const { parseAppChat } = require("../src/features/app-shell/chat/contract") as typeof import("../src/features/app-shell/chat/contract");
-const { chatContext } = require("../src/features/app-shell/chat/Conversation") as typeof import("../src/features/app-shell/chat/Conversation");
 // The descriptor under test is the package's own file, not a copy.
 const crmDescriptor = JSON.parse(require("fs").readFileSync(require("path").join(process.cwd(), "..", "workspace-apps", "crm", "app-chat.json"), "utf8"));
 const crmChat = parseAppChat(crmDescriptor);
@@ -53,10 +52,6 @@ equal(matchDirective("{not json", crmChat), null, "broken JSON is not a directiv
 assert(matchDirective(JSON.stringify({ confirm_token: SECRET }), crmChat)?.kind === "confirmation", "any confirm_token JSON is carded, never shown");
 assert(matchDirective(confirm, null)?.kind === "confirmation", "with no descriptor a token-bearing body is still never printed");
 equal(hideIds("done in ctx-abc-123 now"), "done in this workspace now", "ctx ids hidden");
-equal(chatContext(crmChat, "customers", false)?.label, "Customers", "page chip");
-assert(chatContext(crmChat, "segments", true)?.label.startsWith("Segment"), "record chip names the open record");
-assert((chatContext(crmChat, "campaigns", false)?.prompts.length ?? 0) >= 2 && (chatContext(crmChat, "campaigns", false)?.prompts.length ?? 9) <= 3, "2-3 prompts");
-equal(chatContext(crmChat, null, false), null, "no screen, no chip");
 
 const crm = { install_id: "install-crm", title: "CRM", name: "crm", version: "0.1.0", digest: "d", catalog_generation: "g", approved: true, storage_kind: "workspace", files: [], capabilities: null, connection_slots: [] };
 const ctxs = { contexts: [{ id: "ctx-a", install_id: "install-crm", revision: 1, state: "active", digest: "ca", config: { schema: 1, label: "Acme", input_defaults: {} } }] };
@@ -118,20 +113,29 @@ assert(!text().includes("list_segments") && !text().includes("create_segment"), 
 assert(host.querySelector('[data-chat-card="directive"]'), "CSV confirm renders as a card");
 for (const bad of [SECRET, "req-9", "confirm_token", "cadence_csv_import", "ctx-a", "{"]) assert(!text().includes(bad), `chat never shows ${bad}`);
 assert(text().includes("Customer import"), "card reads as a human summary");
-// Context chip + quick prompts that fill, not send.
-const chip = host.querySelector("[data-chat-context]");
-assert(chip && (chip.textContent ?? "").includes("Customers"), "chip names the page");
-const prompts = Array.from(chip!.querySelectorAll("button"));
-assert(prompts.length >= 2 && prompts.length <= 3, "two or three quick prompts");
-await click(prompts[0]);
+// CAD-1168/CAD-1174: no default chip or prompt row, one shared compact
+// composer. App Attach stays off until the native capability contract.
+assert(!host.querySelector("[data-chat-context]") && !host.querySelector(".app-chat-prompt"), "no default chip or prompt row");
+equal(host.querySelectorAll('.app-chat-composer[data-density="compact"]').length, 1, "one shared compact composer");
 const box = host.querySelector("#app-shell-chat-box") as HTMLTextAreaElement;
-equal(box.value, prompts[0].textContent, "prompt fills the composer");
+assert(box, "the shared composer has a textbox");
+assert(host.querySelector('button.app-chat-send[aria-label="Send message"]'), "the shared composer has an accessible Send");
+// A real unsent draft through the textbox's own editing path; the old
+// prompt click used to supply this.
+const DRAFT = "Draft retained across navigation";
+await React.act(async () => {
+  Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(box, DRAFT);
+  box.dispatchEvent(new Event("input", { bubbles: true }));
+});
+await flush();
+equal(box.value, DRAFT, "the draft is in the composer");
 await React.act(async () => { navigate("/app-installations/install-crm?ctx=ctx-a&crm=segments"); });
 await flush();
-assert((host.querySelector("[data-chat-context]")?.textContent ?? "").includes("Segments"), "chip follows the page");
+assert(!host.querySelector("[data-chat-context]"), "no context chip after navigation");
+equal((host.querySelector("#app-shell-chat-box") as HTMLTextAreaElement).value, DRAFT, "draft survives navigation to segments");
 await React.act(async () => { navigate("/app-installations/install-crm?ctx=ctx-a&crm=segments&record=seg-1"); });
 await flush();
-assert((host.querySelector("[data-chat-context]")?.textContent ?? "").includes("Segment (open)"), "chip names the open record");
+equal((host.querySelector("#app-shell-chat-box") as HTMLTextAreaElement).value, DRAFT, "draft survives navigation to a record");
 
 // Collapse to a rail; draft and pane survive; waiting dot on new reply.
 const before = box.value;

@@ -405,6 +405,10 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
         RouteClass::OperatorOnly,
     ),
     route("POST", "/api/threads/*/messages", RouteClass::OperatorOnly),
+    // CAD-1168: the chat attachment upload — the operator's alone, like
+    // the messages POST. Multipart body (the second non-JSON carve-out
+    // after `/api/wiki/upload`); the daemon re-proves the caller.
+    route("POST", "/api/chat/upload", RouteClass::OperatorOnly),
     // CAD-1098: making a conversation is the operator's chat, like the
     // message POST — the daemon proves the connection again.
     route(
@@ -595,7 +599,7 @@ pub(super) fn admit(
     }
     let ct = if path.ends_with("/artifacts") {
         "application/octet-stream"
-    } else if path == "/api/wiki/upload" {
+    } else if path == "/api/wiki/upload" || path == "/api/chat/upload" {
         // Multipart is the one non-exact rule — `write_guard` checks
         // the bounded `multipart/form-data; boundary=` prefix; the
         // header/origin/fetch-site guards still run exact.

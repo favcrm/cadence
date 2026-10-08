@@ -731,7 +731,7 @@ impl Store {
                     return Err(Error::rejected(format!(
                         "Task '{task_id}' is '{state}' — dispatch is legal from \
                                  draft, revising, or after the live kickoff ended"
-                    )))
+                    )));
                 }
             }
 
@@ -769,6 +769,7 @@ impl Store {
                 task.worktree.as_deref(),
                 &Sender::Unattributed,
                 Priority::Normal,
+                None,
                 None,
                 None,
             )?;

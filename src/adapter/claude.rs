@@ -1377,8 +1377,11 @@ mod tests {
             "an app session must still hold the scoped verbs"
         );
         assert!(
-            app.iter()
-                .all(|t| t.starts_with("Bash(cadence app ") && home.contains(t)),
+            // CAD-1168: `attachment read` is in both profiles — an app
+            // turn reads the file its own message carried.
+            app.iter().all(|t| (t.starts_with("Bash(cadence app ")
+                || *t == "Bash(cadence attachment read *)")
+                && home.contains(t)),
             "{app:?}"
         );
         // A worker's launch ignores the profile.

@@ -3056,7 +3056,11 @@ mod cad1098_tests {
         let (home, app) = (pi_guard_rules(Home), pi_guard_rules(App));
         assert!(heads(&home).iter().any(|h| h == "issue"));
         assert!(!app.is_empty());
-        assert!(heads(&app).iter().all(|h| h == "app"), "{app:?}");
+        assert!(
+            // CAD-1168: `attachment read` rides both profiles.
+            heads(&app).iter().all(|h| h == "app" || h == "attachment"),
+            "{app:?}"
+        );
         assert!(app.iter().all(|r| home.contains(r)));
         let dir = tempfile::Builder::new().prefix("c98p").tempdir().unwrap();
         let rules_in = |path: &Path| -> String {

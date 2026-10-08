@@ -13,6 +13,7 @@ mod agent;
 mod agent_uid;
 mod app;
 mod attach;
+mod attachment;
 mod audit;
 mod backup;
 mod briefing;
@@ -88,6 +89,7 @@ use agent::AgentAction;
 use agent_uid::AgentUidAction;
 use app::AppAction;
 use attach::attach_agent;
+use attachment::AttachmentAction;
 use audit::AuditAction;
 use briefing::{brief_agent, BriefMode};
 #[cfg(test)]

@@ -251,26 +251,176 @@
   flex-shrink: 0;
 }
 
+/* CAD-1168 compact composer (the approved unified-chat mock): one
+   bordered card holding the auto-growing box and an icon-only tool
+   row — Attach on the left, a circular up-arrow Send on the right.
+   No resize grip, no persistent hint row. */
+.app-chat-composer {
+  display: grid;
+  gap: 0.25rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.75rem;
+  background: var(--color-ink-850);
+  padding: 0.55rem 0.6rem;
+}
+
+/* Mock: .composer:focus-within — the card warms toward the accent
+   while the box is active. */
+.app-chat-composer:focus-within {
+  border-color: color-mix(in srgb, var(--color-accent) 55%, var(--color-ink-700));
+}
+
+.app-chat-composer-tools {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
 .app-chat-box {
   width: 100%;
-  resize: vertical;
-  min-height: 2.75rem;
-  max-height: 10rem;
+  resize: none;
+  min-height: 2.3rem;
+  max-height: 7.5rem; /* the mock's 120 px cap, then the box scrolls */
+  overflow-y: auto;
   background: transparent;
   color: var(--color-ink-100);
-  border: 1px solid var(--color-ink-700);
-  border-radius: 0.375rem;
-  padding: 0.5rem;
+  border: 0;
+  padding: 0.25rem 0.15rem;
   font-size: var(--text-secondary);
+  line-height: 1.5;
 }
 
 .app-chat-box:focus-visible {
-  outline: 2px solid var(--color-accent);
-  outline-offset: 1px;
+  outline: none; /* the card's focus-within ring is the cue */
 }
 
 .app-chat-box::placeholder {
   color: var(--color-ink-500);
+}
+
+/* Icon-only Attach (CAD-1168 slice 2 wired it to /api/chat/upload).
+   Mock: .attach-button. */
+.app-chat-attach {
+  display: grid;
+  place-items: center;
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--color-ink-400);
+}
+
+.app-chat-attach:hover:not(:disabled) {
+  background: var(--color-ink-800);
+  color: var(--color-ink-100);
+}
+
+.app-chat-attach:disabled {
+  opacity: 0.45;
+}
+
+.app-chat-attach svg {
+  width: 1.05rem;
+  height: 1.05rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* The queued-attachment chips above the composer — one row per pick,
+   upload→ready/failed inline (CAD-1168 slice 2). */
+.app-chat-attachrow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.375rem;
+  margin-bottom: 0.375rem;
+}
+
+.app-chat-attachchip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  padding: 0.2rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid var(--color-ink-700);
+  background: var(--color-ink-850);
+  color: var(--color-ink-200);
+  max-width: 16rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.app-chat-attachchip.failed {
+  border-color: color-mix(in srgb, var(--color-fail) 50%, transparent);
+  color: var(--color-ink-300);
+}
+
+.app-chat-attachchip .lnk {
+  color: var(--color-ink-400);
+}
+
+.app-chat-attachchip .lnk:hover {
+  color: var(--color-ink-100);
+}
+
+/* Circular up-arrow Send. Mock: .send — a light disc on dark; here
+   the accent ink does the same job on the ink-850 card. */
+.app-chat-send {
+  display: grid;
+  place-items: center;
+  width: 2rem;
+  height: 2rem;
+  margin-left: auto;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 50%;
+  background: var(--color-accent);
+  color: var(--color-ink-950); /* the mock's dark glyph on the light disc */
+  transition: background 0.15s ease, transform 0.15s ease, opacity 0.15s ease;
+}
+
+.app-chat-send:hover:not(:disabled) {
+  filter: brightness(1.1);
+  transform: translateY(-1px);
+}
+
+.app-chat-send:active:not(:disabled) {
+  transform: scale(0.94);
+}
+
+.app-chat-send:disabled {
+  background: var(--color-ink-700);
+  color: var(--color-ink-500);
+  opacity: 0.6;
+}
+
+.app-chat-send:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 3px;
+}
+
+.app-chat-send svg {
+  width: 1rem;
+  height: 1rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+@media (max-width: 1023.98px) {
+  /* Mock's mobile rule: larger touch targets in the drawer. */
+  .app-chat-send,
+  .app-chat-attach {
+    width: 2.5rem;
+    height: 2.5rem;
+  }
 }
 
 /* Generic outlet tabs + detail drawer. */
@@ -988,22 +1138,6 @@ p.sfield-hint {
   padding: 0.5rem 0.65rem;
   background: var(--color-ink-850);
 }
-.app-chat-ctx {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.25rem;
-}
-.app-chat-prompt {
-  border: 1px dashed var(--color-ink-600);
-  background: transparent;
-  border-radius: 0.25rem;
-  padding: 0.1rem 0.45rem;
-  color: var(--color-ink-400);
-}
-.app-chat-prompt:hover:not(:disabled) {
-  border-style: solid;
-  color: var(--color-ink-200);
-}
 .app-chat-dot {
   width: 0.45rem;
   height: 0.45rem;
@@ -1044,14 +1178,6 @@ p.sfield-hint {
   .app-shell-grid {
     transition: none;
   }
-}
-.app-chat-chip {
-  display: inline-flex;
-  gap: 0.35rem;
-  align-items: center;
-  border: 1px solid var(--color-ink-600);
-  border-radius: 0.25rem;
-  padding: 0.1rem 0.4rem;
 }
 
 /* CAD-1058 New campaign dialog: a short modal on the shared confirm
@@ -1135,6 +1261,17 @@ p.sfield-hint {
 
 .crm-table .lnk {
   text-align: left;
+}
+
+/* CAD-1168: the working/Stop row and the jump-to-latest link — the
+   compact versions of Home's working row and newpill. */
+.app-chat-working {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.app-chat-jump {
+  align-self: center;
 }
 
 /* CAD-1098: conversation picker + "+ New" in the chat header. */

@@ -15,6 +15,19 @@
 //! no other install and no path. The route never parses chat semantics
 //! beyond size and JSON validity; the grammar is the install validator's
 //! and the client's.
+//!
+//! CAD-1168/CAD-1114 subset: the same approved snapshot also projects the
+//! installation's reserved `file.upload` declaration as
+//! `file_upload: {declared: <exact reserved tuple>, available: <bool>}`.
+//! `declared` is projected from this response's verified install/digest
+//! alone; `available` additionally requires that the operational
+//! installation/context/conversation-bound text scoped service exists
+//! (upload, reference and read all re-prove this exact-approved
+//! declaration and the stored provenance). The projection is a browser
+//! hint, never a grant: every operational call re-proves the current
+//! exact-digest consent and declaration rather than trusting this read.
+//! PDF/image processing does not exist, so only text kinds are servable.
+//! The `descriptor` JSON itself is unchanged.
 
 use serde_json::{json, Value};
 
@@ -48,16 +61,29 @@ impl Shared {
             let Some(text) = files.get(app_chat::FILE) else {
                 return Ok(None);
             };
-            let app = crate::issue::app::parse_manifest(
+            let manifest = crate::issue::app::parse_manifest(
                 files
                     .get("app.md")
                     .ok_or_else(|| Error::rejected("installation manifest unavailable"))?,
-            )?
-            .app;
+            )?;
             let descriptor = app_chat::size_and_json(text)?;
-            Ok(Some(
-                json!({"descriptor": descriptor, "digest": digest, "app": app}),
-            ))
+            // The reserved declaration is projected only from this
+            // approved snapshot's parsed manifest. `available` is true
+            // only when the declaration is present AND the operational
+            // scoped text service exists — it does (CAD-1168: upload,
+            // reference and read re-prove the current exact-approved
+            // declaration and the stored provenance). A declaration is
+            // still not a grant: this projection only tells the board a
+            // scoped text upload may be attempted, and every daemon call
+            // re-proves authority.
+            let declared = manifest.file_upload().is_some();
+            let app = manifest.app;
+            Ok(Some(json!({
+                "descriptor": descriptor,
+                "digest": digest,
+                "app": app,
+                "file_upload": {"declared": declared, "available": declared},
+            })))
         });
         match read {
             Ok(Some(found)) => Ok(found),

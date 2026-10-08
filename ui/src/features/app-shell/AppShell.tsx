@@ -8,13 +8,85 @@ import { chatScreenFor } from "./chatScreen";
 import { initialContext, rememberedContext, rememberContext, subscribeContext } from "../workspace-apps/contextSelection";
 import CrmOutlet, { type CrmSection, type OutletView } from "./CrmOutlet";
 import Conversation from "./chat/Conversation";
-import { useAppChat } from "./chat/descriptorClient";
+import { useAppChatProjection } from "./chat/descriptorClient";
 import type { ChatBinding, ChatScope } from "./chat/types";
 import { assertRecordId, type HostScope } from "./hostActions";
 import { isDev } from "../../env";
 import AppViewContractPreview, { contractPreviewHref, contractPreviewKey } from "./app-views/AppViewContractPreview";
-import { useChatCollapsed } from "./conversationClient";
+import { useChatCollapsed, type ConversationLinkRequest } from "./conversationClient";
 import "./app-shell.css";
+
+type ParsedConversationLink = Omit<ConversationLinkRequest, "visit"> & { key: string };
+
+function rawQueryValues(rawQuery: string, parameter: string): (string | null)[] {
+  const values: (string | null)[] = [];
+  for (const part of rawQuery.split("&")) {
+    const separator = part.indexOf("=");
+    const rawName = separator < 0 ? part : part.slice(0, separator);
+    let name: string;
+    try {
+      name = decodeURIComponent(rawName.replace(/\+/g, " "));
+    } catch {
+      continue;
+    }
+    if (name !== parameter) continue;
+    const rawValue = separator < 0 ? "" : part.slice(separator + 1);
+    try {
+      values.push(decodeURIComponent(rawValue.replace(/\+/g, " ")));
+    } catch {
+      values.push(null);
+    }
+  }
+  return values;
+}
+
+/** Read host selectors only. Membership and current scope are checked
+ *  separately against the installation's list and verified shell binding. */
+function parseConversationLink(href: string): ParsedConversationLink | null {
+  const queryStart = href.indexOf("?");
+  if (queryStart < 0) return null;
+  const rawQuery = href.slice(queryStart + 1).split("#", 1)[0];
+  const params = new URLSearchParams(rawQuery);
+  const values = params.getAll("conversation");
+  if (values.length === 0) return null;
+  const rawValues = rawQueryValues(rawQuery, "conversation");
+  const contextValues = params.getAll("ctx");
+  const rawContexts = rawQueryValues(rawQuery, "ctx");
+  let contextTarget: string | null = null;
+  let contextError: string | null = null;
+  if (contextValues.length > 1 || rawContexts.length > 1) {
+    contextError = "This conversation link names more than one context — nothing was opened.";
+  } else if (contextValues.length === 1 && (rawContexts.length !== 1 || rawContexts[0] === null)) {
+    contextError = "This conversation link has a malformed context — nothing was opened.";
+  } else if (contextValues.length === 1 && contextValues[0] === "") {
+    contextError = "This conversation link does not name an active context — nothing was opened.";
+  } else if (contextValues.length === 1) {
+    contextTarget = contextValues[0];
+  }
+  const invalid = (error: string): ParsedConversationLink => ({
+    key: JSON.stringify(["invalid", values, rawValues, contextTarget, contextError, error]),
+    target: null,
+    error,
+    contextTarget,
+    contextError,
+  });
+  if (values.length > 1 || rawValues.length > 1) {
+    return invalid("This link names more than one conversation — nothing was opened.");
+  }
+  if (values.length !== 1 || rawValues.length !== 1 || rawValues[0] === null) {
+    return invalid("This link has a malformed conversation id — nothing was opened.");
+  }
+  if (values[0] === "") {
+    return invalid("This link does not name a conversation — nothing was opened.");
+  }
+  return {
+    key: JSON.stringify(["target", values[0], contextTarget, contextError]),
+    target: values[0],
+    error: null,
+    contextTarget,
+    contextError,
+  };
+}
 
 /**
  * The trusted shared App shell (CAD-802): host-owned board surface for
@@ -64,16 +136,82 @@ export default function AppShell({
 }) {
   const href = useHref();
   const query = useMemo(() => new URLSearchParams(href.split("?")[1] ?? ""), [href]);
+  const parsedConversationLink = useMemo(() => parseConversationLink(href), [href]);
+  const conversationVisit = useRef(0);
+  const conversationRequestRef = useRef<{ key: string | null; request: ConversationLinkRequest | null }>({
+    key: null,
+    request: null,
+  });
+  const requestKey = parsedConversationLink === null
+    ? null
+    : JSON.stringify([installId, parsedConversationLink.key]);
+  if (conversationRequestRef.current.key !== requestKey) {
+    conversationRequestRef.current = {
+      key: requestKey,
+      request: parsedConversationLink === null
+        ? null
+        : {
+            visit: ++conversationVisit.current,
+            target: parsedConversationLink.target,
+            error: parsedConversationLink.error,
+            contextTarget: parsedConversationLink.contextTarget,
+            contextError: parsedConversationLink.contextError,
+          },
+    };
+  }
+  const conversationRequest = conversationRequestRef.current.request;
   const [installation, setInstallation] = useState<Installation | null>(null);
   const [contexts, setContexts] = useState<AppContext[]>([]);
-  const [loadError, setLoadError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [loadFailure, setLoadFailure] = useState<{ key: string; message: string } | null>(null);
+  const [requestLoading, setRequestLoading] = useState(true);
+  const [completedReceiptKey, setCompletedReceiptKey] = useState<string | null>(null);
   const [contextId, setContextId] = useState("");
   const [linkNotice, setLinkNotice] = useState<string | null>(null);
   // Social-content's picker owns its selection; the shell observes it
   // in the same tab so chat sends carry the current scope, never the
   // one from the shell's last render.
   const [socialContext, setSocialContext] = useState<string | null>(null);
+  const [socialContextInstall, setSocialContextInstall] = useState<string | null>(null);
+  // Context receipts are per operator/install/selection and per scoped
+  // conversation visit. The browser selection only invalidates a receipt;
+  // membership still comes exclusively from the fresh server response.
+  const scopedConversationVisit =
+    conversationRequest !== null &&
+    conversationRequest.target !== null &&
+    conversationRequest.contextTarget !== null
+      ? conversationRequest.visit
+      : null;
+  const readInputKey = JSON.stringify([
+    installId,
+    viewer.operator,
+    socialContextInstall === installId,
+    socialContextInstall,
+    socialContextInstall === installId ? socialContext : null,
+    scopedConversationVisit,
+  ]);
+  const readVersionRef = useRef({ inputKey: "", version: 0 });
+  if (readVersionRef.current.inputKey !== readInputKey) {
+    readVersionRef.current = {
+      inputKey: readInputKey,
+      version: readVersionRef.current.version + 1,
+    };
+  }
+  const receiptKey = JSON.stringify([readInputKey, readVersionRef.current.version]);
+  const currentReceiptKeyRef = useRef(receiptKey);
+  currentReceiptKeyRef.current = receiptKey;
+  const currentReadComplete = completedReceiptKey === receiptKey;
+  const loadError = loadFailure?.key === receiptKey ? loadFailure.message : null;
+  const socialSelectionReady =
+    installation?.name !== "social-content" || socialContextInstall === installId;
+  const loading = viewer.operator
+    ? requestLoading || !currentReadComplete || !socialSelectionReady
+    : requestLoading;
+  const receiptReady =
+    viewer.operator &&
+    currentReadComplete &&
+    loadError === null &&
+    socialSelectionReady &&
+    installation?.install_id === installId;
   // Outlet state lives in the URL (`ctx`, `appview`, `record`) so
   // direct links and browser back keep scope.
   const view: OutletView = query.get("appview") === "new" ? "new" : "list";
@@ -98,6 +236,7 @@ export default function AppShell({
   // first mount preserves direct links, later switches strip them.
   const firstInstall = useRef(installId);
   const handledQuery = useRef<string | undefined>(undefined);
+  const [adoptedContextKey, setAdoptedContextKey] = useState<string | null>(null);
 
   // Every internal query write marks the resulting key as handled, so
   // the adoption effect below only answers external URL changes
@@ -114,6 +253,7 @@ export default function AppShell({
         ctx?: string | null;
         appview?: OutletView | null;
         record?: string | null;
+        conversation?: string | null;
         crm?: CrmSection | null;
         clearContractPreview?: boolean;
       },
@@ -136,6 +276,10 @@ export default function AppShell({
         if (patch.record === null) q.delete("record");
         else q.set("record", patch.record);
       }
+      if (patch.conversation !== undefined) {
+        if (patch.conversation === null) q.delete("conversation");
+        else q.set("conversation", patch.conversation);
+      }
       if (patch.crm !== undefined) {
         if (patch.crm === null || patch.crm === "customers") q.delete("crm");
         else q.set("crm", patch.crm);
@@ -144,29 +288,39 @@ export default function AppShell({
         q.delete("contract-preview");
         q.delete("contract-preview-view");
       }
-      handledQuery.current = queryKey(q.get("ctx"), q.get("record"), q.get("appview"), q.get("crm"));
+      const adoptedKey = queryKey(q.get("ctx"), q.get("record"), q.get("appview"), q.get("crm"));
+      handledQuery.current = adoptedKey;
+      setAdoptedContextKey(adoptedKey);
       const s = q.toString();
       navigate(path + (s ? `?${s}` : ""), { replace: opts?.replace });
     },
     [href, installId],
   );
 
-  // Verified installation/context receipts. An operator-only read: an
-  // unproven viewer sees the sign-in note, never the records.
+  // Verified installation/context receipts. A current key mismatch is
+  // pending synchronously (before this effect runs); stale requests cannot
+  // publish data or settle loading after selection/install/unmount changes.
   useEffect(() => {
-    if (!viewer.operator) {
-      setLoading(false);
-      return;
-    }
+    let current = true;
     const controller = new AbortController();
-    setLoading(true);
-    setLoadError(null);
+    const isCurrent = () =>
+      current &&
+      !controller.signal.aborted &&
+      currentReceiptKeyRef.current === receiptKey;
+    if (!viewer.operator) {
+      setRequestLoading(false);
+      return () => {
+        current = false;
+        controller.abort();
+      };
+    }
+    setRequestLoading(true);
     Promise.all([
       workspaceApps.detail(installId, controller.signal),
       workspaceApps.contexts(installId, controller.signal),
     ])
       .then(([next, nextContexts]) => {
-        if (controller.signal.aborted) return;
+        if (!isCurrent()) return;
         setInstallation(next);
         setContexts(nextContexts);
         // CAD-1174: a CRM installation without a scope is unusable — the
@@ -202,17 +356,26 @@ export default function AppShell({
               // what to do; a failed default never blocks the app.
             });
         }
+        setLoadFailure(null);
+        setCompletedReceiptKey(receiptKey);
       })
       .catch((e: unknown) => {
-        if (!controller.signal.aborted) {
-          setLoadError(e instanceof Error ? e.message : "Could not load this app");
+        if (isCurrent()) {
+          setLoadFailure({
+            key: receiptKey,
+            message: e instanceof Error ? e.message : "Could not load this app",
+          });
+          setCompletedReceiptKey(receiptKey);
         }
       })
       .finally(() => {
-        if (!controller.signal.aborted) setLoading(false);
+        if (isCurrent()) setRequestLoading(false);
       });
-    return () => controller.abort();
-  }, [installId, viewer.operator]);
+    return () => {
+      current = false;
+      controller.abort();
+    };
+  }, [installId, receiptKey, viewer.operator]);
 
   // Board-level App menu identity: report the verified receipt (or
   // null while it is loading, failed, or belongs to another install)
@@ -221,7 +384,7 @@ export default function AppShell({
   // lingering in host navigation.
   useEffect(() => {
     if (!onInstallation) return;
-    if (installation && installation.install_id === installId) {
+    if (receiptReady && installation && installation.install_id === installId) {
       onInstallation({
         installId,
         kind: installation.name,
@@ -231,12 +394,16 @@ export default function AppShell({
       onInstallation(null);
     }
     return () => onInstallation(null);
-  }, [installId, installation, onInstallation]);
+  }, [installId, installation, onInstallation, receiptReady]);
 
   useEffect(() => {
     setSocialContext(rememberedContext(installId));
+    setSocialContextInstall(installId);
     return subscribeContext((changed, next) => {
-      if (changed === installId) setSocialContext(next);
+      if (changed === installId) {
+        setSocialContext(next);
+        setSocialContextInstall(installId);
+      }
     });
   }, [installId]);
 
@@ -248,20 +415,22 @@ export default function AppShell({
     handledQuery.current = undefined;
     setInstallation(null);
     setContexts([]);
-    setLoadError(null);
+    setLoadFailure(null);
     setLinkNotice(null);
     setContextId("");
-    writeQuery({ ctx: null, appview: null, record: null, crm: null, clearContractPreview: true }, { replace: true });
+    writeQuery({ ctx: null, appview: null, record: null, conversation: null, crm: null, clearContractPreview: true }, { replace: true });
     // The strip marks the emptied query handled: unmark so adoption
     // still runs once the new installation's contexts load.
     handledQuery.current = undefined;
+    setAdoptedContextKey(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [installId]);
 
-  const activeIds = useMemo(
-    () => contexts.filter((c) => c.state === "active").map((c) => c.id),
-    [contexts],
+  const activeContexts = useMemo(
+    () => (receiptReady ? contexts.filter((c) => c.state === "active") : []),
+    [contexts, receiptReady],
   );
+  const activeIds = useMemo(() => activeContexts.map((c) => c.id), [activeContexts]);
 
   // Adopt the URL's context once contexts load, and on later external
   // URL changes (browser back). A linked context must be active here;
@@ -272,7 +441,7 @@ export default function AppShell({
     // switch commit the state still holds the previous install while
     // the URL already names the next one — adopting there would clear
     // or poison the wrong scope.
-    if (loading || installation === null || installation.install_id !== installId) return;
+    if (!receiptReady || loading || installation === null || installation.install_id !== installId) return;
     // Social-content owns its context end to end (the shell renders
     // no selector there): adoption must not read, write, or clear its
     // remembered selection.
@@ -288,8 +457,13 @@ export default function AppShell({
     // never adopt the surviving ctx (the cold deep-link defect). So
     // adoption is fall-through, not early-return: normalize each
     // param, then act on the still-valid remainder.
-    if (handledQuery.current === queryKey(urlCtx, urlRecord, urlView, urlCrm)) return;
-    handledQuery.current = queryKey(urlCtx, urlRecord, urlView, urlCrm);
+    const incomingQueryKey = queryKey(urlCtx, urlRecord, urlView, urlCrm);
+    if (handledQuery.current === incomingQueryKey) {
+      setAdoptedContextKey(incomingQueryKey);
+      return;
+    }
+    handledQuery.current = incomingQueryKey;
+    setAdoptedContextKey(incomingQueryKey);
     // An unknown CRM section never renders: strip it back to the
     // default instead of guessing a section. The explicit default
     // (`crm=customers`) is already canonical, so it is not rewritten.
@@ -303,6 +477,7 @@ export default function AppShell({
       }
     }
     const staleCtx = urlCtx !== null && !activeIds.includes(urlCtx);
+    const hasConversationLink = query.getAll("conversation").length > 0;
     // Single-company mode: with exactly one active context a scopeless
     // record link is unambiguous, so it resolves to that context.
     const soleContext = urlCtx === null && urlRecord !== null && !badRecord && activeIds.length === 1;
@@ -348,7 +523,9 @@ export default function AppShell({
     if (badCrm || badRecord || staleCtx || scopelessRecord || soleContext) {
       writeQuery(
         {
-          ctx: soleContext ? activeIds[0] : staleCtx ? null : undefined,
+          // Preserve a stale ctx selector alongside a conversation link so
+          // its target can fail visibly instead of becoming contextless.
+          ctx: soleContext ? activeIds[0] : staleCtx && !hasConversationLink ? null : undefined,
           crm: badCrm ? null : undefined,
           record: badRecord || staleCtx || scopelessRecord ? null : undefined,
           appview: staleCtx ? null : undefined,
@@ -356,7 +533,7 @@ export default function AppShell({
         { replace: true },
       );
     }
-  }, [loading, installation, activeIds, query, installId, writeQuery]);
+  }, [loading, receiptReady, installation, activeIds, query, installId, writeQuery]);
 
   // The default selection, without persisting an empty choice when
   // this installation has no active contexts to choose from.
@@ -413,12 +590,32 @@ export default function AppShell({
   // plain chat — there is no App scope to bind. A selected context
   // that is no longer active blocks the send early with a clear
   // message; the server re-proves every binding on send regardless.
-  const binding = chatBinding({
-    installId,
-    wanted: (installation?.name === "social-content" ? socialContext || "" : contextId),
-    known: installation !== null && !loading && loadError === null,
-    activeIds,
-  });
+  const verified = receiptReady && installation !== null && installation.install_id === installId;
+  const wantedContext = installation?.name === "social-content" ? socialContext || "" : contextId;
+  const bindingUnavailableError = loadError ??
+    (!viewer.operator
+      ? "Sign in as the operator to verify this app context before sending."
+      : loading
+        ? "The current app context is still being verified. Wait before sending."
+        : "The current app context could not be verified. Retry before sending.");
+  const binding: ChatBinding = verified
+    ? chatBinding({ installId, wanted: wantedContext, known: true, activeIds })
+    : { scope: null, error: bindingUnavailableError };
+  const contextAdoptionReady = installation?.name === "social-content"
+    ? socialContextInstall === installId
+    : adoptedContextKey === queryKey(query.get("ctx"), query.get("record"), query.get("appview"), query.get("crm"));
+  const contextProofStatus = loadError !== null || (!viewer.operator && !loading)
+    ? "failed"
+    : loading || !verified || !contextAdoptionReady
+      ? "pending"
+      : "ready";
+  const conversationContextProof = {
+    status: contextProofStatus as "pending" | "ready" | "failed",
+    contextId: binding.scope?.context_id ?? null,
+    error: contextProofStatus === "failed"
+      ? loadError ?? "The current app context could not be verified."
+      : binding.error ?? (binding.scope === null ? "No active app context is available." : null),
+  };
   const scope: HostScope = { installId, contextId };
   // CAD-813: the Campaigns page mints assistant proposal requests
   // against the operator's most recent chat message stamped by the
@@ -431,18 +628,17 @@ export default function AppShell({
   const isSocial = installation !== null && installation.name === "social-content";
   // The chat's descriptor comes from the installation's own approved package
   // (served pinned to its digest); with none, the pane is plain shared chat.
-  const verified = installation !== null && installation.install_id === installId;
   // CAD-1174: with a single active scope the context concept is not a
   // choice — the operator never sees it. `General` is the one scope a
   // CRM installation gets (created below when it has none); every
   // other app keeps the surfaces it has today.
-  const activeContexts = contexts.filter((value) => value.state === "active");
   const singleScope = verified && installation.name === "crm" && activeContexts.length <= 1;
-  const chatDescriptor = useAppChat(
+  const chatProjection = useAppChatProjection(
     installId,
     verified ? installation.digest : null,
     verified ? installation.name : null,
   );
+  const chatDescriptor = chatProjection.projection?.chat ?? null;
   // The shell's own screen ids (D5): the CRM outlet's sections, or the generic
   // outlet's `list` and `new`; the private-screen app owns its own and has none.
   const chatScreen = chatScreenFor(installation, verified, crmSection, view);
@@ -546,13 +742,18 @@ export default function AppShell({
               contextId: binding.scope?.context_id ?? "",
               screen: chatScreen,
               recordOpen: recordId !== null,
-              contextName: singleScope ? null : contextLabel(contexts, contextId),
+              contextName: singleScope ? null : contextLabel(activeContexts, contextId),
               descriptor: chatDescriptor,
               promptLayout: isSocial ? "list" : "chips",
+              conversationRequest,
+              contextProof: conversationContextProof,
+              fileUpload: chatProjection.projection?.fileUpload ?? { declared: false, available: false },
+              fileUploadLoading: chatProjection.loading || !verified || loading || loadError !== null,
             }}
             density="compact"
             viewer={viewer}
             binding={binding}
+            onFileUploadUnavailable={() => void chatProjection.refresh()}
             collapsed={chatCollapsed}
             onCollapsed={setChatCollapsed}
             onOpenView={openView}
@@ -603,7 +804,7 @@ export default function AppShell({
                 ) : null
               ) : (
                 <p className="num text-micro text-ink-500">
-                  {contexts.find((c) => c.id === contextId)?.config.label ?? "No context"} · {installation.version}
+                  {activeContexts.find((c) => c.id === contextId)?.config.label ?? "No context"} · {installation.version}
                 </p>
               )}
               {/* Scoped entry: a multi-context install with no linked
@@ -657,9 +858,7 @@ export default function AppShell({
                         : "app-shell-scope-list app-shell-switch-list"
                     }
                   >
-                    {contexts
-                      .filter((c) => c.state === "active")
-                      .map((c) => (
+                    {activeContexts.map((c) => (
                         <li key={c.id}>
                           <Link
                             href={scopedEntryHref(href, c.id, contextId)}
@@ -755,12 +954,20 @@ function contextLabel(contexts: AppContext[], contextId: string): string | null 
  *  openable in a new tab), never a dead control. Pure — unit-tested
  *  via the shell. */
 export function scopedEntryHref(href: string, contextId: string, boundId: string): string {
-  if (contextId === boundId) return href;
   const [path, search] = href.split("?");
   const q = new URLSearchParams(search ?? "");
+  const currentContexts = q.getAll("ctx");
+  if (
+    contextId === boundId &&
+    (currentContexts.length === 0 || (currentContexts.length === 1 && currentContexts[0] === boundId))
+  ) {
+    return href;
+  }
   q.set("ctx", contextId);
   q.delete("record");
   q.delete("appview");
+  // An explicit company switch supersedes a pending conversation deep link.
+  q.delete("conversation");
   const s = q.toString();
   return path + (s ? `?${s}` : "");
 }

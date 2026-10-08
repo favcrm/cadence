@@ -115,12 +115,12 @@ impl Shared {
             if let Some(field) = obj.keys().find(|k| {
                 !matches!(
                     k.as_str(),
-                    "alias" | "text" | "message" | "refs" | "app" | "conversation"
+                    "alias" | "text" | "message" | "refs" | "app" | "conversation" | "attachments"
                 )
             }) {
                 return Err(Error::rejected(format!(
-                    "thread send takes alias, text, message, refs, app and conversation \
-                     only; field '{field}' is not accepted"
+                    "thread send takes alias, text, message, refs, app, conversation \
+                     and attachments only; field '{field}' is not accepted"
                 )));
             }
         }

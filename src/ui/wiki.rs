@@ -353,7 +353,7 @@ fn upload(
         Ok(b) => b,
         Err(resp) => return resp,
     };
-    let (fields, file) = match parse_multipart(&body, boundary) {
+    let (fields, file) = match super::parse_multipart(&body, boundary) {
         Ok(v) => v,
         Err(why) => return err_response(400, &why),
     };
@@ -404,84 +404,4 @@ fn upload(
             write_err(&e)
         }
     }
-}
-
-/// `needle`'s first offset in `hay`.
-fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || hay.len() < needle.len() {
-        return None;
-    }
-    hay.windows(needle.len()).position(|w| w == needle)
-}
-
-type Multipart = (std::collections::BTreeMap<String, String>, Option<Vec<u8>>);
-
-/// The simplest multipart reader that is still strict — and byte-safe:
-/// file payloads never pass through a UTF-8 decode. The body must be
-/// `--b\r\n<part-headers>\r\n\r\n<payload>\r\n--b\r\n…\r\n--b--`.
-/// Named fields land in `fields`; the FIRST `file` part's raw payload
-/// is the upload. A payload containing `\r\n--b` truncates early —
-/// the boundary is the client's own random marker, as the format
-/// intends.
-fn parse_multipart(body: &[u8], boundary: &str) -> Result<Multipart, String> {
-    let delim = format!("--{boundary}").into_bytes();
-    let crlf_delim = {
-        let mut v = b"\r\n".to_vec();
-        v.extend_from_slice(&delim);
-        v
-    };
-    let mut fields = std::collections::BTreeMap::new();
-    let mut file = None;
-    let mut pos = 0;
-    loop {
-        if !body[pos..].starts_with(&delim) {
-            return Err("multipart part does not start with the boundary".to_string());
-        }
-        pos += delim.len();
-        if body[pos..].starts_with(b"--") {
-            break; // the final delimiter
-        }
-        if body[pos..].starts_with(b"\r\n") {
-            pos += 2;
-        } else {
-            return Err("multipart boundary is not followed by a part".to_string());
-        }
-        let rest = &body[pos..];
-        let Some(hdr_len) = find_sub(rest, b"\r\n\r\n") else {
-            return Err("multipart part with no header/body split".to_string());
-        };
-        let headers = String::from_utf8_lossy(&rest[..hdr_len]);
-        let content_start = pos + hdr_len + 4;
-        let Some(rel_end) = find_sub(&body[content_start..], &crlf_delim) else {
-            return Err("multipart part never terminates".to_string());
-        };
-        let payload = &body[content_start..content_start + rel_end];
-        let mut name = None;
-        for line in headers.lines() {
-            if line
-                .to_ascii_lowercase()
-                .starts_with("content-disposition:")
-            {
-                for seg in line.split(';') {
-                    let seg = seg.trim();
-                    if let Some(v) = seg.strip_prefix("name=") {
-                        name = Some(v.trim_matches('"').to_string());
-                    }
-                }
-            }
-        }
-        match name.as_deref() {
-            Some("file") => {
-                if file.is_none() {
-                    file = Some(payload.to_vec());
-                }
-            }
-            Some(n) => {
-                fields.insert(n.to_string(), String::from_utf8_lossy(payload).to_string());
-            }
-            None => {}
-        }
-        pos = content_start + rel_end + 2;
-    }
-    Ok((fields, file))
 }
