@@ -7,6 +7,12 @@
 # Env:    CADENCE   path to the cadence binary (default: target/release/cadence
 #                   if built, else `cadence` on PATH)
 #         NOTES     agent-notes directory (default: /var/www/agent-notes)
+#         SEED_REPO_ROOT  replaces $HOME/Project in the seeded --repo
+#                   paths (default: $HOME/Project)
+#         SEED_ALLOW_INITIALIZED=1  lets the seed run against a pm dir
+#                   `cadence issue init` already touched — only while
+#                   `issue project ls` still reports zero projects. Any
+#                   existing project is still a hard refusal.
 #
 # Refuses to run against an existing pm.yaml — seeding is a one-time act.
 
@@ -14,6 +20,7 @@ set -euo pipefail
 
 PM_DIR="${1:-${CADENCE_PM_DIR:-$HOME/pm}}"
 NOTES="${NOTES_DIR:-/var/www/agent-notes}"
+SEED_REPO_ROOT="${SEED_REPO_ROOT:-$HOME/Project}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 if [[ -n "${CADENCE:-}" ]]; then
@@ -24,26 +31,37 @@ else
   BIN="$(command -v cadence)"
 fi
 
-if [[ -f "$PM_DIR/pm.yaml" ]]; then
-  echo "seed: $PM_DIR/pm.yaml already exists — refusing to reseed." >&2
-  echo "      point CADENCE_PM_DIR at a fresh dir for a test seed." >&2
-  exit 1
-fi
-
 export CADENCE_PM_DIR="$PM_DIR"
 note() { [[ -f "$NOTES/$1" ]] && printf '%s' "$NOTES/$1" || printf '%s' "$1"; }
 say() { printf 'seed: %s\n' "$*" >&2; }
 
+if [[ -f "$PM_DIR/pm.yaml" ]]; then
+  # SEED_ALLOW_INITIALIZED=1 admits a pm dir `issue init` already
+  # created (e.g. `sandbox up`), but only while it still has zero
+  # projects — anything seeded is never overwritten.
+  if [[ "${SEED_ALLOW_INITIALIZED:-}" != "1" ]]; then
+    echo "seed: $PM_DIR/pm.yaml already exists — refusing to reseed." >&2
+    echo "      point CADENCE_PM_DIR at a fresh dir for a test seed." >&2
+    exit 1
+  fi
+  count="$("$BIN" issue project ls | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["projects"]))')"
+  if [[ "$count" != "0" ]]; then
+    echo "seed: $PM_DIR already has $count project(s) — refusing to reseed." >&2
+    exit 1
+  fi
+  say "pm dir already initialised with zero projects — seeding into it"
+else
+  "$BIN" issue init
+fi
+
 say "pm dir: $PM_DIR (binary: $BIN)"
 
-"$BIN" issue init
-
 "$BIN" issue project add cadence --prefix CAD \
-  --repo "$HOME/Project/cadence" \
+  --repo "$SEED_REPO_ROOT/cadence" \
   --component adapter --component daemon --component cli --component ui \
   --owner cookie-cesium
 "$BIN" issue project add sportslog --prefix SPL \
-  --repo "$HOME/Project/sportslog" \
+  --repo "$SEED_REPO_ROOT/sportslog" \
   --component app --component api --component admin --component web
 "$BIN" issue project add ops --prefix OPS --owner operator
 
@@ -87,9 +105,11 @@ say "pm dir: $PM_DIR (binary: $BIN)"
 "$BIN" issue link OPS-3 relates CAD-22
 
 # ---- statuses (file source; notes/M3 derivation overrides when present) ----
-"$BIN" issue set CAD-9  status=done
-"$BIN" issue set CAD-12 status=done
-"$BIN" issue set CAD-14 status=done
+# status=done demands evidence the fixture predates — force it with a
+# recorded reason rather than fake refs.
+"$BIN" issue set CAD-9  status=done --force "seed fixture"
+"$BIN" issue set CAD-12 status=done --force "seed fixture"
+"$BIN" issue set CAD-14 status=done --force "seed fixture"
 "$BIN" issue set CAD-30 status=doing
 "$BIN" issue set CAD-11 status=review
 "$BIN" issue set CAD-16 status=doing

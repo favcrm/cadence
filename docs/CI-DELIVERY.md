@@ -467,3 +467,31 @@ compiles PR bytes, and those are never promoted. The `release-full` leg of
 artifact. Residual: the artifact crosses jobs of the queue run, which also
 runs the entry's tests; the upload never overwrites, but the main attestation
 vouches for bytes the queue run built.
+
+## Live staging candidate (CAD-833)
+
+The staging deploy candidate polls the **latest successful** `ci.yml` push run
+on main every five minutes, verifies its attested release with
+`scripts/delivery-candidate.py prepare`, then starts the verified binary in the
+`staging` sandbox. It coalesces intermediate green builds; the timer interval
+is a polling cadence, not an end-to-end SLA. `--run-id` pins a run for an
+operator-directed deploy or recovery. The loopback health and `/api/meta`
+`build_commit` must match the selected source SHA. Failed deploys retain and
+record the proven fallback; candidate and fallback executions are re-hashed
+against their receipts. The first successful start seeds a separate fixture
+tracker and registers two inbox agents once. The timer uses a dedicated clone
+checked out at `origin/main`; its state and release cache are under
+`~/.local/share/cadence-staging`.
+
+**Operator decision — source refresh only; do not install or enable the timer.**
+The operator chose board port 3150, within the permitted 3110–3199 range. The
+board URL is `http://cadence-3150.localhost:3150`; tailnet HTTPS remains on
+`:9460`. This authorizes the source configuration only, not a runtime deploy,
+state-directory migration, unit installation, or timer enablement.
+
+The tailnet URL is `https://ip-172-31-1-32.tail9fcf30.ts.net:9460`. Tailnet
+publishing is through `cadence ui tailscale` under the sandbox opt-in, not
+through sudo or nginx. The deploy code must revalidate an absent/foreign/live
+mapping on ordinary and known-bad healthy ticks, refuse to overwrite foreign
+routes, and keep a healthy loopback board available if a tailnet publish
+restarts it. Tailnet reachability is observed separately from loopback health.
