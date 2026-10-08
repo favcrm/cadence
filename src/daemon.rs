@@ -2560,9 +2560,17 @@ impl Shared {
     /// credentials) — restamps of the public `agents.error` field
     /// publish only the bounded app class. The raw detail still lives
     /// on the message row, which `message read` gates to the operator.
+    ///
+    /// The ownership read fails closed: a transient `has_app_unknown`
+    /// error means ownership is undetermined, not established non-app,
+    /// so the restamp publishes the safe class rather than the stored
+    /// provider text a second read might then return.
     fn preserved_unknown_detail(&self, alias: &str, actor_error: &str) -> String {
-        if self.store.has_app_unknown(alias).unwrap_or(false) {
-            return store::app_runs::app_uncertain_turn_reason();
+        match self.store.has_app_unknown(alias) {
+            Ok(false) => {}
+            // App-owned, or ownership undetermined (read error): publish
+            // the bounded class, never raw provider text.
+            Ok(true) | Err(_) => return store::app_runs::app_uncertain_turn_reason(),
         }
         if let Some(detail) = self.store.preferred_unknown_error(alias).ok().flatten() {
             let bounded = bound_unknown_detail(&detail);
@@ -9004,6 +9012,35 @@ mod app_unknown_fence_privacy {
             unknown.into_app_owned_fatal(),
             Error::OutcomeUnknown(_)
         ));
+    }
+
+    /// The ownership read fails closed: when `has_app_unknown` errors
+    /// (the `source` column is dropped through a side connection — the
+    /// cheapest real read failure, which also fails the companion
+    /// `FENCING_UNKNOWN_SQL` reads) the restamp publishes the bounded
+    /// class, not a stored provider account it could no longer prove
+    /// was non-app.
+    #[test]
+    fn ownership_read_error_restamps_safe_class() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = Shared::new(dir.path(), &ServeOptions::default()).unwrap();
+        let message = app_worker(dir.path(), &shared, "w4", "app-m4");
+        let raw = "Pi native input cleanup was not confirmed: Bearer s3cr3t";
+        let _ = shared.unknown("w4", &message, raw);
+
+        rusqlite::Connection::open(dir.path().join("cadence.sqlite3"))
+            .unwrap()
+            .execute_batch("ALTER TABLE messages DROP COLUMN source")
+            .unwrap();
+        assert!(shared.store.has_app_unknown("w4").is_err());
+        assert!(shared.store.preferred_unknown_error("w4").is_err());
+
+        let detail = shared.preserved_unknown_detail("w4", "generic");
+        assert!(
+            detail.contains("worker turn outcome is uncertain"),
+            "{detail}"
+        );
+        assert!(!detail.contains("s3cr3t"), "{detail}");
     }
 }
 
