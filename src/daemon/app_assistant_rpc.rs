@@ -22,7 +22,7 @@ fn exact(params: &Value, allowed: &[&str]) -> Result<()> {
 
 fn install_descriptor(shared: &Shared, install: &str) -> Result<(String, String, Value)> {
     let pm = shared.pm_at(&shared.pm_dir()?)?;
-    workspace::with_runtime_snapshot(&pm, install, |row, files| {
+    workspace::with_runtime_read(&pm, install, |row, files| {
         let digest = row
             .get("digest")
             .and_then(Value::as_str)

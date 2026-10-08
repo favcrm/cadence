@@ -448,7 +448,7 @@ fn check_expected_digest(expected: &str, actual: &str) -> Result<()> {
 /// writes nothing: no catalog, journal or lock file is created.
 pub(crate) fn install_check(pm: &Pm, source: &str) -> Result<Value> {
     let (files, validated, provenance) = resolved_bundle(pm, source)?;
-    optimistic(|| {
+    optimistic(pm, || {
         let root = Root::open(&pm.dir)?;
         let (catalog, _) = current(&root)?;
         same_name_workspace(&catalog, &validated.manifest.app)
@@ -473,7 +473,6 @@ pub(crate) fn install(
     if let Some(expected) = expected_digest {
         check_expected_digest(expected, &bundle_digest(&files))?;
     }
-    let _apps = super::appslock::acquire(pm)?;
     let _lock = pm.lock()?;
     let root = Root::open(&pm.dir)?;
     let (mut catalog, before_catalog) = current(&root)?;
@@ -539,7 +538,7 @@ pub(crate) fn upgrade_check(
 ) -> Result<Value> {
     let id = InstallationId::parse(id)?;
     let (files, validated, provenance) = resolved_bundle(pm, source)?;
-    let (entry_name, old_files) = optimistic(|| {
+    let (entry_name, old_files) = optimistic(pm, || {
         let root = Root::open(&pm.dir)?;
         let (catalog, _) = current(&root)?;
         let entry = catalog
@@ -600,7 +599,6 @@ pub(crate) fn upgrade(
     validate_source_transport(source)?;
     // Completed request replay must not depend on a mutable/missing source.
     {
-        let _apps = super::appslock::acquire(pm)?;
         let _lock = pm.lock()?;
         let root = Root::open(&pm.dir)?;
         let (catalog, _) = current(&root)?;
@@ -610,7 +608,6 @@ pub(crate) fn upgrade(
     }
     let (files, validated, provenance) = resolved_bundle(pm, source)?;
     let new_digest = bundle_digest(&files);
-    let _apps = super::appslock::acquire(pm)?;
     let _lock = pm.lock()?;
     let root = Root::open(&pm.dir)?;
     let (mut catalog, before_catalog) = current(&root)?;
@@ -862,7 +859,6 @@ fn apply_upgrade(pm: &Pm, root: &Root, journal: &UpgradeJournal) -> Result<Vec<S
 pub(crate) fn upgrade_recover(pm: &Pm, id: &str, request_id: &str) -> Result<Value> {
     let id = InstallationId::parse(id)?;
     crate::proto::identifier(request_id, "upgrade request ID")?;
-    let _apps = super::appslock::acquire(pm)?;
     let _lock = pm.lock()?;
     let root = Root::open(&pm.dir)?;
     let journal: UpgradeJournal = decode(&required(
@@ -1033,7 +1029,6 @@ fn apply(pm: &Pm, root: &Root, journal: &InstallJournal) -> Result<Vec<String>> 
 pub(crate) fn recover(pm: &Pm, state: &Path, id: &str) -> Result<Value> {
     let _ = state; // The daemon proves the calling connection before this backend.
     let id = InstallationId::parse(id)?;
-    let _apps = super::appslock::acquire(pm)?;
     let _lock = pm.lock()?;
     let root = Root::open(&pm.dir)?;
     let journal: InstallJournal = decode(&required(&root, &journal_path(&id), JOURNAL_CAP)?)?;
@@ -1156,11 +1151,14 @@ fn describe(root: &Root, catalog: &Catalog, id: &InstallationId) -> Result<Value
 /// then answers `busy` (retryable), never a mix of old and new state.
 const READ_ATTEMPTS: u32 = 3;
 
+fn is_pending(error: &Error) -> bool {
+    matches!(error, Error::Rejected(m) if m.contains(" is pending"))
+}
+
 fn changed_underneath(error: &Error) -> bool {
     match error {
         Error::Rejected(m) => {
-            m.contains(" is pending")
-                || m.contains("no longer published")
+            m.contains("no longer published")
                 || m.contains("changed during inspection")
                 || m.contains("changed during runtime admission")
         }
@@ -1168,11 +1166,16 @@ fn changed_underneath(error: &Error) -> bool {
     }
 }
 
-fn optimistic<T>(mut read: impl FnMut() -> Result<T>) -> Result<T> {
+fn optimistic<T>(pm: &Pm, mut read: impl FnMut() -> Result<T>) -> Result<T> {
     let mut attempt = 1;
     loop {
         match read() {
-            Err(error) if changed_underneath(&error) => {
+            // A pending journal is transient only while a live writer holds
+            // the PM write flock. With no holder it is a crashed leftover:
+            // one more read (the writer may just have finished), then the
+            // original recovery refusal, never `busy`.
+            Err(error) if is_pending(&error) && !pm.write_lock_held() => return read(),
+            Err(error) if is_pending(&error) || changed_underneath(&error) => {
                 if attempt >= READ_ATTEMPTS {
                     return Err(Error::busy(format!(
                         "app catalog kept changing while it was read; retry ({error})"
@@ -1190,7 +1193,7 @@ fn optimistic<T>(mut read: impl FnMut() -> Result<T>) -> Result<T> {
 }
 
 pub fn list(pm: &Pm) -> Result<Value> {
-    optimistic(|| {
+    optimistic(pm, || {
         let catalog = Catalog::load(&pm.dir)?;
         let root = Root::open(&pm.dir)?;
         let rows = catalog
@@ -1204,7 +1207,7 @@ pub fn list(pm: &Pm) -> Result<Value> {
 }
 pub fn show(pm: &Pm, id: &str) -> Result<Value> {
     let id = InstallationId::parse(id)?;
-    optimistic(|| {
+    optimistic(pm, || {
         let catalog = Catalog::load(&pm.dir)?;
         let root = Root::open(&pm.dir)?;
         describe(&root, &catalog, &id)
@@ -1240,7 +1243,6 @@ fn commit_migration(pm: &Pm, journal: &Journal) -> Result<Vec<String>> {
     .collect())
 }
 pub(crate) fn migrate(pm: &Pm) -> Result<Value> {
-    let _apps = super::appslock::acquire(pm)?;
     let _lock = pm.lock()?;
     let mut foreign = None;
     let catalog = migrate_delivering(pm, |journal| {
@@ -1262,7 +1264,6 @@ pub(crate) fn migrate(pm: &Pm) -> Result<Value> {
     )
 }
 pub(crate) fn migration_recover(pm: &Pm, id: &str, rollback: bool) -> Result<Value> {
-    let _apps = super::appslock::acquire(pm)?;
     let _lock = pm.lock()?;
     let mut foreign = Vec::new();
     recover_delivering(
@@ -1291,11 +1292,34 @@ pub(crate) fn with_runtime_snapshot<T>(
     callback: impl FnOnce(&Value, &BTreeMap<String, String>) -> Result<T>,
 ) -> Result<T> {
     let id = InstallationId::parse(id)?;
-    // Callbacks may create run, binding or context state that the upgrade
-    // preflight inspects, so admission is ordered against catalog writers
-    // by the apps lock (never the PM lock). Apps lock, then PM lock.
-    let _apps = super::appslock::acquire(pm)?;
-    let (description, files) = optimistic(|| {
+    let _lock = pm.lock()?;
+    let root = Root::open(&pm.dir)?;
+    let catalog = Catalog::load(&pm.dir)?;
+    no_pending(&root)?;
+    let description = describe(&root, &catalog, &id)?;
+    let (bundle, _) = catalog.installations[&id].paths(&id);
+    let files = snapshot(&root, &bundle, false)?;
+    if bundle_digest(&files) != description["digest"].as_str().unwrap_or("") {
+        return Err(Error::rejected(
+            "installation changed during runtime admission",
+        ));
+    }
+    callback(&description, &files)
+}
+
+/// CAD-1189: lock-free runtime read for callbacks that write nothing. It
+/// makes the same checks as `with_runtime_snapshot` (pending journal,
+/// catalog generation, record re-read, bundle-digest compare) under the
+/// optimistic retry, but takes no PM lock. A callback that creates or
+/// changes state must use `with_runtime_snapshot`, which the PM lock orders
+/// against install, upgrade, remove and revoke.
+pub(crate) fn with_runtime_read<T>(
+    pm: &Pm,
+    id: &str,
+    callback: impl FnOnce(&Value, &BTreeMap<String, String>) -> Result<T>,
+) -> Result<T> {
+    let id = InstallationId::parse(id)?;
+    let (description, files) = optimistic(pm, || {
         let root = Root::open(&pm.dir)?;
         let catalog = Catalog::load(&pm.dir)?;
         no_pending(&root)?;
@@ -1331,48 +1355,45 @@ pub(crate) fn with_completed_bundle_snapshot<T>(
                     .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
         })
         .ok_or_else(|| Error::rejected("historical bundle digest is invalid"))?;
-    let _apps = super::appslock::acquire(pm)?;
-    let files = optimistic(|| {
-        let root = Root::open(&pm.dir)?;
-        let catalog = Catalog::load(&pm.dir)?;
-        no_pending(&root)?;
-        let current = describe(&root, &catalog, &id)?;
-        let entry = &catalog.installations[&id];
-        if entry.storage != Storage::Workspace {
-            return Err(Error::rejected(
-                "historical bundle needs a workspace installation",
-            ));
-        }
-        let bundle = if current["digest"] == digest {
-            entry.paths(&id).0
+    let _lock = pm.lock()?;
+    let root = Root::open(&pm.dir)?;
+    let catalog = Catalog::load(&pm.dir)?;
+    no_pending(&root)?;
+    let current = describe(&root, &catalog, &id)?;
+    let entry = &catalog.installations[&id];
+    if entry.storage != Storage::Workspace {
+        return Err(Error::rejected(
+            "historical bundle needs a workspace installation",
+        ));
+    }
+    let bundle = if current["digest"] == digest {
+        entry.paths(&id).0
+    } else {
+        let base = Path::new(".apps/installations").join(&*id);
+        let original = base.join("bundle");
+        let old_files = snapshot(&root, &original, false)?;
+        if bundle_digest(&old_files) == digest {
+            original
         } else {
-            let base = Path::new(".apps/installations").join(&*id);
-            let original = base.join("bundle");
-            let old_files = snapshot(&root, &original, false)?;
-            if bundle_digest(&old_files) == digest {
-                original
-            } else {
-                base.join("revisions").join(revision).join("bundle")
-            }
-        };
-        let files = snapshot(&root, &bundle, false)?;
-        if bundle_digest(&files) != digest {
-            return Err(Error::rejected(
-                "retained historical bundle differs from its frozen digest",
-            ));
+            base.join("revisions").join(revision).join("bundle")
         }
-        let manifest = app::parse_manifest(
-            files
-                .get("app.md")
-                .ok_or_else(|| Error::rejected("historical bundle manifest is missing"))?,
-        )?;
-        if manifest.app != entry.app {
-            return Err(Error::rejected(
-                "historical bundle changes installation identity",
-            ));
-        }
-        Ok(files)
-    })?;
+    };
+    let files = snapshot(&root, &bundle, false)?;
+    if bundle_digest(&files) != digest {
+        return Err(Error::rejected(
+            "retained historical bundle differs from its frozen digest",
+        ));
+    }
+    let manifest = app::parse_manifest(
+        files
+            .get("app.md")
+            .ok_or_else(|| Error::rejected("historical bundle manifest is missing"))?,
+    )?;
+    if manifest.app != entry.app {
+        return Err(Error::rejected(
+            "historical bundle changes installation identity",
+        ));
+    }
     callback(&json!({"digest":digest}), &files)
 }
 
@@ -1494,8 +1515,20 @@ Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance
         assert_eq!(list(&other).unwrap().as_array().unwrap().len(), 1);
         let shown = show(&other, &id).unwrap();
         let digest = shown["digest"].as_str().unwrap().to_string();
-        let seen = with_runtime_snapshot(&other, &id, |row, _| Ok(row["digest"].clone())).unwrap();
+        let seen = with_runtime_read(&other, &id, |row, _| Ok(row["digest"].clone())).unwrap();
         assert_eq!(seen, json!(digest));
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// A crashed leftover journal (no live writer) keeps the recovery
+    /// refusal; it is never reported as retryable `busy`.
+    #[test]
+    fn leftover_pending_journal_is_not_busy() {
+        let (pm_dir, _state, _sources, id) = installed();
+        let pm = Pm::at(pm_dir.path()).unwrap();
+        std::fs::write(pm_dir.path().join(UPGRADE_PENDING), "x: 1\n").unwrap();
+        for err in [list(&pm).unwrap_err(), show(&pm, &id).unwrap_err()] {
+            assert_eq!(err.kind(), "rejected", "{err:?}");
+        }
     }
 }

@@ -1066,6 +1066,26 @@ impl Pm {
         }
     }
 
+    /// CAD-1189: true while a live process holds the write flock. A
+    /// non-blocking probe that releases at once: no git status, no marker
+    /// work, no fence check. Unreadable or absent counts as not held.
+    pub(crate) fn write_lock_held(&self) -> bool {
+        let Ok(dir) = self.lock_git_dir() else {
+            return false;
+        };
+        match open_coordination(&dir.join(FLOCK_FILE), false) {
+            Ok(Some(f)) => match flock(&f, libc::LOCK_EX) {
+                Ok(true) => {
+                    drop(Unlock(f));
+                    false
+                }
+                Ok(false) => true,
+                Err(_) => false,
+            },
+            _ => false,
+        }
+    }
+
     /// Read-only probe: who, if anyone, holds the tracker. It takes the
     /// kernel lock without waiting and releases it at once, so a writer
     /// racing the probe sees it busy for an instant (a non-waiting

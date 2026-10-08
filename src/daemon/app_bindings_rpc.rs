@@ -75,7 +75,7 @@ impl Shared {
                 .app_binding_show(install, required_str(params, "binding_id")?),
             "app_binding_list" => {
                 let pm = self.pm_at(&self.pm_dir()?)?;
-                workspace::with_runtime_snapshot(&pm, install, |bundle, files| {
+                workspace::with_runtime_read(&pm, install, |bundle, files| {
                     let digest = required_str(bundle, "digest")?;
                     let mut listed =
                         self.store
