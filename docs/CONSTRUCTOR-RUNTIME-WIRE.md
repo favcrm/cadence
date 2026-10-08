@@ -37,6 +37,13 @@ JS-safe monotonic sequence, plus its exact selected fields:
 - `runtime-daemon-ready`: actual Root-owned daemon reference, NOT serving
 - `runtime-serving-ready`: same reference only after actual physical serving capture
 - `task-event`: task32hex, zero-based ordered part, canonical base64url bytes1..16384
+  Per-task output budget (AOS accepts at most 65,536 decoded bytes in 4,096
+  consecutive parts, else it aborts the runtime): the last part and the marker's
+  bytes are reserved, so data is limited to 4,095 parts and 65,536 minus the
+  marker length in bytes. Output within that is sent unchanged. Beyond it the
+  stream is cut at a UTF-8 boundary and ends with the marker
+  `\n{"type":"output-truncated"}\n` (a whole NDJSON line); every later event is
+  dropped silently and the stream stays Ok.
 - `task-retired`: task32hex only after actual Root family exit and daemon worker/
   adapter/stream quiescence; observation, not provider/successor retirement authority
 - `store-startup`: NO caller-selected binding/purpose/attempt; actual owner elects facts

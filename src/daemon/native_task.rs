@@ -6,9 +6,29 @@ use super::*;
 use crate::adapter::{AdapterHooks, ProviderAdapter};
 use crate::installer_bundle::constructor::private_wire::{self, Packet};
 use std::os::unix::net::UnixDatagram;
+// AOS accepts at most 65,536 decoded bytes in 4,096 consecutive parts per task
+// (agenticos-v2 native-runtime-task-wire.ts `event()`); past either limit it
+// aborts the runtime. CAD therefore keeps a task's output inside that budget.
+const TASK_OUTPUT_MAX_BYTES: usize = 65_536;
+const TASK_OUTPUT_MAX_PARTS: u64 = 4_096;
+const TASK_PART_BYTES: usize = 16_384;
+/// Last bytes of an over-budget task: a valid NDJSON event on its own line.
+const TASK_OUTPUT_TRUNCATED_MARKER: &[u8] = b"\n{\"type\":\"output-truncated\"}\n";
 struct StreamState {
     next: u64,
     closed: bool,
+    bytes: usize,
+    truncated: bool,
+}
+impl StreamState {
+    fn new() -> Self {
+        Self {
+            next: 0,
+            closed: false,
+            bytes: 0,
+            truncated: false,
+        }
+    }
 }
 pub(super) struct Task {
     pub(super) id: String,
@@ -48,10 +68,7 @@ impl Task {
             "/workspace/company",
             &params,
         )?;
-        let part = Arc::new(Mutex::new(StreamState {
-            next: 0,
-            closed: false,
-        }));
+        let part = Arc::new(Mutex::new(StreamState::new()));
         let stream = part.clone();
         let event_control = control.clone();
         let event_task = id.clone();
@@ -295,6 +312,10 @@ fn registration<'a>(alias: &'a str, cwd: &'a str, params: &'a str) -> crate::sto
 #[path = "native_registration_acceptance.rs"]
 mod registration_acceptance;
 
+#[cfg(test)]
+#[path = "native_task_budget_acceptance.rs"]
+mod budget_acceptance;
+
 fn emit(
     control: &UnixDatagram,
     task: &str,
@@ -307,10 +328,33 @@ fn emit(
     let mut sequence = part
         .lock()
         .map_err(|_| Error::unknown("native stream poisoned"))?;
-    if sequence.closed {
+    if sequence.closed || sequence.truncated {
         return Ok(());
     } // refuse late data; no retired-session mutation
-    for chunk in bytes.chunks(16384) {
+      // The last part and the marker's bytes are reserved for the marker, so it
+      // always fits AOS's budget. An event inside the data budget is sent
+      // unchanged; otherwise the stream ends with the longest UTF-8-safe prefix
+      // that fits, then the marker. Later events are dropped silently (an Err
+      // would make the caller `_exit(125)`).
+    let marker = TASK_OUTPUT_TRUNCATED_MARKER.len();
+    let parts_left = TASK_OUTPUT_MAX_PARTS
+        .saturating_sub(1)
+        .saturating_sub(sequence.next) as usize;
+    let room = TASK_OUTPUT_MAX_BYTES
+        .saturating_sub(marker)
+        .saturating_sub(sequence.bytes)
+        .min(parts_left.saturating_mul(TASK_PART_BYTES));
+    if bytes.len() > room {
+        sequence.truncated = true;
+        let mut cut = room;
+        while cut > 0 && (bytes[cut] & 0xC0) == 0x80 {
+            cut -= 1;
+        }
+        bytes.truncate(cut);
+        bytes.extend_from_slice(TASK_OUTPUT_TRUNCATED_MARKER);
+    }
+    sequence.bytes += bytes.len();
+    for chunk in bytes.chunks(TASK_PART_BYTES) {
         let index = sequence.next;
         sequence.next = sequence
             .next
