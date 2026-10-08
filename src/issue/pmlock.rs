@@ -339,7 +339,12 @@ fn describe_holder(scan: &HolderScan, meta: Option<&MarkerMeta>) -> String {
     s
 }
 const FLOCK_FILE: &str = "cadence-write.flock";
-const DIRTY_FILE: &str = "cadence-write.dirty";
+/// The snapshot's file name carries its format. Builds before CAD-1190
+/// wrote a per-file list to `cadence-write.dirty`; this format (an
+/// untracked directory is one `dir/` entry) lives in `.v2` so neither
+/// side ever classifies against the other's format (CAD-1208). Never
+/// read, rewrite or delete the old name: an older binary still owns it.
+const DIRTY_FILE: &str = "cadence-write.dirty.v2";
 const TMP_PREFIX: &str = "cadence-write.tmp-";
 const WAIT: Duration = Duration::from_secs(15);
 /// A waiter parked in a blocking `flock` re-checks the lease and actor
@@ -688,7 +693,9 @@ fn create_exclusive(path: &Path, content: &str) -> std::io::Result<File> {
     Ok(f)
 }
 
-fn read_snapshot(git_dir: &Path) -> Result<HashSet<String>> {
+/// `None` when this version's snapshot does not exist (a crash by an
+/// older build, which wrote another format under another name).
+fn read_snapshot(git_dir: &Path) -> Result<Option<HashSet<String>>> {
     let path = git_dir.join(DIRTY_FILE);
     let file = match OpenOptions::new()
         .read(true)
@@ -696,19 +703,20 @@ fn read_snapshot(git_dir: &Path) -> Result<HashSet<String>> {
         .open(&path)
     {
         Ok(f) => f,
-        // No snapshot: every dirty path counts as the crashed writer's.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(io_unknown(&path, "the dirty-path snapshot", e)),
     };
     let mut buf = Vec::new();
     file.take(16 << 20)
         .read_to_end(&mut buf)
         .map_err(|e| io_unknown(&path, "the dirty-path snapshot", e))?;
-    Ok(String::from_utf8_lossy(&buf)
-        .split('\0')
-        .filter(|p| !p.is_empty())
-        .map(str::to_string)
-        .collect())
+    Ok(Some(
+        String::from_utf8_lossy(&buf)
+            .split('\0')
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect(),
+    ))
 }
 
 /// When the dirty-path snapshot was written: the moment the last
@@ -788,7 +796,7 @@ fn sweep_tmp(git_dir: &Path) {
 
 fn classify(
     tree: &Tree,
-    snapshot: &HashSet<String>,
+    snapshot: Option<&HashSet<String>>,
     inside: &[String],
     whole: &[String],
 ) -> Option<Interruption> {
@@ -803,7 +811,13 @@ fn classify(
         paths.push(p.clone());
     }
     for (kind, p) in &tree.loose {
-        if snapshot.contains(p) {
+        if snapshot.is_none() && *kind == "untracked" {
+            // No snapshot in this version's format (an older build's
+            // crash): present untracked paths cannot be told from
+            // leftovers, so none is blamed. Git state, staged entries
+            // and modified tracked files still refuse.
+            foreign.push(format!("{kind} {p}"));
+        } else if snapshot.is_some_and(|s| s.contains(p)) {
             foreign.push(format!("{kind} {p}"));
         } else if p.ends_with('/') && inside.iter().any(|f| f.starts_with(p.as_str())) {
             // Named by the files found inside it, below.
@@ -1033,7 +1047,9 @@ impl Pm {
     /// by the write path and by `lock_state`/doctor alike. Call it only
     /// with the kernel lock held.
     fn interruption(&self, git_dir: &Path, tree: &Tree) -> Result<Option<Interruption>> {
-        let snapshot = read_snapshot(git_dir)?;
+        let Some(snapshot) = read_snapshot(git_dir)? else {
+            return Ok(classify(tree, None, &[], &[]));
+        };
         // An untracked directory is one `dir/` line. A new one is the
         // crash's: name the files in it, as the per-file listing did.
         // One already in the snapshot cannot be told apart from a crashed
@@ -1056,7 +1072,7 @@ impl Pm {
                 }
             }
         }
-        Ok(classify(tree, &snapshot, &inside, &whole))
+        Ok(classify(tree, Some(&snapshot), &inside, &whole))
     }
 
     /// One acquisition attempt. `declared` (repo-relative or absolute
@@ -1426,7 +1442,7 @@ impl Pm {
             String::new()
         } else {
             format!(
-                " {} foreign path(s) already present before the crash are left alone.",
+                " {} foreign path(s) already present before the crash, or not attributable to it, are left alone.",
                 i.foreign.len()
             )
         };
@@ -1556,5 +1572,27 @@ mod tests {
         let err = pm.lock().unwrap_err();
         assert!(err.to_string().contains("foreign/half-written.md"), "{err}");
         assert!(!err.to_string().contains("foreign/old.txt"), "{err}");
+    }
+
+    /// CAD-1208: a crash marker plus only an older build's per-file
+    /// snapshot (`cadence-write.dirty`, a name this build never reads)
+    /// must not turn a pre-existing untracked file into a leftover, and
+    /// this build must leave the older file untouched.
+    #[test]
+    fn an_older_format_snapshot_blames_no_present_untracked_path() {
+        let (_d, pm) = tracker();
+        std::fs::create_dir_all(pm.dir.join("foreign")).unwrap();
+        std::fs::write(pm.dir.join("foreign/old.txt"), "mine\n").unwrap();
+        let mut lock = pm.lock().unwrap();
+        lock.armed = false;
+        drop(lock);
+        // What the older writer left: its own file, no `.v2`.
+        let git = pm.dir.join(".git");
+        std::fs::remove_file(git.join(DIRTY_FILE)).unwrap();
+        let old = git.join("cadence-write.dirty");
+        std::fs::write(&old, "foreign/old.txt\0").unwrap();
+        let got = pm.lock().expect("an untracked file is not blamed");
+        drop(got);
+        assert_eq!(std::fs::read(&old).unwrap(), b"foreign/old.txt\0");
     }
 }
