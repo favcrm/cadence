@@ -1746,3 +1746,136 @@ fn cad1065_reply_wire_framing_counts_toward_total_bound() {
         .any(|command| ["MAIL", "RCPT", "DATA"].contains(&command.as_str())));
     assert!(initial == fixture.state_snapshot());
 }
+struct Cad1185CompetingFixtureResult {
+    row: Value,
+    receipt: Value,
+    observed: Vec<String>,
+}
+
+#[test]
+fn cad1185_competing_fixture_waits_for_zero_dial_measurement_owner() {
+    let fixture = Fixture::start();
+    let row = bounds_row(&fixture);
+    let route = format!("/api/connections/{}/test", row["id"].as_str().unwrap());
+    let reads = CredentialReads::watch(&fixture.state().join("custody"));
+    let dials = platform::smtp::direct_dial_count();
+    let initial = fixture.state_snapshot();
+
+    let (attempt_tx, attempt_rx) = std::sync::mpsc::channel();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let competing = std::thread::spawn(move || {
+        let _ = attempt_tx.send(());
+        let fixture = Fixture::start();
+        let _ = ready_tx.send(());
+        let row = bounds_row(&fixture);
+        let answer = fixture
+            .rpc(Asserted::Operator, bounds_request(&row))
+            .unwrap();
+        let outcome = Cad1185CompetingFixtureResult {
+            row,
+            receipt: answer,
+            observed: fixture.observed(),
+        };
+        drop(fixture);
+        let _ = done_tx.send(outcome);
+    });
+
+    let attempt_observed = attempt_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+    // A timeout here is only a provisional observation: after releasing A we
+    // still require B's explicit ready signal and successful SMTP completion.
+    // On the unfixed lifecycle B's real ready signal arrives during this
+    // window, before the measurement owner is released.
+    let became_ready_while_owned = ready_rx.recv_timeout(Duration::from_secs(20)).is_ok();
+
+    let rpc_refused = fixture
+        .rpc(Asserted::Unproven, json!({"connection_id":row["id"]}))
+        .is_err_and(|error| error.kind() == "rejected");
+    let (http_status, _, _) = fixture.http(
+        "unproven",
+        &route,
+        json!({"unexpected_field":"malformed"}),
+        None,
+    );
+    let no_credential_read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        reads.assert_no_read();
+    }))
+    .is_ok();
+    let no_provider_traffic = fixture.observed().is_empty();
+    let dial_count_unchanged = platform::smtp::direct_dial_count() == dials;
+    let state_unchanged = fixture.state_snapshot() == initial;
+    drop(reads);
+    drop(fixture);
+
+    // Always release A and reap B before making assertions, including the
+    // expected RED on the old lifecycle when B announced readiness too soon.
+    let competing_result = done_rx.recv_timeout(Duration::from_secs(90));
+    let worker_joined = competing.join().is_ok();
+    let completed_after_release = competing_result.is_ok();
+    let result = competing_result.ok();
+
+    assert!(
+        attempt_observed,
+        "competing fixture did not announce its attempt"
+    );
+    assert!(
+        completed_after_release && worker_joined,
+        "competing fixture did not start and finish after owner release"
+    );
+    assert!(
+        !became_ready_while_owned,
+        "competing fixture became ready while the zero-dial owner was active"
+    );
+    assert!(rpc_refused, "A's malformed RPC request was not rejected");
+    assert_eq!(
+        http_status, 403,
+        "A's malformed HTTP request was not rejected"
+    );
+    assert!(
+        no_credential_read,
+        "A's denied requests accessed credential storage"
+    );
+    assert!(
+        no_provider_traffic,
+        "A's denied requests contacted the SMTP rig"
+    );
+    assert!(
+        dial_count_unchanged,
+        "A's denied requests incremented SMTP dials"
+    );
+    assert!(
+        state_unchanged,
+        "A's denied requests changed connection state"
+    );
+
+    let result = result.unwrap();
+    assert_receipt(&result.receipt, &result.row);
+    assert_eq!(
+        result
+            .observed
+            .iter()
+            .filter(|value| *value == "CONNECT")
+            .count(),
+        1
+    );
+    assert_eq!(
+        result
+            .observed
+            .iter()
+            .filter(|value| *value == "AUTH")
+            .count(),
+        1
+    );
+    assert_eq!(
+        result
+            .observed
+            .iter()
+            .filter(|value| *value == "QUIT")
+            .count(),
+        1
+    );
+    assert!(!result
+        .observed
+        .iter()
+        .any(|value| ["MAIL", "RCPT", "DATA", "RIG_FAILURE"].contains(&value.as_str())));
+}
