@@ -3102,6 +3102,19 @@ impl Shared {
                     // `agent unfence` is the only exit.
                     "unknown": self.store.unknown_messages(&alias)?.len(),
                 });
+                // CAD-1221: this alias's non-terminal tasks and their
+                // job's issue, in one agent-scoped join. The board's
+                // detail reads it instead of the fleet's agent and job lists.
+                out["task_bindings"] = json!(self
+                    .store
+                    .assignee_tasks_bound(&alias)?
+                    .iter()
+                    .map(|b| json!({
+                        "id": b.task.id, "job": b.task.job_id, "title": b.task.title,
+                        "state": b.task.state, "issue": b.issue,
+                        "job_title": b.job_title, "job_state": b.job_state,
+                    }))
+                    .collect::<Vec<_>>());
                 // CAD-879: how many older rows a `limit`/`since` read
                 // left out; absent when the history was not windowed.
                 if let Some(n) = omitted {
@@ -5794,6 +5807,56 @@ mod tests {
         assert!(!format!("{events:?}").contains("private-event-sentinel"));
         let entries = shared.store.thread_entries("w1", 0, 100).unwrap();
         assert!(!format!("{entries:?}").contains("private-event-sentinel"));
+    }
+
+    /// CAD-1221: `agent show` answers the alias's own non-terminal tasks
+    /// with their job's issue, from one join on this alias's rows. The
+    /// rows match the fleet's `agent_list` task ids for the alias, and
+    /// another alias's tasks and terminal tasks stay out.
+    #[test]
+    fn cad1221_agent_show_binds_only_the_aliases_open_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = cad627_shared(dir.path());
+        let conn = rusqlite::Connection::open(dir.path().join("cadence.sqlite3")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO jobs(id,title,spec_path,pm_alias,issue_id,state,created,updated)
+               VALUES('job-bound','Bound job','spec.md','pm','CAD-9','running',1,1),
+                     ('job-free','Free job','spec.md','pm',NULL,'running',1,1);
+             INSERT INTO tasks(id,job_id,title,assignee,state,created,updated) VALUES
+               ('t-open','job-bound','Open task','w1','running',1,2),
+               ('t-free','job-free','Unbound task','w1','queued',1,3),
+               ('t-done','job-bound','Done task','w1','done',1,4),
+               ('t-other','job-bound','Other task','w2','running',1,5);",
+        )
+        .unwrap();
+        let show = shared
+            .dispatch(
+                "agent_show",
+                &json!({"alias": "w1", "active_only": true}),
+                std::process::id(),
+            )
+            .unwrap();
+        assert_eq!(
+            show["task_bindings"],
+            json!([
+                {"id": "t-open", "job": "job-bound", "title": "Open task",
+                 "state": "running", "issue": "CAD-9",
+                 "job_title": "Bound job", "job_state": "running"},
+                {"id": "t-free", "job": "job-free", "title": "Unbound task",
+                 "state": "queued", "issue": null,
+                 "job_title": "Free job", "job_state": "running"},
+            ])
+        );
+        let fleet = shared
+            .dispatch("agent_list", &json!({}), std::process::id())
+            .unwrap();
+        let row = fleet["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["alias"] == "w1")
+            .unwrap();
+        assert_eq!(row["tasks"], json!(["t-open", "t-free"]));
     }
 
     /// The one-second board poll needs running rows, not thousands of

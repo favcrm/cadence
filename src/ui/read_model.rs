@@ -33,7 +33,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{json, Value};
@@ -47,8 +47,14 @@ use crate::overview;
 
 /// The shared stream watcher's poll period.
 const WATCH_EVERY: Duration = Duration::from_secs(1);
-/// While the watcher runs, a daemon snapshot this young is served as is.
-const DAEMON_FRESH: Duration = Duration::from_secs(3);
+/// While the watcher runs, reads serve its last kept daemon snapshot
+/// whatever its age (`snapshot_age_secs` says how old) — the watcher's
+/// next fetch replaces it, and a read never waits on a slow fetch. Past
+/// this age a read joins or starts a fetch instead, so an unreachable
+/// watcher cannot leave reads on data from long ago.
+const DAEMON_MAX_STALE: Duration = Duration::from_secs(120);
+/// A served snapshot this old reports `stale: true` beside its age.
+const SNAPSHOT_STALE: Duration = Duration::from_secs(10);
 /// An overview this young is served without a rebuild; an older one is
 /// served while a background pass refreshes it.
 const OVERVIEW_FRESH: Duration = Duration::from_secs(2);
@@ -67,6 +73,10 @@ type Entities = HashMap<String, (u64, Value)>;
 
 static MODELS: LazyLock<Mutex<Models>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// How one daemon snapshot is fetched. The board uses [`fetch_daemon`];
+/// tests substitute a counting fake.
+type Fetch = Box<dyn Fn(&Path) -> DaemonSnap + Send + Sync>;
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -76,21 +86,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 pub(super) fn get(state_dir: &Path, pm_dir: &Path) -> Arc<Model> {
     lock(&MODELS)
         .entry((state_dir.to_path_buf(), pm_dir.to_path_buf()))
-        .or_insert_with(|| {
-            Arc::new(Model {
-                state_dir: state_dir.to_path_buf(),
-                pm_dir: pm_dir.to_path_buf(),
-                tracker: Mutex::default(),
-                daemon: Mutex::default(),
-                overview: Mutex::default(),
-                hub: Mutex::default(),
-                changed_at: Mutex::default(),
-                build_lock: Mutex::default(),
-                overview_builds: AtomicU64::new(0),
-                request_builds: AtomicU64::new(0),
-                collection_parses: AtomicU64::new(0),
-            })
-        })
+        .or_insert_with(|| Arc::new(Model::new(state_dir, pm_dir, Box::new(fetch_daemon))))
         .clone()
 }
 
@@ -98,7 +94,8 @@ pub(super) struct Model {
     state_dir: PathBuf,
     pm_dir: PathBuf,
     tracker: Mutex<Tracker>,
-    daemon: Mutex<Option<Arc<DaemonSnap>>>,
+    daemon: Mutex<DaemonSlot>,
+    fetch: Fetch,
     overview: Mutex<OverviewState>,
     hub: Mutex<Hub>,
     /// When the daemon side last moved — a change the watcher saw, or a
@@ -115,6 +112,10 @@ pub(super) struct Model {
     /// Issue folders [`board::load_all`] parsed on the watcher thread.
     /// The incremental `parses` counter does not see that scan.
     collection_parses: AtomicU64,
+    /// Daemon fetches started, and callers that waited on one in flight
+    /// instead of starting their own (CAD-1221).
+    daemon_builds: AtomicU64,
+    daemon_joins: AtomicU64,
 }
 
 /// Runs its closure on drop — resets a flag even when a panic unwinds.
@@ -123,6 +124,27 @@ struct OnDrop<F: FnMut()>(F);
 impl<F: FnMut()> Drop for OnDrop<F> {
     fn drop(&mut self) {
         (self.0)()
+    }
+}
+
+impl Model {
+    fn new(state_dir: &Path, pm_dir: &Path, fetch: Fetch) -> Self {
+        Model {
+            state_dir: state_dir.to_path_buf(),
+            pm_dir: pm_dir.to_path_buf(),
+            tracker: Mutex::default(),
+            daemon: Mutex::default(),
+            fetch,
+            overview: Mutex::default(),
+            hub: Mutex::default(),
+            changed_at: Mutex::default(),
+            build_lock: Mutex::default(),
+            overview_builds: AtomicU64::new(0),
+            request_builds: AtomicU64::new(0),
+            collection_parses: AtomicU64::new(0),
+            daemon_builds: AtomicU64::new(0),
+            daemon_joins: AtomicU64::new(0),
+        }
     }
 }
 
@@ -447,6 +469,9 @@ pub(super) struct BoardRead {
     pub by_issue: Value,
     /// CAD-405 gate approvals, read with the daemon snapshot.
     pub approvals: Arc<work::Approvals>,
+    /// Age, staleness and refresh error of the daemon snapshot behind
+    /// this read — the same keys `/api/agents` and the stream carry.
+    pub freshness: Value,
     pm_dir: PathBuf,
 }
 
@@ -483,8 +508,99 @@ impl BoardRead {
 
 // ---------- daemon snapshot ----------
 
+/// The daemon side of a model: the kept snapshot and the fetch running
+/// now, if any. Held only for a field swap, never across an RPC.
+#[derive(Default)]
+struct DaemonSlot {
+    /// The last snapshot kept. Always fetched after the last change mark:
+    /// an invalidation clears it, and a fetch that started before the mark
+    /// is never kept.
+    kept: Option<Arc<DaemonSnap>>,
+    /// The fetch in flight. Callers that need a snapshot join it while it
+    /// started after the last change mark.
+    building: Option<Arc<Build>>,
+    /// The last fetch failed (and left `kept` alone, or had nothing kept).
+    refresh_failed: bool,
+    /// ...and it was `agent_list` that failed: the daemon is unreachable.
+    daemon_down: bool,
+}
+
+/// One daemon fetch shared by its callers. Ends `Done` with the snapshot,
+/// or `Abandoned` when its builder unwound, so waiters retry.
+struct Build {
+    started: Instant,
+    outcome: Mutex<Outcome>,
+    finished: Condvar,
+}
+
+enum Outcome {
+    Running,
+    Done(Arc<DaemonSnap>),
+    Abandoned,
+}
+
+impl Build {
+    fn new() -> Self {
+        Build {
+            started: Instant::now(),
+            outcome: Mutex::new(Outcome::Running),
+            finished: Condvar::new(),
+        }
+    }
+
+    /// Waits for the fetch to end. `None` when its builder abandoned it.
+    fn wait(&self) -> Option<Arc<DaemonSnap>> {
+        let mut outcome = lock(&self.outcome);
+        loop {
+            match &*outcome {
+                Outcome::Running => {
+                    outcome = self
+                        .finished
+                        .wait(outcome)
+                        .unwrap_or_else(|e| e.into_inner());
+                }
+                Outcome::Done(snap) => return Some(snap.clone()),
+                Outcome::Abandoned => return None,
+            }
+        }
+    }
+
+    fn end(&self, outcome: Outcome) {
+        *lock(&self.outcome) = outcome;
+        self.finished.notify_all();
+    }
+}
+
+/// Ends a fetch that unwinds before [`Model::fetch_shared`] completes it:
+/// waiters wake to retry, and the slot forgets the build.
+struct BuildGuard<'a> {
+    model: &'a Model,
+    build: Arc<Build>,
+    done: bool,
+}
+
+impl Drop for BuildGuard<'_> {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        {
+            let mut slot = lock(&self.model.daemon);
+            if slot
+                .building
+                .as_ref()
+                .is_some_and(|b| Arc::ptr_eq(b, &self.build))
+            {
+                slot.building = None;
+            }
+        }
+        self.build.end(Outcome::Abandoned);
+    }
+}
+
 pub(super) struct DaemonSnap {
-    /// When the fetch started — a slower, older fetch never replaces it.
+    /// When the fetch started. The data is at least this old, and a
+    /// slower, older fetch never replaces a newer one.
     at: Instant,
     outcomes: board::JobOutcomes,
     /// `None` when `job_list` failed.
@@ -493,6 +609,11 @@ pub(super) struct DaemonSnap {
     /// `None` when `agent_list` failed.
     agents_fp: Option<u64>,
     approvals: Arc<work::Approvals>,
+    /// `agent_list` or `job_list` failed: the agents are an "unreachable"
+    /// stand-in, never served in place of a good snapshot.
+    failed: bool,
+    /// `agent_list` itself failed: `agents` says `unreachable`.
+    agents_down: bool,
 }
 
 /// Fields of an `agent_list` row (and of the board's agent row) that the
@@ -565,6 +686,8 @@ fn fetch_daemon(state_dir: &Path) -> DaemonSnap {
             approvals.join().unwrap_or_default(),
         )
     });
+    let agents_down = list.is_none();
+    let failed = agents_down || jobs.is_none();
     let agents = agents_payload_from(state_dir, list.clone(), jobs.as_ref());
     let agents_fp =
         list.map(|l| value_fp(&json!([rows_fp(&l["agents"]), rows_fp(&agents["agents"])])));
@@ -579,6 +702,8 @@ fn fetch_daemon(state_dir: &Path) -> DaemonSnap {
         agents,
         agents_fp,
         approvals: Arc::new(approvals),
+        failed,
+        agents_down,
     }
 }
 
@@ -620,6 +745,14 @@ struct Watch {
     rows: HashMap<String, u64>,
     projects: Option<u64>,
     overview: Option<u64>,
+    /// Fetch start of the newest snapshot published: an older one is never
+    /// published after it.
+    at: Option<Instant>,
+    /// The refresh-error state last published.
+    refresh_error: bool,
+    /// Cards and plans are owed a rebuild: a change came while the daemon
+    /// was failing, and a stand-in snapshot has no bindings or job state.
+    cards_stale: bool,
 }
 
 /// A heartbeat the stream loop drops: a failed send is how the watcher
@@ -757,32 +890,151 @@ fn fps(map: &Entities) -> HashMap<String, u64> {
 }
 
 impl Model {
-    /// The daemon snapshot a read serves: the watcher's, while it runs
-    /// and is fresh; otherwise a fetch now.
+    /// The daemon snapshot a read serves. While the watcher runs, its kept
+    /// snapshot, however old up to [`DAEMON_MAX_STALE`]: the watcher's next
+    /// fetch replaces it, and a read never waits on a slow one. Otherwise a
+    /// fetch shared with every caller that needs one now.
     fn daemon_snap(&self) -> Arc<DaemonSnap> {
         let watched = lock(&self.hub).running;
-        if watched {
-            if let Some(snap) = lock(&self.daemon).as_ref() {
-                if snap.at.elapsed() < DAEMON_FRESH {
-                    return snap.clone();
-                }
-            }
+        let kept = lock(&self.daemon).kept.clone();
+        if let Some(snap) = kept.filter(|snap| {
+            watched
+                && !snap.failed
+                && snap.at.elapsed() < DAEMON_MAX_STALE
+                && self.after_change(snap.at)
+        }) {
+            return snap;
         }
-        let snap = Arc::new(fetch_daemon(&self.state_dir));
-        self.keep_snap(snap.clone());
-        snap
+        self.fetch_shared()
+    }
+
+    /// The snapshot from the fetch in flight when it started after the
+    /// last change mark, else from a fetch started now. Concurrent callers
+    /// share one fetch. A waiter whose fetch was abandoned retries. The
+    /// fetch runs outside the slot lock, which is held only to swap fields.
+    fn fetch_shared(&self) -> Arc<DaemonSnap> {
+        loop {
+            let (build, leader) = {
+                let mut slot = lock(&self.daemon);
+                match slot.building.clone() {
+                    Some(build) if self.after_change(build.started) => (build, false),
+                    _ => {
+                        let build = Arc::new(Build::new());
+                        slot.building = Some(build.clone());
+                        (build, true)
+                    }
+                }
+            };
+            if !leader {
+                self.daemon_joins.fetch_add(1, Ordering::Relaxed);
+                if let Some(snap) = build.wait() {
+                    return snap;
+                }
+                continue;
+            }
+            self.daemon_builds.fetch_add(1, Ordering::Relaxed);
+            let mut guard = BuildGuard {
+                model: self,
+                build: build.clone(),
+                done: false,
+            };
+            // The snapshot is as old as the fetch's start, whatever the
+            // fetcher stamped: the change marks compare against that start.
+            let mut fetched = (self.fetch)(&self.state_dir);
+            fetched.at = build.started;
+            let snap = {
+                let mut slot = lock(&self.daemon);
+                if slot
+                    .building
+                    .as_ref()
+                    .is_some_and(|b| Arc::ptr_eq(b, &build))
+                {
+                    slot.building = None;
+                }
+                self.keep_in(&mut slot, Arc::new(fetched))
+            };
+            build.end(Outcome::Done(snap.clone()));
+            guard.done = true;
+            return snap;
+        }
     }
 
     /// Keep `snap` unless a newer one is kept or it started before the
-    /// last change mark (a fetch racing a write may predate the write).
-    fn keep_snap(&self, snap: Arc<DaemonSnap>) {
+    /// last change mark (a fetch racing a write may predate the write),
+    /// and return what the fetch's callers are served. The mark is read
+    /// under the slot lock: [`Self::invalidate`] marks first and clears
+    /// the slot after, so either this keep sees the mark or the clear
+    /// lands after it. A failed fetch is never kept and never replaces the
+    /// last good snapshot: that is served instead, with the failure
+    /// reported by [`Self::freshness`]; with none kept, the failed
+    /// snapshot answers its callers alone.
+    fn keep_in(&self, slot: &mut DaemonSlot, snap: Arc<DaemonSnap>) -> Arc<DaemonSnap> {
         if !self.after_change(snap.at) {
-            return;
+            return snap;
         }
-        let mut slot = lock(&self.daemon);
-        if slot.as_ref().is_none_or(|old| old.at <= snap.at) {
-            *slot = Some(snap);
+        slot.refresh_failed = snap.failed;
+        slot.daemon_down = snap.agents_down;
+        if snap.failed {
+            // Only a kept snapshot still current stands in for it.
+            let current = slot.kept.clone().filter(|k| self.after_change(k.at));
+            return current.unwrap_or(snap);
         }
+        if slot.kept.as_ref().is_none_or(|old| old.at <= snap.at) {
+            slot.kept = Some(snap.clone());
+        }
+        snap
+    }
+
+    /// The snapshot the stream watcher publishes from: one fetched after
+    /// the last change mark (a build a write overtook is fetched again,
+    /// never published) and not older than `after`, the newest snapshot
+    /// already published. `None` when a write keeps overtaking the fetch.
+    /// A failed snapshot (no current good one to fall back on) comes back
+    /// at once, never retried against a daemon that is down:
+    /// the watcher publishes tracker changes from it, never daemon ones.
+    fn fetch_current(&self, after: Option<Instant>) -> Option<Arc<DaemonSnap>> {
+        for _ in 0..3 {
+            let snap = self.fetch_shared();
+            if snap.failed {
+                // Nothing current to retry for: the caller publishes what
+                // needs no daemon.
+                return Some(snap);
+            }
+            if !self.after_change(snap.at) {
+                continue;
+            }
+            if after.is_some_and(|at| snap.at < at) {
+                return None;
+            }
+            return Some(snap);
+        }
+        None
+    }
+
+    /// The `/api/agents` payload of `snap`, as served and as the stream's
+    /// `agent_meta` carries its daemon, totals and bindings: last-good rows
+    /// stay while `agent_list` is failing, but the daemon is reported
+    /// `unreachable` then, like a first-time failure, so the board shows
+    /// it offline.
+    fn served_agents(&self, snap: &DaemonSnap) -> Value {
+        let mut agents = snap.agents.clone();
+        if snap.agents_down || lock(&self.daemon).daemon_down {
+            agents["daemon"] = json!("unreachable");
+        }
+        merge_freshness(&mut agents, self.freshness(snap));
+        agents
+    }
+
+    /// Age, staleness and refresh error of `snap` as it is served, beside
+    /// an HTTP payload or a stream frame.
+    fn freshness(&self, snap: &DaemonSnap) -> Value {
+        let error = snap.failed || lock(&self.daemon).refresh_failed;
+        let age = snap.at.elapsed();
+        json!({
+            "snapshot_age_secs": age.as_secs_f64(),
+            "stale": error || age >= SNAPSHOT_STALE,
+            "refresh_error": error,
+        })
     }
 
     /// Was something read at `at` read after the last change mark?
@@ -806,6 +1058,8 @@ impl Model {
             "overview_builds": self.overview_builds.load(Ordering::Relaxed),
             "request_builds": self.request_builds.load(Ordering::Relaxed),
             "collection_parses": self.collection_parses.load(Ordering::Relaxed),
+            "daemon_builds": self.daemon_builds.load(Ordering::Relaxed),
+            "daemon_joins": self.daemon_joins.load(Ordering::Relaxed),
         })
     }
 
@@ -819,6 +1073,7 @@ impl Model {
             revs: t.revs(),
             by_issue: snap.agents["by_issue"].clone(),
             approvals: snap.approvals.clone(),
+            freshness: self.freshness(snap),
             pm_dir: pm.dir.clone(),
         }
     }
@@ -831,9 +1086,11 @@ impl Model {
         self.board_with(pm, project, &snap)
     }
 
-    /// `/api/agents`.
+    /// `/api/agents`, with the snapshot's [`Self::freshness`] keys:
+    /// `snapshot_age_secs` is its age since its fetch started (the data is
+    /// at least that old).
     pub(super) fn agents(&self) -> Value {
-        self.daemon_snap().agents.clone()
+        self.served_agents(&self.daemon_snap())
     }
 
     /// A board write is about to answer — drop what the daemon side
@@ -842,7 +1099,9 @@ impl Model {
     /// next read re-stamps the folders.
     pub(super) fn invalidate(&self) {
         self.mark_changed(Instant::now());
-        *lock(&self.daemon) = None;
+        // A fetch in flight may predate the write: its build is dropped
+        // here, so no reader joins it, and its keep is refused by the mark.
+        *lock(&self.daemon) = DaemonSlot::default();
         let mut st = lock(&self.overview);
         st.value = None;
         st.sources = None;
@@ -1085,8 +1344,12 @@ impl Model {
             !std::mem::replace(&mut hub.running, true)
         };
         if start {
-            let snap = Arc::new(fetch_daemon(&self.state_dir));
-            self.keep_snap(snap.clone());
+            // A panic before the watcher spawns must not leave `running` set.
+            let _reset = self.reset_hub_on_panic();
+            // The baseline joins the shared fetch like every other reader.
+            let snap = self
+                .fetch_current(None)
+                .unwrap_or_else(|| self.fetch_shared());
             let (cards, plans) = self.entities(&snap);
             let (projects, overview) = self.aggregate_fps();
             let base = Watch {
@@ -1100,6 +1363,9 @@ impl Model {
                 rows: fps(&agent_rows(&snap)),
                 projects,
                 overview,
+                at: Some(snap.at),
+                refresh_error: snap.failed,
+                cards_stale: false,
             };
             let me = self.clone();
             std::thread::spawn(move || me.watch(base));
@@ -1143,18 +1409,23 @@ impl Model {
         (cards, plans)
     }
 
-    fn watch(self: Arc<Self>, mut w: Watch) {
-        // A panicking watcher must not leave `running` set — no stream
-        // would ever start another. Dropping the senders ends the
-        // streams; clients reconnect and start a fresh watcher.
+    /// A panicking watcher (or a start that panics before the watcher
+    /// runs) must not leave `running` set — no stream would ever start
+    /// another. Dropping the senders ends the streams; clients reconnect
+    /// and start a fresh watcher.
+    fn reset_hub_on_panic(self: &Arc<Self>) -> OnDrop<impl FnMut()> {
         let me = self.clone();
-        let _reset = OnDrop(move || {
+        OnDrop(move || {
             if std::thread::panicking() {
                 let mut hub = lock(&me.hub);
                 hub.running = false;
                 hub.subs.clear();
             }
-        });
+        })
+    }
+
+    fn watch(self: Arc<Self>, mut w: Watch) {
+        let _reset = self.reset_hub_on_panic();
         loop {
             std::thread::sleep(WATCH_EVERY);
             {
@@ -1185,6 +1456,14 @@ impl Model {
         // The change mark: whatever was read before this tick began may
         // predate the change it finds.
         let started = Instant::now();
+        // Fetched before the watcher's state moves: with nothing current to
+        // publish the tick leaves it as it was and the next one retries.
+        let Some(snap) = self.fetch_current(w.at) else {
+            return;
+        };
+        if !snap.failed {
+            w.at = Some(snap.at);
+        }
         let scanned = board::collection_parses();
         let tracker = dir_mtime(&self.pm_dir);
         let issues = tracker != w.tracker;
@@ -1200,14 +1479,12 @@ impl Model {
                 frames.push(legacy_frame("issues"));
             }
         }
-        let snap = Arc::new(fetch_daemon(&self.state_dir));
-        self.keep_snap(snap.clone());
-        let jobs = snap.jobs_fp != w.jobs;
+        let jobs = !snap.failed && snap.jobs_fp != w.jobs;
         if jobs {
             w.jobs = snap.jobs_fp;
             frames.push(legacy_frame("jobs"));
         }
-        let agents = snap.agents_fp != w.agents;
+        let agents = !snap.failed && snap.agents_fp != w.agents;
         if agents {
             w.agents = snap.agents_fp;
             frames.push(legacy_frame("agents"));
@@ -1218,20 +1495,54 @@ impl Model {
             w.monitoring = monitoring_fp;
             frames.push(legacy_frame("monitoring"));
         }
-        if issues || jobs || agents {
+        if snap.failed {
+            // Cards, plans and agent rows read from the stand-in are
+            // stripped or empty, and a client that refetches mid-outage
+            // holds them. Poison what was published so the first good tick
+            // upserts every card, plan and agent row again; the ids stay,
+            // so an id removed meanwhile is still deleted.
+            for fp in w
+                .cards
+                .values_mut()
+                .chain(w.plans.values_mut())
+                .chain(w.rows.values_mut())
+            {
+                *fp = u64::MAX;
+            }
+            w.cards_stale = true;
+        } else if issues || jobs || agents || w.cards_stale {
+            w.cards_stale = false;
             let (cards, plans) = self.entities(&snap);
             diff_frames("issue", &w.cards, &cards, frames);
             diff_frames("plan", &w.plans, &plans, frames);
             w.cards = fps(&cards);
             w.plans = fps(&plans);
         }
-        if jobs || agents {
+        let fresh = self.freshness(&snap);
+        let error_moved = (fresh["refresh_error"] == json!(true)) != w.refresh_error;
+        if error_moved {
+            w.refresh_error = !w.refresh_error;
+            if snap.failed {
+                // The error alone: no daemon data to diff, and a client
+                // that sees `agent_meta` refetches and shows it.
+                let mut meta = json!({});
+                if snap.agents_down {
+                    meta["daemon"] = json!("unreachable");
+                }
+                merge_freshness(&mut meta, fresh.clone());
+                frames.push(frame("agent_meta", &meta));
+            }
+        }
+        if !snap.failed && (jobs || agents || error_moved) {
             // Bindings and totals can move without an agent row moving.
+            let served = self.served_agents(&snap);
             frames.push(frame(
                 "agent_meta",
                 &json!({
-                    "daemon": snap.agents["daemon"], "totals": snap.agents["totals"],
-                    "by_issue": snap.agents["by_issue"]
+                    "daemon": served["daemon"], "totals": served["totals"],
+                    "by_issue": served["by_issue"],
+                    "snapshot_age_secs": served["snapshot_age_secs"],
+                    "stale": served["stale"], "refresh_error": served["refresh_error"],
                 }),
             ));
             let rows = agent_rows(&snap);
@@ -1254,6 +1565,13 @@ impl Model {
         if scanned > 0 {
             self.collection_parses.fetch_add(scanned, Ordering::Relaxed);
         }
+    }
+}
+
+/// Adds the keys of the freshness object `fresh` to the JSON object `into`.
+pub(super) fn merge_freshness(into: &mut Value, fresh: Value) {
+    if let (Some(into), Value::Object(fresh)) = (into.as_object_mut(), fresh) {
+        into.extend(fresh);
     }
 }
 
@@ -1304,6 +1622,9 @@ mod tests {
             rows: HashMap::new(),
             projects: None,
             overview: None,
+            at: None,
+            refresh_error: false,
+            cards_stale: false,
         };
         let mut frames = Vec::new();
         model.tick(&mut watch, &mut frames);
@@ -1326,6 +1647,552 @@ mod tests {
             frames.is_empty(),
             "stable delivery state must not cause a refetch loop"
         );
+    }
+
+    /// A model whose daemon fetch counts its calls, answers with the call
+    /// number as `agents.v`, sleeps `delay(call)` and panics on `panic_on`.
+    fn fake_daemon(
+        delay: impl Fn(u64) -> Duration + Send + Sync + 'static,
+        panic_on: Option<u64>,
+    ) -> (Arc<Model>, Arc<AtomicU64>) {
+        fake_daemon_failing(delay, panic_on, |_| false)
+    }
+
+    /// [`fake_daemon`] whose fetch number `n` reports a failed refresh when
+    /// `fails(n)`. Every snapshot carries `n` as its job and agent fingerprint.
+    fn fake_daemon_failing(
+        delay: impl Fn(u64) -> Duration + Send + Sync + 'static,
+        panic_on: Option<u64>,
+        fails: impl Fn(u64) -> bool + Send + Sync + 'static,
+    ) -> (Arc<Model>, Arc<AtomicU64>) {
+        let calls = Arc::new(AtomicU64::new(0));
+        let seen = calls.clone();
+        let fetch: Fetch = Box::new(move |_| {
+            let n = seen.fetch_add(1, Ordering::SeqCst) + 1;
+            std::thread::sleep(delay(n));
+            if panic_on == Some(n) {
+                panic!("fetch {n} unwound");
+            }
+            DaemonSnap {
+                at: Instant::now(),
+                outcomes: Default::default(),
+                jobs_fp: Some(n),
+                // A failed fetch carries the real stand-in the fetcher builds.
+                agents: if fails(n) {
+                    agents_payload_from(Path::new("/nonexistent/state"), None, None)
+                } else {
+                    json!({"daemon": "reachable", "agents": [], "v": n})
+                },
+                agents_fp: Some(n),
+                approvals: Arc::new(Default::default()),
+                failed: fails(n),
+                agents_down: fails(n),
+            }
+        });
+        (
+            Arc::new(Model::new(
+                Path::new("/nonexistent/state"),
+                Path::new("/nonexistent/pm"),
+                fetch,
+            )),
+            calls,
+        )
+    }
+
+    #[test]
+    fn concurrent_cold_reads_share_one_daemon_fetch() {
+        let (model, calls) = fake_daemon(|_| Duration::from_millis(400), None);
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let readers: Vec<_> = (0..8)
+            .map(|_| {
+                let (m, b) = (model.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    b.wait();
+                    m.agents()["v"].clone()
+                })
+            })
+            .collect();
+        for reader in readers {
+            assert_eq!(reader.join().unwrap(), 1);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(model.stats()["daemon_builds"], 1);
+        assert_eq!(model.stats()["daemon_joins"], 7);
+    }
+
+    #[test]
+    fn a_watched_read_serves_the_kept_snapshot_while_a_refresh_is_slow() {
+        let (model, calls) = fake_daemon(
+            |n| {
+                if n == 1 {
+                    Duration::ZERO
+                } else {
+                    Duration::from_millis(1500)
+                }
+            },
+            None,
+        );
+        lock(&model.hub).running = true;
+        assert_eq!(model.agents()["v"], 1);
+        let refresh = {
+            let m = model.clone();
+            std::thread::spawn(move || m.fetch_shared())
+        };
+        std::thread::sleep(Duration::from_millis(150));
+        let asked = Instant::now();
+        let served = model.agents();
+        assert!(
+            asked.elapsed() < Duration::from_millis(500),
+            "a read waited on the slow refresh"
+        );
+        assert_eq!(served["v"], 1);
+        assert!(served["snapshot_age_secs"].as_f64().unwrap() > 0.0);
+        assert_eq!(refresh.join().unwrap().agents["v"], 2);
+        assert_eq!(model.agents()["v"], 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_fetch_started_before_a_write_never_overwrites_the_post_write_view() {
+        let (model, calls) = fake_daemon(
+            |n| {
+                if n == 1 {
+                    Duration::from_millis(400)
+                } else {
+                    Duration::ZERO
+                }
+            },
+            None,
+        );
+        lock(&model.hub).running = true;
+        let before_write = {
+            let m = model.clone();
+            std::thread::spawn(move || m.agents()["v"].clone())
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        model.invalidate();
+        assert_eq!(
+            model.agents()["v"],
+            2,
+            "the write must not join the older fetch"
+        );
+        assert_eq!(before_write.join().unwrap(), 1);
+        assert_eq!(
+            model.agents()["v"],
+            2,
+            "the late older fetch must not be kept"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    fn blank_watch() -> Watch {
+        Watch {
+            tracker: None,
+            delivery: 0,
+            jobs: None,
+            agents: None,
+            monitoring: None,
+            cards: HashMap::new(),
+            plans: HashMap::new(),
+            rows: HashMap::new(),
+            projects: None,
+            overview: None,
+            at: None,
+            refresh_error: false,
+            cards_stale: false,
+        }
+    }
+
+    #[test]
+    fn the_first_stream_subscriber_joins_the_shared_fetch() {
+        let (model, calls) = fake_daemon(|_| Duration::from_millis(400), None);
+        let reader = {
+            let m = model.clone();
+            std::thread::spawn(move || m.agents()["v"].clone())
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        let _rx = model.subscribe();
+        assert_eq!(reader.join().unwrap(), 1);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the stream baseline must not build a second snapshot"
+        );
+        assert_eq!(model.stats()["daemon_joins"], 1);
+    }
+
+    #[test]
+    fn a_failed_refresh_keeps_the_last_good_snapshot_and_says_so() {
+        let (model, calls) = fake_daemon_failing(|_| Duration::ZERO, None, |n| n == 2);
+        lock(&model.hub).running = true;
+        let good = model.agents();
+        assert_eq!(good["v"], 1);
+        assert_eq!(good["refresh_error"], false);
+        let failed = model.fetch_shared();
+        assert_eq!(failed.agents["v"], 1, "the failed fetch replaced last-good");
+        let served = model.agents();
+        assert_eq!(served["v"], 1);
+        assert_eq!(
+            served["daemon"], "unreachable",
+            "the board must show the daemon offline while last-good is served"
+        );
+        assert_eq!(served["refresh_error"], true);
+        assert_eq!(served["stale"], true);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        // The next good fetch clears the error.
+        assert_eq!(model.fetch_shared().agents["v"], 3);
+        assert_eq!(model.agents()["refresh_error"], false);
+    }
+
+    #[test]
+    fn the_stream_reports_an_unreachable_daemon_over_last_good_rows() {
+        let (model, _) = fake_daemon_failing(|_| Duration::ZERO, None, |n| n == 2);
+        let mut watch = blank_watch();
+        let mut frames = Vec::new();
+        model.tick(&mut watch, &mut frames);
+        frames.clear();
+        model.tick(&mut watch, &mut frames);
+        let meta = frames
+            .iter()
+            .find(|f| f.starts_with("event: agent_meta\n"))
+            .unwrap_or_else(|| panic!("no agent_meta: {frames:?}"));
+        assert!(meta.contains("\"daemon\":\"unreachable\""), "{meta}");
+        assert!(meta.contains("\"refresh_error\":true"), "{meta}");
+    }
+
+    #[test]
+    fn the_watcher_publishes_nothing_for_a_failed_refresh() {
+        let (model, _) = fake_daemon_failing(|_| Duration::ZERO, None, |n| n == 2);
+        let mut watch = blank_watch();
+        let mut frames = Vec::new();
+        model.tick(&mut watch, &mut frames);
+        assert_eq!(watch.agents, Some(1));
+        // A write drops last-good; the next fetch fails with nothing to
+        // fall back on, so the stream keeps what it published.
+        model.invalidate();
+        frames.clear();
+        model.tick(&mut watch, &mut frames);
+        assert_eq!(watch.agents, Some(1), "published an unreachable stand-in");
+        assert!(
+            frames
+                .iter()
+                .all(|f| !f.starts_with("event: agent\n") && !f.contains("totals")),
+            "{frames:?}"
+        );
+        model.tick(&mut watch, &mut frames);
+        assert_eq!(watch.agents, Some(3));
+    }
+
+    #[test]
+    fn the_watcher_never_publishes_a_build_a_write_overtook() {
+        // Fetch 1 (the watcher's) is slow; a write lands while it runs and
+        // a post-write read builds fetch 2 and keeps it. Fetch 1 ends
+        // afterwards: the cache refuses it, and the watcher must not
+        // publish it after the newer view.
+        let (model, calls) = fake_daemon(
+            |n| {
+                if n == 1 {
+                    Duration::from_millis(500)
+                } else {
+                    Duration::ZERO
+                }
+            },
+            None,
+        );
+        let ticking = {
+            let m = model.clone();
+            std::thread::spawn(move || {
+                let mut watch = blank_watch();
+                let mut frames = Vec::new();
+                m.tick(&mut watch, &mut frames);
+                (watch.agents, watch.at)
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        model.invalidate();
+        let post_write = model.agents();
+        assert_eq!(post_write["v"], 2);
+        let (published, _) = ticking.join().unwrap();
+        assert_ne!(published, Some(1), "published the pre-write build");
+        assert_eq!(published, Some(3), "the watcher fetches a current view");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn a_daemon_outage_after_a_marked_change_still_streams_tracker_frames() {
+        // Fetch 1 (an HTTP read's) is slow and good; the tick joins it and
+        // marks the change it finds, so the kept snapshot predates the
+        // mark. The daemon then goes down: every later fetch fails.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pm = tmp.path().join("pm");
+        std::fs::create_dir_all(&pm).unwrap();
+        let calls = Arc::new(AtomicU64::new(0));
+        let seen = calls.clone();
+        let fetch: Fetch = Box::new(move |_| {
+            let n = seen.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == 1 {
+                std::thread::sleep(Duration::from_millis(400));
+            }
+            DaemonSnap {
+                at: Instant::now(),
+                outcomes: Default::default(),
+                jobs_fp: (n == 1).then_some(n),
+                agents: if n > 1 {
+                    agents_payload_from(Path::new("/nonexistent/state"), None, None)
+                } else {
+                    json!({"daemon": "reachable", "agents": [], "v": n})
+                },
+                agents_fp: (n == 1).then_some(n),
+                approvals: Arc::new(Default::default()),
+                failed: n > 1,
+                agents_down: n > 1,
+            }
+        });
+        let model = Arc::new(Model::new(Path::new("/nonexistent/state"), &pm, fetch));
+        let reader = {
+            let m = model.clone();
+            std::thread::spawn(move || m.agents())
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        let mut watch = blank_watch();
+        watch.tracker = dir_mtime(&pm);
+        let mut frames = Vec::new();
+        model.tick(&mut watch, &mut frames);
+        reader.join().unwrap();
+        assert_eq!(watch.agents, Some(1));
+        std::thread::sleep(Duration::from_millis(1100));
+        std::fs::write(pm.join("note.md"), "x").unwrap();
+        frames.clear();
+        let before = calls.load(Ordering::SeqCst);
+        model.tick(&mut watch, &mut frames);
+        assert!(
+            frames.iter().any(|f| f.starts_with("event: issues\n")),
+            "the outage silenced the tracker frames: {frames:?}"
+        );
+        assert!(
+            frames.iter().any(|f| f.starts_with("event: agent_meta\n")
+                && f.contains("\"refresh_error\":true")
+                && f.contains("\"daemon\":\"unreachable\"")),
+            "the refresh error was not streamed: {frames:?}"
+        );
+        assert!(
+            calls.load(Ordering::SeqCst) - before <= 1,
+            "a down daemon was fetched more than once in one tick"
+        );
+    }
+
+    /// A tracker with card CAD-1 bound to agent `w` by the daemon, and a
+    /// switch that makes every daemon fetch fail with the real stand-in.
+    #[allow(clippy::type_complexity)]
+    fn outage_fixture() -> (
+        tempfile::TempDir,
+        Arc<Model>,
+        Arc<std::sync::atomic::AtomicBool>,
+        Box<dyn Fn(&str)>,
+    ) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pm = Pm::init(&tmp.path().join("pm")).unwrap();
+        issue_write::project_add(&pm, "cadence", "CAD", &[], &[], &[], None).unwrap();
+        let pm_dir = pm.dir.clone();
+        let write_card = move |title: &str| {
+            let dir = pm_dir.join("cadence").join("CAD-1");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("issue.md"),
+                format!(
+                    "---\nid: CAD-1\ntitle: {title}\nstatus: backlog\npriority: P2\n\
+                     created: 2026-01-01T00:00:00Z\n---\n\nbody\n"
+                ),
+            )
+            .unwrap();
+        };
+        write_card("first");
+        let second = pm.dir.join("cadence").join("CAD-2");
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(
+            second.join("issue.md"),
+            "---\nid: CAD-2\ntitle: other\nstatus: backlog\npriority: P2\n\
+             created: 2026-01-01T00:00:00Z\n---\n\nbody\n",
+        )
+        .unwrap();
+        let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let is_down = down.clone();
+        let second_dir = second.clone();
+        let fetch: Fetch = Box::new(move |_| {
+            let failed = is_down.load(Ordering::SeqCst);
+            // Agent `x` exists while card CAD-2 does.
+            let mut agents = vec![json!({"alias": "w"})];
+            if second_dir.exists() {
+                agents.push(json!({"alias": "x"}));
+            }
+            DaemonSnap {
+                at: Instant::now(),
+                outcomes: Default::default(),
+                jobs_fp: (!failed).then_some(1),
+                agents: if failed {
+                    agents_payload_from(Path::new("/nonexistent/state"), None, None)
+                } else {
+                    json!({"daemon": "reachable", "agents": agents,
+                           "by_issue": {"CAD-1": [{"alias": "w"}]}})
+                },
+                agents_fp: (!failed).then_some(1),
+                approvals: Arc::new(Default::default()),
+                failed,
+                agents_down: failed,
+            }
+        });
+        let model = Arc::new(Model::new(Path::new("/nonexistent/state"), &pm.dir, fetch));
+        (tmp, model, down, Box::new(write_card))
+    }
+
+    fn issue_frames(frames: &[Arc<str>]) -> Vec<String> {
+        frames
+            .iter()
+            .filter(|f| f.starts_with("event: issue\n"))
+            .map(|f| f.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn cards_changed_during_an_outage_are_rebuilt_with_their_bindings_on_recovery() {
+        let (tmp, model, down, write_card) = outage_fixture();
+        let mut watch = blank_watch();
+        let mut frames = Vec::new();
+        model.tick(&mut watch, &mut frames);
+        assert!(
+            issue_frames(&frames)
+                .iter()
+                .any(|f| f.contains("\"alias\":\"w\"")),
+            "{frames:?}"
+        );
+        // A board write drops last-good; the daemon then goes down and a
+        // tracker change lands.
+        model.invalidate();
+        down.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(20));
+        write_card("second");
+        std::fs::write(tmp.path().join("pm").join("note.md"), "x").unwrap();
+        frames.clear();
+        model.tick(&mut watch, &mut frames);
+        assert!(
+            issue_frames(&frames).is_empty(),
+            "a card built from the stand-in went out: {frames:?}"
+        );
+        // The daemon is back with the same data: the card is rebuilt.
+        down.store(false, Ordering::SeqCst);
+        frames.clear();
+        model.tick(&mut watch, &mut frames);
+        let rebuilt = issue_frames(&frames);
+        assert!(
+            rebuilt
+                .iter()
+                .any(|f| f.contains("\"alias\":\"w\"") && f.contains("second")),
+            "recovery left the card stripped: {frames:?}"
+        );
+    }
+
+    #[test]
+    fn a_client_that_refetched_mid_outage_gets_cards_and_agents_upserted_on_recovery() {
+        let (_tmp, model, down, _write_card) = outage_fixture();
+        let mut watch = blank_watch();
+        let mut frames = Vec::new();
+        model.tick(&mut watch, &mut frames);
+        // Nothing changes on disk during the outage; the client's own
+        // `/api/issues` read is built from the stand-in.
+        model.invalidate();
+        down.store(true, Ordering::SeqCst);
+        frames.clear();
+        model.tick(&mut watch, &mut frames);
+        assert!(issue_frames(&frames).is_empty(), "{frames:?}");
+        let pm = Pm::at(&model.pm_dir).unwrap();
+        let read = model.board(&pm, None);
+        assert!(
+            read.by_issue.get("CAD-1").is_none(),
+            "the read was not stripped"
+        );
+        assert_eq!(
+            model.agents()["agents"],
+            json!([]),
+            "the read was not empty"
+        );
+        down.store(false, Ordering::SeqCst);
+        frames.clear();
+        model.tick(&mut watch, &mut frames);
+        assert!(
+            issue_frames(&frames)
+                .iter()
+                .any(|f| f.contains("\"alias\":\"w\"")),
+            "the stripped cards were never repaired: {frames:?}"
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|f| f.starts_with("event: agent\n") && f.contains("\"alias\":\"w\"")),
+            "the emptied agent list was never repaired: {frames:?}"
+        );
+    }
+
+    #[test]
+    fn what_was_removed_during_an_outage_is_deleted_on_recovery() {
+        let (tmp, model, down, _write_card) = outage_fixture();
+        let mut watch = blank_watch();
+        let mut frames = Vec::new();
+        model.tick(&mut watch, &mut frames);
+        assert!(
+            issue_frames(&frames).iter().any(|f| f.contains("CAD-2")),
+            "{frames:?}"
+        );
+        model.invalidate();
+        down.store(true, Ordering::SeqCst);
+        std::fs::remove_dir_all(tmp.path().join("pm").join("cadence").join("CAD-2")).unwrap();
+        for _ in 0..2 {
+            frames.clear();
+            model.tick(&mut watch, &mut frames);
+            assert!(issue_frames(&frames).is_empty(), "{frames:?}");
+        }
+        down.store(false, Ordering::SeqCst);
+        frames.clear();
+        model.tick(&mut watch, &mut frames);
+        let deleted = |kind: &str, id: &str| {
+            frames.iter().any(|f| {
+                f.starts_with(&format!("event: {kind}\n"))
+                    && f.contains("\"op\":\"delete\"")
+                    && f.contains(id)
+            })
+        };
+        assert!(deleted("issue", "CAD-2"), "ghost card: {frames:?}");
+        assert!(deleted("agent", "\"x\""), "ghost agent: {frames:?}");
+        assert!(
+            issue_frames(&frames)
+                .iter()
+                .any(|f| f.contains("CAD-1") && f.contains("\"alias\":\"w\"")),
+            "survivor not upserted: {frames:?}"
+        );
+    }
+
+    #[test]
+    fn a_tick_skips_a_snapshot_older_than_the_one_it_published() {
+        let (model, _) = fake_daemon(|_| Duration::ZERO, None);
+        let mut watch = blank_watch();
+        let mut frames = Vec::new();
+        model.tick(&mut watch, &mut frames);
+        let published = watch.agents;
+        watch.at = Some(Instant::now() + Duration::from_secs(60));
+        model.tick(&mut watch, &mut frames);
+        assert_eq!(watch.agents, published, "an older snapshot was published");
+    }
+
+    #[test]
+    fn a_waiter_retries_when_the_fetch_it_joined_unwinds() {
+        let (model, calls) = fake_daemon(|_| Duration::from_millis(300), Some(1));
+        let crashing = {
+            let m = model.clone();
+            std::thread::spawn(move || m.agents())
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(model.agents()["v"], 2);
+        assert!(crashing.join().is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]

@@ -80,7 +80,7 @@ pub mod crm_sends;
 pub mod crm_smtp;
 mod plans;
 pub mod social_publish;
-pub use plans::{current_verdict, Job, Task, Verdict, JOB_STATES};
+pub use plans::{current_verdict, AssigneeTask, Job, Task, Verdict, JOB_STATES};
 mod quota;
 mod schema;
 mod seal;
