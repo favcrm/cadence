@@ -7,7 +7,6 @@
 //! refused and is never dispatched.
 
 use super::cad1120_tests::{refusal, Fx};
-use super::*;
 
 #[test]
 fn cad1230_a_replay_never_dispatches_an_unapproved_run() {
