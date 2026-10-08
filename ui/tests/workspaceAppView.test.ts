@@ -165,6 +165,12 @@ async function main() {
   await click(host.querySelector('button[aria-label="Optional brand context"]'));
   await click(Array.from(document.querySelectorAll('[role="option"]')).find(value => value.textContent?.includes("No brand context")));
   assert(!button("New post")?.disabled, "Explicit No brand context reveals the actual Local binding");
+  // The shell's header-row context choice is announced through the remembered
+  // selection; the workspace follows it (CAD-1177).
+  await React.act(async () => { require("../src/features/workspace-apps/contextSelection").rememberContext("install-a", "context-b"); });
+  await flush();
+  assert((host.querySelector('button[aria-label="Optional brand context"]')?.textContent ?? "").includes("Brand B"), "An externally chosen context is the workspace's context");
+  await choosePage("Optional brand context", "No brand context");
   await click(host.querySelector('button[aria-label="Optional brand context"]'));
   await click(Array.from(document.querySelectorAll('[role="option"]')).find(value => value.textContent?.includes("Brand B")));
   assert(button("New post")?.disabled && text().includes("Choose and save a Local destination"), "A brand cannot borrow the context-free destination binding");

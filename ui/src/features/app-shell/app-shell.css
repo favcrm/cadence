@@ -1256,3 +1256,16 @@ p.sfield-hint {
 .app-assistant-settings li strong { overflow-wrap: anywhere; color: var(--color-ink-200); }
 .app-assistant-settings li small { overflow-wrap: anywhere; color: var(--color-ink-500); }
 .app-assistant-activity > p { margin: 0; }
+
+/* The Social screen's context choice (2+ active contexts), in the header row. */
+.app-shell-context-pick {
+  min-width: 0;
+  max-width: 14rem;
+  height: 2rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.375rem;
+  background: var(--color-ink-850);
+  color: var(--color-ink-100);
+  font-size: var(--text-label);
+  padding: 0 0.5rem;
+}

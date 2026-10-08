@@ -470,6 +470,29 @@ export default function AppShell({
           {loading ? "Loading…" : title}
         </span>
         <span className="flex-1" />
+        {isSocial && activeIds.length > 1 && (
+          // A private screen offers no in-outlet picker (the screen is the
+          // outlet's first child). With 2+ active contexts the choice lives
+          // here in the header row; 0 or 1 never shows a control.
+          <select
+            className="app-shell-context-pick"
+            aria-label="Context"
+            data-social-context
+            value={socialContext !== null && activeIds.includes(socialContext) ? socialContext : ""}
+            onChange={(e) => e.target.value !== "" && rememberContext(installId, e.target.value)}
+          >
+            <option value="" disabled>
+              Choose a context
+            </option>
+            {contexts
+              .filter((c) => c.state === "active")
+              .map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.config.label}
+                </option>
+              ))}
+          </select>
+        )}
         <Link href="/" className="lnk text-micro app-shell-home-link" data-chat-home-link>
           Earlier history is in Home
         </Link>

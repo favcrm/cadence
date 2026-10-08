@@ -38,7 +38,7 @@ import {
 import { retainedRequest, completeRequest } from "./requests";
 import PublishPanel, { type PublishCandidate } from "./PublishPanel";
 import ScheduleCalendar from "./ScheduleCalendar";
-import { forgetContext, initialContext, rememberedContext, rememberContext, screenContext } from "./contextSelection";
+import { forgetContext, initialContext, rememberedContext, rememberContext, screenContext, subscribeContext } from "./contextSelection";
 import { promptError } from "./promptFields";
 import "./workspace-apps.css";
 import ScreenHost from "./screen/ScreenHost";
@@ -202,6 +202,12 @@ export default function WorkspaceApp({
       activeRead.current?.abort();
     };
   }, [refresh]);
+  // The shell's header-row context choice (2+ active contexts) is announced
+  // through the remembered selection; follow it, and let the reconcile
+  // effect below validate it against the active contexts.
+  useEffect(() => subscribeContext((changed, next) => {
+    if (changed === installId && next !== null) setContextId(next);
+  }), [installId]);
   useEffect(() => {
     if (!data || data.installation.install_id !== installId) return;
     const active = data.contexts.filter(value => value.state === "active").map(value => value.id);
