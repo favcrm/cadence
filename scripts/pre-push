@@ -182,6 +182,11 @@ def main(argv=None):
     steps = plan(root, changed, args.tests)
     env = dict(os.environ)
     env.setdefault("CARGO_BUILD_JOBS", "4")
+    # CAD-1197: a step that runs `cargo test` gets only allowlisted CADENCE_*
+    # variables, so a pane's production CADENCE_PM_DIR/CADENCE_STATE_DIR
+    # never reaches a test binary (scripts/run-result-tests does the same).
+    test_env = {k: v for k, v in env.items()
+                if not k.startswith("CADENCE_") or k in {"CADENCE_SUITE_LOCK"}}
 
     # CAD-1021: the receipt a lane's pre-push hook and report share.
     # `head` binds the verdict to the pushed SHA; `lane` is CADENCE_ALIAS/
@@ -205,7 +210,8 @@ def main(argv=None):
             continue
         t0 = time.monotonic()
         try:
-            r = subprocess.run(argv_, cwd=root, env=env, capture_output=True, text=True)
+            step_env = test_env if argv_[:2] == ["cargo", "test"] else env
+            r = subprocess.run(argv_, cwd=root, env=step_env, capture_output=True, text=True)
             rc, out = r.returncode, (r.stdout + r.stderr)
         except OSError as e:
             rc, out = 127, f"{argv_[0]}: {e}\n"

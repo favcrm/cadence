@@ -7,6 +7,12 @@
 #  - --no-fail-fast: every target reports, not just the first red one; the
 #    lib suite runs even when an integration target failed.
 #  - HOME/XDG/TMPDIR are private; toolchain homes pass through.
+#  - CAD-1197: every CADENCE_* variable is dropped before cargo runs, except
+#    an allowlist (CADENCE_SUITE_LOCK, which CI sets and this script
+#    defaults). A pane's CADENCE_PM_DIR/CADENCE_STATE_DIR once made the lib
+#    suite hold the production tracker's write lock. The script then refuses
+#    if any other CADENCE_* is still set or if a path the tests would use
+#    sits at or under the invoking user's real ~/pm or cadence state dir.
 #  - CARGO_TARGET_DIR is handed to cargo as CARGO_BUILD_TARGET_DIR, so the
 #    build lands in the same place but code under test that reads
 #    CARGO_TARGET_DIR (src/worktree.rs) sees a clean environment.
@@ -16,6 +22,34 @@
 #    host CLI writes under HOME and makes the result depend on the host.
 set -euo pipefail
 caller_cwd=$PWD
+real_home=${HOME:-}
+# CAD-1197: allowlist of CADENCE_* variables that may reach cargo.
+cadence_env_allow=" CADENCE_SUITE_LOCK "
+for v in $(compgen -e | grep '^CADENCE_' || true); do
+  case $cadence_env_allow in *" $v "*) ;; *) unset "$v" ;; esac
+done
+for v in $(compgen -e | grep '^CADENCE_' || true); do
+  case $cadence_env_allow in
+    *" $v "*) ;;
+    *) echo "::error::$v is still set after the CADENCE_* scrub" >&2; exit 1 ;;
+  esac
+done
+# Refuse any path at or under the real production tracker/state dirs.
+refuse_prod_path() { # <label> <path>
+  [ -n "$2" ] || return 0
+  [ -n "$real_home" ] || return 0
+  local p
+  p=$(realpath -m -- "$2")
+  for prod in "$real_home/pm" "$real_home/.local/state/cadence"; do
+    prod=$(realpath -m -- "$prod")
+    case $p in "$prod"|"$prod"/*)
+      echo "::error::$1 ($p) is inside the production path $prod; refusing" >&2
+      exit 1 ;;
+    esac
+  done
+}
+refuse_prod_path CADENCE_SUITE_LOCK "${CADENCE_SUITE_LOCK:-}"
+refuse_prod_path TMPDIR "${TMPDIR:-}"
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
 targets=$("$root/scripts/result-test-args")
@@ -43,6 +77,7 @@ export HOME="$scratch/home" XDG_CONFIG_HOME="$scratch/xdg-config" \
        XDG_CACHE_HOME="$scratch/xdg-cache" TMPDIR="$scratch/tmp"
 mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME" "$TMPDIR"
 export CADENCE_SUITE_LOCK="${CADENCE_SUITE_LOCK:-$scratch/cadence-suite.lock}"
+refuse_prod_path "scratch HOME" "$HOME"
 status=0
 
 # Fails when a target ran 0 tests (cfg-gated off?) or none reported at all.
