@@ -1329,6 +1329,12 @@ impl Store {
             .filter(|v| !v.is_empty())
     }
 
+    /// Snapshot recovery candidates before actors consume them. The daemon
+    /// keeps this independent copy until each actor's pane proof settles.
+    pub fn adoption_snapshot(&self) -> std::collections::HashMap<String, Vec<AdoptEntry>> {
+        self.adoptions.lock().unwrap().clone()
+    }
+
     /// The endpoint facts a hot restart needs per pty alias — recorded
     /// generation, pane pid, native session — read while the endpoint
     /// is still live on the agent row (before detach clears them).

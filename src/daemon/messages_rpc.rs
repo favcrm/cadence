@@ -1134,7 +1134,7 @@ impl Shared {
         let kind = required_str(params, "kind")?;
         let text = optional_str(params, "text");
         let (id, token) = self.report_target(params, peer_pid)?;
-        let message = self
+        let mut message = self
             .store
             .message(&id)?
             .ok_or_else(|| Error::rejected("Unknown message"))?;
@@ -1146,11 +1146,37 @@ impl Shared {
                 ));
             }
         }
-        let agent = self.store.agent(&message.alias)?;
+        let mut agent = self.store.agent(&message.alias)?;
         if message.turn_id.as_deref() != Some(token.as_str()) {
             return Err(Error::rejected(
                 "Token does not match the message's submission token",
             ));
+        }
+        // A recovered turn is neither stale nor valid until the actor
+        // has proved (or refused) its pane. Park only the exact recovered
+        // message/token, after all caller and identity checks, without
+        // holding the store lock or mutating message state.
+        if self.adoption_pending(&message.alias, &id, &token) {
+            if !self.wait_for_adoption(
+                &message.alias,
+                &id,
+                &token,
+                Instant::now() + Duration::from_secs(20),
+            ) {
+                return Err(Error::rejected(
+                    "Timed out waiting for running-turn re-adoption",
+                ));
+            }
+            message = self
+                .store
+                .message(&id)?
+                .ok_or_else(|| Error::rejected("Unknown message"))?;
+            if message.turn_id.as_deref() != Some(token.as_str()) {
+                return Err(Error::rejected(
+                    "Token does not match the message's submission token",
+                ));
+            }
+            agent = self.store.agent(&message.alias)?;
         }
         if !registry::turn_token_current(
             &agent.provider,
