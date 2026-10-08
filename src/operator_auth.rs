@@ -1032,8 +1032,8 @@ impl Auth {
     /// never the credential: this proves the handle names a live public
     /// session's `member`-role user, so a forged `member_as` cannot
     /// borrow another person's favorites or request attribution. The
-    /// daemon's caller rule is `board_session_check`-gated — only the
-    /// operator connection and the bearer may call it.
+    /// daemon reaches this only after `operator_connection` has admitted
+    /// the caller (the board relays over its own connection).
     pub(crate) fn check_member(&mut self, handle: &str, now: i64) -> Result<bool> {
         if self.prune(now) {
             self.persist()?;

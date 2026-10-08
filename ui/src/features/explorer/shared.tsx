@@ -1,3 +1,4 @@
+import { useEffect, useRef } from "react";
 /**
  * The Explorer's shared bits (CAD-1129): the app glyph, trust chip and
  * install-state chip every screen reuses — so a card, the detail hero
@@ -40,4 +41,62 @@ export function InstallStateChip({ state }: { state?: string }) {
     default:
       return null;
   }
+}
+
+const FOCUSABLE =
+  'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+/** Call `onEscape` when Escape is pressed while `active`. */
+export function useEscape(active: boolean, onEscape: () => void): void {
+  const latest = useRef(onEscape);
+  latest.current = onEscape;
+  useEffect(() => {
+    if (!active) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") latest.current();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [active]);
+}
+
+/**
+ * A modal dialog's keyboard contract (CAD-1209): focus moves into the
+ * dialog when it opens, Tab and Shift+Tab wrap inside it, Escape closes it
+ * and focus returns to whatever opened it. Attach the returned ref to the
+ * dialog element (give it `tabIndex={-1}`).
+ */
+export function useModal<T extends HTMLElement>(open: boolean, onClose: () => void) {
+  const ref = useRef<T>(null);
+  const latest = useRef(onClose);
+  latest.current = onClose;
+  useEffect(() => {
+    if (!open) return;
+    const node = ref.current;
+    if (!node) return;
+    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const items = () => Array.from(node.querySelectorAll<HTMLElement>(FOCUSABLE));
+    (items()[0] ?? node).focus();
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        latest.current();
+        return;
+      }
+      if (e.key !== "Tab") return;
+      const list = items();
+      if (list.length === 0) { e.preventDefault(); node.focus(); return; }
+      const first = list[0];
+      const last = list[list.length - 1];
+      const active = document.activeElement;
+      if (e.shiftKey && (active === first || !node.contains(active))) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && (active === last || !node.contains(active))) { e.preventDefault(); first.focus(); }
+    };
+    document.addEventListener("keydown", onKey, true);
+    return () => {
+      document.removeEventListener("keydown", onKey, true);
+      if (opener && document.contains(opener)) opener.focus();
+    };
+  }, [open]);
+  return ref;
 }

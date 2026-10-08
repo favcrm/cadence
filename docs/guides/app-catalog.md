@@ -212,3 +212,55 @@ divergence prevents recovery.
 ## Explicit catalog migration recovery
 
 `cadence app catalog migration-recover <journal-id>` explicitly resumes a retained migration journal; add `--rollback` only when choosing restoration of its verified preimages. This is separate from `recover <install-id>`, which retries installation delivery. Both require operator authority and the daemon, retain divergence refusal, and use normal scoped PM Git delivery. HTTP equivalents are `POST /api/app-installations/migrate` with `{}`, `POST /api/app-installations/<install-id>/recover` with `{}`, and `POST /api/app-installations/migrations/<journal-id>/recover` with `{"rollback": false}` (or explicit `true`). No endpoint grants approval or execution authority.
+
+## The `listing:` block (CAD-1129)
+
+An optional `listing:` mapping in `app.md` frontmatter is the app's display copy
+in the Explorer. It is plain text, covered by the bundle digest, and can declare
+no capability, slot or workflow verb. Keys: `tagline` (≤80 chars), `icon` (an
+`assets/*.svg` path), `screenshots` (≤5 `{file, caption}`), `category` (one of
+marketing, customers, operations, finance, content, other), `tags` (≤5),
+`publisher`, `about`, `can` (what the app can do), `access_notes` (a sentence
+per declared connection or capability slot), `changes`, `setup` and `data`
+(`stores`: what the app keeps, up to five sentences; `personal`: true when that
+includes personal data). Unknown keys, HTML, markdown links, control characters
+and any `cost`, `price` or `pricing` key refuse the bundle.
+
+The detail page's data-access rows come from the manifest, not from the copy
+alone: "Its own data" shows when `data.stores` is non-empty or `data.personal`
+is true, and carries the "Personal data" chip only for `personal`.
+
+## Soft remove and restore
+
+Removing an app from the Explorer (`POST /api/app-installations/<id>/remove`,
+after `remove-preview`) is a journaled soft remove: the record is marked
+removed, its consent is revoked, queued publishes are cancelled and runs are
+refused. Nothing is deleted. The app leaves Open and the sidebar and is listed
+under "Recently removed" for 30 days. Within that window
+`POST /api/app-installations/<id>/restore` clears the mark and re-records
+consent for the same bytes. After the window it refuses: the install can only
+stay removed, and the page no longer offers Restore. A removed app's Explorer
+card and detail page offer Restore (never Install) while the window is open.
+
+## Explorer routes
+
+All are served by the board and relayed to the daemon; reads and favourites are
+open to a verified member as well as the operator, everything else is the
+operator's. Agents are refused on every one.
+
+| Route | Who | Purpose |
+| --- | --- | --- |
+| `GET /api/app-catalog`, `/api/app-catalog/<id>` | operator, member | Built-in catalog rows with install state (`available`, `installed`, `off`; a soft-removed app stays `available` with `removed: true`, its `install_id` and `restorable`). Members get no `digest`, `request_count` or `update_available`. |
+| `POST /api/app-catalog/install` | operator | Install a built-in: `{catalog_id, expected_digest}`; the digest is required. |
+| `POST /api/app-catalog/git-check` | operator | Check a public https Git repository: `{url, git_ref?, dir?}`. |
+| `POST /api/app-catalog/request` | member | Ask the operator to install a built-in. |
+| `GET /api/app-home` | operator, member | One row per installation with its attention state. |
+| `GET/POST /api/app-favorites`, `/opened`, `/default` | operator, member (`default`: operator) | Pinned apps per person. |
+| `GET /api/app-requests`, `POST /api/app-requests/dismiss` | operator | Install requests. |
+| `POST /api/app-installations/<id>/update-check`, `/remove-preview`, `/remove`, `/restore` | operator | Manage one installation. |
+
+A Git source passed to `install`, `install-check`, `upgrade` or `upgrade-check`
+(CLI and board alike) is vetted exactly like the Explorer's Git check: a public
+`https://` repository on a registered-shaped DNS name that resolves only to
+globally routable addresses. SSH, `git@`, IP-literal, localhost-style and
+credential-bearing URLs are refused; use an absolute local checkout for those.

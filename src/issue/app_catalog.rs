@@ -74,14 +74,6 @@ pub struct Entry {
     pub bundle_revision: Option<String>,
 }
 impl Entry {
-    /// Is this installation soft-removed? The mark lives on its
-    /// record, not the catalog — the caller reads the record itself
-    /// (CAD-1129 H5).
-    pub fn removed(&self) -> bool {
-        false
-    }
-}
-impl Entry {
     fn paths(&self, id: &InstallationId) -> (PathBuf, PathBuf) {
         match &self.storage {
             Storage::Legacy { project, name } => {

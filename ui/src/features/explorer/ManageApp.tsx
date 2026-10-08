@@ -7,9 +7,11 @@ import {
   type HomeInstallation,
   type Installation,
   type RemovePreview,
+  notifyAppsChanged,
 } from "../workspace-apps/workspaceApps";
 import type { Viewer } from "../projects/work";
-import { AppGlyph } from "./shared";
+import { AppGlyph, useModal } from "./shared";
+import { appErrorCopy, appLoadErrorCopy } from "./appErrors";
 import "./explorer.css";
 
 /**
@@ -32,12 +34,13 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
 
   const isOp = viewer.operator && !viewer.readOnly;
 
+  const [reread, setReread] = useState(0);
   useEffect(() => {
     const controller = new AbortController();
     setError(null);
     void workspaceApps.detail(installId, controller.signal)
       .then((d) => { if (!controller.signal.aborted) setInst(d); })
-      .catch((e: unknown) => { if (!controller.signal.aborted) setError(e instanceof Error ? e.message : "Could not load the install"); });
+      .catch((e: unknown) => { if (!controller.signal.aborted) setError(appLoadErrorCopy(e, "Could not load the app. Try again in a moment.")); });
     void appExplorer.home(controller.signal)
       .then((h) => {
         if (controller.signal.aborted) return;
@@ -45,7 +48,7 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
       })
       .catch(() => {});
     return () => controller.abort();
-  }, [installId]);
+  }, [installId, reread]);
 
   if (!isOp) {
     return <main className="apps-detail px-4 lg:px-8 pt-4 pb-9">
@@ -68,22 +71,24 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
     return <main className="apps-detail px-4 lg:px-8 pt-4 pb-9"><p className="text-label text-ink-400" role="status">Loading…</p></main>;
   }
 
-  const removed = home?.attention.state === "removed";
-  const off = home?.attention.state === "off" || inst.approved === false;
+  // The record's own mark is authoritative; the home row only agrees with it.
+  const removed = inst.removed != null || home?.attention.state === "removed";
+  const restorable = inst.restore_after == null || Date.now() / 1000 <= inst.restore_after;
+  const off = !removed && (home?.attention.state === "off" || inst.approved === false);
   const updateReady = home?.attention.state === "update";
 
   const checkUpdate = () => {
     setChecking(true); setNotice(null);
     void appExplorer.updateCheck(installId)
       .then((r) => setNotice(r.has_update ? `An update is ready (${r.digest.slice(0, 14)}…).` : "Up to date."))
-      .catch((e: unknown) => setNotice(e instanceof Error ? e.message : "The check didn't finish"))
+      .catch((e: unknown) => setNotice(appErrorCopy(e, "The update check didn't finish. Try again in a moment.")))
       .finally(() => setChecking(false));
   };
 
   const openRemove = () => {
     void appExplorer.removePreview(installId)
       .then(setPreview)
-      .catch((e: unknown) => setNotice(e instanceof Error ? e.message : "Could not preview remove"));
+      .catch((e: unknown) => setNotice(appErrorCopy(e, "Couldn't work out what removing would take. Try again in a moment.")));
     setRemoveOpen(true);
   };
   const doRemove = () => {
@@ -94,15 +99,32 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
       expected_digest: preview.digest,
       request_id: `rm-${Date.now()}`,
     })
-      .then(() => { setRemoveOpen(false); setNotice("Removed — it's under Recently removed for 30 days."); setInst({ ...inst, approved: false }); })
-      .catch((e: unknown) => setNotice(e instanceof Error ? e.message : "Remove didn't finish"))
+      .then(() => {
+        const now = Math.floor(Date.now() / 1000);
+        setRemoveOpen(false);
+        setNotice("Removed — it's under Recently removed for 30 days.");
+        setInst({ ...inst, approved: false, removed: now, restore_after: now + 30 * 24 * 3600 });
+        setHome((h) => h && { ...h, attention: { state: "removed", message: "Removed — restore within 30 days.", action: "restore", count: 0 } });
+        notifyAppsChanged();
+      })
+      .catch((e: unknown) => { setRemoveOpen(false); setNotice(appErrorCopy(e, "Remove didn't finish. Nothing was removed.")); setReread((n) => n + 1); })
       .finally(() => setRemoving(false));
   };
   const restore = () => {
     setRestoring(true); setNotice(null);
     void appExplorer.restore(installId)
-      .then(() => setNotice("Restored — it's live again."))
-      .catch((e: unknown) => setNotice(e instanceof Error ? e.message : "Restore was refused"))
+      .then(() => {
+        setNotice("Restored — it's live again.");
+        setInst({ ...inst, removed: null, restore_after: null });
+        setHome((h) => h && { ...h, attention: { state: "ok", message: null, action: null, count: 0 } });
+        notifyAppsChanged();
+      })
+      .catch((e: unknown) => {
+        setNotice(appErrorCopy(e, "Restore didn't finish. Try again in a moment."));
+        // A refusal means the record is not what the page assumed (the window
+        // closed, or it is already live): read it again rather than guess.
+        setReread((n) => n + 1);
+      })
       .finally(() => setRestoring(false));
   };
 
@@ -120,7 +142,7 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
       </div>
 
       {notice && <div className="alert info mt-4" role="status">{notice}</div>}
-      {removed && <div className="alert warn mt-4">Removed. Restore brings it back within its 30-day window.</div>}
+      {removed && <div className="alert warn mt-4" role="status">{restorable ? "Removed. Restore brings it back within its 30-day window." : "Removed. The 30-day restore window has closed, so it stays removed."}</div>}
 
       <div className="mgrid mt-5">
         <div className="card mcard">
@@ -155,12 +177,12 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
           <div className="swrow">
             <div>
               <p>Let {inst.title} work</p>
-              <p className="hint">{off ? "Off — it can't run or use its connections. Its data is kept." : "On — it can run and use its connections."}</p>
+              <p className="hint">{removed ? "Off — the app is removed." : off ? "Off — it can't run or use its connections. Its data is kept." : "On — it can run and use its connections."}</p>
             </div>
             <button
               className="switch"
               role="switch"
-              aria-checked={!off}
+              aria-checked={!off && !removed}
               aria-label={`Let ${inst.title} work`}
               onClick={() => setNotice(off ? "Turn on through the app's page — consent is recorded there." : "Turn off through the app's page — consent is revoked there.")}
             />
@@ -171,10 +193,12 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
           {removed ? (
             <>
               <h3>Restore {inst.title}</h3>
-              <p>Removed apps restore within 30 days, with the same data.</p>
-              <div className="mt-3">
-                <Button className="btn-primary btn-sm" disabled={restoring} onClick={restore}>{restoring ? "Restoring…" : "Restore"}</Button>
-              </div>
+              <p>{restorable ? "Removed apps restore within 30 days, with the same data." : "The restore window has closed."}</p>
+              {restorable && (
+                <div className="mt-3">
+                  <Button className="btn-primary btn-sm" disabled={restoring} onClick={restore}>{restoring ? "Restoring…" : "Restore"}</Button>
+                </div>
+              )}
             </>
           ) : (
             <>
@@ -189,25 +213,42 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
       </div>
 
       {removeOpen && preview && (
-        <div className="scrim fixed inset-0 bg-black/50 z-50 grid place-items-center p-4" role="presentation" onClick={() => setRemoveOpen(false)}>
-          <div className="modal card p-5 max-w-lg w-full" role="alertdialog" aria-modal="true" aria-labelledby="rmh" onClick={(e) => e.stopPropagation()}>
-            <h2 id="rmh" className="text-cardtitle font-medium text-ink-100 mb-3">Remove {preview.title}?</h2>
-            {preview.personal_data && (
-              <div className="alert warn mb-3">This app holds personal data. Its data is kept for restore.</div>
-            )}
-            <p className="text-label text-ink-400 mb-2">This is taken out of this workspace; its data is kept for 30 days, then deleted for good.</p>
-            {preview.keeps?.data && <p className="text-label text-ink-500 mb-3">Keeps: {preview.keeps.data}</p>}
-            <div className="alert info mb-4">Restorable for 30 days. Bring it back any time from Recently removed on the Apps page.</div>
-            <p className="text-label text-ink-500 mb-4">Only want to pause it? Turn access off from the app's page instead — nothing is removed.</p>
-            <div className="flex gap-2 justify-end">
-              <Button onClick={() => setRemoveOpen(false)}>Cancel</Button>
-              <Button className="btn-danger-solid" disabled={removing} onClick={doRemove}>
-                {removing ? "Removing…" : `Remove ${preview.title}`}
-              </Button>
-            </div>
-          </div>
-        </div>
+        <RemoveDialog preview={preview} removing={removing} onCancel={() => setRemoveOpen(false)} onConfirm={doRemove} />
       )}
     </main>
+  );
+}
+
+/**
+ * The Remove confirmation: an alertdialog that takes focus, keeps Tab
+ * inside and closes on Escape or Cancel (CAD-1209). Mounted only while
+ * open so its focus handling starts and ends with it.
+ */
+function RemoveDialog({ preview, removing, onCancel, onConfirm }: {
+  preview: RemovePreview; removing: boolean; onCancel: () => void; onConfirm: () => void;
+}) {
+  const ref = useModal<HTMLDivElement>(true, onCancel);
+  return (
+    <div className="scrim fixed inset-0 bg-black/50 z-50 grid place-items-center p-4" role="presentation" onClick={onCancel}>
+      <div ref={ref} tabIndex={-1} className="modal card p-5 max-w-lg w-full" role="alertdialog" aria-modal="true"
+        aria-labelledby="rmh" aria-describedby="rmd" onClick={(e) => e.stopPropagation()}>
+        <h2 id="rmh" className="text-cardtitle font-medium text-ink-100 mb-3">Remove {preview.title}?</h2>
+        <div id="rmd">
+          {preview.personal_data && (
+            <div className="alert warn mb-3">This app holds personal data. Its data is kept for restore.</div>
+          )}
+          <p className="text-label text-ink-400 mb-2">This is taken out of this workspace; its data is kept for 30 days, then deleted for good.</p>
+          {preview.keeps?.data && <p className="text-label text-ink-500 mb-3">Keeps: {preview.keeps.data}</p>}
+          <div className="alert info mb-4">Restorable for 30 days. Bring it back any time from Recently removed on the Apps page.</div>
+          <p className="text-label text-ink-500 mb-4">Only want to pause it? Turn access off from the app's page instead — nothing is removed.</p>
+        </div>
+        <div className="flex gap-2 justify-end">
+          <Button onClick={onCancel}>Cancel</Button>
+          <Button className="btn-danger-solid" disabled={removing} onClick={onConfirm}>
+            {removing ? "Removing…" : `Remove ${preview.title}`}
+          </Button>
+        </div>
+      </div>
+    </div>
   );
 }

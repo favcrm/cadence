@@ -1118,4 +1118,65 @@ mod tests {
         assert!(check(&d).is_err(), "listing icon missing from bundle");
         assert_eq!(fx.tree(), before, "install-check wrote");
     }
+
+    // ------------------------------------------------------- CAD-1209
+
+    /// Item 3: an update is pending, the operator's catalog row says so and
+    /// a member's row (list and show) carries no `update_available`.
+    #[test]
+    fn c1209_member_row_has_no_update_available() {
+        let fx = Fx::new();
+        fx.member("alice");
+        let id = fx.install_builtin("crm")["install_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        fx.shared
+            .store
+            .app_update_check_save(&id, true, Some("9.9.9"), None, Some("sha256:x"), &json!({}))
+            .unwrap();
+        let row = |v: &Value| -> Value {
+            v["catalog"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["id"] == "crm")
+                .unwrap()
+                .clone()
+        };
+        let op = row(&fx.op("app_catalog_list", json!({})));
+        assert_eq!(op["update_available"], json!(true), "operator row: {op}");
+        let mem = row(&fx.op("app_catalog_list", json!({"member_as": "alice"})));
+        assert_eq!(mem["state"], "installed", "member row: {mem}");
+        assert!(
+            mem.get("update_available").is_none(),
+            "member sees update state: {mem}"
+        );
+        let shown = fx.op(
+            "app_catalog_show",
+            json!({"id": "crm", "member_as": "alice"}),
+        );
+        assert!(shown.get("update_available").is_none(), "{shown}");
+        assert!(!shown.to_string().contains("9.9.9"), "{shown}");
+    }
+
+    /// Item 1: the detail access rows follow the manifest's `data.stores`,
+    /// independently of `data.personal`. social-content stores records but
+    /// holds no personal data: the row is present without the chip.
+    #[test]
+    fn c1209_access_rows_follow_the_manifest_data_declaration() {
+        let fx = Fx::new();
+        let data_row = |id: &str| -> Option<Value> {
+            fx.op("app_catalog_show", json!({"id": id}))["access"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r.to_string().contains("Its own data"))
+                .cloned()
+        };
+        let social = data_row("social-content").expect("stores set -> data row");
+        assert!(!social.to_string().contains("Personal data"), "{social}");
+        let crm = data_row("crm").expect("stores set -> data row");
+        assert!(crm.to_string().contains("Personal data"), "{crm}");
+    }
 }

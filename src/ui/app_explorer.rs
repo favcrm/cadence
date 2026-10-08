@@ -223,12 +223,14 @@ pub(super) fn write(
     }
 }
 
-/// Read a bounded JSON body, forward the allow-listed fields plus the
-/// caller's `member_as` (when the route admits a member).
-fn body_rpc(
+/// Read a bounded JSON body, forward its allow-listed fields onto `base`
+/// (a path-derived id, or empty), plus the caller's `member_as` when the
+/// route admits a member. Unknown body fields are dropped.
+fn relay_body(
     request: &mut Request,
     state_dir: &Path,
     method: &str,
+    base: Value,
     fields: &[&str],
     member: Option<&str>,
 ) -> HttpResp {
@@ -240,7 +242,7 @@ fn body_rpc(
         Ok(v) => v,
         Err(_) => return err_response(400, "body must be a JSON object"),
     };
-    let mut params = json!({});
+    let mut params = base;
     if let Some(obj) = value.as_object() {
         for f in fields {
             if let Some(v) = obj.get(*f) {
@@ -257,6 +259,16 @@ fn body_rpc(
     }
 }
 
+fn body_rpc(
+    request: &mut Request,
+    state_dir: &Path,
+    method: &str,
+    fields: &[&str],
+    member: Option<&str>,
+) -> HttpResp {
+    relay_body(request, state_dir, method, json!({}), fields, member)
+}
+
 /// Like `body_rpc`, but `install_id` comes from the path, not the
 /// body — the caller never names the install in two places.
 fn body_rpc_install(
@@ -266,26 +278,14 @@ fn body_rpc_install(
     install_id: &str,
     fields: &[&str],
 ) -> HttpResp {
-    let bytes = match read_body(request, BODY_CAP) {
-        Ok(b) => b,
-        Err(resp) => return resp,
-    };
-    let value: Value = match serde_json::from_slice(&bytes) {
-        Ok(v) => v,
-        Err(_) => return err_response(400, "body must be a JSON object"),
-    };
-    let mut params = json!({"install_id": install_id});
-    if let Some(obj) = value.as_object() {
-        for f in fields {
-            if let Some(v) = obj.get(*f) {
-                params[*f] = v.clone();
-            }
-        }
-    }
-    match client::rpc(state_dir, method, params) {
-        Ok(v) => json_response(v),
-        Err(e) => super::home::rpc_err(&e, method),
-    }
+    relay_body(
+        request,
+        state_dir,
+        method,
+        json!({"install_id": install_id}),
+        fields,
+        None,
+    )
 }
 
 #[cfg(test)]
