@@ -63,7 +63,8 @@
 //! The shape and bounds are the v0 bundle shape `app.rs` enforces:
 //! `app.md` plus flat `workflows/`/`rubrics/`/`templates/` only —
 //! nothing else, no dotfiles, no nested dirs — at most 128 files,
-//! each ≤ 256 KiB (`plan::MAX_PLAN_BYTES`), ≤ 2 MiB aggregate
+//! each ≤ 256 KiB (`plan::MAX_PLAN_BYTES`; a screen JS/CSS ≤ 384 KiB,
+//! `app::MAX_SCREEN_ASSET_BYTES`), ≤ 2 MiB aggregate
 //! (`app::MAX_APP_BYTES`), read through `take(MAX_FILE_BYTES + 1)` so
 //! no unbounded allocation happens before the bound is proved.
 
@@ -80,7 +81,7 @@ use std::process::{Command, Output};
 use tempfile::TempDir;
 
 use crate::error::{Error, Result};
-use crate::issue::{app, model, plan};
+use crate::issue::{app, model};
 
 /// Largest URL a selection may carry, bytes.
 const MAX_URL_BYTES: usize = 2048;
@@ -113,10 +114,6 @@ const TOP_DIRS: &[&str] = &["workflows", "rubrics", "templates", "screens", "ass
 /// Most files a bundle may carry — pinned at `app.rs`'s private
 /// `MAX_FILES`.
 const MAX_FILES: usize = 128;
-
-/// Largest single file — `app.rs` defines its private `MAX_FILE_BYTES`
-/// as exactly this.
-const MAX_FILE_BYTES: u64 = plan::MAX_PLAN_BYTES as u64;
 
 /// Largest bundle, all files together — `app.rs`'s crate-visible cap.
 const MAX_APP_BYTES: u64 = app::MAX_APP_BYTES;
@@ -634,18 +631,17 @@ fn read_bounded(dir: &File, name: &[u8], rel: &str) -> Result<String> {
             "bundle entry '{rel}' is not a regular file"
         )));
     }
-    if meta.len() > MAX_FILE_BYTES {
+    let cap = app::file_cap(rel);
+    if meta.len() > cap {
         return Err(Error::rejected(format!(
-            "{rel} is {} bytes — a file is at most {MAX_FILE_BYTES}",
+            "{rel} is {} bytes — a file is at most {cap}",
             meta.len()
         )));
     }
     let mut bytes = Vec::new();
-    file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_FILE_BYTES {
-        return Err(Error::rejected(format!(
-            "{rel} is over {MAX_FILE_BYTES} bytes"
-        )));
+    file.take(cap + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > cap {
+        return Err(Error::rejected(format!("{rel} is over {cap} bytes")));
     }
     String::from_utf8(bytes).map_err(|_| {
         Error::rejected(format!(

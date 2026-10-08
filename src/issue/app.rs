@@ -91,6 +91,23 @@ const TOP_DIRS: &[&str] = &[
 /// plan cap applies; the same bound keeps every other file small.
 const MAX_FILE_BYTES: u64 = plan::MAX_PLAN_BYTES as u64;
 
+/// CAD-1254: a declared screen's JS/CSS asset (`screens/<tag>/<stem>.js|css`)
+/// gets its own 384 KiB per-file cap; nothing else is raised.
+pub(crate) const MAX_SCREEN_ASSET_BYTES: u64 = 384 * 1024;
+
+/// The per-file cap for bundle member `rel`: [`MAX_SCREEN_ASSET_BYTES`] for a
+/// screen JS/CSS leaf, else [`MAX_FILE_BYTES`].
+pub(crate) fn file_cap(rel: &str) -> u64 {
+    let screen_leaf = rel
+        .strip_prefix("screens/")
+        .is_some_and(|r| r.split('/').count() == 2 && (r.ends_with(".js") || r.ends_with(".css")));
+    if screen_leaf {
+        MAX_SCREEN_ASSET_BYTES
+    } else {
+        MAX_FILE_BYTES
+    }
+}
+
 /// Most files a bundle may carry.
 const MAX_FILES: usize = 128;
 
@@ -788,9 +805,10 @@ fn bundle_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
     let mut total = 0u64;
     for (rel, path) in &files {
         let len = path.symlink_metadata().map(|m| m.len()).unwrap_or(0);
-        if len > MAX_FILE_BYTES {
+        if len > file_cap(rel) {
             return Err(Error::rejected(format!(
-                "{rel} is {len} bytes — a file is at most {MAX_FILE_BYTES}"
+                "{rel} is {len} bytes — a file is at most {}",
+                file_cap(rel)
             )));
         }
         total += len;
@@ -861,10 +879,11 @@ pub(crate) fn validate(
     for (rel, path) in paths {
         let bytes = std::fs::read(&path)
             .map_err(|e| Error::rejected(format!("cannot read app file {rel}: {e}")))?;
-        if bytes.len() as u64 > MAX_FILE_BYTES {
+        if bytes.len() as u64 > file_cap(&rel) {
             return Err(Error::rejected(format!(
-                "{rel} is {} bytes — a file is at most {MAX_FILE_BYTES}",
-                bytes.len()
+                "{rel} is {} bytes — a file is at most {}",
+                bytes.len(),
+                file_cap(&rel)
             )));
         }
         let text = match String::from_utf8(bytes) {
@@ -901,7 +920,7 @@ pub(crate) fn validate_texts(
     }
     let mut warnings = Vec::new();
     for (name, text) in &files {
-        if text.len() as u64 > MAX_FILE_BYTES {
+        if text.len() as u64 > file_cap(name) {
             return Err(Error::rejected("app bundle file exceeds its limit"));
         }
         warnings.extend(crate::secret::guard(&format!("app file {name}"), text)?);

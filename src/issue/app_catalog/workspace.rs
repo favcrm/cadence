@@ -315,7 +315,7 @@ fn snapshot(root: &Root, base: &Path, source: bool) -> Result<BTreeMap<String, S
         if files.len() >= 128 {
             return Err(Error::rejected("app bundle exceeds its file limit"));
         }
-        let text = required(root, &path, crate::issue::plan::MAX_PLAN_BYTES as u64)?;
+        let text = required(root, &path, app::file_cap(&name))?;
         bytes += text.len();
         if bytes > app::MAX_APP_BYTES as usize {
             return Err(Error::rejected(
@@ -819,7 +819,7 @@ fn apply_upgrade(pm: &Pm, root: &Root, journal: &UpgradeJournal) -> Result<Vec<S
         return Err(Error::rejected("upgrade manifest changes app identity"));
     }
     for (name, text) in &journal.files {
-        if !member_path_ok(name) || text.len() as u64 > crate::issue::plan::MAX_PLAN_BYTES as u64 {
+        if !member_path_ok(name) || text.len() as u64 > app::file_cap(name) {
             return Err(Error::rejected(
                 "unsafe or oversized upgrade journal bundle file",
             ));
@@ -993,7 +993,7 @@ fn apply(pm: &Pm, root: &Root, journal: &InstallJournal) -> Result<Vec<String>> 
         ));
     }
     for (name, text) in &journal.files {
-        if !member_path_ok(name) || text.len() as u64 > crate::issue::plan::MAX_PLAN_BYTES as u64 {
+        if !member_path_ok(name) || text.len() as u64 > app::file_cap(name) {
             return Err(Error::rejected("unsafe or oversized journal bundle file"));
         }
     }
@@ -1797,6 +1797,8 @@ pub(crate) fn restore(pm: &Pm, install_id: &str) -> Result<Value> {
 
 #[cfg(test)]
 mod cad1189_acceptance;
+#[cfg(test)]
+mod cad1254_acceptance;
 
 #[cfg(test)]
 mod tests {
