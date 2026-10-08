@@ -68,9 +68,17 @@ use crate::error::{Error, Result};
 /// Wire version every v1 door document carries.
 pub const DEVICE_PUBLISH_VERSION: &str = "1";
 
-const PREFLIGHT_PATH: &str = "/v1/runtime/connectors/publish/preflight";
-const EXEC_PATH: &str = "/v1/runtime/connectors/publish";
-const STATUS_PATH: &str = "/v1/runtime/connectors/publish";
+// Route tails, joined to the credential's door prefix (see `route`).
+const PREFLIGHT_PATH: &str = "/publish/preflight";
+const EXEC_PATH: &str = "/publish";
+const STATUS_PATH: &str = "/publish";
+const DEVICE_PREFIX: &str = "/v1/runtime/connectors";
+/// CAD-1267 (AOS-181): the lease door serves the same bodies and envelope
+/// under this prefix, with no Authorization header.
+const HOSTED_PREFIX: &str = "/v1/runtime/connectors/hosted-publish";
+/// The one origin the hosted lease credential may reach: the same fixed
+/// `api.internal` the hosted media admission already pins.
+const HOSTED_ORIGIN: &str = "http://api.internal";
 const RESPONSE_CAP: u64 = 1024 * 1024;
 
 /// Explicit-config surface. Both must be set; neither alone registers.
@@ -113,18 +121,54 @@ pub type MaterialResolver =
 /// Device credential with redacted debug: the bearer secret never
 /// appears in logs, panic messages or test output.
 #[derive(Clone)]
-pub struct DeviceCredential(String);
+pub struct DeviceCredential(Option<String>);
 
 impl DeviceCredential {
     pub fn new(secret: String) -> Self {
-        Self(secret)
+        Self(Some(secret))
+    }
+
+    /// CAD-1267: the hosted lease door authenticates by network position
+    /// (`api.internal`), so there is no bearer to send. Constructible only
+    /// from a [`HostedMediaAdmission`](crate::platform::deployments::HostedMediaAdmission).
+    pub(crate) fn hosted_lease(
+        _admission: &crate::platform::deployments::HostedMediaAdmission,
+    ) -> Self {
+        Self(None)
+    }
+
+    /// The origin check shared by the door clients. A bearer credential
+    /// keeps the existing rule (https, or loopback http). The bearerless
+    /// lease credential is admitted only for the fixed image-owned
+    /// `api.internal` origin and nothing else.
+    pub(crate) fn door_base(&self, base: &str) -> Result<String> {
+        if self.0.is_none() {
+            if base.trim_end_matches('/') == HOSTED_ORIGIN {
+                return Ok(HOSTED_ORIGIN.to_owned());
+            }
+            return Err(Error::rejected(
+                "hosted publish lease is bound to the fixed api.internal origin",
+            ));
+        }
+        super::valid_base(base)
+    }
+
+    /// Full door path for a route tail: the device door, or the hosted
+    /// lease door prefix for the bearerless credential.
+    pub(crate) fn route(&self, tail: &str) -> String {
+        let prefix = if self.0.is_none() {
+            HOSTED_PREFIX
+        } else {
+            DEVICE_PREFIX
+        };
+        format!("{prefix}{tail}")
     }
 
     /// Bearer header value; `pub(crate)` so the sibling media-import
     /// client authenticates the same way. Never logged or returned to a
     /// caller — the secret only ever reaches this one header.
-    pub(crate) fn authorization(&self) -> String {
-        format!("Bearer {}", self.0)
+    pub(crate) fn authorization(&self) -> Option<String> {
+        self.0.as_ref().map(|secret| format!("Bearer {secret}"))
     }
 }
 
@@ -161,7 +205,7 @@ impl HttpPublishSender {
         material: MaterialResolver,
         timeout: Duration,
     ) -> Result<Self> {
-        let base = super::valid_base(base)?;
+        let base = credential.door_base(base)?;
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(timeout))
             .http_status_as_error(false)
@@ -201,7 +245,7 @@ impl HttpPublishSender {
         binding.validate().map_err(Fault::Refused)?;
         check_material(binding, material).map_err(Fault::Refused)?;
         let body = send_body(binding, material);
-        self.post(PREFLIGHT_PATH, &body)
+        self.post(&self.credential.route(PREFLIGHT_PATH), &body)
             .and_then(|data| preflight_of(binding, &data).map_err(Fault::Refused))
     }
 
@@ -241,7 +285,7 @@ impl HttpPublishSender {
             }
         }
         let body = send_body(binding, material);
-        match self.post(EXEC_PATH, &body) {
+        match self.post(&self.credential.route(EXEC_PATH), &body) {
             Ok(data) => match execution_of(binding, &data) {
                 Ok(mut outcome) => {
                     if outcome.state == PublishState::Posted {
@@ -281,18 +325,21 @@ impl HttpPublishSender {
         if !super::publish::valid_idempotency_key(key) {
             return Err(Refusal::new("bad_key", "status key shape is invalid"));
         }
-        let url = format!("{}{STATUS_PATH}/{key}/status", self.base);
-        let envelope = self
-            .http
-            .get(&url)
-            .header("authorization", &self.credential.authorization())
-            .call()
-            .map_err(|_| {
-                Refusal::new(
-                    "refused",
-                    "publish status is uncertain; the intent stays processing",
-                )
-            })?;
+        let url = format!(
+            "{}{}/{key}/status",
+            self.base,
+            self.credential.route(STATUS_PATH)
+        );
+        let mut request = self.http.get(&url);
+        if let Some(authorization) = self.credential.authorization() {
+            request = request.header("authorization", &authorization);
+        }
+        let envelope = request.call().map_err(|_| {
+            Refusal::new(
+                "refused",
+                "publish status is uncertain; the intent stays processing",
+            )
+        })?;
         match read_envelope(envelope, true) {
             Ok(data) => status_of(key, &data),
             Err(Fault::Refused(refusal)) => Err(refusal),
@@ -305,10 +352,11 @@ impl HttpPublishSender {
 
     fn post(&self, path: &str, body: &Value) -> std::result::Result<Value, Fault> {
         assert_no_workspace(body);
-        let envelope = self
-            .http
-            .post(format!("{}{path}", self.base))
-            .header("authorization", &self.credential.authorization())
+        let mut request = self.http.post(format!("{}{path}", self.base));
+        if let Some(authorization) = self.credential.authorization() {
+            request = request.header("authorization", &authorization);
+        }
+        let envelope = request
             .send_json(body.clone())
             .map_err(|_| Fault::Ambiguous)?;
         read_envelope(envelope, false)
@@ -738,6 +786,62 @@ pub fn attach_publish_sender(
     if opts.social_publish_sender.is_some() {
         return Ok(());
     }
+    let metadata = match &opts.provider_deployments {
+        Some(value) => Some(value.clone()),
+        None => crate::platform::deployments::load()?,
+    };
+    attach_publish_sender_with(state_dir, opts, metadata.as_ref())
+}
+
+/// CAD-1267: image metadata carrying the hosted-media lease assertion (AOS-181
+/// serves publish, import and destinations on the same `api.internal` door,
+/// under `hosted-publish`) is the only thing that registers the bearerless sender, importer and
+/// resolver over `api.internal`. No declaration leaves the device-credential
+/// env path exactly as it was; a hosted declaration plus device env config
+/// is a conflict and refuses startup (the lease is never silently replaced).
+fn attach_publish_sender_with(
+    state_dir: &Path,
+    opts: &mut crate::daemon::ServeOptions,
+    metadata: Option<&crate::platform::deployments::DeploymentMetadata>,
+) -> Result<()> {
+    if let Some(admission) = metadata.and_then(|value| value.hosted_media()) {
+        let device_env = [
+            PUBLISH_SEND_URL_ENV,
+            PUBLISH_SEND_CREDENTIAL_FILE_ENV,
+            PUBLISH_READ_URL_ENV,
+            PUBLISH_READ_CREDENTIAL_FILE_ENV,
+        ]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some());
+        if device_env {
+            return Err(Error::rejected(
+                "hosted publish lease conflicts with device publish credential config",
+            ));
+        }
+        let base = HOSTED_ORIGIN;
+        let credential = DeviceCredential::hosted_lease(&admission);
+        opts.social_publish_sender = Some(Arc::new(HttpPublishSender::new(
+            base,
+            credential.clone(),
+            production_resolver(state_dir),
+        )?));
+        if opts.social_media_importer.is_none() {
+            opts.social_media_importer = Some(Arc::new(
+                crate::platform::agenticos_external::media_import::MediaImporter::new(
+                    base,
+                    credential.clone(),
+                )?,
+            ));
+        }
+        if opts.social_media_resolver.is_none() {
+            opts.social_media_resolver = Some(Arc::new(
+                crate::platform::agenticos_external::media_import::MediaResolver::new(
+                    base, credential,
+                )?,
+            ));
+        }
+        return Ok(());
+    }
     let url = std::env::var(PUBLISH_SEND_URL_ENV).unwrap_or_default();
     let credential_file = std::env::var(PUBLISH_SEND_CREDENTIAL_FILE_ENV).unwrap_or_default();
     if url.is_empty() && credential_file.is_empty() {
@@ -1061,11 +1165,151 @@ mod tests {
         );
     }
 
+    // ---- CAD-1267: hosted publish lease registration ----
+
+    /// The baked hosted-media entry is the one declaration that admits the
+    /// lease door; there is no separate publish transport.
+    const HOSTED_PUBLISH: &str = r#"{"schema":1,"providers":[{"provider":"agenticos_external","origin":"http://api.internal","manifest_pin":"agenticos-external-provider-tools@3","transport":"hosted-media-lease@1"}]}"#;
+    /// Metadata that declares no hosted lease transport at all.
+    const NO_TRANSPORT: &str = r#"{"schema":1,"providers":[{"provider":"agenticos_external","origin":"https://api-v2.agenticos.hk","manifest_pin":"agenticos-external-provider-tools@3"}]}"#;
+
+    /// Env is process-global: every test that reads or writes the device
+    /// publish knobs holds this lock and restores a clean environment.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    const DEVICE_ENVS: [&str; 4] = [
+        PUBLISH_SEND_URL_ENV,
+        PUBLISH_SEND_CREDENTIAL_FILE_ENV,
+        PUBLISH_READ_URL_ENV,
+        PUBLISH_READ_CREDENTIAL_FILE_ENV,
+    ];
+
+    fn clean_env() {
+        for name in DEVICE_ENVS {
+            std::env::remove_var(name);
+        }
+    }
+
+    fn metadata(raw: &str) -> crate::platform::deployments::DeploymentMetadata {
+        crate::platform::deployments::DeploymentMetadata::parse(raw.as_bytes()).unwrap()
+    }
+
+    fn registered(opts: &crate::daemon::ServeOptions) -> (bool, bool, bool) {
+        (
+            opts.social_publish_sender.is_some(),
+            opts.social_media_importer.is_some(),
+            opts.social_media_resolver.is_some(),
+        )
+    }
+
+    #[test]
+    fn hosted_publish_metadata_registers_sender_importer_and_resolver() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clean_env();
+        let mut opts = crate::daemon::ServeOptions::default();
+        let dir = tempfile::tempdir().unwrap();
+        attach_publish_sender_with(dir.path(), &mut opts, Some(&metadata(HOSTED_PUBLISH))).unwrap();
+        assert_eq!(registered(&opts), (true, true, true));
+    }
+
+    #[test]
+    fn no_hosted_publish_declaration_registers_no_sender() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clean_env();
+        let dir = tempfile::tempdir().unwrap();
+        for declared in [None, Some(metadata(NO_TRANSPORT))] {
+            let mut opts = crate::daemon::ServeOptions::default();
+            attach_publish_sender_with(dir.path(), &mut opts, declared.as_ref()).unwrap();
+            assert_eq!(registered(&opts), (false, false, false));
+        }
+    }
+
+    #[test]
+    fn device_credential_path_is_unchanged_without_a_declaration() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clean_env();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("send.cred");
+        std::fs::write(&file, ["device", "material"].join("-")).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::env::set_var(PUBLISH_SEND_URL_ENV, "https://publish.example");
+        std::env::set_var(PUBLISH_SEND_CREDENTIAL_FILE_ENV, &file);
+        let mut opts = crate::daemon::ServeOptions::default();
+        // Metadata without the lease assertion leaves the device path alone.
+        attach_publish_sender_with(dir.path(), &mut opts, Some(&metadata(NO_TRANSPORT))).unwrap();
+        // Sender and importer register; the resolver needs its own read env.
+        assert_eq!(registered(&opts), (true, true, false));
+        // One-sided device config still refuses startup.
+        std::env::remove_var(PUBLISH_SEND_CREDENTIAL_FILE_ENV);
+        let mut opts = crate::daemon::ServeOptions::default();
+        assert!(attach_publish_sender_with(dir.path(), &mut opts, None).is_err());
+        clean_env();
+    }
+
+    #[test]
+    fn unknown_publish_transport_is_refused_not_registered() {
+        for transport in ["hosted-publish-lease@1", "hosted-media-lease@2", "publish"] {
+            let raw = HOSTED_PUBLISH.replace("hosted-media-lease@1", transport);
+            assert!(
+                crate::platform::deployments::DeploymentMetadata::parse(raw.as_bytes()).is_err(),
+                "{transport}"
+            );
+        }
+    }
+
+    #[test]
+    fn hosted_declaration_with_device_env_is_a_conflict() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clean_env();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var(PUBLISH_SEND_URL_ENV, "https://publish.example");
+        let mut opts = crate::daemon::ServeOptions::default();
+        assert!(
+            attach_publish_sender_with(dir.path(), &mut opts, Some(&metadata(HOSTED_PUBLISH)))
+                .is_err()
+        );
+        assert_eq!(registered(&opts), (false, false, false));
+        clean_env();
+    }
+
+    #[test]
+    fn lease_credential_sends_no_bearer_and_only_reaches_api_internal() {
+        let admission = metadata(HOSTED_PUBLISH).hosted_media().unwrap();
+        let lease = DeviceCredential::hosted_lease(&admission);
+        assert!(lease.authorization().is_none());
+        assert_eq!(
+            lease.route("/publish/preflight"),
+            "/v1/runtime/connectors/hosted-publish/publish/preflight"
+        );
+        assert_eq!(
+            DeviceCredential::new("x".into()).route("/media/import"),
+            "/v1/runtime/connectors/media/import"
+        );
+        assert!(lease.door_base("http://api.internal").is_ok());
+        for other in [
+            "https://publish.example",
+            "http://127.0.0.1:3110",
+            "http://api.internal:8080",
+            "http://evil.internal",
+        ] {
+            assert!(lease.door_base(other).is_err(), "{other}");
+        }
+        // A bearer credential keeps the old origin rule: plain http to
+        // api.internal is refused for it.
+        let bearer = DeviceCredential::new("x".into());
+        assert!(bearer.door_base("http://api.internal").is_err());
+        assert!(bearer.door_base("https://publish.example").is_ok());
+    }
+
     #[test]
     fn credential_debug_redacts() {
         let credential = DeviceCredential::new("secret-material".into());
         assert_eq!(format!("{credential:?}"), "DeviceCredential(redacted)");
-        assert!(credential.authorization().contains("secret-material"));
+        assert!(credential
+            .authorization()
+            .unwrap()
+            .contains("secret-material"));
     }
 
     #[test]
