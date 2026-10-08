@@ -15,8 +15,13 @@ use std::time::Instant;
 pub(crate) const ENDPOINT: &str = "/run/cadence/private/pi-launch.sock";
 pub(crate) const SUPERVISOR_UID: u32 = 21000;
 pub(crate) const GUEST_UID: u32 = 21001;
+pub(crate) const MAX_REQUEST: usize = 4096;
 pub(crate) const MAX_FRAME: usize = 8 * 1024 * 1024;
 pub(crate) const DEADLINE_SECS: u64 = 30;
+
+#[cfg(test)]
+#[path = "authority/request_bound_check.rs"]
+mod request_bound_check;
 
 #[path = "transport.rs"]
 mod transport;
@@ -451,7 +456,7 @@ impl Channel {
             self.consumed = true;
         }
         let frame = serde_json::to_vec(request).map_err(|_| refused())?;
-        if frame.len() > MAX_FRAME {
+        if frame.len() > MAX_REQUEST {
             return Err(refused());
         }
         self.write_frame(&(frame.len() as u32).to_be_bytes())?;

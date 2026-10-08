@@ -189,7 +189,7 @@ impl Wire {
         self.exact(&mut length)?;
         let length = u32::from_be_bytes(length) as usize;
         // Client requests never contain a graph; only finite selectors/ref.
-        if length == 0 || length > 4096 {
+        if length == 0 || length > authority::MAX_REQUEST {
             return Err(refused());
         }
         let mut bytes = vec![0; length];
