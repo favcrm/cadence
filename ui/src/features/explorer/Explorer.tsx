@@ -1,11 +1,12 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import Link from "../../ui/Link";
 import Button from "../../ui/Button";
-import { appExplorer, type CatalogCard, type InstallRequest } from "../workspace-apps/workspaceApps";
+import { appExplorer, type CatalogCard } from "../workspace-apps/workspaceApps";
 import type { Viewer } from "../projects/work";
 import { AppGlyph, TrustChip, InstallStateChip } from "./shared";
 import InstallCheckPanel from "./InstallCheckPanel";
 import { navigate } from "../../lib/useLocation";
+import { useBackoffLoad } from "../workspace-apps/useBackoffLoad";
 import "./explorer.css";
 
 /** A card opens its detail page through the router. */
@@ -20,9 +21,6 @@ const openDetail = (id: string) => navigate(`/apps/catalog/${encodeURIComponent(
  * as an "unverified app" card, never a catalog row.
  */
 export default function Explorer({ viewer }: { viewer: Viewer }) {
-  const [catalog, setCatalog] = useState<CatalogCard[] | null>(null);
-  const [requests, setRequests] = useState<InstallRequest[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
   const [revision, setRevision] = useState(0);
   const [q, setQ] = useState("");
   const [cat, setCat] = useState("All");
@@ -33,19 +31,14 @@ export default function Explorer({ viewer }: { viewer: Viewer }) {
 
   const isOp = viewer.operator && !viewer.readOnly;
 
-  useEffect(() => {
-    const controller = new AbortController();
-    setError(null);
-    void appExplorer.catalog(controller.signal)
-      .then((r) => { if (!controller.signal.aborted) setCatalog(r.catalog); })
-      .catch((e: unknown) => { if (!controller.signal.aborted) setError(e instanceof Error ? e.message : "Could not load the catalog"); });
-    if (isOp) {
-      void appExplorer.requests(controller.signal)
-        .then((r) => { if (!controller.signal.aborted) setRequests(r.requests); })
-        .catch(() => { if (!controller.signal.aborted) setRequests([]); });
-    }
-    return () => controller.abort();
-  }, [revision, isOp]);
+  // CAD-1189: the catalog and the request list load with the shared busy
+  // backoff, keep their last good answer on a failed refresh and never
+  // read an error as "no apps".
+  const catalogLoad = useBackoffLoad((signal) => appExplorer.catalog(signal).then((r) => r.catalog), revision);
+  const requestsLoad = useBackoffLoad((signal) => appExplorer.requests(signal).then((r) => r.requests), revision, isOp);
+  const catalog = catalogLoad.data;
+  const requests = requestsLoad.data;
+  const error = catalogLoad.error;
 
   const cats = useMemo(() => {
     const set = new Set<string>();
@@ -134,14 +127,14 @@ export default function Explorer({ viewer }: { viewer: Viewer }) {
         </div>
       )}
 
-      {error ? (
-        <div className="err card px-4 py-5" role="alert">
-          <h3 className="font-medium text-ink-100 mb-1">Couldn't load the app catalog</h3>
-          <p className="text-label text-ink-400 mb-3">{error}</p>
-          <Button onClick={() => setRevision((r) => r + 1)}>Try again</Button>
+      {error !== null && (
+        <div className="err card px-4 py-3 mb-4 text-label text-ink-400" role="alert">
+          <b className="text-ink-100">Couldn't load the app catalog.</b> {error} <Button onClick={() => setRevision((r) => r + 1)}>Try again</Button>
         </div>
-      ) : catalog === null ? (
-        <p className="text-label text-ink-400" role="status">Loading the catalog…</p>
+      )}
+      {catalogLoad.retrying && <p className="text-label text-ink-400 mb-2" role="status">The workspace is busy. Retrying…</p>}
+      {catalog === null ? (
+        error === null && !catalogLoad.retrying && <p className="text-label text-ink-400" role="status">Loading the catalog…</p>
       ) : (
         <>
           <div className="flex flex-wrap items-center gap-3 mb-5">

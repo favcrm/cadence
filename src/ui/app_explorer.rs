@@ -19,7 +19,7 @@
 use serde_json::{json, Value};
 use tiny_http::{Method, Request};
 
-use super::{err_response, json_response, operator, read_body, write_err, HttpResp, ServeOpts};
+use super::{err_response, json_response, operator, read_body, HttpResp, ServeOpts};
 use crate::client;
 use std::path::Path;
 
@@ -48,7 +48,7 @@ fn relay(state_dir: &Path, method: &str, mut params: Value, member: Option<&str>
     }
     match client::rpc(state_dir, method, params) {
         Ok(v) => json_response(v),
-        Err(e) => write_err(&e),
+        Err(e) => super::home::rpc_err(&e, method),
     }
 }
 
@@ -253,7 +253,7 @@ fn body_rpc(
     }
     match client::rpc(state_dir, method, params) {
         Ok(v) => json_response(v),
-        Err(e) => write_err(&e),
+        Err(e) => super::home::rpc_err(&e, method),
     }
 }
 
@@ -284,6 +284,6 @@ fn body_rpc_install(
     }
     match client::rpc(state_dir, method, params) {
         Ok(v) => json_response(v),
-        Err(e) => write_err(&e),
+        Err(e) => super::home::rpc_err(&e, method),
     }
 }

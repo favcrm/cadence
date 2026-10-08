@@ -1,4 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
+import { resources } from "../../lib/resources";
+import { useQuery, useResource } from "../../lib/useResource";
+import type { AppRow } from "../../lib/types";
+import { homeNeeds, type HomeNeed } from "../home/needs";
+import { appApprovalChip, appHref, appPurpose, runsSummary } from "./appViewModel";
+import { useBackoffLoad } from "../workspace-apps/useBackoffLoad";
+import { ResourceGate } from "../../ui/ResourceStatus";
+import "./apps.css";
 import Link from "../../ui/Link";
 import Button from "../../ui/Button";
 import { appExplorer, type HomeInstallation, type FavoritesPayload } from "../workspace-apps/workspaceApps";
@@ -16,28 +24,35 @@ import "../explorer/explorer.css";
  * behind `/apps/<project>/<name>` (unchanged); this screen is the
  * workspace-level home the ticket describes.
  */
-export default function Apps({ viewer }: { project: string; viewer: Viewer }) {
-  const [home, setHome] = useState<HomeInstallation[] | null>(null);
-  const [favs, setFavs] = useState<FavoritesPayload | null>(null);
-  const [error, setError] = useState<string | null>(null);
+export default function Apps({ project, viewer }: { project: string; viewer: Viewer }) {
   const [revision, setRevision] = useState(0);
   const [q, setQ] = useState("");
   const [sort, setSort] = useState<"recent" | "name" | "attention">("recent");
   const [busy, setBusy] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   const isOp = viewer.operator && !viewer.readOnly;
 
-  useEffect(() => {
-    const controller = new AbortController();
-    setError(null);
-    void appExplorer.home(controller.signal)
-      .then((r) => { if (!controller.signal.aborted) setHome(r.installations); })
-      .catch((e: unknown) => { if (!controller.signal.aborted) setError(e instanceof Error ? e.message : "Could not load your apps"); });
-    void appExplorer.favorites(controller.signal)
-      .then((f) => { if (!controller.signal.aborted) setFavs(f); })
-      .catch(() => { if (!controller.signal.aborted) setFavs(null); });
-    return () => controller.abort();
-  }, [revision]);
+  // CAD-1189: every list here loads with the shared busy backoff, keeps
+  // its last good answer on a failed refresh, and never reads an error as
+  // "no apps".
+  const homeLoad = useBackoffLoad((signal) => appExplorer.home(signal).then((r) => r.installations), revision);
+  const favLoad = useBackoffLoad((signal) => appExplorer.favorites(signal), revision);
+  const home = homeLoad.data;
+  const [pinned, setPinned] = useState<FavoritesPayload | null>(null);
+  useEffect(() => setPinned(null), [favLoad.data]);
+  const favs = pinned ?? favLoad.data;
+  const loadError = homeLoad.error ?? favLoad.error;
+  const retrying = homeLoad.retrying || favLoad.retrying;
+  const retryAll = () => { setActionError(null); setRevision((r) => r + 1); };
+
+  // Project apps (the legacy `<project>/apps/<name>` installs) keep their
+  // own section below: they are not workspace installs, so the home above
+  // does not list them.
+  const projectApps = useQuery(resources.apps);
+  const overview = useResource(resources.overview);
+  const needs = homeNeeds(overview.data?.needs_me);
+  const projectRows = (projectApps.data ?? []).filter((r) => project === "all" || r.project === project);
 
   const byId = useMemo(() => {
     const map = new Map<string, HomeInstallation>();
@@ -76,15 +91,15 @@ export default function Apps({ viewer }: { project: string; viewer: Viewer }) {
   const pin = (id: string) => {
     const cur = favs?.favorites ?? [];
     const next = cur.includes(id) ? cur.filter((f) => f !== id) : [...cur, id];
-    setFavs(favs ? { ...favs, favorites: next } : { favorites: next, workspace_default: [], recent: [] });
-    void appExplorer.putFavorites(next).catch(() => setRevision((r) => r + 1));
+    setPinned(favs ? { ...favs, favorites: next } : { favorites: next, workspace_default: [], recent: [] });
+    void appExplorer.putFavorites(next).catch(() => { setPinned(null); setRevision((r) => r + 1); });
   };
   const opened = (id: string) => { void appExplorer.opened(id).catch(() => {}); };
   const restore = (id: string) => {
     setBusy(id);
     void appExplorer.restore(id)
       .then(() => setRevision((r) => r + 1))
-      .catch((e: unknown) => setError(e instanceof Error ? e.message : "Restore was refused"))
+      .catch((e: unknown) => setActionError(e instanceof Error ? e.message : "Restore was refused"))
       .finally(() => setBusy(null));
   };
 
@@ -114,17 +129,18 @@ export default function Apps({ viewer }: { project: string; viewer: Viewer }) {
         <Button className="btn-primary" href="/apps/explore">Explore apps</Button>
       </div>
 
-      {error ? (
-        <div className="card px-4 py-5 mb-4" role="alert">
-          <h3 className="font-medium text-ink-100 mb-1">Couldn't load your apps</h3>
-          <p className="text-label text-ink-400 mb-3">{error}</p>
-          <Button onClick={() => setRevision((r) => r + 1)}>Try again</Button>
+      {actionError && <div className="alert fail mb-4" role="alert">{actionError}</div>}
+      {loadError !== null && (
+        <div className="card px-4 py-3 mb-4 text-label text-ink-400" role="alert">
+          {loadError} <Button onClick={retryAll}>Retry</Button>
         </div>
-      ) : home === null ? (
-        <p className="text-label text-ink-400" role="status">Loading your apps…</p>
+      )}
+      {retrying && <p className="text-label text-ink-400 mb-2" role="status">The workspace is busy. Retrying…</p>}
+      {home === null ? (
+        loadError === null && !retrying && <p className="text-label text-ink-400" role="status">Loading your apps…</p>
       ) : (
         <>
-          {live.length === 0 && (
+          {live.length === 0 && loadError === null && (
             <div className="card px-4 py-8 text-center my-4">
               <h3 className="text-cardtitle font-medium text-ink-100 mb-1">No apps yet</h3>
               <p className="text-secondary text-ink-400 mb-4">
@@ -160,6 +176,8 @@ export default function Apps({ viewer }: { project: string; viewer: Viewer }) {
                   </Link>
                 ))}
               </div>
+            ) : favs === null ? (
+              <p className="hint">{favLoad.error ? "Favorites could not be loaded." : "Loading favorites…"}</p>
             ) : (
               <div className="favempty">
                 <span aria-hidden>★</span>
@@ -241,6 +259,108 @@ export default function Apps({ viewer }: { project: string; viewer: Viewer }) {
           )}
         </>
       )}
+      <section className="sec" aria-label="Project apps">
+        <div className="sechead"><h2>Project apps</h2>{projectApps.data && <span className="chip">{projectRows.length}</span>}</div>
+        <ResourceGate
+          state={projectApps}
+          loading="loading apps…"
+          failed="could not load apps"
+          onRetry={() => void resources.apps.invalidate()}
+        />
+        {projectApps.data && projectRows.length === 0 && (
+          <div className="card px-4 py-5 text-secondary text-ink-400">
+            No project apps installed{project === "all" ? "" : ` in ${project}`} —{" "}
+            <code className="num text-ink-300">
+              cadence app install &lt;path|git-url&gt; --project {project === "all" ? "<key>" : project}
+            </code>{" "}
+            puts one here.
+          </div>
+        )}
+        <ul className="space-y-2.5">
+          {projectRows.map((row, i) => (
+            <AppCard key={`${row.project}/${row.name ?? i}`} row={row} needs={needs} showProject={project === "all"} />
+          ))}
+        </ul>
+      </section>
     </main>
   );
+}
+
+/** A monogram tile — the app's first letter, on the board's accent. */
+function AppIcon({ label }: { label: string }) {
+  const letter = (label.trim()[0] ?? "A").toUpperCase();
+  return (
+    <span
+      aria-hidden
+      className="shrink-0 w-9 h-9 rounded-lg bg-accent/15 text-accent grid place-items-center text-cardtitle font-semibold"
+    >
+      {letter}
+    </span>
+  );
+}
+
+function AppCard({
+  row,
+  needs,
+  showProject,
+}: {
+  row: AppRow;
+  needs: HomeNeed[];
+  showProject: boolean;
+}) {
+  const approval = appApprovalChip(row);
+  const title = row.title?.trim() || row.name || "App";
+  const appName = row.name;
+  const href = appName ? appHref(row.project, appName) : null;
+  return (
+    <li className="card px-3.5 py-3 min-w-0" data-app={row.name ?? undefined}>
+      <div className="app-card-layout">
+        <AppIcon label={title} />
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2 min-w-0">
+            {href ? (
+              <Link href={href} className="min-w-0 break-words hover:text-accent">
+                <span className="text-cardtitle font-medium text-ink-100">{title}</span>
+              </Link>
+            ) : (
+              <span className="text-cardtitle font-medium text-ink-100">{title}</span>
+            )}
+            <span className={`chip shrink-0 ${approval.cls}`}>{approval.text}</span>
+          </div>
+          {showProject && <p className="text-micro text-ink-500 mt-0.5 break-words">Project: {row.project}</p>}
+          <p className="text-label text-ink-400 mt-0.5 break-words">{appPurpose(row)}</p>
+          <p className="text-micro text-ink-500 mt-1" data-summary>
+            {row.error ? (
+              row.error
+            ) : appName ? (
+              <AppActivity project={row.project} name={appName} needs={needs} />
+            ) : (
+              "activity unavailable"
+            )}
+          </p>
+        </div>
+        {href && <Button href={href} className="app-card-action" aria-label={`Open ${title} in ${row.project}`}>Open app</Button>}
+      </div>
+    </li>
+  );
+}
+
+/**
+ * The card's live line: the app's runs — the same shared store the app
+ * page uses. Its own component so the runs hook is called
+ * unconditionally, for the rows that have an app to read (CAD-571 N2).
+ */
+function AppActivity({
+  project,
+  name,
+  needs,
+}: {
+  project: string;
+  name: string;
+  needs: HomeNeed[];
+}) {
+  const runs = useQuery(resources.appRuns(`${project}/${name}`));
+  if (runs.status === "failed") return <>activity unavailable</>;
+  if (!runs.data) return <>reading activity…</>;
+  return <>{runsSummary(runs.data, needs) ?? "Nothing running yet"}</>;
 }
