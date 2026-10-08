@@ -146,6 +146,9 @@ pub fn install(pm_dir: &Path) -> Result<Value> {
 }
 
 #[cfg(test)]
+mod cad1255_acceptance;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::process::Command;
