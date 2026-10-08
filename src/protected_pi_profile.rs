@@ -4,7 +4,9 @@ use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 
 // Existing unresolved release slot, NOT the locally captured candidate election.
+#[cfg_attr(not(all(unix, target_os = "linux")), allow(dead_code))] // only pi_guest (linux) uses this
 pub(crate) const NODE_PATH: &str = "/opt/cadence/pi/node";
+#[cfg_attr(not(all(unix, target_os = "linux")), allow(dead_code))] // only pi_guest (linux) uses this
 pub(crate) const NODE_DIGEST: Option<[u8; 32]> = None;
 
 #[derive(Debug)]
@@ -104,6 +106,7 @@ impl Routing {
         }
         Ok(Self { no_session, model })
     }
+    #[cfg_attr(not(all(unix, target_os = "linux")), allow(dead_code))] // only pi_guest (linux) uses this
     pub(crate) fn for_agent(no_session: bool, model: &str) -> Result<Self, String> {
         let mut args = vec!["--mode".into(), "rpc".into()];
         if no_session {
@@ -112,6 +115,7 @@ impl Routing {
         args.extend(["--model".into(), model.into()]);
         Self::parse(&args)
     }
+    #[cfg_attr(not(all(unix, target_os = "linux")), allow(dead_code))] // only pi_guest (linux) uses this
     pub(crate) fn tokens(&self) -> Vec<String> {
         let mut args = vec!["--mode".into(), "rpc".into()];
         if self.no_session {
