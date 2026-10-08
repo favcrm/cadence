@@ -162,8 +162,8 @@ where
 }
 
 /// `openat2`-relative open of a canonical absolute `path`, walking each
-/// component beneath the pinned `/` dirfd. This is the exec-target walk used
-/// by `open_bound`: every ancestor must be an **immutable root-owned**
+/// component beneath the pinned `/` dirfd. This is the walk used by
+/// the `open_at2` callers: every ancestor must be an **immutable root-owned**
 /// directory — owned by uid 0 and not group- or other-writable — so no
 /// intermediate a guest or group could reshape ever sits on the path to a
 /// binary the kernel will exec. The leaf itself is `fstat`-checked by the
@@ -479,8 +479,8 @@ impl ProtectedTopology {
     }
 
     /// The hop policy for the dynamic per-alias view: the skeleton rows plus
-    /// the alias/generation segment rows this launch names. Both `verify_view`
-    /// and `view_dir` walk against this so the per-hop check knows every
+    /// the alias/generation segment rows this launch names. `verify_view`
+    /// walks against this so the per-hop check knows every
     /// intermediate on the protected view path — an alias or generation dir
     /// that is not in the policy is refused.
     fn view_policy(&self, segs: &Segments) -> HopPolicy {

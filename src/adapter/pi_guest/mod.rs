@@ -160,8 +160,8 @@ pub(crate) struct GuestCtx {
 impl GuestCtx {
     /// Verify the whole protected launch context for `agent`'s open. Fails
     /// closed on any missing pre-requisite, any mis-owned or symlinked
-    /// topology component, or any exec digest that does not match the
-    /// compiled pin. Returns the context only when construction — not
+    /// topology component, or any image or launch authority that fails
+    /// qualification. Returns the context only when construction — not
     /// selector parsing — is sound. The owner provisions a fresh generation
     /// only after authenticating supervisor custody and current launch policy.
     pub(crate) fn establish(
