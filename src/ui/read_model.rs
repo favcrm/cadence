@@ -750,6 +750,9 @@ struct Watch {
     at: Option<Instant>,
     /// The refresh-error state last published.
     refresh_error: bool,
+    /// Cards and plans are owed a rebuild: a change came while the daemon
+    /// was failing, and a stand-in snapshot has no bindings or job state.
+    cards_stale: bool,
 }
 
 /// A heartbeat the stream loop drops: a failed send is how the watcher
@@ -1362,6 +1365,7 @@ impl Model {
                 overview,
                 at: Some(snap.at),
                 refresh_error: snap.failed,
+                cards_stale: false,
             };
             let me = self.clone();
             std::thread::spawn(move || me.watch(base));
@@ -1491,12 +1495,20 @@ impl Model {
             w.monitoring = monitoring_fp;
             frames.push(legacy_frame("monitoring"));
         }
-        if issues || jobs || agents {
-            let (cards, plans) = self.entities(&snap);
-            diff_frames("issue", &w.cards, &cards, frames);
-            diff_frames("plan", &w.plans, &plans, frames);
-            w.cards = fps(&cards);
-            w.plans = fps(&plans);
+        if issues || jobs || agents || w.cards_stale {
+            if snap.failed {
+                // Cards built from the stand-in would lose their bindings
+                // and job state, and nothing would repair them once the
+                // daemon is back with the same data: rebuild then.
+                w.cards_stale = true;
+            } else {
+                w.cards_stale = false;
+                let (cards, plans) = self.entities(&snap);
+                diff_frames("issue", &w.cards, &cards, frames);
+                diff_frames("plan", &w.plans, &plans, frames);
+                w.cards = fps(&cards);
+                w.plans = fps(&plans);
+            }
         }
         let fresh = self.freshness(&snap);
         let error_moved = (fresh["refresh_error"] == json!(true)) != w.refresh_error;
@@ -1604,6 +1616,7 @@ mod tests {
             overview: None,
             at: None,
             refresh_error: false,
+            cards_stale: false,
         };
         let mut frames = Vec::new();
         model.tick(&mut watch, &mut frames);
@@ -1778,6 +1791,7 @@ mod tests {
             overview: None,
             at: None,
             refresh_error: false,
+            cards_stale: false,
         }
     }
 
@@ -1956,6 +1970,87 @@ mod tests {
         assert!(
             calls.load(Ordering::SeqCst) - before <= 1,
             "a down daemon was fetched more than once in one tick"
+        );
+    }
+
+    #[test]
+    fn cards_changed_during_an_outage_are_rebuilt_with_their_bindings_on_recovery() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pm = Pm::init(&tmp.path().join("pm")).unwrap();
+        issue_write::project_add(&pm, "cadence", "CAD", &[], &[], &[], None).unwrap();
+        let write_card = |title: &str| {
+            let dir = pm.dir.join("cadence").join("CAD-1");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("issue.md"),
+                format!(
+                    "---\nid: CAD-1\ntitle: {title}\nstatus: backlog\npriority: P2\n\
+                     created: 2026-01-01T00:00:00Z\n---\n\nbody\n"
+                ),
+            )
+            .unwrap();
+        };
+        write_card("first");
+        let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let is_down = down.clone();
+        let fetch: Fetch = Box::new(move |_| {
+            let failed = is_down.load(Ordering::SeqCst);
+            DaemonSnap {
+                at: Instant::now(),
+                outcomes: Default::default(),
+                jobs_fp: (!failed).then_some(1),
+                agents: if failed {
+                    agents_payload_from(Path::new("/nonexistent/state"), None, None)
+                } else {
+                    json!({"daemon": "reachable", "agents": [],
+                           "by_issue": {"CAD-1": [{"alias": "w"}]}})
+                },
+                agents_fp: (!failed).then_some(1),
+                approvals: Arc::new(Default::default()),
+                failed,
+                agents_down: failed,
+            }
+        });
+        let model = Arc::new(Model::new(Path::new("/nonexistent/state"), &pm.dir, fetch));
+        let issue_frames = |frames: &[Arc<str>]| -> Vec<String> {
+            frames
+                .iter()
+                .filter(|f| f.starts_with("event: issue\n"))
+                .map(|f| f.to_string())
+                .collect()
+        };
+        let mut watch = blank_watch();
+        let mut frames = Vec::new();
+        model.tick(&mut watch, &mut frames);
+        assert!(
+            issue_frames(&frames)
+                .iter()
+                .any(|f| f.contains("\"alias\":\"w\"")),
+            "{frames:?}"
+        );
+        // A board write drops last-good; the daemon then goes down and a
+        // tracker change lands.
+        model.invalidate();
+        down.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(20));
+        write_card("second");
+        std::fs::write(pm.dir.join("note.md"), "x").unwrap();
+        frames.clear();
+        model.tick(&mut watch, &mut frames);
+        assert!(
+            issue_frames(&frames).is_empty(),
+            "a card built from the stand-in went out: {frames:?}"
+        );
+        // The daemon is back with the same data: the card is rebuilt.
+        down.store(false, Ordering::SeqCst);
+        frames.clear();
+        model.tick(&mut watch, &mut frames);
+        let rebuilt = issue_frames(&frames);
+        assert!(
+            rebuilt
+                .iter()
+                .any(|f| f.contains("\"alias\":\"w\"") && f.contains("second")),
+            "recovery left the card stripped: {frames:?}"
         );
     }
 
