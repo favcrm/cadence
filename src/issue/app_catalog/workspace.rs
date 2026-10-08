@@ -1377,6 +1377,9 @@ pub(crate) fn with_completed_bundle_snapshot<T>(
 }
 
 #[cfg(test)]
+mod cad1189_acceptance;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
