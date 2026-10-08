@@ -429,6 +429,9 @@ Only an explicit operator-approved ticket can open one; the rules are in
   cadence update --as operator:<name>
   ```
 
+  If `--check` shows `available` older than `current`, or a `blocked:`
+  line naming an older build or unproven ancestry, report it and stop: the approved candidate is stale (CAD-1235).
+
   Only when the operator asks to pin a specific commit, use
   `--to <full main sha>` on both lines. That skips the production-candidate
   receipt and runs the `upgrade --sha` checks instead. Never relay

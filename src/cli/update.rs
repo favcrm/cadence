@@ -202,7 +202,7 @@ pub(super) fn run_update(state_dir: &Path, args: UpdateArgs) -> Result<i32> {
     }
     if args.check {
         let report = update::check(&host)?;
-        if args.to.is_some() && !report.up_to_date {
+        if args.to.is_some() && !report.up_to_date && report.refusals.is_empty() {
             // A pinned check proves the build installs, not only that
             // the sha is on main: a refusal names the failed check.
             update::verify_pinned(&host, &report.target)?;

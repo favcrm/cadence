@@ -493,6 +493,12 @@ pub struct CheckReport {
     pub waiters: Vec<Waiter>,
     /// What would block an update, in operator words.
     pub blockers: Vec<String>,
+    /// CAD-1235: why `update` refuses this target outright (a downgrade,
+    /// an older schema, or ancestry that cannot be proven). Also listed
+    /// in `blockers`; `run` stops on these, never on a lease or a drain.
+    pub refusals: Vec<String>,
+    /// The target is older than the running build or the store.
+    pub older: bool,
 }
 
 impl CheckReport {
@@ -513,7 +519,9 @@ impl CheckReport {
         } else {
             out.push(target);
         }
-        if !self.changes.is_empty() {
+        if self.older {
+            out.push("changes: the target is older than current — no changes list".to_string());
+        } else if !self.changes.is_empty() {
             out.push(format!("changes: {} merged PR(s)", self.changes.len()));
             for change in &self.changes {
                 out.push(format!("  - {change}"));
@@ -570,6 +578,8 @@ impl CheckReport {
                 "age_secs": w.age_secs,
             })).collect::<Vec<_>>(),
             "blockers": self.blockers,
+            "refusals": self.refusals,
+            "older": self.older,
         })
     }
 }
@@ -800,22 +810,71 @@ pub fn check(host: &dyn UpdateHost) -> Result<CheckReport> {
             }
         }
     }
-    let changes = match (&current_sha, up_to_date) {
-        (Some(from), false) => src.merged_titles(from, &target).unwrap_or_default(),
-        _ => Vec::new(),
-    };
     let schema_current = rollout::store_schema(state_dir)?;
     let schema_target = if up_to_date {
         schema_current
     } else {
         src.schema_version(&target).unwrap_or(None)
     };
+    // CAD-1235: `update` only moves forward. Ancestry comes from the same
+    // GitHub compare the changes list uses; an answer that is not "ahead"
+    // refuses, and a compare that fails or knows nothing refuses too
+    // (fail closed). `--rollback` is the one way back.
+    let mut refusals = Vec::new();
+    let mut older = false;
+    if let (Some(from), false) = (&current_sha, up_to_date) {
+        let how = || {
+            format!(
+                "{target} (schema {}) is older than the running build {from} (store schema {}) \
+                 — `cadence update` only moves forward. Approve a newer staging candidate, or \
+                 use `cadence update --rollback` for an intended rollback",
+                schema_target.map_or("unknown".to_string(), |v| v.to_string()),
+                schema_current.map_or("unknown".to_string(), |v| v.to_string()),
+            )
+        };
+        match src.compare(&target, from) {
+            Ok(Some(status)) if status == "behind" => {}
+            Ok(Some(status)) if status == "ahead" => {
+                older = true;
+                refusals.push(how());
+            }
+            Ok(Some(status)) => refusals.push(format!(
+                "{target} is not a descendant of the running build {from} (compare status: \
+                 {status}) — `cadence update` only moves forward. Approve a newer staging \
+                 candidate, or use `cadence update --rollback` for an intended rollback"
+            )),
+            Ok(None) | Err(_) => refusals.push(format!(
+                "cannot prove {target} is newer than the running build {from}: GitHub gave no \
+                 ancestry answer (schema {} vs store {}). Refusing rather than guessing — retry, \
+                 or use `cadence update --rollback` for an intended rollback",
+                schema_target.map_or("unknown".to_string(), |v| v.to_string()),
+                schema_current.map_or("unknown".to_string(), |v| v.to_string()),
+            )),
+        }
+    }
+    if let (Some(from), Some(to), false) = (schema_current, schema_target, up_to_date) {
+        if to < from {
+            older = true;
+            if refusals.is_empty() {
+                refusals.push(format!(
+                    "{target} has schema {to}, older than the store's {from} (running build {}) \
+                     — `cadence update` only moves forward. Approve a newer staging candidate, \
+                     or use `cadence update --rollback` for an intended rollback",
+                    current_sha.as_deref().unwrap_or("none")
+                ));
+            }
+        }
+    }
+    let changes = match (&current_sha, up_to_date, older) {
+        (Some(from), false, false) => src.merged_titles(from, &target).unwrap_or_default(),
+        _ => Vec::new(),
+    };
     let migration = matches!((schema_current, schema_target), (Some(from), Some(to)) if to > from);
     let lease = rollout::status(state_dir)?;
     let lease = (lease["held"].as_bool() == Some(true) && lease["expired"].as_bool() != Some(true))
         .then_some(lease);
     let waiters = host.waiters()?;
-    let mut blockers = Vec::new();
+    let mut blockers = refusals.clone();
     if let Some(lease) = &lease {
         let holder = lease["holder"].as_str().unwrap_or("?");
         if holder != host.identity() {
@@ -845,6 +904,8 @@ pub fn check(host: &dyn UpdateHost) -> Result<CheckReport> {
         lease,
         waiters,
         blockers,
+        refusals,
+        older,
     })
 }
 
@@ -1170,6 +1231,10 @@ fn run_locked(host: &dyn UpdateHost, opts: &Options) -> Result<RunReport> {
     for line in report.lines() {
         host.progress(&line);
         lines.push(line);
+    }
+    // CAD-1235: refuse before the lease, the backup or the install.
+    if !report.refusals.is_empty() {
+        return Err(Error::rejected(report.refusals.join("; ")));
     }
     // The release is already linked when a previous run installed it;
     // if the daemon still answers with another build — or with nothing
@@ -1654,5 +1719,260 @@ fn check_after_rollback(host: &dyn UpdateHost, sha: &str) -> CheckReport {
         lease: None,
         waiters: Vec::new(),
         blockers: Vec::new(),
+        refusals: Vec::new(),
+        older: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! CAD-1235: `update` and `--check` never move to an older build.
+    //! A fake host and source, an isolated state dir, no network.
+    use super::*;
+    use crate::upgrade::{ArtifactState, Job, OnMain, Run};
+    use std::cell::RefCell;
+
+    const CUR: &str = "2b7df4c27a4257fc8762428faf5cea73fee1d044";
+    const OLD: &str = "daa8c7b64b609479d595204734e1149d7ac62df2";
+    const NEW: &str = "3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c";
+
+    struct Src {
+        target: String,
+        /// What `compare(target, current)` answers.
+        compare: Result<Option<String>>,
+        schema: Option<i64>,
+    }
+
+    impl crate::upgrade::ReleaseSource for Src {
+        fn repo(&self) -> &str {
+            "o/r"
+        }
+        fn check_auth(&self) -> Result<()> {
+            Ok(())
+        }
+        fn latest_green_main(&self) -> Result<Option<Run>> {
+            Ok(Some(Run {
+                id: 1,
+                attempt: 1,
+                head_sha: self.target.clone(),
+                head_branch: "main".into(),
+                event: "push".into(),
+                status: "completed".into(),
+                conclusion: "success".into(),
+            }))
+        }
+        fn on_main(&self, _: &str) -> Result<OnMain> {
+            Ok(OnMain::Yes)
+        }
+        fn compare(&self, _: &str, _: &str) -> Result<Option<String>> {
+            match &self.compare {
+                Ok(v) => Ok(v.clone()),
+                Err(e) => Err(Error::internal(e.to_string())),
+            }
+        }
+        fn main_runs(&self, _: &str) -> Result<Vec<Run>> {
+            Ok(Vec::new())
+        }
+        fn merge_group_runs(&self, _: &str) -> Result<Vec<Run>> {
+            Ok(Vec::new())
+        }
+        fn jobs(&self, _: u64) -> Result<Vec<Job>> {
+            Ok(Vec::new())
+        }
+        fn artifact(&self, _: u64, _: &str) -> Result<ArtifactState> {
+            Ok(ArtifactState::Missing)
+        }
+        fn download(&self, _: u64, _: &str, _: &Path) -> Result<()> {
+            Err(Error::internal("no network in tests"))
+        }
+        fn verify_attestation(&self, _: &Path, _: &str) -> Result<String> {
+            Err(Error::internal("no network in tests"))
+        }
+        fn merged_titles(&self, _: &str, _: &str) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        fn schema_version(&self, _: &str) -> Result<Option<i64>> {
+            Ok(self.schema)
+        }
+    }
+
+    struct Host {
+        _dir: tempfile::TempDir,
+        state: PathBuf,
+        layout: Layout,
+        src: Src,
+        lines: RefCell<Vec<String>>,
+    }
+
+    impl Host {
+        /// A store at `store_schema` whose link points at `CUR`.
+        fn new(src: Src, store_schema: i64) -> Self {
+            let dir = tempfile::Builder::new()
+                .prefix("c1235-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let releases = dir.path().join("releases");
+            let bin = releases.join(CUR).join("cadence");
+            std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+            std::fs::write(&bin, "x").unwrap();
+            let link = dir.path().join("bin-cadence");
+            std::os::unix::fs::symlink(&bin, &link).unwrap();
+            let state = dir.path().join("state");
+            std::fs::create_dir(&state).unwrap();
+            let conn = rusqlite::Connection::open(crate::rollout::db_file(&state)).unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TABLE schema_version (version INTEGER); \
+                 INSERT INTO schema_version VALUES ({store_schema});"
+            ))
+            .unwrap();
+            drop(conn);
+            Self {
+                state,
+                _dir: dir,
+                layout: Layout { releases, link },
+                src,
+                lines: RefCell::new(Vec::new()),
+            }
+        }
+        fn installed(&self, sha: &str) -> bool {
+            self.layout.release_dir(sha).exists()
+        }
+    }
+
+    impl UpdateHost for Host {
+        fn state_dir(&self) -> &Path {
+            &self.state
+        }
+        fn layout(&self) -> &Layout {
+            &self.layout
+        }
+        fn source(&self) -> &dyn crate::upgrade::ReleaseSource {
+            &self.src
+        }
+        fn identity(&self) -> &str {
+            "operator:test"
+        }
+        fn progress(&self, line: &str) {
+            self.lines.borrow_mut().push(line.to_string());
+        }
+        fn waiters(&self) -> Result<Vec<Waiter>> {
+            Ok(Vec::new())
+        }
+        fn set_pending(&self, _: Option<&PendingUpdate>) -> Result<()> {
+            Ok(())
+        }
+        fn pending(&self) -> Option<PendingUpdate> {
+            None
+        }
+        fn set_drain(&self, _: bool) -> Result<()> {
+            Ok(())
+        }
+        fn restart(&self, _: &Path) -> Result<RestartOutcome> {
+            Ok(RestartOutcome::Clean)
+        }
+        fn daemon_build(&self) -> Result<Option<String>> {
+            Ok(Some(CUR.to_string()))
+        }
+        fn board_build(&self) -> Result<Option<String>> {
+            Ok(None)
+        }
+        fn board_running(&self) -> bool {
+            false
+        }
+        fn now(&self) -> f64 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(1.0, |d| d.as_secs_f64())
+        }
+        fn sleep(&self, _: Duration) {}
+    }
+
+    fn src(target: &str, compare: &str, schema: i64) -> Src {
+        Src {
+            target: target.to_string(),
+            compare: Ok(Some(compare.to_string())),
+            schema: Some(schema),
+        }
+    }
+
+    fn refused(host: &Host) -> Vec<String> {
+        let report = check(host).unwrap();
+        report
+            .lines()
+            .into_iter()
+            .filter(|l| l.starts_with("blocked:"))
+            .collect()
+    }
+
+    fn assert_named(blocked: &[String], target: &str, tgt_schema: &str) {
+        let text = blocked.join("\n");
+        for needle in [
+            CUR,
+            target,
+            tgt_schema,
+            "33",
+            "--rollback",
+            "staging candidate",
+        ] {
+            assert!(text.contains(needle), "{needle} missing from: {text}");
+        }
+    }
+
+    #[test]
+    fn an_ancestor_target_is_blocked_and_update_refuses_to_install_it() {
+        // Seen live: approved candidate daa8c7b6 is behind running 2b7df4c2.
+        let host = Host::new(src(OLD, "ahead", 32), 33);
+        assert_named(&refused(&host), OLD, "32");
+        let text = check(&host).unwrap().lines().join("\n");
+        assert!(text.contains("older than current"), "{text}");
+        assert!(!text.contains("none recorded"), "{text}");
+        let err = run(&host, &Options::default()).unwrap_err().to_string();
+        assert!(err.contains("--rollback") && err.contains(OLD), "{err}");
+        assert!(!host.installed(OLD), "nothing may be installed");
+        assert!(matches!(
+            upgrade::current(&host.layout).unwrap(),
+            Current::Link { sha: Some(ref s), .. } if s == CUR
+        ));
+    }
+
+    #[test]
+    fn an_older_schema_target_is_blocked_even_when_ancestry_says_ahead() {
+        let host = Host::new(src(NEW, "behind", 32), 33);
+        assert_named(&refused(&host), NEW, "32");
+        let err = run(&host, &Options::default()).unwrap_err().to_string();
+        assert!(err.contains("schema"), "{err}");
+        assert!(!host.installed(NEW));
+    }
+
+    #[test]
+    fn ancestry_that_cannot_be_determined_fails_closed() {
+        for compare in [Ok(None), Err(Error::internal("gh down"))] {
+            let host = Host::new(
+                Src {
+                    target: NEW.into(),
+                    compare,
+                    schema: Some(33),
+                },
+                33,
+            );
+            let blocked = refused(&host).join("\n");
+            assert!(
+                blocked.contains("ancestry") && blocked.contains(NEW),
+                "{blocked}"
+            );
+            assert!(run(&host, &Options::default()).is_err());
+            assert!(!host.installed(NEW));
+        }
+    }
+
+    #[test]
+    fn a_newer_descendant_is_not_blocked() {
+        let host = Host::new(src(NEW, "behind", 34), 33);
+        let report = check(&host).unwrap();
+        assert!(
+            !report.lines().iter().any(|l| l.starts_with("blocked:")),
+            "{:?}",
+            report.lines()
+        );
     }
 }
