@@ -52,12 +52,13 @@ impl Shared {
     pub(super) fn with_file_upload_capability<T>(
         &self,
         install: &str,
+        exclusive: bool,
         callback: impl FnOnce(&str) -> Result<T>,
     ) -> Result<T> {
         let pm_dir = self.pm_dir()?;
         let pm = self.pm_at(&pm_dir)?;
         let store = &self.store;
-        crate::issue::app_catalog::workspace::with_runtime_snapshot(&pm, install, |row, files| {
+        let check = |row: &Value, files: &std::collections::BTreeMap<String, String>| {
             let digest = row["digest"].as_str().ok_or_else(|| {
                 Error::rejected("installation digest unavailable for the file-upload declaration")
             })?;
@@ -79,7 +80,16 @@ impl Shared {
                 ));
             }
             callback(digest)
-        })
+        };
+        // An upload retains bytes and a row, so it holds the PM lock that
+        // orders it against install, upgrade, remove and revoke; a read
+        // writes nothing and takes the lock-free read (CAD-1189), so a
+        // polling app turn never waits on the tracker write lock.
+        if exclusive {
+            crate::issue::app_catalog::workspace::with_runtime_snapshot(&pm, install, check)
+        } else {
+            crate::issue::app_catalog::workspace::with_runtime_read(&pm, install, check)
+        }
     }
 
     /// The one native conversation/context proof a scoped operation
@@ -148,7 +158,7 @@ impl Shared {
             ));
         }
         let app = self.scoped_binding(install, context)?;
-        self.with_file_upload_capability(install, |_digest| {
+        self.with_file_upload_capability(install, false, |_digest| {
             self.prove_scoped_conversation(&app, conversation)?;
             let file = self
                 .store
@@ -177,7 +187,7 @@ impl Shared {
         ids: &[String],
     ) -> Result<Vec<store::ChatFile>> {
         let app = self.scoped_binding(install, context)?;
-        self.with_file_upload_capability(install, |_digest| {
+        self.with_file_upload_capability(install, false, |_digest| {
             self.prove_scoped_conversation(&app, conversation)?;
             let mut files = Vec::with_capacity(ids.len());
             let mut total: u64 = 0;
@@ -287,7 +297,7 @@ impl Shared {
                 // not merely beside its label. An undeclared, revoked or
                 // upgraded bundle, or a conversation/context that moved,
                 // refuses the upload whole.
-                self.with_file_upload_capability(install, |_digest| {
+                self.with_file_upload_capability(install, true, |_digest| {
                     self.prove_scoped_conversation(app, conversation)?;
                     self.store.chat_file_put_in_workspace(
                         store::ChatFileStorageRoots {

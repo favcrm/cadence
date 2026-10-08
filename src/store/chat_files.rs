@@ -268,8 +268,10 @@ pub fn sanitize_name(name: &str) -> Result<String> {
 
 /// Extension (lowercase, without the dot) the name implies — "" when
 /// none. Only the allowlisted set may be claimed.
-fn claimed_ext(name: &str) -> &str {
-    name.rsplit_once('.').map(|(_, e)| e).unwrap_or("")
+fn claimed_ext(name: &str) -> String {
+    name.rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default()
 }
 
 /// What the real bytes sniff as, restricted to the v1 allowlist plus
@@ -295,6 +297,7 @@ fn sniffed_kind(bytes: &[u8]) -> &'static str {
 /// specific reason: their processing is a separate ticket (CAD-1233).
 fn check_kind(name: &str, bytes: &[u8]) -> Result<&'static str> {
     let ext = claimed_ext(name);
+    let ext = ext.as_str();
     let sniffed = sniffed_kind(bytes);
     if matches!(ext, "pdf" | "png" | "jpg" | "jpeg" | "webp")
         || matches!(sniffed, "pdf" | "png" | "jpeg" | "webp")
@@ -700,7 +703,7 @@ fn read_workspace_blob(workspace_dir: &Path, file: &ChatFile) -> Result<Vec<u8>>
     };
     bytes.ok_or_else(|| {
         Error::rejected(format!(
-            "attachment '{}' is not readable — the retained bytes are missing",
+            "attachment '{}' is not readable — the retained blob is missing",
             file.id
         ))
     })
@@ -817,6 +820,9 @@ fn workspace_blob_dir(workspace: &Path, create: bool) -> Result<Option<PinnedBlo
             }
             current = unsafe { OwnedFd::from_raw_fd(fd) };
         }
+        if create {
+            ensure_custody_gitignore(current.as_raw_fd())?;
+        }
         Ok(Some(PinnedBlobDir { fd: current }))
     }
     #[cfg(not(unix))]
@@ -826,6 +832,36 @@ fn workspace_blob_dir(workspace: &Path, create: bool) -> Result<Option<PinnedBlo
             "descriptor-pinned workspace custody is unsupported on this platform",
         ))
     }
+}
+
+/// The workspace is the tracker's git working tree: keep custody bytes out
+/// of it with a `*` ignore rule inside the custody directory, created
+/// exclusively through the pinned descriptor (never following a symlink).
+/// An existing entry is left as is.
+#[cfg(unix)]
+fn ensure_custody_gitignore(dir: std::os::fd::RawFd) -> Result<()> {
+    let fd = unsafe {
+        libc::openat(
+            dir,
+            c".gitignore".as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::EEXIST) {
+            return Ok(());
+        }
+        return Err(Error::rejected(format!(
+            "cannot create the custody ignore rule: {e}"
+        )));
+    }
+    use std::io::Write;
+    use std::os::fd::FromRawFd;
+    let mut file = std::fs::File::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
+    file.write_all(b"*\n")?;
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1002,7 +1038,7 @@ fn quota_scan_dir(fd: std::os::fd::RawFd) -> Result<Vec<QuotaFile>> {
         if raw.to_bytes() == b"." || raw.to_bytes() == b".." {
             continue;
         }
-        if raw.to_bytes() == b".quota.lock" {
+        if matches!(raw.to_bytes(), b".quota.lock" | b".gitignore") {
             continue;
         }
         entries = entries
@@ -1655,7 +1691,7 @@ mod tests {
     #[test]
     fn csv_and_markdown_are_text_kinds() {
         let (dir, s) = store();
-        let csv = put(&s, dir.path(), b"a,b\n1,2", "rows.csv").unwrap();
+        let csv = put(&s, dir.path(), b"a,b\n1,2", "ROWS.CSV").unwrap();
         assert_eq!(csv.mime, "text/csv");
         let md = put(&s, dir.path(), b"# hi", "n.md").unwrap();
         assert_eq!(md.mime, "text/markdown");
@@ -1694,5 +1730,32 @@ mod tests {
         assert_eq!(got[0].id, b.id);
         assert_eq!(got[1].id, a.id);
         assert!(s.chat_files_for(&["chf-missing".into()]).is_err());
+    }
+
+    /// The workspace is the tracker's git tree: after an upload the
+    /// custody paths are git-ignored, so no tracker commit or `git add -A`
+    /// can pick up customer bytes.
+    #[test]
+    fn custody_is_git_ignored_in_the_workspace_repo() {
+        let (dir, s) = store();
+        let ws = workspace(dir.path());
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&ws)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        let f = put(&s, dir.path(), b"a,b\n1,2", "rows.csv").unwrap();
+        let status = git(&["status", "--porcelain", "--untracked-files=all"]);
+        assert!(
+            status.stdout.is_empty(),
+            "{:?}",
+            String::from_utf8_lossy(&status.stdout)
+        );
+        let blob = format!(".cadence/{CHAT_FILES_DIR}/{}", f.sha256);
+        assert!(git(&["check-ignore", "-q", &blob]).status.success());
     }
 }
