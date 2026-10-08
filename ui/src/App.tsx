@@ -1157,7 +1157,7 @@ export default function App() {
           <Apps project={project} viewer={viewer} />
         )}
         {route.screen === "appsExplore" && (
-          <Explorer viewer={{ readOnly, operator: meta?.operator === true }} />
+          <Explorer viewer={viewer} />
         )}
         {route.screen === "appsCatalog" && (
           <CatalogDetail id={route.id} viewer={{ readOnly, operator: meta?.operator === true }} />
