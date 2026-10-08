@@ -1,9 +1,11 @@
 # Workspace app catalog
 
 `cadence app catalog` installs and inspects validated workflow bundles without
-requiring a project. The default workspace is the daemon's PM root. This catalog
-increment provides installation and discovery; it does not run an app, approve
-it, create worker grants, or load custom app UI.
+requiring a project. The default workspace is the daemon's PM root. An operator's
+install or update records consent for the installed digest when its local
+execution contract passes validation. Install and update do not create worker
+grants or load custom app UI; run approvals and outward-effect permissions
+remain separate.
 
 All catalog commands, including reads, require a reachable daemon and an operator
 caller. They fail when the daemon is unavailable; there is no offline catalog
@@ -15,6 +17,8 @@ CAD-631/CAD-632 work. Custom app UI remains separate CAD-633 work.
 | Command | Behavior |
 | --- | --- |
 | `cadence app catalog install-check <source>` | Read-only. Resolve and validate the bundle exactly as install would; return `schema`, `name`, `version`, `source`, `digest`, the `files` list, `committed` (always `false`), `notes` and `secret_warnings`. Writes no catalog, journal or record. |
+| `cadence app catalog approve <install-id> --digest <digest>` | Operator-only. Approve the exact current installed digest for supported local artifact steps, after validating its local execution contract. Refuses a stale digest. |
+| `cadence app catalog revoke <install-id> --digest <digest>` | Operator-only. Revoke local capabilities for the exact current digest. Does not change legacy project approvals; refuses a stale digest. |
 | `cadence app catalog install <source> [--expected-digest sha256:…]` | Validate and copy a local bundle or Git repository root into the workspace; return a new immutable installation ID. With `--expected-digest` the install is refused, before any write, unless the resolved bytes hash to that digest. |
 | `cadence app catalog ls` | Return an array of catalogued installation descriptions. Never initializes or migrates the catalog. |
 | `cadence app catalog show <install-id>` | Inspect one exact installation ID. An app name is not a substitute. |
@@ -25,7 +29,9 @@ CAD-631/CAD-632 work. Custom app UI remains separate CAD-633 work.
 These commands do not accept `--project`. New workspace installations have
 `project: null` and `project_link: null`; no project is created. Catalogued legacy
 installations retain their project metadata. A project link does not grant
-authority.
+authority. Install and update are operator-only and record consent for the exact
+installed digest if it passes the local execution checks; `approve` and `revoke`
+remain available for explicit operator decisions about local capabilities.
 
 ## Pin the exact bytes you consented to
 
@@ -132,9 +138,9 @@ history.
 Only one workspace installation of a given app name is supported in this
 increment. Repeating an install fails with an already-installed error naming
 the existing ID. It does not allocate a duplicate, replace the bundle, or widen
-approval. Workspace replacement, upgrade, removal, approval, and execution are
-not catalog commands in this increment. Do not use a workspace ID with legacy
-name-based update or approval commands.
+approval. Use the workspace `upgrade` commands to update it, and the `approve`
+and `revoke` commands above to manage local capabilities. Do not use a workspace
+ID with legacy name-based update or approval commands.
 
 Install and show return a description object; ls returns an array of such
 objects. Useful fields include:
@@ -145,7 +151,7 @@ objects. Useful fields include:
 | `install_id`, `name`, `title`, `version`, `summary` | Stable identity and manifest metadata. |
 | `project`, `project_link`, `storage_kind` | Optional legacy project metadata and `workspace` or `legacy` storage. |
 | `source`, `digest`, `installed_at` | Recorded source provenance, copied content digest, and installation time. |
-| `approval.state`, `approved`, `executable` | New workspace rows are `unapproved`, `false`, and `false`. Legacy catalog rows report approval `unknown` and `approved: null`; consult the existing legacy surface for approval verification. |
+| `approval.state`, `approved`, `executable` | Reflect the current local-capability approval for the installed digest. An operator install or update records consent when local execution checks pass; otherwise the result reports that consent was not recorded. Legacy catalog rows report approval `unknown` and `approved: null`; consult the existing legacy surface for approval verification. |
 | `guide`, `record`, `files` | Manifest guide, retained installation record, and bundle inventory. |
 
 Successful install/recover responses also report `committed: true` and
@@ -153,9 +159,10 @@ Successful install/recover responses also report `committed: true` and
 `secret_warnings`. Migration instead returns a summary with the generation,
 installation count, delivery fields, and `executable: false`.
 
-`executable: false` describes this catalog surface. It does not disable or
-replace already-established legacy execution paths. Adding an installation
-creates no bindings, team assignments, worker grants, or authority.
+An approved catalog row's `executable: true` means supported local text-workflow
+execution is available through `app run`; it does not authorize outward effects.
+Adding an installation creates no bindings, team assignments, worker grants, or
+authority beyond consent for the validated local execution contract.
 
 ## Legacy compatibility and migration
 
@@ -244,9 +251,33 @@ card and detail page offer Restore (never Install) while the window is open.
 
 ## Explorer routes
 
-All are served by the board and relayed to the daemon; reads and favourites are
-open to a verified member as well as the operator, everything else is the
-operator's. Agents are refused on every one.
+In the board, `/apps` is the installed-app home. Its **Explore apps** button
+opens `/apps/explore`; attention rows offer **Review update**, **Finish setup**,
+or **Manage access** to the operator. From `/apps/explore`, operators can use
+**Install** on a catalog card or detail page, or **More ▾ → Add from Git URL…**
+for a custom bundle. Members can browse, but see **Ask an admin to install**;
+that sends an install request for the operator to review. These install controls
+are operator-only.
+
+To update an installed app in the board, open `/app-installations/<id>` →
+**Settings** → **App package**, enter a package path or Git URL, choose
+**Check update**, review the proposal, then choose **Apply checked update**. This
+requires a verified operator and a writable (not read-only) session.
+
+The remote CLI (`cadence --org …`) only exposes its allowlisted status,
+agent/issue/message reads and issue create/comment/set verbs; it has no app
+management verbs. In a hosted AgenticOS container, install and update apps only
+from the hosted board as the operator.
+
+Built-in apps and their catalog index are embedded in the Cadence binary. A new
+built-in app version therefore arrives with a new Cadence build. An Explorer
+`update_available` flag is shown only to operators and means an update check for
+that installation found a different bundle digest and cached `has_update: true`;
+it is not a general notice that a build exists.
+
+All routes below are served by the board and relayed to the daemon; reads and
+favourites are open to a verified member as well as the operator, everything
+else is the operator's. Agents are refused on every one.
 
 | Route | Who | Purpose |
 | --- | --- | --- |
