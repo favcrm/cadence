@@ -1370,6 +1370,7 @@ pub(crate) fn migration_recover(pm: &Pm, id: &str, rollback: bool) -> Result<Val
 
 /// Runtime admission uses the same descriptor-confined installation lookup.
 /// The callback runs under PM -> SQLite lock ordering, never the reverse.
+#[track_caller]
 pub(crate) fn with_runtime_snapshot<T>(
     pm: &Pm,
     id: &str,
@@ -1474,6 +1475,7 @@ pub(crate) fn with_runtime_read<T>(
 /// catalog still proves the installation identity; only exact retained bundle
 /// bytes may supply the old app contract. Active runs always use the current
 /// runtime snapshot above.
+#[track_caller]
 pub(crate) fn with_completed_bundle_snapshot<T>(
     pm: &Pm,
     id: &str,
@@ -1829,6 +1831,41 @@ Why.\n\n## Research {{topic}}\nagent: dev-1\nsize: S\n\nDo it.\n\n### Acceptance
         let out = install(&pm, state_dir.path(), source.to_str().unwrap(), None).unwrap();
         let id = out["install_id"].as_str().unwrap().to_string();
         (pm_dir, state_dir, sources, id)
+    }
+
+    /// CAD-1234: a hold over 1 s through `with_runtime_snapshot` reports the
+    /// caller's line, not a line inside this file; a same-process busy
+    /// refusal during the hold names the same site.
+    #[test]
+    fn a_long_hold_through_a_helper_names_the_outer_call_site() {
+        let (pm_dir, _state, _sources, id) = installed();
+        let pm = Pm::at(pm_dir.path()).unwrap();
+        crate::issue::pmlock::HOLD_LINES.with(|l| l.borrow_mut().clear());
+        let call_line = line!() + 1;
+        with_runtime_snapshot(&pm, &id, |_, _| {
+            let err = pm
+                .lock_for(std::time::Duration::from_millis(200))
+                .unwrap_err();
+            assert_eq!(err.code(), Some("resource_busy"), "{err}");
+            assert!(
+                err.to_string().contains(&format!(
+                    "at=src/issue/app_catalog/workspace.rs:{call_line}"
+                )),
+                "{err}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1100));
+            Ok(())
+        })
+        .unwrap();
+        let lines = crate::issue::pmlock::HOLD_LINES.with(|l| l.borrow().clone());
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].ends_with(&format!(
+                "at=src/issue/app_catalog/workspace.rs:{call_line}"
+            )),
+            "{}",
+            lines[0]
+        );
     }
 
     /// CAD-585: the show receipt exposes the declared slot contract —

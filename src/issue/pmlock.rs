@@ -65,14 +65,16 @@
 //! (`--separate-git-dir`, a worktree) keeps its coordination files in
 //! the git dir `git rev-parse --git-dir` names.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::panic::Location;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use super::{Pm, MARKER_LOCK_FILE};
@@ -392,7 +394,35 @@ pub struct PmLock {
     scope: Scope,
     /// When this writer took the lock, for the hold-time report.
     since: Instant,
+    /// The caller of `Pm::lock` and friends (CAD-1234): named in the
+    /// hold report and in a same-process busy refusal.
+    site: &'static Location<'static>,
+    /// Key of the process-wide holder record this guard set.
+    site_key: PathBuf,
     _flock: Unlock,
+}
+
+/// CAD-1234: the acquiring call site of every lock this process holds,
+/// by coordination-file path. Set on acquire, cleared on drop, so a
+/// `resource_busy` raised by another thread of this process can name the
+/// holder. Diagnostic only: no decision reads it.
+static HOLDER_SITES: Mutex<BTreeMap<PathBuf, &'static Location<'static>>> =
+    Mutex::new(BTreeMap::new());
+
+fn set_holder_site(key: &Path, site: &'static Location<'static>) {
+    if let Ok(mut m) = HOLDER_SITES.lock() {
+        m.insert(key.to_path_buf(), site);
+    }
+}
+
+fn holder_site(key: &Path) -> Option<&'static Location<'static>> {
+    HOLDER_SITES.lock().ok()?.get(key).copied()
+}
+
+fn clear_holder_site(key: &Path) {
+    if let Ok(mut m) = HOLDER_SITES.lock() {
+        m.remove(key);
+    }
 }
 
 /// Repo-relative path overlap, component-wise in both directions: a
@@ -471,7 +501,7 @@ impl Drop for Unlock {
 /// (`held_ms`), by which process and binary (the same `pid` and `cmd`
 /// the CAD-1167 marker trailer carries) and, for a scoped write, the
 /// declared paths. `None` for a short hold.
-fn hold_line(held: Duration, scope: &Scope) -> Option<String> {
+fn hold_line(held: Duration, scope: &Scope, site: &Location<'_>) -> Option<String> {
     if held <= HOLD_REPORT {
         return None;
     }
@@ -486,12 +516,13 @@ fn hold_line(held: Duration, scope: &Scope) -> Option<String> {
     if let Scope::Paths { admitted, .. } = scope {
         line.push_str(&format!(" paths={}", admitted.join(",")));
     }
+    line.push_str(&format!(" at={}:{}", site.file(), site.line()));
     Some(line)
 }
 
 #[cfg(test)]
 thread_local! {
-    static HOLD_LINES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    pub(crate) static HOLD_LINES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 impl PmLock {
@@ -499,7 +530,7 @@ impl PmLock {
     /// (No `tracing` subscriber is installed in this crate, so an event
     /// would go nowhere.) Never panics: a closed stderr is ignored.
     fn report_hold(&self) {
-        let Some(line) = hold_line(self.since.elapsed(), &self.scope) else {
+        let Some(line) = hold_line(self.since.elapsed(), &self.scope, self.site) else {
             return;
         };
         #[cfg(test)]
@@ -512,6 +543,7 @@ impl PmLock {
 impl Drop for PmLock {
     fn drop(&mut self) {
         self.report_hold();
+        clear_holder_site(&self.site_key);
         // The kernel lock is released after this body, when `_flock`
         // drops, on the unarmed path as well.
         if !self.armed {
@@ -1086,6 +1118,7 @@ impl Pm {
     /// `queued` is a kernel lock a parked waiter already won (see
     /// [`Waiter`]): it is used as the lock taken, in place of a fresh
     /// non-blocking `flock`.
+    #[track_caller]
     fn attempt(&self, declared: Option<&[PathBuf]>, queued: Option<Unlock>) -> Result<Attempt> {
         let git_dir = self.lock_git_dir().map_err(|e| self.git_dir_error(e))?;
         let flock_path = git_dir.join(FLOCK_FILE);
@@ -1142,12 +1175,16 @@ impl Pm {
             declared.map(|ps| self.rel_paths(ps)).transpose()?;
         // Dropping an unarmed lock leaves the stale marker in place, so
         // a refused attempt is re-checked by the next one.
+        let site = Location::caller();
+        set_holder_site(&flock_path, site);
         let mut lock = PmLock {
             legacy,
             ident,
             armed: !reused,
             scope: Scope::Full,
             since: Instant::now(),
+            site,
+            site_key: flock_path,
             _flock: file,
         };
         let tree = self.tree_state(&git_dir)?;
@@ -1205,6 +1242,7 @@ impl Pm {
     /// lock. The lease and actor fences are re-checked on every turn
     /// of the wait and again once the lock is ours: a kernel lock that
     /// frees up is not authority.
+    #[track_caller]
     pub(super) fn acquire(
         &self,
         wait: Option<Duration>,
@@ -1296,16 +1334,19 @@ impl Pm {
         })
     }
 
+    #[track_caller]
     pub(super) fn acquire_default(&self) -> Result<PmLock> {
         self.acquire_for(WAIT)
     }
 
+    #[track_caller]
     pub(super) fn acquire_scoped_default(&self, declared: &[PathBuf]) -> Result<PmLock> {
         Ok(self
             .acquire(Some(WAIT), Some(declared))?
             .expect("a waiting acquire answers"))
     }
 
+    #[track_caller]
     pub(super) fn acquire_for(&self, wait: Duration) -> Result<PmLock> {
         Ok(self
             .acquire(Some(wait), None)?
@@ -1338,9 +1379,16 @@ impl Pm {
                 ),
             )
         } else {
+            // CAD-1234: when this process is the holder, name its call site.
+            let at = self
+                .lock_git_dir()
+                .ok()
+                .and_then(|d| holder_site(&d.join(FLOCK_FILE)))
+                .map(|l| format!(" at={}:{}", l.file(), l.line()))
+                .unwrap_or_default();
             Error::busy(format!(
                 "PM dir is locked by another live writer (kernel lock on \
-                 .git/cadence-write.flock); it frees when that process exits ({holder})"
+                 .git/cadence-write.flock); it frees when that process exits ({holder}{at})"
             ))
         }
     }

@@ -249,11 +249,13 @@ impl Pm {
     /// Serialise writers: comments/artifacts are create-only and ids are
     /// allocated under this same lock. A kernel `flock` on a stable file
     /// (see [`pmlock`]); bounded wait. The lock dies with its process.
+    #[track_caller]
     pub fn lock(&self) -> Result<PmLock> {
         self.acquire_default()
     }
 
     /// [`Self::lock`] with a caller-chosen wait.
+    #[track_caller]
     pub fn lock_for(&self, wait: Duration) -> Result<PmLock> {
         self.acquire_for(wait)
     }
@@ -261,6 +263,7 @@ impl Pm {
     /// [`Self::lock`] without the wait: `None` when another writer holds
     /// it. For a caller that must not stall behind a writer (the daemon
     /// under its own lock, CAD-449) and retries later instead.
+    #[track_caller]
     pub fn try_lock(&self) -> Result<Option<PmLock>> {
         self.acquire(None, None)
     }
@@ -273,12 +276,14 @@ impl Pm {
     /// declared paths — use [`Self::commit_scoped`], which enforces
     /// it. `paths` follow [`Self::commit`]'s convention (absolute or
     /// `pm.dir`-relative; outside the tracker is a caller bug).
+    #[track_caller]
     pub fn lock_for_paths(&self, paths: &[PathBuf]) -> Result<PmLock> {
         self.acquire_scoped_default(paths)
     }
 
     /// [`Self::lock_for_paths`] without the wait: `None` when another
     /// writer holds it.
+    #[track_caller]
     pub fn try_lock_for_paths(&self, paths: &[PathBuf]) -> Result<Option<PmLock>> {
         self.acquire(None, Some(paths))
     }
