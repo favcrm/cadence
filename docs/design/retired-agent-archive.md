@@ -4,7 +4,7 @@ Decision spike, revision 2. Revision 2 answers the independent QA verdict
 `20261008-085249-3c1a2-retired-agent-archive-sol-verdict.md` (REVISE on
 7b7c6038). It changes no code, schema, timer, GC path, caller rule, UI or
 production state, and it archives nothing. Source line numbers are at
-`origin/main` 8522672b, the lane base. Re-check function names before citing.
+`origin/main` 8522672b. The cited files are unchanged at the rebased base `fedd7964`. Re-check function names before citing. Revision 3 adds C1 and C2 from the Sol re-QA on `349eea99`.
 
 Related: CAD-1221 (fleet read cost), CAD-804 (GC predicate, keep marker,
 floor, plan output), CAD-199 (record-only timer), CAD-96 (idle auto-stop),
@@ -62,7 +62,7 @@ retention.
 | `dispatch_task`, `src/store/plans.rs:606` | Assigns a task inside a transaction after `agent_in` (around `:630`). |
 | `route_notice`, `src/store/delivery.rs:595`; `recipient_binding`, `src/store/messages.rs:1215` | Routes terminal reports to `reply_to`. Reasons today: `recipient_missing`, `recipient_identity_unavailable`, `recipient_identity_changed`. A report that cannot route is recorded as `handoff_unresolved` (`messages.rs:1262`, a daemon-stream event). |
 | `resolve_alias`, `agents_rpc.rs:1095` | Exact alias first (`agent_opt`), then `agent_by_native` (`src/store/agents.rs:230`; `thread_id` OR `session_id`, no archive filter). |
-| `Agent::to_json`, `src/store/agents.rs` (around `:200`) | Includes `params`, `quota`, `instructions`. `agent_show` returns it unchanged. |
+| `Agent::to_json`, `src/store/agents.rs` (around `:200`) | Includes `params`, `quota`, `model_selection` (presented), `error`; not `instructions`. `agent_show` returns this JSON unchanged. |
 | Registration reservation | `register_agent` refuses duplicates (`agents.rs:297`, `:314`, `:328`, `duplicate_alias` at `:377`). |
 | Launch UNIQUE branch, `src/cli/launch.rs:462-470` | On an error whose text contains `UNIQUE`, it calls `agent_show`, then `agent_resume` for `stopped` or `offline` rows. Reservation alone therefore resumes a reserved row. |
 
@@ -83,6 +83,37 @@ retention.
   (`src/store/app_contexts.rs:17`) and an expected-revision compare-and-set
   (`app_context_archive`, `:216`; the update at `:251`).
 
+### 1.4 Saved metadata, threads and resumability (C2)
+
+- Open writes the saved metadata in one statement: `thread_id`, `session_id`,
+  `model`, `effort`, `pid`, `pid_start`, `endpoint`, `generation`, `quota`,
+  `state='idle'`, `updated` (`src/store/agents.rs:578`), plus a `ready` event.
+  `params` and `cwd`, `role`, `provider`, `endpoint_kind` are set at
+  registration (`register_agent`). `params` changes through `agent_set`
+  (`src/daemon/agents_rpc.rs:337`).
+- `resumable` is derived, never stored (`agents_rpc.rs:701-714`): stopped or
+  dead, a non-empty `thread_id`, and no unknown. An archived stopped row with a
+  `thread_id` therefore reads `resumable: true`. That is local metadata, not
+  provider availability.
+- Removal detaches threads (`src/store/threads.rs:503`, `thread_detach_in`).
+  The home thread gets a system entry, and its `alias` becomes NULL with
+  `archived_alias` set. `conversations_detach_in` (`threads.rs:531`) does the
+  same for app conversations (`install_id IS NOT NULL`), sets `archived=1`, and
+  is also called on the home-thread path.
+- Lookup: `thread(alias)` (`threads.rs:541`, `thread_in` at `:545`) matches the
+  live alias only. `thread_by_id` (`threads.rs:562`) matches id, and
+  `rpc_thread_read` (`src/daemon/threads_rpc.rs:9-20`) then requires
+  `t.alias == alias`. After a removal detach the alias is NULL, so no current
+  route returns that thread by id. Archived-thread history is therefore not
+  reachable through existing reads. No route is invented here.
+- Archive (this design) leaves `thread_id`, `session_id`, `params`, `cwd` and
+  the thread `alias` untouched: no detach and no move. Thread reads keep their
+  current rules. Restore clears only the marker. It does not start, rebind or
+  verify a provider session.
+- Unverified, not audited here: provider lifetime of a stored `session_id` or
+  `thread_id`; whether `params` contain secrets (`agent_show` returns them);
+  credential and provider availability.
+
 ## 2. Overlap with CAD-804
 
 | Concern | Owner | This design |
@@ -102,7 +133,7 @@ retention.
 | `state='stopped'` | Rejected | Lifecycle state and resume target. Shows in ordinary reads. |
 | `threads.archived` / `archived_alias` | Idea reused, row not | Per-thread, app conversation. Removal moves the alias, which is a routing change. |
 | `app_contexts.state` | Shape reused | `CHECK` on state plus revision compare-and-set. |
-| **New: `archived_at`, `archived_by`, `archive_reason`, `lifecycle_rev`** | **Chosen** | Additive and nullable. `lifecycle_rev` is monotonic (section 6). The row is kept, so alias reservation holds. |
+| **New: `archived_at`, `archived_by`, `archive_reason`, `lifecycle_rev`** | **Chosen** | Additive: `archived_*` are nullable (NULL = not archived). `lifecycle_rev` is `NOT NULL DEFAULT 0` and monotonic (section 6). The row is kept, so alias reservation holds. |
 
 ## 4. Retention and deletion protection (B1)
 
@@ -130,9 +161,12 @@ document.
     bypass it.
   - `timer_gc_remove` returns `Ok(None)` for the same condition, with no
     event.
-  The check must be ordered first, because a SQLite trigger's `RAISE(ABORT)`
-  rolls back only the failing statement. The prune statements run earlier in
-  the same transaction and would otherwise commit.
+  The check must run first. A SQLite `RAISE(ABORT)` aborts only the failing
+  statement. On the normal error path the enclosing `write_tx` rolls back the
+  whole callback when the error propagates (`src/store/mod.rs:308-318`,
+  `src/store/seal.rs:835`), so earlier prune statements are undone. A swallowed
+  error that lets the callback return success would commit them. A pre-prune
+  refusal therefore stays the primary guard; the trigger is only a backstop.
 - **P-DEL-b, truthful candidates.** `gc_candidates` adds
   `AND archived_at IS NULL`. Manual `agent gc`, `agent_gc_plan`, the session
   end dry run and the timer all then exclude archived rows. The plan output
@@ -160,7 +194,8 @@ Coverage: the delete sites are `agents.rs:1150` (`remove_agent`) and
   it was.
 - Restore is local metadata only. It does not guarantee the provider still
   holds the session named by `session_id` or `thread_id`. That is
-  provider-owned and unverified here.
+  provider-owned and unverified here. Restore does not start, rebind or move
+  threads (section 1.4).
 
 ### 4.4 Ownership and ordering
 
@@ -251,9 +286,9 @@ diagnostics must not use the audit event stream for them.
 
 ## 7. Actor, enqueue, assignment and launch paths (B2 related)
 
-Reads are exact-alias and remain available: `agent_show <alias>` and the
-operational list return an archived row with `archived: true`. The races
-below are about **writes** that can make an archived row active.
+Reads: `agent_show <alias>` (exact alias) returns an archived row with
+`archived: true`. The operational list does not return archived rows (section
+8). The races below are about **writes** that can make an archived row active.
 
 | Path | Required refusal (reason `archived`) | Basis |
 |---|---|---|
@@ -274,8 +309,35 @@ Races, with the guard in place:
 - **Archive vs resume.** The lifecycle lock covers the daemon-side owned
   check. `start_actor_locked` re-checks archive state after the lock is held,
   so a resume that began before archive refuses instead of starting.
-- **Archive vs task assignment.** `dispatch_task` checks the assignee inside
-  its transaction; E6 checks open tasks at archive time.
+- **Archive vs task assignment.** The validator (section 7.1) runs inside each
+  assignment transaction. E6 checks open tasks at archive time. Both orders
+  refuse or serialize, as with enqueue.
+
+**7.1 Task assignment (C1).** Four write paths put an assignee on a task or
+move a terminal task back to nonterminal. The proposed shared validator
+`archived_assignee_refusal(tx, alias)` is a design name only. It refuses an
+alias whose row is archived, and it runs inside the same `BEGIN IMMEDIATE`
+transaction as the write, after the existing `agent_in` lookup.
+
+- `create_job` (`src/store/plans.rs:384`; assignee check at `:473-476`). The
+  job row and `job_created` event are written earlier in the callback. The
+  refusal propagates, so the write transaction rolls them back. No partial job,
+  task or event remains. Reached by `rpc_job_new` (`src/daemon/jobs_rpc.rs:34`).
+- `create_task` (`plans.rs:512`; check at `:540-542`), reached by `rpc_task_new`
+  (`jobs_rpc.rs:280`). Same rule and rollback.
+- `dispatch_task` (`plans.rs:606`; check at `:630-631`). The existing guard in
+  section 7 is the same check. The shared validator must replace it, not sit
+  beside it.
+- `reopen_task` (`plans.rs:968`), reached by `rpc_task_reopen`
+  (`jobs_rpc.rs:458`). It sets `blocked`, `verified` or `failed` to `draft`,
+  nonterminal, and keeps the assignee. Refuse when the assignee is archived. The
+  refusal changes nothing: no state write, no assignee cleared, and the terminal
+  historical link is kept.
+
+Other writers of task state or assignee are not validated by this design:
+`plans.rs:720, 867, 939, 981, 1010, 1054`; `agents.rs:1076` (force-unassign);
+`delivery.rs:1130, 1187`; `monitors.rs:593`; and seven `app_runs.rs` writers.
+Inventorying them is an activation prerequisite.
 
 Launch UNIQUE. `cli/launch.rs:462-470` takes the UNIQUE branch, calls
 `agent_show`, and then `agent_resume` for `stopped` or `offline`. The
@@ -295,7 +357,7 @@ not specified here.
 | View | Selection | Notes |
 |---|---|---|
 | Operational (default list) | `WHERE archived_at IS NULL` in SQL, before enrichment | Archived rows incur no per-row enrichment (tasks, liveness, inbox, stall, board). `last_events_of_all` is restricted to listed aliases. This is a server-side claim. The CLI group scope (`src/cli/mod.rs:1636-1643`) is client-side and is not counted. |
-| Recent activity | Operational rows whose `updated` falls inside an operator-supplied `since` | No default window (D-e). |
+| Recent activity | Operational rows (archived rows excluded in SQL, as above) whose `updated` falls inside an operator-supplied `since` | No default window (D-e). |
 | Archived (searchable) | `WHERE archived_at IS NOT NULL`, operator-only, lightweight projection | Projection excludes `params`, `instructions`, `quota`, `model_selection`, `error`. This is not an absolute "never exported" claim: `agent_show` still returns full rows, and that behavior is unchanged. |
 | Explicit alias | Full row with `archived: true` | Unchanged except for the flag. |
 
@@ -307,6 +369,12 @@ archived fraction, measured before and after.
 Activation is blocked until every earlier release is merged and independently
 accepted. No step introduces a runtime enable flag, which would be an invented
 policy.
+
+R1 to R3 are logical dependencies inside one eventual archive feature PR. They
+are not separate PRs and not a stack. AGENTS.md asks for one end-to-end PR unless
+a genuinely permitted split exists, and that PR gets the reviews and approvals
+its own diff requires. A future owner allocation given by the PM is not
+operator approval. It does not assume CAD-804 owns P-DEL.
 
 - **R1 (protection, schema).** Adds `archived_at`, `archived_by`,
   `archive_reason`, `lifecycle_rev` and the trigger. Adds P-DEL-a, b, c and d,
@@ -355,6 +423,7 @@ temp state dir.
 | `archive_mixed_batch_all_or_nothing` | I3 | Batch-set equality plus per-alias digest | Fresh alias archived while stale alias is refused |
 | `archived_row_survives_deletion` | I4, P-DEL-a to c | `remove_agent`, `timer_gc_remove`, the BEFORE DELETE trigger | Manual GC, session end at 3600, timer, direct remove (force and not), master path or raw SQL deletes the row or its history |
 | `archived_row_not_started_or_enqueued` | I5 | `start_actor_locked`, `enqueue_tx_as`, `dispatch_task`, `queued_for_stopped` | Send, dispatch, resume or auto-resume (with an earlier auto-stop marker) starts or queues the archived row |
+| `archived_assignee_refused_on_create_and_reopen` | I5, C1 | `archived_assignee_refusal` in `create_job`, `create_task`, `dispatch_task`, `reopen_task` | An archived worker gets a nonterminal assignment through create or reopen. Refusal must leave no job, task, event or state change, and a reopen race with archive must refuse. |
 | `routed_report_to_archived_recipient` | Section 7 | `recipient_binding` reason | Report delivered into an archived row, or dropped without a record |
 | `archived_register_not_unique_recovery` | I5 | Register error text plus start guard | `launch` takes the UNIQUE branch and resumes the archived alias |
 | `rollup_skips_archived_alias` | Section 4.1 | P-DEL-d | Archived alias's delivery events folded |
