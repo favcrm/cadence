@@ -35,7 +35,7 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
   const [busy, setBusy] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
 
-  const isOp = viewer.operator && !viewer.readOnly;
+  const isOp = viewer.operator === true && !viewer.readOnly;
 
   // CAD-1189: every list here loads with the shared busy backoff, keeps
   // its last good answer on a failed refresh, and never reads an error as
