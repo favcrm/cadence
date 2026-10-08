@@ -511,11 +511,15 @@ pub fn authorize_direct_run(state_dir: &Path) -> Result<()> {
     authorize_spawn_for(state_dir, process_caller()).map(|_| ())
 }
 
-/// A sandbox's own state dir (`<root>/state` beside its marker) takes
-/// no part in a rollout: it is disposable, so a rebuilt binary starts
-/// it, and migrates it, without the lease (CAD-310).
+/// A dev store takes no part in a rollout: it is disposable, so a
+/// rebuilt binary starts it, and migrates it, without the lease
+/// (CAD-310). CAD-1187: the mode is the store's — it must hold the dev
+/// marker `cadence dev up` writes into it and sit under the sandbox
+/// base (`sandbox::dev_owner`). The caller's `CADENCE_PROFILE` is not
+/// consulted, so a hand-set profile on any other store unlocks nothing;
+/// production's rules are unchanged.
 pub fn sandbox_exempt(state_dir: &Path) -> bool {
-    matches!(crate::sandbox::owner_of(state_dir), Ok(Some(_)))
+    matches!(crate::sandbox::dev_owner(state_dir), Ok(Some(_)))
 }
 
 pub fn authorize_spawn_for(state_dir: &Path, caller: Result<Caller>) -> Result<Option<String>> {
@@ -3182,13 +3186,27 @@ mod tests {
         drop(conn);
         let nobody = || Err(Error::rejected("no rollout identity"));
         assert!(authorize_spawn_for(&state, nobody()).is_err());
+        // CAD-1187: the root marker alone no longer exempts — the store
+        // must hold the dev marker and sit under the sandbox base.
         std::fs::write(root.join(".cadence-sandbox"), r#"{"name":"sbx"}"#).unwrap();
+        let previous = std::env::var_os("CADENCE_SANDBOX_ROOT");
+        std::env::set_var("CADENCE_SANDBOX_ROOT", dir.path());
+        assert!(!sandbox_exempt(&state));
+        assert!(authorize_spawn_for(&state, nobody()).is_err());
+        let dev = serde_json::json!({
+            "v": 1, "name": "sbx", "state_dir": crate::sandbox::resolved(&state),
+        });
+        std::fs::write(state.join(crate::sandbox::DEV_MARKER), dev.to_string()).unwrap();
         assert!(sandbox_exempt(&state));
         assert!(authorize_spawn_for(&state, nobody()).is_ok());
         let db = downgrade_to_v11(&state);
         assert!(authorize_migration(&db).is_ok());
         std::fs::remove_file(root.join(".cadence-sandbox")).unwrap();
         assert!(authorize_migration(&db).is_err());
+        match previous {
+            Some(v) => std::env::set_var("CADENCE_SANDBOX_ROOT", v),
+            None => std::env::remove_var("CADENCE_SANDBOX_ROOT"),
+        }
     }
 
     #[test]

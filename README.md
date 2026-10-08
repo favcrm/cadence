@@ -86,7 +86,7 @@ deliberately serving a board in the foreground without one already running.
   to that exact head; `cadence audit` flags merges with no passing verdict.
 - **A board** — read/write SPA + JSON API on loopback; one writer
   implementation behind CLI and API alike.
-- **A sandbox** — `cadence sandbox up <name>` runs a disposable second
+- **A sandbox** — `cadence dev up` (alias `sandbox`) runs a disposable second
   instance with its own state dir, tracker and port.
 
 Task worktrees live under `.cadence/wt/` inside the repo checkout.

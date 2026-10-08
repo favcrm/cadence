@@ -56,6 +56,7 @@ exit 2
             collect: Some(std::cell::RefCell::new(Vec::new())),
             pending: std::cell::RefCell::new(None),
             progress_log: None,
+            pin: None,
         }
     }
 
