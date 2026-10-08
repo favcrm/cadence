@@ -1,4 +1,5 @@
-//! `cadence sandbox` — a disposable Cadence beside production (CAD-310).
+//! `cadence dev` (alias `sandbox`) — a disposable Cadence beside
+//! production (CAD-310, CAD-1187).
 //!
 //! One marked root per name under the sandbox base: `.cadence-sandbox`
 //! (the marker `reset` requires), `state/` (0700), `pm/` (its own
@@ -10,6 +11,16 @@
 //! observe-only provider WAL watcher, no Cursor `cli-config.json` merge.
 //! Every verb first refuses a root that overlaps production's state
 //! dir (and so its socket) or tracker.
+//!
+//! CAD-1187: whether a store may change build without the rollout lease
+//! is a property of the STORE, not of the caller's env. `up` writes a
+//! dev marker (`<state>/.cadence-dev`) into the store, naming its own
+//! resolved path; [`dev_owner`] (what `rollout::sandbox_exempt` asks)
+//! is true only for a store that holds that marker AND sits directly
+//! under the sandbox base. `CADENCE_PROFILE=sandbox:x` alone, a marker
+//! copied to another directory, or a root marker without the dev marker
+//! unlock nothing. `reload` restarts a dev store from a local binary
+//! and checks the same gate first.
 
 use std::net::TcpListener;
 use std::path::{Component, Path, PathBuf};
@@ -25,6 +36,11 @@ use crate::error::{Error, Result};
 /// The file that makes a directory a sandbox root. `reset` deletes
 /// nothing that lacks it.
 const MARKER: &str = ".cadence-sandbox";
+/// CAD-1187: the dev marker inside the store (`<root>/state`). It names
+/// the store's own resolved path, so a copy elsewhere proves nothing.
+pub const DEV_MARKER: &str = ".cadence-dev";
+/// The name `cadence dev up` uses when none is given.
+const DEFAULT_NAME: &str = "dev";
 const PROFILE_PREFIX: &str = "sandbox:";
 /// The production board's port — never a sandbox's.
 const PRODUCTION_UI_PORT: u16 = 3010;
@@ -34,22 +50,50 @@ pub const ALLOW_GLOBAL_ENV: &str = "CADENCE_SANDBOX_ALLOW_GLOBAL";
 
 #[derive(Subcommand)]
 pub enum SandboxAction {
-    /// Create (or reuse) the sandbox and start its daemon and board
-    /// from this binary: its own state dir, tracker and a free port in
-    /// 3110-3199. Prints the paths, URL and env file as JSON.
+    /// Create (or reuse) the dev Cadence and start its daemon and board:
+    /// its own state dir, tracker and a free port in 3110-3199, plus a
+    /// durable dev marker in the new store. Prints the paths, URL and
+    /// env file as JSON.
     Up {
-        /// Sandbox name: [a-z0-9][a-z0-9-]{0,31}.
-        name: String,
+        /// Name: [a-z0-9][a-z0-9-]{0,31} [default: dev].
+        name: Option<String>,
+        /// The same, as a flag.
+        #[arg(
+            long = "name",
+            id = "name_flag",
+            value_name = "NAME",
+            conflicts_with = "name"
+        )]
+        name_flag: Option<String>,
         /// Board port [default: the sandbox's last port, else the first
         /// free one in 3110-3199]. 3010 is refused.
         #[arg(long)]
         port: Option<u16>,
+        /// Start the daemon and board from this binary instead of the
+        /// invoking one.
+        #[arg(long, value_name = "PATH")]
+        build: Option<PathBuf>,
     },
-    /// Print the sandbox's export lines, for
-    /// `eval "$(cadence sandbox env <name>)"`.
-    Env { name: String },
-    /// Stop the sandbox's board and daemon; its files stay.
-    Down { name: String },
+    /// Restart the dev daemon and board from a local binary: no rollout
+    /// lease, no attestation, no backup. Refused unless the store holds
+    /// the dev marker and sits under the sandbox base; nothing is
+    /// stopped or started when refused.
+    Reload {
+        /// The dev Cadence to reload [default: the store this shell
+        /// points at (`CADENCE_STATE_DIR` / `--state-dir`)].
+        #[arg(long)]
+        name: Option<String>,
+        /// The binary to start [default: the newest of the repo's
+        /// `target/release/cadence` and `target/debug/cadence`].
+        #[arg(long, value_name = "PATH")]
+        build: Option<PathBuf>,
+    },
+    /// Print the export lines, for `eval "$(cadence dev env)"`.
+    Env { name: Option<String> },
+    /// Stop the board and daemon; the files stay.
+    Down { name: Option<String> },
+    /// Show whether the dev Cadence is running, and its port.
+    Status { name: Option<String> },
     /// Stop the sandbox, then delete its root — only a directory under
     /// the sandbox base that holds this sandbox's marker.
     Reset { name: String },
@@ -58,12 +102,31 @@ pub enum SandboxAction {
     Ls,
 }
 
-/// `cadence sandbox …`
-pub fn run_cli(action: &SandboxAction) -> Result<i32> {
+/// `cadence dev …`. `state_dir` is the store this shell points at; it
+/// names the default target of `reload`, `env`, `down` and `status`.
+pub fn run_cli(state_dir: &Path, action: &SandboxAction) -> Result<i32> {
     let out = match action {
-        SandboxAction::Up { name, port } => up(&Sandbox::open(name)?, *port)?,
+        SandboxAction::Up {
+            name,
+            name_flag,
+            port,
+            build,
+        } => {
+            let name = name
+                .as_deref()
+                .or(name_flag.as_deref())
+                .unwrap_or(DEFAULT_NAME);
+            let exe = match build {
+                Some(path) => runnable(path)?,
+                None => std::env::current_exe()?,
+            };
+            up(&Sandbox::open(name)?, *port, &exe)?
+        }
+        SandboxAction::Reload { name, build } => {
+            reload(state_dir, name.as_deref(), build.as_deref())?
+        }
         SandboxAction::Env { name } => {
-            let sb = Sandbox::open(name)?;
+            let sb = target(state_dir, name.as_deref())?;
             refuse_production(&sb)?;
             let marker = require_marker(&sb)?;
             let allow = marker["allow_global"].as_bool() == Some(true);
@@ -71,10 +134,16 @@ pub fn run_cli(action: &SandboxAction) -> Result<i32> {
             return Ok(0);
         }
         SandboxAction::Down { name } => {
-            let sb = Sandbox::open(name)?;
+            let sb = target(state_dir, name.as_deref())?;
             refuse_production(&sb)?;
             require_marker(&sb)?;
             down(&sb)?
+        }
+        SandboxAction::Status { name } => {
+            let sb = target(state_dir, name.as_deref())?;
+            refuse_production(&sb)?;
+            require_marker(&sb)?;
+            status(&sb)
         }
         SandboxAction::Reset { name } => reset(&Sandbox::open(name)?)?,
         SandboxAction::Ls => ls()?,
@@ -204,6 +273,24 @@ impl Sandbox {
     fn marker(&self) -> PathBuf {
         self.root.join(MARKER)
     }
+    fn dev_marker(&self) -> PathBuf {
+        self.state_dir().join(DEV_MARKER)
+    }
+    /// The sandbox a state dir is the `state` of, by layout alone
+    /// (`<base>/<name>/state`) — nothing is trusted until the callers'
+    /// checks pass.
+    fn from_state_dir(state_dir: &Path) -> Option<Self> {
+        if state_dir.file_name().and_then(|n| n.to_str()) != Some("state") {
+            return None;
+        }
+        let root = state_dir.parent()?;
+        let name = root.file_name()?.to_str()?.to_string();
+        Some(Self {
+            name,
+            base: root.parent()?.to_path_buf(),
+            root: root.to_path_buf(),
+        })
+    }
     fn profile(&self) -> String {
         format!("{PROFILE_PREFIX}{}", self.name)
     }
@@ -224,6 +311,21 @@ fn validate_name(name: &str) -> Result<()> {
             "sandbox name '{name}' must match [a-z0-9][a-z0-9-]{{0,31}} — \
              e.g. `cadence sandbox up smoke`"
         )))
+    }
+}
+
+/// The sandbox a verb acts on: `name` when given, else the one this
+/// shell's state dir belongs to, else `dev`.
+fn target(state_dir: &Path, name: Option<&str>) -> Result<Sandbox> {
+    match name {
+        Some(name) => Sandbox::open(name),
+        None => match Sandbox::from_state_dir(state_dir) {
+            Some(sb) if sb.marker().exists() => {
+                validate_name(&sb.name)?;
+                Ok(sb)
+            }
+            _ => Sandbox::open(DEFAULT_NAME),
+        },
     }
 }
 
@@ -278,10 +380,18 @@ fn production_dirs(sb: &Sandbox, exported: bool) -> Result<Vec<(&'static str, Pa
         dirs.push(("the production state dir", crate::home::local_state_dir()?));
     }
     if exported && profile().as_deref() != Some(sb.name.as_str()) {
-        if let Some(d) = std::env::var_os("CADENCE_STATE_DIR") {
+        // CAD-1187: a shell pointed at this very sandbox's own dirs
+        // (`--state-dir <root>/state`, a bare export) is not a live
+        // cadence; the sandbox's dirs are checked against production's
+        // defaults above.
+        let own = |d: &std::ffi::OsString| {
+            let d = resolved(Path::new(d));
+            d == resolved(&sb.state_dir()) || d == resolved(&sb.pm_dir())
+        };
+        if let Some(d) = std::env::var_os("CADENCE_STATE_DIR").filter(|d| !own(d)) {
             dirs.push(("the exported CADENCE_STATE_DIR", PathBuf::from(d)));
         }
-        if let Some(d) = std::env::var_os("CADENCE_PM_DIR") {
+        if let Some(d) = std::env::var_os("CADENCE_PM_DIR").filter(|d| !own(d)) {
             dirs.push(("the exported CADENCE_PM_DIR", PathBuf::from(d)));
         }
         if let Some(d) = std::env::var_os("CADENCE_HOME") {
@@ -425,6 +535,76 @@ pub fn owner_of(state_dir: &Path) -> Result<Option<String>> {
             state_dir.display()
         ))
     })
+}
+
+/// CAD-1187: the dev store `state_dir` is — the only kind of store that
+/// may change build without the rollout lease. All of: it is
+/// `<root>/state` beside a usable sandbox marker ([`owner_of`]); `<root>`
+/// is a direct child of the sandbox base once symlinks resolve; and the
+/// store holds a dev marker that names its own resolved path. `None`
+/// otherwise — for production, for a plain `--state-dir`, for a marker
+/// copied elsewhere. The caller's env (`CADENCE_PROFILE`) is not read.
+pub fn dev_owner(state_dir: &Path) -> Result<Option<String>> {
+    dev_owner_under(state_dir, base_dir().ok().as_deref())
+}
+
+fn dev_owner_under(state_dir: &Path, base: Option<&Path>) -> Result<Option<String>> {
+    let Some(name) = owner_of(state_dir)? else {
+        return Ok(None);
+    };
+    let Some(sb) = Sandbox::from_state_dir(state_dir) else {
+        return Ok(None);
+    };
+    if !base.is_some_and(|b| under_base(&sb, b)) || !dev_marker_ok(&sb, state_dir) {
+        return Ok(None);
+    }
+    Ok(Some(name))
+}
+
+/// `<root>` is a direct child of the sandbox base, after symlinks.
+fn under_base(sb: &Sandbox, base: &Path) -> bool {
+    resolved(&sb.root).parent() == Some(resolved(base).as_path())
+}
+
+/// A regular, non-symlink `<state>/.cadence-dev` naming this sandbox
+/// and this store's resolved path.
+fn dev_marker_ok(sb: &Sandbox, state_dir: &Path) -> bool {
+    let path = state_dir.join(DEV_MARKER);
+    let regular = std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_file());
+    if !regular {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(marker) = serde_json::from_str::<Value>(&text) else {
+        return false;
+    };
+    marker["v"].as_u64() == Some(1)
+        && marker["name"].as_str() == Some(sb.name.as_str())
+        && marker["state_dir"].as_str() == resolved(state_dir).to_str()
+}
+
+fn write_dev_marker(sb: &Sandbox) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let marker = json!({
+        "v": 1,
+        "name": sb.name,
+        "state_dir": resolved(&sb.state_dir()),
+    });
+    let path = sb.dev_marker();
+    if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(Error::rejected(format!(
+            "{} is a symlink — refusing to write the dev marker through it",
+            path.display()
+        )));
+    }
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&marker).unwrap_or_default() + "\n",
+    )?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
 }
 
 /// Run as the sandbox `state_dir` belongs to, whatever the caller's
@@ -700,6 +880,9 @@ fn child(sb: &Sandbox, exe: &Path, args: &[&str]) -> Command {
         .env("CADENCE_STATE_DIR", sb.state_dir())
         .env("CADENCE_PM_DIR", sb.pm_dir())
         .env("CADENCE_PROFILE", sb.profile())
+        // The dev gate compares the store with the sandbox base: pin the
+        // base the children (and the daemon) see to the one `up` used.
+        .env("CADENCE_SANDBOX_ROOT", &sb.base)
         .env_remove("CADENCE_ALIAS")
         .env_remove("CADENCE_ROLLOUT_AS")
         .stdin(Stdio::null());
@@ -776,7 +959,7 @@ fn persisted_share(sb: &Sandbox) -> Result<bool> {
     crate::ui::has_persisted_share(&sb.state_dir())
 }
 
-fn up(sb: &Sandbox, wanted_port: Option<u16>) -> Result<Value> {
+fn up(sb: &Sandbox, wanted_port: Option<u16>, exe: &Path) -> Result<Value> {
     refuse_production(sb)?;
     let socket = client::socket_path(&sb.state_dir());
     let len = socket.as_os_str().len();
@@ -810,7 +993,6 @@ fn up(sb: &Sandbox, wanted_port: Option<u16>) -> Result<Value> {
     // has bound the board: a cooperating suite can neither take the
     // port we picked nor have its own leased port stolen in the gap.
     let (port, _lease) = choose_port(sb, wanted_port, &port_lock_dir())?;
-    let exe = std::env::current_exe()?;
     std::fs::create_dir_all(sb.state_dir())?;
     {
         use std::os::unix::fs::PermissionsExt;
@@ -869,10 +1051,13 @@ fn up(sb: &Sandbox, wanted_port: Option<u16>) -> Result<Value> {
         serde_json::to_string_pretty(&marker).unwrap_or_default() + "\n",
     )?;
     std::fs::write(sb.env_file(), env_lines(sb, Some(port), allow_global))?;
-    run_child(sb, &exe, &["issue", "init"])?;
-    let daemon = run_child(sb, &exe, &["daemon", "start"])?;
+    // CAD-1187: the store itself says it is a dev store, before any
+    // daemon starts from it.
+    write_dev_marker(sb)?;
+    run_child(sb, exe, &["issue", "init"])?;
+    let daemon = run_child(sb, exe, &["daemon", "start"])?;
     let port_arg = port.to_string();
-    let ui = run_child(sb, &exe, &["ui", "start", "--port", &port_arg])?;
+    let ui = run_child(sb, exe, &["ui", "start", "--port", &port_arg])?;
     Ok(json!({
         "name": sb.name,
         "root": sb.root,
@@ -885,6 +1070,145 @@ fn up(sb: &Sandbox, wanted_port: Option<u16>) -> Result<Value> {
         "daemon": daemon["state"],
         "ui": ui["state"],
     }))
+}
+
+/// A binary `--build` may name: an absolute, symlink-resolved regular
+/// file with an execute bit.
+fn runnable(path: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let real = std::fs::canonicalize(path)
+        .map_err(|e| Error::rejected(format!("--build {} cannot be read ({e})", path.display())))?;
+    let meta = std::fs::metadata(&real)?;
+    if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
+        return Err(Error::rejected(format!(
+            "--build {} is not an executable file",
+            path.display()
+        )));
+    }
+    Ok(real)
+}
+
+/// The newest `target/{release,debug}/cadence` of the repo the cwd sits
+/// in (the nearest ancestor holding a `Cargo.toml` and a `target/`).
+fn newest_local_build() -> Result<PathBuf> {
+    let cwd = std::env::current_dir()?;
+    let repo = cwd
+        .ancestors()
+        .find(|d| d.join("Cargo.toml").is_file() && d.join("target").is_dir())
+        .ok_or_else(|| {
+            Error::rejected(
+                "no cargo `target/` dir above the cwd — build first, or pass --build <path>",
+            )
+        })?;
+    ["release", "debug"]
+        .iter()
+        .map(|profile| repo.join("target").join(profile).join("cadence"))
+        .filter_map(|bin| {
+            let modified = std::fs::metadata(&bin).ok()?.modified().ok()?;
+            Some((modified, bin))
+        })
+        .max()
+        .map(|(_, bin)| bin)
+        .ok_or_else(|| {
+            Error::rejected(format!(
+                "no target/release/cadence or target/debug/cadence under {} — build \
+                 first, or pass --build <path>",
+                repo.display()
+            ))
+        })
+}
+
+/// `dev reload`: restart the dev store's board and daemon from a local
+/// binary. Every refusal happens before anything is stopped: the
+/// target must not overlap production and must be a dev store
+/// ([`dev_owner`]: dev marker in the store, root under the sandbox
+/// base). It then calls only stop and start verbs — never the rollout
+/// lease, a backup or an attestation check — and the child daemon's own
+/// start gate admits the new build for the same reason `dev_owner`
+/// holds.
+fn reload(state_dir: &Path, name: Option<&str>, build: Option<&Path>) -> Result<Value> {
+    // No name: the store this shell points at, never a fallback to
+    // `dev` — a plain `--state-dir` must be refused, not redirected.
+    let sb = match name {
+        Some(name) => Sandbox::open(name)?,
+        None => Sandbox::from_state_dir(state_dir).ok_or_else(|| {
+            Error::rejected(format!(
+                "{} is not a dev store — `dev reload` only restarts a store that \
+                 `cadence dev up` created. Nothing was stopped or started; production \
+                 builds ship with `cadence update`",
+                state_dir.display()
+            ))
+        })?,
+    };
+    validate_name(&sb.name)?;
+    refuse_production(&sb)?;
+    let store = sb.state_dir();
+    if resolved(&store) != resolved(state_dir) && name.is_none() {
+        return Err(Error::rejected(
+            "dev reload target does not match the store",
+        ));
+    }
+    if dev_owner(&store)?.as_deref() != Some(sb.name.as_str()) {
+        return Err(Error::rejected(format!(
+            "{} is not a dev store — `dev reload` only restarts a store that `cadence dev up` \
+             created: it must hold {DEV_MARKER} and sit directly under the sandbox base {}. \
+             Nothing was stopped or started; production builds ship with `cadence update`",
+            store.display(),
+            sb.base.display()
+        )));
+    }
+    let exe = match build {
+        Some(path) => runnable(path)?,
+        None => runnable(&newest_local_build()?)?,
+    };
+    // CAD-832: the global-write grant is process env fixed at `up`. A
+    // reload restarts the processes with exactly the recorded grant, never
+    // the caller's env, so it can neither add nor drop a grant.
+    if require_marker(&sb)?["allow_global"].as_bool() == Some(true) {
+        std::env::set_var(ALLOW_GLOBAL_ENV, "1");
+    } else {
+        std::env::remove_var(ALLOW_GLOBAL_ENV);
+    }
+    let port = persisted_port(&store);
+    let had_ui = crate::ui::detached_pid(&store).is_some();
+    let had_daemon = daemon_running(&store);
+    // The stop verbs come from the running side, the start verbs from
+    // the new binary.
+    let current = std::env::current_exe()?;
+    if had_ui {
+        run_child(&sb, &current, &["ui", "stop"])?;
+    }
+    if had_daemon {
+        run_child(&sb, &current, &["daemon", "stop"])?;
+    }
+    let daemon = run_child(&sb, &exe, &["daemon", "start"])?;
+    let ui = match port {
+        Some(port) if had_ui => {
+            let port_arg = port.to_string();
+            run_child(&sb, &exe, &["ui", "start", "--port", &port_arg])?["state"].clone()
+        }
+        _ => json!("not_running"),
+    };
+    Ok(json!({
+        "name": sb.name,
+        "build": exe,
+        "daemon": daemon["state"],
+        "ui": ui,
+        "port": port,
+        "lease": "none claimed",
+    }))
+}
+
+fn status(sb: &Sandbox) -> Value {
+    let state = sb.state_dir();
+    json!({
+        "name": sb.name,
+        "root": sb.root,
+        "port": persisted_port(&state),
+        "dev": matches!(dev_owner(&state), Ok(Some(_))),
+        "daemon": if daemon_running(&state) { "running" } else { "stopped" },
+        "ui": if crate::ui::detached_pid(&state).is_some() { "running" } else { "stopped" },
+    })
 }
 
 fn daemon_running(state_dir: &Path) -> bool {
@@ -1188,6 +1512,40 @@ mod tests {
         let err = owner_of(&root.join("state")).unwrap_err();
         assert!(err.to_string().contains("not the root's own"), "{err}");
         assert!(!crate::rollout::sandbox_exempt(&root.join("state")));
+    }
+
+    /// CAD-1187: the dev gate is the store's. A root marker alone, a
+    /// dev marker copied to another store, and a store outside the base
+    /// are not dev stores; only the marker naming this very store under
+    /// the base is.
+    #[test]
+    fn dev_owner_needs_the_marker_in_the_store_and_the_base() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path().join("base");
+        let root = base.join("sbx");
+        let state = root.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(root.join(MARKER), r#"{"name":"sbx"}"#).unwrap();
+        // Root marker only (the pre-CAD-1187 exemption): not a dev store.
+        assert_eq!(dev_owner_under(&state, Some(&base)).unwrap(), None);
+        let sb = Sandbox::from_state_dir(&state).unwrap();
+        write_dev_marker(&sb).unwrap();
+        assert_eq!(
+            dev_owner_under(&state, Some(&base)).unwrap().as_deref(),
+            Some("sbx")
+        );
+        // Same store, but the base is somewhere else.
+        assert_eq!(dev_owner_under(&state, Some(dir.path())).unwrap(), None);
+        assert_eq!(dev_owner_under(&state, None).unwrap(), None);
+        // A copied marker names another store's path.
+        let other = dir.path().join("elsewhere/sbx");
+        std::fs::create_dir_all(other.join("state")).unwrap();
+        std::fs::write(other.join(MARKER), r#"{"name":"sbx"}"#).unwrap();
+        std::fs::copy(state.join(DEV_MARKER), other.join("state").join(DEV_MARKER)).unwrap();
+        assert_eq!(
+            dev_owner_under(&other.join("state"), Some(&dir.path().join("elsewhere"))).unwrap(),
+            None
+        );
     }
 
     #[test]

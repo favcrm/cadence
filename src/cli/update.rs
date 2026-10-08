@@ -70,6 +70,7 @@ pub(super) fn run_update(state_dir: &Path, args: UpdateArgs) -> Result<i32> {
         collect: args.json.then(|| std::cell::RefCell::new(Vec::new())),
         pending: std::cell::RefCell::new(None),
         progress_log: args.progress.clone(),
+        pin: args.to.clone(),
     };
     if args.status {
         let status = client::rpc(state_dir, "update_status", json!({})).unwrap_or_else(
@@ -118,6 +119,11 @@ pub(super) fn run_update(state_dir: &Path, args: UpdateArgs) -> Result<i32> {
     }
     if args.check {
         let report = update::check(&host)?;
+        if args.to.is_some() && !report.up_to_date {
+            // A pinned check proves the build installs, not only that
+            // the sha is on main: a refusal names the failed check.
+            update::verify_pinned(&host, &report.target)?;
+        }
         if args.json {
             print_json(&report.to_json());
         } else {
@@ -172,6 +178,7 @@ pub(super) fn run(
     backup_dir: Option<PathBuf>,
     json: bool,
     progress: Option<PathBuf>,
+    to: Option<String>,
     target: UpdateTargetArgs,
 ) -> Result<i32> {
     let (status, target) = match action {
@@ -190,6 +197,7 @@ pub(super) fn run(
             backup_dir,
             json,
             progress,
+            to,
             as_identity: target.as_identity,
             repo: target.repo,
             link: target.link,

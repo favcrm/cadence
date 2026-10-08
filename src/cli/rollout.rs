@@ -117,7 +117,18 @@ pub(super) fn run(state_dir: PathBuf, action: RolloutAction) -> Result<i32> {
                 },
             )?
         }
-        RolloutAction::Status => cadence_agent::rollout::status(&state_dir)?,
+        RolloutAction::Status => {
+            let status = cadence_agent::rollout::status(&state_dir)?;
+            // CAD-1187: stderr, so the JSON on stdout stays machine-clean.
+            if status["backup"].is_null() {
+                eprintln!(
+                    "hint: no backup receipt is recorded; to ship a build, run \
+                     `cadence update --as operator:<name>` — it claims the lease, takes \
+                     the backup and records the receipt for you"
+                );
+            }
+            status
+        }
         RolloutAction::Release {
             as_identity,
             force,

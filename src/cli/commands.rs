@@ -109,6 +109,7 @@ pub(crate) enum Commands {
     /// lease-free; requiring the lease for that same-build
     /// `daemon restart` is advisory. Inside a cadence pane the holder
     /// is `$CADENCE_ALIAS`; outside a pane pass `--as <identity>`.
+    #[command(hide = true)]
     Rollout {
         #[command(subcommand)]
         action: RolloutAction,
@@ -1293,7 +1294,7 @@ pub(crate) enum Commands {
     /// `<releases>/<sha>/cadence` and atomically repoints the `cadence`
     /// symlink. A release already on disk is reinstalled without a
     /// download (rollback). Never restarts the daemon unless `--restart`.
-    #[command(group(clap::ArgGroup::new("upgrade_target").required(true).args(["sha", "latest_main"])))]
+    #[command(hide = true, group(clap::ArgGroup::new("upgrade_target").required(true).args(["sha", "latest_main"])))]
     Upgrade {
         /// Full 40-hex commit on main to install (or roll back to).
         #[arg(long)]
@@ -1380,16 +1381,27 @@ pub(crate) enum Commands {
         /// lines there too; `--check` and `status` ignore it.
         #[arg(long, value_name = "PATH")]
         progress: Option<PathBuf>,
+        /// Pin the target to this full 40-hex commit instead of the
+        /// approved production candidate (CAD-1187). The same checks as
+        /// `upgrade --sha` run: on main, CI `test` green on that sha,
+        /// sha256, manifest and build-provenance attestation. With
+        /// `--check` it reports that sha.
+        #[arg(long, value_name = "SHA", conflicts_with = "rollback")]
+        to: Option<String>,
         /// Where the release lives and which repository is trusted.
         #[command(flatten)]
         target: UpdateTargetArgs,
     },
-    /// A disposable Cadence beside production: its own state dir,
+    /// Your dev Cadence (CAD-1187; `sandbox` is the old name): a
+    /// disposable Cadence beside production — `dev up`, rebuild,
+    /// `dev reload --build <binary>` with no lease, attestation or
+    /// backup. Its own state dir,
     /// tracker and board port under `$CADENCE_SANDBOX_ROOT` (default
     /// `$XDG_STATE_HOME/cadence-sandbox`), run from this binary with
     /// `CADENCE_PROFILE=sandbox:<name>` — which skips the skill sync
     /// into `$HOME`, refuses `ui tailscale`, and keeps the provider WAL
     /// watcher observe-only. Refuses production's dirs and port 3010.
+    #[command(name = "dev", visible_alias = "sandbox")]
     Sandbox {
         #[command(subcommand)]
         action: cadence_agent::sandbox::SandboxAction,

@@ -62,6 +62,7 @@ pub(crate) struct UpdateArgs {
     pub(super) backup_dir: Option<PathBuf>,
     pub(super) json: bool,
     pub(super) progress: Option<PathBuf>,
+    pub(super) to: Option<String>,
     pub(super) as_identity: Option<String>,
     pub(super) repo: String,
     pub(super) link: Option<PathBuf>,
@@ -84,6 +85,8 @@ pub(crate) struct RealUpdateHost<'a> {
     /// `--progress`: append every line here too, so the board's card can
     /// read the run while this process is detached from it (CAD-561 r2).
     pub(super) progress_log: Option<PathBuf>,
+    /// `--to <sha>`: the pinned target (CAD-1187).
+    pub(super) pin: Option<String>,
 }
 
 impl RealUpdateHost<'_> {
@@ -120,6 +123,9 @@ pub(crate) fn fd_is_path(fd: i32, path: &Path) -> bool {
 }
 
 impl cadence_agent::update::UpdateHost for RealUpdateHost<'_> {
+    fn pin(&self) -> Option<&str> {
+        self.pin.as_deref()
+    }
     fn state_dir(&self) -> &Path {
         self.state_dir
     }
