@@ -300,3 +300,34 @@ A Git source passed to `install`, `install-check`, `upgrade` or `upgrade-check`
 `https://` repository on a registered-shaped DNS name that resolves only to
 globally routable addresses. SSH, `git@`, IP-literal, localhost-style and
 credential-bearing URLs are refused; use an absolute local checkout for those.
+
+## Host requirements (`needs.requires`)
+
+A package may declare the host it needs in `app.md` frontmatter:
+
+```yaml
+needs:
+  requires:
+    core: ">=0.1.0-beta.2 <2.0.0"
+    contracts:
+      app-views: [1]
+      app-chat: [1]
+```
+
+`core` is a bounded AND of semantic-version comparators (`>=`, `>`, `<=`, `<`,
+`=`; a bare version means `=`). `contracts` maps a supported contract name to a
+nonempty list of exact positive major versions. This build supports:
+
+- `app-actions`: major 1 (strict declaration validator; no dispatch implied)
+- `app-assistant`: major 1
+- `app-chat`: major 1
+- `app-screens`: major 1
+- `app-views`: major 1
+
+A package without `needs.requires` is legacy and remains admitted as before; its
+existing structural and bundle digests are unchanged. When requirements are
+declared, malformed fields, unknown keys/contracts, unsupported majors, or a
+core range that excludes this host refuse validation. Install and upgrade
+validate requirements before writing catalog, journal, or record state. The
+install-check and upgrade-check receipts, and catalog show description, include
+the declaration and this host's core version and supported contract majors.
