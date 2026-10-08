@@ -994,14 +994,30 @@ impl Store {
                 // Column add skipped when present (the same half-applied
                 // converge as v14/v15/v16): a store that already carries
                 // the column but rolled the version back converges instead
-                // of failing on a duplicate column.
-                let columns: Vec<String> = conn
-                    .prepare("PRAGMA table_info(social_publish_intents)")?
-                    .query_map([], |row| row.get::<_, String>(1))?
-                    .filter_map(std::result::Result::ok)
-                    .collect();
+                // of failing on a duplicate column — but only when the
+                // existing column is the migration's own shape. A column
+                // that merely shares the name (nullable, wrong type, no
+                // CHECK) is schema drift, not an applied migration:
+                // refuse rather than certify it current.
+                if migration_column_present(&conn, "social_publish_intents", "claim_after_epoch")?
+                    && !column_is_shape(
+                        &conn,
+                        "social_publish_intents",
+                        "claim_after_epoch",
+                        true,
+                        "0",
+                        "claim_after_epoch>=0",
+                    )?
+                {
+                    return Err(Error::rejected(
+                        "social_publish_intents.claim_after_epoch exists but is not the v36 \
+                         column (expected INTEGER NOT NULL DEFAULT 0 CHECK(claim_after_epoch>=0)) \
+                         — refusing to mark the store current",
+                    ));
+                }
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
-                if !columns.iter().any(|column| column == "claim_after_epoch") {
+                if !migration_column_present(&conn, "social_publish_intents", "claim_after_epoch")?
+                {
                     tx.execute_batch(
                         "ALTER TABLE social_publish_intents ADD COLUMN claim_after_epoch INTEGER NOT NULL DEFAULT 0 CHECK(claim_after_epoch>=0)",
                     )?;
@@ -1018,14 +1034,29 @@ impl Store {
                 // nondispatchable until a second, post-commit transaction
                 // installs its undo floor and arms claims. Historical rows
                 // were already dispatchable and therefore default armed.
-                // The column add is skipped when present, as v36's is.
-                let columns: Vec<String> = conn
-                    .prepare("PRAGMA table_info(social_publish_intents)")?
-                    .query_map([], |row| row.get::<_, String>(1))?
-                    .filter_map(std::result::Result::ok)
-                    .collect();
+                // The column add is skipped when present, as v36's is —
+                // with the same verified-shape check: a `claim_armed` that
+                // is not the v37 INTEGER NOT NULL DEFAULT 1 binary CHECK
+                // column is drift, and the open refuses it rather than
+                // marking the store current.
+                if migration_column_present(&conn, "social_publish_intents", "claim_armed")?
+                    && !column_is_shape(
+                        &conn,
+                        "social_publish_intents",
+                        "claim_armed",
+                        true,
+                        "1",
+                        "claim_armed IN (0,1)",
+                    )?
+                {
+                    return Err(Error::rejected(
+                        "social_publish_intents.claim_armed exists but is not the v37 \
+                         column (expected INTEGER NOT NULL DEFAULT 1 CHECK(claim_armed IN (0,1))) \
+                         — refusing to mark the store current",
+                    ));
+                }
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
-                if !columns.iter().any(|column| column == "claim_armed") {
+                if !migration_column_present(&conn, "social_publish_intents", "claim_armed")? {
                     tx.execute_batch(
                         "ALTER TABLE social_publish_intents ADD COLUMN claim_armed INTEGER NOT NULL DEFAULT 1 CHECK(claim_armed IN (0,1))",
                     )?;
@@ -1039,35 +1070,33 @@ impl Store {
             }
             if version < 38 {
                 // Cancellation is terminal for a PREPARED owner action and
-                // its attached-but-unclaimed queue row. Rebuild the narrow
-                // lifecycle table to add that explicit terminal state.
-                // A store whose table already carries `cancelled` (the
-                // rebuild ran, only the version rolled back) skips it —
-                // `CREATE INDEX IF NOT EXISTS` converges the index.
-                let has_cancelled: bool = conn
-                    .prepare("SELECT sql FROM sqlite_master WHERE name='social_publish_prepared'")?
-                    .query_row([], |row| row.get::<_, String>(0))
-                    .map(|sql| sql.contains("'cancelled'"))
-                    .unwrap_or(false);
+                // its attached-but-unclaimed queue row. The rebuild is
+                // unconditional: idempotent (the new table's column set
+                // equals the old's, so the row copy is lossless on an
+                // already-converted table) and data-preserving in one
+                // transaction — and it VALIDATES the existing shape. A
+                // table that merely contains 'cancelled' in an unrelated
+                // position still gets the correct lifecycle CHECK; a
+                // table whose own state CHECK excludes the new state set
+                // fails the INSERT INTO SELECT, rolls back and refuses
+                // the open rather than being marked current.
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
-                if !has_cancelled {
-                    tx.execute_batch(
-                        "DROP INDEX IF EXISTS social_publish_prepared_scope;\n\
-                         ALTER TABLE social_publish_prepared RENAME TO social_publish_prepared_v37;\n\
-                         CREATE TABLE social_publish_prepared(\n\
-                          prepared_id TEXT PRIMARY KEY, request TEXT NOT NULL UNIQUE,\n\
-                          install_id TEXT NOT NULL, context_id TEXT, run_id TEXT NOT NULL,\n\
-                          effect_id TEXT NOT NULL, connection_id TEXT NOT NULL, aos_connection_id TEXT,\n\
-                          destination_id TEXT NOT NULL, destination_label TEXT NOT NULL, toolkit TEXT NOT NULL, timezone TEXT NOT NULL,\n\
-                          caption_digest TEXT NOT NULL, image_digest TEXT, media_key TEXT, approval_id TEXT NOT NULL,\n\
-                          mode TEXT NOT NULL CHECK(mode IN ('now','schedule')),\n\
-                          due_epoch INTEGER NOT NULL CHECK(due_epoch>0), not_before_epoch INTEGER NOT NULL, expires_epoch INTEGER NOT NULL,\n\
-                          state TEXT NOT NULL CHECK(state IN ('prepared','authorized','cancelled','superseded','refused')),\n\
-                          grant_id TEXT, descriptor TEXT NOT NULL, descriptor_digest TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL);\n\
-                         INSERT INTO social_publish_prepared SELECT * FROM social_publish_prepared_v37;\n\
-                         DROP TABLE social_publish_prepared_v37;",
-                    )?;
-                }
+                tx.execute_batch(
+                    "DROP INDEX IF EXISTS social_publish_prepared_scope;\n\
+                     ALTER TABLE social_publish_prepared RENAME TO social_publish_prepared_v37;\n\
+                     CREATE TABLE social_publish_prepared(\n\
+                      prepared_id TEXT PRIMARY KEY, request TEXT NOT NULL UNIQUE,\n\
+                      install_id TEXT NOT NULL, context_id TEXT, run_id TEXT NOT NULL,\n\
+                      effect_id TEXT NOT NULL, connection_id TEXT NOT NULL, aos_connection_id TEXT,\n\
+                      destination_id TEXT NOT NULL, destination_label TEXT NOT NULL, toolkit TEXT NOT NULL, timezone TEXT NOT NULL,\n\
+                      caption_digest TEXT NOT NULL, image_digest TEXT, media_key TEXT, approval_id TEXT NOT NULL,\n\
+                      mode TEXT NOT NULL CHECK(mode IN ('now','schedule')),\n\
+                      due_epoch INTEGER NOT NULL CHECK(due_epoch>0), not_before_epoch INTEGER NOT NULL, expires_epoch INTEGER NOT NULL,\n\
+                      state TEXT NOT NULL CHECK(state IN ('prepared','authorized','cancelled','superseded','refused')),\n\
+                      grant_id TEXT, descriptor TEXT NOT NULL, descriptor_digest TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL);\n\
+                     INSERT INTO social_publish_prepared SELECT * FROM social_publish_prepared_v37;\n\
+                     DROP TABLE social_publish_prepared_v37;",
+                )?;
                 tx.execute_batch(
                     "CREATE INDEX IF NOT EXISTS social_publish_prepared_scope ON social_publish_prepared(install_id,context_id,prepared_id);",
                 )?;
@@ -1704,6 +1733,192 @@ impl std::fmt::Display for ShutdownDrainError {
             Self::Fenced(e) | Self::Failed(e) => e.fmt(f),
         }
     }
+}
+
+/// One `PRAGMA table_info` row — enough of the column's definition to
+/// verify an already-applied migration shape instead of trusting that a
+/// shared name means the migration ran (CAD-1143 review).
+struct TableColumn {
+    name: String,
+    declared_type: String,
+    notnull: bool,
+    dflt_value: String,
+}
+
+impl TableColumn {
+    /// The column declares an integer affinity — SQLite's type-name
+    /// rule: a declared type containing `INT` (the migrations declare
+    /// `INTEGER`). `BLOB`/`TEXT`/`REAL` affinities would accept values
+    /// the migration's column refuses.
+    fn integer_affinity(&self) -> bool {
+        self.declared_type.to_ascii_uppercase().contains("INT")
+    }
+}
+
+/// Every `PRAGMA table_info` row for `table`, or an empty list when the
+/// table does not exist. `dflt_value` is the raw SQL default text — a
+/// plain `0`/`1` for the guard columns these migrations add.
+fn table_columns(conn: &Connection, table: &str) -> Result<Vec<TableColumn>> {
+    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement
+        .query_map([], |row| {
+            Ok(TableColumn {
+                name: row.get::<_, String>(1)?,
+                declared_type: row.get::<_, String>(2)?,
+                notnull: row.get::<_, i64>(3)? != 0,
+                dflt_value: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+            })
+        })?
+        .filter_map(std::result::Result::ok)
+        .collect();
+    Ok(columns)
+}
+
+/// A pre-existing `name` column on `table` is the exact column an
+/// `ADD COLUMN` migration would install — declared type, NOT NULL and
+/// default from PRAGMA, plus the column's CHECK parsed off the table's
+/// CREATE SQL (PRAGMA table_info never reports CHECKs). Anything weaker
+/// or different is drift the open must refuse, not an applied step the
+/// version may skip.
+fn column_is_shape(
+    conn: &Connection,
+    table: &str,
+    name: &str,
+    notnull: bool,
+    dflt_value: &str,
+    check: &str,
+) -> Result<bool> {
+    let Some(column) = table_columns(conn, table)?
+        .into_iter()
+        .find(|c| c.name == name)
+    else {
+        return Ok(false);
+    };
+    if !column.integer_affinity() || column.notnull != notnull || column.dflt_value != dflt_value {
+        return Ok(false);
+    }
+    let check = format!("({check})");
+    Ok(table_sql(conn, table)?
+        .is_some_and(|sql| column_check_predicates(&sql, name).any(|p| p == check)))
+}
+
+/// Whether `table` carries a column named `name` — the bare presence
+/// check the verified-shape test pairs with.
+fn migration_column_present(conn: &Connection, table: &str, name: &str) -> Result<bool> {
+    Ok(table_columns(conn, table)?.iter().any(|c| c.name == name))
+}
+
+/// The CREATE TABLE text `table` was built with, if it exists.
+fn table_sql(conn: &Connection, table: &str) -> Result<Option<String>> {
+    conn.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name=?1")?
+        .query_row([table], |row| row.get::<_, String>(0))
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            e => Err(e.into()),
+        })
+}
+
+/// The `CHECK(...)` predicates written on `column`'s own definition —
+/// every parenthesized group that follows the word `CHECK` before the
+/// column's definition ends at its comma or the table's closing paren.
+/// Table-level CHECKs and other columns' constraints never surface
+/// here, so an unrelated `'cancelled'` elsewhere in the SQL cannot pass
+/// as this column's constraint. Matching is word-bounded, depth- and
+/// quote-aware: `x_check_armed` is not `claim_armed`, `DEFAULT '('`
+/// never opens a group and a nested `IN (0,1)` cannot end one early.
+fn column_check_predicates<'a>(sql: &'a str, column: &str) -> impl Iterator<Item = &'a str> {
+    let bytes = sql.as_bytes();
+    let mut found = Vec::new();
+    let mut start = 0usize;
+    while let Some(off) = sql[start..].find(column) {
+        let at = start + off;
+        let end = at + column.len();
+        let bounded = (at == 0 || !is_ident_byte(bytes[at - 1]))
+            && (end == bytes.len() || !is_ident_byte(bytes[end]));
+        if bounded {
+            let mut i = end;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'\'' => i = skip_literal(bytes, i),
+                    b'(' => {
+                        // A group preceded by the word `CHECK` is this
+                        // column's own constraint predicate.
+                        let word_end = bytes[..i]
+                            .iter()
+                            .rposition(|b| !b.is_ascii_whitespace())
+                            .map_or(0, |p| p + 1);
+                        let word_start = bytes[..word_end]
+                            .iter()
+                            .rposition(|b| !is_ident_byte(*b))
+                            .map_or(0, |p| p + 1);
+                        if sql[word_start..word_end].eq_ignore_ascii_case("check") {
+                            let (group, close) = parenthesized(&sql[i..]);
+                            found.push(group);
+                            i += close;
+                            continue;
+                        }
+                        let (_, close) = parenthesized(&sql[i..]);
+                        i += close;
+                    }
+                    b',' | b')' => break,
+                    _ => i += 1,
+                }
+            }
+        }
+        start = end;
+    }
+    found.into_iter()
+}
+
+/// Skip a `'...'` literal starting at `bytes[at] == '\''`, honouring
+/// SQL's doubled-quote escape; returns the index past its close.
+fn skip_literal(bytes: &[u8], mut at: usize) -> usize {
+    at += 1;
+    while at < bytes.len() {
+        if bytes[at] == b'\'' {
+            at += 1;
+            if at < bytes.len() && bytes[at] == b'\'' {
+                at += 1;
+            } else {
+                break;
+            }
+        } else {
+            at += 1;
+        }
+    }
+    at
+}
+
+/// The parenthesized group at `text[0] == '('` — the balanced span
+/// itself and its length. Unbalanced input yields the rest of `text`.
+fn parenthesized(text: &str) -> (&str, usize) {
+    let bytes = text.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
+                i = skip_literal(bytes, i);
+                continue;
+            }
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    i += 1;
+                    return (&text[..i], i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    (text, text.len())
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
 }
 
 /// sqlite errors worth a fresh shutdown transaction: BUSY — whose

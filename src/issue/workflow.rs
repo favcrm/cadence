@@ -945,25 +945,26 @@ pub fn render_carry_positions(
             format!("the inputs render to an invalid plan — {e}"),
         )
     })?;
-    // Locate where each token landed in the parsed plan — exactly one
-    // position per carry input. The tokens are impossible in any real
-    // input (caller values pass the one-line grammar), so a hit is the
-    // placeholder's own rendering. Zero occurrences means the
-    // placeholder was never used; several means `{{name}}` repeats or
-    // sits mid-word, which would split the carried bytes.
+    // Locate where each token landed — exactly one position per carry
+    // input. The tokens are impossible in any real input (caller
+    // values pass the one-line grammar), so a hit is the placeholder's
+    // own rendering. Zero occurrences means the placeholder was never
+    // used; several means `{{name}}` repeats or sits mid-word, which
+    // would split the carried bytes.
     //
-    // Count EVERY occurrence of the token, not just the placements
-    // `token_matches` accepts: a second `{{name}}` on the same line, or
-    // one embedded mid-word on another line, is still an occurrence —
-    // it must refuse, not sail through with an unresolved token left in
-    // the instruction.
+    // Count EVERY occurrence of the token in the RENDERED SOURCE TEXT,
+    // before the parse partitions it into fields: a second `{{name}}`
+    // on the same line, one embedded mid-word, or one in a structural
+    // field (a ticket heading, an acceptance item, a metadata key)
+    // still leaves an unresolved token the field scan below never
+    // counts. Refuse on the source-wide count, then require the single
+    // occurrence to map to a permitted placement.
     let mut placements = CarryPlacements::default();
     for (name, token) in &tokens {
+        let occurrences = token_occurrences(&rendered, token);
         let mut found: Vec<CarryPlacement> = Vec::new();
-        let mut occurrences = 0usize;
         for (i, meta) in metas.iter().enumerate() {
             for (key, value) in meta {
-                occurrences += token_occurrences(value, token);
                 if value == token {
                     found.push(CarryPlacement::Meta {
                         ticket: i,
@@ -974,7 +975,6 @@ pub fn render_carry_positions(
             }
         }
         for (i, ticket) in doc.tickets.iter().enumerate() {
-            occurrences += token_occurrences(&ticket.description, token);
             for (start, end) in token_matches(&ticket.description, token) {
                 found.push(CarryPlacement::Description {
                     ticket: i,
@@ -3295,6 +3295,54 @@ agent: writer\nsize: S\ndepends_on: 1\naction: local.text.produce\n\nRun this.\n
             "Reissue exactly: {{carry_caption}}\npre{{carry_caption}}post",
         );
         let e = render_carry_positions(&valid_plus_midword, &provided, &carry).unwrap_err();
+        assert!(e.to_string().contains("exactly one position"), "{e}");
+        // Occurrences in fields the parser separates or discards count
+        // too: a second placeholder in a ticket heading (whose title
+        // reaches the dispatched instruction), the frontmatter title,
+        // plan intro text or an acceptance item leaves an unresolved
+        // token the field scan never sees — the source-wide count is
+        // two and the run refuses.
+        for (name, tpl) in [
+            (
+                "heading",
+                WF_CARRY.replace("## Do", "## Do {{carry_caption}}"),
+            ),
+            (
+                "frontmatter_title",
+                WF_CARRY.replace("title: T", "title: \"{{carry_caption}}\""),
+            ),
+            (
+                "intro",
+                WF_CARRY.replace("## Do", "Intro {{carry_caption}}\n\n## Do"),
+            ),
+            (
+                "acceptance_item",
+                WF_CARRY.replace("- [ ] x", "- [ ] {{carry_caption}}"),
+            ),
+        ] {
+            let e = render_carry_positions(&tpl, &provided, &carry).unwrap_err();
+            assert!(
+                e.to_string().contains("exactly one position"),
+                "{name}: {e}"
+            );
+        }
+        // A sole occurrence outside a permitted position — one
+        // placeholder, zero placements — refuses the same way.
+        let title_only = WF_CARRY
+            .replace(
+                "Reissue exactly: {{carry_caption}}",
+                "Reissue the caption exactly",
+            )
+            .replace("## Do", "## {{carry_caption}}");
+        let e = render_carry_positions(&title_only, &provided, &carry).unwrap_err();
+        assert!(e.to_string().contains("exactly one position"), "{e}");
+        let acceptance_only = WF_CARRY
+            .replace(
+                "Reissue exactly: {{carry_caption}}",
+                "Reissue the caption exactly",
+            )
+            .replace("- [ ] x", "- [ ] {{carry_caption}}");
+        let e = render_carry_positions(&acceptance_only, &provided, &carry).unwrap_err();
         assert!(e.to_string().contains("exactly one position"), "{e}");
     }
 }

@@ -1441,3 +1441,127 @@
             assert_eq!(version(), crate::rollout::SCHEMA_VERSION);
         }
     }
+
+    /// A store built by the real migrations then rolled back to the
+    /// version under test — the shared fixture for the convergence
+    /// shape probes below.
+    fn migrated_db(dir: &TempDir) -> std::path::PathBuf {
+        let db = dir.path().join("t.sqlite3");
+        std::fs::create_dir(dir.path().join("w")).unwrap();
+        {
+            let s = Store::open(&db).unwrap();
+            reg(&s, "a1", &dir.path().join("w"));
+        }
+        db
+    }
+
+    fn db_version(db: &std::path::Path) -> i64 {
+        Connection::open(db)
+            .unwrap()
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn migration_v36_v37_refuse_an_incompatible_same_name_column() {
+        // A column that merely shares the migration's name is drift,
+        // not an applied step: a nullable TEXT `claim_armed` with no
+        // default or CHECK accepts nonbinary values, so converging the
+        // version would certify a guard that never installed. The open
+        // must refuse and leave the recorded version behind.
+        let dir = TempDir::new().unwrap();
+        let db = migrated_db(&dir);
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "DROP INDEX social_publish_due;
+                 ALTER TABLE social_publish_intents DROP COLUMN claim_armed;
+                 ALTER TABLE social_publish_intents ADD COLUMN claim_armed TEXT;
+                 UPDATE schema_version SET version=36;",
+            )
+            .unwrap();
+        let error = Store::open_for_schema_tests(&db)
+            .err()
+            .expect("an incompatible claim_armed must refuse the open");
+        assert!(error.to_string().contains("claim_armed"), "{error}");
+        assert_eq!(db_version(&db), 36, "refusal must not bump the version");
+
+        // Same class at v36: a nullable claim_after_epoch without its
+        // NOT NULL/default/CHECK is not the applied column either.
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "DROP INDEX IF EXISTS social_publish_due;
+                 ALTER TABLE social_publish_intents DROP COLUMN claim_armed;
+                 ALTER TABLE social_publish_intents DROP COLUMN claim_after_epoch;
+                 ALTER TABLE social_publish_intents ADD COLUMN claim_after_epoch TEXT;
+                 UPDATE schema_version SET version=35;",
+            )
+            .unwrap();
+        let error = Store::open_for_schema_tests(&db)
+            .err()
+            .expect("an incompatible claim_after_epoch must refuse the open");
+        assert!(error.to_string().contains("claim_after_epoch"), "{error}");
+        assert_eq!(db_version(&db), 35, "refusal must not bump the version");
+    }
+
+    #[test]
+    fn migration_v38_rebuild_validates_rather_than_trusting_a_substring() {
+        // The old predicate treated any `'cancelled'` in the table SQL
+        // as applied. A v37-era prepared table whose state CHECK still
+        // excludes cancelled — the literal rides an unrelated column
+        // default — must not be promoted: the unconditional rebuild
+        // installs the real lifecycle CHECK and preserves the row.
+        let dir = TempDir::new().unwrap();
+        let db = migrated_db(&dir);
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE social_publish_prepared;
+                 CREATE TABLE social_publish_prepared(
+                  prepared_id TEXT PRIMARY KEY, request TEXT NOT NULL UNIQUE,
+                  install_id TEXT NOT NULL, context_id TEXT, run_id TEXT NOT NULL,
+                  effect_id TEXT NOT NULL, connection_id TEXT NOT NULL, aos_connection_id TEXT,
+                  destination_id TEXT NOT NULL, destination_label TEXT NOT NULL DEFAULT 'cancelled',
+                  toolkit TEXT NOT NULL, timezone TEXT NOT NULL,
+                  caption_digest TEXT NOT NULL, image_digest TEXT, media_key TEXT,
+                  approval_id TEXT NOT NULL,
+                  mode TEXT NOT NULL CHECK(mode IN ('now','schedule')),
+                  due_epoch INTEGER NOT NULL CHECK(due_epoch>0),
+                  not_before_epoch INTEGER NOT NULL, expires_epoch INTEGER NOT NULL,
+                  state TEXT NOT NULL CHECK(state IN ('prepared','authorized','superseded','refused')),
+                  grant_id TEXT, descriptor TEXT NOT NULL, descriptor_digest TEXT NOT NULL,
+                  created REAL NOT NULL, updated REAL NOT NULL);
+                 INSERT INTO social_publish_prepared(
+                  prepared_id,request,install_id,context_id,run_id,effect_id,connection_id,
+                  aos_connection_id,destination_id,destination_label,toolkit,timezone,
+                  caption_digest,image_digest,media_key,approval_id,mode,due_epoch,
+                  not_before_epoch,expires_epoch,state,grant_id,descriptor,descriptor_digest,
+                  created,updated)
+                 VALUES('p1','req1','inst',NULL,'run','eff','conn',NULL,
+                  'dest','label','facebook','UTC','cap',NULL,NULL,'appr','now',10,0,20,
+                  'prepared',NULL,'{}','d',1,1);
+                 UPDATE schema_version SET version=37;",
+            )
+            .unwrap();
+        {
+            let _s = Store::open_for_schema_tests(&db).unwrap();
+            assert_eq!(db_version(&db), crate::rollout::SCHEMA_VERSION);
+        }
+        let c = Connection::open(&db).unwrap();
+        c.execute(
+            "UPDATE social_publish_prepared SET state='cancelled' WHERE prepared_id='p1'",
+            [],
+        )
+        .expect("rebuilt state CHECK must admit cancelled");
+        assert_eq!(
+            c.query_row(
+                "SELECT destination_label FROM social_publish_prepared WHERE prepared_id='p1'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "label",
+            "the rebuild dropped the existing row"
+        );
+    }
