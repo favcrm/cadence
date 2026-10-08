@@ -1498,12 +1498,17 @@ impl Model {
         if snap.failed {
             // Cards, plans and agent rows read from the stand-in are
             // stripped or empty, and a client that refetches mid-outage
-            // holds them. Forget what was published so the first good tick
-            // upserts every card, plan and agent row again, whatever
-            // changed meanwhile.
-            w.cards.clear();
-            w.plans.clear();
-            w.rows.clear();
+            // holds them. Poison what was published so the first good tick
+            // upserts every card, plan and agent row again; the ids stay,
+            // so an id removed meanwhile is still deleted.
+            for fp in w
+                .cards
+                .values_mut()
+                .chain(w.plans.values_mut())
+                .chain(w.rows.values_mut())
+            {
+                *fp = u64::MAX;
+            }
             w.cards_stale = true;
         } else if issues || jobs || agents || w.cards_stale {
             w.cards_stale = false;
@@ -2002,10 +2007,24 @@ mod tests {
             .unwrap();
         };
         write_card("first");
+        let second = pm.dir.join("cadence").join("CAD-2");
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(
+            second.join("issue.md"),
+            "---\nid: CAD-2\ntitle: other\nstatus: backlog\npriority: P2\n\
+             created: 2026-01-01T00:00:00Z\n---\n\nbody\n",
+        )
+        .unwrap();
         let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let is_down = down.clone();
+        let second_dir = second.clone();
         let fetch: Fetch = Box::new(move |_| {
             let failed = is_down.load(Ordering::SeqCst);
+            // Agent `x` exists while card CAD-2 does.
+            let mut agents = vec![json!({"alias": "w"})];
+            if second_dir.exists() {
+                agents.push(json!({"alias": "x"}));
+            }
             DaemonSnap {
                 at: Instant::now(),
                 outcomes: Default::default(),
@@ -2013,7 +2032,7 @@ mod tests {
                 agents: if failed {
                     agents_payload_from(Path::new("/nonexistent/state"), None, None)
                 } else {
-                    json!({"daemon": "reachable", "agents": [{"alias": "w"}],
+                    json!({"daemon": "reachable", "agents": agents,
                            "by_issue": {"CAD-1": [{"alias": "w"}]}})
                 },
                 agents_fp: (!failed).then_some(1),
@@ -2110,6 +2129,44 @@ mod tests {
                 .iter()
                 .any(|f| f.starts_with("event: agent\n") && f.contains("\"alias\":\"w\"")),
             "the emptied agent list was never repaired: {frames:?}"
+        );
+    }
+
+    #[test]
+    fn what_was_removed_during_an_outage_is_deleted_on_recovery() {
+        let (tmp, model, down, _write_card) = outage_fixture();
+        let mut watch = blank_watch();
+        let mut frames = Vec::new();
+        model.tick(&mut watch, &mut frames);
+        assert!(
+            issue_frames(&frames).iter().any(|f| f.contains("CAD-2")),
+            "{frames:?}"
+        );
+        model.invalidate();
+        down.store(true, Ordering::SeqCst);
+        std::fs::remove_dir_all(tmp.path().join("pm").join("cadence").join("CAD-2")).unwrap();
+        for _ in 0..2 {
+            frames.clear();
+            model.tick(&mut watch, &mut frames);
+            assert!(issue_frames(&frames).is_empty(), "{frames:?}");
+        }
+        down.store(false, Ordering::SeqCst);
+        frames.clear();
+        model.tick(&mut watch, &mut frames);
+        let deleted = |kind: &str, id: &str| {
+            frames.iter().any(|f| {
+                f.starts_with(&format!("event: {kind}\n"))
+                    && f.contains("\"op\":\"delete\"")
+                    && f.contains(id)
+            })
+        };
+        assert!(deleted("issue", "CAD-2"), "ghost card: {frames:?}");
+        assert!(deleted("agent", "\"x\""), "ghost agent: {frames:?}");
+        assert!(
+            issue_frames(&frames)
+                .iter()
+                .any(|f| f.contains("CAD-1") && f.contains("\"alias\":\"w\"")),
+            "survivor not upserted: {frames:?}"
         );
     }
 
