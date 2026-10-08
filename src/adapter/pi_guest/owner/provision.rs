@@ -222,6 +222,8 @@ impl GenerationView {
         if Instant::now() >= until {
             return Err(refused());
         }
+        #[cfg(all(debug_assertions, feature = "test-seam"))]
+        crate::adapter::pi_guest::diag_seam::before_fchmod(&self.selection)?;
         if unsafe { libc::fchmod(self.generation.as_raw_fd(), 0o700) } != 0 {
             return Err(std::io::Error::last_os_error().into());
         }
@@ -241,6 +243,12 @@ impl GenerationView {
         }
         self.isolation.set(Isolation::Completed(completed));
         Ok(())
+    }
+    /// N1 diagnostic: read-only; true while this view is sticky Unknown.
+    #[cfg(all(debug_assertions, feature = "test-seam"))]
+    #[allow(dead_code)] // read by the native harness
+    pub(crate) fn observe_unknown(&self) -> bool {
+        matches!(self.isolation.get(), Isolation::Unknown)
     }
     /// Completion is private state plus exact original witness/correspondence,
     /// NEVER an observed0700 directory or a helper-only exited/retired boolean.

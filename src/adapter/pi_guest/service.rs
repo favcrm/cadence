@@ -131,6 +131,17 @@ enum Retirement {
     Completed,
 }
 impl RunningLaunch {
+    /// N1 diagnostic: read-only, timestamped; callable before teardown drops
+    /// custody. Changes no state.
+    #[cfg(all(debug_assertions, feature = "test-seam"))]
+    #[allow(dead_code)] // read by the native harness
+    pub(crate) fn observe_pre_teardown(&self) -> super::diag_seam::HeldObservation {
+        super::diag_seam::observe(
+            &self.selection,
+            self.retirement.get() == Retirement::Unknown,
+            self.view.observe_unknown(),
+        )
+    }
     /// Kernel family retirement AND exact held view isolation, before a retire
     /// reply/drain. Worker/stream quiescence is still an independent later ACK.
     pub(crate) fn retire(&self, until: Instant) -> Result<()> {

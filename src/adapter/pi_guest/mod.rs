@@ -13,6 +13,8 @@ use crate::{helper_image_trust, HelperImageTrust};
 
 #[path = "helper_authentication.rs"]
 mod authentication;
+#[cfg(all(debug_assertions, feature = "test-seam"))]
+pub(crate) mod diag_seam;
 #[allow(dead_code)]
 // legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
 mod envp;
