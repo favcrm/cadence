@@ -1,10 +1,16 @@
 # CAD-1159 / AOS-159 paired constructor wire v1
 
-Status: **root construction/enrollment source wired; feature remains draft**.
-Independent image-authority pins are unconfigured, so activation stays closed.
-This is not kernel/provider qualification, deployment or operational evidence.
-Protected Pi and external Store/restore are separate gates being integrated in
-the same feature/PR; enrollment ACK cannot substitute for them.
+Status: **root construction/enrollment, protected runtime, protected Pi and
+the first Store lifecycle relay are source-implemented in this PR; feature
+remains draft**. Independent image-authority pins are unconfigured, so
+activation stays closed. This is not kernel/provider qualification, deployment
+or operational evidence. Enrollment ACK still cannot substitute for the
+separate runtime, Pi and Store authorities, each of which has its own signed
+purpose or owner-issued one-use permit (see the linked documents). Cross-language
+TS/Rust interoperability for the image attestation, runtime authorization, Pi
+authorization and the frames in this document is pinned by
+`src/installer_bundle/constructor/fixtures/native-wire-vectors.v1.json`, which
+is committed byte-identically in the AgenticOS repository.
 
 ## Fixed custody and artifacts
 
@@ -150,11 +156,21 @@ never protected Pi launch, serving readiness or physical terminal state.
 
 The source positive root entry, private child transport, production custody,
 recipient/public trust/phase-specific owner factories and release/consume path
-are implemented. No acquired privileged execution, keys or qualified artifacts
-were used to claim their operation. The independent source-authenticator bad
-case remains owned by its author, unchanged. Remaining coherent feature work:
-protected Pi owner launch/provisioning and Store lifecycle/open/restore gates,
-paired private interfaces, required checks and final independent exact-head
-Standards/Security reviews. Root-owned qualification and human exact-head
-approval remain before activation or enqueue. No earlier artifact evidence is
-transferred.
+are implemented, and so are the layers built on them: the separately signed
+runtime release and bounded owner exchange (CONSTRUCTOR-RUNTIME-WIRE.md), the
+fixed private runtime, daemon, serving handoff and task/readback relay
+(CONSTRUCTOR-PRIVATE-RUNTIME.md), the protected Pi owner, purpose signature
+verification, Root-owned helper and fixed-media helper trust
+(CONSTRUCTOR-PI-WIRE.md), and the Store lifecycle relay for fresh Init plus the
+close and witness readbacks (CONSTRUCTOR-STORE-WIRE.md). No acquired privileged
+execution, keys or qualified artifacts were used to claim their operation. The
+independent source-authenticator bad case remains owned by its author,
+unchanged.
+
+What remains is not source wiring in this document's scope: durable standalone
+capture and restore completion (the second milestone; AgenticOS refuses the
+capture frames), compiled image-authority pins and a new Root-owned
+image/kernel/provider/Pi/tool qualification, native execution evidence, the
+required checks, final independent exact-head Standards and Security reviews,
+and human exact-head approval before activation or enqueue. No earlier
+artifact evidence is transferred.

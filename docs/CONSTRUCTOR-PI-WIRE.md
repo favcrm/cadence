@@ -65,14 +65,17 @@ second /opt/cadence/libexec helper election/localSUID path; contributor must ali
 its fixed helper validation to this actual held artifact. Mixed immutable graph
 and explicit RW data mounts/finite provisioner remain as already agreed.
 
-Accept proposed exact new Pi domain cadence.protected-pi-launch.v1 + NUL + ASCII
-H.P. Canonical compact Ed25519 header {alg:Ed25519,issuer:agenticos-native-owner,
+The Pi purpose signature is implemented: domain cadence.protected-pi-launch.v1 +
+NUL + ASCII H.P. Canonical compact Ed25519 header {alg:Ed25519,issuer:agenticos-native-owner,
 kid,keyVersion,type:protected-pi-launch,version:1}. Payload {version:1,reference,
 scope:EXACT OperationScope,issuedAtMs,expiresAtMs}; JS-safe timestamps, <=30s,
 no future issue/expired/rollback, expiry <= authenticated runtime/image expiry.
 Keep SAME authorization in issued/current/consumed Pi replies. No generic sign(bytes)
-or caller key. Root platform owns actual purpose-confined producer/signing service.
-Signature alone never supplies live custody/currentness/one-use authorization.
+or caller key. The AgenticOS platform owns the purpose-confined producer (its Pi
+signing service and signer Worker); Cadence verifies in pi_guest/purpose.rs
+(authenticate_operation). Signature alone never supplies live custody/currentness/
+one-use authorization. The producer's bytes are pinned by the shared
+native-wire-vectors.v1.json (positive, altered-byte, wrong-kid and expired cases).
 
 Coordinator adds optional signed manifest piTrust PublicTrust ring1..8 with NO
 receipt/grant/runtime fallback. Missing=>Pi unavailable; absent field omitted for
@@ -84,9 +87,12 @@ No key/JSON/filename/env input, guest private key, test Root/Bootstrap mint.
 Pi contributor owns authenticate_operation pure trusted-ring signature comparison
 and opaque private result; real OwnerProfile gets ring/expiry only through this
 interface BEFORE operation permit/provision/Node effects. The trusted helper
-must receive independently authenticated public image/Pi purpose information,
-not accept a ring echoed in Authorized or a guessed UID as its root of trust.
-That helper trust delivery is bounded source integration, not solved by this note.
+receives independently authenticated public image/Pi purpose information, never
+a ring echoed in Authorized or a guessed UID as its root of trust. That delivery
+is implemented: helper_trust.rs reads the fixed read-only root-owned
+/opt/protected/image-qualification.jws through the same bootstrap verifier, and
+helper_authentication.rs binds the signed scope to the privately selected
+profile. With the compiled image-authority table empty, it refuses.
 
 Full operation wrapper current scope equality is ALREADY coordinator source:
 Pi exchange corroborates binding/global/company/epoch/lineage/database_epoch before
@@ -95,23 +101,22 @@ remain required. Root backend must not mint facts from guest scope JSON alone.
 
 ## What is implemented versus pending
 
-Root runtime proof/current/finite Pi relay, Pi public ring/expiry getter, actual
-OwnedHelper and Pi-owned PendingLaunch guard/stdio client are source present.
-Shared StdioAdapter::adopt_protected now consumes opaque RemoteLaunch into ONLY
-File stdin/stdout/stderr and retained RemoteControl, delegates interrupt/retire/
-status_until, never spawns/adopts/signals the observed PID. Failed status/retire
-stays UNKNOWN and cannot become no-child/Exited evidence. Legacy local paths are
-unchanged apart from the shared typed stdin wrapper.
-Actual owned supervisor/daemon registration, root private dispatcher/proxy, signed
-Pi producer and complete authenticated helper profile delivery are still pending.
-Proceed implementing owned source now; do not label proposed caller factories,
-services or qualification as complete. Do not request another routine permission.
+Implemented in source at this head: Root runtime proof/current and the finite Pi
+relay (pi-acquire/pi-consume/pi-current), the Pi public ring/expiry getter, the
+actual OwnedHelper, the Pi-owned PendingLaunch guard and stdio client, purpose
+signature verification (purpose.rs), fixed-media helper trust (helper_trust.rs),
+the Root private dispatcher and proxy, and daemon registration, as described in
+CONSTRUCTOR-PRIVATE-RUNTIME.md. Shared StdioAdapter::adopt_protected consumes
+opaque RemoteLaunch into ONLY File stdin/stdout/stderr and retained
+RemoteControl, delegates interrupt/retire/status_until, and never
+spawns/adopts/signals the observed PID. Failed status/retire stays UNKNOWN and
+cannot become no-child/Exited evidence. Legacy local paths are unchanged apart
+from the shared typed stdin wrapper. The signed Pi producer is the AgenticOS
+platform's, not Cadence's.
 
-Focused unchanged original constructor guard PASS1/0 after this source extension;
-required pre-push fmt/doctor PASS but clippy FAIL on unwired APIs, no suppression,
-no later safety floor or final gates claim. No push while mandatory gate fails.
-Independent guard remains untouched; its author extends SAME ONE check against
-actual production guard, not cold endpoint/shape/PID validation or fake trusted
-Root/keys. Required green gates and exact-head different independent native
-Standards/Security axes/human approval precede enqueue. No earlier qualification
-is inherited, no root keys/acquired execution/deployment or activation this turn.
+Still pending, and not claimed here: native execution of any of this, compiled
+image-authority pins and a new Root-owned qualification, and the final
+independent exact-head reviews and approval. Source presence is not
+qualification or serving evidence. Gate and CI status is tracked on PR809, not
+in this document; no earlier qualification is inherited, and no root keys,
+acquired execution, deployment or activation are implied.

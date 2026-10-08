@@ -1,0 +1,945 @@
+{
+  "schema": "native-wire-vectors.v1",
+  "testOnly": "SYNTHETIC TEST-ONLY VECTORS. Keys are derived from a public label, are not provisioned anywhere and are never production keys. Only public halves appear here. Times are fixed, not wall clock.",
+  "producers": {
+    "imageAttestation": "aos (test-signed; the independent image owner signs in production)",
+    "runtimeAuthorization": "aos (encodeRuntimeAuthorization + synthetic signer)",
+    "piAuthorization": "aos (encodePiAuthorization + synthetic signer)",
+    "frames": "ts frames are captured from the real OwnedInstallerConstruction; rust frames are the sorted compact form the constructor's serializers emit"
+  },
+  "clock": {
+    "nowMs": 1800000000000
+  },
+  "keys": {
+    "image": {
+      "issuer": "agenticos-native-image-owner",
+      "kid": "synthetic-image-owner-0001",
+      "keyVersion": 1,
+      "publicKey": "T-Y0uAwwCyh5CQvEN3CexGxDnUM9_U_nA4FLIAa8kMM"
+    },
+    "receipt": {
+      "issuer": "agenticos-native-owner",
+      "kid": "synthetic-receipt-0001",
+      "keyVersion": 1,
+      "publicKey": "7KVu7_Hkw9RBQ7p-29rcFuAq8-f97meEaFgMgfCsBjo"
+    },
+    "grant": {
+      "issuer": "agenticos-native-owner",
+      "kid": "synthetic-grant-0001",
+      "keyVersion": 1,
+      "publicKey": "PTsWZDo2BvaF4YByVKvZPe3PlL6TJpneUxVwZk_v348"
+    },
+    "runtime": {
+      "issuer": "agenticos-native-owner",
+      "kid": "synthetic-runtime-0001",
+      "keyVersion": 1,
+      "publicKey": "aNElm58BlzEQPhMPR6BFpx0b9dKYwzZP32oQhKZBZBo"
+    },
+    "pi": {
+      "issuer": "agenticos-native-owner",
+      "kid": "synthetic-pi-0001",
+      "keyVersion": 1,
+      "publicKey": "erPeYXda16OMjwv_JXqNZ7yVpk1_IBP44zHDisC3BbQ"
+    }
+  },
+  "scenario": {
+    "operation": "11111111-1111-4111-8111-111111111111",
+    "barrierNonce": "33333333-3333-4333-8333-333333333333",
+    "configureExpiresAtMs": 1800000010000,
+    "launch": {
+      "epoch": 3,
+      "request": {
+        "identity": {
+          "company": "synthetic",
+          "instance": "attempt1",
+          "backend": "native",
+          "tier": "basic",
+          "generation": 1,
+          "imageLane": "baseline"
+        },
+        "purpose": "fresh_start",
+        "challenge": "11111111-1111-4111-8111-111111111111",
+        "image": "registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    "lineage": {
+      "reference": "synthetic-fresh-fork",
+      "databaseEpoch": 1
+    },
+    "installer": {
+      "pid": 321,
+      "starttime": "5678",
+      "uid": 21000,
+      "gid": 21000,
+      "clientDigest": "2222222222222222222222222222222222222222222222222222222222222222",
+      "carrierDigest": "3333333333333333333333333333333333333333333333333333333333333333",
+      "observerDigest": "4444444444444444444444444444444444444444444444444444444444444444"
+    },
+    "recipient": {
+      "pid": 123,
+      "starttime": "1234",
+      "generation": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "nonce": "22222222-2222-4222-8222-222222222222"
+    },
+    "bindingJson": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"challenge\":{\"launch\":{\"epoch\":3,\"request\":{\"challenge\":\"11111111-1111-4111-8111-111111111111\",\"identity\":{\"backend\":\"native\",\"company\":\"synthetic\",\"generation\":1,\"imageLane\":\"baseline\",\"instance\":\"attempt1\",\"tier\":\"basic\"},\"image\":\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"purpose\":\"fresh_start\"}},\"lineage\":{\"databaseEpoch\":1,\"reference\":\"synthetic-fresh-fork\"},\"pins\":{\"helper\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"image\":\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"node\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"piGraph\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"policy\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"source\":\"cccccccccccccccccccccccccccccccccccccccc\"},\"recipient\":{\"generation\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"nonce\":\"22222222-2222-4222-8222-222222222222\",\"pid\":123,\"starttime\":\"1234\"}},\"expiresAtMs\":1800000010000,\"installer\":{\"carrierDigest\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"clientDigest\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"gid\":21000,\"observerDigest\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"pid\":321,\"starttime\":\"5678\",\"uid\":21000},\"version\":1}",
+    "global": "6666666666666666666666666666666666666666666666666666666666666666",
+    "company": "7777777777777777777777777777777777777777777777777777777777777777",
+    "receipt": "synthetic-receipt-test-only",
+    "grant": "synthetic-grant-test-only",
+    "piReference": "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1",
+    "task": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+  },
+  "placeholders": {
+    "image": "@@IMAGE_ATTESTATION@@",
+    "runtime": "@@RUNTIME_AUTHORIZATION@@"
+  },
+  "artifacts": {
+    "imageAttestation": {
+      "domain": "cadence.native-image-qualification.v1",
+      "manifest": {
+        "version": 1,
+        "image": "registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "source": "cccccccccccccccccccccccccccccccccccccccc",
+        "artifacts": {
+          "constructor": "1111111111111111111111111111111111111111111111111111111111111111",
+          "client": "2222222222222222222222222222222222222222222222222222222222222222",
+          "carrier": "3333333333333333333333333333333333333333333333333333333333333333",
+          "observer": "4444444444444444444444444444444444444444444444444444444444444444",
+          "supervisor": "2222222222222222222222222222222222222222222222222222222222222222",
+          "helper": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "node": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "piGraph": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "policy": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        "notBeforeMs": 1799999940000,
+        "expiresAtMs": 1800003600000,
+        "receiptTrust": [
+          {
+            "issuer": "agenticos-native-owner",
+            "kid": "synthetic-receipt-0001",
+            "keyVersion": 1,
+            "publicKey": "7KVu7_Hkw9RBQ7p-29rcFuAq8-f97meEaFgMgfCsBjo"
+          }
+        ],
+        "grantTrust": [
+          {
+            "issuer": "agenticos-native-owner",
+            "kid": "synthetic-grant-0001",
+            "keyVersion": 1,
+            "publicKey": "PTsWZDo2BvaF4YByVKvZPe3PlL6TJpneUxVwZk_v348"
+          }
+        ],
+        "runtimeTrust": [
+          {
+            "issuer": "agenticos-native-owner",
+            "kid": "synthetic-runtime-0001",
+            "keyVersion": 1,
+            "publicKey": "aNElm58BlzEQPhMPR6BFpx0b9dKYwzZP32oQhKZBZBo"
+          }
+        ],
+        "piTrust": [
+          {
+            "issuer": "agenticos-native-owner",
+            "kid": "synthetic-pi-0001",
+            "keyVersion": 1,
+            "publicKey": "erPeYXda16OMjwv_JXqNZ7yVpk1_IBP44zHDisC3BbQ"
+          }
+        ]
+      },
+      "positive": {
+        "parts": [
+          "eyJhbGciOiJFZDI1NTE5IiwiaXNzdWVyIjoiYWdlbnRpY29zLW5hdGl2ZS1pbWFnZS1vd25lciIsImtleVZlcnNpb24iOjEsImtpZCI6InN5bnRoZXRpYy1pbWFnZS1vd25lci0wMDAxIiwidHlwZSI6Im5hdGl2ZS1pbWFnZS1xdWFsaWZpY2F0aW9uIiwidmVyc2lvbiI6MX0",
+          "eyJhcnRpZmFjdHMiOnsiY2FycmllciI6IjMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMiLCJjbGllbnQiOiIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyIiwiY29uc3RydWN0b3IiOiIxMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExIiwiaGVscGVyIjoiZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZCIsIm5vZGUiOiJlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlIiwib2JzZXJ2ZXIiOiI0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0IiwicGlHcmFwaCI6ImZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmYiLCJwb2xpY3kiOiIxMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExIiwic3VwZXJ2aXNvciI6IjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIifSwiZXhwaXJlc0F0TXMiOjE4MDAwMDM2MDAwMDAsImdyYW50VHJ1c3QiOlt7Imlzc3VlciI6ImFnZW50aWNvcy1uYXRpdmUtb3duZXIiLCJrZXlWZXJzaW9uIjoxLCJraWQiOiJzeW50aGV0aWMtZ3JhbnQtMDAwMSIsInB1YmxpY0tleSI6IlBUc1daRG8yQnZhRjRZQnlWS3ZaUGUzUGxMNlRKcG5lVXhWd1prX3YzNDgifV0sImltYWdlIjoicmVnaXN0cnkuZXhhbXBsZS9ydW50aW1lQHNoYTI1NjphYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhIiwibm90QmVmb3JlTXMiOjE3OTk5OTk5NDAwMDAsInBpVHJ1c3QiOlt7Imlzc3VlciI6ImFnZW50aWNvcy1uYXRpdmUtb3duZXIiLCJrZXlWZXJzaW9uIjoxLCJraWQiOiJzeW50aGV0aWMtcGktMDAwMSIsInB1YmxpY0tleSI6ImVyUGVZWGRhMTZPTWp3dl9KWHFOWjd5VnBrMV9JQlA0NHpIRGlzQzNCYlEifV0sInJlY2VpcHRUcnVzdCI6W3siaXNzdWVyIjoiYWdlbnRpY29zLW5hdGl2ZS1vd25lciIsImtleVZlcnNpb24iOjEsImtpZCI6InN5bnRoZXRpYy1yZWNlaXB0LTAwMDEiLCJwdWJsaWNLZXkiOiI3S1Z1N19Ia3c5UkJRN3AtMjlyY0Z1QXE4LWY5N21lRWFGZ01nZkNzQmpvIn1dLCJydW50aW1lVHJ1c3QiOlt7Imlzc3VlciI6ImFnZW50aWNvcy1uYXRpdmUtb3duZXIiLCJrZXlWZXJzaW9uIjoxLCJraWQiOiJzeW50aGV0aWMtcnVudGltZS0wMDAxIiwicHVibGljS2V5IjoiYU5FbG01OEJsekVRUGhNUFI2QkZweDBiOWRLWXd6WlAzMm9RaEtaQlpCbyJ9XSwic291cmNlIjoiY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjYyIsInZlcnNpb24iOjF9",
+          "ceOUNYKfPxQzC5a5a39RZvWd8z-0011OkDIYAz0eAeVvsE0-s0hRXanUQiXsB3QM0IOntyFVvxiyKfGXeUPfAg"
+        ],
+        "nowMs": 1800000000000
+      },
+      "negatives": {
+        "alteredByte": {
+          "parts": [
+            "eyJhbGciOiJFZDI1NTE5IiwiaXNzdWVyIjoiYWdlbnRpY29zLW5hdGl2ZS1pbWFnZS1vd25lciIsImtleVZlcnNpb24iOjEsImtpZCI6InN5bnRoZXRpYy1pbWFnZS1vd25lci0wMDAxIiwidHlwZSI6Im5hdGl2ZS1pbWFnZS1xdWFsaWZpY2F0aW9uIiwidmVyc2lvbiI6MX0",
+            "eyJhcnRpZmFjdHMiOnsiY2FycmllciI6IjMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMiLCJjbGllbnQiOiIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyIiwiY29uc3RydWN0b3IiOiIxMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExIiwiaGVscGVyIjoiZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZCIsIm5vZGUiOiJlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlIiwib2JzZXJ2ZXIiOiI0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0IiwicGlHcmFwaCI6ImZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmYiLCJwb2xpY3kiOiIxMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExIiwic3VwZXJ2aXNvciI6IjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIifSwiZXhwaXJlc0F0TXMiOjE4MDAwMDM2MDAwMDAsImdyYW50VHJ1c3QiOlt7Imlzc3VlciI6ImFnZW50aWNvcy1uYXRpdmUtb3duZXIiLCJrZXlWZXJzaW9uIjoxLCJraWQiOiJzeW50aGV0aWMtZ3JhbnQtMDAwMSIsInB1YmxpY0tleSI6IlBUc1daRG8yQnZhRjRZQnlWS3ZaUGUzUGxMNlRKcG5lVXhWd1prX3YzNDgifV0sImltYWdlIjoicmVnaXN0cnkuZXhhbXBsZS9ydW50aW1lQHNoYTI1NjphYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhIiwibm90QmVmb3JlTXMiOjE3OTk5OTk5NDAwMDAsInBpVHJ1c3QiOlt7Imlzc3VlciI6ImFnZW50aWNvcy1uYXRpdmUtb3duZXIiLCJrZXlWZXJzaW9uIjoxLCJraWQiOiJzeW50aGV0aWMtcGktMDAwMSIsInB1YmxpY0tleSI6ImVyUGVZWGRhMTZPTWp3dl9KWHFOWjd5VnBrMV9JQlA0NHpIRGlzQzNCYlEifV0sInJlY2VpcHRUcnVzdCI6W3siaXNzdWVyIjoiYWdlbnRpY29zLW5hdGl2ZS1vd25lciIsImtleVZlcnNpb24iOjEsImtpZCI6InN5bnRoZXRpYy1yZWNlaXB0LTAwMDEiLCJwdWJsaWNLZXkiOiI3S1Z1N19Ia3c5UkJRN3AtMjlyY0Z1QXE4LWY5N21lRWFGZ01nZkNzQmpvIn1dLCJydW50aW1lVHJ1c3QiOlt7Imlzc3VlciI6ImFnZW50aWNvcy1uYXRpdmUtb3duZXIiLCJrZXlWZXJzaW9uIjoxLCJraWQiOiJzeW50aGV0aWMtcnVudGltZS0wMDAxIiwicHVibGljS2V5IjoiYU5FbG01OEJsekVRUGhNUFI2QkZweDBiOWRLWXd6WlAzMm9RaEtaQlpCbyJ9XSwic291cmNlIjoiZGNjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjYyIsInZlcnNpb24iOjF9",
+            "ceOUNYKfPxQzC5a5a39RZvWd8z-0011OkDIYAz0eAeVvsE0-s0hRXanUQiXsB3QM0IOntyFVvxiyKfGXeUPfAg"
+          ]
+        },
+        "wrongKid": {
+          "parts": [
+            "eyJhbGciOiJFZDI1NTE5IiwiaXNzdWVyIjoiYWdlbnRpY29zLW5hdGl2ZS1pbWFnZS1vd25lciIsImtleVZlcnNpb24iOjEsImtpZCI6InN5bnRoZXRpYy11bmtub3duLWtpZCIsInR5cGUiOiJuYXRpdmUtaW1hZ2UtcXVhbGlmaWNhdGlvbiIsInZlcnNpb24iOjF9",
+            "eyJhcnRpZmFjdHMiOnsiY2FycmllciI6IjMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMiLCJjbGllbnQiOiIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyIiwiY29uc3RydWN0b3IiOiIxMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExIiwiaGVscGVyIjoiZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZCIsIm5vZGUiOiJlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlIiwib2JzZXJ2ZXIiOiI0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0IiwicGlHcmFwaCI6ImZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmYiLCJwb2xpY3kiOiIxMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExIiwic3VwZXJ2aXNvciI6IjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIifSwiZXhwaXJlc0F0TXMiOjE4MDAwMDM2MDAwMDAsImdyYW50VHJ1c3QiOlt7Imlzc3VlciI6ImFnZW50aWNvcy1uYXRpdmUtb3duZXIiLCJrZXlWZXJzaW9uIjoxLCJraWQiOiJzeW50aGV0aWMtZ3JhbnQtMDAwMSIsInB1YmxpY0tleSI6IlBUc1daRG8yQnZhRjRZQnlWS3ZaUGUzUGxMNlRKcG5lVXhWd1prX3YzNDgifV0sImltYWdlIjoicmVnaXN0cnkuZXhhbXBsZS9ydW50aW1lQHNoYTI1NjphYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhIiwibm90QmVmb3JlTXMiOjE3OTk5OTk5NDAwMDAsInBpVHJ1c3QiOlt7Imlzc3VlciI6ImFnZW50aWNvcy1uYXRpdmUtb3duZXIiLCJrZXlWZXJzaW9uIjoxLCJraWQiOiJzeW50aGV0aWMtcGktMDAwMSIsInB1YmxpY0tleSI6ImVyUGVZWGRhMTZPTWp3dl9KWHFOWjd5VnBrMV9JQlA0NHpIRGlzQzNCYlEifV0sInJlY2VpcHRUcnVzdCI6W3siaXNzdWVyIjoiYWdlbnRpY29zLW5hdGl2ZS1vd25lciIsImtleVZlcnNpb24iOjEsImtpZCI6InN5bnRoZXRpYy1yZWNlaXB0LTAwMDEiLCJwdWJsaWNLZXkiOiI3S1Z1N19Ia3c5UkJRN3AtMjlyY0Z1QXE4LWY5N21lRWFGZ01nZkNzQmpvIn1dLCJydW50aW1lVHJ1c3QiOlt7Imlzc3VlciI6ImFnZW50aWNvcy1uYXRpdmUtb3duZXIiLCJrZXlWZXJzaW9uIjoxLCJraWQiOiJzeW50aGV0aWMtcnVudGltZS0wMDAxIiwicHVibGljS2V5IjoiYU5FbG01OEJsekVRUGhNUFI2QkZweDBiOWRLWXd6WlAzMm9RaEtaQlpCbyJ9XSwic291cmNlIjoiY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjYyIsInZlcnNpb24iOjF9",
+            "tMb3iKwT8jK8QU4VDQqJcselqbCdjtzrWziq-tHvQbRUv6R3Glk4aWL-f4KL8eZP4j8pygm0pCo3n0FK3WavAA"
+          ]
+        },
+        "expired": {
+          "parts": [
+            "eyJhbGciOiJFZDI1NTE5IiwiaXNzdWVyIjoiYWdlbnRpY29zLW5hdGl2ZS1pbWFnZS1vd25lciIsImtleVZlcnNpb24iOjEsImtpZCI6InN5bnRoZXRpYy1pbWFnZS1vd25lci0wMDAxIiwidHlwZSI6Im5hdGl2ZS1pbWFnZS1xdWFsaWZpY2F0aW9uIiwidmVyc2lvbiI6MX0",
+            "eyJhcnRpZmFjdHMiOnsiY2FycmllciI6IjMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMiLCJjbGllbnQiOiIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyIiwiY29uc3RydWN0b3IiOiIxMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExIiwiaGVscGVyIjoiZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZCIsIm5vZGUiOiJlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlIiwib2JzZXJ2ZXIiOiI0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0IiwicGlHcmFwaCI6ImZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmYiLCJwb2xpY3kiOiIxMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExIiwic3VwZXJ2aXNvciI6IjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIifSwiZXhwaXJlc0F0TXMiOjE4MDAwMDM2MDAwMDAsImdyYW50VHJ1c3QiOlt7Imlzc3VlciI6ImFnZW50aWNvcy1uYXRpdmUtb3duZXIiLCJrZXlWZXJzaW9uIjoxLCJraWQiOiJzeW50aGV0aWMtZ3JhbnQtMDAwMSIsInB1YmxpY0tleSI6IlBUc1daRG8yQnZhRjRZQnlWS3ZaUGUzUGxMNlRKcG5lVXhWd1prX3YzNDgifV0sImltYWdlIjoicmVnaXN0cnkuZXhhbXBsZS9ydW50aW1lQHNoYTI1NjphYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhIiwibm90QmVmb3JlTXMiOjE3OTk5OTk5NDAwMDAsInBpVHJ1c3QiOlt7Imlzc3VlciI6ImFnZW50aWNvcy1uYXRpdmUtb3duZXIiLCJrZXlWZXJzaW9uIjoxLCJraWQiOiJzeW50aGV0aWMtcGktMDAwMSIsInB1YmxpY0tleSI6ImVyUGVZWGRhMTZPTWp3dl9KWHFOWjd5VnBrMV9JQlA0NHpIRGlzQzNCYlEifV0sInJlY2VpcHRUcnVzdCI6W3siaXNzdWVyIjoiYWdlbnRpY29zLW5hdGl2ZS1vd25lciIsImtleVZlcnNpb24iOjEsImtpZCI6InN5bnRoZXRpYy1yZWNlaXB0LTAwMDEiLCJwdWJsaWNLZXkiOiI3S1Z1N19Ia3c5UkJRN3AtMjlyY0Z1QXE4LWY5N21lRWFGZ01nZkNzQmpvIn1dLCJydW50aW1lVHJ1c3QiOlt7Imlzc3VlciI6ImFnZW50aWNvcy1uYXRpdmUtb3duZXIiLCJrZXlWZXJzaW9uIjoxLCJraWQiOiJzeW50aGV0aWMtcnVudGltZS0wMDAxIiwicHVibGljS2V5IjoiYU5FbG01OEJsekVRUGhNUFI2QkZweDBiOWRLWXd6WlAzMm9RaEtaQlpCbyJ9XSwic291cmNlIjoiY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjYyIsInZlcnNpb24iOjF9",
+            "ceOUNYKfPxQzC5a5a39RZvWd8z-0011OkDIYAz0eAeVvsE0-s0hRXanUQiXsB3QM0IOntyFVvxiyKfGXeUPfAg"
+          ],
+          "nowMs": 1800003600000
+        }
+      }
+    },
+    "runtimeAuthorization": {
+      "domain": "cadence.protected-runtime-owner.v1",
+      "payload": {
+        "version": 1,
+        "bindingJson": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"challenge\":{\"launch\":{\"epoch\":3,\"request\":{\"challenge\":\"11111111-1111-4111-8111-111111111111\",\"identity\":{\"backend\":\"native\",\"company\":\"synthetic\",\"generation\":1,\"imageLane\":\"baseline\",\"instance\":\"attempt1\",\"tier\":\"basic\"},\"image\":\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"purpose\":\"fresh_start\"}},\"lineage\":{\"databaseEpoch\":1,\"reference\":\"synthetic-fresh-fork\"},\"pins\":{\"helper\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"image\":\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"node\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"piGraph\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"policy\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"source\":\"cccccccccccccccccccccccccccccccccccccccc\"},\"recipient\":{\"generation\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"nonce\":\"22222222-2222-4222-8222-222222222222\",\"pid\":123,\"starttime\":\"1234\"}},\"expiresAtMs\":1800000010000,\"installer\":{\"carrierDigest\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"clientDigest\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"gid\":21000,\"observerDigest\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"pid\":321,\"starttime\":\"5678\",\"uid\":21000},\"version\":1}",
+        "runtimeGeneration": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "issuedAtMs": 1800000000000,
+        "expiresAtMs": 1800000600000
+      },
+      "positive": {
+        "parts": [
+          "eyJhbGciOiJFZDI1NTE5IiwiaXNzdWVyIjoiYWdlbnRpY29zLW5hdGl2ZS1vd25lciIsImtleVZlcnNpb24iOjEsImtpZCI6InN5bnRoZXRpYy1ydW50aW1lLTAwMDEiLCJ0eXBlIjoicHJvdGVjdGVkLXJ1bnRpbWUtb3duZXIiLCJ2ZXJzaW9uIjoxfQ",
+          "eyJiaW5kaW5nSnNvbiI6IntcImJhcnJpZXJOb25jZVwiOlwiMzMzMzMzMzMtMzMzMy00MzMzLTgzMzMtMzMzMzMzMzMzMzMzXCIsXCJjaGFsbGVuZ2VcIjp7XCJsYXVuY2hcIjp7XCJlcG9jaFwiOjMsXCJyZXF1ZXN0XCI6e1wiY2hhbGxlbmdlXCI6XCIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTFcIixcImlkZW50aXR5XCI6e1wiYmFja2VuZFwiOlwibmF0aXZlXCIsXCJjb21wYW55XCI6XCJzeW50aGV0aWNcIixcImdlbmVyYXRpb25cIjoxLFwiaW1hZ2VMYW5lXCI6XCJiYXNlbGluZVwiLFwiaW5zdGFuY2VcIjpcImF0dGVtcHQxXCIsXCJ0aWVyXCI6XCJiYXNpY1wifSxcImltYWdlXCI6XCJyZWdpc3RyeS5leGFtcGxlL3J1bnRpbWVAc2hhMjU2OmFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFcIixcInB1cnBvc2VcIjpcImZyZXNoX3N0YXJ0XCJ9fSxcImxpbmVhZ2VcIjp7XCJkYXRhYmFzZUVwb2NoXCI6MSxcInJlZmVyZW5jZVwiOlwic3ludGhldGljLWZyZXNoLWZvcmtcIn0sXCJwaW5zXCI6e1wiaGVscGVyXCI6XCJkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkXCIsXCJpbWFnZVwiOlwicmVnaXN0cnkuZXhhbXBsZS9ydW50aW1lQHNoYTI1NjphYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhXCIsXCJub2RlXCI6XCJlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlXCIsXCJwaUdyYXBoXCI6XCJmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmXCIsXCJwb2xpY3lcIjpcIjExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTFcIixcInNvdXJjZVwiOlwiY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY1wifSxcInJlY2lwaWVudFwiOntcImdlbmVyYXRpb25cIjpcImJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiXCIsXCJub25jZVwiOlwiMjIyMjIyMjItMjIyMi00MjIyLTgyMjItMjIyMjIyMjIyMjIyXCIsXCJwaWRcIjoxMjMsXCJzdGFydHRpbWVcIjpcIjEyMzRcIn19LFwiZXhwaXJlc0F0TXNcIjoxODAwMDAwMDEwMDAwLFwiaW5zdGFsbGVyXCI6e1wiY2FycmllckRpZ2VzdFwiOlwiMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM1wiLFwiY2xpZW50RGlnZXN0XCI6XCIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyXCIsXCJnaWRcIjoyMTAwMCxcIm9ic2VydmVyRGlnZXN0XCI6XCI0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0XCIsXCJwaWRcIjozMjEsXCJzdGFydHRpbWVcIjpcIjU2NzhcIixcInVpZFwiOjIxMDAwfSxcInZlcnNpb25cIjoxfSIsImV4cGlyZXNBdE1zIjoxODAwMDAwNjAwMDAwLCJpc3N1ZWRBdE1zIjoxODAwMDAwMDAwMDAwLCJydW50aW1lR2VuZXJhdGlvbiI6ImJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiIiwidmVyc2lvbiI6MX0",
+          "yZCs_uYHmi15OibuWSTk_wn9wfMxHod_DG7hUxahCwkqfU4VLgg_-AiQhn6m0c95YyT6WFXaMxkeeuMcTSnNAQ"
+        ],
+        "nowMs": 1800000000000
+      },
+      "negatives": {
+        "alteredByte": {
+          "parts": [
+            "eyJhbGciOiJFZDI1NTE5IiwiaXNzdWVyIjoiYWdlbnRpY29zLW5hdGl2ZS1vd25lciIsImtleVZlcnNpb24iOjEsImtpZCI6InN5bnRoZXRpYy1ydW50aW1lLTAwMDEiLCJ0eXBlIjoicHJvdGVjdGVkLXJ1bnRpbWUtb3duZXIiLCJ2ZXJzaW9uIjoxfQ",
+            "eyJiaW5kaW5nSnNvbiI6IntcImJhcnJpZXJOb25jZVwiOlwiMzMzMzMzMzMtMzMzMy00MzMzLTgzMzMtMzMzMzMzMzMzMzMzXCIsXCJjaGFsbGVuZ2VcIjp7XCJsYXVuY2hcIjp7XCJlcG9jaFwiOjMsXCJyZXF1ZXN0XCI6e1wiY2hhbGxlbmdlXCI6XCIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTFcIixcImlkZW50aXR5XCI6e1wiYmFja2VuZFwiOlwibmF0aXZlXCIsXCJjb21wYW55XCI6XCJzeW50aGV0aWNcIixcImdlbmVyYXRpb25cIjoxLFwiaW1hZ2VMYW5lXCI6XCJiYXNlbGluZVwiLFwiaW5zdGFuY2VcIjpcImF0dGVtcHQxXCIsXCJ0aWVyXCI6XCJiYXNpY1wifSxcImltYWdlXCI6XCJyZWdpc3RyeS5leGFtcGxlL3J1bnRpbWVAc2hhMjU2OmFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFcIixcInB1cnBvc2VcIjpcImZyZXNoX3N0YXJ0XCJ9fSxcImxpbmVhZ2VcIjp7XCJkYXRhYmFzZUVwb2NoXCI6MSxcInJlZmVyZW5jZVwiOlwic3ludGhldGljLWZyZXNoLWZvcmtcIn0sXCJwaW5zXCI6e1wiaGVscGVyXCI6XCJkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkXCIsXCJpbWFnZVwiOlwicmVnaXN0cnkuZXhhbXBsZS9ydW50aW1lQHNoYTI1NjphYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhXCIsXCJub2RlXCI6XCJlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlXCIsXCJwaUdyYXBoXCI6XCJmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmXCIsXCJwb2xpY3lcIjpcIjExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTFcIixcInNvdXJjZVwiOlwiY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY1wifSxcInJlY2lwaWVudFwiOntcImdlbmVyYXRpb25cIjpcImJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiXCIsXCJub25jZVwiOlwiMjIyMjIyMjItMjIyMi00MjIyLTgyMjItMjIyMjIyMjIyMjIyXCIsXCJwaWRcIjoxMjMsXCJzdGFydHRpbWVcIjpcIjEyMzRcIn19LFwiZXhwaXJlc0F0TXNcIjoxODAwMDAwMDEwMDAwLFwiaW5zdGFsbGVyXCI6e1wiY2FycmllckRpZ2VzdFwiOlwiMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM1wiLFwiY2xpZW50RGlnZXN0XCI6XCIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyXCIsXCJnaWRcIjoyMTAwMCxcIm9ic2VydmVyRGlnZXN0XCI6XCI0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0XCIsXCJwaWRcIjozMjEsXCJzdGFydHRpbWVcIjpcIjU2NzhcIixcInVpZFwiOjIxMDAwfSxcInZlcnNpb25cIjoxfSIsImV4cGlyZXNBdE1zIjoxODAwMDAwNjAwMDAxLCJpc3N1ZWRBdE1zIjoxODAwMDAwMDAwMDAwLCJydW50aW1lR2VuZXJhdGlvbiI6ImJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiIiwidmVyc2lvbiI6MX0",
+            "yZCs_uYHmi15OibuWSTk_wn9wfMxHod_DG7hUxahCwkqfU4VLgg_-AiQhn6m0c95YyT6WFXaMxkeeuMcTSnNAQ"
+          ]
+        },
+        "wrongKid": {
+          "parts": [
+            "eyJhbGciOiJFZDI1NTE5IiwiaXNzdWVyIjoiYWdlbnRpY29zLW5hdGl2ZS1vd25lciIsImtleVZlcnNpb24iOjEsImtpZCI6InN5bnRoZXRpYy11bmtub3duLWtpZCIsInR5cGUiOiJwcm90ZWN0ZWQtcnVudGltZS1vd25lciIsInZlcnNpb24iOjF9",
+            "eyJiaW5kaW5nSnNvbiI6IntcImJhcnJpZXJOb25jZVwiOlwiMzMzMzMzMzMtMzMzMy00MzMzLTgzMzMtMzMzMzMzMzMzMzMzXCIsXCJjaGFsbGVuZ2VcIjp7XCJsYXVuY2hcIjp7XCJlcG9jaFwiOjMsXCJyZXF1ZXN0XCI6e1wiY2hhbGxlbmdlXCI6XCIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTFcIixcImlkZW50aXR5XCI6e1wiYmFja2VuZFwiOlwibmF0aXZlXCIsXCJjb21wYW55XCI6XCJzeW50aGV0aWNcIixcImdlbmVyYXRpb25cIjoxLFwiaW1hZ2VMYW5lXCI6XCJiYXNlbGluZVwiLFwiaW5zdGFuY2VcIjpcImF0dGVtcHQxXCIsXCJ0aWVyXCI6XCJiYXNpY1wifSxcImltYWdlXCI6XCJyZWdpc3RyeS5leGFtcGxlL3J1bnRpbWVAc2hhMjU2OmFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFcIixcInB1cnBvc2VcIjpcImZyZXNoX3N0YXJ0XCJ9fSxcImxpbmVhZ2VcIjp7XCJkYXRhYmFzZUVwb2NoXCI6MSxcInJlZmVyZW5jZVwiOlwic3ludGhldGljLWZyZXNoLWZvcmtcIn0sXCJwaW5zXCI6e1wiaGVscGVyXCI6XCJkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkXCIsXCJpbWFnZVwiOlwicmVnaXN0cnkuZXhhbXBsZS9ydW50aW1lQHNoYTI1NjphYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhXCIsXCJub2RlXCI6XCJlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlXCIsXCJwaUdyYXBoXCI6XCJmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmXCIsXCJwb2xpY3lcIjpcIjExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTFcIixcInNvdXJjZVwiOlwiY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY1wifSxcInJlY2lwaWVudFwiOntcImdlbmVyYXRpb25cIjpcImJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiXCIsXCJub25jZVwiOlwiMjIyMjIyMjItMjIyMi00MjIyLTgyMjItMjIyMjIyMjIyMjIyXCIsXCJwaWRcIjoxMjMsXCJzdGFydHRpbWVcIjpcIjEyMzRcIn19LFwiZXhwaXJlc0F0TXNcIjoxODAwMDAwMDEwMDAwLFwiaW5zdGFsbGVyXCI6e1wiY2FycmllckRpZ2VzdFwiOlwiMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM1wiLFwiY2xpZW50RGlnZXN0XCI6XCIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyXCIsXCJnaWRcIjoyMTAwMCxcIm9ic2VydmVyRGlnZXN0XCI6XCI0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0XCIsXCJwaWRcIjozMjEsXCJzdGFydHRpbWVcIjpcIjU2NzhcIixcInVpZFwiOjIxMDAwfSxcInZlcnNpb25cIjoxfSIsImV4cGlyZXNBdE1zIjoxODAwMDAwNjAwMDAwLCJpc3N1ZWRBdE1zIjoxODAwMDAwMDAwMDAwLCJydW50aW1lR2VuZXJhdGlvbiI6ImJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiIiwidmVyc2lvbiI6MX0",
+            "QEtwN-VJuAlT4l8wgsDblgST0wVTbbvgTLeKXe9FFWq4bY25TnbPZ5aBRZMz2q6eqceKVj0Ralvh8e2_wnmPBg"
+          ]
+        },
+        "expired": {
+          "parts": [
+            "eyJhbGciOiJFZDI1NTE5IiwiaXNzdWVyIjoiYWdlbnRpY29zLW5hdGl2ZS1vd25lciIsImtleVZlcnNpb24iOjEsImtpZCI6InN5bnRoZXRpYy1ydW50aW1lLTAwMDEiLCJ0eXBlIjoicHJvdGVjdGVkLXJ1bnRpbWUtb3duZXIiLCJ2ZXJzaW9uIjoxfQ",
+            "eyJiaW5kaW5nSnNvbiI6IntcImJhcnJpZXJOb25jZVwiOlwiMzMzMzMzMzMtMzMzMy00MzMzLTgzMzMtMzMzMzMzMzMzMzMzXCIsXCJjaGFsbGVuZ2VcIjp7XCJsYXVuY2hcIjp7XCJlcG9jaFwiOjMsXCJyZXF1ZXN0XCI6e1wiY2hhbGxlbmdlXCI6XCIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTFcIixcImlkZW50aXR5XCI6e1wiYmFja2VuZFwiOlwibmF0aXZlXCIsXCJjb21wYW55XCI6XCJzeW50aGV0aWNcIixcImdlbmVyYXRpb25cIjoxLFwiaW1hZ2VMYW5lXCI6XCJiYXNlbGluZVwiLFwiaW5zdGFuY2VcIjpcImF0dGVtcHQxXCIsXCJ0aWVyXCI6XCJiYXNpY1wifSxcImltYWdlXCI6XCJyZWdpc3RyeS5leGFtcGxlL3J1bnRpbWVAc2hhMjU2OmFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFcIixcInB1cnBvc2VcIjpcImZyZXNoX3N0YXJ0XCJ9fSxcImxpbmVhZ2VcIjp7XCJkYXRhYmFzZUVwb2NoXCI6MSxcInJlZmVyZW5jZVwiOlwic3ludGhldGljLWZyZXNoLWZvcmtcIn0sXCJwaW5zXCI6e1wiaGVscGVyXCI6XCJkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkXCIsXCJpbWFnZVwiOlwicmVnaXN0cnkuZXhhbXBsZS9ydW50aW1lQHNoYTI1NjphYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhXCIsXCJub2RlXCI6XCJlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlXCIsXCJwaUdyYXBoXCI6XCJmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmXCIsXCJwb2xpY3lcIjpcIjExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTFcIixcInNvdXJjZVwiOlwiY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY1wifSxcInJlY2lwaWVudFwiOntcImdlbmVyYXRpb25cIjpcImJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiXCIsXCJub25jZVwiOlwiMjIyMjIyMjItMjIyMi00MjIyLTgyMjItMjIyMjIyMjIyMjIyXCIsXCJwaWRcIjoxMjMsXCJzdGFydHRpbWVcIjpcIjEyMzRcIn19LFwiZXhwaXJlc0F0TXNcIjoxODAwMDAwMDEwMDAwLFwiaW5zdGFsbGVyXCI6e1wiY2FycmllckRpZ2VzdFwiOlwiMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM1wiLFwiY2xpZW50RGlnZXN0XCI6XCIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyXCIsXCJnaWRcIjoyMTAwMCxcIm9ic2VydmVyRGlnZXN0XCI6XCI0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0XCIsXCJwaWRcIjozMjEsXCJzdGFydHRpbWVcIjpcIjU2NzhcIixcInVpZFwiOjIxMDAwfSxcInZlcnNpb25cIjoxfSIsImV4cGlyZXNBdE1zIjoxODAwMDAwNjAwMDAwLCJpc3N1ZWRBdE1zIjoxODAwMDAwMDAwMDAwLCJydW50aW1lR2VuZXJhdGlvbiI6ImJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiIiwidmVyc2lvbiI6MX0",
+            "yZCs_uYHmi15OibuWSTk_wn9wfMxHod_DG7hUxahCwkqfU4VLgg_-AiQhn6m0c95YyT6WFXaMxkeeuMcTSnNAQ"
+          ],
+          "nowMs": 1800000600000
+        }
+      }
+    },
+    "piAuthorization": {
+      "domain": "cadence.protected-pi-launch.v1",
+      "payload": {
+        "version": 1,
+        "reference": "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1",
+        "scope": {
+          "version": 1,
+          "binding_json": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"challenge\":{\"launch\":{\"epoch\":3,\"request\":{\"challenge\":\"11111111-1111-4111-8111-111111111111\",\"identity\":{\"backend\":\"native\",\"company\":\"synthetic\",\"generation\":1,\"imageLane\":\"baseline\",\"instance\":\"attempt1\",\"tier\":\"basic\"},\"image\":\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"purpose\":\"fresh_start\"}},\"lineage\":{\"databaseEpoch\":1,\"reference\":\"synthetic-fresh-fork\"},\"pins\":{\"helper\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"image\":\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"node\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"piGraph\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"policy\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"source\":\"cccccccccccccccccccccccccccccccccccccccc\"},\"recipient\":{\"generation\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"nonce\":\"22222222-2222-4222-8222-222222222222\",\"pid\":123,\"starttime\":\"1234\"}},\"expiresAtMs\":1800000010000,\"installer\":{\"carrierDigest\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"clientDigest\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"gid\":21000,\"observerDigest\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"pid\":321,\"starttime\":\"5678\",\"uid\":21000},\"version\":1}",
+          "global": "6666666666666666666666666666666666666666666666666666666666666666",
+          "company": "7777777777777777777777777777777777777777777777777777777777777777",
+          "epoch": 3,
+          "lineage": "synthetic-fresh-fork",
+          "database_epoch": 1,
+          "alias": "synthetic-alias",
+          "selection": {
+            "alias_sha256": "3b948d88dbcbedc38c300b2ec8931ba468994d8fe82d81333df5fb4b65a3cde8",
+            "generation": "cccccccccccccccccccccccccccccccc",
+            "role": "master",
+            "model": "openai-codex/gpt-6.1-sol"
+          },
+          "helper_sha256": [
+            221,
+            221,
+            221,
+            221,
+            221,
+            221,
+            221,
+            221,
+            221,
+            221,
+            221,
+            221,
+            221,
+            221,
+            221,
+            221,
+            221,
+            221,
+            221,
+            221,
+            221,
+            221,
+            221,
+            221,
+            221,
+            221,
+            221,
+            221,
+            221,
+            221,
+            221,
+            221
+          ],
+          "node_sha256": [
+            238,
+            238,
+            238,
+            238,
+            238,
+            238,
+            238,
+            238,
+            238,
+            238,
+            238,
+            238,
+            238,
+            238,
+            238,
+            238,
+            238,
+            238,
+            238,
+            238,
+            238,
+            238,
+            238,
+            238,
+            238,
+            238,
+            238,
+            238,
+            238,
+            238,
+            238,
+            238
+          ],
+          "profile_sha256": [
+            255,
+            255,
+            255,
+            255,
+            255,
+            255,
+            255,
+            255,
+            255,
+            255,
+            255,
+            255,
+            255,
+            255,
+            255,
+            255,
+            255,
+            255,
+            255,
+            255,
+            255,
+            255,
+            255,
+            255,
+            255,
+            255,
+            255,
+            255,
+            255,
+            255,
+            255,
+            255
+          ],
+          "policy_sha256": [
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17
+          ]
+        },
+        "issuedAtMs": 1800000000000,
+        "expiresAtMs": 1800000030000
+      },
+      "runtimeImageExpiryMs": 1800003600000,
+      "positive": {
+        "parts": [
+          "eyJhbGciOiJFZDI1NTE5IiwiaXNzdWVyIjoiYWdlbnRpY29zLW5hdGl2ZS1vd25lciIsImtleVZlcnNpb24iOjEsImtpZCI6InN5bnRoZXRpYy1waS0wMDAxIiwidHlwZSI6InByb3RlY3RlZC1waS1sYXVuY2giLCJ2ZXJzaW9uIjoxfQ",
+          "eyJleHBpcmVzQXRNcyI6MTgwMDAwMDAzMDAwMCwiaXNzdWVkQXRNcyI6MTgwMDAwMDAwMDAwMCwicmVmZXJlbmNlIjoiZDFkMWQxZDFkMWQxZDFkMWQxZDFkMWQxZDFkMWQxZDEiLCJzY29wZSI6eyJhbGlhcyI6InN5bnRoZXRpYy1hbGlhcyIsImJpbmRpbmdfanNvbiI6IntcImJhcnJpZXJOb25jZVwiOlwiMzMzMzMzMzMtMzMzMy00MzMzLTgzMzMtMzMzMzMzMzMzMzMzXCIsXCJjaGFsbGVuZ2VcIjp7XCJsYXVuY2hcIjp7XCJlcG9jaFwiOjMsXCJyZXF1ZXN0XCI6e1wiY2hhbGxlbmdlXCI6XCIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTFcIixcImlkZW50aXR5XCI6e1wiYmFja2VuZFwiOlwibmF0aXZlXCIsXCJjb21wYW55XCI6XCJzeW50aGV0aWNcIixcImdlbmVyYXRpb25cIjoxLFwiaW1hZ2VMYW5lXCI6XCJiYXNlbGluZVwiLFwiaW5zdGFuY2VcIjpcImF0dGVtcHQxXCIsXCJ0aWVyXCI6XCJiYXNpY1wifSxcImltYWdlXCI6XCJyZWdpc3RyeS5leGFtcGxlL3J1bnRpbWVAc2hhMjU2OmFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFcIixcInB1cnBvc2VcIjpcImZyZXNoX3N0YXJ0XCJ9fSxcImxpbmVhZ2VcIjp7XCJkYXRhYmFzZUVwb2NoXCI6MSxcInJlZmVyZW5jZVwiOlwic3ludGhldGljLWZyZXNoLWZvcmtcIn0sXCJwaW5zXCI6e1wiaGVscGVyXCI6XCJkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkXCIsXCJpbWFnZVwiOlwicmVnaXN0cnkuZXhhbXBsZS9ydW50aW1lQHNoYTI1NjphYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhXCIsXCJub2RlXCI6XCJlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlXCIsXCJwaUdyYXBoXCI6XCJmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmXCIsXCJwb2xpY3lcIjpcIjExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTFcIixcInNvdXJjZVwiOlwiY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY1wifSxcInJlY2lwaWVudFwiOntcImdlbmVyYXRpb25cIjpcImJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiXCIsXCJub25jZVwiOlwiMjIyMjIyMjItMjIyMi00MjIyLTgyMjItMjIyMjIyMjIyMjIyXCIsXCJwaWRcIjoxMjMsXCJzdGFydHRpbWVcIjpcIjEyMzRcIn19LFwiZXhwaXJlc0F0TXNcIjoxODAwMDAwMDEwMDAwLFwiaW5zdGFsbGVyXCI6e1wiY2FycmllckRpZ2VzdFwiOlwiMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM1wiLFwiY2xpZW50RGlnZXN0XCI6XCIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyXCIsXCJnaWRcIjoyMTAwMCxcIm9ic2VydmVyRGlnZXN0XCI6XCI0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0XCIsXCJwaWRcIjozMjEsXCJzdGFydHRpbWVcIjpcIjU2NzhcIixcInVpZFwiOjIxMDAwfSxcInZlcnNpb25cIjoxfSIsImNvbXBhbnkiOiI3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3IiwiZGF0YWJhc2VfZXBvY2giOjEsImVwb2NoIjozLCJnbG9iYWwiOiI2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2IiwiaGVscGVyX3NoYTI1NiI6WzIyMSwyMjEsMjIxLDIyMSwyMjEsMjIxLDIyMSwyMjEsMjIxLDIyMSwyMjEsMjIxLDIyMSwyMjEsMjIxLDIyMSwyMjEsMjIxLDIyMSwyMjEsMjIxLDIyMSwyMjEsMjIxLDIyMSwyMjEsMjIxLDIyMSwyMjEsMjIxLDIyMSwyMjFdLCJsaW5lYWdlIjoic3ludGhldGljLWZyZXNoLWZvcmsiLCJub2RlX3NoYTI1NiI6WzIzOCwyMzgsMjM4LDIzOCwyMzgsMjM4LDIzOCwyMzgsMjM4LDIzOCwyMzgsMjM4LDIzOCwyMzgsMjM4LDIzOCwyMzgsMjM4LDIzOCwyMzgsMjM4LDIzOCwyMzgsMjM4LDIzOCwyMzgsMjM4LDIzOCwyMzgsMjM4LDIzOCwyMzhdLCJwb2xpY3lfc2hhMjU2IjpbMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTddLCJwcm9maWxlX3NoYTI1NiI6WzI1NSwyNTUsMjU1LDI1NSwyNTUsMjU1LDI1NSwyNTUsMjU1LDI1NSwyNTUsMjU1LDI1NSwyNTUsMjU1LDI1NSwyNTUsMjU1LDI1NSwyNTUsMjU1LDI1NSwyNTUsMjU1LDI1NSwyNTUsMjU1LDI1NSwyNTUsMjU1LDI1NSwyNTVdLCJzZWxlY3Rpb24iOnsiYWxpYXNfc2hhMjU2IjoiM2I5NDhkODhkYmNiZWRjMzhjMzAwYjJlYzg5MzFiYTQ2ODk5NGQ4ZmU4MmQ4MTMzM2RmNWZiNGI2NWEzY2RlOCIsImdlbmVyYXRpb24iOiJjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjYyIsIm1vZGVsIjoib3BlbmFpLWNvZGV4L2dwdC02LjEtc29sIiwicm9sZSI6Im1hc3RlciJ9LCJ2ZXJzaW9uIjoxfSwidmVyc2lvbiI6MX0",
+          "hGJ1_YBvx970AFy0lx_Cy2X5D4IpHowF9trOlberUbLcmkSIyeX2C6_hocLTLi7hBpXhRsSis-XReGXeq2M_DA"
+        ],
+        "nowMs": 1800000000000
+      },
+      "negatives": {
+        "alteredByte": {
+          "parts": [
+            "eyJhbGciOiJFZDI1NTE5IiwiaXNzdWVyIjoiYWdlbnRpY29zLW5hdGl2ZS1vd25lciIsImtleVZlcnNpb24iOjEsImtpZCI6InN5bnRoZXRpYy1waS0wMDAxIiwidHlwZSI6InByb3RlY3RlZC1waS1sYXVuY2giLCJ2ZXJzaW9uIjoxfQ",
+            "eyJleHBpcmVzQXRNcyI6MTgwMDAwMDAyOTk5OSwiaXNzdWVkQXRNcyI6MTgwMDAwMDAwMDAwMCwicmVmZXJlbmNlIjoiZDFkMWQxZDFkMWQxZDFkMWQxZDFkMWQxZDFkMWQxZDEiLCJzY29wZSI6eyJhbGlhcyI6InN5bnRoZXRpYy1hbGlhcyIsImJpbmRpbmdfanNvbiI6IntcImJhcnJpZXJOb25jZVwiOlwiMzMzMzMzMzMtMzMzMy00MzMzLTgzMzMtMzMzMzMzMzMzMzMzXCIsXCJjaGFsbGVuZ2VcIjp7XCJsYXVuY2hcIjp7XCJlcG9jaFwiOjMsXCJyZXF1ZXN0XCI6e1wiY2hhbGxlbmdlXCI6XCIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTFcIixcImlkZW50aXR5XCI6e1wiYmFja2VuZFwiOlwibmF0aXZlXCIsXCJjb21wYW55XCI6XCJzeW50aGV0aWNcIixcImdlbmVyYXRpb25cIjoxLFwiaW1hZ2VMYW5lXCI6XCJiYXNlbGluZVwiLFwiaW5zdGFuY2VcIjpcImF0dGVtcHQxXCIsXCJ0aWVyXCI6XCJiYXNpY1wifSxcImltYWdlXCI6XCJyZWdpc3RyeS5leGFtcGxlL3J1bnRpbWVAc2hhMjU2OmFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFcIixcInB1cnBvc2VcIjpcImZyZXNoX3N0YXJ0XCJ9fSxcImxpbmVhZ2VcIjp7XCJkYXRhYmFzZUVwb2NoXCI6MSxcInJlZmVyZW5jZVwiOlwic3ludGhldGljLWZyZXNoLWZvcmtcIn0sXCJwaW5zXCI6e1wiaGVscGVyXCI6XCJkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkXCIsXCJpbWFnZVwiOlwicmVnaXN0cnkuZXhhbXBsZS9ydW50aW1lQHNoYTI1NjphYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhXCIsXCJub2RlXCI6XCJlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlXCIsXCJwaUdyYXBoXCI6XCJmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmXCIsXCJwb2xpY3lcIjpcIjExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTFcIixcInNvdXJjZVwiOlwiY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY1wifSxcInJlY2lwaWVudFwiOntcImdlbmVyYXRpb25cIjpcImJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiXCIsXCJub25jZVwiOlwiMjIyMjIyMjItMjIyMi00MjIyLTgyMjItMjIyMjIyMjIyMjIyXCIsXCJwaWRcIjoxMjMsXCJzdGFydHRpbWVcIjpcIjEyMzRcIn19LFwiZXhwaXJlc0F0TXNcIjoxODAwMDAwMDEwMDAwLFwiaW5zdGFsbGVyXCI6e1wiY2FycmllckRpZ2VzdFwiOlwiMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM1wiLFwiY2xpZW50RGlnZXN0XCI6XCIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyXCIsXCJnaWRcIjoyMTAwMCxcIm9ic2VydmVyRGlnZXN0XCI6XCI0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0XCIsXCJwaWRcIjozMjEsXCJzdGFydHRpbWVcIjpcIjU2NzhcIixcInVpZFwiOjIxMDAwfSxcInZlcnNpb25cIjoxfSIsImNvbXBhbnkiOiI3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3IiwiZGF0YWJhc2VfZXBvY2giOjEsImVwb2NoIjozLCJnbG9iYWwiOiI2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2IiwiaGVscGVyX3NoYTI1NiI6WzIyMSwyMjEsMjIxLDIyMSwyMjEsMjIxLDIyMSwyMjEsMjIxLDIyMSwyMjEsMjIxLDIyMSwyMjEsMjIxLDIyMSwyMjEsMjIxLDIyMSwyMjEsMjIxLDIyMSwyMjEsMjIxLDIyMSwyMjEsMjIxLDIyMSwyMjEsMjIxLDIyMSwyMjFdLCJsaW5lYWdlIjoic3ludGhldGljLWZyZXNoLWZvcmsiLCJub2RlX3NoYTI1NiI6WzIzOCwyMzgsMjM4LDIzOCwyMzgsMjM4LDIzOCwyMzgsMjM4LDIzOCwyMzgsMjM4LDIzOCwyMzgsMjM4LDIzOCwyMzgsMjM4LDIzOCwyMzgsMjM4LDIzOCwyMzgsMjM4LDIzOCwyMzgsMjM4LDIzOCwyMzgsMjM4LDIzOCwyMzhdLCJwb2xpY3lfc2hhMjU2IjpbMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTddLCJwcm9maWxlX3NoYTI1NiI6WzI1NSwyNTUsMjU1LDI1NSwyNTUsMjU1LDI1NSwyNTUsMjU1LDI1NSwyNTUsMjU1LDI1NSwyNTUsMjU1LDI1NSwyNTUsMjU1LDI1NSwyNTUsMjU1LDI1NSwyNTUsMjU1LDI1NSwyNTUsMjU1LDI1NSwyNTUsMjU1LDI1NSwyNTVdLCJzZWxlY3Rpb24iOnsiYWxpYXNfc2hhMjU2IjoiM2I5NDhkODhkYmNiZWRjMzhjMzAwYjJlYzg5MzFiYTQ2ODk5NGQ4ZmU4MmQ4MTMzM2RmNWZiNGI2NWEzY2RlOCIsImdlbmVyYXRpb24iOiJjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjYyIsIm1vZGVsIjoib3BlbmFpLWNvZGV4L2dwdC02LjEtc29sIiwicm9sZSI6Im1hc3RlciJ9LCJ2ZXJzaW9uIjoxfSwidmVyc2lvbiI6MX0",
+            "hGJ1_YBvx970AFy0lx_Cy2X5D4IpHowF9trOlberUbLcmkSIyeX2C6_hocLTLi7hBpXhRsSis-XReGXeq2M_DA"
+          ]
+        },
+        "wrongKid": {
+          "parts": [
+            "eyJhbGciOiJFZDI1NTE5IiwiaXNzdWVyIjoiYWdlbnRpY29zLW5hdGl2ZS1vd25lciIsImtleVZlcnNpb24iOjEsImtpZCI6InN5bnRoZXRpYy11bmtub3duLWtpZCIsInR5cGUiOiJwcm90ZWN0ZWQtcGktbGF1bmNoIiwidmVyc2lvbiI6MX0",
+            "eyJleHBpcmVzQXRNcyI6MTgwMDAwMDAzMDAwMCwiaXNzdWVkQXRNcyI6MTgwMDAwMDAwMDAwMCwicmVmZXJlbmNlIjoiZDFkMWQxZDFkMWQxZDFkMWQxZDFkMWQxZDFkMWQxZDEiLCJzY29wZSI6eyJhbGlhcyI6InN5bnRoZXRpYy1hbGlhcyIsImJpbmRpbmdfanNvbiI6IntcImJhcnJpZXJOb25jZVwiOlwiMzMzMzMzMzMtMzMzMy00MzMzLTgzMzMtMzMzMzMzMzMzMzMzXCIsXCJjaGFsbGVuZ2VcIjp7XCJsYXVuY2hcIjp7XCJlcG9jaFwiOjMsXCJyZXF1ZXN0XCI6e1wiY2hhbGxlbmdlXCI6XCIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTFcIixcImlkZW50aXR5XCI6e1wiYmFja2VuZFwiOlwibmF0aXZlXCIsXCJjb21wYW55XCI6XCJzeW50aGV0aWNcIixcImdlbmVyYXRpb25cIjoxLFwiaW1hZ2VMYW5lXCI6XCJiYXNlbGluZVwiLFwiaW5zdGFuY2VcIjpcImF0dGVtcHQxXCIsXCJ0aWVyXCI6XCJiYXNpY1wifSxcImltYWdlXCI6XCJyZWdpc3RyeS5leGFtcGxlL3J1bnRpbWVAc2hhMjU2OmFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFcIixcInB1cnBvc2VcIjpcImZyZXNoX3N0YXJ0XCJ9fSxcImxpbmVhZ2VcIjp7XCJkYXRhYmFzZUVwb2NoXCI6MSxcInJlZmVyZW5jZVwiOlwic3ludGhldGljLWZyZXNoLWZvcmtcIn0sXCJwaW5zXCI6e1wiaGVscGVyXCI6XCJkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkXCIsXCJpbWFnZVwiOlwicmVnaXN0cnkuZXhhbXBsZS9ydW50aW1lQHNoYTI1NjphYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhXCIsXCJub2RlXCI6XCJlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlXCIsXCJwaUdyYXBoXCI6XCJmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmXCIsXCJwb2xpY3lcIjpcIjExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTFcIixcInNvdXJjZVwiOlwiY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY1wifSxcInJlY2lwaWVudFwiOntcImdlbmVyYXRpb25cIjpcImJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiXCIsXCJub25jZVwiOlwiMjIyMjIyMjItMjIyMi00MjIyLTgyMjItMjIyMjIyMjIyMjIyXCIsXCJwaWRcIjoxMjMsXCJzdGFydHRpbWVcIjpcIjEyMzRcIn19LFwiZXhwaXJlc0F0TXNcIjoxODAwMDAwMDEwMDAwLFwiaW5zdGFsbGVyXCI6e1wiY2FycmllckRpZ2VzdFwiOlwiMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM1wiLFwiY2xpZW50RGlnZXN0XCI6XCIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyXCIsXCJnaWRcIjoyMTAwMCxcIm9ic2VydmVyRGlnZXN0XCI6XCI0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0XCIsXCJwaWRcIjozMjEsXCJzdGFydHRpbWVcIjpcIjU2NzhcIixcInVpZFwiOjIxMDAwfSxcInZlcnNpb25cIjoxfSIsImNvbXBhbnkiOiI3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3IiwiZGF0YWJhc2VfZXBvY2giOjEsImVwb2NoIjozLCJnbG9iYWwiOiI2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2IiwiaGVscGVyX3NoYTI1NiI6WzIyMSwyMjEsMjIxLDIyMSwyMjEsMjIxLDIyMSwyMjEsMjIxLDIyMSwyMjEsMjIxLDIyMSwyMjEsMjIxLDIyMSwyMjEsMjIxLDIyMSwyMjEsMjIxLDIyMSwyMjEsMjIxLDIyMSwyMjEsMjIxLDIyMSwyMjEsMjIxLDIyMSwyMjFdLCJsaW5lYWdlIjoic3ludGhldGljLWZyZXNoLWZvcmsiLCJub2RlX3NoYTI1NiI6WzIzOCwyMzgsMjM4LDIzOCwyMzgsMjM4LDIzOCwyMzgsMjM4LDIzOCwyMzgsMjM4LDIzOCwyMzgsMjM4LDIzOCwyMzgsMjM4LDIzOCwyMzgsMjM4LDIzOCwyMzgsMjM4LDIzOCwyMzgsMjM4LDIzOCwyMzgsMjM4LDIzOCwyMzhdLCJwb2xpY3lfc2hhMjU2IjpbMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTddLCJwcm9maWxlX3NoYTI1NiI6WzI1NSwyNTUsMjU1LDI1NSwyNTUsMjU1LDI1NSwyNTUsMjU1LDI1NSwyNTUsMjU1LDI1NSwyNTUsMjU1LDI1NSwyNTUsMjU1LDI1NSwyNTUsMjU1LDI1NSwyNTUsMjU1LDI1NSwyNTUsMjU1LDI1NSwyNTUsMjU1LDI1NSwyNTVdLCJzZWxlY3Rpb24iOnsiYWxpYXNfc2hhMjU2IjoiM2I5NDhkODhkYmNiZWRjMzhjMzAwYjJlYzg5MzFiYTQ2ODk5NGQ4ZmU4MmQ4MTMzM2RmNWZiNGI2NWEzY2RlOCIsImdlbmVyYXRpb24iOiJjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjYyIsIm1vZGVsIjoib3BlbmFpLWNvZGV4L2dwdC02LjEtc29sIiwicm9sZSI6Im1hc3RlciJ9LCJ2ZXJzaW9uIjoxfSwidmVyc2lvbiI6MX0",
+            "pbFen9pVOeJdT03ydaFty4r4vf17rLW_STYYbFLV5hryNTjx3AVg28IyNQ4SaoFoQaeQ5-ngLsz_Irvse_rcCw"
+          ]
+        },
+        "expired": {
+          "parts": [
+            "eyJhbGciOiJFZDI1NTE5IiwiaXNzdWVyIjoiYWdlbnRpY29zLW5hdGl2ZS1vd25lciIsImtleVZlcnNpb24iOjEsImtpZCI6InN5bnRoZXRpYy1waS0wMDAxIiwidHlwZSI6InByb3RlY3RlZC1waS1sYXVuY2giLCJ2ZXJzaW9uIjoxfQ",
+            "eyJleHBpcmVzQXRNcyI6MTgwMDAwMDAzMDAwMCwiaXNzdWVkQXRNcyI6MTgwMDAwMDAwMDAwMCwicmVmZXJlbmNlIjoiZDFkMWQxZDFkMWQxZDFkMWQxZDFkMWQxZDFkMWQxZDEiLCJzY29wZSI6eyJhbGlhcyI6InN5bnRoZXRpYy1hbGlhcyIsImJpbmRpbmdfanNvbiI6IntcImJhcnJpZXJOb25jZVwiOlwiMzMzMzMzMzMtMzMzMy00MzMzLTgzMzMtMzMzMzMzMzMzMzMzXCIsXCJjaGFsbGVuZ2VcIjp7XCJsYXVuY2hcIjp7XCJlcG9jaFwiOjMsXCJyZXF1ZXN0XCI6e1wiY2hhbGxlbmdlXCI6XCIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTFcIixcImlkZW50aXR5XCI6e1wiYmFja2VuZFwiOlwibmF0aXZlXCIsXCJjb21wYW55XCI6XCJzeW50aGV0aWNcIixcImdlbmVyYXRpb25cIjoxLFwiaW1hZ2VMYW5lXCI6XCJiYXNlbGluZVwiLFwiaW5zdGFuY2VcIjpcImF0dGVtcHQxXCIsXCJ0aWVyXCI6XCJiYXNpY1wifSxcImltYWdlXCI6XCJyZWdpc3RyeS5leGFtcGxlL3J1bnRpbWVAc2hhMjU2OmFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFcIixcInB1cnBvc2VcIjpcImZyZXNoX3N0YXJ0XCJ9fSxcImxpbmVhZ2VcIjp7XCJkYXRhYmFzZUVwb2NoXCI6MSxcInJlZmVyZW5jZVwiOlwic3ludGhldGljLWZyZXNoLWZvcmtcIn0sXCJwaW5zXCI6e1wiaGVscGVyXCI6XCJkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkXCIsXCJpbWFnZVwiOlwicmVnaXN0cnkuZXhhbXBsZS9ydW50aW1lQHNoYTI1NjphYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhXCIsXCJub2RlXCI6XCJlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlXCIsXCJwaUdyYXBoXCI6XCJmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmXCIsXCJwb2xpY3lcIjpcIjExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTFcIixcInNvdXJjZVwiOlwiY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY1wifSxcInJlY2lwaWVudFwiOntcImdlbmVyYXRpb25cIjpcImJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiXCIsXCJub25jZVwiOlwiMjIyMjIyMjItMjIyMi00MjIyLTgyMjItMjIyMjIyMjIyMjIyXCIsXCJwaWRcIjoxMjMsXCJzdGFydHRpbWVcIjpcIjEyMzRcIn19LFwiZXhwaXJlc0F0TXNcIjoxODAwMDAwMDEwMDAwLFwiaW5zdGFsbGVyXCI6e1wiY2FycmllckRpZ2VzdFwiOlwiMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM1wiLFwiY2xpZW50RGlnZXN0XCI6XCIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyXCIsXCJnaWRcIjoyMTAwMCxcIm9ic2VydmVyRGlnZXN0XCI6XCI0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0XCIsXCJwaWRcIjozMjEsXCJzdGFydHRpbWVcIjpcIjU2NzhcIixcInVpZFwiOjIxMDAwfSxcInZlcnNpb25cIjoxfSIsImNvbXBhbnkiOiI3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3IiwiZGF0YWJhc2VfZXBvY2giOjEsImVwb2NoIjozLCJnbG9iYWwiOiI2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2IiwiaGVscGVyX3NoYTI1NiI6WzIyMSwyMjEsMjIxLDIyMSwyMjEsMjIxLDIyMSwyMjEsMjIxLDIyMSwyMjEsMjIxLDIyMSwyMjEsMjIxLDIyMSwyMjEsMjIxLDIyMSwyMjEsMjIxLDIyMSwyMjEsMjIxLDIyMSwyMjEsMjIxLDIyMSwyMjEsMjIxLDIyMSwyMjFdLCJsaW5lYWdlIjoic3ludGhldGljLWZyZXNoLWZvcmsiLCJub2RlX3NoYTI1NiI6WzIzOCwyMzgsMjM4LDIzOCwyMzgsMjM4LDIzOCwyMzgsMjM4LDIzOCwyMzgsMjM4LDIzOCwyMzgsMjM4LDIzOCwyMzgsMjM4LDIzOCwyMzgsMjM4LDIzOCwyMzgsMjM4LDIzOCwyMzgsMjM4LDIzOCwyMzgsMjM4LDIzOCwyMzhdLCJwb2xpY3lfc2hhMjU2IjpbMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTcsMTddLCJwcm9maWxlX3NoYTI1NiI6WzI1NSwyNTUsMjU1LDI1NSwyNTUsMjU1LDI1NSwyNTUsMjU1LDI1NSwyNTUsMjU1LDI1NSwyNTUsMjU1LDI1NSwyNTUsMjU1LDI1NSwyNTUsMjU1LDI1NSwyNTUsMjU1LDI1NSwyNTUsMjU1LDI1NSwyNTUsMjU1LDI1NSwyNTVdLCJzZWxlY3Rpb24iOnsiYWxpYXNfc2hhMjU2IjoiM2I5NDhkODhkYmNiZWRjMzhjMzAwYjJlYzg5MzFiYTQ2ODk5NGQ4ZmU4MmQ4MTMzM2RmNWZiNGI2NWEzY2RlOCIsImdlbmVyYXRpb24iOiJjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjYyIsIm1vZGVsIjoib3BlbmFpLWNvZGV4L2dwdC02LjEtc29sIiwicm9sZSI6Im1hc3RlciJ9LCJ2ZXJzaW9uIjoxfSwidmVyc2lvbiI6MX0",
+            "hGJ1_YBvx970AFy0lx_Cy2X5D4IpHowF9trOlberUbLcmkSIyeX2C6_hocLTLi7hBpXhRsSis-XReGXeq2M_DA"
+          ],
+          "nowMs": 1800000030000
+        }
+      }
+    }
+  },
+  "frames": [
+    {
+      "id": "configure",
+      "producer": "ts",
+      "direction": "ts->rust",
+      "emitted": "{\"version\":1,\"type\":\"configure\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"expiresAtMs\":1800000010000,\"launch\":{\"epoch\":3,\"request\":{\"identity\":{\"company\":\"synthetic\",\"instance\":\"attempt1\",\"backend\":\"native\",\"tier\":\"basic\",\"generation\":1,\"imageLane\":\"baseline\"},\"purpose\":\"fresh_start\",\"challenge\":\"11111111-1111-4111-8111-111111111111\",\"image\":\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}},\"imageAttestation\":\"@@IMAGE_ATTESTATION@@\",\"lineage\":{\"reference\":\"synthetic-fresh-fork\",\"databaseEpoch\":1}}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"expiresAtMs\":1800000010000,\"imageAttestation\":\"@@IMAGE_ATTESTATION@@\",\"launch\":{\"epoch\":3,\"request\":{\"challenge\":\"11111111-1111-4111-8111-111111111111\",\"identity\":{\"backend\":\"native\",\"company\":\"synthetic\",\"generation\":1,\"imageLane\":\"baseline\",\"instance\":\"attempt1\",\"tier\":\"basic\"},\"image\":\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"purpose\":\"fresh_start\"}},\"lineage\":{\"databaseEpoch\":1,\"reference\":\"synthetic-fresh-fork\"},\"operation\":\"11111111-1111-4111-8111-111111111111\",\"type\":\"configure\",\"version\":1}"
+    },
+    {
+      "id": "constructed",
+      "producer": "rust",
+      "direction": "rust->ts",
+      "emitted": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"installer\":{\"carrierDigest\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"clientDigest\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"gid\":21000,\"observerDigest\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"pid\":321,\"starttime\":\"5678\",\"uid\":21000},\"operation\":\"11111111-1111-4111-8111-111111111111\",\"recipient\":{\"generation\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"nonce\":\"22222222-2222-4222-8222-222222222222\",\"pid\":123,\"starttime\":\"1234\"},\"type\":\"constructed\",\"version\":1}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"installer\":{\"carrierDigest\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"clientDigest\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"gid\":21000,\"observerDigest\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"pid\":321,\"starttime\":\"5678\",\"uid\":21000},\"operation\":\"11111111-1111-4111-8111-111111111111\",\"recipient\":{\"generation\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"nonce\":\"22222222-2222-4222-8222-222222222222\",\"pid\":123,\"starttime\":\"1234\"},\"type\":\"constructed\",\"version\":1}"
+    },
+    {
+      "id": "release",
+      "producer": "ts",
+      "direction": "ts->rust",
+      "emitted": "{\"version\":1,\"type\":\"release\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"receipt\":\"synthetic-receipt-test-only\",\"grant\":\"synthetic-grant-test-only\"}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"grant\":\"synthetic-grant-test-only\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"receipt\":\"synthetic-receipt-test-only\",\"type\":\"release\",\"version\":1}"
+    },
+    {
+      "id": "request-owner-prepared",
+      "producer": "rust",
+      "direction": "rust->ts",
+      "emitted": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"sequence\":1,\"type\":\"prepared\",\"version\":1}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"sequence\":1,\"type\":\"prepared\",\"version\":1}"
+    },
+    {
+      "id": "owner-prepared",
+      "producer": "ts",
+      "direction": "ts->rust",
+      "emitted": "{\"version\":1,\"type\":\"owner\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"sequence\":1,\"outcome\":\"prepared\",\"current\":{\"bindingJson\":\"{\\\"barrierNonce\\\":\\\"33333333-3333-4333-8333-333333333333\\\",\\\"challenge\\\":{\\\"launch\\\":{\\\"epoch\\\":3,\\\"request\\\":{\\\"challenge\\\":\\\"11111111-1111-4111-8111-111111111111\\\",\\\"identity\\\":{\\\"backend\\\":\\\"native\\\",\\\"company\\\":\\\"synthetic\\\",\\\"generation\\\":1,\\\"imageLane\\\":\\\"baseline\\\",\\\"instance\\\":\\\"attempt1\\\",\\\"tier\\\":\\\"basic\\\"},\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"purpose\\\":\\\"fresh_start\\\"}},\\\"lineage\\\":{\\\"databaseEpoch\\\":1,\\\"reference\\\":\\\"synthetic-fresh-fork\\\"},\\\"pins\\\":{\\\"helper\\\":\\\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\\",\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"node\\\":\\\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\\",\\\"piGraph\\\":\\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\\",\\\"policy\\\":\\\"1111111111111111111111111111111111111111111111111111111111111111\\\",\\\"source\\\":\\\"cccccccccccccccccccccccccccccccccccccccc\\\"},\\\"recipient\\\":{\\\"generation\\\":\\\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\\",\\\"nonce\\\":\\\"22222222-2222-4222-8222-222222222222\\\",\\\"pid\\\":123,\\\"starttime\\\":\\\"1234\\\"}},\\\"expiresAtMs\\\":1800000010000,\\\"installer\\\":{\\\"carrierDigest\\\":\\\"3333333333333333333333333333333333333333333333333333333333333333\\\",\\\"clientDigest\\\":\\\"2222222222222222222222222222222222222222222222222222222222222222\\\",\\\"gid\\\":21000,\\\"observerDigest\\\":\\\"4444444444444444444444444444444444444444444444444444444444444444\\\",\\\"pid\\\":321,\\\"starttime\\\":\\\"5678\\\",\\\"uid\\\":21000},\\\"version\\\":1}\",\"phase\":\"prepared\",\"global\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"company\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"epoch\":3,\"lineage\":{\"reference\":\"synthetic-fresh-fork\",\"databaseEpoch\":1},\"closure\":\"open\"}}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"current\":{\"bindingJson\":\"{\\\"barrierNonce\\\":\\\"33333333-3333-4333-8333-333333333333\\\",\\\"challenge\\\":{\\\"launch\\\":{\\\"epoch\\\":3,\\\"request\\\":{\\\"challenge\\\":\\\"11111111-1111-4111-8111-111111111111\\\",\\\"identity\\\":{\\\"backend\\\":\\\"native\\\",\\\"company\\\":\\\"synthetic\\\",\\\"generation\\\":1,\\\"imageLane\\\":\\\"baseline\\\",\\\"instance\\\":\\\"attempt1\\\",\\\"tier\\\":\\\"basic\\\"},\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"purpose\\\":\\\"fresh_start\\\"}},\\\"lineage\\\":{\\\"databaseEpoch\\\":1,\\\"reference\\\":\\\"synthetic-fresh-fork\\\"},\\\"pins\\\":{\\\"helper\\\":\\\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\\",\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"node\\\":\\\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\\",\\\"piGraph\\\":\\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\\",\\\"policy\\\":\\\"1111111111111111111111111111111111111111111111111111111111111111\\\",\\\"source\\\":\\\"cccccccccccccccccccccccccccccccccccccccc\\\"},\\\"recipient\\\":{\\\"generation\\\":\\\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\\",\\\"nonce\\\":\\\"22222222-2222-4222-8222-222222222222\\\",\\\"pid\\\":123,\\\"starttime\\\":\\\"1234\\\"}},\\\"expiresAtMs\\\":1800000010000,\\\"installer\\\":{\\\"carrierDigest\\\":\\\"3333333333333333333333333333333333333333333333333333333333333333\\\",\\\"clientDigest\\\":\\\"2222222222222222222222222222222222222222222222222222222222222222\\\",\\\"gid\\\":21000,\\\"observerDigest\\\":\\\"4444444444444444444444444444444444444444444444444444444444444444\\\",\\\"pid\\\":321,\\\"starttime\\\":\\\"5678\\\",\\\"uid\\\":21000},\\\"version\\\":1}\",\"closure\":\"open\",\"company\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"epoch\":3,\"global\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"lineage\":{\"databaseEpoch\":1,\"reference\":\"synthetic-fresh-fork\"},\"phase\":\"prepared\"},\"operation\":\"11111111-1111-4111-8111-111111111111\",\"outcome\":\"prepared\",\"sequence\":1,\"type\":\"owner\",\"version\":1}"
+    },
+    {
+      "id": "request-owner-consume",
+      "producer": "rust",
+      "direction": "rust->ts",
+      "emitted": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"sequence\":2,\"type\":\"consume\",\"version\":1}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"sequence\":2,\"type\":\"consume\",\"version\":1}"
+    },
+    {
+      "id": "owner-consumed",
+      "producer": "ts",
+      "direction": "ts->rust",
+      "emitted": "{\"version\":1,\"type\":\"owner\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"sequence\":2,\"outcome\":\"consumed\",\"current\":{\"bindingJson\":\"{\\\"barrierNonce\\\":\\\"33333333-3333-4333-8333-333333333333\\\",\\\"challenge\\\":{\\\"launch\\\":{\\\"epoch\\\":3,\\\"request\\\":{\\\"challenge\\\":\\\"11111111-1111-4111-8111-111111111111\\\",\\\"identity\\\":{\\\"backend\\\":\\\"native\\\",\\\"company\\\":\\\"synthetic\\\",\\\"generation\\\":1,\\\"imageLane\\\":\\\"baseline\\\",\\\"instance\\\":\\\"attempt1\\\",\\\"tier\\\":\\\"basic\\\"},\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"purpose\\\":\\\"fresh_start\\\"}},\\\"lineage\\\":{\\\"databaseEpoch\\\":1,\\\"reference\\\":\\\"synthetic-fresh-fork\\\"},\\\"pins\\\":{\\\"helper\\\":\\\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\\",\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"node\\\":\\\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\\",\\\"piGraph\\\":\\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\\",\\\"policy\\\":\\\"1111111111111111111111111111111111111111111111111111111111111111\\\",\\\"source\\\":\\\"cccccccccccccccccccccccccccccccccccccccc\\\"},\\\"recipient\\\":{\\\"generation\\\":\\\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\\",\\\"nonce\\\":\\\"22222222-2222-4222-8222-222222222222\\\",\\\"pid\\\":123,\\\"starttime\\\":\\\"1234\\\"}},\\\"expiresAtMs\\\":1800000010000,\\\"installer\\\":{\\\"carrierDigest\\\":\\\"3333333333333333333333333333333333333333333333333333333333333333\\\",\\\"clientDigest\\\":\\\"2222222222222222222222222222222222222222222222222222222222222222\\\",\\\"gid\\\":21000,\\\"observerDigest\\\":\\\"4444444444444444444444444444444444444444444444444444444444444444\\\",\\\"pid\\\":321,\\\"starttime\\\":\\\"5678\\\",\\\"uid\\\":21000},\\\"version\\\":1}\",\"phase\":\"consumed\",\"global\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"company\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"epoch\":3,\"lineage\":{\"reference\":\"synthetic-fresh-fork\",\"databaseEpoch\":1},\"closure\":\"open\"}}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"current\":{\"bindingJson\":\"{\\\"barrierNonce\\\":\\\"33333333-3333-4333-8333-333333333333\\\",\\\"challenge\\\":{\\\"launch\\\":{\\\"epoch\\\":3,\\\"request\\\":{\\\"challenge\\\":\\\"11111111-1111-4111-8111-111111111111\\\",\\\"identity\\\":{\\\"backend\\\":\\\"native\\\",\\\"company\\\":\\\"synthetic\\\",\\\"generation\\\":1,\\\"imageLane\\\":\\\"baseline\\\",\\\"instance\\\":\\\"attempt1\\\",\\\"tier\\\":\\\"basic\\\"},\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"purpose\\\":\\\"fresh_start\\\"}},\\\"lineage\\\":{\\\"databaseEpoch\\\":1,\\\"reference\\\":\\\"synthetic-fresh-fork\\\"},\\\"pins\\\":{\\\"helper\\\":\\\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\\",\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"node\\\":\\\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\\",\\\"piGraph\\\":\\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\\",\\\"policy\\\":\\\"1111111111111111111111111111111111111111111111111111111111111111\\\",\\\"source\\\":\\\"cccccccccccccccccccccccccccccccccccccccc\\\"},\\\"recipient\\\":{\\\"generation\\\":\\\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\\",\\\"nonce\\\":\\\"22222222-2222-4222-8222-222222222222\\\",\\\"pid\\\":123,\\\"starttime\\\":\\\"1234\\\"}},\\\"expiresAtMs\\\":1800000010000,\\\"installer\\\":{\\\"carrierDigest\\\":\\\"3333333333333333333333333333333333333333333333333333333333333333\\\",\\\"clientDigest\\\":\\\"2222222222222222222222222222222222222222222222222222222222222222\\\",\\\"gid\\\":21000,\\\"observerDigest\\\":\\\"4444444444444444444444444444444444444444444444444444444444444444\\\",\\\"pid\\\":321,\\\"starttime\\\":\\\"5678\\\",\\\"uid\\\":21000},\\\"version\\\":1}\",\"closure\":\"open\",\"company\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"epoch\":3,\"global\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"lineage\":{\"databaseEpoch\":1,\"reference\":\"synthetic-fresh-fork\"},\"phase\":\"consumed\"},\"operation\":\"11111111-1111-4111-8111-111111111111\",\"outcome\":\"consumed\",\"sequence\":2,\"type\":\"owner\",\"version\":1}"
+    },
+    {
+      "id": "request-owner-consumed-current",
+      "producer": "rust",
+      "direction": "rust->ts",
+      "emitted": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"sequence\":3,\"type\":\"consumed-current\",\"version\":1}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"sequence\":3,\"type\":\"consumed-current\",\"version\":1}"
+    },
+    {
+      "id": "owner-consumed-current",
+      "producer": "ts",
+      "direction": "ts->rust",
+      "emitted": "{\"version\":1,\"type\":\"owner\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"sequence\":3,\"outcome\":\"consumed\",\"current\":{\"bindingJson\":\"{\\\"barrierNonce\\\":\\\"33333333-3333-4333-8333-333333333333\\\",\\\"challenge\\\":{\\\"launch\\\":{\\\"epoch\\\":3,\\\"request\\\":{\\\"challenge\\\":\\\"11111111-1111-4111-8111-111111111111\\\",\\\"identity\\\":{\\\"backend\\\":\\\"native\\\",\\\"company\\\":\\\"synthetic\\\",\\\"generation\\\":1,\\\"imageLane\\\":\\\"baseline\\\",\\\"instance\\\":\\\"attempt1\\\",\\\"tier\\\":\\\"basic\\\"},\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"purpose\\\":\\\"fresh_start\\\"}},\\\"lineage\\\":{\\\"databaseEpoch\\\":1,\\\"reference\\\":\\\"synthetic-fresh-fork\\\"},\\\"pins\\\":{\\\"helper\\\":\\\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\\",\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"node\\\":\\\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\\",\\\"piGraph\\\":\\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\\",\\\"policy\\\":\\\"1111111111111111111111111111111111111111111111111111111111111111\\\",\\\"source\\\":\\\"cccccccccccccccccccccccccccccccccccccccc\\\"},\\\"recipient\\\":{\\\"generation\\\":\\\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\\",\\\"nonce\\\":\\\"22222222-2222-4222-8222-222222222222\\\",\\\"pid\\\":123,\\\"starttime\\\":\\\"1234\\\"}},\\\"expiresAtMs\\\":1800000010000,\\\"installer\\\":{\\\"carrierDigest\\\":\\\"3333333333333333333333333333333333333333333333333333333333333333\\\",\\\"clientDigest\\\":\\\"2222222222222222222222222222222222222222222222222222222222222222\\\",\\\"gid\\\":21000,\\\"observerDigest\\\":\\\"4444444444444444444444444444444444444444444444444444444444444444\\\",\\\"pid\\\":321,\\\"starttime\\\":\\\"5678\\\",\\\"uid\\\":21000},\\\"version\\\":1}\",\"phase\":\"consumed\",\"global\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"company\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"epoch\":3,\"lineage\":{\"reference\":\"synthetic-fresh-fork\",\"databaseEpoch\":1},\"closure\":\"open\"}}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"current\":{\"bindingJson\":\"{\\\"barrierNonce\\\":\\\"33333333-3333-4333-8333-333333333333\\\",\\\"challenge\\\":{\\\"launch\\\":{\\\"epoch\\\":3,\\\"request\\\":{\\\"challenge\\\":\\\"11111111-1111-4111-8111-111111111111\\\",\\\"identity\\\":{\\\"backend\\\":\\\"native\\\",\\\"company\\\":\\\"synthetic\\\",\\\"generation\\\":1,\\\"imageLane\\\":\\\"baseline\\\",\\\"instance\\\":\\\"attempt1\\\",\\\"tier\\\":\\\"basic\\\"},\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"purpose\\\":\\\"fresh_start\\\"}},\\\"lineage\\\":{\\\"databaseEpoch\\\":1,\\\"reference\\\":\\\"synthetic-fresh-fork\\\"},\\\"pins\\\":{\\\"helper\\\":\\\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\\",\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"node\\\":\\\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\\",\\\"piGraph\\\":\\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\\",\\\"policy\\\":\\\"1111111111111111111111111111111111111111111111111111111111111111\\\",\\\"source\\\":\\\"cccccccccccccccccccccccccccccccccccccccc\\\"},\\\"recipient\\\":{\\\"generation\\\":\\\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\\",\\\"nonce\\\":\\\"22222222-2222-4222-8222-222222222222\\\",\\\"pid\\\":123,\\\"starttime\\\":\\\"1234\\\"}},\\\"expiresAtMs\\\":1800000010000,\\\"installer\\\":{\\\"carrierDigest\\\":\\\"3333333333333333333333333333333333333333333333333333333333333333\\\",\\\"clientDigest\\\":\\\"2222222222222222222222222222222222222222222222222222222222222222\\\",\\\"gid\\\":21000,\\\"observerDigest\\\":\\\"4444444444444444444444444444444444444444444444444444444444444444\\\",\\\"pid\\\":321,\\\"starttime\\\":\\\"5678\\\",\\\"uid\\\":21000},\\\"version\\\":1}\",\"closure\":\"open\",\"company\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"epoch\":3,\"global\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"lineage\":{\"databaseEpoch\":1,\"reference\":\"synthetic-fresh-fork\"},\"phase\":\"consumed\"},\"operation\":\"11111111-1111-4111-8111-111111111111\",\"outcome\":\"consumed\",\"sequence\":3,\"type\":\"owner\",\"version\":1}"
+    },
+    {
+      "id": "owner-unknown",
+      "producer": "ts",
+      "direction": "ts->rust",
+      "emitted": "{\"version\":1,\"type\":\"owner\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"sequence\":1,\"outcome\":\"unknown\",\"current\":null}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"current\":null,\"operation\":\"11111111-1111-4111-8111-111111111111\",\"outcome\":\"unknown\",\"sequence\":1,\"type\":\"owner\",\"version\":1}"
+    },
+    {
+      "id": "ack",
+      "producer": "rust",
+      "direction": "rust->ts",
+      "emitted": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"recipientGeneration\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"type\":\"ack\",\"version\":1}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"recipientGeneration\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"type\":\"ack\",\"version\":1}"
+    },
+    {
+      "id": "runtime-release",
+      "producer": "ts",
+      "direction": "ts->rust",
+      "emitted": "{\"version\":1,\"type\":\"runtime-release\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"authorization\":\"@@RUNTIME_AUTHORIZATION@@\"}",
+      "canonical": "{\"authorization\":\"@@RUNTIME_AUTHORIZATION@@\",\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"type\":\"runtime-release\",\"version\":1}"
+    },
+    {
+      "id": "request-runtime-current",
+      "producer": "rust",
+      "direction": "rust->ts",
+      "emitted": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"sequence\":1,\"type\":\"runtime-current\",\"version\":1}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"sequence\":1,\"type\":\"runtime-current\",\"version\":1}"
+    },
+    {
+      "id": "runtime-owner-runtime-current",
+      "producer": "ts",
+      "direction": "ts->rust",
+      "emitted": "{\"version\":1,\"type\":\"runtime-owner\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"sequence\":1,\"leaseExpiresAtMs\":1800000020000,\"current\":{\"bindingJson\":\"{\\\"barrierNonce\\\":\\\"33333333-3333-4333-8333-333333333333\\\",\\\"challenge\\\":{\\\"launch\\\":{\\\"epoch\\\":3,\\\"request\\\":{\\\"challenge\\\":\\\"11111111-1111-4111-8111-111111111111\\\",\\\"identity\\\":{\\\"backend\\\":\\\"native\\\",\\\"company\\\":\\\"synthetic\\\",\\\"generation\\\":1,\\\"imageLane\\\":\\\"baseline\\\",\\\"instance\\\":\\\"attempt1\\\",\\\"tier\\\":\\\"basic\\\"},\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"purpose\\\":\\\"fresh_start\\\"}},\\\"lineage\\\":{\\\"databaseEpoch\\\":1,\\\"reference\\\":\\\"synthetic-fresh-fork\\\"},\\\"pins\\\":{\\\"helper\\\":\\\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\\",\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"node\\\":\\\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\\",\\\"piGraph\\\":\\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\\",\\\"policy\\\":\\\"1111111111111111111111111111111111111111111111111111111111111111\\\",\\\"source\\\":\\\"cccccccccccccccccccccccccccccccccccccccc\\\"},\\\"recipient\\\":{\\\"generation\\\":\\\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\\",\\\"nonce\\\":\\\"22222222-2222-4222-8222-222222222222\\\",\\\"pid\\\":123,\\\"starttime\\\":\\\"1234\\\"}},\\\"expiresAtMs\\\":1800000010000,\\\"installer\\\":{\\\"carrierDigest\\\":\\\"3333333333333333333333333333333333333333333333333333333333333333\\\",\\\"clientDigest\\\":\\\"2222222222222222222222222222222222222222222222222222222222222222\\\",\\\"gid\\\":21000,\\\"observerDigest\\\":\\\"4444444444444444444444444444444444444444444444444444444444444444\\\",\\\"pid\\\":321,\\\"starttime\\\":\\\"5678\\\",\\\"uid\\\":21000},\\\"version\\\":1}\",\"phase\":\"consumed\",\"global\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"company\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"epoch\":3,\"lineage\":{\"reference\":\"synthetic-fresh-fork\",\"databaseEpoch\":1},\"closure\":\"open\"},\"store\":null,\"pi\":null}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"current\":{\"bindingJson\":\"{\\\"barrierNonce\\\":\\\"33333333-3333-4333-8333-333333333333\\\",\\\"challenge\\\":{\\\"launch\\\":{\\\"epoch\\\":3,\\\"request\\\":{\\\"challenge\\\":\\\"11111111-1111-4111-8111-111111111111\\\",\\\"identity\\\":{\\\"backend\\\":\\\"native\\\",\\\"company\\\":\\\"synthetic\\\",\\\"generation\\\":1,\\\"imageLane\\\":\\\"baseline\\\",\\\"instance\\\":\\\"attempt1\\\",\\\"tier\\\":\\\"basic\\\"},\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"purpose\\\":\\\"fresh_start\\\"}},\\\"lineage\\\":{\\\"databaseEpoch\\\":1,\\\"reference\\\":\\\"synthetic-fresh-fork\\\"},\\\"pins\\\":{\\\"helper\\\":\\\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\\",\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"node\\\":\\\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\\",\\\"piGraph\\\":\\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\\",\\\"policy\\\":\\\"1111111111111111111111111111111111111111111111111111111111111111\\\",\\\"source\\\":\\\"cccccccccccccccccccccccccccccccccccccccc\\\"},\\\"recipient\\\":{\\\"generation\\\":\\\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\\",\\\"nonce\\\":\\\"22222222-2222-4222-8222-222222222222\\\",\\\"pid\\\":123,\\\"starttime\\\":\\\"1234\\\"}},\\\"expiresAtMs\\\":1800000010000,\\\"installer\\\":{\\\"carrierDigest\\\":\\\"3333333333333333333333333333333333333333333333333333333333333333\\\",\\\"clientDigest\\\":\\\"2222222222222222222222222222222222222222222222222222222222222222\\\",\\\"gid\\\":21000,\\\"observerDigest\\\":\\\"4444444444444444444444444444444444444444444444444444444444444444\\\",\\\"pid\\\":321,\\\"starttime\\\":\\\"5678\\\",\\\"uid\\\":21000},\\\"version\\\":1}\",\"closure\":\"open\",\"company\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"epoch\":3,\"global\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"lineage\":{\"databaseEpoch\":1,\"reference\":\"synthetic-fresh-fork\"},\"phase\":\"consumed\"},\"leaseExpiresAtMs\":1800000020000,\"operation\":\"11111111-1111-4111-8111-111111111111\",\"pi\":null,\"sequence\":1,\"store\":null,\"type\":\"runtime-owner\",\"version\":1}"
+    },
+    {
+      "id": "request-store-startup",
+      "producer": "rust",
+      "direction": "rust->ts",
+      "emitted": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"sequence\":2,\"type\":\"store-startup\",\"version\":1}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"sequence\":2,\"type\":\"store-startup\",\"version\":1}"
+    },
+    {
+      "id": "runtime-owner-store-startup",
+      "producer": "ts",
+      "direction": "ts->rust",
+      "emitted": "{\"version\":1,\"type\":\"runtime-owner\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"sequence\":2,\"leaseExpiresAtMs\":1800000020000,\"current\":{\"bindingJson\":\"{\\\"barrierNonce\\\":\\\"33333333-3333-4333-8333-333333333333\\\",\\\"challenge\\\":{\\\"launch\\\":{\\\"epoch\\\":3,\\\"request\\\":{\\\"challenge\\\":\\\"11111111-1111-4111-8111-111111111111\\\",\\\"identity\\\":{\\\"backend\\\":\\\"native\\\",\\\"company\\\":\\\"synthetic\\\",\\\"generation\\\":1,\\\"imageLane\\\":\\\"baseline\\\",\\\"instance\\\":\\\"attempt1\\\",\\\"tier\\\":\\\"basic\\\"},\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"purpose\\\":\\\"fresh_start\\\"}},\\\"lineage\\\":{\\\"databaseEpoch\\\":1,\\\"reference\\\":\\\"synthetic-fresh-fork\\\"},\\\"pins\\\":{\\\"helper\\\":\\\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\\",\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"node\\\":\\\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\\",\\\"piGraph\\\":\\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\\",\\\"policy\\\":\\\"1111111111111111111111111111111111111111111111111111111111111111\\\",\\\"source\\\":\\\"cccccccccccccccccccccccccccccccccccccccc\\\"},\\\"recipient\\\":{\\\"generation\\\":\\\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\\",\\\"nonce\\\":\\\"22222222-2222-4222-8222-222222222222\\\",\\\"pid\\\":123,\\\"starttime\\\":\\\"1234\\\"}},\\\"expiresAtMs\\\":1800000010000,\\\"installer\\\":{\\\"carrierDigest\\\":\\\"3333333333333333333333333333333333333333333333333333333333333333\\\",\\\"clientDigest\\\":\\\"2222222222222222222222222222222222222222222222222222222222222222\\\",\\\"gid\\\":21000,\\\"observerDigest\\\":\\\"4444444444444444444444444444444444444444444444444444444444444444\\\",\\\"pid\\\":321,\\\"starttime\\\":\\\"5678\\\",\\\"uid\\\":21000},\\\"version\\\":1}\",\"phase\":\"consumed\",\"global\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"company\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"epoch\":3,\"lineage\":{\"reference\":\"synthetic-fresh-fork\",\"databaseEpoch\":1},\"closure\":\"open\"},\"store\":{\"facts\":{\"purpose\":\"init\",\"reference\":\"store-ref-0001\"},\"phase\":\"issued\"},\"pi\":null}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"current\":{\"bindingJson\":\"{\\\"barrierNonce\\\":\\\"33333333-3333-4333-8333-333333333333\\\",\\\"challenge\\\":{\\\"launch\\\":{\\\"epoch\\\":3,\\\"request\\\":{\\\"challenge\\\":\\\"11111111-1111-4111-8111-111111111111\\\",\\\"identity\\\":{\\\"backend\\\":\\\"native\\\",\\\"company\\\":\\\"synthetic\\\",\\\"generation\\\":1,\\\"imageLane\\\":\\\"baseline\\\",\\\"instance\\\":\\\"attempt1\\\",\\\"tier\\\":\\\"basic\\\"},\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"purpose\\\":\\\"fresh_start\\\"}},\\\"lineage\\\":{\\\"databaseEpoch\\\":1,\\\"reference\\\":\\\"synthetic-fresh-fork\\\"},\\\"pins\\\":{\\\"helper\\\":\\\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\\",\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"node\\\":\\\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\\",\\\"piGraph\\\":\\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\\",\\\"policy\\\":\\\"1111111111111111111111111111111111111111111111111111111111111111\\\",\\\"source\\\":\\\"cccccccccccccccccccccccccccccccccccccccc\\\"},\\\"recipient\\\":{\\\"generation\\\":\\\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\\",\\\"nonce\\\":\\\"22222222-2222-4222-8222-222222222222\\\",\\\"pid\\\":123,\\\"starttime\\\":\\\"1234\\\"}},\\\"expiresAtMs\\\":1800000010000,\\\"installer\\\":{\\\"carrierDigest\\\":\\\"3333333333333333333333333333333333333333333333333333333333333333\\\",\\\"clientDigest\\\":\\\"2222222222222222222222222222222222222222222222222222222222222222\\\",\\\"gid\\\":21000,\\\"observerDigest\\\":\\\"4444444444444444444444444444444444444444444444444444444444444444\\\",\\\"pid\\\":321,\\\"starttime\\\":\\\"5678\\\",\\\"uid\\\":21000},\\\"version\\\":1}\",\"closure\":\"open\",\"company\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"epoch\":3,\"global\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"lineage\":{\"databaseEpoch\":1,\"reference\":\"synthetic-fresh-fork\"},\"phase\":\"consumed\"},\"leaseExpiresAtMs\":1800000020000,\"operation\":\"11111111-1111-4111-8111-111111111111\",\"pi\":null,\"sequence\":2,\"store\":{\"facts\":{\"purpose\":\"init\",\"reference\":\"store-ref-0001\"},\"phase\":\"issued\"},\"type\":\"runtime-owner\",\"version\":1}"
+    },
+    {
+      "id": "request-store-acquire",
+      "producer": "rust",
+      "direction": "rust->ts",
+      "emitted": "{\"attempt\":\"e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1\",\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"purpose\":\"close\",\"sequence\":3,\"type\":\"store-acquire\",\"version\":1}",
+      "canonical": "{\"attempt\":\"e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1\",\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"purpose\":\"close\",\"sequence\":3,\"type\":\"store-acquire\",\"version\":1}"
+    },
+    {
+      "id": "runtime-owner-store-acquire",
+      "producer": "ts",
+      "direction": "ts->rust",
+      "emitted": "{\"version\":1,\"type\":\"runtime-owner\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"sequence\":3,\"leaseExpiresAtMs\":1800000020000,\"current\":{\"bindingJson\":\"{\\\"barrierNonce\\\":\\\"33333333-3333-4333-8333-333333333333\\\",\\\"challenge\\\":{\\\"launch\\\":{\\\"epoch\\\":3,\\\"request\\\":{\\\"challenge\\\":\\\"11111111-1111-4111-8111-111111111111\\\",\\\"identity\\\":{\\\"backend\\\":\\\"native\\\",\\\"company\\\":\\\"synthetic\\\",\\\"generation\\\":1,\\\"imageLane\\\":\\\"baseline\\\",\\\"instance\\\":\\\"attempt1\\\",\\\"tier\\\":\\\"basic\\\"},\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"purpose\\\":\\\"fresh_start\\\"}},\\\"lineage\\\":{\\\"databaseEpoch\\\":1,\\\"reference\\\":\\\"synthetic-fresh-fork\\\"},\\\"pins\\\":{\\\"helper\\\":\\\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\\",\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"node\\\":\\\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\\",\\\"piGraph\\\":\\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\\",\\\"policy\\\":\\\"1111111111111111111111111111111111111111111111111111111111111111\\\",\\\"source\\\":\\\"cccccccccccccccccccccccccccccccccccccccc\\\"},\\\"recipient\\\":{\\\"generation\\\":\\\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\\",\\\"nonce\\\":\\\"22222222-2222-4222-8222-222222222222\\\",\\\"pid\\\":123,\\\"starttime\\\":\\\"1234\\\"}},\\\"expiresAtMs\\\":1800000010000,\\\"installer\\\":{\\\"carrierDigest\\\":\\\"3333333333333333333333333333333333333333333333333333333333333333\\\",\\\"clientDigest\\\":\\\"2222222222222222222222222222222222222222222222222222222222222222\\\",\\\"gid\\\":21000,\\\"observerDigest\\\":\\\"4444444444444444444444444444444444444444444444444444444444444444\\\",\\\"pid\\\":321,\\\"starttime\\\":\\\"5678\\\",\\\"uid\\\":21000},\\\"version\\\":1}\",\"phase\":\"consumed\",\"global\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"company\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"epoch\":3,\"lineage\":{\"reference\":\"synthetic-fresh-fork\",\"databaseEpoch\":1},\"closure\":\"open\"},\"store\":{\"facts\":{\"purpose\":\"init\",\"reference\":\"store-ref-0001\"},\"phase\":\"issued\"},\"pi\":null}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"current\":{\"bindingJson\":\"{\\\"barrierNonce\\\":\\\"33333333-3333-4333-8333-333333333333\\\",\\\"challenge\\\":{\\\"launch\\\":{\\\"epoch\\\":3,\\\"request\\\":{\\\"challenge\\\":\\\"11111111-1111-4111-8111-111111111111\\\",\\\"identity\\\":{\\\"backend\\\":\\\"native\\\",\\\"company\\\":\\\"synthetic\\\",\\\"generation\\\":1,\\\"imageLane\\\":\\\"baseline\\\",\\\"instance\\\":\\\"attempt1\\\",\\\"tier\\\":\\\"basic\\\"},\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"purpose\\\":\\\"fresh_start\\\"}},\\\"lineage\\\":{\\\"databaseEpoch\\\":1,\\\"reference\\\":\\\"synthetic-fresh-fork\\\"},\\\"pins\\\":{\\\"helper\\\":\\\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\\",\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"node\\\":\\\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\\",\\\"piGraph\\\":\\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\\",\\\"policy\\\":\\\"1111111111111111111111111111111111111111111111111111111111111111\\\",\\\"source\\\":\\\"cccccccccccccccccccccccccccccccccccccccc\\\"},\\\"recipient\\\":{\\\"generation\\\":\\\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\\",\\\"nonce\\\":\\\"22222222-2222-4222-8222-222222222222\\\",\\\"pid\\\":123,\\\"starttime\\\":\\\"1234\\\"}},\\\"expiresAtMs\\\":1800000010000,\\\"installer\\\":{\\\"carrierDigest\\\":\\\"3333333333333333333333333333333333333333333333333333333333333333\\\",\\\"clientDigest\\\":\\\"2222222222222222222222222222222222222222222222222222222222222222\\\",\\\"gid\\\":21000,\\\"observerDigest\\\":\\\"4444444444444444444444444444444444444444444444444444444444444444\\\",\\\"pid\\\":321,\\\"starttime\\\":\\\"5678\\\",\\\"uid\\\":21000},\\\"version\\\":1}\",\"closure\":\"open\",\"company\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"epoch\":3,\"global\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"lineage\":{\"databaseEpoch\":1,\"reference\":\"synthetic-fresh-fork\"},\"phase\":\"consumed\"},\"leaseExpiresAtMs\":1800000020000,\"operation\":\"11111111-1111-4111-8111-111111111111\",\"pi\":null,\"sequence\":3,\"store\":{\"facts\":{\"purpose\":\"init\",\"reference\":\"store-ref-0001\"},\"phase\":\"issued\"},\"type\":\"runtime-owner\",\"version\":1}"
+    },
+    {
+      "id": "request-store-consume",
+      "producer": "rust",
+      "direction": "rust->ts",
+      "emitted": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"reference\":\"store-ref-0001\",\"sequence\":4,\"type\":\"store-consume\",\"version\":1}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"reference\":\"store-ref-0001\",\"sequence\":4,\"type\":\"store-consume\",\"version\":1}"
+    },
+    {
+      "id": "runtime-owner-store-consume",
+      "producer": "ts",
+      "direction": "ts->rust",
+      "emitted": "{\"version\":1,\"type\":\"runtime-owner\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"sequence\":4,\"leaseExpiresAtMs\":1800000020000,\"current\":{\"bindingJson\":\"{\\\"barrierNonce\\\":\\\"33333333-3333-4333-8333-333333333333\\\",\\\"challenge\\\":{\\\"launch\\\":{\\\"epoch\\\":3,\\\"request\\\":{\\\"challenge\\\":\\\"11111111-1111-4111-8111-111111111111\\\",\\\"identity\\\":{\\\"backend\\\":\\\"native\\\",\\\"company\\\":\\\"synthetic\\\",\\\"generation\\\":1,\\\"imageLane\\\":\\\"baseline\\\",\\\"instance\\\":\\\"attempt1\\\",\\\"tier\\\":\\\"basic\\\"},\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"purpose\\\":\\\"fresh_start\\\"}},\\\"lineage\\\":{\\\"databaseEpoch\\\":1,\\\"reference\\\":\\\"synthetic-fresh-fork\\\"},\\\"pins\\\":{\\\"helper\\\":\\\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\\",\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"node\\\":\\\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\\",\\\"piGraph\\\":\\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\\",\\\"policy\\\":\\\"1111111111111111111111111111111111111111111111111111111111111111\\\",\\\"source\\\":\\\"cccccccccccccccccccccccccccccccccccccccc\\\"},\\\"recipient\\\":{\\\"generation\\\":\\\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\\",\\\"nonce\\\":\\\"22222222-2222-4222-8222-222222222222\\\",\\\"pid\\\":123,\\\"starttime\\\":\\\"1234\\\"}},\\\"expiresAtMs\\\":1800000010000,\\\"installer\\\":{\\\"carrierDigest\\\":\\\"3333333333333333333333333333333333333333333333333333333333333333\\\",\\\"clientDigest\\\":\\\"2222222222222222222222222222222222222222222222222222222222222222\\\",\\\"gid\\\":21000,\\\"observerDigest\\\":\\\"4444444444444444444444444444444444444444444444444444444444444444\\\",\\\"pid\\\":321,\\\"starttime\\\":\\\"5678\\\",\\\"uid\\\":21000},\\\"version\\\":1}\",\"phase\":\"consumed\",\"global\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"company\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"epoch\":3,\"lineage\":{\"reference\":\"synthetic-fresh-fork\",\"databaseEpoch\":1},\"closure\":\"open\"},\"store\":{\"facts\":{\"purpose\":\"init\",\"reference\":\"store-ref-0001\"},\"phase\":\"consumed\"},\"pi\":null}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"current\":{\"bindingJson\":\"{\\\"barrierNonce\\\":\\\"33333333-3333-4333-8333-333333333333\\\",\\\"challenge\\\":{\\\"launch\\\":{\\\"epoch\\\":3,\\\"request\\\":{\\\"challenge\\\":\\\"11111111-1111-4111-8111-111111111111\\\",\\\"identity\\\":{\\\"backend\\\":\\\"native\\\",\\\"company\\\":\\\"synthetic\\\",\\\"generation\\\":1,\\\"imageLane\\\":\\\"baseline\\\",\\\"instance\\\":\\\"attempt1\\\",\\\"tier\\\":\\\"basic\\\"},\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"purpose\\\":\\\"fresh_start\\\"}},\\\"lineage\\\":{\\\"databaseEpoch\\\":1,\\\"reference\\\":\\\"synthetic-fresh-fork\\\"},\\\"pins\\\":{\\\"helper\\\":\\\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\\",\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"node\\\":\\\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\\",\\\"piGraph\\\":\\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\\",\\\"policy\\\":\\\"1111111111111111111111111111111111111111111111111111111111111111\\\",\\\"source\\\":\\\"cccccccccccccccccccccccccccccccccccccccc\\\"},\\\"recipient\\\":{\\\"generation\\\":\\\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\\",\\\"nonce\\\":\\\"22222222-2222-4222-8222-222222222222\\\",\\\"pid\\\":123,\\\"starttime\\\":\\\"1234\\\"}},\\\"expiresAtMs\\\":1800000010000,\\\"installer\\\":{\\\"carrierDigest\\\":\\\"3333333333333333333333333333333333333333333333333333333333333333\\\",\\\"clientDigest\\\":\\\"2222222222222222222222222222222222222222222222222222222222222222\\\",\\\"gid\\\":21000,\\\"observerDigest\\\":\\\"4444444444444444444444444444444444444444444444444444444444444444\\\",\\\"pid\\\":321,\\\"starttime\\\":\\\"5678\\\",\\\"uid\\\":21000},\\\"version\\\":1}\",\"closure\":\"open\",\"company\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"epoch\":3,\"global\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"lineage\":{\"databaseEpoch\":1,\"reference\":\"synthetic-fresh-fork\"},\"phase\":\"consumed\"},\"leaseExpiresAtMs\":1800000020000,\"operation\":\"11111111-1111-4111-8111-111111111111\",\"pi\":null,\"sequence\":4,\"store\":{\"facts\":{\"purpose\":\"init\",\"reference\":\"store-ref-0001\"},\"phase\":\"consumed\"},\"type\":\"runtime-owner\",\"version\":1}"
+    },
+    {
+      "id": "request-store-current",
+      "producer": "rust",
+      "direction": "rust->ts",
+      "emitted": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"reference\":\"store-ref-0001\",\"sequence\":5,\"type\":\"store-current\",\"version\":1}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"reference\":\"store-ref-0001\",\"sequence\":5,\"type\":\"store-current\",\"version\":1}"
+    },
+    {
+      "id": "runtime-owner-store-current",
+      "producer": "ts",
+      "direction": "ts->rust",
+      "emitted": "{\"version\":1,\"type\":\"runtime-owner\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"sequence\":5,\"leaseExpiresAtMs\":1800000020000,\"current\":{\"bindingJson\":\"{\\\"barrierNonce\\\":\\\"33333333-3333-4333-8333-333333333333\\\",\\\"challenge\\\":{\\\"launch\\\":{\\\"epoch\\\":3,\\\"request\\\":{\\\"challenge\\\":\\\"11111111-1111-4111-8111-111111111111\\\",\\\"identity\\\":{\\\"backend\\\":\\\"native\\\",\\\"company\\\":\\\"synthetic\\\",\\\"generation\\\":1,\\\"imageLane\\\":\\\"baseline\\\",\\\"instance\\\":\\\"attempt1\\\",\\\"tier\\\":\\\"basic\\\"},\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"purpose\\\":\\\"fresh_start\\\"}},\\\"lineage\\\":{\\\"databaseEpoch\\\":1,\\\"reference\\\":\\\"synthetic-fresh-fork\\\"},\\\"pins\\\":{\\\"helper\\\":\\\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\\",\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"node\\\":\\\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\\",\\\"piGraph\\\":\\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\\",\\\"policy\\\":\\\"1111111111111111111111111111111111111111111111111111111111111111\\\",\\\"source\\\":\\\"cccccccccccccccccccccccccccccccccccccccc\\\"},\\\"recipient\\\":{\\\"generation\\\":\\\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\\",\\\"nonce\\\":\\\"22222222-2222-4222-8222-222222222222\\\",\\\"pid\\\":123,\\\"starttime\\\":\\\"1234\\\"}},\\\"expiresAtMs\\\":1800000010000,\\\"installer\\\":{\\\"carrierDigest\\\":\\\"3333333333333333333333333333333333333333333333333333333333333333\\\",\\\"clientDigest\\\":\\\"2222222222222222222222222222222222222222222222222222222222222222\\\",\\\"gid\\\":21000,\\\"observerDigest\\\":\\\"4444444444444444444444444444444444444444444444444444444444444444\\\",\\\"pid\\\":321,\\\"starttime\\\":\\\"5678\\\",\\\"uid\\\":21000},\\\"version\\\":1}\",\"phase\":\"consumed\",\"global\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"company\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"epoch\":3,\"lineage\":{\"reference\":\"synthetic-fresh-fork\",\"databaseEpoch\":1},\"closure\":\"open\"},\"store\":{\"facts\":{\"purpose\":\"init\",\"reference\":\"store-ref-0001\"},\"phase\":\"consumed\"},\"pi\":null}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"current\":{\"bindingJson\":\"{\\\"barrierNonce\\\":\\\"33333333-3333-4333-8333-333333333333\\\",\\\"challenge\\\":{\\\"launch\\\":{\\\"epoch\\\":3,\\\"request\\\":{\\\"challenge\\\":\\\"11111111-1111-4111-8111-111111111111\\\",\\\"identity\\\":{\\\"backend\\\":\\\"native\\\",\\\"company\\\":\\\"synthetic\\\",\\\"generation\\\":1,\\\"imageLane\\\":\\\"baseline\\\",\\\"instance\\\":\\\"attempt1\\\",\\\"tier\\\":\\\"basic\\\"},\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"purpose\\\":\\\"fresh_start\\\"}},\\\"lineage\\\":{\\\"databaseEpoch\\\":1,\\\"reference\\\":\\\"synthetic-fresh-fork\\\"},\\\"pins\\\":{\\\"helper\\\":\\\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\\",\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"node\\\":\\\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\\",\\\"piGraph\\\":\\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\\",\\\"policy\\\":\\\"1111111111111111111111111111111111111111111111111111111111111111\\\",\\\"source\\\":\\\"cccccccccccccccccccccccccccccccccccccccc\\\"},\\\"recipient\\\":{\\\"generation\\\":\\\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\\",\\\"nonce\\\":\\\"22222222-2222-4222-8222-222222222222\\\",\\\"pid\\\":123,\\\"starttime\\\":\\\"1234\\\"}},\\\"expiresAtMs\\\":1800000010000,\\\"installer\\\":{\\\"carrierDigest\\\":\\\"3333333333333333333333333333333333333333333333333333333333333333\\\",\\\"clientDigest\\\":\\\"2222222222222222222222222222222222222222222222222222222222222222\\\",\\\"gid\\\":21000,\\\"observerDigest\\\":\\\"4444444444444444444444444444444444444444444444444444444444444444\\\",\\\"pid\\\":321,\\\"starttime\\\":\\\"5678\\\",\\\"uid\\\":21000},\\\"version\\\":1}\",\"closure\":\"open\",\"company\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"epoch\":3,\"global\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"lineage\":{\"databaseEpoch\":1,\"reference\":\"synthetic-fresh-fork\"},\"phase\":\"consumed\"},\"leaseExpiresAtMs\":1800000020000,\"operation\":\"11111111-1111-4111-8111-111111111111\",\"pi\":null,\"sequence\":5,\"store\":{\"facts\":{\"purpose\":\"init\",\"reference\":\"store-ref-0001\"},\"phase\":\"consumed\"},\"type\":\"runtime-owner\",\"version\":1}"
+    },
+    {
+      "id": "request-store-database-current",
+      "producer": "rust",
+      "direction": "rust->ts",
+      "emitted": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"reference\":\"store-ref-0001\",\"sequence\":6,\"type\":\"store-database-current\",\"version\":1}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"reference\":\"store-ref-0001\",\"sequence\":6,\"type\":\"store-database-current\",\"version\":1}"
+    },
+    {
+      "id": "runtime-owner-store-database-current",
+      "producer": "ts",
+      "direction": "ts->rust",
+      "emitted": "{\"version\":1,\"type\":\"runtime-owner\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"sequence\":6,\"leaseExpiresAtMs\":1800000020000,\"current\":{\"bindingJson\":\"{\\\"barrierNonce\\\":\\\"33333333-3333-4333-8333-333333333333\\\",\\\"challenge\\\":{\\\"launch\\\":{\\\"epoch\\\":3,\\\"request\\\":{\\\"challenge\\\":\\\"11111111-1111-4111-8111-111111111111\\\",\\\"identity\\\":{\\\"backend\\\":\\\"native\\\",\\\"company\\\":\\\"synthetic\\\",\\\"generation\\\":1,\\\"imageLane\\\":\\\"baseline\\\",\\\"instance\\\":\\\"attempt1\\\",\\\"tier\\\":\\\"basic\\\"},\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"purpose\\\":\\\"fresh_start\\\"}},\\\"lineage\\\":{\\\"databaseEpoch\\\":1,\\\"reference\\\":\\\"synthetic-fresh-fork\\\"},\\\"pins\\\":{\\\"helper\\\":\\\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\\",\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"node\\\":\\\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\\",\\\"piGraph\\\":\\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\\",\\\"policy\\\":\\\"1111111111111111111111111111111111111111111111111111111111111111\\\",\\\"source\\\":\\\"cccccccccccccccccccccccccccccccccccccccc\\\"},\\\"recipient\\\":{\\\"generation\\\":\\\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\\",\\\"nonce\\\":\\\"22222222-2222-4222-8222-222222222222\\\",\\\"pid\\\":123,\\\"starttime\\\":\\\"1234\\\"}},\\\"expiresAtMs\\\":1800000010000,\\\"installer\\\":{\\\"carrierDigest\\\":\\\"3333333333333333333333333333333333333333333333333333333333333333\\\",\\\"clientDigest\\\":\\\"2222222222222222222222222222222222222222222222222222222222222222\\\",\\\"gid\\\":21000,\\\"observerDigest\\\":\\\"4444444444444444444444444444444444444444444444444444444444444444\\\",\\\"pid\\\":321,\\\"starttime\\\":\\\"5678\\\",\\\"uid\\\":21000},\\\"version\\\":1}\",\"phase\":\"consumed\",\"global\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"company\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"epoch\":3,\"lineage\":{\"reference\":\"synthetic-fresh-fork\",\"databaseEpoch\":1},\"closure\":\"open\"},\"store\":{\"facts\":{\"purpose\":\"init\",\"reference\":\"store-ref-0001\"},\"phase\":\"consumed\"},\"pi\":null}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"current\":{\"bindingJson\":\"{\\\"barrierNonce\\\":\\\"33333333-3333-4333-8333-333333333333\\\",\\\"challenge\\\":{\\\"launch\\\":{\\\"epoch\\\":3,\\\"request\\\":{\\\"challenge\\\":\\\"11111111-1111-4111-8111-111111111111\\\",\\\"identity\\\":{\\\"backend\\\":\\\"native\\\",\\\"company\\\":\\\"synthetic\\\",\\\"generation\\\":1,\\\"imageLane\\\":\\\"baseline\\\",\\\"instance\\\":\\\"attempt1\\\",\\\"tier\\\":\\\"basic\\\"},\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"purpose\\\":\\\"fresh_start\\\"}},\\\"lineage\\\":{\\\"databaseEpoch\\\":1,\\\"reference\\\":\\\"synthetic-fresh-fork\\\"},\\\"pins\\\":{\\\"helper\\\":\\\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\\",\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"node\\\":\\\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\\",\\\"piGraph\\\":\\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\\",\\\"policy\\\":\\\"1111111111111111111111111111111111111111111111111111111111111111\\\",\\\"source\\\":\\\"cccccccccccccccccccccccccccccccccccccccc\\\"},\\\"recipient\\\":{\\\"generation\\\":\\\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\\",\\\"nonce\\\":\\\"22222222-2222-4222-8222-222222222222\\\",\\\"pid\\\":123,\\\"starttime\\\":\\\"1234\\\"}},\\\"expiresAtMs\\\":1800000010000,\\\"installer\\\":{\\\"carrierDigest\\\":\\\"3333333333333333333333333333333333333333333333333333333333333333\\\",\\\"clientDigest\\\":\\\"2222222222222222222222222222222222222222222222222222222222222222\\\",\\\"gid\\\":21000,\\\"observerDigest\\\":\\\"4444444444444444444444444444444444444444444444444444444444444444\\\",\\\"pid\\\":321,\\\"starttime\\\":\\\"5678\\\",\\\"uid\\\":21000},\\\"version\\\":1}\",\"closure\":\"open\",\"company\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"epoch\":3,\"global\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"lineage\":{\"databaseEpoch\":1,\"reference\":\"synthetic-fresh-fork\"},\"phase\":\"consumed\"},\"leaseExpiresAtMs\":1800000020000,\"operation\":\"11111111-1111-4111-8111-111111111111\",\"pi\":null,\"sequence\":6,\"store\":{\"facts\":{\"purpose\":\"init\",\"reference\":\"store-ref-0001\"},\"phase\":\"consumed\"},\"type\":\"runtime-owner\",\"version\":1}"
+    },
+    {
+      "id": "request-pi-acquire",
+      "producer": "rust",
+      "direction": "rust->ts",
+      "emitted": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"scope\":{\"alias\":\"synthetic-alias\",\"binding_json\":\"{\\\"barrierNonce\\\":\\\"33333333-3333-4333-8333-333333333333\\\",\\\"challenge\\\":{\\\"launch\\\":{\\\"epoch\\\":3,\\\"request\\\":{\\\"challenge\\\":\\\"11111111-1111-4111-8111-111111111111\\\",\\\"identity\\\":{\\\"backend\\\":\\\"native\\\",\\\"company\\\":\\\"synthetic\\\",\\\"generation\\\":1,\\\"imageLane\\\":\\\"baseline\\\",\\\"instance\\\":\\\"attempt1\\\",\\\"tier\\\":\\\"basic\\\"},\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"purpose\\\":\\\"fresh_start\\\"}},\\\"lineage\\\":{\\\"databaseEpoch\\\":1,\\\"reference\\\":\\\"synthetic-fresh-fork\\\"},\\\"pins\\\":{\\\"helper\\\":\\\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\\",\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"node\\\":\\\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\\",\\\"piGraph\\\":\\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\\",\\\"policy\\\":\\\"1111111111111111111111111111111111111111111111111111111111111111\\\",\\\"source\\\":\\\"cccccccccccccccccccccccccccccccccccccccc\\\"},\\\"recipient\\\":{\\\"generation\\\":\\\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\\",\\\"nonce\\\":\\\"22222222-2222-4222-8222-222222222222\\\",\\\"pid\\\":123,\\\"starttime\\\":\\\"1234\\\"}},\\\"expiresAtMs\\\":1800000010000,\\\"installer\\\":{\\\"carrierDigest\\\":\\\"3333333333333333333333333333333333333333333333333333333333333333\\\",\\\"clientDigest\\\":\\\"2222222222222222222222222222222222222222222222222222222222222222\\\",\\\"gid\\\":21000,\\\"observerDigest\\\":\\\"4444444444444444444444444444444444444444444444444444444444444444\\\",\\\"pid\\\":321,\\\"starttime\\\":\\\"5678\\\",\\\"uid\\\":21000},\\\"version\\\":1}\",\"company\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"database_epoch\":1,\"epoch\":3,\"global\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"helper_sha256\":[221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221],\"lineage\":\"synthetic-fresh-fork\",\"node_sha256\":[238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238],\"policy_sha256\":[17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17],\"profile_sha256\":[255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255],\"selection\":{\"alias_sha256\":\"3b948d88dbcbedc38c300b2ec8931ba468994d8fe82d81333df5fb4b65a3cde8\",\"generation\":\"cccccccccccccccccccccccccccccccc\",\"model\":\"openai-codex/gpt-6.1-sol\",\"role\":\"master\"},\"version\":1},\"sequence\":7,\"type\":\"pi-acquire\",\"version\":1}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"scope\":{\"alias\":\"synthetic-alias\",\"binding_json\":\"{\\\"barrierNonce\\\":\\\"33333333-3333-4333-8333-333333333333\\\",\\\"challenge\\\":{\\\"launch\\\":{\\\"epoch\\\":3,\\\"request\\\":{\\\"challenge\\\":\\\"11111111-1111-4111-8111-111111111111\\\",\\\"identity\\\":{\\\"backend\\\":\\\"native\\\",\\\"company\\\":\\\"synthetic\\\",\\\"generation\\\":1,\\\"imageLane\\\":\\\"baseline\\\",\\\"instance\\\":\\\"attempt1\\\",\\\"tier\\\":\\\"basic\\\"},\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"purpose\\\":\\\"fresh_start\\\"}},\\\"lineage\\\":{\\\"databaseEpoch\\\":1,\\\"reference\\\":\\\"synthetic-fresh-fork\\\"},\\\"pins\\\":{\\\"helper\\\":\\\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\\",\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"node\\\":\\\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\\",\\\"piGraph\\\":\\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\\",\\\"policy\\\":\\\"1111111111111111111111111111111111111111111111111111111111111111\\\",\\\"source\\\":\\\"cccccccccccccccccccccccccccccccccccccccc\\\"},\\\"recipient\\\":{\\\"generation\\\":\\\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\\",\\\"nonce\\\":\\\"22222222-2222-4222-8222-222222222222\\\",\\\"pid\\\":123,\\\"starttime\\\":\\\"1234\\\"}},\\\"expiresAtMs\\\":1800000010000,\\\"installer\\\":{\\\"carrierDigest\\\":\\\"3333333333333333333333333333333333333333333333333333333333333333\\\",\\\"clientDigest\\\":\\\"2222222222222222222222222222222222222222222222222222222222222222\\\",\\\"gid\\\":21000,\\\"observerDigest\\\":\\\"4444444444444444444444444444444444444444444444444444444444444444\\\",\\\"pid\\\":321,\\\"starttime\\\":\\\"5678\\\",\\\"uid\\\":21000},\\\"version\\\":1}\",\"company\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"database_epoch\":1,\"epoch\":3,\"global\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"helper_sha256\":[221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221],\"lineage\":\"synthetic-fresh-fork\",\"node_sha256\":[238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238],\"policy_sha256\":[17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17],\"profile_sha256\":[255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255],\"selection\":{\"alias_sha256\":\"3b948d88dbcbedc38c300b2ec8931ba468994d8fe82d81333df5fb4b65a3cde8\",\"generation\":\"cccccccccccccccccccccccccccccccc\",\"model\":\"openai-codex/gpt-6.1-sol\",\"role\":\"master\"},\"version\":1},\"sequence\":7,\"type\":\"pi-acquire\",\"version\":1}"
+    },
+    {
+      "id": "runtime-owner-pi-acquire",
+      "producer": "ts",
+      "direction": "ts->rust",
+      "emitted": "{\"version\":1,\"type\":\"runtime-owner\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"sequence\":7,\"leaseExpiresAtMs\":1800000020000,\"current\":{\"bindingJson\":\"{\\\"barrierNonce\\\":\\\"33333333-3333-4333-8333-333333333333\\\",\\\"challenge\\\":{\\\"launch\\\":{\\\"epoch\\\":3,\\\"request\\\":{\\\"challenge\\\":\\\"11111111-1111-4111-8111-111111111111\\\",\\\"identity\\\":{\\\"backend\\\":\\\"native\\\",\\\"company\\\":\\\"synthetic\\\",\\\"generation\\\":1,\\\"imageLane\\\":\\\"baseline\\\",\\\"instance\\\":\\\"attempt1\\\",\\\"tier\\\":\\\"basic\\\"},\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"purpose\\\":\\\"fresh_start\\\"}},\\\"lineage\\\":{\\\"databaseEpoch\\\":1,\\\"reference\\\":\\\"synthetic-fresh-fork\\\"},\\\"pins\\\":{\\\"helper\\\":\\\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\\",\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"node\\\":\\\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\\",\\\"piGraph\\\":\\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\\",\\\"policy\\\":\\\"1111111111111111111111111111111111111111111111111111111111111111\\\",\\\"source\\\":\\\"cccccccccccccccccccccccccccccccccccccccc\\\"},\\\"recipient\\\":{\\\"generation\\\":\\\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\\",\\\"nonce\\\":\\\"22222222-2222-4222-8222-222222222222\\\",\\\"pid\\\":123,\\\"starttime\\\":\\\"1234\\\"}},\\\"expiresAtMs\\\":1800000010000,\\\"installer\\\":{\\\"carrierDigest\\\":\\\"3333333333333333333333333333333333333333333333333333333333333333\\\",\\\"clientDigest\\\":\\\"2222222222222222222222222222222222222222222222222222222222222222\\\",\\\"gid\\\":21000,\\\"observerDigest\\\":\\\"4444444444444444444444444444444444444444444444444444444444444444\\\",\\\"pid\\\":321,\\\"starttime\\\":\\\"5678\\\",\\\"uid\\\":21000},\\\"version\\\":1}\",\"phase\":\"consumed\",\"global\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"company\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"epoch\":3,\"lineage\":{\"reference\":\"synthetic-fresh-fork\",\"databaseEpoch\":1},\"closure\":\"open\"},\"store\":null,\"pi\":{\"reference\":\"d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1\",\"phase\":\"issued\"}}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"current\":{\"bindingJson\":\"{\\\"barrierNonce\\\":\\\"33333333-3333-4333-8333-333333333333\\\",\\\"challenge\\\":{\\\"launch\\\":{\\\"epoch\\\":3,\\\"request\\\":{\\\"challenge\\\":\\\"11111111-1111-4111-8111-111111111111\\\",\\\"identity\\\":{\\\"backend\\\":\\\"native\\\",\\\"company\\\":\\\"synthetic\\\",\\\"generation\\\":1,\\\"imageLane\\\":\\\"baseline\\\",\\\"instance\\\":\\\"attempt1\\\",\\\"tier\\\":\\\"basic\\\"},\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"purpose\\\":\\\"fresh_start\\\"}},\\\"lineage\\\":{\\\"databaseEpoch\\\":1,\\\"reference\\\":\\\"synthetic-fresh-fork\\\"},\\\"pins\\\":{\\\"helper\\\":\\\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\\",\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"node\\\":\\\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\\",\\\"piGraph\\\":\\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\\",\\\"policy\\\":\\\"1111111111111111111111111111111111111111111111111111111111111111\\\",\\\"source\\\":\\\"cccccccccccccccccccccccccccccccccccccccc\\\"},\\\"recipient\\\":{\\\"generation\\\":\\\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\\",\\\"nonce\\\":\\\"22222222-2222-4222-8222-222222222222\\\",\\\"pid\\\":123,\\\"starttime\\\":\\\"1234\\\"}},\\\"expiresAtMs\\\":1800000010000,\\\"installer\\\":{\\\"carrierDigest\\\":\\\"3333333333333333333333333333333333333333333333333333333333333333\\\",\\\"clientDigest\\\":\\\"2222222222222222222222222222222222222222222222222222222222222222\\\",\\\"gid\\\":21000,\\\"observerDigest\\\":\\\"4444444444444444444444444444444444444444444444444444444444444444\\\",\\\"pid\\\":321,\\\"starttime\\\":\\\"5678\\\",\\\"uid\\\":21000},\\\"version\\\":1}\",\"closure\":\"open\",\"company\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"epoch\":3,\"global\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"lineage\":{\"databaseEpoch\":1,\"reference\":\"synthetic-fresh-fork\"},\"phase\":\"consumed\"},\"leaseExpiresAtMs\":1800000020000,\"operation\":\"11111111-1111-4111-8111-111111111111\",\"pi\":{\"phase\":\"issued\",\"reference\":\"d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1\"},\"sequence\":7,\"store\":null,\"type\":\"runtime-owner\",\"version\":1}"
+    },
+    {
+      "id": "request-pi-consume",
+      "producer": "rust",
+      "direction": "rust->ts",
+      "emitted": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"reference\":\"d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1\",\"scope\":{\"alias\":\"synthetic-alias\",\"binding_json\":\"{\\\"barrierNonce\\\":\\\"33333333-3333-4333-8333-333333333333\\\",\\\"challenge\\\":{\\\"launch\\\":{\\\"epoch\\\":3,\\\"request\\\":{\\\"challenge\\\":\\\"11111111-1111-4111-8111-111111111111\\\",\\\"identity\\\":{\\\"backend\\\":\\\"native\\\",\\\"company\\\":\\\"synthetic\\\",\\\"generation\\\":1,\\\"imageLane\\\":\\\"baseline\\\",\\\"instance\\\":\\\"attempt1\\\",\\\"tier\\\":\\\"basic\\\"},\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"purpose\\\":\\\"fresh_start\\\"}},\\\"lineage\\\":{\\\"databaseEpoch\\\":1,\\\"reference\\\":\\\"synthetic-fresh-fork\\\"},\\\"pins\\\":{\\\"helper\\\":\\\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\\",\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"node\\\":\\\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\\",\\\"piGraph\\\":\\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\\",\\\"policy\\\":\\\"1111111111111111111111111111111111111111111111111111111111111111\\\",\\\"source\\\":\\\"cccccccccccccccccccccccccccccccccccccccc\\\"},\\\"recipient\\\":{\\\"generation\\\":\\\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\\",\\\"nonce\\\":\\\"22222222-2222-4222-8222-222222222222\\\",\\\"pid\\\":123,\\\"starttime\\\":\\\"1234\\\"}},\\\"expiresAtMs\\\":1800000010000,\\\"installer\\\":{\\\"carrierDigest\\\":\\\"3333333333333333333333333333333333333333333333333333333333333333\\\",\\\"clientDigest\\\":\\\"2222222222222222222222222222222222222222222222222222222222222222\\\",\\\"gid\\\":21000,\\\"observerDigest\\\":\\\"4444444444444444444444444444444444444444444444444444444444444444\\\",\\\"pid\\\":321,\\\"starttime\\\":\\\"5678\\\",\\\"uid\\\":21000},\\\"version\\\":1}\",\"company\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"database_epoch\":1,\"epoch\":3,\"global\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"helper_sha256\":[221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221],\"lineage\":\"synthetic-fresh-fork\",\"node_sha256\":[238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238],\"policy_sha256\":[17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17],\"profile_sha256\":[255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255],\"selection\":{\"alias_sha256\":\"3b948d88dbcbedc38c300b2ec8931ba468994d8fe82d81333df5fb4b65a3cde8\",\"generation\":\"cccccccccccccccccccccccccccccccc\",\"model\":\"openai-codex/gpt-6.1-sol\",\"role\":\"master\"},\"version\":1},\"sequence\":8,\"type\":\"pi-consume\",\"version\":1}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"reference\":\"d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1\",\"scope\":{\"alias\":\"synthetic-alias\",\"binding_json\":\"{\\\"barrierNonce\\\":\\\"33333333-3333-4333-8333-333333333333\\\",\\\"challenge\\\":{\\\"launch\\\":{\\\"epoch\\\":3,\\\"request\\\":{\\\"challenge\\\":\\\"11111111-1111-4111-8111-111111111111\\\",\\\"identity\\\":{\\\"backend\\\":\\\"native\\\",\\\"company\\\":\\\"synthetic\\\",\\\"generation\\\":1,\\\"imageLane\\\":\\\"baseline\\\",\\\"instance\\\":\\\"attempt1\\\",\\\"tier\\\":\\\"basic\\\"},\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"purpose\\\":\\\"fresh_start\\\"}},\\\"lineage\\\":{\\\"databaseEpoch\\\":1,\\\"reference\\\":\\\"synthetic-fresh-fork\\\"},\\\"pins\\\":{\\\"helper\\\":\\\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\\",\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"node\\\":\\\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\\",\\\"piGraph\\\":\\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\\",\\\"policy\\\":\\\"1111111111111111111111111111111111111111111111111111111111111111\\\",\\\"source\\\":\\\"cccccccccccccccccccccccccccccccccccccccc\\\"},\\\"recipient\\\":{\\\"generation\\\":\\\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\\",\\\"nonce\\\":\\\"22222222-2222-4222-8222-222222222222\\\",\\\"pid\\\":123,\\\"starttime\\\":\\\"1234\\\"}},\\\"expiresAtMs\\\":1800000010000,\\\"installer\\\":{\\\"carrierDigest\\\":\\\"3333333333333333333333333333333333333333333333333333333333333333\\\",\\\"clientDigest\\\":\\\"2222222222222222222222222222222222222222222222222222222222222222\\\",\\\"gid\\\":21000,\\\"observerDigest\\\":\\\"4444444444444444444444444444444444444444444444444444444444444444\\\",\\\"pid\\\":321,\\\"starttime\\\":\\\"5678\\\",\\\"uid\\\":21000},\\\"version\\\":1}\",\"company\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"database_epoch\":1,\"epoch\":3,\"global\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"helper_sha256\":[221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221],\"lineage\":\"synthetic-fresh-fork\",\"node_sha256\":[238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238],\"policy_sha256\":[17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17],\"profile_sha256\":[255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255],\"selection\":{\"alias_sha256\":\"3b948d88dbcbedc38c300b2ec8931ba468994d8fe82d81333df5fb4b65a3cde8\",\"generation\":\"cccccccccccccccccccccccccccccccc\",\"model\":\"openai-codex/gpt-6.1-sol\",\"role\":\"master\"},\"version\":1},\"sequence\":8,\"type\":\"pi-consume\",\"version\":1}"
+    },
+    {
+      "id": "runtime-owner-pi-consume",
+      "producer": "ts",
+      "direction": "ts->rust",
+      "emitted": "{\"version\":1,\"type\":\"runtime-owner\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"sequence\":8,\"leaseExpiresAtMs\":1800000020000,\"current\":{\"bindingJson\":\"{\\\"barrierNonce\\\":\\\"33333333-3333-4333-8333-333333333333\\\",\\\"challenge\\\":{\\\"launch\\\":{\\\"epoch\\\":3,\\\"request\\\":{\\\"challenge\\\":\\\"11111111-1111-4111-8111-111111111111\\\",\\\"identity\\\":{\\\"backend\\\":\\\"native\\\",\\\"company\\\":\\\"synthetic\\\",\\\"generation\\\":1,\\\"imageLane\\\":\\\"baseline\\\",\\\"instance\\\":\\\"attempt1\\\",\\\"tier\\\":\\\"basic\\\"},\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"purpose\\\":\\\"fresh_start\\\"}},\\\"lineage\\\":{\\\"databaseEpoch\\\":1,\\\"reference\\\":\\\"synthetic-fresh-fork\\\"},\\\"pins\\\":{\\\"helper\\\":\\\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\\",\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"node\\\":\\\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\\",\\\"piGraph\\\":\\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\\",\\\"policy\\\":\\\"1111111111111111111111111111111111111111111111111111111111111111\\\",\\\"source\\\":\\\"cccccccccccccccccccccccccccccccccccccccc\\\"},\\\"recipient\\\":{\\\"generation\\\":\\\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\\",\\\"nonce\\\":\\\"22222222-2222-4222-8222-222222222222\\\",\\\"pid\\\":123,\\\"starttime\\\":\\\"1234\\\"}},\\\"expiresAtMs\\\":1800000010000,\\\"installer\\\":{\\\"carrierDigest\\\":\\\"3333333333333333333333333333333333333333333333333333333333333333\\\",\\\"clientDigest\\\":\\\"2222222222222222222222222222222222222222222222222222222222222222\\\",\\\"gid\\\":21000,\\\"observerDigest\\\":\\\"4444444444444444444444444444444444444444444444444444444444444444\\\",\\\"pid\\\":321,\\\"starttime\\\":\\\"5678\\\",\\\"uid\\\":21000},\\\"version\\\":1}\",\"phase\":\"consumed\",\"global\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"company\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"epoch\":3,\"lineage\":{\"reference\":\"synthetic-fresh-fork\",\"databaseEpoch\":1},\"closure\":\"open\"},\"store\":null,\"pi\":{\"reference\":\"d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1\",\"phase\":\"consumed\"}}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"current\":{\"bindingJson\":\"{\\\"barrierNonce\\\":\\\"33333333-3333-4333-8333-333333333333\\\",\\\"challenge\\\":{\\\"launch\\\":{\\\"epoch\\\":3,\\\"request\\\":{\\\"challenge\\\":\\\"11111111-1111-4111-8111-111111111111\\\",\\\"identity\\\":{\\\"backend\\\":\\\"native\\\",\\\"company\\\":\\\"synthetic\\\",\\\"generation\\\":1,\\\"imageLane\\\":\\\"baseline\\\",\\\"instance\\\":\\\"attempt1\\\",\\\"tier\\\":\\\"basic\\\"},\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"purpose\\\":\\\"fresh_start\\\"}},\\\"lineage\\\":{\\\"databaseEpoch\\\":1,\\\"reference\\\":\\\"synthetic-fresh-fork\\\"},\\\"pins\\\":{\\\"helper\\\":\\\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\\",\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"node\\\":\\\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\\",\\\"piGraph\\\":\\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\\",\\\"policy\\\":\\\"1111111111111111111111111111111111111111111111111111111111111111\\\",\\\"source\\\":\\\"cccccccccccccccccccccccccccccccccccccccc\\\"},\\\"recipient\\\":{\\\"generation\\\":\\\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\\",\\\"nonce\\\":\\\"22222222-2222-4222-8222-222222222222\\\",\\\"pid\\\":123,\\\"starttime\\\":\\\"1234\\\"}},\\\"expiresAtMs\\\":1800000010000,\\\"installer\\\":{\\\"carrierDigest\\\":\\\"3333333333333333333333333333333333333333333333333333333333333333\\\",\\\"clientDigest\\\":\\\"2222222222222222222222222222222222222222222222222222222222222222\\\",\\\"gid\\\":21000,\\\"observerDigest\\\":\\\"4444444444444444444444444444444444444444444444444444444444444444\\\",\\\"pid\\\":321,\\\"starttime\\\":\\\"5678\\\",\\\"uid\\\":21000},\\\"version\\\":1}\",\"closure\":\"open\",\"company\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"epoch\":3,\"global\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"lineage\":{\"databaseEpoch\":1,\"reference\":\"synthetic-fresh-fork\"},\"phase\":\"consumed\"},\"leaseExpiresAtMs\":1800000020000,\"operation\":\"11111111-1111-4111-8111-111111111111\",\"pi\":{\"phase\":\"consumed\",\"reference\":\"d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1\"},\"sequence\":8,\"store\":null,\"type\":\"runtime-owner\",\"version\":1}"
+    },
+    {
+      "id": "request-pi-current",
+      "producer": "rust",
+      "direction": "rust->ts",
+      "emitted": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"reference\":\"d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1\",\"scope\":{\"alias\":\"synthetic-alias\",\"binding_json\":\"{\\\"barrierNonce\\\":\\\"33333333-3333-4333-8333-333333333333\\\",\\\"challenge\\\":{\\\"launch\\\":{\\\"epoch\\\":3,\\\"request\\\":{\\\"challenge\\\":\\\"11111111-1111-4111-8111-111111111111\\\",\\\"identity\\\":{\\\"backend\\\":\\\"native\\\",\\\"company\\\":\\\"synthetic\\\",\\\"generation\\\":1,\\\"imageLane\\\":\\\"baseline\\\",\\\"instance\\\":\\\"attempt1\\\",\\\"tier\\\":\\\"basic\\\"},\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"purpose\\\":\\\"fresh_start\\\"}},\\\"lineage\\\":{\\\"databaseEpoch\\\":1,\\\"reference\\\":\\\"synthetic-fresh-fork\\\"},\\\"pins\\\":{\\\"helper\\\":\\\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\\",\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"node\\\":\\\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\\",\\\"piGraph\\\":\\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\\",\\\"policy\\\":\\\"1111111111111111111111111111111111111111111111111111111111111111\\\",\\\"source\\\":\\\"cccccccccccccccccccccccccccccccccccccccc\\\"},\\\"recipient\\\":{\\\"generation\\\":\\\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\\",\\\"nonce\\\":\\\"22222222-2222-4222-8222-222222222222\\\",\\\"pid\\\":123,\\\"starttime\\\":\\\"1234\\\"}},\\\"expiresAtMs\\\":1800000010000,\\\"installer\\\":{\\\"carrierDigest\\\":\\\"3333333333333333333333333333333333333333333333333333333333333333\\\",\\\"clientDigest\\\":\\\"2222222222222222222222222222222222222222222222222222222222222222\\\",\\\"gid\\\":21000,\\\"observerDigest\\\":\\\"4444444444444444444444444444444444444444444444444444444444444444\\\",\\\"pid\\\":321,\\\"starttime\\\":\\\"5678\\\",\\\"uid\\\":21000},\\\"version\\\":1}\",\"company\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"database_epoch\":1,\"epoch\":3,\"global\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"helper_sha256\":[221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221],\"lineage\":\"synthetic-fresh-fork\",\"node_sha256\":[238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238],\"policy_sha256\":[17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17],\"profile_sha256\":[255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255],\"selection\":{\"alias_sha256\":\"3b948d88dbcbedc38c300b2ec8931ba468994d8fe82d81333df5fb4b65a3cde8\",\"generation\":\"cccccccccccccccccccccccccccccccc\",\"model\":\"openai-codex/gpt-6.1-sol\",\"role\":\"master\"},\"version\":1},\"sequence\":9,\"type\":\"pi-current\",\"version\":1}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"reference\":\"d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1\",\"scope\":{\"alias\":\"synthetic-alias\",\"binding_json\":\"{\\\"barrierNonce\\\":\\\"33333333-3333-4333-8333-333333333333\\\",\\\"challenge\\\":{\\\"launch\\\":{\\\"epoch\\\":3,\\\"request\\\":{\\\"challenge\\\":\\\"11111111-1111-4111-8111-111111111111\\\",\\\"identity\\\":{\\\"backend\\\":\\\"native\\\",\\\"company\\\":\\\"synthetic\\\",\\\"generation\\\":1,\\\"imageLane\\\":\\\"baseline\\\",\\\"instance\\\":\\\"attempt1\\\",\\\"tier\\\":\\\"basic\\\"},\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"purpose\\\":\\\"fresh_start\\\"}},\\\"lineage\\\":{\\\"databaseEpoch\\\":1,\\\"reference\\\":\\\"synthetic-fresh-fork\\\"},\\\"pins\\\":{\\\"helper\\\":\\\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\\",\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"node\\\":\\\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\\",\\\"piGraph\\\":\\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\\",\\\"policy\\\":\\\"1111111111111111111111111111111111111111111111111111111111111111\\\",\\\"source\\\":\\\"cccccccccccccccccccccccccccccccccccccccc\\\"},\\\"recipient\\\":{\\\"generation\\\":\\\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\\",\\\"nonce\\\":\\\"22222222-2222-4222-8222-222222222222\\\",\\\"pid\\\":123,\\\"starttime\\\":\\\"1234\\\"}},\\\"expiresAtMs\\\":1800000010000,\\\"installer\\\":{\\\"carrierDigest\\\":\\\"3333333333333333333333333333333333333333333333333333333333333333\\\",\\\"clientDigest\\\":\\\"2222222222222222222222222222222222222222222222222222222222222222\\\",\\\"gid\\\":21000,\\\"observerDigest\\\":\\\"4444444444444444444444444444444444444444444444444444444444444444\\\",\\\"pid\\\":321,\\\"starttime\\\":\\\"5678\\\",\\\"uid\\\":21000},\\\"version\\\":1}\",\"company\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"database_epoch\":1,\"epoch\":3,\"global\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"helper_sha256\":[221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221,221],\"lineage\":\"synthetic-fresh-fork\",\"node_sha256\":[238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238,238],\"policy_sha256\":[17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17,17],\"profile_sha256\":[255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255],\"selection\":{\"alias_sha256\":\"3b948d88dbcbedc38c300b2ec8931ba468994d8fe82d81333df5fb4b65a3cde8\",\"generation\":\"cccccccccccccccccccccccccccccccc\",\"model\":\"openai-codex/gpt-6.1-sol\",\"role\":\"master\"},\"version\":1},\"sequence\":9,\"type\":\"pi-current\",\"version\":1}"
+    },
+    {
+      "id": "runtime-owner-pi-current",
+      "producer": "ts",
+      "direction": "ts->rust",
+      "emitted": "{\"version\":1,\"type\":\"runtime-owner\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"sequence\":9,\"leaseExpiresAtMs\":1800000020000,\"current\":{\"bindingJson\":\"{\\\"barrierNonce\\\":\\\"33333333-3333-4333-8333-333333333333\\\",\\\"challenge\\\":{\\\"launch\\\":{\\\"epoch\\\":3,\\\"request\\\":{\\\"challenge\\\":\\\"11111111-1111-4111-8111-111111111111\\\",\\\"identity\\\":{\\\"backend\\\":\\\"native\\\",\\\"company\\\":\\\"synthetic\\\",\\\"generation\\\":1,\\\"imageLane\\\":\\\"baseline\\\",\\\"instance\\\":\\\"attempt1\\\",\\\"tier\\\":\\\"basic\\\"},\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"purpose\\\":\\\"fresh_start\\\"}},\\\"lineage\\\":{\\\"databaseEpoch\\\":1,\\\"reference\\\":\\\"synthetic-fresh-fork\\\"},\\\"pins\\\":{\\\"helper\\\":\\\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\\",\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"node\\\":\\\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\\",\\\"piGraph\\\":\\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\\",\\\"policy\\\":\\\"1111111111111111111111111111111111111111111111111111111111111111\\\",\\\"source\\\":\\\"cccccccccccccccccccccccccccccccccccccccc\\\"},\\\"recipient\\\":{\\\"generation\\\":\\\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\\",\\\"nonce\\\":\\\"22222222-2222-4222-8222-222222222222\\\",\\\"pid\\\":123,\\\"starttime\\\":\\\"1234\\\"}},\\\"expiresAtMs\\\":1800000010000,\\\"installer\\\":{\\\"carrierDigest\\\":\\\"3333333333333333333333333333333333333333333333333333333333333333\\\",\\\"clientDigest\\\":\\\"2222222222222222222222222222222222222222222222222222222222222222\\\",\\\"gid\\\":21000,\\\"observerDigest\\\":\\\"4444444444444444444444444444444444444444444444444444444444444444\\\",\\\"pid\\\":321,\\\"starttime\\\":\\\"5678\\\",\\\"uid\\\":21000},\\\"version\\\":1}\",\"phase\":\"consumed\",\"global\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"company\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"epoch\":3,\"lineage\":{\"reference\":\"synthetic-fresh-fork\",\"databaseEpoch\":1},\"closure\":\"open\"},\"store\":null,\"pi\":{\"reference\":\"d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1\",\"phase\":\"consumed\"}}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"current\":{\"bindingJson\":\"{\\\"barrierNonce\\\":\\\"33333333-3333-4333-8333-333333333333\\\",\\\"challenge\\\":{\\\"launch\\\":{\\\"epoch\\\":3,\\\"request\\\":{\\\"challenge\\\":\\\"11111111-1111-4111-8111-111111111111\\\",\\\"identity\\\":{\\\"backend\\\":\\\"native\\\",\\\"company\\\":\\\"synthetic\\\",\\\"generation\\\":1,\\\"imageLane\\\":\\\"baseline\\\",\\\"instance\\\":\\\"attempt1\\\",\\\"tier\\\":\\\"basic\\\"},\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"purpose\\\":\\\"fresh_start\\\"}},\\\"lineage\\\":{\\\"databaseEpoch\\\":1,\\\"reference\\\":\\\"synthetic-fresh-fork\\\"},\\\"pins\\\":{\\\"helper\\\":\\\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\\",\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"node\\\":\\\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\\",\\\"piGraph\\\":\\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\\",\\\"policy\\\":\\\"1111111111111111111111111111111111111111111111111111111111111111\\\",\\\"source\\\":\\\"cccccccccccccccccccccccccccccccccccccccc\\\"},\\\"recipient\\\":{\\\"generation\\\":\\\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\\",\\\"nonce\\\":\\\"22222222-2222-4222-8222-222222222222\\\",\\\"pid\\\":123,\\\"starttime\\\":\\\"1234\\\"}},\\\"expiresAtMs\\\":1800000010000,\\\"installer\\\":{\\\"carrierDigest\\\":\\\"3333333333333333333333333333333333333333333333333333333333333333\\\",\\\"clientDigest\\\":\\\"2222222222222222222222222222222222222222222222222222222222222222\\\",\\\"gid\\\":21000,\\\"observerDigest\\\":\\\"4444444444444444444444444444444444444444444444444444444444444444\\\",\\\"pid\\\":321,\\\"starttime\\\":\\\"5678\\\",\\\"uid\\\":21000},\\\"version\\\":1}\",\"closure\":\"open\",\"company\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"epoch\":3,\"global\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"lineage\":{\"databaseEpoch\":1,\"reference\":\"synthetic-fresh-fork\"},\"phase\":\"consumed\"},\"leaseExpiresAtMs\":1800000020000,\"operation\":\"11111111-1111-4111-8111-111111111111\",\"pi\":{\"phase\":\"consumed\",\"reference\":\"d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1\"},\"sequence\":9,\"store\":null,\"type\":\"runtime-owner\",\"version\":1}"
+    },
+    {
+      "id": "request-runtime-daemon-ready",
+      "producer": "rust",
+      "direction": "rust->ts",
+      "emitted": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"reference\":\"daemon-ref-0001\",\"sequence\":10,\"type\":\"runtime-daemon-ready\",\"version\":1}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"reference\":\"daemon-ref-0001\",\"sequence\":10,\"type\":\"runtime-daemon-ready\",\"version\":1}"
+    },
+    {
+      "id": "runtime-owner-runtime-daemon-ready",
+      "producer": "ts",
+      "direction": "ts->rust",
+      "emitted": "{\"version\":1,\"type\":\"runtime-owner\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"sequence\":10,\"leaseExpiresAtMs\":1800000020000,\"current\":{\"bindingJson\":\"{\\\"barrierNonce\\\":\\\"33333333-3333-4333-8333-333333333333\\\",\\\"challenge\\\":{\\\"launch\\\":{\\\"epoch\\\":3,\\\"request\\\":{\\\"challenge\\\":\\\"11111111-1111-4111-8111-111111111111\\\",\\\"identity\\\":{\\\"backend\\\":\\\"native\\\",\\\"company\\\":\\\"synthetic\\\",\\\"generation\\\":1,\\\"imageLane\\\":\\\"baseline\\\",\\\"instance\\\":\\\"attempt1\\\",\\\"tier\\\":\\\"basic\\\"},\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"purpose\\\":\\\"fresh_start\\\"}},\\\"lineage\\\":{\\\"databaseEpoch\\\":1,\\\"reference\\\":\\\"synthetic-fresh-fork\\\"},\\\"pins\\\":{\\\"helper\\\":\\\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\\",\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"node\\\":\\\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\\",\\\"piGraph\\\":\\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\\",\\\"policy\\\":\\\"1111111111111111111111111111111111111111111111111111111111111111\\\",\\\"source\\\":\\\"cccccccccccccccccccccccccccccccccccccccc\\\"},\\\"recipient\\\":{\\\"generation\\\":\\\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\\",\\\"nonce\\\":\\\"22222222-2222-4222-8222-222222222222\\\",\\\"pid\\\":123,\\\"starttime\\\":\\\"1234\\\"}},\\\"expiresAtMs\\\":1800000010000,\\\"installer\\\":{\\\"carrierDigest\\\":\\\"3333333333333333333333333333333333333333333333333333333333333333\\\",\\\"clientDigest\\\":\\\"2222222222222222222222222222222222222222222222222222222222222222\\\",\\\"gid\\\":21000,\\\"observerDigest\\\":\\\"4444444444444444444444444444444444444444444444444444444444444444\\\",\\\"pid\\\":321,\\\"starttime\\\":\\\"5678\\\",\\\"uid\\\":21000},\\\"version\\\":1}\",\"phase\":\"consumed\",\"global\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"company\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"epoch\":3,\"lineage\":{\"reference\":\"synthetic-fresh-fork\",\"databaseEpoch\":1},\"closure\":\"open\"},\"store\":null,\"pi\":null}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"current\":{\"bindingJson\":\"{\\\"barrierNonce\\\":\\\"33333333-3333-4333-8333-333333333333\\\",\\\"challenge\\\":{\\\"launch\\\":{\\\"epoch\\\":3,\\\"request\\\":{\\\"challenge\\\":\\\"11111111-1111-4111-8111-111111111111\\\",\\\"identity\\\":{\\\"backend\\\":\\\"native\\\",\\\"company\\\":\\\"synthetic\\\",\\\"generation\\\":1,\\\"imageLane\\\":\\\"baseline\\\",\\\"instance\\\":\\\"attempt1\\\",\\\"tier\\\":\\\"basic\\\"},\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"purpose\\\":\\\"fresh_start\\\"}},\\\"lineage\\\":{\\\"databaseEpoch\\\":1,\\\"reference\\\":\\\"synthetic-fresh-fork\\\"},\\\"pins\\\":{\\\"helper\\\":\\\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\\",\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"node\\\":\\\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\\",\\\"piGraph\\\":\\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\\",\\\"policy\\\":\\\"1111111111111111111111111111111111111111111111111111111111111111\\\",\\\"source\\\":\\\"cccccccccccccccccccccccccccccccccccccccc\\\"},\\\"recipient\\\":{\\\"generation\\\":\\\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\\",\\\"nonce\\\":\\\"22222222-2222-4222-8222-222222222222\\\",\\\"pid\\\":123,\\\"starttime\\\":\\\"1234\\\"}},\\\"expiresAtMs\\\":1800000010000,\\\"installer\\\":{\\\"carrierDigest\\\":\\\"3333333333333333333333333333333333333333333333333333333333333333\\\",\\\"clientDigest\\\":\\\"2222222222222222222222222222222222222222222222222222222222222222\\\",\\\"gid\\\":21000,\\\"observerDigest\\\":\\\"4444444444444444444444444444444444444444444444444444444444444444\\\",\\\"pid\\\":321,\\\"starttime\\\":\\\"5678\\\",\\\"uid\\\":21000},\\\"version\\\":1}\",\"closure\":\"open\",\"company\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"epoch\":3,\"global\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"lineage\":{\"databaseEpoch\":1,\"reference\":\"synthetic-fresh-fork\"},\"phase\":\"consumed\"},\"leaseExpiresAtMs\":1800000020000,\"operation\":\"11111111-1111-4111-8111-111111111111\",\"pi\":null,\"sequence\":10,\"store\":null,\"type\":\"runtime-owner\",\"version\":1}"
+    },
+    {
+      "id": "request-runtime-serving-ready",
+      "producer": "rust",
+      "direction": "rust->ts",
+      "emitted": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"reference\":\"daemon-ref-0001\",\"sequence\":11,\"type\":\"runtime-serving-ready\",\"version\":1}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"reference\":\"daemon-ref-0001\",\"sequence\":11,\"type\":\"runtime-serving-ready\",\"version\":1}"
+    },
+    {
+      "id": "runtime-owner-runtime-serving-ready",
+      "producer": "ts",
+      "direction": "ts->rust",
+      "emitted": "{\"version\":1,\"type\":\"runtime-owner\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"sequence\":11,\"leaseExpiresAtMs\":1800000020000,\"current\":{\"bindingJson\":\"{\\\"barrierNonce\\\":\\\"33333333-3333-4333-8333-333333333333\\\",\\\"challenge\\\":{\\\"launch\\\":{\\\"epoch\\\":3,\\\"request\\\":{\\\"challenge\\\":\\\"11111111-1111-4111-8111-111111111111\\\",\\\"identity\\\":{\\\"backend\\\":\\\"native\\\",\\\"company\\\":\\\"synthetic\\\",\\\"generation\\\":1,\\\"imageLane\\\":\\\"baseline\\\",\\\"instance\\\":\\\"attempt1\\\",\\\"tier\\\":\\\"basic\\\"},\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"purpose\\\":\\\"fresh_start\\\"}},\\\"lineage\\\":{\\\"databaseEpoch\\\":1,\\\"reference\\\":\\\"synthetic-fresh-fork\\\"},\\\"pins\\\":{\\\"helper\\\":\\\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\\",\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"node\\\":\\\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\\",\\\"piGraph\\\":\\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\\",\\\"policy\\\":\\\"1111111111111111111111111111111111111111111111111111111111111111\\\",\\\"source\\\":\\\"cccccccccccccccccccccccccccccccccccccccc\\\"},\\\"recipient\\\":{\\\"generation\\\":\\\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\\",\\\"nonce\\\":\\\"22222222-2222-4222-8222-222222222222\\\",\\\"pid\\\":123,\\\"starttime\\\":\\\"1234\\\"}},\\\"expiresAtMs\\\":1800000010000,\\\"installer\\\":{\\\"carrierDigest\\\":\\\"3333333333333333333333333333333333333333333333333333333333333333\\\",\\\"clientDigest\\\":\\\"2222222222222222222222222222222222222222222222222222222222222222\\\",\\\"gid\\\":21000,\\\"observerDigest\\\":\\\"4444444444444444444444444444444444444444444444444444444444444444\\\",\\\"pid\\\":321,\\\"starttime\\\":\\\"5678\\\",\\\"uid\\\":21000},\\\"version\\\":1}\",\"phase\":\"consumed\",\"global\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"company\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"epoch\":3,\"lineage\":{\"reference\":\"synthetic-fresh-fork\",\"databaseEpoch\":1},\"closure\":\"open\"},\"store\":null,\"pi\":null}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"current\":{\"bindingJson\":\"{\\\"barrierNonce\\\":\\\"33333333-3333-4333-8333-333333333333\\\",\\\"challenge\\\":{\\\"launch\\\":{\\\"epoch\\\":3,\\\"request\\\":{\\\"challenge\\\":\\\"11111111-1111-4111-8111-111111111111\\\",\\\"identity\\\":{\\\"backend\\\":\\\"native\\\",\\\"company\\\":\\\"synthetic\\\",\\\"generation\\\":1,\\\"imageLane\\\":\\\"baseline\\\",\\\"instance\\\":\\\"attempt1\\\",\\\"tier\\\":\\\"basic\\\"},\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"purpose\\\":\\\"fresh_start\\\"}},\\\"lineage\\\":{\\\"databaseEpoch\\\":1,\\\"reference\\\":\\\"synthetic-fresh-fork\\\"},\\\"pins\\\":{\\\"helper\\\":\\\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\\",\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"node\\\":\\\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\\",\\\"piGraph\\\":\\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\\",\\\"policy\\\":\\\"1111111111111111111111111111111111111111111111111111111111111111\\\",\\\"source\\\":\\\"cccccccccccccccccccccccccccccccccccccccc\\\"},\\\"recipient\\\":{\\\"generation\\\":\\\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\\",\\\"nonce\\\":\\\"22222222-2222-4222-8222-222222222222\\\",\\\"pid\\\":123,\\\"starttime\\\":\\\"1234\\\"}},\\\"expiresAtMs\\\":1800000010000,\\\"installer\\\":{\\\"carrierDigest\\\":\\\"3333333333333333333333333333333333333333333333333333333333333333\\\",\\\"clientDigest\\\":\\\"2222222222222222222222222222222222222222222222222222222222222222\\\",\\\"gid\\\":21000,\\\"observerDigest\\\":\\\"4444444444444444444444444444444444444444444444444444444444444444\\\",\\\"pid\\\":321,\\\"starttime\\\":\\\"5678\\\",\\\"uid\\\":21000},\\\"version\\\":1}\",\"closure\":\"open\",\"company\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"epoch\":3,\"global\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"lineage\":{\"databaseEpoch\":1,\"reference\":\"synthetic-fresh-fork\"},\"phase\":\"consumed\"},\"leaseExpiresAtMs\":1800000020000,\"operation\":\"11111111-1111-4111-8111-111111111111\",\"pi\":null,\"sequence\":11,\"store\":null,\"type\":\"runtime-owner\",\"version\":1}"
+    },
+    {
+      "id": "request-task-event",
+      "producer": "rust",
+      "direction": "rust->ts",
+      "emitted": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"bytes\":\"aGVsbG8g8J-MmQ\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"part\":0,\"sequence\":12,\"task\":\"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\",\"type\":\"task-event\",\"version\":1}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"bytes\":\"aGVsbG8g8J-MmQ\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"part\":0,\"sequence\":12,\"task\":\"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\",\"type\":\"task-event\",\"version\":1}"
+    },
+    {
+      "id": "runtime-owner-task-event",
+      "producer": "ts",
+      "direction": "ts->rust",
+      "emitted": "{\"version\":1,\"type\":\"runtime-owner\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"sequence\":12,\"leaseExpiresAtMs\":1800000020000,\"current\":{\"bindingJson\":\"{\\\"barrierNonce\\\":\\\"33333333-3333-4333-8333-333333333333\\\",\\\"challenge\\\":{\\\"launch\\\":{\\\"epoch\\\":3,\\\"request\\\":{\\\"challenge\\\":\\\"11111111-1111-4111-8111-111111111111\\\",\\\"identity\\\":{\\\"backend\\\":\\\"native\\\",\\\"company\\\":\\\"synthetic\\\",\\\"generation\\\":1,\\\"imageLane\\\":\\\"baseline\\\",\\\"instance\\\":\\\"attempt1\\\",\\\"tier\\\":\\\"basic\\\"},\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"purpose\\\":\\\"fresh_start\\\"}},\\\"lineage\\\":{\\\"databaseEpoch\\\":1,\\\"reference\\\":\\\"synthetic-fresh-fork\\\"},\\\"pins\\\":{\\\"helper\\\":\\\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\\",\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"node\\\":\\\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\\",\\\"piGraph\\\":\\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\\",\\\"policy\\\":\\\"1111111111111111111111111111111111111111111111111111111111111111\\\",\\\"source\\\":\\\"cccccccccccccccccccccccccccccccccccccccc\\\"},\\\"recipient\\\":{\\\"generation\\\":\\\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\\",\\\"nonce\\\":\\\"22222222-2222-4222-8222-222222222222\\\",\\\"pid\\\":123,\\\"starttime\\\":\\\"1234\\\"}},\\\"expiresAtMs\\\":1800000010000,\\\"installer\\\":{\\\"carrierDigest\\\":\\\"3333333333333333333333333333333333333333333333333333333333333333\\\",\\\"clientDigest\\\":\\\"2222222222222222222222222222222222222222222222222222222222222222\\\",\\\"gid\\\":21000,\\\"observerDigest\\\":\\\"4444444444444444444444444444444444444444444444444444444444444444\\\",\\\"pid\\\":321,\\\"starttime\\\":\\\"5678\\\",\\\"uid\\\":21000},\\\"version\\\":1}\",\"phase\":\"consumed\",\"global\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"company\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"epoch\":3,\"lineage\":{\"reference\":\"synthetic-fresh-fork\",\"databaseEpoch\":1},\"closure\":\"open\"},\"store\":null,\"pi\":null,\"commands\":[{\"type\":\"task\",\"task\":\"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\",\"alias\":\"synthetic-alias\",\"model\":\"openai-codex/gpt-6.1-sol\",\"prompt\":\"合成 prompt 🌙 \\\"quoted\\\"\\nline\"}]}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"commands\":[{\"alias\":\"synthetic-alias\",\"model\":\"openai-codex/gpt-6.1-sol\",\"prompt\":\"合成 prompt 🌙 \\\"quoted\\\"\\nline\",\"task\":\"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\",\"type\":\"task\"}],\"current\":{\"bindingJson\":\"{\\\"barrierNonce\\\":\\\"33333333-3333-4333-8333-333333333333\\\",\\\"challenge\\\":{\\\"launch\\\":{\\\"epoch\\\":3,\\\"request\\\":{\\\"challenge\\\":\\\"11111111-1111-4111-8111-111111111111\\\",\\\"identity\\\":{\\\"backend\\\":\\\"native\\\",\\\"company\\\":\\\"synthetic\\\",\\\"generation\\\":1,\\\"imageLane\\\":\\\"baseline\\\",\\\"instance\\\":\\\"attempt1\\\",\\\"tier\\\":\\\"basic\\\"},\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"purpose\\\":\\\"fresh_start\\\"}},\\\"lineage\\\":{\\\"databaseEpoch\\\":1,\\\"reference\\\":\\\"synthetic-fresh-fork\\\"},\\\"pins\\\":{\\\"helper\\\":\\\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\\",\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"node\\\":\\\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\\",\\\"piGraph\\\":\\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\\",\\\"policy\\\":\\\"1111111111111111111111111111111111111111111111111111111111111111\\\",\\\"source\\\":\\\"cccccccccccccccccccccccccccccccccccccccc\\\"},\\\"recipient\\\":{\\\"generation\\\":\\\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\\",\\\"nonce\\\":\\\"22222222-2222-4222-8222-222222222222\\\",\\\"pid\\\":123,\\\"starttime\\\":\\\"1234\\\"}},\\\"expiresAtMs\\\":1800000010000,\\\"installer\\\":{\\\"carrierDigest\\\":\\\"3333333333333333333333333333333333333333333333333333333333333333\\\",\\\"clientDigest\\\":\\\"2222222222222222222222222222222222222222222222222222222222222222\\\",\\\"gid\\\":21000,\\\"observerDigest\\\":\\\"4444444444444444444444444444444444444444444444444444444444444444\\\",\\\"pid\\\":321,\\\"starttime\\\":\\\"5678\\\",\\\"uid\\\":21000},\\\"version\\\":1}\",\"closure\":\"open\",\"company\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"epoch\":3,\"global\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"lineage\":{\"databaseEpoch\":1,\"reference\":\"synthetic-fresh-fork\"},\"phase\":\"consumed\"},\"leaseExpiresAtMs\":1800000020000,\"operation\":\"11111111-1111-4111-8111-111111111111\",\"pi\":null,\"sequence\":12,\"store\":null,\"type\":\"runtime-owner\",\"version\":1}"
+    },
+    {
+      "id": "request-task-retired",
+      "producer": "rust",
+      "direction": "rust->ts",
+      "emitted": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"sequence\":13,\"task\":\"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\",\"type\":\"task-retired\",\"version\":1}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"sequence\":13,\"task\":\"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\",\"type\":\"task-retired\",\"version\":1}"
+    },
+    {
+      "id": "runtime-owner-task-retired",
+      "producer": "ts",
+      "direction": "ts->rust",
+      "emitted": "{\"version\":1,\"type\":\"runtime-owner\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"sequence\":13,\"leaseExpiresAtMs\":1800000020000,\"current\":{\"bindingJson\":\"{\\\"barrierNonce\\\":\\\"33333333-3333-4333-8333-333333333333\\\",\\\"challenge\\\":{\\\"launch\\\":{\\\"epoch\\\":3,\\\"request\\\":{\\\"challenge\\\":\\\"11111111-1111-4111-8111-111111111111\\\",\\\"identity\\\":{\\\"backend\\\":\\\"native\\\",\\\"company\\\":\\\"synthetic\\\",\\\"generation\\\":1,\\\"imageLane\\\":\\\"baseline\\\",\\\"instance\\\":\\\"attempt1\\\",\\\"tier\\\":\\\"basic\\\"},\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"purpose\\\":\\\"fresh_start\\\"}},\\\"lineage\\\":{\\\"databaseEpoch\\\":1,\\\"reference\\\":\\\"synthetic-fresh-fork\\\"},\\\"pins\\\":{\\\"helper\\\":\\\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\\",\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"node\\\":\\\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\\",\\\"piGraph\\\":\\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\\",\\\"policy\\\":\\\"1111111111111111111111111111111111111111111111111111111111111111\\\",\\\"source\\\":\\\"cccccccccccccccccccccccccccccccccccccccc\\\"},\\\"recipient\\\":{\\\"generation\\\":\\\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\\",\\\"nonce\\\":\\\"22222222-2222-4222-8222-222222222222\\\",\\\"pid\\\":123,\\\"starttime\\\":\\\"1234\\\"}},\\\"expiresAtMs\\\":1800000010000,\\\"installer\\\":{\\\"carrierDigest\\\":\\\"3333333333333333333333333333333333333333333333333333333333333333\\\",\\\"clientDigest\\\":\\\"2222222222222222222222222222222222222222222222222222222222222222\\\",\\\"gid\\\":21000,\\\"observerDigest\\\":\\\"4444444444444444444444444444444444444444444444444444444444444444\\\",\\\"pid\\\":321,\\\"starttime\\\":\\\"5678\\\",\\\"uid\\\":21000},\\\"version\\\":1}\",\"phase\":\"consumed\",\"global\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"company\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"epoch\":3,\"lineage\":{\"reference\":\"synthetic-fresh-fork\",\"databaseEpoch\":1},\"closure\":\"open\"},\"store\":null,\"pi\":null}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"current\":{\"bindingJson\":\"{\\\"barrierNonce\\\":\\\"33333333-3333-4333-8333-333333333333\\\",\\\"challenge\\\":{\\\"launch\\\":{\\\"epoch\\\":3,\\\"request\\\":{\\\"challenge\\\":\\\"11111111-1111-4111-8111-111111111111\\\",\\\"identity\\\":{\\\"backend\\\":\\\"native\\\",\\\"company\\\":\\\"synthetic\\\",\\\"generation\\\":1,\\\"imageLane\\\":\\\"baseline\\\",\\\"instance\\\":\\\"attempt1\\\",\\\"tier\\\":\\\"basic\\\"},\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"purpose\\\":\\\"fresh_start\\\"}},\\\"lineage\\\":{\\\"databaseEpoch\\\":1,\\\"reference\\\":\\\"synthetic-fresh-fork\\\"},\\\"pins\\\":{\\\"helper\\\":\\\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\\",\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"node\\\":\\\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\\",\\\"piGraph\\\":\\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\\",\\\"policy\\\":\\\"1111111111111111111111111111111111111111111111111111111111111111\\\",\\\"source\\\":\\\"cccccccccccccccccccccccccccccccccccccccc\\\"},\\\"recipient\\\":{\\\"generation\\\":\\\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\\",\\\"nonce\\\":\\\"22222222-2222-4222-8222-222222222222\\\",\\\"pid\\\":123,\\\"starttime\\\":\\\"1234\\\"}},\\\"expiresAtMs\\\":1800000010000,\\\"installer\\\":{\\\"carrierDigest\\\":\\\"3333333333333333333333333333333333333333333333333333333333333333\\\",\\\"clientDigest\\\":\\\"2222222222222222222222222222222222222222222222222222222222222222\\\",\\\"gid\\\":21000,\\\"observerDigest\\\":\\\"4444444444444444444444444444444444444444444444444444444444444444\\\",\\\"pid\\\":321,\\\"starttime\\\":\\\"5678\\\",\\\"uid\\\":21000},\\\"version\\\":1}\",\"closure\":\"open\",\"company\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"epoch\":3,\"global\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"lineage\":{\"databaseEpoch\":1,\"reference\":\"synthetic-fresh-fork\"},\"phase\":\"consumed\"},\"leaseExpiresAtMs\":1800000020000,\"operation\":\"11111111-1111-4111-8111-111111111111\",\"pi\":null,\"sequence\":13,\"store\":null,\"type\":\"runtime-owner\",\"version\":1}"
+    },
+    {
+      "id": "runtime-readback-current",
+      "producer": "ts",
+      "direction": "ts->rust",
+      "emitted": "{\"version\":1,\"type\":\"runtime-readback\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"sequence\":13,\"query\":{\"type\":\"current\"}}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"query\":{\"type\":\"current\"},\"sequence\":13,\"type\":\"runtime-readback\",\"version\":1}"
+    },
+    {
+      "id": "runtime-readback-result-current",
+      "producer": "rust",
+      "direction": "rust->ts",
+      "emitted": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"data\":{\"reference\":\"daemon-ref-0001\",\"revision\":1},\"operation\":\"11111111-1111-4111-8111-111111111111\",\"sequence\":13,\"type\":\"runtime-readback-result\",\"version\":1}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"data\":{\"reference\":\"daemon-ref-0001\",\"revision\":1},\"operation\":\"11111111-1111-4111-8111-111111111111\",\"sequence\":13,\"type\":\"runtime-readback-result\",\"version\":1}"
+    },
+    {
+      "id": "runtime-readback-opening",
+      "producer": "ts",
+      "direction": "ts->rust",
+      "emitted": "{\"version\":1,\"type\":\"runtime-readback\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"sequence\":13,\"query\":{\"type\":\"opening\"}}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"query\":{\"type\":\"opening\"},\"sequence\":13,\"type\":\"runtime-readback\",\"version\":1}"
+    },
+    {
+      "id": "runtime-readback-result-opening",
+      "producer": "rust",
+      "direction": "rust->ts",
+      "emitted": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"data\":{\"path\":\"/srv/cadence/protected/store/cadence.db\",\"purpose\":\"init\",\"reference\":\"daemon-ref-0001\",\"revision\":1},\"operation\":\"11111111-1111-4111-8111-111111111111\",\"sequence\":13,\"type\":\"runtime-readback-result\",\"version\":1}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"data\":{\"path\":\"/srv/cadence/protected/store/cadence.db\",\"purpose\":\"init\",\"reference\":\"daemon-ref-0001\",\"revision\":1},\"operation\":\"11111111-1111-4111-8111-111111111111\",\"sequence\":13,\"type\":\"runtime-readback-result\",\"version\":1}"
+    },
+    {
+      "id": "runtime-readback-database-current",
+      "producer": "ts",
+      "direction": "ts->rust",
+      "emitted": "{\"version\":1,\"type\":\"runtime-readback\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"sequence\":13,\"query\":{\"type\":\"database-current\",\"reference\":\"store-ref-0001\"}}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"query\":{\"reference\":\"store-ref-0001\",\"type\":\"database-current\"},\"sequence\":13,\"type\":\"runtime-readback\",\"version\":1}"
+    },
+    {
+      "id": "runtime-readback-result-database-current",
+      "producer": "rust",
+      "direction": "rust->ts",
+      "emitted": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"data\":{\"facts\":{\"purpose\":\"init\",\"reference\":\"store-ref-0001\"},\"phase\":\"consumed\",\"reference\":\"daemon-ref-0001\",\"revision\":1,\"version\":1},\"operation\":\"11111111-1111-4111-8111-111111111111\",\"sequence\":13,\"type\":\"runtime-readback-result\",\"version\":1}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"data\":{\"facts\":{\"purpose\":\"init\",\"reference\":\"store-ref-0001\"},\"phase\":\"consumed\",\"reference\":\"daemon-ref-0001\",\"revision\":1,\"version\":1},\"operation\":\"11111111-1111-4111-8111-111111111111\",\"sequence\":13,\"type\":\"runtime-readback-result\",\"version\":1}"
+    },
+    {
+      "id": "runtime-readback-task",
+      "producer": "ts",
+      "direction": "ts->rust",
+      "emitted": "{\"version\":1,\"type\":\"runtime-readback\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"sequence\":13,\"query\":{\"type\":\"task\",\"task\":\"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\"}}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"query\":{\"task\":\"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\",\"type\":\"task\"},\"sequence\":13,\"type\":\"runtime-readback\",\"version\":1}"
+    },
+    {
+      "id": "runtime-readback-result-task",
+      "producer": "rust",
+      "direction": "rust->ts",
+      "emitted": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"data\":{\"alias\":\"synthetic-alias\",\"model\":\"openai-codex/gpt-6.1-sol\",\"parts\":1,\"phase\":\"retired\",\"task\":\"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\",\"version\":1},\"operation\":\"11111111-1111-4111-8111-111111111111\",\"sequence\":13,\"type\":\"runtime-readback-result\",\"version\":1}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"data\":{\"alias\":\"synthetic-alias\",\"model\":\"openai-codex/gpt-6.1-sol\",\"parts\":1,\"phase\":\"retired\",\"task\":\"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\",\"version\":1},\"operation\":\"11111111-1111-4111-8111-111111111111\",\"sequence\":13,\"type\":\"runtime-readback-result\",\"version\":1}"
+    },
+    {
+      "id": "runtime-readback-task-retired",
+      "producer": "ts",
+      "direction": "ts->rust",
+      "emitted": "{\"version\":1,\"type\":\"runtime-readback\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"sequence\":13,\"query\":{\"type\":\"task-retired\",\"task\":\"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\"}}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"query\":{\"task\":\"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\",\"type\":\"task-retired\"},\"sequence\":13,\"type\":\"runtime-readback\",\"version\":1}"
+    },
+    {
+      "id": "runtime-readback-result-task-retired",
+      "producer": "rust",
+      "direction": "rust->ts",
+      "emitted": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"data\":{\"databaseReference\":\"store-ref-0001\",\"phase\":\"retired\",\"reference\":\"daemon-ref-0001\",\"revision\":1,\"task\":\"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\"},\"operation\":\"11111111-1111-4111-8111-111111111111\",\"sequence\":13,\"type\":\"runtime-readback-result\",\"version\":1}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"data\":{\"databaseReference\":\"store-ref-0001\",\"phase\":\"retired\",\"reference\":\"daemon-ref-0001\",\"revision\":1,\"task\":\"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\"},\"operation\":\"11111111-1111-4111-8111-111111111111\",\"sequence\":13,\"type\":\"runtime-readback-result\",\"version\":1}"
+    },
+    {
+      "id": "runtime-readback-serving-current",
+      "producer": "ts",
+      "direction": "ts->rust",
+      "emitted": "{\"version\":1,\"type\":\"runtime-readback\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"sequence\":13,\"query\":{\"type\":\"serving-current\",\"reference\":\"store-ref-0001\"}}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"query\":{\"reference\":\"store-ref-0001\",\"type\":\"serving-current\"},\"sequence\":13,\"type\":\"runtime-readback\",\"version\":1}"
+    },
+    {
+      "id": "runtime-readback-result-serving-current",
+      "producer": "rust",
+      "direction": "rust->ts",
+      "emitted": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"data\":{\"databaseReference\":\"store-ref-0001\",\"reference\":\"daemon-ref-0001\",\"revision\":1},\"operation\":\"11111111-1111-4111-8111-111111111111\",\"sequence\":13,\"type\":\"runtime-readback-result\",\"version\":1}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"data\":{\"databaseReference\":\"store-ref-0001\",\"reference\":\"daemon-ref-0001\",\"revision\":1},\"operation\":\"11111111-1111-4111-8111-111111111111\",\"sequence\":13,\"type\":\"runtime-readback-result\",\"version\":1}"
+    },
+    {
+      "id": "runtime-readback-maintenance",
+      "producer": "ts",
+      "direction": "ts->rust",
+      "emitted": "{\"version\":1,\"type\":\"runtime-readback\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"sequence\":13,\"query\":{\"type\":\"maintenance\",\"purpose\":\"close\",\"attempt\":\"e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1\"}}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"query\":{\"attempt\":\"e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1\",\"purpose\":\"close\",\"type\":\"maintenance\"},\"sequence\":13,\"type\":\"runtime-readback\",\"version\":1}"
+    },
+    {
+      "id": "runtime-readback-result-maintenance",
+      "producer": "rust",
+      "direction": "rust->ts",
+      "emitted": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"data\":{\"attempt\":\"e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1\",\"deadlineMs\":1800000005000,\"purpose\":\"close\"},\"operation\":\"11111111-1111-4111-8111-111111111111\",\"sequence\":13,\"type\":\"runtime-readback-result\",\"version\":1}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"data\":{\"attempt\":\"e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1\",\"deadlineMs\":1800000005000,\"purpose\":\"close\"},\"operation\":\"11111111-1111-4111-8111-111111111111\",\"sequence\":13,\"type\":\"runtime-readback-result\",\"version\":1}"
+    },
+    {
+      "id": "runtime-readback-witness",
+      "producer": "ts",
+      "direction": "ts->rust",
+      "emitted": "{\"version\":1,\"type\":\"runtime-readback\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"sequence\":13,\"query\":{\"type\":\"witness\",\"attempt\":\"e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1\"}}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"query\":{\"attempt\":\"e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1\",\"type\":\"witness\"},\"sequence\":13,\"type\":\"runtime-readback\",\"version\":1}"
+    },
+    {
+      "id": "runtime-readback-result-witness",
+      "producer": "rust",
+      "direction": "rust->ts",
+      "emitted": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"data\":{\"attempt\":\"e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1\",\"sha256\":\"8888888888888888888888888888888888888888888888888888888888888888\",\"size\":4096},\"operation\":\"11111111-1111-4111-8111-111111111111\",\"sequence\":13,\"type\":\"runtime-readback-result\",\"version\":1}",
+      "canonical": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"data\":{\"attempt\":\"e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1\",\"sha256\":\"8888888888888888888888888888888888888888888888888888888888888888\",\"size\":4096},\"operation\":\"11111111-1111-4111-8111-111111111111\",\"sequence\":13,\"type\":\"runtime-readback-result\",\"version\":1}"
+    }
+  ],
+  "negativeFrames": [
+    {
+      "id": "configure-extra-field",
+      "consumer": "rust",
+      "emitted": "{\"extra\":1,\"version\":1,\"type\":\"configure\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"expiresAtMs\":1800000010000,\"launch\":{\"epoch\":3,\"request\":{\"identity\":{\"company\":\"synthetic\",\"instance\":\"attempt1\",\"backend\":\"native\",\"tier\":\"basic\",\"generation\":1,\"imageLane\":\"baseline\"},\"purpose\":\"fresh_start\",\"challenge\":\"11111111-1111-4111-8111-111111111111\",\"image\":\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}},\"imageAttestation\":\"@@IMAGE_ATTESTATION@@\",\"lineage\":{\"reference\":\"synthetic-fresh-fork\",\"databaseEpoch\":1}}"
+    },
+    {
+      "id": "release-extra-field",
+      "consumer": "rust",
+      "emitted": "{\"extra\":1,\"version\":1,\"type\":\"release\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"receipt\":\"synthetic-receipt-test-only\",\"grant\":\"synthetic-grant-test-only\"}"
+    },
+    {
+      "id": "owner-unknown-current-null",
+      "consumer": "rust",
+      "emitted": "{\"version\":1,\"type\":\"owner\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"sequence\":1,\"outcome\":\"unknown\",\"current\":null}"
+    },
+    {
+      "id": "runtime-owner-extra-field",
+      "consumer": "rust",
+      "emitted": "{\"extra\":1,\"version\":1,\"type\":\"runtime-owner\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"sequence\":1,\"leaseExpiresAtMs\":1800000020000,\"current\":{\"bindingJson\":\"{\\\"barrierNonce\\\":\\\"33333333-3333-4333-8333-333333333333\\\",\\\"challenge\\\":{\\\"launch\\\":{\\\"epoch\\\":3,\\\"request\\\":{\\\"challenge\\\":\\\"11111111-1111-4111-8111-111111111111\\\",\\\"identity\\\":{\\\"backend\\\":\\\"native\\\",\\\"company\\\":\\\"synthetic\\\",\\\"generation\\\":1,\\\"imageLane\\\":\\\"baseline\\\",\\\"instance\\\":\\\"attempt1\\\",\\\"tier\\\":\\\"basic\\\"},\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"purpose\\\":\\\"fresh_start\\\"}},\\\"lineage\\\":{\\\"databaseEpoch\\\":1,\\\"reference\\\":\\\"synthetic-fresh-fork\\\"},\\\"pins\\\":{\\\"helper\\\":\\\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\\",\\\"image\\\":\\\"registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"node\\\":\\\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\\\",\\\"piGraph\\\":\\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\\",\\\"policy\\\":\\\"1111111111111111111111111111111111111111111111111111111111111111\\\",\\\"source\\\":\\\"cccccccccccccccccccccccccccccccccccccccc\\\"},\\\"recipient\\\":{\\\"generation\\\":\\\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\\",\\\"nonce\\\":\\\"22222222-2222-4222-8222-222222222222\\\",\\\"pid\\\":123,\\\"starttime\\\":\\\"1234\\\"}},\\\"expiresAtMs\\\":1800000010000,\\\"installer\\\":{\\\"carrierDigest\\\":\\\"3333333333333333333333333333333333333333333333333333333333333333\\\",\\\"clientDigest\\\":\\\"2222222222222222222222222222222222222222222222222222222222222222\\\",\\\"gid\\\":21000,\\\"observerDigest\\\":\\\"4444444444444444444444444444444444444444444444444444444444444444\\\",\\\"pid\\\":321,\\\"starttime\\\":\\\"5678\\\",\\\"uid\\\":21000},\\\"version\\\":1}\",\"phase\":\"consumed\",\"global\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"company\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"epoch\":3,\"lineage\":{\"reference\":\"synthetic-fresh-fork\",\"databaseEpoch\":1},\"closure\":\"open\"},\"store\":null,\"pi\":null}"
+    },
+    {
+      "id": "constructed-extra-field",
+      "consumer": "ts",
+      "emitted": "{\"extra\":1,\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"installer\":{\"carrierDigest\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"clientDigest\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"gid\":21000,\"observerDigest\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"pid\":321,\"starttime\":\"5678\",\"uid\":21000},\"operation\":\"11111111-1111-4111-8111-111111111111\",\"recipient\":{\"generation\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"nonce\":\"22222222-2222-4222-8222-222222222222\",\"pid\":123,\"starttime\":\"1234\"},\"type\":\"constructed\",\"version\":1}"
+    },
+    {
+      "id": "owner-request-replayed-sequence",
+      "consumer": "ts",
+      "emitted": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"sequence\":2,\"type\":\"prepared\",\"version\":1}"
+    },
+    {
+      "id": "ack-wrong-recipient-generation",
+      "consumer": "ts",
+      "emitted": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"recipientGeneration\":\"00000000000000000000000000000001\",\"type\":\"ack\",\"version\":1}"
+    },
+    {
+      "id": "runtime-request-bad-purpose",
+      "consumer": "ts",
+      "emitted": "{\"attempt\":\"e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1\",\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"operation\":\"11111111-1111-4111-8111-111111111111\",\"purpose\":\"bogus\",\"sequence\":1,\"type\":\"store-acquire\",\"version\":1}"
+    },
+    {
+      "id": "readback-result-wrong-sequence",
+      "consumer": "ts",
+      "emitted": "{\"barrierNonce\":\"33333333-3333-4333-8333-333333333333\",\"data\":{\"reference\":\"daemon-ref-0001\",\"revision\":1},\"operation\":\"11111111-1111-4111-8111-111111111111\",\"sequence\":99,\"type\":\"runtime-readback-result\",\"version\":1}"
+    }
+  ],
+  "readbacks": [
+    {
+      "query": {
+        "type": "current"
+      },
+      "data": {
+        "reference": "daemon-ref-0001",
+        "revision": 1
+      }
+    },
+    {
+      "query": {
+        "type": "opening"
+      },
+      "data": {
+        "reference": "daemon-ref-0001",
+        "revision": 1,
+        "purpose": "init",
+        "path": "/srv/cadence/protected/store/cadence.db"
+      }
+    },
+    {
+      "query": {
+        "type": "database-current",
+        "reference": "store-ref-0001"
+      },
+      "data": {
+        "version": 1,
+        "reference": "daemon-ref-0001",
+        "revision": 1,
+        "facts": {
+          "purpose": "init",
+          "reference": "store-ref-0001"
+        },
+        "phase": "consumed"
+      }
+    },
+    {
+      "query": {
+        "type": "task",
+        "task": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+      },
+      "data": {
+        "version": 1,
+        "task": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+        "alias": "synthetic-alias",
+        "model": "openai-codex/gpt-6.1-sol",
+        "phase": "retired",
+        "parts": 1
+      }
+    },
+    {
+      "query": {
+        "type": "task-retired",
+        "task": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+      },
+      "data": {
+        "reference": "daemon-ref-0001",
+        "revision": 1,
+        "databaseReference": "store-ref-0001",
+        "task": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+        "phase": "retired"
+      }
+    },
+    {
+      "query": {
+        "type": "serving-current",
+        "reference": "store-ref-0001"
+      },
+      "data": {
+        "reference": "daemon-ref-0001",
+        "revision": 1,
+        "databaseReference": "store-ref-0001"
+      }
+    },
+    {
+      "query": {
+        "type": "maintenance",
+        "purpose": "close",
+        "attempt": "e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1"
+      },
+      "data": {
+        "purpose": "close",
+        "attempt": "e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1",
+        "deadlineMs": 1800000005000
+      }
+    },
+    {
+      "query": {
+        "type": "witness",
+        "attempt": "e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1"
+      },
+      "data": {
+        "attempt": "e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1",
+        "size": 4096,
+        "sha256": "8888888888888888888888888888888888888888888888888888888888888888"
+      }
+    }
+  ]
+}

@@ -683,3 +683,8 @@ pub(super) fn enter(deadline: Deadline) -> Result<()> {
         super::layout::Layout::acquire(Deadline(Instant::now() + Duration::from_secs(10)))?;
     super::dispatcher::run(layout)
 }
+
+// Cross-language wire vectors shared with AgenticOS PR349 (test-only wiring).
+#[cfg(test)]
+#[path = "native_wire_vectors.rs"]
+mod native_wire_vectors;
