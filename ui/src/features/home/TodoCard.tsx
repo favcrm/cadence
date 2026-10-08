@@ -145,7 +145,10 @@ export default function TodoCard({
   const block = useWriteBlock(readOnly);
   const spec = kindSpec(need);
   const issueTitle = useIssueTitle(need);
-  const title = spec.title(need, { issueTitle });
+  // The kind table's template is the fallback; "Fix it" always sends the
+  // template, never the row's agent-authored short_title as an instruction.
+  const template = spec.title(need, { issueTitle });
+  const title = need.shortTitle ?? template;
   const [open, setOpen] = useState(defaultOpen && spec.place === "inline");
   const [menu, setMenu] = useState(false);
   const [details, setDetails] = useState(false);
@@ -195,7 +198,7 @@ export default function TodoCard({
     if (sending) return;
     setSending(true);
     setError(null);
-    void sendToMaster(fixPrompt(need, title), undefined, needRefs(need)).then((r) => {
+    void sendToMaster(fixPrompt(need, template), undefined, needRefs(need)).then((r) => {
       setSending(false);
       if (r.ok) {
         setSent(true);

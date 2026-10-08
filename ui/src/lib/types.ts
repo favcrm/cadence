@@ -368,6 +368,10 @@ export interface ProjectContext {
 export interface NeedsMe {
   kind: string;
   title: string;
+  /** CAD-1219: optional plain-words card title (about 50 characters) and
+   *  one-sentence reason. Display text only; older rows omit them. */
+  short_title?: string;
+  why?: string;
   /** Seconds in this state. */
   age: number;
   project: string;
