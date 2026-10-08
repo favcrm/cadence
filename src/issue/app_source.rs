@@ -358,7 +358,11 @@ pub(crate) fn ls_remote(tmp: &Path, url: &str, git_ref: &str) -> Result<String> 
     let out = git_step(tmp, "ls-remote", |cmd| {
         cmd.arg("ls-remote").arg("--").arg(url).arg(git_ref);
     })?;
-    let text = String::from_utf8_lossy(&out.stdout);
+    pick_ref(&String::from_utf8_lossy(&out.stdout), git_ref)
+}
+
+/// Choose the commit for exactly `git_ref` from `ls-remote` output.
+fn pick_ref(text: &str, git_ref: &str) -> Result<String> {
     // `ls-remote <pattern>` matches any ref ENDING in the pattern
     // (`refs/heads/x/main` for `main`), so pick by exact name: the ref as
     // typed, `refs/heads/<ref>`, `refs/tags/<ref>` or its peeled `^{}`.
@@ -374,7 +378,9 @@ pub(crate) fn ls_remote(tmp: &Path, url: &str, git_ref: &str) -> Result<String> 
         }
         let slot = if name == format!("refs/tags/{git_ref}^{{}}") {
             &mut peeled
-        } else if name == format!("refs/tags/{git_ref}") || name == git_ref && git_ref.starts_with("refs/tags/") {
+        } else if name == format!("refs/tags/{git_ref}")
+            || name == git_ref && git_ref.starts_with("refs/tags/")
+        {
             &mut tag
         } else if name == "HEAD" && git_ref == "HEAD"
             || name == format!("refs/heads/{git_ref}")
@@ -859,4 +865,32 @@ fn snapshot_dir(dir: &File) -> Result<BTreeMap<String, String>> {
         }
     }
     Ok(files)
+}
+
+#[cfg(test)]
+mod ls_remote_exact {
+    //! CAD-1209: `ls-remote <pattern>` matches any ref ENDING in the
+    //! pattern; the resolved commit must come from the exact ref named.
+    use super::pick_ref;
+
+    const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[test]
+    fn a_suffix_match_never_stands_in_for_the_named_ref() {
+        let text = format!("{A}\trefs/heads/feature/main\n");
+        assert!(pick_ref(&text, "main").is_err());
+        assert_eq!(pick_ref(&text, "feature/main").unwrap(), A);
+        let both = format!("{A}\trefs/heads/feature/main\n{B}\trefs/heads/main\n");
+        assert_eq!(pick_ref(&both, "main").unwrap(), B);
+    }
+
+    #[test]
+    fn tags_peel_and_an_ambiguous_name_is_refused() {
+        let tag = format!("{A}\trefs/tags/v1\n{B}\trefs/tags/v1^{{}}\n");
+        assert_eq!(pick_ref(&tag, "v1").unwrap(), B);
+        let clash = format!("{A}\trefs/heads/v1\n{B}\trefs/tags/v1\n");
+        assert!(pick_ref(&clash, "v1").is_err());
+        assert_eq!(pick_ref(&format!("{A}\tHEAD\n"), "HEAD").unwrap(), A);
+    }
 }

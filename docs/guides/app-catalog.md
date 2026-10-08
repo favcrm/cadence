@@ -250,7 +250,7 @@ operator's. Agents are refused on every one.
 
 | Route | Who | Purpose |
 | --- | --- | --- |
-| `GET /api/app-catalog`, `/api/app-catalog/<id>` | operator, member | Built-in catalog rows with install state (`available`, `installed`, `off`, `removed`). Members get no `digest`, `request_count` or `update_available`. |
+| `GET /api/app-catalog`, `/api/app-catalog/<id>` | operator, member | Built-in catalog rows with install state (`available`, `installed`, `off`; a soft-removed app stays `available` with `removed: true`, its `install_id` and `restorable`). Members get no `digest`, `request_count` or `update_available`. |
 | `POST /api/app-catalog/install` | operator | Install a built-in: `{catalog_id, expected_digest}`; the digest is required. |
 | `POST /api/app-catalog/git-check` | operator | Check a public https Git repository: `{url, git_ref?, dir?}`. |
 | `POST /api/app-catalog/request` | member | Ask the operator to install a built-in. |

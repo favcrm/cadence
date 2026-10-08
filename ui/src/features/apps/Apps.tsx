@@ -9,7 +9,8 @@ import { ResourceGate } from "../../ui/ResourceStatus";
 import "./apps.css";
 import Link from "../../ui/Link";
 import Button from "../../ui/Button";
-import { appExplorer, type HomeInstallation, type FavoritesPayload } from "../workspace-apps/workspaceApps";
+import { appExplorer, notifyAppsChanged, type HomeInstallation, type FavoritesPayload } from "../workspace-apps/workspaceApps";
+import { appErrorCopy, appLoadErrorCopy } from "../explorer/appErrors";
 import type { Viewer } from "../projects/work";
 import { AppGlyph } from "../explorer/shared";
 import "../explorer/explorer.css";
@@ -42,7 +43,8 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
   const [pinned, setPinned] = useState<FavoritesPayload | null>(null);
   useEffect(() => setPinned(null), [favLoad.data]);
   const favs = pinned ?? favLoad.data;
-  const loadError = homeLoad.error ?? favLoad.error;
+  const rawLoadError = homeLoad.error ?? favLoad.error;
+  const loadError = rawLoadError === null ? null : appLoadErrorCopy(rawLoadError, "Your apps didn't load.");
   const retrying = homeLoad.retrying || favLoad.retrying;
   const retryAll = () => { setActionError(null); setRevision((r) => r + 1); };
 
@@ -98,8 +100,8 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
   const restore = (id: string) => {
     setBusy(id);
     void appExplorer.restore(id)
-      .then(() => setRevision((r) => r + 1))
-      .catch((e: unknown) => setActionError(e instanceof Error ? e.message : "Restore was refused"))
+      .then(() => { setRevision((r) => r + 1); notifyAppsChanged(); })
+      .catch((e: unknown) => setActionError(appErrorCopy(e, "Restore didn't finish. Try again in a moment.")))
       .finally(() => setBusy(null));
   };
 
@@ -166,14 +168,16 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
             {favorites.length > 0 ? (
               <div className="favs">
                 {favorites.map((h) => (
-                  <Link key={h.install_id} href={`/app-installations/${h.install_id}`} className="card fav"
-                    onClick={() => opened(h.install_id)} aria-label={`Open ${h.title}`}>
-                    <AppGlyph name={h.name} icon={h.icon} />
-                    <span className="nm">{h.title}</span>
-                    <span className="ln">{h.tagline}</span>
+                  <div key={h.install_id} className="card fav">
+                    <Link href={`/app-installations/${h.install_id}`} className="open"
+                      onClick={() => opened(h.install_id)} aria-label={`Open ${h.title}`}>
+                      <AppGlyph name={h.name} icon={h.icon} />
+                      <span className="nm">{h.title}</span>
+                      <span className="ln">{h.tagline}</span>
+                    </Link>
                     <button className="star pinned absolute top-2 right-2" aria-label={`Unpin ${h.title}`}
-                      onClick={(e) => { e.preventDefault(); e.stopPropagation(); pin(h.install_id); }}>★</button>
-                  </Link>
+                      onClick={() => pin(h.install_id)}>★</button>
+                  </div>
                 ))}
               </div>
             ) : favs === null ? (
@@ -192,8 +196,8 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
                 <h2>Installed</h2>
                 <span className="chip">{live.length}</span>
                 <span className="grow" />
-                <input className="field" style={{ width: "min(220px,100%)" }} placeholder="Search your apps" value={q} onChange={(e) => setQ(e.target.value)} aria-label="Search installed apps" />
-                <select className="field" style={{ width: "auto" }} value={sort} onChange={(e) => setSort(e.target.value as typeof sort)} aria-label="Sort">
+                <input className="field search" placeholder="Search your apps" value={q} onChange={(e) => setQ(e.target.value)} aria-label="Search installed apps" />
+                <select className="field sort" value={sort} onChange={(e) => setSort(e.target.value as typeof sort)} aria-label="Sort">
                   <option value="recent">Recently used</option>
                   <option value="name">Name</option>
                   <option value="attention">Needs attention first</option>
@@ -208,26 +212,28 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
                   {items.map((h) => {
                     const pinned = favs?.favorites.includes(h.install_id) ?? false;
                     return (
-                      <Link key={h.install_id} className="card itile" href={`/app-installations/${h.install_id}`}
-                        onClick={() => opened(h.install_id)} aria-label={`Open ${h.title}`}>
-                        <AppGlyph name={h.name} icon={h.icon} size="sm" />
-                        <div className="min-w-0 flex-1">
-                          <div className="nm">{h.title}</div>
-                          <div className="ln">{h.tagline}</div>
-                          {h.project && <div className="ln text-ink-500">Project: {h.project}</div>}
-                          {h.attention.state !== "ok" && (
-                            <div className="mt-1"><span className={`chip ${h.attention.state === "update" ? "info" : h.attention.state === "off" ? "" : "warn"}`}>
-                              {h.attention.state === "update" ? "Update" : h.attention.state === "off" ? "Access off" : h.attention.state === "setup" ? "Finish setup" : "Needs attention"}
-                            </span></div>
-                          )}
-                        </div>
+                      <div key={h.install_id} className="card itile">
+                        <Link className="open" href={`/app-installations/${h.install_id}`}
+                          onClick={() => opened(h.install_id)} aria-label={`Open ${h.title}`}>
+                          <AppGlyph name={h.name} icon={h.icon} size="sm" />
+                          <div className="min-w-0 flex-1">
+                            <div className="nm">{h.title}</div>
+                            <div className="ln">{h.tagline}</div>
+                            {h.project && <div className="ln text-ink-500">Project: {h.project}</div>}
+                            {h.attention.state !== "ok" && (
+                              <div className="mt-1"><span className={`chip ${h.attention.state === "update" ? "info" : h.attention.state === "off" ? "" : "warn"}`}>
+                                {h.attention.state === "update" ? "Update" : h.attention.state === "off" ? "Access off" : h.attention.state === "setup" ? "Finish setup" : "Needs attention"}
+                              </span></div>
+                            )}
+                          </div>
+                        </Link>
                         <div className="acts">
                           <button className={`star ${pinned ? "pinned" : ""}`} aria-pressed={pinned}
                             aria-label={`${pinned ? "Unpin" : "Pin"} ${h.title}`}
-                            onClick={(e) => { e.preventDefault(); e.stopPropagation(); pin(h.install_id); }}>{pinned ? "★" : "☆"}</button>
-                          {isOp && <Link className="star" href={`/apps/manage/${h.install_id}`} aria-label={`Manage ${h.title}`} onClick={(e) => e.stopPropagation()}>⚙</Link>}
+                            onClick={() => pin(h.install_id)}>{pinned ? "★" : "☆"}</button>
+                          {isOp && <Link className="star" href={`/apps/manage/${h.install_id}`} aria-label={`Manage ${h.title}`}>⚙</Link>}
                         </div>
-                      </Link>
+                      </div>
                     );
                   })}
                 </div>
@@ -248,10 +254,12 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
                 {removedList.map((h) => (
                   <div key={h.install_id} className="rrow flex items-center gap-3 p-3">
                     <AppGlyph name={h.name} icon={h.icon} size="sm" />
-                    <div className="grow"><b>{h.title}</b><small className="block text-ink-500">Removed</small></div>
-                    <Button className="btn-sm" disabled={busy === h.install_id} onClick={() => restore(h.install_id)}>
-                      {busy === h.install_id ? "Restoring…" : "Restore"}
-                    </Button>
+                    <div className="grow"><b>{h.title}</b><small className="block text-ink-500">{h.attention.action === "restore" ? "Removed" : "Removed · restore window closed"}</small></div>
+                    {h.attention.action === "restore" && (
+                      <Button className="btn-sm" disabled={busy === h.install_id} onClick={() => restore(h.install_id)}>
+                        {busy === h.install_id ? "Restoring…" : "Restore"}
+                      </Button>
+                    )}
                   </div>
                 ))}
               </div>

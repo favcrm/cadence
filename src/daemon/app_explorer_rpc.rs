@@ -107,7 +107,10 @@ impl Shared {
         if let Some(installed) = installed {
             row["install_id"] = json!(installed.install_id);
             if installed.removed {
-                row["state"] = json!("removed");
+                // Not installed (`available`), but the card knows the
+                // soft-removed install so it offers Restore, never Install.
+                row["state"] = json!("available");
+                row["removed"] = json!(true);
                 row["restorable"] = json!(installed.restorable);
             } else {
                 row["state"] = json!("installed");
@@ -769,11 +772,12 @@ pub(super) fn check_git_url_public(url: &str) -> Result<()> {
 
 /// The one vet every route that fetches a Git source applies before git
 /// runs: the Explorer's check and the CLI-facing install, install-check,
-/// upgrade and upgrade-check. An absolute local path is not a network
+/// upgrade and upgrade-check. An absolute local path or `builtin:` id is not a network
 /// source and passes through to its own checks; anything else must pass
 /// the same public-https allowlist and resolved-host vet as the check.
 pub(super) fn vet_remote_source(source: &str) -> Result<()> {
-    if std::path::Path::new(source).is_absolute() {
+    // `builtin:<id>` is the embedded bundle, resolved without a network.
+    if std::path::Path::new(source).is_absolute() || source.starts_with("builtin:") {
         return Ok(());
     }
     check_git_url_public(source)?;
@@ -856,4 +860,38 @@ fn resolve_git_commit(url: &str, git_ref: &str) -> Result<String> {
     let tmp = tempfile::tempdir()?;
     let out = crate::issue::app_source::ls_remote(tmp.path(), url, git_ref)?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod data_access_rows {
+    //! CAD-1209: the detail page's "Its own data" row comes from the
+    //! manifest's `data` declaration — `stores` (holds records) and
+    //! `personal` are independent.
+    use super::*;
+
+    fn manifest(data: &str) -> crate::issue::app::Manifest {
+        crate::issue::app::parse_manifest(&format!(
+            "---\napp: demo\ntitle: Demo\nversion: '0.1.0'\nneeds:\n  connections: []\nlisting:\n  tagline: t\n{data}---\n\nbody\n"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn records_without_personal_data_still_show_the_row() {
+        let m = manifest("  data:\n    stores:\n      - Your orders\n    personal: false\n");
+        assert_eq!(data_flags(&m), (true, false));
+        let rows = app_access::access_rows(&m, None, true, false);
+        let text = rows["access"].to_string();
+        assert!(text.contains("Its own data"), "{text}");
+        assert!(!text.contains("Personal data"), "{text}");
+    }
+
+    #[test]
+    fn no_declaration_shows_no_data_row() {
+        assert_eq!(data_flags(&manifest("")), (false, false));
+        assert_eq!(
+            data_flags(&manifest("  data:\n    personal: true\n")),
+            (false, true)
+        );
+    }
 }

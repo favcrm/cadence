@@ -4245,3 +4245,82 @@ mod cad1196_acceptance {
         assert!(!status_has_single_nspid(""));
     }
 }
+
+/// CAD-1209: a process the kernel hid from this caller and
+/// `policy_denies_read` excused is named in the scan result, so finish can
+/// report it instead of tolerating it silently.
+#[cfg(all(test, target_os = "linux"))]
+mod cad1209_excused_report {
+    use super::*;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    fn fixture(root: &Path) -> (PathBuf, PathBuf) {
+        let (proc_root, lane) = (root.join("proc"), root.join("lane"));
+        std::fs::create_dir_all(&lane).unwrap();
+        std::fs::create_dir_all(proc_root.join("self/ns")).unwrap();
+        std::fs::create_dir_all(proc_root.join("2/ns")).unwrap();
+        let canon = proc_root.canonicalize().unwrap();
+        std::fs::write(
+            proc_root.join("self/mountinfo"),
+            format!(
+                "1 23 0:55 / {} rw,nosuid,nodev,noexec,relatime - proc proc rw\n",
+                canon.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(proc_root.join("self/kernel-release"), "7.0.0\n").unwrap();
+        std::fs::write(
+            proc_root.join("2/stat"),
+            "2 (kthreadd) S 0 0 0 0 -1 2097152 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        )
+        .unwrap();
+        symlink("pid:[42]", proc_root.join("self/ns/pid")).unwrap();
+        symlink("pid:[42]", proc_root.join("2/ns/pid")).unwrap();
+        std::fs::write(
+            proc_root.join("self/status"),
+            "Name:\tt\nState:\tR (running)\nNSpid:\t7\nCapPrm:\t0000000000000000\n",
+        )
+        .unwrap();
+        process(&proc_root, 2, "0000000000000000");
+        (proc_root, lane)
+    }
+
+    fn process(proc_root: &Path, pid: u32, cap_prm: &str) -> PathBuf {
+        let dir = proc_root.join(pid.to_string());
+        std::fs::create_dir_all(dir.join("fd")).unwrap();
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        std::fs::write(
+            dir.join("status"),
+            format!(
+                "Name:\tfixture\nState:\tS (sleeping)\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\nGid:\t{gid}\t{gid}\t{gid}\t{gid}\nGroups:\t{gid}\nCapEff:\t0000000000000000\nCapPrm:\t{cap_prm}\n"
+            ),
+        )
+        .unwrap();
+        symlink("/", dir.join("cwd")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_policy_hidden_process_is_named_and_the_scan_stays_complete() {
+        let root = tempfile::Builder::new()
+            .prefix("c1209u-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let (proc_root, lane) = fixture(root.path());
+        // Capabilities the caller lacks make its fd/ directory unreadable
+        // by policy; an ordinary process beside it is simply scanned.
+        let hidden = process(&proc_root, 910, "000000000000ffff");
+        process(&proc_root, 911, "0000000000000000");
+        std::fs::set_permissions(hidden.join("fd"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        let uses = process_use_under_from_proc_root(&lane, &proc_root).unwrap();
+        std::fs::set_permissions(hidden.join("fd"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        assert!(
+            uses.enumeration_error.is_none(),
+            "{:?}",
+            uses.enumeration_error
+        );
+        assert_eq!(uses.excused, vec![910]);
+    }
+}

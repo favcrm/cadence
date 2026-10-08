@@ -9,6 +9,7 @@ import ManageApp from "./features/explorer/ManageApp";
 import AppShell, { type ActiveInstallation } from "./features/app-shell/AppShell";
 import { buildAppNav, readLastApp, sectionFromSearch, writeLastApp, type LastApp, type VerifiedApp } from "./features/app-shell/appNav";
 import { useInstallations } from "./features/workspace-apps/useInstallations";
+import { APPS_CHANGED_EVENT } from "./features/workspace-apps/workspaceApps";
 import WorkspaceApp from "./features/workspace-apps/WorkspaceApp";
 import Board from "./features/projects/Board";
 import Drawer from "./features/projects/Drawer";
@@ -594,9 +595,16 @@ export default function App() {
   // good list and says so; a busy daemon is retried before it does.
   // Only the operator may read the list; member and agent sessions would get a
   // 403 and a permanent notice, so they do not ask.
-  const installations = useInstallations(meta?.operator === true, route.screen);
+  const [appsTick, setAppsTick] = useState(0);
+  useEffect(() => {
+    const bump = () => setAppsTick((n) => n + 1);
+    window.addEventListener(APPS_CHANGED_EVENT, bump);
+    return () => window.removeEventListener(APPS_CHANGED_EVENT, bump);
+  }, []);
+  const installations = useInstallations(meta?.operator === true, `${route.screen}:${appsTick}`);
+  // A soft-removed app is not an app to open: drop it from the menu.
   const installed: VerifiedApp[] = useMemo(
-    () => (installations.list ?? []).map((i) => ({ installId: i.install_id, kind: i.name, title: i.title || i.name })),
+    () => (installations.list ?? []).filter((i) => i.removed == null).map((i) => ({ installId: i.install_id, kind: i.name, title: i.title || i.name })),
     [installations.list],
   );
   const onAppScreen = route.screen === "workspaceApp";
