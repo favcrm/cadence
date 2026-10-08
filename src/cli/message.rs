@@ -201,7 +201,7 @@ pub(super) fn run(state_dir: PathBuf, action: MessageAction) -> Result<i32> {
             offset,
             limit,
         } => (
-            client::rpc(
+            client::rpc_relay(
                 &state_dir,
                 "message_read",
                 json!({"message": message, "offset": offset, "limit": limit}),
@@ -228,7 +228,10 @@ pub(super) fn run(state_dir: PathBuf, action: MessageAction) -> Result<i32> {
             if let Some(t) = token {
                 params["token"] = json!(t);
             }
-            (client::rpc(&state_dir, "message_report", params)?, false)
+            (
+                client::rpc_relay(&state_dir, "message_report", params)?,
+                false,
+            )
         }
         MessageAction::Result {
             message,
@@ -244,7 +247,7 @@ pub(super) fn run(state_dir: PathBuf, action: MessageAction) -> Result<i32> {
             note,
             sha,
         } => (
-            client::rpc(
+            client::rpc_relay(
                 &state_dir,
                 "message_reconcile",
                 json!({"message": message, "status": status.as_str(),
@@ -259,7 +262,7 @@ pub(super) fn run(state_dir: PathBuf, action: MessageAction) -> Result<i32> {
             by,
             reason,
         } => (
-            client::rpc(
+            client::rpc_relay(
                 &state_dir,
                 "message_cancel",
                 json!({"message": message, "reason": reason,
@@ -289,14 +292,14 @@ pub(super) fn run(state_dir: PathBuf, action: MessageAction) -> Result<i32> {
                     agent["endpoint_kind"].as_str().unwrap_or_default(),
                 ) {
                     let by = std::env::var("CADENCE_ALIAS").ok();
-                    client::rpc(
+                    client::rpc_relay(
                         &state_dir,
                         "agent_ready",
                         json!({"alias": alias, "by": by, "force": force}),
                     )?;
                 }
             }
-            let result = client::rpc(
+            let result = client::rpc_relay(
                 &state_dir,
                 "agent_ask",
                 json!({"alias": alias, "text": body,
@@ -359,5 +362,8 @@ pub(super) fn run_result(
     if let Some(t) = token {
         params["token"] = json!(t);
     }
-    Ok((client::rpc(state_dir, "message_report", params)?, false))
+    Ok((
+        client::rpc_relay(state_dir, "message_report", params)?,
+        false,
+    ))
 }

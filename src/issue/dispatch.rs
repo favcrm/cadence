@@ -1024,7 +1024,7 @@ pub fn run(
     // reads `running`, the common case) so `bootstrap` never claims a
     // fold that did not happen.
     if fold {
-        match client::rpc(
+        match client::rpc_relay(
             state_dir,
             "message_cancel",
             json!({"message": bootstrap_id, "by": reply_to,

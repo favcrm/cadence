@@ -100,7 +100,7 @@ pub(super) fn run(
     {
         let cap = cadence_agent::issue::task_report::BODY_MAX as u64;
         let text = read_master_command_file(&state_dir, file.as_deref(), cap)?;
-        print_json(&client::rpc(
+        print_json(&client::rpc_relay(
             &state_dir,
             "report_verdict",
             json!({"issue": task, "text": text}),

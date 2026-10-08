@@ -153,7 +153,7 @@ pub(crate) fn brief_agent(
                 exposed_file.display()
             )
         };
-        client::rpc(
+        client::rpc_relay(
             state_dir,
             "agent_send",
             json!({"alias": alias, "text": body,
