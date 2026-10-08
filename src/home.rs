@@ -264,7 +264,7 @@ pub fn guard_tracker(dir: PathBuf) -> Result<PathBuf> {
 }
 
 /// [`guard_tracker`] with the real home passed in (pure; for tests).
-#[cfg(any(test, feature = "test-seam"))]
+#[cfg(test)]
 pub(crate) fn guard_tracker_in(dir: PathBuf, real: Option<&Path>) -> Result<PathBuf> {
     test_guard_in(dir, real, ".", "pm")
 }
