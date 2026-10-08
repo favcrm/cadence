@@ -148,6 +148,76 @@ fn same_lane_process_cannot_hold_and_wait_but_exact_grant_is_idempotent() {
 }
 
 #[test]
+fn same_caller_cannot_grab_suite_while_its_build_request_waits() {
+    for probe in [true, false] {
+        let mut slots = Slots::new(SlotConfig {
+            build_slots: 1,
+            ..budget(2)
+        });
+        let holder = acquire(
+            &mut slots,
+            SlotKind::Build,
+            "holder",
+            "build-holder",
+            false,
+            1.0,
+        );
+        assert_eq!(holder["granted"], true);
+        let holder_token = holder["token"].as_str().unwrap().to_owned();
+
+        let waiting = acquire(
+            &mut slots,
+            SlotKind::Build,
+            "lane-a",
+            "build-wait",
+            false,
+            2.0,
+        );
+        assert_eq!(waiting["granted"], false);
+
+        let refused = slots
+            .acquire(
+                SlotKind::Suite,
+                "lane-a",
+                std::process::id(),
+                "suite-nested",
+                probe,
+                SlotClock::at(3.0, 3.0),
+            )
+            .expect_err("caller with a pending build request must not take a suite grant");
+        assert!(refused.to_string().contains("deadlock guard"), "{refused}");
+
+        let (status, _) = slots.status(
+            SlotCaller {
+                lane: "lane-a",
+                pids: &[std::process::id()],
+            },
+            4.0,
+        );
+        let waiting = status["waiting"].as_array().unwrap();
+        assert_eq!(waiting.len(), 1, "refusal changed the existing queue");
+        assert_eq!(waiting[0]["request_id"], "build-wait");
+        assert_eq!(waiting[0]["kind"], "build");
+        assert_eq!(
+            status["pools"]["suite"]["held"].as_array().unwrap().len(),
+            0
+        );
+        assert_eq!(status["total_held"], 1, "refusal created a new hold");
+
+        release(&mut slots, &holder_token, "holder", 5.0);
+        let original = acquire(
+            &mut slots,
+            SlotKind::Build,
+            "lane-a",
+            "build-wait",
+            false,
+            6.0,
+        );
+        assert_eq!(original["granted"], true, "original request did not grant");
+    }
+}
+
+#[test]
 fn cross_pool_priority_is_not_blocked_by_an_earlier_ordinary_waiter() {
     let mut config = budget(1);
     config.priority_lanes = vec!["priority".to_owned()];

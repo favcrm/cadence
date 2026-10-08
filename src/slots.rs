@@ -226,6 +226,17 @@ fn hold_and_wait_refusal(held: Pool, waiting: Pool) -> Error {
     ))
 }
 
+/// The mirror refusal: the caller's queued waiter is the dependency
+/// that must resolve before any new grant — or any new enqueue.
+fn wait_and_hold_refusal(wanted: Pool, waiting: Pool) -> Error {
+    Error::rejected(format!(
+        "A caller with a queued {} slot request cannot ask for {} — \
+         that queued request must resolve first (wait-then-hold deadlock guard)",
+        waiting.as_str(),
+        wanted.as_str(),
+    ))
+}
+
 struct SlotWait {
     request_id: String,
     kind: SlotKind,
@@ -1454,6 +1465,34 @@ impl Slots {
             .map(|h| h.kind.pool())
     }
 
+    /// The mirror edge (CAD-1268): while one of a caller's requests
+    /// is queued, that caller may not obtain a NEW grant — under the
+    /// shared budget the holder it would become is itself a waiter,
+    /// the same hold+wait deadlock `holds_any_slot` forbids, reached
+    /// through the immediate-grant door. One process therefore keeps
+    /// at most ONE request in the queue at a time: a second request
+    /// identity from the same (lane, pid) is refused at enqueue time
+    /// (and at probe/grant time), because granting one waiter while
+    /// siblings still queue would mint exactly the forbidden
+    /// holder-that-waits — and refusing the grant itself would leave
+    /// every sibling eligible-but-refused forever.
+    ///
+    /// The match key is (lane, pid) — the holding process, the same
+    /// key `holds_any_slot` uses on the held side. Strict callers
+    /// bind the same physical process by construction (a strict
+    /// waiter's pid is its verified holder), so enrollment is not
+    /// part of the caller key: two waiters of one process under
+    /// different enrollments are still one waiting caller.
+    /// Re-polling the ALREADY-QUEUED request never reaches this —
+    /// callers only ask here for a request identity that matched
+    /// nothing in the queue.
+    fn waits_for_slot(&self, req: &SlotReq<'_>) -> Option<Pool> {
+        self.waiting
+            .iter()
+            .find(|w| w.lane == req.lane && w.pid == req.pid)
+            .map(|w| w.kind.pool())
+    }
+
     /// Non-blocking acquire: grants a minted token when the pool has
     /// room and the request leads its effective order, else reports
     /// the queue position. `request_id` makes client polls sticky —
@@ -1527,7 +1566,7 @@ impl Slots {
             // Already queued? A probe is read-only — it reports the
             // existing waiter's real position, never grants it (a
             // grant is a mutation) and never re-ranks it fresh.
-            if let Some(idx) = self.waiting.iter().position(same) {
+            if let Some(idx) = self.waiting.iter().position(&same) {
                 let ranks = self.ranks(now);
                 return Ok((
                     json!({"granted": false, "position": self.outranked(&ranks, idx) + 1,
@@ -1538,6 +1577,13 @@ impl Slots {
                            "total_capacity": self.total_capacity()}),
                     events,
                 ));
+            }
+            // A fresh request identity while this caller already has
+            // a request queued: refused outright — it could never
+            // join (one caller, one queued request) and a grant would
+            // mint a holder that still waits.
+            if let Some(waiting) = self.waits_for_slot(&req) {
+                return Err(wait_and_hold_refusal(pool, waiting));
             }
             // A fresh probe grants exactly when an enqueue would —
             // per-pool AND aggregate capacity free and no eligible
@@ -1582,9 +1628,18 @@ impl Slots {
                 events,
             ));
         }
-        let (idx, created) = match self.waiting.iter().position(same) {
+        let (idx, created) = match self.waiting.iter().position(&same) {
             Some(i) => (i, false),
             None => {
+                // One caller, one queued request: a NEW request
+                // identity from a process already waiting is refused
+                // BEFORE it joins — the wait-then-hold mirror of
+                // `holds_any_slot`. The already-queued request keeps
+                // its exact place and repolls normally; nothing is
+                // cancelled and nothing mutates.
+                if let Some(waiting) = self.waits_for_slot(&req) {
+                    return Err(wait_and_hold_refusal(pool, waiting));
+                }
                 if self.waiting.len() >= MAX_WAITERS {
                     return Err(Error::rejected(format!(
                         "Slot queue is full ({MAX_WAITERS} waiting) — try again later"
@@ -2934,9 +2989,20 @@ mod tests {
         let b = acquire(&mut s, SlotKind::Build, "dev-1", "r1", 0.0);
         assert_eq!(b["granted"], false, "must not adopt another caller's hold");
         assert_eq!(b["position"], 1);
-        // And a different kind under the same request_id also queues.
-        let c = acquire(&mut s, SlotKind::Test, "dev-1", "r1", 0.0);
-        assert_eq!(c["granted"], false);
+        // A second request identity while the first still queues is
+        // refused outright — one caller, one queued request — even
+        // under the SAME request_id with a different kind.
+        let err = s
+            .acquire(
+                SlotKind::Test,
+                "dev-1",
+                me(),
+                "r1",
+                false,
+                SlotClock::at(0.0, 0.0),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("deadlock guard"), "{err}");
         // A same-identity re-poll still adopts its own hold.
         let a2 = acquire_pid(&mut s, SlotKind::Build, "dev-1", other.pid(), "r1", 0.0);
         assert_eq!(a2["token"], a["token"]);
@@ -3094,9 +3160,13 @@ mod tests {
         acquire(&mut s, SlotKind::Build, "qa-1", "qb", 5.0);
         // dev-2 bursts three more requests at t=10 — on the pre-r4
         // head all three inherited t=0 and pinned qa-1 behind them;
-        // now they stamp their own arrival.
-        for req in ["w2", "w3", "w4"] {
-            acquire(&mut s, SlotKind::Build, "dev-2", req, 10.0);
+        // now they stamp their own arrival. Each burst requester is a
+        // DISTINCT live process: one caller holds at most one queued
+        // request (the wait-then-hold guard), so a lane burst is
+        // always a fan-in of separate callers.
+        let burst: Vec<Child> = (0..3).map(|_| Child::spawn()).collect();
+        for (i, req) in ["w2", "w3", "w4"].iter().enumerate() {
+            acquire_pid(&mut s, SlotKind::Build, "dev-2", burst[i].pid(), req, 10.0);
         }
         release_first(&mut s, "dev-1", 20.0);
         let g = acquire(&mut s, SlotKind::Build, "dev-2", "w1", 20.0);
@@ -3105,7 +3175,7 @@ mod tests {
         let g = acquire(&mut s, SlotKind::Build, "qa-1", "qb", 21.0);
         assert_eq!(g["granted"], true, "qa-1's t=5 beats the t=10 burst");
         release_first(&mut s, "qa-1", 22.0);
-        let g = acquire(&mut s, SlotKind::Build, "dev-2", "w2", 22.0);
+        let g = acquire_pid(&mut s, SlotKind::Build, "dev-2", burst[0].pid(), "w2", 22.0);
         assert_eq!(g["granted"], true, "the burst follows in arrival order");
     }
 
@@ -3330,12 +3400,17 @@ mod tests {
     fn queue_cap_rejects_overflow() {
         let mut s = slots(1, 1, 900, &[]);
         acquire(&mut s, SlotKind::Build, "dev-1", "h1", 0.0);
+        // Each queued request is a distinct live process — one caller
+        // holds at most one queued request.
+        let kids: Vec<Child> = (0..MAX_WAITERS).map(|_| Child::spawn()).collect();
+        let mut next = kids.iter();
         for lane in 0..4 {
             for i in 0..MAX_WAITERS_PER_LANE {
-                let q = acquire(
+                let q = acquire_pid(
                     &mut s,
                     SlotKind::Build,
                     &format!("dev-w{lane}"),
+                    next.next().unwrap().pid(),
                     &format!("w{i}"),
                     0.0,
                 );
@@ -3362,8 +3437,18 @@ mod tests {
     fn per_lane_queue_cap_bounds_one_lanes_share() {
         let mut s = slots(1, 1, 900, &[]);
         acquire(&mut s, SlotKind::Build, "dev-1", "h1", 0.0);
-        for i in 0..MAX_WAITERS_PER_LANE {
-            let q = acquire(&mut s, SlotKind::Build, "dev-2", &format!("w{i}"), 0.0);
+        // One caller queues at most one request — the lane's share is
+        // filled by distinct live processes.
+        let kids: Vec<Child> = (0..MAX_WAITERS_PER_LANE).map(|_| Child::spawn()).collect();
+        for (i, kid) in kids.iter().enumerate() {
+            let q = acquire_pid(
+                &mut s,
+                SlotKind::Build,
+                "dev-2",
+                kid.pid(),
+                &format!("w{i}"),
+                0.0,
+            );
             assert_eq!(q["granted"], false);
         }
         let err = s
@@ -3663,8 +3748,9 @@ mod tests {
         }
         let q = acquire(&mut s, SlotKind::Build, "dev-x", "bx", 0.0);
         assert_eq!(q["granted"], false);
-        // The 4th build waits on capacity; a check slot is free anyway.
-        let c = acquire(&mut s, SlotKind::Check, "dev-x", "c1", 0.0);
+        // The 4th build waits on capacity; a different caller can
+        // still take a free check slot without holding while queued.
+        let c = acquire(&mut s, SlotKind::Check, "dev-y", "c1", 0.0);
         assert_eq!(c["granted"], true, "check granted on its own pool: {c}");
         assert_eq!(c["kind"], "check");
     }
@@ -3677,8 +3763,9 @@ mod tests {
         // Below floor: queued, never refused, reason=memory.
         assert_eq!(r["granted"], false);
         assert_eq!(r["wait_reason"], "memory", "{r}");
-        // The check pool uses its own (lower) floor — still under it.
-        let c = acquire(&mut s, SlotKind::Check, "dev-1", "c1", 0.0);
+        // A different caller tests the check pool's own (lower)
+        // floor without submitting a second queued request.
+        let c = acquire(&mut s, SlotKind::Check, "dev-2", "c1", 0.0);
         assert_eq!(c["granted"], false);
         assert_eq!(c["wait_reason"], "memory", "{c}");
     }
@@ -3936,5 +4023,68 @@ mod tests {
         release(&mut s, "slot-b", "dev-2", 14.0);
         let q = acquire(&mut s, SlotKind::Check, "dev-3", "c1", 15.0);
         assert_eq!(q["granted"], true, "drained to the cap: {q}");
+    }
+
+    /// The wait-then-hold mirror guard: one caller keeps at most one
+    /// request in the queue — a NEW request identity (probe or
+    /// acquire) from a process already waiting is refused before it
+    /// joins or grants, because granting it would mint a holder that
+    /// still waits, and queuing it could never be granted without
+    /// creating the same state. The queued request is untouched and
+    /// grants normally once it leads.
+    #[test]
+    fn queued_caller_cannot_take_a_new_grant_elsewhere() {
+        let mut s = Slots::new(SlotConfig {
+            total_slots: 2,
+            build_slots: 1,
+            ..Default::default()
+        });
+        s.use_resources(Some(generous()));
+        // The only build seat is held, but aggregate capacity remains
+        // available for suite: refusal must come from the caller guard.
+        acquire(&mut s, SlotKind::Build, "dev-9", "b9", 0.0);
+        let w = acquire(&mut s, SlotKind::Build, "dev-1", "b1", 0.0);
+        assert_eq!(w["granted"], false);
+        // A NEW suite request identity while the build request still
+        // queues — refused BEFORE it joins, probe or acquire alike.
+        let err = s
+            .acquire(
+                SlotKind::Suite,
+                "dev-1",
+                me(),
+                "s1",
+                false,
+                SlotClock::at(1.0, 0.0),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("deadlock guard"), "{err}");
+        // Same for the read-only probe: refused, never granted.
+        let err = s
+            .acquire(
+                SlotKind::Suite,
+                "dev-1",
+                me(),
+                "s2",
+                true,
+                SlotClock::at(1.0, 0.0),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("deadlock guard"), "{err}");
+        // The refusal removed nothing: dev-1's build waiter is alone.
+        assert_eq!(s.waiting.len(), 1);
+        assert_eq!(s.waiting[0].request_id, "b1");
+        assert_eq!(s.waiting[0].kind, SlotKind::Build);
+        assert!(s.held.iter().all(|h| h.kind.pool() != Pool::Suite));
+        // The queued request itself re-polls and grants normally —
+        // only NEW request identities are refused.
+        release_any(&mut s, 2.0);
+        let g = acquire(&mut s, SlotKind::Build, "dev-1", "b1", 3.0);
+        assert_eq!(g["granted"], true, "queued request grants normally: {g}");
+        // A different process in the same lane is not the queued
+        // caller — the guard binds (lane, pid), so it grants freely.
+        let child = Child::spawn();
+        let q = acquire_pid(&mut s, SlotKind::Suite, "dev-1", child.pid(), "s2", 4.0);
+        assert_eq!(q["granted"], true, "other pid in lane is unguarded: {q}");
+        child.reap();
     }
 }
