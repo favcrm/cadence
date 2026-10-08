@@ -9,10 +9,6 @@ export {};
 function assert(value: unknown, why: string): asserts value {
   if (!value) throw new Error(why);
 }
-function equal(a: unknown, e: unknown, why: string) {
-  if (JSON.stringify(a) !== JSON.stringify(e)) throw new Error(`${why}: expected ${JSON.stringify(e)}, got ${JSON.stringify(a)}`);
-}
-
 async function main() {
 const { Window } = require("happy-dom");
 const win = new Window({ url: "http://localhost/app-installations/install-notes" });
