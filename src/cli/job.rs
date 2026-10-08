@@ -337,7 +337,8 @@ pub(super) fn run_job(state_dir: &Path, action: &JobAction) -> Result<i32> {
                         agent["provider"].as_str().unwrap_or_default(),
                         agent["endpoint_kind"].as_str().unwrap_or_default(),
                     ) {
-                        rpc(
+                        client::rpc_relay(
+                            state_dir,
                             "agent_ready",
                             json!({"alias": assignee, "by": pane, "force": force}),
                         )?;

@@ -621,7 +621,7 @@ pub(super) fn run(state_dir: PathBuf, action: AgentAction) -> Result<i32> {
             // The claimer identity is recorded for audit —
             // CADENCE_ALIAS when the claim came from a pane.
             let by = std::env::var("CADENCE_ALIAS").ok();
-            client::rpc(
+            client::rpc_relay(
                 &state_dir,
                 "agent_ready",
                 json!({"alias": alias, "by": by, "force": force}),

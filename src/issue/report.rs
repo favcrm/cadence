@@ -674,7 +674,7 @@ fn notify_pm(
     let Some(alias) = inbox else {
         return json!(null);
     };
-    match client::rpc(
+    match client::rpc_relay(
         state_dir,
         "agent_send",
         json!({"alias": alias, "text": clean_line(line), "reply_to": reply_to,
