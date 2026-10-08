@@ -83,14 +83,13 @@ fn cad1197_production_routing_never_reaches_the_tests() {
     let rig = rig();
     let pm = rig.home.join("pm");
     let state = rig.home.join(".local/state/cadence");
-    let out = runner(&rig)
-        .env("CADENCE_PM_DIR", &pm)
+    let mut cmd = runner(&rig);
+    cmd.env("CADENCE_PM_DIR", &pm)
         .env("CADENCE_STATE_DIR", &state)
         .env("CADENCE_HOME", rig.home.join(".cadence"))
         .env("CADENCE_ALIAS", "pane-agent")
-        .env("CADENCE_ORG", "local")
-        .output()
-        .unwrap();
+        .env("CADENCE_ORG", "local");
+    let out = cadence_agent::reaper::output(&mut cmd).unwrap();
     let runs = fs::read_dir(&rig.seen).unwrap().count();
     assert!(
         runs > 0,
@@ -117,10 +116,9 @@ fn cad1197_production_routing_never_reaches_the_tests() {
 #[test]
 fn cad1197_a_suite_lock_inside_the_tracker_refuses_before_cargo() {
     let rig = rig();
-    let out = runner(&rig)
-        .env("CADENCE_SUITE_LOCK", rig.home.join("pm/suite.lock"))
-        .output()
-        .unwrap();
+    let mut cmd = runner(&rig);
+    cmd.env("CADENCE_SUITE_LOCK", rig.home.join("pm/suite.lock"));
+    let out = cadence_agent::reaper::output(&mut cmd).unwrap();
     assert!(
         !out.status.success(),
         "the runner accepted a suite lock inside the tracker"
