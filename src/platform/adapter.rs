@@ -89,6 +89,134 @@ impl std::fmt::Display for AppCapabilityError {
 
 impl std::error::Error for AppCapabilityError {}
 
+/// CAD-1315: why a standalone image job did not produce a retained image.
+/// The code is the ONLY thing recorded on the intent: a fixed allow-list, no
+/// provider text, URL or secret. Classified at the failing site by type,
+/// never from message text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageReason {
+    NotApproved,
+    PlanInvalid,
+    MediaDisabled,
+    NotAuthorized,
+    InsufficientFunds,
+    SubmitRefused,
+    SubmitError,
+    ProviderBusy,
+    PollTimeout,
+    ProviderUncertain,
+    JobMalformed,
+    JobFailed,
+    PriceChanged,
+    ArtifactUnavailable,
+    ArtifactMismatch,
+    ArtifactTooLarge,
+    UnsupportedImage,
+    NotSquare,
+    DecodeFailed,
+}
+
+/// How a worker settles a failed attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageSettle {
+    /// Transient: the same idempotency key is retried with backoff until the
+    /// job deadline, then the intent settles `uncertain`.
+    Retry,
+    /// The job may still hold funds or be running: `uncertain`. Only a
+    /// re-check of the SAME key may move it; a new key is never minted.
+    Unresolved,
+    /// The job is over with no usable image (or never ran): terminal.
+    Terminal,
+}
+
+impl ImageReason {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::NotApproved => "not_approved",
+            Self::PlanInvalid => "plan_invalid",
+            Self::MediaDisabled => "media_disabled",
+            Self::NotAuthorized => "not_authorized",
+            Self::InsufficientFunds => "insufficient_funds",
+            Self::SubmitRefused => "submit_refused",
+            Self::SubmitError => "submit_error",
+            Self::ProviderBusy => "provider_busy",
+            Self::PollTimeout => "poll_timeout",
+            Self::ProviderUncertain => "provider_uncertain",
+            Self::JobMalformed => "job_malformed",
+            Self::JobFailed => "job_failed",
+            Self::PriceChanged => "price_changed",
+            Self::ArtifactUnavailable => "artifact_unavailable",
+            Self::ArtifactMismatch => "artifact_mismatch",
+            Self::ArtifactTooLarge => "artifact_too_large",
+            Self::UnsupportedImage => "unsupported_image",
+            Self::NotSquare => "not_square",
+            Self::DecodeFailed => "decode_failed",
+        }
+    }
+
+    pub fn settle(self) -> ImageSettle {
+        match self {
+            Self::SubmitError
+            | Self::ProviderBusy
+            | Self::PollTimeout
+            | Self::ArtifactUnavailable => ImageSettle::Retry,
+            Self::ProviderUncertain | Self::JobMalformed | Self::ArtifactMismatch => {
+                ImageSettle::Unresolved
+            }
+            Self::NotApproved
+            | Self::PlanInvalid
+            | Self::MediaDisabled
+            | Self::NotAuthorized
+            | Self::InsufficientFunds
+            | Self::SubmitRefused
+            | Self::JobFailed
+            | Self::PriceChanged
+            | Self::ArtifactTooLarge
+            | Self::UnsupportedImage
+            | Self::NotSquare
+            | Self::DecodeFailed => ImageSettle::Terminal,
+        }
+    }
+}
+
+/// A typed image failure. `detail` is for logs and the run-bound path only;
+/// it never reaches an intent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageFailure {
+    pub reason: ImageReason,
+    /// The provider confirmed (or the host proved) nothing executed.
+    pub not_executed: bool,
+    pub detail: String,
+}
+
+impl ImageFailure {
+    pub fn refused(reason: ImageReason, detail: impl Into<String>) -> Self {
+        Self {
+            reason,
+            not_executed: true,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn uncertain(reason: ImageReason, detail: impl Into<String>) -> Self {
+        Self {
+            reason,
+            not_executed: false,
+            detail: detail.into(),
+        }
+    }
+}
+
+impl From<ImageFailure> for AppCapabilityError {
+    fn from(failure: ImageFailure) -> Self {
+        if failure.not_executed {
+            Self::Refused(failure.detail)
+        } else {
+            Self::Uncertain(failure.detail)
+        }
+    }
+}
+
 /// One platform's adapter — the proxy's outward leg.
 pub trait PlatformAdapter: Send + Sync {
     /// The adapter's declared tool table, reviewed like code and pinned
@@ -158,6 +286,27 @@ pub trait PlatformAdapter: Send + Sync {
     ) -> std::result::Result<super::AppCapabilityOutput, AppCapabilityError> {
         self.execute_app_capability(credential, authority, input, idempotency_key)
             .map_err(AppCapabilityError::Uncertain)
+    }
+
+    /// CAD-1315: the standalone image job's typed execution. The default
+    /// maps the generic typed outcome conservatively; only the AgenticOS
+    /// adapter classifies real reasons.
+    fn execute_app_image(
+        &self,
+        credential: &[u8],
+        authority: &Value,
+        input: &Value,
+        idempotency_key: &str,
+    ) -> std::result::Result<super::AppCapabilityOutput, ImageFailure> {
+        self.execute_app_capability_outcome(credential, authority, input, idempotency_key)
+            .map_err(|error| match error {
+                AppCapabilityError::Refused(m) => {
+                    ImageFailure::refused(ImageReason::SubmitRefused, m)
+                }
+                AppCapabilityError::Uncertain(m) => {
+                    ImageFailure::uncertain(ImageReason::ProviderUncertain, m)
+                }
+            })
     }
 
     /// Quote the exact reviewed mapping and credential account in a frozen

@@ -37,6 +37,11 @@ CREATE TABLE IF NOT EXISTS app_social_generation_intents(\
  intent_digest TEXT NOT NULL, install_id TEXT NOT NULL, context_id TEXT NOT NULL, alias TEXT NOT NULL, tool TEXT NOT NULL, caller_input_digest TEXT NOT NULL DEFAULT '', input_digest TEXT NOT NULL, input_json TEXT NOT NULL, scope_json TEXT NOT NULL, request_id TEXT NOT NULL UNIQUE,\
  state TEXT NOT NULL CHECK(state IN ('pending','uncertain','completed','refused')), receipt_id TEXT, outcome TEXT, updated REAL NOT NULL,\
  PRIMARY KEY(context_id,intent_digest));\
+CREATE TABLE IF NOT EXISTS app_social_image_jobs(\
+ call_id TEXT PRIMARY KEY, install_id TEXT NOT NULL, context_id TEXT NOT NULL,\
+ intent_digest TEXT NOT NULL, request_id TEXT NOT NULL UNIQUE,\
+ state TEXT NOT NULL CHECK(state IN ('active','succeeded','uncertain','failed')),\
+ reason TEXT, spec_json TEXT, created REAL NOT NULL, deadline REAL NOT NULL, updated REAL NOT NULL);\
 CREATE TABLE IF NOT EXISTS app_social_effects(\
  effect_id TEXT PRIMARY KEY, install_id TEXT NOT NULL, context_id TEXT NOT NULL,\
  draft_id TEXT NOT NULL, revision INTEGER NOT NULL, request_id TEXT NOT NULL UNIQUE,\
@@ -66,6 +71,29 @@ pub struct GenerationStart<'a> {
     pub input: &'a Value,
     pub scope: &'a Value,
     pub request: &'a str,
+}
+
+/// CAD-1315: one standalone image job (the AgenticOS call behind an intent).
+/// `spec` is the frozen authority the worker replays under the same key; it is
+/// dropped once the job is terminal.
+#[derive(Clone, Debug)]
+pub struct ImageJob {
+    pub call_id: String,
+    pub context_id: String,
+    pub intent_digest: String,
+    pub request_id: String,
+    pub state: String,
+    pub reason: Option<String>,
+    pub spec: Option<Value>,
+    pub deadline: f64,
+}
+
+/// How a worker ends an active image job.
+#[derive(Clone, Copy)]
+pub enum ImageSettlement<'a> {
+    Succeeded { receipt: &'a str },
+    Failed { reason: &'a str },
+    Uncertain { reason: &'a str },
 }
 
 /// Arguments of one staged social draft effect.
@@ -440,6 +468,111 @@ impl RecordStore {
         }
         self.write_tx(|tx|{let changed=tx.execute("UPDATE app_social_generation_intents SET state=?,receipt_id=?,outcome=?,updated=? WHERE install_id=? AND context_id=? AND intent_digest=? AND request_id=? AND state IN ('pending','uncertain')",params![state,receipt,outcome,now(),self.install(),context,intent,request])?;if changed!=1{return Err(Error::rejected("generation intent key changed"));}Ok(())})
     }
+    /// CAD-1315: start the one job behind a pending image intent. `call_id`
+    /// is the AgenticOS idempotency key; a repeat is a no-op, so a job exists
+    /// exactly once per key. The intent leaves `uncertain` for `pending` in
+    /// the same transaction, and only for the request that owns it.
+    pub fn app_social_image_job_start(
+        &self,
+        context: &str,
+        intent: &str,
+        request: &str,
+        call_id: &str,
+        spec: &Value,
+        deadline: f64,
+    ) -> Result<()> {
+        let spec = serde_json::to_string(spec).map_err(|e| Error::internal(e.to_string()))?;
+        self.write_tx(|tx| {
+            let at = now();
+            tx.execute("INSERT OR IGNORE INTO app_social_image_jobs(call_id,install_id,context_id,intent_digest,request_id,state,spec_json,created,deadline,updated) VALUES(?,?,?,?,?,'active',?,?,?,?)", params![call_id, self.install(), context, intent, request, spec, at, deadline, at])?;
+            let changed = tx.execute("UPDATE app_social_generation_intents SET state='pending',outcome=NULL,updated=? WHERE install_id=? AND context_id=? AND intent_digest=? AND request_id=? AND state IN ('pending','uncertain')", params![at, self.install(), context, intent, request])?;
+            if changed != 1 {
+                return Err(Error::rejected("generation intent key changed"));
+            }
+            Ok(())
+        })
+    }
+
+    fn image_job_in(conn: &impl StoreConn, filter: &str, key: &str) -> Result<Option<ImageJob>> {
+        let row = conn.query_row(&format!("SELECT call_id,context_id,intent_digest,request_id,state,reason,spec_json,deadline FROM app_social_image_jobs WHERE {filter}=?"), [key], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,Option<String>>(6)?,r.get::<_,f64>(7)?))).optional()?;
+        row.map(|r| {
+            let spec = match r.6 {
+                Some(text) => Some(
+                    serde_json::from_str(&text)
+                        .map_err(|_| Error::rejected("image job spec is corrupt"))?,
+                ),
+                None => None,
+            };
+            Ok(ImageJob {
+                call_id: r.0,
+                context_id: r.1,
+                intent_digest: r.2,
+                request_id: r.3,
+                state: r.4,
+                reason: r.5,
+                spec,
+                deadline: r.7,
+            })
+        })
+        .transpose()
+    }
+
+    pub fn app_social_image_job_for_request(&self, request: &str) -> Result<Option<ImageJob>> {
+        Self::image_job_in(&*self.conn(), "request_id", request)
+    }
+
+    pub fn app_social_image_job(&self, call_id: &str) -> Result<Option<ImageJob>> {
+        Self::image_job_in(&*self.conn(), "call_id", call_id)
+    }
+
+    /// Call ids of every job a restart must drive to a terminal state.
+    pub fn app_social_image_jobs_active(&self) -> Result<Vec<String>> {
+        let conn = self.conn();
+        let rows = conn
+            .prepare("SELECT call_id FROM app_social_image_jobs WHERE install_id=? AND state='active' ORDER BY created")?
+            .query_map([self.install()], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Re-check an unresolved job under its SAME key: `uncertain` returns to
+    /// `active` (a new window), its intent to `pending`. Never a new key.
+    pub fn app_social_image_job_resume(&self, call_id: &str, deadline: f64) -> Result<bool> {
+        self.write_tx(|tx| {
+            let at = now();
+            let changed = tx.execute("UPDATE app_social_image_jobs SET state='active',reason=NULL,deadline=?,updated=? WHERE call_id=? AND install_id=? AND state='uncertain'", params![deadline, at, call_id, self.install()])?;
+            if changed == 1 {
+                tx.execute("UPDATE app_social_generation_intents SET state='pending',outcome=NULL,updated=? WHERE install_id=? AND state='uncertain' AND request_id=(SELECT request_id FROM app_social_image_jobs WHERE call_id=?)", params![at, self.install(), call_id])?;
+            }
+            Ok(changed == 1)
+        })
+    }
+
+    /// Settle an active job and its intent together. The job row is the
+    /// compare-and-set: a second settle (a replayed worker) changes nothing.
+    pub fn app_social_image_job_settle(
+        &self,
+        call_id: &str,
+        settlement: ImageSettlement<'_>,
+    ) -> Result<bool> {
+        let (job_state, intent_state, receipt, reason) = match settlement {
+            ImageSettlement::Succeeded { receipt } => {
+                ("succeeded", "completed", Some(receipt), None)
+            }
+            ImageSettlement::Failed { reason } => ("failed", "refused", None, Some(reason)),
+            ImageSettlement::Uncertain { reason } => ("uncertain", "uncertain", None, Some(reason)),
+        };
+        self.write_tx(|tx| {
+            let at = now();
+            let keep_spec = job_state == "uncertain";
+            let changed = tx.execute(&format!("UPDATE app_social_image_jobs SET state=?,reason=?,{}updated=? WHERE call_id=? AND install_id=? AND state='active'", if keep_spec { "" } else { "spec_json=NULL," }), params![job_state, reason, at, call_id, self.install()])?;
+            if changed == 1 {
+                tx.execute("UPDATE app_social_generation_intents SET state=?,receipt_id=?,outcome=?,updated=? WHERE install_id=? AND state IN ('pending','uncertain') AND request_id=(SELECT request_id FROM app_social_image_jobs WHERE call_id=?)", params![intent_state, receipt, reason, at, self.install(), call_id])?;
+            }
+            Ok(changed == 1)
+        })
+    }
+
     pub fn app_social_generation_complete_request(
         &self,
         request: &str,

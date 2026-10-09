@@ -18,7 +18,9 @@ pub mod local;
 pub mod smtp;
 pub mod smtp_internal;
 
-pub use adapter::{AppArtifactError, AppCapabilityError, PlatformAdapter};
+pub use adapter::{
+    AppArtifactError, AppCapabilityError, ImageFailure, ImageReason, ImageSettle, PlatformAdapter,
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

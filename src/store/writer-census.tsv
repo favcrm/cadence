@@ -91,12 +91,12 @@ store/app_runs.rs	guarded-store-and-read-queries	prepare	2
 store/app_sends.rs	guarded-store-and-read-queries	execute	11
 store/app_sends.rs	guarded-store-and-read-queries	guarded_write	6
 store/app_sends.rs	guarded-store-and-read-queries	prepare	5
-store/app_social_drafts.rs	guarded-store-and-read-queries	execute	27
-store/app_social_drafts.rs	guarded-store-and-read-queries	guarded_write	14
-store/app_social_drafts.rs	guarded-store-and-read-queries	prepare	8
+store/app_social_drafts.rs	guarded-store-and-read-queries	execute	33
+store/app_social_drafts.rs	guarded-store-and-read-queries	guarded_write	17
+store/app_social_drafts.rs	guarded-store-and-read-queries	prepare	9
 store/app_tools.rs	guarded-store-and-read-queries	execute	2
 store/app_tools.rs	guarded-store-and-read-queries	guarded_write	2
-store/app_tools.rs	guarded-store-and-read-queries	prepare	1
+store/app_tools.rs	guarded-store-and-read-queries	prepare	2
 store/chat_files.rs	guarded-store-and-read-queries	execute	1
 store/chat_files.rs	guarded-store-and-read-queries	guarded_write	1
 store/chat_files.rs	guarded-store-and-read-queries	open	1

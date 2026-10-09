@@ -41,6 +41,7 @@
 //! digest, slot, binding, provider, account, credential and effect
 //! class are all derived host-side — never child- or caller-chosen.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use serde_json::{json, Value};
@@ -51,7 +52,7 @@ use crate::contract_fixture::{classify_call, Effect};
 use crate::error::{Error, Result};
 use crate::issue::app_catalog::workspace;
 use crate::operator_auth::Origin;
-use crate::platform::AppCapabilityError;
+use crate::platform::{AppCapabilityError, ImageReason};
 use crate::store::app_runs;
 
 /// One mounted screen's action context. Minted at `app_screen_mint`
@@ -267,7 +268,11 @@ impl Shared {
     /// `token`/`key`/`origin` relay the consuming board request's own
     /// session credentials so the daemon proves them natively; the
     /// action context binds the call to one verified mount.
-    pub(super) fn rpc_app_tool_invoke(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+    pub(super) fn rpc_app_tool_invoke(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
         self.operator_connection("app tool invoke", params, peer_pid)?;
         strict_fields(
             params,
@@ -646,7 +651,13 @@ impl Shared {
                 )?;
                 match gate["mode"].as_str() {
                     Some("existing") => {
-                        return Ok(json!({"generation_intent":gate["intent"],"replayed":true}))
+                        let mut intent = gate["intent"].clone();
+                        // The app validates this reply with `outcome: null`; the
+                        // reason code rides the draft listing instead.
+                        if operation == "image" {
+                            intent["outcome"] = Value::Null;
+                        }
+                        return Ok(json!({"generation_intent":intent,"replayed":true}));
                     }
                     Some("terminal") => {
                         return Err(Error::rejected(
@@ -684,6 +695,24 @@ impl Shared {
                                 authority_source = json!({"receipt_id":receipt_id,"post":post,"post_digest":app_runs::material_digest(post)});
                             }
                         }
+                        // CAD-1315: an image intent that already has its job
+                        // never submits again from here. An unresolved one is
+                        // re-checked under the SAME key; an active one just
+                        // gets a worker if none is alive.
+                        if operation == "image" {
+                            if let Some(job) =
+                                records.app_social_image_job_for_request(request_id)?
+                            {
+                                if job.state == "uncertain" {
+                                    records.app_social_image_job_resume(
+                                        &job.call_id,
+                                        self.image_job_deadline(),
+                                    )?;
+                                }
+                                self.spawn_image_job_worker(&ctx.install_id, &job.call_id);
+                                return Ok(pending_image_reply(request_id, &scope, &plan));
+                            }
+                        }
                         generation = Some((records, context.to_owned(), intent_digest, scope, plan))
                     }
                     _ => return Err(Error::rejected("generation intent state is invalid")),
@@ -715,7 +744,7 @@ impl Shared {
                 })?;
             // Standalone invocation authority is distinct from workflow-run
             // authority; never manufacture run-shaped identifiers here.
-            let authority = json!({
+            let mut authority = json!({
                 "schema": 1,
                 "install_id": ctx.install_id,
                 "context_id": ctx.context_id.clone().map(Value::String).unwrap_or(Value::Null),
@@ -727,6 +756,45 @@ impl Shared {
                 "call_id": call_id,
                 "invocation_id": call_id,
             });
+            // CAD-1315: image generation is a queued job. Freeze the exact
+            // prompt (a restart replays a byte-identical body under the same
+            // key), write the job row and return; a host worker does the
+            // provider I/O outside every lock held here.
+            if let Some((records, context, intent, scope, plan)) = &generation {
+                if scope["operation"] == "image" {
+                    match crate::platform::agenticos_external::frozen_image_prompt(
+                        &authority,
+                        &adapter_input,
+                    ) {
+                        Ok(prompt) => authority["frozen_prompt"] = json!(prompt),
+                        Err(_) => {
+                            records.app_social_generation_finish(
+                                context,
+                                intent,
+                                request_id,
+                                "refused",
+                                None,
+                                Some(ImageReason::PlanInvalid.code()),
+                            )?;
+                            return Err(Error::rejected("image plan is invalid"));
+                        }
+                    }
+                    let spec = json!({
+                        "alias": alias, "slot": slot, "binding_digest": proof.digest,
+                        "input_digest": input_digest, "input": input, "authority": authority,
+                    });
+                    records.app_social_image_job_start(
+                        context,
+                        intent,
+                        request_id,
+                        &call_id,
+                        &spec,
+                        self.image_job_deadline(),
+                    )?;
+                    self.spawn_image_job_worker(&ctx.install_id, &call_id);
+                    return Ok(pending_image_reply(request_id, scope, plan));
+                }
+            }
             let credential = self.app_capability_credential(config)?;
             let output = match adapter.execute_app_capability_outcome(
                 &credential,
@@ -958,6 +1026,12 @@ mod generation_settlement_tests {
             GenerationSettlement::Pending
         );
     }
+}
+
+/// The reply for an image intent whose job is queued or running. It is the
+/// shape a pending intent has always had, so an older app bundle validates it.
+fn pending_image_reply(request_id: &str, scope: &Value, plan: &Value) -> Value {
+    json!({"generation_intent":{"request_id":request_id,"operation":scope["operation"],"draft_id":scope["draft_id"],"revision":scope["revision"],"input_digest":app_runs::material_digest(plan),"input":plan,"state":"pending","updated_at":crate::issue::time::now_epoch()},"replayed":true})
 }
 
 /// CAD-1303: the owner's per-post image idea. The image tool input is `{}` or
