@@ -690,7 +690,7 @@
         }
         assert_eq!(
             crate::rollout::SCHEMA_VERSION,
-            35,
+            36,
             "bump? pin the new version and add its migration test"
         );
         // Half-applied: one table present, version rolled back — the
@@ -1511,4 +1511,56 @@
         }
         assert!(has("table", "app_tool_results"));
         assert!(has("index", "events_alias_kind"));
+    }
+
+    /// CAD-1282: a store already at v35 (the Essential Foods hot-swap) lacks
+    /// `app_run_failures`; v36 creates it idempotently and keeps every other
+    /// table and row.
+    #[test]
+    fn migration_v35_to_v36_adds_app_run_failures_to_a_store_already_at_v35() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("t.sqlite3");
+        std::fs::create_dir(dir.path().join("w")).unwrap();
+        {
+            let s = Store::open(&db).unwrap();
+            reg(&s, "a1", &dir.path().join("w"));
+        }
+        // A genuine v35 that never got the retrofitted table.
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE app_run_failures;
+                 UPDATE schema_version SET version=35;",
+            )
+            .unwrap();
+        let has = |name: &str| -> bool {
+            Connection::open(&db)
+                .unwrap()
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                    [name],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()
+                .unwrap()
+                .is_some()
+        };
+        assert!(!has("app_run_failures"), "v35 store lacks the table");
+        assert!(has("app_tool_claims"), "v35 tool tables are present");
+        {
+            let s = Store::open_for_schema_tests(&db).unwrap();
+            assert!(has("app_run_failures"), "v36 creates app_run_failures");
+            assert!(has("app_tool_claims") && has("app_tool_results"));
+            assert_eq!(
+                Connection::open(&db)
+                    .unwrap()
+                    .query_row("SELECT version FROM schema_version", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                crate::rollout::SCHEMA_VERSION
+            );
+            assert!(s.agent("a1").unwrap().alias == "a1");
+        }
+        // Reopening at v36 is a no-op converge.
+        let _ = Store::open_for_schema_tests(&db).unwrap();
+        assert!(has("app_run_failures"));
     }

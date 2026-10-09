@@ -122,7 +122,7 @@ store/plans.rs	guarded-store-and-read-queries	guarded_write	11
 store/plans.rs	guarded-store-and-read-queries	prepare	1
 store/platform.rs	guarded-store-and-read-queries	execute	15
 store/platform.rs	guarded-store-and-read-queries	guarded_write	11
-store/schema.rs	sqlite-schema-owner-and-restricted-recovery	execute	82
+store/schema.rs	sqlite-schema-owner-and-restricted-recovery	execute	84
 store/schema.rs	sqlite-schema-owner-and-restricted-recovery	guarded_write	2
 store/schema.rs	sqlite-schema-owner-and-restricted-recovery	open	3
 store/schema.rs	sqlite-schema-owner-and-restricted-recovery	prepare	22
@@ -174,9 +174,9 @@ store/tests/native_nudge.rs	test-fixtures	open	1
 store/tests/queue.rs	test-fixtures	execute	1
 store/tests/queue.rs	test-fixtures	guarded_write	1
 store/tests/queue.rs	test-fixtures	open	2
-store/tests/schema.rs	test-fixtures	execute	49
+store/tests/schema.rs	test-fixtures	execute	50
 store/tests/schema.rs	test-fixtures	guarded_write	1
-store/tests/schema.rs	test-fixtures	open	124
+store/tests/schema.rs	test-fixtures	open	130
 store/tests/schema.rs	test-fixtures	prepare	4
 store/tests/social_generation_receipt_acceptance.rs	test-fixtures	execute	1
 store/tests/social_publish.rs	test-fixtures	open	5

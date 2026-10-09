@@ -983,6 +983,22 @@ impl Store {
                 tx.execute("UPDATE schema_version SET version=35", [])?;
                 tx.commit()?;
             }
+            if version < 36 {
+                // CAD-1282: CAD-1171 added `app_run_failures` to `app_runs::SCHEMA`
+                // after the `version < 20` block that creates it had shipped, so
+                // a store already past v20 never got the table. Never add DDL to a
+                // shipped migration block: a new version reaches stores already at
+                // the current one. Same DDL as `app_runs::SCHEMA`, idempotent.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS app_run_failures(
+ run_id TEXT PRIMARY KEY REFERENCES app_runs(id), step_id TEXT NOT NULL,
+ kind TEXT NOT NULL CHECK(kind IN ('refused','uncertain')), reason TEXT NOT NULL,
+ created REAL NOT NULL);",
+                )?;
+                tx.execute("UPDATE schema_version SET version=36", [])?;
+                tx.commit()?;
+            }
             if let Some(crossing) = permit.crossing {
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 Self::event(
