@@ -14,6 +14,7 @@
 //! | `cad1300_publish_after_a_revoked_board_approval_is_refused` | item 4: one approval record per head on every board path; Publish reuses a standing one, refuses a revoked one; the CLI path is unchanged |
 //! | `cad1300_publish_first_then_approve_is_refused` | item 4, converse: a head Publish recorded cannot be approved again |
 //! | `cad1300_owner_with_a_long_actor_is_admitted` | item 3: every platform owner is an approver; the relayed actor is bounded, deterministic and attributable |
+//! | `cad1300_owner_with_a_non_ascii_name_is_admitted` | item 3 (PM, 2026-10-09): an owner whose name has no ASCII characters is an approver too |
 //! | `cad1300_approver_refusal_is_403_and_no_repo_oracle` | item 7 (`rpc_err` 403 mapping on Approve) and item 9 (no registered-repo oracle) |
 //! | `cad1300_reachable_second_layers` | item 7 survivors that can be reached: forged verb fields, `board_revocable`'s `recorded_via` term |
 //!
@@ -734,4 +735,181 @@ fn cad1300_reachable_second_layers() {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------
+// Item 3, PM decision of 2026-10-09: ALL platform-verified owners may
+// approve with no config — including an owner whose verified name has no
+// ASCII characters (陳大文).
+//
+// Why it is refused today: `BoardUser::actor` keeps printable ASCII only,
+// so the name cleans to "" and the actor falls back to `<handle> (board)`
+// (`handle_of(sub, email)`), which drops the email. The daemon's `(board)`
+// shape rule (`platform_owner_actor`) needs `<name> <<email>> (board)`, so
+// `approver_source` refuses it: 403 `approver_not_allowed` on every route.
+//
+// Contract:
+// - The relayed actor for such an owner keeps the `(board)` shape with a
+//   non-empty name part and the verified email: `<name> <<email>> (board)`.
+//   The name part is deterministic and stays within the store's source
+//   rule (1-200 bytes, no control characters, `"<actor> via board"`). The
+//   recommended rendering keeps `actor()` printable-ASCII (it also feeds
+//   commit `Actor:` trailers): when the cleaned name is empty, use the
+//   session's `handle` as the name part — `usr_chan <dawen.chan@example.hk>
+//   (board)`. The check pins the properties, not that string.
+// - Attributable: the source keeps `<local@` of the email, and two owners
+//   with the same non-ASCII name but different emails get different
+//   sources. Deterministic: a second session for the same identity
+//   yields the same source.
+// - The daemon's shape rule is NOT relaxed: the bare `<handle> (board)`
+//   that today's board relays, a bare non-ASCII `陳大文 (board)`, and the
+//   other malformed shapes stay refused at the verb; a member with a
+//   non-ASCII name is still refused at admission.
+// ---------------------------------------------------------------------
+
+/// The record's source for an admitted non-ASCII-named owner.
+#[track_caller]
+fn non_ascii_owner_source(seen: &Value, email: &str) -> String {
+    let source = seen["source"].as_str().unwrap_or_default().to_string();
+    assert!(
+        (1..=SOURCE_MAX).contains(&source.len()),
+        "the source must be 1-{SOURCE_MAX} bytes (the store's rule), is {}: {seen}",
+        source.len()
+    );
+    assert!(!source.chars().any(char::is_control), "{seen}");
+    assert!(
+        source.ends_with(&format!("<{email}> (board) via board")),
+        "{seen}"
+    );
+    let name_part = source
+        .strip_suffix(&format!(" <{email}> (board) via board"))
+        .unwrap_or_default();
+    assert!(
+        !name_part.trim().is_empty(),
+        "the actor keeps a non-empty name part: {seen}"
+    );
+    source
+}
+
+#[test]
+#[ignore = "CAD-1300: enabled by the implementation"]
+fn cad1300_owner_with_a_non_ascii_name_is_admitted() {
+    let root = tempfile::Builder::new().prefix("c1300u").tempdir().unwrap();
+    let board = Board::start(root.path());
+    let name = "\u{9673}\u{5927}\u{6587}"; // 陳大文
+    let email = "dawen.chan@example.hk";
+    let twin_email = "dawen.chan2@example.hk";
+
+    // --- kept refusals first (each passes today and must keep passing) ---
+    for actor in [
+        "usr_chan (board)".to_string(),
+        format!("{name} (board)"),
+        "x (board)".to_string(),
+        format!("{name} <{email}>> (board)"),
+        format!("{name} <{email}> (board) via board"),
+        format!("{name} <{email}> (BOARD)"),
+        format!("<{email}> (board)"),
+    ] {
+        let err = as_operator(
+            &board,
+            VERB,
+            json!({"repo": REPO, "pr": 89, "head": HEAD, "request_actor": actor}),
+        )
+        .expect_err("a malformed (board) actor recorded an approval");
+        assert_eq!(
+            err.code(),
+            Some("approver_not_allowed"),
+            "'{actor}' must be refused by the approver rule: {err}"
+        );
+    }
+    assert_eq!(board.audit_pr(89, HEAD)["state"], "missing");
+    let member = platform_session(
+        &board,
+        "usr_chan_member",
+        name,
+        "member.chan@example.hk",
+        "member",
+        "c1300-u-member",
+    );
+    signed_in(&board, &member, "the non-ASCII-named member");
+    for (path, body) in [
+        (APPROVE.to_string(), Some(approve_pr(89))),
+        (state_path(REPO, 89, HEAD), None),
+        (publish_path(PUBLISH_ISSUE), Some(publish_body())),
+    ] {
+        let (status, reply) = board.public(&path, &member, body.as_deref());
+        assert_eq!(status, 403, "a member on {path}: {reply}");
+        assert_eq!(reply["check"], "member_role", "a member on {path}: {reply}");
+    }
+    assert_eq!(board.audit_pr(89, HEAD)["state"], "missing");
+    assert_eq!(merges(&board), "", "a member's Publish enqueued a merge");
+
+    // --- the owner: read, Approve, read, revoke, Publish ---
+    let owner = platform_session(&board, "usr_chan", name, email, "owner", "c1300-u-1");
+    signed_in(&board, &owner, "the non-ASCII-named owner");
+    let read = state_path(REPO, 90, HEAD);
+    let (status, body) = board.public(&read, &owner, None);
+    assert_eq!(
+        status, 200,
+        "a non-ASCII-named owner reads the state: {body}"
+    );
+    assert_eq!(body["state"], "missing", "{body}");
+    let (status, body) = board.public(APPROVE, &owner, Some(&approve_pr(90)));
+    assert_eq!(status, 200, "a non-ASCII-named owner approves: {body}");
+    let id = body["approval_id"].as_str().unwrap().to_string();
+    let seen = board.audit_pr(90, HEAD);
+    assert_eq!(seen["state"], "in-force", "{seen}");
+    assert_eq!(seen["recorded_via"], "operator-connection", "{seen}");
+    let source = non_ascii_owner_source(&seen, email);
+    assert!(!source.contains("tailscale"), "{seen}");
+    let (status, body) = board.public(&read, &owner, None);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["state"], "in-force", "{body}");
+    assert_eq!(body["board_revocable"], true, "{body}");
+    let (status, body) = board.public(
+        &format!("/api/approvals/{id}/revoke"),
+        &owner,
+        Some(&json!({"reason": "owner re-review"}).to_string()),
+    );
+    assert_eq!(status, 200, "the non-ASCII-named owner revokes: {body}");
+    assert_eq!(board.audit_pr(90, HEAD)["state"], "revoked");
+    let (status, body) = board.public(&publish_path(PUBLISH_ISSUE), &owner, Some(&publish_body()));
+    assert_eq!(status, 200, "the non-ASCII-named owner Publishes: {body}");
+    let seen = board.audit_pr(PUBLISH_PR, HEAD);
+    assert_eq!(seen["state"], "in-force", "{seen}");
+    assert_eq!(
+        non_ascii_owner_source(&seen, email),
+        source,
+        "Approve and Publish attribute the same owner identically"
+    );
+    assert!(merges(&board).contains(&format!("merge {PUBLISH_PR} ")));
+
+    // --- deterministic: a new session for the same verified identity ---
+    let again = platform_session(&board, "usr_chan", name, email, "owner", "c1300-u-2");
+    signed_in(&board, &again, "the owner's second session");
+    let (status, body) = board.public(APPROVE, &again, Some(&approve_pr(91)));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        non_ascii_owner_source(&board.audit_pr(91, HEAD), email),
+        source,
+        "the rendering is deterministic"
+    );
+
+    // --- attributable: another owner with the same name, another email ---
+    let twin = platform_session(
+        &board,
+        "usr_chan_two",
+        name,
+        twin_email,
+        "owner",
+        "c1300-u-twin",
+    );
+    signed_in(&board, &twin, "the same-named owner");
+    let (status, body) = board.public(APPROVE, &twin, Some(&approve_pr(92)));
+    assert_eq!(status, 200, "{body}");
+    let twin_source = non_ascii_owner_source(&board.audit_pr(92, HEAD), twin_email);
+    assert_ne!(
+        twin_source, source,
+        "two same-named owners must not share one attribution"
+    );
 }
