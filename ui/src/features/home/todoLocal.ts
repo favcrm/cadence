@@ -14,10 +14,10 @@ import { needFingerprint, todoCount, todoSplit, type HomeNeed } from "./needs";
  * records the row's fingerprint (`needFingerprint`) and only applies to a
  * row that still has it. Nothing is persisted.
  *
- * A row without a `since` cannot tell one occurrence from the next (the
- * overview is not fetched while the operator is off Home), so its decided
- * and sent marks also belong to one visit: a new mount of the rail drops
- * them. A send in flight is not scoped, so a remount mid-send cannot send twice.
+ * The overview is not read while the operator is off Home, so a decided or
+ * sent mark also belongs to one visit: a new mount of the rail drops it. A
+ * sent mark records the visit current when the send completes. A send in
+ * flight is not scoped, so a remount mid-send cannot send twice.
  */
 export interface TodoLocal {
   hidden: ReadonlyMap<string, string>;
@@ -37,8 +37,8 @@ function set(next: TodoLocal) {
   for (const fn of listeners) fn();
 }
 
-/** The fingerprint a decided or sent mark records: plus the visit when the row has no `since`. */
-const scope = (need: HomeNeed, visit: number) => (need.since === null ? `${needFingerprint(need)}|visit ${visit}` : needFingerprint(need));
+/** The fingerprint a decided or sent mark records: the need, within one visit to Home. */
+const scope = (need: HomeNeed, visit: number) => `${needFingerprint(need)}|visit ${visit}`;
 
 const mark = (m: ReadonlyMap<string, string>, need: HomeNeed, fp = needFingerprint(need)) => new Map(m).set(need.key, fp);
 const unmark = (m: ReadonlyMap<string, string>, need: HomeNeed) => {
@@ -57,7 +57,7 @@ export const settleTodo = (need: HomeNeed, ok: boolean) =>
 
 const has = (m: ReadonlyMap<string, string>, need: HomeNeed, fp = needFingerprint(need)) => m.get(need.key) === fp;
 
-/** The Home rail mounted: marks of an earlier visit no longer apply to rows without a `since`. */
+/** The Home rail mounted: decided and sent marks of an earlier visit no longer apply. */
 export const beginTodoVisit = () => set({ ...state, visit: state.visit + 1 });
 
 /** The marks that still apply to this row. */
@@ -113,6 +113,7 @@ export function useHomeCount(rows: NeedsMe[] | null | undefined): number {
   const local = useTodoLocal();
   const needs = rows ? todoSplit(rows).todo : null;
   const sig = needs?.map((n) => `${n.key}\t${needFingerprint(n)}`).join("\n") ?? null;
+  // `sig` stands for `needs`: re-run only when a key or fingerprint changes.
   useEffect(() => {
     if (needs) reconcileTodo(needs);
   }, [sig]);

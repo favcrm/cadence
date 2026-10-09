@@ -63,9 +63,6 @@ export interface HomeNeed {
   /** The server's plain-words card title and reason, when it sent them (CAD-1219). */
   shortTitle: string | null;
   why: string | null;
-  /** When this occurrence began, when the server says: the same kind on the same
-   *  subject later is a new need. */
-  since: number | null;
   /** Who the item belongs to / who is waiting. */
   owner: string;
   /** Seconds waiting. */
@@ -154,7 +151,6 @@ export function homeNeed(row: NeedsMe, index = 0): HomeNeed {
     title: row.title,
     shortTitle: str(row.short_title),
     why: str(row.why),
-    since: typeof row.since === "number" ? row.since : null,
     age: row.age,
     project: str(row.project),
     subject: row.subject ?? null,
@@ -479,8 +475,8 @@ export function todoCount(rows: NeedsMe[] | null | undefined, settled?: (need: H
 /**
  * What the need behind a row is, beyond its subject key: the server merges
  * every cause for one subject into one row, so the same key can carry a new
- * need. The row's kind, the identity its action carries and its `since` (the
- * occurrence); a local mark
+ * need. The row's kind plus the identity its action carries (never a clock the
+ * server recomputes, which drifts between overviews); a local mark
  * (hidden, decided, sent) applies only while this is unchanged.
  */
 export function needFingerprint(need: HomeNeed): string {
@@ -492,7 +488,7 @@ export function needFingerprint(need: HomeNeed): string {
     : a.type === "plan" ? a.epic
     : a.type === "idea" ? a.issue
     : need.subject?.id ?? "";
-  return `${need.kind}|${id}|${need.since ?? ""}`;
+  return `${need.kind}|${id}`;
 }
 
 /** `74` → `just now`, `240` → `4 min`, `7200` → `2 h`, `3 d`. */

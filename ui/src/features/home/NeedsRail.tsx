@@ -52,7 +52,7 @@ export default function NeedsRail({
   const { todo, updates, decided } = todoSplit(overview.data?.needs_me);
   const [drawer, setDrawer] = useState(false);
   const local = useTodoLocal();
-  // A new visit to Home: earlier decided and sent marks of rows without a `since` stop applying.
+  // A new visit to Home: earlier decided and sent marks stop applying.
   useLayoutEffect(() => beginTodoVisit(), []);
   const [review, setReview] = useState<string | null>(null);
   // The reading items, as they stood when the drawer opened: "n of m" does
