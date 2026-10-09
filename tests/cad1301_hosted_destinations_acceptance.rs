@@ -1,24 +1,29 @@
-//! CAD-1267 acceptance check — written by the Spec/security reviewer
-//! (opus-rev-spec-894), not the implementer.
+//! CAD-1301 acceptance check — written by the Spec/security reviewer
+//! (opus-rev-spec-903), not the implementer.
 //!
-//! Ticket outcome: through the hosted sender, an unapproved social draft
-//! effect, or one whose binding or draft revision changed after approval,
-//! is refused and nothing reaches the provider door.
+//! Ticket outcome: through the real hosted send path, the destinations
+//! document AgenticOS really sends (`devicePublishFixture.destinations`,
+//! replayed verbatim from `tests/fixtures/agenticos/`) resolves the approved
+//! destination and the effect is posted; every drifted reply shape sends
+//! nothing and refuses closed; a revoked or non-publishable row never counts
+//! as a match.
 //!
-//! A real in-process daemon starts with only the baked hosted-media
-//! metadata (no device env, no credential file), so `serve_with` itself
-//! registers the hosted sender, importer and resolver. That transport is
-//! pinned to `http://api.internal`; the test reaches it through a fake
-//! door that ureq is pointed at with `ALL_PROXY` (an HTTP CONNECT proxy
-//! that answers the tunnelled request itself). Every request the hosted
-//! clients make is logged, so "no outbound send" is the log staying empty.
-//! An approved, unchanged effect is the positive control: it does reach
-//! the hosted door, which proves the log can fill.
+//! Harness: the CAD-1267 one. A real in-process daemon registers the hosted
+//! sender, importer and resolver from the baked hosted-media metadata alone;
+//! ureq reaches the pinned `http://api.internal` through a CONNECT-proxy fake
+//! door that logs every request. The destinations reply is swappable per
+//! case. Effects are frozen straight into the record store, caption-only,
+//! with their own toolkit/destination/connection (deliberate: the binding is
+//! bound once to the fixture's Instagram account, and `publish_now` checks
+//! only the binding's digest and revision; only destination parsing on the
+//! `publish_now` path is under test). Instagram needs an image at the send
+//! binding, so the verbatim Instagram fixture leg stops after the grants
+//! read, and the send legs use a facebook row with the fixture row's keys.
 #![cfg(feature = "test-seam")]
 
 use cadence_agent::platform::deployments::DeploymentMetadata;
 use cadence_agent::store::app_records::RecordStore;
-use cadence_agent::store::app_social_drafts::{DraftSource, EffectStage, SocialDraftEdit};
+use cadence_agent::store::app_social_drafts::{DraftSource, EffectStage};
 use cadence_agent::test_seam::{scoped, Asserted, Seam};
 use cadence_agent::{client, daemon};
 use serde_json::{json, Value};
@@ -30,9 +35,14 @@ use std::time::Duration;
 
 const HOSTED: &str = r#"{"schema":1,"providers":[{"provider":"agenticos_external","origin":"http://api.internal","manifest_pin":"agenticos-external-provider-tools@3","transport":"hosted-media-lease@1"}]}"#;
 const PREFIX: &str = "/v1/runtime/connectors/hosted-publish";
-const AOS_CONN: &str = "conn_aos_hosted_1";
-const DEST: &str = "275491372109884";
-const GRANT: &str = "dpq_cad1267_grant";
+const AOS_CONN: &str = "con_harbour_ig";
+const DEST: &str = "17841400008460056";
+const GRANT: &str = "dpq_cad1301_grant";
+/// The facebook account the send legs use: the fixture row's 7 keys, for a
+/// toolkit that may post caption-only.
+const FB_CONN: &str = "con_harbour_fb";
+const FB_DEST: &str = "275491372109884";
+const FIXTURE: &str = include_str!("fixtures/agenticos/device-publish-destinations.json");
 const CAPTION: &str = "Hosted caption";
 
 /// One request the hosted clients sent: tunnel target, method, path and
@@ -42,7 +52,7 @@ type Seen = Arc<Mutex<Vec<(String, String, String, bool)>>>;
 /// The fake `api.internal` door behind a CONNECT proxy. Answers the
 /// destinations read with the one publishable row, preflight and send by
 /// echoing the binding, and anything else with a door error document.
-fn fake_door() -> (String, Seen) {
+fn fake_door(destinations: Arc<Mutex<String>>) -> (String, Seen) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let seen: Seen = Arc::default();
@@ -50,6 +60,7 @@ fn fake_door() -> (String, Seen) {
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let log = log.clone();
+            let destinations = destinations.clone();
             std::thread::spawn(move || {
                 let mut writer = stream.try_clone().unwrap();
                 let mut reader = BufReader::new(stream);
@@ -110,9 +121,20 @@ fn fake_door() -> (String, Seen) {
                 });
                 let reply = match (method.as_str(), path.split('?').next().unwrap_or("")) {
                     ("GET", p) if p == format!("{PREFIX}/destinations") => {
-                        json!({"ok":true,"data":{"version":"1","destinations":[{
-                        "connectionId": AOS_CONN, "toolkit": "facebook", "displayName": "Harbour",
-                        "destinationId": DEST, "status": "active", "available": true, "publishable": true}]}})
+                        let data: Value =
+                            serde_json::from_str(&destinations.lock().unwrap()).unwrap();
+                        json!({"ok": true, "data": data})
+                    }
+                    ("GET", p) if p == format!("{PREFIX}/publish/grants") => {
+                        json!({"ok": true, "data": {"grants": [
+                            {"kind": "standing", "id": GRANT, "workspaceId": "ws_1301",
+                             "connectionId": AOS_CONN, "destinationId": DEST,
+                             "toolkit": "instagram", "dailyCap": 20, "remainingToday": 20,
+                             "expiresAt": null, "revokedAt": null},
+                            {"kind": "standing", "id": GRANT, "workspaceId": "ws_1301",
+                             "connectionId": FB_CONN, "destinationId": FB_DEST,
+                             "toolkit": "facebook", "dailyCap": 20, "remainingToday": 20,
+                             "expiresAt": null, "revokedAt": null}]}})
                     }
                     ("POST", p) if p == format!("{PREFIX}/publish/preflight") => {
                         let mut data = echo.clone();
@@ -167,6 +189,8 @@ struct Fx {
     )>,
     seen: Seen,
     context: std::sync::OnceLock<String>,
+    destinations: Arc<Mutex<String>>,
+    next: std::sync::atomic::AtomicU32,
 }
 
 impl Fx {
@@ -193,12 +217,15 @@ impl Fx {
         let root = tempfile::Builder::new().prefix("c1267").tempdir().unwrap();
         cadence_agent::issue::Pm::init(&root.path().join("pm")).unwrap();
         std::fs::create_dir_all(root.path().join("s")).unwrap();
-        let (door, seen) = fake_door();
+        let destinations = Arc::new(Mutex::new(FIXTURE.to_string()));
+        let (door, seen) = fake_door(destinations.clone());
         let mut fx = Self {
             root,
             daemon: None,
             seen,
             context: Default::default(),
+            destinations,
+            next: Default::default(),
         };
         let (dir, stop) = (fx.dir(), Arc::new(AtomicBool::new(false)));
         let env = cadence_agent::adapter::ProviderEnv::refusing_providers();
@@ -316,7 +343,7 @@ impl Fx {
             json!({"install_id": install, "binding_id": binding["id"],
                 "expected_revision": binding["revision"],
                 "destination_id": DEST, "destination_label": label,
-                "toolkit": "facebook", "timezone": "Asia/Hong_Kong",
+                "toolkit": "instagram", "timezone": "Asia/Hong_Kong",
                 "grant_id": GRANT}),
         )["binding"]
             .clone()
@@ -329,6 +356,7 @@ impl Fx {
         &self,
         (install, bundle, binding): &(String, String, Value),
         tag: &str,
+        (toolkit, dest, conn): (&str, &str, &str),
         approve: bool,
     ) -> (String, String, String) {
         let records = RecordStore::open(&self.dir(), install).unwrap();
@@ -347,11 +375,7 @@ impl Fx {
             .unwrap();
         let draft_id = draft["draft_id"].as_str().unwrap().to_string();
         let hex: String = install.bytes().map(|b| format!("{b:02x}")).collect();
-        let n = ["unapproved", "revised", "control", "rebound"]
-            .iter()
-            .position(|t| *t == tag)
-            .unwrap()
-            + 1;
+        let n = self.next.fetch_add(1, SeqCst) + 1;
         let id = format!("sfx_{hex}_{n:032x}");
         let caption_digest =
             cadence_agent::platform::agenticos_external::publish::caption_digest_of(CAPTION);
@@ -360,9 +384,9 @@ impl Fx {
             "install_id": install, "context_id": self.ctx(), "bundle_digest": bundle,
             "draft_id": draft_id, "revision": 1, "caption": CAPTION,
             "caption_digest": caption_digest, "asset_id": null, "image_digest": null,
-            "mime": null, "size_bytes": null, "toolkit": "facebook",
-            "destination_id": DEST, "destination_label": "Harbour",
-            "timezone": "Asia/Hong_Kong", "grant_id": GRANT, "aos_connection_id": AOS_CONN,
+            "mime": null, "size_bytes": null, "toolkit": toolkit,
+            "destination_id": dest, "destination_label": "Harbour",
+            "timezone": "Asia/Hong_Kong", "grant_id": GRANT, "aos_connection_id": conn,
             "binding": {"slot": "publication", "revision": binding["revision"],
                 "digest": binding["digest"], "config": binding["config"]},
             "effect_id": id, "idempotency_key": format!("social_{n:032x}"),
@@ -418,105 +442,151 @@ impl Drop for Fx {
     }
 }
 
+impl Fx {
+    fn serve(&self, data: &Value) {
+        *self.destinations.lock().unwrap() = data.to_string();
+    }
+
+    /// Requests that left after the first `from` ones, as `METHOD path`.
+    fn since(&self, from: usize) -> Vec<String> {
+        self.sent()[from..]
+            .iter()
+            .map(|(target, method, path, authorized)| {
+                assert_eq!(target, "api.internal:80", "left the lease door");
+                assert!(!authorized, "hosted request carried a bearer");
+                format!("{method} {path}")
+            })
+            .collect()
+    }
+}
+
+/// The fixture's one row, verbatim.
+fn fixture_row() -> Value {
+    serde_json::from_str::<Value>(FIXTURE).unwrap()["destinations"][0].clone()
+}
+
+/// The facebook send account, with exactly the fixture row's keys.
+fn fb_row() -> Value {
+    let mut row = fixture_row();
+    row["connectionId"] = json!(FB_CONN);
+    row["toolkit"] = json!("facebook");
+    row["displayName"] = json!("Harbour page");
+    row["destinationId"] = json!(FB_DEST);
+    row
+}
+
+fn doc(rows: Vec<Value>) -> Value {
+    json!({"version": "1", "destinations": rows})
+}
+
 #[test]
-fn hosted_sender_refuses_unapproved_or_changed_effects_with_no_outbound_send() {
+fn hosted_destinations_resolve_only_the_real_document_and_refuse_drift_closed() {
     let fx = Fx::start();
     let app = fx.install();
     let install = app.0.clone();
+    let instagram = ("instagram", DEST, AOS_CONN);
+    let facebook = ("facebook", FB_DEST, FB_CONN);
+    let destinations = format!("GET {PREFIX}/destinations");
+    let grants = |dest: &str| format!("GET {PREFIX}/publish/grants?destinationId={dest}");
+    let sent_path = [
+        destinations.clone(),
+        grants(FB_DEST),
+        format!("POST {PREFIX}/publish/preflight"),
+        format!("POST {PREFIX}/publish/preflight"),
+        format!("POST {PREFIX}/publish"),
+    ];
+    let posts = |fx: &Fx, data: &Value, tag: &str| {
+        fx.serve(data);
+        let (id, digest, _) = fx.effect(&app, tag, facebook, true);
+        let from = fx.sent().len();
+        let result = fx.publish_now(&id, &digest);
+        let seen = fx.since(from);
+        assert!(
+            seen.len() >= 5 && seen[..5] == sent_path,
+            "{tag}: the approved effect did not reach preflight and publish: {seen:?} {result:?}"
+        );
+        result.unwrap_or_else(|e| panic!("{tag}: approved effect did not publish: {e}"));
+        assert_eq!(fx.state(&install, &id), "posted", "{tag}");
+    };
+    let refuses = |fx: &Fx, data: &Value, tag: &str, closed: &str| {
+        fx.serve(data);
+        let (id, digest, _) = fx.effect(&app, tag, facebook, true);
+        let from = fx.sent().len();
+        let result = fx.publish_now(&id, &digest);
+        // Exactly the destinations read went out (so the drift was really
+        // served): no grants read, import, preflight or publish.
+        assert_eq!(
+            fx.since(from),
+            std::slice::from_ref(&destinations),
+            "{tag}: a drifted reply let a request past the destinations read: {result:?}"
+        );
+        let refused = result.expect_err(tag).to_string();
+        assert!(
+            refused.contains(closed),
+            "{tag}: not a closed refusal: {refused}"
+        );
+        assert_eq!(fx.state(&install, &id), "approved", "{tag}");
+    };
+    const UNAVAILABLE: &str = "capability_unavailable: the destinations resolver is unavailable";
+    const UNMAPPED: &str = "grant_binding_mismatch: no publishable destination binds";
+    const AMBIGUOUS: &str =
+        "capability_unavailable: the destinations read did not isolate one publishable binding";
 
-    // 1. Unapproved: the effect is still waiting for the operator.
-    let (id, digest, _) = fx.effect(&app, "unapproved", false);
-    let refused = fx.publish_now(&id, &digest);
+    // (a1) The real AgenticOS document, verbatim (Instagram), resolves the
+    // approved account: `publish_now` reads the owner's grants only after
+    // `resolve` returned exactly one row whose connection equals the
+    // approved `con_harbour_ig`. Caption-only Instagram is then correctly
+    // refused at the send binding, so this leg stops before preflight.
+    fx.serve(&serde_json::from_str(FIXTURE).unwrap());
+    let (id, digest, _) = fx.effect(&app, "fixture-instagram", instagram, true);
+    let from = fx.sent().len();
+    let result = fx.publish_now(&id, &digest);
+    let seen = fx.since(from);
     assert!(
-        fx.sent().is_empty(),
-        "unapproved effect reached the door: {:?}",
-        fx.sent()
+        seen.len() >= 2 && seen[..2] == [destinations.clone(), grants(DEST)],
+        "the verbatim fixture did not resolve the approved account: {seen:?} {result:?}"
     );
-    let refused = refused.unwrap_err().to_string();
-    assert!(
-        refused.contains("exact approved social draft effect"),
-        "{refused}"
-    );
-    assert_eq!(fx.state(&install, &id), "waiting");
 
-    // 2. Draft revision changed after approval.
-    let (id, digest, draft) = fx.effect(&app, "revised", true);
-    RecordStore::open(&fx.dir(), &install)
-        .unwrap()
-        .app_social_draft_update(
-            fx.ctx(),
-            &draft,
-            &SocialDraftEdit {
-                expected: 1,
-                caption: "Edited after approval",
-                asset_id: None,
-                request_id: "edit-revised",
-                actor: "session:operator",
-            },
-        )
-        .unwrap();
-    let refused = fx.publish_now(&id, &digest);
-    assert!(
-        fx.sent().is_empty(),
-        "revised draft reached the door: {:?}",
-        fx.sent()
-    );
-    let refused = refused.unwrap_err().to_string();
-    assert!(
-        refused.contains("social draft changed since approval"),
-        "{refused}"
-    );
-    assert_eq!(fx.state(&install, &id), "approved");
+    // (a2) The same envelope carrying a facebook row posts end to end.
+    posts(&fx, &doc(vec![fb_row()]), "envelope-facebook");
 
-    // Positive control: an approved, unchanged effect does go out over
-    // the hosted lease door (fixed api.internal origin, hosted prefix,
-    // no bearer), so an empty log above is a real refusal.
-    let (id, digest, _) = fx.effect(&app, "control", true);
-    let _ = fx.publish_now(&id, &digest);
-    let sent = fx.sent();
-    assert!(
-        sent.iter().any(
-            |(target, method, path, authorized)| target == "api.internal:80"
-                && method == "GET"
-                && *path == format!("{PREFIX}/destinations")
-                && !authorized
-        ),
-        "approved effect never reached the hosted door: {sent:?}"
+    // (b) Every drifted shape sends nothing and refuses closed. Each one
+    // carries the approved row, so a tolerant parser would send it.
+    let row = fb_row();
+    refuses(&fx, &json!([row]), "bare-array", UNAVAILABLE);
+    refuses(
+        &fx,
+        &json!({"version": "2", "destinations": [row]}),
+        "version-2",
+        UNAVAILABLE,
     );
-    assert!(
-        sent.iter()
-            .all(|(target, _, path, authorized)| target == "api.internal:80"
-                && path.starts_with(PREFIX)
-                && !authorized),
-        "hosted request left the lease door shape: {sent:?}"
+    refuses(&fx, &json!({"version": "1"}), "no-list", UNAVAILABLE);
+    refuses(
+        &fx,
+        &json!({"version": "1", "rows": [row]}),
+        "renamed-list",
+        UNAVAILABLE,
     );
-    let before = sent.len();
+    let mut malformed = row.clone();
+    malformed["connectionId"] = json!(42);
+    refuses(&fx, &doc(vec![malformed]), "malformed-row", UNMAPPED);
+    // The approved row first: picking the first match would send it.
+    let mut twin = row.clone();
+    twin["connectionId"] = json!("con_harbour_fb_twin");
+    refuses(&fx, &doc(vec![row.clone(), twin]), "two-rows", AMBIGUOUS);
 
-    // 3. Binding changed after approval: the operator re-sets the
-    // publish settings, so the live binding's revision and digest move.
-    let (id, digest, _) = fx.effect(&app, "rebound", true);
-    let live = fx.op(
-        "app_binding_list",
-        json!({"install_id": install, "context_id": fx.ctx()}),
-    )["bindings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|b| b["state"] == "configured")
-        .unwrap()
-        .clone();
-    fx.publish_set(&install, &live, "Harbour moved");
-    let refused = fx.publish_now(&id, &digest);
-    assert_eq!(
-        fx.sent().len(),
-        before,
-        "rebound effect reached the door: {:?}",
-        &fx.sent()[before..]
-    );
-    let refused = refused.unwrap_err().to_string();
-    assert!(
-        refused.contains("social publish binding changed since approval"),
-        "{refused}"
-    );
-    assert_eq!(fx.state(&install, &id), "approved");
+    // (c) A revoked or non-publishable row for the same account never
+    // counts: alone it maps nothing; beside the live row it does not make
+    // the read ambiguous.
+    let mut revoked = row.clone();
+    revoked["connectionId"] = json!("con_harbour_fb_old");
+    revoked["status"] = json!("revoked");
+    revoked["publishable"] = json!(false);
+    let mut closed = row.clone();
+    closed["connectionId"] = json!("con_harbour_fb_closed");
+    closed["available"] = json!(false);
+    closed["publishable"] = json!(false);
+    refuses(&fx, &doc(vec![revoked.clone()]), "revoked-only", UNMAPPED);
+    refuses(&fx, &doc(vec![closed.clone()]), "closed-only", UNMAPPED);
+    posts(&fx, &doc(vec![revoked, closed, row]), "live-beside-revoked");
 }

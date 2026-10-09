@@ -73,7 +73,9 @@ impl Fx {
         let served = Arc::clone(&rows);
         std::thread::spawn(move || {
             for request in stub.incoming_requests() {
-                let body = json!({"ok": true, "data": *served.lock().unwrap()}).to_string();
+                let body = json!({"ok": true, "data": {"version": "1",
+                    "destinations": *served.lock().unwrap()}})
+                .to_string();
                 let _ = request.respond(tiny_http::Response::from_string(body));
             }
         });

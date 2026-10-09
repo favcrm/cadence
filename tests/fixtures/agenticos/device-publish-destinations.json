@@ -1,0 +1,14 @@
+{
+  "version": "1",
+  "destinations": [
+    {
+      "connectionId": "con_harbour_ig",
+      "toolkit": "instagram",
+      "displayName": "Harbour stills",
+      "destinationId": "17841400008460056",
+      "status": "active",
+      "available": true,
+      "publishable": true
+    }
+  ]
+}
