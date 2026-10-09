@@ -374,12 +374,13 @@ impl super::publish::PublishSender for HttpPublishSender {
         self.status_request(key)
     }
 
-    /// CAD-1291: read-only lookup of the grants the owner minted for one
-    /// approval id. The door scopes it to this company; Cadence then selects
-    /// the exact-digest grant and AgenticOS re-checks it at preflight and send.
+    /// CAD-1291: read-only lookup of the owner's standing grants for one
+    /// destination. The door scopes it to this company; Cadence selects the
+    /// live one for the approved account and AgenticOS re-checks company,
+    /// destination, revocation and the daily cap at preflight and send.
     fn find_grant(
         &self,
-        approval_id: &str,
+        destination_id: &str,
     ) -> std::result::Result<Vec<super::publish::FoundGrant>, Refusal> {
         let uncertain = || {
             Refusal::new(
@@ -387,16 +388,19 @@ impl super::publish::PublishSender for HttpPublishSender {
                 "grant lookup is uncertain; nothing was sent, try again",
             )
         };
-        if approval_id.is_empty()
-            || approval_id.len() > 120
-            || !approval_id
+        if destination_id.is_empty()
+            || destination_id.len() > 120
+            || !destination_id
                 .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
         {
-            return Err(Refusal::new("bad_grant", "approval id shape is invalid"));
+            return Err(Refusal::new(
+                "bad_destination",
+                "destination id shape is invalid",
+            ));
         }
         let url = format!(
-            "{}{}?cadenceApprovalId={approval_id}",
+            "{}{}?destinationId={destination_id}",
             self.base,
             self.credential.route(GRANTS_PATH)
         );
@@ -1549,7 +1553,7 @@ mod tests {
         assert!(preflight_of(&binding, &verdict("pending", false)).is_err());
     }
     /// CAD-1291: the lookup is a read-only GET on the door's grants route,
-    /// scoped by approval id; a malformed record fails closed.
+    /// scoped by destination; a malformed record fails closed.
     #[test]
     fn find_grant_reads_the_door_and_refuses_malformed_records() {
         use std::io::{Read, Write};
@@ -1557,7 +1561,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let bodies = [
-            r#"{"ok":true,"data":{"grants":[{"id":"dpq_ownergrant_001","workspaceId":"w","connectionId":"c","destinationId":"d","toolkit":"instagram","captionDigest":"x","imageDigest":null,"cadenceApprovalId":"apv_1","maxUses":1,"remainingUses":1,"notBefore":"n","expiresAt":"e","revokedAt":null}]}}"#,
+            r#"{"ok":true,"data":{"grants":[{"id":"dpq_ownergrant_001","kind":"standing","connectionId":"c","destinationId":"d","toolkit":"instagram","remainingToday":3,"revokedAt":null}]}}"#,
             r#"{"ok":true,"data":{"grants":[{"id":"nope"}]}}"#,
         ];
         let server = std::thread::spawn(move || {
@@ -1588,17 +1592,16 @@ mod tests {
         )
         .unwrap();
         use super::super::publish::PublishSender;
-        let found = sender.find_grant("apv_1").unwrap();
+        let found = sender.find_grant("1784").unwrap();
         assert_eq!(found[0].id, "dpq_ownergrant_001");
-        assert_eq!(sender.find_grant("apv_1").unwrap_err().code, "refused");
+        assert_eq!(sender.find_grant("1784").unwrap_err().code, "refused");
         assert_eq!(
-            sender.find_grant("apv 1/../x").unwrap_err().code,
-            "bad_grant"
+            sender.find_grant("a b/../x").unwrap_err().code,
+            "bad_destination"
         );
         let lines = server.join().unwrap();
         assert!(
-            lines[0]
-                .starts_with("GET /v1/runtime/connectors/publish/grants?cadenceApprovalId=apv_1 "),
+            lines[0].starts_with("GET /v1/runtime/connectors/publish/grants?destinationId=1784 "),
             "{}",
             lines[0]
         );

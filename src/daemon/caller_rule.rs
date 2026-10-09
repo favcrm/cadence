@@ -491,7 +491,6 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("app_effect_list", Rule::Handler("operator_connection (CAD-692)")),
     ("app_effect_decide", Rule::Handler("operator_connection (CAD-692)")),
     ("app_effect_publish_now", Rule::Handler("operator_connection (CAD-1177)")),
-    ("app_effect_grant", Rule::Handler("operator_connection (CAD-1291)")),
     ("app_effect_resolve", Rule::Handler("operator_connection (CAD-692)")),
     ("social_publish_media_import", Rule::Handler("operator_connection (CAD-979)")),
     ("social_publish_schedule", Rule::Handler("operator_connection (CAD-771)")),

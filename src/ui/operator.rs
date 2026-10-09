@@ -141,7 +141,6 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
         "/api/app-effects/*/publish-now",
         RouteClass::OperatorOnly,
     ),
-    route("POST", "/api/app-effects/*/grant", RouteClass::OperatorOnly),
     route(
         "POST",
         "/api/app-installations/*/contexts",

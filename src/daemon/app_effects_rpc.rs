@@ -80,11 +80,12 @@ pub(crate) fn social_effect_install(id: &str) -> Option<String> {
         .collect::<Option<Vec<_>>>()?;
     String::from_utf8(bytes).ok()
 }
-/// CAD-1291: the grant the workspace owner minted in AgenticOS for exactly
-/// this approved post. Cadence never mints one and never takes a grant id
-/// from a request: it asks the hosted door for the grants minted under this
-/// effect's approval id and accepts one only when every digest, the
-/// connection and the destination equal what the operator approved.
+/// CAD-1291: the owner's standing publish grant for the approved
+/// destination. Cadence never mints one and never takes a grant id from a
+/// request or a binding: it asks the hosted door for the standing grants of
+/// this destination and accepts a live one only for exactly this account.
+/// The post itself is still gated by the operator's approval, the exact
+/// effect digest and the draft, binding, destination and image checks.
 fn owner_grant(
     sender: &dyn crate::platform::agenticos_external::publish::PublishSender,
     authority: &Value,
@@ -95,17 +96,14 @@ fn owner_grant(
             .as_str()
             .ok_or_else(|| Refusal::new("bad_grant", "approved social effect is incomplete"))
     };
-    let approval = text("approval_id")?;
-    let found = sender.find_grant(approval)?;
+    let destination = text("destination_id")?;
+    let found = sender.find_grant(destination)?;
     select_grant(
         &found,
         &GrantWant {
-            approval_id: approval,
             connection_id: text("aos_connection_id")?,
-            destination_id: text("destination_id")?,
+            destination_id: destination,
             toolkit: text("toolkit")?,
-            caption_digest: text("caption_digest")?,
-            image_digest: authority["image_digest"].as_str(),
         },
     )
 }
@@ -263,57 +261,6 @@ impl Shared {
         )
     }
 
-    /// CAD-1291: what the owner must confirm in AgenticOS, and whether they
-    /// have. Read-only: it names the exact approval id, caption, image digest
-    /// and destination the card shows, plus the fragment the board opens on
-    /// the owner-confirm page. It mints nothing, and the container cannot:
-    /// only a signed-in workspace owner can mint on AgenticOS.
-    fn social_draft_grant_request(&self, id: &str, digest: &str) -> Result<Value> {
-        let install = social_effect_install(id)
-            .ok_or_else(|| Error::rejected("not a social draft effect"))?;
-        let shown = crate::store::app_records::RecordStore::open(&self.state_dir, &install)?
-            .app_social_effect_show(id)?;
-        if shown["effect"]["digest"] != digest
-            || !matches!(
-                shown["effect"]["state"].as_str(),
-                Some("waiting" | "approved")
-            )
-        {
-            return Err(Error::rejected(
-                "the effect changed or is no longer open; reload the approval card",
-            ));
-        }
-        let authority = &shown["effect"]["authority"];
-        let request = json!({
-            "v": 1,
-            "approvalId": authority["approval_id"],
-            "connectionId": authority["aos_connection_id"],
-            "toolkit": authority["toolkit"],
-            "destinationLabel": authority["destination_label"],
-            "destinationId": authority["destination_id"],
-            "caption": authority["caption"],
-            "imageDigest": authority["image_digest"],
-        });
-        let fragment = base64::Engine::encode(
-            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-            serde_json::to_vec(&request)?,
-        );
-        let grant = match &self.social_publish_sender {
-            None => json!({"state": "unavailable"}),
-            Some(sender) => match owner_grant(sender.as_ref(), authority) {
-                Ok(_) => json!({"state": "ready"}),
-                Err(refusal) if refusal.code == "grant_required" => json!({"state": "waiting"}),
-                Err(refusal) => json!({"state": refusal.code, "detail": refusal.detail}),
-            },
-        };
-        Ok(json!({
-            "effect_id": id,
-            "request": request,
-            "open_path": format!("/__platform/publish-approve#r={fragment}"),
-            "grant": grant,
-        }))
-    }
-
     fn publish_social_draft_now(&self, id: &str, digest: &str) -> Result<Value> {
         use crate::platform::agenticos_external::publish::{Preflight, PublishState};
         let install = social_effect_install(id)
@@ -376,7 +323,7 @@ impl Shared {
                 if resolved.aos_connection_id != authority["aos_connection_id"] {
                     return Err(Error::rejected("social destination changed since approval"));
                 }
-                // The owner's confirmation comes first: no grant, no media
+                // The owner's standing grant comes first: no grant, no media
                 // import and no claim.
                 let grant_id = owner_grant(sender.as_ref(), &authority)
                     .map_err(|refusal| Error::rejected(refusal.to_string()))?;
@@ -482,7 +429,6 @@ impl Shared {
                 "app_effect_list" => &["install_id", "context_id"],
                 "app_effect_decide" => &["effect_id", "digest", "decision"],
                 "app_effect_publish_now" => &["effect_id", "digest"],
-                "app_effect_grant" => &["effect_id", "digest"],
                 "app_effect_resolve" => &["effect_id", "digest", "resolution"],
                 _ => return Err(Error::rejected("unknown app effect method")),
             },
@@ -516,10 +462,6 @@ impl Shared {
                 }
             }
             "app_effect_publish_now" => self.publish_social_draft_now(
-                required_str(params, "effect_id")?,
-                required_str(params, "digest")?,
-            ),
-            "app_effect_grant" => self.social_draft_grant_request(
                 required_str(params, "effect_id")?,
                 required_str(params, "digest")?,
             ),
@@ -1048,19 +990,19 @@ impl Shared {
 // check, written by the reviewer or the ticket author, not the implementer,
 // in a new `tests/cad1291_acceptance.rs` (feature `test-seam`). It must prove
 // against the real guards that these are refused: an agent or container
-// caller on `app_effect_grant` and `app_effect_publish_now`, over RPC and
-// HTTP; a non-owner member (AgenticOS side); and a changed caption, image or
-// destination after approval, with no provider call.
+// caller on `app_effect_publish_now`, over RPC and HTTP; an agent or
+// container minting a grant (AgenticOS side); a non-owner member and a standing grant sent to another destination
+// or company, or past its cap or revoked (AgenticOS side); and an unapproved
+// or changed draft, with no provider call.
 
 #[cfg(test)]
 mod grant_tests {
     use super::*;
     use crate::platform::agenticos_external::publish::{
-        caption_digest_of, FoundGrant, LedgerOutcome, PublishSender, Refusal, SendBinding,
+        FoundGrant, LedgerOutcome, PublishSender, Refusal, SendBinding,
     };
 
-    /// A door that lists fixed grants and never sends: the lookup is all
-    /// these tests may touch.
+    /// A door that lists fixed grants and never sends.
     struct Door(Vec<FoundGrant>);
     impl PublishSender for Door {
         fn execute(&self, _: &SendBinding) -> std::result::Result<LedgerOutcome, Refusal> {
@@ -1069,59 +1011,56 @@ mod grant_tests {
         fn status(&self, _: &str) -> std::result::Result<LedgerOutcome, Refusal> {
             unreachable!("a grant lookup never reconciles")
         }
-        fn find_grant(&self, approval: &str) -> std::result::Result<Vec<FoundGrant>, Refusal> {
+        fn find_grant(&self, destination: &str) -> std::result::Result<Vec<FoundGrant>, Refusal> {
             Ok(self
                 .0
                 .iter()
-                .filter(|g| g.cadence_approval_id == approval)
+                .filter(|g| g.destination_id == destination)
                 .cloned()
                 .collect())
         }
     }
 
-    fn authority(caption: &str) -> Value {
-        json!({"approval_id":"social-approval-1","aos_connection_id":"con_ig",
-            "destination_id":"1784","toolkit":"instagram",
-            "caption_digest": caption_digest_of(caption),
-            "image_digest":"a".repeat(64)})
+    fn authority(destination: &str) -> Value {
+        json!({"aos_connection_id":"con_ig","destination_id":destination,"toolkit":"instagram"})
     }
 
-    fn owner_minted(caption: &str) -> FoundGrant {
+    fn standing() -> FoundGrant {
         FoundGrant {
-            id: "dpq_ownergrant_001".into(),
+            id: "dpq_standing_001".into(),
             connection_id: "con_ig".into(),
             destination_id: "1784".into(),
             toolkit: "instagram".into(),
-            caption_digest: caption_digest_of(caption),
-            image_digest: Some("a".repeat(64)),
-            cadence_approval_id: "social-approval-1".into(),
-            remaining_uses: 1,
+            remaining_today: 5,
             revoked: false,
         }
     }
 
     #[test]
-    fn publish_needs_the_owners_grant_for_exactly_the_approved_post() {
-        let caption = "Harbour at dusk.";
-        let door = Door(vec![owner_minted(caption)]);
-        // Positive control: the owner confirmed this exact post.
+    fn publish_needs_the_owners_standing_grant_for_the_approved_account() {
+        let door = Door(vec![standing()]);
         assert_eq!(
-            owner_grant(&door, &authority(caption)).unwrap(),
-            "dpq_ownergrant_001"
+            owner_grant(&door, &authority("1784")).unwrap(),
+            "dpq_standing_001"
         );
-        // No owner confirmation: nothing may send.
         assert_eq!(
-            owner_grant(&Door(vec![]), &authority(caption))
+            owner_grant(&Door(vec![]), &authority("1784"))
                 .unwrap_err()
                 .code,
             "grant_required"
         );
-        // The caption changed after the owner confirmed.
+        // The approved destination differs from the granted one.
         assert_eq!(
-            owner_grant(&door, &authority("Harbour at dawn."))
+            owner_grant(&door, &authority("9999")).unwrap_err().code,
+            "grant_required"
+        );
+        let mut capped = standing();
+        capped.remaining_today = 0;
+        assert_eq!(
+            owner_grant(&Door(vec![capped]), &authority("1784"))
                 .unwrap_err()
                 .code,
-            "grant_binding_mismatch"
+            "grant_cap_reached"
         );
     }
 
