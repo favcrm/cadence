@@ -33,10 +33,12 @@ function Nudge() {
     writeNudgeDismissed(browserStorage());
     setDismissed(true);
   };
+  // CAD-1312: the strip lives inside the chat panel, so it carries no
+  // shell padding or width of its own — the panel owns both.
   return (
-    <div className="px-4 lg:px-8 pt-4 max-w-[62rem] w-full min-w-0">
+    <div className="w-full min-w-0 shrink-0 mt-1">
       <div
-        className="card flex flex-wrap items-center gap-x-3 gap-y-2 px-4 py-3 border-accent/40"
+        className="card flex flex-wrap items-center gap-x-3 gap-y-2 px-3 py-2 border-accent/40"
         role="status"
       >
         <span className="min-w-0 flex-1 text-secondary text-ink-300">

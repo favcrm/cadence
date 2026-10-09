@@ -59,52 +59,52 @@
 @media (prefers-color-scheme: light) {
   :root:not([data-theme="dark"]) {
     color-scheme: light;
-    --color-ink-950: #e6e8eb;
-    --color-ink-900: #f4f5f6;
-    --color-ink-875: #eceef0;
+    --color-ink-950: #f8f9fa;
+    --color-ink-900: #f8f9fa;
+    --color-ink-875: #f3f5f6;
     --color-ink-850: #ffffff;
-    --color-ink-800: #e9ebee;
-    --color-ink-700: #dfe2e6;
-    --color-ink-600: #cdd2d8;
-    --color-ink-500: #6b7280;
-    --color-ink-400: #4b5563;
-    --color-ink-300: #374151;
-    --color-ink-200: #1b1d21;
-    --color-ink-100: #0b0b0c;
-    --color-accent: #0f766e;
+    --color-ink-800: #edf0f2;
+    --color-ink-700: #e1e6e8;
+    --color-ink-600: #cdd4d8;
+    --color-ink-500: #68767d;
+    --color-ink-400: #536168;
+    --color-ink-300: #38454c;
+    --color-ink-200: #2a353b;
+    --color-ink-100: #20292d;
+    --color-accent: #126b60;
     --color-ok: #15803d;
     --color-fail: #dc2626;
     --color-warn: #b45309;
     --color-info: #2563eb;
     --color-on-accent: #ffffff;
-    --color-edge: #c4c9d0;
-    --color-edge-hover: #9aa1a9;
-    --color-scrim: rgb(17 24 39 / .35);
+    --color-edge: #a6b2b8;
+    --color-edge-hover: #8b979e;
+    --color-scrim: rgb(24 40 47 / .35);
   }
 }
 :root[data-theme="light"] {
   color-scheme: light;
-  --color-ink-950: #e6e8eb;
-  --color-ink-900: #f4f5f6;
-  --color-ink-875: #eceef0;
+  --color-ink-950: #f8f9fa;
+  --color-ink-900: #f8f9fa;
+  --color-ink-875: #f3f5f6;
   --color-ink-850: #ffffff;
-  --color-ink-800: #e9ebee;
-  --color-ink-700: #dfe2e6;
-  --color-ink-600: #cdd2d8;
-  --color-ink-500: #6b7280;
-  --color-ink-400: #4b5563;
-  --color-ink-300: #374151;
-  --color-ink-200: #1b1d21;
-  --color-ink-100: #0b0b0c;
-  --color-accent: #0f766e;
+  --color-ink-800: #edf0f2;
+  --color-ink-700: #e1e6e8;
+  --color-ink-600: #cdd4d8;
+  --color-ink-500: #68767d;
+  --color-ink-400: #536168;
+  --color-ink-300: #38454c;
+  --color-ink-200: #2a353b;
+  --color-ink-100: #20292d;
+  --color-accent: #126b60;
   --color-ok: #15803d;
   --color-fail: #dc2626;
   --color-warn: #b45309;
   --color-info: #2563eb;
   --color-on-accent: #ffffff;
-  --color-edge: #c4c9d0;
-  --color-edge-hover: #9aa1a9;
-  --color-scrim: rgb(17 24 39 / .35);
+  --color-edge: #a6b2b8;
+  --color-edge-hover: #8b979e;
+  --color-scrim: rgb(24 40 47 / .35);
 }
 
 body {
@@ -183,13 +183,14 @@ body {
   background: color-mix(in srgb, var(--color-accent) 13%, var(--color-ink-875));
   color: var(--color-accent);
 }
-/* The sidebar footer's account trigger: a two-line navlink. */
+/* The sidebar footer's account trigger (CAD-1312): one compact 36px
+   line — avatar, name and role, the up-chevron at the edge. */
 .navlink.account-row {
   width: 100%;
   min-width: 0;
-  min-height: 40px;
+  min-height: 36px;
   gap: 8px;
-  padding: 4px 8px;
+  padding: 4px 6px;
   font-size: inherit;
 }
 .navlink-sub {
@@ -255,16 +256,17 @@ textarea.field {
   resize: vertical;
 }
 
-/* Shared Button. Text is centred in the fixed height — a full-width
-   control must not sit on the left, and IBM Plex must not inherit the
-   body's 1.4 line-height into the 2rem box. */
+/* Shared Button (CAD-1312: compact 28px default). Text is centred in
+   the fixed height — a full-width control must not sit on the left,
+   and IBM Plex must not inherit the body's 1.4 line-height into the
+   box. Narrow screens and coarse pointers keep a roomy 36px target. */
 .btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 6px;
-  height: 2rem;
-  padding: 0 0.8rem;
+  height: 1.75rem;
+  padding: 0 0.65rem;
   line-height: 1;
   white-space: nowrap;
   max-width: 100%;
@@ -272,7 +274,7 @@ textarea.field {
   border-radius: 0.25rem;
   background: var(--color-ink-850);
   color: var(--color-ink-200);
-  font-size: var(--text-label);
+  font-size: var(--text-micro);
   text-decoration: none;
   cursor: pointer;
   transition: border-color 0.15s ease, background-color 0.15s ease, filter 0.15s ease;
@@ -287,9 +289,18 @@ textarea.field {
   flex: none;
 }
 .btn-sm {
-  height: 1.75rem;
-  padding: 0 0.6rem;
+  height: 1.5rem;
+  padding: 0 0.5rem;
   font-size: var(--text-micro);
+}
+/* Touch and narrow screens keep roomy 36px targets — after `.btn-sm`
+   so it wins the cascade on the compact small variant too. */
+@media (width < 640px), (pointer: coarse) {
+  .btn {
+    height: 2.25rem;
+    padding: 0 0.8rem;
+    font-size: var(--text-label);
+  }
 }
 .btn-full {
   width: 100%;
@@ -521,10 +532,13 @@ textarea.field {
   }
 }
 @layer components {
+  /* CAD-1312: one quiet badge language — a hairline border tinted by the
+     chip's own status colour, so labels stay semantic in both themes. */
   .chip {
     display: inline-flex;
     align-items: center;
     gap: .3rem;
+    border: 1px solid color-mix(in srgb, currentColor 20%, transparent);
     border-radius: .25rem;
     padding: .05rem .4rem;
     font: 500 .6875rem "IBM Plex Mono", monospace;
@@ -564,6 +578,46 @@ a.lnk:hover, button.lnk:hover {
 }
 pre {
   white-space: pre-wrap;
+}
+
+/* CAD-1312: one shared full-pane state — the sign-in and access refusals
+   and a confirmed-empty workspace render as a calm centred state, not a
+   boxed card among sections. The host's pane sizes it (a bounded pane
+   like the Wiki scroller keeps its own height; a document-flow screen
+   gets the main area below the 36px header). */
+.page-state {
+  margin: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1.5rem;
+  padding: 3rem 1.5rem;
+  text-align: center;
+  min-height: min(30rem, calc(100dvh - 2.25rem - 4rem));
+  justify-content: center;
+}
+.page-state-icon {
+  display: grid;
+  place-items: center;
+  width: 3rem;
+  height: 3rem;
+  border-radius: 0.75rem;
+  border: 1px solid var(--color-ink-700);
+  background: var(--color-ink-875);
+  color: var(--color-ink-400);
+}
+.page-state-title {
+  font-size: 1.375rem;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: var(--color-ink-100);
+}
+.page-state-copy {
+  margin-top: -0.75rem;
+  max-width: 28rem;
+  font-size: var(--text-secondary);
+  line-height: 1.6;
+  color: var(--color-ink-400);
 }
 
 /* ---------- CAD-551: chat turn state, steps, commands, motion ----------
@@ -1182,23 +1236,27 @@ pre {
 }
 
 /* CAD-1216: the To do rail — tabs, one-line cards, the decided history. */
+/* CAD-1312: the rail's tab strip compacts to a 36px row; labels drop
+   to 12px and the tools align vertically with the tabs — the 2px active
+   underline still sits flush on the border. */
 .todo-tabs {
   display: flex;
-  align-items: flex-end;
+  align-items: stretch;
   gap: .25rem;
-  min-height: 3rem;
+  min-height: 2.25rem;
   padding: 0 .75rem;
   border-bottom: 1px solid var(--color-ink-700);
 }
 .todo-tabs > button {
   display: inline-flex;
   align-items: center;
-  gap: .4rem;
-  padding: .85rem .6rem .7rem;
+  gap: .35rem;
+  min-height: 2.25rem;
+  padding: 0 .5rem;
   margin-bottom: -1px;
   border-bottom: 2px solid transparent;
   color: var(--color-ink-400);
-  font-size: var(--text-secondary);
+  font-size: var(--text-label);
 }
 .todo-tabs > button[aria-pressed="true"] {
   color: var(--color-ink-100);
@@ -1209,16 +1267,15 @@ pre {
   margin-left: auto;
   display: inline-flex;
   align-items: center;
-  gap: .75rem;
-  padding-bottom: .8rem;
+  gap: .5rem;
 }
 .todo-count {
-  min-width: 1.1rem;
-  padding: 0 .35rem;
+  min-width: 1rem;
+  padding: 0 .3rem;
   border-radius: 9999px;
   background: var(--color-ink-700);
   color: var(--color-ink-200);
-  font: 600 .65rem/1.1rem "IBM Plex Mono", monospace;
+  font: 600 .625rem/1rem "IBM Plex Mono", monospace;
   text-align: center;
 }
 .todo-count.on {
@@ -1605,15 +1662,25 @@ button.refchip:hover {
   min-height: 0;
   overflow-y: auto;
 }
-.app-header { height: 3.25rem; flex-shrink: 0; }
+/* CAD-1312: the board header is a compact 36px status bar — controls
+   sit with a 6px top/bottom inset inside it at every width. */
+.app-header { height: 2.25rem; flex-shrink: 0; padding-block: 4px; box-sizing: border-box; align-items: center; }
 .header-menu svg { flex-shrink: 0; }
 @media (width >= 1024px) { .app-header .header-menu { display: none; } }
-.header-breadcrumb { display: flex; align-items: center; gap: .65rem; font-size: var(--text-secondary); }
+.header-breadcrumb { display: flex; align-items: center; gap: .5rem; font-size: var(--text-micro); }
+/* CAD-1312: the configured organisation name truncates inside a bounded
+   span so a long configured name never pushes the status controls out. */
+.header-org { flex: 0 1 auto; max-width: 18rem; min-width: 0; }
+@media (width < 640px) { .header-org { max-width: 8rem; } }
 .header-breadcrumb a { color: var(--color-ink-400); }
 .header-breadcrumb a:hover { color: var(--color-ink-100); }
 .header-breadcrumb a:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 3px; border-radius: .15rem; }
-.section-nav { display: flex; flex-shrink: 0; flex-wrap: wrap; align-items: center; gap: .25rem 1rem; border-bottom: 1px solid var(--color-ink-700); min-width: 0; }
-.section-nav-link { display: inline-flex; align-items: center; justify-content: center; min-height: 2.75rem; padding: .5rem .25rem; border-bottom: 2px solid transparent; color: var(--color-ink-400); font-size: var(--text-secondary); white-space: nowrap; }
+/* CAD-1312: section tabs match the compact Home tab row — a 36px strip
+   of 12px labels with the 2px active underline flush on the border.
+   Narrow screens scroll the row sideways rather than wrap it. */
+.section-nav { display: flex; flex-shrink: 0; flex-wrap: nowrap; align-items: stretch; gap: .5rem; border-bottom: 1px solid var(--color-ink-700); min-width: 0; min-height: 2.25rem; overflow-x: auto; scrollbar-width: none; }
+.section-nav::-webkit-scrollbar { display: none; }
+.section-nav-link { display: inline-flex; flex-shrink: 0; align-items: center; justify-content: center; min-height: 2.25rem; padding: 0 .5rem; margin-bottom: -1px; border-bottom: 2px solid transparent; color: var(--color-ink-400); font-size: var(--text-label); white-space: nowrap; }
 .section-nav-link:hover { color: var(--color-ink-100); }
 .section-nav-link[aria-current="page"] { color: var(--color-accent); border-bottom-color: var(--color-accent); font-weight: 500; }
 .section-nav-link:focus-visible { outline: 2px solid var(--color-accent); outline-offset: -2px; border-radius: .25rem; }
@@ -1621,22 +1688,54 @@ button.refchip:hover {
 .header-control-wrap.header-update[data-open="true"] .header-tooltip { visibility: hidden; opacity: 0; }
 .header-update-panel { position: absolute; top: calc(100% + .4rem); right: 0; width: min(18rem, calc(100vw - 2rem)); z-index: 50; }
 @media (width < 640px) {
-  .header-update-trigger { width: 2.5rem; justify-content: center; }
-  .header-update-panel { position: fixed; top: 3.65rem; right: 1rem; }
+  .header-update-trigger { width: 2rem; justify-content: center; }
+  .header-update-panel { position: fixed; top: 2.5rem; right: 1rem; }
 }
 .build-update-action { min-height: 2.75rem; padding-inline: .75rem; font-size: var(--text-label); border-radius: .3rem; }
 .build-update-action:hover { background: var(--color-ink-800); }
 .build-update-action:focus-visible { outline: 2px solid var(--color-accent); outline-offset: -2px; }
-.header-auth-target { min-height: 2rem; }
-@media (width < 640px) { .header-auth-target { min-height: 2.75rem; } }
+.header-auth-target { min-height: 1.5rem; }
+@media (width < 640px) { .header-auth-target { min-height: 1.75rem; } }
 
-/* Header utilities: matching targets, quiet at rest, explicit on focus. */
+/* Header utilities (CAD-1312): a quiet status bar — 14px glyphs in
+   compact hit boxes, borderless at rest and on hover, a subtle surface
+   lift on hover, and an accent outline for keyboard focus only. */
 .header-control-wrap { position: relative; display: inline-flex; }
-.header-icon { position: relative; display: inline-flex; align-items: center; justify-content: center; width: 2.5rem; height: 2.75rem; border-radius: .4rem; transition: background-color .15s, color .15s; }
+.header-icon { position: relative; display: inline-flex; align-items: center; justify-content: center; width: 1.5rem; height: 1.5rem; border-radius: .3rem; border: none; background: transparent; transition: background-color .15s, color .15s; }
+.header-icon svg { width: 14px; height: 14px; }
+@media (width < 640px) { .header-icon { width: 1.75rem; height: 1.75rem; } .header-menu svg { width: 16px; height: 16px; } }
+/* The header's labelled state controls (read-only, update, sign-in)
+   share the same borderless pill — sans micro text, no box outline. */
+.header-state {
+  display: inline-flex;
+  align-items: center;
+  gap: .3rem;
+  height: 1.5rem;
+  padding: 0 .45rem;
+  border: none;
+  border-radius: .3rem;
+  background: transparent;
+  color: var(--color-ink-400);
+  font-size: var(--text-micro);
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: color .15s ease, background-color .15s ease;
+}
+.header-state:hover {
+  background: var(--color-ink-800);
+  color: var(--color-ink-100);
+}
+.header-state:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+.header-state .header-state-action { color: var(--color-accent); }
+@media (width < 640px) { .header-state { height: 1.75rem; } }
 .header-icon:hover, .header-icon:focus-visible { background: var(--color-ink-800); color: var(--color-ink-100); }
 .header-icon:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
-.connection-dot { position: absolute; right: .35rem; bottom: .35rem; width: .3rem; height: .3rem; border-radius: 50%; background: var(--color-accent); box-shadow: 0 0 0 2px var(--color-ink-900); }
-.header-tooltip { position: absolute; top: calc(100% + .5rem); right: 0; z-index: 70; width: max-content; max-width: min(17rem, calc(100vw - 2rem)); padding: .5rem .65rem; border: 1px solid var(--color-ink-700); border-radius: .4rem; background: var(--color-ink-850); color: var(--color-ink-200); font-size: var(--text-label); line-height: 1.4; box-shadow: 0 4px 12px rgb(0 0 0 / .15); visibility: hidden; opacity: 0; pointer-events: none; }
+.connection-dot { position: absolute; right: .15rem; bottom: .15rem; width: .3rem; height: .3rem; border-radius: 50%; background: var(--color-accent); box-shadow: 0 0 0 2px var(--color-ink-900); }
+.header-tooltip { position: absolute; top: calc(100% + .4rem); right: 0; z-index: 70; width: max-content; max-width: min(17rem, calc(100vw - 2rem)); padding: .5rem .65rem; border: 1px solid var(--color-ink-700); border-radius: .4rem; background: var(--color-ink-850); color: var(--color-ink-200); font-size: var(--text-label); line-height: 1.4; box-shadow: 0 4px 12px rgb(0 0 0 / .15); visibility: hidden; opacity: 0; pointer-events: none; }
 .header-control-wrap:hover .header-tooltip, .header-control-wrap:focus-within .header-tooltip { visibility: visible; opacity: 1; }
 @media (prefers-reduced-motion: reduce) { .header-icon { transition: none; } }
 

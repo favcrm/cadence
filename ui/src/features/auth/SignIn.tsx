@@ -1,6 +1,7 @@
 import type { Meta } from "../../lib/types";
 import DeviceSignIn from "./DeviceSignIn";
 import { SIGN_IN_COMMAND } from "./gate";
+import { IconLock } from "../../ui/icons";
 
 /**
  * The header's sign-in state: "Sign in with `cadence ui login`" when this
@@ -14,7 +15,13 @@ export default function SignIn({ meta, onChange }: { meta: Meta | null; onChange
     const device = meta.device_login === true;
     return (
       <details className="relative text-label">
-        <summary className="header-auth-target chip bg-warn/10 text-warn cursor-pointer" aria-label="Read-only. Sign in to make changes"><span className="hidden sm:inline">Read-only · </span>Sign in</summary>
+        {/* CAD-1312: unsigned-in browsing is a neutral state, not a warning —
+            the quiet pill carries the lock, "Read only" and the accent action. */}
+        <summary className="header-auth-target header-state" aria-label="Read-only. Sign in to make changes">
+          <IconLock size={11} />
+          <span className="hidden sm:inline">Read only<span className="text-ink-600" aria-hidden> · </span><span className="header-state-action">Sign in</span></span>
+          <span className="sm:hidden">Sign in</span>
+        </summary>
         <div className={`absolute right-0 top-full mt-2 z-50 card p-4 shadow-xl ${device ? "w-80" : "w-72"}`}>
           {device ? (
             <>

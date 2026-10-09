@@ -3,6 +3,7 @@ import { fmtBytes } from "../../lib/fmt";
 import type { Route } from "../../lib/router";
 import { navigate } from "../../lib/useLocation";
 import Button from "../../ui/Button";
+import PageState from "../../ui/PageState";
 import {
   blobPage,
   wiki,
@@ -357,17 +358,18 @@ function BrowsePane({
 
   if (error) {
     if (error.status === 403) {
+      // CAD-1312: the refusal is the pane's one calm state — same 403
+      // condition and message selection, the shared PageState styling.
       return (
         <>
           <Bar path={path} navHref={navHref} />
-          <EmptyCard title={error.message.includes("session") ? "Sign in to view these pages" : "Access unavailable"} warn>
+          <PageState title={error.message.includes("session") ? "Sign in to view these pages" : "Access unavailable"} actions={
+            <Button href={navHref({ screen: "wiki", mode: "browse", path: null, query: null })}>
+              Back to {scope?.label ?? WIKI_ROOT_LABEL}
+            </Button>
+          }>
             {error.message.includes("session") ? "Use Sign in at the top of the board to open your project pages." : error.message}
-            <div className="mt-2">
-              <Button href={navHref({ screen: "wiki", mode: "browse", path: null, query: null })}>
-                Back to {scope?.label ?? WIKI_ROOT_LABEL}
-              </Button>
-            </div>
-          </EmptyCard>
+          </PageState>
         </>
       );
     }

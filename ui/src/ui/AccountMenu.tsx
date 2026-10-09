@@ -19,9 +19,10 @@ function appliedTheme(): ThemePref {
 
 /**
  * One account menu: who you are, who writes are attributed to, theme and
- * sign out. The "avatar" trigger is a 28px initial (header, phones); the
- * "row" trigger is the desktop sidebar footer (CAD-1033): avatar, name,
- * "role · host" and an up-chevron in a `.navlink`-family row.
+ * sign out. The "avatar" trigger is a 24px initial (header, phones); the
+ * "row" trigger is the desktop sidebar footer (CAD-1033, CAD-1312): a
+ * compact single line — avatar, name, small role and an up-chevron in a
+ * `.navlink`-family row.
  */
 export default function AccountMenu({
   meta,
@@ -114,7 +115,7 @@ export default function AccountMenu({
   // A read-only board shows nothing that writes: the logout route skips the read-only guard.
   const canWrite = !meta.read_only;
   const avatar = trigger === "avatar";
-  const hostLine = `${user?.role || "operator"} · ${location.host}`;
+  const role = user?.role || "operator";
   return (
     <div ref={rootRef} className={avatar ? "header-control-wrap shrink-0" : "relative shrink-0"} data-account-menu onKeyDown={onKeyDown} onBlur={onBlur}>
       <button
@@ -129,14 +130,14 @@ export default function AccountMenu({
           ? "header-icon"
           : "navlink account-row"}
       >
-        <span aria-hidden className="grid h-7 w-7 shrink-0 place-items-center rounded-full bg-accent/15 text-label font-medium uppercase text-accent">
+        <span aria-hidden className="grid h-6 w-6 shrink-0 place-items-center rounded-full bg-accent/15 text-micro font-medium uppercase text-accent">
           {name.trim().charAt(0)}
         </span>
         {!avatar && (
           <>
-            <span className="min-w-0 flex-1 text-left" title={hostLine}>
-              <span className="block truncate text-secondary font-medium text-ink-200">{name}</span>
-              <span className="block truncate text-micro text-ink-500">{hostLine}</span>
+            <span className="flex min-w-0 flex-1 items-baseline gap-1.5 text-left" title={`${name} · ${role}`}>
+              <span className="truncate text-label font-medium text-ink-200">{name}</span>
+              <span className="shrink-0 text-micro text-ink-500">{role}</span>
             </span>
             <span aria-hidden className="shrink-0 rotate-180 text-ink-500"><IconChevron /></span>
           </>

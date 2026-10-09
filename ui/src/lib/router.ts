@@ -64,7 +64,7 @@ export const NAV: { screen: Screen; label: string; route: Route }[] = [
   { screen: "wiki", label: "Wiki", route: { screen: "wiki", mode: "browse", path: null, query: null } },
   { screen: "apps", label: "Apps", route: { screen: "apps", project: null, name: null } },
   { screen: "agents", label: "Agents", route: { screen: "agents", alias: null } },
-  { screen: "outbox", label: "Outbox", route: { screen: "outbox" } },
+  // CAD-1312: Outbox leaves the nav (its route, API and page remain).
   { screen: "settings", label: "Settings", route: { screen: "settings", section: "models" } },
 ];
 

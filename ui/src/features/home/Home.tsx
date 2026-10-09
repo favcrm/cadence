@@ -1,5 +1,5 @@
 import { useWriteBlock } from "../auth/WriteGate";
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { api, ApiError } from "../../lib/api";
 import type { ResourceState } from "../../lib/cache";
 import { resources, threadReader } from "../../lib/resources";
@@ -401,6 +401,7 @@ export default function Home({
   onOpenIssue,
   overviewHref,
   permissionsHref,
+  setupNotice = null,
 }: {
   readOnly: boolean;
   hosted?: boolean | null;
@@ -409,6 +410,10 @@ export default function Home({
   overviewHref: string;
   /** Settings → Master permissions (the standing "Always" rules). */
   permissionsHref: string;
+  /** The first-run setup strip (CAD-1312): rendered inside the chat
+   *  panel below the Assistant heading so the Needs-you rail beside it
+   *  keeps the workspace's top edge. */
+  setupNotice?: ReactNode;
 }) {
   const thread = useQuery(resources.masterThread);
   const agents = useResource(resources.agents);
@@ -822,10 +827,7 @@ export default function Home({
             )}
           </div>
 
-          <p className="text-micro text-ink-400 pt-2 pb-1 flex items-center gap-1.5" data-chat-scope>
-            <span className="inline-block w-[5px] h-[5px] rounded-full bg-accent" aria-hidden />
-            All projects
-          </p>
+          {setupNotice}
 
           {thread.status === "failed" && (
             <div className="card px-3.5 py-3 mt-3 text-label text-fail break-words" role="alert">

@@ -27,11 +27,11 @@ export default function StatusChips({
     <>
       {readOnly && (
         <span
-          className="chip bg-warn/10 text-warn"
+          className={header ? "header-state cursor-default" : "chip bg-ink-800 text-ink-400"}
           title="the server refuses every write — browsing only"
         >
           <IconLock />
-          <span className={labelCls}>read-only</span>
+          <span className={labelCls}>read only</span>
         </span>
       )}
       {children}
@@ -40,7 +40,7 @@ export default function StatusChips({
           <span className="header-control-wrap">
             <span tabIndex={0} role="img" aria-label={connection} aria-describedby={statusId}
               className={`header-icon connection-icon ${!health ? "text-ink-500" : reachable ? "text-ink-400" : "text-warn"}`}>
-              {health && !reachable ? <IconWarning size={16} /> : <IconConnection size={18} />}
+              {health && !reachable ? <IconWarning size={14} /> : <IconConnection size={14} />}
               {reachable && <span className="connection-dot" aria-hidden />}
             </span>
             <span id={statusId} role="tooltip" className="header-tooltip">{connection}</span>
@@ -48,7 +48,7 @@ export default function StatusChips({
           <span className="header-control-wrap">
             <button type="button" onClick={onRefresh} className="header-icon text-ink-400"
               aria-label="Refresh board" aria-describedby={refreshId}>
-              <IconRefresh size={16} />
+              <IconRefresh size={14} />
             </button>
             <span id={refreshId} role="tooltip" className="header-tooltip">Refresh board</span>
           </span>
