@@ -206,7 +206,6 @@ export default function TodoCard({
     );
   };
   const fixIt = () => {
-    if (sending) return;
     sendingTodo(need);
     setError(null);
     void sendToMaster(fixPrompt(need, template), undefined, needRefs(need)).then((r) => {

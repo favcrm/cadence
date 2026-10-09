@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useWriteBlock } from "../auth/WriteGate";
 import type { ResourceState } from "../../lib/cache";
 import type { Agent, Overview } from "../../lib/types";
@@ -8,7 +8,7 @@ import type { AgentUpdate } from "./agentUpdateModel";
 import { READ_ONLY_COPY } from "./AnswerForm";
 import ReviewDrawer from "./ReviewDrawer";
 import TodoCard from "./TodoCard";
-import { doneTodo, hideTodo, marksFor, useTodoLocal } from "./todoLocal";
+import { beginTodoVisit, doneTodo, hideTodo, marksFor, useTodoLocal } from "./todoLocal";
 import Link from "../../ui/Link";
 
 export { NeedMenu } from "./NeedMenu";
@@ -52,6 +52,8 @@ export default function NeedsRail({
   const { todo, updates, decided } = todoSplit(overview.data?.needs_me);
   const [drawer, setDrawer] = useState(false);
   const local = useTodoLocal();
+  // A new visit to Home: earlier decided and sent marks of rows without a `since` stop applying.
+  useLayoutEffect(() => beginTodoVisit(), []);
   const [review, setReview] = useState<string | null>(null);
   // The reading items, as they stood when the drawer opened: "n of m" does
   // not recount when the overview refreshes mid-run.
