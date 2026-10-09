@@ -42,7 +42,7 @@ loader.prototype.require = function (this: unknown, id: string) {
 const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
 const NeedsRail = (require("../src/features/home/NeedsRail") as typeof import("../src/features/home/NeedsRail")).default;
-const { resetTodoLocal } = require("../src/features/home/todoLocal") as typeof import("../src/features/home/todoLocal");
+const { resetTodoLocal, useHomeCount } = require("../src/features/home/todoLocal") as typeof import("../src/features/home/todoLocal");
 const { HEAD_MOVED_COPY } = require("../src/features/home/MergeForm") as typeof import("../src/features/home/MergeForm");
 
 // ---- a fake board: issue reads, and writes recorded and answered per path ----
@@ -64,17 +64,22 @@ const issues: Record<string, unknown> = {
 };
 const posts: { path: string; body: any }[] = [];
 let replies: Record<string, { status: number; body: unknown }> = {};
+// A request that waits to be released, to hold a send in flight.
+let holds: Record<string, Promise<void>> = {};
+let approval: unknown = { state: "missing" };
 const json = (v: unknown, status = 200) => new Response(JSON.stringify(v), { status, headers: { "Content-Type": "application/json" } });
 globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   const url = new URL(String(input), "http://localhost");
   if ((init?.method ?? "GET") === "POST") {
     posts.push({ path: url.pathname, body: JSON.parse(String(init?.body ?? "{}")) });
+    await (holds[url.pathname] as Promise<void> | undefined);
     const r = replies[url.pathname];
     return r ? json(r.body, r.status) : json({ state: "ok" });
   }
   const m = /^\/api\/issues\/([\w-]+)$/.exec(url.pathname);
   if (m && issues[m[1]]) return json(issues[m[1]]);
-  if (url.pathname === "/api/approvals/state") return json({ state: "missing" });
+  if (url.pathname === "/api/approvals/state") return json(approval);
+  if (url.pathname === "/api/agents") return json({ agents: [], by_issue: {} });
   return json({});
 }) as typeof fetch;
 
@@ -119,6 +124,16 @@ const rows = {
     subject: { kind: "report", id: "D-4/q.md" },
     question: { issue: "D-4", report: "q.md", agent: "w1", options: ["hourly", "daily"] },
   },
+  q3: {
+    kind: "question", audience: "operator", title: "D-6 question", age: 125, project: "demo", command: "cadence x",
+    subject: { kind: "report", id: "D-6/q.md" },
+    question: { issue: "D-6", report: "q.md", agent: "w1", options: ["red", "green", "blue"] },
+  },
+  q0: {
+    kind: "question", audience: "operator", title: "D-7 question", age: 126, project: "demo", command: "cadence x",
+    subject: { kind: "report", id: "D-7/q.md" },
+    question: { issue: "D-7", report: "q.md", agent: "w1", options: [] },
+  },
   plan: {
     kind: "plan", audience: "operator", title: "D-1 plan", age: 150, project: "demo", command: "cadence x",
     subject: { kind: "issue", id: "D-1" }, plan: { epic: "D-1", proposed_by: "master" },
@@ -134,24 +149,41 @@ const rows = {
   },
 };
 
-async function render(needs: unknown[], readOnly: boolean) {
-  resetTodoLocal();
-  posts.length = 0;
+function Badge({ needs }: { needs: unknown[] }) {
+  return React.createElement("span", { "data-badge": true }, String(useHomeCount(needs as never)));
+}
+
+async function render(needs: unknown[], readOnly: boolean, opts: { keepLocal?: boolean; noBadge?: boolean } = {}) {
+  if (!opts.keepLocal) {
+    resetTodoLocal();
+    posts.length = 0;
+  }
   const host = document.createElement("div");
   document.body.append(host);
   const root = createRoot(host);
-  const overview = { status: "ok", inFlight: false, error: null, asOf: Date.now(), data: { needs_me: needs } } as unknown as ResourceState<Overview>;
-  await React.act(async () => {
-    root.render(
-      React.createElement(NeedsRail, {
-        overview, readOnly, onOpenIssue: () => {}, overviewHref: "/overview", permissionsHref: "/settings/permissions",
-        onAsk: () => {}, collapsed: false, onToggleCollapse: () => {}, onAskAgent: () => {},
-      }),
-    );
-  });
+  const update = async (rows: unknown[], ro: boolean) => {
+    const overview = { status: "ok", inFlight: false, error: null, asOf: Date.now(), data: { needs_me: rows } } as unknown as ResourceState<Overview>;
+    await React.act(async () => {
+      root.render(
+        React.createElement(
+          React.Fragment,
+          null,
+          // Without the badge nothing reconciles: the marks alone must not hide a changed need.
+          opts.noBadge ? null : React.createElement(Badge, { needs: rows }),
+          React.createElement(NeedsRail, {
+            overview, readOnly: ro, onOpenIssue: () => {}, overviewHref: "/overview", permissionsHref: "/settings/permissions",
+            onAsk: () => {}, collapsed: false, onToggleCollapse: () => {}, onAskAgent: () => {},
+          }),
+        ),
+      );
+    });
+    await flush();
+  };
+  await update(needs, readOnly);
   const card = (kind: string) => host.querySelector(`[data-need="${kind}"]`) as HTMLElement;
+  const badge = () => host.querySelector("[data-badge]")!.textContent;
   const done = async () => { await React.act(async () => { root.unmount(); }); host.remove(); };
-  return { host, card, done };
+  return { host, card, badge, update, done };
 }
 
 // ---- 1. read-only disables every write control, on cards and in the drawer ----
@@ -189,9 +221,20 @@ async function render(needs: unknown[], readOnly: boolean) {
   }
 
   for (const name of ["hourly", "daily"]) {
-    const b = labelled(card("question"), name);
+    const b = labelled(host.querySelector('[data-need-key="report:D-4/q.md"]') as HTMLElement, name);
     assert(b, `answer option present: ${name}`);
     assert(isDisabled(b), `read-only disables the "${name}" answer`);
+  }
+
+  // Questions with other than two options use the answer form: no option, no text box, no send.
+  for (const key of ["q3", "q0"]) {
+    const row = rows[key as "q3" | "q0"];
+    const c = host.querySelector(`[data-need-key="${row.subject.kind}:${row.subject.id}"]`) as HTMLElement;
+    await click(c.querySelector(".todo-hit"));
+    assert(/read-only/i.test(c.textContent ?? ""), `${key}: the read-only copy shows in place of the form`);
+    assert(!c.querySelector("textarea"), `${key}: read-only offers no answer box`);
+    assert(!labelled(c, "Send answer"), `${key}: read-only offers no Send answer`);
+    for (const o of ["red", "green", "blue"]) assert(!labelled(c, o), `${key}: read-only offers no "${o}" answer`);
   }
 
   const drawerControls: [string, string[]][] = [
@@ -274,6 +317,107 @@ async function publish() {
   assert(again && !isDisabled(again), '"Fix it" stays available after a failed send');
   assert(!/Sent to Master/.test(card("blocked").textContent ?? ""), "a failed send is not shown as sent");
   await done();
+}
+
+// ---- a mark applies only to the need it was made for (the server merges causes into one row per subject) ----
+const stoppedW1 = { ...rows.stopped, subject: { kind: "agent", id: "w1" } };
+{
+  // (a) agent w1 fenced → "It got cut off" → the same key now lists a stopped agent
+  const v = await render([rows.fenced], false);
+  await click(v.card("fenced").querySelector(".todo-hit"));
+  await click(labelled(v.card("fenced"), "It got cut off"));
+  await settle(() => assert(/Recorded/.test(v.card("fenced").textContent ?? ""), "the decided card says what was recorded"));
+  assert(v.badge() === "0", `the badge drops with the decided card, got ${v.badge()}`);
+  await v.update([stoppedW1], false);
+  assert(!/Recorded/.test(v.card("stopped").textContent ?? ""), "the new need is not shown as decided");
+  assert(labelled(v.card("stopped"), "Fix it"), "the new need offers its control");
+  assert(v.badge() === "1", `the badge counts the new need, got ${v.badge()}`);
+  await v.update([rows.fenced], false);
+  assert(!/Recorded/.test(v.card("fenced").textContent ?? ""), "the old mark is gone, not waiting to come back");
+  assert(v.badge() === "1", `the old mark no longer hides the card, got ${v.badge()}`);
+  await v.done();
+}
+{
+  // (b) Publish D-2 at one head → the same key lists a merge decision at a new head
+  replies = { "/api/delivery/D-2/merge": { status: 200, body: { state: "queued" } } };
+  const v = await publish();
+  await settle(() => assert(/Published/.test(v.card("merge_decision").textContent ?? ""), "the published card says so"));
+  const moved = { ...rows.merge, merge: { ...rows.merge.merge, sha: "d".repeat(40) } };
+  await v.update([moved], false);
+  assert(!/Published/.test(v.card("merge_decision").textContent ?? ""), "a new head is not shown as published");
+  assert(labelled(v.card("merge_decision"), "Review"), "the new head offers its control");
+  assert(v.badge() === "1", `the badge counts the new head, got ${v.badge()}`);
+  await v.update([rows.merge], false);
+  assert(!/Published/.test(v.card("merge_decision").textContent ?? ""), "the old mark is gone");
+  await v.done();
+}
+{
+  // (c) a plan approved → the same issue key now lists a blocked_ready need
+  replies = { "/api/plans/D-1/approve": { status: 200, body: { state: "approved" } } };
+  const v = await render([rows.plan], false);
+  await click(labelled(v.card("plan"), "Review"));
+  await settle(() => assert(!isDisabled(labelled(v.host.querySelector('[data-drawer="review"]')!, "Approve plan") ?? ({ disabled: true } as HTMLButtonElement)), "plan drawer ready"));
+  await click(labelled(v.host.querySelector('[data-drawer="review"]')!, "Approve plan"));
+  await settle(() => assert(/Plan approved/.test(v.card("plan").textContent ?? ""), "the approved card says so"));
+  const ready = { ...rows.blocked, kind: "blocked_ready", subject: { kind: "issue", id: "D-1" } };
+  await v.update([ready], false);
+  assert(!/Plan approved/.test(v.card("blocked_ready").textContent ?? ""), "the new need is not shown as an approved plan");
+  assert(labelled(v.card("blocked_ready"), "Fix it"), "the new need offers its control");
+  assert(v.badge() === "1", `the badge counts the new need, got ${v.badge()}`);
+  await v.update([rows.plan], false);
+  assert(!/Plan approved/.test(v.card("plan").textContent ?? ""), "the old mark is gone");
+  await v.done();
+}
+
+{
+  // Before any reconcile has run, a mark still must not apply to a changed need.
+  const v = await render([rows.fenced], false, { noBadge: true });
+  await click(v.card("fenced").querySelector(".todo-hit"));
+  await click(labelled(v.card("fenced"), "It got cut off"));
+  await settle(() => assert(/Recorded/.test(v.card("fenced").textContent ?? ""), "decided"));
+  await v.update([stoppedW1], false);
+  assert(!/Recorded/.test(v.card("stopped").textContent ?? ""), "a decided mark does not cover a changed need");
+  await v.done();
+  const h = await render([rows.fenced], false, { noBadge: true });
+  await click(h.card("fenced").querySelector(".needmore"));
+  await click(labelled(h.card("fenced"), "Dismiss"));
+  assert(!h.card("fenced"), "a dismissed card leaves the list");
+  await h.update([stoppedW1], false);
+  assert(h.card("stopped"), "a dismissal does not hide a changed need");
+  await h.done();
+}
+
+// ---- "Fix it" in flight survives a remount of the list: no second send ----
+{
+  let release!: () => void;
+  holds = { "/api/threads/master/messages": new Promise<void>((r) => { release = r; }) };
+  replies = {};
+  const a = await render([rows.blocked], false);
+  await click(labelled(a.card("blocked"), "Fix it"));
+  await a.done();
+  const b = await render([rows.blocked], false, { keepLocal: true });
+  const again = labelled(b.card("blocked"), "Fix it");
+  assert(again && isDisabled(again), 'a remount mid-send does not offer "Fix it" again');
+  await click(again);
+  release();
+  holds = {};
+  await settle(() => assert(/Sent to Master/.test(b.card("blocked").textContent ?? ""), "the send lands as sent"));
+  assert(posts.filter((p) => p.path === "/api/threads/master/messages").length === 1, "one send, not two");
+  await b.done();
+}
+
+// ---- "Take my approval back" is a write: disabled once the board turns read-only ----
+{
+  approval = { state: "in-force", approval_id: "a1", board_revocable: true };
+  const v = await render([rows.merge], false);
+  await click(labelled(v.card("merge_decision"), "Review"));
+  const drawer = () => v.host.querySelector('[data-drawer="review"]')!;
+  await settle(() => assert(labelled(drawer(), "Take my approval back"), "an approval on record can be taken back"));
+  assert(!isDisabled(labelled(drawer(), "Take my approval back")!), "writable: take-back is enabled");
+  await v.update([rows.merge], true);
+  assert(isDisabled(labelled(drawer(), "Take my approval back")!), "read-only disables take-back");
+  approval = { state: "missing" };
+  await v.done();
 }
 
 // ---- 5. an unknown kind still renders as a generic card ----

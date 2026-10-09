@@ -18,7 +18,7 @@ import {
   type UnfenceChoice,
 } from "./needs";
 import { sendToMaster } from "./send";
-import { sentTodo, useTodoLocal } from "./todoLocal";
+import { marksFor, sendingTodo, settleTodo, useTodoLocal } from "./todoLocal";
 
 const ICON: Record<string, string[]> = {
   list: ["M9 5h10M9 12h10M9 19h10", "M4 5l1 1 2-2M4 12l1 1 2-2M4 19l1 1 2-2"],
@@ -141,8 +141,8 @@ export default function TodoCard({
   onReview: (key: string) => void;
   onOpenIssue: (id: string) => void;
   onAsk: (need: HomeNeed) => void;
-  onHide: (key: string) => void;
-  onDone: (key: string, text: string) => void;
+  onHide: (need: HomeNeed) => void;
+  onDone: (need: HomeNeed, text: string) => void;
   /** Fired after "Fix it" sends, so a slide-over can make room for the chat. */
   onSent: () => void;
   /** The card's tap target, so the review drawer can hand focus back to it. */
@@ -164,8 +164,7 @@ export default function TodoCard({
   // The server's own words for the last failure: under ⋯ → Details only, never on the card.
   const [failure, setFailure] = useState<string | null>(null);
   // Kept outside the card: a slide-over that remounts it must not offer "Fix it" again.
-  const sent = useTodoLocal().sent.has(need.key);
-  const [sending, setSending] = useState(false);
+  const { sent, sending } = marksFor(useTodoLocal(), need);
   const action = need.action;
   const answer = action.type === "answer" ? (need as HomeNeed & { action: { type: "answer" } }) : null;
   const yesNo = answer && answer.action.options.length === 2 ? answer : null;
@@ -184,8 +183,8 @@ export default function TodoCard({
     work()
       .then(() => {
         setMenu(false);
-        if (hide) onHide(need.key);
-        else onDone(need.key, what);
+        if (hide) onHide(need);
+        else onDone(need, what);
         refresh();
       })
       .catch((e: unknown) => {
@@ -208,12 +207,11 @@ export default function TodoCard({
   };
   const fixIt = () => {
     if (sending) return;
-    setSending(true);
+    sendingTodo(need);
     setError(null);
     void sendToMaster(fixPrompt(need, template), undefined, needRefs(need)).then((r) => {
-      setSending(false);
+      settleTodo(need, r.ok);
       if (r.ok) {
-        sentTodo(need.key);
         onSent();
       } else {
         setError("It couldn't be sent to Master. Try again.");
@@ -252,11 +250,11 @@ export default function TodoCard({
           // No stated risk shows no risk line ("low" is the card's quiet state).
           card={action.risk ? action : { ...action, risk: "low" }}
           readOnly={readOnly}
-          onDone={(t) => onDone(need.key, t)}
+          onDone={(t) => onDone(need, t)}
         />
       );
     } else if (answer) {
-      inside = <AnswerForm need={answer} readOnly={readOnly} onDone={(t) => onDone(need.key, `Answered: ${t}`)} />;
+      inside = <AnswerForm need={answer} readOnly={readOnly} onDone={(t) => onDone(need, `Answered: ${t}`)} />;
     } else if (need.kind === "fenced" && need.agent) {
       inside = (
         <div className="mt-2 space-y-2">
@@ -311,7 +309,7 @@ export default function TodoCard({
     ) : null;
   const showControl = !done && !(open && spec.place === "inline");
   const controlButton = yesNo ? (
-    <YesNo need={yesNo} block={block} onDone={(t) => onDone(need.key, `Answered: ${t}`)} onError={setError} />
+    <YesNo need={yesNo} block={block} onDone={(t) => onDone(need, `Answered: ${t}`)} onError={setError} />
   ) : sent ? (
     <span className="text-micro text-ok">Sent to Master</span>
   ) : (
