@@ -251,3 +251,170 @@ fn cad1060_hosted_unit_priced_view_freezes_the_unit_price_as_the_ceiling() {
     worker.join().unwrap();
     assert_eq!(seen.lock().unwrap()[1].body["max_charge_minor"], 2000);
 }
+
+/// CAD-1296 acceptance (reviewer-written). `call.response` of the AgenticOS
+/// contract fixture `packages/contracts/fixtures/read-instagram-posts.v1.json`,
+/// copied verbatim: every item carries its own `user`.
+fn contract_reply() -> Value {
+    json!({
+      "ok": true,
+      "data": {
+        "slug": "read_instagram_posts",
+        "repeated": false,
+        "price": { "currency": "USD", "scale": 6, "amount": "0.002000" },
+        "result": {
+          "success": true,
+          "status": "ok",
+          "user": { "username": "example_brand", "is_private": false },
+          "items": [
+            {
+              "id": "1000000000000000001",
+              "code": "AbCd123",
+              "caption": { "text": "Synthetic caption one" },
+              "created_at": "2026-09-27T01:00:00Z",
+              "taken_at": 1790470800,
+              "media_type": 1,
+              "image_versions2": {
+                "candidates": [{ "url": "https://scontent.cdninstagram.com/example.jpg" }]
+              },
+              "user": { "username": "example_brand", "is_private": false }
+            },
+            {
+              "id": "1000000000000000002",
+              "code": "EfGh456",
+              "caption": null,
+              "taken_at": 1790384400,
+              "media_type": 8,
+              "user": { "username": "example_brand", "is_private": false }
+            }
+          ],
+          "more_available": true
+        }
+      }
+    })
+}
+
+#[test]
+fn another_accounts_post_in_the_grid_is_left_out_not_attributed() {
+    let mut proof = proof();
+    proof["inputs"]["profile_handle"] = json!("example_brand");
+    let fetch = |payload: Value| {
+        let (base, seen, worker) = media_door(move |_| json_response(200, payload.clone()));
+        let output =
+            hosted_at(&base).execute_app_capability(b"", &proof, &json!({}), "app-call-1296");
+        worker.join().unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "one POST and no retry");
+        assert_eq!(
+            seen[0].body["query"],
+            json!({"handle":"example_brand","count":12})
+        );
+        output
+    };
+    let ids = |result: &Value| -> Vec<String> {
+        result["posts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|post| post["id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    // A collab post owned by another account sits between the brand's posts.
+    let mut grid = contract_reply();
+    let mut collab = grid["data"]["result"]["items"][0].clone();
+    collab["id"] = json!("1000000000000000003");
+    collab["code"] = json!("Collab789");
+    collab["caption"] = json!({"text":"Partner's own words"});
+    collab["user"] = json!({"username":"partner_brand","is_private":false});
+    grid["data"]["result"]["items"]
+        .as_array_mut()
+        .unwrap()
+        .insert(1, collab);
+
+    // (a) The requested account's posts are kept; the foreign post is left
+    // out and nothing of it is attributed to the requested handle.
+    let kept = fetch(grid.clone()).unwrap().result;
+    assert_eq!(ids(&kept), ["1000000000000000001", "1000000000000000002"]);
+    assert_eq!(kept["handle"], "example_brand");
+    assert_eq!(kept["profile_verified"], true);
+    assert!(!kept.to_string().contains("Partner's own words"));
+    assert!(!kept.to_string().contains("Collab789"));
+
+    // (d) A mixed-case spelling of the requested account is the same account.
+    let mut cased = grid.clone();
+    cased["data"]["result"]["items"][2]["user"]["username"] = json!("Example_Brand");
+    assert_eq!(ids(&fetch(cased).unwrap().result).len(), 2);
+
+    // (b) With the foreign post still in the grid, each identity fault refuses
+    // the whole page and returns nothing.
+    let page = |edit: &dyn Fn(&mut Value)| {
+        let mut page = grid.clone();
+        edit(&mut page["data"]["result"]);
+        page
+    };
+    for (payload, needle) in [
+        (
+            page(&|r| r["user"]["username"] = json!("partner_brand")),
+            "identity changed",
+        ),
+        (page(&|r| r["user"]["is_private"] = json!(true)), "private"),
+        (
+            page(&|r| {
+                r["user"].as_object_mut().unwrap().remove("is_private");
+            }),
+            "private",
+        ),
+        (
+            page(&|r| r["items"][2]["user"]["is_private"] = json!(true)),
+            "private",
+        ),
+        (
+            page(&|r| {
+                r["items"][2]["user"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("is_private");
+            }),
+            "private",
+        ),
+        (
+            page(&|r| r["items"][2]["user"] = json!("example_brand")),
+            "malformed",
+        ),
+        (
+            page(&|r| {
+                r["items"][2]["user"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("username");
+            }),
+            "identity changed",
+        ),
+        (
+            page(&|r| r["items"][2]["user"]["username"] = json!(7)),
+            "identity changed",
+        ),
+        (
+            page(&|r| {
+                r.as_object_mut().unwrap().remove("user");
+                r["items"][2].as_object_mut().unwrap().remove("user");
+            }),
+            "profile is missing",
+        ),
+    ] {
+        let error = fetch(payload).err().unwrap();
+        assert!(error.contains(needle), "{error} lacks {needle}");
+    }
+
+    // (c) A page of foreign posts only, with no top-level profile, yields no
+    // posts and no verified profile.
+    let foreign_only = page(&|r| {
+        r.as_object_mut().unwrap().remove("user");
+        for item in r["items"].as_array_mut().unwrap() {
+            item["user"]["username"] = json!("partner_brand");
+        }
+    });
+    let empty = fetch(foreign_only).unwrap().result;
+    assert!(empty["posts"].as_array().unwrap().is_empty());
+    assert_eq!(empty["profile_verified"], false);
+}
