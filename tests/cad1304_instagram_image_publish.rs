@@ -1072,3 +1072,108 @@ fn a_download_that_breaks_after_the_charge_retries_the_same_key_and_keeps_the_im
     assert_eq!(fx.keys().len(), 1);
     assert_eq!(fx.door.media.job_count(), 1);
 }
+
+// ---- CAD-1315: the worker never loops --------------------------------------
+//
+// A worker run that leaves its job `active` on purpose (parked fence, missing
+// spec, an error, a panic) is NOT restarted by itself; only a run that
+// settled can race a re-check, and that case restarts exactly once. The
+// worker-start count bounds any spin.
+
+use cadence_agent::daemon::image_job_probe as probe;
+
+impl Fx {
+    /// Worker starts over the next two seconds, with nothing else going on.
+    fn starts_over_two_seconds(&self, before: usize) -> usize {
+        std::thread::sleep(Duration::from_secs(2));
+        probe::starts() - before
+    }
+}
+
+#[test]
+fn a_parked_fence_runs_one_worker_and_does_not_respawn_until_asked() {
+    let fx = Fx::start();
+    let source = fx.fetch();
+    let draft = fx.new_draft("p1", &source);
+    let before = probe::starts();
+    probe::trip_fence(true);
+    fx.image(&draft, "image-p1").unwrap();
+    assert_eq!(
+        fx.starts_over_two_seconds(before),
+        1,
+        "the parked worker spun"
+    );
+    assert_eq!(fx.intent(&draft).unwrap()["state"], "pending");
+    // The fence clears and a same-id re-check restarts it: it completes.
+    probe::trip_fence(false);
+    fx.image(&draft, "image-p1").unwrap();
+    fx.wait_intent(&draft, "completed");
+    assert_eq!(probe::starts() - before, 2);
+}
+
+#[test]
+fn an_errored_or_panicked_worker_frees_its_slot_without_respawning() {
+    let fx = Fx::start();
+    let source = fx.fetch();
+    for (tag, fault) in [("e1", 2u8), ("e2", 1u8)] {
+        let draft = fx.new_draft(tag, &source);
+        let before = probe::starts();
+        probe::fault_next(fault);
+        fx.image(&draft, &format!("image-{tag}")).unwrap();
+        assert_eq!(fx.starts_over_two_seconds(before), 1, "{tag} respawned");
+        assert_eq!(fx.intent(&draft).unwrap()["state"], "pending");
+        // The slot is free: a same-id re-check starts a worker that completes.
+        fx.image(&draft, &format!("image-{tag}")).unwrap();
+        fx.wait_intent(&draft, "completed");
+        assert_eq!(probe::starts() - before, 2, "{tag}");
+    }
+}
+
+#[test]
+fn a_job_with_no_spec_runs_one_worker_at_boot_and_does_not_respawn() {
+    let mut fx = Fx::start();
+    let source = fx.fetch();
+    fx.door.media.set(Scenario::Hold);
+    let draft = fx.new_draft("m1", &source);
+    fx.image(&draft, "image-m1").unwrap();
+    fx.wait_door("GET job");
+    fx.stop_daemon();
+    std::thread::sleep(Duration::from_millis(2500));
+    let path = cadence_agent::store::app_records::record_db_path(&fx.dir(), &fx.install).unwrap();
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .execute("UPDATE app_social_image_jobs SET spec_json=NULL", [])
+        .unwrap();
+    let before = probe::starts();
+    fx.launch(0, 0);
+    assert_eq!(
+        fx.starts_over_two_seconds(before),
+        1,
+        "the held worker spun"
+    );
+    assert_eq!(fx.intent(&draft).unwrap()["state"], "pending");
+}
+
+#[test]
+fn a_re_check_that_lands_before_the_slot_is_freed_is_restarted_exactly_once() {
+    // The job settles `uncertain` (poll_timeout) at the end of a 1.2 s window;
+    // the worker then sits 3 s before freeing its slot. A same-id re-check in
+    // that gap finds the slot taken and spawns nothing: the worker itself must
+    // restart the job, once, and it then completes.
+    let fx = Fx::start_with(1200, 100);
+    let source = fx.fetch();
+    fx.door.media.set(Scenario::Hold);
+    let draft = fx.new_draft("c1", &source);
+    let before = probe::starts();
+    probe::pause_after_settle_ms(3000);
+    fx.image(&draft, "image-c1").unwrap();
+    fx.wait_intent(&draft, "uncertain");
+    fx.door.media.set(Scenario::Normal);
+    fx.image(&draft, "image-c1").unwrap();
+    assert_eq!(fx.intent(&draft).unwrap()["state"], "pending");
+    fx.wait_intent(&draft, "completed");
+    probe::pause_after_settle_ms(0);
+    assert_eq!(probe::starts() - before, 2, "one restart, no loop");
+    assert_eq!(fx.keys().len(), 1);
+    assert_eq!(fx.door.media.job_count(), 1);
+}

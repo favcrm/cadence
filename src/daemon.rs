@@ -29,6 +29,8 @@ mod app_contexts_rpc;
 pub(crate) mod app_effects_rpc;
 mod app_explorer_rpc;
 mod app_image_jobs;
+#[cfg(feature = "test-seam")]
+pub use app_image_jobs::test_probe as image_job_probe;
 mod app_records_rpc;
 mod app_runs_rpc;
 mod app_screens_rpc;

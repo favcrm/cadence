@@ -55,8 +55,7 @@ const MEDIA_POLL_INTERVAL: Duration = Duration::from_secs(10);
 const MEDIA_POLL_DEADLINE: Duration = Duration::from_secs(120);
 /// The artifact download may be up to 10 MiB; the JSON calls keep 15 s.
 const ARTIFACT_TIMEOUT: Duration = Duration::from_secs(60);
-const MEDIA_UNCERTAIN_SUBMIT: &str =
-    "AgenticOS image submit outcome is uncertain; no automatic retry was made";
+const MEDIA_UNCERTAIN_SUBMIT: &str = "AgenticOS image submit outcome is uncertain";
 
 /// The exact prompt an image job submits; frozen on the job at admission.
 pub(crate) fn frozen_image_prompt(

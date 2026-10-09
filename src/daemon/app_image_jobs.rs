@@ -30,6 +30,52 @@ pub(super) const JOB_WINDOW_MS: u64 = 10 * 60 * 1000;
 pub(super) const BACKOFF_MIN_MS: u64 = 5 * 1000;
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
 
+/// How one worker run ended: only `Settled` may be followed by a respawn.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunEnd {
+    /// This run settled the job (the intent left `pending`).
+    Settled,
+    /// Left `active` on purpose: closing, a tripped lease fence, no spec, or
+    /// no job. A later boot, re-check or invoke restarts it; never a loop.
+    Held,
+}
+
+/// Test-seam probes: worker-start count, a pause between settle and registry
+/// removal, and a stand-in for a tripped lease fence.
+#[cfg(feature = "test-seam")]
+pub mod test_probe {
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::SeqCst};
+    static STARTS: AtomicUsize = AtomicUsize::new(0);
+    static FENCE: AtomicBool = AtomicBool::new(false);
+    static PAUSE_MS: AtomicU64 = AtomicU64::new(0);
+    static FAULT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    pub fn starts() -> usize {
+        STARTS.load(SeqCst)
+    }
+    pub fn trip_fence(on: bool) {
+        FENCE.store(on, SeqCst);
+    }
+    pub fn pause_after_settle_ms(ms: u64) {
+        PAUSE_MS.store(ms, SeqCst);
+    }
+    /// One-shot fault for the next worker run: 1 panics, 2 returns an error.
+    pub fn fault_next(kind: u8) {
+        FAULT.store(kind, SeqCst);
+    }
+    pub(super) fn take_fault() -> u8 {
+        FAULT.swap(0, SeqCst)
+    }
+    pub(super) fn started() {
+        STARTS.fetch_add(1, SeqCst);
+    }
+    pub(super) fn fenced() -> bool {
+        FENCE.load(SeqCst)
+    }
+    pub(super) fn pause() {
+        std::thread::sleep(std::time::Duration::from_millis(PAUSE_MS.load(SeqCst)));
+    }
+}
+
 impl Shared {
     /// The deadline (epoch seconds) of a job window opened now.
     pub(super) fn image_job_deadline(&self) -> f64 {
@@ -64,16 +110,26 @@ impl Shared {
                 }
             }
             let guard = Registered(Arc::clone(&shared), call_id.clone());
-            if let Err(error) = shared.image_job_run(&install, &call_id) {
-                eprintln!("image job {call_id} worker stopped: {error}");
-            }
+            let end = shared
+                .image_job_run(&install, &call_id)
+                .unwrap_or_else(|error| {
+                    eprintln!("image job {call_id} worker stopped: {error}");
+                    RunEnd::Held
+                });
+            #[cfg(feature = "test-seam")]
+            test_probe::pause();
             drop(guard);
-            // A re-check that landed before the removal saw a live worker and
-            // spawned none: if the job is active again, run it.
+            // Only a run that settled can have raced a re-check that landed
+            // before the removal (it saw a live worker and spawned none): if
+            // the job is active again, run it. Every held exit, an error and
+            // a panic wait for a boot, a re-check or an invoke instead.
+            if end != RunEnd::Settled || shared.closing.load(Ordering::SeqCst) {
+                return;
+            }
             let active = RecordStore::open(&shared.state_dir, &install)
                 .and_then(|records| records.app_social_image_job(&call_id))
                 .is_ok_and(|job| job.is_some_and(|job| job.state == "active"));
-            if active && !shared.closing.load(Ordering::SeqCst) {
+            if active {
                 shared.spawn_image_job_worker(&install, &call_id);
             }
         });
@@ -101,13 +157,22 @@ impl Shared {
         }
     }
 
-    fn image_job_run(&self, install: &str, call_id: &str) -> Result<()> {
+    fn image_job_run(&self, install: &str, call_id: &str) -> Result<RunEnd> {
+        #[cfg(feature = "test-seam")]
+        {
+            test_probe::started();
+            match test_probe::take_fault() {
+                1 => panic!("injected image worker panic"),
+                2 => return Err(Error::internal("injected image worker error")),
+                _ => {}
+            }
+        }
         let records = RecordStore::open(&self.state_dir, install)?;
         let Some(job) = records.app_social_image_job(call_id)? else {
-            return Ok(());
+            return Ok(RunEnd::Held);
         };
         let Some(spec) = job.spec.clone().filter(|_| job.state == "active") else {
-            return Ok(());
+            return Ok(RunEnd::Held);
         };
         let settle = |settlement| records.app_social_image_job_settle(call_id, settlement);
         // A crash between the retained receipt and the settle: finish the
@@ -118,13 +183,18 @@ impl Shared {
             if let Some(created) = receipt["created_at"].as_f64() {
                 records.app_social_tool_receipt_attach(&job.context_id, id, created)?;
             }
-            return Ok(());
+            return Ok(RunEnd::Settled);
         }
         let authority = &spec["authority"];
         let config = &authority["binding"]["config"];
         let mut wait = self.image_job_backoff;
         loop {
-            if self.closing.load(Ordering::SeqCst)
+            #[cfg(feature = "test-seam")]
+            let probe_fence = test_probe::fenced();
+            #[cfg(not(feature = "test-seam"))]
+            let probe_fence = false;
+            if probe_fence
+                || self.closing.load(Ordering::SeqCst)
                 || self
                     .lease
                     .as_ref()
@@ -132,7 +202,7 @@ impl Shared {
                     .is_some()
             {
                 // Left `active`: the next daemon (or a re-check) resumes it.
-                return Ok(());
+                return Ok(RunEnd::Held);
             }
             // Resolved per attempt: at boot the adapter or credential may not
             // be ready yet, which is a retry, never a verdict on the job.
@@ -161,7 +231,8 @@ impl Shared {
             };
             let failure = match outcome {
                 Ok(output) => {
-                    return self.image_job_succeed(&records, &job, &spec, &credential, output)
+                    self.image_job_succeed(&records, &job, &spec, &credential, output)?;
+                    return Ok(RunEnd::Settled);
                 }
                 Err(failure) => failure,
             };
@@ -177,13 +248,13 @@ impl Shared {
                     settle(ImageSettlement::Uncertain {
                         reason: reason.code(),
                     })?;
-                    return Ok(());
+                    return Ok(RunEnd::Settled);
                 }
                 ImageSettle::Terminal => {
                     settle(ImageSettlement::Failed {
                         reason: reason.code(),
                     })?;
-                    return Ok(());
+                    return Ok(RunEnd::Settled);
                 }
             }
         }
