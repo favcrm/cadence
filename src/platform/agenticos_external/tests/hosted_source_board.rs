@@ -852,3 +852,499 @@ fn cad1302_adapter_follows_the_bound_capability_and_refuses_forged_bindings() {
     assert_eq!(posts_1302("read_instagram_posts"), source_before + 1);
     assert_eq!(posts_1302("generate_text"), text_before);
 }
+
+/// CAD-1303 door: the source read as above, plus the image tool's quote. An
+/// image call is refused, so a generation never settles; the test reads the
+/// frozen plan instead. Every POST is recorded.
+static DOOR_1303: std::sync::Mutex<Vec<Value>> = std::sync::Mutex::new(Vec::new());
+
+fn door_1303(method: &str, url: &str, body: &Value) -> Reply {
+    if method == "POST" {
+        DOOR_1303.lock().unwrap().push(body.clone());
+    }
+    match (method, url) {
+        ("GET", MEDIA_PRICE_PATH) => json_response(200, price_view(40, "2026-09-29T00:00:00.000Z")),
+        ("POST", CALL_PATH) if body["slug"] != "read_instagram_posts" => refused("not_allowlisted"),
+        _ => generic_door(method, url, body),
+    }
+}
+
+/// Social Content with a screen declaring the draft alias (`drafts`, the
+/// draft-effect `image` slot) and the source read alias.
+fn social_fixture(root: &std::path::Path) -> PathBuf {
+    let fixture = root.join("app");
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    copy_dir(
+        &manifest_dir.join("workspace-apps/social-content"),
+        &fixture,
+    );
+    let screens = manifest_dir.join("tests/fixtures/apps/ig-tools-fixture/screens");
+    copy_dir(&screens, &fixture.join("screens"));
+    let path = fixture.join("screens/feed/screens.json");
+    let mut doc: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    doc["app"] = json!("social-content");
+    doc["tools"] = json!({"instagram.read":"source","drafts":"image"});
+    std::fs::write(&path, doc.to_string()).unwrap();
+    fixture
+}
+
+/// Install, approve and mount Social Content in one context through `op`
+/// (an operator RPC). Answers (install_id, context_id).
+fn social_install(
+    op: &dyn Fn(&str, Value) -> Value,
+    fixture: &std::path::Path,
+    bind_hosted: bool,
+) -> (String, String) {
+    let install = op(
+        "app_workspace_install",
+        json!({"source":fixture.to_str().unwrap()}),
+    );
+    let install_id = install["install_id"].as_str().unwrap().to_owned();
+    op(
+        "app_local_install_approve",
+        json!({"install_id":install_id,"digest":install["digest"]}),
+    );
+    let context = op(
+        "app_context_create",
+        json!({"install_id":install_id,"label":"EF","input_defaults":{},"request_id":"ctx-1303"}),
+    );
+    let context = context["context"]["id"]
+        .as_str()
+        .or_else(|| context["id"].as_str())
+        .unwrap()
+        .to_owned();
+    if bind_hosted {
+        let rows = op("connection_list", json!({}))["connections"].clone();
+        let hosted = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["account"] == "hosted")
+            .unwrap()["id"]
+            .clone();
+        for slot in ["source", "image"] {
+            op(
+                "app_binding_create",
+                json!({"install_id":install_id,"context_id":context,"slot":slot,"connection_id":hosted,"request_id":format!("bind-1303-{slot}")}),
+            );
+        }
+    }
+    (install_id, context)
+}
+
+/// CAD-1303 acceptance (reviewer-written; the implementer must not edit or
+/// weaken it). Soft discard of a social draft through the real daemon RPC
+/// and the board relay, and the image idea bound on the image tool.
+#[test]
+fn cad1303_discard_is_operator_only_refuses_in_use_and_stale_and_hides_for_good() {
+    use crate::store::app_social_drafts::{DraftSource, EffectStage};
+    let (mut stop, root, state) = boot_daemon(door_1303);
+    let op = |method: &str, params: Value| operator(&state, method, params);
+    let fixture = social_fixture(root.path());
+    let (install, context) = social_install(&op, &fixture, true);
+    crate::store::Store::open(&state.join("cadence.sqlite3"))
+        .unwrap()
+        .register_agent(&crate::store::NewAgent {
+            alias: "worker",
+            provider: "fake",
+            endpoint_kind: "fake",
+            role: "worker",
+            cwd: root.path().to_str().unwrap(),
+            sandbox: "read-only",
+            instructions: None,
+            params: None,
+            team_role: None,
+            model_policy: None,
+        })
+        .unwrap();
+    let records = crate::store::app_records::RecordStore::open(&state, &install).unwrap();
+    records
+        .app_social_sources_save(&context, 0, &["juicysuite_crm".to_owned()], "src-1303")
+        .unwrap();
+
+    // The board, and the operator's session from the real login-link
+    // exchange. Its cookie token and key serve the RPC calls as well.
+    let mut port = 3110 + (std::process::id() % 80) as u16;
+    loop {
+        let (startup, ready) = std::sync::mpsc::channel();
+        let board_opts = crate::ui::ServeOpts {
+            host: "127.0.0.1".into(),
+            port,
+            stop: Some(stop.0.clone()),
+            startup: Some(startup),
+            test_seam: true,
+            ..Default::default()
+        };
+        let (state, pm) = (state.clone(), root.path().join("pm"));
+        let thread = std::thread::spawn(move || drop(crate::ui::serve(&state, &pm, &board_opts)));
+        match ready.recv_timeout(Duration::from_secs(20)).unwrap() {
+            Ok(()) => break stop.1.push(thread),
+            Err(_) if port < 3199 => port += 1,
+            Err(kind) => panic!("board could not bind: {kind:?}"),
+        }
+        thread.join().unwrap();
+    }
+    let seam = Seam::token_at(&state).unwrap();
+    let host = format!("cadence-{port}.localhost:{port}");
+    crate::operator_auth::ensure_secret(&state).unwrap();
+    let secret = crate::operator_auth::read_secret(&state).unwrap();
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let base = format!("http://127.0.0.1:{port}");
+    // (cookie, token, key, action token) of a fresh operator board session
+    // with Social Content mounted. The board revokes a session an agent
+    // presents, so the test signs in again after such a probe.
+    let login = || -> [String; 4] {
+        let nonce = op(
+            "operator_link_mint",
+            json!({"secret":secret,"origin":"loopback"}),
+        )["nonce"]
+            .clone();
+        let session = board(agent.post(format!("{base}/api/session")), &host, &seam)
+            .header("Content-Type", "application/json")
+            .send(json!({"nonce":nonce}).to_string())
+            .unwrap();
+        let set = session.headers()["set-cookie"].to_str().unwrap();
+        let cookie = set[..set.find(';').unwrap()].to_owned();
+        let token = cookie.split_once('=').unwrap().1.to_owned();
+        let key: Value = session.into_body().read_json().unwrap();
+        let key = key["session_key"].as_str().unwrap().to_owned();
+        let mint = op(
+            "app_screen_mint",
+            json!({"install_id":install,"context_id":context,"tag":"feed","token":token,"key":key,"origin":"loopback","generation":1}),
+        );
+        let nonce = mint["mount"].as_str().unwrap().rsplit('/').next().unwrap();
+        op("app_screen_consume", json!({"nonce":nonce}));
+        let action = mint["action_token"].as_str().unwrap().to_owned();
+        [cookie, token, key, action]
+    };
+    let creds = std::cell::RefCell::new(login());
+    let relogin = || *creds.borrow_mut() = login();
+    let session = |extra: Value| {
+        let [_, token, key, action] = creds.borrow().clone();
+        let mut params = json!({"action_token":action,"token":token,"key":key,"origin":"loopback"});
+        for (k, v) in extra.as_object().unwrap() {
+            params[k] = v.clone();
+        }
+        params
+    };
+
+    // Real RPC as `who`, with the operator's valid session and mount, so
+    // only the caller differs.
+    let rpc = |who: Asserted, method: &str, extra: Value| {
+        let mut params = session(extra);
+        params["tool_alias"] = json!("drafts");
+        scoped(who, || crate::client::rpc(&state, method, params))
+    };
+    // The board relay as `who` (the seam header), with the operator's cookie.
+    let http = |who: &Asserted, route: &str, body: Value| -> (u16, Value) {
+        let [cookie, _, key, action] = creds.borrow().clone();
+        let mut body = body;
+        body["action_token"] = json!(action);
+        body["tool_alias"] = json!("drafts");
+        let request = agent
+            .post(format!("{base}/api/app-social-drafts/{route}"))
+            .header("Host", &host)
+            .header("X-Cadence-Board", "1")
+            .header("Origin", format!("http://{host}"))
+            .header(crate::test_seam::AS_HEADER, who.as_str())
+            .header(crate::test_seam::TOKEN_HEADER, &seam)
+            .header("Cookie", &cookie)
+            .header("X-Cadence-Session", &key)
+            .header("Content-Type", "application/json");
+        let mut response = request.send(body.to_string()).unwrap();
+        let status = response.status().as_u16();
+        (
+            status,
+            response.body_mut().read_json().unwrap_or(Value::Null),
+        )
+    };
+    let listed = || -> Vec<(String, i64)> {
+        rpc(Asserted::Operator, "app_social_draft_list", json!({})).unwrap()["drafts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| {
+                (
+                    d["draft_id"].as_str().unwrap().to_owned(),
+                    d["revision"].as_i64().unwrap(),
+                )
+            })
+            .collect()
+    };
+    let effect_state = |id: &str| {
+        op("app_effect_show", json!({"effect_id":id}))["effect"]["state"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+
+    // A retained source receipt through the real Fetch path, for the drafts.
+    let fetched = scoped(Asserted::Operator, || {
+        crate::client::rpc(
+            &state,
+            "app_tool_invoke",
+            session(json!({"tool_alias":"instagram.read","input":{"handle":"juicysuite_crm"},"request_id":"fetch-1303"})),
+        )
+    })
+    .unwrap();
+    let receipt_id = fetched["receipt"]["id"].as_str().unwrap().to_owned();
+    let source = DraftSource::ToolReceipt {
+        receipt_id,
+        post_id: Some("post-1".into()),
+    };
+    let draft = |request: &str| {
+        records
+            .app_social_draft_create(
+                &context,
+                "A caption",
+                &source,
+                None,
+                request,
+                "session:test",
+            )
+            .unwrap()["draft_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let effect_seq = std::cell::Cell::new(0u32);
+    let stage = |draft: &str, revision: i64| {
+        effect_seq.set(effect_seq.get() + 1);
+        let id = format!(
+            "sfx_{}_{:032x}",
+            install
+                .as_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+            effect_seq.get()
+        );
+        let frozen = json!({"draft_id":draft,"revision":revision,"context_id":context});
+        let staged = records
+            .app_social_effect_stage(
+                &context,
+                &EffectStage {
+                    draft,
+                    revision,
+                    request: &format!("stage-{}", effect_seq.get()),
+                    effect_id: &id,
+                    frozen: &frozen,
+                    approval: "approval-1303",
+                },
+            )
+            .unwrap();
+        (id, staged["effect"]["digest"].as_str().unwrap().to_owned())
+    };
+
+    let open = draft("d-open");
+    let (waiting, waiting_digest) = stage(&open, 1);
+    // A draft with an effect approved at revision 1 and edited to revision 2.
+    let approved = draft("d-approved");
+    let (fx, digest) = stage(&approved, 1);
+    records
+        .app_social_effect_decide(&fx, &digest, true)
+        .unwrap();
+    rpc(
+        Asserted::Operator,
+        "app_social_draft_update",
+        json!({"draft_id":approved,"expected_revision":1,"caption":"Edited","request_id":"edit-1303"}),
+    )
+    .unwrap();
+    let sending = draft("d-sending");
+    let (fx, digest) = stage(&sending, 1);
+    records
+        .app_social_effect_decide(&fx, &digest, true)
+        .unwrap();
+    records.app_social_effect_claim_send(&fx, &digest).unwrap();
+    let posted = draft("d-posted");
+    let (fx, digest) = stage(&posted, 1);
+    records
+        .app_social_effect_decide(&fx, &digest, true)
+        .unwrap();
+    records.app_social_effect_claim_send(&fx, &digest).unwrap();
+    records
+        .app_social_effect_finish(&fx, "posted", &json!({}))
+        .unwrap();
+    let mut before = listed();
+    before.sort();
+    let unchanged = |why: &str| {
+        let mut now = listed();
+        now.sort();
+        assert_eq!(now, before, "{why}");
+        assert_eq!(effect_state(&waiting), "waiting", "{why}");
+    };
+
+    // (a) An agent and an unproven caller are refused at the operator gate,
+    // over RPC and over the board relay, and nothing changes.
+    let worker = Asserted::Agent("worker".into());
+    for who in [worker.clone(), Asserted::Unproven] {
+        let error = rpc(
+            who.clone(),
+            "app_social_draft_discard",
+            json!({"draft_id":open,"revision":1}),
+        )
+        .expect_err("a non-operator caller must not discard")
+        .to_string();
+        assert!(
+            error.contains("operator action") || error.contains("not provably the operator"),
+            "{who:?} over RPC: {error}"
+        );
+        unchanged("non-operator RPC");
+        let (status, body) = http(&who, "discard", json!({"draft_id":open,"revision":1}));
+        assert!(status >= 400, "{who:?} over HTTP: {status} {body}");
+        relogin();
+        unchanged("non-operator HTTP");
+    }
+
+    // (b) Any approved, sending or posted effect (of any revision) keeps the
+    // draft, over RPC and HTTP; nothing changes.
+    for (id, revision) in [(&approved, 2), (&sending, 1), (&posted, 1)] {
+        let error = rpc(
+            Asserted::Operator,
+            "app_social_draft_discard",
+            json!({"draft_id":id,"revision":revision}),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), Some("draft_in_use"), "{id}: {error}");
+        let (status, body) = http(
+            &Asserted::Operator,
+            "discard",
+            json!({"draft_id":id,"revision":revision}),
+        );
+        assert!(status >= 400, "{id} over HTTP: {status} {body}");
+        unchanged("in-use draft");
+    }
+
+    // (c) A stale revision and an unknown draft are refused; nothing changes.
+    let stale = rpc(
+        Asserted::Operator,
+        "app_social_draft_discard",
+        json!({"draft_id":open,"revision":2}),
+    )
+    .unwrap_err();
+    assert_eq!(stale.code(), Some("stale_revision"), "{stale}");
+    unchanged("stale revision");
+    let unknown = rpc(
+        Asserted::Operator,
+        "app_social_draft_discard",
+        json!({"draft_id":"sdr-unknown","revision":1}),
+    )
+    .unwrap_err();
+    assert_eq!(unknown.code(), Some("draft_not_found"), "{unknown}");
+    unchanged("unknown draft");
+
+    // (d) The operator's discard over the board relay: gone from list, show
+    // and update; its waiting effect declined and never approvable.
+    let (status, body) = http(
+        &Asserted::Operator,
+        "discard",
+        json!({"draft_id":open,"revision":1}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body,
+        json!({"draft_id":open,"state":"discarded","revision":1})
+    );
+    assert!(listed().iter().all(|(id, _)| id != &open));
+    assert!(rpc(
+        Asserted::Operator,
+        "app_social_draft_show",
+        json!({"draft_id":open})
+    )
+    .is_err());
+    assert!(rpc(
+        Asserted::Operator,
+        "app_social_draft_update",
+        json!({"draft_id":open,"expected_revision":1,"caption":"Back","request_id":"edit-1303-b"}),
+    )
+    .is_err());
+    assert_eq!(effect_state(&waiting), "declined");
+    let decide = op_err(
+        &state,
+        "app_effect_decide",
+        json!({"effect_id":waiting,"digest":waiting_digest,"decision":"accept"}),
+    );
+    assert!(decide.contains("no longer waiting"), "{decide}");
+    assert!(op_err(
+        &state,
+        "app_effect_publish_now",
+        json!({"effect_id":waiting,"digest":waiting_digest}),
+    )
+    .contains("approved"));
+    // An already discarded draft is refused and stays discarded.
+    let again = rpc(
+        Asserted::Operator,
+        "app_social_draft_discard",
+        json!({"draft_id":open,"revision":1}),
+    )
+    .unwrap_err();
+    assert_eq!(again.code(), Some("draft_not_found"), "{again}");
+    assert!(listed().iter().all(|(id, _)| id != &open));
+
+    // (e) The image idea: anything but {} or exactly {image_prompt} of 1-512
+    // plain characters is refused before any provider call; 512 characters
+    // are carried into the frozen plan whole.
+    let target = draft("d-image");
+    let image = |input: Value, request: &str| {
+        scoped(Asserted::Operator, || {
+            crate::client::rpc(
+                &state,
+                "app_tool_invoke",
+                session(
+                    json!({"tool_alias":"drafts","input":input,"request_id":request,"generation_scope":{"operation":"image","draft_id":target,"revision":1}}),
+                ),
+            )
+        })
+    };
+    let posts_before = DOOR_1303.lock().unwrap().len();
+    for (n, bad) in [
+        json!({"image_prompt":"x".repeat(513)}),
+        json!({"image_prompt":""}),
+        json!({"image_prompt":"   "}),
+        json!({"image_prompt":"line\nbreak"}),
+        json!({"image_prompt":"tab\there"}),
+        json!({"image_prompt":"bell\u{7}"}),
+        json!({"image_prompt":"ok","subject":"forged"}),
+        json!({"image_prompt":7}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let error = image(bad.clone(), &format!("img-bad-{n}"))
+            .expect_err("a bad image idea must be refused")
+            .to_string();
+        assert!(
+            error.contains("image idea") || error.contains("image input"),
+            "{bad}: {error}"
+        );
+    }
+    assert_eq!(
+        DOOR_1303.lock().unwrap().len(),
+        posts_before,
+        "no provider call"
+    );
+    let idea = "a".repeat(511) + "z";
+    let _ = image(json!({"image_prompt":idea}), "img-good");
+    let intents = rpc(Asserted::Operator, "app_social_draft_list", json!({})).unwrap()
+        ["generation_intents"]
+        .clone();
+    let plan = intents
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["request_id"] == "img-good")
+        .unwrap_or_else(|| panic!("no frozen plan: {intents}"));
+    assert_eq!(plan["input"]["image_prompt"], json!(idea), "{plan}");
+    drop(stop);
+}
+
+fn op_err(state: &std::path::Path, method: &str, params: Value) -> String {
+    scoped(Asserted::Operator, || {
+        crate::client::rpc(state, method, params)
+    })
+    .expect_err("must be refused")
+    .to_string()
+}

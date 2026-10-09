@@ -47,6 +47,7 @@ lease/http_tests.rs	test-fixtures	open	1
 platform/agenticos_external.rs	non-sqlite-platform-adapter-inline-tests	execute	2
 platform/agenticos_external/publish_sender.rs	read-only-store-publication-observation-and-inline-tests	execute	8
 platform/agenticos_external/publish_sender.rs	read-only-store-publication-observation-and-inline-tests	open	4
+platform/agenticos_external/tests/hosted_source_board.rs	test-fixtures	open	1
 platform/deployments/tests.rs	non-sqlite-platform-deployment-tests	execute	1
 platform/local.rs	read-only-store-platform-observation	open	2
 remote_result_outbox.rs	separate-results.sqlite3	execute	10
