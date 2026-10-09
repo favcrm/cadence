@@ -278,9 +278,7 @@ fn gate_backoff(base: Duration, waits: u32) -> Duration {
 /// Readable via `cadence events daemon`; not a sendable alias.
 const DAEMON_ALIAS: &str = Store::DAEMON_STREAM;
 
-/// How an approval-evidence writer was authorized — the daemon's own
-/// statement, stamped on every record (CAD-217).
-const APPROVAL_RECORDED_VIA: &str = "operator-connection";
+use store::APPROVAL_RECORDED_VIA;
 
 /// Who a model-defaults change is recorded as: the only caller
 /// `model_defaults_set` accepts (CAD-337).

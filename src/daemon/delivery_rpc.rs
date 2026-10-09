@@ -1626,17 +1626,24 @@ impl Shared {
         // The approval object first: a failed enqueue retries cleanly
         // (same evidence dedupes to the same id), and audit never sees
         // a merge without its approval.
-        let (_, approval_id) = self.store.record_approval(
-            &store::NewApproval {
-                id: None,
-                source: &source,
-                action: "merge",
-                head_sha: &sha,
-                repo: &slug,
-                pr: number,
-            },
-            APPROVAL_RECORDED_VIA,
-        )?;
+        let approval = store::NewApproval {
+            id: None,
+            source: &source,
+            action: "merge",
+            head_sha: &sha,
+            repo: &slug,
+            pr: number,
+        };
+        // CAD-1300: a board Publish (it relays `request_actor`) follows the
+        // one-record-per-head rule; the CLI keeps `record_approval`.
+        let approval_id = if params.get("request_actor").is_some() {
+            self.store
+                .record_or_reuse_board_approval(&approval, APPROVAL_RECORDED_VIA)?
+        } else {
+            self.store
+                .record_approval(&approval, APPROVAL_RECORDED_VIA)?
+                .1
+        };
         if let Err(e) = delivery::gh(
             &gh_bin,
             &[
