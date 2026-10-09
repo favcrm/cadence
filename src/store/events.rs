@@ -742,10 +742,15 @@ impl Store {
         &self,
         a: &NewApproval,
         recorded_via: &str,
+        issue: &str,
     ) -> Result<String> {
         approval_source(a.source)?;
+        identifier(a.action, "Approval action")?;
         approval_head(a.head_sha)?;
         approval_repo(a.repo)?;
+        if a.pr == 0 {
+            return Err(Error::rejected("Approval PR number must be positive"));
+        }
         let scope = json!({"repo": a.repo, "pr": a.pr});
         let head = json!(a.head_sha);
         self.write_tx(|conn| {
@@ -755,14 +760,25 @@ impl Store {
             if let Some(id) = Self::standing(&stream, "merge", &fields) {
                 return Ok(id);
             }
-            let on_record = stream.iter().any(|(k, p, _)| {
+            let revoked = Self::revoked_ids(&stream);
+            let mut on_record = stream.iter().filter(|(k, p, _)| {
                 k == APPROVAL_RECORDED_EVENT && p["scope"] == scope && p["head_sha"] == head
             });
-            if on_record {
-                return Err(Error::rejected(
-                    "this head's board approval was revoked — one approval record per head; \
-                     re-approve it with `cadence audit approve` or push a new head",
-                ));
+            if let Some((_, p, _)) = on_record.next() {
+                let was_revoked = p["approval_id"]
+                    .as_str()
+                    .is_some_and(|id| revoked.contains(id));
+                return Err(Error::rejected(if was_revoked {
+                    format!(
+                        "{issue}: this head's board approval was revoked — one approval record \
+                         per head; re-approve it with `cadence audit approve` or push a new head"
+                    )
+                } else {
+                    format!(
+                        "{issue}: this head already has an approval record that is not a board \
+                         merge approval — one approval record per head"
+                    )
+                }));
             }
             let payload = json!({
                 "source": a.source,
