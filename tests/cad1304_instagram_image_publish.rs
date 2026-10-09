@@ -733,12 +733,17 @@ fn a_legacy_sha256_frozen_effect_publishes_unchanged_and_a_changed_image_sends_n
     let (draft, revision, _) = fx.draft_with_image("m", &source);
     let (id, digest) = fx.legacy(&draft, revision, "chg", Some(&png(200)));
     let imports = fx.count(&format!("{PREFIX}/media/import"));
-    let refused = fx.publish_now(&id, &digest).unwrap_err().to_string();
-    assert!(
-        refused.contains("image changed since approval"),
-        "{refused}"
-    );
-    assert_eq!(fx.state(&id), "approved");
+    let refused = fx
+        .rpc_as(
+            Asserted::Operator,
+            "app_effect_decide",
+            json!({"effect_id": id, "digest": digest, "decision": "accept"}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("image changed since staging"), "{refused}");
+    assert!(fx.publish_now(&id, &digest).is_err());
+    assert_eq!(fx.state(&id), "waiting");
     assert_eq!(fx.count(&format!("{PREFIX}/media/import")), imports);
     assert_eq!(fx.count(&format!("{PREFIX}/publish")), 1);
 }
