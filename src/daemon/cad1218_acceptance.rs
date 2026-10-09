@@ -183,6 +183,13 @@ exit 1
 
 impl Board {
     pub(super) fn start(root: &std::path::Path) -> Self {
+        Self::start_cased(root, REPO, REPO)
+    }
+
+    /// [`Board::start`] with the registered checkout's origin naming
+    /// `origin_repo` and the delivery rows' PR URLs naming `row_repo` —
+    /// the same repo, possibly in another letter case (CAD-1300).
+    pub(super) fn start_cased(root: &std::path::Path, origin_repo: &str, row_repo: &str) -> Self {
         let state = root.to_path_buf();
         let pm_dir = state.join("pm");
         let pm = crate::issue::Pm::init(&pm_dir).unwrap();
@@ -195,7 +202,7 @@ impl Board {
                 "remote",
                 "add",
                 "origin",
-                "https://github.com/acme/widgets.git",
+                &format!("https://github.com/{origin_repo}.git"),
             ][..],
         ] {
             let ok = std::process::Command::new("git")
@@ -226,7 +233,7 @@ impl Board {
         for (issue, pr) in [(PUBLISH_ISSUE, PUBLISH_PR), (PUBLISH_ISSUE_2, PUBLISH_PR_2)] {
             let mut rec = crate::delivery::Record::new(issue, "widgets", "fixture-worker", 1);
             rec.state = crate::delivery::State::Passed;
-            rec.pr = Some(format!("https://github.com/{REPO}/pull/{pr}"));
+            rec.pr = Some(format!("https://github.com/{row_repo}/pull/{pr}"));
             rec.head = Some(HEAD.into());
             rec.verdict = Some(crate::delivery::VerdictRec {
                 verdict: "pass".into(),
