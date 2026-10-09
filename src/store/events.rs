@@ -172,6 +172,17 @@ pub(crate) fn event_store_stats(
     })
 }
 
+/// Is `a` the same approval scope as `b`: the same PR in the same repo,
+/// whatever the letter case of the repo (a CLI record keeps the case it
+/// was sent in; the board records lowercase).
+fn same_scope(a: &Value, b: &Value) -> bool {
+    a["pr"] == b["pr"]
+        && match (a["repo"].as_str(), b["repo"].as_str()) {
+            (Some(x), Some(y)) => x.eq_ignore_ascii_case(y),
+            _ => false,
+        }
+}
+
 /// How an approval-evidence writer was authorized — the daemon's own
 /// statement, stamped on every record (CAD-217).
 pub const APPROVAL_RECORDED_VIA: &str = "operator-connection";
@@ -669,9 +680,10 @@ impl Store {
                     Self::event(&tx, APPROVAL_STREAM, APPROVAL_RECORDED_EVENT, payload)?;
                     return Ok((true, id));
                 };
-                let same = ["source", "action", "head_sha", "scope"]
+                let same = ["source", "action", "head_sha"]
                     .iter()
-                    .all(|k| old[k] == evidence[k]);
+                    .all(|k| old[k] == evidence[k])
+                    && same_scope(&old["scope"], &evidence["scope"]);
                 let revoked = Self::approval_event(&tx, APPROVAL_REVOKED_EVENT, &id)?.is_some();
                 match (a.id.is_some(), revoked, same) {
                     (_, false, true) => return Ok((false, id)),
@@ -712,7 +724,9 @@ impl Store {
             let tx = &mut *conn;
             let stream = Self::approval_stream(&tx)?;
             let seen = stream.iter().find(|(k, p, _)| {
-                k == APPROVAL_RECORDED_EVENT && p["scope"] == scope && p["head_sha"] == a.head_sha
+                k == APPROVAL_RECORDED_EVENT
+                    && same_scope(&p["scope"], &scope)
+                    && p["head_sha"] == a.head_sha
             });
             if let Some((_, p, _)) = seen {
                 return Err(Error::rejected(format!(
@@ -756,14 +770,19 @@ impl Store {
         self.write_tx(|conn| {
             let tx = &mut *conn;
             let stream = Self::approval_stream(&tx)?;
-            let fields = [("scope", &scope), ("head_sha", &head)];
-            if let Some(id) = Self::standing(&stream, "merge", &fields) {
-                return Ok(id);
-            }
             let revoked = Self::revoked_ids(&stream);
             let mut on_record = stream.iter().filter(|(k, p, _)| {
-                k == APPROVAL_RECORDED_EVENT && p["scope"] == scope && p["head_sha"] == head
+                k == APPROVAL_RECORDED_EVENT
+                    && same_scope(&p["scope"], &scope)
+                    && p["head_sha"] == head
             });
+            let standing = on_record.clone().find_map(|(_, p, _)| {
+                let id = p["approval_id"].as_str()?;
+                (p["action"] == "merge" && !revoked.contains(id)).then(|| id.to_string())
+            });
+            if let Some(id) = standing {
+                return Ok(id);
+            }
             if let Some((_, p, _)) = on_record.next() {
                 let was_revoked = p["approval_id"]
                     .as_str()

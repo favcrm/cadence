@@ -1251,7 +1251,6 @@ fn cli_record_against_board_paths(repo: &str) {
 }
 
 #[test]
-#[ignore = "CAD-1300: enabled by the implementation"]
 fn cad1300_cli_records_in_any_case_count_as_on_record() {
     // (5) the lowercase control first, then GitHub's canonical case.
     cli_record_against_board_paths(REPO);
