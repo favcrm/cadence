@@ -251,7 +251,7 @@ export function ThreadPermission({ text, readOnly }: { text: string; readOnly: b
   return (
     <div className="card px-3 py-2 ml-8 min-w-0" data-permission-thread={id}>
       {card ? (
-        <PermissionCard card={card} readOnly={readOnly} onDone={() => load()} />
+        <PermissionCard card={card} readOnly={readOnly} onDone={() => load()} compact />
       ) : (
         <p className="text-micro text-ink-400 whitespace-pre-wrap break-words">{text}</p>
       )}

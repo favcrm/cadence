@@ -1,6 +1,9 @@
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
+import PermissionCard from "../src/features/home/PermissionCard";
 import { entryRefs, ThreadItemView, type Density } from "../src/features/home/ThreadView";
+declare function require(name: string): any;
+declare const process: { cwd(): string };
 import type { ThreadEntry, ThreadItem } from "../src/features/home/thread";
 
 /**
@@ -23,6 +26,22 @@ const entry = (over: Partial<ThreadEntry>): ThreadEntry => ({
   ...over,
 });
 
+/** CAD-1306: the daemon's real "Permission requested" message, from the format string in
+ *  src/daemon/master_rpc.rs. Fails loudly if the literal moves or changes shape. */
+const DAEMON_ID = "mp-0123abcd4567";
+function daemonPermissionMessage(id: string): string {
+  const src: string = require("fs").readFileSync(
+    require("path").join(process.cwd(), "..", "src", "daemon", "master_rpc.rs"),
+    "utf8",
+  );
+  const m = src.match(/"(Permission requested \(\{\}, risk \{\}\):[^"]*)"/);
+  if (!m) throw new Error("master_rpc.rs: the `Permission requested ({}, risk {}): ...` format string is missing or changed");
+  const fmt = m[1].replace(/\\n/g, "\n");
+  if ((fmt.match(/\{\}/g) ?? []).length !== 4) throw new Error(`master_rpc.rs: expected 4 placeholders, got: ${fmt}`);
+  const args = [id, "high", "ls -la", "look around"];
+  return fmt.replace(/\{\}/g, () => args.shift() as string);
+}
+
 const noop = () => undefined;
 const render = (item: ThreadItem, density?: Density, readOnly = false) =>
   renderToStaticMarkup(
@@ -35,6 +54,21 @@ const render = (item: ThreadItem, density?: Density, readOnly = false) =>
       onDiscard: noop,
     }),
   );
+
+// CAD-1306: the thread card is the compact card, like the To do rail's.
+{
+  const html = renderToStaticMarkup(
+    createElement(PermissionCard, {
+      card: { id: DAEMON_ID, argv: "ls", cwd: "/", reason: "look around", risk: "high", prefix: null, status: "pending", decisionLabel: "" },
+      readOnly: true,
+      onDone: noop,
+      compact: true,
+    }),
+  );
+  ok(html.includes('data-permission-risk="high"') && html.includes("High risk"), "compact card shows the risk line");
+  ok(html.includes("Allow once") && html.includes("Always ▾") && html.includes("Deny ▾"), "compact card uses the rail's labels");
+  ok(html.includes("Master says:") && html.includes("disabled"), "compact card shows the reason and is read-only");
+}
 
 const items: Record<string, ThreadItem> = {
   operator: { type: "operator", key: "o", entry: entry({ role: "operator", kind: "operator_message", text: "hi" }) },
@@ -114,15 +148,12 @@ for (const density of ["full", "compact"] as const) {
   );
   ok(perm.includes('data-permission-thread="perm-7"'), `${density}: permission renders ThreadPermission`);
   ok(!isDivider(perm), `${density}: permission is not the divider`);
-  // CAD-1306: the daemon's real message. Literal copied from src/daemon/master_rpc.rs (rpc_master_ask_permission, "Permission requested ({}, risk {}): ...").
+  // CAD-1306: the message is built from the daemon's own format string, read from source.
   const real = render(
-    sys({
-      text: "Permission requested (perm-9, risk medium): `ls -la`\nReason: look\nThe operator can allow it once, always, or reject it.",
-      payload: { source: "permission" },
-    }),
+    sys({ text: daemonPermissionMessage(DAEMON_ID), payload: { source: "permission" } }),
     density,
   );
-  ok(real.includes('data-permission-thread="perm-9"'), `${density}: the daemon's real permission message becomes the card`);
+  ok(real.includes(`data-permission-thread="${DAEMON_ID}"`), `${density}: the daemon's real permission message becomes the card`);
   // Even a long multi-line permission text takes the permission route.
   const permLong = render(
     sys({ text: `Permission requested (perm-8)\n${"x".repeat(300)}`, payload: { source: "permission" } }),
