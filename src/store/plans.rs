@@ -52,6 +52,13 @@ pub struct AssigneeTask {
     pub job_state: Option<String>,
 }
 
+/// [`Store::job_task_summary`]: per-job task counts by state and task lists.
+#[derive(Default)]
+pub struct JobTaskSummary {
+    pub counts: std::collections::HashMap<String, std::collections::BTreeMap<String, i64>>,
+    pub lists: std::collections::HashMap<String, Vec<Task>>,
+}
+
 /// A task: the dispatch/QA unit inside a job. `revision` counts
 /// attempts; each attempt is one kickoff message (`dispatch_message`).
 #[derive(Debug, Clone)]
@@ -350,6 +357,48 @@ impl Store {
         })
     }
 
+    /// CAD-1280: what `job list` asked of [`Self::tasks_for_job`] once per
+    /// job, in one read: every job's task counts by state (a grouped query
+    /// `tasks_job(job_id, state)` covers) and, when `lists` is
+    /// `Some(open_only)`, the tasks grouped by job in `tasks_for_job` order.
+    /// `open_only` leaves out the terminal tasks (`verified`, `done`,
+    /// `cancelled`, `failed`), the ones an assignee no longer holds.
+    pub fn job_task_summary(&self, lists: Option<bool>) -> Result<JobTaskSummary> {
+        self.read_tx(|conn| {
+            let mut summary = JobTaskSummary::default();
+            for (job, state, n) in conn.query_vec(
+                "SELECT job_id, state, COUNT(*) FROM tasks GROUP BY job_id, state",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                },
+            )? {
+                summary.counts.entry(job).or_default().insert(state, n);
+            }
+            if let Some(open_only) = lists {
+                let sql = if open_only {
+                    "SELECT * FROM tasks
+                     WHERE state NOT IN ('verified','done','cancelled','failed')
+                     ORDER BY created, rowid"
+                } else {
+                    "SELECT * FROM tasks ORDER BY created, rowid"
+                };
+                for task in conn.query_vec(sql, [], row_task)? {
+                    summary
+                        .lists
+                        .entry(task.job_id.clone())
+                        .or_default()
+                        .push(task);
+                }
+            }
+            Ok(summary)
+        })
+    }
+
     /// An alias's non-terminal task assignments — derived, never stored.
     pub fn tasks_for_assignee(&self, alias: &str) -> Result<Vec<Task>> {
         self.read_tx(|conn| {
@@ -364,9 +413,9 @@ impl Store {
     }
 
     /// CAD-1266: every assignee's non-terminal task ids in one pass, each
-    /// list in [`Self::tasks_for_assignee`] order. `tasks` has no assignee
-    /// index, so asking per agent scans the table once per agent; the fleet
-    /// list asks once.
+    /// list in [`Self::tasks_for_assignee`] order. The fleet list asks once
+    /// instead of once per agent; `tasks_assignee(assignee, state)` (CAD-1280)
+    /// lets both forms skip terminal rows without fetching them.
     pub fn open_task_ids_by_assignee(
         &self,
     ) -> Result<std::collections::HashMap<String, Vec<String>>> {

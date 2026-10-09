@@ -79,19 +79,21 @@ impl Shared {
         }
         // CAD-325: `tasks_detail` lists each task's id/state/title, so the
         // board binds agents to issues without one `job_show` per job.
+        // CAD-1280: `open_tasks_only` leaves terminal tasks out of that
+        // list (the board binds only what an agent still holds), and the
+        // counts and lists come from one query each, not one per job.
         let detail = params.get("tasks_detail").and_then(Value::as_bool) == Some(true);
+        let open_only = params.get("open_tasks_only").and_then(Value::as_bool) == Some(true);
+        let mut summary = self.store.job_task_summary(detail.then_some(open_only))?;
         let mut out = Vec::new();
         for job in jobs {
             let mut j = job.to_json();
-            let mut counts: std::collections::BTreeMap<String, i64> =
-                std::collections::BTreeMap::new();
-            let tasks = self.store.tasks_for_job(&job.id)?;
-            for task in &tasks {
-                *counts.entry(task.state.clone()).or_insert(0) += 1;
-            }
-            j["tasks"] = json!(counts);
+            j["tasks"] = json!(summary.counts.remove(&job.id).unwrap_or_default());
             if detail {
-                j["task_list"] = json!(tasks
+                j["task_list"] = json!(summary
+                    .lists
+                    .remove(&job.id)
+                    .unwrap_or_default()
                     .iter()
                     .map(|t| json!({"id": t.id, "state": t.state, "title": t.title}))
                     .collect::<Vec<_>>());
