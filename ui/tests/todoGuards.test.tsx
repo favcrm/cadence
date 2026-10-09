@@ -387,40 +387,65 @@ const stoppedW1 = { ...rows.stopped, subject: { kind: "agent", id: "w1" } };
   await h.done();
 }
 
-// ---- the same kind returning on the same subject is a new need (the overview is not read while off Home) ----
+// ---- a clock the server recomputes (stalled's `since`) never changes what a mark covers ----
 {
-  // review_escalated D-5: Fix it, then the same kind with a later `since` and no observed gap
-  const row = (since: number) => ({ kind: "review_escalated", audience: "operator", title: "D-5 review escalated", age: 60, project: "demo", command: "cadence x", subject: { kind: "issue", id: "D-5" }, since });
-  const v = await render([row(1000)], false);
-  await click(labelled(v.card("review_escalated"), "Fix it"));
-  await settle(() => assert(/Sent to Master/.test(v.card("review_escalated").textContent ?? ""), "the send lands as sent"));
-  await v.update([row(9000)], false);
-  assert(labelled(v.card("review_escalated"), "Fix it"), "a later occurrence offers Fix it, not a stale sent mark");
-  assert(v.badge() === "1", `the badge counts it, got ${v.badge()}`);
+  const row = (since?: number) => ({ kind: "stalled", audience: "operator", title: "w3 stalled", age: 60, project: "demo", command: "cadence x", subject: { kind: "agent", id: "w3" }, ...(since === undefined ? {} : { since }) });
+  const v = await render([row(100)], false);
+  await click(labelled(v.card("stalled"), "Fix it"));
+  await settle(() => assert(/Sent to Master/.test(v.card("stalled").textContent ?? ""), "the send lands as sent"));
+  for (const next of [row(101), row(), row(99)]) {
+    await v.update([next], false);
+    assert(/Sent to Master/.test(v.card("stalled").textContent ?? ""), "a drifting or missing `since` keeps the card sent");
+    assert(!labelled(v.card("stalled"), "Fix it"), 'no second "Fix it"');
+  }
+  assert(posts.filter((p) => p.path === "/api/threads/master/messages").length === 1, "one send for one occurrence");
   await v.done();
 }
-{
-  // fenced: "It got cut off", then fenced again with a later `since`
-  const row = (since: number) => ({ ...rows.fenced, since });
-  const v = await render([row(1000)], false);
-  await click(v.card("fenced").querySelector(".todo-hit"));
-  await click(labelled(v.card("fenced"), "It got cut off"));
-  await settle(() => assert(/Recorded/.test(v.card("fenced").textContent ?? ""), "decided"));
-  await v.update([row(9000)], false);
-  assert(!/Recorded/.test(v.card("fenced").textContent ?? ""), "a later occurrence is not shown as decided");
-  assert(labelled(v.card("fenced"), "It got cut off"), "a later occurrence offers its choices again");
-  await v.done();
-}
-{
-  // stopped w2 has no `since`: a new visit to Home (a remount) drops its sent mark
-  const row = { ...rows.stopped, subject: { kind: "agent", id: "w2" } };
+
+// ---- leaving Home and coming back is a new visit: decided and sent marks are dropped, for every kind ----
+for (const row of [
+  { kind: "review_escalated", audience: "operator", title: "D-5 review escalated", age: 60, project: "demo", command: "cadence x", subject: { kind: "issue", id: "D-5" }, since: 1000 },
+  { ...rows.stopped, subject: { kind: "agent", id: "w2" } },
+]) {
   const a = await render([row], false);
-  await click(labelled(a.card("stopped"), "Fix it"));
-  await settle(() => assert(/Sent to Master/.test(a.card("stopped").textContent ?? ""), "the send lands as sent"));
+  await click(labelled(a.card(row.kind), "Fix it"));
+  await settle(() => assert(/Sent to Master/.test(a.card(row.kind).textContent ?? ""), "the send lands as sent"));
   await a.done();
   const b = await render([row], false, { keepLocal: true });
-  assert(labelled(b.card("stopped"), "Fix it"), "a new visit offers Fix it for a row without `since`");
+  assert(labelled(b.card(row.kind), "Fix it"), `${row.kind}: a new visit offers Fix it again`);
   await b.done();
+}
+{
+  const a = await render([rows.fenced], false);
+  await click(a.card("fenced").querySelector(".todo-hit"));
+  await click(labelled(a.card("fenced"), "It got cut off"));
+  await settle(() => assert(/Recorded/.test(a.card("fenced").textContent ?? ""), "decided"));
+  await a.done();
+  const b = await render([rows.fenced], false, { keepLocal: true });
+  assert(!/Recorded/.test(b.card("fenced").textContent ?? ""), "a new visit drops the decided mark");
+  await b.done();
+}
+{
+  // Without the badge nothing reconciles: a sent mark alone must not cover a changed need.
+  const a = await render([rows.blocked], false, { noBadge: true });
+  await click(labelled(a.card("blocked"), "Fix it"));
+  await settle(() => assert(/Sent to Master/.test(a.card("blocked").textContent ?? ""), "sent"));
+  await a.update([{ ...rows.blocked, kind: "blocked_ready" }], false);
+  assert(labelled(a.card("blocked_ready"), "Fix it"), "a sent mark does not cover a changed need");
+  await a.done();
+}
+{
+  // A failed snooze says so in plain words; the server's text is only under Details.
+  replies = { "/api/needs/snooze": { status: 500, body: { error: "pid 4242: `cadence needs snooze` failed (pm.yaml)" } } };
+  const v = await render([rows.blocked], false);
+  await click(v.card("blocked").querySelector(".needmore"));
+  await click(labelled(v.card("blocked"), "Snooze 24h"));
+  await settle(() => assert(v.card("blocked").querySelector('[role="alert"]'), "a failed snooze shows an error"));
+  assert(!/pid|cadence|pm\.yaml/.test(v.card("blocked").querySelector('[role="alert"]')!.textContent ?? ""), "no raw server text on the card");
+  await click(labelled(v.card("blocked"), "Details"));
+  assert(/pid 4242/.test(v.card("blocked").querySelector(".todo-tech")?.textContent ?? ""), "the server's words are under Details");
+  replies = {};
+  await v.done();
 }
 {
   // within one visit, closing and reopening the narrow slide-over keeps the card sent
@@ -453,6 +478,7 @@ const stoppedW1 = { ...rows.stopped, subject: { kind: "agent", id: "w1" } };
   holds = {};
   await settle(() => assert(/Sent to Master/.test(b.card("blocked").textContent ?? ""), "the send lands as sent"));
   assert(posts.filter((p) => p.path === "/api/threads/master/messages").length === 1, "one send, not two");
+  assert(!labelled(b.card("blocked"), "Fix it"), 'a send that lands after the remount is not offered again');
   await b.done();
 }
 
