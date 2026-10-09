@@ -222,8 +222,8 @@ impl Shared {
             delivery::filing_order(r["name"].as_str().unwrap_or_default(), &rec.worker)
         });
         let Some(latest) = fresh.last().cloned() else {
-            if matches!(rec.state, State::Unstaffed | State::Working)
-                && rec.outcome_report.is_some()
+            if rec.state == State::Unstaffed
+                || (rec.state == State::Working && rec.outcome_report.is_some())
             {
                 let before = rec.state;
                 self.start_review(pm, rec, hist)?;
