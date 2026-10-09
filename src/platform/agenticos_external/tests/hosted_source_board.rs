@@ -53,6 +53,13 @@ fn operator(state: &std::path::Path, method: &str, params: Value) -> Value {
 /// `hosted` account, and a board on 3110-3199. Answers the board's quote
 /// `(status, body)` and the frozen source binding.
 fn boot_daemon(answer: fn(&str, &str, &Value) -> Reply) -> (Stop, tempfile::TempDir, PathBuf) {
+    boot_daemon_pinned(answer, MANIFEST_PIN)
+}
+
+fn boot_daemon_pinned(
+    answer: fn(&str, &str, &Value) -> Reply,
+    pin: &str,
+) -> (Stop, tempfile::TempDir, PathBuf) {
     let mut stop = Stop(Arc::new(AtomicBool::new(false)), Vec::new());
     let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
     let base = format!("http://{}", server.server_addr().to_ip().unwrap());
@@ -79,7 +86,7 @@ fn boot_daemon(answer: fn(&str, &str, &Value) -> Reply) -> (Stop, tempfile::Temp
     };
     opts.provider_env
         .set("CADENCE_PM_DIR", pm.to_str().unwrap());
-    let mut adapter = hosted_adapter();
+    let mut adapter = hosted_with_pin(pin).unwrap();
     adapter.base = base;
     opts.platforms.insert(PLATFORM.into(), Arc::new(adapter));
     let daemon_state = state.clone();
@@ -324,4 +331,141 @@ fn cad1294_screen_fetch_of_a_saved_handle_reaches_the_provider_door() {
     // An unsaved handle is refused with no further provider call.
     assert!(fetch("someone_else", "fetch-1294-b").is_err());
     assert_eq!(CALLS.lock().unwrap().len(), 1);
+}
+
+static TEXT_CALLS: std::sync::Mutex<Vec<Value>> = std::sync::Mutex::new(Vec::new());
+
+/// The AgenticOS door for `generate_text` (manifest @4): the quote view and
+/// the call reply in the shape the host's text contract validates.
+fn text_door(method: &str, url: &str, body: &Value) -> Reply {
+    let price = json!({"currency":"USD","scale":6,"amount":"0.002000"});
+    match (method, url) {
+        ("GET", "/v1/runtime/tools/generate_text") => json_response(
+            200,
+            json!({"ok":true,"data":{"slug":"generate_text","displayName":"Generate text","effect":"draft","chargePrecondition":"max_charge_minor@1","price":price,"unitPrice":null}}),
+        ),
+        ("POST", CALL_PATH) if body["slug"] == "generate_text" => {
+            TEXT_CALLS.lock().unwrap().push(body.clone());
+            json_response(
+                200,
+                json!({"ok":true,"data":{"slug":"generate_text","repeated":false,"price":price,"result":{"text":"Door caption from the writer slot.","finishReason":"stop","usage":{"inputTokens":9,"outputTokens":5,"totalTokens":14,"cachedInputTokens":null,"reasoningOutputTokens":null}}}}),
+            )
+        }
+        _ => refused("not_allowlisted"),
+    }
+}
+
+/// CAD-1302: Social Content declares its text slot as `writer`
+/// (`tests/fixtures/apps/social-content-writer/app.md` copies the real
+/// declarations verbatim). A caption request through the real screen path
+/// must dispatch on the bound capability and reach the lease door.
+#[test]
+fn cad1302_caption_through_a_slot_named_writer_reaches_the_lease_door() {
+    let (_stop, root, state) = boot_daemon_pinned(text_door, TEXT_MANIFEST_PIN);
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let fixture = root.path().join("app");
+    // The host's Social Content workflows satisfy the local-workflow
+    // check; the manifest is the real app's declarations, `writer` included.
+    copy_dir(
+        &manifest_dir.join("workspace-apps/social-content"),
+        &fixture,
+    );
+    std::fs::copy(
+        manifest_dir.join("tests/fixtures/apps/social-content-writer/app.md"),
+        fixture.join("app.md"),
+    )
+    .unwrap();
+    copy_dir(
+        &manifest_dir.join("tests/fixtures/apps/ig-tools-fixture/screens"),
+        &fixture.join("screens"),
+    );
+    let screens = fixture.join("screens/feed/screens.json");
+    let text = std::fs::read_to_string(&screens).unwrap();
+    let text = text.replace("ig-tools-fixture", "social-content").replace(
+        "\"instagram.read\": \"source\"",
+        "\"caption.generate\": \"writer\"",
+    );
+    assert!(text.contains("caption.generate"), "{text}");
+    std::fs::write(&screens, text).unwrap();
+    let install = operator(
+        &state,
+        "app_workspace_install",
+        json!({"source":fixture.to_str().unwrap()}),
+    );
+    let (install_id, digest) = (install["install_id"].clone(), install["digest"].clone());
+    operator(
+        &state,
+        "app_local_install_approve",
+        json!({"install_id":install_id,"digest":digest}),
+    );
+    let rows = operator(&state, "connection_list", json!({}))["connections"].clone();
+    let hosted = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["account"] == "hosted")
+        .unwrap()["id"]
+        .clone();
+    let context = operator(
+        &state,
+        "app_context_create",
+        json!({"install_id":install_id,"label":"EF","input_defaults":{},"request_id":"ctx-1302"}),
+    );
+    let context = context["context"]["id"]
+        .as_str()
+        .or_else(|| context["id"].as_str())
+        .unwrap()
+        .to_owned();
+    let bind = json!({"install_id":install_id,"context_id":context,"slot":"writer","connection_id":hosted,"request_id":"bind-1302"});
+    operator(&state, "app_binding_create", bind);
+    let draft = crate::store::app_records::RecordStore::open(&state, install_id.as_str().unwrap())
+        .unwrap()
+        .app_social_draft_create(
+            &context,
+            "Draft caption",
+            &crate::store::app_social_drafts::DraftSource::ToolReceipt {
+                receipt_id: "receipt-1302".into(),
+                post_id: None,
+            },
+            None,
+            "draft-1302",
+            "session:test",
+        )
+        .unwrap();
+    crate::operator_auth::ensure_secret(&state).unwrap();
+    let secret = crate::operator_auth::read_secret(&state).unwrap();
+    let nonce = operator(
+        &state,
+        "operator_link_mint",
+        json!({"secret":secret,"origin":"loopback"}),
+    )["nonce"]
+        .clone();
+    let session = operator(
+        &state,
+        "operator_session_open",
+        json!({"nonce":nonce,"origin":"loopback"}),
+    );
+    let (token, key) = (session["token"].clone(), session["key"].clone());
+    let mint = operator(
+        &state,
+        "app_screen_mint",
+        json!({"install_id":install_id,"context_id":context,"tag":"feed","token":token,"key":key,"origin":"loopback","generation":1}),
+    );
+    let nonce = mint["mount"].as_str().unwrap().rsplit('/').next().unwrap();
+    operator(&state, "app_screen_consume", json!({"nonce":nonce}));
+    let receipt = operator(
+        &state,
+        "app_tool_invoke",
+        json!({"action_token":mint["action_token"],"tool_alias":"caption.generate",
+            "input":{"messages":[{"role":"user","content":"Draft a caption."}]},
+            "generation_scope":{"operation":"caption","draft_id":draft["draft_id"],"revision":1},
+            "request_id":"caption-1302","token":token,"key":key,"origin":"loopback"}),
+    );
+    assert_eq!(
+        receipt["receipt"]["result"]["text"], "Door caption from the writer slot.",
+        "{receipt}"
+    );
+    let calls = TEXT_CALLS.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(calls[0]["slug"], "generate_text");
 }

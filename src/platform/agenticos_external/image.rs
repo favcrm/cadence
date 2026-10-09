@@ -78,7 +78,6 @@ pub(super) fn image_prompt(authority: &Value, input: &Value) -> Result<String, S
     let config = &authority["binding"]["config"];
     let mapping = &config["mapping"];
     if authority["schema"] != 1
-        || authority["slot"] != "image"
         || config["provider"] != PLATFORM
         || config["install_id"] != authority["install_id"]
         || config["connection_id"].as_str().is_none_or(str::is_empty)
