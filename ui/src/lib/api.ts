@@ -732,6 +732,12 @@ export const api = {
    *  refuses with 409 `head_moved`; a head with an earlier record refuses. */
   approveHead: (repo: string, pr: number, head: string) =>
     post<{ approval_id: string }>("/api/approvals/approve", { repo, pr, head }),
+  /** `GET /api/approvals/state` (CAD-1218) — whether this head has an
+   *  approval in force, revoked, or none. */
+  approvalState: (repo: string, pr: number, head: string) =>
+    get<{ state: "in-force" | "revoked" | "missing"; approval_id?: string }>(
+      `/api/approvals/state?repo=${encodeURIComponent(repo)}&pr=${pr}&head=${encodeURIComponent(head)}`,
+    ),
   /** `POST /api/approvals/<id>/revoke` (CAD-1218) — withdraw that approval. */
   revokeApproval: (id: string, reason: string) =>
     post<Record<string, unknown>>(`/api/approvals/${encodeURIComponent(id)}/revoke`, { reason }),

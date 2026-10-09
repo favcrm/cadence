@@ -858,7 +858,6 @@ fn read_refused((status, body): (u16, Value), ids: &[&str], what: &str) {
 }
 
 #[test]
-#[ignore = "CAD-1218: enabled by the implementation"]
 fn cad1218_board_approval_state_read_is_operator_only_and_leaks_nothing() {
     let root = tempfile::Builder::new().prefix("c1218s").tempdir().unwrap();
     let board = Board::start(root.path());
@@ -1101,7 +1100,6 @@ fn delivery_state(board: &Board, issue: &str) -> String {
 }
 
 #[test]
-#[ignore = "CAD-1218: enabled by the implementation"]
 fn cad1218_approver_rule_covers_publish_revoke_and_closed_prs() {
     let root = tempfile::Builder::new().prefix("c1218p").tempdir().unwrap();
     let board = Board::start(root.path());

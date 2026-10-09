@@ -1819,6 +1819,8 @@ mod tests {
             "agent_respond",
             "approval_record",
             "approval_record_shown",
+            "approval_state",
+            "approval_revoke_shown",
             "task_accept",
             "agent_file_write",
             "master_start",

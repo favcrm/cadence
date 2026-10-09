@@ -1267,6 +1267,14 @@ impl Shared {
             ));
         }
         let actor = request_actor(params)?;
+        // CAD-1218: a board-relayed approval (Publish) answers to the same
+        // approver rule as the drawer's Approve, before anything is
+        // recorded. The CLI sends no `request_actor` and keeps `operator`.
+        let source = if params.get("request_actor").is_some() {
+            super::approvals_rpc::approver_source(&self.pm()?.config, &actor)?
+        } else {
+            actor.clone()
+        };
         let _g = self.delivery_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut all = delivery::load(&self.state_dir)?;
         let rec = all.get_mut(id).ok_or_else(|| not_in_loop(id))?;
@@ -1331,7 +1339,7 @@ impl Shared {
         let (_, approval_id) = self.store.record_approval(
             &store::NewApproval {
                 id: None,
-                source: &actor,
+                source: &source,
                 action: "merge",
                 head_sha: &sha,
                 repo: &slug,

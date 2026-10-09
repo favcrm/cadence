@@ -352,7 +352,7 @@ function MergeReview({ need, readOnly, index, total, onDone, onClose }: ReviewPr
   const [sendBack, setSendBack] = useState(false);
   const [takeBack, setTakeBack] = useState(false);
   const issue = useIssue(action.issue);
-  const a = useApproveHead(action.pr, action.sha && action.sha.trim() ? action.sha : null);
+  const a = useApproveHead(action.pr, action.sha && action.sha.trim() ? action.sha : null, !!block);
   const m = useMergeDecision(need as HomeNeed & { action: { type: "merge" } }, (t) =>
     onDone(need.key, t.startsWith("declined") ? "Sent back" : "Published"),
   );
@@ -392,7 +392,7 @@ function MergeReview({ need, readOnly, index, total, onDone, onClose }: ReviewPr
           )}
           {a.approved && (
             <>
-              <p className="rv-note">You approved this version.</p>
+              <p className="rv-note">Approved.</p>
               <button type="button" className="rv-dlnk" disabled={!!block || a.busy !== null} onClick={() => setTakeBack((t) => !t)}>
                 Take my approval back
               </button>
@@ -406,10 +406,15 @@ function MergeReview({ need, readOnly, index, total, onDone, onClose }: ReviewPr
               )}
             </>
           )}
-          {a.revoked && <p className="rv-note">Your approval was taken back.</p>}
-          {(m.error ?? a.error) && (
+          {a.revoked && <p className="rv-note">Your approval was taken back. A new version needs a fresh approval.</p>}
+          {a.error && (
             <p className="rv-error" role="alert">
-              {m.error ?? a.error}
+              {a.error}
+            </p>
+          )}
+          {m.error && (
+            <p className="rv-error" role="alert">
+              {m.error}
             </p>
           )}
           <Details
@@ -437,7 +442,7 @@ function MergeReview({ need, readOnly, index, total, onDone, onClose }: ReviewPr
           }
           secondary={
             <>
-              {a.available && !a.approved && (
+              {a.available && !a.approved && !a.revoked && (
                 <Button
                   disabled={!!block || a.busy !== null || m.busy !== null}
                   loading={a.busy === "approve"}

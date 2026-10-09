@@ -955,15 +955,51 @@ impl Store {
         reason: &str,
         recorded_via: &str,
     ) -> Result<bool> {
+        self.revoke_approval_inner(id, source, reason, recorded_via, false)
+    }
+
+    /// CAD-1218: [`Self::revoke_approval`] for the board, which may reach
+    /// only a record a board path wrote: action `merge`, `recorded_via`
+    /// operator-connection and a source ending ` via board`. The target is
+    /// checked in the revoking transaction.
+    pub fn revoke_board_approval(
+        &self,
+        id: &str,
+        source: &str,
+        reason: &str,
+        recorded_via: &str,
+    ) -> Result<bool> {
+        self.revoke_approval_inner(id, source, reason, recorded_via, true)
+    }
+
+    fn revoke_approval_inner(
+        &self,
+        id: &str,
+        source: &str,
+        reason: &str,
+        recorded_via: &str,
+        board_only: bool,
+    ) -> Result<bool> {
         identifier(id, "Approval id")?;
         approval_source(source)?;
         approval_text(reason, "Approval revocation reason", 256)?;
         let evidence = json!({"approval_id": id, "source": source, "reason": reason});
         self.write_tx(|conn| {
             let tx = &mut *conn;
-            if Self::approval_event(&tx, APPROVAL_RECORDED_EVENT, id)?.is_none() {
+            let Some(recorded) = Self::approval_event(&tx, APPROVAL_RECORDED_EVENT, id)? else {
                 return Err(Error::rejected(format!(
                     "Approval id '{id}' has no recorded approval to revoke"
+                )));
+            };
+            let by_board = recorded["action"] == "merge"
+                && recorded["recorded_via"] == recorded_via
+                && recorded["source"]
+                    .as_str()
+                    .is_some_and(|s| s.ends_with(" via board"));
+            if board_only && !by_board {
+                return Err(Error::rejected(format!(
+                    "Approval '{id}' was not recorded from the board — revoke it with \
+                     `cadence audit revoke`"
                 )));
             }
             if let Some(old) = Self::approval_event(&tx, APPROVAL_REVOKED_EVENT, id)? {
