@@ -4453,11 +4453,16 @@ fn load_check_levels_and_slot_detail() {
     let c = check_load(&scan);
     assert_eq!(c.level, Level::Fail, "{}", c.detail);
     // Unset, the warn line derives from the slot plan — the
-    // farm's own (3+1)×4 jobs on this box: warn only above it.
+    // farm's own (3+1)×jobs_per_lane jobs on this box: warn only
+    // above it.
     scan.thresholds.load_warn_ratio = None;
-    let derived = ((3.0 + 1.0) * 4.0 * 1.25 / cpus).max(1.0);
-    // The fixture's slot config (3/1/4) equals the defaults, so
-    // the derived ratio matches either way; below it → ok.
+    // The fixture's slots payload carries no resolved config, so
+    // the check's SlotConfig::default() stand-in applies — mirror
+    // it here rather than restating the constants.
+    let d = crate::slots::SlotConfig::default();
+    let derived =
+        ((d.build_slots + d.suite_slots) as f64 * d.jobs_per_lane as f64 * 1.25 / cpus).max(1.0);
+    // Below the derived warn line → ok.
     proc_load(&scan, cpus * derived * 0.9, Some(2.0));
     let c = check_load(&scan);
     assert_eq!(c.level, Level::Ok, "below plan: {}", c.detail);

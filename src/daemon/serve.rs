@@ -550,6 +550,10 @@ pub(super) fn resolve_slot_config(opts: &ServeOptions) -> SlotConfig {
         if let Some(v) = o.suite_slots {
             c.suite_slots = v as usize;
         }
+        // CAD-1268: the aggregate budget over every pool.
+        if let Some(v) = o.total_slots {
+            c.total_slots = v as usize;
+        }
         if let Some(v) = o.jobs_per_lane {
             c.jobs_per_lane = v as usize;
         }

@@ -214,11 +214,14 @@ fn concurrent_unregistered_callers_never_exceed_the_pool() {
             });
         }
     });
-    // Default pool is 3: exactly three grants, five queued, no double-grant.
-    assert_eq!(granted.load(std::sync::atomic::Ordering::SeqCst), 3);
-    assert_eq!(held(&shared).len(), 3);
+    // The build pool is 3 but CAD-1268's combined default cap is 2:
+    // exactly two grants, six queued, no double-grant.
+    assert_eq!(granted.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(held(&shared).len(), 2);
     let st = shared.rpc_slot_status(&json!({}), peers[0].0).unwrap();
-    assert_eq!(st["waiting"].as_array().unwrap().len(), 5);
+    assert_eq!(st["total_capacity"], 2);
+    assert_eq!(st["config"]["total_slots"], 2);
+    assert_eq!(st["waiting"].as_array().unwrap().len(), 6);
     assert!(st["waiting"]
         .as_array()
         .unwrap()
