@@ -27,6 +27,7 @@
 
 mod body;
 pub mod cli;
+mod issue_matching;
 mod matching;
 mod rendering;
 
@@ -38,13 +39,14 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
-use crate::issue::{board, git, history, parse, project, time, write, Pm};
+use crate::issue::{board, git, parse, project, time, write, Pm};
 use crate::proc;
 
 use body::body_parts;
 use matching::{current_verify, iso_epoch};
 
 pub use body::{apply_line, fact_line};
+pub use issue_matching::{issue_ctx, match_for_issue};
 pub use matching::{
     evidence_json, evidence_label, glob_match, last_verified, match_memories, stale_reason,
     Freshness, MatchCtx, Matched, DEFAULT_STALE_DAYS,
@@ -1369,62 +1371,9 @@ pub fn supersede_native(
 
 // ── Matching ─────────────────────────────────────────────────────
 
-// Matching and freshness labelling live in `matching`; the parent
-// reexports its public names so `crate::memory::…` callers are unchanged.
-
-/// Paths the issue's recorded code commits touched — the path-scope
-/// input for issue matching. Absent commits/repos simply yield none.
-fn issue_paths(pm_dir: &Path, issue: &board::Issue) -> Vec<String> {
-    let mut paths = Vec::new();
-    let (commits, _) = history::code_commits(pm_dir, issue);
-    for c in commits {
-        let (Some(repo), Some(sha)) = (c["repo"].as_str(), c["sha"].as_str()) else {
-            continue;
-        };
-        let dir = project::expand_home(repo);
-        let out = git_bounded(
-            &dir,
-            &["show", "--format=", "--name-only", sha],
-            Duration::from_secs(5),
-        )
-        .unwrap_or_default();
-        paths.extend(out.lines().map(str::to_string));
-    }
-    // Explicit commit refs too — a ref path is a sha in a project repo.
-    for r in issue.front.refs.iter().filter(|r| r.kind == "commit") {
-        let Some(sha) = r.path.as_deref() else {
-            continue;
-        };
-        let Ok(projects) = project::list(pm_dir) else {
-            break;
-        };
-        for p in projects.iter().filter(|p| p.key == issue.project) {
-            for repo in &p.repos {
-                let Some(path) = &repo.path else { continue };
-                let dir = project::expand_home(path);
-                if git_bounded(
-                    &dir,
-                    &["cat-file", "-e", &format!("{sha}^{{commit}}")],
-                    Duration::from_secs(5),
-                )
-                .is_err()
-                {
-                    continue;
-                }
-                if let Ok(out) = git_bounded(
-                    &dir,
-                    &["show", "--format=", "--name-only", sha],
-                    Duration::from_secs(5),
-                ) {
-                    paths.extend(out.lines().map(str::to_string));
-                }
-            }
-        }
-    }
-    paths.sort();
-    paths.dedup();
-    paths
-}
+// Matching and freshness labelling live in `matching`; issue-scoped
+// context and dispatch live in `issue_matching`. The parent reexports
+// their public names so `crate::memory::…` callers are unchanged.
 
 /// `git` bounded through `proc::run_bounded` — returns trimmed stdout.
 fn git_bounded(dir: &Path, args: &[&str], timeout: Duration) -> Result<String> {
@@ -1445,31 +1394,6 @@ fn git_bounded(dir: &Path, args: &[&str], timeout: Duration) -> Result<String> {
         )));
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
-/// Match context for an issue: component, frontmatter tags,
-/// recorded-commit paths, and the target worker's provider.
-pub fn issue_ctx(pm: &Pm, issue: &board::Issue, provider: Option<&str>) -> Result<MatchCtx> {
-    Ok(MatchCtx {
-        components: issue.front.component.clone().into_iter().collect(),
-        paths: issue_paths(&pm.dir, issue),
-        providers: provider.map(|p| vec![p.to_string()]).unwrap_or_default(),
-        tags: issue.front.tags.clone(),
-    })
-}
-
-/// The dispatch/match surface: accepted memories applying to an
-/// issue. Report-mode load — valid records still match when sibling
-/// files are broken; the caller surfaces `errors`.
-pub fn match_for_issue(
-    pm: &Pm,
-    issue: &board::Issue,
-    provider: Option<&str>,
-) -> Result<(Matched, Vec<String>)> {
-    let ctx = issue_ctx(pm, issue, provider)?;
-    let (pool, errors) = load_project_report(&pm.dir, &issue.project);
-    let fresh = Freshness::for_key(&pm.dir, &issue.project);
-    Ok((match_memories(&pool, &ctx, &fresh), errors))
 }
 
 /// Accepted project-wide `rule`s — the briefing's memory section.
