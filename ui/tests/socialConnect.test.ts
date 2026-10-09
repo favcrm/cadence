@@ -57,7 +57,8 @@ async function main() {
   replies = { "/publishing/connect-link": { body: { hosted: true, url: "https://api.example/account/ws/connections/connect?toolkit=instagram&return_to=x" } } };
   let assigned: string | null = null;
   let shown: string | null = null;
-  const ui = { showLink: (url: string) => { shown = url; }, assign: (url: string) => { assigned = url; } };
+  let navigated: string | null = null;
+  const ui = { showLink: (url: string) => { shown = url; }, navigate: (path: string) => { navigated = path; }, assign: (url: string) => { assigned = url; } };
   let result = await runCall(ctx(), "open-link", { url: "/settings/connections" }, ui);
   assert(result.ok && assigned === "https://api.example/account/ws/connections/connect?toolkit=instagram&return_to=x" && shown === null, "hosted opens the AgenticOS link top-level");
   equal(calls[0], { path: "/api/app-installations/inst1/publishing/connect-link", body: { return_to: "https://ef.cadencecloud.app/app-installations/inst1?screen=native" } }, "the host asks with its own return_to");
@@ -69,12 +70,12 @@ async function main() {
   replies = { "/publishing/connect-link": { body: { hosted: true, unavailable: true } } };
   assigned = null; shown = null;
   result = await runCall(ctx(), "open-link", { url: "/settings/connections" }, ui);
-  assert(!result.ok && assigned === null && shown === null, "hosted without an origin is refused");
+  assert(!result.ok && assigned === null && navigated === null, "hosted without an origin is refused");
   // Local board: the daemon says not hosted, the local page link is kept.
   replies = { "/publishing/connect-link": { body: { hosted: false } } };
   assigned = null;
   result = await runCall(ctx(), "open-link", { url: "/settings/connections" }, ui);
-  assert(assigned === null && shown === "/settings/connections", "a local board keeps /settings/connections");
+  assert(assigned === null && navigated === "/settings/connections", "a local board keeps /settings/connections");
 
   // Destinations list verb: exact args, label from the host.
   replies = { "/publishing/destinations": { body: { unavailable: false, destinations: [{ destination_id: "d1", label: "harbour", toolkit: "instagram" }] } } };
