@@ -164,7 +164,7 @@ equal([ageLabel(5), ageLabel(7200), ageLabel(90000)], ["5s", "2h", "1d"], "age l
   const unknown = todo.find((n) => n.kind === "a_new_server_kind")!;
   equal([kindSpec(unknown).type, kindSpec(unknown).control], ["stuck", "Fix it"], "an unknown kind is a generic amber Fix it card");
   const permission = todo.find((n) => n.kind === "master_permission")!;
-  equal(kindSpec(permission).title(permission, { issueTitle: null }), "Send email to 212 customers", "a permission is titled by its reason");
+  equal(kindSpec(permission).title(permission, { issueTitle: null }), "Master wants to run a command", "a permission fallback title is a fixed phrase, never agent text");
   equal(metaLine({ ...permission, project: "customers" }), "customers · just now", "meta line is where · age in words");
 }
 

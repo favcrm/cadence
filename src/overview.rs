@@ -384,41 +384,63 @@ fn item(
 const SHORT_TITLE_MAX: usize = 50;
 const WHY_MAX: usize = 140;
 
-/// Invisible format characters (Unicode Cf): zero-width, bidi overrides
-/// and isolates, BOM, soft hyphen, tag characters.
-fn is_format_char(c: char) -> bool {
-    matches!(c,
-        '\u{AD}' | '\u{600}'..='\u{605}' | '\u{61C}' | '\u{6DD}' | '\u{70F}' | '\u{180E}'
-        | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}'
-        | '\u{2066}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}'
-        | '\u{E0000}'..='\u{E007F}')
+/// Invisible characters: Unicode format (Cf) plus default-ignorable code
+/// points (combining grapheme joiner, Hangul fillers, variation selectors).
+fn strip_invisible(raw: &str) -> String {
+    use std::sync::OnceLock;
+    static INVISIBLE: OnceLock<regex::Regex> = OnceLock::new();
+    INVISIBLE
+        .get_or_init(|| {
+            regex::Regex::new(r"[\p{Cf}\p{Default_Ignorable_Code_Point}]")
+                .expect("valid Unicode categories")
+        })
+        .replace_all(raw, "")
+        .into_owned()
+}
+
+/// Lookalikes of the letters of "cadence" (c, a, d, e, n) folded to ASCII
+/// before the `cadence` check, so a homoglyph spelling is refused too.
+fn fold_lookalikes(lower: &str) -> String {
+    lower
+        .chars()
+        .map(|c| match c {
+            // NFKC turns Greek lunate sigma (U+03F2/U+03F9) into sigma (U+03C2/U+03C3).
+            '\u{441}' | '\u{3F2}' | '\u{3C2}' | '\u{3C3}' | '\u{217D}' | '\u{1D04}' => 'c',
+            '\u{430}' | '\u{251}' | '\u{3B1}' => 'a',
+            '\u{501}' | '\u{217E}' => 'd',
+            '\u{435}' => 'e',
+            '\u{578}' => 'n',
+            c => c,
+        })
+        .collect()
 }
 
 /// Make `raw` safe to show as a card's plain-words text: NFKC-folded
 /// (so fullwidth lookalikes become their ASCII form), whitespace and
 /// newlines collapsed, control and format characters dropped, clipped to
 /// `max` characters on a char boundary. Anything that reads as a
-/// command (a backtick, `$(`, `${`, the word `cadence` anywhere) yields
+/// command (a backtick, `$(`, `${`, the word `cadence` anywhere, also
+/// spelled with lookalike letters) yields
 /// `None`, so the field is omitted rather than shown. Never returns an
 /// empty string.
 fn display_text(raw: &str, max: usize) -> Option<String> {
     use unicode_normalization::UnicodeNormalization;
-    let spaced: String = raw
-        .chars()
-        .filter(|c| !is_format_char(*c))
+    let spaced: String = strip_invisible(raw)
         .nfkc()
         .filter_map(|c| match c {
-            '\n' | '\r' | '\t' => Some(' '),
+            '\n' | '\r' | '\t' | '\u{2800}' => Some(' '),
             c if c.is_control() => None,
             c => Some(c),
         })
         .collect();
-    let text = spaced.split_whitespace().collect::<Vec<_>>().join(" ");
+    let joined = spaced.split_whitespace().collect::<Vec<_>>().join(" ");
+    // A markdown heading marker is not part of the words.
+    let text = joined.trim_start_matches('#').trim_start().to_string();
     if text.is_empty()
         || text.contains('`')
         || text.contains("$(")
         || text.contains("${")
-        || text.to_lowercase().contains("cadence")
+        || fold_lookalikes(&text.to_lowercase()).contains("cadence")
     {
         return None;
     }
@@ -434,7 +456,14 @@ fn display_sentence(raw: &str, max: usize) -> Option<String> {
     let text = display_text(raw, usize::MAX)?;
     let end = text
         .char_indices()
-        .find(|&(i, c)| matches!(c, '.' | '!' | '?') && text[i + c.len_utf8()..].starts_with(' '))
+        .find(|&(i, c)| {
+            matches!(c, '.' | '!' | '?')
+                && text[i + c.len_utf8()..].starts_with(' ')
+                && !{
+                    let head = text[..i].to_lowercase();
+                    head.ends_with("e.g") || head.ends_with("i.e")
+                }
+        })
         .map_or(text.len(), |(i, c)| i + c.len_utf8());
     display_text(&text[..end], max)
 }
@@ -1855,8 +1884,10 @@ fn overview_from(
                 .for_agent(q["agent"].as_str().unwrap_or_default())
                 .since(since)
                 .with_display(
+                    // A refused summary falls back to the body.
                     up.get("summary")
                         .and_then(Value::as_str)
+                        .filter(|s| display_text(s, SHORT_TITLE_MAX).is_some())
                         .or(q["body"].as_str()),
                     q["impact"].as_str(),
                 );
@@ -2411,9 +2442,11 @@ fn overview_from(
         .about("permission", &req.id)
         .since(Some(req.created))
         .with_display(
-            // Without a label the card's own title already is the reason;
-            // never shorten what the operator reads before Allow.
-            Some(req.decision_label.as_str()).filter(|l| !l.is_empty()),
+            // The title is the label, else the sanitized reason (omitted
+            // when refused); the full reason is shown separately as data.
+            Some(req.decision_label.as_str())
+                .filter(|l| !l.is_empty())
+                .or(Some(req.reason.as_str())),
             (!req.decision_label.is_empty()).then_some(req.reason.as_str()),
         );
         row.json["permission"] = crate::master_perm::request_json(&req);
@@ -2535,6 +2568,15 @@ mod tests {
             "run `rm -rf x` now",
             "cadence issue set X status=done",
             "Cadence  go",
+            "Cadence  issue list",
+            "cadence confine off",
+            "cadence daemon stop",
+            "cadence resume worker-1",
+            "\u{3F2}adence stop x",
+            "\u{3F9}adence stop x",
+            "\u{2800}\u{2800}",
+            "run cadence --state-dir x",
+            "c\u{430}dence issue set X",
             "echo $(id)",
             "  \n\u{0} ",
             "cadence\u{200B} issue set X status=done",
@@ -2547,6 +2589,16 @@ mod tests {
         assert_eq!(
             display_text("\u{202E}Send\u{200B} mail\u{2066}", 50).as_deref(),
             Some("Send mail")
+        );
+        for (raw, want) in [
+            ("a\u{13430}b\u{1BCA0}c\u{34F}d\u{3164}e", "abcde"),
+            ("## Heading words", "Heading words"),
+        ] {
+            assert_eq!(display_text(raw, 50).as_deref(), Some(want), "{raw:?}");
+        }
+        assert_eq!(
+            display_sentence("Uses tools, e.g. git. Then more.", WHY_MAX).as_deref(),
+            Some("Uses tools, e.g. git.")
         );
         assert_eq!(
             display_sentence("It sends mail. Then more words follow.", WHY_MAX).as_deref(),

@@ -340,13 +340,6 @@ const fixed = (text: string) => () => text;
 const withTitle = (verb: string, fallback: string) => (_: HomeNeed, ctx: TitleContext) =>
   ctx.issueTitle ? `${verb}: ${ctx.issueTitle}` : fallback;
 
-/** The first line of a free-text field, clipped to a card title. */
-function oneLine(text: string | null | undefined, max = 90): string | null {
-  const line = (text ?? "").split("\n").map((l) => l.trim()).find(Boolean);
-  if (!line) return null;
-  return line.length > max ? `${line.slice(0, max - 1).trimEnd()}…` : line;
-}
-
 const stuck = (title: string, place: NeedPlace = "send"): KindSpec => ({
   type: "stuck",
   place,
@@ -367,7 +360,7 @@ export const KIND_TABLE: Readonly<Record<string, KindSpec>> = {
     type: "ok",
     place: "inline",
     control: "Allow",
-    title: (n) => oneLine(n.summary) ?? "Master wants to run a command",
+    title: fixed("Master wants to run a command"),
   },
   approval: { type: "ok", place: "inline", control: "Review", title: fixed("An agent is waiting for your OK") },
   approval_menu: { type: "ok", place: "inline", control: "Review", title: fixed("An agent is waiting for your OK") },
@@ -375,7 +368,7 @@ export const KIND_TABLE: Readonly<Record<string, KindSpec>> = {
     type: "question",
     place: "inline",
     control: "Answer",
-    title: (n) => oneLine(n.summary) ?? oneLine(n.action.type === "answer" ? n.action.body : null) ?? "An agent has a question",
+    title: fixed("An agent has a question"),
   },
   next_action: { type: "question", place: "inline", control: "Review", title: fixed("An agent needs to know what to do next") },
   idea_duplicate: { type: "question", place: "inline", control: "Review", title: fixed("A new idea looks like an old one") },
