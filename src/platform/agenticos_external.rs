@@ -503,6 +503,7 @@ impl AgenticosExternalAdapter {
         if self.deployment_pin.as_deref() != Some(TEXT_MANIFEST_PIN) {
             return Err(AppCapabilityError::Refused("AgenticOS text generation is unavailable without the reviewed manifest v4 deployment".into()));
         }
+        validate_text_authority(authority).map_err(AppCapabilityError::Refused)?;
         let body = validate_text_input(input).map_err(AppCapabilityError::Refused)?;
         let token = self
             .lease_token(credential, &authority["binding"]["config"])
@@ -1077,6 +1078,26 @@ fn valid_base(base: &str) -> Result<String> {
     Ok(base.to_owned())
 }
 
+fn validate_text_authority(authority: &Value) -> std::result::Result<(), String> {
+    let config = &authority["binding"]["config"];
+    let mapping = &config["mapping"];
+    if authority["schema"] != 1
+        || config["provider"] != PLATFORM
+        || config["install_id"] != authority["install_id"]
+        || config["connection_id"].as_str().is_none_or(str::is_empty)
+        || config["account"].as_str().is_none_or(str::is_empty)
+        || mapping["capability"] != "text.generate"
+        || mapping["version"] != 1
+        || mapping["action"] != "generate_text"
+        || mapping["resource_kind"] != "connection_account"
+        || mapping["tool"] != TEXT_TOOL
+        || mapping["effect"] != "draft"
+    {
+        return Err("frozen text binding does not authorize this provider action".into());
+    }
+    Ok(())
+}
+
 fn validate_source_authority<'a>(
     authority: &'a Value,
     input: &Value,
@@ -1084,7 +1105,6 @@ fn validate_source_authority<'a>(
     let config = &authority["binding"]["config"];
     let mapping = &config["mapping"];
     if authority["schema"] != 1
-        || authority["slot"] != "source"
         || config["provider"] != PLATFORM
         || config["install_id"] != authority["install_id"]
         || config["connection_id"].as_str().is_none()
@@ -1219,13 +1239,18 @@ impl PlatformAdapter for AgenticosExternalAdapter {
         input: &Value,
         idempotency_key: &str,
     ) -> std::result::Result<AppCapabilityOutput, AppCapabilityError> {
-        match authority["slot"].as_str() {
-            Some("source") => Ok(AppCapabilityOutput {
+        // The slot name is the app's own choice (Social Content calls its
+        // text slot `writer`); the frozen binding's capability is what the
+        // operator bound and what each adapter re-validates.
+        match authority["binding"]["config"]["mapping"]["capability"].as_str() {
+            Some("social.read") => Ok(AppCapabilityOutput {
                 result: self.call_source(credential, authority, input, idempotency_key)?,
                 asset: None,
             }),
-            Some("image") => self.call_image(credential, authority, input, idempotency_key),
-            Some("text") => self.call_text(credential, authority, input, idempotency_key),
+            Some("media.generate") => {
+                self.call_image(credential, authority, input, idempotency_key)
+            }
+            Some("text.generate") => self.call_text(credential, authority, input, idempotency_key),
             _ => Err(AppCapabilityError::Refused(
                 "AgenticOS capability slot has no reviewed execution adapter".into(),
             )),
@@ -1374,6 +1399,102 @@ mod tests {
         json!({"schema":1,"install_id":"install1","slot":"source","inputs":{"profile_handle":"juicysuite_crm"},"binding":{"config":{
             "provider":PLATFORM,"account":"company1","install_id":"install1","connection_id":"conn1","mapping":{
                 "capability":"social.read","version":1,"action":"list_posts","resource_kind":"connection_account","tool":POSTS_TOOL,"effect":"read"}}}})
+    }
+
+    /// A frozen text binding under the slot name the app chose.
+    fn text_authority(slot: &str) -> Value {
+        let mut proof = authority();
+        proof["slot"] = json!(slot);
+        let mapping = &mut proof["binding"]["config"]["mapping"];
+        mapping["capability"] = json!("text.generate");
+        mapping["action"] = json!("generate_text");
+        mapping["tool"] = json!(TEXT_TOOL);
+        mapping["effect"] = json!("draft");
+        proof
+    }
+
+    /// CAD-1302: the adapter is chosen by the frozen capability, never by the
+    /// app-chosen slot name.
+    #[test]
+    fn cad1302_adapter_follows_the_bound_capability_not_the_slot_name() {
+        let input = json!({"messages":[{"role":"user","content":"Draft a caption."}]});
+        let door = |body: Value| {
+            let (base, seen, worker) = media_door(move |_| json_response(200, body.clone()));
+            let adapter =
+                AgenticosExternalAdapter::with_deployment_pin(&base, Some(TEXT_MANIFEST_PIN))
+                    .unwrap();
+            (adapter, seen, worker)
+        };
+        let reply = json!({"ok":true,"data":{"result":{"text":"A grounded social caption.","finishReason":"stop","usage":null}}});
+        // `writer` bound to text.generate reaches the text door.
+        let (adapter, seen, worker) = door(reply.clone());
+        let mut proof = text_authority("writer");
+        proof["quote"] = media_quote();
+        let out = adapter
+            .execute_app_capability_outcome(b"token", &proof, &input, "app-call-1302")
+            .unwrap();
+        assert_eq!(out.result["text"], "A grounded social caption.");
+        worker.join().unwrap();
+        assert_eq!(seen.lock().unwrap()[0].url, CALL_PATH);
+        // A slot NAMED `text` bound to another capability never reaches the
+        // text adapter: each of these is refused with no door traffic.
+        for capability in [
+            "text.publish",
+            "text.draft",
+            "social.read",
+            "media.generate",
+            "",
+        ] {
+            let adapter = AgenticosExternalAdapter::with_deployment_pin(
+                "http://127.0.0.1:1",
+                Some(TEXT_MANIFEST_PIN),
+            )
+            .unwrap();
+            let mut proof = text_authority("text");
+            proof["quote"] = media_quote();
+            proof["binding"]["config"]["mapping"]["capability"] = json!(capability);
+            let Err(error) =
+                adapter.execute_app_capability_outcome(b"token", &proof, &input, "app-call-1302")
+            else {
+                panic!("{capability} must be refused");
+            };
+            assert!(
+                matches!(&error, AppCapabilityError::Refused(_)),
+                "{capability}: {error:?}"
+            );
+            if !matches!(capability, "social.read" | "media.generate") {
+                assert_eq!(
+                    error.to_string(),
+                    "AgenticOS capability slot has no reviewed execution adapter",
+                    "{capability}"
+                );
+            }
+        }
+        // The text adapter keeps its own mapping validation.
+        for forge in [
+            ("tool", json!(IMAGE_TOOL)),
+            ("action", json!("generate_image")),
+            ("effect", json!("send")),
+            ("version", json!(2)),
+            ("resource_kind", json!("other")),
+        ] {
+            let mut proof = text_authority("writer");
+            proof["quote"] = media_quote();
+            proof["binding"]["config"]["mapping"][forge.0] = forge.1;
+            assert!(adapter_refuses(&proof, &input), "{}", forge.0);
+        }
+    }
+
+    fn adapter_refuses(proof: &Value, input: &Value) -> bool {
+        let adapter = AgenticosExternalAdapter::with_deployment_pin(
+            "http://127.0.0.1:1",
+            Some(TEXT_MANIFEST_PIN),
+        )
+        .unwrap();
+        matches!(
+            adapter.execute_app_capability_outcome(b"token", proof, input, "app-call-1302"),
+            Err(AppCapabilityError::Refused(_))
+        )
     }
 
     #[test]
@@ -1682,8 +1803,7 @@ mod tests {
     #[test]
     fn text_generation_never_records_uncertain_outcomes_as_a_refusal() {
         let proof = {
-            let mut proof = authority();
-            proof["slot"] = json!("text");
+            let mut proof = text_authority("text");
             proof["quote"] = media_quote();
             proof
         };
@@ -1743,8 +1863,7 @@ mod tests {
     }
 
     fn hosted_text_proof() -> Value {
-        let mut proof = authority();
-        proof["slot"] = json!("text");
+        let mut proof = text_authority("text");
         proof["quote"] = media_quote();
         proof["binding"]["config"]["account"] = json!("hosted");
         proof["binding"]["config"]["connection_kind"] = json!("builtin");
