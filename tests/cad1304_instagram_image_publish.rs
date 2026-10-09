@@ -190,7 +190,7 @@ fn serve(stream: std::net::TcpStream, log: &Seen, door: &Door) {
         }
         // ---- hosted publish door ----
         ("GET", r) if r == format!("{PREFIX}/destinations") => json_reply(
-            json!({"ok":true,"data":[{"connectionId":AOS_CONN,"toolkit":"instagram","displayName":"Harbour stills","destinationId":DEST,"status":"active","available":true,"publishable":true}]}),
+            json!({"ok":true,"data":{"version":"1","destinations":[{"connectionId":AOS_CONN,"toolkit":"instagram","displayName":"Harbour stills","destinationId":DEST,"status":"active","available":true,"publishable":true}]}}),
         ),
         ("GET", r) if r == format!("{PREFIX}/publish/grants") => json_reply(
             json!({"ok":true,"data":{"grants":[{"kind":"standing","id":STANDING,"workspaceId":WORKSPACE,"connectionId":AOS_CONN,"destinationId":DEST,"toolkit":"instagram","dailyCap":20,"remainingToday":20,"expiresAt":null,"revokedAt":null}]}}),
