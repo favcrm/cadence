@@ -343,6 +343,11 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     ),
     route(
         "POST",
+        "/api/app-social-drafts/discard",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
         "/api/app-social-drafts/asset",
         RouteClass::OperatorOnly,
     ),

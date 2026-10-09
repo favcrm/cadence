@@ -68,6 +68,9 @@ const exact = (value: Record<string, unknown>, keys: string[]) => Object.keys(va
 export function plainRefusal(error: unknown): ActionRefusal {
   if (!(error instanceof ApiError)) return { code: "failed", text: "That didn't work. Nothing was started." };
   if (error.status === 401 || error.status === 403) return NO;
+  if (error.code === "draft_in_use") return { code: "draft_in_use", text: "This draft is approved or published, so it can't be discarded." };
+  if (error.code === "stale_revision") return { code: "stale_revision", text: "That changed somewhere else. Reload and try again." };
+  if (error.code === "draft_not_found") return { code: "draft_not_found", text: "That draft is no longer here." };
   const text = error.message.toLowerCase();
   if (text.includes("price_changed")) return { code: "price_changed", text: "Something changed. Please try again." };
   if (text.includes("no default team")) return { code: "team_missing", text: "Set this app's team in Settings first." };
@@ -144,16 +147,18 @@ async function saveDefaults(ctx: ActionContext, args: Record<string, unknown>): 
  *  operator clicks (the SafeLink policy); the frame cannot navigate anything. */
 async function socialDraftCall(verb: CallVerb,args:Record<string,unknown>,ui:{actionToken?:string}):Promise<ActionResult>{
   const actionToken=ui.actionToken;
-  const alias=args.alias;
+  // Discard names no alias (CAD-1303): the draft tool alias is the app's `social.draft`.
+  const alias=verb==="social.drafts.discard"?"social.draft":args.alias;
   if(typeof actionToken!=="string" || !/^[a-f0-9]{64}$/.test(actionToken) || typeof alias!=="string") return refuse("denied","That draft action is unavailable.");
   const common={action_token:actionToken,alias};
-  let operation:"create"|"list"|"show"|"update"|"sources/show"|"sources/save"|"effect-stage";
+  let operation:"create"|"list"|"show"|"update"|"discard"|"sources/show"|"sources/save"|"effect-stage";
   let fields:Record<string,unknown>;
   switch(verb){
     case "social.drafts.list": operation="list"; if(!exact(args,["alias"])) return refuse("bad_args","That request is not valid."); fields={}; break;
     case "social.drafts.show": operation="show"; if(!exact(args,["alias","draft_id"])||typeof args.draft_id!=="string") return refuse("bad_args","That request is not valid."); fields={draft_id:args.draft_id}; break;
     case "social.drafts.create": operation="create"; if(!exact(args,["alias","request_id","caption","source"])&&!exact(args,["alias","request_id","caption","source","asset_id"])) return refuse("bad_args","That request is not valid."); fields={request_id:args.request_id,caption:args.caption,source:args.source,...("asset_id" in args?{asset_id:args.asset_id}:{})}; break;
     case "social.drafts.update": operation="update"; if(!exact(args,["alias","request_id","draft_id","expected_revision","caption"])&&!exact(args,["alias","request_id","draft_id","expected_revision","caption","asset_id"])) return refuse("bad_args","That request is not valid."); fields={request_id:args.request_id,draft_id:args.draft_id,expected_revision:args.expected_revision,caption:args.caption,...("asset_id" in args?{asset_id:args.asset_id}:{})}; break;
+    case "social.drafts.discard": operation="discard"; if(!exact(args,["draft_id","revision"])||typeof args.draft_id!=="string"||!Number.isSafeInteger(args.revision)) return refuse("bad_args","That request is not valid."); fields={draft_id:args.draft_id,revision:args.revision}; break;
     case "social.drafts.publish.stage": operation="effect-stage"; if(!exact(args,["alias","draft_id","revision","request_id"])||typeof args.draft_id!=="string"||!Number.isSafeInteger(args.revision)||typeof args.request_id!=="string") return refuse("bad_args","That request is not valid."); fields={proof:{kind:"social_draft",draft_id:args.draft_id,revision:args.revision},request_id:args.request_id}; break;
     case "social.sources.show": operation="sources/show"; if(!exact(args,["alias"])) return refuse("bad_args","That request is not valid."); fields={}; break;
     case "social.sources.save": operation="sources/save"; if(!exact(args,["alias","request_id","expected_revision","handles"])) return refuse("bad_args","That request is not valid."); fields={request_id:args.request_id,expected_revision:args.expected_revision,handles:args.handles}; break;
@@ -239,6 +244,7 @@ export function runCall(ctx: ActionContext, verb: CallVerb, args: Record<string,
     "social.drafts.show": () => socialDraftCall(verb,args,ui),
     "social.drafts.create": () => socialDraftCall(verb,args,ui),
     "social.drafts.update": () => socialDraftCall(verb,args,ui),
+    "social.drafts.discard": () => socialDraftCall(verb,args,ui),
     "social.drafts.publish.stage": () => socialDraftCall(verb,args,ui),
     "social.sources.show": () => socialDraftCall(verb,args,ui),
     "social.sources.save": () => socialDraftCall(verb,args,ui),

@@ -289,7 +289,7 @@ export const workspaceApps = {
     request<{ revoked: boolean }>("/api/app-screen-tools/revoke", undefined, body),
   /** The retained receipts for one installation (operator read). */
   toolResults: async (id: string, contextId?: string, signal?: AbortSignal) => (await request<{ results: ToolReceipt[] }>(`/api/app-screen-tools/results?install_id=${part(id)}${contextId?`&context_id=${part(contextId)}`:""}`, signal)).results,
-  socialDraftAction: (operation: "create"|"list"|"show"|"update"|"sources/show"|"sources/save"|"effect-stage", body: Record<string, unknown> & { alias: string }) =>
+  socialDraftAction: (operation: "create"|"list"|"show"|"update"|"discard"|"sources/show"|"sources/save"|"effect-stage", body: Record<string, unknown> & { alias: string }) =>
     request<Record<string, unknown>>(`/api/app-social-drafts/${operation}`, undefined, toolActionBody(body)),
   socialDraftAsset: async (body:{action_token:string;alias:string;draft_id:string}):Promise<{bytes:ArrayBuffer;mime:string}> => {
     const response=await fetch("/api/app-social-drafts/asset",{method:"POST",credentials:"same-origin",cache:"no-store",

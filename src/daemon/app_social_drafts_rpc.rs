@@ -3,6 +3,9 @@
 #[cfg(test)]
 #[path = "app_selector_identity_acceptance.rs"]
 mod app_selector_identity_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
+#[path = "app_social_discard_gate_test.rs"]
+mod app_social_discard_gate_test;
 #[cfg(test)]
 #[path = "app_social_local_authority_acceptance.rs"]
 mod app_social_local_authority_acceptance;
@@ -31,6 +34,7 @@ fn local_social_draft_write(method: &str) -> Result<bool> {
         "app_social_draft_asset"
         | "app_social_draft_create"
         | "app_social_draft_update"
+        | "app_social_draft_discard"
         | "app_social_sources_save" => Ok(true),
         _ => Err(Error::rejected("unknown social draft action")),
     }
@@ -310,6 +314,15 @@ impl Shared {
                 "caption",
                 "asset_id",
             ][..],
+            "app_social_draft_discard" => &[
+                "action_token",
+                "token",
+                "key",
+                "origin",
+                "tool_alias",
+                "draft_id",
+                "revision",
+            ][..],
             "app_social_draft_asset" => &[
                 "action_token",
                 "token",
@@ -348,7 +361,10 @@ impl Shared {
         )?;
         let _draft_release = if matches!(
             method,
-            "app_social_draft_create" | "app_social_draft_update" | "app_social_sources_save"
+            "app_social_draft_create"
+                | "app_social_draft_update"
+                | "app_social_draft_discard"
+                | "app_social_sources_save"
         ) {
             Some(
                 self.app_release_lock
@@ -455,6 +471,13 @@ impl Shared {
                     &actor,
                 )
             }
+            "app_social_draft_discard" => records.app_social_draft_discard(
+                &context,
+                required_str(params, "draft_id")?,
+                params["revision"]
+                    .as_i64()
+                    .ok_or_else(|| Error::rejected("revision must be an integer"))?,
+            ),
             "app_social_draft_update" => {
                 let asset = match params.get("asset_id") {
                     None => None,

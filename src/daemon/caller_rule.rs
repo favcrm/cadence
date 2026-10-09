@@ -470,6 +470,7 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("app_social_draft_list", Rule::Handler("operator_connection + live mount + context + declared slot (CAD-1177)")),
     ("app_social_draft_show", Rule::Handler("operator_connection + live mount + context + declared slot (CAD-1177)")),
     ("app_social_draft_update", Rule::Handler("operator_connection + live mount + context + draft slot (CAD-1177)")),
+    ("app_social_draft_discard", Rule::Handler("operator_connection + live mount + context + draft slot (CAD-1303)")),
     ("app_social_draft_asset", Rule::Handler("operator_connection + live mount + context + attached draft asset (CAD-1177)")),
     ("app_social_sources_show", Rule::Handler("operator_connection + live mount + context + declared slot (CAD-1177)")),
     ("app_social_sources_save", Rule::Handler("operator_connection + live mount + context + draft slot (CAD-1177)")),
