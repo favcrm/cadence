@@ -15,6 +15,7 @@
 //! | `cad1300_publish_first_then_approve_is_refused` | item 4, converse: a head Publish recorded cannot be approved again |
 //! | `cad1300_owner_with_a_long_actor_is_admitted` | item 3: every platform owner is an approver; the relayed actor is bounded, deterministic and attributable |
 //! | `cad1300_owner_with_a_non_ascii_name_is_admitted` | item 3 (PM, 2026-10-09): an owner whose name has no ASCII characters is an approver too |
+//! | `cad1300_one_record_per_head_whatever_the_repo_case` | item 4, Spec/security REVISE on PR #913: the one-record rule holds when the PR URL and the registered project spell the repo in different letter case |
 //! | `cad1300_approver_refusal_is_403_and_no_repo_oracle` | item 7 (`rpc_err` 403 mapping on Approve) and item 9 (no registered-repo oracle) |
 //! | `cad1300_reachable_second_layers` | item 7 survivors that can be reached: forged verb fields, `board_revocable`'s `recorded_via` term |
 //!
@@ -906,4 +907,219 @@ fn cad1300_owner_with_a_non_ascii_name_is_admitted() {
         twin_source, source,
         "two same-named owners must not share one attribution"
     );
+}
+
+// ---------------------------------------------------------------------
+// Item 4, Spec/security REVISE on PR #913 (head 60c54b3c): one approval
+// record per head must hold whatever letter case the repo is spelled in.
+// GitHub owner/repo names are case-insensitive; Approve takes the repo of
+// the registered project (lowercased), while Publish takes it from the
+// delivery row's PR URL as the worker reported it (GitHub prints the
+// canonical case, e.g. `Acme/Widgets`). Matching the stored scope by
+// exact JSON let a revoked head be re-approved by Publish and let one
+// head carry two records.
+//
+// Contract (properties, not the mechanism — lowercasing at record time
+// and a case-insensitive compare both satisfy it):
+// - With the row URL `Acme/Widgets` and the project `acme/widgets` (and
+//   the reverse), the board's Approve and Publish share exactly ONE
+//   record per head, in either order: Approve → revoke → Publish is
+//   refused ("revoked", nothing recorded, no `gh pr merge`, the row stays
+//   `passed`); Approve → Publish reuses the standing record with no new
+//   event; Publish → Approve is refused as already on record.
+// - Every board-recorded approval of the repo stores the same canonical
+//   lowercase `scope.repo`, on both paths.
+// - `gh pr merge` still names the row's own slug (`-R Acme/Widgets`).
+// - The CLI path (`delivery_approve` without `request_actor`) is
+//   unchanged: it still records (a fresh id after a revoke), source
+//   `operator`, and enqueues.
+// ---------------------------------------------------------------------
+
+/// `scope.repo` of every recorded approval for `pr`, oldest first.
+fn recorded_repos(board: &Board, pr: u64) -> Vec<String> {
+    let db = rusqlite::Connection::open_with_flags(
+        board.state.join("cadence.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let mut stmt = db
+        .prepare(
+            "SELECT payload FROM events WHERE alias = 'audit:approvals' \
+             AND kind = 'approval_recorded' ORDER BY seq",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|raw| serde_json::from_str::<Value>(&raw.unwrap()).unwrap())
+        .filter(|p| p["scope"]["pr"] == json!(pr))
+        .map(|p| p["scope"]["repo"].as_str().unwrap_or_default().to_string())
+        .collect();
+    rows
+}
+
+/// The audit reader agrees, whichever case the repo is asked in.
+#[track_caller]
+fn audit_state(board: &Board, pr: u64, want: &str, id: &str) {
+    for repo in [REPO, "Acme/Widgets"] {
+        let seen = crate::audit::approval_check(&board.state, repo, pr, HEAD).0;
+        assert_eq!(seen["state"], want, "audit for {repo}#{pr}: {seen}");
+        assert_eq!(seen["approval_id"], id, "audit for {repo}#{pr}: {seen}");
+    }
+}
+
+/// Approve → revoke → Publish refused, then Approve → Publish reuses, on
+/// a board whose project is `origin` and whose rows name `row`.
+fn one_record_both_orders(origin: &str, row: &str) {
+    let root = tempfile::Builder::new().prefix("c1300k").tempdir().unwrap();
+    let board = Board::start_cased(root.path(), origin, row);
+    let operator = board.session();
+    let what = format!("project {origin}, row URL {row}");
+
+    // --- (1) Approve, revoke, Publish: refused, whatever the case ---
+    let (status, body) = board.post(
+        "operator",
+        Some(&operator),
+        APPROVE,
+        &approve_pr(PUBLISH_PR_2),
+    );
+    assert_eq!(status, 200, "setup ({what}): Approve: {body}");
+    let revoked = body["approval_id"].as_str().unwrap().to_string();
+    let (status, body) = board.post(
+        "operator",
+        Some(&operator),
+        &format!("/api/approvals/{revoked}/revoke"),
+        &json!({"reason": "re-review"}).to_string(),
+    );
+    assert_eq!(status, 200, "setup ({what}): revoke: {body}");
+    let events = board.approval_events();
+    let (status, body) = board.post(
+        "operator",
+        Some(&operator),
+        &publish_path(PUBLISH_ISSUE_2),
+        &publish_body(),
+    );
+    assert!(
+        (400..500).contains(&status),
+        "{what}: Publish after a revoked board approval must be refused: {status} {body}"
+    );
+    assert!(
+        body.to_string().to_ascii_lowercase().contains("revoked"),
+        "{what}: the refusal names the revoke: {body}"
+    );
+    assert_eq!(
+        board.approval_events(),
+        events,
+        "{what}: a refused Publish wrote to the approval stream"
+    );
+    assert_eq!(recorded_repos(&board, PUBLISH_PR_2).len(), 1, "{what}");
+    audit_state(&board, PUBLISH_PR_2, "revoked", &revoked);
+    assert!(
+        !merges(&board).contains(&format!("merge {PUBLISH_PR_2} ")),
+        "{what}: a refused Publish enqueued a merge: {}",
+        merges(&board)
+    );
+    assert_eq!(delivery_state(&board, PUBLISH_ISSUE_2), "passed", "{what}");
+
+    // --- (2) Approve, then Publish: the one standing record is reused ---
+    let (status, body) = board.post(
+        "operator",
+        Some(&operator),
+        APPROVE,
+        &approve_pr(PUBLISH_PR),
+    );
+    assert_eq!(status, 200, "setup ({what}): Approve: {body}");
+    let standing = body["approval_id"].as_str().unwrap().to_string();
+    let events = board.approval_events();
+    let (status, body) = board.post(
+        "operator",
+        Some(&operator),
+        &publish_path(PUBLISH_ISSUE),
+        &publish_body(),
+    );
+    assert_eq!(status, 200, "{what}: Publish of an approved head: {body}");
+    assert_eq!(
+        body["approval_id"],
+        standing.as_str(),
+        "{what}: Publish reuses the standing approval: {body}"
+    );
+    assert_eq!(
+        board.approval_events(),
+        events,
+        "{what}: Publish of an approved head wrote a second record"
+    );
+    assert_eq!(
+        recorded_repos(&board, PUBLISH_PR),
+        vec![REPO.to_string()],
+        "{what}: exactly one record, in the canonical lowercase repo"
+    );
+    audit_state(&board, PUBLISH_PR, "in-force", &standing);
+    // The merge still names the row's own slug.
+    assert!(
+        merges(&board).contains(&format!("merge {PUBLISH_PR} -R {row} ")),
+        "{what}: gh pr merge must keep the row's slug: {}",
+        merges(&board)
+    );
+
+    // --- (5) the CLI path is unchanged: a fresh record, and it merges ---
+    let out = as_operator(
+        &board,
+        "delivery_approve",
+        json!({"issue": PUBLISH_ISSUE_2, "sha": HEAD}),
+    )
+    .expect("the CLI's delivery merge still re-approves a revoked head");
+    let fresh = out["approval_id"].as_str().unwrap_or_default().to_string();
+    assert!(
+        !fresh.is_empty() && fresh != revoked,
+        "{what}: the CLI records a fresh id: {out}"
+    );
+    let seen = crate::audit::approval_check(&board.state, REPO, PUBLISH_PR_2, HEAD).0;
+    assert_eq!(seen["state"], "in-force", "{what}: {seen}");
+    assert_eq!(seen["source"], "operator", "{what}: {seen}");
+    assert!(
+        merges(&board).contains(&format!("merge {PUBLISH_PR_2} -R {row} ")),
+        "{what}: {}",
+        merges(&board)
+    );
+}
+
+#[test]
+#[ignore = "CAD-1300: enabled by the implementation"]
+fn cad1300_one_record_per_head_whatever_the_repo_case() {
+    // The row URL in GitHub's canonical mixed case, the project lowercase.
+    one_record_both_orders(REPO, "Acme/Widgets");
+    // The reverse: the project registered in mixed case, the URL lowercase.
+    one_record_both_orders("Acme/Widgets", REPO);
+
+    // --- (2, converse) Publish first, then Approve: already on record ---
+    let root = tempfile::Builder::new().prefix("c1300l").tempdir().unwrap();
+    let board = Board::start_cased(root.path(), REPO, "Acme/Widgets");
+    let operator = board.session();
+    let (status, body) = board.post(
+        "operator",
+        Some(&operator),
+        &publish_path(PUBLISH_ISSUE),
+        &publish_body(),
+    );
+    assert_eq!(status, 200, "a first Publish records and enqueues: {body}");
+    let id = body["approval_id"].as_str().unwrap().to_string();
+    assert!(merges(&board).contains(&format!("merge {PUBLISH_PR} -R Acme/Widgets ")));
+    let events = board.approval_events();
+    let (status, body) = board.post(
+        "operator",
+        Some(&operator),
+        APPROVE,
+        &approve_pr(PUBLISH_PR),
+    );
+    assert!(
+        (400..500).contains(&status),
+        "Approve of a head Publish recorded under the row's case must be refused: {status} {body}"
+    );
+    assert_eq!(board.approval_events(), events, "a refused Approve wrote");
+    assert_eq!(
+        recorded_repos(&board, PUBLISH_PR),
+        vec![REPO.to_string()],
+        "Publish stores the canonical lowercase repo"
+    );
+    audit_state(&board, PUBLISH_PR, "in-force", &id);
 }
