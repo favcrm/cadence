@@ -77,6 +77,8 @@ use serde_json::{json, Value};
 const REPO: &str = "acme/widgets";
 const PR: u64 = 42;
 const HEAD: &str = "1218aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const BASE: &str = "1218dddddddddddddddddddddddddddddddddddd";
+const MERGE_BASE: &str = "1218eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 const MOVED: &str = "1218bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const FORGED: &str = "1218cccccccccccccccccccccccccccccccccccc";
 const VERB: &str = "approval_record_shown";
@@ -157,9 +159,14 @@ fn platform(stop: &mut Stop) -> String {
 fn fake_gh(dir: &std::path::Path) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let gh = dir.join("gh");
-    std::fs::write(
-        &gh,
-        r#"#!/bin/sh
+    let risk_paths = include_str!("../../docs/roles/risk-paths.toml");
+    let one_review = include_str!("../../docs/roles/one-review-paths.toml");
+    let risk_content =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, risk_paths);
+    let review_content =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, one_review);
+    let script = format!(
+        r##"#!/bin/sh
 here=$(dirname "$0")
 if [ "$1" = pr ] && [ "$2" = merge ]; then
   echo "$*" >> "$here/merges"
@@ -168,15 +175,35 @@ fi
 if [ "$1" = pr ] && [ "$2" = view ]; then
   head=$(cat "$here/live-head")
   state=OPEN
+  title="CAD-1218: fixture"
+  case "$3" in 50) title="WID-1: fixture" ;; 51) title="WID-2: fixture" ;; esac
   if [ -f "$here/pr-state-$3" ]; then state=$(cat "$here/pr-state-$3"); fi
-  printf '{"number":%s,"state":"%s","title":"CAD-1218: fixture","headRefOid":"%s","headRefName":"cadence/cad-1218-fixture","baseRefName":"main","author":{"login":"fixture-author"},"statusCheckRollup":[],"additions":1,"deletions":0,"changedFiles":1,"files":[{"path":"src/lib.rs"}],"autoMergeRequest":null,"url":"https://github.com/acme/widgets/pull/%s"}\n' "$3" "$state" "$head" "$3"
+  case "$*" in
+    *headRefOid,baseRefOid,statusCheckRollup*) printf '{{"headRefOid":"%s","baseRefOid":"{BASE}","statusCheckRollup":[{{"context":"fmt","state":"SUCCESS"}},{{"context":"clippy","state":"SUCCESS"}},{{"context":"test","state":"SUCCESS"}},{{"context":"build","state":"SUCCESS"}},{{"context":"ui","state":"SUCCESS"}}]}}\n' "$head" ;;
+    *) printf '{{"number":%s,"state":"%s","title":"%s","headRefOid":"%s","headRefName":"cadence/cad-1218-fixture","baseRefName":"main","baseRefOid":"{BASE}","author":{{"login":"fixture-author"}},"statusCheckRollup":[{{"context":"fmt","state":"SUCCESS"}},{{"context":"clippy","state":"SUCCESS"}},{{"context":"test","state":"SUCCESS"}},{{"context":"build","state":"SUCCESS"}},{{"context":"ui","state":"SUCCESS"}}],"additions":1,"deletions":0,"changedFiles":1,"files":[{{"path":"src/lib.rs"}}],"autoMergeRequest":null,"url":"https://github.com/acme/widgets/pull/%s"}}\n' "$3" "$state" "$title" "$head" "$3" ;;
+  esac
+  exit 0
+fi
+if [ "$1" = repo ] && [ "$2" = view ]; then printf '{{"defaultBranchRef":{{"name":"main"}}}}\n'; exit 0; fi
+if [ "$1" = api ]; then
+  endpoint=$2
+  case "$endpoint" in
+    repos/acme/widgets/compare/{BASE}...{HEAD}) printf '{{"merge_base_commit":{{"sha":"{MERGE_BASE}"}},"files":[{{"filename":"src/lib.rs","status":"modified","additions":1,"deletions":0}}]}}\n' ;;
+    repos/acme/widgets/git/trees/{MERGE_BASE}?recursive=1|repos/acme/widgets/git/trees/{HEAD}?recursive=1) printf '{{"truncated":false,"tree":[{{"path":"src/lib.rs","mode":"100644","type":"blob"}}]}}\n' ;;
+    repos/acme/widgets/contents/docs/roles/risk-paths.toml\?ref={BASE}) printf '{{"encoding":"base64","content":"{risk_content}"}}\n' ;;
+    repos/acme/widgets/contents/docs/roles/one-review-paths.toml\?ref={BASE}) printf '{{"encoding":"base64","content":"{review_content}"}}\n' ;;
+    repos/acme/widgets/rules/branches/main) printf '[{{"type":"required_status_checks","parameters":{{"required_status_checks":[{{"context":"fmt","app_id":15368}},{{"context":"clippy","app_id":15368}},{{"context":"test","app_id":15368}},{{"context":"build","app_id":15368}},{{"context":"ui","app_id":15368}}]}}}}]\n' ;;
+    repos/acme/widgets/branches/main/protection) printf '{{"required_status_checks":{{"contexts":["fmt","clippy","test","build","ui"],"checks":[]}}}}\n' ;;
+    repos/acme/widgets/actions/workflows/ci.yml/runs*) printf '{{"workflow_runs":[{{"id":1218,"head_sha":"{HEAD}","event":"pull_request","status":"completed","conclusion":"success","html_url":"https://github.com/acme/widgets/actions/runs/1218"}}]}}\n' ;;
+    *) echo "fake gh: no API fixture for: $endpoint" >&2; exit 1 ;;
+  esac
   exit 0
 fi
 echo "fake gh: no fixture for: $*" >&2
 exit 1
-"#,
-    )
-    .unwrap();
+"##,
+    );
+    std::fs::write(&gh, script).unwrap();
     std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
     gh
 }
@@ -217,6 +244,24 @@ impl Board {
             None,
         )
         .unwrap();
+        for issue in [PUBLISH_ISSUE, PUBLISH_ISSUE_2] {
+            crate::issue::write::new_issue(
+                &pm,
+                &checkout,
+                Some("widgets"),
+                "Publish approval fixture",
+                None,
+                None,
+                &[],
+                None,
+                None,
+                &[],
+                Some(issue),
+                None,
+                "operator",
+            )
+            .unwrap();
+        }
         let live_head = state.join("live-head");
         std::fs::write(&live_head, HEAD).unwrap();
         let gh = fake_gh(&state);
