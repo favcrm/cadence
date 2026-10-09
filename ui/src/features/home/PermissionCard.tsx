@@ -26,6 +26,41 @@ export interface PermissionCardData {
   decisionLabel: string;
 }
 
+/** Past this many characters the reason waits behind "…more" (never cut silently). */
+const REASON_CAP = 2000;
+
+/** Invisible, bidi and control characters could reorder or hide the text. */
+const INVISIBLE = /[\p{Cf}\p{Default_Ignorable_Code_Point}\p{Cc}]/gu;
+
+/**
+ * What Master said about the command: all of it, as text to read before
+ * Allow (never refused, never clamped). Only characters that cannot be
+ * seen are removed.
+ */
+function ReasonBlock({ reason }: { reason: string }) {
+  const [more, setMore] = useState(false);
+  const text = reason.replace(INVISIBLE, (c) => (c === "\n" || c === "\t" ? c : ""));
+  const long = text.length > REASON_CAP;
+  const shown = long && !more ? text.slice(0, REASON_CAP) : text;
+  return (
+    <div className="rounded border border-ink-700 bg-ink-900 px-2 py-1.5 min-w-0" data-permission-reason>
+      <p className="text-micro text-ink-400">Master says:</p>
+      <p
+        className={`text-label text-ink-300 whitespace-pre-wrap break-words ${more ? "max-h-[50vh] overflow-y-auto" : ""}`}
+        tabIndex={more ? 0 : undefined}
+      >
+        {shown}
+        {long && !more ? "…" : ""}
+      </p>
+      {long ? (
+        <button type="button" className="lnk text-micro mt-1" aria-expanded={more} onClick={() => setMore((v) => !v)}>
+          {more ? "Show less" : "…more"}
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
 /**
  * The operator's permission prompt (CAD-615), shared by the Needs-you
  * rail and the master thread. A decided request shows its outcome and
@@ -40,8 +75,8 @@ export default function PermissionCard({
   card: PermissionCardData;
   readOnly: boolean;
   onDone: (text: string) => void;
-  /** The To do card (CAD-1216): the reason in words and Allow once /
-   *  Always / Deny. The command, folder and risk live under Details. */
+  /** The To do card (CAD-1216): the whole reason in words and Allow once /
+   *  Always / Deny. The command and folder live under Details. */
   compact?: boolean;
 }) {
   const [busy, setBusy] = useState(false);
@@ -78,9 +113,7 @@ export default function PermissionCard({
           {card.risk === "high" ? "High risk" : "Some risk"}: Master wants to run a command that can change or delete things.
         </p>
       ) : null}
-      {card.reason ? (
-        <p className={`text-micro text-ink-500 ${compact ? "line-clamp-2 break-words" : ""}`}>{card.reason}</p>
-      ) : null}
+      {card.reason ? <ReasonBlock reason={card.reason} /> : null}
       {decided ? (
         <p className="text-micro text-ok" data-permission-decided>
           {card.decisionLabel || card.status}

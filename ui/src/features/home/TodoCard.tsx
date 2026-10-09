@@ -231,13 +231,10 @@ export default function TodoCard({
   let inside: ReactNode = null;
   if (open && !done) {
     if (action.type === "permission") {
-      // The template title carries the first line of the reason; a server
-      // short_title (the decision label) does not, so then show it all.
-      const showsAll = !need.shortTitle && action.reason.length <= 90 && !action.reason.includes("\n");
       inside = (
         <PermissionCard
           compact
-          card={{ ...action, reason: showsAll ? "" : action.reason }}
+          card={action}
           readOnly={readOnly}
           onDone={(t) => onDone(need.key, t)}
         />
