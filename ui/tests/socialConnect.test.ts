@@ -1,5 +1,5 @@
 import { makePlanner, runCall, type ActionContext } from "../src/features/workspace-apps/screen/screenActions";
-import { accountLabel, connectOutcome, connectReturnTo, connectToast, publicationBinding, sendSlot, withoutConnectParams } from "../src/features/workspace-apps/socialConnect";
+import { accountLabel, connectOutcome, connectReturnTo, connectToast, publishAllowed, publicationBinding, sendSlot, withoutConnectParams } from "../src/features/workspace-apps/socialConnect";
 import type { AppBinding, Installation } from "../src/features/workspace-apps/workspaceApps";
 
 // CAD-1290: the hosted connect link, the return signal and "Use for publishing".
@@ -43,6 +43,9 @@ async function main() {
   equal(withoutConnectParams("?aos_connect=failed&toolkit=instagram"), "", "nothing left");
   equal(connectToast("connected").text, "Instagram connected", "connected copy");
   equal(connectToast("failed").text, "Connection failed — try again", "failed copy");
+  equal(connectToast("connected", publishAllowed("?aos_connect=connected&toolkit=instagram&aos_publish=allowed")).text, "Publishing allowed", "allowed copy");
+  equal(connectToast("connected", publishAllowed("?aos_connect=connected&toolkit=instagram&aos_publish=skipped")).text, "Instagram connected", "skipped keeps the connected copy");
+  equal(withoutConnectParams("?aos_connect=connected&aos_publish=allowed&toolkit=instagram&screen=native"), "?screen=native", "aos_publish leaves the URL");
   equal(connectToast("cancelled"), connectToast("failed"), "cancelled reads as not connected");
   equal(connectReturnTo("https://ef.cadencecloud.app", "inst 1"), "https://ef.cadencecloud.app/app-installations/inst%201?screen=native", "return_to is this board's host Settings page");
   equal([accountLabel("harbour"), accountLabel("@harbour"), accountLabel("Harbour Cafe")], ["@harbour", "@harbour", "Harbour Cafe"], "handles get an @");

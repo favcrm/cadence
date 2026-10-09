@@ -6,7 +6,7 @@ import type { ToastMsg } from "../../ui/Toast";
 export type ConnectOutcome = "connected" | "failed" | "cancelled";
 const OUTCOMES: readonly string[] = ["connected", "failed", "cancelled"];
 /** The params AgenticOS adds to `return_to`; both are removed after they are read. */
-const RETURN_PARAMS = ["aos_connect", "toolkit"];
+const RETURN_PARAMS = ["aos_connect", "aos_publish", "toolkit"];
 
 /** This board's host-drawn Settings page for the install (`?screen=native`), where the connected
  *  accounts and "Use for publishing" live. The host sends it as `return_to`; AgenticOS refuses any other origin. */
@@ -29,7 +29,13 @@ export function withoutConnectParams(search: string): string {
   return rest ? `?${rest}` : "";
 }
 
-export function connectToast(outcome: ConnectOutcome): ToastMsg {
+/** After a connect, AgenticOS asks the owner to allow publishing; it reports `allowed` or `skipped`. */
+export function publishAllowed(search: string): boolean {
+  return new URLSearchParams(search).get("aos_publish") === "allowed";
+}
+
+export function connectToast(outcome: ConnectOutcome, allowed = false): ToastMsg {
+  if (outcome === "connected" && allowed) return { kind: "ok", text: "Publishing allowed" };
   if (outcome === "connected") return { kind: "ok", text: "Instagram connected" };
   // The cancel signal is unverified upstream: cancelled reads as not connected, like failed.
   return { kind: "err", text: "Connection failed — try again" };

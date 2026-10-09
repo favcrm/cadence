@@ -73,7 +73,7 @@ pub(super) fn compose_connect_url(
         return Err(Error::rejected("the AgenticOS connect link is unavailable"));
     }
     Ok(format!(
-        "{origin}/v2/account/{company}/connections/connect?toolkit={TOOLKIT}&return_to={}",
+        "{origin}/v2/account/{company}/connections/connect?toolkit={TOOLKIT}&allow_publish=1&return_to={}",
         pct(return_to)
     ))
 }
@@ -281,7 +281,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             url,
-            "https://api-v2.agenticos.hk/v2/account/ws_abc-123/connections/connect?toolkit=instagram&return_to=https%3A%2F%2Fessential-foods.cadencecloud.app%2Fapp-installations%2Fi1%3Fview%3Dsettings"
+            "https://api-v2.agenticos.hk/v2/account/ws_abc-123/connections/connect?toolkit=instagram&allow_publish=1&return_to=https%3A%2F%2Fessential-foods.cadencecloud.app%2Fapp-installations%2Fi1%3Fview%3Dsettings"
         );
     }
 

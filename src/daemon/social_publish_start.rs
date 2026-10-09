@@ -26,7 +26,10 @@ pub(super) struct PublishTarget {
     pub destination_label: String,
     pub toolkit: String,
     pub timezone: String,
-    pub grant_id: String,
+    /// The old `social_publish_start` path presents the operator's typed
+    /// grant. A hosted draft binding carries none: its standing grant is
+    /// found at send time through the lease door (CAD-1291).
+    pub grant_id: Option<String>,
 }
 
 impl PublishTarget {
@@ -44,22 +47,21 @@ impl PublishTarget {
         Self::parse_with(publish, true)
     }
 
-    /// CAD-1290/1291: the hosted draft form carries no standing grant. The
-    /// owner confirms each post on AgenticOS, so the settings are exactly the
-    /// four destination fields and `grant_id` is absent (empty on the target).
+    /// A hosted draft binding: the four destination fields and no grant.
     pub(super) fn parse_hosted(publish: &Value) -> Result<Self> {
         Self::parse_with(publish, false)
     }
 
-    fn parse_with(publish: &Value, grant_required: bool) -> Result<Self> {
+    fn parse_with(publish: &Value, with_grant: bool) -> Result<Self> {
+        let fields: &[&str] = if with_grant {
+            &Self::FIELDS
+        } else {
+            &Self::FIELDS[..4]
+        };
         let object = publish
             .as_object()
             .ok_or_else(|| Error::rejected("publish settings must be an object"))?;
-        let expected = Self::FIELDS.len() - usize::from(!grant_required);
-        if object.len() != expected
-            || object.keys().any(|k| !Self::FIELDS.contains(&k.as_str()))
-            || (!grant_required && object.contains_key("grant_id"))
-        {
+        if object.len() != fields.len() || object.keys().any(|k| !fields.contains(&k.as_str())) {
             return Err(Error::rejected(
                 "publish settings need exactly destination_id, destination_label, toolkit, timezone and grant_id",
             ));
@@ -75,10 +77,10 @@ impl PublishTarget {
             text("toolkit")?,
             text("timezone")?,
         );
-        let grant = if grant_required {
-            text("grant_id")?
+        let grant = if with_grant {
+            Some(text("grant_id")?)
         } else {
-            ""
+            None
         };
         let bad = |what: &str| Err(Error::rejected(format!("publish {what} is invalid")));
         if !(1..=120).contains(&id.len())
@@ -105,7 +107,7 @@ impl PublishTarget {
         {
             return bad("timezone");
         }
-        if grant_required && !device::valid_grant_id(grant) {
+        if grant.is_some_and(|grant| !device::valid_grant_id(grant)) {
             return bad("grant_id");
         }
         Ok(Self {
@@ -113,28 +115,16 @@ impl PublishTarget {
             destination_label: label.into(),
             toolkit: toolkit.into(),
             timezone: tz.into(),
-            grant_id: grant.into(),
+            grant_id: grant.map(str::to_owned),
         })
     }
 
-    /// The older publish path (`social_publish_start`) freezes a standing
-    /// grant, so a hosted-draft target (no grant) is refused there.
-    pub(super) fn require_grant(&self) -> Result<()> {
-        if self.grant_id.is_empty() {
-            return Err(Error::rejected(
-                "no_grant: this destination was chosen for hosted drafts and carries no send grant — publish it from the draft's approval card",
-            ));
-        }
-        Ok(())
-    }
-
     /// The target a re-proved binding receipt carries, or the plain reason
-    /// the operator has not set one yet. Either shape: with a standing
-    /// grant (CLI) or the hosted draft form without one.
+    /// the operator has not set one yet.
     pub(super) fn from_binding_config(config: &Value) -> Result<Self> {
         match config.get("publish") {
-            Some(publish) if publish.get("grant_id").is_none() => Self::parse_hosted(publish),
-            Some(publish) => Self::parse(publish),
+            Some(publish) if publish.get("grant_id").is_some() => Self::parse(publish),
+            Some(publish) => Self::parse_hosted(publish),
             None => Err(Error::rejected(
                 "no_destination: the publication binding has no destination — the operator sets it once when binding",
             )),
@@ -235,7 +225,11 @@ impl Shared {
             .store
             .app_publication_material(run_id, &artifact_id, bundle, slot)?;
         let target = PublishTarget::from_binding_config(&material["binding"]["config"])?;
-        target.require_grant()?;
+        let Some(grant_id) = target.grant_id.clone() else {
+            return Err(Error::rejected(
+                "no_grant: this publication binding carries no grant — publish it from Social Content",
+            ));
+        };
         let effect = self.stage_app_artifact(&json!({
             "run_id": run_id,
             "artifact_id": artifact_id,
@@ -286,7 +280,7 @@ impl Shared {
         let mut frozen = scope(json!({
             "effect_id": effect_id,
             "media_key": media_key,
-            "grant_id": target.grant_id,
+            "grant_id": grant_id,
             "approval_id": approval,
             "due_epoch": due,
             "timezone": target.timezone,
@@ -404,29 +398,20 @@ mod tests {
         assert!(none.err().unwrap().to_string().contains("no_destination"));
     }
 
-    /// CAD-1290: the hosted draft form has no grant; the older publish path
-    /// refuses it, and a grant-less form never admits a smuggled grant.
+    /// A hosted draft binding is exactly the four destination fields; the
+    /// old path's five-field shape and its required grant stay as they were.
     #[test]
-    fn the_hosted_form_has_no_grant_and_the_older_path_refuses_it() {
+    fn hosted_publish_settings_are_exactly_four_fields_and_never_a_grant() {
         let mut hosted = publish();
         hosted.as_object_mut().unwrap().remove("grant_id");
-        assert!(PublishTarget::parse_hosted(&hosted).is_ok());
-        assert!(
-            PublishTarget::parse(&hosted).is_err(),
-            "the strict form still needs a grant"
-        );
-        assert!(
-            PublishTarget::parse_hosted(&publish()).is_err(),
-            "a grant is refused in the hosted form"
-        );
-        let target = PublishTarget::from_binding_config(&json!({"publish": hosted})).unwrap();
-        assert!(target
-            .require_grant()
-            .unwrap_err()
-            .to_string()
-            .contains("no_grant"));
-        let strict = PublishTarget::from_binding_config(&json!({"publish": publish()})).unwrap();
-        assert!(strict.require_grant().is_ok());
+        assert!(PublishTarget::parse_hosted(&hosted)
+            .unwrap()
+            .grant_id
+            .is_none());
+        assert!(PublishTarget::parse(&hosted).is_err());
+        assert!(PublishTarget::parse_hosted(&publish()).is_err());
+        let config = json!({"publish": hosted});
+        assert!(PublishTarget::from_binding_config(&config).is_ok());
     }
 
     #[test]

@@ -23,7 +23,7 @@ import { SlotBindings } from "./SlotBindings";
 import { ReadinessPanel } from "./ReadinessPanel";
 import { TeamSettings } from "./TeamSettings";
 import { PublishToInstagram } from "./PublishToInstagram";
-import { connectOutcome, connectToast, withoutConnectParams } from "./socialConnect";
+import { connectOutcome, connectToast, publishAllowed, withoutConnectParams } from "./socialConnect";
 import Toast, { type ToastMsg } from "../../ui/Toast";
 import { declaredSlots } from "./bindingChoices";
 import {
@@ -126,7 +126,7 @@ export default function WorkspaceApp({
   useEffect(() => {
     const outcome = connectOutcome(window.location.search);
     if (!outcome) return;
-    setConnectToastMsg(connectToast(outcome));
+    setConnectToastMsg(connectToast(outcome, publishAllowed(window.location.search)));
     setConnectReturned(value => value + 1);
     window.history.replaceState(window.history.state, "", window.location.pathname + withoutConnectParams(window.location.search) + window.location.hash);
     const timer = window.setTimeout(() => setConnectToastMsg(null), 6000);
