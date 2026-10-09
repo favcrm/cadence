@@ -351,6 +351,18 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         Rule::Handler("operator_connection (CAD-217)"),
     ),
     (
+        "approval_state",
+        Rule::Handler("operator_connection + approver allowlist (CAD-1218)"),
+    ),
+    (
+        "approval_revoke_shown",
+        Rule::Handler("operator_connection + approver allowlist (CAD-1218)"),
+    ),
+    (
+        "approval_record_shown",
+        Rule::Handler("operator_connection + approver allowlist (CAD-1218)"),
+    ),
+    (
         "approval_designate",
         Rule::Handler("operator_connection_on_agent (CAD-918)"),
     ),

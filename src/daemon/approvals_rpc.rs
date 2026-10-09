@@ -117,6 +117,158 @@ impl Shared {
         }))
     }
 
+    /// `approval_record_shown` (CAD-1218) — the board's merge approval for
+    /// the PR head the operator was shown. Operator connection only (the
+    /// board relays over its own proven connection); `request_actor` is
+    /// attribution and must pass the approver allowlist: `operator (ui)`
+    /// (a loopback board session) or `<login> (tailscale)` for a login in
+    /// `pm.yaml` `approvals.tailnet_logins`, read fresh on every call. The
+    /// repo must belong to a registered project, the daemon's own `gh`
+    /// must still show `head` as the open PR's head (`head_moved`), and a
+    /// head with any earlier record, standing or revoked, is refused. The
+    /// action is always `merge`; a refusal writes nothing.
+    pub(super) fn rpc_approval_record_shown(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        const VERB: &str = "approval record shown";
+        self.operator_connection(VERB, params, peer_pid)?;
+        let deny = |why: String| Error::rejected(format!("{VERB}: {why}"));
+        for field in ["source", "action", "id", "delegated", "by", "recorded_via"] {
+            if params.get(field).is_some() {
+                return Err(deny(format!(
+                    "request field '{field}' is not accepted — the daemon derives it"
+                )));
+            }
+        }
+        let actor = request_actor(params)?;
+        let pr = params
+            .get("pr")
+            .and_then(Value::as_u64)
+            .filter(|n| *n > 0)
+            .ok_or_else(|| Error::rejected("Missing or non-numeric 'pr'"))?;
+        let head = required_str(params, "head")?;
+        if head.len() != 40
+            || !head
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(deny(
+                "head must be the full 40-character lowercase hexadecimal SHA".into(),
+            ));
+        }
+        let pm = self.pm()?;
+        let repo = self.project_repo(&pm, params, VERB)?;
+        let source = approver_source(&pm.config, &actor)?;
+        let gh_bin = self.delivery_gh.to_string_lossy().to_string();
+        let view = crate::delivery::pr_view(&gh_bin, &repo, pr)
+            .map_err(|e| deny(format!("reading the PR failed, nothing was approved — {e}")))?;
+        let live = view["headRefOid"].as_str().unwrap_or_default();
+        if live != head || view["state"].as_str() != Some("OPEN") {
+            return Err(Error::invalid(
+                "head_moved",
+                format!(
+                    "the PR head moved or the PR is no longer open (shown {}…, now {}…) — \
+                     re-review before approving",
+                    &head[..12],
+                    live.chars().take(12).collect::<String>()
+                ),
+            ));
+        }
+        let approval = store::NewApproval {
+            id: None,
+            source: &source,
+            action: "merge",
+            head_sha: head,
+            repo: &repo,
+            pr,
+        };
+        let id = self
+            .store
+            .record_approval_once(&approval, APPROVAL_RECORDED_VIA)?;
+        Ok(json!({
+            "state": "recorded",
+            "approval_id": id,
+            "source": source,
+            "action": "merge",
+            "head_sha": head,
+            "scope": {"repo": repo, "pr": pr},
+            "recorded_via": APPROVAL_RECORDED_VIA,
+        }))
+    }
+
+    /// The repo of `params` as a registered project's lowercase slug.
+    fn project_repo(&self, pm: &crate::issue::Pm, params: &Value, verb: &str) -> Result<String> {
+        let raw = required_str(params, "repo")?;
+        let repo = crate::delegation::repo_slug(raw).ok_or_else(|| {
+            Error::rejected(format!("{verb}: repo '{raw}' is not a plain owner/name"))
+        })?;
+        let known = crate::issue::project::list(&pm.dir)?
+            .iter()
+            .any(|p| project_repos(&pm.dir, &p.key).contains(&repo));
+        if !known {
+            return Err(Error::rejected(format!(
+                "{verb}: no registered project has the repo {repo}"
+            )));
+        }
+        Ok(repo)
+    }
+
+    /// `approval_state` (CAD-1218) — whether an approval is in force,
+    /// revoked or missing for one shown head, for the board drawer.
+    /// Operator connection, a registered project's repo and the approver
+    /// rule; answers only the state and its id, and writes nothing.
+    pub(super) fn rpc_approval_state(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        const VERB: &str = "approval state";
+        self.operator_connection(VERB, params, peer_pid)?;
+        let actor = request_actor(params)?;
+        let pr = params
+            .get("pr")
+            .and_then(Value::as_u64)
+            .filter(|n| *n > 0)
+            .ok_or_else(|| Error::rejected("Missing or non-numeric 'pr'"))?;
+        let head = required_str(params, "head")?;
+        let pm = self.pm()?;
+        let repo = self.project_repo(&pm, params, VERB)?;
+        approver_source(&pm.config, &actor)?;
+        let (seen, _) = crate::audit::approval_check(&self.state_dir, &repo, pr, head);
+        match seen["state"].as_str() {
+            Some("in-force") => Ok(json!({
+                "state": "in-force",
+                "approval_id": seen["approval_id"],
+                "board_revocable": store::board_revocable(&json!({
+                    "action": "merge",
+                    "recorded_via": seen["recorded_via"],
+                    "source": seen["source"],
+                })),
+            })),
+            Some("revoked") => Ok(json!({"state": "revoked", "approval_id": seen["approval_id"]})),
+            Some("missing") => Ok(json!({"state": "missing"})),
+            _ => Err(Error::internal("the approval record could not be read")),
+        }
+    }
+
+    /// `approval_revoke_shown` (CAD-1218) — the board's revoke. Operator
+    /// connection and the approver rule; reaches only a record a board
+    /// path wrote (action `merge`, `recorded_via` operator-connection,
+    /// source ending ` via board`), checked in the revoking transaction.
+    pub(super) fn rpc_approval_revoke_shown(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        const VERB: &str = "approval revoke shown";
+        self.operator_connection(VERB, params, peer_pid)?;
+        for field in ["source", "recorded_via", "by"] {
+            if params.get(field).is_some() {
+                return Err(Error::rejected(format!(
+                    "{VERB}: request field '{field}' is not accepted — the daemon derives it"
+                )));
+            }
+        }
+        let actor = request_actor(params)?;
+        let source = approver_source(&self.pm()?.config, &actor)?;
+        let id = required_str(params, "id")?;
+        let reason = required_str(params, "reason")?;
+        let new = self
+            .store
+            .revoke_board_approval(id, &source, reason, APPROVAL_RECORDED_VIA)?;
+        Ok(json!({"state": "revoked", "duplicate": !new, "approval_id": id}))
+    }
+
     /// `approval_revoke` — the only way an approval is withdrawn. A
     /// cancelled or superseded message never reaches this.
     pub(super) fn rpc_approval_revoke(&self, params: &Value, peer_pid: u32) -> Result<Value> {
@@ -408,6 +560,47 @@ impl Shared {
             .filter_map(|d| d["project"].as_str().map(str::to_string))
             .collect())
     }
+}
+
+/// `<name> <<email>> (board)`: the actor the board builds from a
+/// platform-verified `owner` session — a non-empty name and an email in
+/// angle brackets.
+fn platform_owner_actor(actor: &str) -> bool {
+    let Some(rest) = actor.strip_suffix(" (board)") else {
+        return false;
+    };
+    let Some(rest) = rest.strip_suffix('>') else {
+        return false;
+    };
+    rest.rsplit_once(" <").is_some_and(|(name, email)| {
+        !name.trim().is_empty() && email.contains('@') && !email.contains(['<', '>'])
+    })
+}
+
+/// CAD-1218: the one approver rule for everything the board relays that
+/// records or reads an approval. `request_actor` is attribution derived by
+/// the board; it must be exactly `operator (ui)` (a loopback board session)
+/// or `<login> (tailscale)` with `<login>` in `pm.yaml`
+/// `approvals.tailnet_logins`. Returns the record's source,
+/// `"<actor> via board"`.
+pub(super) fn approver_source(
+    config: &crate::issue::PmConfig,
+    request_actor: &str,
+) -> Result<String> {
+    let allowed = match request_actor.strip_suffix(" (tailscale)") {
+        Some(login) => config.approvals.tailnet_logins.iter().any(|l| l == login),
+        None => request_actor == crate::ui::UI_ACTOR || platform_owner_actor(request_actor),
+    };
+    if !allowed {
+        return Err(Error::invalid(
+            "approver_not_allowed",
+            format!(
+                "'{request_actor}' is not on the approval allowlist — a remote board approves \
+                 only for a login listed in pm.yaml approvals.tailnet_logins, or a platform owner"
+            ),
+        ));
+    }
+    Ok(format!("{request_actor} via board"))
 }
 
 /// A project's GitHub repos as lowercase `owner/name`, from each repo's

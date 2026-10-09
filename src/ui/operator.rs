@@ -95,6 +95,8 @@ const fn route(method: &'static str, pattern: &'static str, class: RouteClass) -
 /// that matches no entry is [`RouteClass::OperatorOnly`]
 /// ([`route_class`]) — a new route fails closed until it is listed.
 pub const WRITE_ROUTES: &[WriteRoute] = &[
+    route("POST", "/api/approvals/approve", RouteClass::OperatorOnly),
+    route("POST", "/api/approvals/*/revoke", RouteClass::OperatorOnly),
     route(
         "POST",
         "/api/app-effects/*/resolve",
@@ -663,6 +665,17 @@ pub(super) fn admit_operator_read(
     state_dir: &std::path::Path,
     opts: &ServeOpts,
 ) -> Result<(), HttpResp> {
+    admit_operator_read_caller(request, state_dir, opts).map(|_| ())
+}
+
+/// [`admit_operator_read`], answering the admitted caller so a handler can
+/// narrow it further (CAD-1218: the approval state read is for
+/// `Caller::Operator` only).
+pub(super) fn admit_operator_read_caller(
+    request: &Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+) -> Result<Caller, HttpResp> {
     let caller = board_caller(request, state_dir, opts, false)?;
     let what = format!(
         "GET {}",
@@ -684,8 +697,11 @@ pub(super) fn admit_operator_read(
                 named.actor
             ),
         )),
-        Caller::Named(_) => Ok(()),
-        Caller::Operator(_) => super::home::prove_operator_peer(request, state_dir, opts, &what),
+        Caller::Named(_) => Ok(caller),
+        Caller::Operator(_) => {
+            super::home::prove_operator_peer(request, state_dir, opts, &what)?;
+            Ok(caller)
+        }
     }
 }
 

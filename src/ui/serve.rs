@@ -17,9 +17,9 @@ use super::write_path::{
 };
 use super::{
     app_assistant, app_audiences, app_chat, app_content, app_contexts, app_explorer, app_records,
-    app_release, app_runs, app_screens, apps, cli_route, connections, crm_send, delivery_sync,
-    home, lane, operator, platform_account, read_model, social_publish, stages, threads, updates,
-    wiki, workflows,
+    app_release, app_runs, app_screens, approvals, apps, cli_route, connections, crm_send,
+    delivery_sync, home, lane, operator, platform_account, read_model, social_publish, stages,
+    threads, updates, wiki, workflows,
 };
 use super::{push_device_login_config, ready_file, tailnet_url, ServeOpts, READY_NONCE_ENV};
 use crate::adapter::registry;
@@ -1123,6 +1123,11 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             send(request, model_defaults_get(state_dir, opts.read_only));
         }
         "/api/platform-account" => send(request, platform_account::get(opts)),
+        // CAD-1218: whether the shown head has an approval (drawer state).
+        "/api/approvals/state" => {
+            let resp = approvals::state(&request, state_dir, opts, raw_query);
+            send(request, resp);
+        }
         // CAD-615: the operator's master permission rules and pending
         // requests. The board relays over its own daemon connection, so
         // the HTTP peer is admitted here — the same operator proof as

@@ -15,8 +15,9 @@ use super::serve::{add_security_headers, err_response, json_response};
 use super::ServeOpts;
 use super::{
     app_assistant, app_audiences, app_content, app_contexts, app_explorer, app_records,
-    app_release, app_runs, app_screens, app_social_drafts, apps, connections, crm_send, crm_smtp,
-    home, lane, operator, read_model, social_publish, stages, threads, updates, wiki, workflows,
+    app_release, app_runs, app_screens, app_social_drafts, approvals, apps, connections, crm_send,
+    crm_smtp, home, lane, operator, read_model, social_publish, stages, threads, updates, wiki,
+    workflows,
 };
 use crate::adapter::registry;
 use crate::client;
@@ -1039,6 +1040,21 @@ pub(crate) fn write_route(
             return;
         }
         let resp = home::decide_plan(&mut request, state_dir, epic, verb);
+        send(request, resp);
+        return;
+    }
+    // CAD-1218: the operator's PR-head approval and its revoke — guarded,
+    // operator-only, and only a `Caller::Operator` inside `approvals`.
+    if let Some(route) = approvals::route(path) {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let Some(caller) = &caller else {
+            send(request, err_response(500, "unadmitted write"));
+            return;
+        };
+        let resp = approvals::handle(&mut request, state_dir, caller, route);
         send(request, resp);
         return;
     }

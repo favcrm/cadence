@@ -111,7 +111,7 @@ store/effects.rs	guarded-store-and-read-queries	execute	8
 store/effects.rs	guarded-store-and-read-queries	guarded_write	7
 store/effects.rs	guarded-store-and-read-queries	prepare	1
 store/events.rs	guarded-store-and-read-queries	execute	4
-store/events.rs	guarded-store-and-read-queries	guarded_write	12
+store/events.rs	guarded-store-and-read-queries	guarded_write	13
 store/events.rs	guarded-store-and-read-queries	prepare	7
 store/inbox.rs	guarded-store-and-read-queries	execute	2
 store/inbox.rs	guarded-store-and-read-queries	guarded_write	4
@@ -200,6 +200,7 @@ wiki/index.rs	separate-wiki-index-db	transaction	2
 audit.rs	inline-test-store-fixtures	open	1
 daemon/cad1184_acceptance.rs	independent-daemon-acceptance-fixtures	execute	3
 daemon/cad1184_acceptance.rs	independent-daemon-acceptance-fixtures	open	1
+daemon/cad1218_acceptance.rs	independent-daemon-acceptance-fixtures	open	1
 daemon/cad1184_revision_acceptance.rs	independent-daemon-acceptance-fixtures	execute	2
 daemon/cad1184_revision_acceptance.rs	independent-daemon-acceptance-fixtures	open	1
 daemon/conversations_acceptance.rs	independent-daemon-acceptance-fixtures	execute	5

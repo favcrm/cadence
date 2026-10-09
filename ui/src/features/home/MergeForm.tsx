@@ -7,6 +7,27 @@ import type { HomeNeed } from "./needs";
 export const HEAD_MOVED_COPY = "This changed after it was checked. It needs a fresh review.";
 
 /**
+ * A refusal from an approval or merge route in plain words (CAD-1218).
+ * Chosen by the route's `code`, `check` and status; raw daemon text, pids,
+ * commands and ids never reach the card.
+ */
+export function plainRefusal(e: unknown): string {
+  if (!(e instanceof ApiError)) return "That didn't go through. Try again.";
+  if (e.code === "head_moved") return HEAD_MOVED_COPY;
+  if (e.check === "approver_not_allowed") return "Only the board's owner can approve from here.";
+  if (e.check === "member_role") return "Only the board's owner can decide this.";
+  if (e.check && ["operator_proof", "caller_identity", "operator_only", "operator_session_required", "board_session_required"].includes(e.check)) {
+    return "This board can't confirm it is you right now. Sign in again from your own computer.";
+  }
+  if (e.status === 503) return "The board can't reach the team right now. Try again in a moment.";
+  if (e.status === 409) return "This was already decided. A fresh review makes a new version.";
+  if (e.status === 403) return "You can't do that from here.";
+  if (e.status === 404 || /no registered project/.test(e.message ?? "")) return "This change isn't in a project this board knows.";
+  if (e.status >= 500) return "That didn't go through. Try again, or ask for help.";
+  return "That didn't go through.";
+}
+
+/**
  * The merge decision (CAD-431, CAD-140): Merge pinned to the reviewed
  * head, or Decline with a reason. The merge carries the head it was
  * approved against; a moved head refuses with 409 `head_moved` before
@@ -23,8 +44,7 @@ export function useMergeDecision(
   const head = sha && sha.trim() ? sha : null;
   const [busy, setBusy] = useState<null | "merge" | "decline">(null);
   const [error, setError] = useState<string | null>(null);
-  const fail = (e: ApiError) =>
-    setError(e.code === "head_moved" ? HEAD_MOVED_COPY : (e.message ?? String(e)));
+  const fail = (e: unknown) => setError(plainRefusal(e));
   const merge = () => {
     if (!head) {
       setError("This has no checked version to approve. It needs a fresh review.");

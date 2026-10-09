@@ -172,6 +172,17 @@ pub(crate) fn event_store_stats(
     })
 }
 
+/// CAD-1218: may the board revoke this approval record — one a board path
+/// wrote: action `merge`, `recorded_via` operator-connection, and a source
+/// ending ` via board`. The revoke target rule and the state read share it.
+pub fn board_revocable(record: &Value) -> bool {
+    record["action"] == "merge"
+        && record["recorded_via"] == "operator-connection"
+        && record["source"]
+            .as_str()
+            .is_some_and(|s| s.ends_with(" via board"))
+}
+
 pub fn default_approval_id(action: &str, pr: u64, head: &str) -> String {
     format!("{action}-pr{pr}-{}", &head[..head.len().min(12)])
 }
@@ -680,6 +691,44 @@ impl Store {
         })
     }
 
+    /// CAD-1218: record `a` only if the approval stream holds no record at
+    /// all — standing or revoked, any action — for its `(repo, pr, head)`.
+    /// The check and the write share one transaction, so concurrent calls
+    /// record at most one. Answers the new approval id.
+    pub fn record_approval_once(&self, a: &NewApproval, recorded_via: &str) -> Result<String> {
+        approval_source(a.source)?;
+        identifier(a.action, "Approval action")?;
+        approval_head(a.head_sha)?;
+        approval_repo(a.repo)?;
+        if a.pr == 0 {
+            return Err(Error::rejected("Approval PR number must be positive"));
+        }
+        let scope = json!({"repo": a.repo, "pr": a.pr});
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let stream = Self::approval_stream(&tx)?;
+            let seen = stream.iter().find(|(k, p, _)| {
+                k == APPROVAL_RECORDED_EVENT && p["scope"] == scope && p["head_sha"] == a.head_sha
+            });
+            if let Some((_, p, _)) = seen {
+                return Err(Error::rejected(format!(
+                    "this head already has approval record {} — one record per head, standing \
+                     or revoked; approve a revoked head with `cadence audit approve`",
+                    p["approval_id"].as_str().unwrap_or("?")
+                )));
+            }
+            let base = default_approval_id(a.action, a.pr, a.head_sha);
+            let payload = json!({
+                "source": a.source,
+                "action": a.action,
+                "head_sha": a.head_sha,
+                "scope": scope,
+                "recorded_via": recorded_via,
+            });
+            Self::append_approval(&tx, &stream, &base, payload)
+        })
+    }
+
     /// Every approval-stream event, oldest first: `(kind, payload, at)`.
     fn approval_stream(conn: &impl super::StoreConn) -> Result<Vec<(String, Value, f64)>> {
         let rows: Vec<(String, String, f64)> = conn.query_vec(
@@ -917,15 +966,46 @@ impl Store {
         reason: &str,
         recorded_via: &str,
     ) -> Result<bool> {
+        self.revoke_approval_inner(id, source, reason, recorded_via, false)
+    }
+
+    /// CAD-1218: [`Self::revoke_approval`] for the board, which may reach
+    /// only a record a board path wrote: action `merge`, `recorded_via`
+    /// operator-connection and a source ending ` via board`. The target is
+    /// checked in the revoking transaction.
+    pub fn revoke_board_approval(
+        &self,
+        id: &str,
+        source: &str,
+        reason: &str,
+        recorded_via: &str,
+    ) -> Result<bool> {
+        self.revoke_approval_inner(id, source, reason, recorded_via, true)
+    }
+
+    fn revoke_approval_inner(
+        &self,
+        id: &str,
+        source: &str,
+        reason: &str,
+        recorded_via: &str,
+        board_only: bool,
+    ) -> Result<bool> {
         identifier(id, "Approval id")?;
         approval_source(source)?;
         approval_text(reason, "Approval revocation reason", 256)?;
         let evidence = json!({"approval_id": id, "source": source, "reason": reason});
         self.write_tx(|conn| {
             let tx = &mut *conn;
-            if Self::approval_event(&tx, APPROVAL_RECORDED_EVENT, id)?.is_none() {
+            let Some(recorded) = Self::approval_event(&tx, APPROVAL_RECORDED_EVENT, id)? else {
                 return Err(Error::rejected(format!(
                     "Approval id '{id}' has no recorded approval to revoke"
+                )));
+            };
+            if board_only && !board_revocable(&recorded) {
+                return Err(Error::rejected(format!(
+                    "Approval '{id}' was not recorded from the board — revoke it with \
+                     `cadence audit revoke`"
                 )));
             }
             if let Some(old) = Self::approval_event(&tx, APPROVAL_REVOKED_EVENT, id)? {

@@ -842,6 +842,20 @@ export const api = {
    *  reason (CAD-140); the worker loop stands down. */
   declineDelivery: (issue: string, reason: string) =>
     post<Record<string, unknown>>(`/api/delivery/${encodeURIComponent(issue)}/decline`, { reason }),
+  /** `POST /api/approvals/approve` (CAD-1218) — records the operator's
+   *  merge approval for the exact head the drawer showed. A moved head
+   *  refuses with 409 `head_moved`; a head with an earlier record refuses. */
+  approveHead: (repo: string, pr: number, head: string) =>
+    post<{ approval_id: string }>("/api/approvals/approve", { repo, pr, head }),
+  /** `GET /api/approvals/state` (CAD-1218) — whether this head has an
+   *  approval in force, revoked, or none. */
+  approvalState: (repo: string, pr: number, head: string) =>
+    get<{ state: "in-force" | "revoked" | "missing"; approval_id?: string; board_revocable?: boolean }>(
+      `/api/approvals/state?repo=${encodeURIComponent(repo)}&pr=${pr}&head=${encodeURIComponent(head)}`,
+    ),
+  /** `POST /api/approvals/<id>/revoke` (CAD-1218) — withdraw that approval. */
+  revokeApproval: (id: string, reason: string) =>
+    post<Record<string, unknown>>(`/api/approvals/${encodeURIComponent(id)}/revoke`, { reason }),
   /** `GET /api/master/summary?since=` — 501 on a daemon without it. */
   masterSummary: (since: number) =>
     get<Record<string, unknown>>(`/api/master/summary?since=${Math.floor(since)}`),
