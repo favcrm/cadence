@@ -37,17 +37,19 @@ const INVISIBLE = /[\p{Cf}\p{Default_Ignorable_Code_Point}\p{Cc}]/gu;
  * Allow (never refused, never clamped). Only characters that cannot be
  * seen are removed.
  */
-function ReasonBlock({ reason }: { reason: string }) {
+export function ReasonBlock({ reason, label = "Master says:" }: { reason: string; label?: string }) {
   const [more, setMore] = useState(false);
   const text = reason.replace(INVISIBLE, (c) => (c === "\n" || c === "\t" ? c : ""));
   const long = text.length > REASON_CAP;
   const shown = long && !more ? text.slice(0, REASON_CAP) : text;
   return (
     <div className="rounded border border-ink-700 bg-ink-900 px-2 py-1.5 min-w-0" data-permission-reason>
-      <p className="text-micro text-ink-400">Master says:</p>
+      <p className="text-micro text-ink-400">{label}</p>
       <p
         className={`text-label text-ink-300 whitespace-pre-wrap break-words ${more ? "max-h-[50vh] overflow-y-auto" : ""}`}
         tabIndex={more ? 0 : undefined}
+        role={more ? "region" : undefined}
+        aria-label={more ? "Master's full reason" : undefined}
       >
         {shown}
         {long && !more ? "…" : ""}

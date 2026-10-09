@@ -127,7 +127,7 @@ export default function NeedsRail({
               <ul>
                 {decided.map((n) => (
                   <li key={n.key}>
-                    <span className="todo-decided-t">{kindSpec(n).title(n, { issueTitle: null })}</span>
+                    <span className="todo-decided-t">{n.why ?? n.shortTitle ?? kindSpec(n).title(n, { issueTitle: null })}</span>
                     <span className="chip bg-ink-800 text-ink-300 shrink-0">
                       {n.action.type === "permission" ? n.action.decisionLabel || n.action.status : "decided"}
                     </span>

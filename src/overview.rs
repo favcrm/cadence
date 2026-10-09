@@ -398,68 +398,29 @@ fn strip_invisible(raw: &str) -> String {
         .into_owned()
 }
 
-/// Top-level `cadence` verbs. The word `cadence` followed by one (or by a
-/// flag) reads as a command; "Cadence board shows plans" does not.
-const CADENCE_VERBS: &[&str] = &[
-    "self",
-    "done",
-    "inbox",
-    "issue",
-    "plan",
-    "send",
-    "dispatch",
-    "join",
-    "agent",
-    "build-slot",
-    "secret",
-    "update",
-    "dev",
-    "status",
-    "doctor",
-    "memory",
-    "wiki",
-    "master",
-    "audit",
-    "message",
-    "report",
-    "overview",
-    "rollout",
-    "upgrade",
-    "review",
-    "ui",
-    "org",
-    "help",
-];
-
-/// True when `lower` (already lowercased) has `cadence` followed by a verb
-/// or a flag. Cyrillic/Armenian lookalikes of its letters are folded first.
-fn reads_as_cadence_command(lower: &str) -> bool {
-    let folded: String = lower
+/// Lookalikes of the letters of "cadence" (c, a, d, e, n) folded to ASCII
+/// before the `cadence` check, so a homoglyph spelling is refused too.
+fn fold_lookalikes(lower: &str) -> String {
+    lower
         .chars()
         .map(|c| match c {
-            '\u{430}' => 'a',
-            '\u{441}' => 'c',
+            // NFKC turns Greek lunate sigma (U+03F2/U+03F9) into sigma (U+03C2/U+03C3).
+            '\u{441}' | '\u{3F2}' | '\u{3C2}' | '\u{3C3}' | '\u{217D}' | '\u{1D04}' => 'c',
+            '\u{430}' | '\u{251}' | '\u{3B1}' => 'a',
+            '\u{501}' | '\u{217E}' => 'd',
             '\u{435}' => 'e',
-            '\u{501}' => 'd',
             '\u{578}' => 'n',
             c => c,
         })
-        .collect();
-    folded.match_indices("cadence").any(|(i, m)| {
-        let word: String = folded[i + m.len()..]
-            .trim_start()
-            .chars()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
-            .collect();
-        word.starts_with('-') || CADENCE_VERBS.contains(&word.as_str())
-    })
+        .collect()
 }
 
 /// Make `raw` safe to show as a card's plain-words text: NFKC-folded
 /// (so fullwidth lookalikes become their ASCII form), whitespace and
 /// newlines collapsed, control and format characters dropped, clipped to
 /// `max` characters on a char boundary. Anything that reads as a
-/// command (a backtick, `$(`, `${`, `cadence` followed by a verb or flag) yields
+/// command (a backtick, `$(`, `${`, the word `cadence` anywhere, also
+/// spelled with lookalike letters) yields
 /// `None`, so the field is omitted rather than shown. Never returns an
 /// empty string.
 fn display_text(raw: &str, max: usize) -> Option<String> {
@@ -467,7 +428,7 @@ fn display_text(raw: &str, max: usize) -> Option<String> {
     let spaced: String = strip_invisible(raw)
         .nfkc()
         .filter_map(|c| match c {
-            '\n' | '\r' | '\t' => Some(' '),
+            '\n' | '\r' | '\t' | '\u{2800}' => Some(' '),
             c if c.is_control() => None,
             c => Some(c),
         })
@@ -479,7 +440,7 @@ fn display_text(raw: &str, max: usize) -> Option<String> {
         || text.contains('`')
         || text.contains("$(")
         || text.contains("${")
-        || reads_as_cadence_command(&strip_invisible(&text.to_lowercase()))
+        || fold_lookalikes(&text.to_lowercase()).contains("cadence")
     {
         return None;
     }
@@ -496,10 +457,12 @@ fn display_sentence(raw: &str, max: usize) -> Option<String> {
     let end = text
         .char_indices()
         .find(|&(i, c)| {
-            let head = text[..i].to_lowercase();
             matches!(c, '.' | '!' | '?')
                 && text[i + c.len_utf8()..].starts_with(' ')
-                && !(head.ends_with("e.g") || head.ends_with("i.e"))
+                && !{
+                    let head = text[..i].to_lowercase();
+                    head.ends_with("e.g") || head.ends_with("i.e")
+                }
         })
         .map_or(text.len(), |(i, c)| i + c.len_utf8());
     display_text(&text[..end], max)
@@ -2604,7 +2567,14 @@ mod tests {
         for bad in [
             "run `rm -rf x` now",
             "cadence issue set X status=done",
+            "Cadence  go",
             "Cadence  issue list",
+            "cadence confine off",
+            "cadence daemon stop",
+            "cadence resume worker-1",
+            "\u{3F2}adence stop x",
+            "\u{3F9}adence stop x",
+            "\u{2800}\u{2800}",
             "run cadence --state-dir x",
             "c\u{430}dence issue set X",
             "echo $(id)",
@@ -2622,7 +2592,6 @@ mod tests {
         );
         for (raw, want) in [
             ("a\u{13430}b\u{1BCA0}c\u{34F}d\u{3164}e", "abcde"),
-            ("Cadence board shows plans", "Cadence board shows plans"),
             ("## Heading words", "Heading words"),
         ] {
             assert_eq!(display_text(raw, 50).as_deref(), Some(want), "{raw:?}");

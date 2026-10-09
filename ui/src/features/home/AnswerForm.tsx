@@ -4,6 +4,7 @@ import { api, ApiError } from "../../lib/api";
 import { resources } from "../../lib/resources";
 import type { HomeNeed } from "./needs";
 import Button from "../../ui/Button";
+import { ReasonBlock } from "./PermissionCard";
 
 /** What a blocked action says: one plain line, no command. */
 export const READ_ONLY_COPY = "You're viewing read-only.";
@@ -52,10 +53,8 @@ export default function AnswerForm({
   const { send, busy, error } = useAnswer(need, onDone);
   return (
     <div className="mt-2 space-y-2">
-      {/* The card's title already carries the first line of the summary. */}
-      {need.summary && (need.summary.length > 90 || need.summary.includes("\n")) && (
-        <p className="text-label text-ink-300 break-words line-clamp-2">{need.summary}</p>
-      )}
+      {/* The title is a short label; the whole summary is read here. */}
+      {need.summary && <ReasonBlock reason={need.summary} label="Master's summary:" />}
       {(body || impact) && (
         <details>
           <summary className="text-micro text-ink-500 cursor-pointer">the question in full</summary>

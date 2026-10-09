@@ -1682,9 +1682,10 @@ payload at read time — nothing is stored; `cadence overview [--json]
 Plan, question, merge-decision and master-permission rows may also carry
 display-only `short_title` (about 50 characters) and `why` (one sentence),
 sanitized server-side and omitted when the source is empty or reads as a
-command (`cadence` followed by a verb or flag); nothing reads them back
+command (the word `cadence` anywhere, a backtick, `${` or `$(`); nothing reads them back
 (CAD-1219). A pending master-permission row's `short_title` is its
-sanitized reason and `why` appears only once the request is decided; a
+sanitized reason and `why` appears only once the request is decided; plan
+and merge rows carry no `why` (only `short_title` where they have one); a
 question whose summary is refused uses its body. The board never shows
 agent text as a title on its own, and shows a permission's whole reason
 (`permission.reason`) as text to read before Allow (CAD-1293).
