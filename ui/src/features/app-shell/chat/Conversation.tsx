@@ -590,6 +590,13 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     ((thread.data?.entries ?? []).some((e) => e.message === turnMessage) ||
       (thread.data?.pending ?? []).some((p) => p.message === turnMessage && p.state !== "failed"));
   const working = masterState.data?.turn?.state === "working" && turnOwned;
+  const queuedOwn = masterState.data?.turn?.state === "queued" && turnOwned;
+  // Keep feedback across POST acknowledgement; the daemon's proven turn wins.
+  const sending = (thread.data?.pending ?? []).some((p) => p.state === "sending");
+  const pendingStatus = working || queuedOwn || queued
+    ? null
+    : sending ? "sending"
+      : (thread.data?.pending ?? []).some((p) => p.state === "sent") ? "waiting" : null;
   const onStop = () => {
     const origin = { key: composerKey, visit: visitRef.current, frame: frameToken };
     const isCurrent = () =>
@@ -611,10 +618,10 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     if (unanswered) void resources.masterState.refresh();
   }, [unanswered, convId]);
   useEffect(() => {
-    if (!awaiting) return;
+    if (!awaiting && !sending && !queuedOwn && !working) return;
     const t = setInterval(() => void resources.masterState.refresh(), 6_000);
     return () => clearInterval(t);
-  }, [awaiting]);
+  }, [awaiting, sending, queuedOwn, working]);
 
   // "+ New", `/new` and `/clear` are one call: a fresh conversation.
   const startNew = () => {
@@ -1113,6 +1120,16 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       {queued && (
         <p className="text-label text-ink-300" role="status" data-chat-queued>
           {QUEUED_NOTICE}
+        </p>
+      )}
+      {queuedOwn && (
+        <p className="text-label text-ink-300" role="status" data-chat-status="queued">
+          Queued…
+        </p>
+      )}
+      {pendingStatus && (
+        <p className="text-label text-ink-300" role="status" data-chat-status={pendingStatus}>
+          {pendingStatus === "sending" ? "Sending…" : "Waiting…"}
         </p>
       )}
       {working && viewer.operator && !viewer.readOnly && (
