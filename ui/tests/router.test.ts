@@ -33,6 +33,8 @@ const paths: [string, Route][] = [
   ["/projects/cadence/workflows", { screen: "projects", slug: "cadence", section: "workflows" }],
   ["/projects/cadence/issues/CAD-607", { screen: "issue", project: "cadence", id: "CAD-607", tab: "overview" }],
   ["/apps", { screen: "apps", project: null, name: null }],
+  ["/apps/social-content", { screen: "workspaceAppKey", appKey: "social-content" }],
+  ["/apps/crm", { screen: "workspaceAppKey", appKey: "crm" }],
   ["/app-installations/install-social", { screen: "workspaceApp", installId: "install-social" }],
   ["/apps/cadence/studio", { screen: "apps", project: "cadence", name: "studio" }],
   ["/agents", { screen: "agents", alias: null }],
@@ -55,10 +57,11 @@ equal(matchRoute("/agents/a%20b"), { screen: "agents", alias: "a b" }, "decoded 
 equal(routePath({ screen: "agents", alias: "a b" }), "/agents/a%20b", "encoded alias");
 equal(matchRoute("/index.html"), { screen: "home" }, "index.html is home");
 equal(projectScope({ screen: "workspaceApp", installId: "install-social" }), "none", "workspace app has no project scope");
+equal(projectScope({ screen: "workspaceAppKey", appKey: "crm" }), "none", "friendly app route has no project scope");
 for (const path of ["/app-installations", "/app-installations/..", "/app-installations/a%2Fb", "/app-installations/a/extra"]) {
   equal(matchRoute(path).screen, "notFound", `invalid installation route ${path}`);
 }
-for (const dead of ["/overview/x", "/nope", "/projects/x/y", "/projects/cadence/issues/CAD-1/extra", "/agents/a/b", "/apps/p", "/apps/p/n/x", "/settings/nope", "/setup/x", "/login/x", "/projects/%E0"]) {
+for (const dead of ["/overview/x", "/nope", "/projects/x/y", "/projects/cadence/issues/CAD-1/extra", "/agents/a/b", "/apps/%2F", "/apps/%E0", "/apps/catalog", "/apps/manage", "/apps/p/n/x", "/settings/nope", "/setup/x", "/login/x", "/projects/%E0"]) {
   equal(matchRoute(dead).screen, "notFound", `not found ${dead}`);
 }
 
@@ -123,6 +126,8 @@ equal(showProjectChoices(1, "cadence"), true, "a selected project stays visible"
 
 // CAD-1026: an app page's native-controls choice never follows to another installation.
 {
+  const friendly = readLocation("/apps/crm", "?crm=segments&ctx=scope-a");
+  equal(locationHref(friendly, "?crm=segments&ctx=scope-a"), "/apps/crm?crm=segments&ctx=scope-a", "friendly app href keeps app query context");
   const here = readLocation("/app-installations/install-a", "?screen=native");
   equal(
     locationHref(goTo(here, { screen: "workspaceApp", installId: "install-b" }), "?screen=native&foo=1"),

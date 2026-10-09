@@ -28,9 +28,19 @@ import type { Viewer } from "../projects/work";
  */
 export type GateRow = Pick<AppRow, "error" | "approval" | "connections" | "source" | "project" | "name">;
 
-/** `/apps/<project>/<name>` — one app's detail route. */
+/** `/apps/<project>/<name>` — one project's legacy app detail route. */
 export function appHref(project: string, name: string): string {
   return `/apps/${encodeURIComponent(project)}/${encodeURIComponent(name)}`;
+}
+
+/** A package key's readable route, or null when its segment is reserved or unsafe. */
+export function installedAppHref(name: string): string | null {
+  if (
+    ["explore", "catalog", "manage"].includes(name) ||
+    !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(name) ||
+    name === "." || name === ".."
+  ) return null;
+  return `/apps/${encodeURIComponent(name)}`;
 }
 
 /**
@@ -50,7 +60,7 @@ export function screenInstallHref(
       i.removed == null && i.name === name && i.project_link === project &&
       i.files.some((f) => /^screens\/[a-z0-9][a-z0-9-]{0,31}\/screens\.json$/.test(f)),
   );
-  return hits.length === 1 ? `/app-installations/${encodeURIComponent(hits[0].install_id)}` : null;
+  return hits.length === 1 ? installedAppHref(hits[0].name) : null;
 }
 
 /**

@@ -15,6 +15,7 @@ import { readAppUrlState, type AppTab, type ProjectView } from "./urlState";
  *   /projects/:slug/workflows  its stored workflows and new runs (CAD-496)
  *   /projects/:slug/issues/:id one issue (CAD-607). `?tab=` picks a section.
  *   /apps[/<project>/<app>]    installed apps, optionally one app's detail (CAD-557)
+ *   /apps/<app-key>            one installed app resolved by package key
  *   /agents[/:alias]           agents, optionally one agent's drawer
  *   /wiki[/<path>]             the wiki: folder tree + page (CAD-581)
  *   /wiki/edit|history|upload/<path>   its modes for one path
@@ -47,6 +48,7 @@ export type Route =
   | { screen: "appsCatalog"; id: string }
   | { screen: "appsManage"; installId: string }
   | { screen: "workspaceApp"; installId: string }
+  | { screen: "workspaceAppKey"; appKey: string }
   | { screen: "agents"; alias: string | null }
   | { screen: "wiki"; mode: WikiMode; path: string | null; query: string | null }
   | { screen: "outbox" }
@@ -184,6 +186,8 @@ export function matchRoute(pathname: string): Route {
       // the operator's manage tab (`/apps/manage/<install_id>`). The
       // bare `/apps/<a>` shape is reserved for these reserved words so
       // a project named "explore"/"catalog"/"manage" never collides.
+      // The remaining bare `/apps/<key>` shape opens an installed package key;
+      // project-qualified `/apps/<project>/<name>` links remain legacy details.
       if (!a) return { screen: "apps", project: null, name: null };
       if (a === "explore" && !b) return { screen: "appsExplore" };
       if (a === "catalog" && b) {
@@ -199,6 +203,14 @@ export function matchRoute(pathname: string): Route {
       const project = segment(a);
       const name = b ? segment(b) : null;
       if (project && name) return { screen: "apps", project, name };
+      if (
+        !b && project &&
+        !["explore", "catalog", "manage"].includes(project) &&
+        /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(project) &&
+        project !== "." && project !== ".."
+      ) {
+        return { screen: "workspaceAppKey", appKey: project };
+      }
     }
     if (head === "app-installations" && a && !b) {
       const installId = segment(a);
@@ -231,6 +243,8 @@ export function routePath(route: Route): string {
   switch (route.screen) {
     case "workspaceApp":
       return `/app-installations/${encodeURIComponent(route.installId)}`;
+    case "workspaceAppKey":
+      return `/apps/${encodeURIComponent(route.appKey)}`;
     case "home":
       return "/";
     case "projects": {
@@ -342,7 +356,7 @@ export function locationHref(loc: AppLocation, search = ""): string {
   const route = scopedRoute(loc.route, loc.project);
   // CAD-1068: the mounted CRM app (`workspaceApp`) owns these; they stay
   // on its own route and never follow the user to /settings and the like.
-  if (route.screen !== "workspaceApp") for (const key of CRM_APP_PARAMS) q.delete(key);
+  if (route.screen !== "workspaceApp" && route.screen !== "workspaceAppKey") for (const key of CRM_APP_PARAMS) q.delete(key);
   if (route.screen === "issue") {
     if (route.tab !== "overview") q.set("tab", route.tab);
     const issueSearch = q.toString();

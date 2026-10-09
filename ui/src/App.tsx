@@ -2,13 +2,14 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError, type WriteResp } from "./lib/api";
 import Agents from "./features/agents/Agents";
 import Apps from "./features/apps/Apps";
+import { installedAppHref } from "./features/apps/appViewModel";
 import AppDetail from "./features/apps/AppDetail";
 import Explorer from "./features/explorer/Explorer";
 import CatalogDetail from "./features/explorer/CatalogDetail";
 import ManageApp from "./features/explorer/ManageApp";
 import AppShell, { type ActiveInstallation } from "./features/app-shell/AppShell";
 import { buildAppNav, readLastApp, sectionFromSearch, writeLastApp, type LastApp, type VerifiedApp } from "./features/app-shell/appNav";
-import { useInstallations } from "./features/workspace-apps/useInstallations";
+import { useInstallations, type InstallationsState } from "./features/workspace-apps/useInstallations";
 import { APPS_CHANGED_EVENT } from "./features/workspace-apps/workspaceApps";
 import { appLoadErrorCopy } from "./features/explorer/appErrors";
 import WorkspaceApp from "./features/workspace-apps/WorkspaceApp";
@@ -105,6 +106,7 @@ const SCREEN_LABEL: Record<Screen, string> = {
   appsCatalog: "app",
   appsManage: "manage",
   workspaceApp: "app",
+  workspaceAppKey: "app",
   agents: "agents",
   wiki: "wiki",
   outbox: "outbox",
@@ -631,14 +633,22 @@ export default function App() {
     () => (installations.list ?? []).filter((i) => i.removed == null).map((i) => ({ installId: i.install_id, kind: i.name, title: i.title || i.name })),
     [installations.list],
   );
-  const onAppScreen = route.screen === "workspaceApp";
-  const receipt = onAppScreen && activeApp !== null && activeApp.installId === route.installId ? activeApp : null;
+  const keyInstallations = route.screen === "workspaceAppKey"
+    ? (installations.list ?? []).filter((installation) => installation.name === route.appKey && installation.removed == null)
+    : [];
+  let routeInstallId: string | null = null;
+  if (route.screen === "workspaceApp") routeInstallId = route.installId;
+  else if (route.screen === "workspaceAppKey" && installations.error === null && keyInstallations.length === 1) {
+    routeInstallId = keyInstallations[0].install_id;
+  }
+  const onAppScreen = route.screen === "workspaceApp" || route.screen === "workspaceAppKey";
+  const receipt = onAppScreen && activeApp !== null && activeApp.installId === routeInstallId ? activeApp : null;
   const menuApps =
     receipt !== null && !installed.some((a) => a.installId === receipt.installId)
       ? [...installed, { installId: receipt.installId, kind: receipt.kind, title: receipt.title }]
       : installed;
-  const activeId = onAppScreen
-    ? menuApps.find((a) => a.installId === route.installId)?.installId ?? null
+  const activeId = onAppScreen && routeInstallId !== null
+    ? menuApps.find((a) => a.installId === routeInstallId)?.installId ?? null
     : null;
   const [last, setLast] = useState<LastApp | null>(() => readLastApp());
   const activeSection = activeId === null ? null : sectionFromSearch(menuApps.find((a) => a.installId === activeId)!.kind, search);
@@ -658,7 +668,21 @@ export default function App() {
       activeId,
       activeHref: href,
       last,
-      installHref: (installId) => hrefFor({ screen: "workspaceApp", installId }),
+      installHref: (installId) => {
+        const app = menuApps.find((value) => value.installId === installId);
+        const sameKey = app ? installed.filter((value) => value.kind === app.kind) : [];
+        const readableHref = app ? installedAppHref(app.kind) : null;
+        let next: Route = { screen: "workspaceApp", installId };
+        if (app && installed.some((value) => value.installId === installId) && sameKey.length === 1 && readableHref) {
+          next = { screen: "workspaceAppKey", appKey: app.kind };
+        }
+        const targetSearch = new URLSearchParams(search);
+        if (installId !== activeId) {
+          for (const key of ["crm", "record", "ctx", "appview", "segment", "conversation"]) targetSearch.delete(key);
+        }
+        const nextSearch = targetSearch.toString();
+        return locationHref(goTo(loc, next), contextNavigationSearch(route, next, nextSearch));
+      },
     }),
     notice: installations.retrying
       ? { text: "The workspace is busy. Retrying the app list…", retrying: true, onRetry: installations.retry }
@@ -685,7 +709,7 @@ export default function App() {
       }`}
     >
       <Sidebar
-        screen={screen === "workspaceApp" ? "apps" : screen}
+        screen={screen === "workspaceApp" || screen === "workspaceAppKey" ? "apps" : screen}
         navHref={hrefFor}
         appMenu={appMenu}
         homeCount={homeCount}
@@ -768,7 +792,7 @@ export default function App() {
         {menuOpen && (
           <div id="mobile-navigation" className="lg:hidden border-b border-ink-700 bg-ink-875 px-4 py-3 space-y-1">
             <NavList
-              screen={screen === "workspaceApp" ? "apps" : screen}
+              screen={screen === "workspaceApp" || screen === "workspaceAppKey" ? "apps" : screen}
               navHref={hrefFor}
               appMenu={appMenu}
               homeCount={homeCount}
@@ -991,6 +1015,15 @@ export default function App() {
             <WorkspaceApp installId={route.installId} viewer={{ readOnly, operator: meta?.operator === true }} onBack={() => goRoute({ screen: "apps", project: null, name: null })} />
           </AppShell>
         )}
+        {route.screen === "workspaceAppKey" && (
+          <WorkspaceAppEntry
+            appKey={route.appKey}
+            installations={installations}
+            viewer={{ readOnly, operator: meta?.operator === true }}
+            onInstallation={reportInstallation}
+            onBack={() => goRoute({ screen: "apps", project: null, name: null })}
+          />
+        )}
         {route.screen === "apps" && route.project && route.name && (
           <AppDetail
             project={route.project}
@@ -1100,5 +1133,91 @@ export default function App() {
       <Toast msg={toast} />
     </div>
     </WriteGate.Provider>
+  );
+}
+
+function WorkspaceAppEntry({
+  appKey,
+  installations,
+  viewer,
+  onInstallation,
+  onBack,
+}: {
+  appKey: string;
+  installations: InstallationsState;
+  viewer: { readOnly: boolean; operator: boolean };
+  onInstallation: (installation: ActiveInstallation | null) => void;
+  onBack: () => void;
+}) {
+  if (!viewer.operator) {
+    return (
+      <main className="px-4 lg:px-8 pt-10 pb-9">
+        <h1 className="text-section font-semibold text-ink-100">App unavailable</h1>
+        <p className="text-body text-ink-400 mt-2">Sign in as the operator to resolve an installed app.</p>
+        <Link href="/apps" className="lnk">All apps</Link>
+      </main>
+    );
+  }
+  if (installations.error !== null) {
+    return (
+      <main className="px-4 lg:px-8 pt-10 pb-9">
+        <h1 className="text-section font-semibold text-ink-100">Couldn’t load installed apps</h1>
+        <p className="text-body text-ink-400 mt-2" role="alert">
+          {appLoadErrorCopy(installations.error, "The installed-app list is unavailable.")}
+        </p>
+        <button type="button" className="lnk mt-3" onClick={installations.retry}>Retry</button>
+      </main>
+    );
+  }
+  if (installations.list === null) {
+    return (
+      <main className="px-4 lg:px-8 pt-10 pb-9">
+        <p className="text-body text-ink-400" role="status">Loading installed apps…</p>
+      </main>
+    );
+  }
+
+  const matches = installations.list.filter(
+    (installation) => installation.name === appKey && installation.removed == null,
+  );
+  if (matches.length === 0) {
+    return (
+      <main className="px-4 lg:px-8 pt-10 pb-9">
+        <h1 className="text-section font-semibold text-ink-100">App not installed</h1>
+        <p className="text-body text-ink-400 mt-2">No active installation with app key “{appKey}” was found.</p>
+        <Link href="/apps" className="lnk">All apps</Link>
+      </main>
+    );
+  }
+  if (matches.length > 1) {
+    return (
+      <main className="px-4 lg:px-8 pt-10 pb-9">
+        <h1 className="text-section font-semibold text-ink-100">Choose an installation</h1>
+        <p className="text-body text-ink-400 mt-2">
+          More than one active installation uses app key “{appKey}”. Choose which installation to open.
+        </p>
+        <ul className="mt-4 space-y-2">
+          {matches.map((installation) => (
+            <li key={installation.install_id}>
+              <Link className="lnk" href={`/app-installations/${encodeURIComponent(installation.install_id)}`}>
+                {installation.title || installation.name} · {installation.project_link || "workspace"} · {installation.install_id}
+              </Link>
+            </li>
+          ))}
+        </ul>
+      </main>
+    );
+  }
+
+  const installation = matches[0];
+  return (
+    <AppShell
+      key={installation.install_id}
+      installId={installation.install_id}
+      viewer={viewer}
+      onInstallation={onInstallation}
+    >
+      <WorkspaceApp installId={installation.install_id} appKey={appKey} viewer={viewer} onBack={onBack} />
+    </AppShell>
   );
 }
