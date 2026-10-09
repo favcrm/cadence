@@ -791,6 +791,7 @@ export default function Home({
           }))}
           collapsed={railCollapsed}
           onToggleCollapse={toggleRail}
+          onSent={engage}
         />
       </aside>
 

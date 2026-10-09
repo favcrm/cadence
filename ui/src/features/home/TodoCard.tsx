@@ -1,6 +1,6 @@
-import { useEffect, useState, type KeyboardEvent, type ReactNode } from "react";
+import { useEffect, useState, type KeyboardEvent, type ReactNode, type RefCallback } from "react";
 import { useWriteBlock } from "../auth/WriteGate";
-import { api, ApiError } from "../../lib/api";
+import { api } from "../../lib/api";
 import { resources } from "../../lib/resources";
 import { useMaybeResource } from "../../lib/useResource";
 import AnswerForm, { READ_ONLY_COPY, useAnswer } from "./AnswerForm";
@@ -11,12 +11,14 @@ import {
   kindSpec,
   metaLine,
   needRefs,
+  plainFailure,
   UNFENCE_CHOICES,
   type HomeNeed,
   type NeedType,
   type UnfenceChoice,
 } from "./needs";
 import { sendToMaster } from "./send";
+import { sentTodo, useTodoLocal } from "./todoLocal";
 
 const ICON: Record<string, string[]> = {
   list: ["M9 5h10M9 12h10M9 19h10", "M4 5l1 1 2-2M4 12l1 1 2-2M4 19l1 1 2-2"],
@@ -47,7 +49,7 @@ function useIssueTitle(need: HomeNeed): string | null {
 }
 
 /** The technical fields the card leaves out — one tap away under ⋯ → Details. */
-function Details({ need }: { need: HomeNeed }) {
+function Details({ need, failure }: { need: HomeNeed; failure: string | null }) {
   const a = need.action;
   const rows: [string, string | null][] = [
     ["kind", need.kind],
@@ -61,6 +63,7 @@ function Details({ need }: { need: HomeNeed }) {
     ["folder", a.type === "permission" && a.cwd ? a.cwd : null],
     ["risk", a.type === "permission" ? a.risk : null],
     ["row", need.title],
+    ["last error", failure],
   ];
   return (
     <dl className="todo-tech" data-todo-details>
@@ -92,7 +95,7 @@ function YesNo({
   onError: (message: string | null) => void;
 }) {
   const { send, busy, error } = useAnswer(need, onDone);
-  useEffect(() => onError(error), [error]);
+  useEffect(() => onError(error), [error, onError]);
   return (
     <span className="todo-yn" role="group" aria-label="your answer">
       {need.action.options.map((o) => (
@@ -128,6 +131,7 @@ export default function TodoCard({
   onHide,
   onDone,
   onSent,
+  hitRef,
 }: {
   need: HomeNeed;
   readOnly: boolean;
@@ -141,6 +145,8 @@ export default function TodoCard({
   onDone: (key: string, text: string) => void;
   /** Fired after "Fix it" sends, so a slide-over can make room for the chat. */
   onSent: () => void;
+  /** The card's tap target, so the review drawer can hand focus back to it. */
+  hitRef: RefCallback<HTMLElement>;
 }) {
   const block = useWriteBlock(readOnly);
   const spec = kindSpec(need);
@@ -155,7 +161,10 @@ export default function TodoCard({
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [sent, setSent] = useState(false);
+  // The server's own words for the last failure: under ⋯ → Details only, never on the card.
+  const [failure, setFailure] = useState<string | null>(null);
+  // Kept outside the card: a slide-over that remounts it must not offer "Fix it" again.
+  const sent = useTodoLocal().sent.has(need.key);
   const [sending, setSending] = useState(false);
   const action = need.action;
   const answer = action.type === "answer" ? (need as HomeNeed & { action: { type: "answer" } }) : null;
@@ -179,7 +188,10 @@ export default function TodoCard({
         else onDone(need.key, what);
         refresh();
       })
-      .catch((e: ApiError) => setError(e.message ?? String(e)))
+      .catch((e: unknown) => {
+        setError(plainFailure(e));
+        setFailure((e as Error)?.message ?? null);
+      })
       .finally(() => setBusy(false));
   };
   const decide = (verb: "snooze" | "dismiss", secs?: number) => {
@@ -201,9 +213,12 @@ export default function TodoCard({
     void sendToMaster(fixPrompt(need, template), undefined, needRefs(need)).then((r) => {
       setSending(false);
       if (r.ok) {
-        setSent(true);
+        sentTodo(need.key);
         onSent();
-      } else setError(`It couldn't be sent to Master. ${r.error}`);
+      } else {
+        setError("It couldn't be sent to Master. Try again.");
+        setFailure(r.error);
+      }
     });
   };
   const control = () => {
@@ -234,7 +249,8 @@ export default function TodoCard({
       inside = (
         <PermissionCard
           compact
-          card={action}
+          // No stated risk shows no risk line ("low" is the card's quiet state).
+          card={action.risk ? action : { ...action, risk: "low" }}
           readOnly={readOnly}
           onDone={(t) => onDone(need.key, t)}
         />
@@ -327,6 +343,7 @@ export default function TodoCard({
             role={activates && !done ? "button" : undefined}
             tabIndex={activates && !done ? 0 : undefined}
             aria-expanded={expandable && !done ? open : undefined}
+            ref={hitRef}
             onClick={activate}
             onKeyDown={onKey}
           >
@@ -353,7 +370,7 @@ export default function TodoCard({
           )}
         </div>
       </div>
-      {details && <Details need={need} />}
+      {details && <Details need={need} failure={failure} />}
       {menu && (
         <NeedMenu
           need={need}
