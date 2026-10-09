@@ -102,8 +102,8 @@ async function readRun(ctx: ActionContext, args: Record<string, unknown>): Promi
 }
 
 const DEFAULT_LABEL = "Default";
-/** Save the content defaults into the installation's "Default" context,
- *  creating it when there is none. `expected_revision` is the revision the
+/** Save the content defaults into the selected active context (or the
+ *  installation's "Default" one when none is selected), creating "Default" when there is none. `expected_revision` is the revision the
  *  frame last saw (0 when no Default context existed): a stale one is refused
  *  and nothing is written (the daemon holds the same compare-and-swap). */
 async function saveDefaults(ctx: ActionContext, args: Record<string, unknown>): Promise<ActionResult> {
@@ -120,7 +120,11 @@ async function saveDefaults(ctx: ActionContext, args: Record<string, unknown>): 
   const expected = args.expected_revision as number;
   const contexts = await workspaceApps.contexts(ctx.installId);
   const mine = (value: AppContext) => value.install_id === ctx.installId && value.config.label === DEFAULT_LABEL;
-  const current = contexts.find(value => mine(value) && value.state === "active");
+  // The selected context is where the frame's defaults live (its revision is what the frame saw);
+  // only with no selection does the "Default" context stand in.
+  const selected = ctx.contextId ? contexts.find(value => value.id === ctx.contextId && value.install_id === ctx.installId) : undefined;
+  if (ctx.contextId && (!selected || selected.state !== "active")) return refuse("not_found", "That item is not available.");
+  const current = selected ?? contexts.find(value => mine(value) && value.state === "active");
   let saved: AppContext;
   if (!current) {
     if (expected !== 0) return refuse("stale", "That changed somewhere else. Reload and try again.");
@@ -132,7 +136,7 @@ async function saveDefaults(ctx: ActionContext, args: Record<string, unknown>): 
   } else {
     if (current.revision !== expected) return refuse("stale", "That changed somewhere else. Reload and try again.");
     saved = await workspaceApps.updateContext(ctx.installId, current.id, { expected_revision: current.revision,
-      label: DEFAULT_LABEL, input_defaults: { ...current.config.input_defaults, ...values } });
+      label: current.config.label, input_defaults: { ...current.config.input_defaults, ...values } });
   }
   // Re-read the board first, so the new context is in its data when it becomes
   // the selection: the screen then remounts once, with that context.
