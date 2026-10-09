@@ -183,6 +183,16 @@ pub fn valid_digest(raw: &str) -> bool {
             .all(|b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// The one digest form the publish path freezes and compares: bare
+/// 64-hex (callers validate with `valid_digest`), exactly what the door, the import receipt and
+/// `SendBinding::validate` speak. Custody (`app_tool_results.asset_digest`)
+/// keeps `sha256:<hex>`; an effect staged before CAD-1304 froze that form
+/// and cannot be rewritten (its digest covers the frozen authority), so
+/// every read side strips the prefix before comparing.
+pub fn bare_digest(raw: &str) -> &str {
+    raw.strip_prefix("sha256:").unwrap_or(raw)
+}
+
 pub fn valid_media_key(raw: &str) -> bool {
     (1..=200).contains(&raw.len())
         && raw
@@ -974,6 +984,15 @@ mod tests {
         assert!(valid_caption(
             &"🦊".repeat(DEVICE_PUBLISH_MAX_CAPTION_SCALARS)
         ));
+    }
+
+    #[test]
+    fn bare_digest_accepts_the_custody_form_and_the_wire_form() {
+        let hex = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+        assert!(!valid_digest(&format!("sha256:{hex}")));
+        assert_eq!(bare_digest(&format!("sha256:{hex}")), hex);
+        assert_eq!(bare_digest(hex), hex);
+        assert!(valid_digest(bare_digest(&format!("sha256:{hex}"))));
     }
 
     #[test]

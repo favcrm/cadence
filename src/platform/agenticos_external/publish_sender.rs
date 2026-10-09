@@ -1037,7 +1037,10 @@ fn store_material(
             || frozen["aos_connection_id"].as_str() != Some(binding.connection_id.as_str())
             || frozen["destination_id"].as_str() != Some(binding.destination_id.as_str())
             || frozen["caption_digest"].as_str() != Some(binding.caption_digest.as_str())
-            || frozen["image_digest"].as_str() != binding.image_digest.as_deref()
+            || frozen["image_digest"]
+                .as_str()
+                .map(super::publish::bare_digest)
+                != binding.image_digest.as_deref()
         {
             return Err(Refusal::new(
                 "grant_binding_mismatch",

@@ -2,6 +2,7 @@
 use super::app_bindings_rpc::strict_fields;
 use super::*;
 use crate::issue::app_catalog::workspace;
+use crate::platform::agenticos_external::publish::bare_digest;
 use crate::store::{app_bindings::BindingProof, app_effects, app_runs, EffectRow};
 
 // Only positively classified SMTP adds native JSON-content patterns. Opaque
@@ -35,6 +36,12 @@ fn publication_refuse_leak(
         }
     }
     Ok(())
+}
+
+/// The frozen image digest in the canonical bare form. Effects staged before
+/// CAD-1304 carry custody's `sha256:<hex>`; both forms read as the same digest.
+fn frozen_image_digest(authority: &Value) -> Option<&str> {
+    authority["image_digest"].as_str().map(bare_digest)
 }
 
 // Callers classify the durable record while holding the custody lock.
@@ -238,7 +245,11 @@ impl Shared {
                     if crate::store::app_runs::artifact_digest(&bytes) != digest {
                         return Err(Error::rejected("retained publish image digest changed"));
                     }
-                    (Some(digest), Some(mime.to_string()), Some(bytes.len()))
+                    (
+                        Some(bare_digest(&digest).to_owned()),
+                        Some(mime.to_string()),
+                        Some(bytes.len()),
+                    )
                 } else {
                     (None, None, None)
                 };
@@ -331,7 +342,7 @@ impl Shared {
                     let (header, asset_digest, bytes) =
                         self.store.app_tool_asset_bytes(&install, asset)?;
                     if bytes.len() > 2 * 1024 * 1024
-                        || Some(asset_digest.as_str()) != authority["image_digest"].as_str()
+                        || Some(bare_digest(&asset_digest)) != frozen_image_digest(&authority)
                         || Some(bytes.len() as u64) != authority["size_bytes"].as_u64()
                     {
                         return Err(Error::rejected("social draft image changed since approval"));
@@ -352,7 +363,7 @@ impl Shared {
                     let receipt = importer
                         .import(&resolved.aos_connection_id, mime, &bytes)
                         .map_err(|e| Error::rejected(e.to_string()))?;
-                    if receipt.digest != asset_digest
+                    if receipt.digest != bare_digest(&asset_digest)
                         || receipt.mime != mime
                         || receipt.size_bytes != bytes.len()
                         || receipt.connection_id != resolved.aos_connection_id
@@ -369,6 +380,7 @@ impl Shared {
                 let key = required_str(&authority, "idempotency_key")?;
                 let mut bound = authority.clone();
                 bound["grant_id"] = json!(grant_id);
+                bound["image_digest"] = json!(frozen_image_digest(&authority));
                 let binding = super::social_publish_rpc::sender_binding(&bound, &json!(key))
                     .ok_or_else(|| Error::rejected("approved social publish binding is invalid"))?;
                 match sender.preflight(&binding) {
@@ -542,7 +554,7 @@ impl Shared {
                                 if let Some(asset) = asset {
                                     let (_, digest, bytes) =
                                         self.store.app_tool_asset_bytes(&install, asset)?;
-                                    if Some(digest.as_str()) != authority["image_digest"].as_str()
+                                    if Some(bare_digest(&digest)) != frozen_image_digest(authority)
                                         || bytes.len()
                                             != authority["size_bytes"].as_u64().unwrap_or(0)
                                                 as usize
