@@ -1,9 +1,10 @@
 import { useWriteBlock } from "../auth/WriteGate";
 import { useState } from "react";
-import { api, ApiError } from "../../lib/api";
+import { api } from "../../lib/api";
 import { resources } from "../../lib/resources";
 import { useQuery } from "../../lib/useResource";
 import Button from "../../ui/Button";
+import { plainFailure } from "./needs";
 import { ideaDecisionBody, type IdeaAction } from "./idea";
 
 /**
@@ -39,7 +40,7 @@ export function useIdeaDecision(issue: string, onDecided?: (issue: string, actio
         void resources.overview.invalidate();
         onDecided?.(issue, String((out as { decision?: { action?: unknown } }).decision?.action ?? action));
       })
-      .catch((e: ApiError) => setError(e.message ?? String(e)))
+      .catch((e: unknown) => setError(plainFailure(e)))
       .finally(() => setBusy(null));
   };
   return { state, detail, busy, error, setError, decide };

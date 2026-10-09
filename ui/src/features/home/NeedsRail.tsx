@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useWriteBlock } from "../auth/WriteGate";
 import type { ResourceState } from "../../lib/cache";
 import type { Agent, Overview } from "../../lib/types";
@@ -8,6 +8,7 @@ import type { AgentUpdate } from "./agentUpdateModel";
 import { READ_ONLY_COPY } from "./AnswerForm";
 import ReviewDrawer from "./ReviewDrawer";
 import TodoCard from "./TodoCard";
+import { doneTodo, hideTodo, useTodoLocal } from "./todoLocal";
 import Link from "../../ui/Link";
 
 export { NeedMenu } from "./NeedMenu";
@@ -31,6 +32,7 @@ export default function NeedsRail({
   collapsed,
   onToggleCollapse,
   onAskAgent,
+  onSent,
 }: {
   overview: ResourceState<Overview>;
   readOnly: boolean;
@@ -42,47 +44,52 @@ export default function NeedsRail({
   collapsed: boolean;
   onToggleCollapse: () => void;
   onAskAgent: (agent: Agent, update?: AgentUpdate) => void;
+  /** A "Fix it" reached Master: Home pins the chat to the sent message. */
+  onSent?: () => void;
 }) {
   const [tab, setTab] = useState<"todo" | "updates">("todo");
   const block = useWriteBlock(readOnly);
   const { todo, updates, decided } = todoSplit(overview.data?.needs_me);
   const [drawer, setDrawer] = useState(false);
-  const [hidden, setHidden] = useState<ReadonlySet<string>>(() => new Set());
-  const [done, setDone] = useState<ReadonlyMap<string, string>>(() => new Map());
+  const { hidden, done } = useTodoLocal();
   const [review, setReview] = useState<string | null>(null);
+  // The reading items, as they stood when the drawer opened: "n of m" does
+  // not recount when the overview refreshes mid-run.
+  const [queue, setQueue] = useState<string[]>([]);
   const [showDecided, setShowDecided] = useState(false);
+  const hits = useRef(new Map<string, HTMLElement>());
+  const [refocus, setRefocus] = useState<string | null>(null);
 
   const cards = todo.filter((n) => !hidden.has(n.key));
   const count = cards.filter((n) => !done.has(n.key)).length;
   const readers = cards.filter((n) => kindSpec(n).place === "drawer");
-  const reading = review === null ? -1 : readers.findIndex((n) => n.key === review);
+  const reading = review === null ? undefined : readers.find((n) => n.key === review);
   const firstPermission = cards.findIndex((n) => !done.has(n.key) && n.kind === "master_permission");
 
-  const hide = (key: string) => setHidden((s) => new Set(s).add(key));
-  const markDone = (key: string, text: string) => setDone((m) => new Map(m).set(key, text));
+  const openReview = (key: string) => {
+    setQueue(readers.filter((n) => n.key === key || !done.has(n.key)).map((n) => n.key));
+    setReview(key);
+  };
   /** A review decision landed: mark the card, then move on to the next reading item. */
   const reviewed = (key: string, text: string) => {
-    markDone(key, text);
-    const next = readers.slice(readers.findIndex((n) => n.key === key) + 1).find((n) => !done.has(n.key));
-    setReview(next ? next.key : null);
+    doneTodo(key, text);
+    const next = queue.slice(queue.indexOf(key) + 1).find((k) => !done.has(k) && readers.some((n) => n.key === k));
+    setReview(next ?? null);
   };
   const ask = (need: HomeNeed, lead?: string) => {
     setDrawer(false);
     onAsk(need, lead);
   };
   const closeReview = () => {
-    const key = review;
+    setRefocus(review);
     setReview(null);
-    if (key === null) return;
-    // Hand focus back to the card that opened the drawer (or the nearest one that is left).
-    setTimeout(() => {
-      const target = Array.from(document.querySelectorAll<HTMLElement>("[data-need-key]"))
-        .filter((el) => el.getAttribute("data-need-key") === key)
-        .map((el) => el.querySelector<HTMLElement>(".todo-hit, button"))
-        .find((el) => el !== null && el.isConnected);
-      target?.focus();
-    }, 30);
   };
+  // Hand focus back to the card that opened the drawer, once the drawer is gone.
+  useEffect(() => {
+    if (refocus === null || review !== null) return;
+    hits.current.get(refocus)?.focus();
+    setRefocus(null);
+  }, [refocus, review]);
 
   const todoBody = (
     <>
@@ -104,12 +111,22 @@ export default function NeedsRail({
             readOnly={readOnly}
             defaultOpen={i === firstPermission}
             doneText={done.get(n.key)}
-            onReview={setReview}
+            onReview={openReview}
             onOpenIssue={onOpenIssue}
             onAsk={(need) => ask(need)}
-            onHide={hide}
-            onDone={markDone}
-            onSent={() => setDrawer(false)}
+            onHide={hideTodo}
+            onDone={doneTodo}
+            hitRef={(el) => {
+              if (!el) return;
+              hits.current.set(n.key, el);
+              return () => {
+                if (hits.current.get(n.key) === el) hits.current.delete(n.key);
+              };
+            }}
+            onSent={() => {
+              setDrawer(false);
+              onSent?.();
+            }}
           />
         ))}
       </ul>
@@ -248,13 +265,13 @@ export default function NeedsRail({
         </>
       )}
 
-      {reading >= 0 && (
+      {reading && (
         <ReviewDrawer
-          key={readers[reading].key}
-          need={readers[reading]}
+          key={reading.key}
+          need={reading}
           readOnly={readOnly}
-          index={reading + 1}
-          total={readers.length}
+          index={Math.max(queue.indexOf(reading.key), 0) + 1}
+          total={Math.max(queue.length, 1)}
           onDone={reviewed}
           onClose={closeReview}
           onAsk={(need, lead) => ask(need, lead)}

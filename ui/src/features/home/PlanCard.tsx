@@ -1,9 +1,10 @@
 import { useWriteBlock } from "../auth/WriteGate";
 import { useState } from "react";
-import { api, ApiError } from "../../lib/api";
+import { api } from "../../lib/api";
 import { resources } from "../../lib/resources";
 import { useQuery } from "../../lib/useResource";
 import Button from "../../ui/Button";
+import { plainFailure } from "./needs";
 import { planView, rejectReasonError } from "./plan";
 
 const STATE_CHIP: Record<string, string> = {
@@ -49,7 +50,7 @@ export function usePlanDecision(epic: string, block: string | null, onDecided?: 
         void resources.overview.invalidate();
         onDecided?.(epic, String((out as { state?: unknown }).state ?? verb));
       })
-      .catch((e: ApiError) => setError(e.message ?? String(e)))
+      .catch((e: unknown) => setError(plainFailure(e)))
       .finally(() => setBusy(null));
   };
   return { state, detail, view, busy, error, setError, decide };

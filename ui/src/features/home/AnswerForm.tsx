@@ -1,8 +1,8 @@
 import { useWriteBlock } from "../auth/WriteGate";
 import { useState } from "react";
-import { api, ApiError } from "../../lib/api";
+import { api } from "../../lib/api";
 import { resources } from "../../lib/resources";
-import type { HomeNeed } from "./needs";
+import { plainFailure, type HomeNeed } from "./needs";
 import Button from "../../ui/Button";
 import { ReasonBlock } from "./PermissionCard";
 
@@ -31,7 +31,7 @@ export function useAnswer(
         void resources.issue(issue).invalidate();
         onDone(answer);
       })
-      .catch((e: ApiError) => setError(e.message ?? String(e)))
+      .catch((e: unknown) => setError(plainFailure(e)))
       .finally(() => setBusy(false));
   };
   return { send, busy, error };
