@@ -3,6 +3,7 @@ import { navigate } from "../../../lib/useLocation";
 import { rememberContext } from "../contextSelection";
 import { workspaceApps, type AppContext, type CapabilityQuote, type Installation, type WorkspaceRun } from "../workspaceApps";
 import { contextDefaultKeys, instagramLink } from "./screenProjection";
+import { accountLabel, connectReturnTo, isGrantId, publicationBinding, sendSlot } from "../socialConnect";
 import type { ActionRefusal, ActionResult, CallVerb, SlotVerb } from "./screenProtocol";
 import type { Planner, SlotPlan } from "./screenSlot";
 
@@ -167,6 +168,53 @@ export const BOARD_LINK_PATHS: readonly string[] = ["/settings/connections"];
 /** The visible target of an external link: its host plus path, which is what the confirm names. */
 export const linkTarget = (href: string): string => { const url = new URL(href); return url.host + url.pathname + url.search; };
 
+/** CAD-1290: on a hosted workspace the app's "Manage connections" link opens the AgenticOS Instagram
+ *  connect page top-level. The host composes that URL (the frame never builds it); a local board, or
+ *  any failure, keeps the local connections page. */
+async function connectOrOpen(ctx: ActionContext, args: Record<string, unknown>, ui: { showLink(url: string): void; navigate?: (path: string) => void; assign?: (url: string) => void }): Promise<ActionResult> {
+  if (args.url === "/settings/connections") {
+    try {
+      const reply = await workspaceApps.connectLink(ctx.installId, connectReturnTo(window.location.origin, ctx.installId));
+      if (reply.hosted && reply.url) { (ui.assign ?? (url => window.location.assign(url)))(reply.url); return { ok: true, data: {} }; }
+    } catch { /* keep the local page */ }
+  }
+  return openLink(args, ui);
+}
+
+/** `social.destinations.list`: the company's connected Instagram accounts. Read only. */
+async function listDestinations(args: Record<string, unknown>, ctx: ActionContext): Promise<ActionResult> {
+  if (!exact(args, [])) return refuse("bad_args", "That request is not valid.");
+  const reply = await workspaceApps.destinations(ctx.installId);
+  return { ok: true, data: { unavailable: reply.unavailable, destinations: reply.destinations.map(value => ({ destination_id: value.destination_id, label: accountLabel(value.label || value.destination_id) })) } };
+}
+
+/** `publish.destination.use`: a host-drawn tap points the install's publication binding at one of the
+ *  company's accounts. The label comes from the company's list, never from the frame. */
+async function planUseDestination(ctx: ActionContext, args: Record<string, unknown>): Promise<SlotPlan | ActionRefusal> {
+  if (!exact(args, ["destination_id", "grant_id"]) || typeof args.destination_id !== "string" || typeof args.grant_id !== "string"
+      || !isGrantId(args.grant_id)) return { code: "bad_args", text: "That request is not valid." };
+  const slot = sendSlot(ctx.installation);
+  if (!slot) return { code: "unknown_slot", text: "That isn't available." };
+  const { destination_id: destination, grant_id: grant } = args;
+  try {
+    const listed = await workspaceApps.destinations(ctx.installId);
+    const chosen = listed.destinations.find(value => value.destination_id === destination);
+    if (!chosen) return { code: "unknown_destination", text: "That Instagram account isn't connected." };
+    const contextId = ctx.contextId;
+    const binding = publicationBinding(await workspaceApps.bindings(ctx.installId, contextId || undefined), slot, contextId || null, ctx.installation.digest);
+    const request = randomRequest();
+    return { label: `Use ${accountLabel(chosen.label || destination)} for publishing`, run: async () => {
+      try {
+        await workspaceApps.useDestination(ctx.installId, { destination_id: destination, grant_id: grant,
+          ...(contextId ? { context_id: contextId } : {}),
+          ...(binding ? { expected_revision: binding.revision } : { request_id: request }) });
+        ctx.onChanged();
+        return { ok: true, data: {} };
+      } catch (error) { return { ok: false, refusal: plainRefusal(error) }; }
+    } };
+  } catch (error) { return plainRefusal(error); }
+}
+
 function openLink(args: Record<string, unknown>, ui: { showLink(url: string): void; navigate?: (path: string) => void }): ActionResult {
   if (!exact(args, ["url"]) || typeof args.url !== "string") return refuse("bad_args", "That link is not valid.");
   // A same-origin board path moves the board's router; an external https link
@@ -180,11 +228,12 @@ function openLink(args: Record<string, unknown>, ui: { showLink(url: string): vo
 
 /** The direct (non-spending) verbs. The set is closed in `screenProtocol`. */
 export function runCall(ctx: ActionContext, verb: CallVerb, args: Record<string, unknown>,
-  ui: { showLink(url: string): void; navigate?: (path: string) => void; actionToken?: string }): Promise<ActionResult> {
+  ui: { showLink(url: string): void; navigate?: (path: string) => void; assign?: (url: string) => void; actionToken?: string }): Promise<ActionResult> {
   const table: Record<CallVerb, () => Promise<ActionResult> | ActionResult> = {
     "read.run": () => readRun(ctx, args),
     "context.defaults.save": () => saveDefaults(ctx, args),
-    "open-link": () => openLink(args, ui),
+    "open-link": () => connectOrOpen(ctx, args, ui),
+    "social.destinations.list": () => listDestinations(args, ctx),
     "social.drafts.list": () => socialDraftCall(verb,args,ui),
     "social.drafts.show": () => socialDraftCall(verb,args,ui),
     "social.drafts.create": () => socialDraftCall(verb,args,ui),
@@ -244,6 +293,7 @@ export function makePlanner(get: () => ActionContext): Planner {
   return (verb: SlotVerb, args) => {
     const table: Record<SlotVerb, () => Promise<SlotPlan | ActionRefusal>> = {
       "run.start": () => planRunStart(get(), args),
+      "publish.destination.use": () => planUseDestination(get(), args),
     };
     return table[verb]();
   };

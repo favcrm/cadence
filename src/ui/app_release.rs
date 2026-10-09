@@ -20,6 +20,8 @@ pub(super) enum Route<'a> {
     Decide(&'a str),
     PublishNow(&'a str),
     Resolve(&'a str),
+    /// CAD-1290: `destinations` is an operator read; `connect-link` and `use` are POST writes.
+    Publishing(&'a str, &'a str),
 }
 fn segment(id: &str) -> bool {
     !id.is_empty()
@@ -64,6 +66,11 @@ pub(super) fn route(path: &str) -> Option<Route<'_>> {
         [install, "bindings", binding, "revoke"] if segment(install) && segment(binding) => {
             Some(Route::Revoke(install, binding))
         }
+        [install, "publishing", verb @ ("connect-link" | "destinations" | "use")]
+            if segment(install) =>
+        {
+            Some(Route::Publishing(install, verb))
+        }
         [install, "effects"] if segment(install) => Some(Route::Effects(Some(install), None)),
         [install, "contexts", context, "bindings"] if segment(install) && segment(context) => {
             Some(Route::Bindings(install, Some(context)))
@@ -88,6 +95,7 @@ impl Route<'_> {
                 | Self::Quote(..)
                 | Self::Effects(..)
                 | Self::Effect(_)
+                | Self::Publishing(_, "destinations")
         )
     }
     pub(super) fn is_write(self) -> bool {
@@ -100,6 +108,7 @@ impl Route<'_> {
                 | Self::Decide(_)
                 | Self::PublishNow(_)
                 | Self::Resolve(_)
+                | Self::Publishing(_, "connect-link" | "use")
         )
     }
 }
@@ -114,6 +123,27 @@ struct Create {
     slot: String,
     connection_id: String,
     request_id: String,
+    #[serde(
+        default,
+        deserialize_with = "nonnull_context",
+        skip_serializing_if = "Option::is_none"
+    )]
+    context_id: Option<String>,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ConnectLink {
+    return_to: String,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct UseDestination {
+    destination_id: String,
+    grant_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_revision: Option<u64>,
     #[serde(
         default,
         deserialize_with = "nonnull_context",
@@ -253,7 +283,18 @@ pub(super) fn handle(
                 params["effect_id"] = json!(effect);
                 ("app_effect_resolve", params)
             }
-            Route::Bindings(_, Some(_)) => return Err(err_response(405, "method not allowed")),
+            Route::Publishing(_, "connect-link") => {
+                ("social_connect_link", typed::<ConnectLink>(request)?)
+            }
+            Route::Publishing(_, "destinations") if !write => ("social_destinations", json!({})),
+            Route::Publishing(install, "use") => {
+                let mut params = typed::<UseDestination>(request)?;
+                params["install_id"] = json!(install);
+                ("app_binding_use_destination", params)
+            }
+            Route::Publishing(..) | Route::Bindings(_, Some(_)) => {
+                return Err(err_response(405, "method not allowed"))
+            }
         })
     })();
     let (method, params) = match result {
@@ -334,6 +375,64 @@ mod tests {
         ] {
             assert!(route(path).is_none(), "admitted {path}");
         }
+    }
+    #[test]
+    fn publishing_routes_are_exact_and_destinations_is_the_only_read() {
+        for (path, verb) in [
+            (
+                "/api/app-installations/i/publishing/connect-link",
+                "connect-link",
+            ),
+            (
+                "/api/app-installations/i/publishing/destinations",
+                "destinations",
+            ),
+            ("/api/app-installations/i/publishing/use", "use"),
+        ] {
+            let found = route(path).expect(path);
+            assert!(matches!(found, Route::Publishing("i", v) if v == verb));
+            assert_eq!(found.is_read(), verb == "destinations", "{path}");
+            assert_eq!(found.is_write(), verb != "destinations", "{path}");
+        }
+        for path in [
+            "/api/app-installations/i/publishing",
+            "/api/app-installations/i/publishing/",
+            "/api/app-installations/i/publishing/use/extra",
+            "/api/app-installations/i/publishing/other",
+            "/api/app-installations/i/contexts/c/publishing/use",
+        ] {
+            assert!(route(path).is_none(), "admitted {path}");
+        }
+    }
+    #[test]
+    fn publishing_schemas_reject_forged_authority() {
+        assert!(serde_json::from_str::<ConnectLink>(r#"{"return_to":"https://b/x"}"#).is_ok());
+        assert!(serde_json::from_str::<ConnectLink>(
+            r#"{"return_to":"https://b/x","issuer":"https://evil"}"#
+        )
+        .is_err());
+        let ok = r#"{"destination_id":"d","grant_id":"dpq_abcdefgh","request_id":"r"}"#;
+        assert!(serde_json::from_str::<UseDestination>(ok).is_ok());
+        for field in [
+            "install_id",
+            "destination_label",
+            "label",
+            "toolkit",
+            "timezone",
+            "operator",
+            "connection_id",
+        ] {
+            let mut body: Value = serde_json::from_str(ok).unwrap();
+            body[field] = json!("forged");
+            assert!(
+                serde_json::from_value::<UseDestination>(body).is_err(),
+                "accepted {field}"
+            );
+        }
+        assert!(serde_json::from_str::<UseDestination>(
+            r#"{"destination_id":"d","grant_id":"g","context_id":null}"#
+        )
+        .is_err());
     }
     #[test]
     fn release_schemas_reject_forged_authority_and_caller_content() {

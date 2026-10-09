@@ -72,7 +72,8 @@ export interface SocialDraftEffect {
 export interface AppBinding {
   id: string; install_id: string; context_id: string | null; slot: string;
   revision: number; state: string; digest: string;
-  config: { bundle_digest: string; connection_id: string; provider: string; account: string; mapping: ActionMapping };
+  config: { bundle_digest: string; connection_id: string; provider: string; account: string; mapping: ActionMapping;
+    publish?: { destination_id: string; destination_label: string; toolkit: string } };
   drift?: BindingDrift;
 }
 export interface CompatibilityCheck {
@@ -234,7 +235,16 @@ async function request<T>(path: string, signal?: AbortSignal, body?: object): Pr
   return value as T;
 }
 
+/** One of the company's connected Instagram accounts (CAD-1290). */
+export interface PublishDestination { destination_id: string; label: string; toolkit: string }
 export const workspaceApps = {
+  /** CAD-1290: the host-composed AgenticOS connect link; `hosted:false` on a local board. */
+  connectLink: (id: string, returnTo: string) =>
+    request<{ hosted: boolean; url?: string }>(`${installation(id)}/publishing/connect-link`, undefined, { return_to: returnTo }),
+  destinations: (id: string, signal?: AbortSignal) =>
+    request<{ unavailable: boolean; destinations: PublishDestination[] }>(`${installation(id)}/publishing/destinations`, signal),
+  useDestination: (id: string, body: { destination_id: string; grant_id: string; request_id?: string; expected_revision?: number; context_id?: string }) =>
+    request<{ binding: AppBinding }>(`${installation(id)}/publishing/use`, undefined, body),
   installations: (signal?: AbortSignal) => request<Installation[]>("/api/app-installations", signal),
   detail: (id: string, signal?: AbortSignal) => request<Installation>(installation(id), signal),
   upgradeCheck: (id: string, body: { source: string; expected_digest: string; expected_generation: string }) =>

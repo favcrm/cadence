@@ -22,6 +22,9 @@ import { plainTitle, runLane, statusText, statusTone } from "./presentation";
 import { SlotBindings } from "./SlotBindings";
 import { ReadinessPanel } from "./ReadinessPanel";
 import { TeamSettings } from "./TeamSettings";
+import { PublishToInstagram } from "./PublishToInstagram";
+import { connectOutcome, connectToast, withoutConnectParams } from "./socialConnect";
+import Toast, { type ToastMsg } from "../../ui/Toast";
 import { declaredSlots } from "./bindingChoices";
 import {
   workspaceApps,
@@ -115,6 +118,20 @@ export default function WorkspaceApp({
   const [selectedEffectId, setSelectedEffectId] = useState("");
   const [accessDenied, setAccessDenied] = useState(false);
   const [intentRead, setIntentRead] = useState<IntentRead | undefined>(undefined);
+  // CAD-1290: AgenticOS sends the owner back here with `aos_connect=…`. Say
+  // what happened, drop the params so a reload does not repeat it, and have
+  // the Settings accounts read again.
+  const [connectToastMsg, setConnectToastMsg] = useState<ToastMsg | null>(null);
+  const [connectReturned, setConnectReturned] = useState(0);
+  useEffect(() => {
+    const outcome = connectOutcome(window.location.search);
+    if (!outcome) return;
+    setConnectToastMsg(connectToast(outcome));
+    setConnectReturned(value => value + 1);
+    window.history.replaceState(window.history.state, "", window.location.pathname + withoutConnectParams(window.location.search) + window.location.hash);
+    const timer = window.setTimeout(() => setConnectToastMsg(null), 6000);
+    return () => window.clearTimeout(timer);
+  }, [installId]);
   const clearPrivate = useCallback(() => {
     activeRead.current?.abort();
     activeRead.current = null;
@@ -646,7 +663,7 @@ export default function WorkspaceApp({
     />
   );
   const screen = (fallback: React.ReactNode) => projection
-    ? <><ScreenHost projection={projection} fallback={fallback} loadAsset={screenExtras.loadAsset} actions={screenActions} /></> : fallback;
+    ? <><ScreenHost projection={projection} fallback={fallback} loadAsset={screenExtras.loadAsset} actions={screenActions} /><Toast msg={connectToastMsg} /></> : <>{fallback}<Toast msg={connectToastMsg} /></>;
   if (data && !supportsSocialContentWorkspace(data.installation)) {
     return screen(<main className="workspace-app" aria-label="Workspace app">
       <header className="wa-header"><h1>{data.installation.title || data.installation.name}</h1><Button href="/apps">All apps</Button></header>
@@ -656,6 +673,9 @@ export default function WorkspaceApp({
         <p className="wa-kicker">Installation {installId} · version {data.installation.version}</p>
         <pre className="wa-preview">{data.installation.guide}</pre>
       </section>
+      {actionError && <p className="wa-alert" data-tone="fail" role="alert">{actionError}</p>}
+      <PublishToInstagram installation={data.installation} bindings={data.bindings} contextId={contextId || null}
+        canWrite={canWrite} busy={busy} refreshKey={connectReturned} mutate={mutate} />
     </main>);
   }
   return screen(
@@ -950,6 +970,15 @@ export default function WorkspaceApp({
                   connections={data.connections}
                   canWrite={canWrite}
                   busy={busy}
+                  mutate={mutate}
+                />
+                <PublishToInstagram
+                  installation={data.installation}
+                  bindings={data.bindings}
+                  contextId={contextId || null}
+                  canWrite={canWrite}
+                  busy={busy}
+                  refreshKey={connectReturned}
                   mutate={mutate}
                 />
                 <section className="wa-panel wa-stack">
