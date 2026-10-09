@@ -52,20 +52,18 @@ pub struct DeliveryPolicy {
     pub heavy: SizeLimit,
     /// Over this a delivery cannot merge through the loop.
     pub oversized: SizeLimit,
-    /// CAD-1298: opt-in solo-operator startup profile. `None` on every
-    /// existing/default policy — `skip_serializing_if` keeps a policy without
-    /// it byte-identical, so prior canonical digests and recorded approvals
-    /// are unchanged. The profile only takes effect when the policy that
-    /// carries it resolves as `approved` (`delivery_requirements` reads
-    /// [`Resolved`], never the raw file).
+    /// Optional legacy CAD-1298 profile, retained for compatible reads.
+    /// CAD-1314 needs no profile for default lean classification. Keeping
+    /// `None` omitted preserves existing canonical digests and approvals;
+    /// requirements always use [`Resolved`], never the raw file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub solo_operator: Option<SoloOperatorProfile>,
 }
 
-/// The solo-operator delivery profile (CAD-1298). Presence in an approved
-/// `delivery:` section activates the routine/consequential/sensitive
-/// requirements split; absent (or on an unapproved section) the current
-/// strict requirements apply unchanged. `version` is forward-proofing:
+/// The legacy solo-operator delivery profile (CAD-1298), still readable
+/// after CAD-1314 made the tiers default for valid default-equivalent policies.
+/// Custom, malformed and unapproved policies retain strict requirements.
+/// `version` is forward-proofing:
 /// `1` is the only accepted value, an unknown one refuses the whole
 /// section, so an older binary never silently accepts a profile shape it
 /// does not understand.

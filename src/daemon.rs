@@ -47,7 +47,7 @@ mod cad1212_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1218_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
-mod cad1310_acceptance;
+mod cad1314_approval_acceptance;
 mod caller_rule;
 #[cfg(all(test, feature = "test-seam"))]
 mod campaign_clone_acceptance;
@@ -3407,7 +3407,6 @@ impl Shared {
             "plan_reject" => self.rpc_plan_decide(params, peer_pid, false),
             "epic_stage" => self.rpc_epic_stage(params, peer_pid),
             "project_work_approve" => self.rpc_project_work_approve(params, peer_pid),
-            "project_enable_lean" => self.rpc_project_enable_lean(params, peer_pid),
             "project_new" => self.rpc_project_new(params, peer_pid),
             "area_ack" => self.rpc_area_ack(params, peer_pid),
             "dispatch_record" => self.rpc_dispatch_record(params, peer_pid),

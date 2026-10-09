@@ -120,29 +120,27 @@ PR needs each of the following as a PASS on the exact head you enqueue:
     policy, not per PR; it does not apply to any `human` trigger other
     than reviewer count, and it never lowers the Browser QA,
     qa-verdict-status, or risk-class gates.
-  - **Approved solo-operator delivery profile (CAD-1298):** the legacy policy
-    remains the default. A project may use the approved version-one profile
-    only when it is implemented and activated by the trusted base policy;
-    an optional profile cannot activate or authorize itself. Until that
-    implementation is merged, installed and explicitly activated, this
-    section's existing review and approval requirements govern, including
-    the policy change that introduces the profile. The profile is a bounded
-    startup simplification, not a waiver of evidence or protection gates:
-    routine changes require green exact-head CI and genuine ticket-outcome
-    evidence, but no mandatory review; consequential changes require one
-    independent combined standards-and-spec review. Sensitive changes keep
-    the existing strict review, operator-approval, Browser QA and full-check
-    requirements; no security-reviewer qualification system is introduced.
+  - **Lean delivery defaults (CAD-1314):** the existing version-one
+    routine/consequential/sensitive classification applies to clean default-
+    equivalent policies without a PROJECT.md edit or activation approval.
+    The introducing policy PR still needs the currently installed/trusted-base
+    gates; these defaults cannot waive their own introduction requirements.
+    Approved version-one profiles remain compatible. Explicitly approved
+    custom policies remain in force and strict; malformed, unapproved or
+    unknown policy provenance fails closed. Routine changes still require
+    green exact-head CI and genuine ticket-outcome evidence, but no mandatory
+    review; consequential changes require one independent combined
+    standards-and-spec review. Sensitive changes keep the existing strict
+    review, operator-approval, Browser QA and full-check requirements.
     Unknown, incomplete, protected-mode, deletion and mixed sensitive cases
-    retain the strict legacy floors. Readiness is not a
-    PASS or verdict, and no review may be fabricated. Mandatory protection
-    checks and full merge-group regression remain unchanged. Operator-owned
-    deployment and credential isolation are unchanged. Dry-run inspection
-    is read-only, and
+    retain the strict legacy floors. Readiness is not a PASS or verdict, and
+    no review may be fabricated. Mandatory protection checks and full
+    merge-group regression remain unchanged. Operator-owned deployment and
+    credential isolation are unchanged. Dry-run inspection is read-only, and
     requirements must be freshly bound before queueing. Required operator
     approval must still be recorded through an operator-connection audit
-    event. Existing per-head and scope-approval rules remain unchanged. Conversation or ticket text is
-    not approval evidence.
+    event. Existing per-head and scope-approval rules remain unchanged.
+    Conversation or ticket text is not approval evidence.
   - **The list is mechanical (CAD-957/1099):** `docs/roles/one-review-paths.toml`
     (match rules in its header; exclude wins) is the only list, and
     `scripts/enqueue-reviewed` reads it at the PR's base. It needs no

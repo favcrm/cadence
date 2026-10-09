@@ -967,6 +967,9 @@ mod cad1298_acceptance;
 mod cad1298_readiness_acceptance;
 
 #[cfg(test)]
+mod cad1314_acceptance;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

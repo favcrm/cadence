@@ -14,24 +14,24 @@ The current day-to-day loop (AGENTS.md "Delivery workflow" is the rule text):
 3. Run `scripts/pre-push` before every push. `--tests` is available as a
    focused local diagnostic, not a blanket pre-review prerequisite; required
    CI and the full merge-group regression floor remain unchanged.
-4. Under the legacy default, one independent reviewer; two for auth, identity,
+4. Under strict requirements, one independent reviewer; two for auth, identity,
    secrets, the daemon trees and UI paths (`docs/roles/one-review-paths.toml`
    lists what gets one).
-5. An explicitly activated, trusted-base-approved solo-operator profile may
-   simplify startup using version-one tiers: routine changes need green
-   exact-head CI and genuine ticket-outcome evidence, with no mandatory
-   review; consequential changes need one independent combined standards/spec
-   review. Sensitive changes keep the existing strict review, operator,
-   Browser QA and full-check requirements. Unknown, incomplete, protected-mode,
-   deletion and mixed sensitive cases retain strict legacy floors. Security
-   reviewer qualification and a reduced sensitive review count are deferred.
-   The legacy policy remains the default, and the policy change itself stays
-   under current requirements until the implementation is merged, installed
-   and explicitly activated. The profile cannot self-authorize. Mandatory
-   protection checks, full merge-group regression, credential isolation and
-   operator-owned deployment remain unchanged. No fabricated verdict/readiness
-   counts as review or outcome evidence; dry-run is read-only and requirements
-   must be freshly bound before queueing.
+5. The version-one delivery tiers apply to clean default-equivalent policies
+   by default after the reviewed implementation is installed; the introducing
+   PR must still satisfy the current trusted-base gates. Routine changes need
+   green exact-head CI and genuine
+   ticket-outcome evidence, with no mandatory review; consequential changes
+   need one independent combined standards/spec review. Sensitive changes
+   keep the existing strict review, operator, Browser QA and full-check
+   requirements. Unknown, incomplete, protected-mode, deletion and mixed
+   sensitive cases retain strict legacy floors. Explicitly approved custom
+   policies remain in force and strict; malformed or unapproved policy changes
+   fail closed. Approved version-one profiles remain readable for compatibility.
+   Mandatory protection checks, full merge-group regression, credential
+   isolation and operator-owned deployment remain unchanged. No fabricated
+   verdict/readiness counts as review or outcome evidence; dry-run is read-only
+   and requirements must be freshly bound before queueing.
 6. Review notes never block. Findings that are not defects go in a follow-up
    PR, not into this head.
 7. Operator approval: for a `human`-class PR the operator records ONE scope
