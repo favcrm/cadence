@@ -54,3 +54,4 @@ docs/guides/*
 !docs/guides/wiki-knowledge.md
 !docs/guides/external-agents-social.md
 !docs/guides/crm-package-setup.md
+!docs/guides/chat-attachments.md

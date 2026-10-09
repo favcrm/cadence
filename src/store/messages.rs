@@ -369,6 +369,7 @@ impl Store {
             &Steer::NONE,
             None,
             None,
+            None,
         )
     }
 
@@ -411,6 +412,7 @@ impl Store {
         steer: &Steer,
         refs: Option<&Value>,
         app: Option<&Value>,
+        attachments: Option<&Value>,
     ) -> Result<(bool, String)> {
         self.write_tx(|conn| {
             let tx = &mut *conn;
@@ -454,6 +456,7 @@ impl Store {
                 steer.priority,
                 refs,
                 app,
+                attachments,
             )?;
             for old in &superseded {
                 self.supersede_in(&tx, old, id, steer)?;
@@ -539,6 +542,7 @@ impl Store {
                 &Sender::Unattributed,
                 Priority::Normal,
                 true,
+                None,
                 None,
                 None,
             )?;
@@ -828,6 +832,7 @@ impl Store {
                 steer.priority,
                 None,
                 None,
+                None,
             )?;
             if duplicate {
                 // The stored row is authoritative: the retry learns the
@@ -1034,10 +1039,24 @@ impl Store {
         priority: Priority,
         refs: Option<&Value>,
         app: Option<&Value>,
+        attachments: Option<&Value>,
     ) -> Result<(bool, String)> {
         self.enqueue_tx_as(
-            tx, alias, body, reply_to, id, source, task_id, issue, worktree, sender, priority,
-            false, refs, app,
+            tx,
+            alias,
+            body,
+            reply_to,
+            id,
+            source,
+            task_id,
+            issue,
+            worktree,
+            sender,
+            priority,
+            false,
+            refs,
+            app,
+            attachments,
         )
     }
 
@@ -1058,6 +1077,7 @@ impl Store {
         daemon: bool,
         refs: Option<&Value>,
         app: Option<&Value>,
+        attachments: Option<&Value>,
     ) -> Result<(bool, String)> {
         if !daemon {
             crate::proto::caller_message(id, source)?;
@@ -1097,7 +1117,8 @@ impl Store {
                 && old.worktree.as_deref() == worktree
                 && old.priority == priority
                 && Self::entry_refs_in(tx, id)? == refs.cloned()
-                && Self::entry_app_in(tx, id)? == app.cloned();
+                && Self::entry_app_in(tx, id)? == app.cloned()
+                && Self::entry_attachments_in(tx, id)? == attachments.cloned();
             if !same {
                 return Err(Error::rejected(
                     "Message id was already used with different content",
@@ -1138,7 +1159,17 @@ impl Store {
             task_id,
         )?;
         if source != "app_run_dispatch" {
-            Self::thread_note_enqueued(tx, alias, sender, source, body, id, refs, app)?;
+            Self::thread_note_enqueued(
+                tx,
+                alias,
+                sender,
+                source,
+                body,
+                id,
+                refs,
+                app,
+                attachments,
+            )?;
         }
         Ok((false, "queued".to_string()))
     }

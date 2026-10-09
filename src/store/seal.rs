@@ -57,8 +57,9 @@ fn raw_lease_refusal(reason: String) -> rusqlite::Error {
 /// protected schema is `Unknown`, never default-open. v35 and v36 add only the
 /// standalone `app_tool_claims`/`app_tool_results` tables and one retrofitted `app_run_failures` — they touch no
 /// sealed/witnessed surface, so the guard's assumptions are unchanged.
+/// v37 (CAD-1168) adds only the `chat_files` table, likewise.
 #[allow(dead_code)]
-const PROTECTED_SCHEMA_MAX: i64 = 36;
+const PROTECTED_SCHEMA_MAX: i64 = 37;
 
 /// Arm level + transaction-control phase, shared between the `Store` and
 /// the connection's authorizer. Atomic because the authorizer callback must
@@ -2477,6 +2478,82 @@ mod tests {
         assert_eq!(
             witnessed, actual,
             "witness must record the actual schema, not a supported ceiling"
+        );
+    }
+
+    #[test]
+    fn owner_witness_refuses_unsupported_actual_database_schema() {
+        let dir = TempDir::new().unwrap();
+        let (db, store) = open_legacy(&dir);
+        // Corrupt only this temporary fixture through an independent raw
+        // SQLite connection: Store's authorizer must keep denying that UPDATE.
+        // This is malformed metadata, not evidence of native owner authority.
+        let fixture = Connection::open(&db).unwrap();
+        fixture
+            .execute("UPDATE schema_version SET version=38", [])
+            .unwrap();
+        drop(fixture);
+        store
+            .propose_close(
+                &permit(&db, OwnerOp::Close, b"schema-38", "attempt-38", "art", 38),
+                "test",
+            )
+            .unwrap();
+
+        let latch_before: (i64, i64, Vec<u8>, String, Option<String>, i64) = store
+            .conn()
+            .query_row(
+                "SELECT closed,witness_done,challenge,attempt,artifact,epoch FROM closure_state WHERE id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            )
+            .unwrap();
+        assert_eq!(latch_before.0, 1, "fixture must be sealed before witness");
+        assert_eq!(latch_before.1, 0, "fixture must not already have a witness");
+        let events_before: i64 = store
+            .conn()
+            .query_row("SELECT count(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+
+        let err = store
+            .witness_commit(&permit(
+                &db,
+                OwnerOp::Witness,
+                b"schema-38",
+                "attempt-38",
+                "art",
+                38,
+            ))
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Rejected(message) if message == "owner witness database schema is unsupported"),
+            "must fail at the actual schema guard, got: {err}"
+        );
+
+        let latch_after: (i64, i64, Vec<u8>, String, Option<String>, i64) = store
+            .conn()
+            .query_row(
+                "SELECT closed,witness_done,challenge,attempt,artifact,epoch FROM closure_state WHERE id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            latch_after, latch_before,
+            "refusal must retain sealed latch"
+        );
+        let witness_rows: i64 = store
+            .conn()
+            .query_row("SELECT count(*) FROM owner_witness", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(witness_rows, 0, "refusal must not commit a witness row");
+        let events_after: i64 = store
+            .conn()
+            .query_row("SELECT count(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            events_after, events_before,
+            "refusal must leave business rows unchanged"
         );
     }
 

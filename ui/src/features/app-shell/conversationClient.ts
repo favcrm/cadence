@@ -1,9 +1,9 @@
-import { useCallback, useSyncExternalStore } from "react";
+import { useCallback, useLayoutEffect, useRef, useSyncExternalStore } from "react";
 import { api, ApiError } from "../../lib/api";
 import { cache, resources } from "../../lib/resources";
 import { useQuery } from "../../lib/useResource";
 import type { Resource } from "../../lib/cache";
-import type { MasterState } from "../../lib/types";
+import type { MasterState, ThreadRef } from "../../lib/types";
 import { EMPTY_THREAD, loadThread, type PageReader, type ThreadEntry, type ThreadState, type PendingMessage } from "../home/thread";
 
 /**
@@ -108,31 +108,68 @@ export const conversationList = (installId: string): Resource<ConversationList> 
 
 const inflight = new Map<string, Promise<Conversation>>();
 
+/** Bumped by every explicit selection change (a picker choice, a new
+ *  draft subject). A create that resolves after the operator chose
+ *  another conversation must not yank the picker back to its result. */
+let selectionEpoch = 0;
+const selectionActionEpochs = new Map<string, number>();
+
+function markSelectionAction(installId: string): void {
+  selectionActionEpochs.set(installId, (selectionActionEpochs.get(installId) ?? 0) + 1);
+}
+
+/** Invalidate pending create auto-selection when the displayed frame visits a new owner. */
+export function invalidateConversationSelection(): void {
+  selectionEpoch += 1;
+}
+
 /** Create (or, for a subject, open) a conversation, then refresh the list.
- *  Concurrent calls for the same install and subject share one request. */
+ *  Concurrent calls for the same install, subject AND context share one
+ *  request: the daemon's idempotent subject open is only the same request
+ *  when the full creation binding matches. A differently bound request
+ *  (another context) never borrows the first response — it obtains its
+ *  own server validation instead of silently reusing a result minted for
+ *  a different scope. The created conversation is selected only when the
+ *  operator has not chosen another one while the request was in flight;
+ *  the caller still receives the id so a create-on-first-send reaches its
+ *  original destination. */
 export function createConversation(
   installId: string,
   contextId: string,
   subject?: string,
+  options: { shouldSelect?: () => boolean } = {},
 ): Promise<Conversation> {
-  const key = `${installId}|${subject ?? ""}`;
-  const pending = inflight.get(key);
-  if (pending && subject) return pending;
-  const run = api
-    .conversationCreate(installId, contextId, subject)
-    .then((raw) => {
-      const c = parseConversation(raw.conversation);
-      if (!c) throw new Error("The assistant did not return a conversation.");
-      return c;
-    })
-    .then(async (c) => {
-      await conversationList(installId).refresh();
-      selectConversation(installId, c.id);
-      return c;
-    })
-    .finally(() => inflight.delete(key));
-  if (subject) inflight.set(key, run);
-  return run;
+  // The full captured creation binding is the identity: install, context
+  // and subject. Context is part of it — the daemon proves the scope on
+  // create, so two requests for the same subject under different contexts
+  // are different requests, not one shared idempotent open.
+  const key = `${installId}|${contextId}|${subject ?? ""}`;
+  let request = subject ? inflight.get(key) : undefined;
+  if (request === undefined) {
+    const run = api
+      .conversationCreate(installId, contextId, subject)
+      .then((raw) => {
+        const c = parseConversation(raw.conversation);
+        if (!c) throw new Error("The assistant did not return a conversation.");
+        return c;
+      })
+      .then(async (c) => {
+        await conversationList(installId).refresh();
+        return c;
+      })
+      .finally(() => {
+        if (subject && inflight.get(key) === run) inflight.delete(key);
+      });
+    request = run;
+    if (subject) inflight.set(key, run);
+  }
+  const epoch = selectionEpoch;
+  return request.then((conversation) => {
+    if (selectionEpoch === epoch && (options.shouldSelect?.() ?? true)) {
+      selectConversation(installId, conversation.id);
+    }
+    return conversation;
+  });
 }
 
 /** The campaign's conversation id (created idempotently); null when the
@@ -166,7 +203,9 @@ export async function autoSelectCampaignConversation(
 
 // --- threads -------------------------------------------------------------
 
-function conversationReader(conversation: string): PageReader {
+/** Page reads of one conversation's thread (CAD-1168: the pane pages
+ *  earlier entries within the selected conversation through `before`). */
+export function conversationReader(conversation: string): PageReader {
   return {
     after: (after, limit) => api.thread("master", { after, limit, conversation }),
     tail: (limit) => api.thread("master", { tail: true, limit, conversation }),
@@ -218,14 +257,90 @@ const drafts = new Map<string, string>();
 export function setDraftSubject(installId: string, subject: string | null) {
   if (subject === null) drafts.delete(installId);
   else drafts.set(installId, subject);
+  selectionEpoch += 1;
+  markSelectionAction(installId);
   notify();
 }
 export function useDraftSubject(installId: string): string | null {
   return useSyncExternalStore(subscribe, () => drafts.get(installId) ?? null);
 }
 
+// --- the submitted-envelope outbox (CAD-1168) ----------------------------
+
+/**
+ * One immutable submitted envelope per original composer key, held from
+ * the moment a send is handed off until its destination's own pending
+ * store owns it. A create-on-first-send failure keeps the exact original
+ * request here — message id, body, refs, file ids and captured
+ * destination — so an explicit Retry resends that envelope and nothing
+ * else, beside any later unsent draft. The shared `idleThread` is never
+ * used for this: it is not scoped per installation/subject, so another
+ * scope's request would leak into it.
+ */
+export interface OutboxEnvelope {
+  message: string;
+  text: string;
+  refs?: ThreadRef[];
+  attachments?: { id: string }[];
+  app?: { install_id: string; context_id?: string };
+  /** The unsaved subject this envelope was submitted under — a retry
+   *  creates/opens THIS subject, never the route's current one. */
+  subject?: string;
+  at: number;
+  state: "sending" | "failed";
+  error?: string;
+}
+
+const outbox = new Map<string, OutboxEnvelope>();
+const outboxListeners = new Set<() => void>();
+
+function outboxNotify(): void {
+  for (const listener of outboxListeners) listener();
+}
+
+/** Subscribe a pane to the outbox — module state, one entry per key. */
+export function subscribeOutbox(listener: () => void): () => void {
+  outboxListeners.add(listener);
+  return () => {
+    outboxListeners.delete(listener);
+  };
+}
+
+/** The submitted envelope still awaiting its destination's pending row. */
+export function outboxFor(key: string): OutboxEnvelope | null {
+  return outbox.get(key) ?? null;
+}
+
+export function putOutbox(key: string, envelope: OutboxEnvelope): boolean {
+  const held = outbox.get(key);
+  // An unresolved submitted owner is never replaced implicitly: a new
+  // ordinary submission is refused until the operator retries or
+  // discards the original. A state update for the SAME message id (a
+  // retry, or a failure recorded for the original) is not a replacement.
+  if (held && held.message !== envelope.message) return false;
+  outbox.set(key, envelope);
+  outboxNotify();
+  return true;
+}
+
+/** Drop the outbox entry for `key` only when it is still `message`'s — a
+ *  newer envelope is never removed by an older settlement. */
+export function removeOutbox(key: string, message: string): void {
+  const held = outbox.get(key);
+  if (!held || held.message !== message) return;
+  outbox.delete(key);
+  outboxNotify();
+}
+
+/** The pane's typed drafts and attachment queues now live in
+ *  `chat/composerStore.ts`, keyed by the same `install|conversation`
+ *  identity the composer receives as `storeKey` — one lifetime rule for
+ *  text and files, and an in-flight upload survives the remount. */
+
 export function selectConversation(installId: string, id: string) {
   drafts.delete(installId);
+  selectionEpoch += 1;
+  markSelectionAction(installId);
   writeKey(`chat-conv:${installId}`, id);
   notify();
 }
@@ -250,6 +365,26 @@ export function useChatCollapsed(installId: string): [boolean, (next: boolean) =
   return [raw === "1", set];
 }
 
+export interface ConversationLinkRequest {
+  /** A new value for every visit to a different query target, including A→B→A. */
+  visit: number;
+  /** Parsed URL selector only; the installation's server list proves membership. */
+  target: string | null;
+  /** Malformed, empty or duplicate query values fail without selecting a thread. */
+  error: string | null;
+  /** Optional context selector paired with a permalink; never an authority claim. */
+  contextTarget?: string | null;
+  contextError?: string | null;
+}
+
+export interface ConversationContextProof {
+  /** The shell is still reading its verified installation/context receipt. */
+  status: "pending" | "ready" | "failed";
+  /** The current context from the shell's verified binding, not from the URL. */
+  contextId: string | null;
+  error: string | null;
+}
+
 export interface ActiveConversation {
   state: "loading" | "failed" | "legacy" | "ready";
   error: string | null;
@@ -257,34 +392,248 @@ export interface ActiveConversation {
   selected: Conversation | null;
   /** `campaign:<id>` while the chat shows a not-yet-created campaign conversation. */
   draftSubject: string | null;
+  /** An explicit host permalink is waiting for or failed server-list validation. */
+  requestPending: boolean;
+  requestError: string | null;
   /** The thread store the chat shows; null until a conversation resolves. */
   store: Resource<ThreadState> | null;
   retry: () => void;
 }
 
 /** The install's conversations plus the one the chat is showing. */
-export function useActiveConversation(installId: string): ActiveConversation {
+export function useActiveConversation(
+  installId: string,
+  request: ConversationLinkRequest | null = null,
+  contextProof: ConversationContextProof = { status: "ready", contextId: null, error: null },
+): ActiveConversation {
   const res = conversationList(installId);
   const list = useQuery(res);
   const stored = useSelectedConversationId(installId);
   const draft = useDraftSubject(installId);
+  const selectionAction = useSyncExternalStore(
+    subscribe,
+    () => selectionActionEpochs.get(installId) ?? 0,
+  );
   const retry = useCallback(() => void res.refresh(), [res]);
   const data = list.data;
+  const consumedVisit = useRef<number | null>(null);
+  const recordedLinkVisit = useRef<number | null>(null);
+  const appliedLinkAction = useRef<{ visit: number; action: number } | null>(null);
+  const linkedContextRef = useRef<{ installId: string; target: string; contextId: string; action: number } | null>(null);
+  const contextTarget = request?.contextTarget ?? null;
+  const contextError = request?.contextError ?? null;
+  const contextMismatch =
+    contextTarget !== null &&
+    contextProof.status === "ready" &&
+    contextProof.contextId !== contextTarget;
+  const verifiedContextError =
+    contextError ??
+    (contextTarget === null
+      ? null
+      : contextProof.status === "failed"
+        ? contextProof.error ?? "The linked context could not be verified — nothing was opened."
+        : contextProof.error ??
+          (contextMismatch
+            ? "The linked context does not match this installation's verified current context — nothing was opened."
+            : null));
+  const contextPending = contextTarget !== null && contextProof.status === "pending";
+  const contextMatches = contextTarget === null ||
+    (contextProof.status === "ready" && contextProof.contextId === contextTarget && verifiedContextError === null);
+  const requestedRows =
+    request?.error === null && request.target !== null && data !== null && !data.legacy
+      ? data.conversations.filter((conversation) => conversation.id === request.target)
+      : [];
+  const requested = requestedRows.length === 1 ? requestedRows[0] : null;
+  const requestConsumed = request !== null && consumedVisit.current === request.visit;
+  useLayoutEffect(() => {
+    if (request === null || recordedLinkVisit.current === request.visit) return;
+    recordedLinkVisit.current = request.visit;
+    if (request.target !== null && contextTarget !== null) {
+      linkedContextRef.current = {
+        installId,
+        target: request.target,
+        contextId: contextTarget,
+        action: selectionAction,
+      };
+    } else {
+      linkedContextRef.current = null;
+    }
+  }, [contextTarget, installId, request, selectionAction]);
+  // A consumed context-scoped request keeps owning its selector until an
+  // explicit selection action or URL removal. Pending, failed and mismatched
+  // receipts therefore remain closed under the request's visible error.
+  const requestManuallyChanged =
+    request !== null &&
+    requestConsumed &&
+    appliedLinkAction.current?.visit === request.visit &&
+    appliedLinkAction.current.action !== selectionAction;
+  const linkedContext = linkedContextRef.current;
+  const retiredLinkStillSelected =
+    request === null &&
+    linkedContext !== null &&
+    linkedContext.installId === installId &&
+    linkedContext.action === selectionAction &&
+    stored === linkedContext.target &&
+    draft === null;
+  const retiredContextPending = retiredLinkStillSelected && contextProof.status === "pending";
+  const retiredContextError = retiredLinkStillSelected && contextProof.status === "failed"
+    ? contextProof.error ?? "The conversation's original context could not be verified — chat remains closed."
+    : null;
+  const retiredContextChanged = retiredLinkStillSelected && contextProof.status === "ready" &&
+    contextProof.contextId !== linkedContext?.contextId;
+  const requestOwnsSelection =
+    request !== null &&
+    (!requestConsumed ||
+      (!requestManuallyChanged && stored === request.target && draft === null));
+  const ignoreExpiredLinkedPick = retiredContextChanged;
+
+  useLayoutEffect(() => {
+    if (!ignoreExpiredLinkedPick || data === null || data.legacy || draft !== null) return;
+    const fallback = resolveSelected(data.conversations, null);
+    if (fallback !== null && stored !== fallback.id) selectConversation(installId, fallback.id);
+  }, [data, draft, ignoreExpiredLinkedPick, installId, stored]);
+
+  useLayoutEffect(() => {
+    if (
+      request === null ||
+      request.error !== null ||
+      verifiedContextError !== null ||
+      contextPending ||
+      !contextMatches ||
+      request.target === null ||
+      requestConsumed ||
+      data === null ||
+      data.legacy ||
+      requestedRows.length !== 1
+    ) {
+      return;
+    }
+    // Mark before notifying subscribers so the next render resolves from
+    // the ordinary stored selection; picker/New/campaign choices then win.
+    consumedVisit.current = request.visit;
+    selectConversation(installId, request.target);
+    appliedLinkAction.current = {
+      visit: request.visit,
+      action: selectionActionEpochs.get(installId) ?? 0,
+    };
+    if (contextTarget !== null) {
+      linkedContextRef.current = {
+        installId,
+        target: request.target,
+        contextId: contextTarget,
+        action: selectionActionEpochs.get(installId) ?? 0,
+      };
+    }
+  }, [
+    contextMatches,
+    contextPending,
+    data,
+    installId,
+    request,
+    requestConsumed,
+    requestManuallyChanged,
+    requestedRows.length,
+    selectionAction,
+    contextTarget,
+    verifiedContextError,
+  ]);
+
   if (data === null) {
     const failed = list.status === "failed";
-    return { state: failed ? "failed" : "loading", error: failed ? (list.error ?? "request failed") : null, conversations: [], selected: null, draftSubject: null, store: null, retry };
+    return {
+      state: failed ? "failed" : "loading",
+      error: failed ? (list.error ?? "request failed") : null,
+      conversations: [],
+      selected: null,
+      draftSubject: null,
+      requestPending:
+        (request !== null && request.error === null && verifiedContextError === null && !failed) || retiredContextPending,
+      requestError: request?.error ?? verifiedContextError ?? retiredContextError,
+      store: null,
+      retry,
+    };
   }
   if (data.legacy) {
-    return { state: "legacy", error: null, conversations: [], selected: null, draftSubject: null, store: resources.masterThread, retry };
+    return {
+      state: "legacy",
+      error: null,
+      conversations: [],
+      selected: null,
+      draftSubject: null,
+      requestPending: false,
+      requestError: requestOwnsSelection
+        ? request?.error ?? verifiedContextError ?? "This installation does not support linked conversations — nothing was opened."
+        : retiredContextError,
+      // An explicit conversation request must never fall back to Home's thread.
+      store: request === null && !retiredLinkStillSelected ? resources.masterThread : null,
+      retry,
+    };
   }
-  const draftOpen = draft !== null && !data.conversations.some((c) => c.subject === draft);
-  const selected = draftOpen ? null : resolveSelected(data.conversations, stored);
+
+  if (request === null && retiredLinkStillSelected && (retiredContextPending || retiredContextError !== null)) {
+    return {
+      state: "ready",
+      error: null,
+      conversations: data.conversations,
+      selected: null,
+      draftSubject: null,
+      requestPending: retiredContextPending,
+      requestError: retiredContextError,
+      store: null,
+      retry,
+    };
+  }
+
+  if (requestOwnsSelection) {
+    let requestError = request?.error ?? verifiedContextError;
+    if (requestError === null && contextPending) {
+      return {
+        state: "ready",
+        error: null,
+        conversations: data.conversations,
+        selected: null,
+        draftSubject: null,
+        requestPending: true,
+        requestError: null,
+        store: null,
+        retry,
+      };
+    }
+    if (requestError === null && requestedRows.length > 1) {
+      requestError = "This installation returned duplicate rows for the linked conversation — nothing was opened.";
+    } else if (requestError === null && requestedRows.length === 0) {
+      requestError = "The linked conversation is not available in this installation — nothing was opened.";
+    }
+    return {
+      state: "ready",
+      error: null,
+      conversations: data.conversations,
+      selected: requestError === null ? requested : null,
+      draftSubject: null,
+      requestPending: false,
+      requestError,
+      store: requestError === null && requested ? conversationThread(requested.id) : null,
+      retry,
+    };
+  }
+
+  // Keep an explicitly opened unsaved-subject frame stable through the
+  // create request's own list refresh. The refreshed list may contain the
+  // new subject before createConversation performs its guarded selection;
+  // resolving General in that interval would invalidate that same visit
+  // and strand its source draft. Explicit selection clears this draft.
+  const draftOpen = draft !== null;
+  const selected = draftOpen
+    ? null
+    : resolveSelected(data.conversations, ignoreExpiredLinkedPick ? null : stored);
   return {
     state: "ready",
     error: null,
     conversations: data.conversations,
     selected,
     draftSubject: draftOpen ? draft : null,
+    requestPending: false,
+    requestError: null,
     store: draftOpen ? idleThread : selected ? conversationThread(selected.id) : null,
     retry,
   };

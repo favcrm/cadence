@@ -81,8 +81,8 @@ pub(crate) use serve::{
 pub(crate) use stream::{dir_mtime, event_resources, projects_payload, value_fp};
 pub(crate) use write_path::{
     agent_roots, busy_response, coded_response, guard_fail, header_value, issue_payloads,
-    parse_json, proxied_actor, read_body, tailnet_proxy, with_agents, write_err, write_guard,
-    write_reply, HttpResp, JSON_CAP, UI_ACTOR,
+    parse_json, parse_multipart, proxied_actor, read_body, tailnet_proxy, with_agents, write_err,
+    write_guard, write_reply, HttpResp, JSON_CAP, UI_ACTOR,
 };
 
 /// The options `ui run` and `ui start` share. Every field is optional:

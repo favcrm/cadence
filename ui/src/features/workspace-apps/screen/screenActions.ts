@@ -19,6 +19,8 @@ export interface ActionContext {
   installId: string;
   contextId: string;
   runs: WorkspaceRun[];
+  /** Select a context after its defaults were successfully saved. */
+  onSavedContext?: (saved: AppContext) => void;
   /** Reload the board's data after a write. */
   onChanged: () => void | Promise<void>;
 }
@@ -143,7 +145,8 @@ async function saveDefaults(ctx: ActionContext, args: Record<string, unknown>): 
   await ctx.onChanged();
   // The defaults live in this context: make it the board's selection so the
   // frame (and the runs it starts) read and use them.
-  rememberContext(ctx.installId, saved.id);
+  if (ctx.onSavedContext) ctx.onSavedContext(saved);
+  else rememberContext(ctx.installId, saved.id);
   return { ok: true, data: { context_id: saved.id, revision: saved.revision } };
 }
 

@@ -428,6 +428,7 @@ fn message_entry<'a>(
     id: &'a str,
     refs: Option<&Value>,
     app: Option<&Value>,
+    attachments: Option<&Value>,
 ) -> NewEntry<'a> {
     let (role, mut payload) = match sender {
         Sender::Operator | Sender::OperatorChat => (ROLE_OPERATOR, json!({"source": source})),
@@ -441,6 +442,12 @@ fn message_entry<'a>(
     // at send time, read back by the board and the master turn.
     if let Some(app) = app {
         payload["app"] = app.clone();
+    }
+    // CAD-1168: the daemon-resolved attachment metadata — the ids the
+    // send named are verified against `chat_files` before this rides
+    // the payload, so a stored row is always a real retained file.
+    if let Some(attachments) = attachments {
+        payload["attachments"] = attachments.clone();
     }
     NewEntry {
         role,
@@ -970,8 +977,9 @@ impl Store {
         id: &str,
         refs: Option<&Value>,
         app: Option<&Value>,
+        attachments: Option<&Value>,
     ) -> Result<()> {
-        let entry = message_entry(sender, source, body, id, refs, app);
+        let entry = message_entry(sender, source, body, id, refs, app, attachments);
         // CAD-1098: a verified App binding lands the message in the
         // conversation the server resolves (the client's selector is
         // checked, never trusted). The thread is fixed here, in the
@@ -1081,6 +1089,25 @@ impl Store {
     /// content comparison.
     pub(super) fn entry_refs_in(tx: &impl super::StoreConn, id: &str) -> Result<Option<Value>> {
         Self::entry_payload_field_in(tx, id, "refs")
+    }
+
+    /// The stored `payload.attachments` of `message_id`'s enqueue
+    /// entry — metadata rows only ({id,name,size,mime,sha256}), what
+    /// `delivery_body` renders into the attachment envelope. `None`
+    /// when the entry carries none.
+    pub fn message_attachments(&self, message_id: &str) -> Result<Option<Value>> {
+        let conn = self.conn();
+        Self::entry_attachments_in(&conn, message_id)
+    }
+
+    /// The attachments the enqueue note for `id` recorded (CAD-1168),
+    /// `None` when its payload carries none — the stored side of the
+    /// retry's content comparison.
+    pub(super) fn entry_attachments_in(
+        tx: &impl super::StoreConn,
+        id: &str,
+    ) -> Result<Option<Value>> {
+        Self::entry_payload_field_in(tx, id, "attachments")
     }
 
     /// One named field of the enqueue note's payload for `id`, `None`
@@ -2183,6 +2210,7 @@ mod tests {
             &Steer::NONE,
             None,
             Some(&stamp),
+            None,
         )
         .unwrap();
         let hint = s.message_app("m-1").unwrap().expect("fresh hint");
@@ -2205,6 +2233,7 @@ mod tests {
             None,
             &Sender::OperatorChat,
             &Steer::NONE,
+            None,
             None,
             None,
         )

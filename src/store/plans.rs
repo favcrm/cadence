@@ -771,6 +771,7 @@ impl Store {
                 Priority::Normal,
                 None,
                 None,
+                None,
             )?;
             if duplicate {
                 return Ok((task, kickoff, true, false));

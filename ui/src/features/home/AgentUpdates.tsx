@@ -133,7 +133,7 @@ function AgentCard({ agent, reports, onAsk, onOpenIssue }: {
       {line.text}
       {line.retry && <button type="button" className="lnk text-micro ml-2" onClick={() => setAttempt((n) => n + 1)}>Retry</button>}
     </p>}
-    <button className="lnk text-label mt-3" onClick={() => onAsk(agent, recent[0])}>Ask Master about this <span aria-hidden>↗</span></button>
+    <button className="lnk text-label mt-3" onClick={() => onAsk(agent, recent[0])}>Ask the Assistant about this <span aria-hidden>↗</span></button>
   </li>;
 }
 
@@ -149,10 +149,10 @@ export default function AgentUpdates({ onAsk, onOpenIssue }: {
     return { ...agent, last_activity: latest > 0 ? new Date(latest).toISOString() : agent.last_activity };
   }));
   return <div>
-    <p className="px-4 py-3 text-label text-ink-500 border-b border-ink-700">Recent work across all projects. Ask Master to check in or explain an update.</p>
+    <p className="px-4 py-3 text-label text-ink-500 border-b border-ink-700">Recent work across all projects. Ask the Assistant to check in or explain an update.</p>
     {!state.data && <p className="px-4 py-4 text-label text-ink-500">{state.status === "failed" ? `Agent updates unavailable — ${state.error}` : "Reading agent activity…"}</p>}
     {state.data && state.data.daemon === "unreachable" && <p className="px-4 py-3 text-label text-warn">Daemon unreachable. Showing the last available activity.</p>}
-    {state.data && agents.length === 0 && <p className="px-4 py-6 text-label text-ink-400">No agent activity yet. Ask Master to plan the next job.</p>}
+    {state.data && agents.length === 0 && <p className="px-4 py-6 text-label text-ink-400">No agent activity yet. Ask the Assistant to plan the next job.</p>}
     <ul>{agents.map((agent) => <AgentCard key={agent.alias} agent={agent} reports={reports.get(agent.alias) ?? []} onAsk={onAsk} onOpenIssue={onOpenIssue} />)}</ul>
     {agents.length === 12 && <p className="px-4 py-3 text-micro text-ink-500">Showing the 12 most recently active agents. See Team overview for everyone.</p>}
   </div>;

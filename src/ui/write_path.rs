@@ -409,6 +409,97 @@ pub(crate) fn write_err(e: &Error) -> HttpResp {
     }
 }
 
+/// `needle`'s first offset in `hay`.
+pub(crate) fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+pub(crate) type Multipart = (std::collections::BTreeMap<String, String>, Option<Vec<u8>>);
+
+/// The simplest multipart reader that is still strict — and byte-safe:
+/// file payloads never pass through a UTF-8 decode. The body must be
+/// `--b\r\n<part-headers>\r\n\r\n<payload>\r\n--b\r\n…\r\n--b--`.
+/// Named fields land in `fields`; the FIRST `file` part's raw payload
+/// is the upload. A payload containing `\r\n--b` truncates early —
+/// the boundary is the client's own random marker, as the format
+/// intends.
+pub(crate) fn parse_multipart(
+    body: &[u8],
+    boundary: &str,
+) -> std::result::Result<Multipart, String> {
+    let delim = format!("--{boundary}").into_bytes();
+    let crlf_delim = {
+        let mut v = b"\r\n".to_vec();
+        v.extend_from_slice(&delim);
+        v
+    };
+    let mut fields = std::collections::BTreeMap::new();
+    let mut file = None;
+    let mut pos = 0;
+    loop {
+        if !body[pos..].starts_with(&delim) {
+            return Err("multipart part does not start with the boundary".to_string());
+        }
+        pos += delim.len();
+        if body[pos..].starts_with(b"--") {
+            break; // the final delimiter
+        }
+        if body[pos..].starts_with(b"\r\n") {
+            pos += 2;
+        } else {
+            return Err("multipart boundary is not followed by a part".to_string());
+        }
+        let rest = &body[pos..];
+        let Some(hdr_len) = find_sub(rest, b"\r\n\r\n") else {
+            return Err("multipart part with no header/body split".to_string());
+        };
+        let headers = String::from_utf8_lossy(&rest[..hdr_len]);
+        let content_start = pos + hdr_len + 4;
+        let Some(rel_end) = find_sub(&body[content_start..], &crlf_delim) else {
+            return Err("multipart part never terminates".to_string());
+        };
+        let payload = &body[content_start..content_start + rel_end];
+        let mut name = None;
+        let mut filename = None;
+        for line in headers.lines() {
+            if line
+                .to_ascii_lowercase()
+                .starts_with("content-disposition:")
+            {
+                for seg in line.split(';') {
+                    let seg = seg.trim();
+                    if let Some(v) = seg.strip_prefix("name=") {
+                        name = Some(v.trim_matches('"').to_string());
+                    } else if let Some(v) = seg.strip_prefix("filename=") {
+                        filename = Some(v.trim_matches('"').to_string());
+                    }
+                }
+            }
+        }
+        match name.as_deref() {
+            Some("file") => {
+                if file.is_none() {
+                    file = Some(payload.to_vec());
+                    // The part's own filename rides as `filename` — a
+                    // display hint only; the daemon sanitizes it.
+                    if let Some(f) = filename {
+                        fields.entry("filename".to_string()).or_insert(f);
+                    }
+                }
+            }
+            Some(n) => {
+                fields.insert(n.to_string(), String::from_utf8_lossy(payload).to_string());
+            }
+            None => {}
+        }
+        pos = content_start + rel_end + 2;
+    }
+    Ok((fields, file))
+}
+
 /// The actor a request would write as, header-wise, and the tailnet
 /// proof behind it — `/api/meta`'s `actor` and `tailnet_proof`. A
 /// request [`tailnet_proxy`] proves came through `tailscale serve`
@@ -1345,6 +1436,19 @@ pub(crate) fn write_route(
             return;
         }
         let resp = home::master_command(&mut request, state_dir);
+        send(request, resp);
+        return;
+    }
+    // CAD-1168: the chat attachment upload — OperatorOnly in
+    // `WRITE_ROUTES` (admitted above with the multipart carve-out);
+    // the handler streams the part into staging and relays
+    // `chat_file_upload` over the board's operator connection.
+    if path == "/api/chat/upload" {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let resp = threads::post_upload(&mut request, state_dir);
         send(request, resp);
         return;
     }

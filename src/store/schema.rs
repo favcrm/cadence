@@ -999,6 +999,17 @@ impl Store {
                 tx.execute("UPDATE schema_version SET version=36", [])?;
                 tx.commit()?;
             }
+            if version < 37 {
+                // CAD-1168 slice 2: retained chat attachments — one row
+                // per (sha256, scope, context_id); bytes live
+                // content-addressed in `<workspace>/.cadence/chat-files/`,
+                // never in the table. New table only; nothing is moved or
+                // rewritten, and a missing table on reopen converges.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(super::chat_files::SCHEMA)?;
+                tx.execute("UPDATE schema_version SET version=37", [])?;
+                tx.commit()?;
+            }
             if let Some(crossing) = permit.crossing {
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 Self::event(

@@ -231,7 +231,7 @@ impl Pm {
         }
         let gitignore = dir.join(".gitignore");
         if !gitignore.exists() {
-            std::fs::write(&gitignore, ".write.lock\n.index/\n")?;
+            std::fs::write(&gitignore, ".write.lock\n.index/\n.cadence/\n")?;
         }
         if !dir.join(".git").exists() {
             git(dir, &["init", "-q"])?;
@@ -572,8 +572,12 @@ impl Pm {
         }
         let out = String::from_utf8_lossy(&out.stdout);
         let ours: HashSet<&str> = ours.iter().map(String::as_str).collect();
-        let foreign =
-            |p: &str| !ours.contains(p) && p != ".write.lock" && !p.starts_with(".index/");
+        let foreign = |p: &str| {
+            !ours.contains(p)
+                && p != ".write.lock"
+                && !p.starts_with(".index/")
+                && !p.starts_with(".cadence/chat-files/")
+        };
         let mut found = Vec::new();
         let mut extra = 0usize;
         let mut note = |path: &str| {

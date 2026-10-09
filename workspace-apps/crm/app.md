@@ -1,10 +1,18 @@
 ---
 app: crm
 title: CRM
-version: '0.1.0'
+version: '0.1.1'
 summary: Draft one independently reviewed email brief from pasted facts; customer records, campaign content, SMTP custody and sending stay operator-run host actions.
 needs:
   connections: []
+  capabilities:
+    chat-upload:
+      schema: 1
+      capability: file.upload
+      version: 1
+      action: attach
+      resource_kind: installation
+      effect: draft
 listing:
   tagline: Draft one reviewed email brief from pasted facts
   icon: assets/crm.svg
@@ -42,7 +50,9 @@ reviewed email brief text artifact. The separate `app-assistant.json`
 declares data-only `app-assistant/v1` action IDs for the host's generic
 assistant. It provides no handlers, commands, URLs, actor authority or UI
 code: the host registry owns each implementation and scope, and unknown
-actions are refused.
+actions are refused. The manifest also declares the reserved `file.upload`
+draft slot for host-custodied chat attachment references; it grants no CRM
+or other workflow action.
 
 An approved brief is text for a person to read. It is not campaign
 content: applying content to a campaign, approving it, freezing an
@@ -112,9 +122,11 @@ a new run.
 ## What a brief is, and is not
 
 A successful review records reviewed draft text only. The bundle
-declares no publication slot, no capability slot and no send
-capability, and no step requests an outward mutation. Turning a brief
-into campaign content, binding SMTP, the test send, the audience freeze
-and the campaign send approval are operator actions on the installation
+declares no publication slot or send capability, and no step requests
+an outward mutation. The `file.upload` declaration is only for
+host-custodied source references; it does not auto-import data or itself
+grant consent, approval, release or sending. Turning a brief into
+campaign content, binding SMTP, the test send, the audience freeze and
+the campaign send approval are operator actions on the installation
 governed by host authorization, documented in the CRM guide. Never
 present an approved brief as an approved campaign or a sent email.

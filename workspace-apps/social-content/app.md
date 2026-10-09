@@ -1,11 +1,18 @@
 ---
 app: social-content
 title: Social Content
-version: '0.5.0'
+version: '0.5.1'
 summary: Draft a reviewed zh-HK caption and optional image from retained Instagram or pasted facts with per-post content and image guidance before Local release.
 needs:
   connections: []
   capabilities:
+    chat-upload:
+      schema: 1
+      capability: file.upload
+      version: 1
+      action: attach
+      resource_kind: installation
+      effect: draft
     source:
       schema: 1
       capability: social.read
@@ -72,7 +79,10 @@ post through the `source-instagram` acquisition workflow. This workspace
 bundle needs no project. The channel is a writing brief; releasing a
 caption delivers it to Local, not that social network. An image-enabled
 caption run can retain one generated asset from a selected source.
-Scheduling and external posting remain unavailable in this version.
+The reserved `file.upload` draft declaration is for host-custodied chat
+attachment references only. Upload does not auto-import source data or
+itself grant consent, approval or release. Scheduling and external
+posting remain unavailable in this version.
 
 ## Set up once
 

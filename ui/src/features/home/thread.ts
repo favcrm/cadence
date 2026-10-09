@@ -41,6 +41,14 @@ export interface PendingMessage {
   /** CAD-574: the cited needs subjects the send carried — a retry must
    *  resend the same refs or the daemon's idempotency check conflicts. */
   refs?: { kind: string; id: string }[];
+  /** CAD-1168: the retained-file ids the send carried. A retry resends
+   *  exactly these — sending text without them under the same message
+   *  id is the daemon's content-conflict refusal. */
+  attachments?: { id: string }[];
+  /** CAD-1168: the verified app binding the send carried. A retry
+   *  resends to this original destination, never the route's current
+   *  installation/context. */
+  app?: { install_id: string; context_id?: string };
 }
 
 export interface ThreadState {
@@ -71,7 +79,13 @@ export function asEntry(value: unknown): ThreadEntry | null {
     payload:
       v.payload && typeof v.payload === "object" ? (v.payload as Record<string, unknown>) : null,
     message: typeof v.message === "string" ? v.message : null,
-    created: typeof v.created === "string" ? v.created : null,
+    // The daemon sends epoch seconds (f64); the UI keeps an ISO string.
+    created:
+      typeof v.created === "string"
+        ? v.created
+        : typeof v.created === "number" && Number.isFinite(v.created)
+          ? new Date(v.created * 1000).toISOString()
+          : null,
   };
 }
 
@@ -138,10 +152,12 @@ export function addPending(
   text: string,
   at: number,
   refs?: { kind: string; id: string }[],
+  attachments?: { id: string }[],
+  app?: { install_id: string; context_id?: string },
 ): ThreadState {
   const base = state ?? EMPTY_THREAD;
   const rest = base.pending.filter((p) => p.message !== message);
-  return { ...base, pending: [...rest, { message, text, state: "sending", at, refs }] };
+  return { ...base, pending: [...rest, { message, text, state: "sending", at, refs, attachments, app }] };
 }
 
 /** The POST answered: sent (awaiting its stored entry) or failed. */

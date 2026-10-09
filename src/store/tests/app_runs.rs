@@ -117,7 +117,7 @@ pub(super) fn runtime_fixture() -> (TempDir, Store, Value) {
         .unwrap();
         s.set_identity(alias, &endpoint_at(4242)).unwrap();
     }
-    let text="---\ntitle: Local\ngoal: Reviewed text\n---\n## Write\nagent: writer\naction: local.text.produce\n\nWrite Markdown.\n\n### Acceptance\n- [ ] Markdown artifact exists\n\n## Review\nagent: reviewer\ndepends_on: 1\naction: local.text.review\n\nReview the exact artifact.\n\n### Acceptance\n- [ ] Exact artifact reviewed\n";
+    let text = "---\ntitle: Local\ngoal: Reviewed text\n---\n## Write\nagent: writer\naction: local.text.produce\n\nWrite Markdown.\n\n### Acceptance\n- [ ] Markdown artifact exists\n\n## Review\nagent: reviewer\ndepends_on: 1\naction: local.text.review\n\nReview the exact artifact.\n\n### Acceptance\n- [ ] Exact artifact reviewed\n";
     let inputs = std::collections::BTreeMap::new();
     let workflow = crate::store::app_runs::LocalWorkflow::parse(text, &inputs).unwrap();
     s.app_capability_decide("install-1", "sha256:bundle", true)
@@ -1172,7 +1172,7 @@ fn cad778_frozen_run_with_float_identity_approves() {
         })
         .unwrap();
     }
-    let text="---\ntitle: Local\ngoal: Reviewed text\n---\n## Write\nagent: writer\naction: local.text.produce\n\nWrite Markdown.\n\n### Acceptance\n- [ ] Markdown artifact exists\n\n## Review\nagent: reviewer\ndepends_on: 1\naction: local.text.review\n\nReview the exact artifact.\n\n### Acceptance\n- [ ] Exact artifact reviewed\n";
+    let text = "---\ntitle: Local\ngoal: Reviewed text\n---\n## Write\nagent: writer\naction: local.text.produce\n\nWrite Markdown.\n\n### Acceptance\n- [ ] Markdown artifact exists\n\n## Review\nagent: reviewer\ndepends_on: 1\naction: local.text.review\n\nReview the exact artifact.\n\n### Acceptance\n- [ ] Exact artifact reviewed\n";
     let inputs = std::collections::BTreeMap::new();
     let workflow = crate::store::app_runs::LocalWorkflow::parse(text, &inputs).unwrap();
     s.app_capability_decide("install-1", "sha256:bundle", true)

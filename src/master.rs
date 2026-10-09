@@ -157,6 +157,10 @@ pub const CLAUDE_ALLOWED_TOOLS: &[&str] = &[
     "Bash(cadence wiki search *)",
     "Bash(cadence wiki history *)",
     "Bash(cadence wiki put *)",
+    // CAD-1168: the retained chat attachments the master's turn was
+    // sent — bounded text reads. The daemon resolves the live turn and
+    // checks the id is on its envelope; this lets the master invoke it.
+    "Bash(cadence attachment read *)",
     // CAD-615: ask the operator to approve one plain command. The
     // decision verbs are not here — the master cannot approve itself.
     "Bash(cadence master ask-permission *)",
@@ -208,11 +212,18 @@ pub enum Profile {
 /// profile has no `issue`, `plan`, `report`, `wiki`, `agent`, `master`,
 /// `overview`, `status`, `thread` or `project` verb — and no health verb:
 /// the `health` RPC returns fleet metadata an app turn does not need.
+/// `attachment read` is in BOTH (CAD-1168): an app conversation's turn
+/// reads the file its own message carried — the read binds to the live
+/// turn daemon-side, and the envelope is the only place an id comes from.
 pub fn allowed_tools(profile: Profile) -> Vec<&'static str> {
     CLAUDE_ALLOWED_TOOLS
         .iter()
         .copied()
-        .filter(|t| profile == Profile::Home || t.starts_with("Bash(cadence app "))
+        .filter(|t| {
+            profile == Profile::Home
+                || t.starts_with("Bash(cadence app ")
+                || *t == "Bash(cadence attachment read *)"
+        })
         .collect()
 }
 

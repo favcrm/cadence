@@ -719,5 +719,6 @@ pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
         } => confine::run(state_dir, read, write, command),
         Commands::McpPermission { timeout_secs } => mcp_permission::run(state_dir, timeout_secs),
         Commands::McpAgent => mcp_agent::run(state_dir),
+        Commands::Attachment { action } => attachment::run(state_dir, action),
     }
 }

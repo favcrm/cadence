@@ -95,6 +95,7 @@ const OPERATOR: &[&str] = &[
 const ADVANCED: &[&str] = &[
     "agent-uid",
     "attach",
+    "attachment",
     "auth",
     "claude",
     "codex",

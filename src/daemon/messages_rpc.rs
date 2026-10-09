@@ -352,6 +352,12 @@ impl Shared {
             }
             (app, None) => app,
         };
+        // CAD-1168: `thread_send`'s `attachments` — retained-file ids
+        // resolved to their stored metadata rows (existence + size
+        // re-checked server-side, scope bound to the verified app
+        // binding above). The field is `thread_send`'s alone, like
+        // `refs`/`app`: a `send`/`ask` carrying it is refused whole,
+        // before any file is looked at, never silently stripped.
         let sender = sender_of(&alias)?;
         if refs.is_some() && sender != store::Sender::OperatorChat {
             return Err(Error::rejected(
@@ -359,6 +365,22 @@ impl Shared {
                  needs rows; `cadence send` and `agent_send` carry none",
             ));
         }
+        let attachments = match params.get("attachments") {
+            None | Some(Value::Null) => None,
+            Some(_) if sender != store::Sender::OperatorChat => {
+                return Err(Error::rejected(
+                    "attachments is a thread_send field — only the operator's chat \
+                     attaches retained files; `cadence send` and `agent_send` carry none",
+                ));
+            }
+            Some(_) if !crate::master::is_master(&alias) => {
+                return Err(Error::rejected(
+                    "attachments go only to the master (home or app conversation turns) — \
+                     other agents cannot read retained chat files",
+                ));
+            }
+            Some(v) => Some(thread_attachments(self, v, app.as_ref())?),
+        };
         // CAD-1098: app conversations are the master's. Another agent has
         // no per-conversation session, so an app binding to it is refused.
         if app.is_some() && !crate::master::is_master(&alias) {
@@ -425,6 +447,7 @@ impl Shared {
             &steer,
             refs.as_ref(),
             app.as_ref(),
+            attachments.as_ref(),
         )?;
         // Each superseded row's `reply_to` got a notice in the same
         // transaction — wake those recipients like `message cancel` does.

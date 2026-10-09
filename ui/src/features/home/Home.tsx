@@ -5,7 +5,8 @@ import type { ResourceState } from "../../lib/cache";
 import { resources, threadReader } from "../../lib/resources";
 import { streamInto, type SseErrorState } from "../../lib/sse";
 import { useQuery, useResource } from "../../lib/useResource";
-import type { MasterCommandResult, Overview, ThreadRef } from "../../lib/types";
+import type { MasterAppOrigin, MasterCommandResult, Overview, ThreadRef } from "../../lib/types";
+import Link from "../../ui/Link";
 import Md from "../../ui/Md";
 import {
   composerBlock,
@@ -78,15 +79,31 @@ const reducedMotion = () =>
  * badges, and Stop → `/stop`. `queued`/`submitting` give the operator
  * the honest "behind a turn"/"still sending" states instead of silence.
  */
+function appOriginHref(origin: MasterAppOrigin | null): string | null {
+  if (!origin || typeof origin !== "object") return null;
+  const { install_id, context_id, conversation_id } = origin;
+  // Strict, fail-closed ids: malformed or foreign shapes give no link. An
+  // empty context is a real destination (a no-context app conversation),
+  // so it only omits the `ctx` selector.
+  const strict = (id: unknown): id is string => typeof id === "string" && id.length > 0 && id.trim() === id;
+  if (!strict(install_id) || !strict(conversation_id)) return null;
+  if (context_id !== "" && !strict(context_id)) return null;
+  const ctx = context_id === "" ? "" : `ctx=${encodeURIComponent(context_id)}&`;
+  return `/app-installations/${encodeURIComponent(install_id)}?${ctx}conversation=${encodeURIComponent(conversation_id)}`;
+}
+
 function WorkingRow({
   turn,
+  appOrigin,
   step,
   onStop,
 }: {
   turn: TurnState;
+  appOrigin: MasterAppOrigin | null;
   step: ThreadEntry | null;
   onStop: () => void;
 }) {
+  const appHref = appOriginHref(appOrigin);
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     if (turn.kind !== "working") return;
@@ -126,6 +143,11 @@ function WorkingRow({
         <span className="chip bg-ink-800 text-ink-400 shrink-0">{turn.queued} queued</span>
       )}
       <span className="flex-1" />
+      {appHref && (turn.kind === "working" || turn.kind === "queued") && (
+        <Link href={appHref} className="lnk text-micro shrink-0">
+          Open its conversation <span aria-hidden>↗</span>
+        </Link>
+      )}
       {turn.kind === "working" && (
         <button
           type="button"
@@ -295,7 +317,8 @@ function Examples({ onPick, disabled }: { onPick: (text: string) => void; disabl
   );
 }
 
-const retry = (message: string, text: string, refs?: ThreadRef[]) => sendToMaster(text, message, refs);
+const retry = (message: string, text: string, refs?: ThreadRef[], attachments?: { id: string }[]) =>
+  sendToMaster(text, message, refs, attachments);
 const discard = (message: string) => resources.masterThread.write((s) => discardPending(s, message));
 
 /**
@@ -425,6 +448,30 @@ export default function Home({
   const masterRow = agents.data?.agents.find((a) => a.alias === MASTER);
   const submitting = (thread.data?.pending ?? []).some((p) => p.state !== "failed");
   const turn = turnState(master.data, masterRow, submitting);
+  const serverTurn = master.data?.turn;
+  // `turnState` retains the message id for working turns. For queued turns
+  // it drops that id, so recover it only when its server-derived display
+  // fields still match the same queued master turn (before its row fallback).
+  const displayedTurnMessage =
+    turn.kind === "working"
+      ? turn.message
+      : turn.kind === "queued" &&
+          serverTurn?.state === "queued" &&
+          turn.summary === serverTurn.summary &&
+          turn.since === serverTurn.since
+        ? serverTurn.message
+        : undefined;
+  const turnOrigin =
+    master.status === "ok" &&
+    !master.inFlight &&
+    serverTurn !== undefined &&
+    serverTurn !== null &&
+    displayedTurnMessage !== undefined &&
+    displayedTurnMessage === serverTurn.message &&
+    serverTurn.app_origin != null &&
+    serverTurn.conversation === serverTurn.app_origin.conversation_id
+      ? serverTurn.app_origin
+      : null;
   const step = useMemo(() => openStep(thread.data?.entries ?? []), [thread.data]);
 
   // Live entries: the store opened on the newest page, so the stream
@@ -508,9 +555,9 @@ export default function Home({
     setGlideTick((n) => n + 1);
   }, []);
   const onRetrySend = useCallback(
-    (message: string, text: string, refs?: ThreadRef[]) => {
+    (message: string, text: string, refs?: ThreadRef[], attachments?: { id: string }[]) => {
       engage();
-      retry(message, text, refs);
+      retry(message, text, refs, attachments);
     },
     [engage],
   );
@@ -756,7 +803,8 @@ export default function Home({
             itself never scrolls for the chat. */}
         <div className="relative flex-1 min-h-0 flex flex-col" data-chat-panel>
           <div className="master-heading flex items-center gap-2 flex-wrap pb-2.5 border-b border-ink-700/70">
-            <h1 className="text-section font-semibold text-ink-100">Master</h1>
+            <span className="text-accent text-section" aria-hidden>✳</span>
+            <h1 className="text-section font-semibold text-ink-100">Assistant</h1>
             <span
               className={`chip ${
                 status.kind === "running"
@@ -774,7 +822,10 @@ export default function Home({
             )}
           </div>
 
-          <p className="text-label text-ink-500 pt-2 pb-1">Plan work, check in with your agents, and discuss what comes next. <span className="text-ink-400">All projects</span></p>
+          <p className="text-micro text-ink-400 pt-2 pb-1 flex items-center gap-1.5" data-chat-scope>
+            <span className="inline-block w-[5px] h-[5px] rounded-full bg-accent" aria-hidden />
+            All projects
+          </p>
 
           {thread.status === "failed" && (
             <div className="card px-3.5 py-3 mt-3 text-label text-fail break-words" role="alert">
@@ -819,7 +870,7 @@ export default function Home({
             {cmds.map((c) => (
               <CmdCard key={c.id} cmd={c} onOpenIssue={onOpenIssue} />
             ))}
-            <WorkingRow turn={turn} step={step} onStop={() => runCommand("stop", "")} />
+            <WorkingRow turn={turn} appOrigin={turnOrigin} step={step} onStop={() => runCommand("stop", "")} />
           </div>
 
           {unseen > 0 && (

@@ -483,6 +483,7 @@
                 &steer_as_pm(Priority::Urgent, none),
                 None,
                 None,
+                None,
             )
             .unwrap();
             let order: Vec<String> = (0..3)
@@ -550,6 +551,7 @@
                 Some("/lane/d-1"),
                 &Sender::Unattributed,
                 &Steer::NONE,
+                None,
                 None,
                 None,
             )
@@ -690,7 +692,7 @@
         }
         assert_eq!(
             crate::rollout::SCHEMA_VERSION,
-            36,
+            37,
             "bump? pin the new version and add its migration test"
         );
         // Half-applied: one table present, version rolled back — the
@@ -1563,4 +1565,68 @@
         // Reopening at v36 is a no-op converge.
         let _ = Store::open_for_schema_tests(&db).unwrap();
         assert!(has("app_run_failures"));
+    }
+
+    /// v37 adds the CAD-1168 retained-attachment table only:
+    /// `chat_files` — metadata rows keyed `chf-<hex>` with the
+    /// `(sha256, scope, context_id)` uniqueness index; bytes live
+    /// content-addressed under `<workspace>/.cadence/chat-files/`, never
+    /// in the table. `IF NOT EXISTS`, so a v36 store migrates in place and a
+    /// half-applied v37 converges; pre-v37 rows are preserved.
+    #[test]
+    fn migration_v36_to_v37_adds_chat_files() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("t.sqlite3");
+        std::fs::create_dir(dir.path().join("w")).unwrap();
+        {
+            let s = Store::open(&db).unwrap();
+            reg(&s, "a1", &dir.path().join("w"));
+        }
+        // A genuine v36: everything but the chat_files table.
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE chat_files;
+                 UPDATE schema_version SET version=36;",
+            )
+            .unwrap();
+        let has = |table: &str| -> bool {
+            Connection::open(&db)
+                .unwrap()
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()
+                .unwrap()
+                .is_some()
+        };
+        assert!(!has("chat_files"));
+        {
+            let s = Store::open_for_schema_tests(&db).unwrap();
+            assert!(has("chat_files"));
+            assert_eq!(
+                Connection::open(&db)
+                    .unwrap()
+                    .query_row("SELECT version FROM schema_version", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                crate::rollout::SCHEMA_VERSION
+            );
+            // Pre-v37 rows survive.
+            assert_eq!(s.agent("a1").unwrap().alias, "a1");
+        }
+        // Half-applied: table dropped, version rolled back — the
+        // reopen converges.
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE chat_files;
+                 UPDATE schema_version SET version=36;",
+            )
+            .unwrap();
+        {
+            let _ = Store::open_for_schema_tests(&db).unwrap();
+        }
+        assert!(has("chat_files"));
     }

@@ -968,6 +968,14 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: ThreadAction,
     },
+    /// A retained chat attachment (CAD-1168): `attachment read <id>`
+    /// returns its bounded text (txt/md/csv). The operator reads any
+    /// retained id; the master reads only an id on its own running
+    /// turn's envelope.
+    Attachment {
+        #[command(subcommand)]
+        action: AttachmentAction,
+    },
     /// Daemon-owned persistent supervision registrations and local alerts.
     /// Monitor state describes the observer; delivery remains explicitly
     /// unconfigured in this bounded increment.

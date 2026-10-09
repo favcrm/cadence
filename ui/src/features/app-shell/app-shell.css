@@ -59,93 +59,58 @@
 }
 
 /* The single chat node: a bounded flex column in the left pane on
-   desktop, a fixed left sheet at narrow widths. The column owns
-   internal scrolling: drawer head and composer never shrink, the
-   message list takes the leftover height and scrolls (CAD-1007). */
+   desktop. At narrow widths it is the full-width "Assistant" panel of
+   the approved mock's Assistant | Workspace switch — both panels stay
+   mounted and CSS shows one, so draft, stream and workspace state
+   survive switching. The column owns internal scrolling: the message
+   list takes the leftover height and scrolls (CAD-1007). */
 .app-shell-chat {
   display: flex;
   flex-direction: column;
   min-height: 0;
-  position: fixed;
-  top: 0;
-  bottom: 0;
-  left: 0;
-  right: 0;
-  /* Full screen on narrow widths, as the mockup's `.chat.open`. */
-  width: auto;
-  z-index: 50;
-  background: var(--color-ink-900);
-  border-right: 1px solid var(--color-ink-700);
-  padding: 0.9rem;
-  overflow-y: auto;
-  transform: translateX(-105%);
-  visibility: hidden;
-  transition: transform 0.2s ease, visibility 0.2s;
+  height: 100%;
+  overflow: hidden;
 }
 
-.app-shell-chat[data-open] {
-  transform: translateX(0);
-  visibility: visible;
-}
-
-@media (min-width: 1024px) {
-  .app-shell-chat {
-    position: static;
-    height: 100%;
-    width: auto;
-    z-index: auto;
-    background: transparent;
-    border-right: 0;
-    padding: 0;
-    overflow: hidden;
-    transform: none;
-    visibility: visible;
-    transition: none;
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .app-shell-chat {
-    transition: none;
-  }
-}
-
-/* Drawer chrome exists only at narrow widths; the desktop pane is
-   labelled by the pane itself. */
-.app-shell-chat-head {
+.app-shell-panels {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.75rem;
-  margin-bottom: 0.75rem;
+  gap: 0.5rem;
+  padding: 0.35rem 0;
+  margin-bottom: 0.5rem;
+  border-bottom: 1px solid var(--color-ink-700);
   flex-shrink: 0;
 }
 
+.app-shell-panel-tab {
+  flex: 1;
+  min-height: 2.5rem;
+  padding: 0.35rem;
+  border: 0;
+  border-radius: 0.3rem;
+  background: transparent;
+  color: var(--color-ink-400);
+  font-size: var(--text-label);
+}
+
+.app-shell-panel-tab[aria-pressed="true"] {
+  background: color-mix(in srgb, var(--color-accent) 9%, transparent);
+  color: var(--color-accent);
+}
+
+.app-shell-panel-tab:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
 @media (min-width: 1024px) {
-  .app-shell-chat-head {
+  .app-shell-panels {
     display: none;
   }
 }
 
-.app-shell-chat-toggle {
-  margin-left: auto;
-}
-
-@media (min-width: 1024px) {
-  .app-shell-chat-toggle {
-    display: none;
-  }
-}
-
-.app-shell-scrim {
-  position: fixed;
-  inset: 0;
-  background: var(--color-scrim);
-  z-index: 40;
-}
-
-@media (min-width: 1024px) {
-  .app-shell-scrim {
+@media (max-width: 1023.98px) {
+  .app-shell-grid[data-shell-panel="chat"] .app-shell-outlet,
+  .app-shell-grid[data-shell-panel="work"] .app-shell-chat {
     display: none;
   }
 }
@@ -251,26 +216,246 @@
   flex-shrink: 0;
 }
 
+/* CAD-1168 compact composer (the approved unified-chat mock): one
+   bordered card holding the auto-growing box and an icon-only tool
+   row — Attach on the left, a circular up-arrow Send on the right.
+   No resize grip, no persistent hint row. */
+.app-chat-composer {
+  display: grid;
+  gap: 0.25rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.75rem;
+  background: var(--color-ink-850);
+  padding: 0.55rem 0.6rem;
+}
+
+/* Mock: .composer:focus-within — the card warms toward the accent
+   while the box is active. */
+.app-chat-composer:focus-within {
+  border-color: color-mix(in srgb, var(--color-accent) 55%, var(--color-ink-700));
+}
+
+.app-chat-composer-tools {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
 .app-chat-box {
   width: 100%;
-  resize: vertical;
-  min-height: 2.75rem;
-  max-height: 10rem;
+  resize: none;
+  min-height: 2.3rem;
+  max-height: 7.5rem; /* the mock's 120 px cap, then the box scrolls */
+  overflow-y: auto;
   background: transparent;
   color: var(--color-ink-100);
-  border: 1px solid var(--color-ink-700);
-  border-radius: 0.375rem;
-  padding: 0.5rem;
+  border: 0;
+  padding: 0.25rem 0.15rem;
   font-size: var(--text-secondary);
+  line-height: 1.5;
 }
 
 .app-chat-box:focus-visible {
-  outline: 2px solid var(--color-accent);
-  outline-offset: 1px;
+  outline: none; /* the card's focus-within ring is the cue */
 }
 
 .app-chat-box::placeholder {
   color: var(--color-ink-500);
+}
+
+/* Icon-only Attach (CAD-1168 slice 2 wired it to /api/chat/upload).
+   Mock: .attach-button. */
+.app-chat-attach {
+  display: grid;
+  place-items: center;
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--color-ink-400);
+}
+
+.app-chat-attach:hover:not(:disabled) {
+  background: var(--color-ink-800);
+  color: var(--color-ink-100);
+}
+
+.app-chat-attach:disabled {
+  opacity: 0.45;
+}
+
+.app-chat-attach svg {
+  width: 1.05rem;
+  height: 1.05rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* The queued-attachment rows above the composer — the mock's
+   `.file-row`: icon, name with size · kind, an inline reason when the
+   file was refused, and a Remove icon (CAD-1168 slice 2). */
+.app-chat-attachrow {
+  display: grid;
+  gap: 0.375rem;
+  margin-bottom: 0.375rem;
+}
+
+.app-chat-filerow {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  min-width: 0;
+  padding: 0.45rem 0.5rem 0.45rem 0.6rem;
+  border: 1px solid color-mix(in srgb, var(--color-accent) 30%, var(--color-ink-700));
+  border-radius: 0.375rem;
+  background: color-mix(in srgb, var(--color-accent) 7%, var(--color-ink-850));
+  font-size: var(--text-micro);
+  color: var(--color-ink-200);
+}
+
+.app-chat-filerow.failed {
+  border-color: color-mix(in srgb, var(--color-fail) 50%, var(--color-ink-700));
+  background: color-mix(in srgb, var(--color-fail) 6%, var(--color-ink-850));
+}
+
+.app-chat-filerow > svg {
+  width: 1.05rem;
+  height: 1.05rem;
+  color: var(--color-accent);
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.app-chat-filerow.failed > svg {
+  color: var(--color-fail);
+}
+
+.app-chat-filename {
+  display: grid;
+  min-width: 0;
+  flex: 1;
+  overflow-wrap: anywhere;
+}
+
+.app-chat-filename small {
+  font-size: 0.5625rem;
+  color: var(--color-ink-400);
+}
+
+/* Mock: .upload-error — the refusal reason is visible text. */
+.app-chat-filename small.app-chat-upload-error {
+  font-size: var(--text-micro);
+  color: var(--color-fail);
+}
+
+.app-chat-filerow .lnk {
+  flex-shrink: 0;
+  color: var(--color-ink-300);
+}
+
+.app-chat-remove {
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  width: 1.5rem;
+  height: 1.5rem;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--color-ink-400);
+}
+
+.app-chat-remove:hover {
+  background: var(--color-ink-800);
+  color: var(--color-ink-100);
+}
+
+.app-chat-remove svg {
+  width: 0.85rem;
+  height: 0.85rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+}
+
+.app-chat-remove:focus-visible,
+.app-chat-attach:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+/* Circular up-arrow Send. Mock: .send — a monochrome disc: the lightest
+   ink on dark, the darkest on light, so both themes follow the tokens. */
+.app-chat-send {
+  display: grid;
+  place-items: center;
+  width: 2rem;
+  height: 2rem;
+  margin-left: auto;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 50%;
+  background: var(--color-ink-200);
+  color: var(--color-ink-950);
+  transition: background 0.15s ease, transform 0.15s ease, opacity 0.15s ease;
+}
+
+.app-chat-send:hover:not(:disabled) {
+  background: var(--color-ink-100);
+  transform: translateY(-1px);
+}
+
+.app-chat-send:active:not(:disabled) {
+  transform: scale(0.94);
+}
+
+.app-chat-send:disabled {
+  background: var(--color-ink-600);
+  color: var(--color-ink-500);
+  opacity: 0.6;
+}
+
+.app-chat-send:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 3px;
+}
+
+.app-chat-send svg {
+  width: 1rem;
+  height: 1rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+@media (max-width: 1023.98px) {
+  /* Mock's mobile rule: 40px touch targets and a 16px box (no iOS
+     focus zoom). */
+  .app-chat-send,
+  .app-chat-attach,
+  .app-chat-remove {
+    width: 2.5rem;
+    height: 2.5rem;
+  }
+  .app-chat-remove svg {
+    width: 1rem;
+    height: 1rem;
+  }
+  .app-chat-textarea {
+    font-size: 16px;
+  }
 }
 
 /* Generic outlet tabs + detail drawer. */
@@ -975,11 +1160,109 @@ p.sfield-hint {
 .app-chat-rail {
   display: none;
 }
+/* The approved mock's header: mark + "Assistant", tools on the right. */
 .app-chat-head {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
   gap: 0.5rem;
+}
+.app-chat-title {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: var(--text-body);
+  color: var(--color-ink-100);
+}
+.app-chat-mark {
+  color: var(--color-accent);
+  font-size: 1.25rem;
+  line-height: 1;
+}
+.app-chat-head-tools {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+.app-chat-iconbtn {
+  display: grid;
+  place-items: center;
+  min-width: 2rem;
+  min-height: 2rem;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 0.3rem;
+  background: transparent;
+  color: var(--color-ink-400);
+}
+.app-chat-iconbtn:hover:not(:disabled) {
+  background: var(--color-ink-800);
+  color: var(--color-ink-100);
+}
+.app-chat-iconbtn:disabled {
+  opacity: 0.45;
+}
+.app-chat-iconbtn:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+.app-chat-iconbtn svg {
+  width: 1.1rem;
+  height: 1.1rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+@media (max-width: 1023.98px) {
+  .app-chat-iconbtn {
+    min-width: 2.5rem;
+    min-height: 2.5rem;
+  }
+}
+.app-chat-scope {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-width: 0;
+  font-size: 0.625rem;
+  color: var(--color-ink-300);
+}
+.app-chat-scope-dot {
+  flex-shrink: 0;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--color-accent);
+}
+.app-chat-scope-link {
+  margin-left: auto;
+  flex-shrink: 0;
+  font-size: 0.625rem;
+}
+.app-chat-history {
+  display: grid;
+  gap: 0.15rem;
+  max-height: 10rem;
+  overflow-y: auto;
+  padding: 0.25rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.3rem;
+  background: var(--color-ink-850);
+}
+.app-chat-history-row {
+  text-align: left;
+  padding: 0.4rem 0.5rem;
+  border: 0;
+  border-radius: 0.25rem;
+  background: transparent;
+  color: var(--color-ink-200);
+  font-size: var(--text-label);
+}
+.app-chat-history-row:hover,
+.app-chat-history-row[aria-current="true"] {
+  background: var(--color-ink-800);
 }
 .app-chat-collapse {
   display: none;
@@ -987,22 +1270,6 @@ p.sfield-hint {
 .app-chat-card {
   padding: 0.5rem 0.65rem;
   background: var(--color-ink-850);
-}
-.app-chat-ctx {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.25rem;
-}
-.app-chat-prompt {
-  border: 1px dashed var(--color-ink-600);
-  background: transparent;
-  border-radius: 0.25rem;
-  padding: 0.1rem 0.45rem;
-  color: var(--color-ink-400);
-}
-.app-chat-prompt:hover:not(:disabled) {
-  border-style: solid;
-  color: var(--color-ink-200);
 }
 .app-chat-dot {
   width: 0.45rem;
@@ -1044,14 +1311,6 @@ p.sfield-hint {
   .app-shell-grid {
     transition: none;
   }
-}
-.app-chat-chip {
-  display: inline-flex;
-  gap: 0.35rem;
-  align-items: center;
-  border: 1px solid var(--color-ink-600);
-  border-radius: 0.25rem;
-  padding: 0.1rem 0.4rem;
 }
 
 /* CAD-1058 New campaign dialog: a short modal on the shared confirm
@@ -1135,6 +1394,48 @@ p.sfield-hint {
 
 .crm-table .lnk {
   text-align: left;
+}
+
+/* CAD-1168: the mock's compact "Working…" line with a Stop button. */
+.app-chat-working {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.625rem;
+  color: var(--color-ink-400);
+}
+.app-chat-pulse {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--color-accent);
+  animation: app-chat-pulse 1.2s infinite;
+}
+@keyframes app-chat-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .app-chat-pulse {
+    animation: none;
+  }
+}
+.app-chat-stop {
+  margin-left: auto;
+  padding: 0.25rem 0.55rem;
+  border: 1px solid var(--color-edge);
+  border-radius: 0.25rem;
+  background: transparent;
+  color: var(--color-ink-200);
+  font-size: 0.625rem;
+}
+.app-chat-stop:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+.app-chat-jump {
+  align-self: center;
 }
 
 /* CAD-1098: conversation picker + "+ New" in the chat header. */

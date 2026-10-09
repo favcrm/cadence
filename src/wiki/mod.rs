@@ -1287,7 +1287,7 @@ fn sha256_file(path: &Path) -> Result<String> {
 /// A first-block MIME guess: magic bytes for the kinds the board
 /// streams; UTF-8 → text/plain; else octet-stream. The pointer file
 /// records it; the board's serve rules decide inline vs attachment.
-fn sniff_mime(head: &[u8]) -> &'static str {
+pub(crate) fn sniff_mime(head: &[u8]) -> &'static str {
     match head {
         [0x89, b'P', b'N', b'G', ..] => "image/png",
         [0xff, 0xd8, 0xff, ..] => "image/jpeg",

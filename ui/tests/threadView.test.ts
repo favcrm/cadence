@@ -71,24 +71,23 @@ for (const [name, item] of Object.entries(items)) {
   ok(render(item) === render(item, "full"), `${name}: default equals full`);
 }
 
-// Full classes.
+// Full classes. CAD-1168 (approved mock): no avatars; the label reads
+// "Assistant"/"You" above the body; steps and commentary are unindented.
 const fullAnswer = render(items.answer, "full");
-ok(fullAnswer.includes("w-6 h-6"), "full: avatar w-6 h-6");
-ok(fullAnswer.includes("max-w-[85%]"), "full: bubble max-w-[85%]");
+ok(!fullAnswer.includes("w-6 h-6") && !fullAnswer.includes("w-5 h-5"), "full: no avatar");
+ok(fullAnswer.includes("Assistant") && !fullAnswer.includes("Master"), "full: Assistant label, no Master");
+ok(fullAnswer.includes("max-w-[92%]"), "full: bubble max-w-[92%]");
 ok(fullAnswer.includes("text-body"), "full: answer text-body");
-ok(render(items.tools, "full").includes("ml-8"), "full: tools indent ml-8");
-ok(render(items.commentary, "full").includes("ml-8"), "full: commentary indent ml-8");
+ok(!render(items.tools, "full").includes("ml-8"), "full: tools unindented");
 ok(render(items.operator, "full").includes("text-body"), "full: operator text-body");
+ok(render(items.operator, "full").includes(">You<"), "full: operator labelled You");
 ok(render(items.pending, "full").includes("text-body"), "full: pending text-body");
 
-// Compact swaps exactly the four listed classes.
+// Compact swaps the text size (and drops the bubble cap).
 const compactAnswer = render(items.answer, "compact");
-ok(compactAnswer.includes("w-5 h-5") && !compactAnswer.includes("w-6 h-6"), "compact: avatar w-5 h-5");
-ok(compactAnswer.includes("max-w-[92%]") && !compactAnswer.includes("max-w-[85%]"), "compact: bubble 92%");
+ok(!compactAnswer.includes("w-5 h-5") && !compactAnswer.includes("w-6 h-6"), "compact: no avatar");
 ok(compactAnswer.includes("text-secondary") && !compactAnswer.includes("text-body"), "compact: answer text-secondary");
-ok(render(items.tools, "compact").includes("ml-7"), "compact: tools indent ml-7");
-ok(!render(items.tools, "compact").includes("ml-8"), "compact: tools drops ml-8");
-ok(render(items.commentary, "compact").includes("ml-7"), "compact: commentary indent ml-7");
+ok(!render(items.tools, "compact").includes("ml-7"), "compact: tools unindented");
 ok(!render(items.operator, "compact").includes("text-body"), "compact: operator text-secondary");
 ok(!render(items.pending, "compact").includes("text-body"), "compact: pending text-secondary");
 

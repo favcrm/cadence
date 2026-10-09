@@ -39,6 +39,58 @@ import type {
   WorkflowsPayload,
 } from "./types";
 
+/** The daemon-minted retained-file row `POST /api/chat/upload` answers
+ *  (CAD-1168): the id is the only handle; metadata is server-derived. */
+export interface ChatFileRow {
+  id: string;
+  sha256: string;
+  size: number;
+  mime: string;
+  name: string;
+  scope: string;
+  context_id: string;
+  uploader: string;
+  created: number;
+}
+
+/** Validate the daemon's ChatFile::to_json receipt before a row can become
+ *  ready. This checks the wire shape only; native scope proofs remain the
+ *  authority for upload and later reads. */
+function decodeChatFileRow(value: unknown): ChatFileRow {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("upload returned an invalid attachment receipt — retry or remove the file");
+  }
+  const row = value as Record<string, unknown>;
+  if (
+    typeof row.id !== "string" || !/^chf-[0-9a-f]{32}$/.test(row.id) ||
+    typeof row.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(row.sha256) ||
+    typeof row.size !== "number" || !Number.isSafeInteger(row.size) || row.size <= 0 ||
+    typeof row.mime !== "string" || row.mime.length === 0 ||
+    typeof row.name !== "string" || row.name.trim().length === 0 ||
+    typeof row.scope !== "string" || row.scope.length === 0 ||
+    typeof row.context_id !== "string" ||
+    typeof row.uploader !== "string" || row.uploader.length === 0 ||
+    typeof row.created !== "number" || !Number.isFinite(row.created)
+  ) {
+    throw new Error("upload returned an invalid attachment receipt — retry or remove the file");
+  }
+  return row as unknown as ChatFileRow;
+}
+
+/** Immutable native selector for an app-owned retained file. Omit the
+ *  entire object for Home; omit context_id to preserve its real absence. */
+export interface ChatFileDestination {
+  install_id: string;
+  conversation: string;
+  context_id?: string;
+}
+
+/** Native-served capability state; a hint only, never upload authority. */
+export interface AppFileUploadProjection {
+  declared: boolean;
+  available: boolean;
+}
+
 /** `GET /api/threads/<alias>` — `thread` is null until the first message. */
 export interface ThreadPage {
   alias?: string;
@@ -378,6 +430,7 @@ export const api = {
     refs?: ThreadRef[],
     app?: { install_id: string; context_id?: string },
     conversation?: string,
+    attachments?: { id: string }[],
   ) =>
     post<Record<string, unknown>>(
       `/api/threads/${encodeURIComponent(alias)}/messages`,
@@ -388,13 +441,75 @@ export const api = {
         ...(app ? { app } : {}),
         // CAD-1098: only a selector; the daemon resolves scope, subject and install.
         ...(conversation ? { conversation } : {}),
+        // CAD-1168: `chf-…` ids of retained uploads — the daemon checks
+        // grammar and existence, never the client's metadata.
+        ...(attachments && attachments.length > 0 ? { attachments } : {}),
       },
     ),
+  /** `POST /api/chat/upload` — one retained chat attachment (CAD-1168).
+   *  Operator-only multipart; returns the daemon-minted row. `signal`
+   *  aborts only this upload's transport (a canceled row's late answer
+   *  is ignored by its caller); it never deletes a retained blob. */
+  chatFileUpload: (
+    file: File,
+    signal?: AbortSignal,
+    destination?: ChatFileDestination,
+  ): Promise<ChatFileRow> =>
+    new Promise((resolve, reject) => {
+      if (signal?.aborted) {
+        reject(new DOMException("upload canceled", "AbortError"));
+        return;
+      }
+      const form = new FormData();
+      form.append("name", file.name);
+      if (destination !== undefined) {
+        form.append("install_id", destination.install_id);
+        form.append("conversation", destination.conversation);
+        if (destination.context_id !== undefined) form.append("context_id", destination.context_id);
+      }
+      form.append("file", file, file.name);
+      const xhr = new XMLHttpRequest();
+      const onAbort = () => xhr.abort();
+      signal?.addEventListener("abort", onAbort, { once: true });
+      const cleanup = () => signal?.removeEventListener("abort", onAbort);
+      xhr.open("POST", "/api/chat/upload");
+      xhr.setRequestHeader("X-Cadence-Board", "1");
+      for (const [key, value] of Object.entries(sessionHeaders())) xhr.setRequestHeader(key, value);
+      xhr.onload = () => {
+        cleanup();
+        let body: unknown = null;
+        try {
+          body = JSON.parse(xhr.responseText);
+        } catch {
+          body = null;
+        }
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try {
+            resolve(decodeChatFileRow(body));
+          } catch (error) {
+            reject(error);
+          }
+          return;
+        }
+        const msg =
+          (body as { error?: string } | null)?.error ?? `${xhr.status} ${xhr.statusText}`;
+        reject(new ApiError(msg, xhr.status, (body as object | null) ?? undefined));
+      };
+      xhr.onerror = () => {
+        cleanup();
+        reject(new ApiError("upload failed — connection lost", 0));
+      };
+      xhr.onabort = () => {
+        cleanup();
+        reject(new DOMException("upload canceled", "AbortError"));
+      };
+      xhr.send(form);
+    }),
   /** `GET /api/app-installations/<id>/chat-descriptor` (CAD-1110): the installed
    *  package's `app-chat.json`, pinned to the digest its install consented to. A
    *  404 means no descriptor (plain shared chat). */
   appChatDescriptor: (installId: string) =>
-    get<{ descriptor: unknown; digest: unknown; app: unknown }>(
+    get<{ descriptor: unknown; digest: unknown; app: unknown; file_upload?: AppFileUploadProjection }>(
       `/api/app-installations/${encodeURIComponent(installId)}/chat-descriptor`,
     ),
   /** Generic app-assistant/v1 discovery, durable operations and scoped permissions. */

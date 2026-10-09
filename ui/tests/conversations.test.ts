@@ -33,7 +33,7 @@ const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
 const AppShell = require("../src/features/app-shell/AppShell").default;
 const { resources } = require("../src/lib/resources") as typeof import("../src/lib/resources");
-const { parseSlash, autoSelectCampaignConversation } = require("../src/features/app-shell/conversationClient") as typeof import("../src/features/app-shell/conversationClient");
+const { parseSlash, autoSelectCampaignConversation, conversationThread } = require("../src/features/app-shell/conversationClient") as typeof import("../src/features/app-shell/conversationClient");
 
 equal([parseSlash("/new"), parseSlash(" /CLEAR "), parseSlash("/new now"), parseSlash("hello")], ["new", "new", null, null], "only the bare commands are commands");
 
@@ -51,6 +51,8 @@ const threads: Record<string, any[]> = {
   "o-gen": [],
 };
 let turn: any = null;
+// Set inside a check to hold one send in flight (pending state "sending").
+let deferSend: ((resolve: (r: Response) => void) => void) | null = null;
 const messagePosts: any[] = [];
 const createPosts: any[] = [];
 let created = 0;
@@ -78,6 +80,7 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   if (m) return json(inst(m[1], m[1] === "install-crm" ? "crm" : "reports"));
   if (url.pathname === "/api/threads/master/messages") {
     messagePosts.push(JSON.parse(String(init!.body)));
+    if (deferSend) return new Promise<Response>((r) => deferSend!(r));
     return json({ message: "x", state: "queued", duplicate: false });
   }
   if (url.pathname === "/api/threads/master") {
@@ -125,7 +128,7 @@ await mount("install-crm");
 
 // Picker: General, the campaign conversation, and + New; only the selected conversation's entries show.
 equal(optionLabels(), ["General", "Spring launch"], "picker lists General and the campaign conversation");
-assert(newButton() && newButton().textContent === "+ New", "+ New sits beside the picker");
+assert(newButton() && newButton().getAttribute("aria-label") === "New conversation", "the + icon (New conversation) sits beside the picker");
 equal(picker().value, "c-gen", "General is the default");
 assert(pane().includes("general answer") && !pane().includes("campaign brief"), "General shows only its own thread");
 await pick("c-camp");
@@ -178,6 +181,50 @@ await React.act(async () => { await resources.masterState.refresh(); });
 await settle();
 assert(!pane().includes("your message is queued"), "no notice when the running message is this conversation's own");
 turn = null;
+await React.act(async () => { await resources.masterState.refresh(); });
+await settle();
+
+// CAD-1168 follow-up: the selected conversation's own in-flight turn reads as
+// a compact status — Sending… while its POST is in flight, Queued… when the
+// daemon reports this conversation's message as the queue head. Neither bleeds
+// into another conversation, and only the owned working turn offers Stop.
+await pick("c-camp");
+{
+  let resolveSend: ((r: Response) => void) | null = null;
+  deferSend = (r) => { resolveSend = r; };
+  await type("queued brief update");
+  assert(resolveSend !== null, "the send is still in flight");
+  assert(host.querySelector('[data-chat-status="sending"]') !== null, "an in-flight send shows Sending…");
+  await React.act(async () => { resolveSend!(json({ message: "x", state: "queued", duplicate: false })); });
+  await settle();
+  deferSend = null;
+  assert(host.querySelector('[data-chat-status="waiting"]') !== null, "send acknowledgement keeps a status until the daemon turn arrives");
+
+  const sentMessage = messagePosts[messagePosts.length - 1].message;
+  turn = { state: "queued", message: sentMessage };
+  await React.act(async () => { await resources.masterState.refresh(); });
+  await settle();
+  assert(host.querySelector('[data-chat-status="queued"]') !== null, "an owned queued turn shows Queued…");
+  assert(host.querySelector("[data-chat-stop]") === null, "a queued turn offers no Stop");
+
+  // Once SSE/page reconciliation drops the pending row, the owned queue head
+  // must keep polling: thread entries do not refresh the master projection.
+  threads["c-camp"].push(ent(3, "operator", "message", "queued brief update", sentMessage));
+  await React.act(async () => { await conversationThread("c-camp").refresh(); });
+  await settle();
+  turn = { state: "working", message: sentMessage };
+  await React.act(async () => { await new Promise((r) => setTimeout(r, 6_100)); });
+  await settle();
+  assert(host.querySelector("[data-chat-stop]") !== null, "the owned working turn still offers Stop");
+  assert(pane().includes("Working…"), "the working row still shows");
+
+  await pick("c-gen");
+  assert(host.querySelector("[data-chat-status]") === null, "the status does not bleed into another conversation");
+  turn = null;
+  await React.act(async () => { await resources.masterState.refresh(); });
+  await settle();
+  await pick("c-camp");
+}
 
 // Collapse state is per app.
 await React.act(async () => { (host.querySelector(".app-chat-collapse") as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true })); });

@@ -1,6 +1,7 @@
 import { useMemo, useState, type ReactNode } from "react";
 import type { ThreadRef } from "../../lib/types";
 import Md from "../../ui/Md";
+import { attachMeta } from "../app-shell/chat/attach";
 import { ThreadPermission } from "./PermissionCard";
 import { stepSummary, toolSteps, type ThreadEntry, type ThreadItem } from "./thread";
 
@@ -11,10 +12,12 @@ import { stepSummary, toolSteps, type ThreadEntry, type ThreadItem } from "./thr
  */
 export type Density = "full" | "compact";
 
+const USER_BUBBLE = "rounded-[10px_10px_2px_10px]";
+
 export function time(created: string | null | undefined): string {
   if (!created) return "";
   const d = new Date(created);
-  return Number.isNaN(d.getTime()) ? "" : d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return Number.isNaN(d.getTime()) ? "" : d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
 }
 
 /**
@@ -23,7 +26,7 @@ export function time(created: string | null | undefined): string {
  * a call still running shows the pulse instead of a result. Opening and
  * closing animate through the grid-rows height trick (styles.css).
  */
-function StepsGroup({ entries, density = "full" }: { entries: ThreadEntry[]; density?: Density }) {
+function StepsGroup({ entries }: { entries: ThreadEntry[] }) {
   const [open, setOpen] = useState(false);
   const steps = useMemo(() => toolSteps(entries), [entries]);
   const refused = steps.filter((s) => s.refused).length;
@@ -31,7 +34,7 @@ function StepsGroup({ entries, density = "full" }: { entries: ThreadEntry[]; den
   const running = steps.some((s) => !s.done);
   const last = steps[steps.length - 1];
   return (
-    <div className={`steps ${density === "compact" ? "ml-7" : "ml-8"} min-w-0`} data-kind="tools" data-open={open || undefined}>
+    <div className="steps min-w-0" data-kind="tools" data-open={open || undefined}>
       <button
         type="button"
         className="steps-head"
@@ -87,6 +90,9 @@ function StepsGroup({ entries, density = "full" }: { entries: ThreadEntry[]; den
   );
 }
 
+/** CAD-1168 (approved mock): "You 09:32" / "Assistant 09:33" label above
+ *  the body, no avatars. Home and the app panes share it; density only
+ *  changes the bubble width and text size. */
 function Bubble({
   who,
   at,
@@ -102,22 +108,12 @@ function Bubble({
 }) {
   const compact = density === "compact";
   return (
-    <div className={`flex gap-2.5 min-w-0 ${me ? "flex-row-reverse" : ""}`}>
-      <span
-        className={`shrink-0 ${compact ? "w-5 h-5" : "w-6 h-6"} rounded-full grid place-items-center text-micro font-semibold ${
-          me ? "bg-accent/15 text-accent" : "bg-ink-800 text-ink-300"
-        }`}
-        aria-hidden
-      >
-        {me ? "Y" : "M"}
-      </span>
-      <div className={`min-w-0 ${compact ? "max-w-[92%]" : "max-w-[85%]"} ${me ? "text-right" : ""}`}>
-        <div className="text-micro text-ink-500">
-          <span className="text-ink-300 font-medium">{who}</span>
-          {at ? ` · ${at}` : ""}
-        </div>
-        {children}
+    <div className={`min-w-0 ${me ? "ml-6 text-right" : ""}`} data-chat-message={me ? "user" : "assistant"}>
+      <div className={`flex gap-2 items-center text-micro text-ink-400 mb-1 ${me ? "justify-end" : ""}`}>
+        <span className="text-ink-100 font-medium">{who}</span>
+        {at ? <span>{at}</span> : null}
       </div>
+      <div className={`min-w-0 ${compact ? "" : "max-w-[92%] inline-block"} ${me ? "text-left" : ""}`}>{children}</div>
     </div>
   );
 }
@@ -135,7 +131,12 @@ export function ThreadItemView({
   density?: Density;
   readOnly: boolean;
   onOpenIssue: (id: string) => void;
-  onRetry: (message: string, text: string, refs?: ThreadRef[]) => void;
+  onRetry: (
+    message: string,
+    text: string,
+    refs?: ThreadRef[],
+    attachments?: { id: string }[],
+  ) => void;
   onDiscard: (message: string) => void;
 }) {
   const compact = density === "compact";
@@ -144,8 +145,9 @@ export function ThreadItemView({
     case "operator":
       return (
         <Bubble who="You" at={time(item.entry.created)} me density={density}>
-          <div className={`inline-block text-left mt-0.5 px-3 py-2 rounded-lg bg-accent/10 ${bodyText} text-ink-100 whitespace-pre-wrap break-words`}>
-            {item.entry.text}
+          <div className={`inline-block text-left px-3 py-2 bg-accent/10 border border-accent/20 ${USER_BUBBLE} ${bodyText} text-ink-100 break-words`}>
+            <span className="whitespace-pre-wrap">{item.entry.text}</span>
+            <AttachmentRows files={entryAttachments(item.entry.payload)} />
           </div>
           <RefChips refs={entryRefs(item.entry.payload)} />
         </Bubble>
@@ -159,7 +161,7 @@ export function ThreadItemView({
           density={density}
         >
           <div
-            className={`inline-block text-left mt-0.5 px-3 py-2 rounded-lg ${bodyText} whitespace-pre-wrap break-words ${
+            className={`inline-block text-left px-3 py-2 ${USER_BUBBLE} ${bodyText} whitespace-pre-wrap break-words ${
               item.pending.state === "failed" ? "border border-fail/50 text-ink-200" : "bg-accent/5 text-ink-300"
             }`}
             data-pending={item.pending.state}
@@ -172,7 +174,14 @@ export function ThreadItemView({
               {item.pending.error}{" "}
               <button
                 className="lnk"
-                onClick={() => onRetry(item.pending.message, item.pending.text, item.pending.refs)}
+                onClick={() =>
+                  onRetry(
+                    item.pending.message,
+                    item.pending.text,
+                    item.pending.refs,
+                    item.pending.attachments,
+                  )
+                }
               >
                 Retry
               </button>{" "}
@@ -187,17 +196,17 @@ export function ThreadItemView({
     case "commentary":
       return (
         <div
-          className={`${compact ? "ml-7" : "ml-8"} text-secondary text-ink-400 italic whitespace-pre-wrap break-words`}
+          className={`text-secondary text-ink-400 italic whitespace-pre-wrap break-words`}
           data-kind="commentary"
         >
           {item.entry.text}
         </div>
       );
     case "tools":
-      return <StepsGroup entries={item.entries} density={density} />;
+      return <StepsGroup entries={item.entries} />;
     case "answer":
       return (
-        <Bubble who="Master" at={time(item.entry.created)} density={density}>
+        <Bubble who="Assistant" at={time(item.entry.created)} density={density}>
           <div className={`issue-reader mt-0.5 ${bodyText} text-ink-200 break-words`} data-kind="answer">
             <Md text={item.entry.text} onOpen={onOpenIssue} />
           </div>
@@ -284,6 +293,52 @@ function RefChips({ refs }: { refs: ThreadRef[] }) {
         </span>
       ))}
     </span>
+  );
+}
+
+/** CAD-1168: `payload.attachments` as typed rows — a malformed value
+ *  reads as none. The stored row carries only daemon-resolved metadata
+ *  ({id,name,size,mime,sha256}); the UI never makes a path or URL of it. */
+export interface EntryAttachment {
+  id: string;
+  name: string;
+  size: number;
+  mime: string;
+}
+
+export function entryAttachments(payload: unknown): EntryAttachment[] {
+  const arr = (payload as { attachments?: unknown } | null)?.attachments;
+  if (!Array.isArray(arr)) return [];
+  return arr.filter(
+    (a): a is EntryAttachment =>
+      !!a &&
+      typeof a === "object" &&
+      typeof (a as EntryAttachment).id === "string" &&
+      typeof (a as EntryAttachment).name === "string" &&
+      typeof (a as EntryAttachment).size === "number" &&
+      typeof (a as EntryAttachment).mime === "string",
+  );
+}
+
+/** The operator bubble's retained files as the mock's file card: icon,
+ *  name, `size · kind`. Names, sizes and MIMEs only — a card is never a
+ *  link and never carries a token or path. */
+function AttachmentRows({ files }: { files: EntryAttachment[] }) {
+  if (files.length === 0) return null;
+  return (
+    <div className="grid gap-1.5 mt-2" data-entry-attachments>
+      {files.map((f) => (
+        <div key={f.id} className="app-chat-filerow" title={`${f.mime} · ${f.size} B`}>
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M5 3h9l5 5v13H5zM14 3v6h5M8 13h8M8 17h5" />
+          </svg>
+          <div className="app-chat-filename">
+            <span>{f.name}</span>
+            <small>{attachMeta(f.name, f.size)}</small>
+          </div>
+        </div>
+      ))}
+    </div>
   );
 }
 
