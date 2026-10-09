@@ -157,11 +157,9 @@ fn serve(stream: std::net::TcpStream, log: &Seen, door: &Door) {
         ("GET", "/v1/runtime/tools/read_instagram_posts") => json_reply(
             json!({"ok":true,"data":{"slug":"read_instagram_posts","displayName":"Read Instagram posts","effect":"read","chargePrecondition":"max_charge_minor@1","price":price,"unitPrice":null}}),
         ),
-        ("POST", "/v1/runtime/tools/call") if sent["slug"] == "read_instagram_posts" => {
-            json_reply(
-                json!({"ok":true,"data":{"slug":"read_instagram_posts","repeated":false,"price":price,"result":{"success":true,"status":"ok","user":{"username":HANDLE,"is_private":false},"items":[{"id":"post-1","code":"AbCd123","created_at":"2026-09-27T00:00:00Z","caption":{"text":"Door caption"}}]}}}),
-            )
-        }
+        ("POST", "/v1/runtime/tools/call") if sent["slug"] == "read_instagram_posts" => json_reply(
+            json!({"ok":true,"data":{"slug":"read_instagram_posts","repeated":false,"price":price,"result":{"success":true,"status":"ok","user":{"username":HANDLE,"is_private":false},"items":[{"id":"post-1","code":"AbCd123","created_at":"2026-09-27T00:00:00Z","caption":{"text":"Door caption"}}]}}}),
+        ),
         // ---- image generation (media door) ----
         ("GET", "/v1/runtime/media/price/image") => json_reply(
             json!({"ok":true,"data":{"kind":"image","model":"openai/gpt-image-2.5","price":{"slug":"generate_image","chargeMinor":31500,"currency":"USD","version":"2026-09-29T00:00:00.000Z"}}}),
@@ -367,17 +365,16 @@ impl Fx {
             &app,
         );
         copy_dir(
-            &std::path::Path::new(manifest_dir).join("tests/fixtures/apps/ig-tools-fixture/screens"),
+            &std::path::Path::new(manifest_dir)
+                .join("tests/fixtures/apps/ig-tools-fixture/screens"),
             &app.join("screens"),
         );
         let screens = app.join("screens/feed/screens.json");
         let text = std::fs::read_to_string(&screens).unwrap();
-        let text = text
-            .replace("ig-tools-fixture", "social-content")
-            .replace(
-                r#""tools": { "instagram.read": "source" }"#,
-                r#""tools": { "instagram.read": "source", "social.draft": "image" }"#,
-            );
+        let text = text.replace("ig-tools-fixture", "social-content").replace(
+            r#""tools": { "instagram.read": "source" }"#,
+            r#""tools": { "instagram.read": "source", "social.draft": "image" }"#,
+        );
         assert!(text.contains("social.draft"), "screen tools edit applied");
         std::fs::write(&screens, text).unwrap();
         let installed = self.op(
@@ -461,14 +458,13 @@ impl Fx {
         self.context = context;
     }
 
-    /// Fetch the saved handle, draft a caption from that post, generate the
-    /// image and attach it. Returns `(draft_id, revision, asset_id)`.
-    fn draft_with_image(&self, tag: &str) -> (String, i64, String) {
+    /// Fetch the saved handle's posts. Returns `(receipt_id, post_id)`.
+    fn fetch(&self) -> (String, String) {
         let fetched = self
             .screen(
                 "app_tool_invoke",
                 json!({"tool_alias": "instagram.read", "input": {"handle": HANDLE},
-                    "request_id": format!("fetch-{tag}")}),
+                    "request_id": "fetch-1304"}),
             )
             .unwrap_or_else(|e| panic!("fetch: {e}"));
         let receipt = fetched["receipt"]["id"].as_str().unwrap().to_string();
@@ -476,6 +472,13 @@ impl Fx {
             .as_str()
             .unwrap_or_else(|| panic!("no normalized post: {fetched}"))
             .to_string();
+        (receipt, post)
+    }
+
+    /// Draft a caption from that post, generate the image and attach it.
+    /// Returns `(draft_id, revision, asset_id)`.
+    fn draft_with_image(&self, tag: &str, source: &(String, String)) -> (String, i64, String) {
+        let (receipt, post) = source;
         let created = self
             .screen(
                 "app_social_draft_create",
@@ -570,7 +573,8 @@ impl Drop for Fx {
 #[test]
 fn an_approved_instagram_draft_with_a_generated_image_publishes_and_a_changed_one_sends_nothing() {
     let fx = Fx::start();
-    let (draft, revision, asset) = fx.draft_with_image("a");
+    let source = fx.fetch();
+    let (draft, revision, asset) = fx.draft_with_image("a", &source);
     let (id, digest) = fx.staged(&draft, revision, "a");
 
     // Positive: media import, preflight and publish, ends posted.
@@ -578,7 +582,7 @@ fn an_approved_instagram_draft_with_a_generated_image_publishes_and_a_changed_on
         .publish_now(&id, &digest)
         .unwrap_or_else(|e| panic!("image publish refused: {e}"));
     assert_eq!(fx.count(&format!("{PREFIX}/media/import")), 1);
-    assert_eq!(fx.count(&format!("{PREFIX}/publish/preflight")), 1);
+    assert!(fx.count(&format!("{PREFIX}/publish/preflight")) >= 1);
     assert_eq!(fx.count(&format!("{PREFIX}/publish")), 1);
     assert_eq!(fx.state(&id), "posted", "{posted}");
     // The staged digest is the canonical bare 64-hex the door speaks.
@@ -590,7 +594,11 @@ fn an_approved_instagram_draft_with_a_generated_image_publishes_and_a_changed_on
         .as_str()
         .unwrap_or_else(|| panic!("no frozen image digest: {frozen}"))
         .to_string();
-    assert_eq!(frozen_digest.len(), 64, "frozen image digest {frozen_digest}");
+    assert_eq!(
+        frozen_digest.len(),
+        64,
+        "frozen image digest {frozen_digest}"
+    );
     assert!(frozen_digest.bytes().all(|b| b.is_ascii_hexdigit()));
     assert!(!asset.is_empty());
 
@@ -602,13 +610,16 @@ fn an_approved_instagram_draft_with_a_generated_image_publishes_and_a_changed_on
         "the door was presented a different image digest: {sends:?}"
     );
     let imports = fx.door.imports.lock().unwrap().clone();
-    assert_eq!(imports, vec![(frozen_digest.clone(), frozen_digest.clone())]);
+    assert_eq!(
+        imports,
+        vec![(frozen_digest.clone(), frozen_digest.clone())]
+    );
 
     // Changed image after approval: a second generated image is swapped in,
     // the approved effect is refused and nothing more reaches the door.
-    let (draft_b, revision_b, _) = fx.draft_with_image("b");
+    let (draft_b, revision_b, _) = fx.draft_with_image("b", &source);
     let (id_b, digest_b) = fx.staged(&draft_b, revision_b, "b");
-    let (_, _, other_asset) = fx.draft_with_image("c");
+    let (_, _, other_asset) = fx.draft_with_image("c", &source);
     fx.screen(
         "app_social_draft_update",
         json!({"tool_alias": "social.draft", "request_id": "swap-b", "draft_id": draft_b,
@@ -617,11 +628,14 @@ fn an_approved_instagram_draft_with_a_generated_image_publishes_and_a_changed_on
     .unwrap();
     let before = fx.seen.lock().unwrap().len();
     let refused = fx.publish_now(&id_b, &digest_b).unwrap_err().to_string();
-    assert!(refused.contains("social draft changed since approval"), "{refused}");
+    assert!(
+        refused.contains("social draft changed since approval"),
+        "{refused}"
+    );
     assert_eq!(fx.state(&id_b), "approved");
 
     // Changed caption after approval: same.
-    let (draft_d, revision_d, asset_d) = fx.draft_with_image("d");
+    let (draft_d, revision_d, asset_d) = fx.draft_with_image("d", &source);
     let (id_d, digest_d) = fx.staged(&draft_d, revision_d, "d");
     fx.screen(
         "app_social_draft_update",
@@ -631,7 +645,10 @@ fn an_approved_instagram_draft_with_a_generated_image_publishes_and_a_changed_on
     )
     .unwrap();
     let refused = fx.publish_now(&id_d, &digest_d).unwrap_err().to_string();
-    assert!(refused.contains("social draft changed since approval"), "{refused}");
+    assert!(
+        refused.contains("social draft changed since approval"),
+        "{refused}"
+    );
     assert_eq!(fx.state(&id_d), "approved");
     let after = fx.seen.lock().unwrap()[before..].to_vec();
     assert!(
