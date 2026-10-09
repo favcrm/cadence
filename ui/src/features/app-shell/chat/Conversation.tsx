@@ -56,6 +56,7 @@ import {
   type OutboxEnvelope,
 } from "../conversationClient";
 import {
+  carryEarlyDraft,
   composerScope,
   moveComposerScope,
   restoreSavedIntent,
@@ -350,6 +351,14 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const loaded = thread.data !== null;
   const draftSubject = active.draftSubject;
   const composerKey = `app|${installId}|${convId ?? draftSubject ?? ""}`;
+  // CAD-1279: text typed while the conversation was still resolving lives
+  // under the empty-identity key; carry it to the resolved key.
+  const prevComposerKey = useRef(composerKey);
+  useLayoutEffect(() => {
+    const prev = prevComposerKey.current;
+    prevComposerKey.current = composerKey;
+    if (prev.startsWith(`app|${installId}|`) && prev.endsWith("|")) carryEarlyDraft(prev, composerKey);
+  }, [composerKey, installId]);
   // The store the pane is showing: a late send error paints only while
   // its own destination is the visible one, never an unrelated pane.
   const storeRef = useRef(store);

@@ -301,6 +301,21 @@ export function setComposerContent(key: string, text: string, refs: ThreadRef[])
   pruneCell(cell);
 }
 
+/** CAD-1279: text typed before the pane resolved its conversation sits
+ *  under the empty-identity key. Move it to the resolved key once, only
+ *  into an untouched draft and never while a handoff is in flight, so no
+ *  other conversation's draft is overwritten or leaked. */
+export function carryEarlyDraft(fromKey: string, toKey: string): void {
+  const from = families.get(fromKey);
+  if (!from || fromKey === toKey) return;
+  const src = activeOf(from);
+  if ((src.text === "" && src.refs.length === 0) || src.reserved !== null) return;
+  if (hasIntent(activeOf(familyFor(toKey)))) return;
+  const { text, refs } = src;
+  setComposerContent(toKey, text, refs);
+  setComposerContent(fromKey, "", EMPTY_REFS);
+}
+
 function sameRefs(a: readonly ThreadRef[], b: readonly ThreadRef[]): boolean {
   return a.length === b.length && a.every((r, i) => r.kind === b[i].kind && r.id === b[i].id);
 }
@@ -522,6 +537,13 @@ function uploadDestination(destination: AttachDestination | undefined): ChatFile
   };
 }
 
+let uploadTail: Promise<unknown> = Promise.resolve();
+function oneAtATime<T>(run: () => Promise<T>): Promise<T> {
+  const result = uploadTail.then(run);
+  uploadTail = result.catch(() => undefined);
+  return result;
+}
+
 function startUpload(
   itemKey: string,
   file: File,
@@ -552,13 +574,13 @@ function startUpload(
       if (destination?.app && destination.conversation === undefined) {
         throw new Error("This app attachment has no conversation destination.");
       }
-      if (!stillOwned()) return;
-      const row: ChatFileRow = await api.chatFileUpload(
-        file,
-        controller.signal,
-        uploadDestination(destination),
+      // One transfer at a time: the daemon's quota lock refuses a
+      // concurrent upload instead of waiting, so a multi-file drop must
+      // queue here. A row removed while it waits never starts.
+      const row: ChatFileRow | null = await oneAtATime(() =>
+        stillOwned() ? api.chatFileUpload(file, controller.signal, uploadDestination(destination)) : Promise.resolve(null),
       );
-      if (!stillOwned()) return;
+      if (row === null || !stillOwned()) return;
       controllers.delete(itemKey);
       patch(itemKey, generation, { status: "ready", id: row.id, name: row.name, mime: row.mime, destination });
       try {

@@ -849,36 +849,56 @@ fn ensure_custody_gitignore(dir: std::os::fd::RawFd) -> Result<()> {
             0o600,
         )
     };
-    let existing = open(c".gitignore", libc::O_RDONLY | libc::O_NONBLOCK);
-    if existing >= 0 {
-        let mut file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(existing) });
+    // True when `.gitignore` is already exactly the `*` rule.
+    let has_rule = || {
+        let fd = open(c".gitignore", libc::O_RDONLY | libc::O_NONBLOCK);
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
         let mut buf = Vec::new();
         // Bounded: the rule is two bytes; anything longer is rewritten.
         let ok = Read::take(&mut file, 16).read_to_end(&mut buf).is_ok();
-        if ok && (buf == b"*\n" || buf == b"*") {
-            return Ok(());
-        }
-    } else {
-        let e = std::io::Error::last_os_error();
+        Ok(ok && (buf == b"*\n" || buf == b"*"))
+    };
+    match has_rule() {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
         // ELOOP/other: a symlink or odd entry is replaced below by rename,
         // which never follows it.
-        if e.raw_os_error() != Some(libc::ENOENT) && e.raw_os_error() != Some(libc::ELOOP) {
-            return Err(err(e));
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ELOOP)) => {}
+        Err(e) => return Err(err(e)),
+    }
+    // A unique temp name per call: concurrent first uploads must not
+    // unlink or rename each other's file.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = std::ffi::CString::new(format!(
+        ".gitignore.{}.{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ))
+    .expect("no NUL in a formatted name");
+    let written = (|| {
+        let fd = open(&tmp, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL);
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
         }
-    }
-    let tmp = c".gitignore.tmp";
-    unsafe { libc::unlinkat(dir, tmp.as_ptr(), 0) };
-    let fd = open(tmp, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL);
-    if fd < 0 {
-        return Err(err(std::io::Error::last_os_error()));
-    }
-    let mut file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
-    file.write_all(b"*\n").map_err(err)?;
-    file.sync_all().map_err(err)?;
-    if unsafe { libc::renameat(dir, tmp.as_ptr(), dir, c".gitignore".as_ptr()) } != 0 {
-        let e = std::io::Error::last_os_error();
+        let mut file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+        file.write_all(b"*\n")?;
+        file.sync_all()?;
+        if unsafe { libc::renameat(dir, tmp.as_ptr(), dir, c".gitignore".as_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    })();
+    if let Err(e) = written {
         unsafe { libc::unlinkat(dir, tmp.as_ptr(), 0) };
-        return Err(err(e));
+        // A concurrent first upload may have installed the rule already.
+        return if has_rule().unwrap_or(false) {
+            Ok(())
+        } else {
+            Err(err(e))
+        };
     }
     Ok(())
 }
@@ -1585,6 +1605,27 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let s = Store::open(&dir.path().join("t.sqlite3")).unwrap();
         (dir, s)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_first_gitignore_writes_all_succeed() {
+        use std::os::fd::AsRawFd;
+        let dir = TempDir::new().unwrap();
+        let handle = std::fs::File::open(dir.path()).unwrap();
+        let fd = handle.as_raw_fd();
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| ensure_custody_gitignore(fd)))
+                .collect();
+            for worker in workers {
+                worker.join().unwrap().unwrap();
+            }
+        });
+        assert_eq!(
+            std::fs::read(dir.path().join(".gitignore")).unwrap(),
+            b"*\n"
+        );
     }
 
     fn stage(state_dir: &Path, bytes: &[u8]) -> PathBuf {
