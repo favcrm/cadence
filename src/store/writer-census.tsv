@@ -106,7 +106,7 @@ store/effects.rs	guarded-store-and-read-queries	execute	8
 store/effects.rs	guarded-store-and-read-queries	guarded_write	7
 store/effects.rs	guarded-store-and-read-queries	prepare	1
 store/events.rs	guarded-store-and-read-queries	execute	4
-store/events.rs	guarded-store-and-read-queries	guarded_write	12
+store/events.rs	guarded-store-and-read-queries	guarded_write	13
 store/events.rs	guarded-store-and-read-queries	prepare	7
 store/inbox.rs	guarded-store-and-read-queries	execute	2
 store/inbox.rs	guarded-store-and-read-queries	guarded_write	4
