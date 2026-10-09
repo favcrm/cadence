@@ -1,0 +1,21 @@
+{
+  "contract": "app-screens/v2",
+  "app": "ig-tools-fixture",
+  "entry": "client.js",
+  "host_contract": "screen-actions.v1",
+  "may": ["tools.invoke"],
+  "tools": { "instagram.read": "source" },
+  "assets": [
+    {
+      "name": "client.js",
+      "media_type": "text/javascript",
+      "sha256": "sha256:2dbcdb9bf3c8806aefe5e7149bc2d1bf90da4e3774e495eea930a25d5f1666fa",
+      "size": 892
+    }
+  ],
+  "provenance": {
+    "source_digest": "sha256:25a6634263c1b1f6fc4697a04e2b9904ea4b042a89af59dc93ec1f5d44848a26",
+    "sdk_digest": "sha256:a9d0df1873a041a6e38e2c461ffc6b53d216fd7cfab9bece3e9b5bc5c69b4203",
+    "toolchain_digest": "sha256:8f455bba4522752c63bbcd2b6d4c954e66a2bade8792dbe67be7c088affa422e"
+  }
+}

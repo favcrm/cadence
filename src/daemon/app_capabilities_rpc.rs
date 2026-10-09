@@ -38,6 +38,8 @@ impl Shared {
     /// Called only under the broker's custody lock, never by the legacy
     /// credential/grant path. Empty bytes require a live registered builtin
     /// account and its exact frozen connection/descriptor receipts.
+    /// `pub(super)` for the CAD-1177 standalone tool entry, which reuses
+    /// the identical custody proof.
     pub(super) fn app_capability_credential(&self, config: &Value) -> Result<Vec<u8>> {
         let provider = required_str(config, "provider")?;
         let account = required_str(config, "account")?;

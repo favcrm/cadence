@@ -18,6 +18,7 @@ pub(super) enum Route<'a> {
     Effects(Option<&'a str>, Option<&'a str>),
     Effect(&'a str),
     Decide(&'a str),
+    PublishNow(&'a str),
     Resolve(&'a str),
 }
 fn segment(id: &str) -> bool {
@@ -36,6 +37,7 @@ pub(super) fn route(path: &str) -> Option<Route<'_>> {
         return match parts.as_slice() {
             [id] if segment(id) => Some(Route::Effect(id)),
             [id, "decide"] if segment(id) => Some(Route::Decide(id)),
+            [id, "publish-now"] if segment(id) => Some(Route::PublishNow(id)),
             [id, "resolve"] if segment(id) => Some(Route::Resolve(id)),
             _ => None,
         };
@@ -96,6 +98,7 @@ impl Route<'_> {
                 | Self::Revoke(..)
                 | Self::Stage(_)
                 | Self::Decide(_)
+                | Self::PublishNow(_)
                 | Self::Resolve(_)
         )
     }
@@ -148,6 +151,11 @@ enum Choice {
 struct Decision {
     digest: String,
     decision: Choice,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PublishNow {
+    digest: String,
 }
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -234,6 +242,11 @@ pub(super) fn handle(
                 let mut params = typed::<Decision>(request)?;
                 params["effect_id"] = json!(effect);
                 ("app_effect_decide", params)
+            }
+            Route::PublishNow(effect) => {
+                let mut params = typed::<PublishNow>(request)?;
+                params["effect_id"] = json!(effect);
+                ("app_effect_publish_now", params)
             }
             Route::Resolve(effect) => {
                 let mut params = typed::<Resolve>(request)?;

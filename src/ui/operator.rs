@@ -138,6 +138,11 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     ),
     route(
         "POST",
+        "/api/app-effects/*/publish-now",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
         "/api/app-installations/*/contexts",
         RouteClass::OperatorOnly,
     ),
@@ -300,6 +305,60 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     route(
         "POST",
         "/api/app-installations/*/screens/*/mount",
+        RouteClass::OperatorOnly,
+    ),
+    // CAD-1177: the standalone tool invoke — operator-only write; the
+    // daemon re-proves the session + mount action context it relays.
+    route(
+        "POST",
+        "/api/app-screen-tools/invoke",
+        RouteClass::OperatorOnly,
+    ),
+    // CAD-1177: the mount-teardown revoke — operator-only write; the
+    // daemon only retires a context the proven session owns.
+    route(
+        "POST",
+        "/api/app-screen-tools/revoke",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-social-drafts/create",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-social-drafts/list",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-social-drafts/show",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-social-drafts/update",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-social-drafts/asset",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-social-drafts/sources/show",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-social-drafts/sources/save",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-social-drafts/effect-stage",
         RouteClass::OperatorOnly,
     ),
     route(

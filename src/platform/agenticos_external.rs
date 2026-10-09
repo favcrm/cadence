@@ -3,7 +3,7 @@
 //! External tokens stay in custody; the upstream door derives their company.
 //! Trusted hosted media and source reads (CAD-868, CAD-1060) instead use the
 //! fixed lease-owned door with no bearer; the Worker derives the company.
-mod image;
+pub(crate) mod image;
 pub mod media_import;
 pub mod publish;
 pub mod publish_sender;
@@ -28,10 +28,12 @@ use image::{image_mime, image_prompt, ASSET_LIMIT};
 
 pub const PLATFORM: &str = "agenticos_external";
 pub const MANIFEST_PIN: &str = "agenticos-external-provider-tools@3";
+pub(crate) const TEXT_MANIFEST_PIN: &str = "agenticos-external-provider-tools@4";
 /// CAD-1096: the generic workspace-visible source tool (AOS-140). The raw
 /// provider slug stays hidden from workspaces (AOS-103).
 const POSTS_TOOL: &str = "read_instagram_posts";
 const IMAGE_TOOL: &str = "generate_image";
+const TEXT_TOOL: &str = "generate_text";
 /// The only model the image slot may run; the price read and every job must
 /// echo it back.
 const IMAGE_MODEL: &str = "openai/gpt-image-2.5";
@@ -66,6 +68,15 @@ const TABLE_JSON: &str = r#"{
         {"tool":"generate_image","effect":"draft","scopes":["provider.draft"],"label":"Generate an image draft"}
     ]
 }"#;
+const TABLE_JSON_V4: &str = r#"{
+    "platform":"agenticos_external",
+    "manifest_version":"agenticos-external-provider-tools@4",
+    "tools":[
+        {"tool":"read_instagram_posts","effect":"read","scopes":["provider.read"],"label":"Read public Instagram profile posts"},
+        {"tool":"generate_image","effect":"draft","scopes":["provider.draft"],"label":"Generate an image draft"},
+        {"tool":"generate_text","effect":"draft","scopes":["provider.draft"],"label":"Generate a text draft"}
+    ]
+}"#;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Transport {
@@ -93,11 +104,11 @@ impl AgenticosExternalAdapter {
     }
 
     pub(crate) fn hosted_media(
-        _admission: super::deployments::HostedMediaAdmission,
+        admission: super::deployments::HostedMediaAdmission,
     ) -> Result<Self> {
         Self::new(
             "http://api.internal".into(),
-            Some(MANIFEST_PIN),
+            Some(admission.pin()),
             Transport::HostedMediaLease,
         )
     }
@@ -108,7 +119,12 @@ impl AgenticosExternalAdapter {
             .http_status_as_error(false)
             .max_redirects(0)
             .build();
-        let table = ToolTable::from_json(&serde_json::from_str(TABLE_JSON).expect("table JSON"))
+        let table_json = if deployment_pin == Some(TEXT_MANIFEST_PIN) {
+            TABLE_JSON_V4
+        } else {
+            TABLE_JSON
+        };
+        let table = ToolTable::from_json(&serde_json::from_str(table_json).expect("table JSON"))
             .expect("reviewed tool table");
         let adapter = Self {
             table,
@@ -215,6 +231,13 @@ impl AgenticosExternalAdapter {
             (Some("social.read"), Some(1), Some("list_posts"), Some("read"), Some(POSTS_TOOL)) => {
                 POSTS_TOOL
             }
+            (
+                Some("text.generate"),
+                Some(1),
+                Some("generate_text"),
+                Some("draft"),
+                Some(TEXT_TOOL),
+            ) if self.deployment_pin.as_deref() == Some(TEXT_MANIFEST_PIN) => TEXT_TOOL,
             _ => return Err("provider quote names an unreviewed action".into()),
         };
         let token = self.lease_token(credential, config)?;
@@ -378,7 +401,10 @@ impl AgenticosExternalAdapter {
         credential: &[u8],
         binding: &Value,
     ) -> std::result::Result<AppCapabilityQuote, String> {
-        if self.deployment_pin.as_deref() != Some(MANIFEST_PIN) {
+        if !matches!(
+            self.deployment_pin.as_deref(),
+            Some(MANIFEST_PIN | TEXT_MANIFEST_PIN)
+        ) {
             return Err("image generation has not been approved by this deployment".into());
         }
         let config = &binding["config"];
@@ -463,6 +489,68 @@ impl AgenticosExternalAdapter {
     /// retry under the same key replays the same upstream job. No price
     /// ceiling is enforced here (pass-through pricing); the receipt records
     /// the actual chargeMinor beside the approved rate.
+    fn call_text(
+        &self,
+        credential: &[u8],
+        authority: &Value,
+        input: &Value,
+        idempotency_key: &str,
+    ) -> std::result::Result<AppCapabilityOutput, AppCapabilityError> {
+        const UNCERTAIN: &str =
+            "AgenticOS text generation outcome is uncertain; retry reuses the same key";
+        if self.deployment_pin.as_deref() != Some(TEXT_MANIFEST_PIN) {
+            return Err(AppCapabilityError::Refused("AgenticOS text generation is unavailable without the reviewed manifest v4 deployment".into()));
+        }
+        let body = validate_text_input(input).map_err(AppCapabilityError::Refused)?;
+        let token = self
+            .lease_token(credential, &authority["binding"]["config"])
+            .map_err(AppCapabilityError::Refused)?;
+        if !valid_caller_key(idempotency_key) {
+            return Err(AppCapabilityError::Refused(
+                "provider idempotency key is invalid".into(),
+            ));
+        }
+        let ceiling = frozen_charge_ceiling(authority).map_err(AppCapabilityError::Refused)?;
+        let mut response = authorized(self.http.post(format!("{}{CALL_PATH}", self.base)), token)
+            .header("idempotency-key", idempotency_key)
+            .send_json(json!({"slug":TEXT_TOOL,"body":body,"max_charge_minor":ceiling}))
+            .map_err(|_| AppCapabilityError::Uncertain(UNCERTAIN.to_owned()))?;
+        let status = response.status().as_u16();
+        let bytes = response
+            .body_mut()
+            .with_config()
+            .limit(RESPONSE_CAP)
+            .read_to_vec()
+            .map_err(|_| AppCapabilityError::Uncertain(UNCERTAIN.to_owned()))?;
+        let envelope: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| AppCapabilityError::Uncertain(UNCERTAIN.to_owned()))?;
+        if status != 200 || envelope["ok"] != true {
+            let code = refused_code(&envelope);
+            // A conflict or throttle never proves the provider did not run:
+            // the same idempotency key must be retried or reconciled, so
+            // none of these is a free refusal (the image path agrees).
+            if matches!(status, 408 | 409 | 425 | 429) {
+                return Err(AppCapabilityError::Uncertain(format!(
+                    "AgenticOS text generation outcome is uncertain: {code}"
+                )));
+            }
+            if status >= 500 || status == 0 {
+                return Err(AppCapabilityError::Uncertain(UNCERTAIN.into()));
+            }
+            return Err(AppCapabilityError::Refused(format!(
+                "AgenticOS text generation refused: {code}"
+            )));
+        }
+        // A 200 with a malformed result may already have been charged:
+        // a missing acknowledgment is uncertain, never free.
+        let result = validate_text_result(&envelope["data"]["result"])
+            .map_err(AppCapabilityError::Uncertain)?;
+        Ok(AppCapabilityOutput {
+            result,
+            asset: None,
+        })
+    }
+
     fn call_image(
         &self,
         credential: &[u8],
@@ -470,7 +558,10 @@ impl AgenticosExternalAdapter {
         input: &Value,
         idempotency_key: &str,
     ) -> std::result::Result<AppCapabilityOutput, AppCapabilityError> {
-        if self.deployment_pin.as_deref() != Some(MANIFEST_PIN) {
+        if !matches!(
+            self.deployment_pin.as_deref(),
+            Some(MANIFEST_PIN | TEXT_MANIFEST_PIN)
+        ) {
             return Err(AppCapabilityError::Refused(
                 "image generation has not been approved by this deployment".into(),
             ));
@@ -795,6 +886,112 @@ fn money_micros(value: &Value) -> Option<u64> {
         .checked_add(fractional.parse::<u64>().ok()?)
 }
 
+fn validate_text_input(input: &Value) -> std::result::Result<Value, String> {
+    let fields = input
+        .as_object()
+        .ok_or("text generation input must be an object")?;
+    if fields
+        .keys()
+        .any(|k| !matches!(k.as_str(), "model" | "messages" | "maxOutputTokens"))
+    {
+        return Err("text generation input has unsupported fields".into());
+    }
+    let model = fields
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("z-ai/glm-5.3-flash");
+    if model != "z-ai/glm-5.3-flash" {
+        return Err("text generation model is not reviewed".into());
+    }
+    let messages = fields
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or("text generation messages must be an array")?;
+    if messages.is_empty() || messages.len() > 100 {
+        return Err("text generation messages exceed their supported bound".into());
+    }
+    let mut clean = Vec::with_capacity(messages.len());
+    for message in messages {
+        let m = message
+            .as_object()
+            .ok_or("text generation message must be an object")?;
+        if m.len() != 2 || m.keys().any(|k| !matches!(k.as_str(), "role" | "content")) {
+            return Err("text generation message has unsupported fields".into());
+        }
+        let role = m
+            .get("role")
+            .and_then(Value::as_str)
+            .ok_or("text generation message role is missing")?;
+        let content = m
+            .get("content")
+            .and_then(Value::as_str)
+            .ok_or("text generation message content is missing")?;
+        if !matches!(role, "system" | "user")
+            || content.chars().count() > 64_000
+            || content.contains('\0')
+        {
+            return Err("text generation message role or content is invalid".into());
+        }
+        clean.push(json!({"role":role,"content":content}));
+    }
+    let tokens = fields
+        .get("maxOutputTokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(4096);
+    if !(1..=8192).contains(&tokens) {
+        return Err("text generation output token limit is invalid".into());
+    }
+    Ok(json!({"model":model,"messages":clean,"maxOutputTokens":tokens}))
+}
+
+fn validate_text_result(result: &Value) -> std::result::Result<Value, String> {
+    let fields = result
+        .as_object()
+        .ok_or("AgenticOS text result is malformed")?;
+    if fields.len() != 3
+        || fields
+            .keys()
+            .any(|k| !matches!(k.as_str(), "text" | "finishReason" | "usage"))
+    {
+        return Err("AgenticOS text result has unsupported fields".into());
+    }
+    let text = result["text"]
+        .as_str()
+        .ok_or("AgenticOS text result is missing text")?;
+    if text.is_empty() || text.len() > 65_536 || text.contains('\0') {
+        return Err("AgenticOS text result exceeds its supported bound".into());
+    }
+    if !matches!(result["finishReason"].as_str(), Some("stop" | "length")) {
+        return Err("AgenticOS text result finish reason is invalid".into());
+    }
+    let usage = result
+        .get("usage")
+        .ok_or("AgenticOS text result is missing usage")?;
+    if !usage.is_null() {
+        let u = usage
+            .as_object()
+            .ok_or("AgenticOS text result usage is malformed")?;
+        const KEYS: &[&str] = &[
+            "inputTokens",
+            "outputTokens",
+            "totalTokens",
+            "cachedInputTokens",
+            "reasoningOutputTokens",
+        ];
+        if u.keys().any(|k| !KEYS.contains(&k.as_str())) {
+            return Err("AgenticOS text result usage has unsupported fields".into());
+        }
+        for key in KEYS {
+            if let Some(value) = u.get(*key) {
+                if !value.is_null() && value.as_u64().is_none() {
+                    return Err("AgenticOS text result usage is malformed".into());
+                }
+            }
+        }
+    }
+    Ok(json!({"text":text,"finishReason":result["finishReason"],"usage":usage}))
+}
+
 fn quote_view(
     tool: &str,
     effect: &str,
@@ -1026,6 +1223,7 @@ impl PlatformAdapter for AgenticosExternalAdapter {
                 asset: None,
             }),
             Some("image") => self.call_image(credential, authority, input, idempotency_key),
+            Some("text") => self.call_text(credential, authority, input, idempotency_key),
             _ => Err(AppCapabilityError::Refused(
                 "AgenticOS capability slot has no reviewed execution adapter".into(),
             )),
@@ -1088,6 +1286,28 @@ impl PlatformAdapter for AgenticosExternalAdapter {
                 },
             ],
         };
+        if self.deployment_pin.as_deref() == Some(TEXT_MANIFEST_PIN) {
+            descriptor.capabilities.push(CapabilityDescriptor {
+                id: "text.generate".into(),
+                version: 1,
+                tools: vec![TEXT_TOOL.into()],
+                scopes: vec!["provider.draft".into()],
+                effect: "draft".into(),
+                semantics: CapabilitySemantics::PreviewOnly,
+            });
+            descriptor.action_mappings.push(BoundActionMapping {
+                capability: "text.generate".into(),
+                version: 1,
+                action: "generate_text".into(),
+                resource_kind: "connection_account".into(),
+                tool: TEXT_TOOL.into(),
+                scopes: vec!["provider.draft".into()],
+                effect: "draft".into(),
+                semantics: CapabilitySemantics::PreviewOnly,
+                input_contract: "text.generate.input@1".into(),
+                output_contract: "text.generate.result@1".into(),
+            });
+        }
         if self.transport == Transport::HostedMediaLease {
             // CAD-1060: the same lease door also serves the source read, so
             // the revision moves and every media-only hosted binding stales.
@@ -1457,9 +1677,136 @@ mod tests {
         image_proof(Value::Null)["binding"].clone()
     }
 
+    #[test]
+    fn text_generation_never_records_uncertain_outcomes_as_a_refusal() {
+        let proof = {
+            let mut proof = authority();
+            proof["slot"] = json!("text");
+            proof["quote"] = media_quote();
+            proof
+        };
+        let input = json!({"messages":[{"role":"user","content":"Draft a caption."}]});
+        let run = |status: u16, payload: Value| {
+            let (base, _seen, worker) = media_door(move |_| json_response(status, payload.clone()));
+            let adapter =
+                AgenticosExternalAdapter::with_deployment_pin(&base, Some(TEXT_MANIFEST_PIN))
+                    .unwrap();
+            let out =
+                adapter.execute_app_capability_outcome(b"token", &proof, &input, "app-call-1177");
+            worker.join().unwrap();
+            out.map(|_| ())
+        };
+        for (status, code) in [
+            (409, "uncertain"),
+            (409, "idempotency_in_progress"),
+            (409, "generation_result_unavailable"),
+            (408, "timeout"),
+            (425, "too_early"),
+            (429, "rate_limited"),
+            (503, "unavailable"),
+        ] {
+            assert!(
+                matches!(
+                    run(status, json!({"ok":false,"error":{"code":code}})),
+                    Err(AppCapabilityError::Uncertain(_))
+                ),
+                "{status} {code} must be uncertain"
+            );
+        }
+        // A 200 whose result fails validation may already be charged.
+        assert!(matches!(
+            run(
+                200,
+                json!({"ok":true,"data":{"result":{"text":"","finishReason":"stop","usage":null}}})
+            ),
+            Err(AppCapabilityError::Uncertain(_))
+        ));
+        // A confirmed refusal stays a refusal.
+        assert!(matches!(
+            run(403, json!({"ok":false,"error":{"code":"forbidden"}})),
+            Err(AppCapabilityError::Refused(_))
+        ));
+    }
+
     fn hosted_adapter() -> AgenticosExternalAdapter {
         let metadata = super::super::deployments::DeploymentMetadata::parse(br#"{"schema":1,"providers":[{"provider":"agenticos_external","origin":"http://api.internal","manifest_pin":"agenticos-external-provider-tools@3","transport":"hosted-media-lease@1"}]}"#).unwrap();
         AgenticosExternalAdapter::hosted_media(metadata.hosted_media().unwrap()).unwrap()
+    }
+
+    fn hosted_with_pin(pin: &str) -> Result<AgenticosExternalAdapter> {
+        let metadata = super::super::deployments::DeploymentMetadata::parse(
+            format!(r#"{{"schema":1,"providers":[{{"provider":"agenticos_external","origin":"http://api.internal","manifest_pin":"{pin}","transport":"hosted-media-lease@1"}}]}}"#).as_bytes(),
+        )?;
+        AgenticosExternalAdapter::hosted_media(metadata.hosted_media().unwrap())
+    }
+
+    fn hosted_text_proof() -> Value {
+        let mut proof = authority();
+        proof["slot"] = json!("text");
+        proof["quote"] = media_quote();
+        proof["binding"]["config"]["account"] = json!("hosted");
+        proof["binding"]["config"]["connection_kind"] = json!("builtin");
+        proof
+    }
+
+    #[test]
+    fn hosted_text_is_refused_under_manifest_3_and_callable_under_manifest_4() {
+        let input = json!({"messages":[{"role":"user","content":"Draft a caption."}]});
+        let has_text = |adapter: &AgenticosExternalAdapter| {
+            adapter
+                .connection_descriptor()
+                .unwrap()
+                .capabilities
+                .iter()
+                .any(|capability| capability.id == "text.generate")
+        };
+        // @3: text is not advertised and a call is refused before any HTTP.
+        let v3 = hosted_with_pin(MANIFEST_PIN).unwrap();
+        assert!(!has_text(&v3));
+        let refused = v3
+            .execute_app_capability_outcome(b"", &hosted_text_proof(), &input, "app-call-1177")
+            .err()
+            .expect("@3 refuses text");
+        assert!(
+            matches!(&refused, AppCapabilityError::Refused(reason) if reason.contains("manifest v4")),
+            "{refused:?}"
+        );
+        // @4: advertised, and a call goes through the same guards to the door
+        // with no bearer.
+        let (base, seen, worker) = media_door(|_| {
+            json_response(
+                200,
+                json!({"ok":true,"data":{"result":{"text":"A grounded social caption.","finishReason":"stop","usage":{"inputTokens":9,"outputTokens":5,"totalTokens":14,"cachedInputTokens":null,"reasoningOutputTokens":null}}}}),
+            )
+        });
+        let mut v4 = hosted_with_pin(TEXT_MANIFEST_PIN).unwrap();
+        v4.base = base;
+        assert!(has_text(&v4));
+        let Ok(out) =
+            v4.execute_app_capability_outcome(b"", &hosted_text_proof(), &input, "app-call-1177")
+        else {
+            panic!("@4 allows text");
+        };
+        assert_eq!(out.result["text"], "A grounded social caption.");
+        worker.join().unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].auth.is_none(), "the hosted door carries no bearer");
+        assert_eq!(seen[0].url, CALL_PATH);
+        // The guards still hold under @4: a credentialed account is refused.
+        let mut forged = hosted_text_proof();
+        forged["binding"]["config"]["account"] = json!("company1");
+        assert!(v4
+            .execute_app_capability_outcome(b"", &forged, &input, "app-call-1177")
+            .is_err());
+        // Only reviewed pins parse as a hosted media transport.
+        for bad in [
+            "agenticos-external-provider-tools@5",
+            "agenticos-external-provider-tools@4x",
+            "agenticos-external-provider-tools@2",
+        ] {
+            assert!(hosted_with_pin(bad).is_err(), "{bad}");
+        }
     }
 
     fn hosted_image_proof() -> Value {
@@ -2236,3 +2583,6 @@ mod tests {
         worker.join().unwrap();
     }
 }
+
+#[cfg(test)]
+mod text_contract_tests;

@@ -76,6 +76,8 @@ pub mod app_explorer;
 pub mod app_records;
 pub mod app_runs;
 pub mod app_sends;
+pub mod app_social_drafts;
+pub mod app_tools;
 pub mod crm_sends;
 pub mod crm_smtp;
 mod plans;

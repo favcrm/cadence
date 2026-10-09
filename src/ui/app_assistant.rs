@@ -109,6 +109,16 @@ fn rpc_error(error: Error) -> HttpResp {
         }
     }
     let text = error.to_string();
+    // Two permanent, non-secret states of an installation the operator
+    // already holds: it declares no assistant actions (nothing to show), or
+    // its descriptor is not yet consented. Both stay refusals — only the
+    // fixed, typed message differs, so the board can render them calmly.
+    if text.contains("installation has no assistant actions") {
+        return err_response(404, "no assistant actions declared");
+    }
+    if text.contains("app assistant descriptor is not consented") {
+        return err_response(409, "app assistant is not consented");
+    }
     let status = if text.contains("operator") || text.contains("caller") || text.contains("session")
     {
         403
@@ -255,4 +265,31 @@ pub(super) fn handle(
 #[cfg(test)]
 pub(super) fn busy_status_for_test(e: &Error) -> u16 {
     rpc_error(Error::busy(e.to_string())).status_code().0
+}
+
+#[cfg(test)]
+mod permanent_state_tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_or_unconsented_descriptor_is_a_typed_refusal_and_real_failures_stay_errors() {
+        let status = |e: Error| rpc_error(e).status_code().0;
+        assert_eq!(
+            status(Error::rejected("installation has no assistant actions")),
+            404
+        );
+        assert_eq!(
+            status(Error::rejected("app assistant descriptor is not consented")),
+            409
+        );
+        // Anything else keeps its previous mapping.
+        assert_eq!(status(Error::rejected("caller is not the operator")), 403);
+        assert_eq!(
+            status(Error::rejected(
+                "assistant RPC payload has unsupported fields"
+            )),
+            409
+        );
+        assert_eq!(status(Error::internal("disk")), 503);
+    }
 }

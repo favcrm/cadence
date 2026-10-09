@@ -137,7 +137,7 @@ pub(super) fn image_prompt(authority: &Value, input: &Value) -> Result<String, S
     compose_image_prompt(title, prompt_source, voice, guidance, legacy)
 }
 
-pub(super) fn image_mime(bytes: &[u8], header: &str) -> Result<&'static str, String> {
+pub(crate) fn image_mime(bytes: &[u8], header: &str) -> Result<&'static str, String> {
     let sniffed = image_data_mime(bytes)?;
     if header.trim().to_ascii_lowercase() != sniffed {
         return Err("downloaded image MIME differs from its bytes".into());

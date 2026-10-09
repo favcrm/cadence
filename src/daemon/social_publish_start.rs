@@ -102,7 +102,7 @@ impl PublishTarget {
 
     /// The target a re-proved binding receipt carries, or the plain reason
     /// the operator has not set one yet.
-    fn from_binding_config(config: &Value) -> Result<Self> {
+    pub(super) fn from_binding_config(config: &Value) -> Result<Self> {
         match config.get("publish") {
             Some(publish) => Self::parse(publish),
             None => Err(Error::rejected(

@@ -615,4 +615,7 @@ mod app_bindings;
 mod app_content;
 mod app_effects;
 mod app_records;
+mod app_social_drafts;
+mod app_tools;
+mod social_generation_receipt_acceptance;
 mod social_publish;

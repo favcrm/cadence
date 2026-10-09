@@ -198,8 +198,10 @@ const thread = {
 };
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { "Content-Type": "application/json" } });
 const posts: { path: string; body: any }[] = [];
+const reads: string[] = [];
 globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   const path = String(input);
+  reads.push(path);
   if (init?.method === "POST") {
     posts.push({ path, body: JSON.parse(String(init.body)) });
     return json({ ok: true });
@@ -616,6 +618,19 @@ await click(host.querySelector(".app-chat-form button[type=submit]"));
 await flush();
 assert(!posts.some((p) => p.path === "/api/threads/master/messages"), "stale social scope posts nothing");
 assert(text().includes("not active"), "stale social scope explains itself");
+// CAD-1177: a Social screen with 2+ active contexts offers its context choice
+// in the shell's header row (outside the outlet), and choosing one is the
+// genuine remembered selection the workspace follows.
+const pick = host.querySelector<HTMLSelectElement>(".app-shell-crumb select[data-social-context]");
+assert(pick, "a multi-context Social screen offers a selection control in the header row");
+assert(!host.querySelector(".app-shell-outlet select[data-social-context]"), "the control is never inside the screen outlet");
+equal(Array.from(pick.options).map((o) => o.value).filter(Boolean), ["ctx-brand", "ctx-beta"], "the control lists the active contexts");
+await React.act(async () => {
+  Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")!.set!.call(pick, "ctx-beta");
+  pick.dispatchEvent(new Event("change", { bubbles: true }));
+});
+await flush();
+equal(win.sessionStorage.getItem("cadence.workspace-app.context.install-social"), "ctx-beta", "choosing a context remembers it for the workspace");
 // The workspace picker switches scope; the shell's immediate next
 // send carries the new context ID with no intervening navigation.
 const brand = host.querySelector("#brand") as HTMLSelectElement;
@@ -641,6 +656,7 @@ await settle(() => assert(
   host.textContent?.includes("Only"),
   "second install adopts its sole active context",
 ));
+assert(!host.querySelector("select[data-social-context]"), "a one-context install shows no context control");
 posts.length = 0;
 await fill("#app-shell-chat-box", "second install question");
 await click(host.querySelector(".app-chat-form button[type=submit]"));
@@ -942,6 +958,10 @@ const appsLinks = (hostEl: HTMLElement) =>
   ambiguous.remove();
 }
 
+// The assistant activity panel never asks before it has a context (an empty
+// context ID is a 400 on every poll).
+assert(reads.some((p) => p.includes("/assistant/")), "the assistant panel did read with a context");
+assert(!reads.some((p) => /\/assistant\/[a-z]+\?context_id=(&|$)/.test(p)), "no assistant read is sent with an empty context");
 console.log("app shell checks passed");
 }
 void main();

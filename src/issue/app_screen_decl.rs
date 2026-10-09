@@ -64,8 +64,18 @@ fn asset_bound(name: &str) -> u64 {
     }
 }
 
-/// The one contract string this validator accepts.
-const CONTRACT: &str = "app-screens/v1";
+/// The read-only contract — a mounted frame may only receive the
+/// host-pushed projection (its `may` is empty).
+const CONTRACT_V1: &str = "app-screens/v1";
+/// CAD-1177: the action-capable contract. Identical integrity/asset
+/// grammar to v1, plus an optional `host_contract` pin, a `may`
+/// allowlist of bridge methods and a bounded `tools` alias→slot map.
+/// A screen that does not declare them stays as read-only as v1.
+const CONTRACT_V2: &str = "app-screens/v2";
+/// The only host contract a v2 screen may pin to call tools.
+pub const HOST_CONTRACT_ACTIONS: &str = "screen-actions.v1";
+/// The only bridge method a v2 `may` may list today.
+pub const MAY_TOOLS_INVOKE: &str = "tools.invoke";
 /// The one entry point — pinned, and it must be a declared, supplied
 /// asset.
 const ENTRY: &str = "client.js";
@@ -98,6 +108,7 @@ pub fn remote_image_sources(name: &str) -> Option<&'static [&'static str]> {
 /// not authority of any kind.
 #[derive(Debug)]
 pub struct IntegrityCheckedScreen {
+    contract: String,
     app: String,
     entry: String,
     asset_count: usize,
@@ -105,6 +116,13 @@ pub struct IntegrityCheckedScreen {
     sdk_digest: String,
     toolchain_digest: String,
     remote_images: Vec<String>,
+    /// v2 only: the declared `may` methods (each currently only
+    /// `tools.invoke`). Empty on v1 and on a v2 that declares none.
+    may: Vec<String>,
+    /// v2 only: declared logical tool alias → declared capability slot.
+    /// The alias is app-owned vocabulary the frame calls; the slot is
+    /// the `needs.capabilities` key it resolves through. Empty on v1.
+    tools: BTreeMap<String, String>,
 }
 
 impl IntegrityCheckedScreen {
@@ -112,6 +130,19 @@ impl IntegrityCheckedScreen {
     /// list, distinct; empty unless the screen opted in.
     pub fn remote_images(&self) -> &[String] {
         &self.remote_images
+    }
+    /// The contract this declaration passed under (`app-screens/v1` or
+    /// `app-screens/v2`).
+    pub fn contract(&self) -> &str {
+        &self.contract
+    }
+    /// The declared `may` bridge methods (v2 only; empty on v1).
+    pub fn may(&self) -> &[String] {
+        &self.may
+    }
+    /// The declared tool alias→capability-slot map (v2 only; empty on v1).
+    pub fn tools(&self) -> &BTreeMap<String, String> {
+        &self.tools
     }
     /// The declared app tag (`model::valid_tag` grammar).
     pub fn app(&self) -> &str {
@@ -152,13 +183,24 @@ struct RawDecl {
     entry: String,
     assets: Vec<RawAsset>,
     provenance: RawProvenance,
-    /// Optional; `null`, a non-array or any member refuses.
+    /// Optional; `null`, a non-array or any member refuses. v1 requires
+    /// empty; v2 admits only the closed `MAY_TOOLS_INVOKE` verb.
     #[serde(default)]
     may: Vec<Value>,
     /// Optional named remote image sets (CAD-1123); each must be a host
     /// listed set, without repeats.
     #[serde(default)]
     remote_images: Vec<String>,
+    /// v2 only: the host contract this screen was built against. Must be
+    /// exactly `screen-actions.v1` when present (v2 with `may`/`tools`)
+    /// — an unknown or missing contract keeps the screen read-only.
+    #[serde(default)]
+    host_contract: Option<String>,
+    /// v2 only: logical alias → capability-slot declaration. Each alias
+    /// is app-owned; each slot must name a `needs.capabilities` key the
+    /// installed app declares (checked at invoke, never trusted here).
+    #[serde(default)]
+    tools: BTreeMap<String, String>,
 }
 
 /// One declared asset member — closed, all four fields required.
@@ -249,7 +291,13 @@ pub fn validate_map(
     check_declaration(&decl)?;
     check_assets(&decl, assets)?;
 
+    let tools = decl
+        .tools
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     Ok(IntegrityCheckedScreen {
+        contract: decl.contract,
         asset_count: decl.assets.len(),
         app: decl.app,
         entry: decl.entry,
@@ -257,6 +305,12 @@ pub fn validate_map(
         sdk_digest: decl.provenance.sdk_digest,
         toolchain_digest: decl.provenance.toolchain_digest,
         remote_images: decl.remote_images,
+        may: decl
+            .may
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        tools,
     })
 }
 
@@ -339,13 +393,34 @@ fn check_nodes(value: &Value) -> Result<()> {
 /// [`MAX_ASSETS`] uniquely-named assets each carrying the pinned
 /// `client.js` entry, name/media/digest grammar per member, and
 /// provenance digest syntax.
-fn check_declaration(decl: &RawDecl) -> Result<()> {
-    if decl.contract != CONTRACT {
-        return Err(Error::rejected(format!(
-            "contract {:?} — the only accepted contract is {CONTRACT:?}",
-            decl.contract
-        )));
+/// A v2 logical alias grammar: `word` or dotted `word.word`, each word
+/// lowercase-alnum starting with a letter (e.g. `instagram.read`,
+/// `image.generate`). Bounded, never a provider/tool/account/route name.
+fn valid_tool_alias(alias: &str) -> bool {
+    if alias.is_empty() || alias.len() > 64 {
+        return false;
     }
+    alias.split('.').all(|word| {
+        !word.is_empty()
+            && word.len() <= 32
+            && word.as_bytes()[0].is_ascii_lowercase()
+            && word
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+    })
+}
+
+fn check_declaration(decl: &RawDecl) -> Result<()> {
+    let is_v2 = match decl.contract.as_str() {
+        c if c == CONTRACT_V1 => false,
+        c if c == CONTRACT_V2 => true,
+        other => {
+            return Err(Error::rejected(format!(
+                "contract {other:?} — the only accepted contracts are \
+                 {CONTRACT_V1:?} and {CONTRACT_V2:?}",
+            )))
+        }
+    };
     if !model::valid_tag(&decl.app) {
         return Err(Error::rejected(format!(
             "app {:?} — 1-32 lowercase letters, digits or hyphens, not starting with a hyphen",
@@ -358,10 +433,69 @@ fn check_declaration(decl: &RawDecl) -> Result<()> {
             decl.entry
         )));
     }
-    if !decl.may.is_empty() {
+    // `may` is a string allowlist of bridge methods. v1 admits none;
+    // v2 admits only the closed set, each a string, no repeats. A
+    // non-string member or a method outside the set refuses (fail closed).
+    let mut may_seen = HashSet::new();
+    for member in &decl.may {
+        let Some(name) = member.as_str() else {
+            return Err(Error::rejected("`may` members are strings"));
+        };
+        if !is_v2 || name != MAY_TOOLS_INVOKE {
+            return Err(Error::rejected(format!(
+                "`may` method {name:?} is not a method this contract grants"
+            )));
+        }
+        if !may_seen.insert(name) {
+            return Err(Error::rejected(format!(
+                "`may` method {name:?} is declared twice"
+            )));
+        }
+    }
+    // `host_contract`/`tools` are v2-only action declarations. Declaring
+    // either under v1 refuses — a v1 screen stays read-only and cannot
+    // smuggle a contract it was not reviewed against.
+    if !is_v2 && (decl.host_contract.is_some() || !decl.tools.is_empty()) {
         return Err(Error::rejected(
-            "`may` declares no methods — only an empty array (or its absence) is accepted",
+            "host_contract and tools require contract app-screens/v2",
         ));
+    }
+    if let Some(host) = &decl.host_contract {
+        if host != HOST_CONTRACT_ACTIONS {
+            return Err(Error::rejected(format!(
+                "host_contract {host:?} — the only served contract is {HOST_CONTRACT_ACTIONS:?}",
+            )));
+        }
+    }
+    // A screen that declares tools or a may-method must pin the host
+    // contract it was built against; the pin alone grants nothing.
+    if (!decl.tools.is_empty() || !decl.may.is_empty()) && decl.host_contract.is_none() {
+        return Err(Error::rejected(
+            "a screen declaring may/tools must pin host_contract",
+        ));
+    }
+    // `tools` is a bounded alias→slot map (≤8, matching the app
+    // capability-slot ceiling). Each alias is closed grammar; each slot
+    // is a tag grammar capability key. The actual slot existence is
+    // proven at invoke against the installed app — here we only prove
+    // the declaration is well-formed and bounded.
+    if decl.tools.len() > 8 {
+        return Err(Error::rejected(format!(
+            "{} declared tools — at most 8",
+            decl.tools.len()
+        )));
+    }
+    for (alias, slot) in &decl.tools {
+        if !valid_tool_alias(alias) {
+            return Err(Error::rejected(format!(
+                "tool alias {alias:?} — lowercase words joined by dots"
+            )));
+        }
+        if !model::valid_tag(slot) {
+            return Err(Error::rejected(format!(
+                "tool {alias:?} slot {slot:?} — must name a capability slot"
+            )));
+        }
     }
     let mut sets = HashSet::new();
     for name in &decl.remote_images {

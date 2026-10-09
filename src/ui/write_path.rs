@@ -15,8 +15,8 @@ use super::serve::{add_security_headers, err_response, json_response};
 use super::ServeOpts;
 use super::{
     app_assistant, app_audiences, app_content, app_contexts, app_explorer, app_records,
-    app_release, app_runs, app_screens, apps, connections, crm_send, crm_smtp, home, lane,
-    operator, read_model, social_publish, stages, threads, updates, wiki, workflows,
+    app_release, app_runs, app_screens, app_social_drafts, apps, connections, crm_send, crm_smtp,
+    home, lane, operator, read_model, social_publish, stages, threads, updates, wiki, workflows,
 };
 use crate::adapter::registry;
 use crate::client;
@@ -1224,6 +1224,33 @@ pub(crate) fn write_route(
             return;
         }
         let response = app_screens::mount(&mut request, state_dir, opts, install_id, tag);
+        send(request, response);
+        return;
+    }
+    // CAD-1177: the standalone tool invoke — OperatorOnly write route,
+    // relays the live session + mount action context to `app_tool_invoke`.
+    if app_screens::tool_route(path) {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let response = app_screens::tool_invoke(&mut request, state_dir, opts);
+        send(request, response);
+        return;
+    }
+    // CAD-1177: the host's mount-teardown revoke — OperatorOnly write
+    // route, relays the live session + the mount's action token.
+    if app_screens::tool_revoke_route(path) {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let response = app_screens::tool_revoke(&mut request, state_dir, opts);
+        send(request, response);
+        return;
+    }
+    if let Some(action) = app_social_drafts::route(path) {
+        let response = app_social_drafts::handle(&mut request, state_dir, opts, action);
         send(request, response);
         return;
     }

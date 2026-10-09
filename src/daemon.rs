@@ -31,7 +31,9 @@ mod app_explorer_rpc;
 mod app_records_rpc;
 mod app_runs_rpc;
 mod app_screens_rpc;
+mod app_social_drafts_rpc;
 mod app_teams_rpc;
+mod app_tools_rpc;
 mod approvals_rpc;
 mod area_rpc;
 #[cfg(all(test, feature = "test-seam"))]
@@ -550,6 +552,14 @@ pub struct Shared {
     /// session_id → Vec<Instant> (≤64 per window); the map is bounded
     /// (≤128 sessions) and swept on each mint.
     screen_mint_rate: Mutex<HashMap<String, Vec<Instant>>>,
+    /// CAD-1177: live mount action contexts minted at `app_screen_mint`.
+    /// An opaque token maps to a ToolContext binding the verified session,
+    /// install, digest and declared tool map server-side. The token is held
+    /// by the trusted host (never the frame); a tool call re-proves it plus
+    /// the live session/digest on every invoke. Bounded (≤256), 1 h TTL,
+    /// swept on mint. In-memory: a restart drops every live mount's action
+    /// context (the frame just remounts).
+    tool_contexts: Mutex<HashMap<String, app_tools_rpc::ToolContext>>,
     /// Serializes an app's checked execution claim through bounded Local
     /// commit/readback against binding/context/custody mutations.
     app_release_lock: Mutex<()>,
@@ -809,6 +819,7 @@ impl Shared {
             social_media_resolver: opts.social_media_resolver.clone(),
             screen_caps: Mutex::new(HashMap::new()),
             screen_mint_rate: Mutex::new(HashMap::new()),
+            tool_contexts: Mutex::new(HashMap::new()),
             app_release_lock: Mutex::new(()),
             app_assistant_lock: Mutex::new(()),
             app_release_claim_gate: opts.app_release_claim_gate.clone(),
@@ -3414,6 +3425,16 @@ impl Shared {
             "app_run_list" => self.rpc_app_local(method, params, peer_pid),
             "app_run_artifact" => self.rpc_app_local(method, params, peer_pid),
             "app_binding_quote" => self.rpc_app_capability(method, params, peer_pid),
+            "app_social_draft_create"
+            | "app_social_draft_list"
+            | "app_social_draft_show"
+            | "app_social_draft_update"
+            | "app_social_draft_asset"
+            | "app_social_sources_show"
+            | "app_social_sources_save" => self.rpc_app_social_draft(method, params, peer_pid),
+            "app_tool_invoke" => self.rpc_app_tool_invoke(params, peer_pid),
+            "app_tool_revoke" => self.rpc_app_tool_revoke(params, peer_pid),
+            "app_tool_result" | "app_tool_results" => self.rpc_app_tool_result(params, peer_pid),
             "app_run_capability_call" => self.rpc_app_capability(method, params, peer_pid),
             "app_run_capability_results" => self.rpc_app_capability(method, params, peer_pid),
             "app_run_capability_result" => self.rpc_app_capability(method, params, peer_pid),
@@ -3428,6 +3449,7 @@ impl Shared {
             "app_effect_show" => self.rpc_app_effect(method, params, peer_pid),
             "app_effect_list" => self.rpc_app_effect(method, params, peer_pid),
             "app_effect_decide" => self.rpc_app_effect(method, params, peer_pid),
+            "app_effect_publish_now" => self.rpc_app_effect(method, params, peer_pid),
             "app_effect_resolve" => self.rpc_app_effect(method, params, peer_pid),
             "social_publish_media_import" => self.rpc_social_publish(method, params, peer_pid),
             "social_publish_schedule" => self.rpc_social_publish(method, params, peer_pid),

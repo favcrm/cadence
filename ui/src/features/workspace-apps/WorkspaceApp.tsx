@@ -38,7 +38,7 @@ import {
 import { retainedRequest, completeRequest } from "./requests";
 import PublishPanel, { type PublishCandidate } from "./PublishPanel";
 import ScheduleCalendar from "./ScheduleCalendar";
-import { forgetContext, initialContext, rememberedContext, rememberContext } from "./contextSelection";
+import { forgetContext, initialContext, rememberedContext, rememberContext, screenContext, subscribeContext } from "./contextSelection";
 import { promptError } from "./promptFields";
 import "./workspace-apps.css";
 import ScreenHost from "./screen/ScreenHost";
@@ -202,9 +202,22 @@ export default function WorkspaceApp({
       activeRead.current?.abort();
     };
   }, [refresh]);
+  // The shell's header-row context choice (2+ active contexts) is announced
+  // through the remembered selection; follow it, and let the reconcile
+  // effect below validate it against the active contexts.
+  useEffect(() => subscribeContext((changed, next) => {
+    if (changed === installId && next !== null) setContextId(next);
+  }), [installId]);
   useEffect(() => {
     if (!data || data.installation.install_id !== installId) return;
-    const selected = initialContext(installId, data.contexts.filter(value => value.state === "active").map(value => value.id));
+    const active = data.contexts.filter(value => value.state === "active").map(value => value.id);
+    // A private screen offers no context picker: exactly one active context
+    // is the workspace's single company and is selected for it; none leaves
+    // the app to render its own not-set-up state; several keep the
+    // explicit-choice behaviour.
+    const selected = screenTag(data.installation) !== null
+      ? screenContext(installId, active)
+      : initialContext(installId, active);
     if (selected !== contextId) setContextId(selected);
   }, [data, contextId, installId]);
   // Candidates re-check on every Settings visit — including the return
@@ -593,8 +606,34 @@ export default function WorkspaceApp({
     try { projection = screenProjection(data.installation, tag, contextId, data.contexts, data.runs, data.effects, intentRead, screenExtras.extras); }
     catch { /* Oversized/unavailable scope retains the existing native outlet. */ }
   }
+  const contextPicker = () => (
+    <Select
+      value={contextId}
+      onChange={(value) => {
+        setContextId(value);
+        rememberContext(installId, value);
+        setEditingContextId("");
+        setBrandName(""); setBrandVoice(""); setProtectedTerms("");
+        setContentPrompt(""); setImagePrompt("");
+        setSelectedSource(null);
+        setSelectedRun(null);
+        setSelectedArtifact("");
+        setActionError(null);
+      }}
+      options={[
+        { value: "", label: "No brand context" },
+        ...contexts.map((value) => ({
+          value: value.id,
+          label: value.config.label,
+        })),
+      ]}
+      aria-label="Optional brand context"
+      disabled={busy}
+      full
+    />
+  );
   const screen = (fallback: React.ReactNode) => projection
-    ? <ScreenHost projection={projection} fallback={fallback} loadAsset={screenExtras.loadAsset} actions={screenActions} /> : fallback;
+    ? <><ScreenHost projection={projection} fallback={fallback} loadAsset={screenExtras.loadAsset} actions={screenActions} /></> : fallback;
   if (data && !supportsSocialContentWorkspace(data.installation)) {
     return screen(<main className="workspace-app" aria-label="Workspace app">
       <header className="wa-header"><h1>{data.installation.title || data.installation.name}</h1><Button href="/apps">All apps</Button></header>
@@ -658,32 +697,7 @@ export default function WorkspaceApp({
       {data && (
         <>
           <div className="wa-toolbar">
-            <div className="wa-context">
-              <Select
-                value={contextId}
-                onChange={(value) => {
-                  setContextId(value);
-                  rememberContext(installId, value);
-                  setEditingContextId("");
-                  setBrandName(""); setBrandVoice(""); setProtectedTerms("");
-                  setContentPrompt(""); setImagePrompt("");
-                  setSelectedSource(null);
-                  setSelectedRun(null);
-                  setSelectedArtifact("");
-                  setActionError(null);
-                }}
-                options={[
-                  { value: "", label: "No brand context" },
-                  ...contexts.map((value) => ({
-                    value: value.id,
-                    label: value.config.label,
-                  })),
-                ]}
-                aria-label="Optional brand context"
-                disabled={busy}
-                full
-              />
-            </div>
+            {!projection && <div className="wa-context">{contextPicker()}</div>}
             <Button
               variant="primary"
               onClick={() => {

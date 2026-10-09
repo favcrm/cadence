@@ -1462,6 +1462,21 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 send(request, response);
                 return;
             }
+            // CAD-1177: operator read of retained standalone tool receipts
+            // for one installation — same operator-read gate as app reads.
+            if app_screens::tool_results_route(&path) {
+                if method != Method::Get {
+                    send(request, err_response(405, "method not allowed"));
+                    return;
+                }
+                if let Err(response) = operator::admit_operator_read(&request, state_dir, opts) {
+                    send(request, response);
+                    return;
+                }
+                let response = app_screens::tool_results(&request, state_dir);
+                send(request, response);
+                return;
+            }
             if let Some(route) = app_contexts::route(&path) {
                 if !route.is_read() {
                     send(request, err_response(405, "method not allowed"));

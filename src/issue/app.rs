@@ -664,10 +664,15 @@ fn bundle_files(root: &Path) -> Result<Vec<(String, PathBuf)>> {
             root.display()
         )));
     }
-    if !dirs.iter().any(|(d, _)| d == "workflows") {
+    // CAD-1177: an app bundles workflows and/or screens — a standalone
+    // tools plugin ships only `screens/` (the v2 tool declarations are
+    // its unit of work, checked later in `validate_texts`); a
+    // workflow-driven app ships `workflows/`. One of the two must be
+    // present or the bundle installs nothing usable.
+    if !dirs.iter().any(|(d, _)| d == "workflows" || d == "screens") {
         return Err(Error::rejected(
-            "an app needs workflows/ — the workflows it bundles; an app with \
-             none installs nothing runnable",
+            "an app needs workflows/ or screens/ — an app with neither installs \
+             nothing runnable",
         ));
     }
     for (top, dir) in &dirs {
@@ -1089,7 +1094,15 @@ fn validate_contents(
             Err(e) => errors.push(format!("{rel}: {e}")),
         }
     }
-    if workflow_count == 0 {
+    // CAD-1177: an app may ship no workflows only when it is a genuine
+    // standalone-tools plugin — it carries at least one integrity-checked
+    // `app-screens/v2` screen whose declared `tools` map resolves every
+    // alias to a real `needs.capabilities` slot. That is the v2
+    // no-workflow-file path: the tool, not a run, is the unit of work.
+    // An empty app, a screen that fails integrity, or a tool whose slot
+    // the manifest never declares cannot substitute for workflows and
+    // still refuses.
+    if workflow_count == 0 && !has_tools_only_screen(&files, &manifest) {
         errors.push("workflows/ holds no *.md workflow".to_string());
     }
     let compatibility = match compat::host().and_then(|host| manifest.requires.check(&host)) {
@@ -1111,6 +1124,40 @@ fn validate_contents(
         secret_warnings,
         notes,
         compatibility,
+    })
+}
+
+/// CAD-1177: whether the bundle carries a genuine standalone-tools
+/// screen — an integrity-checked `app-screens/v2` package whose
+/// declared `tools` map is non-empty AND resolves every alias to a
+/// `needs.capabilities` slot with a `read`/`draft` effect (the only
+/// effects a standalone, approval-free invoke may run). This is the
+/// install-time proof that lets a workflow-free plugin install; it is
+/// deliberately strict so an empty or malformed bundle cannot borrow
+/// the exception. Returns false on any integrity/parse failure — a
+/// broken screen never satisfies the exception (its own error is
+/// reported by the screen validators elsewhere).
+fn has_tools_only_screen(files: &[(String, String)], manifest: &Manifest) -> bool {
+    let map: BTreeMap<String, String> = files.iter().cloned().collect();
+    let Ok(tags) = crate::issue::app_screen_pkg::tags_in(&map) else {
+        return false;
+    };
+    tags.iter().any(|tag| {
+        let Ok(pkg) = crate::issue::app_screen_pkg::extract(&map, tag) else {
+            return false;
+        };
+        pkg.contract == "app-screens/v2"
+            // The screen must be FOR this app — a package declaring a
+            // different app can never satisfy this bundle's exception.
+            && pkg.app == manifest.app
+            && !pkg.tools.is_empty()
+            && pkg.may.iter().all(|m| m == "tools.invoke")
+            && pkg.tools.values().all(|slot| {
+                manifest
+                    .capabilities
+                    .get(slot)
+                    .is_some_and(|decl| matches!(decl.effect.as_str(), "read" | "draft"))
+            })
     })
 }
 
@@ -1154,11 +1201,29 @@ fn write_verified(file: &Path, text: &str) -> Result<std::fs::File> {
 /// Copy a verified bundle into `target`, 0644 files — no mode bits,
 /// exec or otherwise, travel with app content.
 fn copy_verified(files: &[(String, String)], target: &Path) -> Result<()> {
+    // The install/update target is itself part of the checked tree. Do not
+    // assume it is safe merely because its caller validated the bundle.
+    mkdir_verified(target)?;
     for (rel, text) in files {
-        let to = target.join(rel);
-        if let Some(parent) = to.parent() {
-            mkdir_verified(parent)?;
+        let relative = Path::new(rel);
+        let components: Vec<_> = relative.components().collect();
+        if components.is_empty()
+            || components
+                .iter()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(Error::rejected(format!(
+                "{} is not a normalized relative bundle path",
+                rel
+            )));
         }
+
+        let mut to = target.to_path_buf();
+        for component in &components[..components.len() - 1] {
+            to.push(component.as_os_str());
+            mkdir_verified(&to)?;
+        }
+        to.push(components[components.len() - 1].as_os_str());
         let f = write_verified(&to, text)?;
         #[cfg(unix)]
         {
@@ -3181,6 +3246,10 @@ pub fn doctor(pm_dir: &Path, known: Option<&HashSet<String>>) -> Value {
 }
 
 #[cfg(test)]
+#[path = "app_nested_copy_acceptance.rs"]
+mod nested_copy_acceptance;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -3419,5 +3488,97 @@ installed_at: '2026-09-27T00:00:00Z'\ninstalled_by: operator\n",
         assert_eq!(split_ref("a/"), None);
         assert_eq!(split_ref("/b"), None);
         assert_eq!(split_ref("A/b"), None);
+    }
+    /// CAD-1177: a workflow-free app installs only when it is a genuine
+    /// standalone-tools plugin — an integrity-checked `app-screens/v2`
+    /// screen whose `tools` all resolve to declared read/draft
+    /// capability slots. An empty app, a failing-integrity screen, or a
+    /// tool naming an undeclared/send slot cannot substitute for
+    /// workflows and still refuses.
+    #[test]
+    fn cad1177_workflow_free_app_installs_only_with_a_real_v2_tools_screen() {
+        let agents = HashSet::new();
+        let js = "console.log('x')";
+        let sha = |b: &str| format!("sha256:{:x}", Sha256::digest(b.as_bytes()));
+        let manifest = "---\napp: studio\ntitle: Studio\nversion: '1'\nneeds:\n  capabilities:\n    source: {schema: 1, capability: social.read, version: 1, action: posts, resource_kind: connection_account, effect: read}\n---\nGuide\n";
+        let screen = |tools: serde_json::Value| {
+            serde_json::json!({
+                "contract":"app-screens/v2","app":"studio","entry":"client.js",
+                "host_contract":"screen-actions.v1","may":["tools.invoke"],
+                "tools":tools,
+                "assets":[{"name":"client.js","media_type":"text/javascript","sha256":sha(js),"size":js.len()}],
+                "provenance":{"source_digest":sha("s"),"sdk_digest":sha("k"),"toolchain_digest":sha("t")}
+            }).to_string()
+        };
+        let files = |decl: String| {
+            vec![
+                ("app.md".to_string(), manifest.to_string()),
+                ("screens/composer/screens.json".to_string(), decl),
+                ("screens/composer/client.js".to_string(), js.to_string()),
+            ]
+        };
+        // A valid tools screen mapped to the declared `source` slot installs.
+        validate_texts(
+            files(screen(serde_json::json!({"instagram.read":"source"}))),
+            &agents,
+            &[],
+        )
+        .unwrap();
+        // Empty app (no workflows, no qualifying screen) refuses.
+        let empty = vec![("app.md".to_string(), manifest.to_string())];
+        assert!(validate_texts(empty, &agents, &[]).is_err());
+        // A v1 (read-only) screen is not a tools plugin.
+        let mut v1: serde_json::Value =
+            serde_json::from_str(&screen(serde_json::json!({"a.b":"source"}))).unwrap();
+        v1["contract"] = serde_json::json!("app-screens/v1");
+        v1.as_object_mut().unwrap().remove("tools");
+        v1.as_object_mut().unwrap().remove("host_contract");
+        v1["may"] = serde_json::json!([]);
+        assert!(validate_texts(files(v1.to_string()), &agents, &[]).is_err());
+        // A tool naming an undeclared slot refuses.
+        assert!(validate_texts(
+            files(screen(serde_json::json!({"a.b":"nosuchslot"}))),
+            &agents,
+            &[]
+        )
+        .is_err());
+        // A tool resolving to a send-effect slot cannot stand alone.
+        let send_manifest = manifest.replace("effect: read", "effect: send");
+        let send_files = vec![
+            ("app.md".to_string(), send_manifest),
+            (
+                "screens/composer/screens.json".to_string(),
+                screen(serde_json::json!({"a.b":"source"})),
+            ),
+            ("screens/composer/client.js".to_string(), js.to_string()),
+        ];
+        assert!(validate_texts(send_files, &agents, &[]).is_err());
+        // A broken-integrity screen (tampered client.js) refuses.
+        let mut tampered = files(screen(serde_json::json!({"a.b":"source"})));
+        tampered[2].1 = "tampered()".to_string();
+        assert!(validate_texts(tampered, &agents, &[]).is_err());
+    }
+
+    /// CAD-1177: the `ig-tools-fixture` bundle ships NO `workflows/` —
+    /// it is the real on-disk tools-only app QA mounts and installs
+    /// against. This proves the shipped fixture validates (the
+    /// acceptance assertions about it belong to QA).
+    #[test]
+    fn cad1177_ig_tools_fixture_is_a_valid_workflow_free_app() {
+        let agents = HashSet::new();
+        let dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/apps/ig-tools-fixture");
+        let validated = validate(&dir, &agents, &[]).unwrap();
+        assert_eq!(validated.manifest.app, "ig-tools-fixture");
+        // No workflows members — the screen is the unit of work.
+        assert!(validated
+            .files
+            .iter()
+            .all(|(rel, _)| !rel.starts_with("workflows/")));
+        // Its v2 screen integrity-checks and maps the alias to `source`.
+        let map: BTreeMap<String, String> = validated.files.iter().cloned().collect();
+        let pkg = crate::issue::app_screen_pkg::extract(&map, "feed").unwrap();
+        assert_eq!(pkg.contract, "app-screens/v2");
+        assert_eq!(pkg.tools["instagram.read"], "source");
     }
 }

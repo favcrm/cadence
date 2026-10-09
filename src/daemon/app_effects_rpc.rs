@@ -56,7 +56,318 @@ fn publication_smtp_envelope(
     Ok(Some(envelope))
 }
 
+fn social_effect_install(id: &str) -> Option<String> {
+    let mut p = id.split('_');
+    if p.next() != Some("sfx") {
+        return None;
+    };
+    let hex = p.next()?;
+    let nonce = p.next()?;
+    if p.next().is_some()
+        || hex.is_empty()
+        || hex.len() % 2 != 0
+        || nonce.len() != 32
+        || !hex
+            .bytes()
+            .chain(nonce.bytes())
+            .all(|b| b.is_ascii_hexdigit())
+    {
+        return None;
+    };
+    let bytes = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+        .collect::<Option<Vec<_>>>()?;
+    String::from_utf8(bytes).ok()
+}
+fn social_effect_id(install: &str) -> String {
+    format!(
+        "sfx_{}_{}",
+        install
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
 impl Shared {
+    fn stage_social_draft_effect(self: &Arc<Self>, params: &Value, pid: u32) -> Result<Value> {
+        let expected = [
+            "action_token",
+            "tool_alias",
+            "key",
+            "origin",
+            "proof",
+            "request_id",
+            "token",
+        ];
+        if !params.as_object().is_some_and(|o| {
+            o.len() == expected.len() && o.keys().all(|k| expected.contains(&k.as_str()))
+        }) {
+            return Err(Error::rejected(
+                "social draft effect request fields are invalid",
+            ));
+        }
+        let proof = params
+            .get("proof")
+            .and_then(Value::as_object)
+            .ok_or_else(|| Error::rejected("social draft effect needs typed draft proof"))?;
+        if proof.len() != 3 || proof.get("kind").and_then(Value::as_str) != Some("social_draft") {
+            return Err(Error::rejected("social draft proof fields are invalid"));
+        }
+        let draft_id = proof
+            .get("draft_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::rejected("social draft proof needs a draft ID"))?;
+        let revision = proof
+            .get("revision")
+            .and_then(Value::as_i64)
+            .filter(|r| *r > 0)
+            .ok_or_else(|| Error::rejected("social draft proof needs a positive revision"))?;
+        let request = required_str(params, "request_id")?;
+        crate::proto::identifier(request, "social draft effect request ID")?;
+        let (ctx, context) = self.social_draft_action(params, pid, true)?;
+        let pm = self.pm_at(&self.pm_dir()?)?;
+        workspace::with_completed_bundle_snapshot(
+            &pm,
+            &ctx.install_id,
+            &ctx.digest,
+            |bundle, files| {
+                let _release = self
+                    .app_release_lock
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let records =
+                    crate::store::app_records::RecordStore::open(&self.state_dir, &ctx.install_id)?;
+                let latest = records.app_social_draft_show(&context, draft_id)?;
+                if latest["revision"].as_i64() != Some(revision) {
+                    return Err(Error::rejected(
+                        "social draft changed; review the latest revision",
+                    ));
+                }
+                let frozen_draft =
+                    records.app_social_draft_revision(&context, draft_id, revision)?;
+                let manifest = crate::issue::app::parse_manifest(
+                    files
+                        .get("app.md")
+                        .ok_or_else(|| Error::rejected("installation manifest unavailable"))?,
+                )?;
+                let mut send_slots = manifest
+                    .capabilities
+                    .iter()
+                    .filter(|(_, need)| need.effect == "send");
+                let (slot, need) = send_slots
+                    .next()
+                    .ok_or_else(|| Error::rejected("installation declares no send capability"))?;
+                if send_slots.next().is_some() {
+                    return Err(Error::rejected(
+                        "social publish requires exactly one declared send slot",
+                    ));
+                }
+                need.validate()?;
+                let binding = self
+                    .app_binding_live(&ctx.install_id, Some(&context), slot, bundle, files)?
+                    .ok_or_else(|| Error::rejected("social publish binding is absent"))?;
+                if binding.config["mapping"]["effect"] != "send" {
+                    return Err(Error::rejected(
+                        "social publish binding is not send authority",
+                    ));
+                }
+                let target = super::social_publish_start::PublishTarget::from_binding_config(
+                    &binding.config,
+                )?;
+                let resolver = self.social_media_resolver.clone().ok_or_else(|| {
+                    Error::rejected("capability_unavailable: no media resolver configured")
+                })?;
+                let resolved = resolver
+                    .resolve(&target.toolkit, &target.destination_id)
+                    .into_result()
+                    .map_err(|e| Error::rejected(e.to_string()))?;
+                let asset_id = frozen_draft["asset_id"].as_str();
+                if target.toolkit == "instagram" && asset_id.is_none() {
+                    return Err(Error::rejected(
+                        "Instagram publish needs a retained JPEG or PNG image",
+                    ));
+                }
+                let (asset_digest, mime, size) = if let Some(asset) = asset_id {
+                    let (header, digest, bytes) =
+                        self.store.app_tool_asset_bytes(&ctx.install_id, asset)?;
+                    if bytes.len() > 2 * 1024 * 1024 {
+                        return Err(Error::rejected(
+                            "publish image exceeds the 2 MiB retained-media limit",
+                        ));
+                    }
+                    let mime =
+                        crate::platform::agenticos_external::image::image_mime(&bytes, &header)
+                            .map_err(Error::rejected)?;
+                    if !matches!(mime, "image/jpeg" | "image/png") {
+                        return Err(Error::rejected("publish image must be JPEG or PNG"));
+                    }
+                    image::load_from_memory(&bytes)
+                        .map_err(|_| Error::rejected("retained publish image cannot be decoded"))?;
+                    if crate::store::app_runs::artifact_digest(&bytes) != digest {
+                        return Err(Error::rejected("retained publish image digest changed"));
+                    }
+                    (Some(digest), Some(mime.to_string()), Some(bytes.len()))
+                } else {
+                    (None, None, None)
+                };
+                let id = social_effect_id(&ctx.install_id);
+                let approval = format!("social-approval-{}", uuid::Uuid::new_v4().simple());
+                let key = format!("social_{}", uuid::Uuid::new_v4().simple());
+                let frozen = json!({"source":{"kind":"social_draft","draft_id":draft_id,"revision":revision},"install_id":ctx.install_id,"context_id":context,"bundle_digest":ctx.digest,"draft_id":draft_id,"revision":revision,"caption":frozen_draft["caption"],"caption_digest":crate::platform::agenticos_external::publish::caption_digest_of(frozen_draft["caption"].as_str().unwrap_or("")),"asset_id":asset_id,"image_digest":asset_digest,"mime":mime,"size_bytes":size,"toolkit":target.toolkit,"destination_id":target.destination_id,"destination_label":target.destination_label,"timezone":target.timezone,"grant_id":target.grant_id,"aos_connection_id":resolved.aos_connection_id,"binding":{"slot":slot,"revision":binding.revision,"digest":binding.digest,"config":binding.config},"effect_id":id,"idempotency_key":key,"approval_id":approval});
+                records.app_social_effect_stage(
+                    &context,
+                    &crate::store::app_social_drafts::EffectStage {
+                        draft: draft_id,
+                        revision,
+                        request,
+                        effect_id: &id,
+                        frozen: &frozen,
+                        approval: &approval,
+                    },
+                )
+            },
+        )
+    }
+
+    fn publish_social_draft_now(&self, id: &str, digest: &str) -> Result<Value> {
+        use crate::platform::agenticos_external::publish::{Preflight, PublishState};
+        let install = social_effect_install(id)
+            .ok_or_else(|| Error::rejected("not a social draft effect"))?;
+        let records = crate::store::app_records::RecordStore::open(&self.state_dir, &install)?;
+        let shown = records.app_social_effect_show(id)?;
+        if shown["effect"]["digest"] != digest || shown["effect"]["state"] != "approved" {
+            return Err(Error::rejected(
+                "Publish now requires the exact approved social draft effect",
+            ));
+        }
+        let authority = shown["effect"]["authority"].clone();
+        let sender = self.social_publish_sender.clone().ok_or_else(|| {
+            Error::rejected("capability_unavailable: publish sender is not registered")
+        })?;
+        let pm = self.pm_at(&self.pm_dir()?)?;
+        let id_owned = id.to_owned();
+        let digest_owned = digest.to_owned();
+        workspace::with_completed_bundle_snapshot(
+            &pm,
+            &install,
+            required_str(&authority, "bundle_digest")?,
+            |bundle, files| {
+                let _custody = self
+                    .platform_custody_lock
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let _release = self
+                    .app_release_lock
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let context = required_str(&authority, "context_id")?;
+                let slot = required_str(&authority["binding"], "slot")?;
+                let current = self
+                    .app_binding_live(&install, Some(context), slot, bundle, files)?
+                    .ok_or_else(|| Error::rejected("social publish binding is unavailable"))?;
+                if current.config["mapping"]["effect"] != "send"
+                    || current.digest != authority["binding"]["digest"]
+                    || current.revision != authority["binding"]["revision"]
+                {
+                    return Err(Error::rejected(
+                        "social publish binding changed since approval",
+                    ));
+                }
+                let current_draft = records
+                    .app_social_draft_show(context, required_str(&authority, "draft_id")?)?;
+                if current_draft["revision"].as_i64() != authority["revision"].as_i64() {
+                    return Err(Error::rejected("social draft changed since approval"));
+                }
+                let resolver = self.social_media_resolver.clone().ok_or_else(|| {
+                    Error::rejected("capability_unavailable: no media resolver configured")
+                })?;
+                let resolved = resolver
+                    .resolve(
+                        required_str(&authority, "toolkit")?,
+                        required_str(&authority, "destination_id")?,
+                    )
+                    .into_result()
+                    .map_err(|e| Error::rejected(e.to_string()))?;
+                if resolved.aos_connection_id != authority["aos_connection_id"] {
+                    return Err(Error::rejected("social destination changed since approval"));
+                }
+                let media_key = if let Some(asset) = authority["asset_id"].as_str() {
+                    let (header, asset_digest, bytes) =
+                        self.store.app_tool_asset_bytes(&install, asset)?;
+                    if bytes.len() > 2 * 1024 * 1024
+                        || Some(asset_digest.as_str()) != authority["image_digest"].as_str()
+                        || Some(bytes.len() as u64) != authority["size_bytes"].as_u64()
+                    {
+                        return Err(Error::rejected("social draft image changed since approval"));
+                    }
+                    let mime =
+                        crate::platform::agenticos_external::image::image_mime(&bytes, &header)
+                            .map_err(Error::rejected)?;
+                    if Some(mime) != authority["mime"].as_str() {
+                        return Err(Error::rejected(
+                            "social draft image type changed since approval",
+                        ));
+                    }
+                    image::load_from_memory(&bytes)
+                        .map_err(|_| Error::rejected("social draft image cannot be decoded"))?;
+                    let importer = self.social_media_importer.clone().ok_or_else(|| {
+                        Error::rejected("capability_unavailable: no media importer configured")
+                    })?;
+                    let receipt = importer
+                        .import(&resolved.aos_connection_id, mime, &bytes)
+                        .map_err(|e| Error::rejected(e.to_string()))?;
+                    if receipt.digest != asset_digest
+                        || receipt.mime != mime
+                        || receipt.size_bytes != bytes.len()
+                        || receipt.connection_id != resolved.aos_connection_id
+                    {
+                        return Err(Error::rejected(
+                            "media import receipt does not match approved image",
+                        ));
+                    }
+                    Some(receipt.media_key)
+                } else {
+                    None
+                };
+                records.app_social_effect_media_key(&id_owned, media_key.as_deref())?;
+                let key = required_str(&authority, "idempotency_key")?;
+                let binding = super::social_publish_rpc::sender_binding(&authority, &json!(key))
+                    .ok_or_else(|| Error::rejected("approved social publish binding is invalid"))?;
+                match sender.preflight(&binding) {
+                    Preflight::Approved => {}
+                    Preflight::Refused(r) => return Err(Error::rejected(r.to_string())),
+                    Preflight::Uncertain(r) => {
+                        return Err(Error::rejected(format!("publish preflight uncertain: {r}")))
+                    }
+                }
+                let Some(_claimed) =
+                    records.app_social_effect_claim_send(&id_owned, &digest_owned)?
+                else {
+                    return Err(Error::rejected(
+                        "social effect is no longer approved for Publish now",
+                    ));
+                };
+                match sender.execute(&binding) {
+                    Ok(outcome) if outcome.state == PublishState::Posted => records
+                        .app_social_effect_finish(&id_owned, "posted", &outcome.evidence_json()),
+                    Ok(outcome) if outcome.state == PublishState::Refused => records
+                        .app_social_effect_finish(&id_owned, "refused", &outcome.evidence_json()),
+                    Ok(_) => records.app_social_effect_show(&id_owned),
+                    Err(refusal) => records
+                        .app_social_effect_show(&id_owned)
+                        .map(|mut receipt| {
+                            receipt["send_error"] = json!(refusal.to_string());
+                            receipt
+                        }),
+                }
+            },
+        )
+    }
+
     pub(super) fn rpc_app_effect(
         self: &Arc<Self>,
         method: &str,
@@ -67,10 +378,23 @@ impl Shared {
         strict_fields(
             params,
             match method {
-                "app_effect_stage" => &["run_id", "artifact_id", "slot", "request_id", "title"],
+                "app_effect_stage" => &[
+                    "run_id",
+                    "artifact_id",
+                    "slot",
+                    "request_id",
+                    "title",
+                    "proof",
+                    "action_token",
+                    "token",
+                    "key",
+                    "origin",
+                    "tool_alias",
+                ],
                 "app_effect_show" => &["effect_id"],
                 "app_effect_list" => &["install_id", "context_id"],
                 "app_effect_decide" => &["effect_id", "digest", "decision"],
+                "app_effect_publish_now" => &["effect_id", "digest"],
                 "app_effect_resolve" => &["effect_id", "digest", "resolution"],
                 _ => return Err(Error::rejected("unknown app effect method")),
             },
@@ -83,14 +407,30 @@ impl Shared {
             }
         }
         match method {
-            "app_effect_show" => self
-                .store
-                .app_effect_show(required_str(params, "effect_id")?),
+            "app_effect_show" => {
+                let id = required_str(params, "effect_id")?;
+                if let Some(install) = social_effect_install(id) {
+                    crate::store::app_records::RecordStore::open(&self.state_dir, &install)?
+                        .app_social_effect_show(id)
+                } else {
+                    self.store.app_effect_show(id)
+                }
+            }
             "app_effect_list" => self.store.app_effect_list(
                 optional_str(params, "install_id"),
                 optional_str(params, "context_id"),
             ),
-            "app_effect_stage" => self.stage_app_artifact(params),
+            "app_effect_stage" => {
+                if params.get("proof").is_some() {
+                    self.stage_social_draft_effect(params, pid)
+                } else {
+                    self.stage_app_artifact(params)
+                }
+            }
+            "app_effect_publish_now" => self.publish_social_draft_now(
+                required_str(params, "effect_id")?,
+                required_str(params, "digest")?,
+            ),
             "app_effect_resolve" => {
                 // Historical reconciliation deliberately needs neither a live
                 // installation nor PM/custody locks. It never executes a send.
@@ -118,6 +458,75 @@ impl Shared {
                         ))
                     }
                 };
+                if let Some(install) = social_effect_install(id) {
+                    let records =
+                        crate::store::app_records::RecordStore::open(&self.state_dir, &install)?;
+                    let frozen = records.app_social_effect_show(id)?;
+                    if frozen["effect"]["digest"] != digest
+                        || frozen["effect"]["state"] != "waiting"
+                    {
+                        return Err(Error::rejected(
+                            "social effect digest is stale or effect is no longer waiting",
+                        ));
+                    }
+                    let authority = &frozen["effect"]["authority"];
+                    let pm = self.pm_at(&self.pm_dir()?)?;
+                    return workspace::with_completed_bundle_snapshot(
+                        &pm,
+                        &install,
+                        required_str(authority, "bundle_digest")?,
+                        |bundle, files| {
+                            if accept {
+                                let _release = self
+                                    .app_release_lock
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                let context = required_str(authority, "context_id")?;
+                                let slot = required_str(&authority["binding"], "slot")?;
+                                let current_binding = self
+                                    .app_binding_live(&install, Some(context), slot, bundle, files)?
+                                    .ok_or_else(|| {
+                                        Error::rejected("social publish binding is unavailable")
+                                    })?;
+                                if current_binding.config["mapping"]["effect"] != "send"
+                                    || current_binding.digest != authority["binding"]["digest"]
+                                    || current_binding.revision != authority["binding"]["revision"]
+                                {
+                                    return Err(Error::rejected(
+                                        "social publish binding changed since staging",
+                                    ));
+                                }
+                                let draft = required_str(authority, "draft_id")?;
+                                let revision = authority["revision"].as_i64().unwrap_or(0);
+                                let current = records.app_social_draft_show(context, draft)?;
+                                if current["revision"].as_i64() != Some(revision) {
+                                    return Err(Error::rejected(
+                                        "social draft changed since effect staging",
+                                    ));
+                                }
+                                let asset = authority["asset_id"].as_str();
+                                if let Some(asset) = asset {
+                                    let (_, digest, bytes) =
+                                        self.store.app_tool_asset_bytes(&install, asset)?;
+                                    if Some(digest.as_str()) != authority["image_digest"].as_str()
+                                        || bytes.len()
+                                            != authority["size_bytes"].as_u64().unwrap_or(0)
+                                                as usize
+                                    {
+                                        return Err(Error::rejected(
+                                            "social draft image changed since staging",
+                                        ));
+                                    }
+                                }
+                            }
+                            records
+                                .app_social_effect_decide(id, digest, accept)?
+                                .ok_or_else(|| {
+                                    Error::rejected("social effect has already been decided")
+                                })
+                        },
+                    );
+                }
                 let frozen = self.store.app_effect_show(id)?;
                 if frozen["effect"]["digest"] != digest || frozen["effect"]["state"] != "waiting" {
                     return Err(Error::rejected(

@@ -931,6 +931,10 @@ Paths never encode title, status or parent. Issues are never deleted — set\n\
 mod lock_tests;
 
 #[cfg(test)]
+#[path = "cad1177_tools_acceptance.rs"]
+mod cad1177_tools_acceptance;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

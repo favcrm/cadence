@@ -4,6 +4,7 @@ import Button from "../../ui/Button";
 import Link from "../../ui/Link";
 import type { Viewer } from "../projects/work";
 import { workspaceApps, type AppContext, type Installation } from "../workspace-apps/workspaceApps";
+import { chatScreenFor } from "./chatScreen";
 import { initialContext, rememberedContext, rememberContext, subscribeContext } from "../workspace-apps/contextSelection";
 import CrmOutlet, { type CrmSection, type OutletView } from "./CrmOutlet";
 import Conversation from "./chat/Conversation";
@@ -444,7 +445,7 @@ export default function AppShell({
   );
   // The shell's own screen ids (D5): the CRM outlet's sections, or the generic
   // outlet's `list` and `new`; the private-screen app owns its own and has none.
-  const chatScreen = !verified || isSocial ? null : installation.name === "crm" ? crmSection : view;
+  const chatScreen = chatScreenFor(installation, verified, crmSection, view);
   // `open-view` card action: navigate within this installation and context.
   const openView = useCallback(
     (target: string) => {
@@ -469,6 +470,32 @@ export default function AppShell({
           {loading ? "Loading…" : title}
         </span>
         <span className="flex-1" />
+        {isSocial && activeIds.length > 1 && (
+          // A private screen offers no in-outlet picker (the screen is the
+          // outlet's first child). With 2+ active contexts the choice lives
+          // here in the header row; 0 or 1 never shows a control.
+          <select
+            className="app-shell-context-pick"
+            aria-label="Context"
+            data-social-context
+            value={socialContext !== null && activeIds.includes(socialContext) ? socialContext : ""}
+            onChange={(e) => e.target.value !== "" && rememberContext(installId, e.target.value)}
+          >
+            <option value="" disabled>
+              Choose a context
+            </option>
+            {contexts
+              .filter((c) => c.state === "active")
+              .map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.config.label}
+                </option>
+              ))}
+          </select>
+        )}
+        <Link href="/" className="lnk text-micro app-shell-home-link" data-chat-home-link>
+          Earlier history is in Home
+        </Link>
         {isDev && installation !== null && (
           <a
             href={contractPreviewHref(href, previewKey === null ? "crm" : null)}
@@ -521,6 +548,7 @@ export default function AppShell({
               recordOpen: recordId !== null,
               contextName: singleScope ? null : contextLabel(contexts, contextId),
               descriptor: chatDescriptor,
+              promptLayout: isSocial ? "list" : "chips",
             }}
             density="compact"
             viewer={viewer}

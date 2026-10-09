@@ -635,10 +635,20 @@ pub(crate) fn sender_binding(
     frozen: &Value,
     request: &Value,
 ) -> Option<crate::platform::agenticos_external::publish::SendBinding> {
-    use crate::platform::agenticos_external::publish::{SendBinding, Toolkit};
+    use crate::platform::agenticos_external::publish::{PublicationSource, SendBinding, Toolkit};
     // v9: `aos_connection_id` is the wire identity sent as `connectionId`/
     // `grant.connectionId` and compared by `check_material` (`parts[2]`).
     // A pre-v9 `frozen` without it is held, never sent under a local id.
+    let source = if frozen["source"]["kind"].as_str() == Some("social_draft") {
+        PublicationSource::SocialDraft {
+            draft_id: frozen["source"]["draft_id"].as_str()?.to_owned(),
+            revision: frozen["source"]["revision"].as_i64()?,
+        }
+    } else {
+        PublicationSource::Run {
+            run_id: frozen["run_id"].as_str()?.to_owned(),
+        }
+    };
     let binding = SendBinding {
         key: request.as_str()?.to_owned(),
         connection_id: frozen["aos_connection_id"].as_str()?.to_owned(),
@@ -646,7 +656,7 @@ pub(crate) fn sender_binding(
         toolkit: Toolkit::parse(frozen["toolkit"].as_str()?)?,
         caption_digest: frozen["caption_digest"].as_str()?.to_owned(),
         image_digest: frozen["image_digest"].as_str().map(str::to_owned),
-        cadence_run_id: frozen["run_id"].as_str()?.to_owned(),
+        source,
         cadence_effect_id: frozen["effect_id"].as_str()?.to_owned(),
         grant_id: frozen["grant_id"].as_str()?.to_owned(),
     };

@@ -105,6 +105,16 @@ fn session_hash_ok(hash: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// What a pending tool context is bound to when its cap is minted.
+#[derive(Clone, Copy)]
+struct ToolContextBinding<'a> {
+    install_id: &'a str,
+    context_id: Option<&'a str>,
+    digest: &'a str,
+    tag: &'a str,
+    generation: u64,
+}
+
 impl Shared {
     /// Resolve a session's real bearer credential to its live
     /// `SessionView` through the daemon's own `Auth` — `token` is the
@@ -210,7 +220,15 @@ impl Shared {
     /// counter. Returns `{mount, bridge_nonce, generation, tag}`.
     pub(super) fn rpc_app_screen_mint(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         self.operator_connection("app screen mint", params, peer_pid)?;
-        const ALLOWED: &[&str] = &["install_id", "tag", "token", "key", "origin", "generation"];
+        const ALLOWED: &[&str] = &[
+            "install_id",
+            "context_id",
+            "tag",
+            "token",
+            "key",
+            "origin",
+            "generation",
+        ];
         let fields = params
             .as_object()
             .ok_or_else(|| Error::rejected("screen mint params must be an object"))?;
@@ -220,6 +238,21 @@ impl Shared {
             ));
         }
         let install_id = required_str(params, "install_id")?;
+        let context_id = params
+            .get("context_id")
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned);
+        if let Some(context) = context_id.as_deref() {
+            // The host may select a context, but cannot assert its authority:
+            // prove it is live and owned by this exact installation here.
+            let (_, proof) = self.store.app_context_proof(install_id, context)?;
+            if proof.install_id != install_id {
+                return Err(Error::rejected(
+                    "screen context belongs to another installation",
+                ));
+            }
+        }
         let tag = required_str(params, "tag")?;
         let token = required_str(params, "token")?;
         let key = params.get("key").and_then(Value::as_str).unwrap_or("");
@@ -265,7 +298,7 @@ impl Shared {
         self.check_mint_rate(&session)?;
         let pm_dir = self.pm_dir()?;
         let pm = self.pm_at(&pm_dir)?;
-        let (digest, _pkg) = self.screen_package_checked(&pm, install_id, tag)?;
+        let (digest, pkg) = self.screen_package_checked(&pm, install_id, tag)?;
 
         self.sweep_screen_caps();
         let mut caps = self.screen_caps.lock().unwrap_or_else(|e| e.into_inner());
@@ -287,6 +320,26 @@ impl Shared {
         // the FrameCap) and returned to the trusted host so it can render
         // it into the bootstrap and later recognize the echoing init.
         let bridge_nonce = mint_nonce();
+        // CAD-1177: a PENDING action context is minted WITH the cap — an
+        // opaque token bound server-side to this mount's verified session
+        // + install + tag + generation + digest + declared tool map, with
+        // `mount: None`. The host holds it and relays it on
+        // `app_tool_invoke`; it is never the FrameCap or bridge nonce and
+        // never enters the frame bootstrap or a child message. It only
+        // becomes invocable when `app_screen_consume` activates it — a
+        // mint that is never consumed, or is superseded, stays refused.
+        // Empty tools → no token (read-only screen).
+        let action_token = self.mint_tool_context(
+            &session,
+            &ToolContextBinding {
+                install_id,
+                context_id: context_id.as_deref(),
+                digest: &digest,
+                tag,
+                generation,
+            },
+            &pkg,
+        );
         caps.insert(
             nonce.clone(),
             ScreenCap {
@@ -299,11 +352,21 @@ impl Shared {
                 issued: Instant::now(),
             },
         );
+        // Aliases the screen declared, advertised to the host only when a
+        // tool context was actually minted. Naming an alias grants nothing:
+        // every invoke still re-proves binding, approval and operator.
+        let tools: Vec<&String> = if action_token.is_null() {
+            Vec::new()
+        } else {
+            pkg.tools.keys().collect()
+        };
         Ok(json!({
             "mount": format!("/api/app-screen/{nonce}"),
             "bridge_nonce": bridge_nonce,
             "generation": generation,
             "tag": tag,
+            "action_token": action_token,
+            "tools": tools,
         }))
     }
 
@@ -356,6 +419,11 @@ impl Shared {
                 "installation digest changed since mint — mount refused",
             ));
         }
+        // CAD-1177: activate the pending action context for THIS consumed
+        // mount — bind it to `cap.bridge_nonce` and retire every other
+        // context the session holds for this install (a remount
+        // supersedes the stale action handle).
+        self.activate_tool_context(&cap);
         Ok(json!({
             "tag": pkg.tag,
             "app": pkg.app,
@@ -363,10 +431,60 @@ impl Shared {
             "install_id": cap.install_id,
             "generation": cap.generation,
             "bridge_nonce": cap.bridge_nonce,
+            "contract": pkg.contract,
+            "may": pkg.may,
+            "tools": pkg.tools,
             "manifest": pkg.manifest,
             "assets": pkg.assets,
             "remote_images": pkg.remote_images,
         }))
+    }
+
+    /// Mint one PENDING in-memory action context for a freshly minted
+    /// cap — bound to the cap's proven (session, install, tag,
+    /// generation), `mount: None`. It becomes invocable only when
+    /// `app_screen_consume` activates it against the real consumed
+    /// mount. Returns the opaque token the trusted host holds (never the
+    /// frame); `Value::Null` when the screen declared no tools — the
+    /// token then carries no invocable aliases anyway.
+    fn mint_tool_context(
+        &self,
+        session: &str,
+        binding: &ToolContextBinding<'_>,
+        pkg: &app_screen_pkg::ScreenPackage,
+    ) -> Value {
+        let ToolContextBinding {
+            install_id,
+            context_id,
+            digest,
+            tag,
+            generation,
+        } = *binding;
+        if pkg.tools.is_empty() {
+            return Value::Null;
+        }
+        let token = mint_nonce();
+        let mut map = self.tool_contexts.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        map.retain(|_, ctx| now.duration_since(ctx.issued) < super::app_tools_rpc::TOOL_CTX_TTL);
+        if map.len() >= super::app_tools_rpc::TOOL_CTX_GLOBAL {
+            return Value::Null;
+        }
+        map.insert(
+            token.clone(),
+            super::app_tools_rpc::ToolContext {
+                install_id: install_id.to_string(),
+                context_id: context_id.map(str::to_owned),
+                digest: digest.to_string(),
+                tag: tag.to_string(),
+                generation,
+                mount: None,
+                session: session.to_string(),
+                tools: pkg.tools.clone(),
+                issued: now,
+            },
+        );
+        json!(token)
     }
 
     /// The shared live re-proof used by mint and consume: recompute the

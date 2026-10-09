@@ -47,3 +47,15 @@ export function initialContext(installId: string, activeIds: string[]): string {
   rememberContext(installId, selected);
   return selected;
 }
+
+/** A private screen has no context picker, so a lone active context is the
+ *  workspace's company and is always the selection (even over a remembered
+ *  "no context"). Zero actives select nothing — never an invented context —
+ *  and several keep the explicit-choice rules of {@link initialContext}. */
+export function screenContext(installId: string, activeIds: string[]): string {
+  if (activeIds.length === 1) {
+    if (rememberedContext(installId) !== activeIds[0]) rememberContext(installId, activeIds[0]);
+    return activeIds[0];
+  }
+  return initialContext(installId, activeIds);
+}

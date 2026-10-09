@@ -52,19 +52,25 @@ export type ChildToHost =
   | { v: 1; op: "state"; data: string }
   | { v: 2; op: "asset"; ref: string }
   | CallRequest
-  | SlotRequest;
+  | SlotRequest
+  | ToolRequest;
 
 /** CAD-1123 HP3 — the closed verb sets. A verb outside its set closes the
  *  port. `call` verbs never spend or publish; every spend or publish verb is a
  *  `slot` verb and waits for a tap on a host-drawn button. The `publish.*` slot
  *  verbs arrive with HP4: add them here and in the host's dispatch table. */
-export const CALL_VERBS = ["read.run", "context.defaults.save", "open-link"] as const;
+export const CALL_VERBS = ["read.run", "context.defaults.save", "open-link", "social.drafts.list", "social.drafts.show", "social.drafts.create", "social.drafts.update", "social.drafts.publish.stage", "social.sources.show", "social.sources.save"] as const;
 export const SLOT_VERBS = ["run.start"] as const;
 export type CallVerb = (typeof CALL_VERBS)[number];
 export type SlotVerb = (typeof SLOT_VERBS)[number];
 /** The verbs a screen.v2 PUSH advertises in `actions`. */
 export const ACTION_VERBS: string[] = [...CALL_VERBS, ...SLOT_VERBS];
 export const ACTION_ID = /^[A-Za-z0-9_-]{1,64}$/;
+/** A v2 tool alias grammar: lowercase words joined by dots (matches the
+ *  declaration). The alias is app vocabulary, never a route/provider name. */
+export const TOOL_ALIAS = /^[a-z][a-z0-9]{0,31}(\.[a-z][a-z0-9]{0,31}){0,3}$/;
+/** A tool request id — one stable idempotency id per intent. */
+export const TOOL_REQUEST_ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
 export const ACTION_ARGS_BYTES = 16 * 1024;
 /** Where the frame asks the host to draw its button: a rectangle in the
  *  frame's own viewport (host clamps it to the frame), or the host footer bar. */
@@ -72,6 +78,13 @@ export type SlotAnchor = { x: number; y: number; w: number; h: number } | "foote
 export type ActionArgs = Record<string, unknown>;
 export interface CallRequest { v: 2; op: "call"; id: string; verb: CallVerb; args: ActionArgs }
 export interface SlotRequest { v: 2; op: "slot"; id: string; verb: SlotVerb; args: ActionArgs; anchor: SlotAnchor }
+/** CAD-1177 — a standalone tool call. `alias` is the app-declared logical
+ *  name its `app-screens/v2` `tools` map binds (never a provider/tool/
+ *  account/route); `input` is its bounded argument bag; `request_id` is
+ *  the stable idempotency id for one intent. The host holds the mount's
+ *  action context — the frame never sees it. */
+export interface GenerationScope { operation:"caption"|"image"; draft_id:string; revision:number }
+export interface ToolRequest { v: 2; op: "tool"; id: string; alias: string; input: ActionArgs; request_id: string; generation_scope?:GenerationScope }
 /** A refusal a person can read: a short code and one plain line (no price,
  *  no daemon detail). */
 export interface ActionRefusal { code: string; text: string }
@@ -80,6 +93,8 @@ export type SlotStateName = "pending" | "done" | "refused";
 export type ReplyMessage =
   | { v: 2; op: "reply"; id: string; ok: true; data: unknown }
   | { v: 2; op: "reply"; id: string; ok: false; refusal: ActionRefusal }
+  | { v: 2; op: "tool-reply"; id: string; ok: true; data: unknown }
+  | { v: 2; op: "tool-reply"; id: string; ok: false; refusal: ActionRefusal }
   | { v: 2; op: "slot-state"; id: string; state: SlotStateName; refusal?: ActionRefusal };
 
 /** CAD-1123 HP1 — the generic read projection v2. A child opts in with
@@ -88,7 +103,11 @@ export type ReplyMessage =
  *  with `v: 2`. Only a v2 child may send `{v:2, op:"asset", ref}`, and only
  *  for an `image_ref` the last PUSH carried. */
 export const SCREEN_V2 = "screen.v2";
-export type Accept = typeof PUBLISH_INTENTS_V1 | typeof SCREEN_V2;
+/** CAD-1177 — the tool/action channel a v2 screen declares with
+ *  `host_contract: "screen-actions.v1"`. A child opts in by listing it in
+ *  `accepts` alongside `screen.v2`; only then may it send `{v:2,op:"tool"}`. */
+export const SCREEN_ACTIONS_V1 = "screen-actions.v1";
+export type Accept = typeof PUBLISH_INTENTS_V1 | typeof SCREEN_V2 | typeof SCREEN_ACTIONS_V1;
 /** The negotiated PUSH shape: the exact CAD-1006 v1, v1 plus
  *  publish-intents.v1, or the v2 projection. */
 export type Shape = "v1" | "intents" | "v2";
@@ -99,8 +118,18 @@ export function shapeOf(accepts: Accept[] | [typeof CHAT_DIRECTIVE_V1] | undefin
   if (accepts.some(a => a === CHAT_DIRECTIVE_V1)) return null;
   return accepts.some(a => a === SCREEN_V2) ? "v2" : "intents";
 }
+/** Whether a ready opt-in includes the tool/action channel. */
+export function wantsActions(accepts: readonly string[] | undefined): boolean {
+  return !!accepts && accepts.includes(SCREEN_ACTIONS_V1);
+}
 /** An asset ref is host-minted (`image:<run id>`), never a receipt id. */
-export const ASSET_REF = /^image:[A-Za-z0-9_-]{1,128}$/;
+export const ASSET_REF = /^(?:image:[A-Za-z0-9_-]{1,128}|draft-image:[A-Za-z0-9_-]{1,128}:[a-z][a-z0-9]{0,31}(?:\.[a-z][a-z0-9]{0,31}){0,3})$/;
+/** The host-held draft image ref: draft id and the tool alias that reads it. */
+const DRAFT_IMAGE_REF = /^draft-image:([A-Za-z0-9_-]{1,128}):([a-z][a-z0-9]{0,31}(?:\.[a-z][a-z0-9]{0,31}){0,3})$/;
+export function parseDraftImageRef(ref: string): { draftId: string; alias: string } | null {
+  const match = DRAFT_IMAGE_REF.exec(ref);
+  return match ? { draftId: match[1], alias: match[2] } : null;
+}
 /** The host's one reply to an asset request: a downscaled data URL. A ref
  *  the host cannot load now gets no reply (the frame keeps its placeholder). */
 export type AssetReply = { v: 2; op: "asset"; ref: string; data_url: string };
@@ -187,8 +216,14 @@ export interface ScreenSourcePost {
   thumb_url?: string;
 }
 export interface ScreenSources {
-  handle: string; run_id: string; fetched_at?: number;
+  handle: string; fetched_at?: number;
   posts: ScreenSourcePost[];
+  /** Set when the library came from a run-bound source read. */
+  run_id?: string;
+  /** Set instead of run_id when the library came from a standalone tool
+   *  invocation (CAD-1177) — the retained app_tool receipt id, distinct
+   *  from any run id. A screen keys refresh/edit to this, never a run. */
+  tool_receipt_id?: string;
 }
 export interface ScreenDefaults {
   context_id: string; revision: number;
@@ -305,6 +340,14 @@ export function parseInit(data: unknown): ScreenInit | null {
 }
 
 /** A plain-object argument bag within its byte bound (JSON-only: no function, undefined or cycle). */
+function generationScope(value:unknown):GenerationScope|null {
+  if(!value||typeof value!=="object"||Array.isArray(value))return null;
+  const s=value as Record<string,unknown>, keys=Object.keys(s).sort().join();
+  if(keys!=="draft_id,operation,revision")return null;
+  if(s.operation!=="caption"&&s.operation!=="image")return null;
+  if(typeof s.draft_id!=="string"||!ACTION_ID.test(s.draft_id)||typeof s.revision!=="number"||!Number.isSafeInteger(s.revision)||s.revision<1)return null;
+  return s as unknown as GenerationScope;
+}
 function actionArgs(value: unknown): ActionArgs | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   try {
@@ -335,9 +378,9 @@ export function parseChild(data: unknown): ChildToHost | null {
   }
   if (
     Object.keys(d).sort().join() === "accepts,op,v" && d.v === 1 && d.op === "ready" &&
-    Array.isArray(d.accepts) && d.accepts.length >= 1 && d.accepts.length <= 2 &&
+    Array.isArray(d.accepts) && d.accepts.length >= 1 && d.accepts.length <= 3 &&
     new Set(d.accepts).size === d.accepts.length &&
-    d.accepts.every(a => a === PUBLISH_INTENTS_V1 || a === SCREEN_V2)
+    d.accepts.every(a => a === PUBLISH_INTENTS_V1 || a === SCREEN_V2 || a === SCREEN_ACTIONS_V1)
   ) {
     return { v: 1, op: "ready", accepts: [...d.accepts] as Accept[] };
   }
@@ -356,6 +399,15 @@ export function parseChild(data: unknown): ChildToHost | null {
     const anchor = slotAnchor(d.anchor);
     if (typeof d.id === "string" && ACTION_ID.test(d.id) && (SLOT_VERBS as readonly unknown[]).includes(d.verb) && args && anchor)
       return { v: 2, op: "slot", id: d.id, verb: d.verb as SlotVerb, args, anchor };
+    return null;
+  }
+  if (d.v === 2 && d.op === "tool" && ["alias,id,input,op,request_id,v","alias,generation_scope,id,input,op,request_id,v"].includes(Object.keys(d).sort().join())) {
+    const input = actionArgs(d.input);
+    const scoped=d.generation_scope===undefined?undefined:generationScope(d.generation_scope);
+    if (typeof d.id === "string" && ACTION_ID.test(d.id) &&
+        typeof d.alias === "string" && TOOL_ALIAS.test(d.alias) &&
+        typeof d.request_id === "string" && TOOL_REQUEST_ID.test(d.request_id) && input && (d.generation_scope===undefined||scoped))
+      return { v: 2, op: "tool", id: d.id, alias: d.alias, input, request_id: d.request_id,...(scoped?{generation_scope:scoped}:{}) };
     return null;
   }
   if (

@@ -690,7 +690,7 @@
         }
         assert_eq!(
             crate::rollout::SCHEMA_VERSION,
-            34,
+            35,
             "bump? pin the new version and add its migration test"
         );
         // Half-applied: one table present, version rolled back — the
@@ -1440,4 +1440,75 @@
             assert!(has_index(), "events_alias_kind missing after converge");
             assert_eq!(version(), crate::rollout::SCHEMA_VERSION);
         }
+    }
+
+    /// v35 adds the CAD-1177 standalone tool receipt tables:
+    /// `app_tool_claims` (claim-before-I/O, one intent per `request_id`
+    /// UNIQUE) and `app_tool_results` (the retained receipt, one per
+    /// `request_id` UNIQUE). `IF NOT EXISTS`, so a genuine v34 store (with
+    /// CAD-1246's index) migrates in place and a half-applied v35
+    /// converges; pre-v35 rows and the v34 index are preserved.
+    #[test]
+    fn migration_v34_to_v35_adds_app_tool_tables() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("t.sqlite3");
+        std::fs::create_dir(dir.path().join("w")).unwrap();
+        {
+            let s = Store::open(&db).unwrap();
+            reg(&s, "a1", &dir.path().join("w"));
+        }
+        // A genuine v34: everything but the tool tables, index kept.
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE app_tool_claims;
+                 DROP TABLE app_tool_results;
+                 UPDATE schema_version SET version=34;",
+            )
+            .unwrap();
+        let has = |kind: &str, name: &str| -> bool {
+            Connection::open(&db)
+                .unwrap()
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2",
+                    [kind, name],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()
+                .unwrap()
+                .is_some()
+        };
+        assert!(has("index", "events_alias_kind"), "v34 index present before");
+        assert!(!has("table", "app_tool_claims"));
+        assert!(!has("table", "app_tool_results"));
+        {
+            let s = Store::open_for_schema_tests(&db).unwrap();
+            for table in ["app_tool_claims", "app_tool_results"] {
+                assert!(has("table", table), "{table} missing after migrate");
+            }
+            assert!(has("index", "events_alias_kind"), "main's v34 index must survive");
+            assert_eq!(
+                Connection::open(&db)
+                    .unwrap()
+                    .query_row("SELECT version FROM schema_version", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                crate::rollout::SCHEMA_VERSION
+            );
+            // The migrated store keeps its pre-v35 rows.
+            assert!(s.agent("a1").unwrap().alias == "a1");
+        }
+        // Half-applied: results table dropped, version rolled back — the
+        // reopen converges.
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE app_tool_results;
+                 UPDATE schema_version SET version=34;",
+            )
+            .unwrap();
+        {
+            let _ = Store::open_for_schema_tests(&db).unwrap();
+        }
+        assert!(has("table", "app_tool_results"));
+        assert!(has("index", "events_alias_kind"));
     }
