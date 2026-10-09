@@ -398,7 +398,7 @@ fn routine_path(path: &str) -> bool {
     (path.starts_with("docs/") || ROUTINE_EXACT.contains(&path)) && path.ends_with(".md")
 }
 
-fn activation_of(resolved: &Resolved) -> Activation {
+pub(crate) fn activation_of(resolved: &Resolved) -> Activation {
     if resolved.policy.validate().is_err()
         || resolved.digest != crate::issue::delivery_policy::digest(&resolved.policy)
     {

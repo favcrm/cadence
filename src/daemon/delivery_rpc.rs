@@ -1570,7 +1570,9 @@ impl Shared {
                     .and_then(crate::issue::delivery_policy::approved_from)
                     .as_ref(),
             );
-            if effective.source == "approved" && effective.policy.solo_operator.is_some() {
+            if crate::issue::delivery_requirements::activation_of(&effective)
+                == crate::issue::delivery_requirements::Activation::Active
+            {
                 let request = json!({"issue": id, "pr": pr_url, "head": live});
                 let current = delivery_requirements_rpc::classify(self, &request)
                     .map_err(|_| Error::rejected("current profile requirements could not be verified; no merge was approved"))?;
