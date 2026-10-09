@@ -8,7 +8,7 @@ import type { AgentUpdate } from "./agentUpdateModel";
 import { READ_ONLY_COPY } from "./AnswerForm";
 import ReviewDrawer from "./ReviewDrawer";
 import TodoCard from "./TodoCard";
-import { doneTodo, hideTodo, useTodoLocal } from "./todoLocal";
+import { doneTodo, hideTodo, marksFor, useTodoLocal } from "./todoLocal";
 import Link from "../../ui/Link";
 
 export { NeedMenu } from "./NeedMenu";
@@ -51,7 +51,7 @@ export default function NeedsRail({
   const block = useWriteBlock(readOnly);
   const { todo, updates, decided } = todoSplit(overview.data?.needs_me);
   const [drawer, setDrawer] = useState(false);
-  const { hidden, done } = useTodoLocal();
+  const local = useTodoLocal();
   const [review, setReview] = useState<string | null>(null);
   // The reading items, as they stood when the drawer opened: "n of m" does
   // not recount when the overview refreshes mid-run.
@@ -60,20 +60,22 @@ export default function NeedsRail({
   const hits = useRef(new Map<string, HTMLElement>());
   const [refocus, setRefocus] = useState<string | null>(null);
 
-  const cards = todo.filter((n) => !hidden.has(n.key));
-  const count = cards.filter((n) => !done.has(n.key)).length;
+  const cards = todo.filter((n) => !marksFor(local, n).hidden);
+  const isDone = (n: HomeNeed) => marksFor(local, n).doneText !== undefined;
+  const count = cards.filter((n) => !isDone(n)).length;
   const readers = cards.filter((n) => kindSpec(n).place === "drawer");
   const reading = review === null ? undefined : readers.find((n) => n.key === review);
-  const firstPermission = cards.findIndex((n) => !done.has(n.key) && n.kind === "master_permission");
+  const firstPermission = cards.findIndex((n) => !isDone(n) && n.kind === "master_permission");
 
   const openReview = (key: string) => {
-    setQueue(readers.filter((n) => n.key === key || !done.has(n.key)).map((n) => n.key));
+    setQueue(readers.filter((n) => n.key === key || !isDone(n)).map((n) => n.key));
     setReview(key);
   };
   /** A review decision landed: mark the card, then move on to the next reading item. */
   const reviewed = (key: string, text: string) => {
-    doneTodo(key, text);
-    const next = queue.slice(queue.indexOf(key) + 1).find((k) => !done.has(k) && readers.some((n) => n.key === k));
+    const need = readers.find((n) => n.key === key);
+    if (need) doneTodo(need, text);
+    const next = queue.slice(queue.indexOf(key) + 1).find((k) => readers.some((n) => n.key === k && !isDone(n)));
     setReview(next ?? null);
   };
   const ask = (need: HomeNeed, lead?: string) => {
@@ -110,7 +112,7 @@ export default function NeedsRail({
             need={n}
             readOnly={readOnly}
             defaultOpen={i === firstPermission}
-            doneText={done.get(n.key)}
+            doneText={marksFor(local, n).doneText}
             onReview={openReview}
             onOpenIssue={onOpenIssue}
             onAsk={(need) => ask(need)}

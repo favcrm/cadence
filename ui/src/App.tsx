@@ -29,8 +29,7 @@ import Update from "./features/settings/Update";
 import Outbox from "./features/outbox/Outbox";
 import OverviewView from "./features/home/Overview";
 import Home from "./features/home/Home";
-import { todoCount, todoSplit } from "./features/home/needs";
-import { reconcileTodo, useTodoLocal } from "./features/home/todoLocal";
+import { useHomeCount } from "./features/home/todoLocal";
 import Context from "./features/projects/Context";
 import { contextNavigationSearch } from "./features/projects/contextRoute";
 import Workflows from "./features/projects/Workflows";
@@ -152,12 +151,7 @@ export default function App() {
   const agentsState = useResource(resources.agents);
   const overviewState = useResource(resources.overview);
   // The Home badge counts pending To do items only (CAD-1216).
-  const todoLocal = useTodoLocal();
-  const homeCount = todoCount(overviewState.data?.needs_me, todoLocal);
-  const todoKeys = overviewState.data ? todoSplit(overviewState.data.needs_me).todo.map((n) => n.key).join("\n") : null;
-  useEffect(() => {
-    if (todoKeys !== null) reconcileTodo(todoKeys ? todoKeys.split("\n") : []);
-  }, [todoKeys]);
+  const homeCount = useHomeCount(overviewState.data?.needs_me);
   const issues = issuesState.data ?? [];
   const projects = projectsState.data ?? [];
   const agents = agentsState.data;

@@ -466,13 +466,28 @@ export function todoSplit(rows: NeedsMe[] | null | undefined): TodoSplit {
 }
 
 /** What the To do tab and the sidebar's Home badge count: pending items only. */
-export function todoCount(
-  rows: NeedsMe[] | null | undefined,
-  local?: { hidden: ReadonlySet<string>; done: ReadonlyMap<string, string> },
-): number {
+export function todoCount(rows: NeedsMe[] | null | undefined, settled?: (need: HomeNeed) => boolean): number {
   const todo = todoSplit(rows).todo;
   // Cards the operator just hid or decided already left the list (CAD-1273).
-  return local ? todo.filter((n) => !local.hidden.has(n.key) && !local.done.has(n.key)).length : todo.length;
+  return settled ? todo.filter((n) => !settled(n)).length : todo.length;
+}
+
+/**
+ * What the need behind a row is, beyond its subject key: the server merges
+ * every cause for one subject into one row, so the same key can carry a new
+ * need. The row's kind plus the identity its action carries; a local mark
+ * (hidden, decided, sent) applies only while this is unchanged.
+ */
+export function needFingerprint(need: HomeNeed): string {
+  const a = need.action;
+  const id =
+    a.type === "merge" ? `${a.issue}@${a.sha ?? ""}`
+    : a.type === "permission" ? a.id
+    : a.type === "answer" ? `${a.issue}/${a.report}`
+    : a.type === "plan" ? a.epic
+    : a.type === "idea" ? a.issue
+    : need.subject?.id ?? "";
+  return `${need.kind}|${id}`;
 }
 
 /** `74` → `just now`, `240` → `4 min`, `7200` → `2 h`, `3 d`. */
