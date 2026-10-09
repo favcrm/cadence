@@ -3,6 +3,7 @@
 //! AgenticOS since AOS-103, refuses every slug but `read_instagram_posts`.
 use super::*;
 use crate::test_seam::{scoped, Asserted, Seam};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -51,7 +52,7 @@ fn operator(state: &std::path::Path, method: &str, params: Value) -> Value {
 /// it, Social Content installed with its source slot bound to the builtin
 /// `hosted` account, and a board on 3110-3199. Answers the board's quote
 /// `(status, body)` and the frozen source binding.
-fn board_quote(answer: fn(&str, &str, &Value) -> Reply, slot: &str) -> (u16, Value, Value) {
+fn boot_daemon(answer: fn(&str, &str, &Value) -> Reply) -> (Stop, tempfile::TempDir, PathBuf) {
     let mut stop = Stop(Arc::new(AtomicBool::new(false)), Vec::new());
     let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
     let base = format!("http://{}", server.server_addr().to_ip().unwrap());
@@ -90,6 +91,12 @@ fn board_quote(answer: fn(&str, &str, &Value) -> Reply, slot: &str) -> (u16, Val
         assert!(std::time::Instant::now() < deadline, "daemon never started");
         std::thread::sleep(Duration::from_millis(50));
     }
+    (stop, root, state)
+}
+
+fn board_quote(answer: fn(&str, &str, &Value) -> Reply, slot: &str) -> (u16, Value, Value) {
+    let (mut stop, root, state) = boot_daemon(answer);
+    let pm = root.path().join("pm");
     let source = concat!(env!("CARGO_MANIFEST_DIR"), "/workspace-apps/social-content");
     let install = operator(&state, "app_workspace_install", json!({"source":source}));
     let approve = json!({"install_id":install["install_id"],"digest":install["digest"]});
@@ -199,4 +206,122 @@ fn cad1096_board_keeps_non_price_refusals_generic() {
     assert_eq!(status, 409, "{body}");
     let generic = "app release management refused or unavailable";
     assert_eq!(body["error"], generic, "{body}");
+}
+
+static CALLS: std::sync::Mutex<Vec<Value>> = std::sync::Mutex::new(Vec::new());
+
+fn recording_door(method: &str, url: &str, body: &Value) -> Reply {
+    if method == "POST" && url == CALL_PATH {
+        CALLS.lock().unwrap().push(body.clone());
+    }
+    generic_door(method, url, body)
+}
+
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+/// CAD-1294: the hosted Fetch posts screen call, through the real daemon
+/// path (session, mounted screen, saved context handle, bound source),
+/// reaches the provider door with the saved handle. A handle that is not
+/// saved is refused before any provider traffic.
+#[test]
+fn cad1294_screen_fetch_of_a_saved_handle_reaches_the_provider_door() {
+    let (_stop, root, state) = boot_daemon(recording_door);
+    // Social Content (declares `list_posts`) plus the tools screen fixture.
+    let fixture = root.path().join("app");
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    copy_dir(
+        &std::path::Path::new(manifest_dir).join("workspace-apps/social-content"),
+        &fixture,
+    );
+    let screen =
+        std::path::Path::new(manifest_dir).join("tests/fixtures/apps/ig-tools-fixture/screens");
+    copy_dir(&screen, &fixture.join("screens"));
+    let screens = fixture.join("screens/feed/screens.json");
+    let text = std::fs::read_to_string(&screens).unwrap();
+    std::fs::write(&screens, text.replace("ig-tools-fixture", "social-content")).unwrap();
+    let install = operator(
+        &state,
+        "app_workspace_install",
+        json!({"source":fixture.to_str().unwrap()}),
+    );
+    let (install_id, digest) = (install["install_id"].clone(), install["digest"].clone());
+    operator(
+        &state,
+        "app_local_install_approve",
+        json!({"install_id":install_id,"digest":digest}),
+    );
+    let rows = operator(&state, "connection_list", json!({}))["connections"].clone();
+    let hosted = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["account"] == "hosted");
+    let context = operator(
+        &state,
+        "app_context_create",
+        json!({"install_id":install_id,"label":"EF","input_defaults":{},"request_id":"ctx-1294"}),
+    );
+    let context = context["context"]["id"]
+        .as_str()
+        .or_else(|| context["id"].as_str())
+        .unwrap()
+        .to_owned();
+    let bind = json!({"install_id":install_id,"context_id":context,"slot":"source","connection_id":hosted.unwrap()["id"],"request_id":"bind-1294"});
+    operator(&state, "app_binding_create", bind);
+    crate::store::app_records::RecordStore::open(&state, install_id.as_str().unwrap())
+        .unwrap()
+        .app_social_sources_save(&context, 0, &["juicysuite_crm".to_owned()], "src-1294")
+        .unwrap();
+    crate::operator_auth::ensure_secret(&state).unwrap();
+    let secret = crate::operator_auth::read_secret(&state).unwrap();
+    let nonce = operator(
+        &state,
+        "operator_link_mint",
+        json!({"secret":secret,"origin":"loopback"}),
+    )["nonce"]
+        .clone();
+    let session = operator(
+        &state,
+        "operator_session_open",
+        json!({"nonce":nonce,"origin":"loopback"}),
+    );
+    let (token, key) = (session["token"].clone(), session["key"].clone());
+    let mint = operator(
+        &state,
+        "app_screen_mint",
+        json!({"install_id":install_id,"context_id":context,"tag":"feed","token":token,"key":key,"origin":"loopback","generation":1}),
+    );
+    let nonce = mint["mount"].as_str().unwrap().rsplit('/').next().unwrap();
+    operator(&state, "app_screen_consume", json!({"nonce":nonce}));
+    let fetch = |handle: &str, request: &str| {
+        scoped(Asserted::Operator, || {
+            crate::client::rpc(
+                &state,
+                "app_tool_invoke",
+                json!({"action_token":mint["action_token"],"tool_alias":"instagram.read","input":{"handle":handle},"request_id":request,"token":token,"key":key,"origin":"loopback"}),
+            )
+        })
+    };
+    let receipt = fetch("juicysuite_crm", "fetch-1294").unwrap();
+    assert_eq!(
+        receipt["receipt"]["result"]["posts"][0]["caption"], "Door caption",
+        "{receipt}"
+    );
+    let calls = CALLS.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(calls[0]["query"]["handle"], "juicysuite_crm");
+    // An unsaved handle is refused with no further provider call.
+    assert!(fetch("someone_else", "fetch-1294-b").is_err());
+    assert_eq!(CALLS.lock().unwrap().len(), 1);
 }

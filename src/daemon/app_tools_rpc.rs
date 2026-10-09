@@ -436,6 +436,7 @@ impl Shared {
                     files,
                 )?
                 .ok_or_else(|| Error::rejected("tool capability binding is absent"))?;
+            let mut saved_handle = None;
             if declaration.capability == "social.read" || declaration.action == "list_posts" {
                 let context = ctx.context_id.as_deref().ok_or_else(|| {
                     Error::rejected("standalone social reads need a mounted context")
@@ -456,6 +457,7 @@ impl Shared {
                         "social read handle is not saved in this context",
                     ));
                 }
+                saved_handle = Some(requested);
             }
             // Re-quote at invoke — the operator's session is the approval;
             // the adapter re-enforces the charge ceiling at execution.
@@ -497,6 +499,12 @@ impl Shared {
             )> = None;
             let mut adapter_input = input.clone();
             let mut authority_inputs = input.clone();
+            // The source authority freezes the validated saved handle under
+            // the workflow input name `profile_handle`, as a run does.
+            if let Some(handle) = saved_handle {
+                adapter_input = json!({"handle": handle});
+                authority_inputs = json!({"profile_handle": handle});
+            }
             let mut authority_source = Value::Null;
             let mut draft_snapshot: Option<Value> = None;
             let generation_caller_digest = input_digest.clone();
