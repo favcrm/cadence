@@ -87,6 +87,7 @@ mod requests_rpc;
 mod review_evidence_rpc;
 mod serve;
 mod slots_rpc;
+mod social_connect_rpc;
 mod social_publish_driver;
 mod social_publish_rpc;
 mod social_publish_start;
@@ -3449,6 +3450,9 @@ impl Shared {
             "app_binding_show" => self.rpc_app_binding(method, params, peer_pid),
             "app_binding_list" => self.rpc_app_binding(method, params, peer_pid),
             "app_binding_publish_set" => self.rpc_app_binding(method, params, peer_pid),
+            "social_connect_link" | "social_destinations" | "app_binding_use_destination" => {
+                self.rpc_social_connect(method, params, peer_pid)
+            }
             "app_effect_stage" => self.rpc_app_effect(method, params, peer_pid),
             "app_effect_show" => self.rpc_app_effect(method, params, peer_pid),
             "app_effect_list" => self.rpc_app_effect(method, params, peer_pid),

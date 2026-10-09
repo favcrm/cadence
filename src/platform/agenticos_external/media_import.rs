@@ -456,6 +456,10 @@ pub struct DestinationRow {
     pub destination_id: String,
     /// `publishable` — a row not publishable cannot be a send target.
     pub publishable: bool,
+    /// `displayName` — shown to the owner only; never an identity.
+    pub display_name: String,
+    /// `available` — the connection is live now.
+    pub available: bool,
 }
 
 /// The typed proof a daemon-layer resolver hands to the store: the
@@ -534,6 +538,52 @@ impl MediaResolver {
         })
     }
 
+    /// One read of the company's destination rows. Malformed rows are
+    /// dropped, not trusted. `Err` is any transport, status or parse fault.
+    fn rows(&self) -> std::result::Result<Vec<DestinationRow>, ()> {
+        let url = format!("{}{}", self.base, self.credential.route(DESTINATIONS_PATH));
+        let mut request = self.http.get(&url);
+        if let Some(authorization) = self.credential.authorization() {
+            request = request.header("authorization", &authorization);
+        }
+        let data = match request.call() {
+            Ok(resp) => read_destinations_envelope(resp).map_err(|_| ())?,
+            Err(_) => return Err(()),
+        };
+        Ok(data
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| {
+                        Some(DestinationRow {
+                            connection_id: v.get("connectionId")?.as_str()?.to_owned(),
+                            toolkit: v.get("toolkit")?.as_str()?.to_owned(),
+                            destination_id: v.get("destinationId")?.as_str()?.to_owned(),
+                            publishable: v
+                                .get("publishable")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
+                            display_name: v
+                                .get("displayName")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned(),
+                            available: v.get("available").and_then(Value::as_bool).unwrap_or(false),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// CAD-1290: the company's active, publishable destinations for one
+    /// toolkit, for the owner to choose from. `None` when the read failed.
+    pub fn list_active(&self, toolkit: &str) -> Option<Vec<DestinationRow>> {
+        let mut rows = self.rows().ok()?;
+        rows.retain(|r| r.toolkit == toolkit && r.publishable && r.available);
+        Some(rows)
+    }
+
     /// Resolve `(toolkit, destination_id)` to its remote AOS `connectionId`
     /// under the read credential's scoped workspace. The reply row set is
     /// already filtered by `listWorkspaceConnectionBindings(…, 100)` — a
@@ -542,42 +592,10 @@ impl MediaResolver {
     /// be ruled out). A caller-supplied id is never trusted; the read is
     /// the only source of the map.
     pub fn resolve(&self, toolkit: &str, destination_id: &str) -> DestinationLookup {
-        let url = format!("{}{}", self.base, self.credential.route(DESTINATIONS_PATH));
-        let mut request = self.http.get(&url);
-        if let Some(authorization) = self.credential.authorization() {
-            request = request.header("authorization", &authorization);
-        }
-        let data = match request.call() {
-            Ok(resp) => match read_destinations_envelope(resp) {
-                Ok(d) => d,
-                Err(Fault::Ambiguous) => return DestinationLookup::Unavailable,
-                Err(Fault::Refused(_)) => return DestinationLookup::Unavailable,
-            },
-            Err(_) => return DestinationLookup::Unavailable,
+        let rows = match self.rows() {
+            Ok(rows) => rows,
+            Err(()) => return DestinationLookup::Unavailable,
         };
-        // Parse the row set; malformed rows are dropped, not trusted.
-        let rows: Vec<DestinationRow> = data
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| {
-                        let connection_id = v.get("connectionId")?.as_str()?.to_owned();
-                        let toolkit = v.get("toolkit")?.as_str()?.to_owned();
-                        let destination_id = v.get("destinationId")?.as_str()?.to_owned();
-                        let publishable = v
-                            .get("publishable")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false);
-                        Some(DestinationRow {
-                            connection_id,
-                            toolkit,
-                            destination_id,
-                            publishable,
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
         // A full 100-row window can't rule out an unseen later match.
         if rows.len() >= 100 {
             return DestinationLookup::Ambiguous;
