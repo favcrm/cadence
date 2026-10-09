@@ -55,6 +55,7 @@ mod conversations_acceptance;
 mod conversations_rpc;
 mod crm_send_rpc;
 mod crm_smtp_rpc;
+mod delivery_requirements_rpc;
 mod delivery_rpc;
 mod dispatch_rpc;
 mod effect_rpc;
@@ -3622,6 +3623,7 @@ impl Shared {
             "report_verdict" => self.rpc_report_verdict(params, peer_pid),
             "answer_route" => self.rpc_answer_route(params, peer_pid),
             "delivery_list" => self.rpc_delivery_list(params),
+            "delivery_requirements" => self.rpc_delivery_requirements(params),
             "delivery_review_evidence" => self.rpc_delivery_review_evidence(params, peer_pid),
             "delivery_observe" => self.rpc_delivery_observe(params, peer_pid),
             "delivery_merge" => self.rpc_delivery_merge(params, peer_pid),

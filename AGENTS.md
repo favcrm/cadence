@@ -112,6 +112,29 @@ PR needs each of the following as a PASS on the exact head you enqueue:
     policy, not per PR; it does not apply to any `human` trigger other
     than reviewer count, and it never lowers the Browser QA,
     qa-verdict-status, or risk-class gates.
+  - **Approved solo-operator delivery profile (CAD-1298):** the legacy policy
+    remains the default. A project may use the approved version-one profile
+    only when it is implemented and activated by the trusted base policy;
+    an optional profile cannot activate or authorize itself. Until that
+    implementation is merged, installed and explicitly activated, this
+    section's existing review and approval requirements govern, including
+    the policy change that introduces the profile. The profile is a bounded
+    startup simplification, not a waiver of evidence or protection gates:
+    routine changes require green exact-head CI and genuine ticket-outcome
+    evidence, but no mandatory review; consequential changes require one
+    independent combined standards-and-spec review. Sensitive changes keep
+    the existing strict review, operator-approval, Browser QA and full-check
+    requirements; no security-reviewer qualification system is introduced.
+    Unknown, incomplete, protected-mode, deletion and mixed sensitive cases
+    retain the strict legacy floors. Readiness is not a
+    PASS or verdict, and no review may be fabricated. Mandatory protection
+    checks and full merge-group regression remain unchanged. Operator-owned
+    deployment and credential isolation are unchanged. Dry-run inspection
+    is read-only, and
+    requirements must be freshly bound before queueing. Required operator
+    approval must still be recorded through an operator-connection audit
+    event. Existing per-head and scope-approval rules remain unchanged. Conversation or ticket text is
+    not approval evidence.
   - **The list is mechanical (CAD-957/1099):** `docs/roles/one-review-paths.toml`
     (match rules in its header; exclude wins) is the only list, and
     `scripts/enqueue-reviewed` reads it at the PR's base. It needs no
@@ -276,9 +299,11 @@ Only an explicit operator-approved ticket can open one; the rules are in
 ### Local builds and tests
 - Before every push run `scripts/pre-push` (fmt, live doctor split check,
   clippy, UI typecheck and active script contracts for what you changed).
-  Use `scripts/pre-push --tests` before requesting review of Rust changes:
-  it always runs the safety floor, even when its source is
-  unchanged. It is the regression floor, not proof of the ticket's outcome (see "Behavior-first verification").
+  `scripts/pre-push --tests` remains available as a focused local diagnostic;
+  it is not a blanket prerequisite before review. Required CI and the full
+  merge-group regression floor remain unchanged and are not waived by this
+  local-workflow guidance. Neither a local run nor a green suite proves the
+  ticket's outcome (see "Behavior-first verification").
   Integration split manifests are retired; do not run `split-map-sync`
   until a reviewed inventory restoration establishes its inputs.
 - sccache is the host-wide rustc wrapper (set in `~/.cargo/config.toml`).

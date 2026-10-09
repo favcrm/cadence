@@ -28,6 +28,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use super::delivery_requirements_rpc::{self, RoutineReadiness};
 use super::{
     check_values, optional_str, optional_strs, request_actor, required_str, Shared,
     APPROVAL_RECORDED_VIA, DAEMON_ALIAS,
@@ -45,6 +46,61 @@ const REASON_MAX: usize = 2_000;
 fn now() -> i64 {
     crate::issue::time::now_epoch()
 }
+
+fn apply_routine_ready_observation(
+    rec: &mut Record,
+    evidence: delivery::ReadyEvidence,
+    was_disable: bool,
+    now: i64,
+) {
+    let prior_state = rec.state;
+    let prior_binding = rec.ready_binding.clone();
+    let prior_evidence = rec.ready_evidence.clone();
+    let expected_head = evidence.head.clone();
+    let binding = delivery::ReadyBinding {
+        repo: evidence.repo.clone(),
+        pr: evidence.pr,
+        head: evidence.head.clone(),
+        base: evidence.base.clone(),
+        policy_digest: evidence.policy_digest.clone(),
+        ci_run_id: evidence.ci_run_id,
+        ci_run_url: evidence.ci_run_url.clone(),
+        outcome_report: evidence.outcome_report.clone(),
+    };
+    let unchanged =
+        prior_binding.as_ref() == Some(&binding) && prior_evidence.as_ref() == Some(&evidence);
+    if prior_state == State::Enqueued && !unchanged {
+        // A changed base, policy, CI run or report invalidates the
+        // old enqueue intent even when HEAD did not move. Do not install
+        // the changed read as replacement proof in this observation.
+        rec.ready_evidence = Some(evidence);
+        rec.enter(State::Ready, now);
+    } else {
+        rec.ready_binding = Some(binding);
+        rec.ready_evidence = Some(evidence);
+    }
+    if prior_state == State::Ready
+        && unchanged
+        && !was_disable
+        && rec.observed.as_ref().is_some_and(|o| {
+            rec.head.as_deref() == Some(expected_head.as_str())
+                && o.head == expected_head
+                && o.ci_green
+                && o.pr_state == "OPEN"
+                && o.auto_merge
+        })
+    {
+        // The reviewed-script enqueue is external to this daemon.
+        rec.enter(State::Enqueued, now);
+    }
+}
+
+#[cfg(test)]
+#[path = "cad1298_observer_acceptance.rs"]
+mod observer_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
+#[path = "cad1298_security_acceptance.rs"]
+mod security_acceptance;
 
 fn hash(text: &str) -> String {
     Sha256::digest(text.as_bytes())
@@ -166,9 +222,12 @@ impl Shared {
             delivery::filing_order(r["name"].as_str().unwrap_or_default(), &rec.worker)
         });
         let Some(latest) = fresh.last().cloned() else {
-            if rec.state == State::Unstaffed {
+            if rec.state == State::Unstaffed
+                || (rec.state == State::Working && rec.outcome_report.is_some())
+            {
+                let before = rec.state;
                 self.start_review(pm, rec, hist)?;
-                return Ok(rec.state != State::Unstaffed);
+                return Ok(rec.state != before || rec.ready_evidence.is_some());
             }
             return Ok(false);
         };
@@ -176,7 +235,14 @@ impl Shared {
         let refusal = match (latest["sha"].as_str(), latest["pr"].as_str()) {
             (Some(sha), Some(pr)) => match self.pr_refusal(pm, rec, pr, held)? {
                 None => {
-                    self.on_done(pm, rec, sha, pr, hist)?;
+                    self.on_done(
+                        pm,
+                        rec,
+                        sha,
+                        pr,
+                        latest["path"].as_str().unwrap_or(""),
+                        hist,
+                    )?;
                     None
                 }
                 why => why,
@@ -247,25 +313,29 @@ impl Shared {
         rec: &mut Record,
         sha: &str,
         pr: &str,
+        outcome_report: &str,
         hist: &[&Record],
     ) -> Result<()> {
         let same_head = rec.head.as_deref() == Some(sha) && rec.pr.as_deref() == Some(pr);
         if same_head
             && matches!(
                 rec.state,
-                State::Reviewing | State::Passed | State::Enqueued
+                State::Reviewing | State::Passed | State::Ready | State::Enqueued
             )
         {
             return Ok(());
         }
         // A new head after review: whatever auto-merge is on was set for
         // the old head.
-        if matches!(rec.state, State::Passed | State::Enqueued)
+        if matches!(rec.state, State::Passed | State::Ready | State::Enqueued)
             && (rec.state == State::Enqueued || rec.observed.as_ref().is_some_and(|o| o.auto_merge))
         {
             rec.disable_auto = true;
         }
         rec.pr = Some(pr.to_string());
+        rec.ready_evidence = None;
+        rec.ready_binding = None;
+        rec.outcome_report = (!outcome_report.is_empty()).then(|| outcome_report.to_string());
         if rec.head.as_deref() != Some(sha) {
             // A new head is a new diff — the risk tier is re-measured.
             rec.risk = None;
@@ -291,6 +361,9 @@ impl Shared {
         }
         // The head that was measured is gone — re-measure the new one.
         rec.risk = None;
+        rec.ready_evidence = None;
+        rec.ready_binding = None;
+        rec.outcome_report = None;
         self.start_review(pm, rec, hist)
     }
 
@@ -339,6 +412,42 @@ impl Shared {
         let (Some(sha), Some(pr)) = (rec.head.clone(), rec.pr.clone()) else {
             return Ok(());
         };
+        // Activated routine work waits on verified CI without dispatching
+        // an unnecessary reviewer. Every retry recollects the authority.
+        if let Some(report) = rec.outcome_report.as_deref() {
+            match delivery_requirements_rpc::routine_readiness(self, &rec.issue, &pr, &sha, report)
+                .unwrap_or(RoutineReadiness::NotRoutine)
+            {
+                RoutineReadiness::Ready(evidence) => {
+                    let binding = delivery::ReadyBinding {
+                        repo: evidence.repo.clone(),
+                        pr: evidence.pr,
+                        head: evidence.head.clone(),
+                        base: evidence.base.clone(),
+                        policy_digest: evidence.policy_digest.clone(),
+                        ci_run_id: evidence.ci_run_id,
+                        ci_run_url: evidence.ci_run_url.clone(),
+                        outcome_report: evidence.outcome_report.clone(),
+                    };
+                    rec.ready_evidence = Some(evidence);
+                    rec.ready_binding = Some(binding);
+                    rec.reviewer = None;
+                    rec.enter(State::Ready, now());
+                    return Ok(());
+                }
+                RoutineReadiness::Waiting => {
+                    rec.ready_evidence = None;
+                    rec.ready_binding = None;
+                    rec.reviewer = None;
+                    rec.enter(State::Working, now());
+                    return Ok(());
+                }
+                RoutineReadiness::NotRoutine => {
+                    rec.ready_evidence = None;
+                    rec.ready_binding = None;
+                }
+            }
+        }
         // Risk is measured once per head — `on_done`/`review_moved_head`
         // clear it when the head moves.
         if rec.risk.is_none() {
@@ -371,6 +480,18 @@ impl Shared {
             }
             return Ok(());
         }
+        // Profile-backed classification comes from the daemon's trusted
+        // GitHub/base evidence and current approved policy, never record risk
+        // or report metadata. Unavailable classification retains the strict
+        // existing review route.
+        let classification = delivery_requirements_rpc::classify(
+            self,
+            &json!({"issue": rec.issue, "pr": pr, "head": sha}),
+        )
+        .ok();
+        let requirement = classification.as_ref().map(|v| &v["requirements"]);
+        let profile_review = requirement
+            .is_some_and(|r| r["activation"] == "active" && r["class"] == "consequential");
         let agents = self.store.agents()?;
         let worker_vendor = agents
             .iter()
@@ -421,7 +542,7 @@ impl Shared {
         let items = issue::parse::acceptance_items(&ticket.body);
         let listing = issue::dispatch::acceptance_listing(&items);
         let round = rec.rounds + 1;
-        let text = delivery::review_kickoff(
+        let mut text = delivery::review_kickoff(
             &rec.issue,
             round,
             &pr,
@@ -432,6 +553,9 @@ impl Shared {
             &ticket.dir.join("issue.md"),
             store::kickoff_ceiling(&agent.provider, &agent.endpoint_kind),
         );
+        if profile_review {
+            text.push_str("\n\nRequired coverage: one combined Standards + Spec/security review of this exact PR head. Address both axes explicitly in the review.");
+        }
         let mid = format!("review-{}", hash(&format!("{}/{sha}/{round}", rec.issue)));
         self.send_as(
             &json!({"alias": reviewer, "text": text, "message": mid, "source": "review"}),
@@ -490,7 +614,7 @@ impl Shared {
                 return Err(Error::rejected(format!(
                     "a verdict comes from {id}'s assigned reviewer — the operator decides at \
                      the merge (`cadence delivery merge|decline {id}`), not by verdict"
-                )))
+                )));
             }
         };
         if master::is_master(&who) {
@@ -739,7 +863,7 @@ impl Shared {
                 _ if moved
                     && matches!(
                         rec.state,
-                        State::Reviewing | State::Passed | State::Enqueued
+                        State::Reviewing | State::Passed | State::Ready | State::Enqueued
                     ) =>
                 {
                     rec.head = Some(head.clone());
@@ -761,11 +885,57 @@ impl Shared {
                 _ => {}
             }
         }
-        // Auto-merge stays on only for the enqueued, reviewed head.
         let was_disable = rec.disable_auto;
-        let approved = rec.state == State::Enqueued && rec.passed_sha() == Some(head.as_str());
-        rec.disable_auto = obs.auto_merge && !approved && rec.state != State::Merged;
         rec.observed = Some(obs);
+        if matches!(rec.state, State::Ready | State::Enqueued)
+            && (rec.ready_evidence.is_some() || rec.state == State::Ready)
+        {
+            let readiness = match (rec.pr.as_deref(), rec.outcome_report.as_deref()) {
+                (Some(pr), Some(report)) => {
+                    delivery_requirements_rpc::routine_readiness(self, id, pr, &head, report)
+                        .unwrap_or(RoutineReadiness::NotRoutine)
+                }
+                _ => RoutineReadiness::NotRoutine,
+            };
+            match readiness {
+                RoutineReadiness::Ready(evidence) => {
+                    apply_routine_ready_observation(rec, evidence, was_disable, now());
+                }
+                RoutineReadiness::Waiting => {
+                    rec.ready_binding = None;
+                    rec.ready_evidence = None;
+                    rec.enter(State::Working, now());
+                }
+                RoutineReadiness::NotRoutine => {
+                    rec.ready_binding = None;
+                    rec.ready_evidence = None;
+                    rec.enter(State::Working, now());
+                    self.start_review(&pm, rec, &hist)?;
+                }
+            }
+        }
+        // Auto-merge remains on only for the freshly bound enqueued head.
+        let routine_approved = rec.state == State::Enqueued
+            && rec
+                .ready_evidence
+                .as_ref()
+                .zip(rec.ready_binding.as_ref())
+                .is_some_and(|(e, b)| {
+                    e.repo == b.repo
+                        && e.pr == b.pr
+                        && e.head == b.head
+                        && e.base == b.base
+                        && e.policy_digest == b.policy_digest
+                        && e.ci_run_id == b.ci_run_id
+                        && e.ci_run_url == b.ci_run_url
+                        && e.outcome_report == b.outcome_report
+                        && e.head == head
+                });
+        let approved = rec.state == State::Enqueued
+            && (rec.passed_sha() == Some(head.as_str()) || routine_approved);
+        rec.disable_auto = rec.observed.as_ref().is_some_and(|o| o.auto_merge)
+            && !approved
+            && rec.state != State::Merged;
         // CAD-776: count the transition into merge-ready here, under
         // `delivery_lock`, so the epoch persists atomically with the
         // observation that caused it — every later wake attempt reads
@@ -877,7 +1047,10 @@ impl Shared {
                         };
                         if attempts >= delivery::MAX_DONE_ATTEMPTS {
                             rec.ticket_done = Some(TicketDone::Refused {
-                                why: format!("the done write failed after {} attempts ({why}) — the operator sets it", delivery::MAX_DONE_ATTEMPTS),
+                                why: format!(
+                                    "the done write failed after {} attempts ({why}) — the operator sets it",
+                                    delivery::MAX_DONE_ATTEMPTS
+                                ),
                             });
                             moved += 1;
                             continue;
@@ -905,7 +1078,10 @@ impl Shared {
                             }
                             if attempts.max(1).saturating_add(1) >= delivery::MAX_DONE_ATTEMPTS {
                                 let failure = next.open().unwrap_or_default();
-                                let reason = format!("the done write failed after {} attempts ({failure}) — the operator sets it", delivery::MAX_DONE_ATTEMPTS);
+                                let reason = format!(
+                                    "the done write failed after {} attempts ({failure}) — the operator sets it",
+                                    delivery::MAX_DONE_ATTEMPTS
+                                );
                                 mine.push(Notice {
                                     issue: id.clone(),
                                     comment: Some(reason.clone()),
@@ -1063,7 +1239,9 @@ impl Shared {
                 // A busy retry may retain its already captured expect.
                 let from = e.from.or_else(|| expect.map(str::to_string));
                 if from.is_none() {
-                    let reason = format!("the done write failed ({why}) before its status was read under lock — the operator sets it");
+                    let reason = format!(
+                        "the done write failed ({why}) before its status was read under lock — the operator sets it"
+                    );
                     notices.pop();
                     notices.push(Notice {
                         issue: id.clone(),
@@ -1171,14 +1349,31 @@ impl Shared {
         let _g = self.delivery_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut all = delivery::load(&self.state_dir)?;
         let rec = all.get_mut(id).ok_or_else(|| not_in_loop(id))?;
-        if rec.state != State::Passed {
+        if !matches!(rec.state, State::Passed | State::Ready) {
             return Err(Error::rejected(format!(
-                "{id} has no standing PASS to merge (it is {})",
+                "{id} has no standing PASS or routine readiness to merge (it is {})",
                 rec.state.as_str()
             )));
         }
-        let sha = rec.passed_sha().unwrap_or_default().to_string();
+        let sha = if rec.state == State::Ready {
+            if !rec.merge_ready() {
+                return Err(Error::rejected(format!(
+                    "{id} routine readiness is stale; sync and retry"
+                )));
+            }
+            rec.ready_evidence
+                .as_ref()
+                .map(|e| e.head.clone())
+                .unwrap_or_default()
+        } else {
+            rec.passed_sha().unwrap_or_default().to_string()
+        };
         let pr = rec.pr.clone().unwrap_or_default();
+        if rec.state == State::Ready && phase != "authorize" {
+            return Err(Error::rejected(format!(
+                "{id} routine readiness must be revalidated by delivery_approve"
+            )));
+        }
         match phase {
             "authorize" => Ok(json!({"issue": id, "sha": sha, "pr": pr})),
             "check" | "enqueued" => {
@@ -1270,12 +1465,13 @@ impl Shared {
         let _g = self.delivery_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut all = delivery::load(&self.state_dir)?;
         let rec = all.get_mut(id).ok_or_else(|| not_in_loop(id))?;
-        if rec.state != State::Passed {
+        if !matches!(rec.state, State::Passed | State::Ready) {
             return Err(Error::rejected(format!(
-                "{id} has no standing PASS to approve (it is {})",
+                "{id} has no standing PASS or fresh routine readiness to approve (it is {})",
                 rec.state.as_str()
             )));
         }
+        let routine = rec.state == State::Ready;
         let pr_url = rec.pr.clone().unwrap_or_default();
         let (slug, number) = task_report::parse_pr_url(&pr_url)
             .map_err(|e| Error::rejected(format!("{id} links no pull request ({e})")))?;
@@ -1314,6 +1510,100 @@ impl Shared {
             at: now(),
             read_at,
         });
+        if routine {
+            let report = rec.outcome_report.as_deref().unwrap_or_default();
+            match delivery_requirements_rpc::routine_readiness(self, id, &pr_url, &live, report) {
+                Ok(RoutineReadiness::Ready(evidence)) => {
+                    let binding = delivery::ReadyBinding {
+                        repo: evidence.repo.clone(),
+                        pr: evidence.pr,
+                        head: evidence.head.clone(),
+                        base: evidence.base.clone(),
+                        policy_digest: evidence.policy_digest.clone(),
+                        ci_run_id: evidence.ci_run_id,
+                        ci_run_url: evidence.ci_run_url.clone(),
+                        outcome_report: evidence.outcome_report.clone(),
+                    };
+                    if rec.ready_binding.as_ref() != Some(&binding) {
+                        rec.ready_binding = None;
+                        rec.ready_evidence = None;
+                        rec.enter(State::Working, now());
+                        rec.disable_auto = rec.observed.as_ref().is_some_and(|o| o.auto_merge);
+                        delivery::save(&self.state_dir, &all)?;
+                        self.wake();
+                        return Err(Error::rejected(format!(
+                            "{id} routine readiness binding changed; refresh and re-authorize"
+                        )));
+                    }
+                    rec.ready_binding = Some(binding);
+                    rec.ready_evidence = Some(evidence);
+                }
+                Ok(RoutineReadiness::Waiting | RoutineReadiness::NotRoutine) | Err(_) => {
+                    rec.ready_binding = None;
+                    rec.ready_evidence = None;
+                    rec.enter(State::Working, now());
+                    rec.disable_auto = rec.observed.as_ref().is_some_and(|o| o.auto_merge);
+                    delivery::save(&self.state_dir, &all)?;
+                    self.wake();
+                    return Err(Error::rejected(format!(
+                        "{id} routine readiness is stale or incomplete; no merge was approved"
+                    )));
+                }
+            }
+        }
+        if !routine {
+            let pm = self.pm()?;
+            let approved = self.store.work_approvals()?;
+            let effective = crate::issue::delivery_policy::effective(
+                &rec.project,
+                crate::issue::delivery_policy::load(&pm.dir, &rec.project),
+                approved
+                    .get(&rec.project)
+                    .and_then(crate::issue::delivery_policy::approved_from)
+                    .as_ref(),
+            );
+            if effective.source == "approved" && effective.policy.solo_operator.is_some() {
+                let request = json!({"issue": id, "pr": pr_url, "head": live});
+                let current = delivery_requirements_rpc::classify(self, &request)
+                    .map_err(|_| Error::rejected("current profile requirements could not be verified; no merge was approved"))?;
+                let requirements = &current["requirements"];
+                if requirements["activation"] != "active"
+                    || requirements["reviews"]
+                        .as_u64()
+                        .is_none_or(|count| count > 1)
+                    || requirements["browser_qa"] == true
+                {
+                    return Err(Error::rejected(
+                        "native approval cannot satisfy current review or Browser QA requirements; use the reviewed-enqueue",
+                    ));
+                }
+                if requirements["full_checks"] == true {
+                    let base = current["base"].as_str().ok_or_else(|| {
+                        Error::rejected("current profile requirements have no base SHA")
+                    })?;
+                    if !delivery_requirements_rpc::full_ci_green(self, &slug, number, &live, base)
+                        .map_err(|_| Error::rejected("current full CI requirements could not be verified; no merge was approved"))?
+                    {
+                        return Err(Error::rejected("current required checks or canonical ci.yml run are not green; no merge was approved"));
+                    }
+                }
+                let confirmed =
+                    delivery_requirements_rpc::classify(self, &request).map_err(|_| {
+                        Error::rejected(
+                            "profile requirements changed during approval; no merge was approved",
+                        )
+                    })?;
+                if confirmed["head"] != current["head"]
+                    || confirmed["base"] != current["base"]
+                    || confirmed["policy_digest"] != current["policy_digest"]
+                    || confirmed["requirements"] != current["requirements"]
+                {
+                    return Err(Error::rejected(
+                        "profile requirements changed during approval; no merge was approved",
+                    ));
+                }
+            }
+        }
         if !rec.merge_ready() {
             let why = match &rec.observed {
                 None => "GitHub has not been read for it yet".to_string(),

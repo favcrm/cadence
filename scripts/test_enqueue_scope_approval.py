@@ -54,6 +54,12 @@ class Case:
         self.ticket_body = BODY
         self.refs = [{"kind": "branch", "path": BRANCH}]
         self.status = "doing"
+        self.project = "cadence"
+        self.requirements_override = None
+        self.requirements_calls = 0
+        self.requirements_after_at = None
+        self.requirements_after = None
+        self.scope_calls = 0
         self.store = [scope_rec()]
         self.note_text = (f"# Verdict: {ISSUE} Review (standards+spec) — pass\n> Issue: {ISSUE}\n> From: rev\n\n"
                           f"## Verdict\npass — PR #5, head {HEAD}\n\nRisk: human (4, 7) — scripts\n"
@@ -92,9 +98,50 @@ class Case:
                 if f"/contents/{f}?ref={BASE}" in url:
                     return 0, (ROOT / f).read_text(), ""
         if argv[:3] == ["cadence", "issue", "show"]:
-            return 0, json.dumps({"id": argv[3], "owner": None, "claim": None, "body": self.ticket_body,
-                                  "status": self.status, "refs": self.refs,
-                                  "comments": [{"body": f"{HEAD} {NOTE}"}]}), ""
+            issue = argv[3]
+            matching = [r for r in self.store if r["issue"].lower() == issue.lower()]
+            approval_id = "merge-pr5-aaaa" if self.per_head else (
+                matching[-1]["approval_id"] if matching else "missing")
+            comment = f"{HEAD} {NOTE}\nOperator approval id: {approval_id}"
+            return 0, json.dumps({"id": issue, "project": self.project, "owner": None, "claim": None,
+                                  "body": self.ticket_body, "status": self.status, "refs": self.refs,
+                                  "comments": [{"body": comment}]}), ""
+        if argv[:3] == ["cadence", "delivery", "requirements"]:
+            issue = argv[argv.index("--issue") + 1]
+            pr_url = argv[argv.index("--pr") + 1]
+            head = argv[argv.index("--head") + 1]
+            pr = int(pr_url.rsplit("/", 1)[-1])
+            # Producer-shaped inactive result for legacy fixtures. This fake
+            # models only the requirements wire shape: derive its fields from
+            # the fixture's current paths/modes and trusted base manifests, but
+            # do not treat that as classifier or native-authority evidence.
+            policy_digest = "sha256:" + "d" * 64
+            changes = [("M", "100644", "100644", path) for path in self.paths]
+            one_text = (ROOT / enq.ONE_REVIEW_FILE).read_text()
+            risk_text = (ROOT / enq.RISK_PATHS_FILE).read_text()
+            reviews = 1 if enq.one_review_qualifies(changes, one_text) else 2
+            review_kind = "combined" if reviews == 1 else "standards_and_spec"
+            verdict_risks = ([v.get("risk") for v in self.verdict_list]
+                             if getattr(self, "verdict_list", None) is not None
+                             else [enq.risk_line(self.note_text or "")])
+            operator_approval = (any(enq.is_human_path(path, enq.risk_globs(risk_text) or ())
+                                     for path in self.paths)
+                                 or any(risk != "auto" for risk in verdict_risks))
+            req = {"class": "strict", "reviews": reviews, "review_kind": review_kind,
+                   "security_capable": False, "browser_qa": any(path.startswith("ui/") for path in self.paths),
+                   "operator_approval": operator_approval,
+                   "full_checks": True, "reasons": ["fixture: legacy project has no approved solo profile"],
+                   "policy_digest": policy_digest, "activation": "no_profile"}
+            response = {"issue": issue, "project": self.project, "repo": "o/r", "pr": pr,
+                        "head": head, "base": BASE, "merge_base": "c" * 40,
+                        "policy_digest": policy_digest, "requirements": req, "readiness": None}
+            self.requirements_calls += 1
+            if self.requirements_override is not None:
+                response = self.requirements_override
+            if (self.requirements_after_at is not None
+                    and self.requirements_calls > self.requirements_after_at):
+                response = self.requirements_after
+            return 0, json.dumps(response), ""
         if argv[:3] == ["cadence", "audit", "verdicts"]:
             return 0, json.dumps({"verdicts": [self.note()], "skipped": []}), ""
         if argv[:3] == ["cadence", "audit", "approval"]:
@@ -103,6 +150,7 @@ class Case:
                                       "source": "op", "recorded_via": OPERATOR}), ""
             return 1, json.dumps({"state": "missing", "reason": "no merge approval"}), ""
         if argv[:3] == ["cadence", "audit", "scope"]:
+            self.scope_calls += 1
             if self.scope_override is not None:
                 return self.scope_rc, self.scope_override, ""
             issue = argv[argv.index("--issue") + 1]

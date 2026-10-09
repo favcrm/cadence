@@ -55,6 +55,8 @@ pub enum State {
     Unstaffed,
     /// PASS on `reviewed.sha`; the merge decision waits on green CI.
     Passed,
+    /// Routine delivery evidence is ready; this is never a reviewer PASS.
+    Ready,
     /// The operator enqueued the merge, pinned to `reviewed.sha`.
     Enqueued,
     /// [`MAX_REVISE`] REVISE verdicts — the operator decides.
@@ -72,6 +74,7 @@ impl State {
             State::Reviewing => "reviewing",
             State::Unstaffed => "unstaffed",
             State::Passed => "passed",
+            State::Ready => "ready",
             State::Enqueued => "enqueued",
             State::Escalated => "escalated",
             State::Merged => "merged",
@@ -93,6 +96,7 @@ impl State {
             State::Reviewing,
             State::Unstaffed,
             State::Passed,
+            State::Ready,
             State::Enqueued,
             State::Escalated,
             State::Merged,
@@ -179,6 +183,33 @@ impl TicketDone {
     }
 }
 
+/// Server-collected no-review readiness, distinct from a reviewer verdict.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadyEvidence {
+    pub repo: String,
+    pub pr: u64,
+    pub head: String,
+    pub base: String,
+    pub policy_digest: String,
+    pub ci_run_id: u64,
+    pub ci_run_url: String,
+    pub outcome_report: String,
+}
+
+/// Last binding freshly revalidated by the daemon; historical evidence alone
+/// is never sufficient to make a record merge-ready.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadyBinding {
+    pub repo: String,
+    pub pr: u64,
+    pub head: String,
+    pub base: String,
+    pub policy_digest: String,
+    pub ci_run_id: u64,
+    pub ci_run_url: String,
+    pub outcome_report: String,
+}
+
 /// A ticket's place in the loop — one per dispatched ticket.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Record {
@@ -212,6 +243,15 @@ pub struct Record {
     /// The latest verdict.
     #[serde(default)]
     pub verdict: Option<VerdictRec>,
+    /// Native routine readiness evidence; never a verdict or PASS.
+    #[serde(default)]
+    pub ready_evidence: Option<ReadyEvidence>,
+    /// Current authoritative binding from the most recent fresh validation.
+    #[serde(default)]
+    pub ready_binding: Option<ReadyBinding>,
+    /// Accepted worker outcome report reference for routine readiness retries.
+    #[serde(default)]
+    pub outcome_report: Option<String>,
     /// Done reports the loop has consumed (file names).
     #[serde(default)]
     pub handled: Vec<String>,
@@ -268,6 +308,9 @@ impl Record {
             rounds: 0,
             revisions: 0,
             verdict: None,
+            ready_evidence: None,
+            ready_binding: None,
+            outcome_report: None,
             handled: vec![],
             observed: None,
             disable_auto: false,
@@ -313,17 +356,93 @@ impl Record {
         if !self.merge_ready() {
             return None;
         }
+        if !matches!(self.state, State::Ready)
+            && !(self.state == State::Enqueued && self.ready_evidence.is_some())
+        {
+            let sha = self.passed_sha()?;
+            return Some(format!("{}/{sha}@{}", self.issue, self.ready_epoch));
+        }
+        let binding = self.ready_binding.as_ref()?;
         Some(format!(
-            "{}/{}@{}",
+            "{}/{}:{}:{}:{}:{}:{}:{}@{}",
             self.issue,
-            self.passed_sha()?,
+            binding.repo,
+            binding.pr,
+            binding.head,
+            binding.base,
+            binding.policy_digest,
+            binding.ci_run_id,
+            binding.outcome_report,
             self.ready_epoch
         ))
     }
 
-    /// The merge decision is ready: a PASS, and the operator's process
-    /// saw that very head open with green CI.
+    /// The merge decision is ready: either a PASS plus its observed green
+    /// head, or a routine receipt plus its freshly validated exact binding.
     pub fn merge_ready(&self) -> bool {
+        if self.state == State::Ready {
+            return self
+                .ready_evidence
+                .as_ref()
+                .zip(self.ready_binding.as_ref())
+                .is_some_and(|(e, b)| {
+                    let valid_sha = |s: &str| {
+                        s.len() == 40
+                            && s.bytes()
+                                .all(|v| v.is_ascii_digit() || (b'a'..=b'f').contains(&v))
+                    };
+                    let run_url =
+                        format!("https://github.com/{}/actions/runs/{}", b.repo, b.ci_run_id);
+                    let digest_valid = b.policy_digest.strip_prefix("sha256:").is_some_and(|hex| {
+                        hex.len() == 64
+                            && hex
+                                .bytes()
+                                .all(|v| v.is_ascii_digit() || (b'a'..=b'f').contains(&v))
+                    });
+                    let report_prefix = format!("{}/reports/", self.issue);
+                    let report_valid =
+                        b.outcome_report
+                            .strip_prefix(&report_prefix)
+                            .is_some_and(|name| {
+                                !name.is_empty()
+                                    && name.ends_with(".md")
+                                    && !name.contains('/')
+                                    && !name.contains("..")
+                            });
+                    let repo_valid = b.repo.split_once('/').is_some_and(|(owner, name)| {
+                        !owner.is_empty()
+                            && !name.is_empty()
+                            && b.repo == b.repo.to_ascii_lowercase()
+                    });
+                    e.repo == b.repo
+                        && e.pr == b.pr
+                        && e.head == b.head
+                        && e.base == b.base
+                        && e.policy_digest == b.policy_digest
+                        && e.ci_run_id == b.ci_run_id
+                        && e.ci_run_url == b.ci_run_url
+                        && e.outcome_report == b.outcome_report
+                        && repo_valid
+                        && e.pr > 0
+                        && valid_sha(&e.head)
+                        && valid_sha(&e.base)
+                        && digest_valid
+                        && b.ci_run_id > 0
+                        && b.ci_run_url == run_url
+                        && report_valid
+                        && self.outcome_report.as_deref() == Some(b.outcome_report.as_str())
+                        && self
+                            .pr
+                            .as_deref()
+                            .and_then(pr_ref)
+                            .is_some_and(|r| r == format!("{}#{}", b.repo, b.pr))
+                        && self.head.as_deref() == Some(b.head.as_str())
+                        && self
+                            .observed
+                            .as_ref()
+                            .is_some_and(|o| o.head == b.head && o.ci_green && o.pr_state == "OPEN")
+                });
+        }
         let Some(sha) = self.passed_sha() else {
             return false;
         };

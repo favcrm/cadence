@@ -746,6 +746,7 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         Rule::Handler("agent_caller: the answer's own recorded author (CAD-447)"),
     ),
     ("delivery_list", Rule::Read),
+    ("delivery_requirements", Rule::Read),
     (
         "delivery_review_evidence",
         Rule::Handler("operator_connection (CAD-120)"),
