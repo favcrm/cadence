@@ -2900,6 +2900,9 @@ impl Shared {
                 check_values("providers", &providers, &registry::provider_ids())?;
                 check_values("kinds", &kinds, &registry::endpoint_kind_ids())?;
                 let mut agents = Vec::new();
+                // CAD-1266: one pass over `tasks` for the whole fleet, not
+                // one unindexed scan per agent.
+                let mut open_tasks = self.store.open_task_ids_by_assignee()?;
                 // CAD-96: one grouped read tells auto-stopped rows apart.
                 let markers = self
                     .store
@@ -2918,13 +2921,7 @@ impl Shared {
                     let mut j = agent.to_json();
                     // The alias's current non-terminal task assignments —
                     // derived from tasks.assignee, never stored.
-                    let tasks: Vec<String> = self
-                        .store
-                        .tasks_for_assignee(&agent.alias)?
-                        .iter()
-                        .map(|t| t.id.clone())
-                        .collect();
-                    j["tasks"] = json!(tasks);
+                    j["tasks"] = json!(open_tasks.remove(&agent.alias).unwrap_or_default());
                     j["capabilities"] =
                         registry::capabilities_json(&agent.provider, &agent.endpoint_kind);
                     j["native_turn_steering_enabled"] = json!(
@@ -2937,7 +2934,14 @@ impl Shared {
                     let (dead, resumable) = self.agent_liveness(&agent);
                     j["dead"] = json!(dead);
                     j["resumable"] = json!(resumable);
-                    if let Some(inbox) = self.store.inbox_status(&agent.alias)? {
+                    // CAD-1266: `inbox_status` answers `None` for any row with
+                    // an actor; skip the store read the answer is known without.
+                    let inbox = if registry::has_actor(&agent.provider, &agent.endpoint_kind) {
+                        None
+                    } else {
+                        self.store.inbox_status(&agent.alias)?
+                    };
+                    if let Some(inbox) = inbox {
                         j["inbox"] = inbox;
                         // CAD-251: stale-consumer evidence + owner.
                         j["inbox_health"] = self.inbox_health(&agent).unwrap_or(Value::Null);
@@ -3815,24 +3819,26 @@ impl Shared {
     /// between paste and render).
     fn inflight_turns(&self) -> Result<Vec<Value>> {
         let now = crate::rollout::unix_now();
+        // CAD-1266: one indexed read of the in-flight rows, filtered to
+        // agents that own an actor — not every agent's full history.
+        let with_actor: std::collections::HashSet<String> = self
+            .store
+            .agents()?
+            .into_iter()
+            .filter(|a| registry::has_actor(&a.provider, &a.endpoint_kind))
+            .map(|a| a.alias)
+            .collect();
         let mut rows = Vec::new();
-        for agent in self.store.agents()? {
-            if !registry::has_actor(&agent.provider, &agent.endpoint_kind) {
+        for (alias, message, state, since) in self.store.inflight_messages()? {
+            if !with_actor.contains(&alias) {
                 continue;
             }
-            let messages = self.store.messages(&agent.alias)?;
-            for m in messages {
-                if !matches!(m.state.as_str(), "running" | "submitted") {
-                    continue;
-                }
-                let since = m.started.unwrap_or(m.created);
-                rows.push(json!({
-                    "alias": agent.alias,
-                    "message": m.id,
-                    "state": m.state,
-                    "age_secs": (now - since).max(0.0).round() as u64,
-                }));
-            }
+            rows.push(json!({
+                "alias": alias,
+                "message": message,
+                "state": state,
+                "age_secs": (now - since).max(0.0).round() as u64,
+            }));
         }
         rows.sort_by(|a, b| {
             b["age_secs"]

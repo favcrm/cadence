@@ -363,6 +363,30 @@ impl Store {
         })
     }
 
+    /// CAD-1266: every assignee's non-terminal task ids in one pass, each
+    /// list in [`Self::tasks_for_assignee`] order. `tasks` has no assignee
+    /// index, so asking per agent scans the table once per agent; the fleet
+    /// list asks once.
+    pub fn open_task_ids_by_assignee(
+        &self,
+    ) -> Result<std::collections::HashMap<String, Vec<String>>> {
+        self.read_tx(|conn| {
+            let rows = conn.query_vec(
+                "SELECT assignee, id FROM tasks WHERE assignee IS NOT NULL
+                 AND state NOT IN ('verified','done','cancelled','failed')
+                 ORDER BY updated",
+                [],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )?;
+            let mut by_assignee: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::new();
+            for (assignee, id) in rows {
+                by_assignee.entry(assignee).or_default().push(id);
+            }
+            Ok(by_assignee)
+        })
+    }
+
     /// An alias's non-terminal task assignments (the same rows as
     /// [`Self::tasks_for_assignee`], same order) each with its job's issue
     /// and job title/state, in one join over this alias's tasks. The
