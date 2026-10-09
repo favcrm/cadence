@@ -27,7 +27,7 @@
 //! | forged head, moved head | the verb's live-head compare (`head_moved`) |
 //! | replay while the approval stands, replay after revoke | the verb's "one record per shown head" rule |
 //! | tailnet actor with an empty allowlist, a login not on it, a public-session actor | the verb's approver allowlist (`pm.yaml` `approvals.tailnet_logins`) |
-//! | public AgenticOS `owner` session on the approve route | the route's `Caller::Operator`-only check (`approver_not_allowed`) |
+//! | (round 5) public AgenticOS `owner` approves; `member` never | see `cad1218_platform_owner_is_an_approver_and_member_never` |
 //!
 //! Round 2 adds two sibling tests below (each ignored until built): the
 //! drawer's approval-state read
@@ -438,9 +438,16 @@ impl Board {
         })
     }
 
-    /// A public (AgenticOS) session for a platform-verified `owner`,
-    /// through the daemon's real assertion exchange.
-    fn public_owner_session(&self) -> String {
+    /// A public (AgenticOS) session for a platform-verified `owner` or
+    /// `member` (`role`), through the daemon's real assertion exchange. The
+    /// board names it `Platform Owner <owner@example.com> (board)` /
+    /// `Platform Member <member@example.com> (board)`.
+    fn public_session(&self, role: &str) -> String {
+        let name = if role == "owner" {
+            "Platform Owner"
+        } else {
+            "Platform Member"
+        };
         let key = Ed25519KeyPair::from_seed_unchecked(&KEY_SEED).unwrap();
         let now = crate::issue::time::now_epoch();
         let part = |v: Value| URL_SAFE_NO_PAD.encode(serde_json::to_vec(&v).unwrap());
@@ -448,10 +455,10 @@ impl Board {
             "{}.{}",
             part(json!({"alg": "EdDSA", "typ": "JWT", "kid": "c1218"})),
             part(json!({
-                "iss": self.issuer, "aud": PUBLIC_HOST, "sub": "usr_owner",
-                "email": "owner@example.com", "name": "Platform Owner",
-                "company": COMPANY, "role": "owner",
-                "iat": now, "exp": now + 30, "jti": "c1218-owner"
+                "iss": self.issuer, "aud": PUBLIC_HOST, "sub": format!("usr_{role}"),
+                "email": format!("{role}@example.com"), "name": name,
+                "company": COMPANY, "role": role,
+                "iat": now, "exp": now + 30, "jti": format!("c1218-{role}")
             }))
         );
         let assertion = format!(
@@ -470,7 +477,9 @@ impl Board {
     }
 
     /// A request on the public host, as the platform relay delivers it: a
-    /// GET without `body`, a POST with one.
+    /// GET without `body`, a POST with one. Each carries a forged
+    /// `Tailscale-User-Login: mallory@example.com` — a public session must
+    /// never be attributed to a tailnet login.
     fn public(&self, path: &str, token: &str, body: Option<&str>) -> (u16, Value) {
         // `__Host-aos-board-session`: the public cookie (contract §7).
         let cookie = format!("__Host-aos-board-session={token}");
@@ -485,6 +494,7 @@ impl Board {
                 .header(crate::test_seam::AS_HEADER, "operator")
                 .header(crate::test_seam::TOKEN_HEADER, &self.token)
                 .header("Content-Type", "application/json")
+                .header("Tailscale-User-Login", "mallory@example.com")
                 .header("Cookie", &cookie)
                 .send(body.to_string()),
             None => self
@@ -493,6 +503,7 @@ impl Board {
                 .header("Host", PUBLIC_HOST)
                 .header(crate::test_seam::AS_HEADER, "operator")
                 .header(crate::test_seam::TOKEN_HEADER, &self.token)
+                .header("Tailscale-User-Login", "mallory@example.com")
                 .header("Cookie", &cookie)
                 .call(),
         }
@@ -601,7 +612,6 @@ fn cad1218_board_pr_head_approval_refuses_agent_forged_head_and_replay() {
     for actor in [
         "mallory@example.com (tailscale)",
         "chris@example.com.evil (tailscale)",
-        "Platform Owner <owner@example.com> (board)",
         "chris@example.com",
     ] {
         let text = board
@@ -626,20 +636,9 @@ fn cad1218_board_pr_head_approval_refuses_agent_forged_head_and_replay() {
         "the source names the tailnet login, marked (tailscale): {seen}"
     );
 
-    // --- a public AgenticOS owner session: valid, admitted by the board's
-    // OperatorOnly class, and still no approver ---
-    let owner = board.public_owner_session();
-    let (status, meta) = board.public("/api/meta", &owner, None);
-    assert_eq!(status, 200, "{meta}");
-    assert_eq!(meta["signed_in"], true, "the owner session is live: {meta}");
-    let public_body = json!({"repo": REPO, "pr": PUBLIC_PR, "head": HEAD}).to_string();
-    let (status, body) = board.public(APPROVE, &owner, Some(&public_body));
-    assert_eq!(status, 403, "a public owner session cannot approve: {body}");
-    assert_eq!(
-        body["check"], "approver_not_allowed",
-        "refused by the approve route's Caller::Operator allowlist, not earlier: {body}"
-    );
-    assert_eq!(board.audit_pr(PUBLIC_PR, HEAD)["state"], "missing");
+    // (Round 5: a platform-verified owner is an approver — operator
+    // decision on CAD-1218 — so the owner's approval is pinned in
+    // `cad1218_platform_owner_is_an_approver_and_member_never`.)
 
     // --- forged sessions ---
     let forged_key = Session {
@@ -799,9 +798,9 @@ fn cad1218_board_pr_head_approval_refuses_agent_forged_head_and_replay() {
 //   head that is not the full lowercase 40-hex SHA, is 400 before any
 //   lookup.
 // - Admission: `operator::admit_operator_read` (session, page key, and the
-//   HTTP-peer operator proof), then `Caller::Operator` only — any other
-//   caller, a public AgenticOS `owner` session included, is
-//   `403 {"check":"approver_not_allowed"}`.
+//   HTTP-peer operator proof), then the approvers only: `Caller::Operator`,
+//   and (round 5) a platform-verified `owner` session; a `member` is
+//   refused by admission itself (`member_role`).
 // - The board relays the daemon verb `approval_state`
 //   `{repo, pr, head, request_actor}`: `operator_connection`, the repo of
 //   a registered project (else refused — no state for it), and the same
@@ -814,6 +813,7 @@ fn cad1218_board_pr_head_approval_refuses_agent_forged_head_and_replay() {
 // ---------------------------------------------------------------------
 
 const STATE_VERB: &str = "approval_state";
+const CHRIS_LOGIN: &str = "chris@example.com (tailscale)";
 
 fn state_path(repo: &str, pr: u64, head: &str) -> String {
     format!("/api/approvals/state?repo={repo}&pr={pr}&head={head}")
@@ -943,15 +943,6 @@ fn cad1218_board_approval_state_read_is_operator_only_and_leaks_nothing() {
         &ids,
         "a forged cookie with the operator's page key",
     );
-    // A live public owner session is no approver, so it reads nothing.
-    let owner = board.public_owner_session();
-    let (status, meta) = board.public("/api/meta", &owner, None);
-    assert_eq!((status, &meta["signed_in"]), (200, &json!(true)), "{meta}");
-    let (status, body) = board.public(&read, &owner, None);
-    assert_eq!(status, 403, "{body}");
-    assert_eq!(body["check"], "approver_not_allowed", "{body}");
-    read_refused((status, body), &ids, "a public owner session");
-
     // --- the request shape ---
     read_refused(
         board.get(
@@ -1006,6 +997,53 @@ fn cad1218_board_approval_state_read_is_operator_only_and_leaks_nothing() {
             "{who:?}: the refusal leaked the id: {text}"
         );
     }
+
+    // --- round 4: the approver rule guards the read too. The head has a
+    // real in-force record; only the relayed actor or the allowlist
+    // differs from the accepted read below ---
+    let pm_yaml = board.state.join("pm").join("pm.yaml");
+    let before = std::fs::read_to_string(&pm_yaml).unwrap();
+    let as_actor = |actor: &str| {
+        scoped(Asserted::Operator, || {
+            crate::client::rpc(
+                &board.state,
+                STATE_VERB,
+                json!({"repo": REPO, "pr": PR, "head": HEAD, "request_actor": actor}),
+            )
+        })
+    };
+    let off_list = |actor: &str, what: &str| {
+        let text = as_actor(actor)
+            .expect_err("the state read answered an actor off the allowlist")
+            .to_string();
+        assert!(
+            text.contains("approval allowlist"),
+            "{what}: refused by the approver rule: {text}"
+        );
+        for leaked in ids.iter().chain(["in-force", "revoked"].iter()) {
+            assert!(
+                !text.contains(leaked),
+                "{what}: the refusal leaked {leaked}: {text}"
+            );
+        }
+    };
+    off_list(
+        CHRIS_LOGIN,
+        "an allowlisted-shape login with an empty allowlist",
+    );
+    std::fs::write(
+        &pm_yaml,
+        format!("{before}approvals:\n  tailnet_logins:\n    - chris@example.com\n"),
+    )
+    .unwrap();
+    off_list(
+        "mallory@example.com (tailscale)",
+        "a login off the allowlist",
+    );
+    let seen = as_actor(CHRIS_LOGIN).expect("the allowlisted login reads");
+    assert_eq!(seen["state"], "in-force", "{seen}");
+    assert_eq!(seen["approval_id"], id.as_str(), "{seen}");
+    std::fs::write(&pm_yaml, &before).unwrap();
 
     // --- a pm.yaml that does not parse makes the read refuse, not answer ---
     let pm_yaml = board.state.join("pm").join("pm.yaml");
@@ -1120,7 +1158,7 @@ fn cad1218_approver_rule_covers_publish_revoke_and_closed_prs() {
 
     // --- (1) Publish: an off-list tailnet login, relayed exactly as the
     // board relays a proven tailnet caller, on a merge-ready row ---
-    for actor in [MALLORY, "Platform Owner <owner@example.com> (board)"] {
+    for actor in [MALLORY, "chris@example.com"] {
         let text = rpc(
             "delivery_approve",
             json!({"issue": PUBLISH_ISSUE, "sha": HEAD, "request_actor": actor}),
@@ -1135,22 +1173,6 @@ fn cad1218_approver_rule_covers_publish_revoke_and_closed_prs() {
         assert_eq!(merges(&board), "", "a refused Publish enqueued a merge");
         assert_eq!(delivery_state(&board, PUBLISH_ISSUE), "passed");
     }
-    // A live public AgenticOS owner session, end to end on the board.
-    let owner = board.public_owner_session();
-    let (status, meta) = board.public("/api/meta", &owner, None);
-    assert_eq!((status, &meta["signed_in"]), (200, &json!(true)), "{meta}");
-    let (status, body) = board.public(&publish, &owner, Some(&publish_body));
-    assert!(
-        (400..500).contains(&status),
-        "a public owner session cannot Publish: {status} {body}"
-    );
-    assert!(
-        body["check"] == "approver_not_allowed" || body.to_string().contains("approval allowlist"),
-        "refused by the approver rule, not an earlier guard: {body}"
-    );
-    assert_eq!(board.audit_pr(PUBLISH_PR, HEAD)["state"], "missing");
-    assert_eq!(merges(&board), "", "a refused Publish enqueued a merge");
-    assert_eq!(delivery_state(&board, PUBLISH_ISSUE), "passed");
     // Positive controls: the loopback operator on the board, and an
     // allowlisted tailnet login through the same verb.
     let (status, body) = board.post("operator", Some(&operator), &publish, &publish_body);
@@ -1211,15 +1233,6 @@ fn cad1218_approver_rule_covers_publish_revoke_and_closed_prs() {
     .to_string();
     assert!(text.contains("approval allowlist"), "{text}");
     assert_eq!(board.audit_pr(TAILNET_PR, HEAD)["state"], "in-force");
-    let (status, body) = board.public(
-        &format!("/api/approvals/{chris_id}/revoke"),
-        &owner,
-        Some(&json!({"reason": "not mine"}).to_string()),
-    );
-    assert_eq!(status, 403, "{body}");
-    assert_eq!(body["check"], "approver_not_allowed", "{body}");
-    assert_eq!(board.audit_pr(TAILNET_PR, HEAD)["state"], "in-force");
-
     // Records no board path wrote: a CLI merge approval, a CLI record of
     // another action whose source imitates the board's, and a ticket
     // scope approval. Each is in force and stays so.
@@ -1407,9 +1420,6 @@ fn cad1218_board_revocable_is_the_board_revoke_predicate() {
     assert_eq!(board.audit_pr(PUBLISH_PR, HEAD)["state"], "missing");
     assert_eq!(merges(&board), "");
     // Publish over HTTP: each refusal names its check.
-    let owner = board.public_owner_session();
-    let (status, meta) = board.public("/api/meta", &owner, None);
-    assert_eq!((status, &meta["signed_in"]), (200, &json!(true)), "{meta}");
     for (who, session, want) in [
         ("agent:worker", None, &["operator_only"][..]),
         (
@@ -1425,12 +1435,6 @@ fn cad1218_board_revocable_is_the_board_revoke_predicate() {
             "{who} on Publish names its check {want:?}: {body}"
         );
     }
-    let (status, body) = board.public(&publish, &owner, Some(&publish_body));
-    assert_eq!(status, 403, "a public owner session on Publish: {body}");
-    assert_eq!(
-        body["check"], "approver_not_allowed",
-        "a public owner on Publish names the approver check: {body}"
-    );
     assert_eq!(board.audit_pr(PUBLISH_PR, HEAD)["state"], "missing");
     assert_eq!(merges(&board), "", "a refused Publish enqueued a merge");
 
@@ -1524,4 +1528,190 @@ fn cad1218_board_revocable_is_the_board_revoke_predicate() {
         "the board revoked a deploy record: {status} {body}"
     );
     assert_eq!(board.approval_events(), events);
+}
+
+// ---------------------------------------------------------------------
+// Round 5 (operator decision on CAD-1218, 2026-10-09, superseding round
+// 2's "public owner sessions are refused"): every platform-verified
+// `owner` session is an approver, with no configuration; a `member`
+// never is. The approver rule admits exactly three kinds of actor:
+// `operator (ui)` (loopback), `<login> (tailscale)` for a login in
+// `pm.yaml` `approvals.tailnet_logins`, and a platform owner as the board
+// names it, `<name> <email> (board)`.
+//
+// Contract:
+// - Board: the approve, revoke and state routes accept `Caller::Operator`
+//   and `Caller::Named(n)` with `n.operator` (the verified `owner` role,
+//   `board_identity::Role::is_operator`), relaying `request_actor =
+//   n.actor` — the string `board_caller` derives from the verified
+//   assertion (`<name> <email> (board)`), never from the request.
+//   Publish already relays `caller.actor()`. A `member` session never
+//   reaches a handler: `admit` / `admit_operator_read` refuse it
+//   (`member_role`), and nothing is recorded or merged.
+// - Daemon: `approver_source` additionally admits an actor of the form
+//   `<name> <<email>> (board)`; the source is `"<actor> via board"`, so
+//   the record is `board_revocable`.
+// - Every daemon verb still requires `operator_connection`: an agent or
+//   unproven caller that dials it with a `(board)` actor is refused.
+// - The actor comes only from the connection: a body `request_actor` is
+//   refused at the board, and a public session is never attributed to a
+//   `Tailscale-User-Login` header.
+// ---------------------------------------------------------------------
+
+const OWNER_ACTOR: &str = "Platform Owner <owner@example.com> (board)";
+
+#[test]
+#[ignore = "CAD-1218: enabled by the implementation"]
+fn cad1218_platform_owner_is_an_approver_and_member_never() {
+    let root = tempfile::Builder::new().prefix("c1218o").tempdir().unwrap();
+    let board = Board::start(root.path());
+    let operator = board.session();
+    let publish = |issue: &str| format!("/api/delivery/{issue}/merge");
+    let publish_body = json!({"sha": HEAD}).to_string();
+    let approve_pr = |pr: u64| json!({"repo": REPO, "pr": pr, "head": HEAD}).to_string();
+
+    // --- the verbs refuse a direct dial even with a (board) actor ---
+    for (method, params) in [
+        (
+            VERB,
+            json!({"repo": REPO, "pr": PUBLIC_PR, "head": HEAD, "request_actor": OWNER_ACTOR}),
+        ),
+        (
+            "delivery_approve",
+            json!({"issue": PUBLISH_ISSUE, "sha": HEAD, "request_actor": OWNER_ACTOR}),
+        ),
+        (
+            STATE_VERB,
+            json!({"repo": REPO, "pr": PUBLIC_PR, "head": HEAD, "request_actor": OWNER_ACTOR}),
+        ),
+        (
+            REVOKE_VERB,
+            json!({"id": "merge-pr44-x", "reason": "r", "request_actor": OWNER_ACTOR}),
+        ),
+    ] {
+        for who in [Asserted::Agent("worker".into()), Asserted::Unproven] {
+            let text = scoped(who.clone(), || {
+                crate::client::rpc(&board.state, method, params.clone())
+            })
+            .expect_err("a non-operator recorded by naming a (board) actor")
+            .to_string();
+            assert!(
+                !text.contains("Unknown method"),
+                "{method} does not exist: {text}"
+            );
+            assert!(
+                text.contains("operator action"),
+                "{who:?} on {method}: {text}"
+            );
+        }
+    }
+    assert_eq!(board.audit_pr(PUBLIC_PR, HEAD)["state"], "missing");
+    assert_eq!(board.audit_pr(PUBLISH_PR, HEAD)["state"], "missing");
+    assert_eq!(merges(&board), "");
+
+    // --- the (board) kind is the board's own shape, `<name> <email> (board)`;
+    // even an operator connection cannot pass a bare or tailnet-looking one ---
+    for actor in ["x (board)", "mallory@example.com (board)", " <> (board)"] {
+        let text = scoped(Asserted::Operator, || {
+            crate::client::rpc(
+                &board.state,
+                VERB,
+                json!({"repo": REPO, "pr": PUBLIC_PR, "head": HEAD, "request_actor": actor}),
+            )
+        })
+        .expect_err("a malformed (board) actor recorded an approval")
+        .to_string();
+        assert!(text.contains("approval allowlist"), "'{actor}': {text}");
+    }
+    assert_eq!(board.audit_pr(PUBLIC_PR, HEAD)["state"], "missing");
+
+    // --- forged actors at the board: the body never names the actor ---
+    let mut forged: Value = serde_json::from_str(&approve_pr(PUBLIC_PR)).unwrap();
+    forged["request_actor"] = json!(OWNER_ACTOR);
+    let (status, body) = board.post("operator", Some(&operator), APPROVE, &forged.to_string());
+    assert!((400..500).contains(&status), "{status} {body}");
+    let forged_publish = json!({"sha": HEAD, "request_actor": OWNER_ACTOR}).to_string();
+    let (status, body) = board.post(
+        "operator",
+        Some(&operator),
+        &publish(PUBLISH_ISSUE),
+        &forged_publish,
+    );
+    assert!((400..500).contains(&status), "{status} {body}");
+    assert_eq!(board.audit_pr(PUBLIC_PR, HEAD)["state"], "missing");
+    assert_eq!(merges(&board), "");
+
+    // --- a platform member: refused by admission at all four routes ---
+    let member = board.public_session("member");
+    let (status, meta) = board.public("/api/meta", &member, None);
+    assert_eq!((status, &meta["signed_in"]), (200, &json!(true)), "{meta}");
+    for (path, body) in [
+        (APPROVE.to_string(), Some(approve_pr(PUBLIC_PR))),
+        (publish(PUBLISH_ISSUE), Some(publish_body.clone())),
+        (state_path(REPO, PUBLIC_PR, HEAD), None),
+        (
+            "/api/approvals/merge-pr44-x/revoke".to_string(),
+            Some(json!({"reason": "member"}).to_string()),
+        ),
+    ] {
+        let (status, reply) = board.public(&path, &member, body.as_deref());
+        assert_eq!(status, 403, "a member on {path}: {reply}");
+        assert_eq!(reply["check"], "member_role", "a member on {path}: {reply}");
+    }
+    assert_eq!(board.audit_pr(PUBLIC_PR, HEAD)["state"], "missing");
+    assert_eq!(board.audit_pr(PUBLISH_PR, HEAD)["state"], "missing");
+    assert_eq!(merges(&board), "", "a member's Publish enqueued a merge");
+
+    // --- a platform owner: an approver on all four routes, no config ---
+    let owner = board.public_session("owner");
+    let (status, meta) = board.public("/api/meta", &owner, None);
+    assert_eq!((status, &meta["signed_in"]), (200, &json!(true)), "{meta}");
+    let read = state_path(REPO, PUBLIC_PR, HEAD);
+    let (status, body) = board.public(&read, &owner, None);
+    assert_eq!(status, 200, "the owner reads: {body}");
+    assert_eq!(body["state"], "missing", "{body}");
+    let (status, body) = board.public(APPROVE, &owner, Some(&approve_pr(PUBLIC_PR)));
+    assert_eq!(status, 200, "the owner approves the shown head: {body}");
+    let id = body["approval_id"].as_str().unwrap().to_string();
+    let seen = board.audit_pr(PUBLIC_PR, HEAD);
+    assert_eq!(seen["state"], "in-force", "{seen}");
+    assert_eq!(seen["approval_id"], id.as_str(), "{seen}");
+    assert_eq!(seen["recorded_via"], "operator-connection", "{seen}");
+    let source = seen["source"].as_str().unwrap_or_default();
+    assert!(
+        source.contains(OWNER_ACTOR),
+        "the source names the verified owner: {seen}"
+    );
+    assert!(
+        !source.contains("tailscale") && !source.contains("mallory"),
+        "a public session is never a tailnet login: {seen}"
+    );
+    let (status, body) = board.public(&read, &owner, None);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["state"], "in-force", "{body}");
+    assert_eq!(body["approval_id"], id.as_str(), "{body}");
+    assert_eq!(body["board_revocable"], true, "{body}");
+    let (status, body) = board.public(
+        &format!("/api/approvals/{id}/revoke"),
+        &owner,
+        Some(&json!({"reason": "owner re-review"}).to_string()),
+    );
+    assert_eq!(status, 200, "the owner revokes their approval: {body}");
+    assert_eq!(board.audit_pr(PUBLIC_PR, HEAD)["state"], "revoked");
+    let (status, body) = board.public(&read, &owner, None);
+    assert_eq!((status, &body["state"]), (200, &json!("revoked")), "{body}");
+    // Publish: recorded and enqueued, attributed to the owner.
+    let (status, body) = board.public(&publish(PUBLISH_ISSUE), &owner, Some(&publish_body));
+    assert_eq!(status, 200, "the owner Publishes: {body}");
+    let seen = board.audit_pr(PUBLISH_PR, HEAD);
+    assert_eq!(seen["state"], "in-force", "{seen}");
+    assert_eq!(seen["recorded_via"], "operator-connection", "{seen}");
+    let source = seen["source"].as_str().unwrap_or_default();
+    assert!(source.contains(OWNER_ACTOR), "{seen}");
+    assert!(!source.contains("tailscale"), "{seen}");
+    assert!(merges(&board).contains(&format!("merge {PUBLISH_PR} ")));
+    assert!(
+        !merges(&board).contains(&format!("merge {PUBLISH_PR_2} ")),
+        "only the owner's Publish enqueued"
+    );
 }
