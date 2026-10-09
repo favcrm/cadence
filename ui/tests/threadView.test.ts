@@ -114,6 +114,15 @@ for (const density of ["full", "compact"] as const) {
   );
   ok(perm.includes('data-permission-thread="perm-7"'), `${density}: permission renders ThreadPermission`);
   ok(!isDivider(perm), `${density}: permission is not the divider`);
+  // CAD-1306: the daemon's real message. Literal copied from src/daemon/master_rpc.rs (rpc_master_ask_permission, "Permission requested ({}, risk {}): ...").
+  const real = render(
+    sys({
+      text: "Permission requested (perm-9, risk medium): `ls -la`\nReason: look\nThe operator can allow it once, always, or reject it.",
+      payload: { source: "permission" },
+    }),
+    density,
+  );
+  ok(real.includes('data-permission-thread="perm-9"'), `${density}: the daemon's real permission message becomes the card`);
   // Even a long multi-line permission text takes the permission route.
   const permLong = render(
     sys({ text: `Permission requested (perm-8)\n${"x".repeat(300)}`, payload: { source: "permission" } }),

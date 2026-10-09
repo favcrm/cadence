@@ -210,7 +210,8 @@ export default function PermissionCard({
 }
 
 export function permissionIdFromText(text: string): string | null {
-  const m = text.match(/Permission requested \(([A-Za-z0-9-]+)\)/);
+  // The daemon writes `Permission requested (<id>, risk <r>): ...`; the bare `(<id>)` form still parses.
+  const m = text.match(/Permission requested \(([A-Za-z0-9-]+)[,)]/);
   return m ? m[1] : null;
 }
 
@@ -246,13 +247,13 @@ export function ThreadPermission({ text, readOnly }: { text: string; readOnly: b
     load();
     return subscribePermission(load);
   }, [id]);
-  if (!id) return <p className="text-micro text-ink-400 whitespace-pre-wrap">{text}</p>;
+  if (!id) return <p className="text-micro text-ink-400 whitespace-pre-wrap break-words">{text}</p>;
   return (
     <div className="card px-3 py-2 ml-8 min-w-0" data-permission-thread={id}>
       {card ? (
         <PermissionCard card={card} readOnly={readOnly} onDone={() => load()} />
       ) : (
-        <p className="text-micro text-ink-400 whitespace-pre-wrap">{text}</p>
+        <p className="text-micro text-ink-400 whitespace-pre-wrap break-words">{text}</p>
       )}
       {error ? (
         <p className="text-micro text-fail" role="alert">
