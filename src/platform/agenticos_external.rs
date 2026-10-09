@@ -32,6 +32,8 @@ pub(crate) const TEXT_MANIFEST_PIN: &str = "agenticos-external-provider-tools@4"
 /// CAD-1096: the generic workspace-visible source tool (AOS-140). The raw
 /// provider slug stays hidden from workspaces (AOS-103).
 const POSTS_TOOL: &str = "read_instagram_posts";
+/// Matches the contract default and the Library page; the contract maximum is 24.
+const POSTS_COUNT: u32 = 12;
 const IMAGE_TOOL: &str = "generate_image";
 const TEXT_TOOL: &str = "generate_text";
 /// The only model the image slot may run; the price read and every job must
@@ -301,7 +303,7 @@ impl AgenticosExternalAdapter {
             .header("idempotency-key", idempotency_key)
             .send_json(json!({
                 "slug": POSTS_TOOL,
-                "query": {"handle": handle},
+                "query": {"handle": handle, "count": POSTS_COUNT},
                 "max_charge_minor": ceiling,
             }))
             .map_err(|_| {
@@ -2545,7 +2547,7 @@ mod tests {
                     request.as_reader().read_to_string(&mut body).unwrap();
                     let body: Value = serde_json::from_str(&body).unwrap();
                     assert_eq!(body["slug"], POSTS_TOOL);
-                    assert_eq!(body["query"], json!({"handle":"juicysuite_crm"}));
+                    assert_eq!(body["query"], json!({"handle":"juicysuite_crm","count":12}));
                     assert_eq!(body["max_charge_minor"], 2000);
                     assert!(body.get("company").is_none());
                     request
