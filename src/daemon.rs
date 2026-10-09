@@ -3382,6 +3382,7 @@ impl Shared {
             "slot_runner" => self.rpc_slot_runner(params, peer_pid),
             "approval_record" => self.rpc_approval_record(params, peer_pid),
             "approval_revoke" => self.rpc_approval_revoke(params, peer_pid),
+            "approval_record_shown" => self.rpc_approval_record_shown(params, peer_pid),
             "approval_designate" => self.rpc_approval_designate(params, peer_pid),
             "approval_designations" => self.rpc_approval_designations(),
             "approval_scope" => self.rpc_approval_scope(params, peer_pid),

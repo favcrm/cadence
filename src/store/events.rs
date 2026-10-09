@@ -680,6 +680,44 @@ impl Store {
         })
     }
 
+    /// CAD-1218: record `a` only if the approval stream holds no record at
+    /// all — standing or revoked, any action — for its `(repo, pr, head)`.
+    /// The check and the write share one transaction, so concurrent calls
+    /// record at most one. Answers the new approval id.
+    pub fn record_approval_once(&self, a: &NewApproval, recorded_via: &str) -> Result<String> {
+        approval_source(a.source)?;
+        identifier(a.action, "Approval action")?;
+        approval_head(a.head_sha)?;
+        approval_repo(a.repo)?;
+        if a.pr == 0 {
+            return Err(Error::rejected("Approval PR number must be positive"));
+        }
+        let scope = json!({"repo": a.repo, "pr": a.pr});
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let stream = Self::approval_stream(&tx)?;
+            let seen = stream.iter().find(|(k, p, _)| {
+                k == APPROVAL_RECORDED_EVENT && p["scope"] == scope && p["head_sha"] == a.head_sha
+            });
+            if let Some((_, p, _)) = seen {
+                return Err(Error::rejected(format!(
+                    "this head already has approval record {} — one record per head, standing \
+                     or revoked; approve a revoked head with `cadence audit approve`",
+                    p["approval_id"].as_str().unwrap_or("?")
+                )));
+            }
+            let base = default_approval_id(a.action, a.pr, a.head_sha);
+            let payload = json!({
+                "source": a.source,
+                "action": a.action,
+                "head_sha": a.head_sha,
+                "scope": scope,
+                "recorded_via": recorded_via,
+            });
+            Self::append_approval(&tx, &stream, &base, payload)
+        })
+    }
+
     /// Every approval-stream event, oldest first: `(kind, payload, at)`.
     fn approval_stream(conn: &impl super::StoreConn) -> Result<Vec<(String, Value, f64)>> {
         let rows: Vec<(String, String, f64)> = conn.query_vec(

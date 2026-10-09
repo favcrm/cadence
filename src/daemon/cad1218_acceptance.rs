@@ -453,7 +453,6 @@ fn refused(board: &Board, (status, body): (u16, Value), what: &str) {
 }
 
 #[test]
-#[ignore = "CAD-1218: enabled by the implementation"]
 fn cad1218_board_pr_head_approval_refuses_agent_forged_head_and_replay() {
     let root = tempfile::Builder::new().prefix("c1218").tempdir().unwrap();
     let board = Board::start(root.path());

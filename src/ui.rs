@@ -44,6 +44,7 @@ mod app_release;
 mod app_runs;
 mod app_screens;
 mod app_social_drafts;
+mod approvals;
 mod apps;
 mod cli_route;
 mod connections;

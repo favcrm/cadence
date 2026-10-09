@@ -104,6 +104,26 @@ pub struct PmConfig {
     /// an author's reviews to one reviewer, `never` bars a pair.
     #[serde(default)]
     pub review: crate::delivery::ReviewRules,
+    /// CAD-1218: who may record a merge approval from a remote board.
+    /// Omitted from a fresh pm.yaml, so an operator's own `approvals:`
+    /// block never collides with a written default.
+    #[serde(default, skip_serializing_if = "ApprovalsConfig::is_empty")]
+    pub approvals: ApprovalsConfig,
+}
+
+/// `pm.yaml`'s `approvals:` section (CAD-1218): the tailnet logins the
+/// operator allows to approve a PR head from the board. Absent or empty
+/// means no remote approvals; the loopback board is always allowed.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ApprovalsConfig {
+    #[serde(default)]
+    pub tailnet_logins: Vec<String>,
+}
+
+impl ApprovalsConfig {
+    fn is_empty(&self) -> bool {
+        self.tailnet_logins.is_empty()
+    }
 }
 
 /// `pm.yaml`'s `wiki:` section.
@@ -149,6 +169,7 @@ impl Default for PmConfig {
             notes_dir: default_notes_dir(),
             wiki: WikiConfig::default(),
             review: crate::delivery::ReviewRules::default(),
+            approvals: ApprovalsConfig::default(),
         }
     }
 }

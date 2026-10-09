@@ -1818,6 +1818,7 @@ mod tests {
             "agent_set",
             "agent_respond",
             "approval_record",
+            "approval_record_shown",
             "task_accept",
             "agent_file_write",
             "master_start",
