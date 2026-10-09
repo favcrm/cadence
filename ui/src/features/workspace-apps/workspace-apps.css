@@ -457,6 +457,24 @@ textarea.wa-prompt-input {
   color: var(--color-ink-200);
   padding: 0;
 }
+/* A short confirm: centred card, not the full-height drawer. */
+.wa-dialog.wa-confirm {
+  /* The slot layer that hosts it is pointer-transparent; the confirm is not. */
+  pointer-events: auto;
+  inset: 0;
+  margin: auto;
+  width: min(28rem, calc(100vw - 2rem));
+  height: fit-content;
+  max-height: calc(100dvh - 2rem);
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.75rem;
+}
+.wa-dialog.wa-confirm::backdrop {
+  pointer-events: auto;
+}
+.wa-dialog.wa-confirm .wa-dialog-body {
+  height: auto;
+}
 .wa-dialog::backdrop {
   background: var(--color-scrim);
 }

@@ -1,12 +1,14 @@
 import { useEffect, useRef, useState } from "react";
-import SafeLink from "../../../ui/SafeLink";
+import Button from "../../../ui/Button";
+import { WorkspaceDialog } from "../WorkspaceDialog";
+import { linkTarget } from "./screenActions";
 import { slotBox, type SlotView } from "./screenSlot";
 
 /**
  * The host-drawn parts over a mounted frame (CAD-1123 HP3), rendered in the
  * parent page so the sandboxed frame can neither click nor restyle them: the
  * approval button the frame asked for, anchored to its requested rectangle,
- * and the link chip `open-link` raises. The label comes only from host data.
+ * and the confirm `open-link` raises for an external link. The label comes only from host data.
  * The press time comes from the browser's own `pointerdown` event; the guard
  * itself is the controller's (500 ms after the slot appears or moves).
  */
@@ -49,12 +51,16 @@ export default function ScreenSlotLayer({ view, link, onTap, onDismissLink }: {
         </div>
       )}
       {link && (
-        <div role="status" style={{ position: "absolute", left: 12, bottom: view && box?.footer ? 68 : 12, maxWidth: "calc(100% - 24px)", pointerEvents: "auto",
-          display: "flex", gap: 8, alignItems: "center", padding: "6px 10px", borderRadius: 8,
-          background: "var(--surface, var(--ink-900, #111))", border: "1px solid var(--line, rgba(128,128,128,.3))" }}>
-          <SafeLink href={link} className="text-label underline break-all">Open link</SafeLink>
-          <button type="button" className="btn btn-ghost btn-sm" aria-label="Dismiss link" onClick={onDismissLink}>×</button>
-        </div>
+        <WorkspaceDialog title="Open this link?" className="wa-confirm" onClose={onDismissLink}>
+          <div className="wa-stack">
+            <p>This app wants to open a page on another site. It will open in a new tab.</p>
+            <p><code className="num break-all" data-link-target>{linkTarget(link)}</code></p>
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+              <Button onClick={onDismissLink}>Cancel</Button>
+              <Button variant="primary" onClick={() => { window.open(link, "_blank", "noopener,noreferrer"); onDismissLink(); }}>Open</Button>
+            </div>
+          </div>
+        </WorkspaceDialog>
       )}
     </div>
   );

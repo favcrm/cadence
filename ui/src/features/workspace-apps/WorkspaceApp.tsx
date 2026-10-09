@@ -130,12 +130,16 @@ export default function WorkspaceApp({
   }, [installId]);
   const refused = (error: unknown) => error instanceof ApiError && [401, 403].includes(error.status);
   const canWrite = viewer.operator && !viewer.readOnly && !accessDenied;
-  const refresh = useCallback(async () => {
+  /** `fresh`: a write just landed, so a read already in flight may predate it: retire it and read again. */
+  const refresh = useCallback(async (fresh = false) => {
     if (!viewer.operator) {
       setLoading(false);
       return;
     }
-    if (activeRead.current && !activeRead.current.signal.aborted) return;
+    if (activeRead.current && !activeRead.current.signal.aborted) {
+      if (!fresh) return;
+      activeRead.current.abort();
+    }
     const controller = new AbortController();
     activeRead.current = controller;
     setLoading(true);
@@ -351,7 +355,7 @@ export default function WorkspaceApp({
   // a scope change remounts the frame and retires any live slot.
   const actionCtx = useRef<ActionContext | null>(null);
   actionCtx.current = data && data.installation.install_id === installId && !accessDenied
-    ? { installation: data.installation, installId, contextId, runs: data.runs, onChanged: () => { void refresh(); } } : null;
+    ? { installation: data.installation, installId, contextId, runs: data.runs, onChanged: () => refresh(true) } : null;
   const screenActions = useMemo(() => viewer.operator && !viewer.readOnly ? {
     call: (verb: Parameters<typeof runCall>[1], args: Record<string, unknown>, ui: Parameters<typeof runCall>[3]) =>
       actionCtx.current ? runCall(actionCtx.current, verb, args, ui)
