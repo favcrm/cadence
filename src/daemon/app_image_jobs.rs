@@ -23,8 +23,9 @@ use crate::store::app_records::RecordStore;
 use crate::store::app_social_drafts::{ImageJob, ImageSettlement};
 use crate::store::app_tools::AppToolRecord;
 
-/// Per-job window before a still-unresolved job settles `uncertain`. Restarts
-/// and explicit re-checks open a fresh window.
+/// Per-job window before a still-unresolved job settles `uncertain`. An
+/// explicit re-check opens a fresh window; a restart always replays the key
+/// once, even past the stored deadline, before that deadline can settle it.
 pub(super) const JOB_WINDOW_MS: u64 = 10 * 60 * 1000;
 pub(super) const BACKOFF_MIN_MS: u64 = 5 * 1000;
 const BACKOFF_MAX: Duration = Duration::from_secs(60);

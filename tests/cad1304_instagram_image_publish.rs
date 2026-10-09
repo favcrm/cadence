@@ -934,21 +934,26 @@ fn a_restart_replays_the_same_key_and_leaves_no_image_intent_pending() {
     fx.image(&draft, "image-r1").unwrap();
     fx.wait_door("GET job");
 
-    // The daemon dies mid-job: the intent is still pending, the job is held
-    // at AgenticOS.
+    // The daemon dies mid-job. Its worker gives up within one attempt
+    // (1.5 s here); the intent stays pending and the job stays held at
+    // AgenticOS, so only the next boot can settle it.
     fx.stop_daemon();
+    std::thread::sleep(Duration::from_millis(2500));
     assert_eq!(fx.intent(&draft).unwrap()["state"], "pending");
+    let key = fx.keys().into_iter().next().unwrap();
+    let mark = fx.door.media.log().len();
     fx.door.media.set(Scenario::Normal);
     fx.launch(0, 0);
 
     // Boot reconciliation replays the key; no second job is ever created.
     let done = fx.wait_intent(&draft, "completed");
     assert!(done["receipt_id"].is_string(), "{done}");
-    assert_eq!(fx.keys().len(), 1, "a restart must replay the same key");
+    let replays = fx.door.media.log()[mark..].to_vec();
     assert!(
-        fx.door.media.submit_keys().len() >= 2,
-        "the key was replayed"
+        replays.contains(&format!("POST image key={key}")),
+        "boot did not replay the key: {replays:?}"
     );
+    assert_eq!(fx.keys().len(), 1, "a restart must replay the same key");
     assert_eq!(fx.door.media.job_count(), 1);
 }
 
