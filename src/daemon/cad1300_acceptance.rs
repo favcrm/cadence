@@ -1084,7 +1084,6 @@ fn one_record_both_orders(origin: &str, row: &str) {
 }
 
 #[test]
-#[ignore = "CAD-1300: enabled by the implementation"]
 fn cad1300_one_record_per_head_whatever_the_repo_case() {
     // The row URL in GitHub's canonical mixed case, the project lowercase.
     one_record_both_orders(REPO, "Acme/Widgets");

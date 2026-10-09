@@ -1626,19 +1626,22 @@ impl Shared {
         // The approval object first: a failed enqueue retries cleanly
         // (same evidence dedupes to the same id), and audit never sees
         // a merge without its approval.
+        // Approvals are scoped by the lowercase slug (what the board's
+        // Approve stores); `gh` keeps the PR link's own case.
+        let approval_repo = slug.to_ascii_lowercase();
         let approval = store::NewApproval {
             id: None,
             source: &source,
             action: "merge",
             head_sha: &sha,
-            repo: &slug,
+            repo: &approval_repo,
             pr: number,
         };
         // CAD-1300: a board Publish (it relays `request_actor`) follows the
         // one-record-per-head rule; the CLI keeps `record_approval`.
         let approval_id = if params.get("request_actor").is_some() {
             self.store
-                .record_or_reuse_board_approval(&approval, APPROVAL_RECORDED_VIA)?
+                .record_or_reuse_board_approval(&approval, APPROVAL_RECORDED_VIA, id)?
         } else {
             self.store
                 .record_approval(&approval, APPROVAL_RECORDED_VIA)?

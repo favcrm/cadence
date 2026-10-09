@@ -396,7 +396,7 @@ function MergeReview({ need, readOnly, index, total, onDone, onClose }: ReviewPr
             <>
               <p className="rv-note">{a.revocable ? "Approved." : "Approved from your terminal."}</p>
               {a.revocable && !block && (
-                <button type="button" className="rv-dlnk" disabled={!!block || a.busy !== null} onClick={() => setTakeBack((t) => !t)}>
+                <button type="button" className="rv-dlnk" disabled={a.busy !== null} onClick={() => setTakeBack((t) => !t)}>
                   Take my approval back
                 </button>
               )}
