@@ -55,10 +55,10 @@ fn state_dir() -> tempfile::TempDir {
 /// Spawn a real child of our own and wait it out: the returned pid
 /// belongs to a process this test spawned and reaped, matching how the
 /// consumer learns `child.id()` before `try_wait` says it exited.
-fn exited_own_child() -> std::process::Child {
+fn exited_own_child() -> u32 {
     let mut child = Command::new("true").spawn().unwrap();
     assert_eq!(child.wait().unwrap().code(), Some(0));
-    child
+    child.id()
 }
 
 fn write_frame(dir: &tempfile::TempDir, pid: u32, frame: &serde_json::Value) {
@@ -72,8 +72,7 @@ fn startup_bind_in_use_refuses_forged_frames_and_accepts_the_bound_one() {
     let nonce = crate::operator_auth::random_credential().unwrap();
     let wrong_nonce = crate::operator_auth::random_credential().unwrap();
     assert_ne!(nonce, wrong_nonce);
-    let child = exited_own_child();
-    let own_pid = child.id();
+    let own_pid = exited_own_child();
 
     let frame =
         |pid: u32, nonce: &str, kind: &str| json!({"pid": pid, "nonce": nonce, "kind": kind});
