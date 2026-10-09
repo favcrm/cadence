@@ -29,6 +29,14 @@ code, duplication and abstractions the change does not need, in the lines
 you changed only, with no behaviour change and no refactor outside the
 ticket. Doing it before review costs no extra head.
 
+Treat the agreed plan and acceptance as the scope boundary. Start with the
+simplest end-to-end solution; enhance it later. Do not automatically add
+requirements, phases, abstractions, tests or adjacent fixes beyond that
+boundary. If expansion is necessary to meet acceptance, explain why and ask
+before proceeding; otherwise defer it. Stop once acceptance and required
+verification are complete. This does not waive required checks, independent
+refusal acceptance, review, approval or production-safety rules.
+
 ### Before you start, and before every push
 - Run `git fetch origin`. Then run
   `gh pr list -R favcrm/cadence --state all --search "<ISSUE-ID>"` as a
