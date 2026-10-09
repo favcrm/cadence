@@ -53,6 +53,8 @@ const MEDIA_POLL_INTERVAL: Duration = Duration::from_secs(10);
 /// Bounded well inside the 700s worker→daemon RPC frame timeout
 /// (`client::rpc`), so a stuck job answers the caller instead of hanging it.
 const MEDIA_POLL_DEADLINE: Duration = Duration::from_secs(120);
+/// The artifact download may be up to 10 MiB; the JSON calls keep 15 s.
+const ARTIFACT_TIMEOUT: Duration = Duration::from_secs(60);
 const MEDIA_UNCERTAIN_SUBMIT: &str =
     "AgenticOS image submit outcome is uncertain; no automatic retry was made";
 
@@ -704,9 +706,7 @@ impl AgenticosExternalAdapter {
                 "failed" | "released" => {
                     return Err(ImageFailure::uncertain(
                         R::JobFailed,
-                        format!(
-                            "AgenticOS image job {id} ended without a retained image; no automatic retry was made"
-                        ),
+                        format!("AgenticOS image job {id} ended without a retained image"),
                     ))
                 }
                 "uncertain" => {
@@ -726,9 +726,7 @@ impl AgenticosExternalAdapter {
             if Instant::now() >= deadline {
                 return Err(ImageFailure::uncertain(
                     R::PollTimeout,
-                    format!(
-                        "AgenticOS image job {id} is still running; no automatic retry was made"
-                    ),
+                    format!("AgenticOS image job {id} is still running"),
                 ));
             }
             std::thread::sleep(self.poll_interval());
@@ -797,6 +795,9 @@ impl AgenticosExternalAdapter {
             .http
             .get(format!("{}{MEDIA_ARTIFACTS_PATH}{artifact_ref}", self.base));
         let mut response = authorized(request, token)
+            .config()
+            .timeout_global(Some(ARTIFACT_TIMEOUT))
+            .build()
             .call()
             .map_err(|_| unconfirmed())?;
         if response.status().as_u16() != 200 {
@@ -813,11 +814,17 @@ impl AgenticosExternalAdapter {
             .with_config()
             .limit(FETCH_LIMIT as u64 + 1)
             .read_to_vec()
-            .map_err(|_| {
-                ImageFailure::uncertain(
+            .map_err(|error| match error {
+                // Only the size cap is "too large"; a timeout, reset or
+                // truncated body is retried under the same key.
+                ureq::Error::BodyExceedsLimit(_) => ImageFailure::uncertain(
                     R::ArtifactTooLarge,
-                    "AgenticOS media artifact exceeds the custody bound",
-                )
+                    "AgenticOS media artifact exceeds the AgenticOS import bound",
+                ),
+                _ => ImageFailure::uncertain(
+                    R::ArtifactUnavailable,
+                    "AgenticOS media artifact download did not complete",
+                ),
             })?;
         if asset_bytes.len() as u64 != artifact_bytes.unwrap_or_default() {
             return Err(ImageFailure::uncertain(
@@ -2485,7 +2492,7 @@ mod tests {
         let big = vec![0u8; image::FETCH_LIMIT + 1];
         let oversized_entry = artifact_entry("med_job1", &big);
         for (entry, bytes, needle) in [
-            (oversized_entry, big, "custody bound"),
+            (oversized_entry, big, "import bound"),
             (wrong_digest, png.clone(), "differs from its receipt"),
             (bad_ref, png.clone(), "artifact descriptor"),
             (artifact.clone(), b"different bytes".to_vec(), "differs"),

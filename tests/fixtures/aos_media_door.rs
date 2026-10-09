@@ -4,7 +4,7 @@
 //! - routes (`POST /image`, `GET /jobs/:id`, `GET /artifacts/:ref`,
 //!   `GET /price/image`): `apps/api/src/media/routes.ts:1383-1401` (hosted)
 //!   and `:1360-1381` (`handleMedia`);
-//! - a fresh submit is 201 `submitted` (`routes.ts:895-901`); a replay of the
+//! - a fresh submit is 201 `submitted` (`routes.ts:1060-1070`); a replay of the
 //!   same key and body is 200 with `repeated:true` (`:807-848`), 409
 //!   `key_conflict` for another body (`:808-810`) and 409 `uncertain` for an
 //!   `uncertain` job (`:812-818`);
@@ -15,8 +15,9 @@
 //! - a job is `mediaJobViewSchema` (`packages/contracts/src/media.ts:118-142`),
 //!   built by `jobView` (`apps/api/src/media/jobs.ts:390-420`): provider is
 //!   always `"kie"`, artifacts are `{ref,digest,bytes,mime}`;
-//! - the artifact is served with `content-type` and `x-artifact-digest`
-//!   (`routes.ts:1346-1357`); AgenticOS imports up to 10 MiB
+//! - the artifact is served with `content-type` (`routes.ts:1349-1357`;
+//!   the real door also sends `x-artifact-digest` and `etag`, this one
+//!   does not); AgenticOS imports up to 10 MiB
 //!   (`jobs.ts:31`).
 //!
 //! The artifact is a 1024x1024 noise PNG (~3 MiB): above the host's 2 MiB
@@ -66,6 +67,7 @@ struct State {
 
 pub struct MediaDoor {
     mode: AtomicU8,
+    truncate: std::sync::atomic::AtomicBool,
     state: Mutex<State>,
 }
 
@@ -119,8 +121,19 @@ impl MediaDoor {
     pub fn new() -> Self {
         Self {
             mode: AtomicU8::new(Scenario::Normal as u8),
+            truncate: Default::default(),
             state: Mutex::default(),
         }
+    }
+
+    /// While on, a test transport serves artifacts with the full
+    /// `Content-Length` but a cut-short body.
+    pub fn truncate_artifacts(&self, on: bool) {
+        self.truncate.store(on, SeqCst);
+    }
+
+    pub fn truncating(&self) -> bool {
+        self.truncate.load(SeqCst)
     }
 
     pub fn set(&self, scenario: Scenario) {

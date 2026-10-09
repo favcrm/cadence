@@ -167,6 +167,14 @@ fn serve(stream: std::net::TcpStream, log: &Seen, door: &Door) {
                 .media
                 .reply(m, r, header("idempotency-key").as_deref(), &body)
             {
+                // CAD-1315: full Content-Length, body cut short, then close.
+                Some((200, content_type, bytes))
+                    if door.media.truncating() && r.contains("/artifacts/") =>
+                {
+                    let mut out = raw(200, content_type, &bytes);
+                    out.truncate(out.len() - bytes.len() + 1024);
+                    out
+                }
                 Some((status, content_type, bytes)) => raw(status, content_type, &bytes),
                 None => raw(404, "application/json", b"{}"),
             }
@@ -1039,6 +1047,27 @@ fn an_unreachable_door_keeps_the_intent_pending_then_settles_uncertain_and_recov
     // The door returns; re-checking replays the same key and completes.
     fx.door.media.set(Scenario::Normal);
     fx.image(&draft, "image-d1").unwrap();
+    fx.wait_intent(&draft, "completed");
+    assert_eq!(fx.keys().len(), 1);
+    assert_eq!(fx.door.media.job_count(), 1);
+}
+
+#[test]
+fn a_download_that_breaks_after_the_charge_retries_the_same_key_and_keeps_the_image() {
+    let fx = Fx::start();
+    let source = fx.fetch();
+    let draft = fx.new_draft("t1", &source);
+    // The job succeeds at the door, but every artifact body is cut short.
+    fx.door.media.truncate_artifacts(true);
+    fx.image(&draft, "image-t1").unwrap();
+    fx.wait_door("GET job");
+    // Let several fetches break: still pending, never a verdict on the job.
+    std::thread::sleep(Duration::from_secs(8));
+    let row = fx.intent(&draft).unwrap();
+    assert_eq!(row["state"], "pending", "{row}");
+    assert_eq!(row["outcome"], Value::Null, "{row}");
+    // The body arrives whole: the same key completes, with no second job.
+    fx.door.media.truncate_artifacts(false);
     fx.wait_intent(&draft, "completed");
     assert_eq!(fx.keys().len(), 1);
     assert_eq!(fx.door.media.job_count(), 1);

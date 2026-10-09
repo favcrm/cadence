@@ -52,14 +52,30 @@ impl Shared {
         let shared = Arc::clone(self);
         let (install, call_id) = (install.to_owned(), call_id.to_owned());
         std::thread::spawn(move || {
+            // Removes the registry entry on every exit, a panic included.
+            struct Registered(Arc<Shared>, String);
+            impl Drop for Registered {
+                fn drop(&mut self) {
+                    self.0
+                        .image_job_workers
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&self.1);
+                }
+            }
+            let guard = Registered(Arc::clone(&shared), call_id.clone());
             if let Err(error) = shared.image_job_run(&install, &call_id) {
                 eprintln!("image job {call_id} worker stopped: {error}");
             }
-            shared
-                .image_job_workers
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&call_id);
+            drop(guard);
+            // A re-check that landed before the removal saw a live worker and
+            // spawned none: if the job is active again, run it.
+            let active = RecordStore::open(&shared.state_dir, &install)
+                .and_then(|records| records.app_social_image_job(&call_id))
+                .is_ok_and(|job| job.is_some_and(|job| job.state == "active"));
+            if active && !shared.closing.load(Ordering::SeqCst) {
+                shared.spawn_image_job_worker(&install, &call_id);
+            }
         });
     }
 
