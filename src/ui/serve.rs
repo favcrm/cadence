@@ -374,7 +374,7 @@ pub(crate) fn board_job_list(state_dir: &Path) -> Option<Value> {
     client::rpc(
         state_dir,
         "job_list",
-        json!({"all": true, "tasks_detail": true}),
+        json!({"all": true, "tasks_detail": true, "open_tasks_only": true}),
     )
     .ok()
 }

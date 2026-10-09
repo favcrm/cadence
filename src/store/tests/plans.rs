@@ -710,8 +710,28 @@
         s.cancel_task("t-done", "test").unwrap();
         s.create_task("j1", "t-free", None, None, None, None, None, None, None)
             .unwrap();
+        // CAD-1280: a second agent with its own open and finished tasks, so
+        // the fleet read is compared on more than one assignee.
+        s.register_agent(&NewAgent {
+            alias: "w2",
+            provider: "fake",
+            endpoint_kind: "fake",
+            role: "worker",
+            cwd: cwd.to_str().unwrap(),
+            sandbox: "read-only",
+            instructions: None,
+            params: Some(&json!({"upstream": "pm"}).to_string()),
+            team_role: None,
+            model_policy: None,
+        })
+        .unwrap();
+        for id in ["t-w2-a", "t-w2-b", "t-w2-done"] {
+            s.create_task("j1", id, None, Some("w2"), None, None, None, None, None)
+                .unwrap();
+        }
+        s.cancel_task("t-w2-done", "test").unwrap();
         let fleet = s.open_task_ids_by_assignee().unwrap();
-        for alias in ["w1", "pm", "ghost"] {
+        for alias in ["w1", "w2", "pm", "ghost"] {
             let per_agent: Vec<String> = s
                 .tasks_for_assignee(alias)
                 .unwrap()
@@ -726,6 +746,8 @@
         }
         assert!(fleet["w1"].contains(&"t-open".to_string()), "{fleet:?}");
         assert!(!fleet["w1"].contains(&"t-done".to_string()), "{fleet:?}");
+        assert_eq!(fleet["w2"].len(), 2, "{fleet:?}");
+        assert!(!fleet["w2"].contains(&"t-w2-done".to_string()), "{fleet:?}");
 
         // In flight: only the running kickoff, never completed history.
         assert!(s.inflight_messages().unwrap().is_empty());
@@ -734,7 +756,63 @@
         assert_eq!(inflight.len(), 1, "{inflight:?}");
         assert_eq!((inflight[0].0.as_str(), inflight[0].1.as_str()), ("w1", m.id.as_str()));
         assert_eq!(inflight[0].2, "running");
+        // CAD-1280: a pty turn whose paste was accepted (`submitted`
+        // marker) is still the one in-flight row, not a second or none.
+        s.mark_submitted(&m).unwrap();
+        let inflight = s.inflight_messages().unwrap();
+        assert_eq!(inflight.len(), 1, "{inflight:?}");
+        assert_eq!((inflight[0].0.as_str(), inflight[0].1.as_str()), ("w1", m.id.as_str()));
+        assert_eq!(inflight[0].2, "running");
         s.finish(&m, "completed", &json!({"status": "completed", "text": "x"}), None)
             .unwrap();
         assert!(s.inflight_messages().unwrap().is_empty());
+    }
+
+    /// CAD-1280: `job list` reads task counts and lists in one pass; each
+    /// job's numbers and list order equal the per-job `tasks_for_job`, and
+    /// `open_only` leaves out exactly the terminal tasks.
+    #[test]
+    fn job_task_summary_matches_the_per_job_reads() {
+        let (dir, s) = store();
+        let cwd = dir.path().join("w");
+        seeded_task(&s, &cwd);
+        s.create_task("j1", "t-open", None, Some("w1"), None, None, None, None, None)
+            .unwrap();
+        s.create_task("j1", "t-done", None, Some("w1"), None, None, None, None, None)
+            .unwrap();
+        s.cancel_task("t-done", "test").unwrap();
+        s.create_job(
+            "j2", None, "/s.md", &"0".repeat(64), "pm", None, None, None, 2, None, None, None,
+            None, None, None, None,
+        )
+        .unwrap();
+        for open_only in [false, true] {
+            let summary = s.job_task_summary(Some(open_only)).unwrap();
+            for job in ["j1", "j2"] {
+                let tasks = s.tasks_for_job(job).unwrap();
+                let mut counts = std::collections::BTreeMap::new();
+                for t in &tasks {
+                    *counts.entry(t.state.clone()).or_insert(0i64) += 1;
+                }
+                assert_eq!(summary.counts.get(job).cloned().unwrap_or_default(), counts);
+                let want: Vec<String> = tasks
+                    .iter()
+                    .filter(|t| {
+                        !open_only
+                            || !matches!(
+                                t.state.as_str(),
+                                "verified" | "done" | "cancelled" | "failed"
+                            )
+                    })
+                    .map(|t| t.id.clone())
+                    .collect();
+                let got: Vec<String> = summary
+                    .lists
+                    .get(job)
+                    .map(|l| l.iter().map(|t| t.id.clone()).collect())
+                    .unwrap_or_default();
+                assert_eq!(got, want, "{job} open_only={open_only}");
+            }
+        }
+        assert!(s.job_task_summary(None).unwrap().lists.is_empty());
     }
