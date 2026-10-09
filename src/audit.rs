@@ -1910,7 +1910,7 @@ fn approval_in_force(ev: &StoreEvidence, repo: &str, pr: u64, head: &str) -> Val
         .collect();
     if let Some(a) = bound.iter().find(|a| !ev.revocations.contains_key(&a.id)) {
         return json!({"state": "in-force", "approval_id": a.id, "source": a.source,
-                      "recorded_via": a.recorded_via, "verified": false,
+                      "action": a.action, "recorded_via": a.recorded_via, "verified": false,
                       "note": APPROVAL_UNVERIFIED});
     }
     if let Some(a) = bound.first() {
