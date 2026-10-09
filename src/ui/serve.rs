@@ -21,7 +21,10 @@ use super::{
     delivery_sync, home, lane, operator, platform_account, read_model, social_publish, stages,
     threads, updates, wiki, workflows,
 };
-use super::{push_device_login_config, ready_file, tailnet_url, ServeOpts, READY_NONCE_ENV};
+use super::{
+    push_device_login_config, ready_file, startup_failed_file, tailnet_url, ServeOpts,
+    READY_NONCE_ENV,
+};
 use crate::adapter::registry;
 use crate::client;
 use crate::doctor::host::redact_argv;
@@ -1907,12 +1910,59 @@ pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
     } else {
         Default::default()
     };
+    // CAD-1283 test seam: pause before the actual bind so a driver can
+    // hold this start's port and reproduce a native AddrInUse collision.
+    // Delays only `Server::http` below — nonce, identity, pid and
+    // readiness proofs are unchanged, and no failure is fabricated.
+    // Compiled only under the `test-seam` feature, which release builds
+    // refuse (CAD-482). Valid range 1..=1000 ms.
+    #[cfg(feature = "test-seam")]
+    if let Ok(ms) = std::env::var("CADENCE_TEST_UI_BIND_DELAY_MS") {
+        if let Ok(ms) = ms.parse::<u64>() {
+            if (1..=1000).contains(&ms) {
+                std::thread::sleep(Duration::from_millis(ms));
+            }
+        }
+    }
     let server = Server::http(format!("{}:{}", opts.host, opts.port)).map_err(|e| {
+        let kind = e
+            .downcast_ref::<std::io::Error>()
+            .map_or(std::io::ErrorKind::Other, std::io::Error::kind);
         if let Some(startup) = opts.startup.take() {
-            let kind = e
-                .downcast_ref::<std::io::Error>()
-                .map_or(std::io::ErrorKind::Other, std::io::Error::kind);
             let _ = startup.send(Err(kind));
+        }
+        // CAD-1283: an actual AddrInUse with this start's nonce writes
+        // `ui.startup-failed-{pid}` — the only writer — so `ui start`
+        // can classify its dead child's failure as typed evidence
+        // rather than a log substring. The path is scoped to this
+        // process's own pid: `create_new` refuses any existing path
+        // (stale record under a reused pid, foreign file, symlink,
+        // FIFO, dir) and leaves it untouched — no temp, no rename, no
+        // overwrite, no unlink; O_NOFOLLOW refuses a planted symlink.
+        // A partial or malformed frame reads as false to the consumer,
+        // which only ever reads after its own child exited. Absent or
+        // unwritable nonce/dir records nothing (a `ui run` with no
+        // starter proves nothing to anyone).
+        if kind == std::io::ErrorKind::AddrInUse {
+            if let Some(nonce) = opts.ready_nonce.as_ref() {
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                let frame = json!({
+                    "pid": std::process::id(),
+                    "nonce": nonce,
+                    "kind": "addr_in_use",
+                });
+                let path = startup_failed_file(state_dir, std::process::id());
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                    .open(path)
+                {
+                    let _ = f.write_all(frame.to_string().as_bytes());
+                }
+            }
         }
         Error::internal(format!("ui bind {}:{}: {e}", opts.host, opts.port))
     })?;

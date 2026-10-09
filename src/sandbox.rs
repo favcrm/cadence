@@ -25,7 +25,7 @@
 use std::net::TcpListener;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::Subcommand;
 use serde_json::{json, Value};
@@ -726,6 +726,20 @@ fn choose_port(
     wanted: Option<u16>,
     lock_dir: &Option<PathBuf>,
 ) -> Result<(u16, Option<std::fs::File>)> {
+    choose_port_skip(sb, wanted, lock_dir, &[])
+}
+
+/// `choose_port` plus ports the caller already proved unusable — `up`'s
+/// bind-collision retry must not re-pick a candidate whose own child
+/// just died `AddrInUse`, and must not be pointed back at the failed
+/// port's own `ui.json` record (a fresh allocation's persisted port is
+/// the failed candidate's, not an established claim).
+fn choose_port_skip(
+    sb: &Sandbox,
+    wanted: Option<u16>,
+    lock_dir: &Option<PathBuf>,
+    skip: &[u16],
+) -> Result<(u16, Option<std::fs::File>)> {
     let state = sb.state_dir();
     let running = crate::ui::detached_pid(&state)
         .is_some()
@@ -743,36 +757,41 @@ fn choose_port(
         }
         (Some(p), _) => (p, true, None),
         (None, Some(r)) => (r, false, None),
-        (None, None) => match persisted_port(&state) {
-            Some(p) => (p, false, None),
-            None => {
-                let taken = sandbox_roots(&sb.base)
-                    .iter()
-                    .filter_map(|root| persisted_port(&root.join("state")))
-                    .collect::<Vec<_>>();
-                let mut free = None;
-                for port in PORTS {
-                    if taken.contains(&port) {
-                        continue;
+        (None, None) => {
+            // A `ui.json` port this `up` already proved a failed
+            // bind is a skipped candidate, not an established claim.
+            let persisted = persisted_port(&state).filter(|p| !skip.contains(p));
+            match persisted {
+                Some(p) => (p, false, None),
+                None => {
+                    let taken = sandbox_roots(&sb.base)
+                        .iter()
+                        .filter_map(|root| persisted_port(&root.join("state")))
+                        .collect::<Vec<_>>();
+                    let mut free = None;
+                    for port in PORTS {
+                        if taken.contains(&port) || skip.contains(&port) {
+                            continue;
+                        }
+                        let Ok(lease) = fenced_lease(lock_dir, port) else {
+                            continue;
+                        };
+                        if bindable(port) {
+                            free = Some((port, lease));
+                            break;
+                        }
                     }
-                    let Ok(lease) = fenced_lease(lock_dir, port) else {
-                        continue;
-                    };
-                    if bindable(port) {
-                        free = Some((port, lease));
-                        break;
-                    }
-                }
-                match free {
-                    Some((p, lease)) => (p, false, lease),
-                    None => {
-                        return Err(Error::rejected(
-                            "no free port in 3110-3199 — pass `--port <n>`",
-                        ))
+                    match free {
+                        Some((p, lease)) => (p, false, lease),
+                        None => {
+                            return Err(Error::rejected(
+                                "no free port in 3110-3199 — pass `--port <n>`",
+                            ))
+                        }
                     }
                 }
             }
-        },
+        }
     };
     let hint = if flag {
         "pass another `--port` or omit it"
@@ -905,19 +924,48 @@ fn child(sb: &Sandbox, exe: &Path, args: &[&str], grant: bool) -> Command {
 
 /// Run one child verb to completion; its JSON stdout is the result.
 fn run_child(sb: &Sandbox, exe: &Path, args: &[&str], grant: bool) -> Result<Value> {
-    let out = crate::reaper::output(&mut child(sb, exe, args, grant))?;
+    run_child_env(sb, exe, args, grant, &[])
+}
+
+/// [`run_child`] plus env pairs for this child only — `up`'s `ui start`
+/// uses it to hand the retry's remaining budget down without touching
+/// this process's environment or any other child's.
+fn run_child_env(
+    sb: &Sandbox,
+    exe: &Path,
+    args: &[&str],
+    grant: bool,
+    env: &[(String, String)],
+) -> Result<Value> {
+    let mut cmd = child(sb, exe, args, grant);
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    let out = crate::reaper::output(&mut cmd)?;
     if !out.status.success() {
-        return Err(Error::rejected(format!(
+        // The child's own error frame is typed: preserve its `kind`,
+        // never reclassify from the message text. Only the one kind `up`
+        // retries — a verified own-child `AddrInUse` — becomes the
+        // distinct variant; every other kind is the ordinary wrap.
+        let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let kind = serde_json::from_str::<Value>(&detail)
+            .ok()
+            .and_then(|v| v["kind"].as_str().map(str::to_string));
+        let what = format!(
             "`cadence {}` in sandbox '{}' failed: {} — see {}/*.log; \
              `cadence sandbox down {}` stops what did start, \
              `cadence sandbox reset {}` starts the sandbox over",
             args.join(" "),
             sb.name,
-            String::from_utf8_lossy(&out.stderr).trim(),
+            detail,
             sb.state_dir().display(),
             sb.name,
             sb.name
-        )));
+        );
+        return Err(match kind.as_deref() {
+            Some("ui_bind_in_use") => Error::ui_bind_in_use(what),
+            _ => Error::rejected(what),
+        });
     }
     Ok(serde_json::from_slice(&out.stdout).unwrap_or(Value::Null))
 }
@@ -997,10 +1045,19 @@ fn up(sb: &Sandbox, wanted_port: Option<u16>, exe: &Path) -> Result<Value> {
             )))
         }
     }
+    // CAD-1283: eligibility for a bind-collision retry is captured
+    // BEFORE the first `ui start` writes `ui.json` — after it,
+    // `persisted_port` would always find the port `choose_port` picked
+    // and a fresh automatic pick would be indistinguishable from a
+    // persisted one. Only a fresh default allocation may retry.
+    let fresh_auto = wanted_port.is_none()
+        && persisted_port(&sb.state_dir()).is_none()
+        && crate::ui::detached_pid(&sb.state_dir()).is_none();
+    let lock_dir = port_lock_dir();
     // The chosen port's lease is held from the pick until `ui start`
     // has bound the board: a cooperating suite can neither take the
     // port we picked nor have its own leased port stolen in the gap.
-    let (port, _lease) = choose_port(sb, wanted_port, &port_lock_dir())?;
+    let (port, lease) = choose_port(sb, wanted_port, &lock_dir)?;
     std::fs::create_dir_all(sb.state_dir())?;
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1063,9 +1120,87 @@ fn up(sb: &Sandbox, wanted_port: Option<u16>, exe: &Path) -> Result<Value> {
     // daemon starts from it.
     write_dev_marker(sb)?;
     run_child(sb, exe, &["issue", "init"], allow_global)?;
+    // The daemon starts once, before the board retry window opens: a
+    // bind collision is the board's port, never the daemon's socket,
+    // so a retried `ui start` reuses this daemon and nothing is
+    // replayed.
     let daemon = run_child(sb, exe, &["daemon", "start"], allow_global)?;
-    let port_arg = port.to_string();
-    let ui = run_child(sb, exe, &["ui", "start", "--port", &port_arg], allow_global)?;
+    // CAD-1283: only a fresh automatic allocation gets the retry
+    // window and the remaining-budget env (a clamp, never a raise) —
+    // an explicit `--port`, a persisted `ui.json` port or an
+    // already-running board runs the single unchanged `ui start`.
+    const BOARD_START_BUDGET: Duration = Duration::from_secs(60);
+    let deadline = fresh_auto.then(|| Instant::now() + BOARD_START_BUDGET);
+    // `tried` holds the ports this `up` already saw lose their bind,
+    // so a retried pick can neither re-pick a failed candidate nor be
+    // pointed back at the failed port's own `ui.json` record.
+    let mut tried = Vec::new();
+    let mut port = port;
+    let mut lease = lease;
+    let ui;
+    // The `ui start` may retry a fresh automatic allocation when its
+    // own child proved the bind lost to another listener
+    // (`Error::UiBindInUse`). Each candidate's lease stays held until
+    // that start's child provably bound or died; it is dropped only
+    // after the verified own exit, before the next pick frees the
+    // claim for a successor. Nothing else is replayed — no daemon
+    // start, no marker, no tailnet, no device-login work.
+    loop {
+        // The retry budget env exists only on a fresh automatic
+        // allocation's `ui start`; other candidates inherit nothing.
+        let env = match (fresh_auto, deadline) {
+            (true, Some(dl)) => {
+                let left = dl.saturating_duration_since(Instant::now()).as_secs();
+                if left == 0 {
+                    return Err(Error::rejected(format!(
+                        "sandbox '{}' board start ran out of its {}s retry window \
+                         before the next candidate could start",
+                        sb.name,
+                        BOARD_START_BUDGET.as_secs()
+                    )));
+                }
+                vec![(crate::ui::START_REMAINING_ENV.to_string(), left.to_string())]
+            }
+            _ => Vec::new(),
+        };
+        let port_arg = port.to_string();
+        let result = run_child_env(
+            sb,
+            exe,
+            &["ui", "start", "--port", &port_arg],
+            allow_global,
+            &env,
+        );
+        match result {
+            // The verified bind collision — own dead child, exact
+            // pid/nonce/kind frame — retries a fresh automatic
+            // allocation only. An explicit `--port`, a persisted
+            // `ui.json` port or an already-running board fails closed.
+            Err(e @ Error::UiBindInUse(_)) if fresh_auto => {
+                tried.push(port);
+                // The failed candidate's own lease frees its claim for
+                // the next pick — only now that its own child provably
+                // exited and `start_inner` cleaned up.
+                drop(lease);
+                match choose_port_skip(sb, None, &lock_dir, &tried) {
+                    Ok((next, next_lease)) => {
+                        port = next;
+                        lease = next_lease;
+                    }
+                    Err(_) => return Err(e),
+                }
+            }
+            _ => {
+                ui = result?;
+                break;
+            }
+        }
+    }
+    // The board may have landed on a retried port; the env file must
+    // name the port that actually bound, not the first candidate.
+    if fresh_auto {
+        std::fs::write(sb.env_file(), env_lines(sb, Some(port), allow_global))?;
+    }
     Ok(json!({
         "name": sb.name,
         "root": sb.root,
