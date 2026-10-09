@@ -110,9 +110,9 @@ fn fake_door() -> (String, Seen) {
                 });
                 let reply = match (method.as_str(), path.split('?').next().unwrap_or("")) {
                     ("GET", p) if p == format!("{PREFIX}/destinations") => {
-                        json!({"ok":true,"data":[{
+                        json!({"ok":true,"data":{"version":"1","destinations":[{
                         "connectionId": AOS_CONN, "toolkit": "facebook", "displayName": "Harbour",
-                        "destinationId": DEST, "status": "active", "available": true, "publishable": true}]})
+                        "destinationId": DEST, "status": "active", "available": true, "publishable": true}]}})
                     }
                     ("POST", p) if p == format!("{PREFIX}/publish/preflight") => {
                         let mut data = echo.clone();

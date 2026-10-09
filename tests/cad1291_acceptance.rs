@@ -137,10 +137,10 @@ fn fake_door() -> (String, Seen, Arc<DoorState>) {
                 });
                 let route = path.split('?').next().unwrap_or("").to_string();
                 let reply = if method == "GET" && route == format!("{PREFIX}/destinations") {
-                    json!({"ok":true,"data":[{
+                    json!({"ok":true,"data":{"version":"1","destinations":[{
                         "connectionId": *door.connection.lock().unwrap(), "toolkit": "facebook",
                         "displayName": "Harbour", "destinationId": DEST, "status": "active",
-                        "available": true, "publishable": true}]})
+                        "available": true, "publishable": true}]}})
                 } else if method == "GET"
                     && path == format!("{PREFIX}/publish/grants?destinationId={DEST}")
                 {

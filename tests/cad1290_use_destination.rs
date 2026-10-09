@@ -25,7 +25,7 @@ struct Fx {
 }
 
 fn rows() -> Value {
-    json!({"ok": true, "data": [
+    json!({"ok": true, "data": {"version": "1", "destinations": [
         {"connectionId": "c1", "toolkit": "instagram", "displayName": "@harbour",
          "destinationId": MINE, "status": "active", "available": true, "publishable": true},
         {"connectionId": "c5", "toolkit": "instagram", "displayName": "@second",
@@ -36,7 +36,7 @@ fn rows() -> Value {
          "destinationId": "999", "status": "expired", "available": false, "publishable": false},
         {"connectionId": "c4", "toolkit": "instagram", "displayName": "@paused",
          "destinationId": "888", "status": "active", "available": false, "publishable": true},
-    ]})
+    ]}})
 }
 
 impl Fx {

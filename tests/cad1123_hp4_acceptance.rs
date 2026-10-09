@@ -154,11 +154,11 @@ impl Fx {
     fn arm_resolver(&self) {
         let stub = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let addr = stub.server_addr().to_string();
-        let body = json!({"ok": true, "data": [{
+        let body = json!({"ok": true, "data": {"version": "1", "destinations": [{
             "connectionId": CONN, "toolkit": "facebook",
             "displayName": "Harbour", "destinationId": DEST,
             "status": "active", "available": true, "publishable": true,
-        }]})
+        }]}})
         .to_string();
         std::thread::spawn(move || {
             for request in stub.incoming_requests() {

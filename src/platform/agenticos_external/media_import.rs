@@ -550,30 +550,7 @@ impl MediaResolver {
             Ok(resp) => read_destinations_envelope(resp).map_err(|_| ())?,
             Err(_) => return Err(()),
         };
-        Ok(data
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| {
-                        Some(DestinationRow {
-                            connection_id: v.get("connectionId")?.as_str()?.to_owned(),
-                            toolkit: v.get("toolkit")?.as_str()?.to_owned(),
-                            destination_id: v.get("destinationId")?.as_str()?.to_owned(),
-                            publishable: v
-                                .get("publishable")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(false),
-                            display_name: v
-                                .get("displayName")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_owned(),
-                            available: v.get("available").and_then(Value::as_bool).unwrap_or(false),
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default())
+        parse_destinations(&data)
     }
 
     /// CAD-1290: the company's active, publishable destinations for one
@@ -616,7 +593,42 @@ impl MediaResolver {
     }
 }
 
-/// Read the destinations envelope. Only a 2xx `{ok:true,data:[…]}` is a
+/// The destinations document (`DevicePublishDestinations`, AOS
+/// `device-publish.ts`): `{version:"1", destinations:[…]}`. Strict by
+/// design: a bare array, a missing `destinations` array or another version
+/// is contract drift and fails the read, because "zero rows" would hide it
+/// (CAD-1301). Individual malformed rows are dropped, not trusted.
+fn parse_destinations(data: &Value) -> std::result::Result<Vec<DestinationRow>, ()> {
+    if data.get("version").and_then(Value::as_str) != Some("1") {
+        return Err(());
+    }
+    let rows = data
+        .get("destinations")
+        .and_then(Value::as_array)
+        .ok_or(())?;
+    Ok(rows
+        .iter()
+        .filter_map(|v| {
+            Some(DestinationRow {
+                connection_id: v.get("connectionId")?.as_str()?.to_owned(),
+                toolkit: v.get("toolkit")?.as_str()?.to_owned(),
+                destination_id: v.get("destinationId")?.as_str()?.to_owned(),
+                publishable: v
+                    .get("publishable")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                display_name: v
+                    .get("displayName")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                available: v.get("available").and_then(Value::as_bool).unwrap_or(false),
+            })
+        })
+        .collect())
+}
+
+/// Read the destinations envelope. Only a 2xx `{ok:true,data:{…}}` is a
 /// read; a 4xx door error is a refused read, 5xx/redirect/drift ambiguous.
 /// The upstream `message` is never consulted.
 fn read_destinations_envelope(
