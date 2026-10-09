@@ -15,8 +15,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const MINE: &str = "17841400008460056";
+const SECOND: &str = "17841400009999999";
 const OTHER_FB: &str = "275491372109884";
-const GRANT: &str = "dpq_cad1290_grant_01";
 
 struct Fx {
     root: tempfile::TempDir,
@@ -28,6 +28,8 @@ fn rows() -> Value {
     json!({"ok": true, "data": [
         {"connectionId": "c1", "toolkit": "instagram", "displayName": "@harbour",
          "destinationId": MINE, "status": "active", "available": true, "publishable": true},
+        {"connectionId": "c5", "toolkit": "instagram", "displayName": "@second",
+         "destinationId": SECOND, "status": "active", "available": true, "publishable": true},
         {"connectionId": "c2", "toolkit": "facebook", "displayName": "Harbour page",
          "destinationId": OTHER_FB, "status": "active", "available": true, "publishable": true},
         {"connectionId": "c3", "toolkit": "instagram", "displayName": "@expired",
@@ -134,7 +136,7 @@ impl Fx {
     }
     fn use_params(&self, install: &str, destination: &str, extra: Value) -> Value {
         let mut params = json!({"install_id": install, "destination_id": destination,
-            "grant_id": GRANT, "request_id": "use-1"});
+            "request_id": "use-1"});
         for (key, value) in extra.as_object().into_iter().flatten() {
             params[key] = value.clone();
         }
@@ -157,9 +159,10 @@ fn the_destination_list_is_only_active_instagram_accounts_of_the_company() {
     let listed = fx.op("social_destinations", json!({}));
     assert_eq!(listed["unavailable"], false, "{listed}");
     let all = listed["destinations"].as_array().unwrap();
-    assert_eq!(all.len(), 1, "{listed}");
+    assert_eq!(all.len(), 2, "{listed}");
     assert_eq!(all[0]["destination_id"], MINE);
     assert_eq!(all[0]["label"], "@harbour");
+    assert_eq!(all[1]["destination_id"], SECOND);
 }
 
 #[test]
@@ -174,7 +177,10 @@ fn use_for_publishing_creates_then_replaces_with_a_revision_check() {
     assert_eq!(publish["destination_id"], MINE, "{created}");
     assert_eq!(publish["destination_label"], "@harbour");
     assert_eq!(publish["toolkit"], "instagram");
-    assert_eq!(publish["grant_id"], GRANT);
+    assert!(
+        publish.get("grant_id").is_none(),
+        "no standing grant: {created}"
+    );
     let revision = created["binding"]["revision"].as_i64().unwrap();
     // Replacing needs the revision the caller saw.
     let no_revision = fx.rpc(
@@ -191,20 +197,19 @@ fn use_for_publishing_creates_then_replaces_with_a_revision_check() {
     assert!(stale.is_err(), "replaced on a stale revision");
     let replaced = fx.op(
         "app_binding_use_destination",
-        fx.use_params(
-            &install,
-            MINE,
-            json!({"expected_revision": revision, "grant_id": "dpq_cad1290_grant_02"}),
-        ),
+        fx.use_params(&install, SECOND, json!({"expected_revision": revision})),
     );
     assert_eq!(
         replaced["binding"]["revision"].as_i64().unwrap(),
         revision + 1
     );
     assert_eq!(
-        replaced["binding"]["config"]["publish"]["grant_id"],
-        "dpq_cad1290_grant_02"
+        replaced["binding"]["config"]["publish"]["destination_id"],
+        SECOND
     );
+    assert!(replaced["binding"]["config"]["publish"]
+        .get("grant_id")
+        .is_none());
     assert_eq!(fx.bindings(&install).len(), 1);
 }
 
@@ -219,6 +224,25 @@ fn a_destination_outside_the_company_list_is_refused_and_nothing_is_written() {
             fx.use_params(&install, destination, json!({})),
         );
         assert!(result.is_err(), "bound {destination}");
+    }
+    assert!(fx.bindings(&install).is_empty());
+}
+
+#[test]
+fn a_request_cannot_bring_its_own_grant_or_label() {
+    let fx = Fx::start();
+    let install = fx.install();
+    for (field, value) in [
+        ("grant_id", "dpq_forged_grant_01"),
+        ("destination_label", "forged"),
+        ("toolkit", "facebook"),
+    ] {
+        let params = fx.use_params(&install, MINE, json!({ field: value }));
+        assert!(
+            fx.rpc(Asserted::Operator, "app_binding_use_destination", params)
+                .is_err(),
+            "accepted {field}"
+        );
     }
     assert!(fx.bindings(&install).is_empty());
 }

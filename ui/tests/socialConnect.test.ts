@@ -1,5 +1,5 @@
 import { makePlanner, runCall, type ActionContext } from "../src/features/workspace-apps/screen/screenActions";
-import { accountLabel, connectOutcome, connectReturnTo, connectToast, isGrantId, publicationBinding, sendSlot, withoutConnectParams } from "../src/features/workspace-apps/socialConnect";
+import { accountLabel, connectOutcome, connectReturnTo, connectToast, publicationBinding, sendSlot, withoutConnectParams } from "../src/features/workspace-apps/socialConnect";
 import type { AppBinding, Installation } from "../src/features/workspace-apps/workspaceApps";
 
 // CAD-1290: the hosted connect link, the return signal and "Use for publishing".
@@ -46,7 +46,6 @@ async function main() {
   equal(connectToast("cancelled"), connectToast("failed"), "cancelled reads as not connected");
   equal(connectReturnTo("https://ef.cadencecloud.app", "inst 1"), "https://ef.cadencecloud.app/app-installations/inst%201?screen=native", "return_to is this board's host Settings page");
   equal([accountLabel("harbour"), accountLabel("@harbour"), accountLabel("Harbour Cafe")], ["@harbour", "@harbour", "Harbour Cafe"], "handles get an @");
-  assert(isGrantId("dpq_abcdefgh") && !isGrantId("dpq_short") && !isGrantId("grant-abcdefgh"), "grant grammar");
   equal(sendSlot(installation), "publication", "one send slot");
   equal(sendSlot({ ...installation, capabilities: {} } as Installation), null, "no send slot");
   assert(publicationBinding([binding()], "publication", "ctx1", "sha256:d1"), "live binding found");
@@ -66,6 +65,11 @@ async function main() {
   assigned = null; calls.length = 0;
   result = await runCall(ctx(), "open-link", { url: "https://evil.example/x" }, ui);
   assert(!result.ok && assigned === null && calls.length === 0, "an arbitrary link neither connects nor reaches the daemon");
+  // Hosted without a public AgenticOS address: refused, not sent to the local page.
+  replies = { "/publishing/connect-link": { body: { hosted: true, unavailable: true } } };
+  assigned = null; shown = null;
+  result = await runCall(ctx(), "open-link", { url: "/settings/connections" }, ui);
+  assert(!result.ok && assigned === null && shown === null, "hosted without an origin is refused");
   // Local board: the daemon says not hosted, the local page link is kept.
   replies = { "/publishing/connect-link": { body: { hosted: false } } };
   assigned = null;
@@ -85,23 +89,23 @@ async function main() {
     "/publishing/use": { body: { binding: binding() } } };
   calls.length = 0;
   let changed = 0;
-  const planned = await makePlanner(() => ctx(() => { changed += 1; }))("publish.destination.use", { destination_id: "d1", grant_id: "dpq_abcdefgh" });
+  const planned = await makePlanner(() => ctx(() => { changed += 1; }))("publish.destination.use", { destination_id: "d1" });
   assert("run" in planned && planned.label === "Use @harbour for publishing", "label comes from the company's list");
   const done = await planned.run();
   assert(done.ok && changed === 1, "the tap runs and the board reloads");
-  equal(calls[calls.length - 1], { path: "/api/app-installations/inst1/publishing/use", body: { destination_id: "d1", grant_id: "dpq_abcdefgh", context_id: "ctx1", expected_revision: 3 } }, "replace sends the revision it saw");
+  equal(calls[calls.length - 1], { path: "/api/app-installations/inst1/publishing/use", body: { destination_id: "d1", context_id: "ctx1", expected_revision: 3 } }, "replace sends the revision it saw");
   // An account that is not in the company's list never gets a button.
-  const missing = await makePlanner(() => ctx())("publish.destination.use", { destination_id: "other-company", grant_id: "dpq_abcdefgh" });
+  const missing = await makePlanner(() => ctx())("publish.destination.use", { destination_id: "other-company" });
   assert("code" in missing && missing.code === "unknown_destination", "a destination outside the list is refused before any tap");
-  // A forged field or a bad grant is refused.
-  for (const args of [{ destination_id: "d1" }, { destination_id: "d1", grant_id: "nope" }, { destination_id: "d1", grant_id: "dpq_abcdefgh", label: "forged" }]) {
+  // A forged field (a grant, a label) or no destination is refused.
+  for (const args of [{}, { destination_id: "d1", grant_id: "dpq_abcdefgh" }, { destination_id: "d1", label: "forged" }]) {
     const refused = await makePlanner(() => ctx())("publish.destination.use", args as Record<string, unknown>);
     assert("code" in refused && refused.code === "bad_args", "bad args refused");
   }
   // No existing binding: create with a request id, no revision.
   replies["/contexts/ctx1/bindings"] = { body: { bindings: [] } };
   calls.length = 0;
-  const fresh = await makePlanner(() => ctx())("publish.destination.use", { destination_id: "d1", grant_id: "dpq_abcdefgh" });
+  const fresh = await makePlanner(() => ctx())("publish.destination.use", { destination_id: "d1" });
   assert("run" in fresh, "plans");
   await fresh.run();
   const sent = calls[calls.length - 1].body as Record<string, unknown>;

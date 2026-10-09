@@ -240,10 +240,10 @@ export interface PublishDestination { destination_id: string; label: string; too
 export const workspaceApps = {
   /** CAD-1290: the host-composed AgenticOS connect link; `hosted:false` on a local board. */
   connectLink: (id: string, returnTo: string) =>
-    request<{ hosted: boolean; url?: string }>(`${installation(id)}/publishing/connect-link`, undefined, { return_to: returnTo }),
+    request<{ hosted: boolean; url?: string; unavailable?: boolean }>(`${installation(id)}/publishing/connect-link`, undefined, { return_to: returnTo }),
   destinations: (id: string, signal?: AbortSignal) =>
     request<{ unavailable: boolean; destinations: PublishDestination[] }>(`${installation(id)}/publishing/destinations`, signal),
-  useDestination: (id: string, body: { destination_id: string; grant_id: string; request_id?: string; expected_revision?: number; context_id?: string }) =>
+  useDestination: (id: string, body: { destination_id: string; request_id?: string; expected_revision?: number; context_id?: string }) =>
     request<{ binding: AppBinding }>(`${installation(id)}/publishing/use`, undefined, body),
   installations: (signal?: AbortSignal) => request<Installation[]>("/api/app-installations", signal),
   detail: (id: string, signal?: AbortSignal) => request<Installation>(installation(id), signal),

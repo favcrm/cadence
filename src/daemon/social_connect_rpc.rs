@@ -35,6 +35,14 @@ fn pct(raw: &str) -> String {
     out
 }
 
+/// An https origin with no path, query, userinfo or backslash.
+fn valid_origin(origin: &str) -> bool {
+    let origin = origin.trim_end_matches('/');
+    origin
+        .strip_prefix("https://")
+        .is_some_and(|host| !host.is_empty() && !host.contains(['/', '?', '#', '@', '\\']))
+}
+
 /// The AgenticOS owner connect link for this board. `return_to` is accepted
 /// only as `https://<this board's host>/…`: plain printable ASCII, no
 /// userinfo, no fragment, no backslash.
@@ -56,8 +64,7 @@ pub(super) fn compose_connect_url(
         return Err(refuse());
     }
     let origin = issuer.trim_end_matches('/');
-    if !origin.starts_with("https://")
-        || origin.contains(['?', '#', '@', '\\'])
+    if !valid_origin(origin)
         || company.is_empty()
         || !company
             .bytes()
@@ -97,8 +104,19 @@ impl Shared {
                     return Ok(json!({"hosted": false}));
                 }
                 let board = crate::board_identity::read_config(&self.state_dir)?;
+                // The hosted issuer is the container-internal `http://api.internal`,
+                // never a browser address. The platform injects the public API
+                // origin as AGENTICOS_BOARD_API_ORIGIN; a self-hosted board with
+                // real egress has an https issuer, which is the same origin.
+                let origin = std::env::var("AGENTICOS_BOARD_API_ORIGIN")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| board.issuer.clone());
+                if !valid_origin(&origin) {
+                    return Ok(json!({"hosted": true, "unavailable": true}));
+                }
                 let url = compose_connect_url(
-                    &board.issuer,
+                    &origin,
                     &board.company,
                     &board.host,
                     required_str(params, "return_to")?,
@@ -137,7 +155,6 @@ impl Shared {
                 "install_id",
                 "context_id",
                 "destination_id",
-                "grant_id",
                 "request_id",
                 "expected_revision",
             ],
@@ -179,9 +196,8 @@ impl Shared {
             "destination_label": if label.is_empty() { destination } else { label },
             "toolkit": TOOLKIT,
             "timezone": TIMEZONE,
-            "grant_id": params.get("grant_id"),
         });
-        PublishTarget::parse(&publish)?;
+        PublishTarget::parse_hosted(&publish)?;
         let expected = params.get("expected_revision");
         let pm = self.pm_at(&self.pm_dir()?)?;
         workspace::with_runtime_snapshot(&pm, install, |bundle, files| {
@@ -291,6 +307,9 @@ mod tests {
     fn a_non_https_platform_origin_or_odd_company_is_refused() {
         let ok = "https://essential-foods.cadencecloud.app/x";
         assert!(compose_connect_url("http://api.agenticos.hk", "ws1", HOST, ok).is_err());
+        // The hosted issuer is container-internal, never a browser address.
+        assert!(compose_connect_url("http://api.internal", "ws1", HOST, ok).is_err());
+        assert!(compose_connect_url("https://api.example/extra", "ws1", HOST, ok).is_err());
         assert!(compose_connect_url(ISSUER, "ws1/../x", HOST, ok).is_err());
         assert!(compose_connect_url(ISSUER, "", HOST, ok).is_err());
     }

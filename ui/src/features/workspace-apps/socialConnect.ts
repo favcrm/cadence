@@ -57,6 +57,3 @@ export function publishingTo(binding: AppBinding | null, destinations: PublishDe
   const id = binding?.config.publish?.destination_id;
   return id ? destinations.find(value => value.destination_id === id) ?? null : null;
 }
-
-/** A send grant id: `dpq_` then 8–64 letters, digits, `_` or `-` (mirrors the daemon). */
-export const isGrantId = (value: string): boolean => /^dpq_[A-Za-z0-9_-]{8,64}$/.test(value);

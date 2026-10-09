@@ -139,7 +139,6 @@ struct ConnectLink {
 #[serde(deny_unknown_fields)]
 struct UseDestination {
     destination_id: String,
-    grant_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     request_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -411,14 +410,15 @@ mod tests {
             r#"{"return_to":"https://b/x","issuer":"https://evil"}"#
         )
         .is_err());
-        let ok = r#"{"destination_id":"d","grant_id":"dpq_abcdefgh","request_id":"r"}"#;
+        let ok = r#"{"destination_id":"d","request_id":"r"}"#;
         assert!(serde_json::from_str::<UseDestination>(ok).is_ok());
         for field in [
             "install_id",
             "destination_label",
             "label",
             "toolkit",
-            "timezone",
+            "connection_id",
+            "grant_id",
             "operator",
             "connection_id",
         ] {
@@ -430,7 +430,7 @@ mod tests {
             );
         }
         assert!(serde_json::from_str::<UseDestination>(
-            r#"{"destination_id":"d","grant_id":"g","context_id":null}"#
+            r#"{"destination_id":"d","context_id":null}"#
         )
         .is_err());
     }

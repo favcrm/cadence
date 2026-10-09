@@ -3,7 +3,7 @@ import { navigate } from "../../../lib/useLocation";
 import { rememberContext } from "../contextSelection";
 import { workspaceApps, type AppContext, type CapabilityQuote, type Installation, type WorkspaceRun } from "../workspaceApps";
 import { contextDefaultKeys, instagramLink } from "./screenProjection";
-import { accountLabel, connectReturnTo, isGrantId, publicationBinding, sendSlot } from "../socialConnect";
+import { accountLabel, connectReturnTo, publicationBinding, sendSlot } from "../socialConnect";
 import type { ActionRefusal, ActionResult, CallVerb, SlotVerb } from "./screenProtocol";
 import type { Planner, SlotPlan } from "./screenSlot";
 
@@ -176,6 +176,8 @@ async function connectOrOpen(ctx: ActionContext, args: Record<string, unknown>, 
     try {
       const reply = await workspaceApps.connectLink(ctx.installId, connectReturnTo(window.location.origin, ctx.installId));
       if (reply.hosted && reply.url) { (ui.assign ?? (url => window.location.assign(url)))(reply.url); return { ok: true, data: {} }; }
+      // Hosted but no public AgenticOS address: say so, never send the owner to the local page.
+      if (reply.hosted) return refuse("unavailable", "Instagram connect isn't available for this workspace yet.");
     } catch { /* keep the local page */ }
   }
   return openLink(args, ui);
@@ -191,11 +193,10 @@ async function listDestinations(args: Record<string, unknown>, ctx: ActionContex
 /** `publish.destination.use`: a host-drawn tap points the install's publication binding at one of the
  *  company's accounts. The label comes from the company's list, never from the frame. */
 async function planUseDestination(ctx: ActionContext, args: Record<string, unknown>): Promise<SlotPlan | ActionRefusal> {
-  if (!exact(args, ["destination_id", "grant_id"]) || typeof args.destination_id !== "string" || typeof args.grant_id !== "string"
-      || !isGrantId(args.grant_id)) return { code: "bad_args", text: "That request is not valid." };
+  if (!exact(args, ["destination_id"]) || typeof args.destination_id !== "string") return { code: "bad_args", text: "That request is not valid." };
   const slot = sendSlot(ctx.installation);
   if (!slot) return { code: "unknown_slot", text: "That isn't available." };
-  const { destination_id: destination, grant_id: grant } = args;
+  const destination = args.destination_id;
   try {
     const listed = await workspaceApps.destinations(ctx.installId);
     const chosen = listed.destinations.find(value => value.destination_id === destination);
@@ -205,7 +206,7 @@ async function planUseDestination(ctx: ActionContext, args: Record<string, unkno
     const request = randomRequest();
     return { label: `Use ${accountLabel(chosen.label || destination)} for publishing`, run: async () => {
       try {
-        await workspaceApps.useDestination(ctx.installId, { destination_id: destination, grant_id: grant,
+        await workspaceApps.useDestination(ctx.installId, { destination_id: destination,
           ...(contextId ? { context_id: contextId } : {}),
           ...(binding ? { expected_revision: binding.revision } : { request_id: request }) });
         ctx.onChanged();

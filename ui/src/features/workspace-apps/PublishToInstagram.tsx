@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import Button from "../../ui/Button";
 import { navigate } from "../../lib/useLocation";
 import { retainedRequest, completeRequest } from "./requests";
-import { accountLabel, connectReturnTo, isGrantId, publicationBinding, sendSlot } from "./socialConnect";
+import { accountLabel, connectReturnTo, publicationBinding, sendSlot } from "./socialConnect";
 import { workspaceApps, type AppBinding, type Installation, type PublishDestination } from "./workspaceApps";
 
 type Listed = { unavailable: boolean; destinations: PublishDestination[] } | "loading";
@@ -25,7 +25,6 @@ export function PublishToInstagram({ installation, bindings, contextId, canWrite
   const slot = sendSlot(installation);
   const binding = slot ? publicationBinding(bindings, slot, contextId, installation.digest) : null;
   const [listed, setListed] = useState<Listed>("loading");
-  const [grant, setGrant] = useState("");
   const [note, setNote] = useState<string | null>(null);
   const load = useCallback((signal?: AbortSignal) => {
     setListed("loading");
@@ -57,13 +56,13 @@ export function PublishToInstagram({ installation, bindings, contextId, canWrite
     try {
       const reply = await workspaceApps.connectLink(installId, connectReturnTo(window.location.origin, installId));
       if (reply.hosted && reply.url) window.location.assign(reply.url);
+      else if (reply.hosted) setNote("Instagram connect isn’t available for this workspace yet.");
       else navigate("/settings/connections");
     } catch { setNote("Couldn't open the Instagram connect page. Try again."); }
   };
   const current = binding?.config.publish ?? null;
   const rows = listed === "loading" ? [] : listed.destinations;
   const stale = !!current && listed !== "loading" && !listed.unavailable && !rows.some(row => row.destination_id === current.destination_id);
-  const grantOk = isGrantId(grant.trim());
   return (
     <section className="wa-panel wa-stack" aria-label="Publish to Instagram" data-publish-instagram>
       <h2>Publish to Instagram</h2>
@@ -76,14 +75,6 @@ export function PublishToInstagram({ installation, bindings, contextId, canWrite
       {stale && current && (
         <p className="wa-alert">Connection expired — {accountLabel(current.destination_label)} can’t publish until you reconnect.</p>
       )}
-      {rows.length > 0 && (
-        <label className="wa-field">
-          <span>Send grant</span>
-          <input className="wa-input" type="text" value={grant} placeholder="dpq_…" autoComplete="off" spellCheck={false}
-            onChange={event => setGrant(event.target.value)} disabled={!canWrite || busy} />
-          <span className="wa-muted">{grant && !grantOk ? "A send grant id is dpq_ followed by 8–64 letters, digits, _ or -." : "The grant your AgenticOS owner approved for publishing."}</span>
-        </label>
-      )}
       <ul className="wa-stack" style={{ listStyle: "none", padding: 0, margin: 0 }}>
         {rows.map(row => {
           const using = current?.destination_id === row.destination_id;
@@ -91,12 +82,12 @@ export function PublishToInstagram({ installation, bindings, contextId, canWrite
             <li key={row.destination_id} className="wa-row" data-destination={row.destination_id}>
               <span>Connected: <strong>{accountLabel(row.label || row.destination_id)}</strong></span>
               {using ? <span className="wa-kicker">Publishing here</span> : (
-                <Button size="sm" variant="primary" disabled={!canWrite || busy || !grantOk}
+                <Button size="sm" variant="primary" disabled={!canWrite || busy}
                   onClick={() => void mutate(async () => {
                     const key = JSON.stringify([installId, "use-destination", contextId, slot, row.destination_id, binding?.revision ?? 0]);
                     try {
                       await workspaceApps.useDestination(installId, {
-                        destination_id: row.destination_id, grant_id: grant.trim(),
+                        destination_id: row.destination_id,
                         ...(contextId ? { context_id: contextId } : {}),
                         ...(binding ? { expected_revision: binding.revision } : { request_id: retainedRequest(key) }),
                       });
