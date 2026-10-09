@@ -939,7 +939,23 @@ fn store_material(
     state_dir: &Path,
     binding: &SendBinding,
 ) -> std::result::Result<SendMaterial, Refusal> {
-    let db_path = state_dir.join("cadence.sqlite3");
+    // A social draft effect lives in its install's record store, not the
+    // main store; the install is encoded in the `sfx_` effect id.
+    let db_path = match &binding.source {
+        super::publish::PublicationSource::SocialDraft { .. } => {
+            crate::daemon::app_effects_rpc::social_effect_install(&binding.cadence_effect_id)
+                .and_then(|install| {
+                    crate::store::app_records::record_db_path(state_dir, &install).ok()
+                })
+                .ok_or_else(|| {
+                    Refusal::new(
+                        "unknown_key",
+                        "no approved social draft effect holds this key",
+                    )
+                })?
+        }
+        _ => state_dir.join("cadence.sqlite3"),
+    };
     // Transient store failures (open / busy) are `store_unavailable` —
     // the send-now preflight maps them to Uncertain (row stays queued,
     // the operator retries), never Refused: a SQLITE_BUSY blip must not
@@ -1300,6 +1316,66 @@ mod tests {
         let bearer = DeviceCredential::new("x".into());
         assert!(bearer.door_base("http://api.internal").is_err());
         assert!(bearer.door_base("https://publish.example").is_ok());
+    }
+
+    /// CAD-1267: a social draft effect is read from its install's record
+    /// store (install decoded from the `sfx_` id), never the main store.
+    #[test]
+    fn social_draft_material_reads_the_install_record_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let install = "install-one";
+        let hex: String = install.bytes().map(|b| format!("{b:02x}")).collect();
+        let effect_id = format!("sfx_{hex}_{:032x}", 7);
+        let caption = "Hosted caption";
+        let key = format!("social_{:032x}", 7);
+        let bound = SendBinding {
+            key: key.clone(),
+            connection_id: "con_hosted".into(),
+            destination_id: "275491372109884".into(),
+            toolkit: Toolkit::Facebook,
+            caption_digest: caption_digest_of(caption),
+            image_digest: None,
+            source: super::super::publish::PublicationSource::SocialDraft {
+                draft_id: "draft-1".into(),
+                revision: 1,
+            },
+            cadence_effect_id: effect_id.clone(),
+            grant_id: "dpq_test_grant_01".into(),
+        };
+        let frozen = json!({
+            "idempotency_key": key, "effect_id": effect_id,
+            "source": {"kind": "social_draft", "draft_id": "draft-1", "revision": 1},
+            "aos_connection_id": "con_hosted", "destination_id": "275491372109884",
+            "caption_digest": caption_digest_of(caption), "image_digest": null,
+            "grant_id": "dpq_test_grant_01", "caption": caption,
+        });
+        let path = crate::store::app_records::record_db_path(dir.path(), install).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let db = rusqlite::Connection::open(path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE app_social_effects(effect_id TEXT, frozen_json TEXT, state TEXT, digest TEXT, media_key TEXT)",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO app_social_effects VALUES(?,?,?,?,NULL)",
+            rusqlite::params![
+                effect_id,
+                frozen.to_string(),
+                "approved",
+                crate::store::app_runs::material_digest(&frozen)
+            ],
+        )
+        .unwrap();
+        let material = super::store_material(dir.path(), &bound).unwrap();
+        assert_eq!(material.caption, caption);
+        // An effect id that names no install is refused, never read from
+        // the main store.
+        let mut forged = bound.clone();
+        forged.cadence_effect_id = "sfx_zz_bad".into();
+        assert_eq!(
+            super::store_material(dir.path(), &forged).unwrap_err().code,
+            "unknown_key"
+        );
     }
 
     #[test]

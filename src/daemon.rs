@@ -26,7 +26,7 @@ mod app_capabilities_rpc;
 mod app_chat_rpc;
 mod app_content_rpc;
 mod app_contexts_rpc;
-mod app_effects_rpc;
+pub(crate) mod app_effects_rpc;
 mod app_explorer_rpc;
 mod app_records_rpc;
 mod app_runs_rpc;

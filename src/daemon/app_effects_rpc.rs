@@ -56,7 +56,7 @@ fn publication_smtp_envelope(
     Ok(Some(envelope))
 }
 
-fn social_effect_install(id: &str) -> Option<String> {
+pub(crate) fn social_effect_install(id: &str) -> Option<String> {
     let mut p = id.split('_');
     if p.next() != Some("sfx") {
         return None;
