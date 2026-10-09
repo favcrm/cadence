@@ -698,6 +698,7 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
     reasons, report = [], []
     if evidence is not None:
         evidence.clear()
+    approval_evidence = evidence if evidence is not None else {}
     pr, head = args.pr, args.head
     fields = "number,state,title,headRefName,headRefOid,baseRefName,baseRefOid,mergeStateStatus,autoMergeRequest,statusCheckRollup,author"
     view = gh_json(["pr", "view", str(pr), "-R", repo, "--json", fields])
@@ -837,8 +838,6 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
             if len({n.get("reviewer") for n in combined}) != 1:
                 reasons.append(f"active {klass} delivery requires exactly one independent combined review")
         report.append("counted verdicts: " + (", ".join(f"{n['reviewer']} {n['kind']} ({n['name']})" for n in counted) or "none"))
-        if require_comment:
-            reasons += check_comment(ticket.get("comments"), head, counted, required_comment_evidence)
 
     # Human class: paths, size, or any head-pinned note whose Risk is not exactly `auto`.
     rc, risk_text, _ = run(["gh", "api", "-H", "Accept: application/vnd.github.raw",
@@ -854,10 +853,10 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
         why.append(f"Risk {not_auto[0]['risk'] or '(missing)'!r} in {not_auto[0]['name']}")
     if why:
         report.append("class: human (" + "; ".join(why) + ")")
-        rs = check_approval(repo, pr, head, report, evidence)
+        rs = check_approval(repo, pr, head, report, approval_evidence)
         if rs:  # legacy CAD-1106 scope fallback only
             sr = check_scope(issue, view.get("title"), view.get("headRefName"), ticket, paths,
-                             risk_text, one_text, verdicts, counted, report, evidence)
+                             risk_text, one_text, verdicts, counted, report, approval_evidence)
             if sr:
                 report.append("scope approval not used: " + "; ".join(sr))
             else:
@@ -867,15 +866,19 @@ def evaluate(args, repo, *, require_comment=True, evidence=None):
         report.append("class: auto (every head-pinned note says Risk: auto; no path or size trigger)")
     authoritative_operator = bool(authority and authority["requirements"]["operator_approval"])
     if authoritative_operator and not why:
-        rs = check_approval(repo, pr, head, report, evidence)
+        rs = check_approval(repo, pr, head, report, approval_evidence)
         if rs:
             sr = check_scope(issue, view.get("title"), view.get("headRefName"), ticket, paths,
-                             risk_text, one_text, verdicts, counted, report, evidence)
+                             risk_text, one_text, verdicts, counted, report, approval_evidence)
             if sr:
                 report.append("scope approval not used: " + "; ".join(sr))
             else:
                 rs = []
         reasons += rs
+    if require_comment:
+        if approval_evidence.get("approval"):
+            required_comment_evidence.append("Operator approval id: " + approval_evidence["approval"])
+        reasons += check_comment(ticket.get("comments"), head, counted, required_comment_evidence)
     if evidence is not None and not reasons:
         evidence.update(issue=issue, repo=repo, pr=pr, head=head, base=base_oid,
                         notes=sorted({n["name"] for n in counted}),
@@ -1031,7 +1034,8 @@ def main(argv):
                 reasons += check_evidence_head(args, repo, evidence)
                 if (not reasons and (final_evidence.get("binding") != evidence.get("binding")
                                      or final_evidence.get("requirements") != evidence.get("requirements")
-                                     or final_evidence.get("readiness") != evidence.get("readiness"))):
+                                     or final_evidence.get("readiness") != evidence.get("readiness")
+                                     or final_evidence.get("approval") != evidence.get("approval"))):
                     reasons.append("delivery policy/base/readiness binding changed after evidence collection; revalidate before enqueue")
     except (RuntimeError, KeyError, TypeError) as e:
         reasons, report = [f"cannot read the PR: {e}"], []

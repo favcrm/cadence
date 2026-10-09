@@ -86,6 +86,7 @@ class Case(scope.Case):
         self.store = []  # no ticket scope approval; the proof is per-head
         self.per_head = True
         self.approval_id = APPROVAL_ID
+        self.approval_id_after = None
         self.approval_via = OPERATOR
         self.approval_missing_after = None   # return "missing" once calls exceed this
         self.approval_calls = 0
@@ -202,7 +203,9 @@ class Case(scope.Case):
             if (self.approval_missing_after is not None
                     and self.approval_calls > self.approval_missing_after):
                 return 1, json.dumps({"state": "missing", "reason": "no merge approval"}), ""
-            return 0, json.dumps({"state": "in-force", "approval_id": self.approval_id,
+            approval_id = (self.approval_id_after if self.approval_id_after is not None
+                           and self.approval_calls > 1 else self.approval_id)
+            return 0, json.dumps({"state": "in-force", "approval_id": approval_id,
                                   "source": "op", "recorded_via": self.approval_via}), ""
         return super().run(argv)
 
@@ -238,12 +241,30 @@ class EvidencePosting(unittest.TestCase):
     # ---- dry run -----------------------------------------------------------
 
     def test_dry_run_checks_everything_and_writes_nothing(self):
-        self.c.comments = [{"body": f"{HEAD} {NOTE}"}]
+        self.c.comments = [{"body": f"{HEAD} {NOTE}\nOperator approval id: {APPROVAL_ID}"}]
         rc, out, err = self.run_main("--dry-run")
         self.assertEqual(rc, 0, (out, err))
         self.assertIn("dry run", out)
         self.assertEqual(self.c.posted, [], "a tracker comment was written")
         self.assertEqual(self.c.merges, [], "a merge command ran")
+
+    def test_dry_run_requires_the_current_approval_id_in_the_comment(self):
+        for approval_id in (None, "replaced-approval"):
+            with self.subTest(approval_id=approval_id):
+                self.fresh()
+                body = f"{HEAD} {NOTE}"
+                if approval_id is not None:
+                    body += f"\nOperator approval id: {approval_id}"
+                self.c.comments = [{"body": body}]
+                rc, out, err = self.run_main("--dry-run")
+                self.assertEqual(rc, 1, (out, err))
+                self.assert_refused_clean(rc, err)
+        self.fresh()
+        self.c.comments = [{"body": f"{HEAD} {NOTE}\nOperator approval id: {APPROVAL_ID}"}]
+        rc, out, err = self.run_main("--dry-run")
+        self.assertEqual(rc, 0, (out, err))
+        self.assertEqual(self.c.posted, [])
+        self.assertEqual(self.c.merges, [])
 
     def test_dry_run_with_a_missing_comment_refuses_without_posting(self):
         rc, out, err = self.run_main("--dry-run")
@@ -263,6 +284,14 @@ class EvidencePosting(unittest.TestCase):
         self.assertEqual(len(self.c.merges), 1, self.c.merges)
         self.assertIn("--match-head-commit", self.c.merges[0])
         self.assertIn(HEAD, self.c.merges[0])
+
+    def test_replaced_operator_approval_after_post_refuses_enqueue(self):
+        self.c.approval_id_after = "merge-pr5-bbbb"
+        rc, out, err = self.run_main()
+        self.assertEqual(rc, 1, (out, err))
+        self.assertEqual(len(self.c.posted), 1, self.c.posted)
+        self.assertIn(f"Operator approval id: {APPROVAL_ID}", self.c.posted[0])
+        self.assertEqual(self.c.merges, [], "a replaced approval was enqueued")
 
     def test_a_retry_posts_no_duplicate_comment(self):
         rc, out, err = self.run_main()

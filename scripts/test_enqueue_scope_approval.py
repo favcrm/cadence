@@ -98,9 +98,14 @@ class Case:
                 if f"/contents/{f}?ref={BASE}" in url:
                     return 0, (ROOT / f).read_text(), ""
         if argv[:3] == ["cadence", "issue", "show"]:
-            return 0, json.dumps({"id": argv[3], "project": self.project, "owner": None, "claim": None,
+            issue = argv[3]
+            matching = [r for r in self.store if r["issue"].lower() == issue.lower()]
+            approval_id = "merge-pr5-aaaa" if self.per_head else (
+                matching[-1]["approval_id"] if matching else "missing")
+            comment = f"{HEAD} {NOTE}\nOperator approval id: {approval_id}"
+            return 0, json.dumps({"id": issue, "project": self.project, "owner": None, "claim": None,
                                   "body": self.ticket_body, "status": self.status, "refs": self.refs,
-                                  "comments": [{"body": f"{HEAD} {NOTE}"}]}), ""
+                                  "comments": [{"body": comment}]}), ""
         if argv[:3] == ["cadence", "delivery", "requirements"]:
             issue = argv[argv.index("--issue") + 1]
             pr_url = argv[argv.index("--pr") + 1]
