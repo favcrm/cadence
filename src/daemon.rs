@@ -2901,7 +2901,7 @@ impl Shared {
                 check_values("kinds", &kinds, &registry::endpoint_kind_ids())?;
                 let mut agents = Vec::new();
                 // CAD-1266: one pass over `tasks` for the whole fleet, not
-                // one unindexed scan per agent.
+                // one query per agent.
                 let mut open_tasks = self.store.open_task_ids_by_assignee()?;
                 // CAD-96: one grouped read tells auto-stopped rows apart.
                 let markers = self
@@ -5885,6 +5885,53 @@ mod tests {
             .find(|a| a["alias"] == "w1")
             .unwrap();
         assert_eq!(row["tasks"], json!(["t-open", "t-free"]));
+    }
+
+    /// CAD-1280: `job_list` with `open_tasks_only` lists only the tasks an
+    /// assignee still holds, keeps every job's full state counts, and the
+    /// plain and `tasks_detail` forms are unchanged.
+    #[test]
+    fn cad1280_job_list_open_tasks_only_trims_the_task_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = cad627_shared(dir.path());
+        let conn = rusqlite::Connection::open(dir.path().join("cadence.sqlite3")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO jobs(id,title,spec_path,pm_alias,issue_id,state,created,updated)
+               VALUES('job-a','A','spec.md','pm','CAD-9','running',1,1),
+                     ('job-b','B','spec.md','pm',NULL,'done',2,2);
+             INSERT INTO tasks(id,job_id,title,assignee,state,created,updated) VALUES
+               ('t-open','job-a','Open','w1','running',1,2),
+               ('t-done','job-a','Done','w1','done',2,3),
+               ('t-bad','job-a','Failed','w1','failed',3,4),
+               ('t-b','job-b','Other','w2','verified',1,5);",
+        )
+        .unwrap();
+        let list = |params: Value| {
+            shared
+                .dispatch("job_list", &params, std::process::id())
+                .unwrap()["jobs"]
+                .clone()
+        };
+        let ids = |job: &Value| -> Vec<String> {
+            job["task_list"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let counts_a = json!({"running": 1, "done": 1, "failed": 1});
+        let plain = list(json!({"all": true}));
+        assert_eq!(plain[0]["tasks"], counts_a);
+        assert!(plain[0].get("task_list").is_none());
+        let full = list(json!({"all": true, "tasks_detail": true}));
+        assert_eq!(ids(&full[0]), ["t-open", "t-done", "t-bad"]);
+        assert_eq!(ids(&full[1]), ["t-b"]);
+        let open = list(json!({"all": true, "tasks_detail": true, "open_tasks_only": true}));
+        assert_eq!(ids(&open[0]), ["t-open"]);
+        assert!(ids(&open[1]).is_empty());
+        assert_eq!(open[0]["tasks"], counts_a);
+        assert_eq!(open[1]["tasks"], json!({"verified": 1}));
     }
 
     /// The one-second board poll needs running rows, not thousands of

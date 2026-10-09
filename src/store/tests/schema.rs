@@ -1442,6 +1442,74 @@
         }
     }
 
+    /// CAD-1280: `msg_state` and `tasks_assignee` are plain indexes added
+    /// WITHOUT a schema bump, so an older binary (which refuses a store
+    /// recorded at a newer version) still opens the store. A fresh store
+    /// has both; a store that lost them (a restore from a copy taken
+    /// before) gets them back on open at the same version; the queries
+    /// they exist for are planned through them.
+    #[test]
+    fn read_indexes_are_unversioned_and_used_by_their_queries() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("t.sqlite3");
+        drop(Store::open(&db).unwrap());
+        let indexes = || -> Vec<String> {
+            let conn = Connection::open(&db).unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE type='index'
+                     AND name IN ('msg_state','tasks_assignee') ORDER BY name",
+                )
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        let version = || -> i64 {
+            Connection::open(&db)
+                .unwrap()
+                .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(indexes(), ["msg_state", "tasks_assignee"]);
+        // The schema version is the last migration's: these indexes do not
+        // move it (an older binary compares it, and refuses a higher one).
+        assert_eq!(version(), crate::rollout::SCHEMA_VERSION);
+
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch("DROP INDEX msg_state; DROP INDEX tasks_assignee;")
+            .unwrap();
+        assert!(indexes().is_empty());
+        drop(Store::open(&db).unwrap());
+        assert_eq!(indexes(), ["msg_state", "tasks_assignee"]);
+        assert_eq!(version(), crate::rollout::SCHEMA_VERSION);
+
+        let plan = |sql: &str| -> String {
+            let conn = Connection::open(&db).unwrap();
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let rows: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            rows.join(" | ")
+        };
+        let inflight = plan(
+            "SELECT alias, id, state, COALESCE(started, created) FROM messages
+             WHERE state IN ('running','submitted')",
+        );
+        assert!(inflight.contains("USING INDEX msg_state"), "{inflight}");
+        assert!(!inflight.contains("SCAN messages"), "{inflight}");
+        let per_agent = plan(
+            "SELECT * FROM tasks WHERE assignee='w1'
+             AND state NOT IN ('verified','done','cancelled','failed') ORDER BY updated",
+        );
+        assert!(per_agent.contains("USING INDEX tasks_assignee"), "{per_agent}");
+        assert!(!per_agent.contains("SCAN tasks"), "{per_agent}");
+    }
+
     /// v35 adds the CAD-1177 standalone tool receipt tables:
     /// `app_tool_claims` (claim-before-I/O, one intent per `request_id`
     /// UNIQUE) and `app_tool_results` (the retained receipt, one per

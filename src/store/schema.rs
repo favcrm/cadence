@@ -999,6 +999,29 @@ impl Store {
                 tx.execute("UPDATE schema_version SET version=36", [])?;
                 tx.commit()?;
             }
+            // CAD-1280: two read indexes, deliberately NOT a schema bump. A
+            // bump makes every older binary refuse the store (`rollout.rs`:
+            // "database schema N is newer than this binary's schema"), so a
+            // rollback would need a backup restore. A plain index changes no
+            // row and no table; an older binary ignores it and keeps
+            // maintaining it on write. `IF NOT EXISTS` runs on every open,
+            // so a store a downgrade touched converges again. Names are
+            // reserved: a later schema step must not reuse them differently.
+            //  * `msg_state` turns `inflight_messages` (`state IN
+            //    ('running','submitted')`) from a scan of every message
+            //    ever stored into a seek.
+            //  * `tasks_assignee` serves `tasks_for_assignee`,
+            //    `assignee_tasks_bound` (`agent show`) and the fleet read
+            //    `open_task_ids_by_assignee`; `state` rides the index so
+            //    terminal rows are skipped without a table fetch.
+            {
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(
+                    "CREATE INDEX IF NOT EXISTS msg_state ON messages(state);
+                     CREATE INDEX IF NOT EXISTS tasks_assignee ON tasks(assignee, state);",
+                )?;
+                tx.commit()?;
+            }
             if let Some(crossing) = permit.crossing {
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 Self::event(
