@@ -72,6 +72,7 @@ pub const DEVICE_PUBLISH_VERSION: &str = "1";
 const PREFLIGHT_PATH: &str = "/publish/preflight";
 const EXEC_PATH: &str = "/publish";
 const STATUS_PATH: &str = "/publish";
+const GRANTS_PATH: &str = "/publish/grants";
 const DEVICE_PREFIX: &str = "/v1/runtime/connectors";
 /// CAD-1267 (AOS-181): the lease door serves the same bodies and envelope
 /// under this prefix, with no Authorization header.
@@ -371,6 +372,57 @@ impl super::publish::PublishSender for HttpPublishSender {
 
     fn status(&self, key: &str) -> std::result::Result<LedgerOutcome, Refusal> {
         self.status_request(key)
+    }
+
+    /// CAD-1291: read-only lookup of the owner's standing grants for one
+    /// destination. The door scopes it to this company; Cadence selects the
+    /// live one for the approved account and AgenticOS re-checks company,
+    /// destination, revocation and the daily cap at preflight and send.
+    fn find_grant(
+        &self,
+        destination_id: &str,
+    ) -> std::result::Result<Vec<super::publish::FoundGrant>, Refusal> {
+        let uncertain = || {
+            Refusal::new(
+                "refused",
+                "grant lookup is uncertain; nothing was sent, try again",
+            )
+        };
+        if destination_id.is_empty()
+            || destination_id.len() > 120
+            || !destination_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+        {
+            return Err(Refusal::new(
+                "bad_destination",
+                "destination id shape is invalid",
+            ));
+        }
+        let url = format!(
+            "{}{}?destinationId={destination_id}",
+            self.base,
+            self.credential.route(GRANTS_PATH)
+        );
+        let mut request = self.http.get(&url);
+        if let Some(authorization) = self.credential.authorization() {
+            request = request.header("authorization", &authorization);
+        }
+        let response = request.call().map_err(|_| uncertain())?;
+        let data = match read_envelope(response, false) {
+            Ok(data) => data,
+            Err(Fault::Refused(refusal)) => return Err(refusal),
+            Err(Fault::Ambiguous) => return Err(uncertain()),
+        };
+        data.get("grants")
+            .and_then(Value::as_array)
+            .and_then(|grants| {
+                grants
+                    .iter()
+                    .map(super::publish::FoundGrant::from_wire)
+                    .collect::<Option<Vec<_>>>()
+            })
+            .ok_or_else(uncertain)
     }
 
     /// CAD-1041: pre-claim staging for an explicit send-now. Resolves
@@ -986,7 +1038,6 @@ fn store_material(
             || frozen["destination_id"].as_str() != Some(binding.destination_id.as_str())
             || frozen["caption_digest"].as_str() != Some(binding.caption_digest.as_str())
             || frozen["image_digest"].as_str() != binding.image_digest.as_deref()
-            || frozen["grant_id"].as_str() != Some(binding.grant_id.as_str())
         {
             return Err(Refusal::new(
                 "grant_binding_mismatch",
@@ -1499,5 +1550,113 @@ mod tests {
         assert!(preflight_of(&binding, &verdict("granted", true)).is_err());
         assert!(preflight_of(&binding, &verdict("declined", false)).is_err());
         assert!(preflight_of(&binding, &verdict("pending", false)).is_err());
+    }
+    /// CAD-1291: the lookup is a read-only GET on the door's grants route,
+    /// scoped by destination; a malformed record fails closed.
+    #[test]
+    fn find_grant_reads_the_door_and_refuses_malformed_records() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let bodies = [
+            r#"{"ok":true,"data":{"grants":[{"id":"dpq_ownergrant_001","kind":"standing","connectionId":"c","destinationId":"d","toolkit":"instagram","remainingToday":3,"revokedAt":null}]}}"#,
+            r#"{"ok":true,"data":{"grants":[{"id":"nope"}]}}"#,
+        ];
+        let server = std::thread::spawn(move || {
+            let mut lines = Vec::new();
+            for body in bodies {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap();
+                lines.push(
+                    String::from_utf8_lossy(&buf[..n])
+                        .lines()
+                        .next()
+                        .unwrap()
+                        .to_owned(),
+                );
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(reply.as_bytes()).unwrap();
+            }
+            lines
+        });
+        let sender = HttpPublishSender::new(
+            &format!("http://127.0.0.1:{port}"),
+            DeviceCredential::new("x".repeat(8)),
+            test_resolver("c", None),
+        )
+        .unwrap();
+        use super::super::publish::PublishSender;
+        let found = sender.find_grant("1784").unwrap();
+        assert_eq!(found[0].id, "dpq_ownergrant_001");
+        assert_eq!(sender.find_grant("1784").unwrap_err().code, "refused");
+        assert_eq!(
+            sender.find_grant("a b/../x").unwrap_err().code,
+            "bad_destination"
+        );
+        let lines = server.join().unwrap();
+        assert!(
+            lines[0].starts_with("GET /v1/runtime/connectors/publish/grants?destinationId=1784 "),
+            "{}",
+            lines[0]
+        );
+    }
+    /// CAD-1291: a social draft effect freezes no grant id (the owner's
+    /// standing grant is found at send time), so the stored-material check
+    /// must not demand one; every other frozen field still has to match.
+    #[test]
+    fn social_draft_material_needs_no_frozen_grant_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let install = "install-1";
+        let effect_id = format!(
+            "sfx_{}_{}",
+            install
+                .bytes()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+            "0".repeat(32)
+        );
+        let mut b = binding();
+        b.source = super::super::publish::PublicationSource::SocialDraft {
+            draft_id: "d1".into(),
+            revision: 2,
+        };
+        b.cadence_effect_id = effect_id.clone();
+        let frozen = json!({"idempotency_key": b.key, "effect_id": effect_id,
+            "source":{"kind":"social_draft","draft_id":"d1","revision":2},
+            "aos_connection_id": b.connection_id, "destination_id": b.destination_id,
+            "caption_digest": b.caption_digest, "caption":"Harbour at dusk."});
+        let path = crate::store::app_records::record_db_path(dir.path(), install).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE app_social_effects (effect_id TEXT, frozen_json TEXT, state TEXT, digest TEXT, media_key TEXT)",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO app_social_effects VALUES (?,?,?,?,NULL)",
+            rusqlite::params![
+                effect_id,
+                frozen.to_string(),
+                "approved",
+                crate::store::app_runs::material_digest(&frozen)
+            ],
+        )
+        .unwrap();
+        let material = super::store_material(dir.path(), &b).unwrap();
+        assert_eq!(material.caption, "Harbour at dusk.");
+        // A drifted caption digest is still refused.
+        let mut drifted = b.clone();
+        drifted.caption_digest = "0".repeat(64);
+        assert_eq!(
+            super::store_material(dir.path(), &drifted)
+                .unwrap_err()
+                .code,
+            "grant_binding_mismatch"
+        );
     }
 }
