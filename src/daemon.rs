@@ -28,6 +28,7 @@ mod app_content_rpc;
 mod app_contexts_rpc;
 pub(crate) mod app_effects_rpc;
 mod app_explorer_rpc;
+mod app_image_jobs;
 mod app_records_rpc;
 mod app_runs_rpc;
 mod app_screens_rpc;
@@ -497,6 +498,10 @@ pub struct Shared {
     /// CAD-786: live send workers keyed `install/context/send` — at
     /// most one runner drains one send's queue.
     crm_send_workers: Mutex<std::collections::HashSet<String>>,
+    /// CAD-1315: standalone image jobs with a live worker (by call id).
+    image_job_workers: Mutex<std::collections::HashSet<String>>,
+    image_job_window: Duration,
+    image_job_backoff: Duration,
     /// CAD-786: pause between campaign submissions; default 1 s,
     /// tests shorten it.
     crm_send_interval: Duration,
@@ -801,6 +806,17 @@ impl Shared {
             platform_custody: crate::platform::Custody::open(state_dir)?,
             platform_custody_lock: Box::leak(Box::new(Mutex::new(()))),
             crm_send_workers: Mutex::new(std::collections::HashSet::new()),
+            image_job_workers: Mutex::new(std::collections::HashSet::new()),
+            image_job_window: Duration::from_millis(if opts.image_job_window_ms == 0 {
+                app_image_jobs::JOB_WINDOW_MS
+            } else {
+                opts.image_job_window_ms
+            }),
+            image_job_backoff: Duration::from_millis(if opts.image_job_backoff_ms == 0 {
+                app_image_jobs::BACKOFF_MIN_MS
+            } else {
+                opts.image_job_backoff_ms
+            }),
             crm_send_interval: Duration::from_millis(if opts.crm_send_interval_ms == 0 {
                 1000
             } else {
@@ -867,6 +883,9 @@ impl Shared {
         // delivered; never resent) and a worker respawns for the
         // still-`queued` rest.
         shared.reconcile_crm_sends();
+        // CAD-1315: an image job in flight when the last daemon stopped
+        // replays its key and settles; no intent stays `pending`.
+        shared.reconcile_image_jobs();
         // CAD-1015: a `submitting` native nudge means the daemon died
         // between the durable bind and the provider reply — it may have
         // landed, so it closes non-fencing `unknown`, never replayed.
@@ -5314,6 +5333,12 @@ pub struct ServeOptions {
     /// platform's owner approval, in milliseconds; `0` is the
     /// production default (30 s).
     pub crm_send_pending_poll_ms: u64,
+    /// CAD-1315: window before a still-unresolved image job settles
+    /// `uncertain`, in milliseconds; `0` is the production default (10 min).
+    pub image_job_window_ms: u64,
+    /// CAD-1315: first retry pause after a transient image failure, in
+    /// milliseconds; `0` is the production default (5 s).
+    pub image_job_backoff_ms: u64,
     /// CAD-1063: the hosted CRM email transport. Set by
     /// `platform::agenticos::attach` on a daemon holding a hosted
     /// lease (and by fixtures); `None` keeps the SMTP path. Never

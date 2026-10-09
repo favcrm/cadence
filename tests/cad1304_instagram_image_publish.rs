@@ -21,12 +21,14 @@ use cadence_agent::test_seam::{scoped, Asserted, Seam};
 use cadence_agent::{client, daemon};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+#[path = "fixtures/aos_media_door.rs"]
+mod aos_media_door;
 
 const HOSTED: &str = r#"{"schema":1,"providers":[{"provider":"agenticos_external","origin":"http://api.internal","manifest_pin":"agenticos-external-provider-tools@3","transport":"hosted-media-lease@1"}]}"#;
 const PREFIX: &str = "/v1/runtime/connectors/hosted-publish";
@@ -42,13 +44,12 @@ type Seen = Arc<Mutex<Vec<(String, String)>>>;
 
 #[derive(Default)]
 struct Door {
-    /// `job id -> png bytes`, served at `/media/artifacts/<job>.<digest>`.
-    artifacts: Mutex<HashMap<String, Vec<u8>>>,
+    /// The AgenticOS media door in its real job shape (CAD-1315).
+    media: aos_media_door::MediaDoor,
     /// Digest query and body hash of every media import, in order.
     imports: Mutex<Vec<(String, String)>>,
     /// Publish and preflight bodies, in order.
     sends: Mutex<Vec<Value>>,
-    jobs: AtomicUsize,
 }
 
 /// A distinct 1x1 PNG per `n`.
@@ -161,30 +162,12 @@ fn serve(stream: std::net::TcpStream, log: &Seen, door: &Door) {
             json!({"ok":true,"data":{"slug":"read_instagram_posts","repeated":false,"price":price,"result":{"success":true,"status":"ok","user":{"username":HANDLE,"is_private":false},"items":[{"id":"post-1","code":"AbCd123","created_at":"2026-09-27T00:00:00Z","caption":{"text":"Door caption"}}]}}}),
         ),
         // ---- image generation (media door) ----
-        ("GET", "/v1/runtime/media/price/image") => json_reply(
-            json!({"ok":true,"data":{"kind":"image","model":"openai/gpt-image-2.5","price":{"slug":"generate_image","chargeMinor":31500,"currency":"USD","version":"2026-09-29T00:00:00.000Z"}}}),
-        ),
-        ("POST", "/v1/runtime/media/image") => {
-            let n = door.jobs.fetch_add(1, SeqCst) as u8 + 1;
-            let bytes = png(n);
-            let digest = hex(&bytes);
-            let job_id = format!("med_job{n}");
-            let reference = format!("{job_id}.{digest}");
-            door.artifacts
-                .lock()
-                .unwrap()
-                .insert(reference.clone(), bytes.clone());
-            json_reply(
-                json!({"ok":true,"data":{"job":{"id":job_id,"kind":"image","status":"succeeded","model":"openai/gpt-image-2.5","provider":"upstream-fixture","providerTaskId":null,
-                    "artifacts":[{"ref":reference,"digest":digest,"bytes":bytes.len(),"mime":"image/png"}],"artifactError":null,"usage":{"providerCredits":null},
-                    "price":{"slug":"generate_image","chargeMinor":31500,"currency":"USD","version":"2026-09-29T00:00:00.000Z"},
-                    "repeated":false,"cached":false,"stale":false}}}),
-            )
-        }
-        ("GET", artifact) if artifact.starts_with("/v1/runtime/media/artifacts/") => {
-            let reference = &artifact["/v1/runtime/media/artifacts/".len()..];
-            match door.artifacts.lock().unwrap().get(reference) {
-                Some(bytes) => raw(200, "image/png", bytes),
+        (m, r) if r.starts_with("/v1/runtime/media/") => {
+            match door
+                .media
+                .reply(m, r, header("idempotency-key").as_deref(), &body)
+            {
+                Some((status, content_type, bytes)) => raw(status, content_type, &bytes),
                 None => raw(404, "application/json", b"{}"),
             }
         }
@@ -260,6 +243,7 @@ struct Fx {
     )>,
     seen: Seen,
     door: Arc<Door>,
+    door_addr: String,
     install: String,
     context: String,
     session: Value,
@@ -290,6 +274,12 @@ impl Fx {
     }
 
     fn start() -> Self {
+        Self::start_with(0, 0)
+    }
+
+    /// `window_ms` / `backoff_ms` shorten the image job's window and retry
+    /// pause (`0` keeps the production values).
+    fn start_with(window_ms: u64, backoff_ms: u64) -> Self {
         for name in [
             "CADENCE_PUBLISH_SEND_URL",
             "CADENCE_PUBLISH_SEND_CREDENTIAL_FILE",
@@ -312,16 +302,24 @@ impl Fx {
             daemon: None,
             seen,
             door,
+            door_addr,
             install: String::new(),
             context: String::new(),
             session: Value::Null,
             action_token: Value::Null,
         };
-        let (dir, stop) = (fx.dir(), Arc::new(AtomicBool::new(false)));
+        fx.launch(window_ms, backoff_ms);
+        fx.setup();
+        fx
+    }
+
+    /// Start (or restart) the daemon on this fixture's state dir.
+    fn launch(&mut self, window_ms: u64, backoff_ms: u64) {
+        let (dir, stop) = (self.dir(), Arc::new(AtomicBool::new(false)));
         let env = cadence_agent::adapter::ProviderEnv::refusing_providers();
         env.set(
             "CADENCE_PM_DIR",
-            fx.root.path().join("pm").to_str().unwrap(),
+            self.root.path().join("pm").to_str().unwrap(),
         );
         let mut opts = daemon::ServeOptions {
             provider_env: env,
@@ -334,6 +332,8 @@ impl Fx {
             report_router: Some(0),
             checkup: Some(0),
             provider_deployments: Some(DeploymentMetadata::parse(HOSTED.as_bytes()).unwrap()),
+            image_job_window_ms: window_ms,
+            image_job_backoff_ms: backoff_ms,
             ..Default::default()
         };
         cadence_agent::platform::local::register_at(
@@ -342,11 +342,13 @@ impl Fx {
             dir.join("outbox"),
             "http://127.0.0.1:3010".into(),
         );
-        std::env::set_var("ALL_PROXY", format!("http://{door_addr}"));
+        std::env::set_var("ALL_PROXY", format!("http://{}", self.door_addr));
+        std::env::set_var("CADENCE_TEST_MEDIA_POLL_MS", "20");
+        std::env::set_var("CADENCE_TEST_MEDIA_DEADLINE_MS", "1500");
         let handle = std::thread::spawn(move || daemon::serve_with(&dir, opts));
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        while client::rpc_timeout(&fx.dir(), "health", json!({}), Duration::from_secs(2)).is_err()
-            || Seam::token_at(&fx.dir()).is_none()
+        while client::rpc_timeout(&self.dir(), "health", json!({}), Duration::from_secs(2)).is_err()
+            || Seam::token_at(&self.dir()).is_none()
         {
             assert!(
                 !handle.is_finished() && std::time::Instant::now() < deadline,
@@ -355,9 +357,14 @@ impl Fx {
             std::thread::sleep(Duration::from_millis(50));
         }
         std::env::remove_var("ALL_PROXY");
-        fx.daemon = Some((stop, handle));
-        fx.setup();
-        fx
+        self.daemon = Some((stop, handle));
+    }
+
+    fn stop_daemon(&mut self) {
+        if let Some((stop, handle)) = self.daemon.take() {
+            stop.store(true, SeqCst);
+            let _ = handle.join();
+        }
     }
 
     /// Social Content with a screen that may call the source read and the
@@ -481,6 +488,35 @@ impl Fx {
         (receipt, post)
     }
 
+    /// Poll the draft listing until the image intent completes; returns its
+    /// receipt id.
+    fn image_receipt(&self, draft: &str) -> String {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let listed = self
+                .screen(
+                    "app_social_draft_list",
+                    json!({"tool_alias": "social.draft"}),
+                )
+                .unwrap_or_else(|e| panic!("list: {e}"));
+            let done = listed["generation_intents"].as_array().and_then(|rows| {
+                rows.iter().find(|row| {
+                    row["scope"]["draft_id"] == draft
+                        && row["scope"]["operation"] == "image"
+                        && row["state"] == "completed"
+                })
+            });
+            if let Some(row) = done {
+                return row["receipt_id"].as_str().unwrap().to_string();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "image never completed: {listed}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// Draft a caption from that post, generate the image and attach it.
     /// Returns `(draft_id, revision, asset_id)`.
     fn draft_with_image(&self, tag: &str, source: &(String, String)) -> (String, i64, String) {
@@ -502,10 +538,13 @@ impl Fx {
                     "generation_scope": {"operation": "image", "draft_id": draft, "revision": 1}}),
             )
             .unwrap_or_else(|e| panic!("generate image: {e}"));
-        let asset = generated["receipt"]["id"]
-            .as_str()
-            .unwrap_or_else(|| panic!("no image receipt: {generated}"))
-            .to_string();
+        // CAD-1315: the call returns at once with the intent pending; the
+        // host worker settles it against the media door's real job shape.
+        assert_eq!(
+            generated["generation_intent"]["state"], "pending",
+            "image generation must queue, not block: {generated}"
+        );
+        let asset = self.image_receipt(&draft);
         let attached = self
             .screen(
                 "app_social_draft_update",
@@ -746,4 +785,256 @@ fn a_legacy_sha256_frozen_effect_publishes_unchanged_and_a_changed_image_sends_n
     assert_eq!(fx.state(&id), "waiting");
     assert_eq!(fx.count(&format!("{PREFIX}/media/import")), imports);
     assert_eq!(fx.count(&format!("{PREFIX}/publish")), 1);
+}
+
+// ---- CAD-1315: image generation as a queued job -------------------------
+//
+// The media door above answers in AgenticOS's real job shape (see
+// `fixtures/aos_media_door.rs`): 201 `submitted`, then `running`, then
+// `succeeded` with a ~3 MiB artifact.
+
+use aos_media_door::Scenario;
+
+impl Fx {
+    /// Create a draft from the fetched source; returns its id.
+    fn new_draft(&self, tag: &str, source: &(String, String)) -> String {
+        let created = self
+            .screen(
+                "app_social_draft_create",
+                json!({"tool_alias": "social.draft", "request_id": format!("draft-{tag}"),
+                    "caption": CAPTION,
+                    "source": {"kind": "tool_receipt", "receipt_id": source.0, "post_id": source.1}}),
+            )
+            .unwrap_or_else(|e| panic!("draft create: {e}"));
+        created["draft_id"].as_str().unwrap().to_string()
+    }
+
+    fn image(&self, draft: &str, request: &str) -> cadence_agent::Result<Value> {
+        self.screen(
+            "app_tool_invoke",
+            json!({"tool_alias": "social.draft", "input": {}, "request_id": request,
+                "generation_scope": {"operation": "image", "draft_id": draft, "revision": 1}}),
+        )
+    }
+
+    /// The draft's image intent, read from the record file (no live session
+    /// needed, so it also works across a daemon restart).
+    fn intent(&self, draft: &str) -> Option<Value> {
+        RecordStore::open(&self.dir(), &self.install)
+            .unwrap()
+            .app_social_generation_intents(&self.context)
+            .unwrap()
+            .into_iter()
+            .find(|row| row["scope"]["draft_id"] == draft && row["scope"]["operation"] == "image")
+    }
+
+    fn wait_intent(&self, draft: &str, state: &str) -> Value {
+        let deadline = std::time::Instant::now() + Duration::from_secs(40);
+        loop {
+            let row = self.intent(draft);
+            if let Some(row) = row.filter(|row| row["state"] == state) {
+                return row;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "intent never reached {state}: {:?}",
+                self.intent(draft)
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn wait_door(&self, what: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !self.door.media.log().iter().any(|l| l.starts_with(what)) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "door never saw {what}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn keys(&self) -> std::collections::BTreeSet<String> {
+        self.door.media.submit_keys().into_iter().collect()
+    }
+}
+
+#[test]
+fn an_image_job_returns_at_once_leaves_the_board_free_and_retains_a_custody_sized_jpeg() {
+    let fx = Fx::start();
+    let source = fx.fetch();
+    // One attempt may poll for 30 s: a board write that waits on the worker
+    // cannot finish inside this test's bound.
+    std::env::set_var("CADENCE_TEST_MEDIA_DEADLINE_MS", "30000");
+    fx.door.media.set(Scenario::Hold);
+    let draft = fx.new_draft("q1", &source);
+
+    let started = std::time::Instant::now();
+    let reply = fx.image(&draft, "image-q1").unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the call blocked"
+    );
+    // The reply is the shape an older app bundle already validates.
+    assert_eq!(reply["replayed"], true, "{reply}");
+    let intent = reply["generation_intent"].as_object().unwrap();
+    let mut keys: Vec<&str> = intent.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "draft_id",
+            "input",
+            "input_digest",
+            "operation",
+            "request_id",
+            "revision",
+            "state",
+            "updated_at"
+        ],
+        "{reply}"
+    );
+    assert_eq!(intent["state"], "pending");
+
+    // The job is in flight at the door; another board write completes now.
+    fx.wait_door("GET job");
+    let other = std::time::Instant::now();
+    let second = fx.new_draft("q1b", &source);
+    fx.screen(
+        "app_social_draft_update",
+        json!({"tool_alias": "social.draft", "request_id": "edit-q1b", "draft_id": second,
+            "expected_revision": 1, "caption": "A second caption"}),
+    )
+    .unwrap_or_else(|e| panic!("a board write stalled behind the image job: {e}"));
+    assert!(other.elapsed() < Duration::from_secs(10));
+    assert_eq!(fx.intent(&draft).unwrap()["state"], "pending");
+
+    // The door finishes the job; the 3 MiB PNG is retained within custody.
+    fx.door.media.set(Scenario::Normal);
+    let done = fx.wait_intent(&draft, "completed");
+    let receipt = fx.op("app_tool_result", json!({"receipt_id": done["receipt_id"]}));
+    let asset = &receipt["asset"];
+    assert_eq!(asset["media_type"], "image/jpeg", "{receipt}");
+    assert!(
+        asset["size"].as_u64().unwrap() <= 2 * 1024 * 1024,
+        "{receipt}"
+    );
+    assert_eq!(receipt["result"]["asset_media_type"], "image/jpeg");
+    assert_eq!(fx.keys().len(), 1, "one key, one job");
+    assert_eq!(fx.door.media.job_count(), 1);
+}
+
+#[test]
+fn a_restart_replays_the_same_key_and_leaves_no_image_intent_pending() {
+    let mut fx = Fx::start();
+    let source = fx.fetch();
+    fx.door.media.set(Scenario::Hold);
+    let draft = fx.new_draft("r1", &source);
+    fx.image(&draft, "image-r1").unwrap();
+    fx.wait_door("GET job");
+
+    // The daemon dies mid-job: the intent is still pending, the job is held
+    // at AgenticOS.
+    fx.stop_daemon();
+    assert_eq!(fx.intent(&draft).unwrap()["state"], "pending");
+    fx.door.media.set(Scenario::Normal);
+    fx.launch(0, 0);
+
+    // Boot reconciliation replays the key; no second job is ever created.
+    let done = fx.wait_intent(&draft, "completed");
+    assert!(done["receipt_id"].is_string(), "{done}");
+    assert_eq!(fx.keys().len(), 1, "a restart must replay the same key");
+    assert!(
+        fx.door.media.submit_keys().len() >= 2,
+        "the key was replayed"
+    );
+    assert_eq!(fx.door.media.job_count(), 1);
+}
+
+#[test]
+fn a_new_key_is_minted_only_after_the_old_job_is_terminal() {
+    let fx = Fx::start();
+    let source = fx.fetch();
+
+    // An unresolved job (AgenticOS answers `uncertain`) records its reason
+    // and is re-checked under the SAME key; no request id starts a second one.
+    fx.door.media.set(Scenario::Uncertain);
+    let stuck = fx.new_draft("k1", &source);
+    fx.image(&stuck, "image-k1").unwrap();
+    let row = fx.wait_intent(&stuck, "uncertain");
+    assert_eq!(row["outcome"], "provider_uncertain", "{row}");
+    let submits = fx.door.media.submit_keys().len();
+    fx.image(&stuck, "image-k1").unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while fx.door.media.submit_keys().len() == submits
+        || fx.intent(&stuck).unwrap()["state"] != "uncertain"
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the re-check never ran"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let traffic = fx.door.media.log().len();
+    let other = fx.image(&stuck, "image-k1-other").unwrap();
+    assert_eq!(other["generation_intent"]["state"], "uncertain", "{other}");
+    assert_eq!(other["generation_intent"]["request_id"], "image-k1");
+    assert_eq!(
+        fx.door.media.log().len(),
+        traffic,
+        "another request id reached the door"
+    );
+    assert_eq!(fx.keys().len(), 1);
+    assert_eq!(fx.door.media.job_count(), 1);
+
+    // A job AgenticOS closed as failed is terminal: it records why, and the
+    // next request id is a new job under a new key. The old job stays.
+    fx.door.media.set(Scenario::Fail);
+    let failed = fx.new_draft("k2", &source);
+    fx.image(&failed, "image-k2").unwrap();
+    let row = fx.wait_intent(&failed, "refused");
+    assert_eq!(row["outcome"], "job_failed", "{row}");
+    assert_eq!(fx.keys().len(), 2);
+    fx.door.media.set(Scenario::Normal);
+    fx.image(&failed, "image-k2-again").unwrap();
+    fx.wait_intent(&failed, "completed");
+    assert_eq!(fx.keys().len(), 3, "the retry is a new key");
+    let records = RecordStore::open(&fx.dir(), &fx.install).unwrap();
+    let old = records
+        .app_social_image_job_for_request("image-k2")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (old.state.as_str(), old.reason.as_deref()),
+        ("failed", Some("job_failed"))
+    );
+}
+
+#[test]
+fn an_unreachable_door_keeps_the_intent_pending_then_settles_uncertain_and_recovers_on_the_same_key(
+) {
+    let fx = Fx::start_with(2500, 100);
+    let source = fx.fetch();
+    fx.door.media.set(Scenario::Hold);
+    let draft = fx.new_draft("d1", &source);
+    fx.image(&draft, "image-d1").unwrap();
+    fx.wait_door("GET job");
+
+    // AgenticOS goes away: no fake terminal state while the window is open.
+    fx.door.media.set(Scenario::Down);
+    std::thread::sleep(Duration::from_millis(800));
+    assert_eq!(fx.intent(&draft).unwrap()["state"], "pending");
+
+    // The window is bounded: the intent settles with a reason.
+    let row = fx.wait_intent(&draft, "uncertain");
+    let reason = row["outcome"].as_str().unwrap();
+    assert!(matches!(reason, "submit_error" | "poll_timeout"), "{row}");
+
+    // The door returns; re-checking replays the same key and completes.
+    fx.door.media.set(Scenario::Normal);
+    fx.image(&draft, "image-d1").unwrap();
+    fx.wait_intent(&draft, "completed");
+    assert_eq!(fx.keys().len(), 1);
+    assert_eq!(fx.door.media.job_count(), 1);
 }

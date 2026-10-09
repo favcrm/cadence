@@ -8,9 +8,13 @@ use serde_json::Value;
 
 use super::{IMAGE_TOOL, PLATFORM};
 
-/// Custody bound on the retained artifact; the AgenticOS backend ceiling is
-/// larger, but this is what the downstream release path accepts.
+/// Custody bound on the retained artifact. Downstream (draft listing, app
+/// bundles, publish) accepts no more, so a larger AgenticOS artifact is
+/// re-encoded to fit (`fit_to_custody`), never retained as is.
 pub(crate) const ASSET_LIMIT: usize = 2 * 1024 * 1024;
+/// What one artifact fetch may read: AgenticOS imports at most 10 MiB
+/// (`MEDIA_IMPORT_MAX_BYTES`, apps/api/src/media/jobs.ts:31).
+pub(crate) const FETCH_LIMIT: usize = 10 * 1024 * 1024;
 // The fixed image operation asks for one square image. Keep decode work
 // independent of the compressed byte count: a tiny file can expand enormously.
 const IMAGE_SIDE_LIMIT: u32 = 2048;
@@ -136,17 +140,35 @@ pub(super) fn image_prompt(authority: &Value, input: &Value) -> Result<String, S
     compose_image_prompt(title, prompt_source, voice, guidance, legacy)
 }
 
+/// Why downloaded bytes are not a retainable image (CAD-1315).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImageFault {
+    Unsupported,
+    NotSquare,
+    Decode,
+    TooLarge,
+}
+
+type Fault = (ImageFault, &'static str);
+
 pub(crate) fn image_mime(bytes: &[u8], header: &str) -> Result<&'static str, String> {
+    image_checked(bytes, header).map_err(|(_, message)| message.to_owned())
+}
+
+pub(crate) fn image_checked(bytes: &[u8], header: &str) -> Result<&'static str, Fault> {
     let sniffed = image_data_mime(bytes)?;
     if header.trim().to_ascii_lowercase() != sniffed {
-        return Err("downloaded image MIME differs from its bytes".into());
+        return Err((
+            ImageFault::Unsupported,
+            "downloaded image MIME differs from its bytes",
+        ));
     }
     Ok(sniffed)
 }
 
 /// Byte-sniffed custody decode shared by CDN and base64 paths: no header
 /// trust, full decode inside square/dimension/pixel/allocation limits.
-fn image_data_mime(bytes: &[u8]) -> Result<&'static str, String> {
+fn image_data_mime(bytes: &[u8]) -> Result<&'static str, Fault> {
     let png = bytes.len() >= 45
         && bytes.starts_with(&[
             0x89, b'P', b'N', b'G', 13, 10, 26, 10, 0, 0, 0, 13, b'I', b'H', b'D', b'R',
@@ -167,7 +189,10 @@ fn image_data_mime(bytes: &[u8]) -> Result<&'static str, String> {
     } else if webp {
         "image/webp"
     } else {
-        return Err("downloaded image has no supported image signature".into());
+        return Err((
+            ImageFault::Unsupported,
+            "downloaded image has no supported image signature",
+        ));
     };
     let format = match sniffed {
         "image/png" => image::ImageFormat::Png,
@@ -175,31 +200,90 @@ fn image_data_mime(bytes: &[u8]) -> Result<&'static str, String> {
         "image/webp" => image::ImageFormat::WebP,
         _ => unreachable!(),
     };
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(IMAGE_SIDE_LIMIT);
-    limits.max_image_height = Some(IMAGE_SIDE_LIMIT);
-    limits.max_alloc = Some(IMAGE_DECODE_ALLOC_LIMIT);
+    let limits = decode_limits();
     let mut probe = image::ImageReader::with_format(Cursor::new(bytes), format);
     probe.limits(limits.clone());
-    let (width, height) = probe
-        .into_dimensions()
-        .map_err(|_| "downloaded image dimensions are invalid or exceed custody limit")?;
+    let (width, height) = probe.into_dimensions().map_err(|_| {
+        (
+            ImageFault::Decode,
+            "downloaded image dimensions are invalid or exceed custody limit",
+        )
+    })?;
     if width == 0
         || height == 0
         || width != height
         || u64::from(width) * u64::from(height) > IMAGE_PIXEL_LIMIT
     {
-        return Err("downloaded image is not a bounded square image".into());
+        return Err((
+            ImageFault::NotSquare,
+            "downloaded image is not a bounded square image",
+        ));
     }
     let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
     reader.limits(limits);
-    let decoded = reader
-        .decode()
-        .map_err(|_| "downloaded image cannot be decoded within custody limits")?;
+    let decoded = reader.decode().map_err(|_| {
+        (
+            ImageFault::Decode,
+            "downloaded image cannot be decoded within custody limits",
+        )
+    })?;
     if decoded.width() != width || decoded.height() != height {
-        return Err("downloaded image dimensions changed during decode".into());
+        return Err((
+            ImageFault::Decode,
+            "downloaded image dimensions changed during decode",
+        ));
     }
     Ok(sniffed)
+}
+
+fn decode_limits() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(IMAGE_SIDE_LIMIT);
+    limits.max_image_height = Some(IMAGE_SIDE_LIMIT);
+    limits.max_alloc = Some(IMAGE_DECODE_ALLOC_LIMIT);
+    limits
+}
+
+/// An artifact above the custody bound is re-encoded as a JPEG that fits it
+/// (quality steps down until it does), inside the same decode limits. The
+/// caller has already proven the ORIGINAL bytes against the AgenticOS
+/// descriptor; the retained bytes are these.
+pub(crate) fn fit_to_custody(bytes: &[u8]) -> Result<Vec<u8>, Fault> {
+    let sniffed = image_data_mime(bytes)?;
+    let format = match sniffed {
+        "image/png" => image::ImageFormat::Png,
+        "image/jpeg" => image::ImageFormat::Jpeg,
+        _ => image::ImageFormat::WebP,
+    };
+    let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
+    reader.limits(decode_limits());
+    let rgb = reader
+        .decode()
+        .map_err(|_| {
+            (
+                ImageFault::Decode,
+                "downloaded image cannot be decoded within custody limits",
+            )
+        })?
+        .to_rgb8();
+    for quality in [90u8, 80, 70, 60] {
+        let mut out = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality)
+            .encode_image(&rgb)
+            .map_err(|_| {
+                (
+                    ImageFault::Decode,
+                    "downloaded image could not be re-encoded",
+                )
+            })?;
+        if out.len() <= ASSET_LIMIT {
+            return Ok(out);
+        }
+    }
+    Err((
+        ImageFault::TooLarge,
+        "downloaded image does not fit the custody bound",
+    ))
 }
 
 /// CAD-734 mapping onto the AOS-94 slice-1 device media-import shape

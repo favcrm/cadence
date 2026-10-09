@@ -169,6 +169,17 @@ impl Store {
         )?)
     }
 
+    /// Installs that ever reserved a paid call: a restart looks for unfinished
+    /// image jobs only in their record files.
+    pub(crate) fn app_tool_claim_installs(&self) -> Result<Vec<String>> {
+        let conn = self.conn();
+        let installs = conn
+            .prepare("SELECT DISTINCT install_id FROM app_tool_claims")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(installs)
+    }
+
     /// The retained receipt for one request id, or `None`.
     pub(crate) fn app_tool_result_for_request(&self, request: &str) -> Result<Option<Value>> {
         let id = self

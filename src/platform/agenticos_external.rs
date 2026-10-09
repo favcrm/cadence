@@ -24,7 +24,8 @@ use crate::platform::connections::{
 use crate::platform::{
     AppCapabilityAsset, AppCapabilityError, AppCapabilityOutput, AppCapabilityQuote,
 };
-use image::{image_mime, image_prompt, ASSET_LIMIT};
+use crate::platform::{ImageFailure, ImageReason};
+use image::{fit_to_custody, image_checked, image_prompt, ImageFault, ASSET_LIMIT, FETCH_LIMIT};
 
 pub const PLATFORM: &str = "agenticos_external";
 pub const MANIFEST_PIN: &str = "agenticos-external-provider-tools@3";
@@ -54,6 +55,14 @@ const MEDIA_POLL_INTERVAL: Duration = Duration::from_secs(10);
 const MEDIA_POLL_DEADLINE: Duration = Duration::from_secs(120);
 const MEDIA_UNCERTAIN_SUBMIT: &str =
     "AgenticOS image submit outcome is uncertain; no automatic retry was made";
+
+/// The exact prompt an image job submits; frozen on the job at admission.
+pub(crate) fn frozen_image_prompt(
+    authority: &Value,
+    input: &Value,
+) -> std::result::Result<String, String> {
+    image_prompt(authority, input)
+}
 
 pub(crate) fn image_plan_preflight(
     inputs: &BTreeMap<String, String>,
@@ -148,7 +157,10 @@ impl AgenticosExternalAdapter {
 
     fn poll_interval(&self) -> Duration {
         #[cfg(feature = "test-seam")]
-        if let Some(interval) = self.test_poll_interval {
+        if let Some(interval) = self
+            .test_poll_interval
+            .or_else(|| test_env_ms("CADENCE_TEST_MEDIA_POLL_MS"))
+        {
             return interval;
         }
         MEDIA_POLL_INTERVAL
@@ -156,7 +168,10 @@ impl AgenticosExternalAdapter {
 
     fn poll_deadline(&self) -> Duration {
         #[cfg(feature = "test-seam")]
-        if let Some(deadline) = self.test_poll_deadline {
+        if let Some(deadline) = self
+            .test_poll_deadline
+            .or_else(|| test_env_ms("CADENCE_TEST_MEDIA_DEADLINE_MS"))
+        {
             return deadline;
         }
         MEDIA_POLL_DEADLINE
@@ -554,6 +569,8 @@ impl AgenticosExternalAdapter {
         })
     }
 
+    /// The pre-CAD-1315 entry (run-bound images): the typed failure folded
+    /// back into the generic refused/uncertain outcome.
     fn call_image(
         &self,
         credential: &[u8],
@@ -561,24 +578,50 @@ impl AgenticosExternalAdapter {
         input: &Value,
         idempotency_key: &str,
     ) -> std::result::Result<AppCapabilityOutput, AppCapabilityError> {
+        self.call_image_coded(credential, authority, input, idempotency_key)
+            .map_err(Into::into)
+    }
+
+    /// Submit (idempotent on `idempotency_key`: AgenticOS replays the same job
+    /// for the same key and body, never a second reserve), poll, fetch. Every
+    /// failure carries an allow-listed [`ImageReason`], classified here by
+    /// type and never from provider text.
+    fn call_image_coded(
+        &self,
+        credential: &[u8],
+        authority: &Value,
+        input: &Value,
+        idempotency_key: &str,
+    ) -> std::result::Result<AppCapabilityOutput, ImageFailure> {
+        use ImageReason as R;
+        let uncertain_submit = || ImageFailure::uncertain(R::SubmitError, MEDIA_UNCERTAIN_SUBMIT);
         if !matches!(
             self.deployment_pin.as_deref(),
             Some(MANIFEST_PIN | TEXT_MANIFEST_PIN)
         ) {
-            return Err(AppCapabilityError::Refused(
-                "image generation has not been approved by this deployment".into(),
+            return Err(ImageFailure::refused(
+                R::NotApproved,
+                "image generation has not been approved by this deployment",
             ));
         }
-        let prompt = image_prompt(authority, input).map_err(AppCapabilityError::Refused)?;
+        // A job admitted by this daemon froze its exact prompt: a restart on a
+        // newer build must replay the byte-identical body under the same key.
+        let prompt = match authority["frozen_prompt"].as_str() {
+            Some(frozen) => frozen.to_owned(),
+            None => image_prompt(authority, input)
+                .map_err(|detail| ImageFailure::refused(R::PlanInvalid, detail))?,
+        };
         // The frozen quote still proves shape (schema/currency/units); its
         // amount is recorded, never enforced as a charge ceiling.
-        let quoted = frozen_charge_ceiling(authority).map_err(AppCapabilityError::Refused)?;
+        let quoted = frozen_charge_ceiling(authority)
+            .map_err(|detail| ImageFailure::refused(R::PlanInvalid, detail))?;
         let token = self
             .lease_token(credential, &authority["binding"]["config"])
-            .map_err(AppCapabilityError::Refused)?;
+            .map_err(|detail| ImageFailure::refused(R::NotApproved, detail))?;
         if !valid_caller_key(idempotency_key) {
-            return Err(AppCapabilityError::Refused(
-                "provider idempotency key is invalid".into(),
+            return Err(ImageFailure::refused(
+                R::PlanInvalid,
+                "provider idempotency key is invalid",
             ));
         }
         let request = self.http.post(format!("{}{MEDIA_SUBMIT_PATH}", self.base));
@@ -589,25 +632,26 @@ impl AgenticosExternalAdapter {
                 "prompt": prompt,
                 "aspectRatio": "1:1",
             }))
-            .map_err(|_| AppCapabilityError::Uncertain(MEDIA_UNCERTAIN_SUBMIT.into()))?;
+            .map_err(|_| uncertain_submit())?;
         let status = response.status().as_u16();
         let bytes = response
             .body_mut()
             .with_config()
             .limit(RESPONSE_CAP)
             .read_to_vec()
-            .map_err(|_| AppCapabilityError::Uncertain(MEDIA_UNCERTAIN_SUBMIT.into()))?;
-        let envelope: Value = serde_json::from_slice(&bytes)
-            .map_err(|_| AppCapabilityError::Uncertain(MEDIA_UNCERTAIN_SUBMIT.into()))?;
+            .map_err(|_| uncertain_submit())?;
+        let envelope: Value = serde_json::from_slice(&bytes).map_err(|_| uncertain_submit())?;
         match status {
             200 | 201 if envelope["ok"] == true => {}
             404 if envelope["ok"] == false => {
-                return Err(AppCapabilityError::Refused(
-                    "AgenticOS media serving is not enabled for this deployment".into(),
+                return Err(ImageFailure::refused(
+                    R::MediaDisabled,
+                    "AgenticOS media serving is not enabled for this deployment",
                 ))
             }
             403 if envelope["ok"] == false => {
-                return Err(AppCapabilityError::Refused(
+                return Err(ImageFailure::refused(
+                    R::NotAuthorized,
                     match refused_code(&envelope).as_str() {
                         "insufficient_scope" => {
                             "AgenticOS connection credential lacks the runtime draft scope".into()
@@ -620,55 +664,72 @@ impl AgenticosExternalAdapter {
                 ))
             }
             402 if envelope["ok"] == false && refused_code(&envelope) == "insufficient_funds" => {
-                return Err(AppCapabilityError::Refused(
-                    "AgenticOS workspace has insufficient credit".into(),
+                return Err(ImageFailure::refused(
+                    R::InsufficientFunds,
+                    "AgenticOS workspace has insufficient credit",
                 ));
             }
             409 | 408 | 425 | 429 => {
-                return Err(AppCapabilityError::Uncertain(format!(
-                    "AgenticOS image submit outcome is uncertain: {}",
-                    refused_code(&envelope)
-                )))
+                let code = refused_code(&envelope);
+                let reason = match (status, code.as_str()) {
+                    (409, "price_changed") => R::PriceChanged,
+                    (409, "uncertain" | "key_conflict") => R::ProviderUncertain,
+                    _ => R::ProviderBusy,
+                };
+                return Err(ImageFailure::uncertain(
+                    reason,
+                    format!("AgenticOS image submit outcome is uncertain: {code}"),
+                ));
             }
-            s if s >= 500 => {
-                return Err(AppCapabilityError::Uncertain(MEDIA_UNCERTAIN_SUBMIT.into()))
-            }
+            s if s >= 500 => return Err(uncertain_submit()),
             s if (400..500).contains(&s) && envelope["ok"] == false => {
-                return Err(AppCapabilityError::Refused(format!(
-                    "AgenticOS image submit refused: {}",
-                    refused_code(&envelope)
-                )))
+                return Err(ImageFailure::refused(
+                    R::SubmitRefused,
+                    format!(
+                        "AgenticOS image submit refused: {}",
+                        refused_code(&envelope)
+                    ),
+                ))
             }
-            _ => return Err(AppCapabilityError::Uncertain(MEDIA_UNCERTAIN_SUBMIT.into())),
+            _ => return Err(uncertain_submit()),
         }
         let mut job = envelope["data"]["job"].clone();
-        checked_media_job(&job, None).map_err(AppCapabilityError::Uncertain)?;
+        checked_media_job(&job, None)
+            .map_err(|detail| ImageFailure::uncertain(R::JobMalformed, detail))?;
         let deadline = Instant::now() + self.poll_deadline();
         loop {
             let id = job["id"].as_str().unwrap_or_default().to_owned();
             match job["status"].as_str().unwrap_or("") {
                 "succeeded" => break,
                 "failed" | "released" => {
-                    return Err(AppCapabilityError::Uncertain(format!(
-                        "AgenticOS image job {id} ended without a retained image; no automatic retry was made"
-                    )))
+                    return Err(ImageFailure::uncertain(
+                        R::JobFailed,
+                        format!(
+                            "AgenticOS image job {id} ended without a retained image; no automatic retry was made"
+                        ),
+                    ))
                 }
                 "uncertain" => {
-                    return Err(AppCapabilityError::Uncertain(format!(
-                        "AgenticOS image job {id} needs reconciliation"
-                    )))
+                    return Err(ImageFailure::uncertain(
+                        R::ProviderUncertain,
+                        format!("AgenticOS image job {id} needs reconciliation"),
+                    ))
                 }
                 "admitting" | "submitted" | "queued" | "running" => {}
                 _ => {
-                    return Err(AppCapabilityError::Uncertain(
-                        "AgenticOS media job status is unknown".into(),
+                    return Err(ImageFailure::uncertain(
+                        R::JobMalformed,
+                        "AgenticOS media job status is unknown",
                     ))
                 }
             }
             if Instant::now() >= deadline {
-                return Err(AppCapabilityError::Uncertain(format!(
-                    "AgenticOS image job {id} is still running; no automatic retry was made"
-                )));
+                return Err(ImageFailure::uncertain(
+                    R::PollTimeout,
+                    format!(
+                        "AgenticOS image job {id} is still running; no automatic retry was made"
+                    ),
+                ));
             }
             std::thread::sleep(self.poll_interval());
             let url = format!("{}{MEDIA_JOBS_PATH}{id}", self.base);
@@ -686,20 +747,29 @@ impl AgenticosExternalAdapter {
                 if status >= 500 {
                     continue;
                 }
-                return Err(AppCapabilityError::Uncertain(format!(
-                    "AgenticOS image job status could not be confirmed: {}",
-                    refused_code(&envelope)
-                )));
+                return Err(ImageFailure::uncertain(
+                    if matches!(status, 408 | 425 | 429) {
+                        R::ProviderBusy
+                    } else {
+                        R::ProviderUncertain
+                    },
+                    format!(
+                        "AgenticOS image job status could not be confirmed: {}",
+                        refused_code(&envelope)
+                    ),
+                ));
             }
             job = envelope["data"]["job"].clone();
-            checked_media_job(&job, Some(&id)).map_err(AppCapabilityError::Uncertain)?;
+            checked_media_job(&job, Some(&id))
+                .map_err(|detail| ImageFailure::uncertain(R::JobMalformed, detail))?;
         }
         let id = job["id"].as_str().unwrap_or_default().to_owned();
         let artifacts = job["artifacts"].as_array().cloned().unwrap_or_default();
         if artifacts.is_empty() {
-            return Err(AppCapabilityError::Uncertain(format!(
-                "AgenticOS image job {id} succeeded without a retained artifact"
-            )));
+            return Err(ImageFailure::uncertain(
+                R::ArtifactUnavailable,
+                format!("AgenticOS image job {id} succeeded without a retained artifact"),
+            ));
         }
         let artifact = &artifacts[0];
         let artifact_ref = artifact["ref"].as_str().unwrap_or_default();
@@ -712,20 +782,25 @@ impl AgenticosExternalAdapter {
                 .unwrap_or(true)
             || artifact_bytes.is_none()
         {
-            return Err(AppCapabilityError::Uncertain(
-                "AgenticOS media artifact descriptor is malformed".into(),
+            return Err(ImageFailure::uncertain(
+                R::ArtifactMismatch,
+                "AgenticOS media artifact descriptor is malformed",
             ));
         }
+        let unconfirmed = || {
+            ImageFailure::uncertain(
+                R::ArtifactUnavailable,
+                "AgenticOS media artifact could not be confirmed",
+            )
+        };
         let request = self
             .http
             .get(format!("{}{MEDIA_ARTIFACTS_PATH}{artifact_ref}", self.base));
-        let mut response = authorized(request, token).call().map_err(|_| {
-            AppCapabilityError::Uncertain("AgenticOS media artifact could not be confirmed".into())
-        })?;
+        let mut response = authorized(request, token)
+            .call()
+            .map_err(|_| unconfirmed())?;
         if response.status().as_u16() != 200 {
-            return Err(AppCapabilityError::Uncertain(
-                "AgenticOS media artifact could not be confirmed".into(),
-            ));
+            return Err(unconfirmed());
         }
         let header = response
             .headers()
@@ -736,26 +811,48 @@ impl AgenticosExternalAdapter {
         let asset_bytes = response
             .body_mut()
             .with_config()
-            .limit(ASSET_LIMIT as u64 + 1)
+            .limit(FETCH_LIMIT as u64 + 1)
             .read_to_vec()
             .map_err(|_| {
-                AppCapabilityError::Uncertain(
-                    "AgenticOS media artifact exceeds the custody bound".into(),
+                ImageFailure::uncertain(
+                    R::ArtifactTooLarge,
+                    "AgenticOS media artifact exceeds the custody bound",
                 )
             })?;
         if asset_bytes.len() as u64 != artifact_bytes.unwrap_or_default() {
-            return Err(AppCapabilityError::Uncertain(
-                "AgenticOS media artifact byte count differs from its receipt".into(),
+            return Err(ImageFailure::uncertain(
+                R::ArtifactMismatch,
+                "AgenticOS media artifact byte count differs from its receipt",
             ));
         }
         if format!("{:x}", Sha256::digest(&asset_bytes)) != artifact_digest {
-            return Err(AppCapabilityError::Uncertain(
-                "AgenticOS media artifact digest differs from its receipt".into(),
+            return Err(ImageFailure::uncertain(
+                R::ArtifactMismatch,
+                "AgenticOS media artifact digest differs from its receipt",
             ));
         }
-        let media_type =
-            image_mime(&asset_bytes, &header).map_err(AppCapabilityError::Uncertain)?;
-        let digest = format!("sha256:{artifact_digest}");
+        let fault = |(fault, detail): (ImageFault, &str)| {
+            ImageFailure::uncertain(
+                match fault {
+                    ImageFault::Unsupported => R::UnsupportedImage,
+                    ImageFault::NotSquare => R::NotSquare,
+                    ImageFault::Decode => R::DecodeFailed,
+                    ImageFault::TooLarge => R::ArtifactTooLarge,
+                },
+                detail,
+            )
+        };
+        let mut media_type = image_checked(&asset_bytes, &header).map_err(fault)?;
+        // The original is proven against the AgenticOS descriptor above; what
+        // is retained must fit custody, so a larger one is re-encoded.
+        let asset_bytes = if asset_bytes.len() > ASSET_LIMIT {
+            let jpeg = fit_to_custody(&asset_bytes).map_err(fault)?;
+            media_type = image_checked(&jpeg, "image/jpeg").map_err(fault)?;
+            jpeg
+        } else {
+            asset_bytes
+        };
+        let digest = format!("sha256:{:x}", Sha256::digest(&asset_bytes));
         let charge_minor = job["price"]["chargeMinor"].as_u64().unwrap_or_default();
         let result = json!({
             "schema":1,"kind":"media.generated.image","provider":PLATFORM,
@@ -777,6 +874,16 @@ impl AgenticosExternalAdapter {
             }),
         })
     }
+}
+
+/// Test-seam builds only: an integration test shortens the media timings
+/// through the environment (the daemon builds its own adapter).
+#[cfg(feature = "test-seam")]
+fn test_env_ms(name: &str) -> Option<Duration> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_millis)
 }
 
 /// The hosted lease door takes no bearer; the external door always has one.
@@ -1255,6 +1362,22 @@ impl PlatformAdapter for AgenticosExternalAdapter {
                 "AgenticOS capability slot has no reviewed execution adapter".into(),
             )),
         }
+    }
+
+    fn execute_app_image(
+        &self,
+        credential: &[u8],
+        authority: &Value,
+        input: &Value,
+        idempotency_key: &str,
+    ) -> std::result::Result<AppCapabilityOutput, ImageFailure> {
+        if authority["binding"]["config"]["mapping"]["capability"] != "media.generate" {
+            return Err(ImageFailure::refused(
+                ImageReason::NotApproved,
+                "AgenticOS capability slot has no reviewed image adapter",
+            ));
+        }
+        self.call_image_coded(credential, authority, input, idempotency_key)
     }
 
     fn table(&self) -> &ToolTable {
@@ -2358,8 +2481,8 @@ mod tests {
                 json!("med_other.5c1480e7e57bb317cfc0431d6b0b2457815986cd9f55b8d07a1c6c9c24e1b697");
             entry
         };
-        // Past the custody bound the artifact read is refused at the cap.
-        let big = vec![0u8; image::ASSET_LIMIT + 1];
+        // Past what AgenticOS itself imports the artifact read is refused at the cap.
+        let big = vec![0u8; image::FETCH_LIMIT + 1];
         let oversized_entry = artifact_entry("med_job1", &big);
         for (entry, bytes, needle) in [
             (oversized_entry, big, "custody bound"),

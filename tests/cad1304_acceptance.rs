@@ -36,12 +36,14 @@ use cadence_agent::test_seam::{scoped, Asserted, Seam};
 use cadence_agent::{client, daemon};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+#[path = "fixtures/aos_media_door.rs"]
+mod aos_media_door;
 
 const HOSTED: &str = r#"{"schema":1,"providers":[{"provider":"agenticos_external","origin":"http://api.internal","manifest_pin":"agenticos-external-provider-tools@3","transport":"hosted-media-lease@1"}]}"#;
 const PREFIX: &str = "/v1/runtime/connectors/hosted-publish";
@@ -57,25 +59,14 @@ type Seen = Arc<Mutex<Vec<(String, String)>>>;
 
 #[derive(Default)]
 struct Door {
-    /// `job id -> png bytes`, served at `/media/artifacts/<job>.<digest>`.
-    artifacts: Mutex<HashMap<String, Vec<u8>>>,
+    /// The AgenticOS media door in its real job shape (CAD-1315).
+    media: aos_media_door::MediaDoor,
     /// Digest query and body hash of every media import, in order.
     imports: Mutex<Vec<(String, String)>>,
     /// Publish and preflight bodies, in order.
     sends: Mutex<Vec<Value>>,
-    jobs: AtomicUsize,
     /// When set, media import answers with a receipt for other bytes.
     lie: AtomicBool,
-}
-
-/// A distinct 1x1 PNG per `n`.
-fn png(n: u8) -> Vec<u8> {
-    use image::ImageEncoder as _;
-    let mut bytes = Vec::new();
-    image::codecs::png::PngEncoder::new(&mut bytes)
-        .write_image(&[n], 1, 1, image::ExtendedColorType::L8)
-        .unwrap();
-    bytes
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -178,30 +169,12 @@ fn serve(stream: std::net::TcpStream, log: &Seen, door: &Door) {
             json!({"ok":true,"data":{"slug":"read_instagram_posts","repeated":false,"price":price,"result":{"success":true,"status":"ok","user":{"username":HANDLE,"is_private":false},"items":[{"id":"post-1","code":"AbCd123","created_at":"2026-09-27T00:00:00Z","caption":{"text":"Door caption"}}]}}}),
         ),
         // ---- image generation (media door) ----
-        ("GET", "/v1/runtime/media/price/image") => json_reply(
-            json!({"ok":true,"data":{"kind":"image","model":"openai/gpt-image-2.5","price":{"slug":"generate_image","chargeMinor":31500,"currency":"USD","version":"2026-09-29T00:00:00.000Z"}}}),
-        ),
-        ("POST", "/v1/runtime/media/image") => {
-            let n = door.jobs.fetch_add(1, SeqCst) as u8 + 1;
-            let bytes = png(n);
-            let digest = hex(&bytes);
-            let job_id = format!("med_job{n}");
-            let reference = format!("{job_id}.{digest}");
-            door.artifacts
-                .lock()
-                .unwrap()
-                .insert(reference.clone(), bytes.clone());
-            json_reply(
-                json!({"ok":true,"data":{"job":{"id":job_id,"kind":"image","status":"succeeded","model":"openai/gpt-image-2.5","provider":"upstream-fixture","providerTaskId":null,
-                    "artifacts":[{"ref":reference,"digest":digest,"bytes":bytes.len(),"mime":"image/png"}],"artifactError":null,"usage":{"providerCredits":null},
-                    "price":{"slug":"generate_image","chargeMinor":31500,"currency":"USD","version":"2026-09-29T00:00:00.000Z"},
-                    "repeated":false,"cached":false,"stale":false}}}),
-            )
-        }
-        ("GET", artifact) if artifact.starts_with("/v1/runtime/media/artifacts/") => {
-            let reference = &artifact["/v1/runtime/media/artifacts/".len()..];
-            match door.artifacts.lock().unwrap().get(reference) {
-                Some(bytes) => raw(200, "image/png", bytes),
+        (m, r) if r.starts_with("/v1/runtime/media/") => {
+            match door
+                .media
+                .reply(m, r, header("idempotency-key").as_deref(), &body)
+            {
+                Some((status, content_type, bytes)) => raw(status, content_type, &bytes),
                 None => raw(404, "application/json", b"{}"),
             }
         }
@@ -355,6 +328,7 @@ impl Fx {
             "http://127.0.0.1:3010".into(),
         );
         std::env::set_var("ALL_PROXY", format!("http://{door_addr}"));
+        std::env::set_var("CADENCE_TEST_MEDIA_POLL_MS", "20");
         let handle = std::thread::spawn(move || daemon::serve_with(&dir, opts));
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         while client::rpc_timeout(&fx.dir(), "health", json!({}), Duration::from_secs(2)).is_err()
@@ -493,6 +467,35 @@ impl Fx {
         (receipt, post)
     }
 
+    /// Poll the draft listing until the image intent completes; returns its
+    /// receipt id.
+    fn image_receipt(&self, draft: &str) -> String {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let listed = self
+                .screen(
+                    "app_social_draft_list",
+                    json!({"tool_alias": "social.draft"}),
+                )
+                .unwrap_or_else(|e| panic!("list: {e}"));
+            let done = listed["generation_intents"].as_array().and_then(|rows| {
+                rows.iter().find(|row| {
+                    row["scope"]["draft_id"] == draft
+                        && row["scope"]["operation"] == "image"
+                        && row["state"] == "completed"
+                })
+            });
+            if let Some(row) = done {
+                return row["receipt_id"].as_str().unwrap().to_string();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "image never completed: {listed}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// Draft a caption from that post, generate the image and attach it.
     /// Returns `(draft_id, revision, asset_id)`.
     fn draft_with_image(&self, tag: &str, source: &(String, String)) -> (String, i64, String) {
@@ -514,10 +517,13 @@ impl Fx {
                     "generation_scope": {"operation": "image", "draft_id": draft, "revision": 1}}),
             )
             .unwrap_or_else(|e| panic!("generate image: {e}"));
-        let asset = generated["receipt"]["id"]
-            .as_str()
-            .unwrap_or_else(|| panic!("no image receipt: {generated}"))
-            .to_string();
+        // CAD-1315: the call returns at once with the intent pending; the
+        // host worker settles it against the media door's real job shape.
+        assert_eq!(
+            generated["generation_intent"]["state"], "pending",
+            "image generation must queue, not block: {generated}"
+        );
+        let asset = self.image_receipt(&draft);
         let attached = self
             .screen(
                 "app_social_draft_update",
