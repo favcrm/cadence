@@ -131,42 +131,33 @@ impl Shared {
         const VERB: &str = "approval record shown";
         self.operator_connection(VERB, params, peer_pid)?;
         let deny = |why: String| Error::rejected(format!("{VERB}: {why}"));
-        for field in ["source", "action", "id", "delegated", "by", "recorded_via"] {
-            if params.get(field).is_some() {
-                return Err(deny(format!(
-                    "request field '{field}' is not accepted — the daemon derives it"
-                )));
-            }
-        }
         let actor = request_actor(params)?;
         let pr = params
             .get("pr")
             .and_then(Value::as_u64)
             .filter(|n| *n > 0)
             .ok_or_else(|| Error::rejected("Missing or non-numeric 'pr'"))?;
-        let head = required_str(params, "head")?;
-        if head.len() != 40
-            || !head
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        {
-            return Err(deny(
-                "head must be the full 40-character lowercase hexadecimal SHA".into(),
-            ));
-        }
+        let head = full_head(params, VERB)?;
         let pm = self.pm()?;
-        let repo = self.project_repo(&pm, params, VERB)?;
+        // The approver rule first: an off-list actor learns nothing about
+        // which repos are registered.
         let source = approver_source(&pm.config, &actor)?;
+        let repo = self.project_repo(&pm, params, VERB)?;
         let gh_bin = self.delivery_gh.to_string_lossy().to_string();
         let view = crate::delivery::pr_view(&gh_bin, &repo, pr)
             .map_err(|e| deny(format!("reading the PR failed, nothing was approved — {e}")))?;
         let live = view["headRefOid"].as_str().unwrap_or_default();
-        if live != head || view["state"].as_str() != Some("OPEN") {
+        if view["state"].as_str() != Some("OPEN") {
+            return Err(Error::invalid(
+                "head_moved",
+                "the PR is no longer open (merged or closed) — nothing was approved",
+            ));
+        }
+        if live != head {
             return Err(Error::invalid(
                 "head_moved",
                 format!(
-                    "the PR head moved or the PR is no longer open (shown {}…, now {}…) — \
-                     re-review before approving",
+                    "the PR head moved (shown {}…, now {}…) — re-review before approving",
                     &head[..12],
                     live.chars().take(12).collect::<String>()
                 ),
@@ -224,17 +215,17 @@ impl Shared {
             .and_then(Value::as_u64)
             .filter(|n| *n > 0)
             .ok_or_else(|| Error::rejected("Missing or non-numeric 'pr'"))?;
-        let head = required_str(params, "head")?;
+        let head = full_head(params, VERB)?;
         let pm = self.pm()?;
-        let repo = self.project_repo(&pm, params, VERB)?;
         approver_source(&pm.config, &actor)?;
+        let repo = self.project_repo(&pm, params, VERB)?;
         let (seen, _) = crate::audit::approval_check(&self.state_dir, &repo, pr, head);
         match seen["state"].as_str() {
             Some("in-force") => Ok(json!({
                 "state": "in-force",
                 "approval_id": seen["approval_id"],
                 "board_revocable": store::board_revocable(&json!({
-                    "action": "merge",
+                    "action": seen["action"],
                     "recorded_via": seen["recorded_via"],
                     "source": seen["source"],
                 })),
@@ -601,6 +592,21 @@ pub(super) fn approver_source(
         ));
     }
     Ok(format!("{request_actor} via board"))
+}
+
+/// `head` of `params`: the full 40-character lowercase hexadecimal SHA.
+fn full_head<'a>(params: &'a Value, verb: &str) -> Result<&'a str> {
+    let head = required_str(params, "head")?;
+    if head.len() != 40
+        || !head
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(Error::rejected(format!(
+            "{verb}: head must be the full 40-character lowercase hexadecimal SHA"
+        )));
+    }
+    Ok(head)
 }
 
 /// A project's GitHub repos as lowercase `owner/name`, from each repo's

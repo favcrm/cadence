@@ -120,7 +120,6 @@ fn signed_in(board: &Board, token: &str, who: &str) {
 // ---------------------------------------------------------------------
 
 #[test]
-#[ignore = "CAD-1300: enabled by the implementation"]
 fn cad1300_publish_after_a_revoked_board_approval_is_refused() {
     let root = tempfile::Builder::new().prefix("c1300r").tempdir().unwrap();
     let board = Board::start(root.path());
@@ -257,7 +256,6 @@ fn cad1300_publish_after_a_revoked_board_approval_is_refused() {
 }
 
 #[test]
-#[ignore = "CAD-1300: enabled by the implementation"]
 fn cad1300_publish_first_then_approve_is_refused() {
     let root = tempfile::Builder::new().prefix("c1300c").tempdir().unwrap();
     let board = Board::start(root.path());
@@ -357,7 +355,6 @@ fn bounded_owner_source(seen: &Value, name: &str, email: &str) -> String {
 }
 
 #[test]
-#[ignore = "CAD-1300: enabled by the implementation"]
 fn cad1300_owner_with_a_long_actor_is_admitted() {
     let root = tempfile::Builder::new().prefix("c1300o").tempdir().unwrap();
     let board = Board::start(root.path());
@@ -559,7 +556,6 @@ fn cad1300_owner_with_a_long_actor_is_admitted() {
 // ---------------------------------------------------------------------
 
 #[test]
-#[ignore = "CAD-1300: enabled by the implementation"]
 fn cad1300_approver_refusal_is_403_and_no_repo_oracle() {
     let root = tempfile::Builder::new().prefix("c1300m").tempdir().unwrap();
     let board = Board::start(root.path());
@@ -681,7 +677,6 @@ fn cad1300_approver_refusal_is_403_and_no_repo_oracle() {
 // ---------------------------------------------------------------------
 
 #[test]
-#[ignore = "CAD-1300: enabled by the implementation"]
 fn cad1300_reachable_second_layers() {
     // --- the predicate, one field at a time ---
     let board_record = json!({
@@ -792,7 +787,6 @@ fn non_ascii_owner_source(seen: &Value, email: &str) -> String {
 }
 
 #[test]
-#[ignore = "CAD-1300: enabled by the implementation"]
 fn cad1300_owner_with_a_non_ascii_name_is_admitted() {
     let root = tempfile::Builder::new().prefix("c1300u").tempdir().unwrap();
     let board = Board::start(root.path());

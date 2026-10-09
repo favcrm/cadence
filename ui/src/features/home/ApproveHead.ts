@@ -21,29 +21,32 @@ export type ApprovalState = "unknown" | "missing" | "in-force" | "revoked";
  * and taking it back. The state is read when the drawer opens and after
  * each action, so an approval made earlier shows as approved. Records
  * only: the daemon re-reads the version and refuses a moved one, a repeat,
- * or a caller that is not the operator. While `blocked` (read-only board)
- * no request is made.
+ * or a caller that is not the operator. The state read is a GET, so it runs
+ * on a read-only board too.
  */
-export function useApproveHead(pr: string | null, head: string | null, blocked: boolean) {
+export function useApproveHead(pr: string | null, head: string | null) {
   const target = prTarget(pr);
   const [state, setState] = useState<ApprovalState>("unknown");
   const [approval, setApproval] = useState<string | null>(null);
   const [revocable, setRevocable] = useState(false);
   const [busy, setBusy] = useState<null | "approve" | "revoke">(null);
   const [error, setError] = useState<string | null>(null);
+  const [member, setMember] = useState(false);
   const repo = target?.repo;
   const number = target?.number;
   const read = useCallback(async () => {
-    if (!repo || !number || !head || blocked) return;
+    if (!repo || !number || !head) return;
     try {
       const out = await api.approvalState(repo, number, head);
       setState(out.state);
       setApproval(out.state === "missing" ? null : (out.approval_id ?? null));
       setRevocable(out.state === "in-force" && out.board_revocable === true);
-    } catch {
+    } catch (e) {
       setState("unknown");
+      // A hosted member may not decide: the read says so before any click.
+      if (e instanceof ApiError && (e.check ?? e.code) === "member_role") setMember(true);
     }
-  }, [repo, number, head, blocked]);
+  }, [repo, number, head]);
   useEffect(() => {
     void read();
   }, [read]);
@@ -75,8 +78,11 @@ export function useApproveHead(pr: string | null, head: string | null, blocked: 
     /** Only an approval a board path recorded can be taken back here. */
     revocable,
     revoked: state === "revoked",
+    /** A hosted member session: Approve and Publish are the owner's. */
+    member,
     busy,
     error,
+    clearError: () => setError(null),
     approve,
     revoke,
   };

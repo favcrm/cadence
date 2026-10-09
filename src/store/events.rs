@@ -172,12 +172,16 @@ pub(crate) fn event_store_stats(
     })
 }
 
+/// How an approval-evidence writer was authorized — the daemon's own
+/// statement, stamped on every record (CAD-217).
+pub const APPROVAL_RECORDED_VIA: &str = "operator-connection";
+
 /// CAD-1218: may the board revoke this approval record — one a board path
 /// wrote: action `merge`, `recorded_via` operator-connection, and a source
 /// ending ` via board`. The revoke target rule and the state read share it.
 pub fn board_revocable(record: &Value) -> bool {
     record["action"] == "merge"
-        && record["recorded_via"] == "operator-connection"
+        && record["recorded_via"] == APPROVAL_RECORDED_VIA
         && record["source"]
             .as_str()
             .is_some_and(|s| s.ends_with(" via board"))
@@ -725,6 +729,49 @@ impl Store {
                 "scope": scope,
                 "recorded_via": recorded_via,
             });
+            Self::append_approval(&tx, &stream, &base, payload)
+        })
+    }
+
+    /// CAD-1300: a board Publish's approval — one record per `(repo, pr,
+    /// head)` from every board path. A standing merge record is reused
+    /// (Approve then Publish, or a retry after a failed enqueue); a head
+    /// with any other record, revoked included, is refused; otherwise a
+    /// new record is appended. One transaction. Answers the approval id.
+    pub fn record_or_reuse_board_approval(
+        &self,
+        a: &NewApproval,
+        recorded_via: &str,
+    ) -> Result<String> {
+        approval_source(a.source)?;
+        approval_head(a.head_sha)?;
+        approval_repo(a.repo)?;
+        let scope = json!({"repo": a.repo, "pr": a.pr});
+        let head = json!(a.head_sha);
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let stream = Self::approval_stream(&tx)?;
+            let fields = [("scope", &scope), ("head_sha", &head)];
+            if let Some(id) = Self::standing(&stream, "merge", &fields) {
+                return Ok(id);
+            }
+            let on_record = stream.iter().any(|(k, p, _)| {
+                k == APPROVAL_RECORDED_EVENT && p["scope"] == scope && p["head_sha"] == head
+            });
+            if on_record {
+                return Err(Error::rejected(
+                    "this head's board approval was revoked — one approval record per head; \
+                     re-approve it with `cadence audit approve` or push a new head",
+                ));
+            }
+            let payload = json!({
+                "source": a.source,
+                "action": a.action,
+                "head_sha": a.head_sha,
+                "scope": scope,
+                "recorded_via": recorded_via,
+            });
+            let base = default_approval_id(a.action, a.pr, a.head_sha);
             Self::append_approval(&tx, &stream, &base, payload)
         })
     }

@@ -466,24 +466,42 @@ impl BoardUser {
     }
 
     /// The display/audit actor: `Fable Chen <fable@example.com> (board)`,
-    /// printable-ASCII only — it lands in commit `Actor:` trailers.
+    /// printable-ASCII only — it lands in commit `Actor:` trailers — and at
+    /// most [`ACTOR_MAX`] characters, so the record's `"<actor> via board"`
+    /// source fits the store's 200 (CAD-1300). A name with no ASCII
+    /// characters shows the handle. An email over 100 characters keeps its
+    /// first 91, `~` and 8 hex digits of the sha256 of the full email (so
+    /// two long emails stay distinct); the name is cut to the room left.
     pub fn actor(&self) -> String {
         let clean = |raw: &str| -> String {
             raw.chars()
                 .filter(|c| c.is_ascii() && !c.is_ascii_control() && *c != '<' && *c != '>')
-                .take(120)
                 .collect::<String>()
                 .trim()
                 .to_string()
         };
-        let (name, email) = (clean(&self.name), clean(&self.email));
-        match (name.is_empty(), email.is_empty()) {
-            (false, false) => format!("{name} <{email}> (board)"),
-            (false, true) => format!("{name} (board)"),
-            _ => format!("{} (board)", self.handle),
+        let mut email = clean(&self.email);
+        if email.len() > 100 {
+            email = format!("{}~{}", &email[..91], &digest(&self.email)[..8]);
         }
+        let name = match clean(&self.name) {
+            n if n.is_empty() => self.handle.clone(),
+            n => n,
+        };
+        let email_part = if email.is_empty() {
+            String::new()
+        } else {
+            format!(" <{email}>")
+        };
+        let room = ACTOR_MAX - " (board)".len() - email_part.len();
+        let name = name.get(..room).unwrap_or(&name).trim_end();
+        format!("{name}{email_part} (board)")
     }
 }
+
+/// Longest rendered [`BoardUser::actor`]: with `" via board"` it fits the
+/// store's 200-character source limit.
+const ACTOR_MAX: usize = 190;
 
 /// One stored session: the token's hash and what `ui sessions` shows.
 #[derive(Clone, Debug, Serialize, Deserialize)]
