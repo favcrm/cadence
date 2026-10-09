@@ -392,6 +392,88 @@ pub fn read_project_md(pm_dir: &Path, key: &str) -> Result<Option<String>> {
         .map_err(|e| Error::rejected(format!("cannot read {}: {e}", file.display())))
 }
 
+/// Add a delivery policy while preserving unrelated frontmatter bytes
+/// and the Markdown body. Only the existing top-level delivery section
+/// is replaced; the surrounding YAML is left untouched.
+pub fn with_delivery_policy(
+    text: Option<&str>,
+    policy: &crate::issue::delivery_policy::DeliveryPolicy,
+) -> Result<String> {
+    let text = text.unwrap_or_default();
+    let (bom, trimmed) = text
+        .strip_prefix('\u{feff}')
+        .map(|rest| ("\u{feff}", rest))
+        .unwrap_or(("", text));
+    let (yaml, body) = if trimmed.starts_with("---\n") || trimmed.starts_with("---\r\n") {
+        parse::split_front(trimmed)?
+    } else {
+        ("", trimmed)
+    };
+    let mut front: serde_yaml::Value = if yaml.trim().is_empty() {
+        serde_yaml::Value::Mapping(serde_yaml::Mapping::new())
+    } else {
+        serde_yaml::from_str(yaml).map_err(|e| {
+            Error::rejected(format!("PROJECT.md frontmatter: {}", scrub(&e.to_string())))
+        })?
+    };
+    let Some(mapping) = front.as_mapping_mut() else {
+        return Err(Error::rejected(
+            "PROJECT.md frontmatter must be a mapping to enable lean delivery",
+        ));
+    };
+    let key = serde_yaml::Value::String("delivery".into());
+    let existed = mapping.contains_key(&key);
+    let value = serde_yaml::to_value(policy)
+        .map_err(|e| Error::internal(format!("cannot encode delivery policy: {e}")))?;
+    mapping.insert(key.clone(), value);
+    let mut section_doc = serde_yaml::Mapping::new();
+    section_doc.insert(key, mapping["delivery"].clone());
+    let section = serde_yaml::to_string(&serde_yaml::Value::Mapping(section_doc))
+        .map_err(|e| Error::internal(format!("cannot encode delivery policy: {e}")))?;
+    let updated_yaml = if existed {
+        let mut start = None;
+        let mut end = None;
+        let mut offset = 0;
+        for line in yaml.split_inclusive('\n') {
+            let content = line.trim_end_matches(['\r', '\n']);
+            if start.is_none() && content.starts_with("delivery:") {
+                start = Some(offset);
+            } else if start.is_some()
+                && !content.is_empty()
+                && !content.starts_with(' ')
+                && !content.starts_with('\t')
+                && !content.starts_with('#')
+            {
+                end = Some(offset);
+                break;
+            }
+            offset += line.len();
+        }
+        let start = start.ok_or_else(|| {
+            Error::rejected("cannot safely replace the existing delivery frontmatter key")
+        })?;
+        let end = end.unwrap_or(yaml.len());
+        let comments = yaml[start..end]
+            .split_inclusive('\n')
+            .filter(|line| line.trim_start().starts_with('#'))
+            .collect::<String>();
+        format!("{}{}{}{}", &yaml[..start], section, comments, &yaml[end..])
+    } else if yaml.is_empty() {
+        section
+    } else if yaml.ends_with('\n') {
+        format!("{yaml}{section}")
+    } else {
+        format!("{yaml}\n{section}")
+    };
+    let updated = format!("{bom}---\n{updated_yaml}---\n\n{body}");
+    if crate::issue::delivery_policy::parse(&updated)?.as_ref() != Some(policy) {
+        return Err(Error::rejected(
+            "updated PROJECT.md does not contain the intended delivery policy",
+        ));
+    }
+    Ok(updated)
+}
+
 /// Lenient load for readers: a bad file reads as the defaults plus the
 /// error, which views surface as `config_error` and lint warns about.
 pub fn load_config_or_default(pm_dir: &Path, key: &str) -> (WorkConfig, Option<String>) {

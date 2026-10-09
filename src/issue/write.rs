@@ -206,11 +206,39 @@ pub(crate) fn sets_done(pairs: &[String]) -> bool {
 }
 
 /// Write `text` to `path` atomically (temp file + rename).
-fn atomic_write(path: &Path, text: &str) -> Result<()> {
-    let tmp = path.with_extension("md.tmp");
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+pub(crate) fn atomic_write(path: &Path, text: &str) -> Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let permissions = std::fs::metadata(path).ok().map(|meta| meta.permissions());
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let (tmp, mut file) = loop {
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = parent.join(format!(".cadence-write-{}-{seq}.tmp", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(file) => break (tmp, file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    };
+    let result = (|| -> std::io::Result<()> {
+        file.write_all(text.as_bytes())?;
+        if let Some(permissions) = permissions {
+            file.set_permissions(permissions)?;
+        }
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(tmp);
+    }
+    result.map_err(Into::into)
 }
 
 /// A tracker file's bytes before this write touches it — `None` when

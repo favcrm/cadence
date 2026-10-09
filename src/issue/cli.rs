@@ -764,6 +764,13 @@ pub enum ProjectAction {
         /// Project key.
         key: String,
     },
+    /// Enable the installed version-1 solo-operator delivery profile.
+    /// Only default-equivalent delivery policies are accepted; the
+    /// daemon writes and approves the resulting policy as the operator.
+    EnableLean {
+        /// Registered project key.
+        key: String,
+    },
 }
 
 pub(crate) fn print_json(value: &Value) {
@@ -828,6 +835,15 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                     state_dir,
                     "project_work_approve",
                     json!({"project": key}),
+                )?);
+                Ok(0)
+            }
+            ProjectAction::EnableLean { key } => {
+                model::check_key(key)?;
+                print_json(&crate::client::rpc(
+                    state_dir,
+                    "project_enable_lean",
+                    json!({"key": key}),
                 )?);
                 Ok(0)
             }
