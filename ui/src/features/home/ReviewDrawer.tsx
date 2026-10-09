@@ -176,7 +176,7 @@ function PlanReview({ need, readOnly, index, total, onDone, onClose, onAsk }: Re
   const p = usePlanDecision(epic, block, (_, state) => onDone(need.key, state === "rejected" ? "Sent back" : "Plan approved"));
   const view = p.view;
   const open = view?.state === "proposed";
-  const title = view?.title ?? "Plan";
+  const title = view?.title ?? need.shortTitle ?? "Plan";
   const lead = firstSentence(view?.goal);
   const body = !p.detail ? (
     <p className="rv-note">{p.state.status === "failed" ? "This plan could not be read." : "Reading the plan…"}</p>
@@ -365,7 +365,7 @@ function MergeReview({ need, readOnly, index, total, onDone, onClose }: ReviewPr
     <Shell
       need={need}
       verb="Approve change"
-      title={issue?.title ?? "Publish a change"}
+      title={issue?.title ?? need.shortTitle ?? "Publish a change"}
       subtitle={`Ready ${waiting(need)}`}
       onClose={onClose}
       body={

@@ -1306,6 +1306,10 @@ pre {
   line-height: 1.3;
 }
 .todo-meta {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   margin-top: .0625rem;
   color: var(--color-ink-500);
   font-size: var(--text-label);

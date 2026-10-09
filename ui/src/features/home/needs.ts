@@ -60,6 +60,9 @@ export interface HomeNeed {
   /** Short chip label. */
   label: string;
   title: string;
+  /** The server's plain-words card title and reason, when it sent them (CAD-1219). */
+  shortTitle: string | null;
+  why: string | null;
   /** Who the item belongs to / who is waiting. */
   owner: string;
   /** Seconds waiting. */
@@ -146,6 +149,8 @@ export function homeNeed(row: NeedsMe, index = 0): HomeNeed {
     kind: row.kind,
     label: LABEL[row.kind] ?? row.kind.replace(/_/g, " "),
     title: row.title,
+    shortTitle: str(row.short_title),
+    why: str(row.why),
     age: row.age,
     project: str(row.project),
     subject: row.subject ?? null,
@@ -482,7 +487,7 @@ export function ageWords(secs: number): string {
 /** The card's one meta line: where · how long. */
 export function metaLine(need: HomeNeed): string {
   const where = need.project && need.project !== "all" ? need.project : null;
-  return [where, ageWords(need.age)].filter(Boolean).join(" · ");
+  return [need.why, where, ageWords(need.age)].filter(Boolean).join(" · ");
 }
 
 /** A short sentence from free text — headings and markdown markers dropped. */

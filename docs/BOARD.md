@@ -1679,6 +1679,10 @@ payload at read time — nothing is stored; `cadence overview [--json]
 
 **Needs me** — one row per subject, ranked by urgency then age, each with
 `{kind, title, age, project, link, command, audience, audience_reason}`.
+Plan, question, merge-decision and master-permission rows may also carry
+display-only `short_title` (about 50 characters) and `why` (one sentence),
+sanitized server-side and omitted when the source is empty or reads as a
+command; nothing reads them back (CAD-1219).
 *Class* is where a kind starts; *Owner* is who must act on it:
 
 | Rank | Kind | Class | Owner | Command |

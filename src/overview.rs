@@ -380,7 +380,87 @@ fn item(
     }
 }
 
+/// CAD-1219: display-only text caps (characters).
+const SHORT_TITLE_MAX: usize = 50;
+const WHY_MAX: usize = 140;
+
+/// Invisible format characters (Unicode Cf): zero-width, bidi overrides
+/// and isolates, BOM, soft hyphen, tag characters.
+fn is_format_char(c: char) -> bool {
+    matches!(c,
+        '\u{AD}' | '\u{600}'..='\u{605}' | '\u{61C}' | '\u{6DD}' | '\u{70F}' | '\u{180E}'
+        | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}'
+        | '\u{2066}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}'
+        | '\u{E0000}'..='\u{E007F}')
+}
+
+/// Make `raw` safe to show as a card's plain-words text: NFKC-folded
+/// (so fullwidth lookalikes become their ASCII form), whitespace and
+/// newlines collapsed, control and format characters dropped, clipped to
+/// `max` characters on a char boundary. Anything that reads as a
+/// command (a backtick, `$(`, `${`, the word `cadence` anywhere) yields
+/// `None`, so the field is omitted rather than shown. Never returns an
+/// empty string.
+fn display_text(raw: &str, max: usize) -> Option<String> {
+    use unicode_normalization::UnicodeNormalization;
+    let spaced: String = raw
+        .chars()
+        .filter(|c| !is_format_char(*c))
+        .nfkc()
+        .filter_map(|c| match c {
+            '\n' | '\r' | '\t' => Some(' '),
+            c if c.is_control() => None,
+            c => Some(c),
+        })
+        .collect();
+    let text = spaced.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.is_empty()
+        || text.contains('`')
+        || text.contains("$(")
+        || text.contains("${")
+        || text.to_lowercase().contains("cadence")
+    {
+        return None;
+    }
+    if text.chars().count() <= max {
+        return Some(text);
+    }
+    let clipped: String = text.chars().take(max.saturating_sub(1)).collect();
+    Some(format!("{}…", clipped.trim_end()))
+}
+
+/// [`display_text`] limited to the first sentence — for `why`.
+fn display_sentence(raw: &str, max: usize) -> Option<String> {
+    let text = display_text(raw, usize::MAX)?;
+    let end = text
+        .char_indices()
+        .find(|&(i, c)| matches!(c, '.' | '!' | '?') && text[i + c.len_utf8()..].starts_with(' '))
+        .map_or(text.len(), |(i, c)| i + c.len_utf8());
+    display_text(&text[..end], max)
+}
+
 impl Item {
+    /// CAD-1219: optional plain-words `short_title` and `why` for a To do
+    /// card. Display text only — nothing reads them back. A field whose
+    /// source is missing or fails [`display_text`] is left out.
+    fn set_display(&mut self, short_title: Option<&str>, why: Option<&str>) {
+        if let Some(t) = short_title.and_then(|t| display_text(t, SHORT_TITLE_MAX)) {
+            self.json["short_title"] = json!(t);
+        }
+        // A reason that only repeats the title adds nothing.
+        if let Some(w) = why
+            .and_then(|w| display_sentence(w, WHY_MAX))
+            .filter(|w| self.json["short_title"].as_str() != Some(w))
+        {
+            self.json["why"] = json!(w);
+        }
+    }
+
+    fn with_display(mut self, short_title: Option<&str>, why: Option<&str>) -> Self {
+        self.set_display(short_title, why);
+        self
+    }
+
     /// Name the row's subject: `agent`, `issue`, `pr`, `repo`,
     /// `deploy`, `tracker` or `report`.
     fn about(mut self, kind: &'static str, id: &str) -> Self {
@@ -1730,7 +1810,8 @@ fn overview_from(
                     &format!("cadence plan show {id} && cadence plan approve {id}"),
                 )
                 .about("issue", id)
-                .since(since);
+                .since(since)
+                .with_display(Some(&v.issue.front.title), None);
                 row.json["plan"] = json!({"epic": id, "proposed_by": plan.proposed_by,
                                           "tickets": plan.tickets});
                 needs.push(row);
@@ -1772,7 +1853,13 @@ fn overview_from(
                     &format!("{id}/{}", q["name"].as_str().unwrap_or_default()),
                 )
                 .for_agent(q["agent"].as_str().unwrap_or_default())
-                .since(since);
+                .since(since)
+                .with_display(
+                    up.get("summary")
+                        .and_then(Value::as_str)
+                        .or(q["body"].as_str()),
+                    q["impact"].as_str(),
+                );
                 row.json["question"] = json!({
                     "issue": id, "report": q["name"], "agent": q["agent"],
                     "options": q["options"], "impact": q["impact"], "body": q["body"],
@@ -2016,7 +2103,18 @@ fn overview_from(
         }
         needs.extend(backlog_stale);
         needs.extend(intake);
-        needs.extend(delivery_items(state_dir, now));
+        let mut delivery = delivery_items(state_dir, now);
+        for row in delivery
+            .iter_mut()
+            .filter(|r| r.json["kind"] == "merge_decision")
+        {
+            let title = row.json["merge"]["issue"]
+                .as_str()
+                .and_then(|i| view_of.get(i))
+                .map(|bv| bv.issue.front.title.clone());
+            row.set_display(title.as_deref(), None);
+        }
+        needs.extend(delivery);
         if !clock.skipped.is_empty() {
             degraded_notes.push(degraded(
                 "tracker_status_time",
@@ -2311,7 +2409,13 @@ fn overview_from(
             &format!("cadence master allow-once {}", req.id),
         )
         .about("permission", &req.id)
-        .since(Some(req.created));
+        .since(Some(req.created))
+        .with_display(
+            // Without a label the card's own title already is the reason;
+            // never shorten what the operator reads before Allow.
+            Some(req.decision_label.as_str()).filter(|l| !l.is_empty()),
+            (!req.decision_label.is_empty()).then_some(req.reason.as_str()),
+        );
         row.json["permission"] = crate::master_perm::request_json(&req);
         row.json["reason"] = json!(req.reason);
         needs.push(row);
@@ -2415,6 +2519,43 @@ pub(crate) fn checks_green_pub(rollup: &[Value]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CAD-1219: the display fields clip, strip and refuse command text.
+    #[test]
+    fn display_text_clips_strips_and_refuses_commands() {
+        assert_eq!(
+            display_text("  Send\n\temail\u{7}  to   212 customers ", 50).as_deref(),
+            Some("Send email to 212 customers")
+        );
+        let long = "é".repeat(80);
+        let clipped = display_text(&long, SHORT_TITLE_MAX).unwrap();
+        assert_eq!(clipped.chars().count(), SHORT_TITLE_MAX);
+        assert!(clipped.ends_with('…'));
+        for bad in [
+            "run `rm -rf x` now",
+            "cadence issue set X status=done",
+            "Cadence  go",
+            "echo $(id)",
+            "  \n\u{0} ",
+            "cadence\u{200B} issue set X status=done",
+            "please run: cadence issue set X",
+            "echo ${HOME}",
+            "run \u{FF40}id\u{FF40}",
+        ] {
+            assert_eq!(display_text(bad, 50), None, "{bad:?}");
+        }
+        assert_eq!(
+            display_text("\u{202E}Send\u{200B} mail\u{2066}", 50).as_deref(),
+            Some("Send mail")
+        );
+        assert_eq!(
+            display_sentence("It sends mail. Then more words follow.", WHY_MAX).as_deref(),
+            Some("It sends mail.")
+        );
+        let mut row = item(1, "plan", "t", 0, "", None, "c");
+        row.set_display(Some("cadence plan approve X"), Some(""));
+        assert!(row.json.get("short_title").is_none() && row.json.get("why").is_none());
+    }
 
     #[test]
     fn iso_parses() {
