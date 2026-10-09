@@ -72,6 +72,7 @@ pub const DEVICE_PUBLISH_VERSION: &str = "1";
 const PREFLIGHT_PATH: &str = "/publish/preflight";
 const EXEC_PATH: &str = "/publish";
 const STATUS_PATH: &str = "/publish";
+const GRANTS_PATH: &str = "/publish/grants";
 const DEVICE_PREFIX: &str = "/v1/runtime/connectors";
 /// CAD-1267 (AOS-181): the lease door serves the same bodies and envelope
 /// under this prefix, with no Authorization header.
@@ -371,6 +372,53 @@ impl super::publish::PublishSender for HttpPublishSender {
 
     fn status(&self, key: &str) -> std::result::Result<LedgerOutcome, Refusal> {
         self.status_request(key)
+    }
+
+    /// CAD-1291: read-only lookup of the grants the owner minted for one
+    /// approval id. The door scopes it to this company; Cadence then selects
+    /// the exact-digest grant and AgenticOS re-checks it at preflight and send.
+    fn find_grant(
+        &self,
+        approval_id: &str,
+    ) -> std::result::Result<Vec<super::publish::FoundGrant>, Refusal> {
+        let uncertain = || {
+            Refusal::new(
+                "refused",
+                "grant lookup is uncertain; nothing was sent, try again",
+            )
+        };
+        if approval_id.is_empty()
+            || approval_id.len() > 120
+            || !approval_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+        {
+            return Err(Refusal::new("bad_grant", "approval id shape is invalid"));
+        }
+        let url = format!(
+            "{}{}?cadenceApprovalId={approval_id}",
+            self.base,
+            self.credential.route(GRANTS_PATH)
+        );
+        let mut request = self.http.get(&url);
+        if let Some(authorization) = self.credential.authorization() {
+            request = request.header("authorization", &authorization);
+        }
+        let response = request.call().map_err(|_| uncertain())?;
+        let data = match read_envelope(response, false) {
+            Ok(data) => data,
+            Err(Fault::Refused(refusal)) => return Err(refusal),
+            Err(Fault::Ambiguous) => return Err(uncertain()),
+        };
+        data.get("grants")
+            .and_then(Value::as_array)
+            .and_then(|grants| {
+                grants
+                    .iter()
+                    .map(super::publish::FoundGrant::from_wire)
+                    .collect::<Option<Vec<_>>>()
+            })
+            .ok_or_else(uncertain)
     }
 
     /// CAD-1041: pre-claim staging for an explicit send-now. Resolves
@@ -1499,5 +1547,60 @@ mod tests {
         assert!(preflight_of(&binding, &verdict("granted", true)).is_err());
         assert!(preflight_of(&binding, &verdict("declined", false)).is_err());
         assert!(preflight_of(&binding, &verdict("pending", false)).is_err());
+    }
+    /// CAD-1291: the lookup is a read-only GET on the door's grants route,
+    /// scoped by approval id; a malformed record fails closed.
+    #[test]
+    fn find_grant_reads_the_door_and_refuses_malformed_records() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let bodies = [
+            r#"{"ok":true,"data":{"grants":[{"id":"dpq_ownergrant_001","workspaceId":"w","connectionId":"c","destinationId":"d","toolkit":"instagram","captionDigest":"x","imageDigest":null,"cadenceApprovalId":"apv_1","maxUses":1,"remainingUses":1,"notBefore":"n","expiresAt":"e","revokedAt":null}]}}"#,
+            r#"{"ok":true,"data":{"grants":[{"id":"nope"}]}}"#,
+        ];
+        let server = std::thread::spawn(move || {
+            let mut lines = Vec::new();
+            for body in bodies {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap();
+                lines.push(
+                    String::from_utf8_lossy(&buf[..n])
+                        .lines()
+                        .next()
+                        .unwrap()
+                        .to_owned(),
+                );
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(reply.as_bytes()).unwrap();
+            }
+            lines
+        });
+        let sender = HttpPublishSender::new(
+            &format!("http://127.0.0.1:{port}"),
+            DeviceCredential::new("x".repeat(8)),
+            test_resolver("c", None),
+        )
+        .unwrap();
+        use super::super::publish::PublishSender;
+        let found = sender.find_grant("apv_1").unwrap();
+        assert_eq!(found[0].id, "dpq_ownergrant_001");
+        assert_eq!(sender.find_grant("apv_1").unwrap_err().code, "refused");
+        assert_eq!(
+            sender.find_grant("apv 1/../x").unwrap_err().code,
+            "bad_grant"
+        );
+        let lines = server.join().unwrap();
+        assert!(
+            lines[0]
+                .starts_with("GET /v1/runtime/connectors/publish/grants?cadenceApprovalId=apv_1 "),
+            "{}",
+            lines[0]
+        );
     }
 }

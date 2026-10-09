@@ -710,6 +710,96 @@ impl Default for FakePublishLedger {
     }
 }
 
+/// CAD-1291: one owner-minted grant as the hosted door lists it for an
+/// approval id. Cadence never mints: it only finds the grant the workspace
+/// owner confirmed in AgenticOS for exactly this post, then presents its id
+/// at preflight and send, where AgenticOS re-checks every digest, the window
+/// and the use count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoundGrant {
+    pub id: String,
+    pub connection_id: String,
+    pub destination_id: String,
+    pub toolkit: String,
+    pub caption_digest: String,
+    pub image_digest: Option<String>,
+    pub cadence_approval_id: String,
+    pub remaining_uses: u64,
+    pub revoked: bool,
+}
+
+impl FoundGrant {
+    /// Strict wire parse: a malformed record is a refusal, never skipped.
+    pub fn from_wire(wire: &serde_json::Value) -> Option<Self> {
+        let text = |field: &str| wire.get(field)?.as_str().map(str::to_owned);
+        Some(Self {
+            id: text("id").filter(|id| valid_grant_id(id))?,
+            connection_id: text("connectionId")?,
+            destination_id: text("destinationId")?,
+            toolkit: text("toolkit")?,
+            caption_digest: text("captionDigest")?,
+            image_digest: match wire.get("imageDigest")? {
+                serde_json::Value::Null => None,
+                other => Some(other.as_str()?.to_owned()),
+            },
+            cadence_approval_id: text("cadenceApprovalId")?,
+            remaining_uses: wire.get("remainingUses")?.as_u64()?,
+            revoked: !wire.get("revokedAt")?.is_null(),
+        })
+    }
+}
+
+/// Exactly what the operator approved: the grant must match every field.
+#[derive(Debug, Clone)]
+pub struct GrantWant<'a> {
+    pub approval_id: &'a str,
+    pub connection_id: &'a str,
+    pub destination_id: &'a str,
+    pub toolkit: &'a str,
+    pub caption_digest: &'a str,
+    pub image_digest: Option<&'a str>,
+}
+
+/// Pick the live grant minted for exactly `want`. No grant, or a grant for
+/// other content, never authorizes: the post stays unsent until the owner
+/// confirms the exact caption, image and destination again.
+pub fn select_grant(found: &[FoundGrant], want: &GrantWant<'_>) -> Result<String, Refusal> {
+    let for_approval: Vec<&FoundGrant> = found
+        .iter()
+        .filter(|grant| grant.cadence_approval_id == want.approval_id)
+        .collect();
+    if for_approval.is_empty() {
+        return Err(Refusal::new(
+            "grant_required",
+            "the workspace owner has not confirmed this exact post in AgenticOS",
+        ));
+    }
+    let exact = |grant: &&FoundGrant| {
+        grant.connection_id == want.connection_id
+            && grant.destination_id == want.destination_id
+            && grant.toolkit == want.toolkit
+            && grant.caption_digest == want.caption_digest
+            && grant.image_digest.as_deref() == want.image_digest
+    };
+    let matching: Vec<&FoundGrant> = for_approval.into_iter().filter(exact).collect();
+    if matching.is_empty() {
+        return Err(Refusal::new(
+            "grant_binding_mismatch",
+            "the owner's grant is for different content or destination; confirm this post again",
+        ));
+    }
+    matching
+        .iter()
+        .find(|grant| !grant.revoked && grant.remaining_uses > 0)
+        .map(|grant| grant.id.clone())
+        .ok_or_else(|| {
+            Refusal::new(
+                "grant_exhausted",
+                "the owner's grant is used up or revoked; confirm this post again",
+            )
+        })
+}
+
 /// Daemon-side dispatch observation: the party that speaks to the provider
 /// door, so posted reports verify against evidence the daemon itself
 /// observed — never operator-supplied JSON alone. Production leaves the
@@ -730,6 +820,14 @@ pub trait PublishSender: Send + Sync {
     /// ambiguity instead of claiming a row it cannot send.
     fn preflight(&self, _binding: &SendBinding) -> Preflight {
         Preflight::Approved
+    }
+    /// CAD-1291: list the owner-minted grants for one approval id. The
+    /// default refuses, so a sender with no hosted door can never invent one.
+    fn find_grant(&self, _approval_id: &str) -> Result<Vec<FoundGrant>, Refusal> {
+        Err(Refusal::new(
+            "grant_required",
+            "this sender cannot look up an owner grant",
+        ))
     }
 }
 
@@ -934,5 +1032,154 @@ mod tests {
             "con_harbour_ig",
             &digest_value
         ));
+    }
+    // ---- CAD-1291: select the owner-minted grant for exactly this post ----
+
+    fn grant_wire(approval: &str, caption: &str) -> serde_json::Value {
+        serde_json::json!({"id":"dpq_ownergrant_001","workspaceId":"ws_a",
+            "connectionId":"con_ig","destinationId":"1784","toolkit":"instagram",
+            "captionDigest": caption_digest_of(caption),"imageDigest": digest(1),
+            "cadenceApprovalId": approval,"maxUses":1,"remainingUses":1,
+            "notBefore":"2026-10-09T00:00:00.000Z","expiresAt":"2026-10-09T00:30:00.000Z",
+            "revokedAt": serde_json::Value::Null})
+    }
+
+    fn want<'a>(approval: &'a str, caption_digest: &'a str, image: &'a str) -> GrantWant<'a> {
+        GrantWant {
+            approval_id: approval,
+            connection_id: "con_ig",
+            destination_id: "1784",
+            toolkit: "instagram",
+            caption_digest,
+            image_digest: Some(image),
+        }
+    }
+
+    #[test]
+    fn grant_selected_only_for_the_exact_approved_post() {
+        let caption = caption_digest_of("Harbour at dusk.");
+        let image = digest(1);
+        let grant = FoundGrant::from_wire(&grant_wire("apv_1", "Harbour at dusk.")).unwrap();
+        // The positive control: the exact post selects the owner's grant.
+        assert_eq!(
+            select_grant(
+                std::slice::from_ref(&grant),
+                &want("apv_1", &caption, &image)
+            )
+            .unwrap(),
+            "dpq_ownergrant_001"
+        );
+        // No grant at all: the owner has not confirmed.
+        assert_eq!(
+            select_grant(&[], &want("apv_1", &caption, &image))
+                .unwrap_err()
+                .code,
+            "grant_required"
+        );
+        // A grant minted under another approval id never authorizes this one.
+        assert_eq!(
+            select_grant(
+                std::slice::from_ref(&grant),
+                &want("apv_2", &caption, &image)
+            )
+            .unwrap_err()
+            .code,
+            "grant_required"
+        );
+        // A changed caption, image, destination, connection or toolkit after
+        // the owner confirmed is refused: re-confirmation is required.
+        let changed = caption_digest_of("Harbour at dusk!");
+        assert_eq!(
+            select_grant(
+                std::slice::from_ref(&grant),
+                &want("apv_1", &changed, &image)
+            )
+            .unwrap_err()
+            .code,
+            "grant_binding_mismatch"
+        );
+        assert_eq!(
+            select_grant(
+                std::slice::from_ref(&grant),
+                &want("apv_1", &caption, &digest(2))
+            )
+            .unwrap_err()
+            .code,
+            "grant_binding_mismatch"
+        );
+        for tweak in [
+            GrantWant {
+                destination_id: "9999",
+                ..want("apv_1", &caption, &image)
+            },
+            GrantWant {
+                connection_id: "con_other",
+                ..want("apv_1", &caption, &image)
+            },
+            GrantWant {
+                toolkit: "facebook",
+                ..want("apv_1", &caption, &image)
+            },
+            GrantWant {
+                image_digest: None,
+                ..want("apv_1", &caption, &image)
+            },
+        ] {
+            assert_eq!(
+                select_grant(std::slice::from_ref(&grant), &tweak)
+                    .unwrap_err()
+                    .code,
+                "grant_binding_mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn spent_or_revoked_grant_is_never_selected() {
+        let caption = caption_digest_of("Harbour at dusk.");
+        let image = digest(1);
+        let mut spent = grant_wire("apv_1", "Harbour at dusk.");
+        spent["remainingUses"] = serde_json::json!(0);
+        let mut revoked = grant_wire("apv_1", "Harbour at dusk.");
+        revoked["revokedAt"] = serde_json::json!("2026-10-09T00:10:00.000Z");
+        for wire in [spent, revoked] {
+            let grant = FoundGrant::from_wire(&wire).unwrap();
+            assert_eq!(
+                select_grant(&[grant], &want("apv_1", &caption, &image))
+                    .unwrap_err()
+                    .code,
+                "grant_exhausted"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_grant_records_do_not_parse() {
+        let mut bad_id = grant_wire("apv_1", "x");
+        bad_id["id"] = serde_json::json!("grant");
+        let mut bad_uses = grant_wire("apv_1", "x");
+        bad_uses["remainingUses"] = serde_json::json!("1");
+        let mut no_revoked = grant_wire("apv_1", "x");
+        no_revoked.as_object_mut().unwrap().remove("revokedAt");
+        for wire in [bad_id, bad_uses, no_revoked] {
+            assert!(FoundGrant::from_wire(&wire).is_none(), "{wire}");
+        }
+    }
+
+    #[test]
+    fn a_sender_without_a_hosted_door_cannot_find_a_grant() {
+        struct Plain;
+        impl PublishSender for Plain {
+            fn execute(&self, _: &SendBinding) -> Result<LedgerOutcome, Refusal> {
+                unreachable!()
+            }
+            fn status(&self, _: &str) -> Result<LedgerOutcome, Refusal> {
+                unreachable!()
+            }
+        }
+        assert_eq!(
+            Plain.find_grant("apv_1").unwrap_err().code,
+            "grant_required"
+        );
     }
 }

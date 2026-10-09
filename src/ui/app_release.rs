@@ -19,6 +19,7 @@ pub(super) enum Route<'a> {
     Effect(&'a str),
     Decide(&'a str),
     PublishNow(&'a str),
+    Grant(&'a str),
     Resolve(&'a str),
 }
 fn segment(id: &str) -> bool {
@@ -38,6 +39,7 @@ pub(super) fn route(path: &str) -> Option<Route<'_>> {
             [id] if segment(id) => Some(Route::Effect(id)),
             [id, "decide"] if segment(id) => Some(Route::Decide(id)),
             [id, "publish-now"] if segment(id) => Some(Route::PublishNow(id)),
+            [id, "grant"] if segment(id) => Some(Route::Grant(id)),
             [id, "resolve"] if segment(id) => Some(Route::Resolve(id)),
             _ => None,
         };
@@ -99,6 +101,7 @@ impl Route<'_> {
                 | Self::Stage(_)
                 | Self::Decide(_)
                 | Self::PublishNow(_)
+                | Self::Grant(_)
                 | Self::Resolve(_)
         )
     }
@@ -248,6 +251,11 @@ pub(super) fn handle(
                 params["effect_id"] = json!(effect);
                 ("app_effect_publish_now", params)
             }
+            Route::Grant(effect) => {
+                let mut params = typed::<PublishNow>(request)?;
+                params["effect_id"] = json!(effect);
+                ("app_effect_grant", params)
+            }
             Route::Resolve(effect) => {
                 let mut params = typed::<Resolve>(request)?;
                 params["effect_id"] = json!(effect);
@@ -321,6 +329,8 @@ mod tests {
             route("/api/app-effects/effect-a/decide"),
             Some(Route::Decide("effect-a"))
         ));
+        let grant = route("/api/app-effects/effect-a/grant").unwrap();
+        assert!(matches!(grant, Route::Grant("effect-a")) && grant.is_write());
         for path in [
             "/api/app-installations/../bindings",
             "/api/app-installations/i/bindings/",
