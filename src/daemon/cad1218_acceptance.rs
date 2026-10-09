@@ -824,10 +824,12 @@ fn state_path(repo: &str, pr: u64, head: &str) -> String {
 fn state_is(board: &Board, (status, body): (u16, Value), want: &str, id: Option<&str>) {
     assert_eq!(status, 200, "the operator's read: {body}");
     let keys: Vec<&String> = body.as_object().expect("a JSON object").keys().collect();
-    let allowed = ["state", "approval_id"];
+    // Round 3 adds `board_revocable` (a boolean, in-force only); nothing
+    // else may appear.
+    let allowed = ["state", "approval_id", "board_revocable"];
     assert!(
         keys.iter().all(|k| allowed.contains(&k.as_str())),
-        "the read answers only state and approval_id: {body}"
+        "the read answers only state, approval_id and board_revocable: {body}"
     );
     assert_eq!(body["state"], want, "{body}");
     match id {
@@ -1312,4 +1314,214 @@ fn cad1218_approver_rule_covers_publish_revoke_and_closed_prs() {
         let (status, reply) = board.post("operator", Some(&operator), APPROVE, &body);
         assert_eq!(status, 200, "the open PR's head approves: {reply}");
     }
+}
+
+// ---------------------------------------------------------------------
+// Round 3 (Browser QA F2 on PR #899): the drawer offers "Take my approval
+// back" only where the board's revoke would accept it.
+//
+// Contract:
+// - The state read's 200 body gains `board_revocable` (a JSON boolean)
+//   when, and only when, `state` is `in-force`; it is omitted for
+//   `missing` and `revoked`. It describes the record whose
+//   `approval_id` the read returns.
+// - It is the board-revoke target predicate, one pure function in
+//   `src/store/events.rs`: `board_revocable(record: &Value) -> bool` —
+//   action `merge`, `recorded_via` `operator-connection`, source ending
+//   " via board" — called by both `Store::revoke_board_approval` and
+//   `approval_state`. So `board_revocable == true` ⇔ the board revoke is
+//   accepted; the check proves it both ways on every in-force kind.
+// - The approver rule's refusal is machine-readable: `approver_source`
+//   fails with the structured code `approver_not_allowed` (as
+//   `head_moved` is), and every board relay of an approval verb
+//   (approve, revoke, state, Publish) answers it as
+//   `403 {"check": "approver_not_allowed"}`. The Publish route's other
+//   refusals keep their existing `check` codes (`operator_only`,
+//   `caller_identity` / `operator_proof`).
+// ---------------------------------------------------------------------
+
+/// The read for `pr`'s HEAD as the loopback operator sees it.
+fn read_state(board: &Board, operator: &Session, pr: u64) -> Value {
+    let (status, body) = board.get("operator", Some(operator), &state_path(REPO, pr, HEAD));
+    assert_eq!(status, 200, "the operator's read of PR {pr}: {body}");
+    body
+}
+
+/// The board revoke of `id`: whether it was accepted, and the reply.
+fn board_revoke(board: &Board, operator: &Session, id: &str) -> (bool, u16, Value) {
+    let (status, body) = board.post(
+        "operator",
+        Some(operator),
+        &format!("/api/approvals/{id}/revoke"),
+        &json!({"reason": "drawer revoke"}).to_string(),
+    );
+    ((200..300).contains(&status), status, body)
+}
+
+#[test]
+#[ignore = "CAD-1218: enabled by the implementation"]
+fn cad1218_board_revocable_is_the_board_revoke_predicate() {
+    let root = tempfile::Builder::new().prefix("c1218v").tempdir().unwrap();
+    let board = Board::start(root.path());
+    let operator = board.session();
+    let pm_yaml = board.state.join("pm").join("pm.yaml");
+    let mut yaml = std::fs::read_to_string(&pm_yaml).unwrap();
+    yaml.push_str("approvals:\n  tailnet_logins:\n    - chris@example.com\n");
+    std::fs::write(&pm_yaml, yaml).unwrap();
+    let rpc = |method: &str, params: Value| {
+        scoped(Asserted::Operator, || {
+            crate::client::rpc(&board.state, method, params)
+        })
+    };
+    let publish = format!("/api/delivery/{PUBLISH_ISSUE}/merge");
+    let publish_body = json!({"sha": HEAD}).to_string();
+
+    // --- the approver rule's refusal carries a stable code ---
+    // Every verb the board relays, with the actor the board would relay for
+    // an off-list tailnet login; each request is otherwise accepted.
+    for (method, params) in [
+        (
+            "delivery_approve",
+            json!({"issue": PUBLISH_ISSUE, "sha": HEAD, "request_actor": MALLORY}),
+        ),
+        (
+            VERB,
+            json!({"repo": REPO, "pr": 95, "head": HEAD, "request_actor": MALLORY}),
+        ),
+        (
+            STATE_VERB,
+            json!({"repo": REPO, "pr": 95, "head": HEAD, "request_actor": MALLORY}),
+        ),
+        (
+            REVOKE_VERB,
+            json!({"id": "merge-pr95-unknown", "reason": "r", "request_actor": MALLORY}),
+        ),
+    ] {
+        let err = rpc(method, params).expect_err("an off-list login passed the approver rule");
+        assert_eq!(
+            err.code(),
+            Some("approver_not_allowed"),
+            "{method}: the approver refusal is machine-readable: {err}"
+        );
+    }
+    assert_eq!(board.audit_pr(PUBLISH_PR, HEAD)["state"], "missing");
+    assert_eq!(merges(&board), "");
+    // Publish over HTTP: each refusal names its check.
+    let owner = board.public_owner_session();
+    let (status, meta) = board.public("/api/meta", &owner, None);
+    assert_eq!((status, &meta["signed_in"]), (200, &json!(true)), "{meta}");
+    for (who, session, want) in [
+        ("agent:worker", None, &["operator_only"][..]),
+        (
+            "unproven",
+            Some(&operator),
+            &["caller_identity", "operator_proof"][..],
+        ),
+    ] {
+        let (status, body) = board.post(who, session, &publish, &publish_body);
+        assert_eq!(status, 403, "{who} on Publish: {body}");
+        assert!(
+            want.contains(&body["check"].as_str().unwrap_or("")),
+            "{who} on Publish names its check {want:?}: {body}"
+        );
+    }
+    let (status, body) = board.public(&publish, &owner, Some(&publish_body));
+    assert_eq!(status, 403, "a public owner session on Publish: {body}");
+    assert_eq!(
+        body["check"], "approver_not_allowed",
+        "a public owner on Publish names the approver check: {body}"
+    );
+    assert_eq!(board.audit_pr(PUBLISH_PR, HEAD)["state"], "missing");
+    assert_eq!(merges(&board), "", "a refused Publish enqueued a merge");
+
+    // --- board_revocable is the revoke predicate, proven both ways ---
+    // Missing: no flag.
+    let missing = read_state(&board, &operator, 93);
+    assert_eq!(missing["state"], "missing", "{missing}");
+    assert!(missing.get("board_revocable").is_none(), "{missing}");
+
+    // Recorded on the board: Approve, Publish, and an allowlisted tailnet
+    // login through the verb — each true, and each board revoke accepted.
+    let (status, body) = board.post("operator", Some(&operator), APPROVE, &approve_body(HEAD));
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = board.post("operator", Some(&operator), &publish, &publish_body);
+    assert_eq!(status, 200, "{body}");
+    rpc(
+        VERB,
+        json!({"repo": REPO, "pr": TAILNET_PR, "head": HEAD, "request_actor": CHRIS}),
+    )
+    .unwrap();
+    // Recorded on the terminal path (`cadence audit approve` sends
+    // `approval_record`): false, and the board revoke refused.
+    rpc(
+        "approval_record",
+        json!({"repo": REPO, "pr": 90, "head": HEAD, "source": "chris in chat"}),
+    )
+    .unwrap();
+    // The predicate is the record's fields, so a terminal record that
+    // carries the board's source shape is revocable — and is revoked.
+    rpc(
+        "approval_record",
+        json!({"repo": REPO, "pr": 91, "head": HEAD, "source": "operator (ui) via board"}),
+    )
+    .unwrap();
+    for (pr, want, what) in [
+        (PR, true, "Approve on the board"),
+        (PUBLISH_PR, true, "Publish on the board"),
+        (TAILNET_PR, true, "an allowlisted tailnet login"),
+        (90, false, "a terminal approval"),
+        (91, true, "a terminal record in the board's shape"),
+    ] {
+        let seen = read_state(&board, &operator, pr);
+        assert_eq!(seen["state"], "in-force", "{what}: {seen}");
+        assert_eq!(
+            seen["board_revocable"],
+            json!(want),
+            "{what}: board_revocable must be a boolean that says whether the board may revoke: {seen}"
+        );
+        let id = seen["approval_id"].as_str().unwrap().to_string();
+        let events = board.approval_events();
+        let (accepted, status, body) = board_revoke(&board, &operator, &id);
+        assert_eq!(
+            accepted, want,
+            "{what}: board_revocable={want} but the board revoke answered {status} {body}"
+        );
+        let after = read_state(&board, &operator, pr);
+        if want {
+            assert_eq!(after["state"], "revoked", "{what}: {after}");
+            assert!(
+                after.get("board_revocable").is_none(),
+                "a revoked approval carries no flag: {after}"
+            );
+        } else {
+            assert!((400..500).contains(&status), "{what}: {status} {body}");
+            assert_eq!(
+                board.approval_events(),
+                events,
+                "{what}: a refused revoke wrote"
+            );
+            assert_eq!(after, seen, "{what}: a refused revoke changed the read");
+        }
+    }
+    // Another action's record never reads as in-force for the head, so it
+    // offers nothing; the board revoke refuses it and writes nothing.
+    let deploy = rpc(
+        "approval_record",
+        json!({"repo": REPO, "pr": 92, "head": HEAD, "action": "deploy",
+               "source": "operator (ui) via board"}),
+    )
+    .unwrap()["approval_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let seen = read_state(&board, &operator, 92);
+    assert_eq!(seen["state"], "missing", "{seen}");
+    assert!(seen.get("board_revocable").is_none(), "{seen}");
+    let events = board.approval_events();
+    let (accepted, status, body) = board_revoke(&board, &operator, &deploy);
+    assert!(
+        !accepted,
+        "the board revoked a deploy record: {status} {body}"
+    );
+    assert_eq!(board.approval_events(), events);
 }
