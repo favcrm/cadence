@@ -16,6 +16,7 @@
 //! | `cad1300_owner_with_a_long_actor_is_admitted` | item 3: every platform owner is an approver; the relayed actor is bounded, deterministic and attributable |
 //! | `cad1300_owner_with_a_non_ascii_name_is_admitted` | item 3 (PM, 2026-10-09): an owner whose name has no ASCII characters is an approver too |
 //! | `cad1300_one_record_per_head_whatever_the_repo_case` | item 4, Spec/security REVISE on PR #913: the one-record rule holds when the PR URL and the registered project spell the repo in different letter case |
+//! | `cad1300_cli_records_in_any_case_count_as_on_record` | item 4, Spec/security REVISE r2 on PR #913: an approval the operator's CLI recorded in mixed case counts for the one-record rule |
 //! | `cad1300_approver_refusal_is_403_and_no_repo_oracle` | item 7 (`rpc_err` 403 mapping on Approve) and item 9 (no registered-repo oracle) |
 //! | `cad1300_reachable_second_layers` | item 7 survivors that can be reached: forged verb fields, `board_revocable`'s `recorded_via` term |
 //!
@@ -1121,4 +1122,168 @@ fn cad1300_one_record_per_head_whatever_the_repo_case() {
         "Publish stores the canonical lowercase repo"
     );
     audit_state(&board, PUBLISH_PR, "in-force", &id);
+}
+
+// ---------------------------------------------------------------------
+// Item 4, Spec/security REVISE round 2 on PR #913 (head 02ca64c0): the
+// one-record-per-head and revoke-sticks rule must also hold against a
+// record the operator's CLI wrote. `cadence audit approve` defaults
+// `--repo` to the checkout's origin slug as spelled (`Acme/Widgets`) and
+// `approval_record` stores it as sent, while the board paths look the
+// head up as `acme/widgets`. `audit::approval_in_force` already compares
+// the repo case-insensitively; the write-side lookups must agree.
+//
+// Contract (properties; a case-insensitive repo compare, PR equal, in
+// the store's head lookups — `record_approval_once`, the standing and
+// on-record lookups of the board Publish, and `record_approval`'s dedupe
+// — is the recommended mechanism; it also covers mixed-case records
+// already stored):
+// - (1) a CLI record in any case, then a CLI revoke, then board Publish:
+//   refused ("revoked"), no new event, no `gh pr merge`, row `passed`;
+// - (2) a standing CLI record in any case: board Publish reuses it (same
+//   id, no new event) and enqueues;
+// - (3) board Approve after a CLI record in any case: refused, no event;
+// - (4) the CLI's own `delivery_approve` (no `request_actor`) retried
+//   against a standing `operator` record of the same head dedupes to it in
+//   any case, exactly as it does for the lowercase record;
+// - (5) each case runs first with a lowercase CLI record as the control
+//   (today's behaviour), then with `Acme/Widgets`; the outcome must not
+//   depend on the letter case.
+// ---------------------------------------------------------------------
+
+fn cli_record(board: &Board, repo: &str, pr: u64, source: &str) -> String {
+    as_operator(
+        board,
+        "approval_record",
+        json!({"repo": repo, "pr": pr, "head": HEAD, "source": source}),
+    )
+    .expect("setup: the CLI's approval_record")["approval_id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// Cases (1)-(3) with the CLI record spelled `repo`.
+fn cli_record_against_board_paths(repo: &str) {
+    let root = tempfile::Builder::new().prefix("c1300x").tempdir().unwrap();
+    let board = Board::start(root.path());
+    let operator = board.session();
+    let what = format!("CLI record for {repo}");
+
+    // --- (1) CLI record, CLI revoke, board Publish: refused ---
+    let revoked = cli_record(&board, repo, PUBLISH_PR_2, "chris in chat");
+    as_operator(
+        &board,
+        "approval_revoke",
+        json!({"id": revoked, "source": "operator", "reason": "re-review"}),
+    )
+    .expect("setup: the CLI's approval_revoke");
+    audit_state(&board, PUBLISH_PR_2, "revoked", &revoked);
+    let events = board.approval_events();
+    let (status, body) = board.post(
+        "operator",
+        Some(&operator),
+        &publish_path(PUBLISH_ISSUE_2),
+        &publish_body(),
+    );
+    assert!(
+        (400..500).contains(&status),
+        "{what}: board Publish after the CLI record was revoked must be refused: {status} {body}"
+    );
+    assert!(
+        body.to_string().to_ascii_lowercase().contains("revoked"),
+        "{what}: the refusal names the revoke: {body}"
+    );
+    assert_eq!(
+        board.approval_events(),
+        events,
+        "{what}: a refused Publish wrote"
+    );
+    audit_state(&board, PUBLISH_PR_2, "revoked", &revoked);
+    assert!(
+        !merges(&board).contains(&format!("merge {PUBLISH_PR_2} ")),
+        "{what}: a refused Publish enqueued a merge: {}",
+        merges(&board)
+    );
+    assert_eq!(delivery_state(&board, PUBLISH_ISSUE_2), "passed", "{what}");
+
+    // --- (2) a standing CLI record: board Publish reuses it ---
+    let standing = cli_record(&board, repo, PUBLISH_PR, "chris in chat");
+    let events = board.approval_events();
+    let (status, body) = board.post(
+        "operator",
+        Some(&operator),
+        &publish_path(PUBLISH_ISSUE),
+        &publish_body(),
+    );
+    assert_eq!(
+        status, 200,
+        "{what}: board Publish of a CLI-approved head: {body}"
+    );
+    assert_eq!(
+        body["approval_id"],
+        standing.as_str(),
+        "{what}: Publish reuses the standing CLI record: {body}"
+    );
+    assert_eq!(
+        board.approval_events(),
+        events,
+        "{what}: Publish wrote a second record for the head"
+    );
+    assert_eq!(recorded_repos(&board, PUBLISH_PR).len(), 1, "{what}");
+    audit_state(&board, PUBLISH_PR, "in-force", &standing);
+    assert!(merges(&board).contains(&format!("merge {PUBLISH_PR} ")));
+
+    // --- (3) board Approve after a CLI record: already on record ---
+    let cli = cli_record(&board, repo, 60, "chris in chat");
+    let events = board.approval_events();
+    let (status, body) = board.post("operator", Some(&operator), APPROVE, &approve_pr(60));
+    assert!(
+        (400..500).contains(&status),
+        "{what}: board Approve of a CLI-approved head must be refused: {status} {body}"
+    );
+    assert_eq!(
+        board.approval_events(),
+        events,
+        "{what}: a refused Approve wrote"
+    );
+    audit_state(&board, 60, "in-force", &cli);
+}
+
+#[test]
+#[ignore = "CAD-1300: enabled by the implementation"]
+fn cad1300_cli_records_in_any_case_count_as_on_record() {
+    // (5) the lowercase control first, then GitHub's canonical case.
+    cli_record_against_board_paths(REPO);
+    cli_record_against_board_paths("Acme/Widgets");
+
+    // --- (4) the CLI's delivery merge retried against a standing
+    // `operator` record dedupes to it: lowercase control, then mixed ---
+    let root = tempfile::Builder::new().prefix("c1300y").tempdir().unwrap();
+    let board = Board::start(root.path());
+    for (repo, issue, pr) in [
+        (REPO, PUBLISH_ISSUE, PUBLISH_PR),
+        ("Acme/Widgets", PUBLISH_ISSUE_2, PUBLISH_PR_2),
+    ] {
+        let earlier = cli_record(&board, repo, pr, "operator");
+        let events = board.approval_events();
+        let out = as_operator(
+            &board,
+            "delivery_approve",
+            json!({"issue": issue, "sha": HEAD}),
+        )
+        .expect("the CLI's delivery merge of an approved head");
+        assert_eq!(
+            out["approval_id"],
+            earlier.as_str(),
+            "{repo}: the CLI retry dedupes to the standing record: {out}"
+        );
+        assert_eq!(
+            board.approval_events(),
+            events,
+            "{repo}: the CLI retry minted a second record for the head"
+        );
+        audit_state(&board, pr, "in-force", &earlier);
+        assert!(merges(&board).contains(&format!("merge {pr} ")), "{repo}");
+    }
 }
