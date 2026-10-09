@@ -127,7 +127,7 @@ export default function App() {
   const loc = useMemo(() => currentLocation(), [href]);
   const { route, view, project, openId, filters } = loc;
   const screen = route.screen;
-  const fullHeight = screen === "home" || screen === "wiki" || screen === "workspaceApp" ||
+  const fullHeight = screen === "home" || screen === "wiki" || screen === "workspaceApp" || screen === "workspaceAppKey" ||
     (route.screen === "projects" && route.section === "context" && Boolean(route.slug));
   const search = href.includes("?") ? href.slice(href.indexOf("?")) : "";
   /** The href of a route, carrying the scope and drawer like `goTo`. */
