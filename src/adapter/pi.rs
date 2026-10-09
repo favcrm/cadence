@@ -648,13 +648,19 @@ fn confine_command(env: &ProviderEnv) -> String {
 }
 
 /// The directory an npm-installed package lives in: `program`'s real
-/// path's first ancestor holding a `package.json`. Pi is a node script
+/// path's first ancestor holding a `package.json` within its enclosing
+/// `node_modules` tree. Unrelated ancestor manifests are not install roots.
+/// Pi is a node script
 /// inside `…/node_modules/@earendil-works/pi-coding-agent`, so the bin
 /// symlink's parent alone is not enough — the package dir is added to
 /// the master's read set.
 fn package_root(program: &Path) -> Option<PathBuf> {
     let real = program.canonicalize().ok()?;
+    let node_modules = real
+        .ancestors()
+        .find(|dir| dir.file_name().is_some_and(|name| name == "node_modules"))?;
     real.ancestors()
+        .take_while(|dir| *dir != node_modules)
         .find(|dir| dir.join("package.json").is_file())
         .map(Path::to_path_buf)
 }
