@@ -5,9 +5,11 @@ import { IconClose } from "../../ui/icons";
 export function WorkspaceDialog({
   title,
   onClose,
+  className,
   children,
 }: {
   title: string;
+  className?: string;
   onClose: () => void;
   children: ReactNode;
 }) {
@@ -25,7 +27,7 @@ export function WorkspaceDialog({
   return (
     <dialog
       ref={panel}
-      className="wa-dialog"
+      className={className ? `wa-dialog ${className}` : "wa-dialog"}
       aria-label={title}
       onCancel={(event) => {
         event.preventDefault();

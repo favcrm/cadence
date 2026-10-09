@@ -1,4 +1,5 @@
 import { ApiError } from "../../../lib/api";
+import { navigate } from "../../../lib/useLocation";
 import { rememberContext } from "../contextSelection";
 import { workspaceApps, type AppContext, type CapabilityQuote, type Installation, type WorkspaceRun } from "../workspaceApps";
 import { contextDefaultKeys, instagramLink } from "./screenProjection";
@@ -18,7 +19,7 @@ export interface ActionContext {
   contextId: string;
   runs: WorkspaceRun[];
   /** Reload the board's data after a write. */
-  onChanged: () => void;
+  onChanged: () => void | Promise<void>;
 }
 
 const NO: ActionRefusal = { code: "denied", text: "Only the operator can do that." };
@@ -71,6 +72,8 @@ export function plainRefusal(error: unknown): ActionRefusal {
   if (text.includes("no default team")) return { code: "team_missing", text: "Set this app's team in Settings first." };
   if (text.includes("worker")) return { code: "team_unavailable", text: "A team member is unavailable right now." };
   if (text.includes("stale")) return { code: "stale", text: "That changed somewhere else. Reload and try again." };
+  // A missing binding is a setup problem the app can name, not a bad input.
+  if (text.includes("capability binding is absent")) return { code: "binding_absent", text: "Finish setting this app up in Settings first." };
   if (error.status === 409) return { code: "refused", text: "Cadence couldn't do that. Nothing was started." };
   return { code: "failed", text: "That didn't work. Nothing was started." };
 }
@@ -127,10 +130,12 @@ async function saveDefaults(ctx: ActionContext, args: Record<string, unknown>): 
     saved = await workspaceApps.updateContext(ctx.installId, current.id, { expected_revision: current.revision,
       label: DEFAULT_LABEL, input_defaults: { ...current.config.input_defaults, ...values } });
   }
+  // Re-read the board first, so the new context is in its data when it becomes
+  // the selection: the screen then remounts once, with that context.
+  await ctx.onChanged();
   // The defaults live in this context: make it the board's selection so the
   // frame (and the runs it starts) read and use them.
   rememberContext(ctx.installId, saved.id);
-  ctx.onChanged();
   return { ok: true, data: { context_id: saved.id, revision: saved.revision } };
 }
 
@@ -157,23 +162,29 @@ async function socialDraftCall(verb: CallVerb,args:Record<string,unknown>,ui:{ac
   catch(error){return {ok:false,refusal:plainRefusal(error)};}
 }
 
-function openLink(args: Record<string, unknown>, showLink: (url: string) => void): ActionResult {
+/** Board paths an app may send the operator to. Exact paths only, never a caller-built route. */
+export const BOARD_LINK_PATHS: readonly string[] = ["/settings/connections"];
+/** The visible target of an external link: its host plus path, which is what the confirm names. */
+export const linkTarget = (href: string): string => { const url = new URL(href); return url.host + url.pathname + url.search; };
+
+function openLink(args: Record<string, unknown>, ui: { showLink(url: string): void; navigate?: (path: string) => void }): ActionResult {
   if (!exact(args, ["url"]) || typeof args.url !== "string") return refuse("bad_args", "That link is not valid.");
-  // One explicit trusted internal destination is allowed for connection
-  // setup. This is exact-path allowlisting, never a caller-provided URL.
-  const url = args.url === "/settings/connections" ? "/settings/connections" : instagramLink(args.url);
+  // A same-origin board path moves the board's router; an external https link
+  // is only shown, and the operator confirms its visible target before it opens.
+  if (BOARD_LINK_PATHS.includes(args.url)) { (ui.navigate ?? navigate)(args.url); return { ok: true, data: {} }; }
+  const url = instagramLink(args.url);
   if (!url) return refuse("link_blocked", "That link can't be opened here.");
-  showLink(url);
+  ui.showLink(url);
   return { ok: true, data: {} };
 }
 
 /** The direct (non-spending) verbs. The set is closed in `screenProtocol`. */
 export function runCall(ctx: ActionContext, verb: CallVerb, args: Record<string, unknown>,
-  ui: { showLink(url: string): void; actionToken?: string }): Promise<ActionResult> {
+  ui: { showLink(url: string): void; navigate?: (path: string) => void; actionToken?: string }): Promise<ActionResult> {
   const table: Record<CallVerb, () => Promise<ActionResult> | ActionResult> = {
     "read.run": () => readRun(ctx, args),
     "context.defaults.save": () => saveDefaults(ctx, args),
-    "open-link": () => openLink(args, ui.showLink),
+    "open-link": () => openLink(args, ui),
     "social.drafts.list": () => socialDraftCall(verb,args,ui),
     "social.drafts.show": () => socialDraftCall(verb,args,ui),
     "social.drafts.create": () => socialDraftCall(verb,args,ui),
