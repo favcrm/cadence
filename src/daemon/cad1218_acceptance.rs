@@ -26,6 +26,27 @@
 //! | repo of no registered project | the route's/verb's project-repo allowlist |
 //! | forged head, moved head | the verb's live-head compare (`head_moved`) |
 //! | replay while the approval stands, replay after revoke | the verb's "one record per shown head" rule |
+//! | tailnet actor with an empty allowlist, a login not on it, a public-session actor | the verb's approver allowlist (`pm.yaml` `approvals.tailnet_logins`) |
+//! | public AgenticOS `owner` session on the approve route | the route's `Caller::Operator`-only check (`approver_not_allowed`) |
+//!
+//! The approver allowlist (operator decision on CAD-1218, 2026-10-09):
+//! `approval_record_shown` accepts `request_actor` exactly `operator (ui)`
+//! (a loopback board session) or `<login> (tailscale)` whose `<login>` is
+//! listed in the tracker's `pm.yaml`:
+//!
+//! ```yaml
+//! approvals:
+//!   tailnet_logins: [chris@example.com]
+//! ```
+//!
+//! read fresh on every call, matched exactly; absent or empty means no
+//! remote approvals. Anything else is refused with a message containing
+//! "approval allowlist". A tailnet request cannot be produced in a test —
+//! `tailnet_proof::prove` needs a client socket owned by tailscaled's
+//! foreign uid, and the seam never yields the tailnet origin — so the
+//! tailnet cases drive the verb with the actor string the board derives
+//! (`proxied_actor`), and the board's relay of that actor is the
+//! Spec/security reviewer's probe (see the design note).
 //!
 //! What `scripts/enqueue-reviewed` sees is read through the audit's own
 //! reader (`audit::approval_check`, the code behind `cadence audit
@@ -41,6 +62,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::test_seam::{scoped, Asserted, Seam};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
+use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde_json::{json, Value};
 
 const REPO: &str = "acme/widgets";
@@ -50,6 +74,13 @@ const MOVED: &str = "1218bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const FORGED: &str = "1218cccccccccccccccccccccccccccccccccccc";
 const VERB: &str = "approval_record_shown";
 const APPROVE: &str = "/api/approvals/approve";
+/// The PRs the allowlist cases use, so each starts with no record.
+const TAILNET_PR: u64 = 43;
+const PUBLIC_PR: u64 = 44;
+/// This board's public AgenticOS name and the fixture platform.
+const PUBLIC_HOST: &str = "c1218.board.localhost";
+const COMPANY: &str = "c1218-company";
+const KEY_SEED: [u8; 32] = [18; 32];
 
 struct Stop(Arc<AtomicBool>, Vec<std::thread::JoinHandle<()>>);
 
@@ -76,7 +107,33 @@ struct Board {
     base: String,
     host: String,
     token: String,
+    issuer: String,
     _stop: Stop,
+}
+
+/// A fixture AgenticOS platform: serves the JWKS for [`KEY_SEED`] until
+/// the fixture stops. Returns its issuer origin.
+fn platform(stop: &mut Stop) -> String {
+    let server = (3110..=3199)
+        .find_map(|port| tiny_http::Server::http(("127.0.0.1", port)).ok())
+        .expect("no free fixture port in 3110..3199 for the platform");
+    let issuer = format!("http://{}", server.server_addr());
+    let key = Ed25519KeyPair::from_seed_unchecked(&KEY_SEED).unwrap();
+    let x = URL_SAFE_NO_PAD.encode(key.public_key().as_ref());
+    let flag = stop.0.clone();
+    stop.1.push(std::thread::spawn(move || {
+        while !flag.load(Ordering::SeqCst) {
+            let Ok(Some(request)) = server.recv_timeout(Duration::from_millis(100)) else {
+                continue;
+            };
+            let body = json!({"keys": [{"kty": "OKP", "crv": "Ed25519", "kid": "c1218", "x": x}]});
+            let response = tiny_http::Response::from_string(body.to_string()).with_header(
+                tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap(),
+            );
+            let _ = request.respond(response);
+        }
+    }));
+    issuer
 }
 
 /// A fake `gh` the daemon is booted with: `pr view <n> …` answers an open
@@ -144,6 +201,7 @@ impl Board {
         let gh = fake_gh(&state);
 
         let mut stop = Stop(Arc::new(AtomicBool::new(false)), Vec::new());
+        let issuer = platform(&mut stop);
         let opts = crate::daemon::ServeOptions {
             test_seam: true,
             stop: Some(stop.0.clone()),
@@ -174,6 +232,14 @@ impl Board {
                 stop: Some(stop.0.clone()),
                 startup: Some(startup),
                 test_seam: true,
+                public: Some(crate::ui::PublicBoard {
+                    host: PUBLIC_HOST.into(),
+                    issuer: issuer.clone(),
+                    company: COMPANY.into(),
+                    authorize_url: format!("{issuer}/authorize"),
+                }),
+                allow_hosts: vec![PUBLIC_HOST.into()],
+                allow_origins: vec![format!("http://{PUBLIC_HOST}")],
                 ..Default::default()
             };
             let (s, p) = (state.clone(), pm_dir.clone());
@@ -211,6 +277,7 @@ impl Board {
             base: format!("http://127.0.0.1:{port}"),
             host: format!("cadence-{port}.localhost:{port}"),
             token,
+            issuer,
             _stop: stop,
         }
     }
@@ -275,7 +342,89 @@ impl Board {
     /// What `cadence audit approval` — and so `scripts/enqueue-reviewed` —
     /// reads for `head` of the fixture PR.
     fn audit(&self, head: &str) -> Value {
-        crate::audit::approval_check(&self.state, REPO, PR, head).0
+        self.audit_pr(PR, head)
+    }
+
+    fn audit_pr(&self, pr: u64, head: &str) -> Value {
+        crate::audit::approval_check(&self.state, REPO, pr, head).0
+    }
+
+    /// The daemon verb as the board relays it, from a proven operator
+    /// connection, attributed to `actor`.
+    fn shown(&self, pr: u64, actor: &str) -> crate::Result<Value> {
+        scoped(Asserted::Operator, || {
+            crate::client::rpc(
+                &self.state,
+                VERB,
+                json!({"repo": REPO, "pr": pr, "head": HEAD, "request_actor": actor}),
+            )
+        })
+    }
+
+    /// A public (AgenticOS) session for a platform-verified `owner`,
+    /// through the daemon's real assertion exchange.
+    fn public_owner_session(&self) -> String {
+        let key = Ed25519KeyPair::from_seed_unchecked(&KEY_SEED).unwrap();
+        let now = crate::issue::time::now_epoch();
+        let part = |v: Value| URL_SAFE_NO_PAD.encode(serde_json::to_vec(&v).unwrap());
+        let signed = format!(
+            "{}.{}",
+            part(json!({"alg": "EdDSA", "typ": "JWT", "kid": "c1218"})),
+            part(json!({
+                "iss": self.issuer, "aud": PUBLIC_HOST, "sub": "usr_owner",
+                "email": "owner@example.com", "name": "Platform Owner",
+                "company": COMPANY, "role": "owner",
+                "iat": now, "exp": now + 30, "jti": "c1218-owner"
+            }))
+        );
+        let assertion = format!(
+            "{signed}.{}",
+            URL_SAFE_NO_PAD.encode(key.sign(signed.as_bytes()).as_ref())
+        );
+        let opened = scoped(Asserted::Operator, || {
+            crate::client::rpc(
+                &self.state,
+                "board_session_open",
+                json!({"assertion": assertion}),
+            )
+        })
+        .unwrap();
+        opened["token"].as_str().unwrap().to_string()
+    }
+
+    /// A request on the public host, as the platform relay delivers it: a
+    /// GET without `body`, a POST with one.
+    fn public(&self, path: &str, token: &str, body: Option<&str>) -> (u16, Value) {
+        // `__Host-aos-board-session`: the public cookie (contract §7).
+        let cookie = format!("__Host-aos-board-session={token}");
+        let url = format!("{}{path}", self.base);
+        let response = match body {
+            Some(body) => self
+                .agent
+                .post(url)
+                .header("Host", PUBLIC_HOST)
+                .header("X-Cadence-Board", "1")
+                .header("Origin", format!("http://{PUBLIC_HOST}"))
+                .header(crate::test_seam::AS_HEADER, "operator")
+                .header(crate::test_seam::TOKEN_HEADER, &self.token)
+                .header("Content-Type", "application/json")
+                .header("Cookie", &cookie)
+                .send(body.to_string()),
+            None => self
+                .agent
+                .get(url)
+                .header("Host", PUBLIC_HOST)
+                .header(crate::test_seam::AS_HEADER, "operator")
+                .header(crate::test_seam::TOKEN_HEADER, &self.token)
+                .header("Cookie", &cookie)
+                .call(),
+        }
+        .unwrap();
+        let status = response.status().as_u16();
+        (
+            status,
+            response.into_body().read_json().unwrap_or(Value::Null),
+        )
     }
 
     fn move_head(&self, head: &str) {
@@ -355,6 +504,66 @@ fn cad1218_board_pr_head_approval_refuses_agent_forged_head_and_replay() {
         );
         refused(&board, (403, json!(text)), "direct daemon call");
     }
+
+    // --- the approver allowlist (pm.yaml `approvals.tailnet_logins`) ---
+    // Each tailnet case is the board's own relay of a proven tailnet login;
+    // only the allowlist differs between the refusals and the record.
+    let chris = "chris@example.com (tailscale)";
+    let empty = board.shown(TAILNET_PR, chris);
+    let text = empty
+        .expect_err("an empty allowlist admitted a tailnet login")
+        .to_string();
+    assert!(
+        text.contains("approval allowlist"),
+        "no allowlist means no remote approvals: {text}"
+    );
+    assert_eq!(board.audit_pr(TAILNET_PR, HEAD)["state"], "missing");
+    let pm_yaml = board.state.join("pm").join("pm.yaml");
+    let mut yaml = std::fs::read_to_string(&pm_yaml).unwrap();
+    yaml.push_str("approvals:\n  tailnet_logins:\n    - chris@example.com\n");
+    std::fs::write(&pm_yaml, yaml).unwrap();
+    for actor in [
+        "mallory@example.com (tailscale)",
+        "chris@example.com.evil (tailscale)",
+        "Platform Owner <owner@example.com> (board)",
+        "chris@example.com",
+    ] {
+        let text = board
+            .shown(TAILNET_PR, actor)
+            .expect_err("an actor off the allowlist recorded an approval")
+            .to_string();
+        assert!(
+            text.contains("approval allowlist"),
+            "'{actor}' must be refused by the approver allowlist: {text}"
+        );
+        assert_eq!(board.audit_pr(TAILNET_PR, HEAD)["state"], "missing");
+    }
+    let out = board
+        .shown(TAILNET_PR, chris)
+        .expect("an allowlisted tailnet login records");
+    assert!(out["approval_id"].is_string(), "{out}");
+    let seen = board.audit_pr(TAILNET_PR, HEAD);
+    assert_eq!(seen["state"], "in-force", "{seen}");
+    assert_eq!(seen["recorded_via"], "operator-connection", "{seen}");
+    assert!(
+        seen["source"].as_str().is_some_and(|s| s.contains(chris)),
+        "the source names the tailnet login, marked (tailscale): {seen}"
+    );
+
+    // --- a public AgenticOS owner session: valid, admitted by the board's
+    // OperatorOnly class, and still no approver ---
+    let owner = board.public_owner_session();
+    let (status, meta) = board.public("/api/meta", &owner, None);
+    assert_eq!(status, 200, "{meta}");
+    assert_eq!(meta["signed_in"], true, "the owner session is live: {meta}");
+    let public_body = json!({"repo": REPO, "pr": PUBLIC_PR, "head": HEAD}).to_string();
+    let (status, body) = board.public(APPROVE, &owner, Some(&public_body));
+    assert_eq!(status, 403, "a public owner session cannot approve: {body}");
+    assert_eq!(
+        body["check"], "approver_not_allowed",
+        "refused by the approve route's Caller::Operator allowlist, not earlier: {body}"
+    );
+    assert_eq!(board.audit_pr(PUBLIC_PR, HEAD)["state"], "missing");
 
     // --- forged sessions ---
     let forged_key = Session {
