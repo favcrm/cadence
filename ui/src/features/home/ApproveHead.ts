@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, ApiError } from "../../lib/api";
-import { HEAD_MOVED_COPY } from "./MergeForm";
+import { plainRefusal } from "./MergeForm";
 
 /** `owner/repo` and the PR number from the row's `owner/repo#N` or PR link. */
 export function prTarget(pr: string | null): { repo: string; number: number } | null {
@@ -8,16 +8,11 @@ export function prTarget(pr: string | null): { repo: string; number: number } | 
   return m ? { repo: m[1], number: Number(m[2]) } : null;
 }
 
-/** A refusal in plain words; raw daemon text never reaches the card. */
-const refusal = (e: unknown) => {
-  if (!(e instanceof ApiError)) return "That didn't work. Try again.";
-  if (e.code === "head_moved") return HEAD_MOVED_COPY;
-  if (e.check === "approver_not_allowed") return "Only you can approve from here.";
-  if (/allowlist/.test(e.message)) return "This device isn't allowed to approve. Ask the owner to allow it.";
-  if (e.status === 409) return "This version already has an approval on record. A fresh review makes a new version.";
-  if (e.status === 503) return "The board can't reach the team right now. Try again in a moment.";
-  return "The approval didn't go through. Try again, or ask for help.";
-};
+/** A refusal in plain words; an approval already on record gets its own line. */
+const refusal = (e: unknown) =>
+  e instanceof ApiError && e.status === 409 && e.code !== "head_moved"
+    ? "This version already has an approval on record. A fresh review makes a new version."
+    : plainRefusal(e);
 
 export type ApprovalState = "unknown" | "missing" | "in-force" | "revoked";
 
@@ -33,6 +28,7 @@ export function useApproveHead(pr: string | null, head: string | null, blocked: 
   const target = prTarget(pr);
   const [state, setState] = useState<ApprovalState>("unknown");
   const [approval, setApproval] = useState<string | null>(null);
+  const [revocable, setRevocable] = useState(false);
   const [busy, setBusy] = useState<null | "approve" | "revoke">(null);
   const [error, setError] = useState<string | null>(null);
   const repo = target?.repo;
@@ -43,6 +39,7 @@ export function useApproveHead(pr: string | null, head: string | null, blocked: 
       const out = await api.approvalState(repo, number, head);
       setState(out.state);
       setApproval(out.state === "missing" ? null : (out.approval_id ?? null));
+      setRevocable(out.state === "in-force" && out.board_revocable === true);
     } catch {
       setState("unknown");
     }
@@ -75,6 +72,8 @@ export function useApproveHead(pr: string | null, head: string | null, blocked: 
     available: !!target && !!head,
     state,
     approved: state === "in-force",
+    /** Only an approval a board path recorded can be taken back here. */
+    revocable,
     revoked: state === "revoked",
     busy,
     error,

@@ -1123,15 +1123,15 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             send(request, model_defaults_get(state_dir, opts.read_only));
         }
         "/api/platform-account" => send(request, platform_account::get(opts)),
-        // CAD-615: the operator's master permission rules and pending
-        // requests. The board relays over its own daemon connection, so
-        // the HTTP peer is admitted here — the same operator proof as
-        // the decision writes.
         // CAD-1218: whether the shown head has an approval (drawer state).
         "/api/approvals/state" => {
             let resp = approvals::state(&request, state_dir, opts, raw_query);
             send(request, resp);
         }
+        // CAD-615: the operator's master permission rules and pending
+        // requests. The board relays over its own daemon connection, so
+        // the HTTP peer is admitted here — the same operator proof as
+        // the decision writes.
         "/api/master/permissions" => {
             if let Err(resp) = operator::admit_operator_read(&request, state_dir, opts) {
                 send(request, resp);

@@ -8,9 +8,9 @@
 //!
 //! Both are operator-only in `operator::WRITE_ROUTES`, so `admit` has run
 //! the write guards, the session check and the HTTP-peer operator proof
-//! before a handler here runs. Each handler then accepts only
-//! `Caller::Operator` — a public AgenticOS `owner` session passes `admit`
-//! to an operator-only route but is no approver (`approver_not_allowed`).
+//! before a handler here runs. Each handler then accepts only the operator
+//! session or a platform-verified `owner` (`Caller::Named` with
+//! `operator`); anything else is `approver_not_allowed`.
 //! The deciding actor is the one `board_caller` derived, relayed as
 //! `request_actor`; the daemon applies the approver allowlist again. The
 //! bodies deny unknown fields, so no request names the source, action or id.
@@ -65,7 +65,7 @@ pub(super) fn handle(
     route: Route<'_>,
 ) -> HttpResp {
     // An allowlist: only a proven operator board session approves.
-    let Caller::Operator(actor) = caller else {
+    let Some(actor) = approver(caller) else {
         return guard_fail("approver_not_allowed", NOT_APPROVER);
     };
     let bytes = match read_body(request, BODY_CAP) {
@@ -112,6 +112,16 @@ pub(super) fn handle(
     }
 }
 
+/// The relayed actor, derived by `board_caller` (never from the request):
+/// the operator session, or a platform-verified `owner`. Allowlist.
+fn approver(caller: &Caller) -> Option<&str> {
+    match caller {
+        Caller::Operator(actor) => Some(actor),
+        Caller::Named(named) if named.operator => Some(&named.actor),
+        _ => None,
+    }
+}
+
 const NOT_APPROVER: &str = "only the operator can record or revoke an approval from the board";
 
 /// `GET /api/approvals/state`: exactly `repo`, `pr` and `head`, each once,
@@ -126,7 +136,7 @@ pub(super) fn state(
         Ok(caller) => caller,
         Err(resp) => return resp,
     };
-    let Caller::Operator(actor) = caller else {
+    let Some(actor) = approver(&caller) else {
         return guard_fail("approver_not_allowed", NOT_APPROVER);
     };
     let (mut repo, mut pr, mut head) = (None, None, None);

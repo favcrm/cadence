@@ -392,11 +392,13 @@ function MergeReview({ need, readOnly, index, total, onDone, onClose }: ReviewPr
           )}
           {a.approved && (
             <>
-              <p className="rv-note">Approved.</p>
-              <button type="button" className="rv-dlnk" disabled={!!block || a.busy !== null} onClick={() => setTakeBack((t) => !t)}>
-                Take my approval back
-              </button>
-              {takeBack && (
+              <p className="rv-note">{a.revocable ? "Approved." : "Approved from your terminal."}</p>
+              {a.revocable && (
+                <button type="button" className="rv-dlnk" disabled={!!block || a.busy !== null} onClick={() => setTakeBack((t) => !t)}>
+                  Take my approval back
+                </button>
+              )}
+              {a.revocable && takeBack && (
                 <SendBack
                   label="Take it back"
                   placeholder="Why are you taking it back?"

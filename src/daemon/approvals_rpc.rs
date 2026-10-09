@@ -230,9 +230,16 @@ impl Shared {
         approver_source(&pm.config, &actor)?;
         let (seen, _) = crate::audit::approval_check(&self.state_dir, &repo, pr, head);
         match seen["state"].as_str() {
-            Some(state @ ("in-force" | "revoked")) => {
-                Ok(json!({"state": state, "approval_id": seen["approval_id"]}))
-            }
+            Some("in-force") => Ok(json!({
+                "state": "in-force",
+                "approval_id": seen["approval_id"],
+                "board_revocable": store::board_revocable(&json!({
+                    "action": "merge",
+                    "recorded_via": seen["recorded_via"],
+                    "source": seen["source"],
+                })),
+            })),
+            Some("revoked") => Ok(json!({"state": "revoked", "approval_id": seen["approval_id"]})),
             Some("missing") => Ok(json!({"state": "missing"})),
             _ => Err(Error::internal("the approval record could not be read")),
         }
@@ -555,6 +562,21 @@ impl Shared {
     }
 }
 
+/// `<name> <<email>> (board)`: the actor the board builds from a
+/// platform-verified `owner` session — a non-empty name and an email in
+/// angle brackets.
+fn platform_owner_actor(actor: &str) -> bool {
+    let Some(rest) = actor.strip_suffix(" (board)") else {
+        return false;
+    };
+    let Some(rest) = rest.strip_suffix('>') else {
+        return false;
+    };
+    rest.rsplit_once(" <").is_some_and(|(name, email)| {
+        !name.trim().is_empty() && email.contains('@') && !email.contains(['<', '>'])
+    })
+}
+
 /// CAD-1218: the one approver rule for everything the board relays that
 /// records or reads an approval. `request_actor` is attribution derived by
 /// the board; it must be exactly `operator (ui)` (a loopback board session)
@@ -567,13 +589,16 @@ pub(super) fn approver_source(
 ) -> Result<String> {
     let allowed = match request_actor.strip_suffix(" (tailscale)") {
         Some(login) => config.approvals.tailnet_logins.iter().any(|l| l == login),
-        None => request_actor == crate::ui::UI_ACTOR,
+        None => request_actor == crate::ui::UI_ACTOR || platform_owner_actor(request_actor),
     };
     if !allowed {
-        return Err(Error::rejected(format!(
-            "'{request_actor}' is not on the approval allowlist — a remote board approves only \
-             for a login listed in pm.yaml approvals.tailnet_logins"
-        )));
+        return Err(Error::invalid(
+            "approver_not_allowed",
+            format!(
+                "'{request_actor}' is not on the approval allowlist — a remote board approves \
+                 only for a login listed in pm.yaml approvals.tailnet_logins, or a platform owner"
+            ),
+        ));
     }
     Ok(format!("{request_actor} via board"))
 }

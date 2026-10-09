@@ -1372,7 +1372,6 @@ fn board_revoke(board: &Board, operator: &Session, id: &str) -> (bool, u16, Valu
 }
 
 #[test]
-#[ignore = "CAD-1218: enabled by the implementation"]
 fn cad1218_board_revocable_is_the_board_revoke_predicate() {
     let root = tempfile::Builder::new().prefix("c1218v").tempdir().unwrap();
     let board = Board::start(root.path());
@@ -1561,7 +1560,6 @@ fn cad1218_board_revocable_is_the_board_revoke_predicate() {
 const OWNER_ACTOR: &str = "Platform Owner <owner@example.com> (board)";
 
 #[test]
-#[ignore = "CAD-1218: enabled by the implementation"]
 fn cad1218_platform_owner_is_an_approver_and_member_never() {
     let root = tempfile::Builder::new().prefix("c1218o").tempdir().unwrap();
     let board = Board::start(root.path());

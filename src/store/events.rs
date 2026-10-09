@@ -172,6 +172,17 @@ pub(crate) fn event_store_stats(
     })
 }
 
+/// CAD-1218: may the board revoke this approval record — one a board path
+/// wrote: action `merge`, `recorded_via` operator-connection, and a source
+/// ending ` via board`. The revoke target rule and the state read share it.
+pub fn board_revocable(record: &Value) -> bool {
+    record["action"] == "merge"
+        && record["recorded_via"] == "operator-connection"
+        && record["source"]
+            .as_str()
+            .is_some_and(|s| s.ends_with(" via board"))
+}
+
 pub fn default_approval_id(action: &str, pr: u64, head: &str) -> String {
     format!("{action}-pr{pr}-{}", &head[..head.len().min(12)])
 }
@@ -991,12 +1002,7 @@ impl Store {
                     "Approval id '{id}' has no recorded approval to revoke"
                 )));
             };
-            let by_board = recorded["action"] == "merge"
-                && recorded["recorded_via"] == recorded_via
-                && recorded["source"]
-                    .as_str()
-                    .is_some_and(|s| s.ends_with(" via board"));
-            if board_only && !by_board {
+            if board_only && !board_revocable(&recorded) {
                 return Err(Error::rejected(format!(
                     "Approval '{id}' was not recorded from the board — revoke it with \
                      `cadence audit revoke`"

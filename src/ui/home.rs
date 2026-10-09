@@ -268,6 +268,10 @@ pub(super) fn rpc_err(e: &Error, method: &str) -> HttpResp {
             None,
         );
     }
+    // CAD-1218: the approver rule refused the relayed actor.
+    if e.code() == Some("approver_not_allowed") {
+        return guard_fail("approver_not_allowed", &text);
+    }
     // The daemon's own operator gate refused the board's connection.
     if text.contains("operator action") || text.contains("not provably the operator") {
         return coded_response(403, "operator_proof", &text, None);
