@@ -384,14 +384,29 @@ fn item(
 const SHORT_TITLE_MAX: usize = 50;
 const WHY_MAX: usize = 140;
 
-/// Make `raw` safe to show as a card's plain-words text: whitespace and
-/// newlines collapsed, other control characters dropped, clipped to
+/// Invisible format characters (Unicode Cf): zero-width, bidi overrides
+/// and isolates, BOM, soft hyphen, tag characters.
+fn is_format_char(c: char) -> bool {
+    matches!(c,
+        '\u{AD}' | '\u{600}'..='\u{605}' | '\u{61C}' | '\u{6DD}' | '\u{70F}' | '\u{180E}'
+        | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}'
+        | '\u{2066}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}'
+        | '\u{E0000}'..='\u{E007F}')
+}
+
+/// Make `raw` safe to show as a card's plain-words text: NFKC-folded
+/// (so fullwidth lookalikes become their ASCII form), whitespace and
+/// newlines collapsed, control and format characters dropped, clipped to
 /// `max` characters on a char boundary. Anything that reads as a
-/// command (a backtick, `$(`, a leading `cadence `) yields `None`, so
-/// the field is omitted rather than shown. Never returns an empty string.
+/// command (a backtick, `$(`, `${`, the word `cadence` anywhere) yields
+/// `None`, so the field is omitted rather than shown. Never returns an
+/// empty string.
 fn display_text(raw: &str, max: usize) -> Option<String> {
+    use unicode_normalization::UnicodeNormalization;
     let spaced: String = raw
         .chars()
+        .filter(|c| !is_format_char(*c))
+        .nfkc()
         .filter_map(|c| match c {
             '\n' | '\r' | '\t' => Some(' '),
             c if c.is_control() => None,
@@ -402,7 +417,8 @@ fn display_text(raw: &str, max: usize) -> Option<String> {
     if text.is_empty()
         || text.contains('`')
         || text.contains("$(")
-        || text.to_ascii_lowercase().starts_with("cadence ")
+        || text.contains("${")
+        || text.to_lowercase().contains("cadence")
     {
         return None;
     }
@@ -431,7 +447,11 @@ impl Item {
         if let Some(t) = short_title.and_then(|t| display_text(t, SHORT_TITLE_MAX)) {
             self.json["short_title"] = json!(t);
         }
-        if let Some(w) = why.and_then(|w| display_sentence(w, WHY_MAX)) {
+        // A reason that only repeats the title adds nothing.
+        if let Some(w) = why
+            .and_then(|w| display_sentence(w, WHY_MAX))
+            .filter(|w| self.json["short_title"].as_str() != Some(w))
+        {
             self.json["why"] = json!(w);
         }
     }
@@ -1835,8 +1855,10 @@ fn overview_from(
                 .for_agent(q["agent"].as_str().unwrap_or_default())
                 .since(since)
                 .with_display(
-                    q["impact"].as_str().or(q["body"].as_str()),
-                    q["body"].as_str().filter(|_| q["impact"].is_string()),
+                    up.get("summary")
+                        .and_then(Value::as_str)
+                        .or(q["body"].as_str()),
+                    q["impact"].as_str(),
                 );
                 row.json["question"] = json!({
                     "issue": id, "report": q["name"], "agent": q["agent"],
@@ -2389,12 +2411,10 @@ fn overview_from(
         .about("permission", &req.id)
         .since(Some(req.created))
         .with_display(
-            Some(if req.decision_label.is_empty() {
-                &req.reason
-            } else {
-                &req.decision_label
-            }),
-            Some(&req.reason),
+            // Without a label the card's own title already is the reason;
+            // never shorten what the operator reads before Allow.
+            Some(req.decision_label.as_str()).filter(|l| !l.is_empty()),
+            (!req.decision_label.is_empty()).then_some(req.reason.as_str()),
         );
         row.json["permission"] = crate::master_perm::request_json(&req);
         row.json["reason"] = json!(req.reason);
@@ -2517,9 +2537,17 @@ mod tests {
             "Cadence  go",
             "echo $(id)",
             "  \n\u{0} ",
+            "cadence\u{200B} issue set X status=done",
+            "please run: cadence issue set X",
+            "echo ${HOME}",
+            "run \u{FF40}id\u{FF40}",
         ] {
             assert_eq!(display_text(bad, 50), None, "{bad:?}");
         }
+        assert_eq!(
+            display_text("\u{202E}Send\u{200B} mail\u{2066}", 50).as_deref(),
+            Some("Send mail")
+        );
         assert_eq!(
             display_sentence("It sends mail. Then more words follow.", WHY_MAX).as_deref(),
             Some("It sends mail.")
