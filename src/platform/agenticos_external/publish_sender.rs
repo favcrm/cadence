@@ -1038,7 +1038,6 @@ fn store_material(
             || frozen["destination_id"].as_str() != Some(binding.destination_id.as_str())
             || frozen["caption_digest"].as_str() != Some(binding.caption_digest.as_str())
             || frozen["image_digest"].as_str() != binding.image_digest.as_deref()
-            || frozen["grant_id"].as_str() != Some(binding.grant_id.as_str())
         {
             return Err(Refusal::new(
                 "grant_binding_mismatch",
@@ -1604,6 +1603,60 @@ mod tests {
             lines[0].starts_with("GET /v1/runtime/connectors/publish/grants?destinationId=1784 "),
             "{}",
             lines[0]
+        );
+    }
+    /// CAD-1291: a social draft effect freezes no grant id (the owner's
+    /// standing grant is found at send time), so the stored-material check
+    /// must not demand one; every other frozen field still has to match.
+    #[test]
+    fn social_draft_material_needs_no_frozen_grant_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let install = "install-1";
+        let effect_id = format!(
+            "sfx_{}_{}",
+            install
+                .bytes()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+            "0".repeat(32)
+        );
+        let mut b = binding();
+        b.source = super::super::publish::PublicationSource::SocialDraft {
+            draft_id: "d1".into(),
+            revision: 2,
+        };
+        b.cadence_effect_id = effect_id.clone();
+        let frozen = json!({"idempotency_key": b.key, "effect_id": effect_id,
+            "source":{"kind":"social_draft","draft_id":"d1","revision":2},
+            "aos_connection_id": b.connection_id, "destination_id": b.destination_id,
+            "caption_digest": b.caption_digest, "caption":"Harbour at dusk."});
+        let path = crate::store::app_records::record_db_path(dir.path(), install).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE app_social_effects (effect_id TEXT, frozen_json TEXT, state TEXT, digest TEXT, media_key TEXT)",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO app_social_effects VALUES (?,?,?,?,NULL)",
+            rusqlite::params![
+                effect_id,
+                frozen.to_string(),
+                "approved",
+                crate::store::app_runs::material_digest(&frozen)
+            ],
+        )
+        .unwrap();
+        let material = super::store_material(dir.path(), &b).unwrap();
+        assert_eq!(material.caption, "Harbour at dusk.");
+        // A drifted caption digest is still refused.
+        let mut drifted = b.clone();
+        drifted.caption_digest = "0".repeat(64);
+        assert_eq!(
+            super::store_material(dir.path(), &drifted)
+                .unwrap_err()
+                .code,
+            "grant_binding_mismatch"
         );
     }
 }
