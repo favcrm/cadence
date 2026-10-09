@@ -75,11 +75,32 @@ export interface AppBinding {
   config: { bundle_digest: string; connection_id: string; provider: string; account: string; mapping: ActionMapping };
   drift?: BindingDrift;
 }
+export interface CompatibilityCheck {
+  kind: "core" | "contract";
+  required: string | number[];
+  host?: string;
+  contract?: string;
+  supported?: number[];
+  stage?: string | null;
+  ok: boolean;
+}
+export interface CompatibilityReceipt {
+  schema: number;
+  ok: boolean | null;
+  compatible?: boolean | null;
+  status?: string;
+  declared: boolean;
+  core?: string | null;
+  contracts?: Record<string, number[]>;
+  unmet?: string | null;
+  host?: { core: string; contracts: Record<string, number[]> } | null;
+  checks: CompatibilityCheck[];
+}
 export interface UpgradeProposal {
   install_id: string; name: string; version: string; digest: string;
   expected_digest: string; expected_generation: string;
   structural_diff: { added: string[]; changed: string[]; removed: string[] };
-  compatibility?: unknown; notes?: string[];
+  compatibility?: CompatibilityReceipt; notes?: string[];
   secret_warnings: unknown[];
 }
 export interface ArtifactReceipt { id: string; step_id: string; digest: string; media_type: string; size: number }

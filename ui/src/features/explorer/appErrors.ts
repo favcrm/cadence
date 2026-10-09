@@ -6,8 +6,18 @@
  * (backticks, a `cadence ...` command) falls back to a plain sentence.
  */
 const SIGN_IN = /operator'?s session|ui login|carries none|not signed in|sign in|unauthori[sz]ed|\b40[13]\b/i;
+const UNCHANGED_UPGRADE = /^upgrade bundle is unchanged$/i;
+
+export function isUnchangedUpgradeError(cause: unknown): boolean {
+  const text = cause instanceof Error ? cause.message : typeof cause === "string" ? cause : "";
+  return UNCHANGED_UPGRADE.test(text);
+}
 
 const PATTERNS: { test: RegExp; copy: string }[] = [
+  {
+    test: UNCHANGED_UPGRADE,
+    copy: "Up to date — this package is the version you have.",
+  },
   {
     test: SIGN_IN,
     copy: "You're not signed in as an admin. Sign in to see and manage your apps.",

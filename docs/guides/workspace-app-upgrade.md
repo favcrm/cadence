@@ -27,6 +27,27 @@ absolute source paths, Git URLs, and `builtin:<catalog_id>`. In a hosted
 AgenticOS container the remote CLI still has no app-management verbs, so the
 Manage page is the board path for operators updating any app there.
 
+## Test a Git-sourced update
+
+Use a throwaway Cadence instance and a public HTTPS repository you control; do
+not use a production workspace. The board's Git check accepts public HTTPS
+repositories only, with the app bundle (including `app.md`) at the repository
+root. Keep the app identity the same between versions and change the manifest
+version and at least one bundle file so the new digest differs.
+
+1. Push a valid v1 bundle to the repository's default branch, then install it
+   from the Apps page using the Git-source check/install flow.
+2. Push a v2 bundle to that same branch and repository.
+3. Open the installed app's `/apps/manage/<install-id>` page. Its package source
+   should be prefilled with the repository URL. Select **Check update**, review
+   the v2 proposal and changed files, then select **Apply checked update**.
+4. Confirm the installed version is v2. Repeating **Check update** without
+   another bundle change should report that the package is up to date.
+
+Use a public repository without embedded credentials. For a branch other than
+the default branch, select the Git ref supported by the Git-source check when
+installing and checking the update.
+
 Installing or updating is the operator's consent for the exact installed
 digest when the bundle passes local execution validation. `cadence app catalog
 approve <install-id> --digest <digest>` explicitly approves the exact current
