@@ -81,7 +81,7 @@ const IMPORT_MAX_BYTES: usize = super::image::ASSET_LIMIT;
 /// receipt.
 const IMPORT_RESPONSE_CAP: u64 = 64 * 1024;
 
-const IMPORT_PATH: &str = "/v1/runtime/connectors/media/import";
+const IMPORT_PATH: &str = "/media/import";
 
 /// Bounded well inside the worker→daemon RPC frame so a stuck door answers
 /// the caller instead of hanging it.
@@ -143,7 +143,7 @@ impl MediaImporter {
         credential: DeviceCredential,
         timeout: Duration,
     ) -> Result<Self> {
-        let base = super::valid_base(base)?;
+        let base = credential.door_base(base)?;
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(timeout))
             .http_status_as_error(false)
@@ -200,11 +200,12 @@ impl MediaImporter {
         // it over the same bytes and the receipt must echo it. The key that
         // comes back must embed this digest — anything else is refused.
         let digest = format!("{:x}", Sha256::digest(bytes));
-        let url = format!("{}{}", self.base, IMPORT_PATH);
-        let envelope = self
-            .http
-            .post(&url)
-            .header("authorization", &self.credential.authorization())
+        let url = format!("{}{}", self.base, self.credential.route(IMPORT_PATH));
+        let mut request = self.http.post(&url);
+        if let Some(authorization) = self.credential.authorization() {
+            request = request.header("authorization", &authorization);
+        }
+        let envelope = request
             .header("content-type", mime)
             .query("connectionId", connection_id)
             .query("digest", &digest)
@@ -441,7 +442,7 @@ fn receipt_of(
 // that workspace is `not_found` and never mints a key.
 // ===========================================================================
 
-const DESTINATIONS_PATH: &str = "/v1/runtime/connectors/destinations";
+const DESTINATIONS_PATH: &str = "/destinations";
 
 /// One upstream destination row (`toDeviceDestination`, AOS
 /// `device-publish.ts`): `{connectionId, toolkit, displayName,
@@ -520,7 +521,7 @@ pub struct MediaResolver {
 
 impl MediaResolver {
     pub fn new(base: &str, credential: DeviceCredential) -> Result<Self> {
-        let base = super::valid_base(base)?;
+        let base = credential.door_base(base)?;
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(IMPORT_TIMEOUT))
             .http_status_as_error(false)
@@ -541,13 +542,12 @@ impl MediaResolver {
     /// be ruled out). A caller-supplied id is never trusted; the read is
     /// the only source of the map.
     pub fn resolve(&self, toolkit: &str, destination_id: &str) -> DestinationLookup {
-        let url = format!("{}{}", self.base, DESTINATIONS_PATH);
-        let data = match self
-            .http
-            .get(&url)
-            .header("authorization", &self.credential.authorization())
-            .call()
-        {
+        let url = format!("{}{}", self.base, self.credential.route(DESTINATIONS_PATH));
+        let mut request = self.http.get(&url);
+        if let Some(authorization) = self.credential.authorization() {
+            request = request.header("authorization", &authorization);
+        }
+        let data = match request.call() {
             Ok(resp) => match read_destinations_envelope(resp) {
                 Ok(d) => d,
                 Err(Fault::Ambiguous) => return DestinationLookup::Unavailable,
