@@ -64,7 +64,7 @@ fn cad1060_hosted_source_quotes_and_calls_the_lease_door_without_bearer_or_compa
     // Company and account come from the container binding, never the body.
     assert_eq!(
         seen[1].body,
-        json!({"slug":POSTS_TOOL,"query":{"handle":"juicysuite_crm"},"max_charge_minor":2000})
+        json!({"slug":POSTS_TOOL,"query":{"handle":"juicysuite_crm","count":12},"max_charge_minor":2000})
     );
 }
 

@@ -90,6 +90,17 @@ pub(super) fn normalize_posts(handle: &str, result: &Value) -> Result<Value, Str
     let mut seen = std::collections::HashSet::new();
     for row in items.iter().take(MAX_POSTS) {
         if let Some(user) = row.get("user") {
+            // A collab or partner post can appear in this grid but belong to
+            // another account: leave it out so it is never attributed to
+            // `handle`. A matching user that is private or has unknown privacy,
+            // a malformed user, or one with no username still refuses the page.
+            if user
+                .get("username")
+                .and_then(Value::as_str)
+                .is_some_and(|owner| !owner.eq_ignore_ascii_case(handle))
+            {
+                continue;
+            }
             verified_profile(user, handle)?;
         } else if top_user.is_none() {
             return Err("source post profile is missing".into());
@@ -232,10 +243,44 @@ mod tests {
     }
 
     #[test]
+    fn foreign_owner_post_is_skipped_and_other_identity_faults_refuse() {
+        let mut page = reply();
+        page["items"][0]["user"]["username"] = json!("Partner_Brand");
+        let ids = |page: &Value| -> Vec<Value> {
+            normalize_posts("juicysuite_crm", page).unwrap()["posts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|post| post["id"].clone())
+                .collect()
+        };
+        assert_eq!(ids(&page), vec![json!("456")]);
+        // Case-insensitive match keeps the post.
+        page["items"][0]["user"]["username"] = json!("JuicySuite_CRM");
+        assert_eq!(ids(&page).len(), 2);
+        page["items"][1]["user"]["is_private"] = json!(true);
+        assert!(normalize_posts("juicysuite_crm", &page).is_err());
+        page["items"][1]["user"] = json!("juicysuite_crm");
+        assert!(normalize_posts("juicysuite_crm", &page).is_err());
+        page["items"][1]["user"] = json!({"username":"juicysuite_crm","is_private":false});
+        page["user"]["username"] = json!("partner_brand");
+        assert!(normalize_posts("juicysuite_crm", &page).is_err());
+        // Only foreign posts and no verified top-level user: nothing attributed.
+        page.as_object_mut().unwrap().remove("user");
+        page["items"][0]["user"]["username"] = json!("partner_brand");
+        page["items"][1]["user"]["username"] = json!("partner_brand");
+        let none = normalize_posts("juicysuite_crm", &page).unwrap();
+        assert!(none["posts"].as_array().unwrap().is_empty());
+        assert_eq!(none["profile_verified"], false);
+    }
+
+    #[test]
     fn forged_resource_and_private_source_fail_closed() {
         let mut page = reply();
+        // CAD-1296: another account's post is left out, not refused.
         page["items"][0]["user"]["username"] = json!("another_company");
-        assert!(normalize_posts("juicysuite_crm", &page).is_err());
+        let kept = normalize_posts("juicysuite_crm", &page).unwrap();
+        assert_eq!(kept["posts"].as_array().unwrap().len(), 1);
         page["items"][0]["user"]["username"] = json!("juicysuite_crm");
         page["items"][0]["user"]["is_private"] = json!(true);
         assert!(normalize_posts("juicysuite_crm", &page).is_err());
