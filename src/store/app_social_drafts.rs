@@ -10,6 +10,7 @@ const DRAFT_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS app_social_drafts(\
  install_id TEXT NOT NULL, context_id TEXT NOT NULL, draft_id TEXT NOT NULL,\
  revision INTEGER NOT NULL CHECK(revision>0), caption TEXT NOT NULL,\
  source_json TEXT NOT NULL, asset_id TEXT, created REAL NOT NULL, updated REAL NOT NULL,\
+ discarded_at REAL,\
  PRIMARY KEY(context_id,draft_id));\
 CREATE INDEX IF NOT EXISTS app_social_drafts_context ON app_social_drafts(context_id,updated,draft_id);\
 CREATE TABLE IF NOT EXISTS app_social_draft_revisions(\
@@ -127,6 +128,17 @@ pub(crate) fn ensure_schema(conn: &rusqlite::Connection) -> Result<()> {
             [],
         )?;
     }
+    // CAD-1303: soft discard marker. Additive; the file schema version stays.
+    let draft_columns = conn
+        .prepare("PRAGMA table_info(app_social_drafts)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !draft_columns.iter().any(|c| c == "discarded_at") {
+        conn.execute(
+            "ALTER TABLE app_social_drafts ADD COLUMN discarded_at REAL",
+            [],
+        )?;
+    }
     let generation_columns = conn
         .prepare("PRAGMA table_info(app_social_generation_intents)")?
         .query_map([], |r| r.get::<_, String>(1))?
@@ -154,7 +166,7 @@ impl RecordStore {
         id: &str,
     ) -> Result<Value> {
         let row = conn.query_row(
-            "SELECT draft_id,revision,caption,source_json,asset_id,created,updated FROM app_social_drafts WHERE install_id=? AND context_id=? AND draft_id=?",
+            "SELECT draft_id,revision,caption,source_json,asset_id,created,updated FROM app_social_drafts WHERE install_id=? AND context_id=? AND draft_id=? AND discarded_at IS NULL",
             params![install, context, id],
             |r| Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,f64>(5)?,r.get::<_,f64>(6)?)),
         ).optional()?.ok_or_else(|| Error::rejected("social draft not found in this context"))?;
@@ -171,7 +183,7 @@ impl RecordStore {
 
     pub fn app_social_draft_list(&self, context: &str) -> Result<Value> {
         let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT draft_id FROM app_social_drafts WHERE install_id=? AND context_id=? ORDER BY updated DESC,draft_id LIMIT 101")?;
+        let mut stmt = conn.prepare("SELECT draft_id FROM app_social_drafts WHERE install_id=? AND context_id=? AND discarded_at IS NULL ORDER BY updated DESC,draft_id LIMIT 101")?;
         let ids = stmt
             .query_map(params![self.install(), context], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -252,13 +264,68 @@ impl RecordStore {
                 if saved!=intent || draft!=id { return Err(Error::rejected("social draft request ID was reused for a different intent")); }
                 return Self::social_draft_in(tx,self.install(),context,id);
             }
-            let (revision,old_source,old_asset):(i64,String,Option<String>)=tx.query_row("SELECT revision,source_json,asset_id FROM app_social_drafts WHERE install_id=? AND context_id=? AND draft_id=?",params![self.install(),context,id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?.ok_or_else(||Error::rejected("social draft not found in this context"))?;
+            let (revision,old_source,old_asset):(i64,String,Option<String>)=tx.query_row("SELECT revision,source_json,asset_id FROM app_social_drafts WHERE install_id=? AND context_id=? AND draft_id=? AND discarded_at IS NULL",params![self.install(),context,id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?.ok_or_else(||Error::rejected("social draft not found in this context"))?;
             if revision!=expected { return Err(Error::conflict(expected,"social draft revision is stale")); }
             let newasset=asset_id.unwrap_or(old_asset.as_deref()).map(str::to_owned); let next=revision+1; let at=now();
             tx.execute("UPDATE app_social_drafts SET revision=?,caption=?,asset_id=?,updated=? WHERE install_id=? AND context_id=? AND draft_id=? AND revision=?",params![next,caption,newasset,at,self.install(),context,id,expected])?;
             tx.execute("INSERT INTO app_social_draft_revisions(install_id,context_id,draft_id,revision,caption,source_json,asset_id,actor,at) VALUES(?,?,?,?,?,?,?,?,?)",params![self.install(),context,id,next,caption,old_source,newasset,actor,at])?;
             tx.execute("INSERT INTO app_social_draft_requests(request_id,install_id,context_id,draft_id,intent_digest,response_json,at) VALUES(?,?,?,?,?,?,?)",params![request_id,self.install(),context,id,intent,"{}",at])?;
             Self::social_draft_in(tx,self.install(),context,id)
+        })
+    }
+
+    /// CAD-1303: soft discard. The record, its revisions and its effects stay
+    /// for audit and cost history; it only leaves list/show/update. Refused
+    /// while any effect of the draft is approved, sending or posted. Waiting
+    /// effects are declined so a hidden draft can never be approved later.
+    pub fn app_social_draft_discard(
+        &self,
+        context: &str,
+        id: &str,
+        revision: i64,
+    ) -> Result<Value> {
+        crate::proto::identifier(context, "context ID")?;
+        crate::proto::identifier(id, "social draft ID")?;
+        self.write_tx(|tx| {
+            let current: Option<i64> = tx
+                .query_row(
+                    "SELECT revision FROM app_social_drafts WHERE install_id=? AND context_id=? AND draft_id=? AND discarded_at IS NULL",
+                    params![self.install(), context, id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let current = current.ok_or_else(|| {
+                Error::invalid("draft_not_found", "That draft is no longer here.")
+            })?;
+            if current != revision {
+                return Err(Error::Structured(crate::error::Structured {
+                    kind: "conflict",
+                    code: "stale_revision".into(),
+                    message: "social draft revision is stale".into(),
+                    revision: Some(current),
+                }));
+            }
+            let live: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM app_social_effects WHERE install_id=? AND context_id=? AND draft_id=? AND state IN ('approved','sending','posted')",
+                params![self.install(), context, id],
+                |r| r.get(0),
+            )?;
+            if live > 0 {
+                return Err(Error::gate_coded(
+                    "draft_in_use",
+                    "This draft is approved or published, so it cannot be discarded.",
+                ));
+            }
+            let at = now();
+            tx.execute(
+                "UPDATE app_social_effects SET state='declined',updated=? WHERE install_id=? AND context_id=? AND draft_id=? AND state='waiting'",
+                params![at, self.install(), context, id],
+            )?;
+            tx.execute(
+                "UPDATE app_social_drafts SET discarded_at=? WHERE install_id=? AND context_id=? AND draft_id=? AND revision=? AND discarded_at IS NULL",
+                params![at, self.install(), context, id, revision],
+            )?;
+            Ok(json!({"draft_id":id,"state":"discarded","revision":revision}))
         })
     }
 
@@ -465,7 +532,7 @@ impl RecordStore {
     }
     pub fn app_social_effect_list(&self, context: &str) -> Result<Value> {
         let conn = self.conn();
-        let ids=conn.prepare("SELECT effect_id FROM app_social_effects WHERE install_id=? AND context_id=? ORDER BY created DESC,effect_id LIMIT 101")?.query_map(params![self.install(),context],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let ids=conn.prepare("SELECT effect_id FROM app_social_effects WHERE install_id=? AND context_id=? AND draft_id NOT IN (SELECT draft_id FROM app_social_drafts WHERE install_id=? AND context_id=? AND discarded_at IS NOT NULL) ORDER BY created DESC,effect_id LIMIT 101")?.query_map(params![self.install(),context,self.install(),context],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
         if ids.len() > 100 {
             return Err(Error::rejected(
                 "social effect inventory exceeds its supported bound",

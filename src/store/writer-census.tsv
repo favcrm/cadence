@@ -47,6 +47,7 @@ lease/http_tests.rs	test-fixtures	open	1
 platform/agenticos_external.rs	non-sqlite-platform-adapter-inline-tests	execute	2
 platform/agenticos_external/publish_sender.rs	read-only-store-publication-observation-and-inline-tests	execute	8
 platform/agenticos_external/publish_sender.rs	read-only-store-publication-observation-and-inline-tests	open	4
+platform/agenticos_external/tests/hosted_source_board.rs	test-fixtures	open	1
 platform/deployments/tests.rs	non-sqlite-platform-deployment-tests	execute	1
 platform/local.rs	read-only-store-platform-observation	open	2
 remote_result_outbox.rs	separate-results.sqlite3	execute	10
@@ -90,9 +91,9 @@ store/app_runs.rs	guarded-store-and-read-queries	prepare	2
 store/app_sends.rs	guarded-store-and-read-queries	execute	11
 store/app_sends.rs	guarded-store-and-read-queries	guarded_write	6
 store/app_sends.rs	guarded-store-and-read-queries	prepare	5
-store/app_social_drafts.rs	guarded-store-and-read-queries	execute	24
-store/app_social_drafts.rs	guarded-store-and-read-queries	guarded_write	13
-store/app_social_drafts.rs	guarded-store-and-read-queries	prepare	7
+store/app_social_drafts.rs	guarded-store-and-read-queries	execute	27
+store/app_social_drafts.rs	guarded-store-and-read-queries	guarded_write	14
+store/app_social_drafts.rs	guarded-store-and-read-queries	prepare	8
 store/app_tools.rs	guarded-store-and-read-queries	execute	2
 store/app_tools.rs	guarded-store-and-read-queries	guarded_write	2
 store/app_tools.rs	guarded-store-and-read-queries	prepare	1

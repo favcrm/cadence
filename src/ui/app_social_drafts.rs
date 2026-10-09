@@ -11,6 +11,7 @@ pub(super) fn route(path: &str) -> Option<&'static str> {
         "/api/app-social-drafts/list" => Some("app_social_draft_list"),
         "/api/app-social-drafts/show" => Some("app_social_draft_show"),
         "/api/app-social-drafts/update" => Some("app_social_draft_update"),
+        "/api/app-social-drafts/discard" => Some("app_social_draft_discard"),
         "/api/app-social-drafts/asset" => Some("app_social_draft_asset"),
         "/api/app-social-drafts/sources/show" => Some("app_social_sources_show"),
         "/api/app-social-drafts/sources/save" => Some("app_social_sources_save"),

@@ -563,6 +563,7 @@ impl Shared {
                 );
                 let mut plan = input.clone();
                 if operation == "image" {
+                    let image_idea = image_idea(&input)?;
                     // Standalone image generation is grounded in the draft's
                     // retained source, never a caller-supplied receipt or facts.
                     let current = records.app_social_draft_show(context, draft)?;
@@ -621,7 +622,7 @@ impl Shared {
                         "subject": subject,
                         "source": frozen_source,
                         "brand_voice": "",
-                        "image_prompt": "",
+                        "image_prompt": image_idea,
                     });
                     adapter_input = json!({});
                     authority_inputs = plan.clone();
@@ -956,5 +957,65 @@ mod generation_settlement_tests {
             )),
             GenerationSettlement::Pending
         );
+    }
+}
+
+/// CAD-1303: the owner's per-post image idea. The image tool input is `{}` or
+/// exactly `{image_prompt}`: plain text, at most 512 characters, no control
+/// characters. Anything else is refused, never truncated or dropped.
+fn image_idea(input: &Value) -> Result<String> {
+    let fields = input
+        .as_object()
+        .ok_or_else(|| Error::rejected("image input must be an object"))?;
+    if fields.is_empty() {
+        return Ok(String::new());
+    }
+    let idea = match (fields.len(), fields.get("image_prompt")) {
+        (1, Some(Value::String(text))) => text.trim(),
+        _ => {
+            return Err(Error::rejected(
+                "image input accepts only an image_prompt text",
+            ))
+        }
+    };
+    if idea.is_empty() || idea.chars().count() > 512 || idea.chars().any(char::is_control) {
+        return Err(Error::rejected(
+            "image idea must be plain text of at most 512 characters",
+        ));
+    }
+    Ok(idea.to_owned())
+}
+
+#[cfg(test)]
+mod image_idea_tests {
+    use super::image_idea;
+    use serde_json::json;
+
+    #[test]
+    fn image_idea_is_trimmed_bounded_plain_text_and_never_truncated() {
+        assert_eq!(image_idea(&json!({})).unwrap(), "");
+        assert_eq!(
+            image_idea(&json!({"image_prompt": "  a calm bowl of noodles "})).unwrap(),
+            "a calm bowl of noodles"
+        );
+        assert_eq!(
+            image_idea(&json!({"image_prompt": "x".repeat(512)}))
+                .unwrap()
+                .len(),
+            512
+        );
+        for bad in [
+            json!({"image_prompt": "x".repeat(513)}),
+            json!({"image_prompt": ""}),
+            json!({"image_prompt": "   "}),
+            json!({"image_prompt": "line\nbreak"}),
+            json!({"image_prompt": "nul\u{0}"}),
+            json!({"image_prompt": 7}),
+            json!({"image_prompt": "ok", "subject": "forged"}),
+            json!({"source": "forged"}),
+            json!([]),
+        ] {
+            assert!(image_idea(&bad).is_err(), "{bad}");
+        }
     }
 }

@@ -23,6 +23,7 @@ fn local_social_draft_classifier_is_an_exact_closed_allowlist() {
     for method in [
         "app_social_draft_create",
         "app_social_draft_update",
+        "app_social_draft_discard",
         "app_social_draft_asset",
         "app_social_sources_save",
     ] {

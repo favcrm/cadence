@@ -3434,6 +3434,7 @@ impl Shared {
             | "app_social_draft_list"
             | "app_social_draft_show"
             | "app_social_draft_update"
+            | "app_social_draft_discard"
             | "app_social_draft_asset"
             | "app_social_sources_show"
             | "app_social_sources_save" => self.rpc_app_social_draft(method, params, peer_pid),

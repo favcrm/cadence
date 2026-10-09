@@ -59,7 +59,7 @@ export type ChildToHost =
  *  port. `call` verbs never spend or publish; every spend or publish verb is a
  *  `slot` verb and waits for a tap on a host-drawn button. The `publish.*` slot
  *  verbs arrive with HP4: add them here and in the host's dispatch table. */
-export const CALL_VERBS = ["read.run", "context.defaults.save", "open-link", "social.drafts.list", "social.drafts.show", "social.drafts.create", "social.drafts.update", "social.drafts.publish.stage", "social.sources.show", "social.sources.save", "social.destinations.list"] as const;
+export const CALL_VERBS = ["read.run", "context.defaults.save", "open-link", "social.drafts.list", "social.drafts.show", "social.drafts.create", "social.drafts.update", "social.drafts.discard", "social.drafts.publish.stage", "social.sources.show", "social.sources.save", "social.destinations.list"] as const;
 export const SLOT_VERBS = ["run.start", "publish.destination.use"] as const;
 export type CallVerb = (typeof CALL_VERBS)[number];
 export type SlotVerb = (typeof SLOT_VERBS)[number];

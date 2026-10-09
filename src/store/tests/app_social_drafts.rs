@@ -372,3 +372,105 @@ fn uncertain_generation_intent_is_never_restarted_under_a_new_request_id() {
     assert_eq!(attached["intent"]["request_id"], "request-a");
     assert_eq!(attached["intent"]["state"], "uncertain");
 }
+
+/// CAD-1303: a soft discard hides the draft, keeps the record, and refuses
+/// stale revisions and any draft that has an approved, sending or posted effect.
+#[test]
+fn social_draft_discard_is_soft_revision_checked_and_refused_while_in_use() {
+    let root = tempfile::tempdir().unwrap();
+    let store = RecordStore::open(root.path(), "install-discard").unwrap();
+    let source = DraftSource::ToolReceipt {
+        receipt_id: "receipt-1".into(),
+        post_id: Some("post-9".into()),
+    };
+    let make = |request: &str| {
+        store
+            .app_social_draft_create("ctx", "A caption", &source, None, request, "session:test")
+            .unwrap()["draft_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let stage = |draft: &str, effect: &str| {
+        let frozen = json!({"draft_id": draft, "revision": 1});
+        store
+            .app_social_effect_stage(
+                "ctx",
+                &EffectStage {
+                    draft,
+                    revision: 1,
+                    request: effect,
+                    effect_id: effect,
+                    frozen: &frozen,
+                    approval: "approval",
+                },
+            )
+            .unwrap()["effect"]["digest"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+
+    // Plain discard: hidden from list/show/update, record and revisions kept.
+    let plain = make("r-plain");
+    let err = store
+        .app_social_draft_discard("ctx", &plain, 2)
+        .unwrap_err();
+    assert_eq!(err.code(), Some("stale_revision"));
+    assert_eq!(err.revision(), Some(1));
+    assert_eq!(
+        store.app_social_draft_discard("ctx", &plain, 1).unwrap(),
+        json!({"draft_id": plain, "state": "discarded", "revision": 1})
+    );
+    assert!(store.app_social_draft_list("ctx").unwrap()["drafts"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(store.app_social_draft_show("ctx", &plain).is_err());
+    assert!(store.app_social_draft_revision("ctx", &plain, 1).is_ok());
+    let again = store
+        .app_social_draft_discard("ctx", &plain, 1)
+        .unwrap_err();
+    assert_eq!(again.code(), Some("draft_not_found"));
+    let unknown = store
+        .app_social_draft_discard("ctx", "sdr-none", 1)
+        .unwrap_err();
+    assert_eq!(unknown.code(), Some("draft_not_found"));
+
+    // A waiting effect does not block, and is declined so it cannot be approved later.
+    let waiting = make("r-waiting");
+    let digest = stage(&waiting, "eff-waiting");
+    store.app_social_draft_discard("ctx", &waiting, 1).unwrap();
+    assert!(store
+        .app_social_effect_decide("eff-waiting", &digest, true)
+        .is_err());
+    assert!(store.app_social_effect_list("ctx").unwrap()["effects"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    // Approved, sending and posted effects each refuse the discard.
+    let used = make("r-used");
+    let digest = stage(&used, "eff-used");
+    store
+        .app_social_effect_decide("eff-used", &digest, true)
+        .unwrap();
+    for step in ["approved", "sending", "posted"] {
+        match step {
+            "sending" => {
+                store
+                    .app_social_effect_claim_send("eff-used", &digest)
+                    .unwrap();
+            }
+            "posted" => {
+                store
+                    .app_social_effect_finish("eff-used", "posted", &json!({}))
+                    .unwrap();
+            }
+            _ => {}
+        }
+        let refused = store.app_social_draft_discard("ctx", &used, 1).unwrap_err();
+        assert_eq!(refused.code(), Some("draft_in_use"), "{step}");
+        assert!(store.app_social_draft_show("ctx", &used).is_ok(), "{step}");
+    }
+}

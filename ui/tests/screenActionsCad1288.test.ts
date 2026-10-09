@@ -52,6 +52,43 @@ async function main() {
   // CAD-1288 (3): a missing binding reaches the app as a typed setup reason.
   equal(plainRefusal(new ApiError("tool capability binding is absent", 409)).code, "binding_absent", "binding_absent code");
   equal(plainRefusal(new ApiError("something else", 409)).code, "refused", "other refusals stay generic");
+  // CAD-1303: defaults save into the SELECTED context, whatever its label.
+  const qa = { id: "ctx-qa", install_id: "inst", revision: 1, digest: "d", state: "active", config: { schema: 1, label: "Essential Foods QA", input_defaults: { handle: "old" } } };
+  const calls: { method: string; url: string; body: Record<string, unknown> }[] = [];
+  globalThis.fetch = async (input, init) => {
+    const method = init?.method ?? "GET";
+    calls.push({ method, url: String(input), body: init?.body ? JSON.parse(String(init.body)) : {} });
+    const body = method === "GET" ? { contexts: [qa] } : { context: { ...qa, revision: 2 } };
+    return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+  };
+  const qaCtx = { installation, installId: "inst", contextId: "ctx-qa", runs: [], onChanged: async () => {} } as unknown as ActionContext;
+  const stale = await runCall(qaCtx, "context.defaults.save", { values: { handle: "x" }, expected_revision: 2 }, ui([]));
+  assert(!stale.ok && stale.refusal.code === "stale" && calls.every(c => c.method === "GET"), "wrong revision is stale and writes nothing");
+  const okSave = await runCall(qaCtx, "context.defaults.save", { values: { handle: "x" }, expected_revision: 1 }, ui([]));
+  const write = calls.find(c => c.method !== "GET");
+  assert(okSave.ok && write && write.url.includes("ctx-qa") && (write.body as { label?: string }).label === "Essential Foods QA", "save updates the selected context and keeps its label");
+  const unknown = await runCall({ ...qaCtx, contextId: "ctx-gone" } as ActionContext, "context.defaults.save", { values: { handle: "x" }, expected_revision: 1 }, ui([]));
+  assert(!unknown.ok && unknown.refusal.code === "not_found", "an unknown selected context is refused");
+
+  // CAD-1303: discard sends exactly {draft_id, revision} (the host names the draft alias) and
+  // names the host's refusal codes; an extra field such as an alias never leaves the frame.
+  const sent: { url: string; body: Record<string, unknown> }[] = [];
+  globalThis.fetch = async (input, init) => {
+    sent.push({ url: String(input), body: JSON.parse(String(init?.body ?? "{}")) });
+    return new Response(JSON.stringify({ draft_id: "sdr-1", state: "discarded", revision: 3 }), { status: 200, headers: { "Content-Type": "application/json" } });
+  };
+  const withToken = { ...ui([]), actionToken: "a".repeat(64) };
+  const discarded = await runCall(ctx, "social.drafts.discard", { draft_id: "sdr-1", revision: 3 }, withToken);
+  equal(discarded.ok && (discarded.data as Record<string, unknown>).state, "discarded", "discard relays the host reply");
+  assert(sent.length === 1 && sent[0].url.endsWith("/api/app-social-drafts/discard"), "discard uses its own route");
+  equal(Object.keys(sent[0].body).sort(), ["action_token", "draft_id", "revision", "tool_alias"], "discard body fields");
+  for (const bad of [{ alias: "social.draft", draft_id: "sdr-1", revision: 3 }, { draft_id: "sdr-1" }, { draft_id: "sdr-1", revision: 1.5 }]) {
+    const refused = await runCall(ctx, "social.drafts.discard", bad, withToken);
+    assert(!refused.ok && refused.refusal.code === "bad_args", `discard refuses ${JSON.stringify(bad)}`);
+  }
+  assert(sent.length === 1, "refused discards never reach the host");
+  equal(plainRefusal(new ApiError("x", 400, { code: "draft_in_use" })).code, "draft_in_use", "draft_in_use code");
+  equal(plainRefusal(new ApiError("revision is stale", 409, { code: "stale_revision" })).code, "stale_revision", "stale_revision code");
   console.log("screenActionsCad1288 ok");
 }
 main().catch(error => { console.error(error); { throw error; }; });
