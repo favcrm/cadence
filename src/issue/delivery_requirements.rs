@@ -57,15 +57,15 @@ pub struct TrustedLists<'a> {
     pub one_review: Option<&'a str>,
 }
 
-/// Whether an approved solo-operator profile is in force, and when it
-/// is not, why not.
+/// Whether default lean classification applies, and if not, why strict
+/// requirements are retained.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Activation {
-    /// `source == "approved"` and the approved policy carries a valid
-    /// `solo_operator` profile.
+    /// A valid default-equivalent policy is in force.
     Active,
-    /// The in-force policy carries no `solo_operator` section.
+    /// The policy is custom or its provenance is unknown. The serialized
+    /// name is retained for compatibility with existing requirements readers.
     NoProfile,
     /// A `delivery:` section exists but is not the approved one
     /// (`delivery_unapproved`) — the legacy requirements stay.
@@ -96,7 +96,7 @@ pub enum DeliveryClass {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewKind {
-    /// No review required (routine under an activated profile only).
+    /// No review required (routine under a valid default-equivalent policy).
     None,
     /// One combined `Review (standards+spec)` verdict.
     Combined,
@@ -110,7 +110,7 @@ pub enum ReviewKind {
 pub struct Requirements {
     pub class: DeliveryClass,
     /// Independent verdict count on the exact head: `0` only for
-    /// routine under an activated profile.
+    /// routine under a valid default-equivalent policy.
     pub reviews: u32,
     pub review_kind: ReviewKind,
     /// The combined review must be filed by a security-capable
@@ -404,14 +404,18 @@ fn activation_of(resolved: &Resolved) -> Activation {
     {
         return Activation::Malformed;
     }
-    if resolved.source == "approved" && resolved.policy.solo_operator.is_some() {
-        return Activation::Active;
-    }
     let note = resolved.note.as_deref().unwrap_or("");
     if note.starts_with("delivery_error") {
-        Activation::Malformed
-    } else if note.starts_with("delivery_unapproved") {
-        Activation::NotApproved
+        return Activation::Malformed;
+    }
+    if note.starts_with("delivery_unapproved") {
+        return Activation::NotApproved;
+    }
+
+    let mut policy = resolved.policy.clone();
+    policy.solo_operator = None;
+    if matches!(resolved.source, "default" | "file" | "approved") && policy == default_policy() {
+        Activation::Active
     } else {
         Activation::NoProfile
     }
@@ -492,8 +496,8 @@ pub fn classify(
 
     if activation != Activation::Active {
         reasons.push(format!(
-            "no approved solo-operator profile is in force ({activation:?}) — \
-             the legacy requirements apply"
+            "default lean classification does not apply ({activation:?}) — \
+             the strict requirements apply"
         ));
         return strict_requirements(
             resolved,
@@ -504,7 +508,7 @@ pub fn classify(
             reasons,
         );
     }
-    reasons.push("approved solo-operator profile in force".to_string());
+    reasons.push("default lean delivery policy in force".to_string());
 
     let Some(lists) = parsed else {
         reasons.push("the trusted-base lists could not be read or parsed".to_string());

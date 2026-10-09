@@ -397,7 +397,6 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         ),
     ),
     ("project_work_approve", Rule::Handler("operator_connection")),
-    ("project_enable_lean", Rule::Handler("operator_connection")),
     (
         "area_ack",
         Rule::Handler("rpc_area_ack: the operator, or the area's owner PM by its connection (CAD-378)"),

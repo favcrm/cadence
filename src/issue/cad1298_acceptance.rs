@@ -44,12 +44,23 @@ fn assert_legacy_strict_with_lists(
     size: u64,
     lists: &dr::TrustedLists<'_>,
 ) {
-    let legacy = dr::classify(
-        &dr::default_resolved(),
-        std::slice::from_ref(change),
-        size,
-        lists,
+    // A valid approved custom policy stays on the legacy strict path and
+    // provides the reference requirements independently of the new defaults.
+    let mut policy = dp::default_policy();
+    policy.max_revise += 1;
+    policy.validate().expect("custom policy is valid");
+    let digest = dp::digest(&policy);
+    let approval = dp::approved_from(&json!({
+        "delivery_digest": digest,
+        "delivery": policy,
+    }))
+    .expect("custom policy approval passes the production decoder");
+    let resolved = dp::effective(
+        "cad1298",
+        Ok(Some(approval.policy.clone().unwrap())),
+        Some(&approval),
     );
+    let legacy = dr::classify(&resolved, std::slice::from_ref(change), size, lists);
     assert_eq!(req.class, dr::DeliveryClass::Strict);
     assert_eq!(req.reviews, legacy.reviews);
     assert_eq!(req.review_kind, legacy.review_kind);
@@ -99,19 +110,27 @@ fn cad1298_acceptance_routine_consequential_sensitive_and_mixed() {
 #[test]
 fn cad1298_acceptance_legacy_and_refusal_inputs_never_relax() {
     let approved = active();
-    let strict_paths = [
-        changed("docs/roles/risk-classes.md"),
-        changed("src/issue/unknown_module.rs"),
-    ];
-    for change in &strict_paths {
-        let req = dr::classify(
-            &dr::default_resolved(),
-            std::slice::from_ref(change),
-            1,
-            &TRUSTED,
-        );
-        assert_legacy_strict(&req, change, 1);
-    }
+    let protected = changed("docs/roles/risk-classes.md");
+    let req = dr::classify(
+        &dr::default_resolved(),
+        std::slice::from_ref(&protected),
+        1,
+        &TRUSTED,
+    );
+    assert_legacy_strict(&req, &protected, 1);
+
+    // This path is an ordinary source change covered by the real one-review
+    // base list, not an unknown top-level path or malformed diff evidence.
+    let ordinary = dr::classify(
+        &dr::default_resolved(),
+        &[changed("src/issue/unknown_module.rs")],
+        1,
+        &TRUSTED,
+    );
+    assert_eq!(ordinary.class, dr::DeliveryClass::Consequential);
+    assert_eq!(ordinary.reviews, 1);
+    assert_eq!(ordinary.review_kind, dr::ReviewKind::Combined);
+    assert!(ordinary.full_checks);
 
     let missing_lists = dr::TrustedLists::default();
     let missing_change = changed("docs/guide.md");
@@ -173,7 +192,7 @@ fn cad1298_acceptance_legacy_and_refusal_inputs_never_relax() {
 }
 
 #[test]
-fn cad1298_acceptance_only_approved_valid_default_profile_activates() {
+fn cad1298_acceptance_approved_valid_default_profile_remains_compatible() {
     let active = active();
     assert_eq!(
         dr::classify(&active, &[changed("docs/guide.md")], 1, &TRUSTED).class,
@@ -238,7 +257,7 @@ fn cad1298_acceptance_only_approved_valid_default_profile_activates() {
         .as_deref()
         .is_some_and(|n| n.starts_with("delivery_unapproved")));
     let req = dr::classify(&effective, &[changed("docs/guide.md")], 1, &TRUSTED);
-    assert_eq!(req.class, dr::DeliveryClass::Routine);
+    assert_legacy_strict(&req, &changed("docs/guide.md"), 1);
 }
 
 #[test]
