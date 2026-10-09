@@ -11,13 +11,30 @@ The current day-to-day loop (AGENTS.md "Delivery workflow" is the rule text):
    One ticket per feature too; when the PR merges the lane reconciles the
    ticket and cleans up its scratch and processes.
 2. Put the design note in the PR description, not in a separate document.
-3. Run `scripts/pre-push` before every push (`--tests` before asking for
-   review of Rust changes).
-4. One independent reviewer. Two for auth, identity, secrets, the daemon trees
-   and UI paths (`docs/roles/one-review-paths.toml` lists what gets one).
-5. Review notes never block. Findings that are not defects go in a follow-up
+3. Run `scripts/pre-push` before every push. `--tests` is available as a
+   focused local diagnostic, not a blanket pre-review prerequisite; required
+   CI and the full merge-group regression floor remain unchanged.
+4. Under the legacy default, one independent reviewer; two for auth, identity,
+   secrets, the daemon trees and UI paths (`docs/roles/one-review-paths.toml`
+   lists what gets one).
+5. An explicitly activated, trusted-base-approved solo-operator profile may
+   simplify startup using version-one tiers: routine changes need green
+   exact-head CI and genuine ticket-outcome evidence, with no mandatory
+   review; consequential changes need one independent combined standards/spec
+   review. Sensitive changes keep the existing strict review, operator,
+   Browser QA and full-check requirements. Unknown, incomplete, protected-mode,
+   deletion and mixed sensitive cases retain strict legacy floors. Security
+   reviewer qualification and a reduced sensitive review count are deferred.
+   The legacy policy remains the default, and the policy change itself stays
+   under current requirements until the implementation is merged, installed
+   and explicitly activated. The profile cannot self-authorize. Mandatory
+   protection checks, full merge-group regression, credential isolation and
+   operator-owned deployment remain unchanged. No fabricated verdict/readiness
+   counts as review or outcome evidence; dry-run is read-only and requirements
+   must be freshly bound before queueing.
+6. Review notes never block. Findings that are not defects go in a follow-up
    PR, not into this head.
-6. Operator approval: for a `human`-class PR the operator records ONE scope
+7. Operator approval: for a `human`-class PR the operator records ONE scope
    approval per ticket with
    `cadence audit approve --issue <ID> --action scope`. It covers the ticket
    only while it is ready, doing or review, and its body declares its risk
@@ -25,9 +42,9 @@ The current day-to-day loop (AGENTS.md "Delivery workflow" is the rule text):
    editing the body voids it, and verdict notes state `Scope: in-scope <ID>`.
    A per-PR approval (`--pr <n> --head <sha>`) is needed only for triggers 1
    or 3, or for a diff outside the declared scope.
-7. Enqueue with `scripts/enqueue-reviewed <n> --head <full-sha>`; it checks the
+8. Enqueue with `scripts/enqueue-reviewed <n> --head <full-sha>`; it checks the
    scope rules above.
-8. Production: dispatch a staging promote, then the GitHub `production`
+9. Production: dispatch a staging promote, then the GitHub `production`
    approval, then `cadence update --as operator:<n>`.
 
 ## What #738 taught us

@@ -75,7 +75,8 @@ paths = ["docs/roles/**", "docs/CHARTER.md", "docs/AUDIT.md",
   "AGENTS.md", "cadence-review.toml", "clippy.toml", "src/review.rs", "src/review/**",
   "src/audit.rs", "src/audit/**", "src/delegation.rs", "src/delegation/**",
   "src/daemon/approvals_rpc.rs", "src/store/events.rs", "src/overview.rs",
-  "src/delivery.rs", "src/issue/delivery_policy.rs", "src/issue/model.rs",
+  "src/delivery.rs", "src/issue/delivery_policy.rs", "src/issue/delivery_requirements.rs",
+  "src/issue/model.rs",
   "src/issue/board.rs", "src/issue/parse.rs", "src/cli/audit.rs", "src/cli/mod.rs",
   "scripts/**", "tests/**"]
 

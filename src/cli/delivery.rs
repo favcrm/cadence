@@ -40,6 +40,21 @@ pub(crate) enum DeliveryAction {
         #[arg(long)]
         json: bool,
     },
+    /// Derive delivery requirements from the ticket, current PR and approved policy.
+    Requirements {
+        /// The ticket id.
+        #[arg(long)]
+        issue: String,
+        /// Full GitHub pull-request URL.
+        #[arg(long)]
+        pr: String,
+        /// Expected full 40-hex PR head.
+        #[arg(long)]
+        head: String,
+        /// Output JSON (the command always returns JSON).
+        #[arg(long)]
+        json: bool,
+    },
     /// Read each open PR in the loop from GitHub (head, CI, diff stats)
     /// and hand it to the daemon; turn auto-merge off where the head
     /// moved past what was reviewed. Operator only. `--watch <secs>`
@@ -139,6 +154,16 @@ pub(super) fn run_delivery(state_dir: &Path, action: DeliveryAction) -> Result<i
             )?;
             out
         }
+        DeliveryAction::Requirements {
+            issue,
+            pr,
+            head,
+            json: _,
+        } => client::rpc(
+            state_dir,
+            "delivery_requirements",
+            json!({"issue": issue, "pr": pr, "head": head}),
+        )?,
         DeliveryAction::Sync { issue, watch } => match watch {
             None => delivery::sync(state_dir, issue.as_deref(), delivery::GH)?,
             Some(secs) => loop {

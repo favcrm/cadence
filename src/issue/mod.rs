@@ -23,6 +23,7 @@ pub mod claim;
 pub mod cli;
 pub mod context;
 pub mod delivery_policy;
+pub mod delivery_requirements;
 pub mod dispatch;
 pub mod doctor;
 pub mod edit;
@@ -933,6 +934,12 @@ mod lock_tests;
 #[cfg(test)]
 #[path = "cad1177_tools_acceptance.rs"]
 mod cad1177_tools_acceptance;
+
+#[cfg(test)]
+mod cad1298_acceptance;
+
+#[cfg(test)]
+mod cad1298_readiness_acceptance;
 
 #[cfg(test)]
 mod tests {

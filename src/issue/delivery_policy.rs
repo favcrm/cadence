@@ -52,6 +52,27 @@ pub struct DeliveryPolicy {
     pub heavy: SizeLimit,
     /// Over this a delivery cannot merge through the loop.
     pub oversized: SizeLimit,
+    /// CAD-1298: opt-in solo-operator startup profile. `None` on every
+    /// existing/default policy — `skip_serializing_if` keeps a policy without
+    /// it byte-identical, so prior canonical digests and recorded approvals
+    /// are unchanged. The profile only takes effect when the policy that
+    /// carries it resolves as `approved` (`delivery_requirements` reads
+    /// [`Resolved`], never the raw file).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub solo_operator: Option<SoloOperatorProfile>,
+}
+
+/// The solo-operator delivery profile (CAD-1298). Presence in an approved
+/// `delivery:` section activates the routine/consequential/sensitive
+/// requirements split; absent (or on an unapproved section) the current
+/// strict requirements apply unchanged. `version` is forward-proofing:
+/// `1` is the only accepted value, an unknown one refuses the whole
+/// section, so an older binary never silently accepts a profile shape it
+/// does not understand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SoloOperatorProfile {
+    pub version: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -160,6 +181,8 @@ struct RawDelivery {
     heavy: Option<RawSize>,
     #[serde(default)]
     oversized: Option<RawSize>,
+    #[serde(default)]
+    solo_operator: Option<SoloOperatorProfile>,
 }
 
 #[derive(Deserialize)]
@@ -304,6 +327,14 @@ impl RawDelivery {
         for (name, raw) in self.reviews {
             reviews.insert(name.clone(), raw.into_review(&name)?);
         }
+        if let Some(ref s) = self.solo_operator {
+            if s.version != 1 {
+                return Err(err(format!(
+                    "solo_operator.version {}: the only supported version is 1",
+                    s.version
+                )));
+            }
+        }
         Ok(DeliveryPolicy {
             merge: MergePolicy {
                 method: merge.method.unwrap_or(MergeMethod::Squash),
@@ -314,6 +345,7 @@ impl RawDelivery {
             risk: self.risk,
             heavy,
             oversized,
+            solo_operator: self.solo_operator,
         })
     }
 }
@@ -346,6 +378,7 @@ pub fn default_policy() -> DeliveryPolicy {
             lines_over: crate::delivery::OVERSIZED_LINES,
             files_over: crate::delivery::OVERSIZED_FILES,
         },
+        solo_operator: None,
     }
 }
 
@@ -595,6 +628,31 @@ impl DeliveryPolicy {
     /// Every rule fails closed: a malformed section is refused whole,
     /// never partially applied.
     pub fn validate(&self) -> Result<()> {
+        if let Some(s) = &self.solo_operator {
+            // Checked here too, not only in RawDelivery: `approved_from`
+            // deserializes an approval's `delivery` directly and calls
+            // this — a recorded profile must satisfy the same rules.
+            if s.version != 1 {
+                return Err(err(format!(
+                    "solo_operator.version {}: the only supported version is 1",
+                    s.version
+                )));
+            }
+            // CAD-1298: the profile never silently discards custom
+            // requirements — it is supported only on an otherwise
+            // default-equivalent policy. A custom reviews/risk/limits
+            // configuration alongside a profile is refused rather than
+            // partially honored.
+            let mut rest = self.clone();
+            rest.solo_operator = None;
+            if rest != default_policy() {
+                return Err(err(
+                    "solo_operator is supported only on the default delivery policy — \
+                     a custom merge/reviews/risk/limits configuration beside a \
+                     profile is refused",
+                ));
+            }
+        }
         if self.reviews.is_empty() {
             return Err(err("reviews must name at least one review"));
         }

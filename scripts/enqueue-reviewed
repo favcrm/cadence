@@ -22,7 +22,8 @@ unless ALL of these hold for the pinned head:
     list (docs/roles/one-review-paths.toml, CAD-957, read at the PR's base
     commit so a PR cannot widen its own list). A `ui/` change also needs a
     Browser QA pass;
-  * a ticket comment for this head lists those verdict notes;
+  * a ticket comment for this head lists those verdict notes (created after
+    the other gates pass; dry-run only checks an existing comment);
   * for a human-class diff (a path trigger, more than 1500 changed lines, or
     any head-pinned note whose Risk is not exactly `auto`),
     `cadence audit approval` reports an approval in
@@ -41,6 +42,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 import unicodedata
@@ -74,6 +76,7 @@ HUMAN_EXACT = {
     "src/cli/daemon.rs", "src/cli/update.rs", "src/cli/upgrade.rs",
     # trigger 7: approval and delivery rules (CAD-1104)
     "src/audit.rs", "src/delegation.rs", "src/issue/delivery_policy.rs",
+    "src/issue/delivery_requirements.rs",
     "docs/AUDIT.md", "tests/safety_floor.rs",
 }
 
@@ -93,10 +96,10 @@ REGULAR_MODES = ("100644", "100755")
 FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 
 
-def run(argv):
+def run(argv, input_text=None):
     """(returncode, stdout, stderr); a missing binary is rc 127."""
     try:
-        r = subprocess.run(argv, capture_output=True, text=True)
+        r = subprocess.run(argv, input=input_text, capture_output=True, text=True)
     except OSError as e:
         return 127, "", str(e)
     return r.returncode, r.stdout, r.stderr
@@ -375,23 +378,99 @@ def check_reviews(verdicts, qualifies_one, need_qa, authors, issue):
     return reasons, counted
 
 
-def check_comment(comments, head, counted):
+def check_comment(comments, head, counted, required=()):
     names = sorted({n["name"] for n in counted})
     for c in comments or []:
         body = c.get("body") or ""
-        if head in body and all(n in body for n in names):
+        if head in body and all(n in body for n in names) and all(v in body for v in required):
             return []
-    return [f"no ticket comment names head {head} and lists the verdict notes"
+    suffix = (f" and required delivery evidence ({', '.join(required)})" if required else "")
+    return [f"no ticket comment names head {head} and lists the verdict notes{suffix}"
             + (f" ({', '.join(names)})" if names else "")]
 
 
-def check_approval(repo, pr, head, report):
+def requirements_inspection(issue, repo, pr, head):
+    """Read the daemon's trusted, policy-aware requirements decision."""
+    pr_url = f"https://github.com/{repo}/pull/{pr}"
+    rc, out, err = run(["cadence", "delivery", "requirements", "--issue", issue,
+                        "--pr", pr_url, "--head", head, "--json"])
+    try:
+        result = json.loads(out)
+        req = result["requirements"]
+        if rc != 0 or not isinstance(result, dict) or not isinstance(req, dict):
+            raise ValueError("unexpected response shape")
+        if (result.get("issue") != issue or result.get("repo") != repo.lower()
+                or result.get("pr") != pr or result.get("head") != head
+                or not FULL_SHA.fullmatch(result.get("base", ""))
+                or not FULL_SHA.fullmatch(result.get("merge_base", ""))
+                or not re.fullmatch(r"sha256:[0-9a-f]{64}", result.get("policy_digest", ""))
+                or req.get("policy_digest") != result.get("policy_digest")
+                or req.get("class") not in ("routine", "consequential", "sensitive", "strict")
+                or req.get("activation") not in ("active", "no_profile", "not_approved", "malformed")
+                or type(req.get("reviews")) is not int or req["reviews"] not in (0, 1, 2)
+                or req.get("review_kind") not in ("none", "combined", "standards_and_spec")
+                or type(req.get("security_capable")) is not bool
+                or type(req.get("operator_approval")) is not bool
+                or type(req.get("browser_qa")) is not bool
+                or type(req.get("full_checks")) is not bool
+                or not isinstance(req.get("reasons"), list)
+                or not all(isinstance(v, str) for v in req["reasons"])):
+            raise ValueError("requirements binding or fields are malformed")
+        expected = {
+            "routine": (0, "none", False, False, False),
+            "consequential": (1, "combined", False, False, True),
+        }
+        if req["class"] in expected and req["activation"] == "active":
+            reviews, kind, security, approval, full = expected[req["class"]]
+            if (req["reviews"], req["review_kind"], req["security_capable"],
+                    req["operator_approval"], req["full_checks"]) != (
+                    reviews, kind, security, approval, full):
+                raise ValueError("active class does not match its mandatory requirements")
+        elif req["class"] != "strict" or req["reviews"] not in (1, 2):
+            raise ValueError("inactive or strict result attempts a non-legacy waiver")
+        if req["class"] == "strict":
+            legacy_kind = "combined" if req["reviews"] == 1 else "standards_and_spec"
+            if req["review_kind"] != legacy_kind or not req["full_checks"]:
+                raise ValueError("strict requirements do not preserve the native legacy review/check floor")
+        if req["class"] == "routine" and req["activation"] != "active":
+            raise ValueError("routine classification without an active approved profile")
+        if req["class"] == "routine" and req["browser_qa"]:
+            raise ValueError("routine classification cannot require Browser QA")
+        binding = {key: result[key] for key in
+                   ("issue", "project", "repo", "pr", "head", "base", "merge_base", "policy_digest")}
+        if not isinstance(binding["project"], str) or not binding["project"]:
+            raise ValueError("requirements response has no project binding")
+        readiness = result.get("readiness")
+        if readiness is not None:
+            if not isinstance(readiness, dict):
+                raise ValueError("routine readiness is malformed")
+            if (readiness.get("repo") != repo.lower() or readiness.get("pr") != pr
+                    or readiness.get("head") != head or readiness.get("base") != result["base"]
+                    or readiness.get("policy_digest") != result["policy_digest"]
+                    or type(readiness.get("ci_run_id")) is not int or readiness["ci_run_id"] <= 0
+                    or readiness.get("ci_run_url") != f"https://github.com/{repo.lower()}/actions/runs/{readiness.get('ci_run_id')}"
+                    or not isinstance(readiness.get("outcome_report"), str)
+                    or not readiness["outcome_report"].startswith(f"{issue}/reports/")
+                    or readiness["outcome_report"].count("/") != 2
+                    or readiness["outcome_report"].split("/")[-1] in ("", ".", "..")
+                    or any(unicodedata.category(char) == "Cc" for char in readiness["outcome_report"])):
+                raise ValueError("routine readiness does not bind to this issue, PR, head, base and policy")
+        return {"binding": binding, "requirements": req, "readiness": readiness}
+    except (ValueError, KeyError, TypeError, AttributeError) as e:
+        raise RuntimeError(f"cannot use authoritative `cadence delivery requirements` result: {e}; {(err or out).strip()[:200]}")
+
+
+def check_approval(repo, pr, head, report, evidence=None):
     rc, out, err = run(["cadence", "audit", "approval", "--pr", str(pr), "--head", head, "--repo", repo])
     try:
         state = json.loads(out)
     except ValueError:
         return [f"cannot read the operator approval via `cadence audit approval` (rc {rc}): {(err or out).strip()[:200]}"]
-    if rc == 0 and state.get("state") == "in-force":
+    if (rc == 0 and state.get("state") == "in-force"
+            and state.get("recorded_via") == SCOPE_RECORDED_VIA
+            and isinstance(state.get("approval_id"), str) and state["approval_id"]):
+        if evidence is not None:
+            evidence["approval"] = state["approval_id"]
         report.append(f"approval in force: id {state.get('approval_id')}, source {state.get('source')!r}, "
                       f"recorded_via {state.get('recorded_via')} (an operator claim until CAD-280)")
         return []
@@ -592,7 +671,7 @@ def read_note_file(path):
         return None
 
 
-def check_scope(issue, title, branch, ticket, paths, risk_text, one_text, verdicts, counted, report):
+def check_scope(issue, title, branch, ticket, paths, risk_text, one_text, verdicts, counted, report, evidence=None):
     """Reasons ([] = covered). Appends which approval was used to `report`."""
     try:
         rc, out, _ = run(["cadence", "audit", "scope", "--issue", issue or ""])
@@ -603,6 +682,10 @@ def check_scope(issue, title, branch, ticket, paths, risk_text, one_text, verdic
         why = scope_reasons(issue, title, branch, ticket, paths, risk_text, one_text, verdicts, counted, scopes, read_note_file)
         if not why:
             a = pick_scope_approval(scopes, ticket["body"])
+            if not isinstance(a.get("approval_id"), str) or not a["approval_id"]:
+                return ["scope approval has no approval id"]
+            if evidence is not None:
+                evidence["approval"] = a["approval_id"]
             report.append(f"scope approval in force: id {a.get('approval_id')}, ticket {issue}, digest {a['digest'][:12]}, "
                           f"source {a.get('source')!r}, recorded_via {a.get('recorded_via')} (an operator claim until CAD-280)")
         return why
@@ -610,9 +693,11 @@ def check_scope(issue, title, branch, ticket, paths, risk_text, one_text, verdic
         return [f"scope approval check failed: {e}"]
 
 
-def evaluate(args, repo):
-    """(reasons, report lines). Every rule is evaluated; none returns early."""
+def evaluate(args, repo, *, require_comment=True, evidence=None):
+    """(reasons, report lines). Preparing evidence skips only comment presence."""
     reasons, report = [], []
+    if evidence is not None:
+        evidence.clear()
     pr, head = args.pr, args.head
     fields = "number,state,title,headRefName,headRefOid,baseRefName,baseRefOid,mergeStateStatus,autoMergeRequest,statusCheckRollup,author"
     view = gh_json(["pr", "view", str(pr), "-R", repo, "--json", fields])
@@ -627,6 +712,8 @@ def evaluate(args, repo):
         reasons.append(f"auto-merge is already enabled on PR #{pr}; disable it, then review the exact head")
     base = view.get("baseRefName") or ""
     base_oid = view.get("baseRefOid") or ""
+    if not FULL_SHA.fullmatch(base_oid):
+        reasons.append("cannot bind evidence to a full base commit SHA")
     try:
         default = gh_json(["repo", "view", repo, "--json", "defaultBranchRef"])["defaultBranchRef"]["name"]
     except (RuntimeError, KeyError, TypeError) as e:
@@ -669,7 +756,10 @@ def evaluate(args, repo):
     else:
         rc, out, err = run(["cadence", "issue", "show", issue, "--json"])
         try:
-            ticket = json.loads(out)
+            loaded = json.loads(out)
+            if rc != 0 or not isinstance(loaded, dict) or loaded.get("id") != issue:
+                raise ValueError("ticket reply is not bound to this issue")
+            ticket = loaded
         except ValueError:
             reasons.append(f"cannot read ticket {issue} via `cadence issue show` (rc {rc}): {(err or out).strip()[:200]}")
 
@@ -682,6 +772,32 @@ def evaluate(args, repo):
     if (ticket.get("claim") or {}).get("by"):
         authors.add(str(ticket["claim"]["by"]).lower())
 
+    authority = None
+    required_comment_evidence = []
+    if issue:
+        try:
+            authority = requirements_inspection(issue, repo, pr, head)
+            if (authority["binding"]["base"] != base_oid
+                    or authority["binding"]["repo"] != repo.lower()
+                    or authority["binding"]["project"] != ticket.get("project")):
+                raise RuntimeError("authoritative requirements binding differs from the ticket project, PR base or repository")
+            req = authority["requirements"]
+            need_qa = need_qa or req["browser_qa"]
+            report.append(f"delivery requirements: {req['class']} ({req['activation']}); policy {authority['binding']['policy_digest']}")
+            report.extend(f"delivery reason: {reason}" for reason in req["reasons"])
+            if req["activation"] == "active":
+                required_comment_evidence.extend((f"Delivery class: {req['class']}",
+                                                  f"Policy digest: {authority['binding']['policy_digest']}"))
+                ci_url = green_ci_run(repo, head)
+                required_comment_evidence.append(f"Green CI run: {ci_url}")
+            if authority["readiness"]:
+                ready = authority["readiness"]
+                report.append(f"routine outcome: {ready['outcome_report']}; CI run {ready['ci_run_id']} {ready['ci_run_url']}")
+                required_comment_evidence.extend((f"Outcome report: {ready['outcome_report']}",
+                                                  f"Native CI run: {ready['ci_run_id']} {ready['ci_run_url']}"))
+        except RuntimeError as e:
+            reasons.append(str(e))
+
     verdicts, counted = [], []
     if issue:
         try:
@@ -693,10 +809,36 @@ def evaluate(args, repo):
                     report.append(f"ignored note {v['name']}: its title names no known review kind")
         except RuntimeError as e:
             reasons.append(str(e))
-        rs, counted = check_reviews(verdicts, one, need_qa, authors, issue)
-        reasons += rs
+        active = authority is not None and authority["requirements"]["activation"] == "active"
+        klass = authority["requirements"]["class"] if authority else None
+        counted = []
+        if not active or klass == "strict":
+            native_one = bool(authority and authority["requirements"]["reviews"] == 1)
+            effective_one = one and native_one
+            rs, counted = check_reviews(verdicts, effective_one, need_qa, authors, issue)
+            reasons += rs
+        elif klass == "routine":
+            if authority["readiness"] is None:
+                reasons.append("active routine delivery has no fresh native readiness proof for this exact binding")
+            else:
+                ready = authority["readiness"]
+                try:
+                    ci_url = green_ci_run(repo, head)
+                    if ci_url != ready["ci_run_url"]:
+                        reasons.append("native routine readiness CI run is not the actual successful ci.yml run at this head")
+                except RuntimeError as e:
+                    reasons.append(str(e))
+            if need_qa:
+                reasons += check_reviews(verdicts, True, True, authors, issue)[0]
+        elif klass == "consequential":
+            rs, counted = check_reviews(verdicts, True, need_qa, authors, issue)
+            reasons += rs
+            combined = [n for n in counted if n.get("kind") == "combined"]
+            if len({n.get("reviewer") for n in combined}) != 1:
+                reasons.append(f"active {klass} delivery requires exactly one independent combined review")
         report.append("counted verdicts: " + (", ".join(f"{n['reviewer']} {n['kind']} ({n['name']})" for n in counted) or "none"))
-        reasons += check_comment(ticket.get("comments"), head, counted)
+        if require_comment:
+            reasons += check_comment(ticket.get("comments"), head, counted, required_comment_evidence)
 
     # Human class: paths, size, or any head-pinned note whose Risk is not exactly `auto`.
     rc, risk_text, _ = run(["gh", "api", "-H", "Accept: application/vnd.github.raw",
@@ -712,10 +854,10 @@ def evaluate(args, repo):
         why.append(f"Risk {not_auto[0]['risk'] or '(missing)'!r} in {not_auto[0]['name']}")
     if why:
         report.append("class: human (" + "; ".join(why) + ")")
-        rs = check_approval(repo, pr, head, report)
-        if rs:  # CAD-1106: fall back to a live ticket scope approval
+        rs = check_approval(repo, pr, head, report, evidence)
+        if rs:  # legacy CAD-1106 scope fallback only
             sr = check_scope(issue, view.get("title"), view.get("headRefName"), ticket, paths,
-                             risk_text, one_text, verdicts, counted, report)
+                             risk_text, one_text, verdicts, counted, report, evidence)
             if sr:
                 report.append("scope approval not used: " + "; ".join(sr))
             else:
@@ -723,7 +865,93 @@ def evaluate(args, repo):
         reasons += rs
     else:
         report.append("class: auto (every head-pinned note says Risk: auto; no path or size trigger)")
+    authoritative_operator = bool(authority and authority["requirements"]["operator_approval"])
+    if authoritative_operator and not why:
+        rs = check_approval(repo, pr, head, report, evidence)
+        if rs:
+            sr = check_scope(issue, view.get("title"), view.get("headRefName"), ticket, paths,
+                             risk_text, one_text, verdicts, counted, report, evidence)
+            if sr:
+                report.append("scope approval not used: " + "; ".join(sr))
+            else:
+                rs = []
+        reasons += rs
+    if evidence is not None and not reasons:
+        evidence.update(issue=issue, repo=repo, pr=pr, head=head, base=base_oid,
+                        notes=sorted({n["name"] for n in counted}),
+                        checks=sorted(names), comments=ticket.get("comments") or [],
+                        binding=authority["binding"] if authority else None,
+                        requirements=authority["requirements"] if authority else None,
+                        readiness=authority["readiness"] if authority else None)
+        try:
+            evidence["ci_run"] = green_ci_run(repo, head)
+        except RuntimeError as e:
+            reasons.append(str(e))
     return reasons, report
+
+
+def green_ci_run(repo, head):
+    """An actual successful ci.yml PR run at this head, not a guessed URL."""
+    doc = gh_json(["api", f"repos/{repo}/actions/workflows/ci.yml/runs"
+                   f"?head_sha={head}&event=pull_request&status=success&per_page=100"])
+    runs = doc.get("workflow_runs") if isinstance(doc, dict) else None
+    if not isinstance(runs, list):
+        raise RuntimeError("cannot read a green CI run for the evidence comment")
+    for run_ in runs:
+        if not isinstance(run_, dict):
+            continue
+        run_id = run_.get("id")
+        if (type(run_id) is int and run_id > 0
+                and run_.get("head_sha") == head and run_.get("event") == "pull_request"
+                and run_.get("status") == "completed" and run_.get("conclusion") == "success"
+                and run_.get("html_url") == f"https://github.com/{repo}/actions/runs/{run_id}"):
+            return run_["html_url"]
+    raise RuntimeError(f"no successful ci.yml PR run is available for exact head {head}")
+
+
+def evidence_body(evidence):
+    lines = [f"Delivery evidence: {evidence['repo']}#{evidence['pr']}",
+             f"Head: {evidence['head']}", f"Base: {evidence['base']}",
+             f"Green CI run: {evidence['ci_run']}",
+             "Required checks: " + ", ".join(evidence["checks"]),
+             "Verdict notes: " + (", ".join(evidence["notes"]) or "none required")]
+    binding = evidence.get("binding")
+    if binding:
+        lines.extend((f"Delivery class: {evidence['requirements']['class']}",
+                      f"Policy digest: {binding['policy_digest']}"))
+    readiness = evidence.get("readiness")
+    if readiness:
+        lines.extend((f"Outcome report: {readiness['outcome_report']}",
+                      f"Native CI run: {readiness['ci_run_id']} {readiness['ci_run_url']}"))
+    if evidence.get("approval"):
+        lines.append("Operator approval id: " + evidence["approval"])
+    return "\n".join(lines)
+
+
+def check_evidence_head(args, repo, evidence):
+    view = gh_json(["pr", "view", str(args.pr), "-R", repo, "--json",
+                    "state,headRefOid,baseRefOid,autoMergeRequest"])
+    if (view.get("state") != "OPEN" or view.get("headRefOid") != evidence["head"]
+            or view.get("baseRefOid") != evidence["base"] or view.get("autoMergeRequest")):
+        return ["PR head/base/state changed during evidence collection; revalidate before enqueue"]
+    return []
+
+
+def post_evidence(args, repo, evidence):
+    """Post once only after preflight; no tracker write during dry-run."""
+    if args.dry_run:
+        return []
+    reasons = check_evidence_head(args, repo, evidence)
+    if reasons:
+        return reasons
+    body = evidence_body(evidence)
+    if any(c.get("body") == body for c in evidence["comments"]):
+        return []
+    rc, out, err = run(["cadence", "issue", "comment", evidence["issue"], "--file", "-"],
+                       input_text=body)
+    if rc != 0:
+        return [f"evidence comment failed (rc {rc}): {(err or out).strip()[:200]}"]
+    return []
 
 
 def queued(repo, pr):
@@ -789,8 +1017,23 @@ def main(argv):
         if not re.match(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$", repo):
             print(f"{ME}: bad repo {repo!r}", file=sys.stderr)
             return 2
-        reasons, report = evaluate(args, repo)
-    except (RuntimeError, KeyError) as e:
+        if args.dry_run:
+            reasons, report = evaluate(args, repo)
+        else:
+            evidence = {}
+            reasons, report = evaluate(args, repo, require_comment=False, evidence=evidence)
+            if not reasons:
+                reasons += post_evidence(args, repo, evidence)
+            if not reasons:
+                # Re-read every gate after the write, including approvals and comments.
+                final_evidence = {}
+                reasons, report = evaluate(args, repo, evidence=final_evidence)
+                reasons += check_evidence_head(args, repo, evidence)
+                if (not reasons and (final_evidence.get("binding") != evidence.get("binding")
+                                     or final_evidence.get("requirements") != evidence.get("requirements")
+                                     or final_evidence.get("readiness") != evidence.get("readiness"))):
+                    reasons.append("delivery policy/base/readiness binding changed after evidence collection; revalidate before enqueue")
+    except (RuntimeError, KeyError, TypeError) as e:
         reasons, report = [f"cannot read the PR: {e}"], []
     for line in report:
         print(f"{ME}: {line}")
