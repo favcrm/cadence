@@ -248,7 +248,11 @@ fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
     }
 }
 
+/// `ALL_PROXY` is process-global: one daemon fixture at a time.
+static SERIAL: Mutex<()> = Mutex::new(());
+
 struct Fx {
+    _serial: std::sync::MutexGuard<'static, ()>,
     root: tempfile::TempDir,
     daemon: Option<(
         Arc<AtomicBool>,
@@ -297,11 +301,13 @@ impl Fx {
         ] {
             std::env::remove_var(name);
         }
+        let serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let root = tempfile::Builder::new().prefix("c1304").tempdir().unwrap();
         cadence_agent::issue::Pm::init(&root.path().join("pm")).unwrap();
         std::fs::create_dir_all(root.path().join("s")).unwrap();
         let (door_addr, seen, door) = fake_door();
         let mut fx = Self {
+            _serial: serial,
             root,
             daemon: None,
             seen,
@@ -533,6 +539,57 @@ impl Fx {
         (id, digest)
     }
 
+    /// An effect staged the way main did before CAD-1304: the real staged
+    /// authority with the image digest re-frozen as `sha256:<hex>` (or the
+    /// digest of `forged` bytes), waiting. Returns `(effect_id, digest)`.
+    fn legacy(
+        &self,
+        draft: &str,
+        revision: i64,
+        tag: &str,
+        forged: Option<&[u8]>,
+    ) -> (String, String) {
+        let real = self
+            .screen(
+                "app_effect_stage",
+                json!({"tool_alias": "social.draft",
+                    "proof": {"kind": "social_draft", "draft_id": draft, "revision": revision},
+                    "request_id": format!("stage-real-{tag}")}),
+            )
+            .unwrap_or_else(|e| panic!("stage: {e}"));
+        let mut frozen = real["effect"]["authority"].clone();
+        let bare = forged.map_or_else(|| frozen["image_digest"].as_str().unwrap().to_string(), hex);
+        let hexed: String = self.install.bytes().map(|b| format!("{b:02x}")).collect();
+        let id = format!("sfx_{hexed}_{:032x}", 0xdead_u32 + tag.len() as u32);
+        frozen["image_digest"] = json!(format!("sha256:{bare}"));
+        frozen["effect_id"] = json!(id);
+        frozen["idempotency_key"] = json!(format!("social_{:032x}", 0xbeef_u32 + tag.len() as u32));
+        frozen["approval_id"] = json!(format!("social-approval-legacy-{tag}"));
+        let staged = RecordStore::open(&self.dir(), &self.install)
+            .unwrap()
+            .app_social_effect_stage(
+                &self.context,
+                &cadence_agent::store::app_social_drafts::EffectStage {
+                    draft,
+                    revision,
+                    request: &format!("stage-legacy-{tag}"),
+                    effect_id: &id,
+                    frozen: &frozen,
+                    approval: &format!("social-approval-legacy-{tag}"),
+                },
+            )
+            .unwrap();
+        let digest = staged["effect"]["digest"].as_str().unwrap().to_string();
+        (id, digest)
+    }
+
+    fn accept(&self, id: &str, digest: &str) {
+        self.op(
+            "app_effect_decide",
+            json!({"effect_id": id, "digest": digest, "decision": "accept"}),
+        );
+    }
+
     fn publish_now(&self, id: &str, digest: &str) -> cadence_agent::Result<Value> {
         self.rpc_as(
             Asserted::Operator,
@@ -657,4 +714,31 @@ fn an_approved_instagram_draft_with_a_generated_image_publishes_and_a_changed_on
                 || p.starts_with(&format!("{PREFIX}/publish")))),
         "a changed draft reached the door: {after:?}"
     );
+}
+
+#[test]
+fn a_legacy_sha256_frozen_effect_publishes_unchanged_and_a_changed_image_sends_nothing() {
+    let fx = Fx::start();
+    let source = fx.fetch();
+    let (draft, revision, _) = fx.draft_with_image("l", &source);
+    let (id, digest) = fx.legacy(&draft, revision, "ok", None);
+    fx.accept(&id, &digest);
+    let posted = fx
+        .publish_now(&id, &digest)
+        .unwrap_or_else(|e| panic!("legacy image publish refused: {e}"));
+    assert_eq!(fx.state(&id), "posted", "{posted}");
+    assert_eq!(fx.count(&format!("{PREFIX}/publish")), 1);
+
+    // The frozen image is not the one in custody: refused before any import.
+    let (draft, revision, _) = fx.draft_with_image("m", &source);
+    let (id, digest) = fx.legacy(&draft, revision, "chg", Some(&png(200)));
+    let imports = fx.count(&format!("{PREFIX}/media/import"));
+    let refused = fx.publish_now(&id, &digest).unwrap_err().to_string();
+    assert!(
+        refused.contains("image changed since approval"),
+        "{refused}"
+    );
+    assert_eq!(fx.state(&id), "approved");
+    assert_eq!(fx.count(&format!("{PREFIX}/media/import")), imports);
+    assert_eq!(fx.count(&format!("{PREFIX}/publish")), 1);
 }

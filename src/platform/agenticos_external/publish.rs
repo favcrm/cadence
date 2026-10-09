@@ -184,7 +184,7 @@ pub fn valid_digest(raw: &str) -> bool {
 }
 
 /// The one digest form the publish path freezes and compares: bare
-/// lowercase 64-hex, exactly what the door, the import receipt and
+/// 64-hex (callers validate with `valid_digest`), exactly what the door, the import receipt and
 /// `SendBinding::validate` speak. Custody (`app_tool_results.asset_digest`)
 /// keeps `sha256:<hex>`; an effect staged before CAD-1304 froze that form
 /// and cannot be rewritten (its digest covers the frozen authority), so

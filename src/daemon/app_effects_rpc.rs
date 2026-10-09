@@ -246,10 +246,7 @@ impl Shared {
                         return Err(Error::rejected("retained publish image digest changed"));
                     }
                     (
-                        Some(
-                            crate::platform::agenticos_external::publish::bare_digest(&digest)
-                                .to_owned(),
-                        ),
+                        Some(bare_digest(&digest).to_owned()),
                         Some(mime.to_string()),
                         Some(bytes.len()),
                     )
