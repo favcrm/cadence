@@ -11,6 +11,7 @@ use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
@@ -1301,9 +1302,9 @@ fn slug(value: &str) -> bool {
 }
 
 /// Accept only an owner grant for exactly the requested workspace and
-/// audience (`https://<slug>.cadencecloud.app`), with only `cli.*`
-/// capabilities. The issuer binds slug to workspace itself; the response
-/// carries no slug field.
+/// audience (`https://<slug>.cadencecloud.app`), with exactly the requested
+/// `cli.read` and `cli.write` capabilities. The issuer binds slug to workspace
+/// itself; the response carries no slug field.
 fn login_grant(value: &Value, org: Option<&str>, hint: Option<&str>) -> Result<LoginGrant> {
     let at = now()?;
     let (principal, credential) = (&value["principal"], &value["credential"]);
@@ -1317,11 +1318,12 @@ fn login_grant(value: &Value, org: Option<&str>, hint: Option<&str>) -> Result<L
     let caps = value["capabilities"]
         .as_array()
         .ok_or_else(|| reject("Invalid hosted login capabilities"))?;
-    let every_cli = !caps.is_empty()
-        && caps.iter().all(|c| {
-            c.as_str()
-                .is_some_and(|s| s.starts_with("cli.") && s.len() <= 32)
-        });
+    let exact_cli = caps.len() == 2
+        && caps
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<BTreeSet<_>>()
+            == BTreeSet::from(["cli.read", "cli.write"]);
     if field(value, "version")? != VERSION
         || org.is_some_and(|expected| organization_id != expected)
         || hint.is_some_and(|expected| slug_value != expected)
@@ -1331,7 +1333,7 @@ fn login_grant(value: &Value, org: Option<&str>, hint: Option<&str>) -> Result<L
         || field(principal, "kind")? != "user"
         || field(principal, "current_role")? != "owner"
         || !id(field(principal, "subject_id")?)
-        || !every_cli
+        || !exact_cli
         || field(credential, "token_type")? != "Bearer"
         || !token(field(credential, "access_token")?, "hct_")
         || !id(field(credential, "credential_id")?)
@@ -3330,6 +3332,42 @@ mod tests {
             wrong_audience["audience"] = json!(audience);
             let (out, _) = run_portal_acceptance(None, wrong_audience, &dir);
             assert!(out.is_err(), "{audience}");
+            assert_nothing_stored(&dir);
+        }
+    }
+
+    #[test]
+    fn hosted_portal_requires_exact_requested_capabilities_before_storage() {
+        // The issuer may return the two requested capabilities in either
+        // order, but an additional CLI capability is outside the consent.
+        let root = tempfile::tempdir().unwrap();
+        let mut reordered = login_grant_body();
+        reordered["organization_slug"] = json!("acme");
+        reordered["capabilities"] = json!(["cli.write", "cli.read"]);
+        let dir = root.path().join("reordered/auth");
+        let (out, runtime) = run_portal_acceptance(None, reordered, &dir);
+        assert!(
+            out.is_ok(),
+            "reordering requested capabilities was rejected"
+        );
+        assert_eq!(runtime.requests.len(), 2);
+        assert_nothing_stored(&dir);
+
+        for (case, capabilities) in [
+            ("extra-admin", json!(["cli.read", "cli.write", "cli.admin"])),
+            ("missing-write", json!(["cli.read"])),
+            (
+                "duplicate-read",
+                json!(["cli.read", "cli.read", "cli.write"]),
+            ),
+        ] {
+            let mut grant = login_grant_body();
+            grant["organization_slug"] = json!("acme");
+            grant["capabilities"] = capabilities;
+            let dir = root.path().join(format!("{case}/auth"));
+            let (out, runtime) = run_portal_acceptance(None, grant, &dir);
+            assert!(out.is_err(), "issuer capability set {case} was accepted");
+            assert_eq!(runtime.requests.len(), 2);
             assert_nothing_stored(&dir);
         }
     }
