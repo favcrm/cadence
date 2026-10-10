@@ -496,6 +496,30 @@ pub const CONFINE_SYSTEM_READ: &[&str] = &[
     "/proc/sys/kernel/pid_max",
 ];
 
+/// CAD-1287: where systemd-resolved keeps the stub `/etc/resolv.conf`
+/// points at on stock Ubuntu; `/etc` alone does not cover it.
+const RESOLVED_DIR: &str = "/run/systemd/resolve";
+
+/// The resolver directory the master may also read: exactly
+/// [`RESOLVED_DIR`], and only when `resolv_conf` is a symlink whose
+/// canonical target is inside it. A regular file, any other target, a
+/// dangling link or any resolution error grants nothing.
+fn resolver_read(resolv_conf: &Path) -> Option<PathBuf> {
+    let meta = std::fs::symlink_metadata(resolv_conf).ok()?;
+    if !meta.file_type().is_symlink() {
+        return None;
+    }
+    resolver_grant(&std::fs::canonicalize(resolv_conf).ok()?)
+}
+
+fn resolver_grant(canonical: &Path) -> Option<PathBuf> {
+    let dir = Path::new(RESOLVED_DIR);
+    let inside = canonical.starts_with(dir)
+        && canonical != dir
+        && canonical.components().all(|c| c != Component::ParentDir);
+    inside.then(|| dir.to_path_buf())
+}
+
 /// Device files the master's process tree may use — not `/dev` whole
 /// (`/dev/shm` holds other processes' shared memory), and no pty: the
 /// managed master talks over pipes.
@@ -557,6 +581,7 @@ pub struct ConfineInputs {
 /// sandbox does not restrict.
 pub fn confinement(inputs: &ConfineInputs) -> crate::confine::Policy {
     let mut read: Vec<PathBuf> = CONFINE_SYSTEM_READ.iter().map(PathBuf::from).collect();
+    read.extend(resolver_read(Path::new("/etc/resolv.conf")));
     let mut write: Vec<PathBuf> = CONFINE_SYSTEM_WRITE.iter().map(PathBuf::from).collect();
     if let Some(home) = &inputs.home {
         read.extend(inputs.home_read.iter().map(|p| home.join(p)));
@@ -1487,6 +1512,44 @@ pub fn compose(files: &[(String, String)]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn resolver_grant_only_for_systemd_resolved_targets() {
+        let dir = Some(PathBuf::from("/run/systemd/resolve"));
+        for ok in [
+            "/run/systemd/resolve/stub-resolv.conf",
+            "/run/systemd/resolve/resolv.conf",
+        ] {
+            assert_eq!(super::resolver_grant(Path::new(ok)), dir, "{ok}");
+        }
+        for no in [
+            "/run/NetworkManager/resolv.conf",
+            "/run/systemd/resolve",
+            "/run/systemd/resolved/x",
+            "/run/systemd",
+            "/etc/x",
+            "../etc/x",
+            "/run/systemd/resolve/../../x",
+        ] {
+            assert_eq!(super::resolver_grant(Path::new(no)), None, "{no}");
+        }
+    }
+
+    #[test]
+    fn resolver_read_fails_closed() {
+        let t = tempfile::tempdir().unwrap();
+        let file = t.path().join("resolv.conf");
+        std::fs::write(&file, "nameserver 1.1.1.1\n").unwrap();
+        let other = t.path().join("other.conf");
+        std::os::unix::fs::symlink(&file, &other).unwrap();
+        let dangling = t.path().join("dangling.conf");
+        std::os::unix::fs::symlink(t.path().join("missing"), &dangling).unwrap();
+        for p in [&file, &other, &dangling, &t.path().join("absent")] {
+            assert_eq!(super::resolver_read(p), None, "{p:?}");
+        }
+    }
+
     #[test]
     fn pi_private_config_is_independent_of_confinement() {
         let state = tempfile::tempdir().unwrap();
