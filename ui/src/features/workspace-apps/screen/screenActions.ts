@@ -4,7 +4,8 @@ import { rememberContext } from "../contextSelection";
 import { workspaceApps, type AppContext, type CapabilityQuote, type Installation, type WorkspaceRun } from "../workspaceApps";
 import { contextDefaultKeys, instagramLink } from "./screenProjection";
 import { accountLabel, connectReturnTo, publicationBinding, sendSlot } from "../socialConnect";
-import type { ActionRefusal, ActionResult, CallVerb, SlotVerb } from "./screenProtocol";
+import { TOOL_ALIAS, type ActionRefusal, type ActionResult, type CallVerb, type SlotVerb } from "./screenProtocol";
+import { downscaleToDataUrl } from "./screenAssets";
 import type { Planner, SlotPlan } from "./screenSlot";
 
 /**
@@ -228,6 +229,53 @@ async function planUseDestination(ctx: ActionContext, args: Record<string, unkno
   } catch (error) { return plainRefusal(error); }
 }
 
+const hex = (bytes: ArrayBuffer) => Array.from(new Uint8Array(bytes), b => b.toString(16).padStart(2, "0")).join("");
+const bareDigest = (digest: string) => digest.replace(/^sha256:/, "");
+/** The image the card shows is the draft's own, and must be the bytes the daemon froze. */
+async function frozenImage(token: string, alias: string, authority: Record<string, unknown>): Promise<string | null> {
+  if (typeof authority.asset_id !== "string") return null;
+  const image = await workspaceApps.socialDraftAsset({ action_token: token, alias, draft_id: String(authority.draft_id) });
+  if (typeof authority.image_digest === "string" && globalThis.crypto?.subtle &&
+      hex(await crypto.subtle.digest("SHA-256", image.bytes)) !== bareDigest(authority.image_digest)) throw new Error("image changed");
+  const bytes = new Uint8Array(image.bytes);
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+  return downscaleToDataUrl(btoa(binary), image.mime);
+}
+
+/** `publish.draft.confirm`: the app staged a draft's publish effect and asks the host to confirm it.
+ *  The host reads the FROZEN effect (caption, image, account) from the daemon and shows it on its own
+ *  card; one tap approves and sends it. The frame supplies only the effect id and its tool alias. */
+async function planConfirmPublish(ctx: ActionContext, args: Record<string, unknown>, actionToken?: string): Promise<SlotPlan | ActionRefusal> {
+  if (!exact(args, ["alias", "effect_id"]) || typeof args.alias !== "string" || typeof args.effect_id !== "string" || !TOOL_ALIAS.test(args.alias))
+    return { code: "bad_args", text: "That request is not valid." };
+  try {
+    const found = await workspaceApps.socialDraftEffect(args.effect_id);
+    const authority = found.authority;
+    if (found.authorization_kind !== "social_draft" || found.effect_id !== args.effect_id || found.install_id !== ctx.installId ||
+        (ctx.contextId && found.context_id !== ctx.contextId) || typeof authority.caption !== "string")
+      return { code: "not_found", text: "That item is not available." };
+    if (!["waiting", "approved"].includes(found.state)) return { code: "handled", text: "That post was already handled." };
+    const target = accountLabel(String(authority.destination_label ?? authority.destination_id ?? ""));
+    let image: string | null = null;
+    if (actionToken) {
+      try { image = await frozenImage(actionToken, args.alias, authority); }
+      catch { return { code: "stale", text: "That changed somewhere else. Reload and try again." }; }
+    } else if (typeof authority.asset_id === "string") return { code: "failed", text: "That didn't work. Nothing was started." };
+    const effectId = found.effect_id;
+    const digest = found.digest;
+    return { label: `Post to ${target}`, card: { target, caption: authority.caption, image }, run: async () => {
+      try {
+        const sent = await workspaceApps.confirmSocialDraftPublish(effectId, { digest });
+        ctx.onChanged();
+        if (sent.state === "posted") return { ok: true, data: {} };
+        if (sent.state === "refused") return { ok: false, refusal: { code: "refused", text: "Instagram didn't take that post." } };
+        return { ok: false, refusal: { code: "unconfirmed", text: "That isn't confirmed yet. Check before trying again." } };
+      } catch (error) { return { ok: false, refusal: plainRefusal(error) }; }
+    } };
+  } catch (error) { return plainRefusal(error); }
+}
+
 function openLink(args: Record<string, unknown>, ui: { showLink(url: string): void; navigate?: (path: string) => void }): ActionResult {
   if (!exact(args, ["url"]) || typeof args.url !== "string") return refuse("bad_args", "That link is not valid.");
   // A same-origin board path moves the board's router; an external https link
@@ -304,10 +352,11 @@ async function planRunStart(ctx: ActionContext, args: Record<string, unknown>): 
 
 /** The spend/publish verbs. HP4 adds `publish.*` here; the set is closed in `screenProtocol`. */
 export function makePlanner(get: () => ActionContext): Planner {
-  return (verb: SlotVerb, args) => {
+  return (verb: SlotVerb, args, ui) => {
     const table: Record<SlotVerb, () => Promise<SlotPlan | ActionRefusal>> = {
       "run.start": () => planRunStart(get(), args),
       "publish.destination.use": () => planUseDestination(get(), args),
+      "publish.draft.confirm": () => planConfirmPublish(get(), args, ui?.actionToken),
     };
     return table[verb]();
   };

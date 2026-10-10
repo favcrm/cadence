@@ -698,6 +698,67 @@ impl Store {
         })
     }
 
+    /// CAD-1328: an operator-proven context save moves every configured
+    /// binding of that context onto the new `{id, install_id, revision,
+    /// digest}` pin, in the caller's transaction (the context row is already
+    /// updated). Only the `context` field of the receipt changes: the pin
+    /// exists to catch a changed connection, bundle, descriptor or sink, and
+    /// those fields stay as stored, so `binding_drift` still refuses them.
+    /// Derived grants rest on the connection, not the context, so they stay.
+    /// Waiting effects pinned to the old incarnation fail at send time on
+    /// the binding revision check. The only caller is the operator-gated
+    /// context update; no other path re-pins.
+    pub(super) fn app_bindings_repin_context_in(
+        tx: &impl super::StoreConn,
+        install: &str,
+        context: &str,
+    ) -> Result<()> {
+        let shown = Self::app_context_show_in(tx, install, context)?;
+        if shown["state"] != "active" {
+            return Ok(());
+        }
+        let pin = json!({"id":context,"install_id":install,
+            "revision":shown["revision"],"digest":shown["digest"]});
+        let ids: Vec<String> = tx.query_vec(
+            "SELECT id FROM app_bindings WHERE install_id=? AND context_id=? AND state='configured'",
+            params![install, context],
+            |r| r.get(0),
+        )?;
+        for id in ids {
+            let row = binding_in(tx, install, &id)?;
+            if row["config"]["context"] == pin {
+                continue;
+            }
+            let mut config = row["config"].clone();
+            config["context"] = pin.clone();
+            validate_config(install, Some(context), &config)?;
+            let slot = row["slot"]
+                .as_str()
+                .ok_or_else(|| Error::internal("invalid binding slot"))?;
+            let digest = config_digest(install, Some(context), slot, &config);
+            let updated = tx.execute("UPDATE app_bindings SET config=?,digest=?,revision=revision+1,updated=? WHERE install_id=? AND id=? AND revision=? AND state='configured'",params![config.to_string(),digest,now(),install,id,row["revision"].as_i64()])?;
+            if updated != 1 {
+                return Err(Error::rejected("binding re-pin lost its revision claim"));
+            }
+            Self::event(
+                tx,
+                "app_bindings",
+                "app_binding_repinned",
+                json!({"install_id":install,"binding_id":id,"slot":slot,
+                       "revision":row["revision"].as_i64().unwrap_or(0)+1,"digest":digest,
+                       "from_digest":row["digest"],"from_context":row["config"]["context"],
+                       "to_context":pin,"actor":"operator"}),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// CAD-1328: the operator's destination choice re-pins the context's
+    /// bindings the same way a context save does (see above).
+    pub fn app_context_repin(&self, install: &str, context: &str) -> Result<()> {
+        self.write_tx(|conn| Self::app_bindings_repin_context_in(&*conn, install, context))
+    }
+
     pub fn app_binding_revoke(&self, install: &str, id: &str, expected: i64) -> Result<Value> {
         self.write_tx(|conn| {
             let tx = &mut *conn;

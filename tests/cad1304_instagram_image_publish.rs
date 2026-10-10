@@ -1177,3 +1177,93 @@ fn a_re_check_that_lands_before_the_slot_is_freed_is_restarted_exactly_once() {
     assert_eq!(fx.keys().len(), 1);
     assert_eq!(fx.door.media.job_count(), 1);
 }
+
+/// CAD-1328: the operator's own context save re-pins the context's bindings,
+/// and one confirm on the staged effect approves and sends it exactly once.
+#[test]
+fn an_operator_context_save_re_pins_and_one_confirm_posts_the_staged_draft_once() {
+    let fx = Fx::start();
+    let pins = || {
+        let listed = fx.op(
+            "app_binding_list",
+            json!({"install_id": fx.install, "context_id": fx.context}),
+        );
+        listed["bindings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| {
+                (
+                    b["drift"]["state"].clone(),
+                    b["config"]["context"]["revision"].clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(pins().len(), 3);
+    assert!(pins().iter().all(|(s, r)| s == "current" && *r == json!(1)));
+    let update = |who: Asserted| {
+        fx.rpc_as(
+            who,
+            "app_context_update",
+            json!({"install_id": fx.install, "context_id": fx.context, "expected_revision": 1,
+                "label": "EF renamed", "input_defaults": {}}),
+        )
+    };
+    // No operator proof: nothing is saved and nothing is re-pinned.
+    assert!(update(Asserted::Agent("worker".into())).is_err());
+    assert!(update(Asserted::Unproven).is_err());
+    assert!(pins().iter().all(|(s, r)| s == "current" && *r == json!(1)));
+    // The operator's save moves every binding to revision 2 in one step.
+    update(Asserted::Operator).unwrap();
+    let after = pins();
+    assert_eq!(after.len(), 3);
+    assert!(
+        after.iter().all(|(s, r)| s == "current" && *r == json!(2)),
+        "{after:?}"
+    );
+
+    // Publish after the save: staged by the screen, confirmed with one call.
+    let source = fx.fetch();
+    let (draft, revision, _) = fx.draft_with_image("one", &source);
+    let staged = fx
+        .screen(
+            "app_effect_stage",
+            json!({"tool_alias": "social.draft",
+                "proof": {"kind": "social_draft", "draft_id": draft, "revision": revision},
+                "request_id": "stage-one"}),
+        )
+        .unwrap_or_else(|e| panic!("stage after a context save: {e}"));
+    let id = staged["effect"]["effect_id"].as_str().unwrap().to_string();
+    let digest = staged["effect"]["digest"].as_str().unwrap().to_string();
+    let confirm = |who: Asserted, digest: &str| {
+        fx.rpc_as(
+            who,
+            "app_effect_confirm_publish",
+            json!({"effect_id": id, "digest": digest}),
+        )
+    };
+    // An agent, an unproven caller and a stale digest send nothing.
+    assert!(confirm(Asserted::Agent("worker".into()), &digest).is_err());
+    assert!(confirm(Asserted::Unproven, &digest).is_err());
+    assert!(confirm(Asserted::Operator, "sha256:stale").is_err());
+    assert_eq!(fx.state(&id), "waiting");
+    assert_eq!(fx.count(&format!("{PREFIX}/publish")), 0);
+    // A run artifact effect is not eligible for the one-step path.
+    assert!(fx
+        .rpc_as(
+            Asserted::Operator,
+            "app_effect_confirm_publish",
+            json!({"effect_id": "effect-0123", "digest": digest}),
+        )
+        .is_err());
+
+    confirm(Asserted::Operator, &digest).unwrap_or_else(|e| panic!("confirm refused: {e}"));
+    assert_eq!(fx.state(&id), "posted");
+    assert_eq!(fx.count(&format!("{PREFIX}/publish")), 1);
+    // A replayed tap returns the receipt and posts nothing more.
+    let replay = confirm(Asserted::Operator, &digest).unwrap();
+    assert_eq!(replay["effect"]["state"], "posted");
+    assert_eq!(fx.count(&format!("{PREFIX}/publish")), 1);
+    assert_eq!(fx.count(&format!("{PREFIX}/media/import")), 1);
+}

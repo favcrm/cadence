@@ -233,7 +233,7 @@ impl Shared {
                 required_str(bundle, "digest")?,
             )?;
             let mut config;
-            match (current, expected) {
+            let saved = match (current, expected) {
                 (Some(proof), Some(rev)) if rev.as_i64() == Some(proof.revision) => {
                     config = proof.config.clone();
                     config["publish"] = publish;
@@ -258,7 +258,17 @@ impl Shared {
                     self.store
                         .app_binding_create(install, context, slot, &config, request)
                 }
+            }?;
+            // CAD-1328: the operator's own choice also re-pins the context's
+            // bindings (this caller is operator-gated), so an earlier context
+            // save that left them behind no longer blocks publishing.
+            if let Some(context) = context {
+                self.store.app_context_repin(install, context)?;
+                if let Some(id) = saved["binding"]["id"].as_str() {
+                    return self.store.app_binding_show(install, id);
+                }
             }
+            Ok(saved)
         })
     }
 }

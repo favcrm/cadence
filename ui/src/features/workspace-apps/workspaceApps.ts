@@ -303,6 +303,9 @@ export const workspaceApps = {
   stageEffect: async (id: string, body: { artifact_id: string; slot: string; request_id: string; title: string }) => (await request<{ effect: AppEffect }>(`${run(id)}/effects`, undefined, body)).effect,
   decideEffect: async (id: string, body: { digest: string; decision: "accept" | "decline" }) => (await request<{ effect: AppEffect }>(`${effect(id)}/decide`, undefined, body)).effect,
   decideSocialDraftEffect: async (id:string,body:{digest:string;decision:"accept"|"decline"})=>(await request<{effect:SocialDraftEffect}>(`${effect(id)}/decide`,undefined,body)).effect,
+  socialDraftEffect: async (id:string,signal?:AbortSignal)=>(await request<{effect:SocialDraftEffect}>(effect(id),signal)).effect,
+  /** CAD-1328: one operator tap approves and sends a screen-staged social draft effect. */
+  confirmSocialDraftPublish: async (id:string,body:{digest:string})=>(await request<{effect:SocialDraftEffect}>(`${effect(id)}/confirm-publish`,undefined,body)).effect,
   publishSocialDraftNow: async (id:string,body:{digest:string})=>(await request<{effect:SocialDraftEffect}>(`${effect(id)}/publish-now`,undefined,body)).effect,
   resolveEffect: async (id: string, body: { digest: string; resolution: "close" | "acknowledge" }) => (await request<{ effect: AppEffect }>(`${effect(id)}/resolve`, undefined, body)).effect,
   outbox: (id: string, signal?: AbortSignal) => request<WorkspaceOutbox>(`/api/outbox?effect_id=${part(id)}`, signal),

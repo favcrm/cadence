@@ -722,17 +722,16 @@ impl Default for FakePublishLedger {
 
 /// CAD-1291: the owner's standing publish grant for one destination, as the
 /// hosted door lists it. The owner mints it once on AgenticOS (company,
-/// connection, destination and toolkit scoped, no content digests, a daily
-/// cap, revocable); Cadence never mints one. Each post is still approved
+/// connection, destination and toolkit scoped, no content digests,
+/// revocable); Cadence never mints one. Each post is still approved
 /// by the Cadence operator and re-checked here; AgenticOS re-checks the
-/// destination, company, revocation and cap at preflight and send.
+/// destination, company and revocation at preflight and send.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FoundGrant {
     pub id: String,
     pub connection_id: String,
     pub destination_id: String,
     pub toolkit: String,
-    pub remaining_today: u64,
     pub revoked: bool,
 }
 
@@ -748,7 +747,6 @@ impl FoundGrant {
             connection_id: text("connectionId")?,
             destination_id: text("destinationId")?,
             toolkit: text("toolkit")?,
-            remaining_today: wire.get("remainingToday")?.as_u64()?,
             revoked: !wire.get("revokedAt")?.is_null(),
         })
     }
@@ -763,8 +761,7 @@ pub struct GrantWant<'a> {
 }
 
 /// Pick the live standing grant for exactly this destination. No grant, a
-/// grant for another account, a revoked one or one at its daily cap never
-/// authorizes: the approved post stays unsent.
+/// grant for another account or a revoked one never authorizes: the approved post stays unsent.
 pub fn select_grant(found: &[FoundGrant], want: &GrantWant<'_>) -> Result<String, Refusal> {
     let own: Vec<&FoundGrant> = found
         .iter()
@@ -787,15 +784,7 @@ pub fn select_grant(found: &[FoundGrant], want: &GrantWant<'_>) -> Result<String
             "the owner revoked publishing to this account in AgenticOS",
         ));
     }
-    live.iter()
-        .find(|grant| grant.remaining_today > 0)
-        .map(|grant| grant.id.clone())
-        .ok_or_else(|| {
-            Refusal::new(
-                "grant_cap_reached",
-                "today's publishing cap for this account is reached; try again tomorrow",
-            )
-        })
+    Ok(live[0].id.clone())
 }
 
 /// Daemon-side dispatch observation: the party that speaks to the provider
@@ -1092,28 +1081,19 @@ mod tests {
     }
 
     #[test]
-    fn revoked_or_capped_standing_grant_is_never_selected() {
+    fn revoked_standing_grant_is_never_selected() {
         let mut revoked = grant_wire();
         revoked["revokedAt"] = serde_json::json!("2026-10-09T00:10:00.000Z");
-        let mut capped = grant_wire();
-        capped["remainingToday"] = serde_json::json!(0);
         let revoked = FoundGrant::from_wire(&revoked).unwrap();
-        let capped = FoundGrant::from_wire(&capped).unwrap();
         assert_eq!(
             select_grant(std::slice::from_ref(&revoked), &want())
                 .unwrap_err()
                 .code,
             "grant_revoked"
         );
-        assert_eq!(
-            select_grant(std::slice::from_ref(&capped), &want())
-                .unwrap_err()
-                .code,
-            "grant_cap_reached"
-        );
         // A live grant beside a revoked one still selects.
         let live = FoundGrant::from_wire(&grant_wire()).unwrap();
-        assert!(select_grant(&[revoked, capped, live], &want()).is_ok());
+        assert!(select_grant(&[revoked, live], &want()).is_ok());
     }
 
     #[test]
@@ -1122,11 +1102,9 @@ mod tests {
         per_post["kind"] = serde_json::json!("post");
         let mut bad_id = grant_wire();
         bad_id["id"] = serde_json::json!("grant");
-        let mut bad_left = grant_wire();
-        bad_left["remainingToday"] = serde_json::json!("1");
         let mut no_revoked = grant_wire();
         no_revoked.as_object_mut().unwrap().remove("revokedAt");
-        for wire in [per_post, bad_id, bad_left, no_revoked] {
+        for wire in [per_post, bad_id, no_revoked] {
             assert!(FoundGrant::from_wire(&wire).is_none(), "{wire}");
         }
     }

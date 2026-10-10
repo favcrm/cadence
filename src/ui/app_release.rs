@@ -19,6 +19,8 @@ pub(super) enum Route<'a> {
     Effect(&'a str),
     Decide(&'a str),
     PublishNow(&'a str),
+    /// CAD-1328: the board's one-tap confirm of a screen-staged social draft effect.
+    ConfirmPublish(&'a str),
     Resolve(&'a str),
     /// CAD-1290: `destinations` is an operator read; `connect-link` and `use` are POST writes.
     Publishing(&'a str, &'a str),
@@ -40,6 +42,7 @@ pub(super) fn route(path: &str) -> Option<Route<'_>> {
             [id] if segment(id) => Some(Route::Effect(id)),
             [id, "decide"] if segment(id) => Some(Route::Decide(id)),
             [id, "publish-now"] if segment(id) => Some(Route::PublishNow(id)),
+            [id, "confirm-publish"] if segment(id) => Some(Route::ConfirmPublish(id)),
             [id, "resolve"] if segment(id) => Some(Route::Resolve(id)),
             _ => None,
         };
@@ -107,6 +110,7 @@ impl Route<'_> {
                 | Self::Stage(_)
                 | Self::Decide(_)
                 | Self::PublishNow(_)
+                | Self::ConfirmPublish(_)
                 | Self::Resolve(_)
                 | Self::Publishing(_, "connect-link" | "use")
         )
@@ -276,6 +280,11 @@ pub(super) fn handle(
                 let mut params = typed::<PublishNow>(request)?;
                 params["effect_id"] = json!(effect);
                 ("app_effect_publish_now", params)
+            }
+            Route::ConfirmPublish(effect) => {
+                let mut params = typed::<PublishNow>(request)?;
+                params["effect_id"] = json!(effect);
+                ("app_effect_confirm_publish", params)
             }
             Route::Resolve(effect) => {
                 let mut params = typed::<Resolve>(request)?;
