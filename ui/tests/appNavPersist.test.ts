@@ -103,29 +103,30 @@ history.pushState(null, "", "/");
 await React.act(async () => { root.render(React.createElement(App)); });
 
 // (b) The Apps item lists the installed apps from the API on a non-app
-// screen, each linking to its installation.
+// screen, each linking to its readable app-key route when unique.
 await settle(() => assert(appLink("CRM") && appLink("Social Content"), "installed apps list from the API on Home"));
 assert(listCalls > 0, "the list came from GET /api/app-installations");
-equal(appLink("Social Content")!.getAttribute("href"), "/app-installations/install-soc", "app links to its installation");
+equal(appLink("Social Content")!.getAttribute("href"), "/apps/social-content", "app links to its readable key");
 assert(sections().length === 0, "no sections before any app was used");
 
 // (a) Visit CRM on its Segments section; the sections stay on Settings.
-await go("/app-installations/install-crm?crm=segments");
+await go("/apps/crm?crm=segments&ctx=crm-context&conversation=crm-conversation&keep=1");
 await settle(() => assert(sections().length === 3, "CRM sections show on the CRM screen"));
 assert(appLink("CRM")!.getAttribute("aria-current") === "true", "the open app is highlighted");
+equal(appLink("Social Content")!.getAttribute("href"), "/apps/social-content?keep=1", "switching apps drops installation-scoped query but preserves unrelated state");
 await go("/settings/email-sending");
 await settle(() => assert(location.pathname.startsWith("/settings"), "on Settings"));
 await settle(() => assert(sections().length === 3, "CRM sections stay visible on Settings"));
 
 // (c) The last section is restored: the app link and the Segments row
 // return to Segments, and a fresh mount (reload) remembers it.
-equal(appLink("CRM")!.getAttribute("href"), "/app-installations/install-crm?crm=segments", "app link returns to the last section");
+equal(appLink("CRM")!.getAttribute("href"), "/apps/crm?crm=segments", "app link returns to the last section");
 await React.act(async () => { root.unmount(); });
 const root2 = createRoot(host);
 history.pushState(null, "", "/");
 await React.act(async () => { root2.render(React.createElement(App)); });
 await settle(() => assert(sections().length === 3, "sections restored after reload"));
-equal(appLink("CRM")!.getAttribute("href"), "/app-installations/install-crm?crm=segments", "last section survives a reload");
+equal(appLink("CRM")!.getAttribute("href"), "/apps/crm?crm=segments", "last section survives a reload");
 const clicked = appLink("CRM")!;
 await React.act(async () => { clicked.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
 await settle(() => assert(location.search.includes("crm=segments"), "clicking returns to CRM at Segments"));

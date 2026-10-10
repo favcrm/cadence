@@ -3,7 +3,7 @@ import { resources } from "../../lib/resources";
 import { useQuery, useResource } from "../../lib/useResource";
 import type { AppRow } from "../../lib/types";
 import { homeNeeds, type HomeNeed } from "../home/needs";
-import { appApprovalChip, appHref, appPurpose, runsSummary, screenInstallHref } from "./appViewModel";
+import { appApprovalChip, appHref, appPurpose, installedAppHref, runsSummary, screenInstallHref } from "./appViewModel";
 import { useBackoffLoad } from "../workspace-apps/useBackoffLoad";
 import { useInstallations } from "../workspace-apps/useInstallations";
 import { ResourceGate } from "../../ui/ResourceStatus";
@@ -124,6 +124,13 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
       .finally(() => setBusy(null));
   };
 
+  const openHref = (installation: HomeInstallation) => {
+    const sameKey = live.filter((item) => item.name === installation.name);
+    const stableHref = `/app-installations/${encodeURIComponent(installation.install_id)}`;
+    if (sameKey.length !== 1) return stableHref;
+    return installedAppHref(installation.name) ?? stableHref;
+  };
+
   const attentionRow = (h: HomeInstallation) => {
     const s = h.attention.state;
     const label = s === "off" ? "Access off" : s === "setup" ? "Finish setup" : s === "update" ? "Update ready" : "Needs attention";
@@ -132,7 +139,7 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
         <AppGlyph name={h.name} icon={h.icon} size="sm" />
         <span className="txt"><b>{h.title}</b> · {h.attention.message ?? label}</span>
         {isOp ? (
-          <Button className="btn-sm" href={s === "off" || s === "update" ? `/apps/manage/${h.install_id}` : `/app-installations/${h.install_id}`}>
+          <Button className="btn-sm" href={s === "off" || s === "update" ? `/apps/manage/${h.install_id}` : openHref(h)}>
             {s === "off" ? "Manage access" : s === "update" ? "Review update" : "Finish setup"}
           </Button>
         ) : (
@@ -229,7 +236,7 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
               <div className="favs">
                 {favorites.map((h) => (
                   <div key={h.install_id} className="card fav">
-                    <Link href={`/app-installations/${h.install_id}`} className="open"
+                    <Link href={openHref(h)} className="open"
                       onClick={() => opened(h.install_id)} aria-label={`Open ${h.title}`}>
                       <AppGlyph name={h.name} icon={h.icon} />
                       <span className="nm">{h.title}</span>
@@ -274,7 +281,7 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
                     const pinned = favs?.favorites.includes(h.install_id) ?? false;
                     return (
                       <div key={h.install_id} className="card itile">
-                        <Link className="open" href={`/app-installations/${h.install_id}`}
+                        <Link className="open" href={openHref(h)}
                           onClick={() => opened(h.install_id)} aria-label={`Open ${h.title}`}>
                           <AppGlyph name={h.name} icon={h.icon} size="sm" />
                           <div className="min-w-0 flex-1">

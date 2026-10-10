@@ -121,16 +121,22 @@ function rawQueryValues(rawQuery: string, parameter: string): (string | null)[] 
   return values;
 }
 
-function parseSocialDestination(href: string, installId: string): SocialDestination | null {
+function workspaceHrefMatches(path: string, installId: string, appKey?: string): boolean {
+  const prefix = "/app-installations/";
+  if (path.startsWith(prefix) && !path.slice(prefix.length).includes("/")) {
+    try { return decodeURIComponent(path.slice(prefix.length)) === installId; }
+    catch { return false; }
+  }
+  const appPrefix = "/apps/";
+  if (!appKey || !path.startsWith(appPrefix) || path.slice(appPrefix.length).includes("/")) return false;
+  try { return decodeURIComponent(path.slice(appPrefix.length)) === appKey; }
+  catch { return false; }
+}
+
+function parseSocialDestination(href: string, installId: string, appKey?: string): SocialDestination | null {
   const queryStart = href.indexOf("?");
   const path = queryStart < 0 ? href : href.slice(0, queryStart);
-  const prefix = "/app-installations/";
-  if (!path.startsWith(prefix) || path.slice(prefix.length).includes("/")) return null;
-  try {
-    if (decodeURIComponent(path.slice(prefix.length)) !== installId) return null;
-  } catch {
-    return null;
-  }
+  if (!workspaceHrefMatches(path, installId, appKey)) return null;
   if (queryStart < 0) return null;
   const rawQuery = href.slice(queryStart + 1).split("#", 1)[0];
   const params = new URLSearchParams(rawQuery);
@@ -148,19 +154,13 @@ function parseSocialDestination(href: string, installId: string): SocialDestinat
   return { contextId: contextIds[0], conversationId: conversationIds[0] };
 }
 
-function withoutSocialDestination(href: string, installId: string): string | null {
+function withoutSocialDestination(href: string, installId: string, appKey?: string): string | null {
   const hashStart = href.indexOf("#");
   const withoutHash = hashStart < 0 ? href : href.slice(0, hashStart);
   const hash = hashStart < 0 ? "" : href.slice(hashStart);
   const queryStart = withoutHash.indexOf("?");
   const path = queryStart < 0 ? withoutHash : withoutHash.slice(0, queryStart);
-  const prefix = "/app-installations/";
-  if (!path.startsWith(prefix) || path.slice(prefix.length).includes("/")) return null;
-  try {
-    if (decodeURIComponent(path.slice(prefix.length)) !== installId) return null;
-  } catch {
-    return null;
-  }
+  if (!workspaceHrefMatches(path, installId, appKey)) return null;
   if (queryStart < 0) return null;
   let removed = false;
   const kept = withoutHash.slice(queryStart + 1).split("&").filter(part => {
@@ -185,10 +185,12 @@ export default function WorkspaceApp({
   installId,
   viewer,
   onBack,
+  appKey,
 }: {
   installId: string;
   viewer: Viewer;
   onBack?: () => void;
+  appKey?: string;
 }) {
   const [data, setData] = useState<Snapshot | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -212,7 +214,7 @@ export default function WorkspaceApp({
   const href = useHref();
   const hrefRef = useRef(href);
   hrefRef.current = href;
-  const destination = useMemo(() => parseSocialDestination(href, installId), [href, installId]);
+  const destination = useMemo(() => parseSocialDestination(href, installId, appKey), [href, installId, appKey]);
   const linkSignature = destination
     ? JSON.stringify([installId, destination.contextId, destination.conversationId])
     : null;
@@ -246,10 +248,10 @@ export default function WorkspaceApp({
     userContextIntentEpoch.current += 1;
     consumedDestinationVisit.current = destinationVisitRef.current;
     setDestinationProof(null);
-    const nextHref = withoutSocialDestination(hrefRef.current, installId);
+    const nextHref = withoutSocialDestination(hrefRef.current, installId, appKey);
     if (nextHref && nextHref !== hrefRef.current) navigate(nextHref, { replace: true });
     return true;
-  }, [installId]);
+  }, [installId, appKey]);
   const [artifact, setArtifact] = useState<TextArtifact | null>(null);
   const [artifactError, setArtifactError] = useState<string | null>(null);
   const [artifactLoading, setArtifactLoading] = useState(false);
@@ -669,7 +671,7 @@ export default function WorkspaceApp({
     ) return;
 
     userContextIntentEpoch.current += 1;
-    const nextHref = withoutSocialDestination(hrefRef.current, action.installId);
+    const nextHref = withoutSocialDestination(hrefRef.current, action.installId, appKey);
     if (invocation.visitKey) consumedDestinationVisit.current = invocation.visitKey;
     setDestinationProof(null);
     if (contextId !== saved.id) {
