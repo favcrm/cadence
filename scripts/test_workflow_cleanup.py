@@ -5,6 +5,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -158,12 +159,14 @@ class CleanupTests(unittest.TestCase):
         self.assertIn("scripts/run-result-tests", test)
         runner = (ROOT / "scripts/run-result-tests").read_text()
         self.assertIn("scripts/result-test-args", runner)
-        # CAD-1105: the lib unit tests run too, in the same runner.
-        for needle in ("--features test-seam", "--no-fail-fast", "--test-threads 2",
-                       "running 0 tests", "HOME=", "XDG_CONFIG_HOME=",
-                       "--features test-seam --lib --no-fail-fast",
-                       "--features test-seam --bins --no-fail-fast",
-                       "CARGO_BUILD_TARGET_DIR", "unset CARGO_TARGET_DIR"):
+        # CAD-1334: one pinned nextest invocation keeps every selected
+        # integration target plus lib and bins, with bounded concurrency and
+        # a result-level guard against empty suites.
+        for needle in ('scripts/cadence-nextest" --locked --features test-seam',
+                       '"${target_args[@]}" --lib --bins', '-j 2',
+                       'no runnable tests', 'junit_report=', 'HOME=',
+                       'XDG_CONFIG_HOME=', 'CARGO_BUILD_TARGET_DIR',
+                       'unset CARGO_TARGET_DIR'):
             self.assertIn(needle, runner)
         selected = subprocess.run([str(ROOT / "scripts/result-test-args")],
                                   capture_output=True, text=True, check=True).stdout.split()
@@ -235,35 +238,18 @@ class CleanupTests(unittest.TestCase):
                     self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
 
 
-# CAD-1105: scripts/run-result-tests against a stub cargo. The stub answers
-# `cargo metadata` with one test target and logs every `cargo test` call
-# with the environment the test binaries would inherit.
+# The provider-refusal case uses a stub cargo only to keep metadata lookup
+# local; every runner behavior (selection, isolation, lock, and zero-test
+# refusal) is exercised by the independent real-nextest acceptance below.
 STUB_CARGO = r"""#!/bin/sh
 case "$1" in
 metadata)
   printf '%s' '{"packages":[{"targets":[{"name":"floor","kind":["test"]}]}]}'
   exit 0 ;;
-test)
-  printf '%s|PATH=%s|CTD=%s|CBTD=%s|HOME=%s\n' "$*" "$PATH" \
-    "${CARGO_TARGET_DIR-unset}" "${CARGO_BUILD_TARGET_DIR-unset}" "$HOME" >> "$STUB_LOG"
-  case " $* " in
-  *" --lib "*)
-    [ -n "${STUB_LIB_SILENT:-}" ] || echo "running ${STUB_LIB_N:-3} tests"
-    exit "${STUB_LIB_RC:-0}" ;;
-  *" --bins "*)
-    # Most binaries have no unit tests: a 0 beside a non-zero is normal.
-    echo "running 0 tests"
-    [ -n "${STUB_BINS_SILENT:-}" ] || echo "running ${STUB_BINS_N:-4} tests"
-    exit "${STUB_BINS_RC:-0}" ;;
-  *)
-    echo "running 2 tests"
-    [ -z "${STUB_INT_ZERO:-}" ] || echo "running 0 tests"
-    exit "${STUB_INT_RC:-0}" ;;
-  esac ;;
 esac
+echo "unexpected cargo invocation: $*" >&2
 exit 1
 """
-SYSTEM_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 
 class RunResultTestsRunner(unittest.TestCase):
@@ -291,29 +277,11 @@ class RunResultTestsRunner(unittest.TestCase):
         calls = log.read_text().splitlines() if log.exists() else []
         return result, calls, toolchain
 
-    def test_lib_suite_runs_isolated_after_the_integration_targets(self):
-        with tempfile.TemporaryDirectory(dir="/tmp") as root:
-            result, calls, toolchain = self.run_runner(root, CARGO_TARGET_DIR="rel/tgt")
-            out = result.stdout + result.stderr
-            self.assertEqual(result.returncode, 0, out)
-            self.assertEqual(len(calls), 3, calls)
-            integration, lib, bins = calls
-            self.assertIn("--test floor", integration)
-            self.assertNotIn("--lib", integration)
-            for needle in ("test --locked --features test-seam --lib --no-fail-fast",
-                           "-- --test-threads 2"):
-                self.assertIn(needle, lib)
-            # The lib suite's PATH is the toolchain dir plus system dirs only.
-            self.assertIn(f"|PATH={toolchain}:{SYSTEM_PATH}|", lib)
-            self.assertNotIn("host-bin", lib)
-            # CAD-1214: binary-target unit tests, same flags and isolation.
-            for needle in ("test --locked --features test-seam --bins --no-fail-fast",
-                           "-- --test-threads 2", f"|PATH={toolchain}:{SYSTEM_PATH}|"):
-                self.assertIn(needle, bins)
-            for call in calls:
-                self.assertIn("|CTD=unset|", call)
-                self.assertIn(f"|CBTD={root}/rel/tgt|", call)
-                self.assertIn(f"|HOME={root}/result-tests.", call)
+    def test_real_nextest_runner_acceptance(self):
+        check = ROOT / "scripts/acceptance/test-cad-1334-nextest-contract.py"
+        result = subprocess.run([sys.executable, str(check)], cwd=ROOT,
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_provider_cli_beside_cargo_refuses_before_any_test_runs(self):
         for cli in ("claude", "codex", "cursor-agent", "pi", "devin"):
@@ -322,33 +290,6 @@ class RunResultTestsRunner(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0, result.stdout)
                 self.assertIn(f"provider CLI {cli} resolves", result.stderr)
                 self.assertEqual(calls, [])
-
-    def test_red_lib_or_red_integration_fails_and_both_still_run(self):
-        for env in ({"STUB_LIB_RC": "101"}, {"STUB_INT_RC": "101"}, {"STUB_BINS_RC": "101"}):
-            with self.subTest(env=env), tempfile.TemporaryDirectory(dir="/tmp") as root:
-                result, calls, _ = self.run_runner(root, **env)
-                self.assertNotEqual(result.returncode, 0, result.stdout)
-                self.assertEqual(len(calls), 3, calls)
-                self.assertIn("--lib", calls[1])
-                self.assertIn("--bins", calls[2])
-
-    def test_target_that_runs_no_tests_fails(self):
-        # One of several targets at 0 still fails; so does a lib with none.
-        for env in ({"STUB_LIB_N": "0"}, {"STUB_LIB_SILENT": "1"}, {"STUB_INT_ZERO": "1"}):
-            with self.subTest(env=env), tempfile.TemporaryDirectory(dir="/tmp") as root:
-                result, calls, _ = self.run_runner(root, **env)
-                self.assertNotEqual(result.returncode, 0, result.stdout)
-                self.assertIn("ran 0 tests", result.stderr)
-                self.assertEqual(len(calls), 3, calls)
-
-    def test_bins_step_fails_only_when_no_binary_ran_a_test(self):
-        # CAD-1214: one binary at 0 beside others with tests passes; none fails.
-        for env in ({"STUB_BINS_N": "0"}, {"STUB_BINS_SILENT": "1"}):
-            with self.subTest(env=env), tempfile.TemporaryDirectory(dir="/tmp") as root:
-                result, calls, _ = self.run_runner(root, **env)
-                self.assertNotEqual(result.returncode, 0, result.stdout)
-                self.assertIn("no binary target ran any test", result.stderr)
-                self.assertEqual(len(calls), 3, calls)
 
 
 if __name__ == "__main__":

@@ -411,3 +411,37 @@ pub trait PlatformAdapter: Send + Sync {
         None
     }
 }
+
+#[cfg(test)]
+mod image_reason_tests {
+    use super::{ImageReason as R, ImageSettle as S};
+
+    #[test]
+    fn image_failure_settlement_is_a_pure_reason_mapping() {
+        let cases = [
+            (R::SubmitError, S::Retry),
+            (R::ProviderBusy, S::Retry),
+            (R::PollTimeout, S::Retry),
+            (R::ArtifactUnavailable, S::Retry),
+            (R::ProviderUncertain, S::Unresolved),
+            (R::JobMalformed, S::Unresolved),
+            (R::ArtifactMismatch, S::Unresolved),
+            (R::NotApproved, S::Terminal),
+            (R::PlanInvalid, S::Terminal),
+            (R::MediaDisabled, S::Terminal),
+            (R::NotAuthorized, S::Terminal),
+            (R::InsufficientFunds, S::Terminal),
+            (R::SubmitRefused, S::Terminal),
+            (R::JobFailed, S::Terminal),
+            (R::PriceChanged, S::Terminal),
+            (R::ArtifactTooLarge, S::Terminal),
+            (R::UnsupportedImage, S::Terminal),
+            (R::NotSquare, S::Terminal),
+            (R::DecodeFailed, S::Terminal),
+        ];
+
+        for (reason, expected) in cases {
+            assert_eq!(reason.settle(), expected, "{reason:?}");
+        }
+    }
+}
