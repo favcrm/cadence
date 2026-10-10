@@ -183,6 +183,7 @@ impl Shared {
             if let Some(created) = receipt["created_at"].as_f64() {
                 records.app_social_tool_receipt_attach(&job.context_id, id, created)?;
             }
+            self.social_attach_image(&records, &job.context_id, &job.request_id, id);
             return Ok(RunEnd::Settled);
         }
         let authority = &spec["authority"];
@@ -312,6 +313,7 @@ impl Shared {
         if let Some(created) = receipt["created_at"].as_f64() {
             records.app_social_tool_receipt_attach(&job.context_id, id, created)?;
         }
+        self.social_attach_image(records, &job.context_id, &job.request_id, id);
         Ok(())
     }
 

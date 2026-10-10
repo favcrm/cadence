@@ -187,7 +187,7 @@ impl Shared {
         Ok((ctx, context))
     }
 
-    fn verify_source(
+    pub(super) fn verify_source(
         &self,
         install: &str,
         context: &str,

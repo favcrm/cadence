@@ -20,6 +20,7 @@ mod agent_wait;
 mod agents_rpc;
 mod answer_rpc;
 mod app_assistant_rpc;
+mod app_assistant_social;
 mod app_audiences_rpc;
 mod app_bindings_rpc;
 mod app_capabilities_rpc;
@@ -51,6 +52,8 @@ mod cad1212_acceptance;
 mod cad1218_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1314_approval_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad1327_acceptance;
 mod caller_rule;
 #[cfg(all(test, feature = "test-seam"))]
 mod campaign_clone_acceptance;
