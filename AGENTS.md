@@ -11,6 +11,9 @@ and discover peers with `cadence agent list`.
 
 ## Delivery workflow
 
+For artifact-specific rollout order, rollback and verification, see the
+[rollout checklist](docs/guides/rollout-checklist.md).
+
 Main moves every few minutes and many sessions work in parallel. The
 merge, approval and production-safety steps below are exact; follow them
 as written.
