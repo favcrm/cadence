@@ -47,7 +47,7 @@ fn bundle(dir: &Path, app: &str, rel: &str, len: usize) {
     if let Some(leaf) = rel.strip_prefix("screens/board/") {
         let sha = |t: &str| {
             use sha2::{Digest, Sha256};
-            format!("{:x}", Sha256::digest(t.as_bytes()))
+            format!("sha256:{:x}", Sha256::digest(t.as_bytes()))
         };
         let decl = serde_json::json!({
             "contract": "app-screens/v1",
