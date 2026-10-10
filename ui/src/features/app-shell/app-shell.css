@@ -1438,27 +1438,6 @@ p.sfield-hint {
   align-self: center;
 }
 
-/* CAD-1098: conversation picker + "+ New" in the chat header. */
-.app-chat-conv {
-  display: flex;
-  gap: 0.5rem;
-  align-items: center;
-  min-width: 0;
-}
-.app-chat-conv-select {
-  flex: 1 1 auto;
-  min-width: 0;
-  background: transparent;
-  color: var(--color-ink-100);
-  border: 1px solid var(--color-ink-700);
-  border-radius: 0.375rem;
-  padding: 0.25rem 0.4rem;
-}
-.app-chat-conv-select:focus-visible {
-  outline: 2px solid var(--color-accent);
-  outline-offset: 1px;
-}
-
 /* Generic durable app-assistant activity and consent controls. */
 .app-assistant-activity {
   display: grid;
@@ -1571,12 +1550,4 @@ p.sfield-hint {
   color: var(--color-ink-100);
   font-size: var(--text-label);
   padding: 0 0.5rem;
-}
-
-/* The Home history link would push the Assistant chat button onto a second
-   line on a phone; the desktop header keeps it. */
-@media (max-width: 1023px) {
-  .app-shell-home-link {
-    display: none;
-  }
 }

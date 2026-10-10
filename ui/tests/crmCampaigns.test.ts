@@ -1000,17 +1000,17 @@ async function mountedFlow() {
   const savedCampaignId = openDoc().campaign_id as string;
   // CAD-1098: the operator switches the chat to General, leaves, and the
   // campaign page auto-selects its own conversation again.
-  const picker = () => host.querySelector('select[aria-label="Conversation"]') as HTMLSelectElement;
-  await React.act(async () => {
-    Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")!.set!.call(picker(), "conv-general");
-    picker().dispatchEvent(new Event("change", { bubbles: true }));
-  });
-  equal(picker().value, "conv-general", "the picker switches to General");
+  const openLabel = () => host.querySelector("[data-chat-conv-label]")?.textContent ?? "";
+  await React.act(async () => { (host.querySelector('[aria-label="Conversation history"]') as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+  const generalRow = Array.from(host.querySelectorAll("[data-chat-history] .app-chat-history-row")).find((r) => r.textContent === "General") as HTMLElement;
+  await React.act(async () => { generalRow.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+  await flush();
+  assert(openLabel().includes("General"), "the history switches the chat to General");
   await openPage("customers");
   await React.act(async () => { navigate(`${location.pathname}?ctx=ctx-a&crm=campaigns&record=${savedCampaignId}`); });
   await flush();
   await settle(() => assert(host.querySelector('[data-tab="overview"][aria-selected="true"]'), "a fresh detail opens on Overview"));
-  await settle(() => equal(picker().value, `conv-campaign:${savedCampaignId}`, "the campaign page auto-selects its conversation"));
+  await settle(() => assert(!openLabel().includes("General"), "the campaign page auto-selects its own conversation"));
   await openTab("audience");
   await settle(() => assert(host.querySelector('section[aria-label="Frozen audience"]'), "detail names its freeze panel"));
   await openTab("email");

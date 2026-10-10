@@ -952,6 +952,18 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const subjectOf = (subject: string | null) => subject?.split(":")[0] ?? null;
   const draftKind = subjectOf(draftSubject);
   const draftLabel = subjects.find((s) => s.kind === draftKind)?.label.toLowerCase();
+  // The removed picker was the only place naming the open conversation.
+  const selectedIndex = active.state === "ready" ? active.conversations.findIndex((c) => c.id === convId) : -1;
+  const convLabel =
+    active.state !== "ready"
+      ? null
+      : draftSubject !== null
+        ? draftLabel
+          ? `New ${draftLabel} conversation (unsaved)`
+          : "New conversation (unsaved)"
+        : active.selected !== null
+          ? conversationLabel(active.selected, selectedIndex, subjects)
+          : null;
 
   return (
     <div className="app-chat" data-chat-pane data-collapsed={collapsed || undefined}>
@@ -972,6 +984,21 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           <strong>Assistant</strong>
         </div>
         <div className="app-chat-head-tools">
+          {active.state !== "legacy" && (
+            <button
+              type="button"
+              className="app-chat-iconbtn"
+              data-chat-new
+              aria-label="New conversation"
+              title="New conversation"
+              disabled={!canCreate || creating}
+              onClick={startNew}
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 5v14M5 12h14" />
+              </svg>
+            </button>
+          )}
           {active.state !== "legacy" && (
             <button
               type="button"
@@ -1017,50 +1044,14 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           ))}
         </div>
       )}
-      {active.state !== "legacy" && (
-        <div className="app-chat-conv" data-chat-conversations>
-          <select
-            className="app-chat-conv-select text-secondary"
-            aria-label="Conversation"
-            value={convId ?? ""}
-            disabled={
-              active.state !== "ready" ||
-              active.requestPending ||
-              active.requestError !== null ||
-              (active.conversations.length === 0 && draftSubject === null)
-            }
-            onChange={(e) => e.target.value !== "" && selectConversation(installId, e.target.value)}
-          >
-            {active.conversations.length === 0 && draftSubject === null && mode.conversationRequest === null && (
-              <option value="">General</option>
-            )}
-            {draftSubject !== null && (
-              <option value="">{draftLabel ? `New ${draftLabel} conversation (unsaved)` : "New conversation (unsaved)"}</option>
-            )}
-            {active.conversations.map((c, i) => (
-              <option key={c.id} value={c.id}>
-                {conversationLabel(c, i, subjects)}
-              </option>
-            ))}
-          </select>
-          <button
-            type="button"
-            className="app-chat-iconbtn"
-            data-chat-new
-            aria-label="New conversation"
-            title="New conversation"
-            disabled={!canCreate || creating}
-            onClick={startNew}
-          >
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M12 5v14M5 12h14" />
-            </svg>
-          </button>
-        </div>
-      )}
       <div className="app-chat-scope" data-chat-scope>
         <span className="app-chat-scope-dot" aria-hidden />
         <span className="truncate">{mode.scopeLabel}</span>
+        {convLabel !== null && (
+          <span className="truncate text-ink-500" data-chat-conv-label>
+            · {convLabel}
+          </span>
+        )}
         {active.state === "ready" &&
           active.selected !== null &&
           !active.selected.isGeneral &&
@@ -1299,7 +1290,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           surface: no default chip or prompt row, and a record chip waits
           for a server-proven reference rather than the route's
           `recordOpen` flag. */}
-      {ctx !== null && mode.promptLayout === "list" && (
+      {ctx !== null && mode.promptLayout === "list" && usable && loaded && items.length === 0 && outbox === null && (
         <div className="app-chat-sugg" data-chat-context data-chat-prompts>
           {ctx.prompts.map((p) => (
             <button
