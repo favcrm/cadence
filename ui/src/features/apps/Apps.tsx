@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { resources } from "../../lib/resources";
 import { ApiError } from "../../lib/api";
+import { useLocale } from "../../lib/locale";
 import { prefetchWorkspaceApp, readInstallationsFresh, readInstallationsSnapshot, dropInstallationsSnapshot, appExplorer, notifyAppsChanged, type HomeInstallation, type FavoritesPayload, type Installation } from "../workspace-apps/workspaceApps";
 import { useQuery, useResource } from "../../lib/useResource";
 import type { AppRow } from "../../lib/types";
@@ -30,6 +31,7 @@ import "../explorer/explorer.css";
  * workspace-level home the ticket describes.
  */
 export default function Apps({ project, viewer }: { project: string; viewer: Viewer }) {
+  const { t } = useLocale();
   const [revision, setRevision] = useState(0);
   const [q, setQ] = useState("");
   const [sort, setSort] = useState<"recent" | "name" | "attention">("recent");
@@ -95,6 +97,10 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
   const bareApps =
     noWorkspaceApps && noProjectApps && (home !== null || loadError !== null);
 
+  const noMatchCopy = t("No installed app matches “{query}” — try another word, or look in Explore.").replace("{query}", q);
+  const [noMatchBeforeExplore, noMatchAfterExplore] = noMatchCopy.split(/Explore|「探索」/);
+  const noMatchExploreLabel = noMatchCopy.match(/Explore|「探索」/)?.[0] ?? "Explore";
+
   const items = useMemo(() => {
     const needle = q.trim().toLowerCase();
     let list = live.filter((h) => !needle || [h.name, h.title, h.tagline].filter(Boolean).join(" ").toLowerCase().includes(needle));
@@ -121,7 +127,7 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
     setBusy(id);
     void appExplorer.restore(id)
       .then(() => { setRevision((r) => r + 1); notifyAppsChanged(); })
-      .catch((e: unknown) => setActionError(appErrorCopy(e, "Restore didn't finish. Try again in a moment.")))
+      .catch((e: unknown) => setActionError(t(appErrorCopy(e, "Restore didn't finish. Try again in a moment."))))
       .finally(() => setBusy(null));
   };
 
@@ -134,56 +140,56 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
 
   const attentionRow = (h: HomeInstallation) => {
     const s = h.attention.state;
-    const label = s === "off" ? "Access off" : s === "setup" ? "Finish setup" : s === "update" ? "Update ready" : "Needs attention";
+    const label = t(s === "off" ? "Access off" : s === "setup" ? "Finish setup" : s === "update" ? "Update ready" : "Needs attention");
     return (
       <div key={h.install_id} className="attn-row">
         <AppGlyph name={h.name} icon={h.icon} size="sm" />
         <span className="txt"><b>{h.title}</b> · {h.attention.message ?? label}</span>
         {isOp ? (
           <Button className="btn-sm" href={s === "off" || s === "update" ? `/apps/manage/${h.install_id}` : openHref(h)}>
-            {s === "off" ? "Manage access" : s === "update" ? "Review update" : "Finish setup"}
+            {t(s === "off" ? "Manage access" : s === "update" ? "Review update" : "Finish setup")}
           </Button>
         ) : (
-          <span className="hint">An admin needs to handle this</span>
+          <span className="hint">{t("An admin needs to handle this")}</span>
         )}
       </div>
     );
   };
 
   return (
-    <main className={`apps-home px-4 lg:px-8 min-w-0 ${bareApps ? "flex" : "pt-4 pb-9"}`} aria-label="apps">
+    <main className={`apps-home px-4 lg:px-8 min-w-0 ${bareApps ? "flex" : "pt-4 pb-9"}`} aria-label={t("apps")}>
       {bareApps ? (
         <PageState
           title={
             loadError === UNVERIFIED_APPS_COPY
-              ? "Sign in to view your apps"
+              ? t("Sign in to view your apps")
               : loadError !== null
-                ? "Apps could not be loaded"
-                : "No apps installed yet"
+                ? t("Apps could not be loaded")
+                : t("No apps installed yet")
           }
           icon={loadError === UNVERIFIED_APPS_COPY ? <IconLock size={32} /> : <IconApps size={32} />}
           actions={
             loadError !== null && loadError !== UNVERIFIED_APPS_COPY ? (
-              <Button onClick={retryAll}>Retry</Button>
+              <Button onClick={retryAll}>{t("Retry")}</Button>
             ) : (
-              <Button className="btn-primary" href="/apps/explore">Explore apps</Button>
+              <Button className="btn-primary" href="/apps/explore">{t("Explore apps")}</Button>
             )
           }
         >
           {loadError === UNVERIFIED_APPS_COPY
-            ? `${loadError} Use Sign in in the status bar.`
+            ? `${t(loadError)} ${t("Use Sign in in the status bar.")}`
             : loadError !== null
-              ? loadError
+              ? t(loadError)
               : isOp
-                ? "Apps add new skills to your workspace — a customer list, social posts and more. Browse what's available and install one in a tap."
-                : "Your admin hasn't installed any apps yet. Browse what's available and ask for one."}
+                ? t("Apps add new skills to your workspace — a customer list, social posts and more. Browse what's available and install one in a tap.")
+                : t("Your admin hasn't installed any apps yet. Browse what's available and ask for one.")}
         </PageState>
       ) : (
         <>
       <div className="ohead flex flex-wrap items-center gap-3 mb-2">
-        <h1 className="text-section font-semibold text-ink-100">Apps</h1>
+        <h1 className="text-section font-semibold text-ink-100">{t("Apps")}</h1>
         <span className="grow" />
-        {!emptyWorkspace && <Button className="btn-primary" href="/apps/explore">Explore apps</Button>}
+        {!emptyWorkspace && <Button className="btn-primary" href="/apps/explore">{t("Explore apps")}</Button>}
       </div>
 
       {isOp && <WorkspaceCatalog />}
@@ -195,87 +201,87 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
           ) : null}
           <div className="apps-state-body">
             <h2 className="apps-state-title">
-              {loadError === UNVERIFIED_APPS_COPY ? "Sign in to view workspace apps" : "Apps could not be loaded"}
+              {loadError === UNVERIFIED_APPS_COPY ? t("Sign in to view workspace apps") : t("Apps could not be loaded")}
             </h2>
-            <p className="apps-state-copy">{loadError}</p>
+            <p className="apps-state-copy">{loadError === null ? null : t(loadError)}</p>
           </div>
-          <Button className="btn-sm" onClick={retryAll}>Retry</Button>
+          <Button className="btn-sm" onClick={retryAll}>{t("Retry")}</Button>
         </div>
       )}
-      {retrying && <p className="text-label text-ink-400 mb-2" role="status">The workspace is busy. Retrying…</p>}
+      {retrying && <p className="text-label text-ink-400 mb-2" role="status">{t("The workspace is busy. Retrying…")}</p>}
       {home === null ? (
-        loadError === null && !retrying && <p className="text-label text-ink-400" role="status">Loading your apps…</p>
+        loadError === null && !retrying && <p className="text-label text-ink-400" role="status">{t("Loading your apps…")}</p>
       ) : (
         <>
           {emptyWorkspace && (
             <div className="apps-state card my-4">
               <span className="apps-state-icon text-accent" aria-hidden><IconApps size={18} /></span>
               <div className="apps-state-body">
-                <h2 className="apps-state-title">No apps installed yet</h2>
+                <h2 className="apps-state-title">{t("No apps installed yet")}</h2>
                 <p className="apps-state-copy">
                   {isOp
-                    ? "Apps add new skills to your workspace — a customer list, social posts and more. Browse what's available and install one in a tap."
-                    : "Your admin hasn't installed any apps yet. Browse what's available and ask for one."}
+                    ? t("Apps add new skills to your workspace — a customer list, social posts and more. Browse what's available and install one in a tap.")
+                    : t("Your admin hasn't installed any apps yet. Browse what's available and ask for one.")}
                 </p>
               </div>
-              <Button className="btn-primary" href="/apps/explore">Explore apps</Button>
+              <Button className="btn-primary" href="/apps/explore">{t("Explore apps")}</Button>
             </div>
           )}
 
           {attention.length > 0 && (
-            <section className="attn" aria-label="Needs attention">
-              <div className="attn-head"><span aria-hidden>⚠</span>{attention.length} {attention.length === 1 ? "app needs" : "apps need"} attention</div>
+            <section className="attn" aria-label={t("Needs attention")}>
+              <div className="attn-head"><span aria-hidden>⚠</span>{attention.length} {t(attention.length === 1 ? "app needs attention" : "apps need attention")}</div>
               {attention.map(attentionRow)}
             </section>
           )}
 
           {!emptyWorkspace && (
-          <section className="sec" aria-label="Favorites">
+          <section className="sec" aria-label={t("Favorites")}>
             <div className="sechead">
-              <h2>Favorites</h2>
+              <h2>{t("Favorites")}</h2>
             </div>
             {favorites.length > 0 ? (
               <div className="favs">
                 {favorites.map((h) => (
                   <div key={h.install_id} className="card fav">
                     <Link href={openHref(h)} className="open"
-                      onClick={() => opened(h.install_id)} aria-label={`Open ${h.title}`}>
+                      onClick={() => opened(h.install_id)} aria-label={`${t("Open")} ${h.title}`}>
                       <AppGlyph name={h.name} icon={h.icon} />
                       <span className="nm">{h.title}</span>
                       <span className="ln">{h.tagline}</span>
                     </Link>
-                    <button className="star pinned absolute top-2 right-2" aria-label={`Unpin ${h.title}`}
+                    <button className="star pinned absolute top-2 right-2" aria-label={`${t("Unpin")} ${h.title}`}
                       onClick={() => pin(h.install_id)}>★</button>
                   </div>
                 ))}
               </div>
             ) : favs === null ? (
-              <p className="hint">{favLoad.error ? "Favorites could not be loaded." : "Loading favorites…"}</p>
+              <p className="hint">{t(favLoad.error ? "Favorites could not be loaded." : "Loading favorites…")}</p>
             ) : (
               <div className="favempty">
                 <span aria-hidden>★</span>
-                <span>Pin the apps you use every day. Tap the star on any app below and it appears here and in the sidebar.</span>
+                <span>{t("Pin the apps you use every day. Tap the star on any app below and it appears here and in the sidebar.")}</span>
               </div>
             )}
           </section>
           )}
 
           {live.length > 0 && (
-            <section className="sec" aria-label="Installed">
+            <section className="sec" aria-label={t("Installed")}>
               <div className="sechead">
-                <h2>Installed</h2>
+                <h2>{t("Installed")}</h2>
                 <span className="chip">{live.length}</span>
                 <span className="grow" />
-                <input className="field search" placeholder="Search your apps" value={q} onChange={(e) => setQ(e.target.value)} aria-label="Search installed apps" />
-                <select className="field sort" value={sort} onChange={(e) => setSort(e.target.value as typeof sort)} aria-label="Sort">
-                  <option value="recent">Recently used</option>
-                  <option value="name">Name</option>
-                  <option value="attention">Needs attention first</option>
+                <input className="field search" placeholder={t("Search your apps")} value={q} onChange={(e) => setQ(e.target.value)} aria-label={t("Search installed apps")} />
+                <select className="field sort" value={sort} onChange={(e) => setSort(e.target.value as typeof sort)} aria-label={t("Sort")}>
+                  <option value="recent">{t("Recently used")}</option>
+                  <option value="name">{t("Name")}</option>
+                  <option value="attention">{t("Needs attention first")}</option>
                 </select>
               </div>
               {items.length === 0 ? (
                 <div className="card px-4 py-5 text-secondary text-ink-400">
-                  No installed app matches “{q}” — try another word, or look in <Link href="/apps/explore">Explore</Link>.
+                  {noMatchBeforeExplore}<Link href="/apps/explore">{noMatchExploreLabel}</Link>{noMatchAfterExplore}
                 </div>
               ) : (
                 <div className="igrid">
@@ -289,17 +295,17 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
                           <div className="min-w-0 flex-1">
                             <div className="nm">{h.title}</div>
                             <div className="ln">{h.tagline}</div>
-                            {h.project && <div className="ln text-ink-500">Project: {h.project}</div>}
+                            {h.project && <div className="ln text-ink-500">{t("Project")}: {h.project}</div>}
                             {h.attention.state !== "ok" && (
                               <div className="mt-1"><span className={`chip ${h.attention.state === "update" ? "info" : h.attention.state === "off" ? "" : "warn"}`}>
-                                {h.attention.state === "update" ? "Update" : h.attention.state === "off" ? "Access off" : h.attention.state === "setup" ? "Finish setup" : "Needs attention"}
+                                {t(h.attention.state === "update" ? "Update" : h.attention.state === "off" ? "Access off" : h.attention.state === "setup" ? "Finish setup" : "Needs attention")}
                               </span></div>
                             )}
                           </div>
                         </Link>
                         <div className="acts">
                           <button className={`star ${pinned ? "pinned" : ""}`} aria-pressed={pinned}
-                            aria-label={`${pinned ? "Unpin" : "Pin"} ${h.title}`}
+                            aria-label={`${t(pinned ? "Unpin" : "Pin")} ${h.title}`}
                             onClick={() => pin(h.install_id)}>{pinned ? "★" : "☆"}</button>
                           {isOp && <Link className="star" href={`/apps/manage/${h.install_id}`} aria-label={`Manage ${h.title}`}>⚙</Link>}
                         </div>
@@ -308,26 +314,26 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
                   })}
                 </div>
               )}
-              <Link href="/apps/explore" className="explore-card mt-3">
+              <Link href="/apps/explore" className="explore-card mt-3" aria-label={t("Find more apps")}>
                 <span aria-hidden>⌖</span>
-                <span className="flex-1"><b>Find more apps</b><small className="block">Bookings, reviews, invoices and more, made for small businesses.</small></span>
+                <span className="flex-1"><b>{t("Find more apps")}</b><small className="block">{t("Bookings, reviews, invoices and more, made for small businesses.")}</small></span>
                 <span aria-hidden>→</span>
               </Link>
             </section>
           )}
 
           {isOp && removedList.length > 0 && (
-            <section className="sec" aria-label="Recently removed">
-              <div className="sechead"><h2>Recently removed</h2><span className="chip">{removedList.length}</span></div>
-              <p className="hint mb-2">Removed apps restore for 30 days, then they're deleted for good.</p>
+            <section className="sec" aria-label={t("Recently removed")}>
+              <div className="sechead"><h2>{t("Recently removed")}</h2><span className="chip">{removedList.length}</span></div>
+              <p className="hint mb-2">{t("Removed apps restore for 30 days, then they're deleted for good.")}</p>
               <div className="card p-0 divide-y divide-ink-800">
                 {removedList.map((h) => (
                   <div key={h.install_id} className="rrow flex items-center gap-3 p-3">
                     <AppGlyph name={h.name} icon={h.icon} size="sm" />
-                    <div className="grow"><b>{h.title}</b><small className="block text-ink-500">{h.attention.action === "restore" ? "Removed" : "Removed · restore window closed"}</small></div>
+                    <div className="grow"><b>{h.title}</b><small className="block text-ink-500">{t(h.attention.action === "restore" ? "Removed" : "Removed · restore window closed")}</small></div>
                     {h.attention.action === "restore" && (
                       <Button className="btn-sm" disabled={busy === h.install_id} onClick={() => restore(h.install_id)}>
-                        {busy === h.install_id ? "Restoring…" : "Restore"}
+                        {t(busy === h.install_id ? "Restoring…" : "Restore")}
                       </Button>
                     )}
                   </div>
@@ -337,19 +343,19 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
           )}
         </>
       )}
-      <section className="sec" aria-label="Project apps">
-        <div className="sechead"><h2>Project apps</h2>{projectApps.data && <span className="chip">{projectRows.length}</span>}</div>
+      <section className="sec" aria-label={t("Project apps")}>
+        <div className="sechead"><h2>{t("Project apps")}</h2>{projectApps.data && <span className="chip">{projectRows.length}</span>}</div>
         <ResourceGate
           state={projectApps}
-          loading="loading apps…"
-          failed="could not load apps"
+          loading={t("loading apps…")}
+          failed={t("could not load apps")}
           onRetry={() => void resources.apps.invalidate()}
         />
         {projectApps.data && projectRows.length === 0 && (
           <div className="apps-substate text-label text-ink-500">
-            <p>No project apps installed{project === "all" ? "" : ` in ${project}`}.</p>
+            <p>{t("No project apps installed")}{project === "all" ? "" : ` ${t("in")} ${project}`}.</p>
             <details className="apps-substate-install">
-              <summary>Install a project app</summary>
+              <summary>{t("Install a project app")}</summary>
               <code className="num text-ink-300">
                 cadence app install &lt;path|git-url&gt; --project {project === "all" ? "<key>" : project}
               </code>
@@ -439,8 +445,9 @@ function AppCard({
   needs: HomeNeed[];
   showProject: boolean;
 }) {
+  const { t } = useLocale();
   const approval = appApprovalChip(row);
-  const title = row.title?.trim() || row.name || "App";
+  const title = row.title?.trim() || row.name || t("App");
   const appName = row.name;
   const legacyHref = appName ? appHref(row.project, appName) : null;
   const screenHref = appName ? screenInstallHref(installs, row.project, appName) : null;
@@ -460,7 +467,7 @@ function AppCard({
             )}
             <span className={`chip shrink-0 ${approval.cls}`}>{approval.text}</span>
           </div>
-          {showProject && <p className="text-micro text-ink-500 mt-0.5 break-words">Project: {row.project}</p>}
+          {showProject && <p className="text-micro text-ink-500 mt-0.5 break-words">{t("Project")}: {row.project}</p>}
           <p className="text-label text-ink-400 mt-0.5 break-words">{appPurpose(row)}</p>
           <p className="text-micro text-ink-500 mt-1" data-summary>
             {row.error ? (
@@ -472,8 +479,8 @@ function AppCard({
             )}
           </p>
         </div>
-        {href && <Button href={href} className="app-card-action" aria-label={`Open ${title} in ${row.project}`}>Open app</Button>}
-        {screenHref && legacyHref && <Link href={legacyHref} className="text-micro text-ink-500 hover:text-accent">Legacy page</Link>}
+        {href && <Button href={href} className="app-card-action" aria-label={`${t("Open")} ${title} ${t("in")} ${row.project}`}>{t("Open app")}</Button>}
+        {screenHref && legacyHref && <Link href={legacyHref} className="text-micro text-ink-500 hover:text-accent">{t("Legacy page")}</Link>}
       </div>
     </li>
   );
@@ -493,8 +500,9 @@ function AppActivity({
   name: string;
   needs: HomeNeed[];
 }) {
+  const { t } = useLocale();
   const runs = useQuery(resources.appRuns(`${project}/${name}`));
-  if (runs.status === "failed") return <>activity unavailable</>;
-  if (!runs.data) return <>reading activity…</>;
-  return <>{runsSummary(runs.data, needs) ?? "Nothing running yet"}</>;
+  if (runs.status === "failed") return <>{t("activity unavailable")}</>;
+  if (!runs.data) return <>{t("reading activity…")}</>;
+  return <>{runsSummary(runs.data, needs) ?? t("Nothing running yet")}</>;
 }
