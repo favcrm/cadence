@@ -889,15 +889,6 @@ pre {
     transition: none;
   }
 }
-::-webkit-scrollbar {
-  height: 10px;
-  width: 10px;
-}
-::-webkit-scrollbar-thumb {
-  background: var(--color-ink-700);
-  border-radius: 6px;
-}
-
 /* The issue reader stays shrinkable on phones. */
 .issue-reader {
   min-width: 0;
