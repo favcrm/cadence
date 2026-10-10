@@ -66,6 +66,53 @@ type Section =
   | "Sources";
 /** CAD-1137: the app page's snapshot — the same read set the cache stores. */
 type Snapshot = WorkspaceAppSnapshot;
+
+/** Display-only stale content while AppShell obtains fresh scope receipts.
+ *  This never mounts the app screen or any workspace controls. */
+export function WorkspaceAppCachedPreview({
+  snapshot,
+  contextId,
+}: {
+  snapshot: Snapshot;
+  contextId: string | null;
+}) {
+  const context = contextId === null
+    ? null
+    : snapshot.contexts.find((value) =>
+      value.id === contextId && value.install_id === snapshot.installation.install_id && value.state === "active",
+    ) ?? null;
+  const runs = context
+    ? snapshot.runs.filter((run) => run.install_id === snapshot.installation.install_id && run.context_id === context.id).slice(0, 3)
+    : [];
+  return (
+    <section className="card px-4 py-5" aria-label="Cached workspace preview" role="status">
+      <p className="text-micro text-ink-500">Previously viewed · verifying access</p>
+      <h2 className="mt-1 text-cardtitle font-medium text-ink-100">
+        {snapshot.installation.title || snapshot.installation.name}
+      </h2>
+      {context ? (
+        <>
+          <p className="mt-1 text-micro text-ink-500">{context.config.label}</p>
+          {runs.length > 0 ? (
+            <ul className="mt-4 space-y-2" aria-label="Previously viewed runs">
+              {runs.map((run) => (
+                <li key={run.id} className="rounded border border-line/50 px-3 py-2">
+                  <span className="text-label text-ink-200">{run.snapshot.workflow.title}</span>
+                  <span className="ml-2 text-micro text-ink-500">{run.state}</span>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="mt-3 text-label text-ink-400">No recent activity in this context.</p>
+          )}
+        </>
+      ) : (
+        <p className="mt-3 text-label text-ink-400">Workspace details will appear after access is verified.</p>
+      )}
+    </section>
+  );
+}
+
 const message = (error: unknown) =>
   error instanceof Error
     ? error.message
