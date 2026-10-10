@@ -210,6 +210,10 @@ export class ScreenChannel extends FrameChannel {
   tapSlot(token: string, trusted: boolean, pressedAt: number): boolean {
     return !this.closed && (this.slots?.tap(token, trusted, pressedAt) ?? false);
   }
+  /** The person closed the host-drawn confirm card. */
+  cancelSlot(token: string): void {
+    if (!this.closed) this.slots?.cancel(token);
+  }
   close(report = false): void {
     this.slots?.close();
     super.close(report);

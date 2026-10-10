@@ -64,8 +64,8 @@ store/agents.rs	guarded-store-and-read-queries	prepare	4
 store/app_audiences.rs	guarded-store-and-read-queries	execute	10
 store/app_audiences.rs	guarded-store-and-read-queries	guarded_write	3
 store/app_audiences.rs	guarded-store-and-read-queries	prepare	3
-store/app_bindings.rs	guarded-store-and-read-queries	execute	7
-store/app_bindings.rs	guarded-store-and-read-queries	guarded_write	4
+store/app_bindings.rs	guarded-store-and-read-queries	execute	8
+store/app_bindings.rs	guarded-store-and-read-queries	guarded_write	5
 store/app_bindings.rs	guarded-store-and-read-queries	prepare	1
 store/app_capabilities.rs	guarded-store-and-read-queries	execute	2
 store/app_capabilities.rs	guarded-store-and-read-queries	guarded_write	2

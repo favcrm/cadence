@@ -12,9 +12,9 @@ import { slotBox, type SlotView } from "./screenSlot";
  * The press time comes from the browser's own `pointerdown` event; the guard
  * itself is the controller's (500 ms after the slot appears or moves).
  */
-export default function ScreenSlotLayer({ view, link, onTap, onDismissLink }: {
+export default function ScreenSlotLayer({ view, link, onTap, onCancel, onDismissLink }: {
   view: SlotView | null; link: string | null;
-  onTap: (token: string, trusted: boolean, pressedAt: number) => void; onDismissLink: () => void;
+  onTap: (token: string, trusted: boolean, pressedAt: number) => void; onCancel: (token: string) => void; onDismissLink: () => void;
 }) {
   const layer = useRef<HTMLDivElement>(null);
   const pressed = useRef(0);
@@ -29,7 +29,7 @@ export default function ScreenSlotLayer({ view, link, onTap, onDismissLink }: {
     observer.observe(node);
     return () => observer.disconnect();
   }, []);
-  const box = view ? slotBox(view.anchor, size.w, size.h) : null;
+  const box = view && !view.card ? slotBox(view.anchor, size.w, size.h) : null;
   return (
     <div ref={layer} className="screen-slot-layer" style={{ position: "absolute", inset: 0, pointerEvents: "none", zIndex: 5 }}>
       {view && box && (
@@ -49,6 +49,27 @@ export default function ScreenSlotLayer({ view, link, onTap, onDismissLink }: {
             {view.pending ? "Working…" : view.label}
           </button>
         </div>
+      )}
+      {view?.card && (
+        <WorkspaceDialog title="Post this now?" className="wa-confirm" onClose={() => { if (!view.pending) onCancel(view.token); }}>
+          <div className="wa-stack" data-host-confirm={view.token.slice(0, 8)}>
+            {view.card.image && <img src={view.card.image} alt="The image that will post" style={{ maxWidth: "100%", maxHeight: 240, objectFit: "contain", borderRadius: 8 }} />}
+            <p className="wa-caption" style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{view.card.caption}</p>
+            <p>To <strong>{view.card.target}</strong></p>
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", flexWrap: "wrap" }}>
+              <Button disabled={view.pending} onClick={() => onCancel(view.token)}>Cancel</Button>
+              <button type="button" className="btn btn-primary" disabled={view.pending} aria-busy={view.pending}
+                onPointerDown={event => { pressed.current = event.timeStamp; }}
+                onClick={event => {
+                  const at = event.detail === 0 ? performance.now() : pressed.current;
+                  pressed.current = 0;
+                  onTap(view.token, event.isTrusted, at);
+                }}>
+                {view.pending ? "Posting…" : view.label}
+              </button>
+            </div>
+          </div>
+        </WorkspaceDialog>
       )}
       {link && (
         <WorkspaceDialog title="Open this link?" className="wa-confirm" onClose={onDismissLink}>

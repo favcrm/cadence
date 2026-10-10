@@ -167,6 +167,9 @@ impl Fx {
             provider_env: env,
             stop: Some(Arc::clone(&stop)),
             test_seam: true,
+            // This fixture proves the manual send-now path against a daemon
+            // that "dies" on status; the scheduled driver would settle the row.
+            social_publish_driver_off: true,
             slots: Some(Default::default()),
             lease: Some(Default::default()),
             auto_stop: Some(daemon::AutoStopSetting::off()),
