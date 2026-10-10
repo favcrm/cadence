@@ -2,6 +2,25 @@
 
 use super::*;
 
+fn show_login_code(url: &str, code: &str, no_open: bool) -> Result<()> {
+    eprintln!("Approve hosted Cadence access at: {url}\nCode: {code}");
+    if !no_open {
+        let program = if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
+        let mut opener = std::process::Command::new(program);
+        opener
+            .arg(url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let _ = cadence_agent::reaper::spawn(&mut opener);
+    }
+    Ok(())
+}
+
 pub(crate) fn run() -> Result<i32> {
     let argv: Vec<String> = std::env::args_os()
         .map(|a| a.to_string_lossy().into_owned())
@@ -47,6 +66,7 @@ pub(crate) fn run() -> Result<i32> {
     // Remote credentials are independent of local daemon state and sandbox adoption.
     match &cli.command {
         Commands::Login {
+            hint,
             issuer,
             org,
             slug,
@@ -58,44 +78,41 @@ pub(crate) fn run() -> Result<i32> {
             // `--token-stdin` is the legacy AgenticOS token path, not org login.
             let dir = cadence_agent::remote_auth::auth_dir(auth_dir.as_deref())?;
             if *token_stdin {
+                let issuer = issuer
+                    .as_deref()
+                    .expect("clap requires --issuer with --token-stdin");
+                let org = org
+                    .as_deref()
+                    .expect("clap requires --org with --token-stdin");
                 return cadence_agent::remote_auth::login(issuer, org, &dir, true, *no_open);
             }
-            let slug = slug
+            let issuer = issuer
                 .as_deref()
-                .ok_or_else(|| Error::rejected("login needs --slug <org-slug>"))?;
-            let grant = cadence_agent::remote_enrollment::login_browser(
-                issuer,
-                org,
-                slug,
-                &dir,
-                |url, code| {
-                    eprintln!("Approve hosted Cadence access at: {url}\nCode: {code}");
-                    if !no_open {
-                        let program = if cfg!(target_os = "macos") {
-                            "open"
-                        } else {
-                            "xdg-open"
-                        };
-                        let mut opener = std::process::Command::new(program);
-                        opener
-                            .arg(url)
-                            .stdin(std::process::Stdio::null())
-                            .stdout(std::process::Stdio::null())
-                            .stderr(std::process::Stdio::null());
-                        let _ = cadence_agent::reaper::spawn(&mut opener);
-                    }
-                    Ok(())
-                },
-            )?;
+                .unwrap_or(cadence_agent::remote_enrollment::HOSTED_LOGIN_ISSUER);
+            let grant = if let Some(org) = org.as_deref() {
+                let slug = slug.as_deref().ok_or_else(|| {
+                    Error::rejected("legacy login with --org needs --slug <org-slug>")
+                })?;
+                cadence_agent::remote_enrollment::login_browser(
+                    issuer,
+                    org,
+                    slug,
+                    &dir,
+                    |url, code| show_login_code(url, code, *no_open),
+                )?
+            } else {
+                cadence_agent::remote_enrollment::login_portal(
+                    issuer,
+                    hint.as_deref().or(slug.as_deref()),
+                    &dir,
+                    |url, code| show_login_code(url, code, *no_open),
+                )?
+            };
             // Record first: a refused registry write (changed endpoint, name
             // taken by `local`) must leave no credential behind.
-            let view =
-                org::record_remote(&grant.slug, &grant.endpoint, &grant.organization_id, *use_)?;
+            org::record_remote(&grant.slug, &grant.endpoint, &grant.organization_id, *use_)?;
             grant.save_credential(&dir)?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&view).unwrap_or_default()
-            );
+            println!("Signed in to {} ({})", grant.slug, grant.endpoint);
             return Ok(0);
         }
         Commands::Auth { action } => {
