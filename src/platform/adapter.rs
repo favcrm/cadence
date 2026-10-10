@@ -417,31 +417,32 @@ mod image_reason_tests {
     use super::{ImageReason as R, ImageSettle as S};
 
     #[test]
-    fn image_failure_settlement_is_a_pure_reason_mapping() {
+    fn image_failure_code_and_settlement_are_pure_reason_mappings() {
         let cases = [
-            (R::SubmitError, S::Retry),
-            (R::ProviderBusy, S::Retry),
-            (R::PollTimeout, S::Retry),
-            (R::ArtifactUnavailable, S::Retry),
-            (R::ProviderUncertain, S::Unresolved),
-            (R::JobMalformed, S::Unresolved),
-            (R::ArtifactMismatch, S::Unresolved),
-            (R::NotApproved, S::Terminal),
-            (R::PlanInvalid, S::Terminal),
-            (R::MediaDisabled, S::Terminal),
-            (R::NotAuthorized, S::Terminal),
-            (R::InsufficientFunds, S::Terminal),
-            (R::SubmitRefused, S::Terminal),
-            (R::JobFailed, S::Terminal),
-            (R::PriceChanged, S::Terminal),
-            (R::ArtifactTooLarge, S::Terminal),
-            (R::UnsupportedImage, S::Terminal),
-            (R::NotSquare, S::Terminal),
-            (R::DecodeFailed, S::Terminal),
+            (R::SubmitError, "submit_error", S::Retry),
+            (R::ProviderBusy, "provider_busy", S::Retry),
+            (R::PollTimeout, "poll_timeout", S::Retry),
+            (R::ArtifactUnavailable, "artifact_unavailable", S::Retry),
+            (R::ProviderUncertain, "provider_uncertain", S::Unresolved),
+            (R::JobMalformed, "job_malformed", S::Unresolved),
+            (R::ArtifactMismatch, "artifact_mismatch", S::Unresolved),
+            (R::NotApproved, "not_approved", S::Terminal),
+            (R::PlanInvalid, "plan_invalid", S::Terminal),
+            (R::MediaDisabled, "media_disabled", S::Terminal),
+            (R::NotAuthorized, "not_authorized", S::Terminal),
+            (R::InsufficientFunds, "insufficient_funds", S::Terminal),
+            (R::SubmitRefused, "submit_refused", S::Terminal),
+            (R::JobFailed, "job_failed", S::Terminal),
+            (R::PriceChanged, "price_changed", S::Terminal),
+            (R::ArtifactTooLarge, "artifact_too_large", S::Terminal),
+            (R::UnsupportedImage, "unsupported_image", S::Terminal),
+            (R::NotSquare, "not_square", S::Terminal),
+            (R::DecodeFailed, "decode_failed", S::Terminal),
         ];
 
-        for (reason, expected) in cases {
-            assert_eq!(reason.settle(), expected, "{reason:?}");
+        for (reason, expected_code, expected_settle) in cases {
+            assert_eq!(reason.code(), expected_code, "{reason:?}");
+            assert_eq!(reason.settle(), expected_settle, "{reason:?}");
         }
     }
 }
