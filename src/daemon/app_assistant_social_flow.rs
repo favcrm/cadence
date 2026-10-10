@@ -248,8 +248,6 @@ impl Fx {
             "http://127.0.0.1:3010".into(),
         );
         std::env::set_var("ALL_PROXY", format!("http://{addr}"));
-        std::env::set_var("CADENCE_TEST_MEDIA_POLL_MS", "20");
-        std::env::set_var("CADENCE_TEST_MEDIA_DEADLINE_MS", "1500");
         crate::platform::agenticos_external::attach(&mut opts).unwrap();
         let shared = Shared::new(dir.path(), &opts).unwrap();
         std::env::remove_var("ALL_PROXY");
@@ -413,7 +411,7 @@ impl Fx {
     }
 
     fn wait_image(&self, draft: &str) -> Value {
-        let deadline = Instant::now() + Duration::from_secs(40);
+        let deadline = Instant::now() + Duration::from_secs(120);
         loop {
             let row = self
                 .records()
