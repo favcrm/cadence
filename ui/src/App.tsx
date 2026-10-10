@@ -8,6 +8,8 @@ import Explorer from "./features/explorer/Explorer";
 import CatalogDetail from "./features/explorer/CatalogDetail";
 import ManageApp from "./features/explorer/ManageApp";
 import AppShell, { type ActiveInstallation } from "./features/app-shell/AppShell";
+import { Loading, Notice } from "./features/app-shell/shared/States";
+import type { Viewer } from "./features/projects/work";
 import { buildAppNav, readLastApp, sectionFromSearch, writeLastApp, type LastApp, type VerifiedApp } from "./features/app-shell/appNav";
 import { useInstallations, type InstallationsState } from "./features/workspace-apps/useInstallations";
 import { APPS_CHANGED_EVENT } from "./features/workspace-apps/workspaceApps";
@@ -1174,7 +1176,7 @@ export default function App() {
           <WorkspaceAppEntry
             appKey={route.appKey}
             installations={installations}
-            viewer={{ readOnly, operator: meta?.operator === true }}
+            viewer={viewer}
             onInstallation={reportInstallation}
             onBack={() => goRoute({ screen: "apps", project: null, name: null })}
           />
@@ -1301,11 +1303,22 @@ function WorkspaceAppEntry({
 }: {
   appKey: string;
   installations: InstallationsState;
-  viewer: { readOnly: boolean; operator: boolean };
+  viewer: Viewer;
   onInstallation: (installation: ActiveInstallation | null) => void;
   onBack: () => void;
 }) {
-  if (!viewer.operator) {
+  if (viewer.operator === null) {
+    return (
+      <main className="px-4 lg:px-8 pt-10 pb-9">
+        {viewer.access === "unavailable" ? (
+          <Notice state="access-unavailable" onRetry={viewer.onRetryAccess} retryLabel="Retry access check">
+            Access could not be confirmed. Retry the access check before opening an installed app.
+          </Notice>
+        ) : <Loading>Checking access…</Loading>}
+      </main>
+    );
+  }
+  if (viewer.operator !== true) {
     return (
       <main className="px-4 lg:px-8 pt-10 pb-9">
         <h1 className="text-section font-semibold text-ink-100">App unavailable</h1>
