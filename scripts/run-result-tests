@@ -94,12 +94,10 @@ export HOME="$scratch/home" XDG_CONFIG_HOME="$scratch/xdg-config" \
 mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME" "$TMPDIR"
 export CADENCE_SUITE_LOCK="${CADENCE_SUITE_LOCK:-$scratch/cadence-suite.lock}"
 refuse_prod_path "scratch HOME" "$HOME"
-# Use the already installed binary when available (the wrapper verifies its
-# pinned version and checksum); otherwise install the reviewed artifact into
-# this run's isolated XDG data directory, which the EXIT trap removes.
-if nextest_bin=$(command -v cargo-nextest 2>/dev/null); then
-  export CADENCE_NEXTTEST_BIN=$nextest_bin
-elif [ -x "$original_xdg_data/cadence/tools/cadence-nextest-0.9.145/cargo-nextest" ]; then
+# Reuse only the repository-pinned tool in the original XDG data home;
+# otherwise install the trusted artifact into this run's isolated XDG data
+# directory. The nextest wrapper verifies its version and checksum either way.
+if [ -x "$original_xdg_data/cadence/tools/cadence-nextest-0.9.145/cargo-nextest" ]; then
   export CADENCE_NEXTTEST_BIN="$original_xdg_data/cadence/tools/cadence-nextest-0.9.145/cargo-nextest"
 else
   "$root/scripts/install-cadence-nextest"

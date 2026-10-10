@@ -123,7 +123,7 @@ def write_fixture(directory: Path, names: list[str], *, zero_target: str | None 
         if name == zero_target:
             path.write_text("// Deliberately selected integration target with zero tests.\n", encoding="utf-8")
         else:
-            path.write_text("""#[test]\n""" + rust_test_body(f"integration-{name}", f"integration target {name}"),
+            path.write_text(rust_test_body(f"integration-{name}", f"integration target {name}"),
                             encoding="utf-8")
         with manifest.open("a", encoding="utf-8") as cargo_toml:
             cargo_toml.write(f'\n[[test]]\nname = "{name}"\npath = "tests/{name}.rs"\n')
