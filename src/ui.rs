@@ -1120,6 +1120,63 @@ pub(crate) fn ready_file(state_dir: &Path) -> PathBuf {
 /// own environment before serving so nothing downstream inherits it.
 pub(crate) const READY_NONCE_ENV: &str = "CADENCE_UI_READY_NONCE";
 
+/// The frame a spawned `ui run` writes when its bind fails with a real
+/// `AddrInUse` — `{pid, nonce, kind}` for the `ui start` that is
+/// waiting on it (CAD-1283). The path is scoped to the writing child's
+/// own pid, `ui.startup-failed-{pid}`, so concurrent genuine starts
+/// never share a file and no start can overwrite another's proof. A
+/// starter trusts it only when pid and nonce are this start's own
+/// child and env nonce, so a stale, malformed or foreign frame can
+/// never classify an unrelated exit as a bind collision. It carries no
+/// role the nonce did not already have — the child's provenance for
+/// its own start result.
+pub(crate) fn startup_failed_file(state_dir: &Path, pid: u32) -> PathBuf {
+    state_dir.join(format!("ui.startup-failed-{pid}"))
+}
+
+/// `true` only when `ui.startup-failed-{pid}` is a regular, non-symlink
+/// file holding a well-formed frame that exactly names this start's own
+/// child `pid`, this start's `nonce`, and the `addr_in_use` kind (CAD-1283).
+/// Any miss — absent file, symlink, non-regular file, unreadable,
+/// malformed, wrong pid, wrong nonce, unknown kind — is `false`: the
+/// failure stays untyped and the caller must treat it as a generic exit,
+/// never a bind collision it may retry. The file is opened
+/// `O_NOFOLLOW` and read through that fd so a symlink or last-component
+/// swap cannot redirect the proof to another file's bytes. Read only
+/// after the start's own `child.try_wait()` reported exit — the child's
+/// exit plus the exact pid/nonce match is what makes the frame proof
+/// rather than a stale leftover from another start.
+pub(crate) fn startup_bind_in_use(state_dir: &Path, pid: u32, nonce: &str) -> bool {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    // O_NOFOLLOW refuses a symlink; O_NONBLOCK refuses to hang on a
+    // FIFO or device before the regular-file check can reject it.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(startup_failed_file(state_dir, pid));
+    let Ok(file) = file else {
+        return false;
+    };
+    let Ok(meta) = file.metadata() else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    // The frame is a small fixed JSON; anything larger is not ours.
+    let mut text = String::new();
+    if file.take(4097).read_to_string(&mut text).is_err() || text.len() > 4096 {
+        return false;
+    }
+    let Ok(v) = serde_json::from_str::<Value>(&text) else {
+        return false;
+    };
+    v["kind"].as_str() == Some("addr_in_use")
+        && v["nonce"].as_str() == Some(nonce)
+        && v["pid"].as_u64() == Some(u64::from(pid))
+}
+
 /// Read `ui.ready`; `Some(pid)` only when it names `nonce` — a stale
 /// or foreign marker is a miss, not a match.
 pub(crate) fn ready_pid(state_dir: &Path, nonce: &str) -> Option<i32> {
@@ -1385,6 +1442,13 @@ pub(crate) fn start(state_dir: &Path, flags: &UiFlags, reset: bool) -> Result<i3
     start_inner(state_dir, flags, reset, false)
 }
 
+/// CAD-1283: `dev up`'s board-start retry budget transfer. `up` sets it
+/// on the `ui start` child process env only (never exported globally);
+/// `start_inner` clamps its start budget to min(existing, remaining)
+/// and clears the var. A start cannot grant itself more than the outer
+/// retry still has, and no other caller is affected.
+pub(crate) const START_REMAINING_ENV: &str = "CADENCE_DEV_UP_START_REMAINING_SECS";
+
 /// CAD-1251: the board's start proof (bind, readiness report, health)
 /// defaults to 10 s for an interactive `ui start`.
 pub(crate) const START_BUDGET_DEFAULT: Duration = Duration::from_secs(10);
@@ -1589,17 +1653,46 @@ pub(crate) fn start_inner(
             Ok(())
         });
     }
+    // CAD-1283: `dev up`'s fresh automatic allocation can carry a
+    // remaining retry budget in its env; this start clamps its own
+    // budget DOWN to it (never up) and drops the var before the child
+    // is spawned. Absent or unparsable: the unchanged `start_budget()`.
+    let outer_budget = std::env::var(START_REMAINING_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    std::env::remove_var(START_REMAINING_ENV);
     let mut child = crate::reaper::spawn(&mut command)?;
     std::fs::write(pid_file(state_dir), child.id().to_string())?;
-    let budget = start_budget();
+    let budget = match outer_budget {
+        Some(remaining) => start_budget().min(Duration::from_secs(remaining)),
+        None => start_budget(),
+    };
     let began = Instant::now();
     let deadline = began + budget;
     loop {
         if child.try_wait()?.is_some() {
-            // The bind failed (or the child died before it) — the log
-            // line is the why, the port the what.
-            let _ = std::fs::remove_file(pid_file(state_dir));
-            let _ = std::fs::remove_file(ready_file(state_dir));
+            // CAD-1283: the child is dead; only now read its
+            // startup-failure frame. An exact pid+nonce+kind match is
+            // typed proof the port was taken between `up`'s probe and
+            // this bind; anything else (absent, stale, malformed,
+            // foreign) stays the untyped exit below. The frame file is
+            // pid-scoped and retained — no start ever unlinks a proof
+            // file, so a concurrent or later start's frame can never
+            // be removed out from under it.
+            let bind_in_use = startup_bind_in_use(state_dir, child.id(), &nonce);
+            // The legacy pid/ready unlinks are unchanged in order and
+            // path; their results are now captured so a cleanup error
+            // (anything but success or already-absent NotFound) keeps
+            // the exit untyped — unknown cleanup state is not retried.
+            let cleanup_ok = [
+                std::fs::remove_file(pid_file(state_dir)),
+                std::fs::remove_file(ready_file(state_dir)),
+            ]
+            .into_iter()
+            .all(|r| match r {
+                Ok(()) => true,
+                Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+            });
             let detail = std::fs::read_to_string(state_dir.join("ui.log"))
                 .unwrap_or_default()
                 .lines()
@@ -1613,9 +1706,12 @@ pub(crate) fn start_inner(
             } else {
                 detail
             };
-            return Err(Error::rejected(format!(
-                "ui server exited during start — port {port} on {host}: {detail}"
-            )));
+            let what = format!("ui server exited during start — port {port} on {host}: {detail}");
+            return Err(if bind_in_use && cleanup_ok {
+                Error::ui_bind_in_use(what)
+            } else {
+                Error::rejected(what)
+            });
         }
         if ready_pid(state_dir, &nonce) == Some(child.id() as i32) {
             // The child bound and reported itself — the health check
@@ -2179,6 +2275,10 @@ fn qr_term(text: &str) -> Option<String> {
     }
     Some(out)
 }
+
+#[cfg(test)]
+#[path = "ui/cad1283_pid_startup_refusal_tests.rs"]
+mod cad1283_pid_startup_refusal_tests;
 
 #[cfg(test)]
 mod tests {

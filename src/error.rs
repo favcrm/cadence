@@ -59,6 +59,13 @@ pub enum Error {
     AppOwnedFatal(String),
     OutcomeUnknown(String),
     Internal(String),
+    /// CAD-1283: a spawned `ui run` proved its own bind failed with
+    /// `AddrInUse` — the `ui.startup-failed` frame matched this start's
+    /// child pid and readiness nonce, so the classification is typed
+    /// evidence, never a log substring. Only `dev up`'s fresh automatic
+    /// allocation may retry it; every other caller sees an ordinary
+    /// failure (exit 1 via the default table).
+    UiBindInUse(String),
     /// Invalid input or a revision conflict, with a stable code.
     Structured(Structured),
     /// The endpoint is not safe to submit to right now; the message
@@ -118,6 +125,10 @@ impl Error {
     }
     pub fn internal(message: impl Into<String>) -> Self {
         Self::Internal(message.into())
+    }
+    /// CAD-1283: [`Error::UiBindInUse`].
+    pub fn ui_bind_in_use(message: impl Into<String>) -> Self {
+        Self::UiBindInUse(message.into())
     }
     pub fn not_rendered(miss: RenderMiss) -> Self {
         Self::NotRendered(Box::new(miss))
@@ -203,6 +214,7 @@ impl Error {
             Self::Provider(_) | Self::AppOwnedFatal(_) => "provider",
             Self::OutcomeUnknown(_) => "unknown",
             Self::Internal(_) => "internal",
+            Self::UiBindInUse(_) => "ui_bind_in_use",
             Self::GateRefused(_) => "gate",
             // Wire-compatible with `rejected`: it is one — the variant
             // only exists so the actor can match the pre-write proof.
@@ -252,6 +264,7 @@ impl fmt::Display for Error {
             | Self::AppOwnedFatal(m)
             | Self::OutcomeUnknown(m)
             | Self::Internal(m)
+            | Self::UiBindInUse(m)
             | Self::GateRefused(m)
             | Self::PreWrite(m) => f.write_str(m),
             Self::Structured(m) => f.write_str(&m.message),
