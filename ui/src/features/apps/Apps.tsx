@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { resources } from "../../lib/resources";
+import { ApiError } from "../../lib/api";
+import { prefetchWorkspaceApp, readInstallationsFresh, readInstallationsSnapshot, dropInstallationsSnapshot, appExplorer, notifyAppsChanged, type HomeInstallation, type FavoritesPayload, type Installation } from "../workspace-apps/workspaceApps";
 import { useQuery, useResource } from "../../lib/useResource";
 import type { AppRow } from "../../lib/types";
 import { homeNeeds, type HomeNeed } from "../home/needs";
@@ -10,7 +12,6 @@ import { ResourceGate } from "../../ui/ResourceStatus";
 import "./apps.css";
 import Link from "../../ui/Link";
 import Button from "../../ui/Button";
-import { appExplorer, notifyAppsChanged, type HomeInstallation, type FavoritesPayload, type Installation } from "../workspace-apps/workspaceApps";
 import { appErrorCopy, appLoadErrorCopy, UNVERIFIED_APPS_COPY } from "../explorer/appErrors";
 import type { Viewer } from "../projects/work";
 import { AppGlyph } from "../explorer/shared";
@@ -185,6 +186,7 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
         {!emptyWorkspace && <Button className="btn-primary" href="/apps/explore">Explore apps</Button>}
       </div>
 
+      {isOp && <WorkspaceCatalog />}
       {actionError && <div className="alert fail mb-4" role="alert">{actionError}</div>}
       {loadError !== null && (
         <div className="apps-state card mb-4" role="alert">
@@ -366,6 +368,53 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
   );
 }
 
+/** Workspace installations remain visible independently of the legacy project filter. */
+function WorkspaceCatalog() {
+  // CAD-1137: a revisit paints this session's last list at once and
+  // refetches behind it; only the very first read shows the load line.
+  const [rows, setRows] = useState<Installation[] | null>(() =>
+    readInstallationsSnapshot()?.filter(row => row.storage_kind === "workspace") ?? null,
+  );
+  const [error, setError] = useState<string | null>(null);
+  const [revision, setRevision] = useState(0);
+  useEffect(() => {
+    const controller = new AbortController();
+    const cached = readInstallationsSnapshot()?.filter(row => row.storage_kind === "workspace") ?? null;
+    setRows(cached);
+    setError(null);
+    void readInstallationsFresh(controller.signal).then(value => {
+      if (!controller.signal.aborted) setRows(value.filter(row => row.storage_kind === "workspace"));
+    }).catch((cause: unknown) => {
+      if (controller.signal.aborted) return;
+      if (cause instanceof ApiError && [401, 403].includes(cause.status)) {
+        dropInstallationsSnapshot();
+        setRows(null);
+      }
+      setError(cause instanceof Error ? cause.message : "Could not load workspace apps");
+    });
+    return () => controller.abort();
+  }, [revision]);
+  return <section aria-label="Workspace apps" className="mb-5">
+    <h2 className="text-cardtitle font-medium text-ink-100 mb-2">Workspace apps</h2>
+    {error && <div className="card px-4 py-3 text-label text-ink-400" role="alert">
+      {error} <Button onClick={() => setRevision(value => value + 1)}>Retry</Button>
+    </div>}
+    {rows === null ? error ? null : <p className="text-label text-ink-400" role="status">Loading workspace apps…</p> : rows.length === 0 ? <div className="card px-4 py-3 text-label text-ink-400">
+      No workspace apps installed. Install a package with <code>cadence app catalog install &lt;path|git-url&gt;</code>.
+    </div> : <ul className="space-y-2.5">{rows.map(row => <li key={row.install_id} className="card px-3.5 py-3 min-w-0"
+      onMouseEnter={() => prefetchWorkspaceApp(row.install_id)} onFocus={() => prefetchWorkspaceApp(row.install_id)}>
+      <div className="app-card-layout">
+        <AppIcon label={row.title || row.name} />
+        <div className="min-w-0 flex-1">
+          <Link href={`/app-installations/${encodeURIComponent(row.install_id)}`} className="text-cardtitle font-medium text-ink-100 hover:text-accent">{row.title || row.name}</Link>
+          {row.approved !== true && <span className="chip ml-2">Access off</span>}
+          <p className="text-label text-ink-400 mt-0.5 break-words">{row.summary}</p>
+        </div>
+        <Button href={`/app-installations/${encodeURIComponent(row.install_id)}`} className="app-card-action">Open app</Button>
+      </div>
+    </li>)}</ul>}
+  </section>;
+}
 /** A monogram tile — the app's first letter, on the board's accent. */
 function AppIcon({ label }: { label: string }) {
   const letter = (label.trim()[0] ?? "A").toUpperCase();

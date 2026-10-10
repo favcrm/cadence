@@ -29,15 +29,16 @@ import Toast, { type ToastMsg } from "../../ui/Toast";
 import { declaredSlots } from "./bindingChoices";
 import {
   workspaceApps,
-  type Installation,
+  readWorkspaceAppSnapshot,
+  readWorkspaceAppSnapshotFresh,
+  dropWorkspaceAppSnapshot,
   type AppContext,
-  type AppBinding,
+  type Installation,
   type WorkspaceRun,
   type TextArtifact,
-  type AppEffect,
-  type Connection,
   type WorkspaceOutbox,
   type UpgradeProposal,
+  type WorkspaceAppSnapshot,
 } from "./workspaceApps";
 import { retainedRequest, completeRequest } from "./requests";
 import PublishPanel, { type PublishCandidate } from "./PublishPanel";
@@ -63,15 +64,55 @@ type Section =
   | "Settings"
   | "Schedule"
   | "Sources";
-type Snapshot = {
-  installation: Installation;
-  contexts: AppContext[];
-  bindings: AppBinding[];
-  connections: Connection[];
-  agents: Agent[];
-  runs: WorkspaceRun[];
-  effects: AppEffect[];
-};
+/** CAD-1137: the app page's snapshot — the same read set the cache stores. */
+type Snapshot = WorkspaceAppSnapshot;
+
+/** Display-only stale content while AppShell obtains fresh scope receipts.
+ *  This never mounts the app screen or any workspace controls. */
+export function WorkspaceAppCachedPreview({
+  snapshot,
+  contextId,
+}: {
+  snapshot: Snapshot;
+  contextId: string | null;
+}) {
+  const context = contextId === null
+    ? null
+    : snapshot.contexts.find((value) =>
+      value.id === contextId && value.install_id === snapshot.installation.install_id && value.state === "active",
+    ) ?? null;
+  const runs = context
+    ? snapshot.runs.filter((run) => run.install_id === snapshot.installation.install_id && run.context_id === context.id).slice(0, 3)
+    : [];
+  return (
+    <section className="card px-4 py-5" aria-label="Cached workspace preview" role="status">
+      <p className="text-micro text-ink-500">Previously viewed · verifying access</p>
+      <h2 className="mt-1 text-cardtitle font-medium text-ink-100">
+        {snapshot.installation.title || snapshot.installation.name}
+      </h2>
+      {context ? (
+        <>
+          <p className="mt-1 text-micro text-ink-500">{context.config.label}</p>
+          {runs.length > 0 ? (
+            <ul className="mt-4 space-y-2" aria-label="Previously viewed runs">
+              {runs.map((run) => (
+                <li key={run.id} className="rounded border border-line/50 px-3 py-2">
+                  <span className="text-label text-ink-200">{run.snapshot.workflow.title}</span>
+                  <span className="ml-2 text-micro text-ink-500">{run.state}</span>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="mt-3 text-label text-ink-400">No recent activity in this context.</p>
+          )}
+        </>
+      ) : (
+        <p className="mt-3 text-label text-ink-400">Workspace details will appear after access is verified.</p>
+      )}
+    </section>
+  );
+}
+
 const message = (error: unknown) =>
   error instanceof Error
     ? error.message
@@ -192,11 +233,15 @@ export default function WorkspaceApp({
   onBack?: () => void;
   appKey?: string;
 }) {
-  const [data, setData] = useState<Snapshot | null>(null);
+  // CAD-1137: a revisit mounts with the last session's snapshot already
+  // painted (stale-while-revalidate); only the very first load skeletons.
+  const [data, setData] = useState<Snapshot | null>(() => readWorkspaceAppSnapshot(installId));
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionStatus, setActionStatus] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(() => readWorkspaceAppSnapshot(installId) === null);
+  /** True while a revalidation runs behind painted data — the subtle cue. */
+  const refreshing = loading && data !== null;
   const [section, setSection] = useState<Section>("Board");
   const [contextId, setContextId] = useState(() => rememberedContext(installId) ?? "");
   const [selectedRun, setSelectedRun] = useState<string | null>(null);
@@ -315,6 +360,7 @@ export default function WorkspaceApp({
     setData(null); setSelectedRun(null); setSelectedArtifact(""); setArtifact(null);
     setVerifiedImage(null);
     setOutbox(null); setSelectedEffectId(""); setCreating(false); setAccessDenied(true);
+    dropWorkspaceAppSnapshot(installId);
   }, [installId]);
   const refused = (error: unknown) => error instanceof ApiError && [401, 403].includes(error.status);
   const canWrite = viewer.operator === true && !viewer.readOnly && !accessDenied;
@@ -336,35 +382,11 @@ export default function WorkspaceApp({
     const readFor = { visitKey: destinationVisitRef.current, installId };
     setLoading(true);
     try {
-      const [
-        installation,
-        contexts,
-        bindings,
-        connections,
-        agents,
-        runs,
-        effects,
-      ] = await Promise.all([
-        workspaceApps.detail(installId, controller.signal),
-        workspaceApps.contexts(installId, controller.signal),
-        workspaceApps.bindings(installId, undefined, controller.signal),
-        workspaceApps.connections(controller.signal),
-        workspaceApps.agents(controller.signal),
-        workspaceApps.runs(installId, undefined, controller.signal),
-        workspaceApps.effects(installId, undefined, controller.signal),
-      ]);
+      const snapshot = await readWorkspaceAppSnapshotFresh(installId, controller.signal);
       if (!controller.signal.aborted) {
         ownerReadReceipt.current = readFor;
         setAccessDenied(false);
-        setData({
-          installation,
-          contexts,
-          bindings,
-          connections,
-          agents,
-          runs,
-          effects,
-        });
+        setData(snapshot);
         setLoadError(null);
       }
     } catch (error) {
@@ -378,7 +400,10 @@ export default function WorkspaceApp({
     }
   }, [installId, viewer.operator, clearPrivate]);
   useEffect(() => {
-    setData(null);
+    // Re-entry paints this session's last snapshot for the route's
+    // installation; a first (or stale) visit gets the skeleton instead.
+    const cached = readWorkspaceAppSnapshot(installId);
+    setData(cached);
     setBrandName(""); setBrandVoice(""); setProtectedTerms("");
     setContentPrompt(""); setImagePrompt(""); setEditingContextId("");
     setImporting(false); setSelectedSource(null);
@@ -389,7 +414,7 @@ export default function WorkspaceApp({
     setSelectedEffectId("");
     setArtifact(null);
     setOutbox(null);
-    setLoading(true);
+    setLoading(cached === null);
     setActionError(null);
     void refresh();
     const timer = window.setInterval(() => {
@@ -1046,11 +1071,19 @@ export default function WorkspaceApp({
           {onBack && <Button onClick={onBack}>All apps</Button>}
           <Button
             icon={<IconRefresh />}
-            loading={loading}
+            loading={loading && !data}
             onClick={() => void refresh()}
           >
             Refresh
           </Button>
+          {refreshing && (
+            <span
+              className="wa-live-dot"
+              role="status"
+              title="Refreshing in the background"
+              aria-label="Refreshing in the background"
+            />
+          )}
         </div>
       </header>
       {!canWrite && (
@@ -1076,9 +1109,36 @@ export default function WorkspaceApp({
         </p>
       )}
       {loading && !data && (
-        <p className="wa-empty" role="status">
-          Loading this workspace app…
-        </p>
+        // The first load only: a quiet skeleton in the page's real shape,
+        // never a spinner — a revisit paints the snapshot before this.
+        <div className="wa-skeleton" role="status" aria-label="Loading this workspace app">
+          <span className="sr-only">Loading this workspace app…</span>
+          <div className="wa-skel-head">
+            <span className="wa-skel wa-skel-pulse" style={{ width: "2.5rem", height: "2.5rem", borderRadius: "0.5rem" }} />
+            <span className="wa-skel wa-skel-pulse" style={{ width: "10rem", height: "1.25rem" }} />
+            <span style={{ flex: 1 }} />
+            <span className="wa-skel wa-skel-pulse" style={{ width: "5rem", height: "2rem" }} />
+          </div>
+          <div className="wa-skel-head">
+            <span className="wa-skel wa-skel-pulse" style={{ width: "min(18rem, 55%)", height: "2rem" }} />
+            <span style={{ flex: 1 }} />
+            <span className="wa-skel wa-skel-pulse" style={{ width: "5.5rem", height: "2rem" }} />
+          </div>
+          <div className="wa-skel-tabs">
+            {[5.5, 4.5, 3, 5.5, 4, 5, 4.5].map((w, i) => (
+              <span key={i} className="wa-skel wa-skel-pulse" style={{ width: `${w}rem`, height: "0.85rem" }} />
+            ))}
+          </div>
+          <div className="wa-skel-board">
+            {["Drafting", "In review", "Needs you", "Released"].map((lane) => (
+              <div key={lane} className="wa-skel-lane">
+                <span className="wa-skel wa-skel-pulse" style={{ width: "45%", height: "0.8rem" }} />
+                <span className="wa-skel wa-skel-pulse" style={{ width: "100%", height: "4.5rem" }} />
+                <span className="wa-skel wa-skel-pulse" style={{ width: "100%", height: "4.5rem" }} />
+              </div>
+            ))}
+          </div>
+        </div>
       )}
       {data && (
         <>

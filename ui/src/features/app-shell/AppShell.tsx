@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { navigate, useHref } from "../../lib/useLocation";
+import { ApiError } from "../../lib/api";
 import Button from "../../ui/Button";
 import Link from "../../ui/Link";
 import type { Viewer } from "../projects/work";
-import { workspaceApps, type AppContext, type Installation } from "../workspace-apps/workspaceApps";
+import { dropWorkspaceAppSnapshot, readWorkspaceAppSnapshot, workspaceApps, type AppContext, type Installation } from "../workspace-apps/workspaceApps";
+import { WorkspaceAppCachedPreview } from "../workspace-apps/WorkspaceApp";
 import { chatScreenFor } from "./chatScreen";
 import { initialContext, rememberedContext, rememberContext, subscribeContext } from "../workspace-apps/contextSelection";
 import CrmOutlet, { type CrmSection, type OutletView } from "./CrmOutlet";
@@ -391,6 +393,9 @@ export default function AppShell({
       })
       .catch((e: unknown) => {
         if (isCurrent()) {
+          if (e instanceof ApiError && [401, 403, 404].includes(e.status)) {
+            dropWorkspaceAppSnapshot(installId);
+          }
           setLoadFailure({
             key: receiptKey,
             message: e instanceof Error ? e.message : "Could not load this app",
@@ -630,6 +635,19 @@ export default function AppShell({
 
   const title = installation?.title || installation?.name || "App";
   const isSocial = installation !== null && installation.name === "social-content";
+  const cachedPreviewSnapshot = !receiptReady && viewer.operator === true && loadError === null
+    ? readWorkspaceAppSnapshot(installId)
+    : null;
+  const cachedPreviewContextId = (() => {
+    if (!cachedPreviewSnapshot) return null;
+    const active = cachedPreviewSnapshot.contexts.filter((context) =>
+      context.install_id === installId && context.state === "active",
+    );
+    const values = query.getAll("ctx");
+    if (values.length === 0) return active.length === 1 ? active[0].id : null;
+    if (values.length !== 1) return null;
+    return active.some((context) => context.id === values[0]) ? values[0] : null;
+  })();
   // The chat's descriptor comes from the installation's own approved package
   // (served pinned to its digest); with none, the pane is plain shared chat.
   // CAD-1174: with a single active scope the context concept is not a
@@ -754,11 +772,17 @@ export default function AppShell({
           />
         </div>
         <section id="app-shell-workspace" className="app-shell-outlet" aria-label={`${title} workspace`}>
-          {loading && (
-            <p className="card px-4 py-5 text-secondary text-ink-400" role="status">
-              Loading this app…
-            </p>
-          )}
+          {cachedPreviewSnapshot?.installation.install_id === installId &&
+            cachedPreviewSnapshot.installation.name === "social-content" && loading ? (
+              <WorkspaceAppCachedPreview
+                snapshot={cachedPreviewSnapshot}
+                contextId={cachedPreviewContextId}
+              />
+            ) : loading ? (
+              <p className="card px-4 py-5 text-secondary text-ink-400" role="status">
+                Loading this app…
+              </p>
+            ) : null}
           {loadError && (
             <p className="card px-4 py-5 text-secondary text-fail border-fail/40" role="alert">
               {loadError}{" "}
@@ -811,7 +835,7 @@ export default function AppShell({
               </p>
             </main>
           )}
-          {installation && (
+          {receiptReady && installation && (
             <>
               {isSocial ? (
                 // The private-screen frame owns its own chrome — the

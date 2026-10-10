@@ -11,6 +11,12 @@ import type { ScreenPush } from "./screenProtocol";
  * nothing here for a non-operator). Native unmounts the outlet, so its frame
  * and port close exactly as on a context switch, and dropping the parameter
  * mounts a fresh one.
+ *
+ * CAD-1137: the outlet's own remount scope is the frame's identity —
+ * (install, bundle digest, screen tag, context) — so the workspace's
+ * in-app tab switches (Home, Runs, Needs you, Settings…) re-render the
+ * host but keep the mounted frame and its handshake; only a context
+ * switch, a new bundle or another screen rebuilds it.
  */
 export default function ScreenHost({ projection, fallback, loadAsset, actions }: { projection: ScreenPush; fallback: ReactNode; loadAsset?: AssetLoader; actions?: Pick<ScreenActions, "call" | "planner"> }) {
   const href = useHref();

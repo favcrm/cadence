@@ -2,6 +2,7 @@ import { Fragment, type ReactNode } from "react";
 import { countLabel, issueCounts } from "../lib/counts";
 import type { ResourceState } from "../lib/cache";
 import type { AppNav } from "../features/app-shell/appNav";
+import { prefetchWorkspaceApp } from "../features/workspace-apps/workspaceApps";
 import { navMatches } from "../features/issues/model";
 import { NAV, type Route, type Screen } from "../lib/router";
 import type { IssueCard, Project } from "../lib/types";
@@ -77,6 +78,10 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
                     <Link
                       href={app.href}
                       onClick={onNavigate}
+                      // CAD-1137: hover/focus warms the app's snapshot so
+                      // opening it paints the last data at once.
+                      onMouseEnter={() => prefetchWorkspaceApp(app.installId)}
+                      onFocus={() => prefetchWorkspaceApp(app.installId)}
                       className="navlink navlink-sub"
                       title={app.title}
                       aria-current={here && app.current ? (app.sections ? "true" : "page") : undefined}
@@ -91,6 +96,8 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
                             key={s.label}
                             href={s.href}
                             onClick={onNavigate}
+                            onMouseEnter={() => prefetchWorkspaceApp(app.installId)}
+                            onFocus={() => prefetchWorkspaceApp(app.installId)}
                             className="navlink navlink-sub"
                             aria-current={s.current && app.current ? "page" : undefined}
                           >

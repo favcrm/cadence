@@ -217,6 +217,79 @@ button.wa-post-card:hover {
   line-height: 1.7;
   padding: 1rem;
 }
+/* CAD-1137: the first load's one quiet skeleton — the page's real shape
+   (heading, toolbar, tabs, board lanes) instead of a bare line, so the
+   board's own panels never flash on a revisit. */
+.wa-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+.wa-skeleton,
+.wa-skeleton * {
+  pointer-events: none;
+}
+.wa-skel {
+  display: block;
+  border-radius: 0.375rem;
+  background: var(--color-ink-800);
+}
+.wa-skel-pulse {
+  animation: wa-skel-pulse 1.6s ease-in-out infinite;
+}
+@keyframes wa-skel-pulse {
+  0%, 100% { opacity: 0.55; }
+  50% { opacity: 1; }
+}
+.wa-skel-head {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+.wa-skel-tabs {
+  display: flex;
+  gap: 1.5rem;
+  border-bottom: 1px solid var(--color-ink-700);
+  padding-bottom: 0.6rem;
+}
+.wa-skel-board {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+.wa-skel-lane {
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.5rem;
+  background: var(--color-ink-875);
+  padding: 0.875rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  min-height: 12rem;
+}
+.wa-skel-lane .wa-skel {
+  flex: none;
+}
+@media (max-width: 700px) {
+  .wa-skel-board {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .wa-skel-pulse {
+    animation: none;
+  }
+}
+/* The subtle background-refresh cue: one small dot by the refresh
+   control while the last data stays on screen. */
+.wa-live-dot {
+  display: inline-block;
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: 50%;
+  background: var(--color-accent);
+  animation: wa-skel-pulse 1.2s ease-in-out infinite;
+}
 .wa-panel {
   border: 1px solid var(--color-ink-700);
   border-radius: 0.5rem;

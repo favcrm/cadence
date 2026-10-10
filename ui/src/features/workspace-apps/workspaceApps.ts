@@ -1,5 +1,5 @@
 import { ApiError } from "../../lib/api";
-import { sessionHeaders } from "../../lib/sessionKey";
+import { sessionHeaders, sessionKey } from "../../lib/sessionKey";
 import type { Agent } from "../../lib/types";
 
 export type { Agent };
@@ -431,3 +431,147 @@ export const appExplorer = {
   remove: (installId: string, body: { expected_generation: string; expected_digest: string; request_id: string }) => request<unknown>(`/api/app-installations/${part(installId)}/remove`, undefined, body),
   restore: (installId: string) => request<{ restored: boolean; digest: string }>(`/api/app-installations/${part(installId)}/restore`, undefined, {}),
 };
+// ---------- CAD-1137: per-session snapshot cache ----------
+
+/**
+ * The app page's read set in one in-memory snapshot, keyed by the route's
+ * installation. A revisit paints it at once and the page revalidates behind
+ * it (stale-while-revalidate); writes go through `workspaceApps`.
+ *
+ * The store is this tab's memory only — nothing is persisted — and it is
+ * cleared when the session key changes, so a sign-out or a different
+ * operator session can never see the previous session's payload. Entries
+ * older than `SNAPSHOT_TTL_MS` are ignored rather than revived.
+ */
+export interface WorkspaceAppSnapshot {
+  installation: Installation;
+  contexts: AppContext[];
+  bindings: AppBinding[];
+  connections: Connection[];
+  agents: Agent[];
+  runs: WorkspaceRun[];
+  effects: AppEffect[];
+}
+
+const SNAPSHOT_TTL_MS = 10 * 60 * 1000;
+const snapshots = new Map<string, { at: number; session: string | null; data: WorkspaceAppSnapshot }>();
+
+/** The last snapshot for `installId` from this operator session, or null. */
+export function readWorkspaceAppSnapshot(installId: string): WorkspaceAppSnapshot | null {
+  const entry = snapshots.get(installId);
+  if (!entry) return null;
+  if (entry.session !== sessionKey() || Date.now() - entry.at > SNAPSHOT_TTL_MS) {
+    snapshots.delete(installId);
+    return null;
+  }
+  return entry.data;
+}
+
+/** Record the snapshot a successful read produced. */
+export function writeWorkspaceAppSnapshot(installId: string, data: WorkspaceAppSnapshot, session = sessionKey()): void {
+  if (session !== sessionKey()) return;
+  snapshots.set(installId, { at: Date.now(), session, data });
+}
+
+/** Forget one installation's snapshot (access refusal, removal). */
+export function dropWorkspaceAppSnapshot(installId: string): void {
+  snapshots.delete(installId);
+  for (const [key, flight] of snapshotReads) {
+    if (flight.installId === installId) {
+      if (snapshotReads.get(key) === flight) snapshotReads.delete(key);
+      flight.controller.abort();
+    }
+  }
+}
+
+/** The app page's reads, fired in parallel and stored as one snapshot. */
+type SnapshotRead = { installId: string; controller: AbortController; subscribers: number; settled: boolean; promise: Promise<WorkspaceAppSnapshot> };
+const snapshotReads = new Map<string, SnapshotRead>();
+export function readWorkspaceAppSnapshotFresh(installId: string, signal?: AbortSignal): Promise<WorkspaceAppSnapshot> {
+  if (signal?.aborted) return Promise.reject(new DOMException("The operation was aborted", "AbortError"));
+  const requestSession = sessionKey();
+  const key = JSON.stringify([installId, requestSession]);
+  let flight = snapshotReads.get(key);
+  if (!flight) {
+    const controller = new AbortController();
+    const created: SnapshotRead = { installId, controller, subscribers: 0, settled: false, promise: Promise.resolve(null as never) };
+    created.promise = (async () => {
+      const [installation, contexts, bindings, connections, agents, runs, effects] = await Promise.all([
+        workspaceApps.detail(installId, controller.signal),
+        workspaceApps.contexts(installId, controller.signal),
+        workspaceApps.bindings(installId, undefined, controller.signal),
+        workspaceApps.connections(controller.signal),
+        workspaceApps.agents(controller.signal),
+        workspaceApps.runs(installId, undefined, controller.signal),
+        workspaceApps.effects(installId, undefined, controller.signal),
+      ]);
+      if (controller.signal.aborted) throw new DOMException("The operation was aborted", "AbortError");
+      if (requestSession !== sessionKey()) throw new ApiError("The session changed while loading this app", 401);
+      const data = { installation, contexts, bindings, connections, agents, runs, effects };
+      writeWorkspaceAppSnapshot(installId, data, requestSession);
+      return data;
+    })().finally(() => {
+      created.settled = true;
+      if (snapshotReads.get(key) === created) snapshotReads.delete(key);
+    });
+    flight = created;
+    snapshotReads.set(key, flight);
+  }
+  const shared = flight;
+  shared.subscribers += 1;
+  return new Promise((resolve, reject) => {
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      signal?.removeEventListener("abort", abort);
+      shared.subscribers -= 1;
+      if (shared.subscribers === 0 && !shared.settled) {
+        if (snapshotReads.get(key) === shared) snapshotReads.delete(key);
+        shared.controller.abort();
+      }
+    };
+    const abort = () => { release(); reject(new DOMException("The operation was aborted", "AbortError")); };
+    signal?.addEventListener("abort", abort, { once: true });
+    shared.promise.then(value => { if (!released) { release(); resolve(value); } }, error => { if (!released) { release(); reject(error); } });
+  });
+}
+
+/**
+ * Warm the cache for `installId` — the sidebar's app links call this on
+ * hover/focus so opening the app paints before the click lands. Joins a
+ * read already in flight for the same installation; failures are dropped.
+ */
+const prefetching = new Map<string, Promise<unknown>>();
+export function prefetchWorkspaceApp(installId: string): void {
+  if (prefetching.has(installId)) return;
+  if (readWorkspaceAppSnapshot(installId) !== null) return;
+  const task = readWorkspaceAppSnapshotFresh(installId)
+    .catch(() => null)
+    .finally(() => { prefetching.delete(installId); });
+  prefetching.set(installId, task);
+}
+
+/** The `/api/app-installations` list, held the same way: the Apps
+ *  screen paints the last read at once and refetches behind it. */
+let installationsSnapshot: { at: number; session: string | null; rows: Installation[] } | null = null;
+
+export function readInstallationsSnapshot(): Installation[] | null {
+  if (!installationsSnapshot || installationsSnapshot.session !== sessionKey() ||
+      Date.now() - installationsSnapshot.at > SNAPSHOT_TTL_MS) return null;
+  return installationsSnapshot.rows;
+}
+
+/** Fresh read of the installations list; stores the snapshot. */
+export async function readInstallationsFresh(signal?: AbortSignal): Promise<Installation[]> {
+  const requestSession = sessionKey();
+  const rows = await workspaceApps.installations(signal);
+  if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
+  if (requestSession !== sessionKey()) throw new ApiError("The session changed while loading apps", 401);
+  installationsSnapshot = { at: Date.now(), session: requestSession, rows };
+  return rows;
+}
+
+export function dropInstallationsSnapshot(): void {
+  installationsSnapshot = null;
+}
