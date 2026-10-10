@@ -639,11 +639,14 @@ export default function AppShell({
     ? readWorkspaceAppSnapshot(installId)
     : null;
   const cachedPreviewContextId = (() => {
+    if (!cachedPreviewSnapshot) return null;
+    const active = cachedPreviewSnapshot.contexts.filter((context) =>
+      context.install_id === installId && context.state === "active",
+    );
     const values = query.getAll("ctx");
-    if (values.length !== 1 || !cachedPreviewSnapshot) return null;
-    return cachedPreviewSnapshot.contexts.some((context) =>
-      context.id === values[0] && context.install_id === installId && context.state === "active",
-    ) ? values[0] : null;
+    if (values.length === 0) return active.length === 1 ? active[0].id : null;
+    if (values.length !== 1) return null;
+    return active.some((context) => context.id === values[0]) ? values[0] : null;
   })();
   // The chat's descriptor comes from the installation's own approved package
   // (served pinned to its digest); with none, the pane is plain shared chat.
