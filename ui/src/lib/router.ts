@@ -22,6 +22,8 @@ import { readAppUrlState, type AppTab, type ProjectView } from "./urlState";
  *   /wiki/search[/<query>]     full-text search
  *   /setup                     first-run setup
  *   /settings[/memory|update|account|permissions|connections]  model defaults, memory, update, account, master permissions, connections
+ *   /settings/connections/new[/<provider>]   the add-connection chooser and one pinned service's setup
+ *   /settings/connections/account/<id>       one connection's detail page
  *   /login                     a `cadence ui login` link lands here
  *
  * Query parameters carry the rest: `project` (the in-page filter on
@@ -38,6 +40,17 @@ export type SettingsSection = "models" | "memory" | "update" | "account" | "perm
 /** The wiki's modes; `browse` opens a path by its kind (CAD-581). */
 export type WikiMode = "browse" | "edit" | "history" | "search" | "upload";
 
+/**
+ * CAD-1319: the Connections section's sub-pages. Absent = the index;
+ * `add` = the service chooser; `addProvider` = one service's pinned
+ * setup (the canonical provider name); `detail` = one connection's
+ * page (its id). Never carries a credential — only identifiers.
+ */
+export type ConnectionPage =
+  | { kind: "add" }
+  | { kind: "addProvider"; provider: string }
+  | { kind: "detail"; id: string };
+
 export type Route =
   | { screen: "home" }
   | { screen: "overview" }
@@ -53,7 +66,7 @@ export type Route =
   | { screen: "wiki"; mode: WikiMode; path: string | null; query: string | null }
   | { screen: "outbox" }
   | { screen: "setup" }
-  | { screen: "settings"; section: SettingsSection }
+  | { screen: "settings"; section: SettingsSection; page?: ConnectionPage }
   | { screen: "login" }
   | { screen: "notFound"; path: string };
 
@@ -169,9 +182,9 @@ export function matchRoute(pathname: string): Route {
     const issueId = segment(rest[0]);
     if (slug && issueId) return { screen: "issue", project: slug, id: issueId, tab: "overview" };
   }
-  if (rest.length === 0) {
-    if (!head && !a) return { screen: "home" };
-    if (head === "index.html" && !a) return { screen: "home" };
+  if (rest.length === 0 || (head === "settings" && a === "connections" && rest.length === 1)) {
+    if (!head && !a && rest.length === 0) return { screen: "home" };
+    if (head === "index.html" && !a && rest.length === 0) return { screen: "home" };
     if (head === "projects") {
       if (!a) return { screen: "projects", slug: null, section: "overview" };
       const slug = segment(a);
@@ -226,14 +239,44 @@ export function matchRoute(pathname: string): Route {
     if (head === "overview" && !a) return { screen: "overview" };
     // `?item=<effect_id>` deep-links one published item (CAD-546).
     if (head === "outbox" && !a) return { screen: "outbox" };
-    if (head === "settings" && !b) {
+    // `!b` keeps the original one-segment shape; the connections
+    // section alone may carry its /new, /new/<provider> and
+    // /account/<id> sub-pages (bounded to one extra segment above).
+    if (head === "settings" && (!b || a === "connections")) {
       if (!a) return { screen: "settings", section: "models" };
       if (a === "memory") return { screen: "settings", section: "memory" };
       if (a === "update") return { screen: "settings", section: "update" };
       if (a === "account") return { screen: "settings", section: "account" };
       if (a === "permissions") return { screen: "settings", section: "permissions" };
-      if (a === "connections") return { screen: "settings", section: "connections" };
       if (a === "email") return { screen: "settings", section: "email" };
+      if (a === "connections") {
+        if (!b) return { screen: "settings", section: "connections" };
+        // CAD-1319: the dedicated pages — the add chooser, one pinned
+        // service's setup and one connection's detail. `parts` dropped
+        // empty segments, so the RAW path is re-checked here: an
+        // internal `//` (a dropped empty segment) must not normalize
+        // into a valid sub-page. A trailing slash still normalizes,
+        // like every other route; the index above is untouched.
+        const rawSegs = pathname.split("/").slice(1);
+        const emptyInternal = rawSegs.some((s, i) => s === "" && i < rawSegs.length - 1);
+        if (!emptyInternal) {
+          if (b === "new" && rest.length === 0) {
+            return { screen: "settings", section: "connections", page: { kind: "add" } };
+          }
+          if (b === "new" && rest.length === 1) {
+            const provider = segment(rest[0]);
+            if (provider) {
+              return { screen: "settings", section: "connections", page: { kind: "addProvider", provider } };
+            }
+          }
+          if (b === "account" && rest.length === 1) {
+            const id = segment(rest[0]);
+            if (id) {
+              return { screen: "settings", section: "connections", page: { kind: "detail", id } };
+            }
+          }
+        }
+      }
     }
   }
   return { screen: "notFound", path: pathname };
@@ -288,7 +331,16 @@ export function routePath(route: Route): string {
       if (route.section === "memory") return "/settings/memory";
       if (route.section === "update") return "/settings/update";
       if (route.section === "permissions") return "/settings/permissions";
-      if (route.section === "connections") return "/settings/connections";
+      if (route.section === "connections") {
+        if (route.page?.kind === "add") return "/settings/connections/new";
+        if (route.page?.kind === "addProvider") {
+          return `/settings/connections/new/${encodeURIComponent(route.page.provider)}`;
+        }
+        if (route.page?.kind === "detail") {
+          return `/settings/connections/account/${encodeURIComponent(route.page.id)}`;
+        }
+        return "/settings/connections";
+      }
       if (route.section === "email") return "/settings/email";
       return "/settings";
     case "notFound":
