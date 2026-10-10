@@ -372,12 +372,14 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
 function WorkspaceCatalog() {
   // CAD-1137: a revisit paints this session's last list at once and
   // refetches behind it; only the very first read shows the load line.
-  const [rows, setRows] = useState<Installation[] | null>(() => readInstallationsSnapshot());
+  const [rows, setRows] = useState<Installation[] | null>(() =>
+    readInstallationsSnapshot()?.filter(row => row.storage_kind === "workspace") ?? null,
+  );
   const [error, setError] = useState<string | null>(null);
   const [revision, setRevision] = useState(0);
   useEffect(() => {
     const controller = new AbortController();
-    const cached = readInstallationsSnapshot();
+    const cached = readInstallationsSnapshot()?.filter(row => row.storage_kind === "workspace") ?? null;
     setRows(cached);
     setError(null);
     void readInstallationsFresh(controller.signal).then(value => {
