@@ -125,7 +125,7 @@ const SCREEN_LABEL: Record<Screen, string> = {
 const overviewOn = (s: Screen) => s === "home" || s === "overview";
 
 export default function App() {
-  const { setSession } = useLocale();
+  const { setSession, t } = useLocale();
   // App selection lives in the URL — the route (`/projects/cadence`) plus
   // `?view=list&issue=CAD-16` — so a refresh or pasted link restores it.
   const href = useHref();
@@ -896,16 +896,16 @@ export default function App() {
           <button
             onClick={() => setMenuOpen((o) => !o)}
             className="header-menu header-icon -ml-1 shrink-0 gap-1 text-ink-200"
-            aria-label="Open navigation"
+            aria-label={t("Open navigation")}
             aria-expanded={menuOpen}
             aria-controls="mobile-navigation"
           >
             <IconList size={16} />
           </button>
-          <nav className="header-breadcrumb min-w-0 flex-1" aria-label="Breadcrumb">
+          <nav className="header-breadcrumb min-w-0 flex-1" aria-label={t("Breadcrumb")}>
             {/* The organisation's display name, or the board's neutral
                 label — never a hostname or project mistaken for an org. */}
-            <span className="header-org truncate font-medium text-ink-100" title={orgName}>{orgName}</span>
+            <span className="header-org hidden truncate font-medium text-ink-100 sm:inline" title={orgName}>{orgName}</span>
             <span className="hidden sm:inline text-ink-600" aria-hidden="true">/</span>
             {route.screen === "projects" && route.slug ? (
               <>
@@ -913,7 +913,7 @@ export default function App() {
                 <span className="hidden sm:inline text-ink-600" aria-hidden="true">/</span>
                 <span className="truncate text-ink-100" title={route.slug}>{route.slug}</span>
               </>
-            ) : <span className="truncate text-ink-200 capitalize">{route.screen === "issue" ? route.id : SCREEN_LABEL[screen]}</span>}
+            ) : <span className="truncate text-ink-200 capitalize">{route.screen === "issue" ? route.id : t(SCREEN_LABEL[screen])}</span>}
           </nav>
 
           <div className="ml-auto flex items-center gap-1 shrink-0">
@@ -1310,41 +1310,42 @@ function WorkspaceAppEntry({
   onInstallation: (installation: ActiveInstallation | null) => void;
   onBack: () => void;
 }) {
+  const { t } = useLocale();
   if (viewer.operator === null) {
     return (
       <main className="px-4 lg:px-8 pt-10 pb-9">
         {viewer.access === "unavailable" ? (
-          <Notice state="access-unavailable" onRetry={viewer.onRetryAccess} retryLabel="Retry access check">
-            Access could not be confirmed. Retry the access check before opening an installed app.
+          <Notice state="access-unavailable" onRetry={viewer.onRetryAccess} retryLabel={t("Retry access check")}>
+            {t("Access could not be confirmed. Retry the access check before opening an installed app.")}
           </Notice>
-        ) : <Loading>Checking access…</Loading>}
+        ) : <Loading>{t("Checking access…")}</Loading>}
       </main>
     );
   }
   if (viewer.operator !== true) {
     return (
       <main className="px-4 lg:px-8 pt-10 pb-9">
-        <h1 className="text-section font-semibold text-ink-100">App unavailable</h1>
-        <p className="text-body text-ink-400 mt-2">Sign in as the operator to resolve an installed app.</p>
-        <Link href="/apps" className="lnk">All apps</Link>
+        <h1 className="text-section font-semibold text-ink-100">{t("App unavailable")}</h1>
+        <p className="text-body text-ink-400 mt-2">{t("Sign in as the operator to resolve an installed app.")}</p>
+        <Link href="/apps" className="lnk">{t("All apps")}</Link>
       </main>
     );
   }
   if (installations.error !== null) {
     return (
       <main className="px-4 lg:px-8 pt-10 pb-9">
-        <h1 className="text-section font-semibold text-ink-100">Couldn’t load installed apps</h1>
+        <h1 className="text-section font-semibold text-ink-100">{t("Couldn’t load installed apps")}</h1>
         <p className="text-body text-ink-400 mt-2" role="alert">
-          {appLoadErrorCopy(installations.error, "The installed-app list is unavailable.")}
+          {t(appLoadErrorCopy(installations.error, "The installed-app list is unavailable."))}
         </p>
-        <button type="button" className="lnk mt-3" onClick={installations.retry}>Retry</button>
+        <button type="button" className="lnk mt-3" onClick={installations.retry}>{t("Retry")}</button>
       </main>
     );
   }
   if (installations.list === null) {
     return (
       <main className="px-4 lg:px-8 pt-10 pb-9">
-        <p className="text-body text-ink-400" role="status">Loading installed apps…</p>
+        <p className="text-body text-ink-400" role="status">{t("Loading installed apps…")}</p>
       </main>
     );
   }
@@ -1355,18 +1356,18 @@ function WorkspaceAppEntry({
   if (matches.length === 0) {
     return (
       <main className="px-4 lg:px-8 pt-10 pb-9">
-        <h1 className="text-section font-semibold text-ink-100">App not installed</h1>
-        <p className="text-body text-ink-400 mt-2">No active installation with app key “{appKey}” was found.</p>
-        <Link href="/apps" className="lnk">All apps</Link>
+        <h1 className="text-section font-semibold text-ink-100">{t("App not installed")}</h1>
+        <p className="text-body text-ink-400 mt-2">{t("No active installation with app key “{appKey}” was found.").replace("{appKey}", appKey)}</p>
+        <Link href="/apps" className="lnk">{t("All apps")}</Link>
       </main>
     );
   }
   if (matches.length > 1) {
     return (
       <main className="px-4 lg:px-8 pt-10 pb-9">
-        <h1 className="text-section font-semibold text-ink-100">Choose an installation</h1>
+        <h1 className="text-section font-semibold text-ink-100">{t("Choose an installation")}</h1>
         <p className="text-body text-ink-400 mt-2">
-          More than one active installation uses app key “{appKey}”. Choose which installation to open.
+          {t("More than one active installation uses app key “{appKey}”. Choose which installation to open.").replace("{appKey}", appKey)}
         </p>
         <ul className="mt-4 space-y-2">
           {matches.map((installation) => (
