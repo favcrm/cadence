@@ -82,9 +82,16 @@ fn cadence_1334_runner_environment_lock_and_execution() {{
         let value = std::env::var(key).unwrap_or_else(|_| panic!("runner omitted {{key}}"));
         assert!(Path::new(&value).starts_with(&root), "{{key}} was not isolated: {{value}}");
     }}
-    for key in ["CADENCE_PM_DIR", "CADENCE_STATE_DIR", "CADENCE_HOME"] {{
+    for key in ["CADENCE_PM_DIR", "CADENCE_STATE_DIR", "CADENCE_HOME", "CARGO_TARGET_DIR"] {{
         assert!(std::env::var_os(key).is_none(), "{{key}} reached a test process");
     }}
+    let expected_build_target_dir =
+        std::env::var("CAD1334_EXPECT_CARGO_BUILD_TARGET_DIR").unwrap();
+    assert_eq!(
+        std::env::var("CARGO_BUILD_TARGET_DIR").unwrap(),
+        expected_build_target_dir,
+        "runner must preserve the original isolated Cargo build target directory"
+    );
 
     let lock = std::env::var("CAD1334_LOCK_PATH").unwrap();
     assert!(Path::new(&lock).exists(), "suite lock file was not created");
@@ -152,6 +159,7 @@ def invoke(manifest: Path, temp: Path, nextest: Path, *, fail_test: str | None =
                CAD1334_ORIGINAL_HOME=os.environ.get("HOME", ""),
                CAD1334_LOCK_PATH=str(temp / "suite.lock"),
                CAD1334_MARKER_DIR=str(temp / "markers"),
+               CAD1334_EXPECT_CARGO_BUILD_TARGET_DIR=str(temp / "cargo-target"),
                CARGO_TARGET_DIR=str(temp / "cargo-target"))
     if fail_test:
         env["CAD1334_FAIL_TEST"] = fail_test
