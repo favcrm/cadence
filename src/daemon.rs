@@ -5240,6 +5240,9 @@ pub struct ServeOptions {
     /// test seam; bypasses the production seconds clamp so tests run
     /// the loop hot. `None` resolves env/default. Never from PM/RPC.
     pub social_publish_driver_ms: Option<u64>,
+    /// Test seam only: parks the publish driver so a fixture can observe a
+    /// crashed daemon's rows untouched. No env knob; production always runs it.
+    pub social_publish_driver_off: bool,
     /// CAD-1020: test-only clock for the driver's due/lateness
     /// comparisons — `None` is wall epoch. Tests pin it to schedule
     /// in the past/future without sleeping.

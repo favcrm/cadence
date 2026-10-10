@@ -89,7 +89,10 @@ pub(crate) fn social_effect_install(id: &str) -> Option<String> {
 }
 
 /// How long Publish now waits for AgenticOS to settle a `processing` send.
-const SETTLE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+/// Short on purpose: the board holds its global write lock for the whole
+/// request, so a long wait would freeze every other board write. A longer
+/// wait is a repeated confirm, which re-polls.
+const SETTLE_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 const SETTLE_STEP: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Publish now returns while the provider may still be `processing`, and
@@ -556,8 +559,9 @@ impl Shared {
             Some("waiting") => {
                 self.decide_social_effect(id, digest, true)?;
             }
-            Some("approved") => {}
-            Some("sending" | "posted" | "refused") => return Ok(shown),
+            // A `sending` effect re-polls the provider; it never sends again.
+            Some("approved" | "sending") => {}
+            Some("posted" | "refused") => return Ok(shown),
             _ => {
                 return Err(Error::rejected(
                     "social effect is no longer waiting for confirmation",

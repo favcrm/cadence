@@ -79,6 +79,8 @@ pub(super) struct Driver {
     /// Resolved tick interval (test seam overrides in ms, bypassing
     /// the seconds clamp like `crm_send_interval_ms`).
     pub interval: Duration,
+    /// Test seam: parks the loop (see `ServeOptions::social_publish_driver_off`).
+    pub off: bool,
     /// Lateness bound for claim-vs-hold.
     pub max_lateness_secs: i64,
     /// The driver's clock (epoch seconds) — wall unless a test pins it.
@@ -128,6 +130,7 @@ impl Driver {
             .max(0);
         Self {
             interval,
+            off: opts.social_publish_driver_off,
             max_lateness_secs,
             clock: opts
                 .social_publish_driver_clock
@@ -152,6 +155,7 @@ impl Driver {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         json!({
             "status": if state.status.is_empty() { "idle" } else { state.status },
+            "off": self.off,
             "interval_secs": self.interval.as_secs_f64(),
             "max_lateness_secs": self.max_lateness_secs,
             "last_tick": state.last_tick,
@@ -244,6 +248,11 @@ impl Shared {
             }
             if self.social_publish_sender.is_none() {
                 driver.set_status("sender_not_configured", None);
+                sleep_until(&self.closing, Instant::now() + driver.interval);
+                continue;
+            }
+            if driver.off {
+                driver.set_status("off", None);
                 sleep_until(&self.closing, Instant::now() + driver.interval);
                 continue;
             }
