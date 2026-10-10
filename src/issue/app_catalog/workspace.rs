@@ -1306,17 +1306,102 @@ fn read_catalog<T>(pm: &Pm, mut read: impl FnMut() -> Result<T>) -> Result<T> {
     })
 }
 
+/// CAD-1318: prove `.apps` is a never-initialized registry, called only
+/// when no `catalog.yaml` was read. Absence of the catalog alone says
+/// nothing — every retained artifact or coordination leftover refuses,
+/// so a crashed install, a stranded journal, unexplained entries or a
+/// torn generation never surface as an empty list. Writes nothing.
+fn unpopulated(root: &Root, pm: &Pm) -> Result<()> {
+    // The legacy seqlock must be steady before the inventories below
+    // mean anything: an odd or unreadable generation is a crashed or
+    // in-flight legacy rewrite, never an empty registry.
+    match pm.legacy_generation() {
+        Some(generation) if generation % 2 == 0 => {}
+        _ => {
+            return Err(Error::invalid(
+                super::LEGACY_CHANGED,
+                "legacy app files changed during read",
+            ))
+        }
+    }
+    let legacy = legacy_records(root)?;
+    if !legacy.is_empty() {
+        return Err(legacy_unmigrated(&legacy));
+    }
+    let mut budget = MAX_INVENTORY_ENTRIES;
+    match root.kind(Path::new(".apps"))? {
+        None => {}
+        // The only scaffold a catalog-less registry may carry: a real
+        // `.apps` dir holding nothing but an empty real `installations`
+        // dir. A catalog or pending marker appearing mid-scan is sorted
+        // by the ordered rechecks below, not refused here. Anything else
+        // — journals, migrations, orphans, symlinks, wrong types — is
+        // unexplained retained state and refuses.
+        Some(libc::S_IFDIR) => {
+            for name in root.list(Path::new(".apps"), &mut budget)? {
+                let entry = Path::new(".apps").join(&name);
+                if entry == Path::new(CATALOG)
+                    || entry == Path::new(INSTALL_PENDING)
+                    || entry == Path::new(UPGRADE_PENDING)
+                    || entry == Path::new(PENDING)
+                    || (name == "installations"
+                        && root.kind(&entry)? == Some(libc::S_IFDIR)
+                        && root.list(&entry, &mut budget)?.is_empty())
+                {
+                    continue;
+                }
+                return Err(Error::rejected(
+                    "workspace app registry retains unexplained state without a catalog",
+                ));
+            }
+        }
+        _ => {
+            return Err(Error::rejected(
+                "workspace app registry retains unexplained state without a catalog",
+            ))
+        }
+    }
+    // Nothing may have queued or published while the inventory ran:
+    // recheck pending, then prove the catalog still absent. Observing a
+    // publication here is a torn read, never an empty list — the
+    // existing freshness class retries the whole read.
+    no_pending(root)?;
+    if root.kind(Path::new(CATALOG))?.is_some() {
+        return Err(Error::invalid(
+            super::CATALOG_NOT_CURRENT,
+            "workspace catalog published during inspection",
+        ));
+    }
+    Ok(())
+}
+
 pub fn list(pm: &Pm) -> Result<Value> {
     read_catalog(pm, || {
-        let catalog = Catalog::load(&pm.dir)?;
         let root = Root::open(&pm.dir)?;
-        let rows = catalog
-            .installations
-            .keys()
-            .map(|id| describe(&root, &catalog, id))
-            .collect::<Result<Vec<_>>>()?;
-        catalog.require_current(&root)?;
-        Ok(json!(rows))
+        no_pending(&root)?;
+        match root.read(Path::new(CATALOG), CATALOG_CAP)? {
+            // A published registry keeps the strict path `Catalog::load`
+            // enforced: validate, describe every installation and prove
+            // the generation is still current.
+            Some(text) => {
+                let catalog: Catalog = decode(&text)?;
+                catalog.validate()?;
+                let rows = catalog
+                    .installations
+                    .keys()
+                    .map(|id| describe(&root, &catalog, id))
+                    .collect::<Result<Vec<_>>>()?;
+                catalog.require_current(&root)?;
+                Ok(json!(rows))
+            }
+            // The registry is created lazily by the first install, so a
+            // missing catalog can be a genuinely fresh workspace — once
+            // `unpopulated` proves nothing was retained.
+            None => {
+                unpopulated(&root, pm)?;
+                Ok(json!([]))
+            }
+        }
     })
 }
 pub fn show(pm: &Pm, id: &str) -> Result<Value> {
