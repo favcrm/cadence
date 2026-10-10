@@ -46,6 +46,7 @@ const { createRoot } =
 const Agents = (
   require("../src/features/agents/Agents") as typeof import("../src/features/agents/Agents")
 ).default;
+const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
 type Agent = import("../src/lib/types").Agent;
 type AgentDetail = import("../src/lib/types").AgentDetail;
 type IssueCard = import("../src/lib/types").IssueCard;
@@ -195,7 +196,7 @@ const flush = async () => {
 async function render() {
   await React.act(() =>
     root.render(
-      React.createElement(Agents, {
+      React.createElement(LocaleProvider, null, React.createElement(Agents, {
         state,
         issues: issueState,
         project,
@@ -210,7 +211,7 @@ async function render() {
         onRetryAssignments: () => {
           assignmentRetries += 1;
         },
-      }),
+      })),
     ),
   );
   await flush();

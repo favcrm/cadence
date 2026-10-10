@@ -17,6 +17,7 @@ moduleLoader.prototype.require = function (this: unknown, id: string) {
 };
 const { createElement, act } = require("react");
 const { createRoot } = require("react-dom/client");
+const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
 const { default: AccountMenu } = require("../src/ui/AccountMenu") as typeof import("../src/ui/AccountMenu");
 
 function assert(condition: unknown, message: string): void {
@@ -29,7 +30,7 @@ for (const role of ["member", "operator"]) {
   document.body.append(host);
   const root = createRoot(host);
   const meta = { ...base, session: { id: "safe-session", origin: "public", user: { name: "Fable Chen", email: "fable@example.com", role } } } as unknown as Meta;
-  act(() => root.render(createElement(AccountMenu, { meta, actor: "x", mayWrite: true, onChange: () => undefined, trigger: "avatar", placement: "below-end" })));
+  act(() => root.render(createElement(LocaleProvider, null, createElement(AccountMenu, { meta, actor: "x", mayWrite: true, onChange: () => undefined, trigger: "avatar", placement: "below-end" }))));
   act(() => { host.querySelector("button")?.click(); });
   const panel = host.querySelector("[role=dialog]");
   assert(panel?.textContent?.includes("Fable Chen"), "account menu must name the person");

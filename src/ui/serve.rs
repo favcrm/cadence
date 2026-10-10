@@ -18,9 +18,9 @@ use super::write_path::{
 use super::{
     app_assistant, app_audiences, app_chat, app_content, app_contexts, app_explorer, app_records,
     app_release, app_runs, app_screens, approvals, apps, business_templates, cli_route,
-    connections, crm_send, delivery_sync, home, lane, operator, platform_account, read_model,
-    social_publish, stages, threads, topics, updates, wiki, wiki_envelope, work_conversations,
-    workflows,
+    connections, crm_send, delivery_sync, home, lane, locale, operator, platform_account,
+    read_model, social_publish, stages, threads, topics, updates, wiki, wiki_envelope,
+    work_conversations, workflows,
 };
 use super::{
     push_device_login_config, ready_file, startup_failed_file, tailnet_url, ServeOpts,
@@ -1074,6 +1074,10 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
     }
 
     match path.as_str() {
+        "/api/locale" => {
+            let response = locale::get(&request, state_dir, opts);
+            send(request, response);
+        }
         // What the SPA needs to render itself correctly for this
         // client: read-only mode, the actor this request would write
         // as, and the tailnet URL when sharing is armed. Build identity

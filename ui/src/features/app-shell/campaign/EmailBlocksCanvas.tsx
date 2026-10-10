@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import { useLocale } from "../../../lib/locale";
 import { newBlock, type EditorBlock } from "./useEmailDraft";
 
 export const MAX_BLOCKS = 12;
@@ -37,6 +38,7 @@ export default function EmailBlocksCanvas({
   /** Keystroke text edit: never touches undo history. */
   onText: (key: number, patch: Partial<EditorBlock>) => void;
 }) {
+  const { t, formatNumber } = useLocale();
   const move = (index: number, by: -1 | 1) => {
     const next = blocks.slice();
     const [item] = next.splice(index, 1);
@@ -47,7 +49,7 @@ export default function EmailBlocksCanvas({
 
   return (
     <div className="crm-vcanvas">
-      <article className="crm-vemail" data-device={device} aria-label="Email canvas — edit directly">
+      <article className="crm-vemail" data-device={device} aria-label={t("Email canvas — edit directly")}>
         <div className="crm-vbrand">{brandName}</div>
         <div className="crm-vbody">
           {blocks.map((block, index) => (
@@ -56,9 +58,9 @@ export default function EmailBlocksCanvas({
                 <VisualText
                   kind="heading"
                   className="crm-vedit crm-vheading"
-                  label={`Email heading, block ${index + 1}`}
+                  label={`${t("Email heading")}, ${t("block")} ${formatNumber(index + 1)}`}
                   value={block.text}
-                  placeholder="Heading"
+                  placeholder={t("Heading")}
                   multiline={false}
                   disabled={disabled}
                   onInput={(text) => onText(block.key, { text })}
@@ -68,9 +70,9 @@ export default function EmailBlocksCanvas({
                 <VisualText
                   kind="paragraph"
                   className="crm-vedit crm-vparagraph"
-                  label={`Email paragraph, block ${index + 1}`}
+                  label={`${t("Email paragraph")}, ${t("block")} ${formatNumber(index + 1)}`}
                   value={block.text}
-                  placeholder="Write your message"
+                  placeholder={t("Write your message")}
                   multiline
                   disabled={disabled}
                   onInput={(text) => onText(block.key, { text })}
@@ -81,16 +83,16 @@ export default function EmailBlocksCanvas({
                   <VisualText
                     kind="label"
                     className="crm-vedit crm-vcta"
-                    label={`Button label, block ${index + 1}`}
+                    label={`${t("Button label")}, ${t("block")} ${formatNumber(index + 1)}`}
                     value={block.label}
-                    placeholder="Button label"
+                    placeholder={t("Button label")}
                     multiline={false}
                     disabled={disabled}
                     onInput={(label) => onText(block.key, { label })}
                   />
                   <input
                     className="crm-vurl"
-                    aria-label={`Button link, block ${index + 1}`}
+                    aria-label={`${t("Button link")}, ${t("block")} ${formatNumber(index + 1)}`}
                     value={block.url}
                     disabled={disabled}
                     placeholder="https://"
@@ -100,10 +102,10 @@ export default function EmailBlocksCanvas({
                   />
                 </span>
               )}
-              <span className="crm-vtools" role="group" aria-label={`Block ${index + 1} actions`}>
+              <span className="crm-vtools" role="group" aria-label={`${t("Block")} ${formatNumber(index + 1)} ${t("actions")}`}>
                 <button
                   type="button"
-                  aria-label={`Move block ${index + 1} up`}
+                  aria-label={`${t("Move block")} ${formatNumber(index + 1)} ${t("up")}`}
                   disabled={disabled || index === 0}
                   onClick={() => move(index, -1)}
                 >
@@ -111,7 +113,7 @@ export default function EmailBlocksCanvas({
                 </button>
                 <button
                   type="button"
-                  aria-label={`Move block ${index + 1} down`}
+                  aria-label={`${t("Move block")} ${formatNumber(index + 1)} ${t("down")}`}
                   disabled={disabled || index === blocks.length - 1}
                   onClick={() => move(index, 1)}
                 >
@@ -119,7 +121,7 @@ export default function EmailBlocksCanvas({
                 </button>
                 <button
                   type="button"
-                  aria-label={`Remove block ${index + 1}`}
+                  aria-label={`${t("Remove block")} ${formatNumber(index + 1)}`}
                   disabled={disabled}
                   onClick={() => onStructure(blocks.filter((b) => b.key !== block.key))}
                 >
@@ -129,18 +131,18 @@ export default function EmailBlocksCanvas({
             </div>
           ))}
           {blocks.length === 0 && (
-            <p className="crm-vempty">Start with text, a heading, or your own HTML.</p>
+            <p className="crm-vempty">{t("Start with text, a heading, or your own HTML.")}</p>
           )}
         </div>
       </article>
       <div className="crm-vfoot">
         {canUndo && (
           <button type="button" className="lnk" onClick={onUndo} disabled={disabled}>
-            Undo last block change
+            {t("Undo last block change")}
           </button>
         )}
         <span className="crm-vhint" data-canvas-hint>
-          Click to edit · ⋯ for block actions · The unsubscribe footer is always included.
+          {t("Click to edit · ⋯ for block actions · The unsubscribe footer is always included.")}
         </span>
       </div>
     </div>
@@ -157,17 +159,18 @@ export function AddBlockTools({
   full: boolean;
   onAdd: (block: EditorBlock) => void;
 }) {
+  const { t } = useLocale();
   if (!full) return null;
   return (
-    <span className="crm-addtools" role="group" aria-label="Add block">
+    <span className="crm-addtools" role="group" aria-label={t("Add block")}>
       <button type="button" disabled={disabled} onClick={() => onAdd(newBlock("paragraph"))}>
-        + Text
+        + {t("Text")}
       </button>
       <button type="button" disabled={disabled} onClick={() => onAdd(newBlock("heading"))}>
-        Heading
+        {t("Heading")}
       </button>
       <button type="button" disabled={disabled} onClick={() => onAdd(newBlock("button"))}>
-        Button
+        {t("Button")}
       </button>
     </span>
   );

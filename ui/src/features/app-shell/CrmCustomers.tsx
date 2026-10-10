@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { ApiError } from "../../lib/api";
+import { useLocale } from "../../lib/locale";
 import Button from "../../ui/Button";
 import Select from "../../ui/Select";
 import type { Viewer } from "../projects/work";
@@ -186,6 +187,7 @@ function CustomerList({
   onNew: () => void;
   onImport: () => void;
 }) {
+  const { t, formatNumber } = useLocale();
   const canWrite = viewer.operator === true && !viewer.readOnly;
   const [query, setQuery] = useState("");
   const [committed, setCommitted] = useState("");
@@ -262,14 +264,14 @@ function CustomerList({
   }, [reloadToken]);
 
   return (
-    <section aria-label="Customers list" className="crm-list">
+    <section aria-label={t("Customers list")} className="crm-list">
       <h3 className="text-cardtitle font-medium text-ink-100" data-outlet-heading>
-        Customers
+        {t("Customers")}
       </h3>
       <div className="crm-toolbar mb-1">
         <div className="crm-search">
           <label className="sr-only" htmlFor="crm-customer-search">
-            Search customers
+            {t("Search customers")}
           </label>
           <input
             id="crm-customer-search"
@@ -278,16 +280,16 @@ function CustomerList({
             onChange={(e) => setQuery(e.target.value)}
             maxLength={120}
             autoComplete="off"
-            placeholder="Search name, email or tag…"
+            placeholder={t("Search name, email or tag…")}
           />
         </div>
         {canWrite && (
           <>
             <Button size="sm" onClick={onImport}>
-              Import CSV
+              {t("Import CSV")}
             </Button>
             <Button variant="primary" size="sm" onClick={onNew}>
-              New customer
+              {t("New customer")}
             </Button>
           </>
         )}
@@ -296,7 +298,7 @@ function CustomerList({
         viewer.access === "unavailable" ? (
           // CAD-1193: a completed unanswered check is unavailable, not
           // still checking — the retry re-runs the real access probe.
-          <Notice state="access-unavailable" onRetry={viewer.onRetryAccess} retryLabel="Retry access check">
+          <Notice state="access-unavailable" onRetry={viewer.onRetryAccess} retryLabel={t("Retry access check")}>
             Access could not be confirmed — the board's access check did
             not answer, so customer records stay closed.
           </Notice>
@@ -305,16 +307,16 @@ function CustomerList({
         )
       )}
       {viewer.operator === false && (
-        <Notice>Sign in as the operator to inspect customer records.</Notice>
+        <Notice>{t("Sign in as the operator to inspect customer records.")}</Notice>
       )}
       {viewer.operator && viewer.readOnly && (
-        <Notice state="read-only">Read-only view. Record creation and edits are unavailable.</Notice>
+        <Notice state="read-only">{t("Read-only view. Record creation and edits are unavailable.")}</Notice>
       )}
       {scope.contextId === "" && viewer.operator && (
-        <Notice>Administrator CRM setup is required before customers open.</Notice>
+        <Notice>{t("Administrator CRM setup is required before customers open.")}</Notice>
       )}
       {scope.contextId !== "" && viewer.operator && loading && (
-        <Loading>Reading customers…</Loading>
+        <Loading>{t("Reading customers…")}</Loading>
       )}
       {scope.contextId !== "" && viewer.operator && error !== null && !loading && (
         <ErrorNotice onRetry={() => setRetry((count) => count + 1)}>{error}</ErrorNotice>
@@ -322,32 +324,32 @@ function CustomerList({
       {scope.contextId !== "" && viewer.operator && error === null && !loading && records.length === 0 && (
         <EmptyState
           name="customers"
-          title={committed === "" ? "No customers yet" : "No customers match this search"}
+          title={t(committed === "" ? "No customers yet" : "No customers match this search")}
         >
           {committed === ""
-            ? "Create the first record with New customer, or import a CSV. Only real server rows appear here."
-            : "Clear the search to see every record."}
+            ? t("Create the first record with New customer, or import a CSV. Only real server rows appear here.")
+            : t("Clear the search to see every record.")}
         </EmptyState>
       )}
       {scope.contextId !== "" && viewer.operator && error === null && records.length > 0 && (
         <>
-          <div className="crm-filters" role="group" aria-label="Filter customers on this page">
+          <div className="crm-filters" role="group" aria-label={t("Filter customers on this page")}>
             <Select
               value={consentFilter}
               onChange={setConsentFilter}
               options={[
-                { value: "", label: "Email consent: any" },
+                { value: "", label: t("Email consent: any") },
                 { value: "granted", label: "Granted" },
                 { value: "unknown", label: "Unknown" },
                 { value: "denied", label: "Withdrawn" },
               ]}
-              aria-label="Filter by email consent"
+              aria-label={t("Filter by email consent")}
             />
             <Select
               value={sourceFilter}
               onChange={setSourceFilter}
-              options={[{ value: "", label: "Source: any" }, ...sources.map((v) => ({ value: v, label: v }))]}
-              aria-label="Filter by source"
+              options={[{ value: "", label: t("Source: any") }, ...sources.map((v) => ({ value: v, label: v }))]}
+              aria-label={t("Filter by source")}
             />
             {tagFilter !== "" && (
               <button type="button" className="chip crm-chip-on" onClick={() => setTagFilter("")} aria-label={`Clear tag filter ${tagFilter}`}>
@@ -357,15 +359,15 @@ function CustomerList({
           </div>
           {selected.size > 0 && (
             <p className="crm-selection text-label text-ink-300" role="status">
-              {selected.size} selected{" "}
+              {formatNumber(selected.size)} {t("selected")}{" "}
               <button type="button" className="lnk" onClick={() => setSelected(new Set())}>
-                Clear
+                {t("Clear")}
               </button>
             </p>
           )}
           {shown.length === 0 && (
-            <EmptyState name="customers" title="No customers on this page match the filters">
-              Clear a filter to see this page's rows again.
+            <EmptyState name="customers" title={t("No customers on this page match the filters")}>
+              {t("Clear a filter to see this page's rows again.")}
             </EmptyState>
           )}
           {shown.length > 0 && (
@@ -389,7 +391,7 @@ function CustomerList({
                 header: (
                   <input
                     type="checkbox"
-                    aria-label="Select all customers on this page"
+                    aria-label={t("Select all customers on this page")}
                     checked={shown.length > 0 && shown.every((r) => selected.has(r.id))}
                     onChange={(e) =>
                       setSelected(e.target.checked ? new Set(shown.map((r) => r.id)) : new Set())
@@ -436,7 +438,7 @@ function CustomerList({
                   return tags.length > 0 ? (
                     <span className="crm-chips">
                       {tags.map((tag) => (
-                        <button key={tag} type="button" className="chip" title={`Filter by tag ${tag}`} onClick={() => setTagFilter(tag)}>
+                        <button key={tag} type="button" className="chip" title={`${t("Filter by tag")} ${tag}`} onClick={() => setTagFilter(tag)}>
                           {tag}
                         </button>
                       ))}
@@ -523,6 +525,7 @@ function CustomerForm({
   formError: string | null;
   onSubmit: (fields: CustomerFormFields, provenance: ConsentProvenance | null) => void;
 }) {
+  const { t } = useLocale();
   const [fields, setFields] = useState<CustomerFormFields>(initial);
   const [method, setMethod] = useState<ConsentMethod | "">("");
   const [note, setNote] = useState("");
@@ -549,7 +552,7 @@ function CustomerForm({
         onSubmit(fields, provenance);
       }}
     >
-      <Field label="Display name" id="crm-display-name" required className="crm-field">
+      <Field label={t("Display name")} id="crm-display-name" required className="crm-field">
         {(c) => (
           <input
             {...c}
@@ -562,7 +565,7 @@ function CustomerForm({
         )}
       </Field>
       <div className="crm-field-row">
-        <Field label="Email (optional)" id="crm-email" className="crm-field">
+        <Field label={t("Email (optional)")} id="crm-email" className="crm-field">
           {(c) => (
             <input
               {...c}
@@ -572,11 +575,11 @@ function CustomerForm({
               onChange={(e) => set({ email: e.target.value })}
               maxLength={254}
               autoComplete="off"
-              placeholder="name@example.com"
+              placeholder={t("name@example.com")}
             />
           )}
         </Field>
-        <Field label="Phone (optional)" id="crm-phone" className="crm-field">
+        <Field label={t("Phone (optional)")} id="crm-phone" className="crm-field">
           {(c) => (
             <input
               {...c}
@@ -591,7 +594,7 @@ function CustomerForm({
         </Field>
       </div>
       <div className="crm-field-row">
-        <Field label="Tags (optional)" id="crm-tags" hint="Comma separated" className="crm-field">
+        <Field label={t("Tags (optional)")} id="crm-tags" hint={t("Comma separated")} className="crm-field">
           {(c) => (
             <input
               {...c}
@@ -600,11 +603,11 @@ function CustomerForm({
               onChange={(e) => set({ tags: e.target.value })}
               maxLength={400}
               autoComplete="off"
-              placeholder="vip, newsletter"
+              placeholder={t("vip, newsletter")}
             />
           )}
         </Field>
-        <Field label="Source (optional)" id="crm-source" className="crm-field">
+        <Field label={t("Source (optional)")} id="crm-source" className="crm-field">
           {(c) => (
             <input
               {...c}
@@ -613,33 +616,33 @@ function CustomerForm({
               onChange={(e) => set({ source: e.target.value })}
               maxLength={40}
               autoComplete="off"
-              placeholder="import"
+              placeholder={t("import")}
             />
           )}
         </Field>
       </div>
       {!hideConsent && (
       <div className="crm-field-row">
-        <Field label="Email consent (explicit)" id="crm-consent-email" hint="No marketing until granted" className="crm-field">
+        <Field label={t("Email consent (explicit)")} id="crm-consent-email" hint={t("No marketing until granted")} className="crm-field">
           {(c) => (
             <Select
               id={c.id}
               value={fields.consentEmail}
               onChange={(value) => isConsentChoice(value) && set({ consentEmail: value })}
-              options={CONSENT_OPTIONS}
-              aria-label="Email consent"
+              options={CONSENT_OPTIONS.map((option) => ({ ...option, label: t(option.label) }))}
+              aria-label={t("Email consent")}
               full
             />
           )}
         </Field>
-        <Field label="SMS consent (explicit)" id="crm-consent-sms" hint="No marketing until granted" className="crm-field">
+        <Field label={t("SMS consent (explicit)")} id="crm-consent-sms" hint={t("No marketing until granted")} className="crm-field">
           {(c) => (
             <Select
               id={c.id}
               value={fields.consentSms}
               onChange={(value) => isConsentChoice(value) && set({ consentSms: value })}
-              options={CONSENT_OPTIONS}
-              aria-label="SMS consent"
+              options={CONSENT_OPTIONS.map((option) => ({ ...option, label: t(option.label) }))}
+              aria-label={t("SMS consent")}
               full
             />
           )}
@@ -654,7 +657,7 @@ function CustomerForm({
                 id={c.id}
                 value={method}
                 onChange={(v) => { setMethod(v as ConsentMethod | ""); setFieldError(null); }}
-                options={[{ value: "", label: "Not recorded" }, ...CONSENT_METHODS]}
+                options={[{ value: "", label: t("Not recorded") }, ...CONSENT_METHODS.map((option) => ({ ...option, label: t(option.label) }))]}
                 aria-label="How consent was given"
                 full
               />
@@ -682,7 +685,7 @@ function CustomerForm({
       {formId === undefined && (
         <div>
           <Button type="submit" variant="primary" loading={pending} disabled={pending}>
-            {submitLabel}
+            {t(submitLabel)}
           </Button>
         </div>
       )}
@@ -712,6 +715,7 @@ function ConsentForm({
   formError: string | null;
   onSubmit: (change: ReturnType<typeof buildConsentChange>) => void;
 }) {
+  const { t } = useLocale();
   const current = viewProfile(profile);
   const [email, setEmail] = useState<ConsentSetting>(asSetting(current.consentEmail));
   const [sms, setSms] = useState<ConsentSetting>(asSetting(current.consentSms));
@@ -735,26 +739,26 @@ function ConsentForm({
       }}
     >
       <div className="crm-field-row">
-        <Field label="Email marketing" id="crm-rc-email" className="crm-field">
+        <Field label={t("Email marketing")} id="crm-rc-email" className="crm-field">
           {(c) => (
             <Select
               id={c.id}
               value={email}
               onChange={(v) => { setEmail(asSetting(v)); setFieldError(null); }}
               options={CONSENT_SETTINGS}
-              aria-label="Email marketing consent"
+              aria-label={t("Email marketing consent")}
               full
             />
           )}
         </Field>
-        <Field label="SMS marketing" id="crm-rc-sms" className="crm-field">
+        <Field label={t("SMS marketing")} id="crm-rc-sms" className="crm-field">
           {(c) => (
             <Select
               id={c.id}
               value={sms}
               onChange={(v) => { setSms(asSetting(v)); setFieldError(null); }}
               options={CONSENT_SETTINGS}
-              aria-label="SMS marketing consent"
+              aria-label={t("SMS marketing consent")}
               full
             />
           )}
@@ -767,7 +771,7 @@ function ConsentForm({
               id={c.id}
               value={method}
               onChange={(v) => { setMethod(v as ConsentMethod | ""); setFieldError(null); }}
-              options={[{ value: "", label: "Choose…" }, ...CONSENT_METHODS]}
+              options={[{ value: "", label: t("Choose…") }, ...CONSENT_METHODS.map((option) => ({ ...option, label: t(option.label) }))]}
               aria-label="How consent was given"
               full
             />
@@ -783,7 +787,7 @@ function ConsentForm({
             onChange={(e) => { setNote(e.target.value); setFieldError(null); }}
             maxLength={CONSENT_NOTE_MAX}
             autoComplete="off"
-            placeholder="e.g. Signed at the counter, 2 Oct"
+            placeholder={t("e.g. Signed at the counter, 2 Oct")}
           />
         )}
       </Field>
@@ -803,6 +807,7 @@ function CustomerNew({
   onCreated: (recordId: string) => void;
   onCancel: () => void;
 }) {
+  const { t } = useLocale();
   const canWrite = viewer.operator === true && !viewer.readOnly;
   const headRef = useRef<HTMLHeadingElement | null>(null);
   const [pending, setPending] = useState(false);
@@ -812,22 +817,22 @@ function CustomerNew({
     headRef.current?.focus();
   }, []);
   return (
-    <section aria-label="New customer">
+    <section aria-label={t("New customer")}>
       <h3 ref={headRef} className="text-cardtitle font-medium text-ink-100" tabIndex={-1} data-outlet-heading>
-        New customer
+        {t("New customer")}
       </h3>
       <p className="text-label text-ink-400 mt-1">
         <button type="button" className="lnk" onClick={onCancel}>
-          ← Customers
+          ← {t("Customers")}
         </button>{" "}
-        — duplicates and stale writes are refused by the server.
+        {t("— duplicates and stale writes are refused by the server.")}
       </p>
       {!canWrite ? (
         <Notice className="mt-2" state="read-only">
-          Read-only view. A verified operator creates customer records.
+          {t("Read-only view. A verified operator creates customer records.")}
         </Notice>
       ) : scope.contextId === "" ? (
-        <Notice className="mt-2">Administrator CRM setup is required before creating a customer.</Notice>
+        <Notice className="mt-2">{t("Administrator CRM setup is required before creating a customer.")}</Notice>
       ) : (
         <div className="mt-2">
           <CustomerForm
@@ -873,6 +878,7 @@ function CustomerDrawer({
   canWrite: boolean;
   onClose: () => void;
 }) {
+  const { t, formatDate } = useLocale();
   const [record, setRecord] = useState<HostRecord | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -917,34 +923,34 @@ function CustomerDrawer({
   };
   const ready = !loading && error === null && record !== null && view !== null;
 
-  const when = (at: number) => new Date(at * 1000).toISOString().slice(0, 10);
+  const when = (at: number) => formatDate(at * 1000, { dateStyle: "medium" });
   const tabs: DrawerTab[] =
     ready && record !== null && view !== null
       ? [
           {
             id: "overview",
-            label: "Overview",
+            label: t("Overview"),
             panel: (
               <>
-                <section className="crm-sect" aria-label="Consent">
-                  <h4>Consent</h4>
+                <section className="crm-sect" aria-label={t("Consent")}>
+                  <h4>{t("Consent")}</h4>
                   <div className="crm-consent-cards">
                     <div className="card px-3 py-2" data-consent="email">
-                      <div className="text-label text-ink-300">Email marketing</div>
-                      <span className={`chip ${view.consentEmail === "granted" ? "crm-consent-ok" : ""}`}>{consentLabel(view.consentEmail)}</span>
+                      <div className="text-label text-ink-300">{t("Email marketing")}</div>
+                      <span className={`chip ${view.consentEmail === "granted" ? "crm-consent-ok" : ""}`}>{t(consentLabel(view.consentEmail))}</span>
                       <div className="text-micro text-ink-500">
-                        {view.consentEmail === "granted" ? "Can receive campaigns" : "No marketing until granted"}
+                        {t(view.consentEmail === "granted" ? "Can receive campaigns" : "No marketing until granted")}
                       </div>
                     </div>
                     <div className="card px-3 py-2" data-consent="sms">
-                      <div className="text-label text-ink-300">SMS marketing</div>
-                      <span className={`chip ${view.consentSms === "granted" ? "crm-consent-ok" : ""}`}>{consentLabel(view.consentSms)}</span>
-                      <div className="text-micro text-ink-500">{view.consentSms === null ? "Not recorded" : "Per customer choice"}</div>
+                      <div className="text-label text-ink-300">{t("SMS marketing")}</div>
+                      <span className={`chip ${view.consentSms === "granted" ? "crm-consent-ok" : ""}`}>{t(consentLabel(view.consentSms))}</span>
+                      <div className="text-micro text-ink-500">{t(view.consentSms === null ? "Not recorded" : "Per customer choice")}</div>
                     </div>
                   </div>
                 </section>
-                <section className="crm-sect" aria-label="Profile">
-                  <h4>Profile</h4>
+                <section className="crm-sect" aria-label={t("Profile")}>
+                  <h4>{t("Profile")}</h4>
                   <Detail
                     className="crm-detail"
                     label="Customer fields"
@@ -956,23 +962,23 @@ function CustomerDrawer({
                     ]}
                   />
                 </section>
-                <section className="crm-sect" aria-label="Segments">
-                  <h4>Segments</h4>
-                  <p className="text-secondary text-ink-400">Membership is shown on each segment.</p>
+                <section className="crm-sect" aria-label={t("Segments")}>
+                  <h4>{t("Segments")}</h4>
+                  <p className="text-secondary text-ink-400">{t("Membership is shown on each segment.")}</p>
                 </section>
-                <section className="crm-sect" aria-label="Campaigns">
-                  <h4>Campaigns</h4>
-                  <p className="text-secondary text-ink-400">Send history is shown on each campaign.</p>
+                <section className="crm-sect" aria-label={t("Campaigns")}>
+                  <h4>{t("Campaigns")}</h4>
+                  <p className="text-secondary text-ink-400">{t("Send history is shown on each campaign.")}</p>
                 </section>
               </>
             ),
           },
           {
             id: "activity",
-            label: "Activity",
+            label: t("Activity"),
             panel:
               timeline.length > 0 ? (
-                <ol className="crm-timeline" aria-label="Activity">
+                <ol className="crm-timeline" aria-label={t("Activity")}>
                   {timeline.map((item) => (
                     <li key={item.key}>
                       <span>{item.text}</span>
@@ -982,14 +988,14 @@ function CustomerDrawer({
                   ))}
                 </ol>
               ) : (
-                <p className="text-secondary text-ink-400">No activity recorded yet.</p>
+                <p className="text-secondary text-ink-400">{t("No activity recorded yet.")}</p>
               ),
           },
           {
             id: "details",
-            label: "Details",
+            label: t("Details"),
             panel: (
-              <section aria-label="Record diagnostics">
+              <section aria-label={t("Record diagnostics")}>
                 <p className="text-micro text-ink-500 mb-2">
                   Selection is chat context only — the server re-proves scope on every send.
                 </p>
@@ -1020,15 +1026,15 @@ function CustomerDrawer({
   return (
     <DrawerShell
       kind="customer"
-      label="Customer details"
-      title={loading ? "Customer details" : (view?.displayName ?? "Customer details")}
+      label={t("Customer details")}
+      title={loading ? t("Customer details") : (view?.displayName ?? t("Customer details"))}
       avatar={initials || undefined}
       subtitle={view?.email ?? undefined}
       pills={
         view && ready ? (
           <>
-            <span className="chip" title="Email consent">Email: {view.consentEmail}</span>
-            <span className="chip" title="SMS consent">SMS: {view.consentSms ?? "unknown"}</span>
+            <span className="chip" title={t("Email consent")}>{t("Email")}: {t(consentLabel(view.consentEmail))}</span>
+            <span className="chip" title={t("SMS consent")}>SMS: {t(consentLabel(view.consentSms))}</span>
             {view.tags.map((tag) => (
               <span key={tag} className="chip">{tag}</span>
             ))}
@@ -1038,7 +1044,7 @@ function CustomerDrawer({
       tabs={tabs}
       state={
         loading ? (
-          <Loading>Reading the record…</Loading>
+          <Loading>{t("Reading the record…")}</Loading>
         ) : error !== null ? (
           <ErrorNotice onRetry={reload}>{error}</ErrorNotice>
         ) : undefined

@@ -50,6 +50,7 @@ pub mod delivery_sync;
 mod home;
 mod lane;
 mod lifecycle;
+mod locale;
 mod login;
 mod operator;
 mod platform_account;

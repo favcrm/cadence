@@ -47,7 +47,9 @@ loader.prototype.require = function (this: unknown, id: string) {
 };
 const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
-const App = (require("../src/App") as typeof import("../src/App")).default;
+const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
+const AppComponent = (require("../src/App") as typeof import("../src/App")).default;
+const App = () => React.createElement(LocaleProvider, null, React.createElement(AppComponent));
 const outlet = require("../src/features/app-shell/CrmOutlet") as typeof import("../src/features/app-shell/CrmOutlet");
 // Pure menu derivation: titles, hrefs and current flags from the
 // route href alone.

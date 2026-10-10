@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useLocale } from "../../lib/locale";
 import {
   activeCount,
   NO_FILTERS,
@@ -30,6 +31,7 @@ function tally(values: (string | undefined)[][]): [string, number][] {
 }
 
 export default function FilterBar({ scope, issues, filters, onChange, view }: Props) {
+  const { t, formatNumber } = useLocale();
   const titleOf = new Map(issues.map((i) => [i.id, i.title]));
   const facets: [Facet, string, [string, number][]][] = [
     ["tags", "tag", tally(scope.map((t) => t.tags ?? []))],
@@ -47,14 +49,14 @@ export default function FilterBar({ scope, issues, filters, onChange, view }: Pr
     <section
       className="card mb-4 px-4 py-2.5 flex flex-wrap items-start gap-x-5 gap-y-2 reveal"
       style={{ animationDelay: "100ms" }}
-      aria-label="Filters"
+      aria-label={t("Filters")}
     >
       <button
         aria-expanded={open}
         onClick={() => setOpen(!open)}
         className="chip !py-[.15rem] bg-ink-800 text-ink-400 hover:text-ink-200 transition-colors"
       >
-        {open ? "hide filters" : "filters"}{active > 0 ? ` · ${active}` : ""}
+        {t(open ? "hide filters" : "filters")}{active > 0 ? ` · ${formatNumber(active)}` : ""}
       </button>
       <div className={open ? "contents" : "hidden"}>
       {facets.map(([facet, label, options]) => {
@@ -67,7 +69,7 @@ export default function FilterBar({ scope, issues, filters, onChange, view }: Pr
         if (all.length === 0) return null;
         return (
           <div key={facet} className="flex items-center gap-2 min-w-0 flex-wrap">
-            <span className="slabel">{label}</span>
+            <span className="slabel">{t(label)}</span>
             <div className="flex flex-wrap gap-1.5">
               {all.map(([value, n]) => {
                 const on = filters[facet].includes(value);
@@ -85,7 +87,7 @@ export default function FilterBar({ scope, issues, filters, onChange, view }: Pr
                   >
                     {value}
                     <span className={on ? "text-accent/70" : "text-ink-500"}>
-                      {n}
+                      {formatNumber(n)}
                     </span>
                   </button>
                 );
@@ -107,9 +109,9 @@ export default function FilterBar({ scope, issues, filters, onChange, view }: Pr
                 ? "bg-accent/10 text-accent"
                 : "bg-ink-800 text-ink-400 hover:text-ink-200"
             }`}
-            title="finished issues are hidden by default — a search still matches them"
+            title={t("finished issues are hidden by default — a search still matches them")}
           >
-            done {doneCount}
+            {t("done")} {formatNumber(doneCount)}
           </button>
         )}
         {view === "kanban" && (
@@ -119,9 +121,9 @@ export default function FilterBar({ scope, issues, filters, onChange, view }: Pr
             className={`chip !py-[.15rem] transition-colors ${
               filters.groupByEpic ? "bg-accent/10 text-accent" : "bg-ink-800 text-ink-400 hover:text-ink-200"
             }`}
-            title="one swimlane per epic, with its progress"
+            title={t("one swimlane per epic, with its progress")}
           >
-            group by epic
+            {t("group by epic")}
           </button>
         )}
         {active > 0 && (
@@ -135,7 +137,7 @@ export default function FilterBar({ scope, issues, filters, onChange, view }: Pr
             }
             className="chip !py-[.15rem] bg-ink-800 text-ink-400 hover:text-ink-200 transition-colors"
           >
-            clear {active}
+            {t("clear")} {formatNumber(active)}
           </button>
         )}
       </div>

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { ApiError } from "../../lib/api";
+import { useLocale } from "../../lib/locale";
 import {
   EMAIL_SENDING_HREF,
   WAITING_APPROVAL_TEXT,
@@ -175,6 +176,7 @@ function CampaignList({
   onSelect: (campaignId: string) => void;
   onNew: () => void;
 }) {
+  const { t, formatNumber } = useLocale();
   const canWrite = viewer.operator === true && !viewer.readOnly;
   const [campaigns, setCampaigns] = useState<ContentDoc[]>([]);
   const [sends, setSends] = useState<SendListEntry[]>([]);
@@ -251,18 +253,17 @@ function CampaignList({
   })();
 
   return (
-    <section aria-label="Campaigns list" className="crm-list">
+    <section aria-label={t("Campaigns list")} className="crm-list">
       <h3 className="text-cardtitle font-medium text-ink-100" data-outlet-heading>
-        Campaigns
+        {t("Campaigns")}
       </h3>
       <div className="crm-toolbar mb-4">
         <p className="crm-toolbar-lede text-secondary text-ink-300">
-          Versioned email content with content-only approval. Audience freezes and test-send
-          receipts live on each campaign's page.
+          {t("Versioned email content with content-only approval. Audience freezes and test-send receipts live on each campaign's page.")}
         </p>
         {canWrite && (
           <Button variant="primary" size="sm" onClick={onNew}>
-            New campaign
+            {t("New campaign")}
           </Button>
         )}
       </div>
@@ -287,33 +288,32 @@ function CampaignList({
       )}
       {viewer.operator === false && (
         <p className="card px-4 py-3 text-label text-ink-400">
-          Sign in as the operator to inspect campaigns.
+          {t("Sign in as the operator to inspect campaigns.")}
         </p>
       )}
       {viewer.operator && viewer.readOnly && (
         <p className="card px-4 py-3 text-label text-ink-400" data-state="read-only">
-          Read-only view. Campaign creation and edits are unavailable.
+          {t("Read-only view. Campaign creation and edits are unavailable.")}
         </p>
       )}
       {scope.contextId === "" && viewer.operator && (
         <p className="card px-4 py-3 text-label text-ink-400">
-          Administrator CRM setup is required before campaigns open.
+          {t("Administrator CRM setup is required before campaigns open.")}
         </p>
       )}
       {scope.contextId !== "" && viewer.operator && loading && (
         <p className="text-secondary text-ink-400" role="status">
-          Reading campaigns…
+          {t("Reading campaigns…")}
         </p>
       )}
       {scope.contextId !== "" && viewer.operator && error !== null && !loading && (
-        <ErrorNotice onRetry={() => setRetry((count) => count + 1)}>{error}</ErrorNotice>
+        <ErrorNotice onRetry={() => setRetry((count) => count + 1)} retryLabel={t("Retry")}>{t(error)}</ErrorNotice>
       )}
       {scope.contextId !== "" && viewer.operator && error === null && !loading && campaigns.length === 0 && (
         <div className="card px-4 py-5 text-secondary text-ink-400" data-empty="campaigns" role="status">
-          <p className="font-medium text-ink-200">No campaigns yet</p>
+          <p className="font-medium text-ink-200">{t("No campaigns yet")}</p>
           <p className="mt-1">
-            Create the first campaign with New campaign — audience, editor, preview and test-send
-            all live there, never on this list. Only real server rows appear here.
+            {t("Create the first campaign with New campaign — audience, editor, preview and test-send all live there, never on this list. Only real server rows appear here.")}
           </p>
         </div>
       )}
@@ -322,16 +322,16 @@ function CampaignList({
           className="crm-table-wrap"
           tabIndex={0}
           role="region"
-          aria-label="Campaigns table — scroll horizontally to reach every column"
+          aria-label={t("Campaigns table — scroll horizontally to reach every column")}
         >
           <table className="crm-table">
             <thead>
               <tr>
-                <th scope="col">Campaign</th>
-                <th scope="col">Content</th>
-                <th scope="col">Latest send</th>
+                <th scope="col">{t("Campaign")}</th>
+                <th scope="col">{t("Content")}</th>
+                <th scope="col">{t("Latest send")}</th>
                 <th scope="col">
-                  <span className="sr-only">Open</span>
+                  <span className="sr-only">{t("Open")}</span>
                 </th>
               </tr>
             </thead>
@@ -347,17 +347,17 @@ function CampaignList({
                   <td>
                     <span
                       className="chip"
-                      title={
+                      title={t(
                         campaign.approval.valid
                           ? `The saved content is approved${campaign.approval.revision !== campaign.revision ? " on an earlier saved version" : ""}`
-                          : "The saved content is not approved yet"
-                      }
+                          : "The saved content is not approved yet",
+                      )}
                     >
                       {campaign.approval.valid
                         ? campaign.approval.revision === campaign.revision
-                          ? "Approved"
-                          : "Needs review — edited since approval"
-                        : "Draft"}
+                          ? t("Approved")
+                          : t("Needs review — edited since approval")
+                        : t("Draft")}
                     </span>
                   </td>
                   <td className="num text-ink-300" data-send-state>
@@ -371,9 +371,9 @@ function CampaignList({
                           <span
                             className="chip crm-send-chip"
                             data-state={send.state}
-                            title="Prepared but not yet approved — nothing was sent"
+                            title={t("Prepared but not yet approved — nothing was sent")}
                           >
-                            Pending send
+                            {t("Pending send")}
                           </span>
                         );
                       }
@@ -389,9 +389,9 @@ function CampaignList({
                         <span
                           className="chip crm-send-chip"
                           data-state={send.state}
-                          title="SMTP acceptance only — not proof of inbox delivery"
+                          title={t("SMTP acceptance only — not proof of inbox delivery")}
                         >
-                          {send.state} · {send.counts.accepted}/{total} accepted
+                          {t(send.state)} · {formatNumber(send.counts.accepted)}/{formatNumber(total)} {t("accepted")}
                         </span>
                       );
                     })()}
@@ -421,17 +421,16 @@ function CampaignList({
         return (
           <div className="card px-4 py-4 mt-4" data-pending-drafts>
             <h4 className="text-cardtitle font-medium text-ink-100">
-              Assistant drafts awaiting review
+              {t("Assistant drafts awaiting review")}
             </h4>
             <p className="text-secondary text-ink-400">
-              The assistant drafted these emails from your chat. Nothing is saved until you
-              open one and Apply.
+              {t("The assistant drafted these emails from your chat. Nothing is saved until you open one and Apply.")}
             </p>
             <ul className="grid gap-2 mt-2">
               {draftOnly.map((proposal) => (
                 <li key={proposal.proposalId} className="flex items-center gap-3">
                   <span className="text-ink-100 flex-1">
-                    {proposal.subject !== "" ? proposal.subject : <em>Untitled draft</em>}
+                    {proposal.subject !== "" ? proposal.subject : <em>{t("Untitled draft")}</em>}
                     <span className="num text-micro text-ink-500"> · {proposal.campaignId}</span>
                   </span>
                   <button
@@ -439,7 +438,7 @@ function CampaignList({
                     className="lnk"
                     onClick={() => onSelect(proposal.campaignId)}
                   >
-                    Review draft
+                    {t("Review draft")}
                   </button>
                 </li>
               ))}
@@ -505,6 +504,7 @@ function AudienceSection({
    *  suppressions behind an Advanced disclosure. */
   layout?: "full" | "detail";
 }) {
+  const { t } = useLocale();
   const canWrite = viewer.operator === true && !viewer.readOnly;
   const [segments, setSegments] = useState<{ id: string; name: string }[]>([]);
   const [exclusions, setExclusions] = useState<{ id: string; name: string }[]>([]);
@@ -669,21 +669,21 @@ function AudienceSection({
   };
 
   return (
-    <section aria-label="Audience" className="card px-4 py-4 grid gap-3">
+    <section aria-label={t("Audience")} className="card px-4 py-4 grid gap-3">
       <h4 className="text-cardtitle font-medium text-ink-100">
-        {layout === "detail" ? "Send to" : "Audience — one base mode"}
+        {layout === "detail" ? t("Send to") : t("Audience — one base mode")}
       </h4>
       {listsError && (
         <p className="text-label text-fail" role="alert">
           {listsError}
         </p>
       )}
-      <div role="radiogroup" aria-label="Base audience mode" className="crm-toolbar">
+      <div role="radiogroup" aria-label={t("Base audience mode")} className="crm-toolbar">
         {(
           [
-            ["all", "All eligible customers"],
-            ["segment", "One saved segment"],
-            ["custom", "Custom customer IDs"],
+            ["all", t("All eligible customers")],
+            ["segment", t("One saved segment")],
+            ["custom", t("Custom customer IDs")],
           ] as [AudienceBaseInput["mode"], string][]
         ).map(([mode, label]) => (
           <label key={mode} className="text-label text-ink-200">
@@ -695,21 +695,21 @@ function AudienceSection({
               onChange={() => setMode(mode)}
             />{" "}
             {label}
-            {mode === "segment" && segments.length === 0 ? " (none saved yet)" : ""}
+            {mode === "segment" && segments.length === 0 ? ` (${t("none saved yet")})` : ""}
           </label>
         ))}
       </div>
       {pick.base.mode === "segment" && (
         <div className="crm-field">
           <label className="text-label text-ink-300" htmlFor="aud-segment">
-            Saved segment
+            {t("Saved segment")}
           </label>
           <Select
             id="aud-segment"
             value={pick.base.segmentId}
             onChange={(value) => onPick({ ...pick, base: { mode: "segment", segmentId: value } })}
             options={segments.map((row) => ({ value: row.id, label: `${row.name} · ${row.id}` }))}
-            aria-label="Saved segment"
+            aria-label={t("Saved segment")}
             disabled={!canWrite}
             full
           />
@@ -718,7 +718,7 @@ function AudienceSection({
       {pick.base.mode === "custom" && (
         <div className="crm-field">
           <label className="text-label text-ink-300" htmlFor="aud-custom">
-            Customer IDs (comma or space separated — the final suppression union still applies)
+            {t("Customer IDs (comma or space separated — the final suppression union still applies)")}
           </label>
           <textarea
             id="aud-custom"
@@ -745,7 +745,7 @@ function AudienceSection({
             onRetry={() => setPreviewToken((count) => count + 1)}
           />
           <details className="crm-diag" data-advanced>
-            <summary className="text-label text-ink-300">Advanced: exclusions and suppressions</summary>
+            <summary className="text-label text-ink-300">{t("Advanced: exclusions and suppressions")}</summary>
             <div className="grid gap-3 mt-2">
       <div className="crm-field">
         <label className="text-label text-ink-300" htmlFor="aud-exclusion">
@@ -1041,7 +1041,7 @@ function AudienceSection({
         loading={previewLoading}
         error={previewError}
         onRetry={() => setPreviewToken((count) => count + 1)}
-        label="Audience preview"
+        label={t("Audience preview")}
       />
       <section aria-label="Suppressions" className="mt-1">
         <h4 className="text-label font-medium text-ink-200">
@@ -1162,6 +1162,7 @@ function DeliveryRows({
   view: SendView;
   onResolved: () => void;
 }) {
+  const { t, formatNumber } = useLocale();
   const canWrite = viewer.operator === true && !viewer.readOnly;
   const [confirm, setConfirm] = useState<{
     customerId: string;
@@ -1174,25 +1175,25 @@ function DeliveryRows({
     <>
       {error && (
         <p className="text-label text-fail" role="alert">
-          {error}
+          {t(error)}
         </p>
       )}
       <div
         className="crm-table-wrap"
         tabIndex={0}
         role="region"
-        aria-label="Delivery rows — scroll horizontally to reach every column"
+        aria-label={t("Delivery rows — scroll horizontally to reach every column")}
       >
         <table className="crm-table">
           <thead>
             <tr>
-              <th scope="col">Recipient</th>
-              <th scope="col">State</th>
-              <th scope="col">Attempts</th>
+              <th scope="col">{t("Recipient")}</th>
+              <th scope="col">{t("State")}</th>
+              <th scope="col">{t("Attempts")}</th>
               <th scope="col">SMTP</th>
-              <th scope="col">Reason</th>
+              <th scope="col">{t("Reason")}</th>
               <th scope="col">
-                <span className="sr-only">Resolve</span>
+                <span className="sr-only">{t("Resolve")}</span>
               </th>
             </tr>
           </thead>
@@ -1205,13 +1206,13 @@ function DeliveryRows({
                     className="chip crm-send-chip"
                     data-state={waitingApproval(row) ? "pending" : row.state}
                   >
-                    {waitingApproval(row) ? WAITING_APPROVAL_TEXT : row.state}
+                    {waitingApproval(row) ? t(WAITING_APPROVAL_TEXT) : t(row.state)}
                   </span>
                   {row.resolvedBy !== null && (
-                    <span className="text-micro text-ink-500"> · by {row.resolvedBy}</span>
+                    <span className="text-micro text-ink-500"> · {t("by")} {row.resolvedBy}</span>
                   )}
                 </td>
-                <td className="num text-ink-400">{row.attempts}</td>
+                <td className="num text-ink-400">{formatNumber(row.attempts)}</td>
                 <td className="num text-ink-400">{row.smtpCode ?? "—"}</td>
                 <td className="text-ink-400">{waitingApproval(row) ? "—" : (row.reason ?? "—")}</td>
                 <td>
@@ -1225,7 +1226,7 @@ function DeliveryRows({
                           setConfirm({ customerId: row.customerId, resolution: "accepted" });
                         }}
                       >
-                        Mark accepted
+                        {t("Mark accepted")}
                       </button>
                       <button
                         type="button"
@@ -1235,7 +1236,7 @@ function DeliveryRows({
                           setConfirm({ customerId: row.customerId, resolution: "failed" });
                         }}
                       >
-                        Mark failed
+                        {t("Mark failed")}
                       </button>
                     </span>
                   )}
@@ -1247,15 +1248,13 @@ function DeliveryRows({
       </div>
       {confirm !== null && (
         <ConfirmDialog
-          title={`Mark this delivery ${confirm.resolution}?`}
+          title={`${t("Mark this delivery")} ${t(confirm.resolution)}?`}
           body={
             <p>
-              The daemon lost the submission's answer, so this row is uncertain — the message may
-              already have been sent. Marking it {confirm.resolution} records your reconciliation
-              only: <strong>no resend happens either way</strong>.
+              {t("The daemon lost the submission's answer, so this row is uncertain — the message may already have been sent. Marking it")} {t(confirm.resolution)} {t("records your reconciliation only:")} <strong>{t("no resend happens either way")}</strong>.
             </p>
           }
-          confirmLabel={`Mark ${confirm.resolution}`}
+          confirmLabel={`${t("Mark")} ${t(confirm.resolution)}`}
           pending={pending}
           error={null}
           onCancel={() => setConfirm(null)}
@@ -1291,6 +1290,7 @@ function SendProgressPanel({
   viewer: Viewer;
   sendId: string;
 }) {
+  const { t, formatNumber } = useLocale();
   const [view, setView] = useState<SendView | null>(null);
   const [error, setError] = useState<string | null>(null);
   const pollRef = useRef<{ timer: ReturnType<typeof setTimeout> | null }>({ timer: null });
@@ -1329,14 +1329,14 @@ function SendProgressPanel({
   if (view === null && error === null) {
     return (
       <p className="text-label text-ink-400" role="status">
-        Reading the send…
+        {t("Reading the send…")}
       </p>
     );
   }
   if (view === null) {
     return (
       <p className="text-label text-fail" role="alert">
-        {error}
+        {t(error ?? "The send request was refused — retry.")}
       </p>
     );
   }
@@ -1352,36 +1352,36 @@ function SendProgressPanel({
     ["closed", counts.closed],
   ];
   return (
-    <section aria-label="Send progress" className="grid gap-3">
+    <section aria-label={t("Send progress")} className="grid gap-3">
       <p className="text-label text-ink-300">
         <span className="chip crm-send-chip" data-state={view.send.state}>
-          {view.send.state}
+          {t(view.send.state)}
         </span>{" "}
         <span className="num">
-          {view.send.sendId} · digest {view.send.sendDigest.slice(0, 18)}…
+          {view.send.sendId} · {t("digest")} {view.send.sendDigest.slice(0, 18)}…
         </span>
         {view.send.closeReason !== null && (
           <span className="text-fail"> · {view.send.closeReason}</span>
         )}
       </p>
-      <dl className="crm-detail" aria-label="Delivery counts">
+      <dl className="crm-detail" aria-label={t("Delivery counts")}>
         {cells.map(([label, count]) => (
           <div key={label}>
-            <dt>{label}</dt>
+            <dt>{t(label)}</dt>
             <dd className="num" data-count={label}>
-              {count}
+              {formatNumber(count)}
             </dd>
           </div>
         ))}
       </dl>
       <p className="text-micro text-ink-500">
         {DELIVERY_CLAIM === "smtp-acceptance-only" || view.deliveryClaim === DELIVERY_CLAIM
-          ? "SMTP accepted the message — this is not proof of inbox delivery."
+          ? t("SMTP accepted the message — this is not proof of inbox delivery.")
           : view.deliveryClaim}
       </p>
       {error && (
         <p className="text-label text-fail" role="alert">
-          {error}
+          {t(error)}
         </p>
       )}
       {view.deliveries.length > 0 && (
@@ -1430,6 +1430,7 @@ function FinalSendPanel({
   binding: SmtpBinding | null | undefined;
   testEvidence: TestSendReceipt | null;
 }) {
+  const { t, formatNumber } = useLocale();
   const canWrite = viewer.operator === true && !viewer.readOnly;
   const [prepared, setPrepared] = useState<PreparedSend | null>(null);
   const [preparePending, setPreparePending] = useState(false);
@@ -1455,19 +1456,16 @@ function FinalSendPanel({
   };
 
   return (
-    <section id="cmp-final-send" tabIndex={-1} aria-label="Final send" className="card px-4 py-4 grid gap-3 crm-send">
+    <section id="cmp-final-send" tabIndex={-1} aria-label={t("Final send")} className="card px-4 py-4 grid gap-3 crm-send">
       <h4 className="text-cardtitle font-medium text-ink-100">
-        Final send — approved, bounded, no resend
+        {t("Final send — approved, bounded, no resend")}
       </h4>
       <p className="text-label text-ink-400">
-        Prepare commits content revision + digest, the audience freeze, the sender link and the
-        unsubscribe origin into one send digest the operator then approves. Any material change
-        between prepare and approve refuses the send. SMTP acceptance is recorded — never inbox
-        delivery, never reads.
+        {t("Prepare commits content revision + digest, the audience freeze, the sender link and the unsubscribe origin into one send digest the operator then approves. Any material change between prepare and approve refuses the send. SMTP acceptance is recorded — never inbox delivery, never reads.")}
       </p>
       {missing.length > 0 ? (
         <div className="card px-3 py-3" data-prerequisites="missing">
-          <p className="text-label text-ink-300">Prepare stays unavailable — missing:</p>
+          <p className="text-label text-ink-300">{t("Prepare stays unavailable — missing:")}</p>
           <ul className="crm-history">
             {missing.map((item) => (
               <li key={item} className="text-label text-warn">
@@ -1478,14 +1476,13 @@ function FinalSendPanel({
         </div>
       ) : (
         <p className="text-label text-ok" data-prerequisites="met">
-          Every prerequisite is in place — approved r{doc.revision}, the frozen audience
-          (checked just now), sender {binding?.sender.address}, accepted test send of this content.
+          {t("Every prerequisite is in place — approved revision")} {formatNumber(doc.revision)}, {t("the frozen audience (checked just now), sender")} {binding?.sender.address}, {t("accepted test send of this content.")}
         </p>
       )}
       {error && (
         <p className="text-label text-fail" role="alert">
-          {error}{" "}
-          {prepared === null && <span className="text-ink-500">Prepare again.</span>}
+          {t(error)}{" "}
+          {prepared === null && <span className="text-ink-500">{t("Prepare again.")}</span>}
         </p>
       )}
       {canWrite && (
@@ -1497,76 +1494,76 @@ function FinalSendPanel({
             disabled={!canPrepare || preparePending}
             title={
               canPrepare
-                ? "Freeze the send's material and show what approval commits"
-                : `Missing: ${missing.join("; ")}`
+                ? t("Freeze the send's material and show what approval commits")
+                : `${t("Missing:")} ${missing.map((item) => t(item)).join("; ")}`
             }
             onClick={prepare}
           >
-            Prepare send
+            {t("Prepare send")}
           </Button>
         </div>
       )}
       {prepared !== null && (
-        <section aria-label="Prepared send" className="card px-3 py-3 grid gap-3" data-prepared>
+        <section aria-label={t("Prepared send")} className="card px-3 py-3 grid gap-3" data-prepared>
           <p className="text-label text-ink-200">
-            Send <span className="num">{prepared.send.sendId}</span> — state{" "}
+            {t("Send")} <span className="num">{prepared.send.sendId}</span> — {t("state")} {" "}
             <span className="chip crm-send-chip" data-state={prepared.send.state}>
-              {prepared.send.state}
+              {t(prepared.send.state)}
             </span>
           </p>
-          <dl className="crm-detail" aria-label="Prepared counts">
+          <dl className="crm-detail" aria-label={t("Prepared counts")}>
             <div>
-              <dt>Included</dt>
+              <dt>{t("Included")}</dt>
               <dd className="num" data-count="included">
                 {prepared.counts.included}
               </dd>
             </div>
             <div>
-              <dt>Excluded</dt>
+              <dt>{t("Excluded")}</dt>
               <dd className="num" data-count="excluded">
                 {prepared.counts.excluded}
               </dd>
             </div>
             <div>
-              <dt>Suppressed now</dt>
+              <dt>{t("Suppressed now")}</dt>
               <dd className="num" data-count="suppressed_now">
                 {prepared.counts.suppressedNow}
               </dd>
             </div>
             <div>
-              <dt>Final recipients</dt>
+              <dt>{t("Final recipients")}</dt>
               <dd className="num" data-count="final">
-                {prepared.counts.final} / ceiling {prepared.counts.maxRecipients}
+                {formatNumber(prepared.counts.final)} / {t("ceiling")} {formatNumber(prepared.counts.maxRecipients)}
               </dd>
             </div>
             <div>
-              <dt>Content</dt>
+              <dt>{t("Content")}</dt>
               <dd className="num">
                 r{prepared.send.contentRevision} · {prepared.send.contentDigest.slice(0, 18)}…
               </dd>
             </div>
             <div>
-              <dt>Audience freeze</dt>
+              <dt>{t("Audience freeze")}</dt>
               <dd className="num">
                 {prepared.send.audienceFreezeId} · {prepared.send.audienceDigest.slice(0, 18)}…
               </dd>
             </div>
             <div>
-              <dt>Sender</dt>
+              <dt>{t("Sender")}</dt>
               <dd className="num break-all">
                 {binding?.sender.address ?? "—"}
                 <details>
-                  <summary className="cursor-pointer text-ink-400">Details</summary>
+                  <summary className="cursor-pointer text-ink-400">{t("Details")}</summary>
                   {prepared.send.connectionId} · link r{prepared.send.linkRevision}
                 </details>
               </dd>
             </div>
             <div>
-              <dt>Unsubscribe origin</dt>
+              <dt>{t("Unsubscribe origin")}</dt>
               <dd className="num">{prepared.send.unsubscribeOrigin}</dd>
             </div>
             <div>
-              <dt>Send digest</dt>
+              <dt>{t("Send digest")}</dt>
               <dd className="num" title={prepared.sendDigest}>
                 {prepared.sendDigest.slice(0, 24)}…
               </dd>
@@ -1574,7 +1571,7 @@ function FinalSendPanel({
           </dl>
           {prepared.sample.length > 0 && (
             <p className="text-micro text-ink-500">
-              Sample (masked):{" "}
+              {t("Sample (masked):")} {" "}
               {prepared.sample.map((row) => `${row.customerId} · ${row.email}`).join(", ")}
             </p>
           )}
@@ -1588,39 +1585,36 @@ function FinalSendPanel({
                 setConfirmApprove(true);
               }}
             >
-              Approve and send…
+              {t("Approve and send…")}
             </Button>
             <button
               type="button"
               className="lnk text-label"
               onClick={() => setPrepared(null)}
             >
-              Discard prepared view
+              {t("Discard prepared view")}
             </button>
           </div>
         </section>
       )}
       {confirmApprove && prepared !== null && (
         <ConfirmDialog
-          title={`Approve send of ${prepared.counts.final} recipients?`}
+          title={`${t("Approve send of")} ${formatNumber(prepared.counts.final)} ${t("recipients")}?`}
           body={
             <>
               <p>
-                This approves send <span className="num">{prepared.send.sendId}</span> exactly as
-                prepared — {prepared.counts.final} recipients, content r
-                {prepared.send.contentRevision}, digest{" "}
-                <span className="num">{prepared.sendDigest.slice(0, 24)}…</span>. The host
-                re-verifies every input; a refusal discards this prepared view.
+                {t("This approves send")} <span className="num">{prepared.send.sendId}</span> {t("exactly as prepared —")} {formatNumber(prepared.counts.final)} {t("recipients, content revision")} {formatNumber(prepared.send.contentRevision)}, {t("digest")} {" "}
+                <span className="num">{prepared.sendDigest.slice(0, 24)}…</span>. {t("The host re-verifies every input; a refusal discards this prepared view.")}
               </p>
               <p className="text-micro text-ink-500">
-                SMTP acceptance is recorded per recipient — it is not proof of inbox delivery.
+                {t("SMTP acceptance is recorded per recipient — it is not proof of inbox delivery.")}
               </p>
             </>
           }
           expect="count"
           match={String(prepared.counts.final)}
-          inputLabel={`Type ${prepared.counts.final} (the final recipient count) to approve`}
-          confirmLabel="Approve and send"
+          inputLabel={`${t("Type")} ${formatNumber(prepared.counts.final)} (${t("the final recipient count")}) ${t("to approve")}`}
+          confirmLabel={t("Approve and send")}
           pending={approvePending}
           error={approveError}
           onCancel={() => setConfirmApprove(false)}
@@ -1695,6 +1689,7 @@ function CampaignWorkspace({
   tab?: CampaignTab;
   onTab?: (tab: CampaignTab) => void;
 }) {
+  const { t, formatNumber } = useLocale();
   const canWrite = viewer.operator === true && !viewer.readOnly;
   const emailDraft = useEmailDraft(scope, campaignId, doc, onDoc);
   const [contentBindings, setContentBindings] = useState<{ id: string; name: string; address: string }[]>([]);
@@ -1926,15 +1921,14 @@ function CampaignWorkspace({
   const previewBody =
     doc === null ? (
       <p className="text-label text-ink-400" data-preview="unsaved">
-        No saved email yet. Ask the assistant in the left chat to draft this campaign&apos;s
-        email, then Apply its verified proposal below to create revision 1.
+        {t("No saved email yet. Ask the assistant in the left chat to draft this campaign's email, then Apply its verified proposal below to create revision 1.")}
       </p>
     ) : (
       <>
         <div className="crm-field-row">
           <div className="crm-field">
             <label className="text-label text-ink-300" htmlFor="cmp-sample">
-              Sample first name (optional)
+              {t("Sample first name (optional)")}
             </label>
             <input
               id="cmp-sample"
@@ -1943,27 +1937,27 @@ function CampaignWorkspace({
               onChange={(e) => setSampleName(e.target.value)}
               maxLength={40}
               autoComplete="off"
-              placeholder="Ada"
+              placeholder={t("Ada")}
             />
           </div>
           <div>
-            <span className="text-label text-ink-300">Saved render</span>
+            <span className="text-label text-ink-300">{t("Saved render")}</span>
             <div className="mt-1">
               <Button
                 size="sm"
                 loading={renderPending}
                 disabled={renderPending}
-                title="Re-render the last saved version with the current sample name"
+                title={t("Re-render the last saved version with the current sample name")}
                 onClick={() => setRenderToken((count) => count + 1)}
               >
-                Refresh preview
+                {t("Refresh preview")}
               </Button>
             </div>
           </div>
         </div>
         {renderError !== null && !renderPending && (
           <p className="text-label text-fail" role="alert">
-            {renderError}{" "}
+            {t(renderError)}{" "}
             <button type="button" className="lnk" onClick={() => setRenderToken((count) => count + 1)}>
               Retry
             </button>
@@ -1971,12 +1965,12 @@ function CampaignWorkspace({
         )}
         {render === null && renderPending && (
           <p className="text-label text-ink-500" role="status" data-preview="loading">
-            Rendering the saved email…
+            {t("Rendering the saved email…")}
           </p>
         )}
         {dirty && (
           <p className="text-micro text-ink-500" data-preview="dirty">
-            Preview shows the last saved version. Save changes to refresh.
+            {t("Preview shows the last saved version. Save changes to refresh.")}
           </p>
         )}
         {render !== null && (
@@ -1989,12 +1983,12 @@ function CampaignWorkspace({
                 {render.sender.name} · {render.sender.address}
               </span>
             </p>
-            <div className="app-outlet-tabs" role="tablist" aria-label="Preview format">
+            <div className="app-outlet-tabs" role="tablist" aria-label={t("Preview format")}>
               {(
                 [
-                  ["visual", "Visual"],
+                  ["visual", t("Visual")],
                   ["html", "HTML"],
-                  ["text", "Text"],
+                  ["text", t("Text")],
                 ] as ["visual" | "html" | "text", string][]
               ).map(([tab, label]) => (
                 <button
@@ -2012,7 +2006,7 @@ function CampaignWorkspace({
             </div>
             {previewTab === "visual" && (
               <iframe
-                title={`Visual email preview, saved revision ${render.revision}`}
+                title={`${t("Visual email preview, saved revision")} ${formatNumber(render.revision)}`}
                 sandbox=""
                 srcDoc={render.html}
                 className="crm-preview-frame"
@@ -2031,42 +2025,40 @@ function CampaignWorkspace({
     );
 
   const previewSection = (
-    <section aria-label="Email preview" className="card px-4 py-4 grid gap-3">
+    <section aria-label={t("Email preview")} className="card px-4 py-4 grid gap-3">
       <h4 className="text-cardtitle font-medium text-ink-100">
-        Preview{doc !== null ? " — saved version" : ""}
+        {t("Preview")}{doc !== null ? ` — ${t("saved version")}` : ""}
       </h4>
       {previewBody}
     </section>
   );
 
   const contentForm = (
-      <div className="card px-4 py-4 grid gap-3" aria-label="Email content">
+      <div className="card px-4 py-4 grid gap-3" aria-label={t("Email content")}>
         <h4 className="text-cardtitle font-medium text-ink-100">
-          Content {doc === null ? "— not drafted yet" : `— revision ${doc.revision}`}
+          {t("Content")} {doc === null ? `— ${t("not drafted yet")}` : `— ${t("revision")} ${formatNumber(doc.revision)}`}
         </h4>
         {doc === null && (
           <p className="text-label text-ink-400" data-state="no-draft">
-            No email draft yet. Ask the assistant in the left chat to draft this campaign&apos;s
-            email, then Apply its verified proposal below to create revision 1 — or use the
-            inline editor after a draft exists.
+            {t("No email draft yet. Ask the assistant in the left chat to draft this campaign's email, then Apply its verified proposal below to create revision 1 — or use the inline editor after a draft exists.")}
           </p>
         )}
         {doc !== null && (
           <dl className="sdetail" data-content-summary>
             <div>
-              <dt>Subject</dt>
+              <dt>{t("Subject")}</dt>
               <dd>{doc.subject}</dd>
             </div>
             <div>
-              <dt>Preheader</dt>
+              <dt>{t("Preheader")}</dt>
               <dd>{doc.preheader === "" ? "—" : doc.preheader}</dd>
             </div>
             <div>
-              <dt>Body</dt>
+              <dt>{t("Body")}</dt>
               <dd>
                 {doc.mode === "html"
-                  ? "HTML body"
-                  : `${doc.blocks.length} block${doc.blocks.length === 1 ? "" : "s"}`}{" "}
+                  ? t("HTML body")
+                  : `${formatNumber(doc.blocks.length)} ${t(doc.blocks.length === 1 ? "block" : "blocks")}`}{" "}
                 · {doc.contentDigest.slice(0, 18)}…
               </dd>
             </div>
@@ -2074,31 +2066,30 @@ function CampaignWorkspace({
         )}
         {doc !== null && (
           <p className="text-label text-ink-400">
-            Edit the email on the campaign&apos;s Email tab.
+            {t("Edit the email on the campaign's Email tab.")}
           </p>
         )}
       </div>
   );
 
   const approvalSection = doc !== null && (
-        <section aria-label="Content approval" id={APPROVAL_ANCHOR} tabIndex={-1} className="card px-4 py-4 grid gap-2">
-          <h4 className="text-cardtitle font-medium text-ink-100">Approval — content-only</h4>
+        <section aria-label={t("Content approval")} id={APPROVAL_ANCHOR} tabIndex={-1} className="card px-4 py-4 grid gap-2">
+          <h4 className="text-cardtitle font-medium text-ink-100">{t("Approval — content-only")}</h4>
           <p className="text-label text-ink-300">
             {doc.approval.valid ? (
-              <span className="chip" title="Content-only approval on this revision">
-                Approved r{doc.approval.revision}
+              <span className="chip" title={t("Content-only approval on this revision")}>
+                {t("Approved")} r{doc.approval.revision === null ? "" : formatNumber(doc.approval.revision)}
               </span>
             ) : (
-              "No content approval on this revision. Any content edit invalidates approval."
+              t("No content approval on this revision. Any content edit invalidates approval.")
             )}{" "}
             <span className="text-ink-500">
-              Approval never sends — the bounded send below is a separate operator decision over
-              exact revisions.
+              {t("Approval never sends — the bounded send below is a separate operator decision over exact revisions.")}
             </span>
           </p>
           {approveError && (
             <p className="text-label text-fail" role="alert">
-              {approveError}
+              {t(approveError)}
             </p>
           )}
           {canWrite && !doc.approval.valid && (
@@ -2117,7 +2108,7 @@ function CampaignWorkspace({
                     .finally(() => setApprovePending(false));
                 }}
               >
-                Approve r{doc.revision} (content-only)
+                {t("Approve r")}{formatNumber(doc.revision)} ({t("content-only")})
               </Button>
             </div>
           )}
@@ -2125,18 +2116,16 @@ function CampaignWorkspace({
   );
 
   const testSection = doc !== null && (
-        <section aria-label="Test send" id={TEST_ANCHOR} tabIndex={-1} className="card px-4 py-4 grid gap-2 crm-test">
+        <section aria-label={t("Test send")} id={TEST_ANCHOR} tabIndex={-1} className="card px-4 py-4 grid gap-2 crm-test">
           <h4 className="text-cardtitle font-medium text-ink-100">
-            Test send — one operator address
+            {t("Test send — one operator address")}
           </h4>
           <p className="text-label text-ink-400">
-            Sends the exact frozen content through the campaign sender to one operator-typed
-            address. The receipt records acceptance or refusal only — a campaign send needs one
-            accepted test send of this exact content and sender.
+            {t("Sends the exact frozen content through the campaign sender to one operator-typed address. The receipt records acceptance or refusal only — a campaign send needs one accepted test send of this exact content and sender.")}
           </p>
           {bindingError !== null && (
             <p className="text-label text-fail" role="alert">
-              {bindingError}{" "}
+              {t(bindingError)}{" "}
               <button
                 type="button"
                 className="lnk"
@@ -2152,8 +2141,7 @@ function CampaignWorkspace({
           )}
           {binding !== undefined && sendingFrom(binding) === null && bindingError === null && (
             <p className="text-label text-ink-500" data-testsend="disabled">
-              No sender is set up — <Link href={EMAIL_SENDING_HREF}>set up sending</Link> to send a
-              test.
+              {t("No sender is set up")} — <Link href={EMAIL_SENDING_HREF}>{t("set up sending")}</Link> {t("to send a test.")}
             </p>
           )}
           <form
@@ -2176,7 +2164,7 @@ function CampaignWorkspace({
           >
             <div className="crm-field">
               <label className="text-label text-ink-300" htmlFor="cmp-test-email">
-                Test recipient (one operator address)
+                {t("Test recipient (one operator address)")}
               </label>
               <input
                 id="cmp-test-email"
@@ -2191,7 +2179,7 @@ function CampaignWorkspace({
               />
             </div>
             <div>
-              <span className="text-label text-ink-300">Send</span>
+              <span className="text-label text-ink-300">{t("Send")}</span>
               <div className="mt-1">
                 <Button
                   type="submit"
@@ -2201,28 +2189,28 @@ function CampaignWorkspace({
                   disabled={!canWrite || testPending || sendingFrom(binding) === null}
                   title={
                     sendingFrom(binding) === null
-                      ? "No sender is set up"
-                      : "Send one test message through the campaign sender"
+                      ? t("No sender is set up")
+                      : t("Send one test message through the campaign sender")
                   }
                 >
-                  Send test
+                  {t("Send test")}
                 </Button>
               </div>
             </div>
           </form>
           {testError && (
             <p className="text-label text-fail" role="alert">
-              {testError}
+              {t(testError)}
             </p>
           )}
           {testReceipt && (
-            <dl className="crm-detail" aria-label="Test-send receipt" data-testreceipt>
+            <dl className="crm-detail" aria-label={t("Test-send receipt")} data-testreceipt>
               <div>
-                <dt>Result</dt>
+                <dt>{t("Result")}</dt>
                 <dd>
                   {testReceipt.pendingApproval ? (
                     <span className="chip crm-send-chip" data-state="pending">
-                      {WAITING_APPROVAL_TEXT}
+                      {t(WAITING_APPROVAL_TEXT)}
                     </span>
                   ) : (
                     <>
@@ -2230,7 +2218,7 @@ function CampaignWorkspace({
                         className="chip crm-send-chip"
                         data-state={testReceipt.accepted ? "accepted" : "failed"}
                       >
-                        {testReceipt.accepted ? "Accepted" : "Refused"}
+                        {t(testReceipt.accepted ? "Accepted" : "Refused")}
                       </span>{" "}
                       <span className="num">
                         SMTP {testReceipt.smtpCode ?? "—"} {testReceipt.smtpMessage}
@@ -2240,24 +2228,24 @@ function CampaignWorkspace({
                 </dd>
               </div>
               <div>
-                <dt>Recipient</dt>
+                <dt>{t("Recipient")}</dt>
                 <dd className="num">{testReceipt.to}</dd>
               </div>
               <div>
-                <dt>Claim</dt>
+                <dt>{t("Claim")}</dt>
                 <dd className="text-ink-300">
                   {testReceipt.pendingApproval
-                    ? "Nothing was sent yet. Send the same test again once the owner has approved it."
-                    : "The sender accepted the message — this is not proof of inbox delivery."}
+                    ? t("Nothing was sent yet. Send the same test again once the owner has approved it.")
+                    : t("The sender accepted the message — this is not proof of inbox delivery.")}
                 </dd>
               </div>
               <div>
-                <dt>Details</dt>
+                <dt>{t("Details")}</dt>
                 <dd>
                   <details>
-                    <summary className="cursor-pointer text-ink-400">Show</summary>
+                    <summary className="cursor-pointer text-ink-400">{t("Show")}</summary>
                     <span className="num break-all">
-                      r{testReceipt.contentRevision} · {testReceipt.contentDigest.slice(0, 18)}…
+                      r{formatNumber(testReceipt.contentRevision)} · {testReceipt.contentDigest.slice(0, 18)}…
                     </span>
                   </details>
                 </dd>
@@ -2273,15 +2261,15 @@ function CampaignWorkspace({
     setRender(null);
     setTestReceipt(null);
     setProposalNote(
-      `Applied as revision ${next.revision} — content approval invalidated; re-approve before any send preparation.`,
+      `${t("Applied as revision")} ${formatNumber(next.revision)} — ${t("content approval invalidated; re-approve before any send preparation.")}`,
     );
   };
   const discardProposal = (id: string) => {
     setProposalToken((count) => count + 1);
     setProposalNote(
       doc === null
-        ? `Proposal ${id} discarded — still no saved revision.`
-        : `Proposal ${id} discarded — draft unchanged at r${doc.revision} (${doc.contentDigest.slice(0, 18)}…).`,
+        ? `${t("Proposal")} ${id} ${t("discarded — still no saved revision.")}`
+        : `${t("Proposal")} ${id} ${t("discarded — draft unchanged at r")}${formatNumber(doc.revision)} (${doc.contentDigest.slice(0, 18)}…).`,
     );
   };
 
@@ -2289,15 +2277,14 @@ function CampaignWorkspace({
   // mint/apply path is the creation route now that the manual composer is
   // gone. expectedRevision is 0 for an unsaved campaign (source_revision=0).
   const proposalsSection = (
-        <section aria-label="Assistant proposals" className="card px-4 py-4 grid gap-3">
-          <h4 className="text-cardtitle font-medium text-ink-100">Proposals — Apply or Discard</h4>
+        <section aria-label={t("Assistant proposals")} className="card px-4 py-4 grid gap-3">
+          <h4 className="text-cardtitle font-medium text-ink-100">{t("Proposals — Apply or Discard")}</h4>
           <p className="text-label text-ink-400">
-            Only Apply changes the saved version (approval invalidates); Discard is
-            non-mutating. Nothing proposes, edits or sends silently.
+            {t("Only Apply changes the saved version (approval invalidates); Discard is non-mutating. Nothing proposes, edits or sends silently.")}
           </p>
           {proposalsError && (
             <p className="text-label text-fail" role="alert">
-              {proposalsError}{" "}
+              {t(proposalsError)}{" "}
               <button type="button" className="lnk" onClick={() => setProposalToken((count) => count + 1)}>
                 Retry
               </button>
@@ -2305,7 +2292,7 @@ function CampaignWorkspace({
           )}
           {proposalError && (
             <p className="text-label text-fail" role="alert">
-              {proposalError}
+              {t(proposalError)}
             </p>
           )}
           {proposalNote && (
@@ -2315,23 +2302,22 @@ function CampaignWorkspace({
           )}
           {canWrite && (
             <p className="text-label text-ink-500" data-assistant-hint>
-              Ask the assistant in the left chat to draft this email — its
-              proposal appears below for review.{" "}
+              {t("Ask the assistant in the left chat to draft this email — its proposal appears below for review.")}{" "}
               <button
                 type="button"
                 className="lnk"
                 onClick={() => setProposalToken((count) => count + 1)}
               >
-                Refresh drafts
+                {t("Refresh drafts")}
               </button>
             </p>
           )}
           {proposals.filter((row) => row.state === "pending").length === 0 ? (
             <p className="text-label text-ink-400" data-empty="proposals">
-              No pending proposals for this campaign.
+              {t("No pending proposals for this campaign.")}
             </p>
           ) : (
-            <ol className="crm-history" aria-label="Pending proposals">
+            <ol className="crm-history" aria-label={t("Pending proposals")}>
               {proposals
                 .filter((row) => row.state === "pending")
                 .map((row) => (
@@ -2443,7 +2429,7 @@ function CampaignWorkspace({
     testEvidence: testReceipt,
   });
   const pendingProposals = proposals.filter((row) => row.state === "pending");
-  const emailBadge = pendingProposals.length > 0 ? `${pendingProposals.length} draft` : null;
+  const emailBadge = pendingProposals.length > 0 ? `${formatNumber(pendingProposals.length)} ${t("draft")}` : null;
   return (
     <>
       {onCloned !== undefined && doc !== null && (
@@ -2601,6 +2587,7 @@ function ProposalRow({
   onDiscarded: (proposalId: string) => void;
   onError: (message: string | null) => void;
 }) {
+  const { t, formatNumber } = useLocale();
   const [pending, setPending] = useState<"apply" | "discard" | null>(null);
   const [showBody, setShowBody] = useState(false);
   const [bodyRender, setBodyRender] = useState<ProposalRenderDoc | null>(null);
@@ -2636,9 +2623,9 @@ function ProposalRow({
           <span
             className="chip"
             data-badge="verified-assistant"
-            title="Host-verified: the assistant produced this draft on this campaign — the browser's copy is never the authority"
+            title={t("Host-verified: the assistant produced this draft on this campaign — the browser's copy is never the authority")}
           >
-            Verified assistant draft
+            {t("Verified assistant draft")}
           </span>{" "}
           <span className="num text-micro text-ink-500">
             {receipt.agent} · campaign {receipt.campaignId} · source r{receipt.sourceRevision}
@@ -2649,9 +2636,9 @@ function ProposalRow({
           <span
             className="chip"
             data-badge="operator-submitted"
-            title="Submitted through the operator proposal route — no assistant provenance"
+            title={t("Submitted through the operator proposal route — no assistant provenance")}
           >
-            Operator-submitted
+            {t("Operator-submitted")}
           </span>{" "}
           <span className="num text-micro text-ink-500">
             actor {proposal.actor} · origin {proposal.origin} · source r{proposal.sourceRevision}
@@ -2670,36 +2657,36 @@ function ProposalRow({
         data-proposal-preview={proposal.proposalId}
         onClick={() => (showBody ? setShowBody(false) : openBody())}
       >
-        {showBody ? "Hide preview" : "Preview draft"}
+        {t(showBody ? "Hide preview" : "Preview draft")}
       </button>
       {showBody && (
         <div className="crm-proposal-body mt-2" data-proposal-body={proposal.proposalId}>
           {bodyPending && (
             <p className="text-label text-ink-500" role="status" data-preview="loading">
-              Rendering the draft preview…
+              {t("Rendering the draft preview…")}
             </p>
           )}
           {bodyError !== null && (
             <p className="text-label text-fail" role="alert">
-              {bodyError}
+              {t(bodyError)}
             </p>
           )}
           {bodyRender !== null ? (
             <>
               <p className="text-label text-ink-300">
-                <span className="chip" title="Preview-only sender material — host-locked">
-                  preview-only
+                <span className="chip" title={t("Preview-only sender material — host-locked")}>
+                  {t("preview-only")}
                 </span>{" "}
                 <span className="num">
                   {bodyRender.sender.name} · {bodyRender.sender.address}
                 </span>
               </p>
-              <div className="app-outlet-tabs" role="tablist" aria-label="Draft preview format">
+              <div className="app-outlet-tabs" role="tablist" aria-label={t("Draft preview format")}>
                 {(
                   [
-                    ["visual", "Visual"],
+                    ["visual", t("Visual")],
                     ["html", "HTML"],
-                    ["text", "Text"],
+                    ["text", t("Text")],
                   ] as const
                 ).map(([key, label]) => (
                   <button
@@ -2716,7 +2703,7 @@ function ProposalRow({
               </div>
               {bodyTab === "visual" && (
                 <iframe
-                  title="Draft email preview"
+                  title={t("Draft email preview")}
                   sandbox=""
                   srcDoc={bodyRender.html}
                   className="crm-preview-frame"
@@ -2733,21 +2720,21 @@ function ProposalRow({
             bodyError === null && !bodyPending ? null : (
               <>
                 <p className="text-label text-ink-200">
-                  <span className="text-ink-500">Subject:</span> {proposal.subject}
+                  <span className="text-ink-500">{t("Subject:")}</span> {proposal.subject}
                 </p>
                 {proposal.preheader !== "" && (
                   <p className="text-label text-ink-400">
-                    <span className="text-ink-500">Preheader:</span> {proposal.preheader}
+                    <span className="text-ink-500">{t("Preheader:")}</span> {proposal.preheader}
                   </p>
                 )}
-                <ol className="grid gap-1 mt-1" aria-label="Draft body blocks">
+                <ol className="grid gap-1 mt-1" aria-label={t("Draft body blocks")}>
                   {proposal.blocks.map((block, index) => (
                     <li key={index} className="text-label text-ink-300">
                       {block.type === "heading" ? (
                         <strong className="text-ink-100">{block.text}</strong>
                       ) : block.type === "button" ? (
                         <span className="chip" data-block="button">
-                          Button: {block.label}
+                          {t("Button:")} {block.label}
                         </span>
                       ) : (
                         block.text
@@ -2762,8 +2749,7 @@ function ProposalRow({
       )}
       {stale && proposal.state === "pending" && (
         <p className="text-label text-warn mt-1" data-state="stale">
-          Needs review (stale) — drafted against r{proposal.sourceRevision}, the saved version is
-          now r{expectedRevision}. Re-review its text before asking the assistant to draft again.
+          {t("Needs review (stale) — drafted against revision")} {formatNumber(proposal.sourceRevision)}, {t("the saved version is now revision")} {formatNumber(expectedRevision)}. {t("Re-review its text before asking the assistant to draft again.")}
         </p>
       )}
       {canWrite && (
@@ -2775,8 +2761,8 @@ function ProposalRow({
             disabled={pending !== null || stale}
             title={
               stale
-                ? "Apply is disabled: the proposal's stamped source revision is behind the current draft"
-                : `Apply as a new revision (expects the draft at r${expectedRevision})`
+                ? t("Apply is disabled: the proposal's stamped source revision is behind the current draft")
+                : `${t("Apply as a new revision (expects the draft at revision")} ${formatNumber(expectedRevision)})`
             }
             onClick={() => {
               onError(null);
@@ -2798,7 +2784,7 @@ function ProposalRow({
                 .finally(() => setPending(null));
             }}
           >
-            Apply (new revision)
+            {t("Apply (new revision)")}
           </Button>
           <Button
             size="sm"
@@ -2814,7 +2800,7 @@ function ProposalRow({
                 .finally(() => setPending(null));
             }}
           >
-            Discard
+            {t("Discard")}
           </Button>
         </div>
       )}
@@ -2823,32 +2809,31 @@ function ProposalRow({
 }
 
 function SenderPanel({ render }: { render: ContentRender }) {
+  const { t } = useLocale();
   return (
-    <section aria-label="Sender" className="card px-3 py-3 grid gap-2">
-      <h4 className="text-label font-medium text-ink-200">Sender in this render — preview</h4>
+    <section aria-label={t("Sender")} className="card px-3 py-3 grid gap-2">
+      <h4 className="text-label font-medium text-ink-200">{t("Sender in this render — preview")}</h4>
       <dl className="crm-detail">
         <div>
-          <dt>From</dt>
+          <dt>{t("From")}</dt>
           <dd className="num">
             {render.sender.name} · {render.sender.address}
           </dd>
         </div>
         <div>
-          <dt>Unsubscribe</dt>
+          <dt>{t("Unsubscribe")}</dt>
           <dd className="num">{render.unsubscribeUrl}</dd>
         </div>
         <div>
-          <dt>Binding</dt>
+          <dt>{t("Binding")}</dt>
           <dd className="num">
-            {render.bindingId} · preview-only
-            {render.previewOnly ? "" : " (unexpected — reported)"}
+            {render.bindingId} · {t("preview-only")}
+            {render.previewOnly ? "" : ` (${t("unexpected — reported")})`}
           </dd>
         </div>
       </dl>
       <p className="text-micro text-ink-500">
-        The render names the host's preview sender; the real sender is the bound SMTP connection
-        above, and every send's unsubscribe links build on the configured origin. A preview proves
-        the bytes only — sending is the operator's separate decision below.
+        {t("The render names the host's preview sender; the real sender is the bound SMTP connection above, and every send's unsubscribe links build on the configured origin. A preview proves the bytes only — sending is the operator's separate decision below.")}
       </p>
     </section>
   );
@@ -2871,6 +2856,7 @@ function CampaignDetail({
   onBack: () => void;
   onCloned: (campaignId: string) => void;
 }) {
+  const { t, formatNumber } = useLocale();
   const canWrite = viewer.operator === true && !viewer.readOnly;
   const headRef = useRef<HTMLHeadingElement | null>(null);
   const [doc, setDoc] = useState<ContentDoc | null>(null);
@@ -3081,36 +3067,36 @@ function CampaignDetail({
   };
 
   return (
-    <section aria-label="Campaign details" className="grid gap-3">
+    <section aria-label={t("Campaign details")} className="grid gap-3">
       <div>
         <h3 ref={headRef} className="text-cardtitle font-medium text-ink-100" tabIndex={-1} data-outlet-heading>
-          {loading ? "Campaign details" : (doc !== null ? campaignTitle(doc) : "Campaign details")}{" "}
+          {loading ? t("Campaign details") : (doc !== null ? campaignTitle(doc) : t("Campaign details"))}{" "}
           {doc !== null && (
             <span className="chip align-middle" data-campaign-status>
-              {doc.approval.valid && doc.approval.revision === doc.revision ? "Approved" : "Draft"}
+              {doc.approval.valid && doc.approval.revision === doc.revision ? t("Approved") : t("Draft")}
             </span>
           )}
         </h3>
         <p className="text-label text-ink-400 mt-1">
           <button type="button" className="lnk" onClick={requestBack}>
-            ← Campaigns
+            ← {t("Campaigns")}
           </button>
         </p>
         <details className="crm-diag">
-          <summary className="text-micro text-ink-500">Details</summary>
-          <p className="num text-micro text-ink-500 mt-1" title="Campaign ID">
-            Campaign ID {campaignId}
+          <summary className="text-micro text-ink-500">{t("Details")}</summary>
+          <p className="num text-micro text-ink-500 mt-1" title={t("Campaign ID")}>
+            {t("Campaign ID")} {campaignId}
           </p>
         </details>
       </div>
       {loading && (
         <p className="text-secondary text-ink-400" role="status">
-          Reading the campaign…
+          {t("Reading the campaign…")}
         </p>
       )}
       {error !== null && !loading && (
         <p className="card px-4 py-3 text-label text-fail border-fail/40" role="alert">
-          {error}{" "}
+          {t(error)}{" "}
           <button
             type="button"
             className="lnk"
@@ -3132,8 +3118,7 @@ function CampaignDetail({
         <>
           {pendingOnly && doc === null && (
             <p className="card px-4 py-3 text-label text-ink-300" data-pending-only>
-              This campaign exists only as a pending assistant draft — no content is saved yet.
-              Review it below and Apply to save the first revision, or Discard it.
+              {t("This campaign exists only as a pending assistant draft — no content is saved yet. Review it below and Apply to save the first revision, or Discard it.")}
             </p>
           )}
           <CampaignWorkspace
@@ -3165,16 +3150,14 @@ function CampaignDetail({
                   onPreview={recordAudiencePreview}
                   layout="detail"
                 />
-                <section aria-label="Frozen audience" className="card px-4 py-4 grid gap-3">
-                  <h4 className="text-cardtitle font-medium text-ink-100">Freeze</h4>
+                <section aria-label={t("Frozen audience")} className="card px-4 py-4 grid gap-3">
+                  <h4 className="text-cardtitle font-medium text-ink-100">{t("Freeze")}</h4>
                   <p className="text-label text-ink-400">
-                    A freeze snapshots exactly who receives this campaign, so later customer
-                    changes cannot alter it. The audience above is the freeze — no ids to
-                    handle: freeze it, and recheck whenever the audience changes.
+                    {t("A freeze snapshots exactly who receives this campaign, so later customer changes cannot alter it. The audience above is the freeze — no ids to handle: freeze it, and recheck whenever the audience changes.")}
                   </p>
                   {freezeError && (
                     <p className="text-label text-fail" role="alert">
-                      {freezeError}
+                      {t(freezeError)}
                     </p>
                   )}
                   <p className="text-label text-ink-100" data-freeze-state={
@@ -3182,11 +3165,11 @@ function CampaignDetail({
                   }>
                     {freeze === null
                       ? freezeMissing
-                        ? "This audience is not frozen yet. Freezing snapshots exactly who receives the campaign, so later customer changes cannot alter it."
-                        : "Checking the freeze…"
+                        ? t("This audience is not frozen yet. Freezing snapshots exactly who receives the campaign, so later customer changes cannot alter it.")
+                        : t("Checking the freeze…")
                       : freeze.valid === true
-                        ? `Audience frozen · ${freeze.finalCount} recipient${freeze.finalCount === 1 ? "" : "s"} · checked just now`
-                        : `Audience changed since you froze it (was ${freeze.finalCount}, now ${freeze.currentCount ?? "—"}) — refreeze to continue.`}
+                        ? `${t("Audience frozen")} · ${formatNumber(freeze.finalCount)} ${t("recipients")} · ${t("checked just now")}`
+                        : `${t("Audience changed since you froze it")} (${t("was")} ${formatNumber(freeze.finalCount)}, ${t("now")} ${freeze.currentCount === null ? "—" : formatNumber(freeze.currentCount)}) — ${t("refreeze to continue.")}`}
                   </p>
                   <div className="flex flex-wrap items-center gap-2">
                     <Button
@@ -3196,44 +3179,44 @@ function CampaignDetail({
                       disabled={freezePending || !canWrite || audiencePreview === null || audiencePreview.finalCount === 0}
                       onClick={freezeAudience}
                     >
-                      {freeze !== null && freeze.valid === false ? "Use audience · refresh snapshot" : freeze === null ? "Use audience · create snapshot" : "Use audience · refresh snapshot"}
+                      {t(freeze !== null && freeze.valid === false ? "Use audience · refresh snapshot" : freeze === null ? "Use audience · create snapshot" : "Use audience · refresh snapshot")}
                     </Button>
                     {freeze !== null && (
                       <Button size="sm" loading={freezePending} disabled={freezePending} onClick={checkFreeze}>
-                        Recheck
+                        {t("Recheck")}
                       </Button>
                     )}
                   </div>
                   {freeze && (
                     <>
-                      <dl className="crm-detail" aria-label="Freeze validity">
+                      <dl className="crm-detail" aria-label={t("Freeze validity")}>
                         <div>
-                          <dt>Frozen recipients</dt>
-                          <dd className="num">{freeze.finalCount}</dd>
+                          <dt>{t("Frozen recipients")}</dt>
+                          <dd className="num">{formatNumber(freeze.finalCount)}</dd>
                         </div>
                         <div>
-                          <dt>Current recount</dt>
-                          <dd className="num">{freeze.currentCount ?? "—"}</dd>
+                          <dt>{t("Current recount")}</dt>
+                          <dd className="num">{freeze.currentCount === null ? "—" : formatNumber(freeze.currentCount)}</dd>
                         </div>
                         <div>
-                          <dt>Validity</dt>
+                          <dt>{t("Validity")}</dt>
                           <dd>
                             <span
                               className="chip"
-                              title={freeze.drift ?? "The frozen digest still matches the live audience"}
+                              title={freeze.drift ?? t("The frozen digest still matches the live audience")}
                             >
-                              {freeze.valid === true ? "Valid" : freeze.valid === false ? `Invalid — ${freeze.drift}` : "Unknown"}
+                              {freeze.valid === true ? t("Valid") : freeze.valid === false ? `${t("Invalid")} — ${freeze.drift}` : t("Unknown")}
                             </span>
                           </dd>
                         </div>
                       </dl>
                       <details className="crm-diag">
-                        <summary className="text-micro text-ink-500">Technical details</summary>
-                        <p className="num text-micro text-ink-500 mt-1" title="Freeze ID (derived from the audience)">
-                          Freeze {freezeId}
+                        <summary className="text-micro text-ink-500">{t("Technical details")}</summary>
+                        <p className="num text-micro text-ink-500 mt-1" title={t("Freeze ID (derived from the audience)")}>
+                          {t("Freeze")} {freezeId}
                         </p>
-                        <p className="num text-micro text-ink-500 mt-1" title="Frozen audience digest">
-                          Digest {freeze.digest}
+                        <p className="num text-micro text-ink-500 mt-1" title={t("Frozen audience digest")}>
+                          {t("Digest")} {freeze.digest}
                         </p>
                       </details>
                     </>
@@ -3246,9 +3229,9 @@ function CampaignDetail({
       )}
       {(confirmLeave || pendingNavigation !== null) && (
         <ConfirmDialog
-          title="Leave with unsaved email changes?"
-          body={<p>Your email draft has not been saved. Leave this campaign and discard those local edits?</p>}
-          confirmLabel={pendingNavigation === null ? "Leave campaign" : "Leave page"}
+          title={t("Leave with unsaved email changes?")}
+          body={<p>{t("Your email draft has not been saved. Leave this campaign and discard those local edits?")}</p>}
+          confirmLabel={t(pendingNavigation === null ? "Leave campaign" : "Leave page")}
           pending={false}
           error={null}
           onCancel={() => { setConfirmLeave(false); setPendingNavigation(null); }}
@@ -3277,6 +3260,7 @@ function CampaignSends({
   viewer: Viewer;
   campaignId: string;
 }) {
+  const { t, formatNumber } = useLocale();
   const [sends, setSends] = useState<SendListEntry[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [openId, setOpenId] = useState<string | null>(null);
@@ -3300,22 +3284,22 @@ function CampaignSends({
   }, [token]);
 
   return (
-    <section aria-label="Campaign sends" className="card px-4 py-4 grid gap-3">
-      <h4 className="text-cardtitle font-medium text-ink-100">Sends of this campaign</h4>
+    <section aria-label={t("Campaign sends")} className="card px-4 py-4 grid gap-3">
+      <h4 className="text-cardtitle font-medium text-ink-100">{t("Sends of this campaign")}</h4>
       {error !== null ? (
         <p className="text-label text-fail" role="alert">
-          {error}
+          {t(error)}
         </p>
       ) : sends === null ? (
         <p className="text-label text-ink-400" role="status">
-          Reading sends…
+          {t("Reading sends…")}
         </p>
       ) : sends.length === 0 ? (
         <p className="text-label text-ink-400" data-empty="sends">
-          No sends of this campaign yet — prepare and approve above.
+          {t("No sends of this campaign yet — prepare and approve above.")}
         </p>
       ) : (
-        <ol className="crm-history" aria-label="Sends">
+        <ol className="crm-history" aria-label={t("Sends")}>
           {sends.map((row) => {
             const total =
               row.counts.queued +
@@ -3330,17 +3314,17 @@ function CampaignSends({
                 <p className="text-label text-ink-200">
                   <span className="num">{row.sendId}</span>{" "}
                   <span className="chip crm-send-chip" data-state={row.state}>
-                    {row.state}
+                    {t(row.state)}
                   </span>{" "}
                   <span className="num text-ink-400">
-                    {row.counts.accepted}/{total} accepted · digest {row.sendDigest.slice(0, 18)}…
+                    {formatNumber(row.counts.accepted)}/{formatNumber(total)} {t("accepted")} · {t("digest")} {row.sendDigest.slice(0, 18)}…
                   </span>{" "}
                   <button
                     type="button"
                     className="lnk"
                     onClick={() => setOpenId(openId === row.sendId ? null : row.sendId)}
                   >
-                    {openId === row.sendId ? "Hide" : "Show"}
+                    {t(openId === row.sendId ? "Hide" : "Show")}
                   </button>
                 </p>
                 {openId === row.sendId && (

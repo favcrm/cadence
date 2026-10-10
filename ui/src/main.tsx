@@ -12,6 +12,7 @@ import App from "./App";
 import { applyLegacyRedirect, installClientNav } from "./lib/useLocation";
 import { initTheme } from "./lib/theme";
 import { captureLoginNonce } from "./features/auth/session";
+import { LocaleProvider } from "./lib/locale";
 
 // The stored theme pick, before the first paint of the app.
 initTheme();
@@ -29,6 +30,6 @@ captureLoginNonce();
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <App />
+    <LocaleProvider><App /></LocaleProvider>
   </StrictMode>,
 );
