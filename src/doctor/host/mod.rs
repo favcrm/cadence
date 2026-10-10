@@ -550,6 +550,7 @@ pub fn run(scan: &Scan) -> Value {
     let checks = [
         check_disk(scan),
         check_provider_state(scan),
+        check_provider_commands(),
         check_cadence_store(scan),
         check_pipes(scan),
         check_memory(scan),
@@ -692,7 +693,7 @@ use pipes::{check_pipes, scan_pipes, PipeStats};
 #[allow(unused_imports)]
 use processes::check_processes;
 #[allow(unused_imports)]
-use provider_state::{check_provider_state, store_level};
+use provider_state::{check_provider_commands, check_provider_state, store_level};
 #[allow(unused_imports)]
 use sessions::{check_sessions, MAX_METRIC_PIDS};
 #[allow(unused_imports)]
