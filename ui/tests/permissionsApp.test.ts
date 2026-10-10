@@ -27,7 +27,9 @@ loader.prototype.require = function (this: unknown, id: string) {
 };
 const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
-const App = (require("../src/App") as typeof import("../src/App")).default;
+const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
+const AppComponent = (require("../src/App") as typeof import("../src/App")).default;
+const App = () => React.createElement(LocaleProvider, null, React.createElement(AppComponent));
 const { setSessionKey } = require("../src/lib/sessionKey") as typeof import("../src/lib/sessionKey");
 const json = (data: unknown, status = 200) => new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json" } });
 const identity = (id: string, operator: boolean | null) => ({

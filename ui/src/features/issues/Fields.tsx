@@ -3,6 +3,7 @@ import { api } from "../../lib/api";
 import type { IssueCard, IssueDetail } from "../../lib/types";
 import Select from "../../ui/Select";
 import { noDragReason } from "../projects/Card";
+import { useLocale } from "../../lib/locale";
 import { type IssuePageProps as Props } from "./issuePageProps";
 
 const STATUSES = ["backlog", "ready", "doing", "review", "done", "dropped"];
@@ -23,6 +24,7 @@ export function Fields({
   onError: Props["onError"];
   onPatch: (body: Parameters<typeof api.patch>[1], verb: string) => void;
 }) {
+  const { t } = useLocale();
   const locked = noDragReason(detail);
   const [owner, setOwner] = useState(detail.owner ?? "");
   useEffect(() => setOwner(detail.owner ?? ""), [detail.owner, detail.rev]);
@@ -43,32 +45,32 @@ export function Fields({
       .catch((e) => onError(e, "epic"));
   };
   return (
-    <section className="card p-3.5 grid gap-2.5" aria-label="Fields">
-      <div className="slabel">Fields</div>
+    <section className="card p-3.5 grid gap-2.5" aria-label={t("Fields")}>
+      <div className="slabel">{t("Fields")}</div>
       <label className="grid gap-1.5">
-        <span className="slabel">Status</span>
+        <span className="slabel">{t("Status")}</span>
         <Select
           full
           value={detail.status}
           disabled={readOnly || !!locked}
           title={locked ?? undefined}
-          aria-label="Status"
+          aria-label={t("Status")}
           options={[
             ...(STATUSES.includes(detail.status)
               ? []
-              : [{ value: detail.status, label: detail.status }]),
-            ...STATUSES.map((s) => ({ value: s, label: s })),
+              : [{ value: detail.status, label: t(detail.status) } ]),
+            ...STATUSES.map((s) => ({ value: s, label: t(s) })),
           ]}
           onChange={(status) => onPatch({ status }, `${detail.id} status`)}
         />
       </label>
       <label className="grid gap-1.5">
-        <span className="slabel">Priority</span>
+        <span className="slabel">{t("Priority")}</span>
         <Select
           full
           value={detail.priority}
           disabled={readOnly}
-          aria-label="Priority"
+          aria-label={t("Priority")}
           options={[
             ...(PRIORITIES.includes(detail.priority)
               ? []
@@ -81,12 +83,12 @@ export function Fields({
         />
       </label>
       <label className="grid gap-1.5">
-        <span className="slabel">Owner</span>
+        <span className="slabel">{t("Owner")}</span>
         <input
           className="field w-full"
           value={owner}
           disabled={readOnly}
-          aria-label="Owner"
+          aria-label={t("Owner")}
           onChange={(e) => setOwner(e.target.value)}
           onBlur={() => {
             if ((detail.owner ?? "") !== owner)
@@ -95,14 +97,14 @@ export function Fields({
         />
       </label>
       <label className="grid gap-1.5">
-        <span className="slabel">Epic</span>
+        <span className="slabel">{t("Epic")}</span>
         <Select
           full
           value={detail.parent ?? ""}
           disabled={readOnly}
-          aria-label="Epic"
+          aria-label={t("Epic")}
           options={[
-            { value: "", label: "None" },
+            { value: "", label: t("None") },
             ...(detail.parent && !epics.some((e) => e.id === detail.parent)
               ? [{ value: detail.parent, label: detail.parent }]
               : []),

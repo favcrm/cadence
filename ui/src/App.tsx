@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError, type WriteResp } from "./lib/api";
+import { useLocale } from "./lib/locale";
 import Agents from "./features/agents/Agents";
 import Apps from "./features/apps/Apps";
 import { installedAppHref } from "./features/apps/appViewModel";
@@ -124,6 +125,7 @@ const SCREEN_LABEL: Record<Screen, string> = {
 const overviewOn = (s: Screen) => s === "home" || s === "overview";
 
 export default function App() {
+  const { setSession } = useLocale();
   // App selection lives in the URL — the route (`/projects/cadence`) plus
   // `?view=list&issue=CAD-16` — so a refresh or pasted link restores it.
   const href = useHref();
@@ -163,6 +165,7 @@ export default function App() {
   const [health, setHealth] = useState<Health | null>(null);
   const [meta, setMeta] = useState<Meta | null>(null);
   const [updateBanner, setUpdateBanner] = useState<UpdateBanner | null>(null);
+  useEffect(() => setSession(meta), [meta, setSession]);
   // The open drawer's detail, cached per id: reopening a drawer paints
   // the last payload while it revalidates.
   const detailState = useMaybeResource(openId ? resources.issue(openId) : null);

@@ -184,6 +184,7 @@ loader.prototype.require = function (this: unknown, id: string) {
 };
 const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
+const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
 const CrmOutlet = (require("../src/features/app-shell/CrmOutlet") as typeof import("../src/features/app-shell/CrmOutlet")).default;
 const { useHref } = require("../src/lib/useLocation") as typeof import("../src/lib/useLocation");
 
@@ -316,7 +317,7 @@ async function fillArea(selector: string, value: string) {
 }
 
 await React.act(async () => {
-  root.render(React.createElement(Harness, { viewer: { operator: true, readOnly: false } }));
+  root.render(React.createElement(LocaleProvider, null, React.createElement(Harness, { viewer: { operator: true, readOnly: false } })));
 });
 await settle(() => assert(text().includes("Search Alpha One"), "list paints real server rows"));
 assert(host.querySelector("[data-outlet-heading]")?.textContent?.trim() === "Customers", "customers list retains its section heading");
@@ -846,7 +847,7 @@ await settle(() => assert(host.querySelector('#crm-customer-search'), "the list 
 globalThis.fetch = priorFetch;
 
 // Read-only viewers get truthful states, never forms.
-await React.act(async () => { root.render(React.createElement(Harness, { viewer: { operator: true, readOnly: true } })); });
+await React.act(async () => { root.render(React.createElement(LocaleProvider, null, React.createElement(Harness, { viewer: { operator: true, readOnly: true } }))); });
 await flush(); await flush();
 assert(text().includes("Read-only"), "read-only state is explicit");
 assert(!host.querySelector("#crm-display-name"), "read-only renders no edit form");

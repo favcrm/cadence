@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { ApiError } from "../../lib/api";
+import { useLocale } from "../../lib/locale";
 import { navigate, useHref } from "../../lib/useLocation";
 import Button from "../../ui/Button";
 import Select from "../../ui/Select";
@@ -25,22 +26,23 @@ import {
 
 /** Human-readable predicate: the same labels the rule form offers.
  *  Unknown stored values fall back to the raw tokens, never hide. */
-export function describeRule(rule: SegmentPredicate): string {
+export function describeRule(rule: SegmentPredicate, translate: (value: string) => string = (value) => value): string {
   const field = SEGMENT_FIELDS.find((f) => f.value === rule.field)?.label ?? rule.field;
   const op = SEGMENT_OPS.find((o) => o.value === rule.op)?.label ?? rule.op;
-  return `${field} ${op} ${rule.value}`;
+  return `${translate(field)} ${translate(op)} ${rule.value}`;
 }
 
 /** Rule as a sentence of tokens: "Customers where [tag] [is] [vip]". */
 function RuleSentence({ rules }: { rules: SegmentPredicate[] }) {
+  const { t } = useLocale();
   return (
     <p className="crm-rule-sentence" data-testid="rule-sentence">
-      <span>Customers where</span>
+      <span>{t("Customers where")}</span>
       {rules.map((rule, i) => (
         <span key={i} className="crm-rule-sentence">
-          {i > 0 && <span>and</span>}
-          <span className="chip">{SEGMENT_FIELDS.find((f) => f.value === rule.field)?.label ?? rule.field}</span>
-          <span className="chip">{SEGMENT_OPS.find((o) => o.value === rule.op)?.label ?? rule.op}</span>
+          {i > 0 && <span>{t("and")}</span>}
+          <span className="chip">{t(SEGMENT_FIELDS.find((f) => f.value === rule.field)?.label ?? rule.field)}</span>
+          <span className="chip">{t(SEGMENT_OPS.find((o) => o.value === rule.op)?.label ?? rule.op)}</span>
           <span className="chip">{rule.value}</span>
         </span>
       ))}
@@ -55,27 +57,27 @@ export interface FunnelStep {
 
 /** Eligibility funnel built only from the host's membership-preview
  *  counts, plus the one plain-language reason that blocks most people. */
-export function eligibilityFunnel(p: AudiencePreview): { steps: FunnelStep[]; reason: string | null } {
+export function eligibilityFunnel(p: AudiencePreview, translate: (value: string) => string = (value) => value): { steps: FunnelStep[]; reason: string | null } {
   const valid = Math.max(p.finalCount, p.baseCount - p.excluded.invalid);
   const consent = Math.max(p.finalCount, valid - p.excluded.noConsent - p.excluded.unsubscribed);
   const steps = [
-    { label: "Match the rule", count: p.baseCount },
-    { label: "Valid email", count: valid },
-    { label: "Email consent", count: consent },
-    { label: "Can be emailed", count: p.finalCount },
+    { label: translate("Match the rule"), count: p.baseCount },
+    { label: translate("Valid email"), count: valid },
+    { label: translate("Email consent"), count: consent },
+    { label: translate("Can be emailed"), count: p.finalCount },
   ];
   const causes: [number, string][] = [
-    [p.excluded.noConsent, "have not agreed to receive email"],
-    [p.excluded.unsubscribed, "have unsubscribed"],
-    [p.excluded.invalid, "have no valid email address"],
-    [p.excluded.suppressed, "are on the suppression list"],
-    [p.exclusionCount, "are on the saved exclusion list"],
+    [p.excluded.noConsent, translate("have not agreed to receive email")],
+    [p.excluded.unsubscribed, translate("have unsubscribed")],
+    [p.excluded.invalid, translate("have no valid email address")],
+    [p.excluded.suppressed, translate("are on the suppression list")],
+    [p.exclusionCount, translate("are on the saved exclusion list")],
   ];
   const top = causes.filter(([n]) => n > 0).sort((a, b) => b[0] - a[0])[0];
   let reason: string | null = null;
-  if (p.baseCount === 0) reason = "No customers match this rule yet.";
-  else if (p.finalCount === 0 && top) reason = `Nobody can be emailed: ${top[0]} ${top[1]}.`;
-  else if (p.finalCount < p.baseCount && top) reason = `${top[0]} ${top[0] === 1 ? "customer" : "customers"} ${top[1]}.`;
+  if (p.baseCount === 0) reason = translate("No customers match this rule yet.");
+  else if (p.finalCount === 0 && top) reason = `${translate("Nobody can be emailed:")} ${top[0]} ${top[1]}.`;
+  else if (p.finalCount < p.baseCount && top) reason = `${top[0]} ${translate(top[0] === 1 ? "customer" : "customers")} ${top[1]}.`;
   return { steps, reason };
 }
 
@@ -249,6 +251,7 @@ function SegmentList({
   onSelect: (segmentId: string) => void;
   onNew: () => void;
 }) {
+  const { t, formatNumber } = useLocale();
   const canWrite = viewer.operator === true && !viewer.readOnly;
   const [segments, setSegments] = useState<SegmentDoc[]>([]);
   const [loading, setLoading] = useState(true);
@@ -294,17 +297,17 @@ function SegmentList({
   }, [reloadToken]);
 
   return (
-    <section aria-label="Segments list" className="crm-list">
+    <section aria-label={t("Segments list")} className="crm-list">
       <h3 className="text-cardtitle font-medium text-ink-100" data-outlet-heading>
-        Segments
+        {t("Segments")}
       </h3>
       <div className="crm-toolbar mb-4">
         <p className="crm-toolbar-lede text-secondary text-ink-300">
-          Saved rules over customer tags, source, consent and email domain.
+          {t("Saved rules over customer tags, source, consent and email domain.")}
         </p>
         {canWrite && (
           <Button variant="primary" size="sm" onClick={onNew}>
-            New segment
+            {t("New segment")}
           </Button>
         )}
       </div>
@@ -329,22 +332,22 @@ function SegmentList({
       )}
       {viewer.operator === false && (
         <p className="card px-4 py-3 text-label text-ink-400">
-          Sign in as the operator to inspect saved segments.
+          {t("Sign in as the operator to inspect saved segments.")}
         </p>
       )}
       {viewer.operator && viewer.readOnly && (
         <p className="card px-4 py-3 text-label text-ink-400" data-state="read-only">
-          Read-only view. Segment creation and edits are unavailable.
+          {t("Read-only view. Segment creation and edits are unavailable.")}
         </p>
       )}
       {scope.contextId === "" && viewer.operator && (
         <p className="card px-4 py-3 text-label text-ink-400">
-          Administrator CRM setup is required before segments open.
+          {t("Administrator CRM setup is required before segments open.")}
         </p>
       )}
       {scope.contextId !== "" && viewer.operator && loading && (
         <p className="text-secondary text-ink-400" role="status">
-          Reading segments…
+          {t("Reading segments…")}
         </p>
       )}
       {scope.contextId !== "" && viewer.operator && error !== null && !loading && (
@@ -352,9 +355,9 @@ function SegmentList({
       )}
       {scope.contextId !== "" && viewer.operator && error === null && !loading && segments.length === 0 && (
         <div className="card px-4 py-5 text-secondary text-ink-400" data-empty="segments" role="status">
-          <p className="font-medium text-ink-200">No segments yet</p>
+          <p className="font-medium text-ink-200">{t("No segments yet")}</p>
           <p className="mt-1">
-            Create the first saved rule with New segment. Only real server rows appear here.
+            {t("Create the first saved rule with New segment. Only real server rows appear here.")}
           </p>
         </div>
       )}
@@ -363,17 +366,17 @@ function SegmentList({
           className="crm-table-wrap"
           tabIndex={0}
           role="region"
-          aria-label="Segments table — scroll horizontally to reach every column"
+          aria-label={t("Segments table — scroll horizontally to reach every column")}
         >
           <table className="crm-table">
             <thead>
               <tr>
-                <th scope="col">Name</th>
-                <th scope="col">Rule</th>
-                <th scope="col">Matches</th>
-                <th scope="col">Can be emailed</th>
+                <th scope="col">{t("Name")}</th>
+                <th scope="col">{t("Rule")}</th>
+                <th scope="col">{t("Matches")}</th>
+                <th scope="col">{t("Can be emailed")}</th>
                 <th scope="col">
-                  <span className="sr-only">Open</span>
+                  <span className="sr-only">{t("Open")}</span>
                 </th>
               </tr>
             </thead>
@@ -394,9 +397,9 @@ function SegmentList({
                     <span className="num text-micro text-ink-500"> · {segment.id}</span>
                   </td>
                   <td className="text-ink-300">
-                    <span className="chip">{segment.predicates[0] ? describeRule(segment.predicates[0]) : "—"}</span>
+                    <span className="chip">{segment.predicates[0] ? describeRule(segment.predicates[0], t) : "—"}</span>
                     {segment.predicates.length > 1 && (
-                      <span className="num text-micro text-ink-500"> +{segment.predicates.length - 1} more</span>
+                      <span className="num text-micro text-ink-500"> +{formatNumber(segment.predicates.length - 1)} {t("more")}</span>
                     )}
                   </td>
                   <td className="num text-ink-300">{counts[segment.id]?.baseCount ?? "—"}</td>
@@ -411,7 +414,7 @@ function SegmentList({
                   </td>
                   <td>
                     <button type="button" className="lnk" onClick={() => onSelect(segment.id)}>
-                      Open
+                      {t("Open")}
                     </button>
                   </td>
                 </tr>
@@ -443,35 +446,36 @@ function RuleRows({
   disabled: boolean;
   onChange: (rules: RuleDraft[]) => void;
 }) {
+  const { t, formatNumber } = useLocale();
   const set = (index: number, patch: Partial<RuleDraft>) => {
     onChange(rules.map((rule, at) => (at === index ? { ...rule, ...patch } : rule)));
   };
   return (
-    <ol className="crm-history" aria-label="Segment rules">
+    <ol className="crm-history" aria-label={t("Segment rules")}>
       {rules.map((rule, index) => (
         <li key={index} className="card px-3 py-3">
           <div className="crm-field-row">
-            <Field label={`Field ${index + 1}`} id={`seg-rule-field-${index}`} className="crm-field">
+            <Field label={`${t("Field")} ${formatNumber(index + 1)}`} id={`seg-rule-field-${index}`} className="crm-field">
               {(c) => (
                 <Select
                   id={c.id}
                   value={rule.field}
                   onChange={(value) => isSegmentField(value) && set(index, { field: value })}
-                  options={SEGMENT_FIELDS.map((entry) => ({ value: entry.value, label: entry.label }))}
-                  aria-label={`Rule ${index + 1} field`}
+                  options={SEGMENT_FIELDS.map((entry) => ({ value: entry.value, label: t(entry.label) }))}
+                  aria-label={`${t("Rule")} ${formatNumber(index + 1)} ${t("field")}`}
                   disabled={disabled}
                   full
                 />
               )}
             </Field>
-            <Field label={`Operator ${index + 1}`} id={`seg-rule-op-${index}`} className="crm-field">
+            <Field label={`${t("Operator")} ${formatNumber(index + 1)}`} id={`seg-rule-op-${index}`} className="crm-field">
               {(c) => (
                 <Select
                   id={c.id}
                   value={rule.op}
                   onChange={(value) => isSegmentOp(value) && set(index, { op: value })}
-                  options={SEGMENT_OPS.map((entry) => ({ value: entry.value, label: entry.label }))}
-                  aria-label={`Rule ${index + 1} operator`}
+                  options={SEGMENT_OPS.map((entry) => ({ value: entry.value, label: t(entry.label) }))}
+                  aria-label={`${t("Rule")} ${formatNumber(index + 1)} ${t("operator")}`}
                   disabled={disabled}
                   full
                 />
@@ -479,9 +483,9 @@ function RuleRows({
             </Field>
           </div>
           <Field
-            label={`Value ${index + 1}`}
+            label={`${t("Value")} ${formatNumber(index + 1)}`}
             id={`seg-rule-value-${index}`}
-            hint={ruleHint(rule.field)}
+            hint={t(ruleHint(rule.field))}
             disabled={disabled}
             className="crm-field mt-2"
           >
@@ -504,7 +508,7 @@ function RuleRows({
                 className="lnk text-label"
                 onClick={() => onChange(rules.filter((_, at) => at !== index))}
               >
-                Remove rule {index + 1}
+                {t("Remove rule")} {formatNumber(index + 1)}
               </button>
             </p>
           )}
@@ -525,6 +529,7 @@ function SegmentNew({
   onCreated: (segmentId: string) => void;
   onCancel: () => void;
 }) {
+  const { t } = useLocale();
   const canWrite = viewer.operator === true && !viewer.readOnly;
   const headRef = useRef<HTMLHeadingElement | null>(null);
   const [name, setName] = useState("");
@@ -535,23 +540,23 @@ function SegmentNew({
     headRef.current?.focus();
   }, []);
   return (
-    <section aria-label="New segment">
+    <section aria-label={t("New segment")}>
       <h3 ref={headRef} className="text-cardtitle font-medium text-ink-100" tabIndex={-1} data-outlet-heading>
-        New segment
+        {t("New segment")}
       </h3>
       <p className="text-label text-ink-400 mt-1">
         <button type="button" className="lnk" onClick={onCancel}>
-          ← Segments
+          ← {t("Segments")}
         </button>{" "}
-        — exact recipient counts render on the detail after Create.
+        {t("— exact recipient counts render on the detail after Create.")}
       </p>
       {!canWrite ? (
         <p className="card px-4 py-3 mt-2 text-label text-ink-400" data-state="read-only">
-          Read-only view. A verified operator creates saved segments.
+          {t("Read-only view. A verified operator creates saved segments.")}
         </p>
       ) : scope.contextId === "" ? (
         <p className="card px-4 py-3 mt-2 text-label text-ink-400">
-          Administrator CRM setup is required before creating a segment.
+          {t("Administrator CRM setup is required before creating a segment.")}
         </p>
       ) : (
         <form
@@ -635,10 +640,11 @@ export function PreviewPanel({
   onRetry: () => void;
   label: string;
 }) {
+  const { t, formatNumber } = useLocale();
   if (loading) {
     return (
       <p className="text-secondary text-ink-400" role="status">
-        Reading host audience counts…
+        {t("Reading host audience counts…")}
       </p>
     );
   }
@@ -647,46 +653,46 @@ export function PreviewPanel({
       <p className="card px-4 py-3 text-label text-fail border-fail/40" role="alert">
         {error}{" "}
         <button type="button" className="lnk" onClick={onRetry}>
-          Retry
+          {t("Retry")}
         </button>
       </p>
     );
   }
   if (preview === null) return null;
   return (
-    <div aria-label={label}>
+    <div aria-label={t(label)}>
       <dl className="crm-detail">
         <div>
-          <dt>Base matches</dt>
-          <dd className="num">{preview.baseCount}</dd>
+          <dt>{t("Base matches")}</dt>
+          <dd className="num">{formatNumber(preview.baseCount)}</dd>
         </div>
         <div>
-          <dt>Saved exclusions</dt>
-          <dd className="num">{preview.exclusionCount}</dd>
+          <dt>{t("Saved exclusions")}</dt>
+          <dd className="num">{formatNumber(preview.exclusionCount)}</dd>
         </div>
         <div>
-          <dt>Invalid address</dt>
-          <dd className="num">{preview.excluded.invalid}</dd>
+          <dt>{t("Invalid address")}</dt>
+          <dd className="num">{formatNumber(preview.excluded.invalid)}</dd>
         </div>
         <div>
-          <dt>No consent</dt>
-          <dd className="num">{preview.excluded.noConsent}</dd>
+          <dt>{t("No consent")}</dt>
+          <dd className="num">{formatNumber(preview.excluded.noConsent)}</dd>
         </div>
         <div>
-          <dt>Unsubscribed</dt>
-          <dd className="num">{preview.excluded.unsubscribed}</dd>
+          <dt>{t("Unsubscribed")}</dt>
+          <dd className="num">{formatNumber(preview.excluded.unsubscribed)}</dd>
         </div>
         <div>
-          <dt>Suppressed</dt>
-          <dd className="num">{preview.excluded.suppressed}</dd>
+          <dt>{t("Suppressed")}</dt>
+          <dd className="num">{formatNumber(preview.excluded.suppressed)}</dd>
         </div>
         <div>
-          <dt>Final recipients</dt>
-          <dd className="num">{preview.finalCount}</dd>
+          <dt>{t("Final recipients")}</dt>
+          <dd className="num">{formatNumber(preview.finalCount)}</dd>
         </div>
         <div>
-          <dt>Preview digest</dt>
-          <dd className="num" title="Host audience digest">
+          <dt>{t("Preview digest")}</dt>
+          <dd className="num" title={t("Host audience digest")}>
             {preview.digest.slice(0, 18)}…
           </dd>
         </div>
@@ -724,6 +730,7 @@ function SegmentDrawer({
   onClose: () => void;
   onOpen: (segmentId: string) => void;
 }) {
+  const { t, formatNumber } = useLocale();
   const [segment, setSegment] = useState<SegmentDoc | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -791,12 +798,12 @@ function SegmentDrawer({
   const ready = !loading && error === null && segment !== null;
 
   const members = preview?.sample ?? [];
-  const funnel = preview ? eligibilityFunnel(preview) : null;
+  const funnel = preview ? eligibilityFunnel(preview, t) : null;
   const memberList = (rows: { id: string; displayName: string }[]) => (
-    <ul className="crm-history" aria-label="Segment members">
+    <ul className="crm-history" aria-label={t("Segment members")}>
       {rows.map((m) => (
         <li key={m.id} className="text-label text-ink-300">
-          {m.displayName || "—"} <span className="chip" data-tone="ok">Can email</span>
+          {m.displayName || "—"} <span className="chip" data-tone="ok">{t("Can email")}</span>
         </li>
       ))}
     </ul>
@@ -806,21 +813,21 @@ function SegmentDrawer({
       ? [
           {
             id: "overview",
-            label: "Overview",
+            label: t("Overview"),
             panel: (
               <>
-                <section aria-label="Segment rule">
+                <section aria-label={t("Segment rule")}>
                   <RuleSentence rules={segment.predicates} />
                 </section>
-                <section aria-label="Who can be emailed" className="mt-3">
-                  <h4 className="text-label font-medium text-ink-200">Who can be emailed</h4>
+                <section aria-label={t("Who can be emailed")} className="mt-3">
+                  <h4 className="text-label font-medium text-ink-200">{t("Who can be emailed")}</h4>
                   {previewLoading && (
-                    <p className="text-secondary text-ink-400" role="status">Reading host audience counts…</p>
+                    <p className="text-secondary text-ink-400" role="status">{t("Reading host audience counts…")}</p>
                   )}
                   {previewError !== null && (
                     <p className="card px-4 py-3 text-label text-fail border-fail/40" role="alert">
                       {previewError}{" "}
-                      <button type="button" className="lnk" onClick={() => setPreviewToken((n) => n + 1)}>Retry</button>
+                      <button type="button" className="lnk" onClick={() => setPreviewToken((n) => n + 1)}>{t("Retry")}</button>
                     </p>
                   )}
                   {funnel && !previewLoading && previewError === null && (
@@ -842,14 +849,14 @@ function SegmentDrawer({
                     </>
                   )}
                 </section>
-                <section aria-label="Members preview" className="mt-3">
-                  <h4 className="text-label font-medium text-ink-200">Members</h4>
+                <section aria-label={t("Members preview")} className="mt-3">
+                  <h4 className="text-label font-medium text-ink-200">{t("Members")}</h4>
                   {members.length === 0 && !previewLoading && (
-                    <p className="text-secondary text-ink-400">No one can be emailed from this segment yet.</p>
+                    <p className="text-secondary text-ink-400">{t("No one can be emailed from this segment yet.")}</p>
                   )}
                   {memberList(members.slice(0, 10))}
                   {members.length > 0 && (
-                    <button type="button" className="lnk text-label" onClick={() => setTab("members")}>View all</button>
+                    <button type="button" className="lnk text-label" onClick={() => setTab("members")}>{t("View all")}</button>
                   )}
                 </section>
               </>
@@ -857,11 +864,11 @@ function SegmentDrawer({
           },
           {
             id: "members",
-            label: "Members",
+            label: t("Members"),
             panel: (
-              <section aria-label="All members">
+              <section aria-label={t("All members")}>
                 <p className="text-label text-ink-400">
-                  Showing {members.length} of {preview?.finalCount ?? 0} customers who can be emailed.
+                  {t("Showing")} {formatNumber(members.length)} {t("of")} {formatNumber(preview?.finalCount ?? 0)} {t("customers who can be emailed.")}
                 </p>
                 {memberList(members)}
               </section>
@@ -869,7 +876,7 @@ function SegmentDrawer({
           },
           {
             id: "details",
-            label: "Details",
+            label: t("Details"),
             panel: (
               <section aria-label="Record diagnostics">
                 <p className="num text-micro text-ink-500">
@@ -883,7 +890,7 @@ function SegmentDrawer({
                     loading={previewLoading}
                     error={previewError}
                     onRetry={() => setPreviewToken((count) => count + 1)}
-                    label="Current matches"
+                    label={t("Current matches")}
                   />
                 </div>
               </section>

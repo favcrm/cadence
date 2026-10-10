@@ -47,6 +47,7 @@ loader.prototype.require = function (this: unknown, id: string) {
 const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
 const App = (require("../src/App") as typeof import("../src/App")).default;
+const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
 
 const mk = (id: string, name: string, title: string) => ({
   install_id: id, title, name, version: "0.1.0",
@@ -100,7 +101,7 @@ const sections = () => Array.from(host.querySelectorAll('aside nav[aria-label="C
 
 win.localStorage.clear();
 history.pushState(null, "", "/");
-await React.act(async () => { root.render(React.createElement(App)); });
+await React.act(async () => { root.render(React.createElement(LocaleProvider, null, React.createElement(App))); });
 
 // (b) The Apps item lists the installed apps from the API on a non-app
 // screen, each linking to its readable app-key route when unique.
@@ -124,7 +125,7 @@ equal(appLink("CRM")!.getAttribute("href"), "/apps/crm?crm=segments", "app link 
 await React.act(async () => { root.unmount(); });
 const root2 = createRoot(host);
 history.pushState(null, "", "/");
-await React.act(async () => { root2.render(React.createElement(App)); });
+await React.act(async () => { root2.render(React.createElement(LocaleProvider, null, React.createElement(App))); });
 await settle(() => assert(sections().length === 3, "sections restored after reload"));
 equal(appLink("CRM")!.getAttribute("href"), "/apps/crm?crm=segments", "last section survives a reload");
 const clicked = appLink("CRM")!;

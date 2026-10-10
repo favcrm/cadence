@@ -929,6 +929,15 @@ pub(crate) fn write_route(
         send(request, resp);
         return;
     }
+    if path == "/api/locale" {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let resp = super::locale::post(&mut request, state_dir, opts);
+        send(request, resp);
+        return;
+    }
     // CAD-140: filing a report or idea — the same `report::file` path
     // `cadence report` uses (scrubbing, context, intake shape, PM
     // heads-up), never a bare issue create. Admitted above, like every

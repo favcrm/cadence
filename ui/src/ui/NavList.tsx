@@ -8,6 +8,7 @@ import { NAV, type Route, type Screen } from "../lib/router";
 import type { IssueCard, Project } from "../lib/types";
 import Link from "./Link";
 import { IconAgents, IconApps, IconHome, IconOutbox, IconProjects, IconSettings, IconWiki } from "./icons";
+import { useLocale } from "../lib/locale";
 
 const NAV_ICONS: Record<string, ReactNode> = {
   home: <IconHome size={16} />,
@@ -36,8 +37,9 @@ interface NavListProps {
 /** The one nav row list: the desktop sidebar and the phone menu both
  *  render it, so there is a single row style. */
 export function NavList({ screen, navHref, appMenu = null, label = "Primary", onNavigate, homeCount = 0 }: NavListProps) {
+  const { t } = useLocale();
   return (
-    <nav className="grid gap-[2px]" aria-label={label}>
+    <nav className="grid gap-[2px]" aria-label={t(label)}>
       {NAV.map((item) => {
         const here = navMatches(screen, item.screen);
         const apps = item.screen === "apps" && appMenu !== null ? appMenu.apps : [];
@@ -54,9 +56,9 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
               data-parent-current={parent ? "" : undefined}
             >
               {NAV_ICONS[item.screen]}
-              {item.label}
+              {t(item.label)}
               {item.screen === "home" && homeCount > 0 && (
-                <span className="navbadge num" title={`${homeCount} waiting for you`}>
+                <span className="navbadge num" title={`${homeCount} ${t("waiting for you")}`}>
                   {homeCount}
                 </span>
               )}
@@ -66,7 +68,7 @@ export function NavList({ screen, navHref, appMenu = null, label = "Primary", on
                 {appMenu.notice.text}{" "}
                 {!appMenu.notice.retrying && (
                   <button type="button" onClick={appMenu.notice.onRetry} className="text-accent hover:underline">
-                    Retry
+                    {t("Retry")}
                   </button>
                 )}
               </div>
@@ -131,9 +133,10 @@ interface ProjectListProps {
 /** Project rows. With no projects (and no load error) the "All
  *  projects" row gives way to a plain line. */
 export function ProjectList({ project, projectHref, projects, issues, projectsError, onNavigate }: ProjectListProps) {
+  const { t } = useLocale();
   // "…" until the cards load; a stale list keeps its numbers.
   const count = (key: string) => {
-    if (!issues.data) return { n: issues.status === "failed" ? "!" : "…", title: issues.error ?? "loading issues" };
+    if (!issues.data) return { n: issues.status === "failed" ? "!" : "…", title: issues.error ?? t("loading issues") };
     const c = issueCounts(issues.data, key);
     return { n: String(c.open), title: countLabel(c) };
   };
@@ -141,10 +144,10 @@ export function ProjectList({ project, projectHref, projects, issues, projectsEr
   return (
     <div className="grid gap-[2px]">
       {projects.length === 0 && !projectsError ? (
-        <span className="mx-[10px] py-1 text-micro text-ink-500">No projects yet</span>
+        <span className="mx-[10px] py-1 text-micro text-ink-500">{t("No projects yet")}</span>
       ) : (
         <Link href={projectHref("all")} onClick={onNavigate} className={`proj ${project === "all" ? "on" : ""}`}>
-          <span className="truncate">All projects</span>
+          <span className="truncate">{t("All projects")}</span>
           <span className="num text-micro text-ink-500" title={all.title}>{all.n}</span>
         </Link>
       )}
@@ -163,7 +166,7 @@ export function ProjectList({ project, projectHref, projects, issues, projectsEr
       ))}
       {projectsError && (
         <span className="mx-[11px] mt-1 text-micro text-fail" role="alert" title={projectsError}>
-          could not load projects
+          {t("could not load projects")}
         </span>
       )}
     </div>

@@ -43,12 +43,17 @@ loader.prototype.require = function (this: unknown, id: string) {
 const React = require("react") as typeof import("react");
 const { createRoot } =
   require("react-dom/client") as typeof import("react-dom/client");
-const AppDetail = (
+const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
+const AppDetailComponent = (
   require("../src/features/apps/AppDetail") as typeof import("../src/features/apps/AppDetail")
 ).default;
-const Apps = (
+const AppDetail = (props: React.ComponentProps<typeof AppDetailComponent>) =>
+  React.createElement(LocaleProvider, null, React.createElement(AppDetailComponent, props));
+const AppsComponent = (
   require("../src/features/apps/Apps") as typeof import("../src/features/apps/Apps")
 ).default;
+const Apps = (props: React.ComponentProps<typeof AppsComponent>) =>
+  React.createElement(LocaleProvider, null, React.createElement(AppsComponent, props));
 const { resources } =
   require("../src/lib/resources") as typeof import("../src/lib/resources");
 const { navigate } =

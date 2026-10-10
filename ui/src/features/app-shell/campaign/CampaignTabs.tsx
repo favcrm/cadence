@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { useLocale } from "../../../lib/locale";
 import type { CampaignTab } from "./readiness";
 
 export interface TabSpec {
@@ -25,6 +26,7 @@ export default function CampaignTabs({
   onChange: (tab: CampaignTab) => void;
   children: ReactNode;
 }) {
+  const { t } = useLocale();
   const move = (from: CampaignTab, key: string) => {
     const index = ORDER.indexOf(from);
     const next =
@@ -42,7 +44,7 @@ export default function CampaignTabs({
   };
   return (
     <>
-      <div className="crm-ctabs" role="tablist" aria-label="Campaign sections">
+      <div className="crm-ctabs" role="tablist" aria-label={t("Campaign sections")}>
         {tabs.map((tab) => (
           <button
             key={tab.id}
@@ -59,8 +61,8 @@ export default function CampaignTabs({
               if (move(tab.id, e.key)) e.preventDefault();
             }}
           >
-            {tab.label}
-            {tab.badge ? <span className="chip">{tab.badge}</span> : null}
+            {t(tab.label)}
+            {tab.badge ? <span className="chip">{t(tab.badge)}</span> : null}
           </button>
         ))}
       </div>

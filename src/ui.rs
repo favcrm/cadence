@@ -53,6 +53,7 @@ mod crm_smtp;
 pub mod delivery_sync;
 mod home;
 mod lane;
+mod locale;
 mod login;
 mod operator;
 mod platform_account;
