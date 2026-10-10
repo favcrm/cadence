@@ -16,6 +16,7 @@
 #![cfg(feature = "test-seam")]
 
 use cadence_agent::platform::deployments::DeploymentMetadata;
+use cadence_agent::platform::ImageReason;
 use cadence_agent::store::app_records::RecordStore;
 use cadence_agent::test_seam::{scoped, Asserted, Seam};
 use cadence_agent::{client, daemon};
@@ -1039,8 +1040,15 @@ fn an_unreachable_door_keeps_the_intent_pending_then_settles_uncertain_and_recov
     std::thread::sleep(Duration::from_millis(800));
     assert_eq!(fx.intent(&draft).unwrap()["state"], "pending");
 
-    // The window is bounded: the intent settles with a reason.
-    fx.wait_intent(&draft, "uncertain");
+    // The window is bounded: the intent settles with one of the two retry reasons.
+    let row = fx.wait_intent(&draft, "uncertain");
+    let reason = row["outcome"].as_str().unwrap();
+    assert!(
+        [ImageReason::SubmitError, ImageReason::PollTimeout]
+            .iter()
+            .any(|expected| expected.code() == reason),
+        "unexpected reason for the unreachable-door path: {row}"
+    );
 
     // The door returns; re-checking replays the same key and completes.
     fx.door.media.set(Scenario::Normal);
