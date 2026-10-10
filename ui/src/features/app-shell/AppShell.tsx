@@ -649,9 +649,6 @@ export default function AppShell({
               ))}
           </select>
         )}
-        <Link href="/" className="lnk text-micro app-shell-home-link" data-chat-home-link>
-          Earlier history is in Home
-        </Link>
         {isDev && installation !== null && (
           <a
             href={contractPreviewHref(href, previewKey === null ? "crm" : null)}

@@ -44,11 +44,14 @@ const conv = (id: string, over: object = {}) => ({ id, title: null, subject: nul
 const convs: Record<string, any[]> = {
   "install-crm": [conv("c-gen", { is_general: true }), conv("c-camp", { subject: "campaign:cmp-1", title: "Spring launch" })],
   "install-other": [conv("o-gen", { is_general: true })],
+  "install-social": [conv("s-gen", { is_general: true }), conv("s-full", { title: "Has messages" })],
 };
 const threads: Record<string, any[]> = {
   "c-gen": [ent(1, "operator", "message", "general question", "m-gen"), ent(2, "agent", "turn_result", "general answer", "m-gen")],
   "c-camp": [ent(1, "operator", "message", "campaign brief", "m-camp")],
   "o-gen": [],
+  "s-gen": [],
+  "s-full": [ent(1, "operator", "message", "earlier question", "m-s")],
 };
 let turn: any = null;
 // Set inside a check to hold one send in flight (pending state "sending").
@@ -64,6 +67,9 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   if (url.pathname === "/api/app-installations/install-crm/chat-descriptor") {
     return json({ descriptor: JSON.parse(require("fs").readFileSync(require("path").join(process.cwd(), "..", "workspace-apps", "crm", "app-chat.json"), "utf8")), digest: "d", app: "crm" });
   }
+  if (url.pathname === "/api/app-installations/install-social/chat-descriptor") {
+    return json({ descriptor: { contract: "app-chat/v1", app: "social-content", contexts: [{ id: "main", label: "Social Content", prompts: ["Fetch posts"] }], attachments: [], directives: [], subjects: [] }, digest: "d", app: "social-content" });
+  }
   if (url.pathname.endsWith("/chat-descriptor")) return json({ error: "no chat descriptor" }, 404);
   const m = url.pathname.match(/^\/api\/app-installations\/([^/]+)(\/contexts|\/conversations)?$/);
   if (m && m[2] === "/conversations") {
@@ -77,6 +83,7 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
     return json({ conversations: convs[m[1]] });
   }
   if (m && m[2] === "/contexts") return json(ctxs(m[1]));
+  if (m && m[1] === "install-social") return json({ ...inst(m[1], "social-content"), executable: true, files: ["app.md", "screens/main/screens.json"] });
   if (m) return json(inst(m[1], m[1] === "install-crm" ? "crm" : "reports"));
   if (url.pathname === "/api/threads/master/messages") {
     messagePosts.push(JSON.parse(String(init!.body)));
@@ -103,16 +110,25 @@ async function mount(installId: string, viewer = { operator: true, readOnly: fal
   await React.act(async () => { root.render(React.createElement(AppShell, { installId, viewer })); });
   await settle();
 }
-const picker = () => host.querySelector('select[aria-label="Conversation"]') as HTMLSelectElement;
-const optionLabels = () => Array.from(picker().options).map((o) => o.textContent);
+// CAD-1326: the select is gone; the history button lists conversations and
+// the scope row names the open one (or the unsaved draft).
+const histBtn = () => host.querySelector('[aria-label="Conversation history"]') as HTMLButtonElement;
+const rows = () => Array.from(host.querySelectorAll("[data-chat-history] .app-chat-history-row")) as HTMLButtonElement[];
+async function openHistory() {
+  if (!host.querySelector("[data-chat-history]")) {
+    await React.act(async () => { histBtn().dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+  }
+}
+const optionLabels = async () => { await openHistory(); return rows().map((r) => r.textContent); };
+const openLabel = () => host.querySelector("[data-chat-conv-label]")?.textContent?.replace(/^·\s*/, "") ?? null;
 const pane = () => (host.querySelector("[data-chat-pane]") as HTMLElement).textContent ?? "";
 const box = () => host.querySelector("#app-shell-chat-box") as HTMLTextAreaElement;
 const newButton = () => host.querySelector("[data-chat-new]") as HTMLButtonElement;
-async function pick(id: string) {
-  await React.act(async () => {
-    Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")!.set!.call(picker(), id);
-    picker().dispatchEvent(new Event("change", { bubbles: true }));
-  });
+async function pick(label: string) {
+  await openHistory();
+  const row = rows().find((r) => r.textContent === label);
+  assert(row, `history lists ${label}`);
+  await React.act(async () => { row!.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
   await settle();
 }
 async function type(text: string, key = "Enter") {
@@ -127,11 +143,15 @@ async function type(text: string, key = "Enter") {
 await mount("install-crm");
 
 // Picker: General, the campaign conversation, and + New; only the selected conversation's entries show.
-equal(optionLabels(), ["General", "Spring launch"], "picker lists General and the campaign conversation");
-assert(newButton() && newButton().getAttribute("aria-label") === "New conversation", "the + icon (New conversation) sits beside the picker");
-equal(picker().value, "c-gen", "General is the default");
+equal(await optionLabels(), ["General", "Spring launch"], "history lists General and the campaign conversation");
+assert(newButton() && newButton().getAttribute("aria-label") === "New conversation", "the + icon (New conversation) sits in the header tools");
+assert(newButton().closest(".app-chat-head-tools") && newButton().nextElementSibling === histBtn(), "New sits before the history button in the header tools");
+assert(!host.querySelector('select[aria-label="Conversation"], [data-chat-home-link], [data-chat-conversations]'), "no conversation select, row or Home link");
+equal(openLabel(), "General", "General is the default and the scope row names it");
+await optionLabels();
+equal(rows()[0].getAttribute("aria-current"), "true", "history marks General as the open one");
 assert(pane().includes("general answer") && !pane().includes("campaign brief"), "General shows only its own thread");
-await pick("c-camp");
+await pick("Spring launch");
 assert(pane().includes("campaign brief") && !pane().includes("general answer"), "the campaign conversation shows only its own thread");
 
 // A send names the selected conversation as a selector only.
@@ -144,8 +164,8 @@ for (const forged of ["subject", "scope", "thread", "install_id", "is_general"])
 await type("/new");
 equal(messagePosts.length, 1, "/new is not sent as a message");
 equal(createPosts, [{ install: "install-crm", body: { context_id: "ctx-a" } }], "/new creates one conversation with no subject");
-equal(picker().value, "new-1", "the fresh conversation is selected");
-assert(optionLabels().length === 3 && optionLabels().includes("General"), "older conversations stay listed");
+assert(openLabel() !== "General" && openLabel() !== "Spring launch", "the fresh conversation is the open one");
+assert((await optionLabels()).length === 3 && (await optionLabels()).includes("General"), "older conversations stay listed");
 equal(box().value, "", "the command is cleared from the composer");
 await type("/clear");
 equal(messagePosts.length, 1, "/clear is not sent as a message");
@@ -162,7 +182,7 @@ equal(createPosts.map((p) => p.body), [{ context_id: "ctx-a" }, { context_id: "c
   await React.act(async () => { await autoSelectCampaignConversation("install-crm", "cmp-fresh"); });
   await settle();
   equal(createPosts.length, createsBefore, "opening a campaign page creates no conversation");
-  assert(optionLabels().includes("New campaign conversation (unsaved)"), "the campaign conversation shows as new");
+  equal(openLabel(), "New campaign conversation (unsaved)", "the unsaved campaign draft is named in the scope row");
   await type("first brief");
   equal(createPosts.length, createsBefore + 1, "exactly one create on first send");
   equal(createPosts[createPosts.length - 1].body, { context_id: "ctx-a", subject: "campaign:cmp-fresh" }, "the create names the campaign subject");
@@ -171,7 +191,7 @@ equal(createPosts.map((p) => p.body), [{ context_id: "ctx-a" }, { context_id: "c
 }
 
 // Queued notice: the master is on another conversation's message while this one waits.
-await pick("c-camp");
+await pick("Spring launch");
 turn = { state: "working", message: "m-gen-elsewhere" };
 await React.act(async () => { await resources.masterState.refresh(); });
 await settle();
@@ -188,7 +208,7 @@ await settle();
 // a compact status — Sending… while its POST is in flight, Queued… when the
 // daemon reports this conversation's message as the queue head. Neither bleeds
 // into another conversation, and only the owned working turn offers Stop.
-await pick("c-camp");
+await pick("Spring launch");
 {
   let resolveSend: ((r: Response) => void) | null = null;
   deferSend = (r) => { resolveSend = r; };
@@ -218,12 +238,12 @@ await pick("c-camp");
   assert(host.querySelector("[data-chat-stop]") !== null, "the owned working turn still offers Stop");
   assert(pane().includes("Working…"), "the working row still shows");
 
-  await pick("c-gen");
+  await pick("General");
   assert(host.querySelector("[data-chat-status]") === null, "the status does not bleed into another conversation");
   turn = null;
   await React.act(async () => { await resources.masterState.refresh(); });
   await settle();
-  await pick("c-camp");
+  await pick("Spring launch");
 }
 
 // Collapse state is per app.
@@ -231,9 +251,20 @@ await React.act(async () => { (host.querySelector(".app-chat-collapse") as HTMLE
 assert(host.querySelector(".app-shell-grid")!.hasAttribute("data-chat-collapsed"), "CRM chat collapses");
 await mount("install-other");
 assert(!host.querySelector(".app-shell-grid")!.hasAttribute("data-chat-collapsed"), "another app's chat is not collapsed");
-equal(optionLabels(), ["General"], "another app lists only its own conversations");
+equal(await optionLabels(), ["General"], "another app lists only its own conversations");
 await mount("install-crm");
 assert(host.querySelector(".app-shell-grid")!.hasAttribute("data-chat-collapsed"), "the CRM chat stays collapsed");
+
+// CAD-1326: Social's quick-action rows show only while the open conversation
+// has no messages; they return when a new empty conversation starts.
+await mount("install-social");
+const prompts = () => host.querySelector("[data-chat-prompts]");
+assert(prompts(), "an empty conversation shows the quick actions");
+await pick("Has messages");
+assert(!prompts(), "a conversation with messages hides the quick actions");
+await React.act(async () => { newButton().dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+await settle();
+assert(prompts(), "a new empty conversation brings the quick actions back");
 
 // A read-only viewer cannot create a conversation by any route.
 await mount("install-crm", { operator: true, readOnly: true });
