@@ -1162,8 +1162,15 @@ fn validate_contents(
             }
         }
         for tag in candidates {
-            if let Err(e) = crate::issue::app_screen_pkg::extract(&screen_map, tag) {
-                errors.push(format!("screens/{tag}: {e}"));
+            match crate::issue::app_screen_pkg::extract(&screen_map, tag) {
+                // Same binding the mount RPC enforces: the package's
+                // declared `app` must be this bundle's manifest app —
+                // a package cannot claim a different app.
+                Ok(pkg) if pkg.app != manifest.app => errors.push(format!(
+                    "screens/{tag}: screen package declares an app that is not the installation"
+                )),
+                Err(e) => errors.push(format!("screens/{tag}: {e}")),
+                Ok(_) => {}
             }
         }
     }

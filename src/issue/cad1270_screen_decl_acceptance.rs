@@ -104,6 +104,29 @@ fn cad1270_valid_screen_package_passes_validate_texts() {
     assert_eq!(validated.manifest.app, "fixture-app");
 }
 
+/// A valid declaration whose app identity differs from `app.md` must be
+/// refused by the shared install validator, even though its assets, tag
+/// directory, workflow and declaration integrity are otherwise sound.
+/// The tag remains `board`: package routing is independent of app identity.
+#[test]
+fn cad1270_screen_declaring_another_app_refuses_validate_texts() {
+    let js = "console.log('x');";
+    let files = bundle(
+        &screen_decl("some-other-app", &[("client.js", js)]),
+        &[("client.js", js)],
+    );
+
+    match validate(files) {
+        Ok(_) => panic!("screen package declaring another app must be refused"),
+        Err(error) => assert!(
+            error
+                .to_string()
+                .contains("screen package declares an app that is not the installation"),
+            "refusal must come from the authoritative app-binding guard, got: {error}"
+        ),
+    }
+}
+
 /// A declaration the authoritative `validate_map` refuses must refuse
 /// `validate_texts` even though every workflow parses and every cap is
 /// met. Each mutation targets a different integrity clause: tampered
