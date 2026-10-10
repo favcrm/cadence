@@ -333,7 +333,7 @@ impl Shared {
                 .get("instructions")
                 .and_then(Value::as_str)
                 .filter(|t| !t.trim().is_empty())
-                .map(|t| format!(" Your note: \"{}\".", clip(t.trim(), 60)))
+                .map(|t| format!(" Your note: \"{}\".", t.trim()))
                 .unwrap_or_default();
             (
                 format!(
@@ -358,6 +358,11 @@ impl Shared {
                 }),
             )
         };
+        if reason.chars().count() > MAX_REASON {
+            return Err(Error::rejected(
+                "the note is too long to show in full on the confirmation card; shorten it",
+            ));
+        }
         records.app_assistant_operation_set(crate::store::app_records::AssistantOperationUpdate {
             operation_id,
             context,
@@ -367,7 +372,7 @@ impl Shared {
             result: &Value::Null,
             resource_refs: &json!([]),
             permission_request: &json!({
-                "reason": clip(&reason, MAX_REASON),
+                "reason": reason,
                 "scope": {"install_id":install,"context_id":context,"action_id":action,"resource_id":clip(&resource,128)},
                 "allow_always": false,
                 "preview": preview,

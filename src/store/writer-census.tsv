@@ -14,8 +14,6 @@ contract_fixture.rs	contract-test-fixtures	execute	1
 daemon.rs	daemon-store-construction-and-inline-tests	execute	24
 daemon.rs	daemon-store-construction-and-inline-tests	open	19
 daemon.rs	daemon-store-construction-and-inline-tests	transaction	2
-daemon/app_assistant_social_flow.rs	test-fixtures	execute	1
-daemon/app_assistant_social_flow.rs	test-fixtures	open	1
 daemon/app_capabilities_rpc/tests.rs	test-fixtures	execute	1
 daemon/app_capabilities_rpc/tests.rs	test-fixtures	open	1
 daemon/app_effects_rpc.rs	non-sqlite-platform-adapter-execution	execute	1
@@ -205,6 +203,8 @@ daemon/cad1184_acceptance.rs	independent-daemon-acceptance-fixtures	open	1
 daemon/cad1218_acceptance.rs	independent-daemon-acceptance-fixtures	open	1
 daemon/cad1184_revision_acceptance.rs	independent-daemon-acceptance-fixtures	execute	2
 daemon/cad1184_revision_acceptance.rs	independent-daemon-acceptance-fixtures	open	1
+daemon/cad1327_acceptance.rs	independent-daemon-acceptance-fixtures	execute	1
+daemon/cad1327_acceptance.rs	independent-daemon-acceptance-fixtures	open	1
 daemon/conversations_acceptance.rs	independent-daemon-acceptance-fixtures	execute	5
 daemon/conversations_acceptance.rs	independent-daemon-acceptance-fixtures	open	4
 daemon/campaign_clone_acceptance.rs	independent-daemon-acceptance-fixtures	open	1

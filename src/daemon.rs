@@ -32,8 +32,6 @@ mod app_explorer_rpc;
 mod app_image_jobs;
 #[cfg(feature = "test-seam")]
 pub use app_image_jobs::test_probe as image_job_probe;
-#[cfg(all(test, feature = "test-seam"))]
-mod app_assistant_social_flow;
 mod app_records_rpc;
 mod app_runs_rpc;
 mod app_screens_rpc;
@@ -54,6 +52,8 @@ mod cad1212_acceptance;
 mod cad1218_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1314_approval_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad1327_acceptance;
 mod caller_rule;
 #[cfg(all(test, feature = "test-seam"))]
 mod campaign_clone_acceptance;
