@@ -6,6 +6,20 @@ use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+fn stable_social_effect_material(frozen: &Value) -> Value {
+    json!({
+        "install_id": frozen["install_id"],
+        "context_id": frozen["context_id"],
+        "draft_id": frozen["draft_id"],
+        "revision": frozen["revision"],
+        "caption_digest": frozen["caption_digest"],
+        "image_digest": frozen["image_digest"],
+        "binding_digest": frozen["binding"]["digest"],
+        "toolkit": frozen["toolkit"],
+        "destination_id": frozen["destination_id"],
+    })
+}
+
 const DRAFT_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS app_social_drafts(\
  install_id TEXT NOT NULL, context_id TEXT NOT NULL, draft_id TEXT NOT NULL,\
  revision INTEGER NOT NULL CHECK(revision>0), caption TEXT NOT NULL,\
@@ -693,7 +707,10 @@ impl RecordStore {
         self.write_tx(|tx|{
             if let Some((existing,))=tx.query_row("SELECT effect_id FROM app_social_effects WHERE request_id=?",[request],|r|Ok((r.get::<_,String>(0)?,))).optional()? {
                 let shown=Self::social_effect_in(tx,self.install(),&existing)?;
-                if shown["effect"]["digest"]!=digest{return Err(Error::rejected("social effect request ID was reused for changed frozen material"));}
+                let stored_frozen = &shown["effect"]["authority"];
+                if stable_social_effect_material(stored_frozen) != stable_social_effect_material(frozen) {
+                    return Err(Error::rejected("social effect request ID was reused for changed frozen material"));
+                }
                 return Ok(shown);
             }
             let at=now();tx.execute("INSERT INTO app_social_effects(effect_id,install_id,context_id,draft_id,revision,request_id,digest,frozen_json,state,approval_id,created,updated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",params![effect_id,self.install(),context,draft,revision,request,digest,packed,"waiting",approval,at,at])?;
