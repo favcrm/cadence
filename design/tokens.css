@@ -48,53 +48,53 @@
 @media (prefers-color-scheme: light) {
   :root:not([data-theme="dark"]) {
     color-scheme: light;
-    --color-ink-950: #e6e8eb;
-    --color-ink-900: #f4f5f6;
-    --color-ink-875: #eceef0;
+    --color-ink-950: #f8f9fa;
+    --color-ink-900: #f8f9fa;
+    --color-ink-875: #f3f5f6;
     --color-ink-850: #ffffff;
-    --color-ink-800: #e9ebee;
-    --color-ink-700: #dfe2e6;
-    --color-ink-600: #cdd2d8;
-    --color-ink-500: #6b7280;
-    --color-ink-400: #4b5563;
-    --color-ink-300: #374151;
-    --color-ink-200: #1b1d21;
-    --color-ink-100: #0b0b0c;
-    --color-accent: #0f766e;
+    --color-ink-800: #edf0f2;
+    --color-ink-700: #e1e6e8;
+    --color-ink-600: #cdd4d8;
+    --color-ink-500: #68767d;
+    --color-ink-400: #536168;
+    --color-ink-300: #38454c;
+    --color-ink-200: #2a353b;
+    --color-ink-100: #20292d;
+    --color-accent: #126b60;
     --color-ok: #15803d;
     --color-fail: #dc2626;
     --color-warn: #b45309;
     --color-info: #2563eb;
     --color-on-accent: #ffffff;
-    --color-edge: #c4c9d0;
-    --color-edge-hover: #9aa1a9;
-    --color-scrim: rgb(17 24 39 / .35);
+    --color-edge: #a6b2b8;
+    --color-edge-hover: #8b979e;
+    --color-scrim: rgb(24 40 47 / .35);
   }
 }
 
 [data-theme="light"] {
   color-scheme: light;
-  --color-ink-950: #e6e8eb;
-  --color-ink-900: #f4f5f6;
-  --color-ink-875: #eceef0;
+  --color-ink-950: #f8f9fa;
+  --color-ink-900: #f8f9fa;
+  --color-ink-875: #f3f5f6;
   --color-ink-850: #ffffff;
-  --color-ink-800: #e9ebee;
-  --color-ink-700: #dfe2e6;
-  --color-ink-600: #cdd2d8;
-  --color-ink-500: #6b7280;
-  --color-ink-400: #4b5563;
-  --color-ink-300: #374151;
-  --color-ink-200: #1b1d21;
-  --color-ink-100: #0b0b0c;
-  --color-accent: #0f766e;
+  --color-ink-800: #edf0f2;
+  --color-ink-700: #e1e6e8;
+  --color-ink-600: #cdd4d8;
+  --color-ink-500: #68767d;
+  --color-ink-400: #536168;
+  --color-ink-300: #38454c;
+  --color-ink-200: #2a353b;
+  --color-ink-100: #20292d;
+  --color-accent: #126b60;
   --color-ok: #15803d;
   --color-fail: #dc2626;
   --color-warn: #b45309;
   --color-info: #2563eb;
   --color-on-accent: #ffffff;
-  --color-edge: #c4c9d0;
-  --color-edge-hover: #9aa1a9;
-  --color-scrim: rgb(17 24 39 / .35);
+  --color-edge: #a6b2b8;
+  --color-edge-hover: #8b979e;
+  --color-scrim: rgb(24 40 47 / .35);
 }
 
 [data-theme="dark"] {

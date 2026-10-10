@@ -104,23 +104,21 @@ const pointerDown = (target: any) => act(() => { target.dispatchEvent(new win.Ev
   done();
 }
 
-// The sidebar row trigger: avatar, name, "role · host" with the full value in a title, an up-chevron.
+// The sidebar row trigger (CAD-1312): avatar, name and role on one compact
+// line with a title and an up-chevron — no host, which the header owns now.
 {
-  const longHost = "demo-company-with-a-very-long-name.cadencecloud.app";
-  const real = win.location.href;
-  win.happyDOM.setURL(`http://${longHost}/`);
   const { host, done } = mount(menu(signedIn, { trigger: "row", placement: "above-start" }));
   const t = trigger(host);
   assert(t.className.includes("navlink") && t.className.includes("account-row"), "row trigger uses the navlink family");
-  assert(t.textContent?.includes("Fable Chen") && t.textContent.includes(`operator · ${longHost}`), "row shows name and role · host");
-  assert(host.querySelector(`[title='operator · ${longHost}']`), "full role · host in a title");
-  assert(t.querySelector(".truncate") && t.querySelector(".rotate-180"), "host truncates and the chevron points up");
+  assert(t.textContent?.includes("Fable Chen") && t.textContent.includes("operator"), "row shows name and role");
+  assert(!t.textContent?.includes("localhost"), "row no longer repeats the host");
+  assert(host.querySelector("[title='Fable Chen · operator']"), "full name · role in a title");
+  assert(t.querySelector(".truncate") && t.querySelector(".rotate-180"), "name truncates and the chevron points up");
   assert(!t.textContent?.includes("Sign out"), "row trigger is only the trigger");
   act(() => t.click());
   const cls = panel(host).className as string;
   assert(cls.includes("bottom-full") && cls.includes("left-0") && !cls.includes("top-full"), "above-start opens above, left-aligned");
   done();
-  win.happyDOM.setURL(real);
 }
 
 // Identity and the writes line.

@@ -9,6 +9,7 @@ import Button from "../../ui/Button";
 import Link from "../../ui/Link";
 import Md from "../../ui/Md";
 import Select from "../../ui/Select";
+import PageState from "../../ui/PageState";
 import { IconCaret, IconRefresh, IconSearch } from "../../ui/icons";
 import {
   outboxHref,
@@ -84,17 +85,10 @@ export default function Outbox({
       </div>
 
       {!operator ? (
-        <div className="card outbox-notice">
-          <div>
-            <h2 className="text-secondary font-medium text-ink-100 mb-1">
-              Sign in to view published posts
-            </h2>
-            <p>
-              Outbox is available to the operator. Use Sign in in the top bar to
-              connect with a login link.
-            </p>
-          </div>
-        </div>
+        <PageState title="Operator access required">
+          Outbox is available to the operator. Use Sign in in the status bar if you have
+          operator access.
+        </PageState>
       ) : filters.item ? (
         <OutboxDetailView
           key={filters.item}

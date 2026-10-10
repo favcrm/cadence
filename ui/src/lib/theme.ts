@@ -1,9 +1,10 @@
 /**
- * The colour theme: the system preference unless the operator picked one.
+ * The colour theme: dark by default, unless the operator picked one.
  * A pick is stored per browser and applied as `data-theme` on <html>,
- * which styles.css reads; "system" removes both, so the media query
- * decides again. Storage can throw (private windows, locked-down web
- * views) — then the pick lasts only for the page.
+ * which styles.css reads; "system" is stored explicitly so the media
+ * query decides instead of the dark fallback. Storage can throw
+ * (private windows, locked-down web views) — then the pick lasts only
+ * for the page.
  */
 
 export type ThemePref = "system" | "light" | "dark";
@@ -13,9 +14,9 @@ const THEME_KEY = "cadence-theme";
 export function readThemePref(storage: Pick<Storage, "getItem"> | undefined): ThemePref {
   try {
     const value = storage?.getItem(THEME_KEY);
-    return value === "light" || value === "dark" ? value : "system";
+    return value === "light" || value === "dark" || value === "system" ? value : "dark";
   } catch {
-    return "system";
+    return "dark";
   }
 }
 
@@ -24,8 +25,9 @@ export function writeThemePref(
   storage: Pick<Storage, "setItem" | "removeItem"> | undefined,
 ): void {
   try {
-    if (pref === "system") storage?.removeItem(THEME_KEY);
-    else storage?.setItem(THEME_KEY, pref);
+    // "system" is a real pick, not an absence: it is stored explicitly so
+    // the next load does not conflate it with the dark default.
+    storage?.setItem(THEME_KEY, pref);
   } catch {
     // Unstorable: the theme still applies until the page reloads.
   }

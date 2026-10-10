@@ -4,6 +4,7 @@ import type { Connection } from "../../lib/types";
 import Button from "../../ui/Button";
 import Link from "../../ui/Link";
 import Select from "../../ui/Select";
+import PageState from "../../ui/PageState";
 import type { Viewer } from "../projects/work";
 import ConfirmDialog from "../app-shell/shared/ConfirmDialog";
 import { newAudienceId } from "../app-shell/segmentGrammar";
@@ -85,9 +86,10 @@ export default function EmailSending({ viewer }: { viewer: Viewer }) {
         until an operator approves a campaign.
       </p>
       {!viewer.operator ? (
-        <div className="card px-4 py-5 text-label text-ink-400">
-          Email sending is available to the operator. Use Sign in in the top bar.
-        </div>
+        <PageState title="Operator access required">
+          Email sending is available to the operator. Use Sign in in the status bar if you
+          have operator access.
+        </PageState>
       ) : error !== null ? (
         <p className="text-label text-fail" role="alert">
           {error}

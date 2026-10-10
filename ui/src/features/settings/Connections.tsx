@@ -6,6 +6,7 @@ import type { Connection, ConnectionProvider } from "../../lib/types";
 import Button from "../../ui/Button";
 import { ResourceGate, StaleChip } from "../../ui/ResourceStatus";
 import { IconRefresh } from "../../ui/icons";
+import PageState from "../../ui/PageState";
 import {
   acceptsSmtp,
   acceptsToken,
@@ -162,15 +163,10 @@ export default function Connections({
       </div>
 
       {!viewer.operator ? (
-        <div className="card px-4 py-5">
-          <h2 className="text-secondary font-medium text-ink-100 mb-1">
-            Sign in to manage connections
-          </h2>
-          <p className="text-label text-ink-400">
-            Connections are available to the operator. Use Sign in in the top bar to connect
-            with a login link.
-          </p>
-        </div>
+        <PageState title="Operator access required">
+          Connections are available to the operator. Use Sign in in the status bar if you
+          have operator access.
+        </PageState>
       ) : (
         <>
           <ResourceGate

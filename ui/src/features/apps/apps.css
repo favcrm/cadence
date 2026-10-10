@@ -57,3 +57,73 @@
     font-size: 1rem;
   }
 }
+
+/* CAD-1312: the Apps home's states — sign-in refusal, load failure and
+   the empty workspace — share one restrained left-aligned panel instead
+   of a wide banner or a centred hero card. */
+.apps-state {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.75rem 1rem;
+  text-align: left;
+}
+.apps-state-icon {
+  flex: none;
+  display: inline-flex;
+}
+.apps-state-body {
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: 24rem;
+}
+.apps-state-title {
+  font-size: var(--text-secondary);
+  font-weight: 500;
+  color: var(--color-ink-100);
+}
+.apps-state-copy {
+  margin-top: 0.125rem;
+  font-size: var(--text-label);
+  color: var(--color-ink-400);
+  line-height: 1.5;
+}
+.apps-state .btn {
+  flex: none;
+  margin-left: auto;
+}
+.apps-substate {
+  padding: 0.375rem 0.125rem;
+}
+.apps-substate-install {
+  margin-top: 0.25rem;
+}
+.apps-substate-install > summary {
+  cursor: pointer;
+  color: var(--color-ink-400);
+  font-size: var(--text-micro);
+  width: fit-content;
+}
+.apps-substate-install > summary:hover {
+  color: var(--color-accent);
+}
+.apps-substate-install > code {
+  display: inline-block;
+  margin-top: 0.375rem;
+  padding: 0.25rem 0.5rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.25rem;
+  background: var(--color-ink-875);
+}
+@media (max-width: 639px) {
+  .apps-state {
+    flex-wrap: wrap;
+  }
+}
+
+/* CAD-1312: the unified zero-content state uses the shared .page-state
+   (ui/PageState.tsx); the host screen only has to flex so it can centre
+   in the pane below the header. */
+.apps-home.flex {
+  min-height: calc(100dvh - 2.25rem);
+}

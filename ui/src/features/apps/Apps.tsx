@@ -11,9 +11,11 @@ import "./apps.css";
 import Link from "../../ui/Link";
 import Button from "../../ui/Button";
 import { appExplorer, notifyAppsChanged, type HomeInstallation, type FavoritesPayload, type Installation } from "../workspace-apps/workspaceApps";
-import { appErrorCopy, appLoadErrorCopy } from "../explorer/appErrors";
+import { appErrorCopy, appLoadErrorCopy, UNVERIFIED_APPS_COPY } from "../explorer/appErrors";
 import type { Viewer } from "../projects/work";
 import { AppGlyph } from "../explorer/shared";
+import PageState from "../../ui/PageState";
+import { IconApps, IconLock } from "../../ui/icons";
 import "../explorer/explorer.css";
 
 /**
@@ -78,6 +80,20 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
     return ids.map((id) => byId.get(id)).filter((h): h is HomeInstallation => !!h);
   }, [favs, byId]);
 
+  // CAD-1312: a fully-loaded empty workspace drops the header's Explore
+  // CTA — the state panel carries the same action once, next to its copy.
+  const emptyWorkspace = home !== null && live.length === 0 && loadError === null;
+  // When nothing exists on either list — a confirmed-empty project-apps
+  // answer and no workspace apps (live or recently removed) — the screen
+  // becomes one full-page state instead of stacked empty sections. The
+  // sign-in refusal and a load failure get their own honest variants; a
+  // partially loaded screen (stale rows, removed apps to restore, project
+  // rows, a project list still loading or failed) keeps normal sections.
+  const noWorkspaceApps = live.length === 0 && removedList.length === 0;
+  const noProjectApps = projectApps.data != null && projectRows.length === 0;
+  const bareApps =
+    noWorkspaceApps && noProjectApps && (home !== null || loadError !== null);
+
   const items = useMemo(() => {
     const needle = q.trim().toLowerCase();
     let list = live.filter((h) => !needle || [h.name, h.title, h.tagline].filter(Boolean).join(" ").toLowerCase().includes(needle));
@@ -127,17 +143,54 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
   };
 
   return (
-    <main className="apps-home px-4 lg:px-8 pt-4 pb-9 min-w-0" aria-label="apps">
+    <main className={`apps-home px-4 lg:px-8 min-w-0 ${bareApps ? "flex" : "pt-4 pb-9"}`} aria-label="apps">
+      {bareApps ? (
+        <PageState
+          title={
+            loadError === UNVERIFIED_APPS_COPY
+              ? "Sign in to view your apps"
+              : loadError !== null
+                ? "Apps could not be loaded"
+                : "No apps installed yet"
+          }
+          icon={loadError === UNVERIFIED_APPS_COPY ? <IconLock size={32} /> : <IconApps size={32} />}
+          actions={
+            loadError !== null && loadError !== UNVERIFIED_APPS_COPY ? (
+              <Button onClick={retryAll}>Retry</Button>
+            ) : (
+              <Button className="btn-primary" href="/apps/explore">Explore apps</Button>
+            )
+          }
+        >
+          {loadError === UNVERIFIED_APPS_COPY
+            ? `${loadError} Use Sign in in the status bar.`
+            : loadError !== null
+              ? loadError
+              : isOp
+                ? "Apps add new skills to your workspace — a customer list, social posts and more. Browse what's available and install one in a tap."
+                : "Your admin hasn't installed any apps yet. Browse what's available and ask for one."}
+        </PageState>
+      ) : (
+        <>
       <div className="ohead flex flex-wrap items-center gap-3 mb-2">
         <h1 className="text-section font-semibold text-ink-100">Apps</h1>
         <span className="grow" />
-        <Button className="btn-primary" href="/apps/explore">Explore apps</Button>
+        {!emptyWorkspace && <Button className="btn-primary" href="/apps/explore">Explore apps</Button>}
       </div>
 
       {actionError && <div className="alert fail mb-4" role="alert">{actionError}</div>}
       {loadError !== null && (
-        <div className="card px-4 py-3 mb-4 text-label text-ink-400" role="alert">
-          {loadError} <Button onClick={retryAll}>Retry</Button>
+        <div className="apps-state card mb-4" role="alert">
+          {loadError === UNVERIFIED_APPS_COPY ? (
+            <span className="apps-state-icon text-ink-500" aria-hidden><IconLock size={16} /></span>
+          ) : null}
+          <div className="apps-state-body">
+            <h2 className="apps-state-title">
+              {loadError === UNVERIFIED_APPS_COPY ? "Sign in to view workspace apps" : "Apps could not be loaded"}
+            </h2>
+            <p className="apps-state-copy">{loadError}</p>
+          </div>
+          <Button className="btn-sm" onClick={retryAll}>Retry</Button>
         </div>
       )}
       {retrying && <p className="text-label text-ink-400 mb-2" role="status">The workspace is busy. Retrying…</p>}
@@ -145,15 +198,18 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
         loadError === null && !retrying && <p className="text-label text-ink-400" role="status">Loading your apps…</p>
       ) : (
         <>
-          {live.length === 0 && loadError === null && (
-            <div className="card px-4 py-8 text-center my-4">
-              <h3 className="text-cardtitle font-medium text-ink-100 mb-1">No apps yet</h3>
-              <p className="text-secondary text-ink-400 mb-4">
-                {isOp
-                  ? "Apps add new skills to your workspace — a customer list, social posts and more. Browse what's available and install one in a tap."
-                  : "Your admin hasn't installed any apps yet. Browse what's available and ask for one."}
-              </p>
-              <Button className="btn-primary btn-lg" href="/apps/explore">Explore apps</Button>
+          {emptyWorkspace && (
+            <div className="apps-state card my-4">
+              <span className="apps-state-icon text-accent" aria-hidden><IconApps size={18} /></span>
+              <div className="apps-state-body">
+                <h2 className="apps-state-title">No apps installed yet</h2>
+                <p className="apps-state-copy">
+                  {isOp
+                    ? "Apps add new skills to your workspace — a customer list, social posts and more. Browse what's available and install one in a tap."
+                    : "Your admin hasn't installed any apps yet. Browse what's available and ask for one."}
+                </p>
+              </div>
+              <Button className="btn-primary" href="/apps/explore">Explore apps</Button>
             </div>
           )}
 
@@ -164,6 +220,7 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
             </section>
           )}
 
+          {!emptyWorkspace && (
           <section className="sec" aria-label="Favorites">
             <div className="sechead">
               <h2>Favorites</h2>
@@ -192,6 +249,7 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
               </div>
             )}
           </section>
+          )}
 
           {live.length > 0 && (
             <section className="sec" aria-label="Installed">
@@ -279,12 +337,14 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
           onRetry={() => void resources.apps.invalidate()}
         />
         {projectApps.data && projectRows.length === 0 && (
-          <div className="card px-4 py-5 text-secondary text-ink-400">
-            No project apps installed{project === "all" ? "" : ` in ${project}`} —{" "}
-            <code className="num text-ink-300">
-              cadence app install &lt;path|git-url&gt; --project {project === "all" ? "<key>" : project}
-            </code>{" "}
-            puts one here.
+          <div className="apps-substate text-label text-ink-500">
+            <p>No project apps installed{project === "all" ? "" : ` in ${project}`}.</p>
+            <details className="apps-substate-install">
+              <summary>Install a project app</summary>
+              <code className="num text-ink-300">
+                cadence app install &lt;path|git-url&gt; --project {project === "all" ? "<key>" : project}
+              </code>
+            </details>
           </div>
         )}
         <ul className="space-y-2.5">
@@ -293,6 +353,8 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
           ))}
         </ul>
       </section>
+        </>
+      )}
     </main>
   );
 }

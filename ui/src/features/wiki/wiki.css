@@ -1168,3 +1168,14 @@
     font-size: 16px;
   }
 }
+
+/* CAD-1312: the pane's PageState (a 403 refusal) centres in the pane's
+   own height — the pane scrolls normally, so the state gets a flex
+   column to centre within. */
+.wk-pane:has(> .page-state) {
+  display: flex;
+  flex-direction: column;
+}
+.wk-pane > .page-state {
+  min-height: min(28rem, 100%);
+}

@@ -50,7 +50,8 @@ import Login from "./features/auth/Login";
 import SignIn from "./features/auth/SignIn";
 import { kickoffBlock as operatorKickoffBlock, writeBlock } from "./features/auth/gate";
 import { WriteGate } from "./features/auth/WriteGate";
-import { sessionKey, setSessionKey } from "./lib/sessionKey";
+import { sessionHeaders, sessionKey, setSessionKey } from "./lib/sessionKey";
+import type { PlatformAccount as PlatformAccountInfo } from "./features/settings/accountDisplay";
 import { buildChanged, serverBuild, subscribeSse, UI_BUILD } from "./lib/sse";
 import { runningRelease } from "./lib/fmt";
 import { applyDraft, composerField, sessionStore, stashDraft, takeDraft } from "./lib/draft";
@@ -176,6 +177,30 @@ export default function App() {
   const block = writeBlock(meta);
   const readOnly = block !== null;
   const actor = meta?.actor ?? "operator (ui)";
+
+  // CAD-1312: the header's organisation label is the hosted board's
+  // configured company display name (`GET /api/platform-account`, already
+  // projected server-side). Local and tailnet boards have no configured
+  // organisation — the label stays the neutral "Cadence", never a
+  // hostname, user or project name. One nonblocking read per page load;
+  // a failure or missing name leaves the fallback.
+  const [orgName, setOrgName] = useState("Cadence");
+  useEffect(() => {
+    if (meta === null) return;
+    if (meta.platform_account_configured !== true) {
+      setOrgName("Cadence");
+      return;
+    }
+    const abort = new AbortController();
+    fetch("/api/platform-account", { headers: sessionHeaders(), signal: abort.signal })
+      .then((resp) => (resp.ok ? (resp.json() as Promise<PlatformAccountInfo>) : null))
+      .then((data) => {
+        const name = data?.account?.company.name?.trim();
+        if (!abort.signal.aborted) setOrgName(name || "Cadence");
+      })
+      .catch(() => undefined);
+    return () => abort.abort();
+  }, [meta?.platform_account_configured, meta === null]);
 
   useEffect(() => {
     persistBrowserProjectView(view);
@@ -720,9 +745,13 @@ export default function App() {
             aria-expanded={menuOpen}
             aria-controls="mobile-navigation"
           >
-            <IconList size={18} />
+            <IconList size={16} />
           </button>
           <nav className="header-breadcrumb min-w-0 flex-1" aria-label="Breadcrumb">
+            {/* The organisation's display name, or the board's neutral
+                label — never a hostname or project mistaken for an org. */}
+            <span className="header-org truncate font-medium text-ink-100" title={orgName}>{orgName}</span>
+            <span className="hidden sm:inline text-ink-600" aria-hidden="true">/</span>
             {route.screen === "projects" && route.slug ? (
               <>
                 <Link href={hrefFor({ screen: "projects", slug: null, section: "overview" })} className="hidden sm:inline-flex">Projects</Link>
@@ -732,7 +761,7 @@ export default function App() {
             ) : <span className="truncate text-ink-200 capitalize">{route.screen === "issue" ? route.id : SCREEN_LABEL[screen]}</span>}
           </nav>
 
-          <div className="ml-auto flex items-center gap-0 sm:gap-2 shrink-0">
+          <div className="ml-auto flex items-center gap-1 shrink-0">
             <StatusChips
               variant="header"
               readOnly={boardReadOnly}
@@ -808,7 +837,6 @@ export default function App() {
           </div>
         )}
 
-        {screen === "home" && <SetupNudge readOnly={meta ? boardReadOnly : null} />}
         {screen === "home" && (
           <Home
             readOnly={readOnly}
@@ -817,6 +845,7 @@ export default function App() {
             onOpenIssue={openIssue}
             overviewHref={hrefFor({ screen: "overview" })}
             permissionsHref={hrefFor({ screen: "settings", section: "permissions" })}
+            setupNotice={<SetupNudge readOnly={meta ? boardReadOnly : null} />}
           />
         )}
         {screen === "overview" && (
@@ -1031,7 +1060,8 @@ export default function App() {
             tabs={[
               { label: "Models", href: hrefFor({ screen: "settings", section: "models" }), on: route.section === "models" },
               { label: "Connections", href: hrefFor({ screen: "settings", section: "connections" }), on: route.section === "connections" },
-              { label: "Email sending", href: hrefFor({ screen: "settings", section: "email" }), on: route.section === "email" },
+              // CAD-1312: Email sending leaves the settings nav; its
+              // /settings/email route and screen remain reachable directly.
               { label: "Memory", href: hrefFor({ screen: "settings", section: "memory" }), on: route.section === "memory" },
               { label: "Update", href: hrefFor({ screen: "settings", section: "update" }), on: route.section === "update" },
               ...(meta?.platform_account_configured ? [{ label: "Account", href: hrefFor({ screen: "settings", section: "account" }), on: route.section === "account" }] : []),

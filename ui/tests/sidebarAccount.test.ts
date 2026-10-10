@@ -71,7 +71,8 @@ const rowTrigger = (host: Element) => host.querySelector("aside button[aria-hasp
   const { host, done } = await mountApp({ ...base, signed_in: true, session: { id: "s1", origin: "public", user } });
   const row = rowTrigger(host);
   assert(row, "the sidebar footer renders the row trigger");
-  assert(row.className.includes("account-row") && row.textContent?.includes("Fable Chen") && row.textContent.includes("member · localhost"), "row shows name and role · host");
+  assert(row.className.includes("account-row") && row.textContent?.includes("Fable Chen") && row.textContent.includes("member"), "row shows name and role");
+  assert(!row.textContent?.includes("localhost"), "row no longer repeats the host");
   assert(!(host.querySelector("aside")?.textContent ?? "").toLowerCase().includes("session"), "no old SESSION block");
   assert(!row.closest(".overflow-y-auto"), "the footer is outside the scrolling nav, so its dialog is not clipped");
   const aside = host.querySelector("aside")!;

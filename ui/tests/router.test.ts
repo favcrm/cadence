@@ -62,10 +62,10 @@ for (const dead of ["/overview/x", "/nope", "/projects/x/y", "/projects/cadence/
   equal(matchRoute(dead).screen, "notFound", `not found ${dead}`);
 }
 
-// Main nav: MVP screens only (Wiki joined in CAD-581).
+// Main nav: MVP screens only (Wiki joined in CAD-581; Outbox left the nav in CAD-1312, its route stays).
 equal(
   NAV.map((n) => n.label),
-  ["Home", "Projects", "Wiki", "Apps", "Agents", "Outbox", "Settings"],
+  ["Home", "Projects", "Wiki", "Apps", "Agents", "Settings"],
   "nav",
 );
 

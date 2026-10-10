@@ -141,7 +141,7 @@ async function main() {
   await render(false);
   assert(
     reads.length === 0 &&
-      host.textContent?.includes("Sign in to view") &&
+      host.textContent?.includes("Operator access required") &&
       !host.textContent?.includes("No published posts"),
     "unproven viewer never requests or claims empty, even on a direct link",
   );
@@ -330,7 +330,7 @@ async function main() {
   await flush();
   assert(
     reads.length === count &&
-      host.textContent?.includes("Sign in to view") &&
+      host.textContent?.includes("Operator access required") &&
       !host.textContent?.includes("Recovered content"),
     "access revocation unmounts protected content and ignores pending response",
   );

@@ -3,9 +3,9 @@ import { nextThemePref, setThemePref, type ThemePref } from "../lib/theme";
 import { IconMoon, IconSun, IconTheme } from "./icons";
 
 const icons: Record<ThemePref, ReactNode> = {
-  system: <IconTheme />,
-  light: <IconSun />,
-  dark: <IconMoon />,
+  system: <IconTheme size={14} />,
+  light: <IconSun size={14} />,
+  dark: <IconMoon size={14} />,
 };
 
 /** Header button cycling system → light → dark; the pick persists per browser. */
