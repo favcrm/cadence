@@ -11,7 +11,7 @@ export function ReadNotice<T>({
   state: ResourceState<T>;
   retry: () => void;
 }) {
-  const { t } = useLocale();
+  const { t, locale } = useLocale();
   // Successful refreshes stay silent: the retained data is the current view.
   if (state.data !== null && !state.error) return null;
   if (!state.error && !state.inFlight && state.status !== "loading")
@@ -38,7 +38,7 @@ export function ReadNotice<T>({
           </>
         ) : (
           <span>
-            {t("Loading")} {t(name)}…
+            {t("Loading")}{locale === "zh-TW" ? "" : " "}{t(name)}…
           </span>
         )}
       </div>
