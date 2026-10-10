@@ -274,6 +274,7 @@ export default function AssistantOperations({ installId, contextId, canDecide }:
   canDecide: boolean;
 }) {
   const scopeKey = JSON.stringify([installId, contextId]);
+  const contextReady = installId !== "" && contextId !== "";
   const poller = useRef<Poller | null>(null);
   const [data, setData] = useState<AssistantData>(() => emptyData(scopeKey));
   const [busyState, setBusyState] = useState<{ scopeKey: string; id: string | null }>({ scopeKey, id: null });
@@ -282,6 +283,11 @@ export default function AssistantOperations({ installId, contextId, canDecide }:
   const busy = busyState.scopeKey === scopeKey ? busyState.id : null;
 
   useEffect(() => {
+    // An unresolved context owns no poller and sends no assistant requests.
+    if (!contextReady) {
+      setData(emptyData(scopeKey));
+      return;
+    }
     // One effect run owns one scope. A scope change or unmount ends it, so
     // its in-flight read can never render into the new scope.
     let alive = true;
@@ -396,7 +402,7 @@ export default function AssistantOperations({ installId, contextId, canDecide }:
       document.removeEventListener("visibilitychange", onVisibility);
       if (poller.current === handle) poller.current = null;
     };
-  }, [installId, contextId, scopeKey]);
+  }, [installId, contextId, scopeKey, contextReady]);
 
   const runWrite = async (busyId: string, write: () => Promise<unknown>, failure: string) => {
     const handle = poller.current;

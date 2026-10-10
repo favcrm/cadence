@@ -24,11 +24,17 @@ export function Notice({
   children,
   className,
   state,
+  onRetry,
+  retryLabel = "Retry",
 }: {
   children: ReactNode;
   className?: string;
   /** Optional `data-state` marker (e.g. "read-only") for tests/QA. */
   state?: string;
+  /** CAD-1193: an unavailable access check offers a bounded retry of
+   *  the real check — wired by the caller, never a reload. */
+  onRetry?: () => void;
+  retryLabel?: ReactNode;
 }) {
   return (
     <p
@@ -38,6 +44,14 @@ export function Notice({
       data-state={state}
     >
       {children}
+      {onRetry ? (
+        <>
+          {" "}
+          <button type="button" className="lnk" onClick={onRetry}>
+            {retryLabel}
+          </button>
+        </>
+      ) : null}
     </p>
   );
 }

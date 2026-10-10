@@ -3,6 +3,8 @@
 //! repeating requests, so a hung call never holds a daemon slot.
 
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -369,6 +371,484 @@ pub fn rpc_timeout(
     timeout: Duration,
 ) -> Result<Value> {
     proto::unwrap(rpc_frame(state_dir, method, params, timeout)?)
+}
+
+/// CAD-1193: the shared deadline for the read-only dependency RPCs one
+/// `/api/meta` response chains — session validation, the board/agent
+/// identity facts behind the operator proof, daemon build info. Those
+/// reads inform a courtesy answer only: a stalled or missing
+/// dependency must cost the request seconds, not the default 700 s
+/// call bound, and must produce an explicit unknown/unavailable
+/// answer, never a granted authority or a manufactured sign-out.
+///
+/// This is purely a transport bound for existing RPCs: it supplies no
+/// answer, no identity and no authority of its own, changes no rule
+/// the daemon enforces, and is never applied to a write. One `Meta`
+/// request shares one budget across every dependent read, so a slow
+/// daemon cannot consume the bound serially call after call.
+#[derive(Clone, Copy, Debug)]
+pub struct MetaBudget {
+    deadline: Instant,
+}
+
+impl MetaBudget {
+    /// The bound `/api/meta` works under end to end — the ticket's
+    /// five-second target.
+    pub const LIMIT: Duration = Duration::from_secs(5);
+    /// The most one dependent read may wait: the whole remaining
+    /// budget, capped so a stalled call cannot consume it all while
+    /// earlier facts are still unproven.
+    pub const READ_CAP: Duration = Duration::from_secs(2);
+
+    /// A budget whose deadline is `limit` from now.
+    pub fn fresh(limit: Duration) -> Self {
+        Self {
+            deadline: Instant::now() + limit,
+        }
+    }
+
+    /// A budget that allows no further RPC time — the request's bound
+    /// is already spent before the first dependent read.
+    pub fn exhausted() -> Self {
+        Self {
+            deadline: Instant::now(),
+        }
+    }
+
+    /// This call's absolute expiry — the earlier of the shared request
+    /// deadline and the per-read cap — so one dependency cannot spend
+    /// the whole budget while earlier facts are still unproven.
+    fn call_deadline(&self) -> Instant {
+        self.deadline.min(Instant::now() + Self::READ_CAP)
+    }
+
+    /// One bounded required read for courtesy metadata. Returns the
+    /// daemon's real answer, or `Err` on transport failure, refusal or
+    /// an exhausted budget — callers turn that into unknown, never a
+    /// fabricated `true`/`false`.
+    ///
+    /// The whole call — connect, the request write and the reply read
+    /// — must finish by one absolute instant, [`call_deadline`]: a
+    /// full socket backlog, a stalled accept, a peer that accepts no
+    /// bytes or a trickled reply all draw on the same bound, which the
+    /// per-phase timeout on the general [`rpc_timeout`] path cannot
+    /// guarantee. An expired budget does not even connect. What the
+    /// bound does NOT cover: time the daemon spends answering inside
+    /// its own process past this instant is only abandoned, not
+    /// cancelled, and the board's own `/proc` walks keep whatever
+    /// latency the filesystem has — this transport bounds the socket
+    /// dependency only.
+    ///
+    /// [`call_deadline`]: MetaBudget::call_deadline
+    pub fn read(&self, state_dir: &Path, method: &str, params: Value) -> Result<Value> {
+        let socket = rpc_socket_path(state_dir)?;
+        proto::unwrap(rpc_deadline_frame_on(
+            state_dir,
+            &socket,
+            method,
+            params,
+            self.call_deadline(),
+        )?)
+    }
+
+    /// The same bounded read pinned to the private socket — the boot
+    /// UID authority, which must never honor an inherited
+    /// `CADENCE_SOCKET`.
+    pub fn read_private(&self, state_dir: &Path, method: &str, params: Value) -> Result<Value> {
+        proto::unwrap(rpc_deadline_frame_on(
+            state_dir,
+            &socket_path(state_dir),
+            method,
+            params,
+            self.call_deadline(),
+        )?)
+    }
+}
+
+/// One request/response frame under a single absolute `deadline`
+/// covering connect, the request write and the reply read together.
+/// Only [`MetaBudget`] uses this: a courtesy metadata answer must
+/// degrade inside seconds even when the dependency's listen backlog
+/// is full (a blocking `UnixStream::connect` has no timeout), when the
+/// peer accepts no bytes (the general path's write is unbounded), or
+/// when the reply trickles (a per-read timeout resets on every byte).
+/// The wire frames are identical to [`rpc_frame_on`]'s; the deadline
+/// only decides when this side stops waiting — it supplies no answer,
+/// no identity and no authority of its own, and there is no retry or
+/// replay: the call happens once or not at all.
+fn rpc_deadline_frame_on(
+    state_dir: &Path,
+    socket: &Path,
+    method: &str,
+    params: Value,
+    deadline: Instant,
+) -> Result<Value> {
+    // An already-spent budget connects nothing: build the frame and
+    // fail before the socket is even created.
+    if Instant::now() >= deadline {
+        return Err(Error::busy("metadata read deadline reached"));
+    }
+    let mut request = proto::request(method, params);
+    // CAD-482: a test-seam caller asserts its identity on the frame —
+    // scoped in-process ([`crate::test_seam::scoped`]) or via
+    // `CADENCE_TEST_AS` in a spawned test binary. Absent the feature
+    // this attaches nothing.
+    if let Some(test_caller) = crate::test_seam::caller_frame(state_dir)? {
+        request[crate::test_seam::FRAME_FIELD] = test_caller;
+    }
+    let mut body = request.to_string();
+    body.push('\n');
+    let stream = connect_bounded(socket, deadline).map_err(|e| match e {
+        // A spent deadline is reported as spent, never as "not
+        // reachable" — the distinction keeps a timeout from looking
+        // like an absent daemon.
+        e @ Error::Structured(_) => e,
+        _ => Error::internal(format!(
+            "Daemon is not reachable at {} — start it with `cadence daemon start`",
+            socket.display()
+        )),
+    })?;
+    let fd = stream.as_raw_fd();
+    write_bounded(fd, body.as_bytes(), deadline)?;
+    let line = read_line_bounded(fd, deadline)?;
+    serde_json::from_str(&line).map_err(|_| Error::internal("Daemon returned a malformed response"))
+}
+
+/// Poll `fd` for `events` until it signals or `deadline` passes.
+/// `Ok(false)` is the spent deadline — the caller reports it; a real
+/// readiness (data, hangup, error) is `Ok(true)` and the next syscall
+/// surfaces which. EINTR recomputes the remaining time and waits on.
+fn poll_deadline(fd: RawFd, events: libc::c_short, deadline: Instant) -> Result<bool> {
+    loop {
+        let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+            return Ok(false);
+        };
+        let millis = left.as_millis().clamp(1, i32::MAX as u128) as i32;
+        let mut fds = [libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        }];
+        // SAFETY: `fds` points to one valid pollfd for the call; `fd`
+        // is a live descriptor the caller keeps open across it.
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), 1, millis) };
+        if ready > 0 {
+            if fds[0].revents & libc::POLLNVAL != 0 {
+                return Err(Error::internal("metadata socket became invalid"));
+            }
+            return Ok(true);
+        }
+        if ready == 0 {
+            return Ok(false);
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            return Err(e.into());
+        }
+    }
+}
+
+/// connect(2) on a fresh nonblocking unix socket, completed or
+/// abandoned by `deadline`. Unlike `UnixStream::connect` — which can
+/// block far past a read bound on a full listen backlog — this waits
+/// on POLLOUT and reads the verdict from SO_ERROR.
+fn connect_bounded(socket: &Path, deadline: Instant) -> Result<UnixStream> {
+    // Linux/Android: SOCK_NONBLOCK | SOCK_CLOEXEC create the
+    // descriptor already nonblocking and close-on-exec — atomic, so a
+    // multithreaded board has no window where an exec'ing child could
+    // inherit a live peer connection. Darwin's libc has no such
+    // flags: plain SOCK_STREAM, with fcntl applying both flags
+    // immediately after (see `arm_socket`).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const SOCK_TYPE: libc::c_int = libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    const SOCK_TYPE: libc::c_int = libc::SOCK_STREAM;
+    // SAFETY: fixed, valid socket(2) arguments.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, SOCK_TYPE, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    match arm_socket(fd)
+        .and_then(|()| no_sigpipe(fd))
+        .and_then(|()| connect_on(fd, socket, deadline))
+    {
+        Ok(()) => {
+            // SAFETY: `fd` is a live connected descriptor we own.
+            Ok(unsafe { UnixStream::from_raw_fd(fd) })
+        }
+        Err(e) => {
+            // SAFETY: `fd` is a live descriptor we still own.
+            unsafe { libc::close(fd) };
+            Err(e)
+        }
+    }
+}
+
+/// Set O_NONBLOCK + FD_CLOEXEC on `fd` the portable way — fcntl
+/// exists on every unix target; SOCK_NONBLOCK/SOCK_CLOEXEC socket(2)
+/// flags do not (Darwin lacks them, so `connect_bounded` creates a
+/// plain SOCK_STREAM there and this does the arming). On
+/// Linux/Android the socket(2) flags already made this atomic — this
+/// call then only re-asserts the same bits.
+fn arm_socket(fd: RawFd) -> Result<()> {
+    // SAFETY: fcntl(2) on a live descriptor with valid flag args.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let fdflags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if fdflags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, fdflags | libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+/// Apple targets have no MSG_NOSIGNAL send flag; keep socket writes
+/// from ever raising SIGPIPE the way std's own `UnixStream` does:
+/// SO_NOSIGPIPE on the descriptor. No process signal state is
+/// touched. On every other unix target MSG_NOSIGNAL on the send
+/// already covers it and this is a no-op.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos"
+))]
+fn no_sigpipe(fd: RawFd) -> Result<()> {
+    let one: libc::c_int = 1;
+    // SAFETY: `fd` is a live socket; `one` is the proper in-parameter
+    // for SO_NOSIGPIPE.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_NOSIGPIPE,
+            (&one as *const libc::c_int).cast::<libc::c_void>(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+/// MSG_NOSIGNAL exists on every other unix libc target this code
+/// reaches — no per-socket opt needed there.
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos"
+)))]
+fn no_sigpipe(_fd: RawFd) -> Result<()> {
+    Ok(())
+}
+
+/// Fill a sockaddr_un for `socket`. Returns the connect(2) `len`:
+/// POSIX wants the bytes through the NUL after the path (or the
+/// whole fixed buffer when it fills completely). BSD-family targets
+/// (macOS and the BSDs in CI) additionally take `sun_len` = the same
+/// length; linux-like ABIs have no such field.
+fn unix_addr(socket: &Path) -> Result<(libc::sockaddr_un, libc::socklen_t)> {
+    let path = socket.as_os_str().as_bytes();
+    // SAFETY: an all-zero sockaddr_un is a valid starting value.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if path.len() >= addr.sun_path.len() {
+        return Err(Error::internal(format!(
+            "socket path is too long: {}",
+            socket.display()
+        )));
+    }
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    // The slot is zeroed, so the byte after `path` is already NUL.
+    for (slot, byte) in addr.sun_path.iter_mut().zip(path.iter().copied()) {
+        *slot = byte as libc::c_char;
+    }
+    let len =
+        (std::mem::offset_of!(libc::sockaddr_un, sun_path) + path.len() + 1) as libc::socklen_t;
+    set_sun_len(&mut addr, len);
+    Ok((addr, len))
+}
+
+/// BSD sockaddr_un carries `sun_len` = the length argument connect(2)
+/// receives; the kernel tolerates 0 but the ABI field must be set for
+/// strict BSD peers (Darwin's sockaddr_un layout is sun_len first).
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+fn set_sun_len(addr: &mut libc::sockaddr_un, len: libc::socklen_t) {
+    addr.sun_len = len as u8;
+}
+
+/// Linux (and every non-BSD unix here) has no `sun_len` field.
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos",
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "netbsd",
+    target_os = "openbsd"
+)))]
+fn set_sun_len(_addr: &mut libc::sockaddr_un, _len: libc::socklen_t) {}
+
+/// The connect itself: start it, wait for writability inside
+/// `deadline`, then read SO_ERROR for the kernel's verdict.
+fn connect_on(fd: RawFd, socket: &Path, deadline: Instant) -> Result<()> {
+    let (addr, len) = unix_addr(socket)?;
+    // SAFETY: `addr` is a sockaddr_un valid for `len` bytes; `fd` is a
+    // live nonblocking unix stream socket.
+    let rc = unsafe {
+        libc::connect(
+            fd,
+            (&addr as *const libc::sockaddr_un).cast::<libc::sockaddr>(),
+            len,
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    if e.raw_os_error() != Some(libc::EINPROGRESS) && e.kind() != std::io::ErrorKind::Interrupted {
+        return Err(e.into());
+    }
+    // EINPROGRESS (and EINTR, whose attempt continues asynchronously):
+    // the verdict arrives as writability plus SO_ERROR.
+    if !poll_deadline(fd, libc::POLLOUT, deadline)? {
+        return Err(Error::busy(
+            "metadata read deadline reached while connecting",
+        ));
+    }
+    let mut so_err: libc::c_int = 0;
+    let mut optlen = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `fd` is a live socket; `so_err`/`optlen` are the proper
+    // out-parameters for SO_ERROR.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_ERROR,
+            (&mut so_err as *mut libc::c_int).cast::<libc::c_void>(),
+            &mut optlen,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if so_err == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::from_raw_os_error(so_err).into())
+    }
+}
+
+/// `write_all` bounded by the absolute `deadline`: a peer whose
+/// buffers never drain fails the call at the deadline instead of
+/// holding it, the way the general path's unbounded blocking write
+/// can. Retries on EAGAIN and EINTR — with the deadline re-checked
+/// each round — never grant the peer more time. send(2), not write(2):
+/// MSG_NOSIGNAL keeps a racing peer-close from raising SIGPIPE,
+/// matching what std's UnixStream does on every unix target that has
+/// the flag; the BSD targets without it get SO_NOSIGPIPE at socket
+/// setup instead ([`no_sigpipe`]).
+fn write_bounded(fd: RawFd, mut bytes: &[u8], deadline: Instant) -> Result<()> {
+    // MSG_NOSIGNAL where send(2) supports it (every unix target here
+    // except Apple); 0 on Apple where SO_NOSIGPIPE on the socket
+    // already did the work.
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos"
+    ))]
+    const SEND_FLAGS: libc::c_int = 0;
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos"
+    )))]
+    const SEND_FLAGS: libc::c_int = libc::MSG_NOSIGNAL;
+    while !bytes.is_empty() {
+        if !poll_deadline(fd, libc::POLLOUT, deadline)? {
+            return Err(Error::busy("metadata read deadline reached while writing"));
+        }
+        // SAFETY: `fd` is a live nonblocking socket; `bytes` is a
+        // valid slice advanced only by the count send(2) reports.
+        let n = unsafe {
+            libc::send(
+                fd,
+                bytes.as_ptr().cast::<libc::c_void>(),
+                bytes.len(),
+                SEND_FLAGS,
+            )
+        };
+        if n > 0 {
+            bytes = &bytes[n as usize..];
+            continue;
+        }
+        let e = std::io::Error::last_os_error();
+        match e.kind() {
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted => continue,
+            _ => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
+/// Read one reply line bounded by the absolute `deadline`. The
+/// deadline never extends — received bytes cannot reset it, so a
+/// trickled reply cannot out-wait the budget the way it out-waits the
+/// general path's per-read inactivity timeout. Peer EOF before the
+/// newline is a closed connection, not an answer.
+fn read_line_bounded(fd: RawFd, deadline: Instant) -> Result<String> {
+    let mut line = Vec::new();
+    let mut buf = [0u8; 2048];
+    loop {
+        if !poll_deadline(fd, libc::POLLIN, deadline)? {
+            return Err(Error::busy(
+                "metadata read deadline reached awaiting the reply",
+            ));
+        }
+        // SAFETY: `fd` is a live nonblocking socket; `buf` is valid
+        // for buf.len() bytes.
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+        if n > 0 {
+            let chunk = &buf[..n as usize];
+            match chunk.iter().position(|b| *b == b'\n') {
+                Some(end) => {
+                    line.extend_from_slice(&chunk[..end]);
+                    break;
+                }
+                None => line.extend_from_slice(chunk),
+            }
+            continue;
+        }
+        if n == 0 {
+            return Err(Error::internal("daemon closed the connection mid-reply"));
+        }
+        let e = std::io::Error::last_os_error();
+        match e.kind() {
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted => continue,
+            _ => return Err(e.into()),
+        }
+    }
+    String::from_utf8(line).map_err(|_| Error::internal("Daemon returned a malformed response"))
 }
 
 /// Query the daemon bound to this private state directory, ignoring

@@ -150,7 +150,7 @@ function GenericOutlet({
   onSelect: (recordId: string | null) => void;
 }) {
   const [draft, setDraft] = useState("");
-  const canWrite = viewer.operator && !viewer.readOnly;
+  const canWrite = viewer.operator === true && !viewer.readOnly;
   const newHeadRef = useRef<HTMLHeadingElement | null>(null);
   // Keyboard users land on the New heading when the view changes.
   useEffect(() => {

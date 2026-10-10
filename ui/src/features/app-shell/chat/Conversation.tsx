@@ -496,9 +496,9 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     atTail.current = true;
     setJump(false);
   };
-  const canSend = viewer.operator && !viewer.readOnly && usable;
+  const canSend = viewer.operator === true && !viewer.readOnly && usable;
   const canCreate =
-    viewer.operator &&
+    viewer.operator === true &&
     !viewer.readOnly &&
     active.state === "ready" &&
     active.requestError === null &&
@@ -507,7 +507,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const capturedBinding = composerScope(composerKey);
   const uploadScope = capturedBinding === undefined ? frameScope : capturedBinding;
   const attachEnabled =
-    viewer.operator &&
+    viewer.operator === true &&
     !viewer.readOnly &&
     active.state === "ready" &&
     (convId !== null || draftSubject !== null) &&
@@ -563,7 +563,11 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
             ? binding.error
             : "Attach is available only in a writable, resolved app conversation.";
   // Why the composer is disabled — always a plain reason, never a fake reply.
-  const sendBlockedReason = !viewer.operator
+  const sendBlockedReason = viewer.operator === null
+    ? viewer.access === "unavailable"
+      ? "Access could not be confirmed — retry the access check"
+      : "Checking access before messaging the assistant"
+    : viewer.operator === false
     ? "Sign in as the operator to message the assistant"
     : viewer.readOnly
       ? "Read-only · Sending is unavailable"
@@ -1202,7 +1206,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           </li>
         ))}
       </ol>
-      <AssistantOperations key={`${installId}\u0000${mode.contextId}`} installId={installId} contextId={mode.contextId} canDecide={viewer.operator && !viewer.readOnly} />
+      <AssistantOperations key={`${installId}\u0000${mode.contextId}`} installId={installId} contextId={mode.contextId} canDecide={viewer.operator === true && !viewer.readOnly} />
       {jump && (
         <button type="button" className="lnk text-label app-chat-jump" onClick={jumpToLatest} data-jump-to-latest>
           ↓ New messages

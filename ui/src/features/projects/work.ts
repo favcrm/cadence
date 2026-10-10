@@ -110,8 +110,21 @@ export function progressView(p: WorkProgress | null | undefined): ProgressView {
 /** Who may move stages here. */
 export interface Viewer {
   readOnly: boolean;
-  /** Passed the board's operator proof (`/api/meta` → `operator`). */
-  operator: boolean;
+  /** Passed the board's operator proof (`/api/meta` → `operator`).
+   *  CAD-1193: `null` means the proof could not answer — access is
+   *  still being checked. Unknown is never shown as signed out and
+   *  grants nothing: every consumer reads `=== true` as the only yes. */
+  operator: boolean | null;
+  /** CAD-1193: when `operator` is `null`, `access` says which unknown
+   *  it is — `"checking"` while the first probe is still in flight,
+   *  `"unavailable"` once a completed probe failed or the server
+   *  could not answer. Absent/`null` reads as the unknown the
+   *  `operator` value already carries; it never grants anything and
+   *  never marks a signed-out or non-operator viewer. */
+  access?: "checking" | "unavailable" | null;
+  /** CAD-1193: a bounded retry of the access check itself — wired to
+   *  the real metadata refresh, never a reload or a sign-in. */
+  onRetryAccess?: () => void;
 }
 
 /**
@@ -146,6 +159,11 @@ export function noMoveReason(stage: WorkStage | null | undefined, viewer: Viewer
     return stage.source === "plan" ? "The plan decides this stage until it is approved." : "No stage move is open.";
   }
   if (viewer.readOnly) return "The board is read-only.";
+  if (viewer.operator === null) {
+    return viewer.access === "unavailable"
+      ? "The access check could not confirm this session — stage moves stay off until it answers."
+      : "Checking whether this session may move stages…";
+  }
   if (!viewer.operator) {
     return "Stage moves on the board are the operator's. Agents move a stage with `cadence issue epic stage`.";
   }

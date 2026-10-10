@@ -2848,6 +2848,14 @@ impl Shared {
                     "build_time": crate::overview::BUILD_TIME,
                     "started_at": self.started_at,
                     "connections": connections,
+                    // CAD-1193: the lock-holding daemon's own pid — the
+                    // same fact `health` reports, without the fleet-wide
+                    // adopted-process and inflight-turn collection
+                    // `health` runs first. The board's operator proof
+                    // reads it here so a courtesy read never waits on
+                    // the heavyweight probe. Daemon-owned and computed
+                    // per reply, never caller-supplied.
+                    "pid": std::process::id(),
                 })
             }),
             "shutdown" => {

@@ -1068,15 +1068,27 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
         // reachable (`daemon_info` carries the running build, which is
         // the one deploy drift measures).
         "/api/meta" => {
-            let daemon = client::rpc(state_dir, "daemon_info", json!({})).ok();
+            // CAD-1193: one shared read budget for every daemon fact
+            // this courtesy answer needs (target 5 s end to end). A
+            // dependency that cannot answer in it produces `null` —
+            // unknown — never a granted role or a manufactured
+            // sign-out. Writes are untouched: their guards keep the
+            // full RPC bound.
+            let budget = client::MetaBudget::fresh(client::MetaBudget::LIMIT);
+            let daemon = budget.read(state_dir, "daemon_info", json!({})).ok();
             let (actor, tailnet_proof) = request_identity(&request, opts);
             // CAD-432: may this client make the operator's board
             // decisions — the same proof those writes run. It walks
             // /proc, so it is computed only when asked (`?operator=1`,
             // once per page load), never on the 30 s poll.
+            // `Some(true|false)` is the proven answer; `None` — a
+            // dependency could not answer in budget — serializes as
+            // `operator: null`, which the UI shows as unavailable,
+            // never as a resolved non-operator.
             let operator = matches!(query("operator").as_deref(), Some("1" | "true"))
-                .then(|| home::operator_viewer(&request, state_dir, opts));
-            let session = operator::meta(&request, state_dir, opts);
+                .then(|| home::operator_viewer(&request, state_dir, opts, &budget))
+                .flatten();
+            let session = operator::meta(&request, state_dir, opts, &budget);
             // Display the same verified identity that attributes public
             // board writes, never a name supplied by request fields.
             // Public-origin sessions carry a verified user; every other

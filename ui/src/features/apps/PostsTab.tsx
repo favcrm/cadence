@@ -90,9 +90,18 @@ export default function PostsTab({
             ? "Complete setup in Settings before starting a post."
             : viewer.readOnly && viewer.operator
               ? "New posts cannot be started on this read-only board."
+            : viewer.operator === null && viewer.access === "unavailable"
+              ? "Access could not be confirmed — the board's access check did not answer."
+            : viewer.operator === null
+              ? "Checking whether this session may start a post…"
             : !viewer.operator
               ? "Sign in as the operator to start a post."
-              : "Start a post when you’re ready. You’ll review the plan before any work runs."}</p>
+              : "Start a post when you’re ready. You’ll review the plan before any work runs."}{" "}
+            {viewer.operator === null && viewer.access === "unavailable" && viewer.onRetryAccess && (
+              <button type="button" className="lnk" onClick={viewer.onRetryAccess}>
+                Retry access check
+              </button>
+            )}</p>
         </div>
       )}
       {runsState.data && runs.length > 0 && shown.length === 0 && (

@@ -131,8 +131,8 @@ export class ApiError extends Error {
 
 const conditional = new ConditionalGet((input, init) => fetch(input, init), sessionKey);
 
-async function get<T>(path: string): Promise<T> {
-  const { response: resp, value } = await conditional.get<T>(path, sessionHeaders());
+async function get<T>(path: string, signal?: AbortSignal): Promise<T> {
+  const { response: resp, value } = await conditional.get<T>(path, sessionHeaders(), signal);
   if (!resp.ok && !(resp.status === 304 && value !== undefined)) {
     const body = await resp.json().catch(() => null);
     throw new ApiError(
@@ -251,8 +251,11 @@ export interface MasterPermissionRule {
 
 export const api = {
   health: () => get<Health>("/api/health"),
-  /** `withOperator` asks the server to run the operator proof (CAD-432) — once per page load. */
-  meta: (withOperator = false) => get<Meta>(withOperator ? "/api/meta?operator=1" : "/api/meta"),
+  /** `withOperator` asks the server to run the operator proof (CAD-432) — once per page load.
+   *  `signal` bounds the wait (CAD-1193): an aborted read is a failed
+   *  probe — unknown — never a sign-out or a resolved negative. */
+  meta: (withOperator = false, signal?: AbortSignal) =>
+    get<Meta>(withOperator ? "/api/meta?operator=1" : "/api/meta", signal),
   overview: () => get<Overview>("/api/overview"),
   projects: () => get<{ projects: Project[] }>("/api/projects"),
   projectContext: (project: string, role: ContextRole = "pm", expectedRevision?: string) => {

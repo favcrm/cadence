@@ -62,7 +62,9 @@ export default function EmailSending({ viewer }: { viewer: Viewer }) {
   const [picked, setPicked] = useState(0);
 
   useEffect(() => {
-    if (!viewer.operator) return;
+    // CAD-1193: unresolved role (null) waits; only a proven operator
+    // issues the sender-target read.
+    if (viewer.operator !== true) return;
     const controller = new AbortController();
     loadTargets(controller.signal).then(
       (rows) => {
@@ -85,7 +87,22 @@ export default function EmailSending({ viewer }: { viewer: Viewer }) {
         Choose where CRM campaign email is sent from. Campaigns use this sender; nothing is sent
         until an operator approves a campaign.
       </p>
-      {!viewer.operator ? (
+      {viewer.operator === null ? (
+        <PageState title={viewer.access === "unavailable" ? "Access could not be confirmed" : "Checking access…"}>
+          {viewer.access === "unavailable" ? (
+            <>
+              The board's access check did not answer, so email sending stays closed.{" "}
+              {viewer.onRetryAccess && (
+                <Button size="sm" onClick={viewer.onRetryAccess}>
+                  Retry access check
+                </Button>
+              )}
+            </>
+          ) : (
+            "Checking whether this session may manage email sending…"
+          )}
+        </PageState>
+      ) : !viewer.operator ? (
         <PageState title="Operator access required">
           Email sending is available to the operator. Use Sign in in the status bar if you
           have operator access.
@@ -128,7 +145,7 @@ export default function EmailSending({ viewer }: { viewer: Viewer }) {
 }
 
 function SenderCard({ scope, viewer }: { scope: HostScope; viewer: Viewer }) {
-  const canWrite = viewer.operator && !viewer.readOnly;
+  const canWrite = viewer.operator === true && !viewer.readOnly;
   const [rows, setRows] = useState<Connection[] | null>(null);
   const [hostedSmtp, setHostedSmtp] = useState(false);
   const [replacing, setReplacing] = useState(false);
@@ -394,7 +411,7 @@ function SenderCard({ scope, viewer }: { scope: HostScope; viewer: Viewer }) {
 
 /** The daemon-wide unsubscribe origin — set once; every campaign uses it. */
 function OriginCard({ viewer }: { viewer: Viewer }) {
-  const canWrite = viewer.operator && !viewer.readOnly;
+  const canWrite = viewer.operator === true && !viewer.readOnly;
   const [origin, setOrigin] = useState<string | null | undefined>(undefined);
   const [stored, setStored] = useState(false);
   const [input, setInput] = useState("");

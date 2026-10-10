@@ -57,7 +57,7 @@ fn board_caller(
     state_dir: &Path,
     opts: &ServeOpts,
 ) -> Result<operator::Caller, HttpResp> {
-    operator::board_caller(request, state_dir, opts, false)
+    operator::board_caller(request, state_dir, opts, false, None)
 }
 
 /// GET reads: `/api/app-catalog`, `/api/app-catalog/<id>`,

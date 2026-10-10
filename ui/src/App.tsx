@@ -8,6 +8,8 @@ import Explorer from "./features/explorer/Explorer";
 import CatalogDetail from "./features/explorer/CatalogDetail";
 import ManageApp from "./features/explorer/ManageApp";
 import AppShell, { type ActiveInstallation } from "./features/app-shell/AppShell";
+import { Loading, Notice } from "./features/app-shell/shared/States";
+import type { Viewer } from "./features/projects/work";
 import { buildAppNav, readLastApp, sectionFromSearch, writeLastApp, type LastApp, type VerifiedApp } from "./features/app-shell/appNav";
 import { useInstallations, type InstallationsState } from "./features/workspace-apps/useInstallations";
 import { APPS_CHANGED_EVENT } from "./features/workspace-apps/workspaceApps";
@@ -280,12 +282,60 @@ export default function App() {
   // page load and keep the answer across the 30 s polls.
   // The proof belongs to one credential/session and board mode. Switching
   // accounts must clear it even when both sessions report signed_in=true.
+  // CAD-1193: the meta read itself is bounded — an overlapping 30 s poll
+  // or an aborted fetch joins the in-flight request instead of stacking
+  // a second one, and a timed-out or failed probe is `unknown`, never a
+  // sign-out and never a resolved non-operator.
   const operatorKnown = useRef(false);
   const metaIdentity = useRef<string | null>(null);
   const metaKey = useRef<string | null>(null);
   const metaRequest = useRef(0);
+  const metaInFlight = useRef<{ scope: string; promise: Promise<Meta | null> } | null>(null);
   const [credentialGeneration, setCredentialGeneration] = useState(0);
-  const refresh = useCallback(() => {
+  // CAD-1193: the two unknowns stay distinct. `meta === null` alone is
+  // "checking"; a completed probe that could not answer — the fetch
+  // failed/aborted, or the server answered `operator: null` /
+  // `signed_in: null` — marks the check `unavailable` so the surfaces
+  // can say access could not be confirmed and offer a bounded retry,
+  // instead of showing "Checking…" forever. Never a sign-out, never a
+  // resolved non-operator, and never authority: only an answered probe
+  // clears it.
+  const [metaUnavailable, setMetaUnavailable] = useState(false);
+
+  /** One bounded meta read. The same tab key shares one in-flight
+   *  request; a different key (sign-in/sign-out) starts a fresh probe
+   *  and supersedes the old one's answer. A fetch that aborts or a
+   *  server that cannot answer yields `null` — unknown — which the
+   *  caller turns into an honest unavailable state, never false. */
+  const metaProbe = useCallback((withOperator: boolean, key: string | null): Promise<Meta | null> => {
+    // The credential scopes the cache: a probe under another key must
+    // never answer this one. The operator flag is part of the scope —
+    // a bare poll cannot satisfy a proof request.
+    const scope = `${key ?? ""}${withOperator ? "|operator" : ""}`;
+    const inFlight = metaInFlight.current;
+    if (inFlight && inFlight.scope === scope) return inFlight.promise;
+    const controller = new AbortController();
+    // The server bounds its own dependency reads at ~5 s; the client
+    // bound sits just above so a wedged connection cannot hold the
+    // access state open indefinitely.
+    const timeout = window.setTimeout(() => controller.abort(), 8_000);
+    const promise = api
+      .meta(withOperator, controller.signal)
+      .then((next) => {
+        window.clearTimeout(timeout);
+        if (metaInFlight.current?.promise === promise) metaInFlight.current = null;
+        return next;
+      })
+      .catch(() => {
+        window.clearTimeout(timeout);
+        if (metaInFlight.current?.promise === promise) metaInFlight.current = null;
+        return null;
+      });
+    metaInFlight.current = { scope, promise };
+    return promise;
+  }, []);
+
+  const refresh = useCallback((forceProof = false) => {
     api.health().then(setHealth).catch(() => setHealth(null));
     const request = ++metaRequest.current;
     const sentKey = sessionKey();
@@ -293,57 +343,119 @@ export default function App() {
       metaKey.current = sentKey;
       metaIdentity.current = null;
       operatorKnown.current = false;
+      metaInFlight.current = null;
       setCredentialGeneration((generation) => generation + 1);
       setMeta(null);
+      // A new credential owns its own check from scratch — the last
+      // key's outcome (including its failure) never follows it.
+      setMetaUnavailable(false);
     }
-    const asked = !operatorKnown.current;
+    // An explicit re-probe (the Retry an unavailable check offers)
+    // re-runs the real `?operator=1` proof; it never reuses the bare
+    // poll's in-flight request or its unproven answer. The flag is
+    // strictly `=== true` — event handlers that pass `refresh` a
+    // truthy argument (a click's MouseEvent) stay bare polls.
+    const asked = forceProof === true || !operatorKnown.current;
     let expectedKey = sentKey;
     const current = () => request === metaRequest.current && sessionKey() === expectedKey;
-    api
-      .meta(asked)
-      .then((next) => {
-        if (!current()) return;
-        const identity = JSON.stringify([next.signed_in ?? null, next.session?.id ?? null, next.read_only]);
-        const changed = metaIdentity.current !== null && identity !== metaIdentity.current;
-        metaIdentity.current = identity;
-        // A key the server refused (expired, revoked) is dropped — only
-        // the very key this request carried: a sign-in that finished
-        // while it was in flight stored a newer one.
-        if (next.signed_in === false && sentKey) {
-          setSessionKey(null);
-          metaKey.current = null;
-          expectedKey = null;
-          setCredentialGeneration((generation) => generation + 1);
-        }
-        if (changed && !asked) {
+    metaProbe(asked, sentKey).then((next) => {
+      if (!current() || next === null) {
+        if (next === null && current()) {
+          // The probe could not answer — access drops to unknown:
+          // write controls gate while the board re-checks, and the
+          // operator role is re-asked next refresh. The tab key itself
+          // is NOT cleared — only a server-proven `signed_in: false`
+          // below does that.
           operatorKnown.current = false;
-          setMeta({ ...next, operator: undefined });
-          api
-            .meta(true)
-            .then((fresh) => {
-              if (!current()) return;
-              metaIdentity.current = JSON.stringify([fresh.signed_in ?? null, fresh.session?.id ?? null, fresh.read_only]);
-              operatorKnown.current = typeof fresh.operator === "boolean";
-              setMeta(fresh);
-            })
-            .catch(() => undefined);
-          return;
+          setMeta(null);
+          setMetaUnavailable(true);
         }
-        if (typeof next.operator === "boolean") operatorKnown.current = true;
-        setMeta((prev) => ({ ...next, operator: next.operator ?? (!asked && !changed ? prev?.operator : undefined) }));
-      })
-      .catch(() => {
-        if (!current()) return;
-        // Lost meta loses the answer too: ask again on the next refresh.
+        return;
+      }
+      const identity = JSON.stringify([next.signed_in ?? null, next.session?.id ?? null, next.read_only]);
+      const changed = metaIdentity.current !== null && identity !== metaIdentity.current;
+      metaIdentity.current = identity;
+      // A key the server refused (expired, revoked) is dropped — only
+      // the very key this request carried, and only on a proven
+      // `signed_in: false`, never on a null or a failed probe.
+      if (next.signed_in === false && sentKey) {
+        setSessionKey(null);
+        metaKey.current = null;
+        metaInFlight.current = null;
+        expectedKey = null;
+        setCredentialGeneration((generation) => generation + 1);
+      }
+      if (changed && !asked) {
         operatorKnown.current = false;
-        setMeta(null);
-      });
+        // The follow-up proof gets a payload without an `operator`
+        // field, so it cannot confuse a stale value for a new answer.
+        setMeta({ ...next, operator: undefined });
+        setMetaUnavailable(true);
+        metaProbe(true, sentKey).then((fresh) => {
+          if (!current() || fresh === null) return;
+          metaIdentity.current = JSON.stringify([fresh.signed_in ?? null, fresh.session?.id ?? null, fresh.read_only]);
+          operatorKnown.current = typeof fresh.operator === "boolean";
+          setMeta(fresh);
+          setMetaUnavailable(fresh.operator === null || fresh.operator === undefined);
+        });
+        return;
+      }
+      if (typeof next.operator === "boolean") {
+        operatorKnown.current = true;
+        // A proven role — the check answered; unknown is behind us.
+        setMetaUnavailable(false);
+      } else if (next.operator === null && asked) {
+        // The asked proof answered but its dependencies could not —
+        // the completed check is unavailable, not still checking.
+        setMetaUnavailable(true);
+      } else if (!asked) {
+        if (next.signed_in === null) {
+          // The session check itself could not answer — the cached
+          // authority is dropped below and the check reports
+          // unavailable. A recovered session changes the identity and
+          // re-proves through the `changed` path above.
+          setMetaUnavailable(true);
+        } else {
+          // A bare poll never asks the proof, so `operator: null` here
+          // says nothing about the role: the previously proven one is
+          // preserved below and the check stays answered — an
+          // unrequested `null` is not an unavailable verdict.
+          setMetaUnavailable(false);
+        }
+      } else {
+        // An asked probe answered without an `operator` field at all
+        // (a pre-CAD-432 daemon): the proof never ran, so the state is
+        // unavailable rather than a resolved role or a pending check.
+        setMetaUnavailable(true);
+      }
+      // The preserved role rides only an unchanged, session-verified
+      // bare poll: an asked answer, an identity change, or a null
+      // session check drops it to `undefined` rather than guessing.
+      setMeta((prev) => ({
+        ...next,
+        operator: next.operator ?? (!asked && !changed && next.signed_in !== null ? prev?.operator : undefined),
+      }));
+    });
     void resources.projects.refresh();
     void resources.issues.refresh();
     void resources.agents.refresh();
     if (overviewWantedRef.current) void resources.overview.refresh();
     loadDetail();
-  }, [loadDetail]);
+  }, [loadDetail, metaProbe]);
+
+  // The Retry an unavailable access check offers (CAD-1193): a real
+  // re-probe of this credential's metadata — a fresh `?operator=1`
+  // read, never the bare poll the proof was skipped on. The failed
+  // probe's slot is dropped so the same key starts one new bounded
+  // request instead of joining a settled-null promise, and
+  // `operatorKnown` resets so the answer is asked for, not assumed.
+  // Never a reload, never a sign-in, and never a key clear: ownership
+  // rules in `refresh` are unchanged.
+  const retryAccess = useCallback(() => {
+    metaInFlight.current = null;
+    operatorKnown.current = false;
+    refresh(true);
+  }, [refresh]);
 
   useEffect(() => {
     refresh();
@@ -675,6 +787,18 @@ export default function App() {
   const activeId = onAppScreen && routeInstallId !== null
     ? menuApps.find((a) => a.installId === routeInstallId)?.installId ?? null
     : null;
+  // CAD-1193: one viewer for every consumer — `access` splits the
+  // `operator: null` unknown into "checking" (a probe is still in
+  // flight or has never run) and "unavailable" (a completed probe
+  // could not answer), and `onRetryAccess` gives the surfaces a real
+  // re-check instead of a reload. `operator === true` stays the only
+  // grant; both unknowns and every failure grant nothing.
+  const viewer = {
+    readOnly,
+    operator: meta?.operator ?? null,
+    access: metaUnavailable ? ("unavailable" as const) : ("checking" as const),
+    onRetryAccess: retryAccess,
+  };
   const [last, setLast] = useState<LastApp | null>(() => readLastApp());
   const activeSection = activeId === null ? null : sectionFromSearch(menuApps.find((a) => a.installId === activeId)!.kind, search);
   useEffect(() => {
@@ -726,7 +850,11 @@ export default function App() {
   );
 
   return (
-    <WriteGate.Provider value={meta === null ? "Checking write access…" : block}>
+    <WriteGate.Provider value={meta === null
+      ? metaUnavailable
+        ? "The access check could not confirm this session — writes stay off until it answers."
+        : "Checking write access…"
+      : block}>
     <div
       data-app-shell
       className={`grid lg:grid-cols-[208px_minmax(0,1fr)] bg-ink-900 ${
@@ -792,7 +920,7 @@ export default function App() {
               health={health}
               onRefresh={refresh}
             >
-              <SignIn meta={meta} onChange={refresh} />
+              <SignIn meta={meta} onChange={refresh} access={viewer.access} onRetryAccess={retryAccess} />
               {staleBuild !== null && staleBuild !== dismissedBuild && (
                 <BuildUpdateNotice onReload={reload} onDismiss={() => setDismissedBuild(staleBuild)} />
               )}
@@ -849,7 +977,7 @@ export default function App() {
                 health={health}
                 onRefresh={refresh}
               >
-                <SignIn meta={meta} onChange={refresh} />
+                <SignIn meta={meta} onChange={refresh} access={viewer.access} onRetryAccess={retryAccess} />
               </StatusChips>
             </div>
           </div>
@@ -1002,7 +1130,7 @@ export default function App() {
           <Epics
             project={route.slug}
             issues={issuesState}
-            viewer={{ readOnly, operator: meta?.operator === true }}
+            viewer={viewer}
             onOpenIssue={openIssue}
             onRetry={() => void resources.issues.refresh()}
           />
@@ -1013,7 +1141,7 @@ export default function App() {
         {route.screen === "projects" && route.slug && route.section === "workflows" && (
           <Workflows
             project={route.slug}
-            viewer={{ readOnly, operator: meta?.operator === true }}
+            viewer={viewer}
             onOpenIssue={openIssue}
             onHome={() => goRoute({ screen: "home" })}
           />
@@ -1028,27 +1156,27 @@ export default function App() {
           />
         )}
         {route.screen === "apps" && !route.project && (
-          <Apps project={project} viewer={{ readOnly, operator: meta?.operator === true }} />
+          <Apps project={project} viewer={viewer} />
         )}
         {route.screen === "appsExplore" && (
-          <Explorer viewer={{ readOnly, operator: meta?.operator === true }} />
+          <Explorer viewer={viewer} />
         )}
         {route.screen === "appsCatalog" && (
-          <CatalogDetail id={route.id} viewer={{ readOnly, operator: meta?.operator === true }} />
+          <CatalogDetail id={route.id} viewer={viewer} />
         )}
         {route.screen === "appsManage" && (
-          <ManageApp key={route.installId} installId={route.installId} viewer={{ readOnly, operator: meta?.operator === true }} />
+          <ManageApp key={route.installId} installId={route.installId} viewer={viewer} />
         )}
         {route.screen === "workspaceApp" && (
-          <AppShell installId={route.installId} viewer={{ readOnly, operator: meta?.operator === true }} onInstallation={reportInstallation}>
-            <WorkspaceApp installId={route.installId} viewer={{ readOnly, operator: meta?.operator === true }} onBack={() => goRoute({ screen: "apps", project: null, name: null })} />
+          <AppShell installId={route.installId} viewer={viewer} onInstallation={reportInstallation}>
+            <WorkspaceApp installId={route.installId} viewer={viewer} onBack={() => goRoute({ screen: "apps", project: null, name: null })} />
           </AppShell>
         )}
         {route.screen === "workspaceAppKey" && (
           <WorkspaceAppEntry
             appKey={route.appKey}
             installations={installations}
-            viewer={{ readOnly, operator: meta?.operator === true }}
+            viewer={viewer}
             onInstallation={reportInstallation}
             onBack={() => goRoute({ screen: "apps", project: null, name: null })}
           />
@@ -1057,7 +1185,7 @@ export default function App() {
           <AppDetail
             project={route.project}
             name={route.name}
-            viewer={{ readOnly, operator: meta?.operator === true }}
+            viewer={viewer}
             onOpenIssue={openIssue}
             onHome={() => goRoute({ screen: "home" })}
           />
@@ -1111,16 +1239,16 @@ export default function App() {
         )}
         {route.screen === "settings" && route.section === "models" && <ModelDefaults />}
         {route.screen === "settings" && route.section === "connections" && (
-          <Connections viewer={{ readOnly, operator: meta?.operator === true }} />
+          <Connections viewer={viewer} />
         )}
         {route.screen === "settings" && route.section === "email" && (
-          <EmailSending viewer={{ readOnly, operator: meta?.operator === true }} />
+          <EmailSending viewer={viewer} />
         )}
         {route.screen === "settings" && route.section === "account" && <PlatformAccount />}
         {route.screen === "settings" && route.section === "update" && (
-          <Update viewer={{ readOnly, operator: meta?.operator === true }} />
+          <Update viewer={viewer} />
         )}
-        {route.screen === "settings" && route.section === "permissions" && <MasterPermissions viewer={{ readOnly, operator: meta?.operator === true, boardReadOnly, signedIn: meta?.signed_in === true, sessionId: meta?.session?.id ?? null }} />}
+        {route.screen === "settings" && route.section === "permissions" && <MasterPermissions viewer={{ ...viewer, boardReadOnly, signedIn: meta?.signed_in === true, sessionId: meta?.session?.id ?? null }} />}
         {screen === "login" && (
           <Login
             onSignedIn={() => {
@@ -1175,11 +1303,22 @@ function WorkspaceAppEntry({
 }: {
   appKey: string;
   installations: InstallationsState;
-  viewer: { readOnly: boolean; operator: boolean };
+  viewer: Viewer;
   onInstallation: (installation: ActiveInstallation | null) => void;
   onBack: () => void;
 }) {
-  if (!viewer.operator) {
+  if (viewer.operator === null) {
+    return (
+      <main className="px-4 lg:px-8 pt-10 pb-9">
+        {viewer.access === "unavailable" ? (
+          <Notice state="access-unavailable" onRetry={viewer.onRetryAccess} retryLabel="Retry access check">
+            Access could not be confirmed. Retry the access check before opening an installed app.
+          </Notice>
+        ) : <Loading>Checking access…</Loading>}
+      </main>
+    );
+  }
+  if (viewer.operator !== true) {
     return (
       <main className="px-4 lg:px-8 pt-10 pb-9">
         <h1 className="text-section font-semibold text-ink-100">App unavailable</h1>

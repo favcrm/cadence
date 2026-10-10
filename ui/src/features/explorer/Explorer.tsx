@@ -6,6 +6,7 @@ import type { Viewer } from "../projects/work";
 import { AppGlyph, TrustChip, InstallStateChip, useEscape } from "./shared";
 import { appErrorCopy, appLoadErrorCopy } from "./appErrors";
 import InstallCheckPanel from "./InstallCheckPanel";
+import { Loading, Notice } from "../app-shell/shared/States";
 import { navigate } from "../../lib/useLocation";
 import { useBackoffLoad } from "../workspace-apps/useBackoffLoad";
 import "./explorer.css";
@@ -30,12 +31,12 @@ export default function Explorer({ viewer }: { viewer: Viewer }) {
   const [notice, setNotice] = useState<string | null>(null);
   const [reviewing, setReviewing] = useState<{ id: string; title: string } | null>(null);
 
-  const isOp = viewer.operator && !viewer.readOnly;
+  const isOp = viewer.operator === true && !viewer.readOnly;
 
   // CAD-1189: the catalog and the request list load with the shared busy
   // backoff, keep their last good answer on a failed refresh and never
   // read an error as "no apps".
-  const catalogLoad = useBackoffLoad((signal) => appExplorer.catalog(signal).then((r) => r.catalog), revision);
+  const catalogLoad = useBackoffLoad((signal) => appExplorer.catalog(signal).then((r) => r.catalog), revision, viewer.operator !== null);
   const requestsLoad = useBackoffLoad((signal) => appExplorer.requests(signal).then((r) => r.requests), revision, isOp);
   const catalog = catalogLoad.data;
   const requests = requestsLoad.data;
@@ -82,6 +83,19 @@ export default function Explorer({ viewer }: { viewer: Viewer }) {
       .catch((e: unknown) => setNotice(appErrorCopy(e, "Restore didn't finish. Try again in a moment.")))
       .finally(() => setBusy((b) => ({ ...b, [id]: false })));
   };
+
+  if (viewer.operator === null) {
+    return (
+      <main className="apps-explore px-4 lg:px-8 pt-4 pb-9 min-w-0" aria-label="explore apps">
+        <h1 className="text-section font-semibold text-ink-100 mb-4">Explore apps</h1>
+        {viewer.access === "unavailable" ? (
+          <Notice state="access-unavailable" onRetry={viewer.onRetryAccess} retryLabel="Retry access check">
+            Access could not be confirmed. Retry the access check before acting.
+          </Notice>
+        ) : <Loading>Checking whether this session can act…</Loading>}
+      </main>
+    );
+  }
 
   return (
     <main className="apps-explore px-4 lg:px-8 pt-4 pb-9 min-w-0" aria-label="explore apps">
