@@ -607,7 +607,10 @@ impl Shared {
             .clone()
             .ok_or_else(|| Error::internal("writer slot unresolved"))?;
         let live = writer.micros + quoted.image.as_ref().map_or(0, |s| s.micros);
-        if live > confirmed || writer.micros > text_ceiling {
+        if live > confirmed
+            || writer.micros > text_ceiling
+            || quoted.image.as_ref().map_or(0, |s| s.micros) > image_ceiling
+        {
             return Err(Error::rejected(
                 "price_changed: above the confirmed estimate",
             ));
