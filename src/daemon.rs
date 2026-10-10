@@ -3497,6 +3497,7 @@ impl Shared {
             "app_effect_list" => self.rpc_app_effect(method, params, peer_pid),
             "app_effect_decide" => self.rpc_app_effect(method, params, peer_pid),
             "app_effect_publish_now" => self.rpc_app_effect(method, params, peer_pid),
+            "app_effect_confirm_publish" => self.rpc_app_effect(method, params, peer_pid),
             "app_effect_resolve" => self.rpc_app_effect(method, params, peer_pid),
             "social_publish_media_import" => self.rpc_social_publish(method, params, peer_pid),
             "social_publish_schedule" => self.rpc_social_publish(method, params, peer_pid),
@@ -5239,12 +5240,9 @@ pub struct ServeOptions {
     /// test seam; bypasses the production seconds clamp so tests run
     /// the loop hot. `None` resolves env/default. Never from PM/RPC.
     pub social_publish_driver_ms: Option<u64>,
-    /// CAD-1020: kill switch — opt-IN, not opt-out. `None` reads
-    /// `CADENCE_SOCIAL_PUBLISH_DRIVER`: only `on` runs the driver; any
-    /// other value (or unset) parks it, so a sender attached for the
-    /// CAD-979 import flow never starts the loop by itself.
-    /// `Some(true)` forces inert; `Some(false)` forces on (tests).
-    pub social_publish_driver_off: Option<bool>,
+    /// Test seam only: parks the publish driver so a fixture can observe a
+    /// crashed daemon's rows untouched. No env knob; production always runs it.
+    pub social_publish_driver_off: bool,
     /// CAD-1020: test-only clock for the driver's due/lateness
     /// comparisons — `None` is wall epoch. Tests pin it to schedule
     /// in the past/future without sleeping.

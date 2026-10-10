@@ -150,7 +150,7 @@ void (async () => {
   // 2. A v2 child receives phase, caption excerpt, refusal, permalink and defaults (no price).
   const v2 = mount(full); v2.port.receive({ v: 1, op: "ready", accepts: ["screen.v2"] });
   const p = v2.port.sent[0] as ScreenPush;
-  check(p.v === 2 && p.actions!.join() === "read.run,context.defaults.save,open-link,social.drafts.list,social.drafts.show,social.drafts.create,social.drafts.update,social.drafts.discard,social.drafts.publish.stage,social.sources.show,social.sources.save,social.destinations.list,run.start,publish.destination.use" && !!p.publish_intents, "v2 envelope: v 2, intents kept, the closed verb list for an operator view");
+  check(p.v === 2 && p.actions!.join() === "read.run,context.defaults.save,open-link,social.drafts.list,social.drafts.show,social.drafts.create,social.drafts.update,social.drafts.discard,social.drafts.publish.stage,social.sources.show,social.sources.save,social.destinations.list,run.start,publish.destination.use,publish.draft.confirm" && !!p.publish_intents, "v2 envelope: v 2, intents kept, the closed verb list for an operator view");
   const byId = new Map(p.runs.map(r => [r.id, r]));
   check(byId.get("run-ready")!.phase === "ready" && byId.get("run-writing")!.phase === "working:produce_text" &&
     byId.get("run-checking")!.phase === "checking" && byId.get("run-failed")!.phase === "failed", "phase from real step receipts");

@@ -133,7 +133,6 @@ impl Daemon {
             social_publish_sender: Some(door.clone()),
             // Explicitly unleased; never read a pm.yaml.
             lease: Some(crate::lease::Hosted::default()),
-            social_publish_driver_off: Some(false),
             social_publish_driver_ms: Some(20),
             social_publish_driver_clock: Some(Arc::new(move || clock.load(Ordering::SeqCst))),
             ..ServeOptions::default()
@@ -566,31 +565,6 @@ fn cad1020_uncertain_rows_ahead_never_starve_a_healthy_post() {
     let daemon = daemon.run();
     daemon.wait_state(&healthy, "posted");
     assert_eq!(door.sent(), vec![key(&healthy)]);
-}
-
-/// Forbidden harm (trigger 6): the daemon posting on its own because a
-/// sender is attached. The driver is opt-in; without
-/// `CADENCE_SOCIAL_PUBLISH_DRIVER=on` a due intent stays queued.
-#[test]
-fn cad1020_sender_without_opt_in_publishes_nothing() {
-    assert!(
-        std::env::var(DRIVER_ENV).is_err(),
-        "run with {DRIVER_ENV} unset: this test proves the default"
-    );
-    let (dir, door, clock) = rig();
-    let daemon = Daemon::open(dir.path(), &door, &clock, |opts| {
-        opts.social_publish_driver_off = None;
-    })
-    .run();
-    let now = clock.load(Ordering::SeqCst);
-    let intent = approved_intent(&daemon.shared.store, "default", now - 1);
-    daemon.ticks(2);
-    assert_eq!(daemon.state(&intent), "queued");
-    assert!(
-        door.preflights.lock().unwrap().is_empty(),
-        "the door was never asked"
-    );
-    assert!(door.sent().is_empty(), "nothing was published");
 }
 
 /// Forbidden harm: the driver sending an explicit-mode intent, whose

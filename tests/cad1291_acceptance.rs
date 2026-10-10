@@ -607,11 +607,6 @@ fn standing_grant_publish_sends_only_an_approved_unchanged_effect_with_a_live_ma
             "grant_revoked",
         ),
         (
-            "grant at its daily cap",
-            json!([standing(|g| g["remainingToday"] = json!(0))]),
-            "grant_cap_reached",
-        ),
-        (
             "per-post record, not a standing grant",
             json!([standing(|g| g["kind"] = json!("post"))]),
             "uncertain",

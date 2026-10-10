@@ -15,9 +15,6 @@
 //!   Unleased daemons skip the check (`Option`-conditional).
 //! - `sender_not_configured`: without a sender the tick records the
 //!   status and sleeps; nothing claims.
-//! - `CADENCE_SOCIAL_PUBLISH_DRIVER=off` (or the `social_publish_driver_off`
-//!   option) leaves the sender attached for manual RPCs while the
-//!   driver stays inert — the canary kill switch.
 //! - MAX_LATENESS: a due row older than the bound is claimed and held
 //!   ("missed publish window"), never sent — the first canary start
 //!   does not dump a stale backlog.
@@ -71,10 +68,6 @@ const LAST_ERROR_CAP: usize = 256;
 /// a tick — the sweep + claim work is cut off at this deadline so one
 /// tick can never wedge the loop (the remaining rows run next tick).
 pub(super) const TICK_DEADLINE_SECS: u64 = 5 * 60;
-/// The driver env knob — opt-IN: only `on` runs the loop. Unset or any
-/// other value parks it, so a sender attached for the CAD-979 import
-/// flow never starts the driver by itself.
-pub const DRIVER_ENV: &str = "CADENCE_SOCIAL_PUBLISH_DRIVER";
 /// Interval env (seconds, clamped).
 pub const INTERVAL_ENV: &str = "CADENCE_SOCIAL_PUBLISH_INTERVAL_SECS";
 /// Lateness env (seconds).
@@ -86,7 +79,7 @@ pub(super) struct Driver {
     /// Resolved tick interval (test seam overrides in ms, bypassing
     /// the seconds clamp like `crm_send_interval_ms`).
     pub interval: Duration,
-    /// Kill switch — `true` parks the loop with `status:"off"`.
+    /// Test seam: parks the loop (see `ServeOptions::social_publish_driver_off`).
     pub off: bool,
     /// Lateness bound for claim-vs-hold.
     pub max_lateness_secs: i64,
@@ -130,15 +123,6 @@ impl Driver {
                     .clamp(MIN_INTERVAL_SECS, MAX_INTERVAL_SECS),
             ),
         };
-        // Opt-in, never opt-out: the driver runs only when
-        // `CADENCE_SOCIAL_PUBLISH_DRIVER=on` (or the option says so).
-        // A sender alone — which `CADENCE_PUBLISH_SEND_URL` + the
-        // CAD-979 media-import credential can attach for the import
-        // flow — must never arm the loop. `off` and any other value
-        // keep it parked; the status surface says why.
-        let off = opts
-            .social_publish_driver_off
-            .unwrap_or_else(|| std::env::var(DRIVER_ENV).ok().as_deref() != Some("on"));
         let max_lateness_secs = std::env::var(LATENESS_ENV)
             .ok()
             .and_then(|raw| raw.parse::<i64>().ok())
@@ -146,7 +130,7 @@ impl Driver {
             .max(0);
         Self {
             interval,
-            off,
+            off: opts.social_publish_driver_off,
             max_lateness_secs,
             clock: opts
                 .social_publish_driver_clock

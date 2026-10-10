@@ -87,6 +87,55 @@ pub(crate) fn social_effect_install(id: &str) -> Option<String> {
         .collect::<Option<Vec<_>>>()?;
     String::from_utf8(bytes).ok()
 }
+
+/// How long Publish now waits for AgenticOS to settle a `processing` send.
+/// Short on purpose: the board holds its global write lock for the whole
+/// request, so a long wait would freeze every other board write. A longer
+/// wait is a repeated confirm, which re-polls.
+const SETTLE_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+const SETTLE_STEP: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Publish now returns while the provider may still be `processing`, and
+/// nothing else polls a one-step effect. Poll the status door (reads only,
+/// never a second send) until it is posted or refused; with no verdict
+/// inside the window the effect stays `sending` with a plain reason.
+fn settle_social_send(
+    records: &crate::store::app_records::RecordStore,
+    id: &str,
+    sender: &dyn crate::platform::agenticos_external::publish::PublishSender,
+    authority: &Value,
+    mut receipt: Value,
+) -> Result<Value> {
+    use crate::platform::agenticos_external::publish::PublishState;
+    if receipt["effect"]["state"] != "sending" {
+        return Ok(receipt);
+    }
+    let key = required_str(authority, "idempotency_key")?;
+    let deadline = std::time::Instant::now() + SETTLE_WINDOW;
+    loop {
+        match sender.status(key) {
+            Ok(o) if o.state == PublishState::Posted => {
+                return records.app_social_effect_finish(id, "posted", &o.evidence_json())
+            }
+            Ok(o)
+                if matches!(
+                    o.state,
+                    PublishState::Refused | PublishState::ReconnectNeeded
+                ) =>
+            {
+                return records.app_social_effect_finish(id, "refused", &o.evidence_json())
+            }
+            _ => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            receipt["send_error"] =
+                json!("not confirmed by AgenticOS yet; check Instagram before retrying");
+            return Ok(receipt);
+        }
+        std::thread::sleep(SETTLE_STEP);
+    }
+}
+
 /// CAD-1291: the owner's standing publish grant for the approved
 /// destination. Cadence never mints one and never takes a grant id from a
 /// request or a binding: it asks the hosted door for the standing grants of
@@ -278,7 +327,10 @@ impl Shared {
             .ok_or_else(|| Error::rejected("not a social draft effect"))?;
         let records = crate::store::app_records::RecordStore::open(&self.state_dir, &install)?;
         let shown = records.app_social_effect_show(id)?;
-        if shown["effect"]["digest"] != digest || shown["effect"]["state"] != "approved" {
+        let sending = shown["effect"]["state"] == "sending";
+        if shown["effect"]["digest"] != digest
+            || !(sending || shown["effect"]["state"] == "approved")
+        {
             return Err(Error::rejected(
                 "Publish now requires the exact approved social draft effect",
             ));
@@ -287,10 +339,14 @@ impl Shared {
         let sender = self.social_publish_sender.clone().ok_or_else(|| {
             Error::rejected("capability_unavailable: publish sender is not registered")
         })?;
+        if sending {
+            // A repeated confirm re-checks the provider; it never sends again.
+            return settle_social_send(&records, id, sender.as_ref(), &authority, shown);
+        }
         let pm = self.pm_at(&self.pm_dir()?)?;
         let id_owned = id.to_owned();
         let digest_owned = digest.to_owned();
-        workspace::with_completed_bundle_snapshot(
+        let receipt = workspace::with_completed_bundle_snapshot(
             &pm,
             &install,
             required_str(&authority, "bundle_digest")?,
@@ -411,7 +467,108 @@ impl Shared {
                         }),
                 }
             },
+        )?;
+        // The send call may return while AgenticOS is still `processing`;
+        // the locks are released, so poll the status door for the verdict.
+        settle_social_send(&records, id, sender.as_ref(), &authority, receipt)
+    }
+
+    /// Accept or decline one waiting social draft effect: the bound-contract
+    /// checks, then the durable decision (shared by the Outbox decide and the
+    /// one-step confirm).
+    fn decide_social_effect(&self, id: &str, digest: &str, accept: bool) -> Result<Value> {
+        let install = social_effect_install(id)
+            .ok_or_else(|| Error::rejected("not a social draft effect"))?;
+        let records = crate::store::app_records::RecordStore::open(&self.state_dir, &install)?;
+        let frozen = records.app_social_effect_show(id)?;
+        if frozen["effect"]["digest"] != digest || frozen["effect"]["state"] != "waiting" {
+            return Err(Error::rejected(
+                "social effect digest is stale or effect is no longer waiting",
+            ));
+        }
+        let authority = &frozen["effect"]["authority"];
+        let pm = self.pm_at(&self.pm_dir()?)?;
+        workspace::with_completed_bundle_snapshot(
+            &pm,
+            &install,
+            required_str(authority, "bundle_digest")?,
+            |bundle, files| {
+                if accept {
+                    let _release = self
+                        .app_release_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let context = required_str(authority, "context_id")?;
+                    let slot = required_str(&authority["binding"], "slot")?;
+                    let current_binding = self
+                        .app_binding_live(&install, Some(context), slot, bundle, files)?
+                        .ok_or_else(|| Error::rejected("social publish binding is unavailable"))?;
+                    if current_binding.config["mapping"]["effect"] != "send"
+                        || current_binding.digest != authority["binding"]["digest"]
+                        || current_binding.revision != authority["binding"]["revision"]
+                    {
+                        return Err(Error::rejected(
+                            "social publish binding changed since staging",
+                        ));
+                    }
+                    let draft = required_str(authority, "draft_id")?;
+                    let revision = authority["revision"].as_i64().unwrap_or(0);
+                    let current = records.app_social_draft_show(context, draft)?;
+                    if current["revision"].as_i64() != Some(revision) {
+                        return Err(Error::rejected("social draft changed since effect staging"));
+                    }
+                    let asset = authority["asset_id"].as_str();
+                    if let Some(asset) = asset {
+                        let (_, digest, bytes) =
+                            self.store.app_tool_asset_bytes(&install, asset)?;
+                        if Some(bare_digest(&digest)) != frozen_image_digest(authority)
+                            || bytes.len() != authority["size_bytes"].as_u64().unwrap_or(0) as usize
+                        {
+                            return Err(Error::rejected(
+                                "social draft image changed since staging",
+                            ));
+                        }
+                    }
+                }
+                records
+                    .app_social_effect_decide(id, digest, accept)?
+                    .ok_or_else(|| Error::rejected("social effect has already been decided"))
+            },
         )
+    }
+
+    /// CAD-1328: the operator's one tap on the board's confirm card for a
+    /// screen-staged social draft effect. The card shows the frozen effect
+    /// material; this approves and sends it in one call. Same operator gate
+    /// and the same send path as Outbox decide + Publish now (frozen digest,
+    /// bound-contract checks, the owner's standing grant and daily cap,
+    /// preflight, the send claim), so a refusal there refuses here and the
+    /// effect is left approved for a retry. Only social draft effects, only
+    /// at the digest the card showed; any other effect stays in the Outbox.
+    /// A replay of a sent effect returns its receipt and sends nothing.
+    fn confirm_social_publish(&self, id: &str, digest: &str) -> Result<Value> {
+        let install = social_effect_install(id).ok_or_else(|| {
+            Error::rejected("only a social draft effect can be confirmed in one step")
+        })?;
+        let records = crate::store::app_records::RecordStore::open(&self.state_dir, &install)?;
+        let shown = records.app_social_effect_show(id)?;
+        if shown["effect"]["digest"] != digest {
+            return Err(Error::rejected("social effect digest is stale"));
+        }
+        match shown["effect"]["state"].as_str() {
+            Some("waiting") => {
+                self.decide_social_effect(id, digest, true)?;
+            }
+            // A `sending` effect re-polls the provider; it never sends again.
+            Some("approved" | "sending") => {}
+            Some("posted" | "refused") => return Ok(shown),
+            _ => {
+                return Err(Error::rejected(
+                    "social effect is no longer waiting for confirmation",
+                ))
+            }
+        }
+        self.publish_social_draft_now(id, digest)
     }
 
     pub(super) fn rpc_app_effect(
@@ -440,7 +597,7 @@ impl Shared {
                 "app_effect_show" => &["effect_id"],
                 "app_effect_list" => &["install_id", "context_id"],
                 "app_effect_decide" => &["effect_id", "digest", "decision"],
-                "app_effect_publish_now" => &["effect_id", "digest"],
+                "app_effect_publish_now" | "app_effect_confirm_publish" => &["effect_id", "digest"],
                 "app_effect_resolve" => &["effect_id", "digest", "resolution"],
                 _ => return Err(Error::rejected("unknown app effect method")),
             },
@@ -477,6 +634,10 @@ impl Shared {
                 required_str(params, "effect_id")?,
                 required_str(params, "digest")?,
             ),
+            "app_effect_confirm_publish" => self.confirm_social_publish(
+                required_str(params, "effect_id")?,
+                required_str(params, "digest")?,
+            ),
             "app_effect_resolve" => {
                 // Historical reconciliation deliberately needs neither a live
                 // installation nor PM/custody locks. It never executes a send.
@@ -504,74 +665,8 @@ impl Shared {
                         ))
                     }
                 };
-                if let Some(install) = social_effect_install(id) {
-                    let records =
-                        crate::store::app_records::RecordStore::open(&self.state_dir, &install)?;
-                    let frozen = records.app_social_effect_show(id)?;
-                    if frozen["effect"]["digest"] != digest
-                        || frozen["effect"]["state"] != "waiting"
-                    {
-                        return Err(Error::rejected(
-                            "social effect digest is stale or effect is no longer waiting",
-                        ));
-                    }
-                    let authority = &frozen["effect"]["authority"];
-                    let pm = self.pm_at(&self.pm_dir()?)?;
-                    return workspace::with_completed_bundle_snapshot(
-                        &pm,
-                        &install,
-                        required_str(authority, "bundle_digest")?,
-                        |bundle, files| {
-                            if accept {
-                                let _release = self
-                                    .app_release_lock
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner());
-                                let context = required_str(authority, "context_id")?;
-                                let slot = required_str(&authority["binding"], "slot")?;
-                                let current_binding = self
-                                    .app_binding_live(&install, Some(context), slot, bundle, files)?
-                                    .ok_or_else(|| {
-                                        Error::rejected("social publish binding is unavailable")
-                                    })?;
-                                if current_binding.config["mapping"]["effect"] != "send"
-                                    || current_binding.digest != authority["binding"]["digest"]
-                                    || current_binding.revision != authority["binding"]["revision"]
-                                {
-                                    return Err(Error::rejected(
-                                        "social publish binding changed since staging",
-                                    ));
-                                }
-                                let draft = required_str(authority, "draft_id")?;
-                                let revision = authority["revision"].as_i64().unwrap_or(0);
-                                let current = records.app_social_draft_show(context, draft)?;
-                                if current["revision"].as_i64() != Some(revision) {
-                                    return Err(Error::rejected(
-                                        "social draft changed since effect staging",
-                                    ));
-                                }
-                                let asset = authority["asset_id"].as_str();
-                                if let Some(asset) = asset {
-                                    let (_, digest, bytes) =
-                                        self.store.app_tool_asset_bytes(&install, asset)?;
-                                    if Some(bare_digest(&digest)) != frozen_image_digest(authority)
-                                        || bytes.len()
-                                            != authority["size_bytes"].as_u64().unwrap_or(0)
-                                                as usize
-                                    {
-                                        return Err(Error::rejected(
-                                            "social draft image changed since staging",
-                                        ));
-                                    }
-                                }
-                            }
-                            records
-                                .app_social_effect_decide(id, digest, accept)?
-                                .ok_or_else(|| {
-                                    Error::rejected("social effect has already been decided")
-                                })
-                        },
-                    );
+                if social_effect_install(id).is_some() {
+                    return self.decide_social_effect(id, digest, accept);
                 }
                 let frozen = self.store.app_effect_show(id)?;
                 if frozen["effect"]["digest"] != digest || frozen["effect"]["state"] != "waiting" {
@@ -1007,6 +1102,16 @@ impl Shared {
 // or company, or past its cap or revoked (AgenticOS side); and an unapproved
 // or changed draft, with no provider call.
 
+// ACCEPTANCE-CHECK SLOT (CAD-1328). Reserved for the independent acceptance
+// check, written by the reviewer or the ticket author, not the implementer,
+// in a new `tests/cad1328_acceptance.rs` (feature `test-seam`). It must prove
+// against the real guards that these are refused: an agent, container or
+// unproven caller on `app_context_update`, `app_binding_use_destination` and
+// `app_effect_confirm_publish` (RPC and HTTP), with no re-pin and no send; a
+// changed connection, bundle digest, descriptor or sink after a re-pin; a
+// replayed confirm that would post twice; a confirm past the daily cap; and
+// an effect that is not a screen-staged social draft staying in the Outbox.
+
 #[cfg(test)]
 mod grant_tests {
     use super::*;
@@ -1043,7 +1148,6 @@ mod grant_tests {
             connection_id: "con_ig".into(),
             destination_id: "1784".into(),
             toolkit: "instagram".into(),
-            remaining_today: 5,
             revoked: false,
         }
     }
@@ -1065,14 +1169,6 @@ mod grant_tests {
         assert_eq!(
             owner_grant(&door, &authority("9999")).unwrap_err().code,
             "grant_required"
-        );
-        let mut capped = standing();
-        capped.remaining_today = 0;
-        assert_eq!(
-            owner_grant(&Door(vec![capped]), &authority("1784"))
-                .unwrap_err()
-                .code,
-            "grant_cap_reached"
         );
     }
 

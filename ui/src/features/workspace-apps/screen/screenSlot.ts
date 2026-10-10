@@ -20,9 +20,11 @@ import type { ActionRefusal, ActionResult, ReplyMessage, SlotAnchor, SlotRequest
 export const SLOT_GUARD_MS = 500;
 export const SLOT_TTL_MS = 120_000;
 
-export interface SlotPlan { label: string; run: () => Promise<ActionResult> }
-export type Planner = (verb: SlotVerb, args: Record<string, unknown>) => Promise<SlotPlan | ActionRefusal>;
-export interface SlotView { token: string; label: string; anchor: SlotAnchor; pending: boolean }
+/** CAD-1328: what a confirm card shows, from the daemon's frozen effect material (never from the frame). */
+export interface SlotCard { target: string; caption: string; image: string | null }
+export interface SlotPlan { label: string; run: () => Promise<ActionResult>; card?: SlotCard }
+export type Planner = (verb: SlotVerb, args: Record<string, unknown>, ui?: { actionToken?: string }) => Promise<SlotPlan | ActionRefusal>;
+export interface SlotView { token: string; label: string; anchor: SlotAnchor; pending: boolean; card?: SlotCard }
 
 interface Live { id: string; key: string; view: SlotView; since: number; plan: SlotPlan; busy: boolean; timer: ReturnType<typeof setTimeout> }
 
@@ -65,7 +67,7 @@ export class SlotController {
     this.planning = null;
     if (!("run" in plan)) { this.send({ v: 2, op: "slot-state", id: req.id, state: "refused", refusal: plan }); return; }
     const timer = setTimeout(() => { if (this.live?.id === req.id && !this.live.busy) this.retire("expired"); }, SLOT_TTL_MS);
-    this.live = { id: req.id, key, view: { token: randomToken(), label: plan.label, anchor, pending: false }, since: this.clock(), plan, busy: false, timer };
+    this.live = { id: req.id, key, view: { token: randomToken(), label: plan.label, anchor, pending: false, ...(plan.card ? { card: plan.card } : {}) }, since: this.clock(), plan, busy: false, timer };
     this.changed(this.live.view);
   }
 
@@ -91,12 +93,17 @@ export class SlotController {
     return true;
   }
 
+  /** The person closed a confirm card: nothing runs, the frame is told. */
+  cancel(token: string): void {
+    if (this.live && !this.live.busy && token === this.live.view.token) this.retire("cancelled");
+  }
+
   private retire(code: string): void {
     const live = this.live;
     if (!live) return;
     clearTimeout(live.timer);
     this.live = null;
-    this.send({ v: 2, op: "slot-state", id: live.id, state: "refused", refusal: { code, text: code === "expired" ? "That took too long. Try again." : "Replaced by another action." } });
+    this.send({ v: 2, op: "slot-state", id: live.id, state: "refused", refusal: { code, text: code === "expired" ? "That took too long. Try again." : code === "cancelled" ? "Cancelled. Nothing was posted." : "Replaced by another action." } });
     this.changed(null);
   }
 
