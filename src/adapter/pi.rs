@@ -1729,6 +1729,71 @@ fn resolved_pi_model(state: &Value) -> Option<(String, &str)> {
     Some((format!("{provider}/{id}"), id))
 }
 
+/// CAD-601: the execution-shaping fields a fabricated `--model` entry
+/// can forge. On a cold pi-devin catalog real Pi accepts an unknown
+/// `provider/id` and mints an entry whose `thinkingLevelMap` resolves
+/// `--effort` onto a paid family while `get_state` still echoes the
+/// requested name — so the reported id alone cannot prove the model.
+/// The open must cross-check these fields against `get_available_models`.
+/// `name`/`cost`/`contextWindow`/`maxTokens` are deliberately excluded:
+/// the display label and the metered price are mutable catalog metadata,
+/// not the execution identity. When BOTH sides omit a field they agree
+/// (the `normal` fixture's minimal `{id,name,provider}` shape stays a
+/// valid open); a field present on one side and absent on the other is a
+/// mismatch.
+const PI_MODEL_EXECUTION_FIELDS: [&str; 4] = ["api", "baseUrl", "thinkingLevelMap", "reasoning"];
+
+/// Cross-check the model `get_state` resolved against the provider's
+/// own `get_available_models` catalog (CAD-601). A model is refused
+/// when the catalog cannot answer, lists no usable entry for the
+/// reported `provider/id`, or the reported execution fields disagree
+/// with the listed entry — the reported `provider/id` was already
+/// proven equal to the requested model by the caller, so it names both.
+/// Membership is mandatory: get_available_models is the catalog of
+/// record, and a reported model it does not list is not a real entry —
+/// absent the catalog simply refuses. When a catalog entry exists,
+/// both sides may omit the optional execution fields (the `normal`
+/// fixture's minimal `{id,name,provider}` shape stays a valid open);
+/// a field present on one side and absent on the other is a mismatch.
+/// The `Err` names only the configured model and the disagreeing
+/// field — never a catalog/payload/cost value.
+fn catalog_backed_model(catalog: &Value, reported_full: &str, model: &Value) -> Result<()> {
+    let models = catalog
+        .get("models")
+        .and_then(Value::as_array)
+        .filter(|ms| !ms.is_empty())
+        .ok_or_else(|| {
+            Error::provider(format!(
+                "pi model '{reported_full}' is unverifiable — get_available_models \
+                 returned no usable catalog (CAD-601)"
+            ))
+        })?;
+    let provider = model.get("provider").and_then(Value::as_str);
+    let id = model.get("id").and_then(Value::as_str);
+    let listed = models.iter().find(|entry| {
+        entry.get("provider").and_then(Value::as_str) == provider
+            && entry.get("id").and_then(Value::as_str) == id
+    });
+    match listed {
+        Some(entry) => {
+            for field in PI_MODEL_EXECUTION_FIELDS {
+                if model.get(field) != entry.get(field) {
+                    return Err(Error::provider(format!(
+                        "pi reports model {reported_full} whose '{field}' disagrees \
+                         with the catalog entry — the running model was fabricated \
+                         rather than resolved (CAD-601)"
+                    )));
+                }
+            }
+            Ok(())
+        }
+        None => Err(Error::provider(format!(
+            "pi reports model {reported_full} but get_available_models does not list \
+             it — a fabricated or unresolvable entry (CAD-601)"
+        ))),
+    }
+}
+
 impl PiAdapter {
     pub fn new(
         hooks: AdapterHooks,
@@ -2698,6 +2763,17 @@ impl ProviderAdapter for PiAdapter {
                     reported_full
                 )));
             }
+            // CAD-601: the requested name matching is not proof the
+            // model is real — on a cold pi-devin catalog Pi fabricates
+            // the entry and get_state still echoes it. Cross-check the
+            // reported execution identity against get_available_models
+            // inside this cleanup boundary so a refusal revokes prompt.
+            let catalog = self.checked("get_available_models", json!({}))?;
+            catalog_backed_model(
+                &catalog,
+                &reported_full,
+                data.get("model").unwrap_or(&Value::Null),
+            )?;
             let model = Some(reported_full);
             let effort = data
                 .get("thinkingLevel")
