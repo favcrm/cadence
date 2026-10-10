@@ -25,6 +25,8 @@ campaign. Retention and quota are described in
 - Kinds (interim allowlist, enforced by daemon byte-sniff, not the extension
   alone): `.txt`, `.md`, `.csv`. The extension must match the sniffed bytes.
 - Size: at most **10 MiB** per file; at most **5 files** per message.
+- Attachments fail closed: a symlink anywhere in the PM directory path, or a
+  group- or world-writable `.cadence` directory, makes every upload refuse.
 - The composer pre-checks the same list and cap and its file picker offers
   only `.txt,.md,.csv`; the daemon's checks are the enforcement. A `.pdf`,
   `.png`, `.jpg`, `.jpeg` or `.webp` upload (by name or by sniffed bytes) is

@@ -1,4 +1,4 @@
-import { addFiles, attachItems, removeAttach, retryAttach } from "../src/features/app-shell/chat/composerStore";
+import { addFiles, carryEarlyDraft, composerDraftState, setComposerDraft, attachItems, removeAttach, retryAttach } from "../src/features/app-shell/chat/composerStore";
 
 function equal(actual: unknown, expected: unknown, what: string): void {
   const a = JSON.stringify(actual);
@@ -28,4 +28,19 @@ retryAttach(key, sixth.key);
 equal(attachItems(key)[5].status, "failed", "Retry on the sixth file is a no-op, never a sixth ready row");
 
 for (const row of attachItems(key)) removeAttach(key, row.key);
+// CAD-1279: text typed before the conversation resolved (key `app|i|`)
+// is lost when the pane remounts under `app|i|c1`; carrying it moves it
+// once, never over another draft and never into a different install.
+setComposerDraft("app|i|", "typed early");
+equal(composerDraftState("app|i|c1").text, "", "before the carry the resolved key is empty (the lost draft)");
+carryEarlyDraft("app|i|", "app|i|c1");
+equal(composerDraftState("app|i|c1").text, "typed early", "the early draft survives the key change");
+equal(composerDraftState("app|i|").text, "", "the early slot is emptied, not duplicated");
+setComposerDraft("app|i|", "second");
+carryEarlyDraft("app|i|", "app|i|c1");
+equal(composerDraftState("app|i|c1").text, "typed early", "an existing draft is never overwritten");
+equal(composerDraftState("app|i|").text, "second", "the refused carry leaves the early text in place");
+setComposerDraft("app|i|", "");
+setComposerDraft("app|i|c1", "");
+
 console.log("chatAttachStore.test.ts: all assertions passed");

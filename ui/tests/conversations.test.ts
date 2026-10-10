@@ -33,7 +33,7 @@ const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
 const AppShell = require("../src/features/app-shell/AppShell").default;
 const { resources } = require("../src/lib/resources") as typeof import("../src/lib/resources");
-const { parseSlash, autoSelectCampaignConversation, conversationThread } = require("../src/features/app-shell/conversationClient") as typeof import("../src/features/app-shell/conversationClient");
+const { parseSlash, autoSelectCampaignConversation, conversationThread, conversationList } = require("../src/features/app-shell/conversationClient") as typeof import("../src/features/app-shell/conversationClient");
 
 equal([parseSlash("/new"), parseSlash(" /CLEAR "), parseSlash("/new now"), parseSlash("hello")], ["new", "new", null, null], "only the bare commands are commands");
 
@@ -234,6 +234,52 @@ assert(!host.querySelector(".app-shell-grid")!.hasAttribute("data-chat-collapsed
 equal(optionLabels(), ["General"], "another app lists only its own conversations");
 await mount("install-crm");
 assert(host.querySelector(".app-shell-grid")!.hasAttribute("data-chat-collapsed"), "the CRM chat stays collapsed");
+
+// A cached legacy response leaves the real composer editable while the next
+// conversation-list request is pending. Draft text must survive when that
+// same request resolves to the install's General conversation.
+{
+  const fixtureFetch = globalThis.fetch;
+  let listMode: "legacy" | "pending" = "legacy";
+  let resolveModernList: (response: Response) => void = () => { throw new Error("modern list request did not start"); };
+  let modernListPending = false;
+  globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+    const url = new URL(String(input), "http://localhost");
+    if (url.pathname === "/api/app-installations/install-crm/conversations" && (init?.method ?? "GET") === "GET") {
+      if (listMode === "legacy") return json({ error: "not found" }, 404);
+      modernListPending = true;
+      return new Promise<Response>((resolve) => { resolveModernList = resolve; });
+    }
+    return fixtureFetch(input as RequestInfo | URL, init);
+  }) as typeof fetch;
+  try {
+    await React.act(async () => { (host.querySelector(".app-chat-collapse") as HTMLElement).dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+    await settle();
+    await React.act(async () => { await conversationList("install-crm").refresh(); });
+    await settle();
+    assert(box() && !box().disabled, "the actual legacy-mode composer is editable");
+
+    listMode = "pending";
+    let refresh!: Promise<void>;
+    await React.act(async () => { refresh = conversationList("install-crm").refresh(); });
+    await settle();
+    assert(modernListPending, "the next real conversation-list lookup is pending");
+    assert(!box().disabled, "cached legacy data keeps the mounted composer editable during refresh");
+    await React.act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(box(), "draft during legacy refresh");
+      box().dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    equal(box().value, "draft during legacy refresh", "the text was entered through the mounted textarea");
+    await React.act(async () => { resolveModernList(json({ conversations: [conv("c-gen", { is_general: true })] })); });
+    await React.act(async () => { await refresh!; });
+    await settle();
+    equal(picker().value, "c-gen", "the same app resolves to its General conversation");
+    equal(box().value, "draft during legacy refresh", "the real composer keeps the draft after General resolves");
+  } finally {
+    if (modernListPending) resolveModernList(json({ conversations: [conv("c-gen", { is_general: true })] }));
+    globalThis.fetch = fixtureFetch;
+  }
+}
 
 // A read-only viewer cannot create a conversation by any route.
 await mount("install-crm", { operator: true, readOnly: true });
