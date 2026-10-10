@@ -11,13 +11,18 @@ import { agentsEmptyCopy } from "../../lib/uxCopy";
 import { ResourceGate, StaleChip } from "../../ui/ResourceStatus";
 import { IconSearch } from "../../ui/icons";
 import Button from "../../ui/Button";
-import { activeTasks, AgentActivity, AgentQueue, AgentState, WorkBlock } from "./AgentBlocks";
+import { activeTasks, AgentActivity, WorkBlock } from "./AgentBlocks";
+import AgentAvatar, { lookFor } from "./AgentAvatar";
 import AgentDrawer from "./AgentDrawer";
 import {
   AGENT_FILTERS,
+  agentHoldsWorkButDead,
   agentMatchesFilter,
   agentMatchesSearch,
   agentOrder,
+  LIFECYCLE_SECTIONS,
+  lifecycleBadge,
+  lifecycleOf,
   type AgentFilter,
 } from "./agentView";
 import "./agents.css";
@@ -55,29 +60,175 @@ function RelatedIssues({
   );
 }
 
-function AgentIdentity({
-  agent: a,
-  onOpen,
+/** The card's work block: first active task as issue link + clamped title
+ * + mono state line; the shared WorkBlock covers every other state. */
+function CardWork({
+  agent,
+  onOpenIssue,
 }: {
   agent: Agent;
-  onOpen: () => void;
+  onOpenIssue: (id: string) => void;
 }) {
+  const task = activeTasks(agent)[0];
+  if (!task)
+    return (
+      <div className="work">
+        <WorkBlock agent={agent} onOpenIssue={onOpenIssue} />
+      </div>
+    );
+  const runningTaskIds = new Set(
+    (agent.running_messages ?? [])
+      .map((message) => message.task)
+      .filter(Boolean),
+  );
+  const live = runningTaskIds.has(task.task);
   return (
-    <div className="min-w-0">
-      <button
-        type="button"
-        className="agent-name"
-        onClick={onOpen}
-        aria-label={`Open agent ${a.alias}`}
-      >
-        {a.alias}
-      </button>
-      <p className="text-micro text-ink-500 mt-1 break-words">
-        {a.role ?? "Agent"} · {a.provider} · {a.group_root ? "root" : a.group}
-      </p>
+    <div className="work">
+      <div className="flex items-start gap-1.5 min-w-0">
+        <i
+          className={`w-1.5 h-1.5 rounded-full shrink-0 mt-1.5 ${live ? "bg-info" : "bg-ink-600"}`}
+        />
+        {task.issue && (
+          <button
+            className="lnk num shrink-0"
+            onClick={(event) => {
+              event.stopPropagation();
+              onOpenIssue(task.issue);
+            }}
+          >
+            {task.issue}
+          </button>
+        )}
+        <span className="work-tt text-ink-300" title={task.title ?? task.task}>
+          {task.title ?? task.task}
+        </span>
+      </div>
+      <div className="num text-micro text-ink-500 pl-3">
+        {live ? "running" : task.task_state}
+        {task.job_title
+          ? ` · ${task.job_title}`
+          : task.job
+            ? ` · ${task.job}`
+            : ""}
+        {task.job_state ? ` · stage ${task.job_state}` : ""}
+        {activeTasks(agent).length > 1
+          ? ` · +${activeTasks(agent).length - 1} more`
+          : ""}
+      </div>
     </div>
   );
 }
+
+/** One catalog card: avatar top-center, name/meta, work, lifecycle badge
+ * bottom-left opposite the queued chip, lifecycle-coloured top edge. */
+function AgentCard({
+  agent: a,
+  index,
+  onOpen,
+  onOpenIssue,
+}: {
+  agent: Agent;
+  index: IssueIndex;
+  onOpen: () => void;
+  onOpenIssue: (id: string) => void;
+}) {
+  const lifecycle = lifecycleOf(a);
+  const tone = LIFECYCLE_SECTIONS.find((s) => s.key === lifecycle)!.tone;
+  const badge = lifecycleBadge(a);
+  return (
+    <article
+      className={`agent-card tone-${tone}`}
+      onClick={onOpen}
+      aria-label={`Agent ${a.alias}`}
+    >
+      <div className="top">
+        <div className="avwrap">
+          <AgentAvatar
+            slug={lookFor(a.alias)}
+            active={lifecycle === "active"}
+            still={lifecycle !== "active"}
+          />
+          {agentHoldsWorkButDead(a) && (
+            <span className="agent-hold" title="Dead but still holds work">
+              !
+            </span>
+          )}
+        </div>
+        <div className="min-w-0">
+          <button
+            type="button"
+            className="agent-name name"
+            onClick={(event) => {
+              event.stopPropagation();
+              onOpen();
+            }}
+            aria-label={`Open agent ${a.alias}`}
+          >
+            {a.alias}
+          </button>
+          <p className="meta break-words">
+            {a.role ?? "Agent"} · {a.provider} ·{" "}
+            {a.group_root ? "root" : a.group}
+          </p>
+        </div>
+      </div>
+      <CardWork agent={a} onOpenIssue={onOpenIssue} />
+      <RelatedIssues agent={a} index={index} onOpenIssue={onOpenIssue} />
+      <div className="-mt-2 text-micro">
+        <AgentActivity agent={a} />
+      </div>
+      <div className="foot">
+        <span className={`stateb tone-${badge.tone}`}>
+          <i aria-hidden="true" />
+          {badge.label}
+        </span>
+        <span className={`agent-qchip${a.queued >= 100 ? " hot" : ""}`}>
+          {a.queued} queued
+        </span>
+      </div>
+    </article>
+  );
+}
+
+/** Triage strip cell → the filter it applies. Dead and idle holdings
+ * share the "holding" filter; the sections split them again. */
+const TRIAGE: {
+  label: string;
+  tone: "fail" | "warn" | "info" | "ok";
+  filter: AgentFilter;
+  count: (a: Agent) => boolean;
+}[] = [
+  {
+    label: "Dead · holding work",
+    tone: "fail",
+    filter: "holding",
+    count: (a) => lifecycleOf(a) === "dead-holding",
+  },
+  {
+    label: "Idle · holding claim",
+    tone: "warn",
+    filter: "holding",
+    count: (a) => lifecycleOf(a) === "idle-holding",
+  },
+  {
+    label: "Stale inbox",
+    tone: "info",
+    filter: "inbox",
+    count: (a) => lifecycleOf(a) === "stale-inbox",
+  },
+  {
+    label: "Needs attention",
+    tone: "warn",
+    filter: "attention",
+    count: (a) => agentMatchesFilter(a, "attention"),
+  },
+  {
+    label: "Working",
+    tone: "ok",
+    filter: "working",
+    count: (a) => lifecycleOf(a) === "active",
+  },
+];
 
 export default function Agents({
   state,
@@ -122,6 +273,10 @@ export default function Agents({
     .sort(
       (a, b) => agentOrder(a) - agentOrder(b) || a.alias.localeCompare(b.alias),
     );
+  const sections = LIFECYCLE_SECTIONS.map((section) => ({
+    ...section,
+    agents: agents.filter((a) => lifecycleOf(a) === section.key),
+  })).filter((section) => section.agents.length > 0);
   const globalAgents = allAgents.filter((a) =>
     agentIsUnassigned(a, issueProjects),
   );
@@ -209,6 +364,26 @@ export default function Agents({
 
       {payload && !scopeUnavailable && (
         <>
+          <div
+            className="agents-triage"
+            role="group"
+            aria-label="Agent lifecycle triage"
+          >
+            {TRIAGE.map((cell) => (
+              <button
+                key={cell.label}
+                type="button"
+                className={`agents-triage-cell tone-${cell.tone}`}
+                aria-pressed={filter === cell.filter}
+                onClick={() => setFilter(cell.filter)}
+              >
+                <span className="agents-triage-n">
+                  {scoped.filter(cell.count).length}
+                </span>
+                <span className="agents-triage-t">{cell.label}</span>
+              </button>
+            ))}
+          </div>
           <div className="agents-tools mb-4">
             <div
               className="agents-filters"
@@ -258,98 +433,26 @@ export default function Agents({
               {emptyCopy}
             </div>
           ) : (
-            <>
-              <div className="agents-cards space-y-3">
-                {agents.map((a) => (
-                  <article key={a.alias} className="card p-4">
-                    <div className="flex items-start justify-between gap-3">
-                      <AgentIdentity
-                        agent={a}
-                        onOpen={() => setOpen(a.alias)}
-                      />
-                      <AgentState agent={a} />
-                    </div>
-                    {a.fenced && (
-                      <p className="text-label text-fail mt-2">
-                        Recovery required · Open agent for guidance
-                      </p>
-                    )}
-                    <div className="mt-3">
-                      <WorkBlock agent={a} onOpenIssue={onOpenIssue} />
-                      <RelatedIssues
-                        agent={a}
-                        index={issueProjects}
-                        onOpenIssue={onOpenIssue}
-                      />
-                    </div>
-                    <div className="agents-card-footer">
-                      <AgentQueue agent={a} />
-                      <AgentActivity agent={a} />
-                    </div>
-                  </article>
-                ))}
-              </div>
-              <div className="agents-table card overflow-hidden">
-                <table className="w-full text-label">
-                  <caption className="sr-only">
-                    Agents in {project === "all" ? "all projects" : project}
-                  </caption>
-                  <thead>
-                    <tr>
-                      {[
-                        "Agent",
-                        "Status",
-                        "Current work",
-                        "Queue",
-                        "Last activity",
-                      ].map((h) => (
-                        <th
-                          key={h}
-                          scope="col"
-                          className="slabel font-normal text-left px-4 py-3"
-                        >
-                          {h}
-                        </th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-ink-700/70">
-                    {agents.map((a) => (
-                      <tr key={a.alias}>
-                        <td>
-                          <AgentIdentity
-                            agent={a}
-                            onOpen={() => setOpen(a.alias)}
-                          />
-                        </td>
-                        <td>
-                          <AgentState agent={a} />
-                          {a.fenced && (
-                            <p className="text-micro text-fail mt-2">
-                              Recovery required
-                            </p>
-                          )}
-                        </td>
-                        <td>
-                          <WorkBlock agent={a} onOpenIssue={onOpenIssue} />
-                          <RelatedIssues
-                            agent={a}
-                            index={issueProjects}
-                            onOpenIssue={onOpenIssue}
-                          />
-                        </td>
-                        <td>
-                          <AgentQueue agent={a} />
-                        </td>
-                        <td>
-                          <AgentActivity agent={a} />
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </>
+            sections.map((section) => (
+              <section key={section.key}>
+                <div className="agents-sec">
+                  <h2>{section.title}</h2>
+                  <span className="cnt">{section.agents.length}</span>
+                  <span className="rule" aria-hidden="true" />
+                </div>
+                <div className="agents-grid">
+                  {section.agents.map((a) => (
+                    <AgentCard
+                      key={a.alias}
+                      agent={a}
+                      index={issueProjects}
+                      onOpen={() => setOpen(a.alias)}
+                      onOpenIssue={onOpenIssue}
+                    />
+                  ))}
+                </div>
+              </section>
+            ))
           )}
           {project !== "all" &&
             issuesState.data !== null &&
