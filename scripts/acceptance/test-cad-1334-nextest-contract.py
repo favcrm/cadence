@@ -143,7 +143,8 @@ def invoke(manifest: Path, temp: Path, nextest: Path, *, fail_test: str | None =
     env = os.environ.copy()
     env.pop("CADENCE_NEXTTEST_BIN", None)
     env["PATH"] = f"{nextest.parent}{os.pathsep}{env.get('PATH', '')}"
-    env.update(TMPDIR=str(temp), CADENCE_SUITE_LOCK=str(temp / "suite.lock"),
+    env.update(TMPDIR=str(temp), RUNNER_TEMP=str(temp),
+               CADENCE_SUITE_LOCK=str(temp / "suite.lock"),
                CADENCE_PM_DIR=str(temp / "must-be-scrubbed-pm"),
                CADENCE_STATE_DIR=str(temp / "must-be-scrubbed-state"),
                CADENCE_HOME=str(temp / "must-be-scrubbed-home"),
