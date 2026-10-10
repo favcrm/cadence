@@ -33,6 +33,8 @@ impl ManagedFixture {
             .tempdir()
             .unwrap();
         let root_path = root.path().to_path_buf();
+        // An unrelated HOME manifest must not authorize the managed wrapper or siblings.
+        std::fs::write(root_path.join("package.json"), "{}\n").unwrap();
         let wrapper_dir = root_path.join(".pi/agent/bin");
         let install = root_path.join(".pi/agent/install");
         let release = install.join("releases/1.1.0");
