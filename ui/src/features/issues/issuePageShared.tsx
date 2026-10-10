@@ -11,7 +11,7 @@ export function ReadNotice<T>({
   state: ResourceState<T>;
   retry: () => void;
 }) {
-  const { t } = useLocale();
+  const { t, locale } = useLocale();
   if (!state.error && !state.inFlight && state.status !== "loading")
     return null;
   const loading = state.inFlight || state.status === "loading";
@@ -36,7 +36,7 @@ export function ReadNotice<T>({
           </>
         ) : (
           <span>
-            {t(state.data === null ? "Loading" : "Refreshing")} {t(name)}…
+            {t(state.data === null ? "Loading" : "Refreshing")}{locale === "zh-TW" ? "" : " "}{t(name)}…
           </span>
         )}
       </div>
