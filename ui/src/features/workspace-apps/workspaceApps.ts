@@ -476,8 +476,11 @@ export function writeWorkspaceAppSnapshot(installId: string, data: WorkspaceAppS
 /** Forget one installation's snapshot (access refusal, removal). */
 export function dropWorkspaceAppSnapshot(installId: string): void {
   snapshots.delete(installId);
-  for (const flight of snapshotReads.values()) {
-    if (flight.installId === installId) flight.controller.abort();
+  for (const [key, flight] of snapshotReads) {
+    if (flight.installId === installId) {
+      if (snapshotReads.get(key) === flight) snapshotReads.delete(key);
+      flight.controller.abort();
+    }
   }
 }
 
@@ -523,7 +526,10 @@ export function readWorkspaceAppSnapshotFresh(installId: string, signal?: AbortS
       released = true;
       signal?.removeEventListener("abort", abort);
       shared.subscribers -= 1;
-      if (shared.subscribers === 0 && !shared.settled) shared.controller.abort();
+      if (shared.subscribers === 0 && !shared.settled) {
+        if (snapshotReads.get(key) === shared) snapshotReads.delete(key);
+        shared.controller.abort();
+      }
     };
     const abort = () => { release(); reject(new DOMException("The operation was aborted", "AbortError")); };
     signal?.addEventListener("abort", abort, { once: true });
