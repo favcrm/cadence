@@ -49,7 +49,12 @@ fn hosted_enrollment_cli_requires_explicit_trust_and_has_no_secret_argv() {
 }
 
 #[test]
-fn remote_auth_cli_requires_explicit_issuer_org_and_never_accepts_token_argv() {
+fn remote_auth_cli_supports_hosted_portal_and_never_accepts_token_argv() {
+    assert!(Cli::try_parse_from(["cadence", "login"]).is_ok());
+    assert!(Cli::try_parse_from(["cadence", "login", "fav-limited"]).is_ok());
+    assert!(
+        Cli::try_parse_from(["cadence", "login", "--issuer", "https://api.example.com"]).is_ok()
+    );
     assert!(Cli::try_parse_from([
         "cadence",
         "login",
@@ -60,10 +65,19 @@ fn remote_auth_cli_requires_explicit_issuer_org_and_never_accepts_token_argv() {
         "--token-stdin"
     ])
     .is_ok());
-    assert!(Cli::try_parse_from(["cadence", "login", "--token", "secret"]).is_err());
+    assert!(Cli::try_parse_from([
+        "cadence",
+        "login",
+        "--issuer",
+        "https://api.example.com",
+        "--token-stdin"
+    ])
+    .is_err());
     assert!(
-        Cli::try_parse_from(["cadence", "login", "--issuer", "https://api.example.com"]).is_err()
+        Cli::try_parse_from(["cadence", "login", "--org", "ws_test", "--token-stdin"]).is_err()
     );
+    assert!(Cli::try_parse_from(["cadence", "login", "--token", "secret"]).is_err());
+    assert!(Cli::try_parse_from(["cadence", "login", "--token-stdin"]).is_err());
     assert!(Cli::try_parse_from([
         "cadence",
         "auth",

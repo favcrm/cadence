@@ -27,6 +27,7 @@ const ACCESS_INGRESS: &str = "access-issuer.json";
 const DEVICE_VERSION: &str = "hosted-cadence-device.v1";
 const CONTINUITY_VERSION: &str = "hosted-cadence-continuity.v1";
 const CONTINUITY_RECORD: &str = "continuity.json";
+pub const HOSTED_LOGIN_ISSUER: &str = "https://api-v2.agenticos.hk";
 
 #[derive(Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -659,6 +660,20 @@ fn require_trusted_issuer(dir: &Path, issuer: &str) -> Result<()> {
     Ok(())
 }
 
+fn require_login_issuer(dir: &Path, issuer: &str) -> Result<()> {
+    if issuer == HOSTED_LOGIN_ISSUER {
+        private_dir(dir, true)?;
+        match fs::symlink_metadata(dir.join(TRUSTED_ISSUER)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            // A present or inaccessible pin must be validated; only genuine
+            // absence permits the compiled hosted issuer default.
+            _ => require_trusted_issuer(dir, issuer)?,
+        }
+        return Ok(());
+    }
+    require_trusted_issuer(dir, issuer)
+}
+
 /// Optional ingress credential. This is a Cloudflare Access pass for the
 /// pinned issuer only, never an AgenticOS identity or a board credential.
 #[derive(Clone, PartialEq, Eq, Deserialize)]
@@ -714,6 +729,23 @@ fn confirm_access_ingress(
     expected: &Option<AccessIngress>,
 ) -> Result<()> {
     require_trusted_issuer(dir, issuer)?;
+    confirm_access_ingress_config(dir, issuer, expected)
+}
+
+fn confirm_login_access_ingress(
+    dir: &Path,
+    issuer: &str,
+    expected: &Option<AccessIngress>,
+) -> Result<()> {
+    require_login_issuer(dir, issuer)?;
+    confirm_access_ingress_config(dir, issuer, expected)
+}
+
+fn confirm_access_ingress_config(
+    dir: &Path,
+    issuer: &str,
+    expected: &Option<AccessIngress>,
+) -> Result<()> {
     if &read_access_ingress(dir, issuer)? != expected {
         return Err(reject(
             "Hosted Access ingress configuration changed during enrollment",
@@ -1272,9 +1304,16 @@ fn slug(value: &str) -> bool {
 /// audience (`https://<slug>.cadencecloud.app`), with only `cli.*`
 /// capabilities. The issuer binds slug to workspace itself; the response
 /// carries no slug field.
-fn login_grant(value: &Value, org: &str, slug_value: &str) -> Result<LoginGrant> {
+fn login_grant(value: &Value, org: Option<&str>, hint: Option<&str>) -> Result<LoginGrant> {
     let at = now()?;
     let (principal, credential) = (&value["principal"], &value["credential"]);
+    let organization_id = field(value, "organization_id")?;
+    let slug_value = if org.is_some() {
+        hint.ok_or_else(|| reject("Legacy login needs --slug"))?
+    } else {
+        field(value, "organization_slug")?
+    };
+    let endpoint = format!("https://{slug_value}{CLOUD_SUFFIX}");
     let caps = value["capabilities"]
         .as_array()
         .ok_or_else(|| reject("Invalid hosted login capabilities"))?;
@@ -1283,9 +1322,10 @@ fn login_grant(value: &Value, org: &str, slug_value: &str) -> Result<LoginGrant>
             c.as_str()
                 .is_some_and(|s| s.starts_with("cli.") && s.len() <= 32)
         });
-    let endpoint = format!("https://{slug_value}{CLOUD_SUFFIX}");
     if field(value, "version")? != VERSION
-        || field(value, "organization_id")? != org
+        || org.is_some_and(|expected| organization_id != expected)
+        || hint.is_some_and(|expected| slug_value != expected)
+        || !id(organization_id)
         || !slug(slug_value)
         || field(value, "audience")? != endpoint
         || field(principal, "kind")? != "user"
@@ -1301,7 +1341,7 @@ fn login_grant(value: &Value, org: &str, slug_value: &str) -> Result<LoginGrant>
         return Err(reject("Issuer grant did not match hosted login consent"));
     }
     Ok(LoginGrant {
-        organization_id: org.to_string(),
+        organization_id: organization_id.to_string(),
         slug: slug_value.to_string(),
         endpoint,
         expires_at: timestamp(credential, "expires_at")?,
@@ -1399,6 +1439,16 @@ pub fn login_browser(
     )
 }
 
+pub fn login_portal(
+    issuer: &str,
+    hint: Option<&str>,
+    dir: &Path,
+    show_code: impl FnOnce(&str, &str) -> Result<()>,
+) -> Result<LoginGrant> {
+    let issuer = origin(issuer, cfg!(test))?;
+    login_device_flow(&issuer, None, hint, dir, show_code, &mut RealLoginRuntime)
+}
+
 fn login_browser_with(
     issuer: &str,
     org: &str,
@@ -1411,26 +1461,55 @@ fn login_browser_with(
     if !id(org) || !slug(slug_value) {
         return Err(reject("Invalid hosted login request"));
     }
-    let audience = format!("https://{slug_value}{CLOUD_SUFFIX}");
-    // CAD-1125: first login creates the credential dir (0700, owner check
-    // kept) before the pin is read — a fresh HOME gets the actionable pin
-    // refusal, never a raw ENOENT.
+    login_device_flow(
+        &issuer,
+        Some(org),
+        Some(slug_value),
+        dir,
+        show_code,
+        runtime,
+    )
+}
+
+fn login_device_flow(
+    issuer: &str,
+    org: Option<&str>,
+    hint: Option<&str>,
+    dir: &Path,
+    show_code: impl FnOnce(&str, &str) -> Result<()>,
+    runtime: &mut dyn LoginRuntime,
+) -> Result<LoginGrant> {
+    if org.is_some_and(|value| !id(value)) || hint.is_some_and(|value| !slug(value)) {
+        return Err(reject("Invalid hosted login request"));
+    }
+    let issuer = issuer.to_owned();
+    // Create the credential dir (0700, owner check kept) before checking the
+    // optional issuer pin; a fresh HOME may use the compiled hosted default.
     private_dir(dir, true)?;
     let _guard = lock(dir, true)?;
-    require_trusted_issuer(dir, &issuer)?;
+    require_login_issuer(dir, &issuer)?;
     let access = read_access_ingress(dir, &issuer)?;
     let mut random = [0_u8; 32];
     getrandom::fill(&mut random).map_err(|_| reject("Unable to create PKCE verifier"))?;
     let verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random);
     let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .encode(Sha256::digest(verifier.as_bytes()));
-    confirm_access_ingress(dir, &issuer, &access)?;
+    confirm_login_access_ingress(dir, &issuer, &access)?;
+    let mut request = json!({"version":DEVICE_VERSION,
+        "client_label":"cadence-cli","requested_capabilities":["cli.read","cli.write"],
+        "code_challenge":challenge});
+    if let (Some(org), Some(hint)) = (org, hint) {
+        request["organization_id"] = json!(org);
+        request["audience"] = json!(format!("https://{hint}{CLOUD_SUFFIX}"));
+    } else if org.is_none() {
+        if let Some(hint) = hint {
+            request["organization_slug"] = json!(hint);
+        }
+    }
     let (status, code) = runtime.post_public(
         &issuer,
         "/v1/hosted-cadence/device/code",
-        json!({"version":DEVICE_VERSION,"organization_id":org,"audience":audience,
-            "client_label":"cadence-cli","requested_capabilities":["cli.read","cli.write"],
-            "code_challenge":challenge}),
+        request,
         access.as_ref(),
     )?;
     if status != 200 {
@@ -1448,7 +1527,7 @@ fn login_browser_with(
         if runtime.now() >= deadline {
             return Err(expired());
         }
-        confirm_access_ingress(dir, &issuer, &access)?;
+        confirm_login_access_ingress(dir, &issuer, &access)?;
         let (status, response) = runtime.post_public(
             &issuer,
             "/v1/hosted-cadence/device/token",
@@ -1469,8 +1548,8 @@ fn login_browser_with(
             _ => return Err(reject("Hosted browser grant refused; start again")),
         }
     };
-    let grant = login_grant(&grant, org, slug_value)?;
-    confirm_access_ingress(dir, &issuer, &access)?;
+    let grant = login_grant(&grant, org, hint)?;
+    confirm_login_access_ingress(dir, &issuer, &access)?;
     Ok(grant)
 }
 
@@ -3110,6 +3189,174 @@ mod tests {
     fn assert_nothing_stored(dir: &Path) {
         assert!(!dir.join("cli-acme.json").exists());
         assert!(!dir.join(RECORD).exists());
+    }
+
+    /// Independent AOS-198 acceptance runtime for the unbound portal
+    /// contract, with and without an organization slug hint. It rejects any
+    /// other device/code request shape and returns the authoritative grant.
+    struct PortalAcceptanceRuntime {
+        issuer: String,
+        grant: Option<Value>,
+        requests: Vec<(String, Value)>,
+        baseline: Instant,
+        elapsed: u64,
+    }
+
+    impl LoginRuntime for PortalAcceptanceRuntime {
+        fn now(&mut self) -> Instant {
+            self.baseline + Duration::from_secs(self.elapsed)
+        }
+        fn wait(&mut self, interval: Duration) {
+            self.elapsed += interval.as_secs();
+        }
+        fn post_public(
+            &mut self,
+            issuer: &str,
+            path: &str,
+            body: Value,
+            access: Option<&AccessIngress>,
+        ) -> Result<(u16, Value)> {
+            assert_eq!(issuer, self.issuer);
+            assert!(access.is_none());
+            self.requests.push((path.to_string(), body.clone()));
+            if path.ends_with("/device/code") {
+                assert_eq!(path, "/v1/hosted-cadence/device/code");
+                let keys = [
+                    "version",
+                    "client_label",
+                    "requested_capabilities",
+                    "code_challenge",
+                ];
+                let has_slug_hint = body.get("organization_slug").is_some();
+                let request = body.as_object().unwrap();
+                assert_eq!(request.len(), keys.len() + usize::from(has_slug_hint));
+                assert!(keys.iter().all(|key| request.contains_key(*key)));
+                assert_eq!(body["version"], DEVICE_VERSION);
+                assert_eq!(body["client_label"], "cadence-cli");
+                assert_eq!(
+                    body["requested_capabilities"],
+                    json!(["cli.read", "cli.write"])
+                );
+                assert!(body.get("organization_id").is_none());
+                assert!(body.get("audience").is_none());
+                if has_slug_hint {
+                    assert_eq!(body["organization_slug"], "acme");
+                }
+                return Ok((200, browser_code(60)));
+            }
+            assert_eq!(path, "/v1/hosted-cadence/device/token");
+            assert!(body["device_code"].is_string());
+            assert!(body["code_verifier"].is_string());
+            Ok((200, self.grant.take().expect("one portal grant")))
+        }
+    }
+
+    fn run_portal_acceptance(
+        hint: Option<&str>,
+        grant: Value,
+        dir: &Path,
+    ) -> (Result<LoginGrant>, PortalAcceptanceRuntime) {
+        let mut runtime = PortalAcceptanceRuntime {
+            issuer: HOSTED_LOGIN_ISSUER.to_string(),
+            grant: Some(grant),
+            requests: Vec::new(),
+            baseline: Instant::now(),
+            elapsed: 0,
+        };
+        let out = login_device_flow(
+            HOSTED_LOGIN_ISSUER,
+            None,
+            hint,
+            dir,
+            |_, _| Ok(()),
+            &mut runtime,
+        );
+        (out, runtime)
+    }
+
+    #[test]
+    fn hosted_portal_acceptance_binds_only_the_issuer_selected_workspace() {
+        // A fresh HOME has no manually installed issuer pin. Bare login sends
+        // an unbound request; the issuer's returned workspace identity is the
+        // only source for the resulting endpoint and slug.
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("fresh-home/auth");
+        let mut grant = login_grant_body();
+        grant["organization_slug"] = json!("acme");
+        let (out, runtime) = run_portal_acceptance(None, grant, &dir);
+        let grant = out.unwrap();
+        assert_eq!(
+            (
+                grant.organization_id.as_str(),
+                grant.slug.as_str(),
+                grant.endpoint.as_str()
+            ),
+            ("ws_real", "acme", LOGIN_ENDPOINT)
+        );
+        assert_eq!(runtime.requests.len(), 2);
+        assert!(!dir.join(TRUSTED_ISSUER).exists());
+        assert_nothing_stored(&dir);
+
+        // A positional slug is an unbound selector hint, never a locally
+        // pinned organization id or audience.
+        let mut hinted_grant = login_grant_body();
+        hinted_grant["organization_slug"] = json!("acme");
+        let (out, runtime) = run_portal_acceptance(Some("acme"), hinted_grant, &dir);
+        assert_eq!(out.unwrap().slug, "acme");
+        assert_eq!(runtime.requests.len(), 2);
+        assert!(runtime.requests[0].1.get("organization_id").is_none());
+        assert!(runtime.requests[0].1.get("audience").is_none());
+        assert_eq!(runtime.requests[0].1["organization_slug"], "acme");
+
+        // A positional slug is a selector hint only: a different server
+        // selection, even with otherwise valid identity/audience, is refused.
+        let mut mismatched_hint = login_grant_body();
+        mismatched_hint["organization_slug"] = json!("other");
+        mismatched_hint["audience"] = json!("https://other.cadencecloud.app");
+        let (out, runtime) = run_portal_acceptance(Some("acme"), mismatched_hint, &dir);
+        assert!(out.is_err());
+        assert_eq!(runtime.requests.len(), 2);
+        assert_nothing_stored(&dir);
+
+        // A grant's audience must be canonical for its server-returned slug;
+        // port/path/lookalike variants are not registrations.
+        for audience in [
+            "https://acme.cadencecloud.app:444",
+            "https://acme.cadencecloud.app/",
+            "https://acme.cadencecloud.app.evil.test",
+        ] {
+            let mut wrong_audience = login_grant_body();
+            wrong_audience["organization_slug"] = json!("acme");
+            wrong_audience["audience"] = json!(audience);
+            let (out, _) = run_portal_acceptance(None, wrong_audience, &dir);
+            assert!(out.is_err(), "{audience}");
+            assert_nothing_stored(&dir);
+        }
+    }
+
+    #[test]
+    fn hosted_portal_rejects_conflicting_exact_issuer_pin_before_request() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("e");
+        trust(&dir, "https://api-v2.agenticos.hk:444");
+        let mut runtime = PortalAcceptanceRuntime {
+            issuer: HOSTED_LOGIN_ISSUER.to_string(),
+            grant: Some(login_grant_body()),
+            requests: Vec::new(),
+            baseline: Instant::now(),
+            elapsed: 0,
+        };
+        let out = login_device_flow(
+            HOSTED_LOGIN_ISSUER,
+            None,
+            None,
+            &dir,
+            |_, _| Ok(()),
+            &mut runtime,
+        );
+        assert!(out.is_err());
+        assert!(runtime.requests.is_empty(), "pin conflict reached issuer");
+        assert_nothing_stored(&dir);
     }
 
     #[test]

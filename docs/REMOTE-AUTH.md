@@ -68,39 +68,51 @@ token or terminate remote sessions. Device credentials currently expire after
 30 days; the protocol has no refresh token or token expiry introspection field.
 For imported tokens, expiry is unknown locally and checked by the issuer.
 
-## Remote org transport (CAD-1019)
+## Hosted login and remote org transport (CAD-1019, CAD-1329)
 
-`cadence login --issuer <api-origin> --org <workspace-id> --slug <slug>`
-runs the hosted-cadence owner-consent device grant (PKCE, `hcd_` device
-code, `hct_` bridge credential) and records an org whose connection is
-`Remote { endpoint: https://<slug>.cadencecloud.app, org_id }` — slug,
-endpoint and org id all come from the issuer's verified grant, never
-derived from each other. Login never moves the saved default: without
-`--use` the org is recorded but the existing destination (ambient local
-on a fresh machine) stays selected; pass `--use` to make the remote org
-the default. The `hct_` is stored at
-`$XDG_CONFIG_HOME/cadence/remote-auth/cli-<slug>.json` (0600) and is
-bound to the org id and endpoint it was issued for — it is never sent
-to another host.
+For a first login, run `cadence login`. The CLI opens the trusted hosted
+AgenticOS portal, where you choose a workspace and approve access. To
+preselect a workspace, use `cadence login <slug>`; the issuer verifies
+that selection and returns the authoritative workspace ID and slug. The
+CLI validates the returned slug and canonical audience before recording
+the remote org and credential. Use `cadence login --use` (or
+`cadence login <slug> --use`) to make it the saved default; without
+`--use`, the current default is unchanged. `--no-open` prints the approval
+URL and code without opening a browser.
 
-### First login on a fresh machine
+The default issuer is the compiled exact HTTPS origin
+`https://api-v2.agenticos.hk`; no issuer or workspace files are needed on
+a fresh HOME. If a `trusted-issuer` pin already exists, it must match that
+origin or login refuses without overwriting it. A custom issuer is an
+advanced override: pass `--issuer <origin>` and establish its exact origin
+in a private `trusted-issuer` file under the credential directory first.
+The CLI never creates or replaces that pin. A mismatched issuer, symlink,
+or unsafe permissions refuse.
+
+The explicit legacy bound flow remains available as
+`cadence login --issuer <origin> --org <workspace-id> --slug <slug>`; it
+requires an existing issuer pin. The legacy `--token-stdin` flow also
+requires explicit `--issuer` and `--org`. Browser login uses PKCE and
+short-lived device codes; denial, expiry, mismatched identity or audience
+refuse before recording the org or credential. Org records use the
+verified workspace slug and canonical `https://<slug>.cadencecloud.app`
+endpoint. Credentials are stored at
+`$XDG_CONFIG_HOME/cadence/remote-auth/cli-<slug>.json` (0600), bound to
+the verified workspace ID and endpoint, and never sent to another host.
+
+### Advanced custom issuer trust
 
 The credential directory is created by login itself (0700, owner-only).
-The operator then establishes the independent issuer pin before any
-request goes out: login refuses with an actionable message until the
-exact issuer origin sits in a 0600 `trusted-issuer` file inside that
-directory. The CLI never creates the pin — it is the operator's own
-trust decision:
+Custom issuers require an independent exact-origin pin in a private
+`trusted-issuer` file before any request goes out. The CLI never creates
+or replaces this pin:
 
 ```sh
-cadence login --issuer https://your-agenticos-api.example --org ws_company --slug company
-# → refused: "Trusted issuer pin is missing. Create it yourself, then retry: …"
-#   (the refusal prints the exact pin path — on this host it is
-#   ${XDG_CONFIG_HOME:-$HOME/.config}/cadence/remote-auth/trusted-issuer,
-#   or the --auth-dir you passed)
+cadence login --issuer https://your-agenticos-api.example
+# → refused with the exact trusted-issuer pin path
 printf '%s\n' 'https://your-agenticos-api.example' > "${XDG_CONFIG_HOME:-$HOME/.config}/cadence/remote-auth/trusted-issuer"
 chmod 600 "${XDG_CONFIG_HOME:-$HOME/.config}/cadence/remote-auth/trusted-issuer"
-cadence login --issuer https://your-agenticos-api.example --org ws_company --slug company
+cadence login --issuer https://your-agenticos-api.example
 # → device code prompt; approve in the browser
 ```
 
