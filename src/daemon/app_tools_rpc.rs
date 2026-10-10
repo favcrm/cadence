@@ -89,6 +89,17 @@ pub(crate) struct ToolContext {
     pub issued: Instant,
 }
 
+/// One tool call into the guarded execution core.
+pub(super) struct ToolCall<'a> {
+    pub slot: &'a str,
+    pub alias: &'a str,
+    pub request_id: &'a str,
+    pub input: &'a Value,
+    pub generation_scope: Option<&'a Value>,
+    /// The price the operator confirmed; a higher live quote is refused.
+    pub ceiling_micros: Option<u64>,
+}
+
 /// Bounded action-context map: ≤256 live mounts' contexts process-wide.
 pub(crate) const TOOL_CTX_GLOBAL: usize = 256;
 /// Action-context lifetime — a mount's context outlives its frame but
@@ -343,8 +354,39 @@ impl Shared {
             .cloned()
             .ok_or_else(|| Error::rejected("tool is not declared by this screen"))?;
 
-        // Re-prove the live installation digest + approval pin and the
-        // declared-slot binding, all under the PM/custody/release locks.
+        self.app_tool_execute(
+            &ctx,
+            ToolCall {
+                slot: &slot,
+                alias,
+                request_id,
+                input: &input,
+                generation_scope: params.get("generation_scope"),
+                ceiling_micros: None,
+            },
+        )
+    }
+
+    /// The guarded execution core shared by the screen entry above and the
+    /// operator-approved assistant action (CAD-1327): digest pin, approval,
+    /// declared-slot effect, request-id replay, live binding, re-quote,
+    /// exactly-once claim and receipt. `ceiling_micros`, when set, is the
+    /// price the operator confirmed: a live quote above it is refused before
+    /// any claim or provider I/O.
+    pub(super) fn app_tool_execute(
+        self: &Arc<Self>,
+        ctx: &ToolContext,
+        call: ToolCall<'_>,
+    ) -> Result<Value> {
+        let ToolCall {
+            slot,
+            alias,
+            request_id,
+            input,
+            generation_scope,
+            ceiling_micros,
+        } = call;
+        let input = input.clone();
         let pm_dir = self.pm_dir()?;
         let pm = self.pm_at(&pm_dir)?;
         workspace::with_runtime_snapshot(&pm, &ctx.install_id, |bundle, files| {
@@ -378,7 +420,7 @@ impl Shared {
                     .get("app.md")
                     .ok_or_else(|| Error::rejected("installation manifest unavailable"))?,
             )?;
-            let declaration = manifest.capabilities.get(slot.as_str()).ok_or_else(|| {
+            let declaration = manifest.capabilities.get(slot).ok_or_else(|| {
                 Error::rejected("tool resolves to a slot the app does not declare")
             })?;
             declaration.validate()?;
@@ -436,7 +478,7 @@ impl Shared {
                 .app_binding_live(
                     &ctx.install_id,
                     ctx.context_id.as_deref(),
-                    &slot,
+                    slot,
                     bundle,
                     files,
                 )?
@@ -467,6 +509,13 @@ impl Shared {
             // Re-quote at invoke — the operator's session is the approval;
             // the adapter re-enforces the charge ceiling at execution.
             let quote = self.app_capability_quote(&proof)?;
+            if ceiling_micros.is_some_and(|ceiling| quote.total_price_micros > ceiling) {
+                return Err(Error::rejected(format!(
+                    "price_changed: the live price {} micros is above the confirmed {} micros",
+                    quote.total_price_micros,
+                    ceiling_micros.unwrap_or(0)
+                )));
+            }
             let config = &proof.config;
             let provider = required_str(config, "provider")?;
             let tool = required_str(&config["mapping"], "tool")?;
@@ -514,12 +563,9 @@ impl Shared {
             let mut draft_snapshot: Option<Value> = None;
             let generation_caller_digest = input_digest.clone();
             if generation_capability {
-                let spec = params
-                    .get("generation_scope")
-                    .and_then(Value::as_object)
-                    .ok_or_else(|| {
-                        Error::rejected("generation tool needs a stable draft-operation scope")
-                    })?;
+                let spec = generation_scope.and_then(Value::as_object).ok_or_else(|| {
+                    Error::rejected("generation tool needs a stable draft-operation scope")
+                })?;
                 if !(spec.len() == 3
                     && spec.contains_key("operation")
                     && spec.contains_key("draft_id")
@@ -717,7 +763,7 @@ impl Shared {
                     }
                     _ => return Err(Error::rejected("generation intent state is invalid")),
                 }
-            } else if params.get("generation_scope").is_some() {
+            } else if generation_scope.is_some() {
                 return Err(Error::rejected(
                     "generation scope is accepted only by reviewed text/image generation tools",
                 ));
@@ -737,7 +783,7 @@ impl Shared {
                     request: request_id,
                     install: &ctx.install_id,
                     alias,
-                    slot: &slot,
+                    slot,
                     binding_digest: &proof.digest,
                     input_digest: &input_digest,
                     call_id: &call_id,
@@ -858,7 +904,7 @@ impl Shared {
                     request: request_id,
                     install: &ctx.install_id,
                     alias,
-                    slot: &slot,
+                    slot,
                     binding_digest: &proof.digest,
                     input_digest: &input_digest,
                     input: &input,

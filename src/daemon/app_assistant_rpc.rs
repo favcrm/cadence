@@ -48,7 +48,7 @@ fn install_descriptor(shared: &Shared, install: &str) -> Result<(String, String,
     })
 }
 
-fn assistant_error_is_definite_refusal(error: &Error) -> bool {
+pub(super) fn assistant_error_is_definite_refusal(error: &Error) -> bool {
     match error {
         Error::Rejected(_) => true,
         Error::Structured(details) => matches!(details.kind, "rejected" | "conflict" | "gate"),
@@ -93,7 +93,7 @@ fn normalize_interrupted_operation(
     Ok(public_operation(operation))
 }
 
-fn public_operation(mut op: Value) -> Value {
+pub(super) fn public_operation(mut op: Value) -> Value {
     if let Some(fields) = op.as_object_mut() {
         fields.remove("_input");
         fields.remove("_operation_digest");
@@ -153,6 +153,9 @@ impl Shared {
             return Ok(json!({"operation":op}));
         }
         let (descriptor_digest, _app, descriptor) = install_descriptor(self, &scoped.install)?;
+        // The registry binds actions to the installed manifest's app (an
+        // allow-list); the descriptor's own `app` claim is not trusted.
+        let app = self.install_app_slug(&scoped.install)?;
         if method == "app_assistant_actions" {
             let declared = descriptor
                 .get("actions")
@@ -166,6 +169,9 @@ impl Shared {
                 let Some(meta) = crate::app_assistant::registered_action(id) else {
                     continue;
                 };
+                if !crate::app_assistant::allowed_for_app(&app, id) {
+                    continue;
+                }
                 actions.push(json!({"id":id,"description":row["description"],"input_schema":meta.input_schema,"effect":meta.effect,"confirmation":meta.confirmation,"availability":"available"}));
             }
             return Ok(
@@ -185,6 +191,11 @@ impl Shared {
         {
             return Err(Error::rejected(
                 "action is not declared by this consented installation",
+            ));
+        }
+        if !crate::app_assistant::allowed_for_app(&app, action_id) {
+            return Err(Error::rejected(
+                "action is not available for this installation's app",
             ));
         }
         crate::app_assistant::validate_input(&meta.input_schema, input)?;
@@ -213,6 +224,16 @@ impl Shared {
             return Ok(json!({"operation":public_operation(op)}));
         }
         let execution = (|| -> Result<Value> {
+            if matches!(action_id, "social.posts.fetch" | "social.draft.create") {
+                return self.social_request_permission(
+                    &records,
+                    &scoped.install,
+                    &scoped.context,
+                    operation_id,
+                    action_id,
+                    input,
+                );
+            }
             if action_id == "customer.tags.update" {
                 let customer = required_str(input, "customer_id")?;
                 // Exact customer scope and current revision are checked before
@@ -352,6 +373,7 @@ impl Shared {
                     }
                     self.rpc_app_segment_assistant_save(&segment_params, peer_pid)
                 }
+                "social.drafts.status" => self.social_status(&records, &scoped.context),
                 "campaigns.list" => records.app_content_list(&scoped.context),
                 "campaigns.show" => {
                     records.app_content_show(&scoped.context, required_str(input, "campaign_id")?)
@@ -460,7 +482,7 @@ impl Shared {
     }
 
     pub(super) fn rpc_app_assistant_operator(
-        &self,
+        self: &Arc<Self>,
         method: &str,
         params: &Value,
         peer_pid: u32,
@@ -515,10 +537,13 @@ impl Shared {
         match method {
             "app_assistant_actions_operator" => {
                 let (digest, _, descriptor) = install_descriptor(self, install)?;
+                let app = self.install_app_slug(install)?;
                 let mut actions = Vec::new();
                 for row in descriptor["actions"].as_array().into_iter().flatten() {
                     if let Some(id) = row["id"].as_str() {
-                        if let Some(meta) = crate::app_assistant::registered_action(id) {
+                        if let Some(meta) = crate::app_assistant::registered_action(id)
+                            .filter(|_| crate::app_assistant::allowed_for_app(&app, id))
+                        {
                             actions.push(json!({"id":id,"description":row["description"],"input_schema":meta.input_schema,"effect":meta.effect,"confirmation":meta.confirmation,"availability":"available"}));
                         }
                     }
@@ -600,7 +625,7 @@ impl Shared {
     }
 
     fn decide_assistant_operation(
-        &self,
+        self: &Arc<Self>,
         records: &RecordStore,
         install: &str,
         context: &str,
@@ -641,10 +666,23 @@ impl Shared {
             return Ok(json!({"operation":result}));
         }
         let action = required_str(&op, "action_id")?;
-        if action != "customer.tags.update" {
+        if action != "customer.tags.update" && !crate::app_assistant::is_social(action) {
             return Err(Error::rejected(
                 "no operator decision handler is registered for this action",
             ));
+        }
+        if crate::app_assistant::is_social(action) {
+            if decision != "allow_once" {
+                return Err(Error::rejected(
+                    "paid social actions are allowed one time only",
+                ));
+            }
+            let app = self.install_app_slug(install)?;
+            if !crate::app_assistant::allowed_for_app(&app, action) {
+                return Err(Error::rejected(
+                    "action is not available for this installation's app",
+                ));
+            }
         }
         let (descriptor_digest, _, descriptor) = install_descriptor(self, install)?;
         if !descriptor["actions"]
@@ -669,6 +707,9 @@ impl Shared {
             return Err(Error::rejected(
                 "assistant action semantics changed; permission must be requested again",
             ));
+        }
+        if crate::app_assistant::is_social(action) {
+            return self.social_run(records, install, context, &op, &input);
         }
         let customer = required_str(&input, "customer_id")?;
         let preview = op
@@ -735,6 +776,21 @@ impl Shared {
 }
 
 fn resource_refs(action: &str, result: &Value) -> Value {
+    if action == "social.drafts.status" {
+        return Value::Array(
+            result["drafts"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|row| {
+                    let id = row["draft_id"].as_str()?;
+                    let caption = row["caption"].as_str().unwrap_or("").trim();
+                    let label = if caption.is_empty() { "Draft" } else { caption };
+                    Some(json!({"kind":"social_draft","id":id,"label":label}))
+                })
+                .collect(),
+        );
+    }
     if action == "customers.search" {
         return Value::Array(
             result

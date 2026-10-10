@@ -53,6 +53,15 @@ fn schema(id: &str) -> Option<Value> {
             json!({"customer_id":{"type":"string","minLength":1,"maxLength":128},"tags":{"type":"array","maxItems":16,"items":{"type":"string","maxLength":40}},"expected_revision":{"type":"integer","minimum":1}}),
             &["customer_id", "tags", "expected_revision"],
         ),
+        "social.posts.fetch" => object(
+            json!({"handle":{"type":"string","minLength":1,"maxLength":64}}),
+            &[],
+        ),
+        "social.draft.create" => object(
+            json!({"post":{"type":"string","minLength":1,"maxLength":128},"instructions":{"type":"string","maxLength":500},"with_image":{"type":"boolean"}}),
+            &["post"],
+        ),
+        "social.drafts.status" => object(json!({}), &[]),
         _ => return None,
     })
 }
@@ -127,6 +136,9 @@ fn validate_value(rule: &Value, value: &Value) -> crate::Result<()> {
                 return Err(invalid());
             }
         }
+        "boolean" => {
+            value.as_bool().ok_or_else(invalid)?;
+        }
         "integer" => {
             let number = value.as_i64().ok_or_else(invalid)?;
             if number
@@ -186,6 +198,9 @@ pub fn registered_action(id: &str) -> Option<RegisteredAction> {
         "campaigns.create_draft" => ("draft", "none"),
         "email.draft" => ("proposal", "none"),
         "customer.tags.update" => ("write", "permission_required"),
+        "social.posts.fetch" => ("read", "permission_required"),
+        "social.draft.create" => ("draft", "permission_required"),
+        "social.drafts.status" => ("read", "none"),
         _ => return None,
     };
     Some(RegisteredAction {
@@ -201,6 +216,9 @@ pub fn registered_action(id: &str) -> Option<RegisteredAction> {
             "campaigns.create_draft" => "campaigns.create_draft",
             "email.draft" => "email.draft",
             "customer.tags.update" => "customer.tags.update",
+            "social.posts.fetch" => "social.posts.fetch",
+            "social.draft.create" => "social.draft.create",
+            "social.drafts.status" => "social.drafts.status",
             _ => unreachable!(),
         },
         effect,
@@ -223,5 +241,31 @@ pub fn registered_ids() -> &'static [&'static str] {
         "campaigns.create_draft",
         "email.draft",
         "customer.tags.update",
+        "social.posts.fetch",
+        "social.draft.create",
+        "social.drafts.status",
     ]
+}
+
+/// The installed app a registered action belongs to. The registry is the
+/// allow-list: the Social Content app may use exactly its own three actions
+/// and no other app may use them (CAD-1327).
+pub const SOCIAL_APP: &str = "social-content";
+pub const SOCIAL_ACTIONS: [&str; 3] = [
+    "social.posts.fetch",
+    "social.draft.create",
+    "social.drafts.status",
+];
+
+pub fn is_social(id: &str) -> bool {
+    SOCIAL_ACTIONS.contains(&id)
+}
+
+/// `true` when `id` may run for an installation whose manifest app is `app`.
+pub fn allowed_for_app(app: &str, id: &str) -> bool {
+    if app == SOCIAL_APP {
+        is_social(id)
+    } else {
+        !is_social(id)
+    }
 }

@@ -61,6 +61,14 @@ pub fn validate(text: &str) -> Result<Descriptor> {
                 action.id
             )));
         };
+        if crate::app_assistant::is_social(&action.id)
+            != (descriptor.app.as_deref() == Some(crate::app_assistant::SOCIAL_APP))
+        {
+            return Err(Error::rejected(format!(
+                "app assistant action '{}' does not belong to the declared app",
+                action.id
+            )));
+        }
         if !seen.insert(&action.id)
             || action.description.trim().is_empty()
             || action.description.len() > 240
