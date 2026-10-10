@@ -1654,11 +1654,15 @@ button.refchip:hover {
   overflow-y: auto;
 }
 /* CAD-1312: the board header is a compact 36px status bar — controls
-   sit with a 6px top/bottom inset inside it at every width. */
+   sit with a 6px top/bottom inset on desktop. */
 .app-header { height: 2.25rem; flex-shrink: 0; padding-block: 4px; box-sizing: border-box; align-items: center; }
 .header-menu svg { flex-shrink: 0; }
 @media (width >= 1024px) { .app-header .header-menu { display: none; } }
 .header-breadcrumb { display: flex; align-items: center; gap: .5rem; font-size: var(--text-micro); }
+@media (width < 640px) {
+  .app-header { height: auto; min-height: 2.25rem; flex-wrap: wrap; }
+  .header-breadcrumb { order: 1; flex: 0 0 100%; }
+}
 /* CAD-1312: the configured organisation name truncates inside a bounded
    span so a long configured name never pushes the status controls out. */
 .header-org { flex: 0 1 auto; max-width: 18rem; min-width: 0; }
