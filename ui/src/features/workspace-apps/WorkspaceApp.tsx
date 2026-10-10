@@ -32,6 +32,8 @@ import {
   readWorkspaceAppSnapshot,
   readWorkspaceAppSnapshotFresh,
   dropWorkspaceAppSnapshot,
+  type AppContext,
+  type Installation,
   type WorkspaceRun,
   type TextArtifact,
   type WorkspaceOutbox,

@@ -476,10 +476,13 @@ export function writeWorkspaceAppSnapshot(installId: string, data: WorkspaceAppS
 /** Forget one installation's snapshot (access refusal, removal). */
 export function dropWorkspaceAppSnapshot(installId: string): void {
   snapshots.delete(installId);
+  for (const flight of snapshotReads.values()) {
+    if (flight.installId === installId) flight.controller.abort();
+  }
 }
 
 /** The app page's reads, fired in parallel and stored as one snapshot. */
-type SnapshotRead = { controller: AbortController; subscribers: number; settled: boolean; promise: Promise<WorkspaceAppSnapshot> };
+type SnapshotRead = { installId: string; controller: AbortController; subscribers: number; settled: boolean; promise: Promise<WorkspaceAppSnapshot> };
 const snapshotReads = new Map<string, SnapshotRead>();
 export function readWorkspaceAppSnapshotFresh(installId: string, signal?: AbortSignal): Promise<WorkspaceAppSnapshot> {
   if (signal?.aborted) return Promise.reject(new DOMException("The operation was aborted", "AbortError"));
@@ -488,7 +491,7 @@ export function readWorkspaceAppSnapshotFresh(installId: string, signal?: AbortS
   let flight = snapshotReads.get(key);
   if (!flight) {
     const controller = new AbortController();
-    const created: SnapshotRead = { controller, subscribers: 0, settled: false, promise: Promise.resolve(null as never) };
+    const created: SnapshotRead = { installId, controller, subscribers: 0, settled: false, promise: Promise.resolve(null as never) };
     created.promise = (async () => {
       const [installation, contexts, bindings, connections, agents, runs, effects] = await Promise.all([
         workspaceApps.detail(installId, controller.signal),
