@@ -506,7 +506,34 @@ pub fn run(
     state_dir: &Path,
     limit: usize,
 ) -> Result<Value> {
-    run_inner(
+    run_with_clock(
+        pm,
+        project,
+        dry_run,
+        actor,
+        state_dir,
+        limit,
+        &write::RealWait,
+    )
+}
+
+/// [`run`] on an injected [`write::WaitClock`] (CAD-1359): the same
+/// production entry — the shared close deadline is still
+/// `clock.now() + CLI_CLOSE_LOCK_WAIT`, computed once, and each close
+/// waits the real `try_lock` loop on its remaining budget. `pub(crate)`
+/// for the deterministic shared-deadline check; production passes
+/// [`write::RealWait`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_with_clock(
+    pm: &Pm,
+    project: Option<&str>,
+    dry_run: bool,
+    actor: &str,
+    state_dir: &Path,
+    limit: usize,
+    clock: &dyn write::WaitClock,
+) -> Result<Value> {
+    run_inner_with(
         pm,
         project,
         dry_run,
@@ -516,7 +543,8 @@ pub fn run(
         None,
         &gh_list,
         &gh_view,
-        Some(Instant::now() + CLI_CLOSE_LOCK_WAIT),
+        Some(clock.now() + CLI_CLOSE_LOCK_WAIT),
+        clock,
     )
 }
 
@@ -551,6 +579,39 @@ fn run_inner(
     pr_list: PrLookup<'_>,
     pr_view: PrView<'_>,
     close_lock_deadline: Option<Instant>,
+) -> Result<Value> {
+    run_inner_with(
+        pm,
+        project,
+        dry_run,
+        actor,
+        state_dir,
+        limit,
+        cursor,
+        pr_list,
+        pr_view,
+        close_lock_deadline,
+        &write::RealWait,
+    )
+}
+
+/// [`run_inner`] on an injected [`write::WaitClock`] (CAD-1359): each
+/// close passes the real try_lock retry loop the deadline's remaining
+/// budget measured on `clock` — identical arithmetic to the wall-time
+/// path, only the clock source differs.
+#[allow(clippy::too_many_arguments)]
+fn run_inner_with(
+    pm: &Pm,
+    project: Option<&str>,
+    dry_run: bool,
+    actor: &str,
+    state_dir: Option<&Path>,
+    limit: usize,
+    cursor: Option<&str>,
+    pr_list: PrLookup<'_>,
+    pr_view: PrView<'_>,
+    close_lock_deadline: Option<Instant>,
+    clock: &dyn write::WaitClock,
 ) -> Result<Value> {
     let issues = board::load_all(&pm.dir, project)?;
     // Candidacy follows the derived status, not only the file field:
@@ -662,15 +723,16 @@ fn run_inner(
                 if dry_run {
                     row["outcome"] = json!("would-close");
                 } else {
-                    match write::mark_done_on_merge_waiting(
+                    match write::mark_done_on_merge_waiting_with(
                         pm,
                         &p.id,
                         &why,
                         actor,
                         Some(&p.status),
                         close_lock_deadline
-                            .map(|d| d.saturating_duration_since(Instant::now()))
+                            .map(|d| d.saturating_duration_since(clock.now()))
                             .unwrap_or(Duration::ZERO),
+                        clock,
                     ) {
                         Ok(None) => {
                             row["outcome"] = json!("closed");
@@ -959,12 +1021,31 @@ mod tests {
         assert_eq!(status(&rig, &id), "done", "{out}");
     }
 
-    /// CAD-1153: `run` creates the shared deadline — one
+    /// CAD-1359: the check clock — `now` starts at a real base and
+    /// advances only through the backoff the real `try_lock` loop
+    /// requests, so the recorded total is the exact virtual budget
+    /// spent.
+    struct ScriptedWait {
+        now: std::cell::Cell<Instant>,
+        waited: std::cell::RefCell<Duration>,
+    }
+
+    impl write::WaitClock for ScriptedWait {
+        fn now(&self) -> Instant {
+            self.now.get()
+        }
+        fn sleep(&self, d: Duration) {
+            *self.waited.borrow_mut() += d;
+            self.now.set(self.now.get() + d);
+        }
+    }
+
+    /// CAD-1153/CAD-1359: `run` creates the shared deadline — one
     /// `CLI_CLOSE_LOCK_WAIT` across the whole run, not per close. The
-    /// elapsed lower bound proves the configured nonzero CLI wait is
-    /// exercised (a zero-wait `CLI_CLOSE_LOCK_WAIT` would finish too
-    /// quickly); the upper bound proves both closes share its budget.
-    /// `run` returns the rows, not an Err, when closes fail.
+    /// scripted clock makes the real `try_lock` loop deterministic:
+    /// the first close spends the full budget, the second sees it
+    /// already spent. `run` returns the rows, not an Err, when closes
+    /// fail.
     #[test]
     fn run_shares_one_close_lock_deadline() {
         let rig = rig();
@@ -974,9 +1055,11 @@ mod tests {
         let id1 = put_issue(&rig, 60, None);
         let id2 = put_issue(&rig, 61, None);
         lane(&rig.repo, true);
-        let t0 = Instant::now();
-        let out = run(&rig.pm, None, false, "op", &state, 0).unwrap();
-        let elapsed = t0.elapsed();
+        let clock = ScriptedWait {
+            now: std::cell::Cell::new(Instant::now()),
+            waited: std::cell::RefCell::new(Duration::ZERO),
+        };
+        let out = run_with_clock(&rig.pm, None, false, "op", &state, 0, &clock).unwrap();
         drop(held);
         assert_eq!(out["rows"].as_array().unwrap().len(), 2, "{out}");
         assert!(
@@ -991,17 +1074,13 @@ mod tests {
         assert!(out["finish"].is_object(), "{out}");
         assert_eq!(status(&rig, &id1), "doing");
         assert_eq!(status(&rig, &id2), "doing");
-        // The 25 s floor is independent of CLI_CLOSE_LOCK_WAIT, so
-        // changing that constant to ZERO cannot satisfy this check.
-        // Two closes at ~30 s each would take ~60 s; the 55 s ceiling
-        // leaves scheduler slack while proving they share one budget.
-        assert!(
-            elapsed >= Duration::from_secs(25),
-            "CLI close-lock wait was shorter than configured: {elapsed:?}"
-        );
-        assert!(
-            elapsed < Duration::from_secs(55),
-            "shared deadline not observed: {elapsed:?}"
+        // The exact virtual total is independent of
+        // CLI_CLOSE_LOCK_WAIT's configured value: a ZERO or shortened
+        // constant underspends; a fresh 30 s per close totals 60 s.
+        assert_eq!(
+            *clock.waited.borrow(),
+            Duration::from_secs(30),
+            "two closes must share one 30 s close-lock deadline"
         );
     }
 
