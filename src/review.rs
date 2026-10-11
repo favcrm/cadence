@@ -1172,7 +1172,7 @@ impl ReviewTree {
                 "review merge-result has untracked files; retaining checkout",
             ));
         }
-        match crate::issue::finish::process_use_under(&self.dir) {
+        match crate::issue::process_use::process_use_under(&self.dir) {
             Ok(uses)
                 if uses.enumeration_error.is_none()
                     && uses.cwd.is_empty()
@@ -1284,7 +1284,7 @@ impl ReviewTree {
             Err(e) => return Some(format!("cannot inspect review checkout dirt: {e}")),
             _ => {}
         }
-        match crate::issue::finish::process_use_under(&self.dir) {
+        match crate::issue::process_use::process_use_under(&self.dir) {
             Ok(uses) if uses.enumeration_error.is_some() => Some(format!(
                 "cannot fully enumerate live process use: {}",
                 uses.enumeration_error

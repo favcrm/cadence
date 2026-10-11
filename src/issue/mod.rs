@@ -40,6 +40,7 @@ pub mod notes;
 pub mod parse;
 pub mod plan;
 mod pmlock;
+pub(crate) mod process_use;
 pub mod project;
 pub mod project_new;
 pub mod reclaim;
