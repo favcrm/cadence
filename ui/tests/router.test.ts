@@ -44,6 +44,10 @@ const paths: [string, Route][] = [
   ["/settings", { screen: "settings", section: "models" }],
   ["/settings/memory", { screen: "settings", section: "memory" }],
   ["/settings/permissions", { screen: "settings", section: "permissions" }],
+  ["/settings/connections", { screen: "settings", section: "connections" }],
+  ["/settings/connections/new", { screen: "settings", section: "connections", page: { kind: "add" } }],
+  ["/settings/connections/new/smtp", { screen: "settings", section: "connections", page: { kind: "addProvider", provider: "smtp" } }],
+  ["/settings/connections/account/c-1", { screen: "settings", section: "connections", page: { kind: "detail", id: "c-1" } }],
   ["/settings/email", { screen: "settings", section: "email" }],
   ["/outbox", { screen: "outbox" }],
   ["/login", { screen: "login" }],
@@ -61,7 +65,7 @@ equal(projectScope({ screen: "workspaceAppKey", appKey: "crm" }), "none", "frien
 for (const path of ["/app-installations", "/app-installations/..", "/app-installations/a%2Fb", "/app-installations/a/extra"]) {
   equal(matchRoute(path).screen, "notFound", `invalid installation route ${path}`);
 }
-for (const dead of ["/overview/x", "/nope", "/projects/x/y", "/projects/cadence/issues/CAD-1/extra", "/agents/a/b", "/apps/%2F", "/apps/%E0", "/apps/catalog", "/apps/manage", "/apps/p/n/x", "/settings/nope", "/setup/x", "/login/x", "/projects/%E0"]) {
+for (const dead of ["/overview/x", "/nope", "/projects/x/y", "/projects/cadence/issues/CAD-1/extra", "/agents/a/b", "/apps/%2F", "/apps/%E0", "/apps/catalog", "/apps/manage", "/apps/p/n/x", "/settings/nope", "/setup/x", "/login/x", "/projects/%E0", "/settings/connections/new/smtp/extra", "/settings/connections/account", "/settings/connections/bogus", "/settings/connections/new/%E0", "/settings/account/unwanted", "/settings/memory/extra", "/settings/update/extra", "/settings/permissions/extra", "/settings/email/extra", "/settings/connections/account/x/y", "/settings/connections/new//smtp", "/settings/connections/account//c-1", "/settings/connections//new"]) {
   equal(matchRoute(dead).screen, "notFound", `not found ${dead}`);
 }
 

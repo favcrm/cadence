@@ -183,13 +183,22 @@ async function main() {
   act(() => (byText("button", "Other") as HTMLButtonElement).click());
   await settle(() => assert(field("Mail server"), "Other opens the custom mail server"));
   assert(field("Port & security"), "paired port & security select renders");
+  // CAD-1319: a custom SMTP server speaks SMTP, not app-password mail
+  // accounts — the labels never pretend otherwise, and the sender line
+  // does not claim a verified status it does not have.
+  assert(field("SMTP username"), "custom SMTP labels its username");
+  assert(field("SMTP password"), "custom SMTP labels its password");
+  assert(!field("Your email address"), "custom SMTP does not call its login an email address");
+  assert(!field("App password"), "custom SMTP does not call its secret an app password");
+  const senderLab = field("Sender address");
+  assert(senderLab && !(senderLab.textContent ?? "").includes("verified"), "sender label does not claim verification");
 
   // Fill the SMTP form and submit: the body carries ONLY email:send —
   // never the union including email:read.
   fill("Email account name", "newsletter");
   fill("Mail server", "mail.example.com");
-  fill("Your email address", "mailer");
-  fill("App password", "s3cret-password");
+  fill("SMTP username", "mailer");
+  fill("SMTP password", "s3cret-password");
   fill("Sender address", "news@example.com");
   const addBtn = () => byText("button", "Add connection") as HTMLButtonElement | null;
   await act(async () => addBtn()!.click());
@@ -199,7 +208,7 @@ async function main() {
   assert(posts[0].body.secret === undefined || posts[0].body.secret === "s3cret-password", "secret crosses only in the request body");
 
   // Password cleared from the form on settle.
-  const pw = field("App password")!.parentElement!.querySelector("input") as HTMLInputElement;
+  const pw = field("SMTP password")!.parentElement!.querySelector("input") as HTMLInputElement;
   assert(pw.value === "", "password field is cleared after submit");
 
   // custody_unprotected → visible explicit consent beside Save, not pre-checked.
@@ -208,7 +217,7 @@ async function main() {
       status: 400,
       headers: { "Content-Type": "application/json" },
     });
-  fill("App password", "s3cret-password");
+  fill("SMTP password", "s3cret-password");
   await act(async () => addBtn()!.click());
   await settle(() => {
     assert(text().includes("nothing was stored"), "custody_unprotected reports nothing was stored");
@@ -226,7 +235,7 @@ async function main() {
   act(() => {
     consent.checked && consent.click();
   });
-  fill("App password", "s3cret-password");
+  fill("SMTP password", "s3cret-password");
   await act(async () => addBtn()!.click());
   await settle(() => assert(text().includes("Could not confirm the connection was added"), "unknown failure is honest"));
   assert(!text().includes("s3cret"), "the credential never echoes back in the error");
@@ -504,47 +513,86 @@ async function main() {
   }, 30000);
 
   const text5 = () => host5.textContent ?? "";
-  // Contextual setup on enrollable services only; explicit unsupported
-  // reason on the empty/built-in ones; built-in outbox not editable.
-  assert(byTextIn(host5, "button", "Set up Email (SMTP)"), "smtp service has a Set up action");
-  assert(byTextIn(host5, "button", "Set up AgenticOS"), "token service has a Set up action");
+  // CAD-1319: the index is compact links and routed setup actions — no
+  // in-place expansion, no credential form. Contextual setup lands on
+  // enrollable services only; the empty/built-in ones carry the explicit
+  // unsupported reason; an unregistered account is never dropped.
+  assert(byTextIn(host5, "a", "Set up Email (SMTP)"), "smtp service links to its pinned setup");
+  assert(byTextIn(host5, "a", "Set up AgenticOS"), "token service links to its pinned setup");
+  assert(
+    (byTextIn(host5, "a", "Set up Email (SMTP)") as HTMLAnchorElement)?.getAttribute("href") ===
+      "/settings/connections/new/smtp",
+    "smtp setup href is the pinned new/<provider> route",
+  );
   assert(text5().includes("No empty_svc account connected yet"), "empty provider names its setup state");
   assert(
     text5().includes("could not be loaded") || text5().includes("not proof") || text5().includes("may be stale") || text5().includes("not registered"),
     "unregistered provider is honest — metadata-missing is not deregistration",
   );
+  assert(!text5().includes("Check configuration"), "index carries no expanded detail");
+  assert(!host5.querySelector('section[aria-label="add connection"]'), "index carries no credential form");
 
-  // Expand the smtp row: its detail lands in place with the local-only
-  // check and the honest unsupported remote-verification line.
-  const smtpRowBtn = Array.from(host5.querySelectorAll("button")).find((b) => (b.textContent ?? "").includes("news"));
-  assert(smtpRowBtn, "smtp account row renders");
-  await act(async () => smtpRowBtn!.click());
+  // Account rows are links to their own detail pages — the smtp row
+  // names its exact /account/<id> URL.
+  const smtpRowLink = Array.from(host5.querySelectorAll("a")).find((a) => (a.textContent ?? "").includes("news")) as HTMLAnchorElement | undefined;
+  assert(smtpRowLink, "smtp account row renders as a link");
+  equal(smtpRowLink!.getAttribute("href"), "/settings/connections/account/c-smtp", "smtp row links to its detail route");
+
+  // The dedicated detail page mounts the exact row — check, update and
+  // disconnect in place; the honest unsupported remote-verification line
+  // stays behind the collapsed technical details.
+  const host6 = document.createElement("div");
+  document.body.appendChild(host6);
+  const root6 = createRoot(host6);
+  act(() => {
+    root6.render(React.createElement(ConnectionsPage, {
+      viewer: { operator: true, readOnly: false },
+      page: { kind: "detail", id: "c-smtp" },
+    }));
+  });
+  const text6 = () => host6.textContent ?? "";
   await settle(() => {
-    assert(text5().includes("Check configuration"), "local check action present");
-    assert(text5().includes("Technical details"), "technical disclosure present");
-    assert(text5().includes("Update credentials"), "enrolled account offers update");
-    assert(text5().includes("Disconnect"), "enrolled account offers disconnect");
+    assert(text6().includes("Check configuration"), "detail page has the local check action");
+    assert(text6().includes("Technical details"), "technical disclosure present");
+    assert(text6().includes("Update credentials"), "enrolled account offers update");
+    assert(text6().includes("Disconnect"), "enrolled account offers disconnect");
   });
   // Open the technical disclosure to find the remote-verification line.
-  const summary = host5.querySelector("summary");
-  await act(async () => (summary as HTMLElement)?.click?.() ?? summary?.dispatchEvent(new Event("click", { bubbles: true })));
+  const summary6 = host6.querySelector("summary");
+  await act(async () => (summary6 as HTMLElement)?.click?.() ?? summary6?.dispatchEvent(new Event("click", { bubbles: true })));
   await settle(() => {
-    assert(text5().includes("Remote verification"), "disclosure carries a remote-verification line");
-    assert(text5().includes("unsupported"), "remote verification reports unsupported, never a fake success");
-    assert(!text5().includes("Login verified"), "no simulated success ships");
+    assert(text6().includes("Remote verification"), "disclosure carries a remote-verification line");
+    assert(text6().includes("unsupported"), "remote verification reports unsupported, never a fake success");
+    assert(!text6().includes("Login verified"), "no simulated success ships");
   });
 
-  // The built-in Local outbox row expands to NO edit/disconnect actions.
-  const outboxRowBtn = Array.from(host5.querySelectorAll("button")).find((b) => (b.textContent ?? "").includes("Local outbox"));
-  assert(outboxRowBtn, "local outbox row renders");
-  await act(async () => outboxRowBtn!.click());
+  // The built-in Local outbox detail has NO edit/disconnect actions.
+  act(() => {
+    root6.render(React.createElement(ConnectionsPage, {
+      viewer: { operator: true, readOnly: false },
+      page: { kind: "detail", id: "builtin-local" },
+    }));
+  });
   await settle(() => {
-    const detail = host5.querySelector('section[aria-label="Local outbox detail"]');
-    assert(detail, "outbox detail expands");
+    const detail = host6.querySelector('section[aria-label="Local outbox detail"]');
+    assert(detail, "outbox detail renders on its own route");
     const dt = detail!.textContent ?? "";
     assert(!dt.includes("Update credentials") && !dt.includes("Disconnect"), "built-in has no edit/disconnect");
     assert(dt.includes("cannot be") || dt.includes("always present"), "built-in explains why");
   });
+
+  // An unknown id is not-found only on a fresh answer — never a loading
+  // or stale read mislabelled as deleted.
+  act(() => {
+    root6.render(React.createElement(ConnectionsPage, {
+      viewer: { operator: true, readOnly: false },
+      page: { kind: "detail", id: "c-gone" },
+    }));
+  });
+  await settle(() => {
+    assert(text6().includes("not found") || text6().includes("not on this board"), "a fresh list's missing row reads not-found");
+  });
+  await act(async () => root6.unmount());
 
   // Provider-list failure must NOT blank the loaded account list.
   failProviders = true;
