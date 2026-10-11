@@ -115,19 +115,64 @@ pub fn write_frame_kit(out: &Path, bundle: Option<&Path>, parent_origin: &str) -
 }
 
 fn validate_origin(origin: &str) -> Result<()> {
-    let (scheme, authority) = origin
-        .split_once("://")
-        .ok_or_else(|| Error::invalid("parent_origin", "expected an exact http(s) origin"))?;
-    if !matches!(scheme, "http" | "https")
-        || authority.is_empty()
-        || authority.contains(['/', '?', '#', '@', ' ', '\\'])
-        || authority.starts_with(':')
-        || origin.ends_with('/')
-    {
-        return Err(Error::invalid(
+    let invalid = || {
+        Error::invalid(
             "parent_origin",
-            "expected an exact http(s) origin including its port when present",
-        ));
+            "expected a canonical exact http(s) origin with a valid host and port",
+        )
+    };
+    // Accept only the exact serialized spelling used as the browser origin:
+    // lowercase http(s), canonical IP text, lowercase ASCII DNS names and decimal ports.
+    let uri = origin.parse::<ureq::http::Uri>().map_err(|_| invalid())?;
+    let scheme = uri.scheme_str().ok_or_else(invalid)?;
+    if !matches!(scheme, "http" | "https") {
+        return Err(invalid());
+    }
+    let authority = uri.authority().ok_or_else(invalid)?;
+    let host = authority.host();
+    if host.is_empty() || origin != format!("{scheme}://{authority}") {
+        return Err(invalid());
+    }
+
+    let canonical_host =
+        if let Some(ipv6) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+            ipv6.parse::<std::net::Ipv6Addr>()
+                .is_ok_and(|ip| host == format!("[{ip}]"))
+        } else if let Ok(ipv4) = host.parse::<std::net::Ipv4Addr>() {
+            host == ipv4.to_string()
+        } else {
+            host.len() <= 253
+                && host.is_ascii()
+                && host == host.to_ascii_lowercase()
+                && host.split('.').all(|label| {
+                    !label.is_empty()
+                        && label.len() <= 63
+                        && !label.starts_with('-')
+                        && !label.ends_with('-')
+                        && label
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                })
+                && !host.rsplit('.').next().is_some_and(|label| {
+                    label.bytes().all(|b| b.is_ascii_digit())
+                        || label.strip_prefix("0x").is_some_and(|hex| {
+                            !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit())
+                        })
+                })
+        };
+    if !canonical_host {
+        return Err(invalid());
+    }
+
+    let valid_authority = match authority.port() {
+        Some(port) => {
+            let port = port.as_u16();
+            authority.as_str() == format!("{host}:{port}")
+        }
+        None => authority.as_str() == host,
+    };
+    if !valid_authority {
+        return Err(invalid());
     }
     Ok(())
 }
