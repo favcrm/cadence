@@ -202,9 +202,9 @@ fn git_command(home: &Path, cwd: &Path, args: &[&str]) -> Output {
 
 fn integration_targets() -> Vec<String> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let out = Command::new(root.join("scripts/result-test-args"))
-        .current_dir(root)
-        .output()
+    let mut command = Command::new(root.join("scripts/result-test-args"));
+    command.current_dir(root);
+    let out = cadence_agent::reaper::output(&mut command)
         .expect("read active integration target selection");
     assert!(out.status.success(), "result-test-args failed");
     let lines: Vec<_> = String::from_utf8(out.stdout)
@@ -212,9 +212,10 @@ fn integration_targets() -> Vec<String> {
         .lines()
         .map(str::to_owned)
         .collect();
-    assert!(!lines.is_empty() && lines.len() % 2 == 0);
-    lines
-        .chunks_exact(2)
+    let (pairs, remainder) = lines.as_slice().as_chunks::<2>();
+    assert!(!lines.is_empty() && remainder.is_empty());
+    pairs
+        .iter()
         .map(|pair| {
             assert_eq!(pair[0], "--test");
             pair[1].clone()
