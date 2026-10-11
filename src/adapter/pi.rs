@@ -280,13 +280,18 @@ pub(crate) fn resolve_pi_launch_command(
         .unwrap_or_else(|| "pi".to_string());
     let path_display = path.unwrap_or_default();
     if !program.contains('/') {
-        if path.is_some_and(|p| std::env::split_paths(p).any(|entry| !entry.is_absolute())) {
-            return Err("startup resolution is indeterminate: PATH contains a relative entry and agents launch in their own working directories; use absolute PATH entries or CADENCE_PI_COMMAND".to_string());
+        let path = path.ok_or_else(|| "startup resolution is indeterminate: PATH is unavailable; configure CADENCE_PI_COMMAND as an absolute executable path".to_string())?;
+        for entry in path.split(':') {
+            if !Path::new(entry).is_absolute() {
+                return Err("startup resolution is indeterminate: PATH reaches a relative entry before a match and agents launch in their own working directories; use absolute PATH entries or CADENCE_PI_COMMAND".to_string());
+            }
+            if let Some(resolved) = crate::master::which(&program, Some(entry)) {
+                return Ok(resolved);
+            }
         }
-        let resolved = crate::master::which(&program, path)
-            .ok_or_else(|| format!("command '{program}' not found on PATH ({path_display})"))?;
-        return std::path::absolute(&resolved)
-            .map_err(|e| format!("cannot resolve command '{program}' to an absolute path: {e}"));
+        return Err(format!(
+            "command '{program}' not found on PATH ({path_display})"
+        ));
     }
     let candidate = PathBuf::from(&program);
     if !candidate.is_absolute() {
@@ -3112,6 +3117,15 @@ mod cad1247_tests {
         assert!(resolve_pi_launch_command(&env, Some(relative_path))
             .unwrap_err()
             .contains("indeterminate"));
+        assert_eq!(
+            resolve_pi_launch_command(&env, Some(&format!("{path}:{relative_path}"))).unwrap(),
+            pi
+        );
+        assert!(
+            resolve_pi_launch_command(&env, Some(&format!("{relative_path}:{path}")))
+                .unwrap_err()
+                .contains("indeterminate")
+        );
         env.set("CADENCE_PI_COMMAND", relative_pi.to_str().unwrap());
         assert!(resolve_pi_launch_command(&env, Some(&path))
             .unwrap_err()
