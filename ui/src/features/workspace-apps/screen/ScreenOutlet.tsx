@@ -121,7 +121,7 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions 
     </div>
     {/* CAD-1137: a quiet first-mount skeleton, with the blank frame hidden until handshake readiness. */}
     {state === "loading" && (
-      <div className="wa-skeleton" role="status" aria-label="Loading installed app" style={{ padding: "0.5rem 0.25rem" }}>
+      <div className="wa-skeleton wa-screen-skeleton" role="status" aria-label="Loading installed app" style={{ padding: "0.5rem 0.25rem" }}>
         <span className="sr-only">Loading installed app…</span>
         <div className="wa-skel-tabs">
           {[3, 3.5, 4.5, 3.5].map((w, i) => (
