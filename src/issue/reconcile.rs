@@ -960,13 +960,11 @@ mod tests {
     }
 
     /// CAD-1153: `run` creates the shared deadline — one
-    /// `CLI_CLOSE_LOCK_WAIT` across the whole run, not per close. A
-    /// deadline that is already exhausted when the second close arrives
-    /// proves the first close's wait spent the same budget, and proves
-    /// `run` passes a deadline at all (a zero-wait `run` — a
-    /// `CLI_CLOSE_LOCK_WAIT` typo — fails the same way, so this is the
-    /// test CAD-1150's note asked for). `run` returns the rows, not an
-    /// Err, when closes fail.
+    /// `CLI_CLOSE_LOCK_WAIT` across the whole run, not per close. The
+    /// elapsed lower bound proves the configured nonzero CLI wait is
+    /// exercised (a zero-wait `CLI_CLOSE_LOCK_WAIT` would finish too
+    /// quickly); the upper bound proves both closes share its budget.
+    /// `run` returns the rows, not an Err, when closes fail.
     #[test]
     fn run_shares_one_close_lock_deadline() {
         let rig = rig();
@@ -993,11 +991,14 @@ mod tests {
         assert!(out["finish"].is_object(), "{out}");
         assert_eq!(status(&rig, &id1), "doing");
         assert_eq!(status(&rig, &id2), "doing");
-        // Two closes at ~30 s each would take ~60 s; the shared
-        // deadline bounds the whole run at ~30 s. The bound is loose
-        // (a loaded host only adds slack): what the test pins is that
-        // the second close sees an exhausted budget, which requires
-        // the first close's 30 s to have come out of the same clock.
+        // The 25 s floor is independent of CLI_CLOSE_LOCK_WAIT, so
+        // changing that constant to ZERO cannot satisfy this check.
+        // Two closes at ~30 s each would take ~60 s; the 55 s ceiling
+        // leaves scheduler slack while proving they share one budget.
+        assert!(
+            elapsed >= Duration::from_secs(25),
+            "CLI close-lock wait was shorter than configured: {elapsed:?}"
+        );
         assert!(
             elapsed < Duration::from_secs(55),
             "shared deadline not observed: {elapsed:?}"
