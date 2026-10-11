@@ -15,7 +15,9 @@ loader.prototype.require = function (this: unknown, id: string) {
 };
 const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
-const Board = (require("../src/features/projects/Board") as typeof import("../src/features/projects/Board")).default;
+const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
+const BoardComponent = (require("../src/features/projects/Board") as typeof import("../src/features/projects/Board")).default;
+const Board = (props: React.ComponentProps<typeof BoardComponent>) => React.createElement(LocaleProvider, null, React.createElement(BoardComponent, props));
 const Drawer = (require("../src/features/projects/Drawer") as typeof import("../src/features/projects/Drawer")).default;
 const { api } = require("../src/lib/api") as typeof import("../src/lib/api");
 const { NO_FILTERS } = require("../src/lib/filters") as typeof import("../src/lib/filters");

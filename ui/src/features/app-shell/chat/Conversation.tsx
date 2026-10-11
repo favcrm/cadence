@@ -33,6 +33,7 @@ import {
   type ThreadItem,
 } from "../../home/thread";
 import type { Viewer } from "../../projects/work";
+import { useLocale } from "../../../lib/locale";
 import {
   QUEUED_NOTICE,
   conversationLabel,
@@ -162,8 +163,9 @@ export default function Conversation(props: HomeListProps | AppPaneProps) {
 
 /** Home's rows: the exact `<ol>` Home rendered before, one renderer. */
 function HomeList({ items, readOnly, liveAfter, onOpenIssue, onRetry, onDiscard, after }: HomeListProps) {
+  const { t } = useLocale();
   return (
-    <ol className="space-y-3 min-w-0" aria-label="messages" data-rendered={items.length}>
+    <ol className="space-y-3 min-w-0" aria-label={t("messages")} data-rendered={items.length}>
       {items.map((item) => {
         // Live items (or the operator's pending ones) enter with the
         // rise animation; anything at or below the mount seq is history.
@@ -258,11 +260,12 @@ function AppRow({
   ) => void;
   onDiscard: (message: string) => void;
 }) {
+  const { t, formatNumber } = useLocale();
   if (directive?.kind === "card") return <DirectiveCard card={directive.card} fields={directive.fields} actions={actions} />;
   if (directive?.kind === "confirmation") return <ConfirmationCard />;
   if (directive?.kind === "frame" && frame) {
-    if (frame.state === "closed") return <p className="text-micro text-ink-500" data-chat-frame-state="closed">Preview closed</p>;
-    if (frame.state === "updated") return <p className="text-micro text-ink-500" data-chat-frame-state="updated">Preview updated above</p>;
+    if (frame.state === "closed") return <p className="text-micro text-ink-500" data-chat-frame-state="closed">{t("Preview closed")}</p>;
+    if (frame.state === "updated") return <p className="text-micro text-ink-500" data-chat-frame-state="updated">{t("Preview updated above")}</p>;
     return (
       <ChatFrame
         installId={mode.installId}
@@ -280,7 +283,7 @@ function AppRow({
     const failed = steps.some((s) => s.error);
     return (
       <p className="text-micro text-ink-500" data-chat-steps>
-        {open ? "Working" : failed ? "Finished with an issue" : "✓ Done"} · {steps.length} step{steps.length === 1 ? "" : "s"}
+        {open ? t("Working") : failed ? t("Finished with an issue") : `✓ ${t("Done")}`} · {formatNumber(steps.length)} {t(steps.length === 1 ? "step" : "steps")}
       </p>
     );
   }
@@ -307,6 +310,7 @@ function AppRow({
  * stamps the verified binding on the entry.
  */
 function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, collapsed, onCollapsed, onOpenView }: AppPaneProps) {
+  const { t, formatNumber } = useLocale();
   const { installId, descriptor } = mode;
   const fileUpload = mode.fileUpload ?? { declared: false, available: false };
   const fileUploadLoading = mode.fileUploadLoading ?? true;
@@ -971,26 +975,26 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       <button
         type="button"
         className="btn btn-ghost btn-sm app-chat-rail"
-        aria-label="Expand assistant chat"
+        aria-label={t("Expand assistant chat")}
         aria-expanded={!collapsed}
         onClick={() => onCollapsed(false)}
         data-waiting={waiting || undefined}
       >
-        {waiting && <span className="app-chat-dot" role="status" aria-label="New reply waiting" />}
-        <span className="app-chat-rail-label text-micro text-ink-400">ASSISTANT</span>
+        {waiting && <span className="app-chat-dot" role="status" aria-label={t("New reply waiting")} />}
+        <span className="app-chat-rail-label text-micro text-ink-400">{t("ASSISTANT")}</span>
       </button>
       <div className="app-chat-head">
         <div className="app-chat-title">
           <span className="app-chat-mark" aria-hidden>✳</span>
-          <strong>Assistant</strong>
+          <strong>{t("Assistant")}</strong>
         </div>
         <div className="app-chat-head-tools">
           {active.state !== "legacy" && (
             <button
               type="button"
               className="app-chat-iconbtn"
-              aria-label="Conversation history"
-              title="Conversation history"
+              aria-label={t("Conversation history")}
+              title={t("Conversation history")}
               aria-expanded={historyOpen}
               disabled={active.state !== "ready" || active.conversations.length === 0}
               onClick={() => setHistoryOpen((o) => !o)}
@@ -1003,8 +1007,8 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           <button
             type="button"
             className="app-chat-iconbtn app-chat-collapse"
-            aria-label="Collapse assistant chat"
-            title="Collapse assistant chat"
+            aria-label={t("Collapse assistant chat")}
+            title={t("Collapse assistant chat")}
             aria-expanded={!collapsed}
             onClick={() => onCollapsed(true)}
           >
@@ -1013,7 +1017,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         </div>
       </div>
       {historyOpen && active.state === "ready" && (
-        <div className="app-chat-history" role="group" aria-label="Conversation history" data-chat-history>
+        <div className="app-chat-history" role="group" aria-label={t("Conversation history")} data-chat-history>
           {active.conversations.map((c, i) => (
             <button
               key={c.id}
@@ -1034,7 +1038,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         <div className="app-chat-conv" data-chat-conversations>
           <select
             className="app-chat-conv-select text-secondary"
-            aria-label="Conversation"
+            aria-label={t("Conversation")}
             value={convId ?? ""}
             disabled={
               active.state !== "ready" ||
@@ -1045,10 +1049,10 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
             onChange={(e) => e.target.value !== "" && selectConversation(installId, e.target.value)}
           >
             {active.conversations.length === 0 && draftSubject === null && mode.conversationRequest === null && (
-              <option value="">General</option>
+              <option value="">{t("General")}</option>
             )}
             {draftSubject !== null && (
-              <option value="">{draftLabel ? `New ${draftLabel} conversation (unsaved)` : "New conversation (unsaved)"}</option>
+              <option value="">{draftLabel ? `${t("New")} ${draftLabel} ${t("conversation (unsaved)")}` : t("New conversation (unsaved)")}</option>
             )}
             {active.conversations.map((c, i) => (
               <option key={c.id} value={c.id}>
@@ -1060,8 +1064,8 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
             type="button"
             className="app-chat-iconbtn"
             data-chat-new
-            aria-label="New conversation"
-            title="New conversation"
+            aria-label={t("New conversation")}
+            title={t("New conversation")}
             disabled={!canCreate || creating}
             onClick={startNew}
           >
@@ -1086,8 +1090,8 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
             <Link
               href={`/app-installations/${encodeURIComponent(installId)}?ctx=${encodeURIComponent(binding.scope.context_id)}&conversation=${encodeURIComponent(active.selected.id)}`}
               className="lnk app-chat-scope-link"
-              aria-label="Link to this conversation"
-              title="Shareable link to this conversation"
+              aria-label={t("Link to this conversation")}
+              title={t("Shareable link to this conversation")}
               data-chat-conversation-link
             >
               Link
@@ -1100,7 +1104,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           (binding.scope === null || binding.scope.context_id === "") && (
             <span
               className="app-chat-scope-link text-ink-500"
-              title="A shareable link needs a verified context"
+              title={t("A shareable link needs a verified context")}
               data-chat-link-unavailable
             >
               Link unavailable
@@ -1119,7 +1123,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       )}
       {active.state === "failed" && (
         <p className="text-label text-fail" role="alert">
-          The conversations could not be read — {active.error}{" "}
+          {t("The conversations could not be read")} — {active.error}{" "}
           <button type="button" className="lnk" onClick={active.retry}>
             Retry
           </button>
@@ -1127,43 +1131,43 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       )}
       {active.state === "ready" && convId === null && (
         <p className="text-label text-ink-500" data-empty="conversations">
-          No conversation yet. Start one with + New.
+          {t("No conversation yet. Start one with + New.")}
         </p>
       )}
       {queued && (
         <p className="text-label text-ink-300" role="status" data-chat-queued>
-          {QUEUED_NOTICE}
+          {t(QUEUED_NOTICE)}
         </p>
       )}
       {queuedOwn && (
         <p className="text-label text-ink-300" role="status" data-chat-status="queued">
-          Queued…
+          {t("Queued…")}
         </p>
       )}
       {pendingStatus && (
         <p className="text-label text-ink-300" role="status" data-chat-status={pendingStatus}>
-          {pendingStatus === "sending" ? "Sending…" : "Waiting…"}
+          {pendingStatus === "sending" ? t("Sending…") : t("Waiting…")}
         </p>
       )}
       {working && viewer.operator && !viewer.readOnly && (
         <div className="app-chat-working" role="status">
           <span className="app-chat-pulse" aria-hidden />
-          <span>Working…</span>
+          <span>{t("Working…")}</span>
           <button
             type="button"
             className="app-chat-stop"
             onClick={onStop}
             data-chat-stop
-            aria-label="Stop the current turn (applies to the whole assistant, not only this conversation)"
-            title="Stops the assistant's running turn. The board command is global, not scoped to this conversation, and cancels the turn only — it cannot undo a committed effect."
+            aria-label={t("Stop the current turn (applies to the whole assistant, not only this conversation)")}
+            title={t("Stops the assistant's running turn. The board command is global, not scoped to this conversation, and cancels the turn only — it cannot undo a committed effect.")}
           >
-            Stop
+            {t("Stop")}
           </button>
         </div>
       )}
       {thread.status === "failed" && (
         <p className="text-label text-fail" role="alert">
-          The thread could not be read — {thread.error}{" "}
+          {t("The thread could not be read")} — {thread.error}{" "}
           <button type="button" className="lnk" onClick={() => void store.refresh()}>
             Retry
           </button>
@@ -1171,12 +1175,12 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       )}
       {usable && !loaded && thread.status !== "failed" && (
         <p className="text-label text-ink-500" role="status">
-          Reading the thread…
+          {t("Reading the thread…")}
         </p>
       )}
       {usable && loaded && items.length === 0 && (
         <p className="text-label text-ink-500" data-empty="chat">
-          Nothing here yet. Send the first message.
+          {t("Nothing here yet. Send the first message.")}
         </p>
       )}
       {usable && loaded && items.length > 0 && (hidden > 0 || moreBefore) && (
@@ -1188,11 +1192,11 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
             onClick={onEarlier}
             data-chat-earlier
           >
-            {loadingEarlier ? "Loading…" : "Load earlier messages ↑"}
+            {loadingEarlier ? t("Loading…") : t("Load earlier messages ↑")}
           </button>
         </div>
       )}
-      <ol className="app-chat-list" ref={listRef} onScroll={onListScroll} aria-label="Conversation messages">
+      <ol className="app-chat-list" ref={listRef} onScroll={onListScroll} aria-label={t("Conversation messages")}>
         {shown.map((item, i) => (
           <li
             key={item.key}
@@ -1218,7 +1222,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       <AssistantOperations key={`${installId}\u0000${mode.contextId}`} installId={installId} contextId={mode.contextId} canDecide={viewer.operator === true && !viewer.readOnly} />
       {jump && (
         <button type="button" className="lnk text-label app-chat-jump" onClick={jumpToLatest} data-jump-to-latest>
-          ↓ New messages
+          ↓ {t("New messages")}
         </button>
       )}
       {sendError && (
@@ -1233,21 +1237,21 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       )}
       {composerNotice && (
         <p className="text-micro text-ink-400" role="status" data-chat-notice>
-          {composerNotice}
+          {t(composerNotice)}
         </p>
       )}
       {failedOutbox !== null && (
         <div className="app-chat-outbox" data-chat-outbox ref={outboxRef}>
-          <p className="text-micro text-ink-400">Not sent — the conversation could not be created.</p>
+          <p className="text-micro text-ink-400">{t("Not sent — the conversation could not be created.")}</p>
           <p className="text-secondary text-ink-300 break-words">{failedOutbox.text}</p>
           {failedOutbox.error && <p className="text-micro text-ink-500 break-words">{failedOutbox.error}</p>}
           <p className="text-micro">
             <button type="button" className="lnk" onClick={() => retryOutbox(failedOutbox)}>
-              Retry
+              {t("Retry")}
             </button>{" "}
             ·{" "}
             <button type="button" className="lnk" onClick={() => discardOutbox(failedOutbox)}>
-              Discard
+              {t("Discard")}
             </button>
           </p>
         </div>
@@ -1256,8 +1260,8 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         <div className="app-chat-outbox" data-chat-saved-intent>
           <p className="text-micro text-ink-400">
             {savedIntents.length === 1
-              ? "An unsent draft is kept — this conversation already had its own."
-              : `${savedIntents.length} unsent drafts are kept — this conversation already had its own.`}
+              ? t("An unsent draft is kept — this conversation already had its own.")
+              : `${formatNumber(savedIntents.length)} ${t("unsent drafts are kept — this conversation already had its own.")}`}
           </p>
           <p className="text-micro">
             {savedIntents.map((record, i) => (
@@ -1270,7 +1274,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
                     restoreSavedIntent(composerKey, record.slot);
                   }}
                 >
-                  {savedIntents.length === 1 ? "Restore saved draft" : `Restore saved draft ${i + 1}`}
+                  {savedIntents.length === 1 ? t("Restore saved draft") : `${t("Restore saved draft")} ${formatNumber(i + 1)}`}
                 </button>
               </span>
             ))}
@@ -1345,7 +1349,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         onResolveOriginal={() => outboxRef.current?.scrollIntoView?.({ block: "nearest" })}
         textareaId="app-shell-chat-box"
         ariaLabel="Message to Assistant"
-        placeholder="Message Assistant…"
+        placeholder={t("Message Assistant…")}
         className="app-chat-form"
       />
     </div>

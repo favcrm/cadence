@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useLocale } from "../../../lib/locale";
 import Button from "../../../ui/Button";
 import type { AudienceScope } from "../audienceClient";
 import {
@@ -80,6 +81,7 @@ export default function EmailPane({
   onProposalError: (message: string | null) => void;
   edit: EmailDraftApi | null;
 }) {
+  const { t, formatNumber } = useLocale();
   const [mode, setMode] = useState<Mode>("visual");
   const [device, setDevice] = useState<Device>("desktop");
   const [draftId, setDraftId] = useState<string | null>(null);
@@ -194,8 +196,7 @@ export default function EmailPane({
     if (draft === null && doc === null && !editing) {
       return (
         <p className="text-label text-ink-400" data-preview="unsaved">
-          No saved email yet. Ask the assistant in the left chat to draft this campaign&apos;s
-          email, then use a verified proposal in the editor and explicitly Save revision 1.
+          {t("No saved email yet. Ask the assistant in the left chat to draft this campaign's email, then use a verified proposal in the editor and explicitly Save revision 1.")}
         </p>
       );
     }
@@ -206,11 +207,11 @@ export default function EmailPane({
           data-device={device}
           {...(draft !== null ? { "data-proposal-body": draft.proposalId } : {})}
         >
-          <div className="crm-envelope" aria-label="Email envelope">
+          <div className="crm-envelope" aria-label={t("Email envelope")}>
             {editing && edit !== null ? (
               <>
                 <label className="crm-env-row">
-                  <span className="text-ink-500">Subject</span>
+                  <span className="text-ink-500">{t("Subject")}</span>
                   <input
                     id="cmp-subject"
                     className="field crm-subject-direct"
@@ -223,7 +224,7 @@ export default function EmailPane({
                 </label>
                 {preheaderOpen ? (
                   <label className="crm-env-row">
-                    <span className="text-ink-500">Preheader</span>
+                    <span className="text-ink-500">{t("Preheader")}</span>
                     <input
                       id="cmp-preheader"
                       className="field crm-preheader-direct"
@@ -231,7 +232,7 @@ export default function EmailPane({
                       onChange={(e) => edit.patch({ preheader: e.target.value })}
                       maxLength={200}
                       autoComplete="off"
-                      placeholder="Optional inbox preview text"
+                      placeholder={t("Optional inbox preview text")}
                       disabled={edit.saving || edit.reloading}
                     />
                   </label>
@@ -245,29 +246,29 @@ export default function EmailPane({
                   disabled={edit.saving || edit.reloading}
                   onClick={() => setPreheaderOpen((open) => !open)}
                 >
-                  {preheaderOpen ? "− Hide preheader" : "+ Add preheader"}{" "}
-                  <span className="text-ink-500">(optional)</span>
+                  {preheaderOpen ? `− ${t("Hide preheader")}` : `+ ${t("Add preheader")}`}{" "}
+                  <span className="text-ink-500">({t("optional")})</span>
                 </button>
               </>
             ) : (
               <>
                 <p>
-                  <span className="text-ink-500">Subject </span>
+                  <span className="text-ink-500">{t("Subject")} </span>
                   <strong className="text-ink-100">{subject}</strong>
                 </p>
                 <p>
-                  <span className="text-ink-500">Preheader </span>
+                  <span className="text-ink-500">{t("Preheader")} </span>
                   {preheader === "" ? "—" : preheader}
                 </p>
               </>
             )}
             <p className="text-label text-ink-400">
-              From{" "}
+              {t("From")} {" "}
               <span className="num">
                 {shown !== null ? `${shown.sender.name} <${shown.sender.address}>` : "…"}
               </span>{" "}
-              · To <span className="num">{sampleName.trim() === "" ? "each recipient" : sampleName.trim()}</span>{" "}
-              <span className="chip" title="Sender material is host-locked preview-only bytes">
+              · {t("To")} <span className="num">{sampleName.trim() === "" ? t("each recipient") : sampleName.trim()}</span>{" "}
+              <span className="chip" title={t("Sender material is host-locked preview-only bytes")}>
                 preview-only
               </span>
             </p>
@@ -293,8 +294,7 @@ export default function EmailPane({
                 }
               />
               <p className="crm-footer-lock" data-host-footer>
-                🔒 host footer — the unsubscribe link and sender address are added by the host
-                and cannot be edited.
+                🔒 {t("host footer — the unsubscribe link and sender address are added by the host and cannot be edited.")}
               </p>
             </>
           )}
@@ -306,16 +306,10 @@ export default function EmailPane({
                 data-html-note
                 data-html-save-boundary
               >
-                <strong>Save keeps a sanitized body fragment, not a full document.</strong> The host
-                removes the doctype and document wrappers (&lt;html&gt;, &lt;head&gt; and &lt;body&gt;),
-                including head content such as the title and stylesheet &lt;style&gt; blocks. Only
-                selected supported inline style attributes may persist; unsupported or unsafe
-                content is stripped. The protected sender and unsubscribe footer are appended
-                separately by the host. Switching modes preserves your unsaved source, but Save
-                does not save a full document or stylesheet verbatim.
+                <strong>{t("Save keeps a sanitized body fragment, not a full document.")}</strong> {t("The host removes the doctype and document wrappers, including head content such as the title and stylesheet blocks. Only selected supported inline style attributes may persist; unsupported or unsafe content is stripped. The protected sender and unsubscribe footer are appended separately by the host. Switching modes preserves your unsaved source, but Save does not save a full document or stylesheet verbatim.")}
               </p>
               <label className="text-label text-ink-300" htmlFor="cmp-html-source">
-                HTML source
+                {t("HTML source")}
               </label>
               <textarea
                 id="cmp-html-source"
@@ -323,12 +317,12 @@ export default function EmailPane({
                 rows={12}
                 spellCheck={false}
                 value={htmlSource}
-                placeholder="Paste or edit the email body HTML"
+                placeholder={t("Paste or edit the email body HTML")}
                 disabled={edit.saving || edit.reloading}
                 onChange={(e) => edit.patch({ html: e.target.value })}
               />
               <iframe
-                title="Live HTML draft preview"
+                title={t("Live HTML draft preview")}
                 sandbox=""
                 srcDoc={draftHtmlPreview(htmlSource)}
                 className="crm-preview-frame"
@@ -338,17 +332,17 @@ export default function EmailPane({
           )}
           {editing && (
             <p className="text-micro text-ink-500 mt-2">
-              Host render of the saved version{doc !== null ? ` (v${doc.revision})` : ""}:
+              {t("Host render of the saved version")}{doc !== null ? ` (v${formatNumber(doc.revision)})` : ""}:
             </p>
           )}
           {shown === null && (draft !== null ? draftPending : renderPending) && (
             <p className="text-label text-ink-500 mt-2" role="status" data-preview="loading">
-              {draft !== null ? "Rendering the draft preview…" : "Rendering the saved email…"}
+              {t(draft !== null ? "Rendering the draft preview…" : "Rendering the saved email…")}
             </p>
           )}
           {editing && mode === "visual" && edit !== null && edit.draft.html !== null && (
             <iframe
-              title="Visual preview of HTML draft"
+              title={t("Visual preview of HTML draft")}
               sandbox=""
               srcDoc={draftHtmlPreview(edit.draft.html)}
               className="crm-preview-frame"
@@ -359,8 +353,8 @@ export default function EmailPane({
             <iframe
               title={
                 draft !== null
-                  ? "Draft email preview"
-                  : `Visual email preview, saved revision ${render?.revision ?? ""}`
+                  ? t("Draft email preview")
+                  : `${t("Visual email preview, saved revision")} ${render?.revision == null ? "" : formatNumber(render.revision)}`
               }
               sandbox=""
               srcDoc={shown.html}
@@ -375,7 +369,7 @@ export default function EmailPane({
           )}
           {mode === "html" && (
             <details className="crm-diag" data-advanced-text>
-              <summary className="text-label text-ink-300">Advanced: plain-text version</summary>
+              <summary className="text-label text-ink-300">{t("Advanced: plain-text version")}</summary>
               <div className="grid gap-2 mt-2">
                 {editing && edit !== null && (
                   <>
@@ -396,12 +390,12 @@ export default function EmailPane({
                           )
                         }
                       />{" "}
-                      Write my own
+                      {t("Write my own")}
                     </label>
                     {edit.draft.ownText ? (
                       <div className="crm-field">
                         <label className="text-label text-ink-300" htmlFor="cmp-text-override">
-                          Custom plain-text override
+                          {t("Custom plain-text override")}
                         </label>
                         <textarea
                           id="cmp-text-override"
@@ -412,12 +406,12 @@ export default function EmailPane({
                           onChange={(event) => edit.patch({ text: event.target.value })}
                         />
                         <p className="text-micro text-ink-500">
-                          Unsaved custom text is saved only when you choose Save.
+                          {t("Unsaved custom text is saved only when you choose Save.")}
                         </p>
                       </div>
                     ) : (
                       <p className="text-micro text-ink-500">
-                        The host generates plain text from the email body unless you write an override.
+                        {t("The host generates plain text from the email body unless you write an override.")}
                       </p>
                     )}
                   </>
@@ -426,18 +420,18 @@ export default function EmailPane({
                   <div className="crm-field" data-preview="plain-text">
                     <span className="text-label text-ink-300">
                       {draft !== null
-                        ? "Suggested plain-text render (not saved)"
+                        ? t("Suggested plain-text render (not saved)")
                         : doc?.textOverride != null
-                          ? `Saved custom plain-text render (v${doc.revision})`
+                          ? `${t("Saved custom plain-text render")} (v${formatNumber(doc.revision)})`
                           : doc !== null
-                            ? `Saved host-generated plain text (v${doc.revision})`
-                            : "Host-rendered plain text"}
+                            ? `${t("Saved host-generated plain text")} (v${formatNumber(doc.revision)})`
+                            : t("Host-rendered plain text")}
                     </span>
                     <pre className="crm-preview">{shown.text}</pre>
                   </div>
                 )}
                 <p className="text-micro text-ink-500" data-host-footer-note>
-                  The required sender and unsubscribe footer is appended by the host and cannot be edited here.
+                  {t("The required sender and unsubscribe footer is appended by the host and cannot be edited here.")}
                 </p>
               </div>
             </details>
@@ -447,7 +441,7 @@ export default function EmailPane({
               <p className="text-label text-fail" role="alert">
                 {draftError}
               </p>
-              <ol className="grid gap-1" aria-label="Draft body blocks">
+              <ol className="grid gap-1" aria-label={t("Draft body blocks")}>
                 {draft.blocks.map((block, index) => (
                   <li key={index} className="text-label text-ink-300">
                     {block.type === "heading" ? (
@@ -471,7 +465,7 @@ export default function EmailPane({
 
   return (
     <div className="grid gap-3">
-      <section aria-label="Assistant proposals" className="grid gap-2">
+      <section aria-label={t("Assistant proposals")} className="grid gap-2">
         {proposalsError && (
           <p className="text-label text-fail" role="alert">
             {proposalsError}{" "}
@@ -518,14 +512,13 @@ export default function EmailPane({
             />
             {replacementConfirmationId === row.proposalId && edit?.dirty && (
               <ConfirmDialog
-                title="Replace unsaved email changes?"
+                title={t("Replace unsaved email changes?")}
                 body={
                   <p>
-                    Using this proposal replaces your unsaved subject, preheader, body, and text override.
-                    Saved content stays unchanged until you choose Save.
+                    {t("Using this proposal replaces your unsaved subject, preheader, body, and text override. Saved content stays unchanged until you choose Save.")}
                   </p>
                 }
-                confirmLabel="Replace local draft"
+                confirmLabel={t("Replace local draft")}
                 pending={edit.saving || edit.reloading}
                 error={null}
                 onConfirm={() => useProposalInEditor(row, true)}
@@ -536,14 +529,13 @@ export default function EmailPane({
         ))}
         {proposals.length === 0 && (
           <p className="text-label text-ink-400" data-empty="proposals">
-            No pending assistant draft.
+            {t("No pending assistant draft.")}
             {canWrite && (
               <span data-assistant-hint>
                 {" "}
-                Ask the assistant in the left chat to draft or improve this email — its proposal
-                appears here for review.{" "}
+                {t("Ask the assistant in the left chat to draft or improve this email — its proposal appears here for review.")}{" "}
                 <button type="button" className="lnk" onClick={onRefreshDrafts}>
-                  Refresh drafts
+                  {t("Refresh drafts")}
                 </button>
               </span>
             )}
@@ -551,7 +543,7 @@ export default function EmailPane({
         )}
         {proposals.length > 0 && canWrite && (
           <p className="text-micro text-ink-500">
-            Use in editor changes only the local draft. Save creates a new revision; Discard changes nothing.{" "}
+            {t("Use in editor changes only the local draft. Save creates a new revision; Discard changes nothing.")}{" "}
             <button type="button" className="lnk" onClick={onRefreshDrafts}>
               Refresh drafts
             </button>
@@ -559,9 +551,9 @@ export default function EmailPane({
         )}
       </section>
 
-      <section aria-label="Email preview" className="grid gap-3">
+      <section aria-label={t("Email preview")} className="grid gap-3">
         <div className="crm-pvbar">
-          <span className="crm-seg" role="group" aria-label="Email editing mode">
+          <span className="crm-seg" role="group" aria-label={t("Email editing mode")}>
             {MODES.map(([key, label]) => (
               <button key={key} type="button" aria-pressed={mode === key} onClick={() => setMode(key)}>
                 {label}
@@ -579,16 +571,16 @@ export default function EmailPane({
               }}
             />
           )}
-          <span className="crm-seg" role="group" aria-label="Preview width">
+          <span className="crm-seg" role="group" aria-label={t("Preview width")}>
             {(["desktop", "mobile"] as Device[]).map((key) => (
               <button key={key} type="button" aria-pressed={device === key} data-device={key} onClick={() => setDevice(key)}>
-                {key === "desktop" ? "Desktop" : "Mobile"}
+                {t(key === "desktop" ? "Desktop" : "Mobile")}
               </button>
             ))}
           </span>
           <div className="crm-field">
             <label className="text-label text-ink-300" htmlFor="cmp-sender-preview">
-              Sender preview (not send authorization)
+              {t("Sender preview (not send authorization)")}
             </label>
             <select
               id="cmp-sender-preview"
@@ -597,7 +589,7 @@ export default function EmailPane({
               value={senderBindingId ?? ""}
               onChange={(event) => onSenderBindingId(event.target.value === "" ? null : event.target.value)}
             >
-              <option value="">Preview placeholder — no sender selected</option>
+              <option value="">{t("Preview placeholder — no sender selected")}</option>
               {senderBindings.map((binding) => (
                 <option key={binding.id} value={binding.id}>{binding.name} · {binding.address}</option>
               ))}
@@ -606,7 +598,7 @@ export default function EmailPane({
           {senderBindingError !== null && <p className="text-label text-fail" role="alert">{senderBindingError}</p>}
           <div className="crm-field">
             <label className="text-label text-ink-300" htmlFor="cmp-sample">
-              Sample recipient first name (optional)
+              {t("Sample recipient first name (optional)")}
             </label>
             <input
               id="cmp-sample"
@@ -623,10 +615,10 @@ export default function EmailPane({
               size="sm"
               loading={renderPending}
               disabled={renderPending}
-              title="Re-render the last saved version with the current sample name"
+              title={t("Re-render the last saved version with the current sample name")}
               onClick={onRefresh}
             >
-              Refresh preview
+              {t("Refresh preview")}
             </Button>
           )}
         </div>
@@ -637,13 +629,7 @@ export default function EmailPane({
             data-state="html-body"
             data-html-save-boundary
           >
-            <strong>Save keeps a sanitized body fragment, not this full document.</strong> The host
-            removes the doctype and document wrappers (&lt;html&gt;, &lt;head&gt; and &lt;body&gt;),
-            including head content such as the title and stylesheet &lt;style&gt; blocks. Only
-            selected supported inline style attributes may persist; unsupported or unsafe content
-            is stripped. The protected sender and unsubscribe footer are appended separately by
-            the host. Switching modes preserves your unsaved source, but Save does not save a full
-            document or stylesheet verbatim.
+            <strong>{t("Save keeps a sanitized body fragment, not this full document.")}</strong> {t("The host removes the doctype and document wrappers, including head content such as the title and stylesheet blocks. Only selected supported inline style attributes may persist; unsupported or unsafe content is stripped. The protected sender and unsubscribe footer are appended separately by the host. Switching modes preserves your unsaved source, but Save does not save a full document or stylesheet verbatim.")}
           </p>
         )}
         {renderError !== null && !renderPending && draft === null && (
@@ -656,19 +642,19 @@ export default function EmailPane({
         )}
         {draft !== null ? (
           <p className="text-micro text-ink-500" data-preview="draft-note">
-            Review this suggestion and use it in the editor; nothing is saved until you choose Save.
+            {t("Review this suggestion and use it in the editor; nothing is saved until you choose Save.")}
           </p>
         ) : (
           dirty && (
             <p className="text-micro text-ink-500" data-preview="dirty">
-              Preview shows the last saved version. Save changes to refresh.
+              {t("Preview shows the last saved version. Save changes to refresh.")}
             </p>
           )
         )}
         {stage}
         {doc !== null && !canWrite && (
           <p className="text-label text-ink-400" data-state="read-only">
-            Read-only view. A verified operator saves content revisions.
+            {t("Read-only view. A verified operator saves content revisions.")}
           </p>
         )}
         {editing && edit !== null && (
@@ -682,14 +668,11 @@ export default function EmailPane({
               <div className="crm-unsaved" data-unsaved-bar>
                 <div className="grid gap-1">
                   <span className="text-label text-ink-100">
-                    Unsaved changes to v{edit.source} · Saving creates v{edit.source + 1} and
-                    resets approval
+                    {t("Unsaved changes to v")}{formatNumber(edit.source)} · {t("Saving creates v")}{formatNumber(edit.source + 1)} {t("and resets approval")}
                   </span>
                   {edit.stale && (
                     <span className="text-micro text-warn" role="status" data-stale-edit>
-                      A newer version was saved while you were editing — your text is kept, but
-                      saving is pinned to v{edit.source} and will be refused rather than
-                      overwrite it.
+                      {t("A newer version was saved while you were editing — your text is kept, but saving is pinned to v")} {formatNumber(edit.source)} {t("and will be refused rather than overwrite it.")}
                     </span>
                   )}
                   {edit.error !== null && (
@@ -700,10 +683,10 @@ export default function EmailPane({
                 </div>
                 <span className="flex-1" />
                 <Button size="sm" variant="ghost" loading={edit.reloading} disabled={edit.saving || edit.reloading} onClick={edit.discard}>
-                  {edit.reloading ? "Reloading latest…" : "Discard"}
+                  {t(edit.reloading ? "Reloading latest…" : "Discard")}
                 </Button>
                 <Button size="sm" variant="primary" loading={edit.saving} disabled={edit.saving || edit.reloading} onClick={edit.save}>
-                  {`Save as v${edit.source + 1}`}
+                  {`${t("Save as v")}${formatNumber(edit.source + 1)}`}
                 </Button>
               </div>
             )}

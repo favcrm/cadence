@@ -2,6 +2,7 @@ import type { Meta } from "../../lib/types";
 import DeviceSignIn from "./DeviceSignIn";
 import { SIGN_IN_COMMAND } from "./gate";
 import { IconLock } from "../../ui/icons";
+import { useLocale } from "../../lib/locale";
 
 /**
  * The header's sign-in state: "Sign in with `cadence ui login`" when this
@@ -22,6 +23,7 @@ export default function SignIn({
   /** Bounded retry of the access check (the real metadata refresh). */
   onRetryAccess?: () => void;
 }) {
+  const { t } = useLocale();
   // CAD-1193: `signed_in === null` is an unanswerable check —
   // unavailable, never a sign-out. A completed check that could not
   // answer says so explicitly and offers a bounded retry of the real
@@ -32,7 +34,7 @@ export default function SignIn({
         Access check unavailable
         {onRetryAccess && (
           <button type="button" className="lnk text-warn" onClick={onRetryAccess}>
-            Retry
+            {t("Retry")}
           </button>
         )}
       </span>
@@ -46,24 +48,24 @@ export default function SignIn({
       <details className="relative text-label">
         {/* CAD-1312: unsigned-in browsing is a neutral state, not a warning —
             the quiet pill carries the lock, "Read only" and the accent action. */}
-        <summary className="header-auth-target header-state" aria-label="Read-only. Sign in to make changes">
+        <summary className="header-auth-target header-state" aria-label={t("Read-only. Sign in to make changes")}>
           <IconLock size={11} />
-          <span className="hidden sm:inline">Read only<span className="text-ink-600" aria-hidden> · </span><span className="header-state-action">Sign in</span></span>
-          <span className="sm:hidden">Sign in</span>
+          <span className="hidden sm:inline">{t("Read only")}<span className="text-ink-600" aria-hidden> · </span><span className="header-state-action">{t("Sign in")}</span></span>
+          <span className="sm:hidden">{t("Sign in")}</span>
         </summary>
         <div className={`absolute right-0 top-full mt-2 z-50 card p-4 shadow-xl ${device ? "w-80" : "w-72"}`}>
           {device ? (
             <>
-              <p className="text-label text-ink-200 mb-2">Sign in remotely</p>
+              <p className="text-label text-ink-200 mb-2">{t("Sign in remotely")}</p>
               <div className="mb-3">
                 <DeviceSignIn onSignedIn={onChange} />
               </div>
-              <p className="text-label text-ink-400 mb-2">Or, on the host:</p>
+              <p className="text-label text-ink-400 mb-2">{t("Or, on the host:")}</p>
             </>
           ) : (
-            <p className="text-label text-ink-200 mb-2">Sign in to send messages and make decisions.</p>
+            <p className="text-label text-ink-200 mb-2">{t("Sign in to send messages and make decisions.")}</p>
           )}
-          <p className="text-label text-ink-400 mb-2">Run this command on the host, then open the link it prints in this tab.</p>
+          <p className="text-label text-ink-400 mb-2">{t("Run this command on the host, then open the link it prints in this tab.")}</p>
           <code className="num text-label text-accent break-words select-all">{cmd}</code>
         </div>
       </details>

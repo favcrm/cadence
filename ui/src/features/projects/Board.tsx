@@ -2,7 +2,7 @@ import { useWriteBlock } from "../auth/WriteGate";
 import { useEffect, useState } from "react";
 import type { WriteResp } from "../../lib/api";
 import { boardHeadline, boardScope, boardVisible, issueCounts } from "../../lib/counts";
-import { epicProgress, matches, type BoardFilters } from "../../lib/filters";
+import { activeCount, epicProgress, matches, type BoardFilters } from "../../lib/filters";
 import type { ResourceState } from "../../lib/cache";
 import { issuePath } from "../issues/model";
 import Link from "../../ui/Link";
@@ -14,6 +14,7 @@ import FilterBar from "./FilterBar";
 import NewIssueForm from "./NewIssueForm";
 import Button from "../../ui/Button";
 import { ResourceGate, StaleChip } from "../../ui/ResourceStatus";
+import { useLocale } from "../../lib/locale";
 
 const COLS: [string, string, number?][] = [
   ["backlog", "Backlog"],
@@ -60,6 +61,7 @@ const byPriority = (a: IssueCard, b: IssueCard) =>
   a.id.localeCompare(b.id, undefined, { numeric: true });
 
 function IssueList({ issues, project, onOpen }: { issues: IssueCard[]; project: string; onOpen: (id: string) => void }) {
+  const { t, formatNumber } = useLocale();
   const [sort, setSort] = useState<{ key: "id" | "title" | "status" | "priority" | "owner"; direction: "asc" | "desc" }>({ key: "status", direction: "asc" });
   const sortRows = (key: typeof sort.key) => setSort((current) => ({
     key,
@@ -77,38 +79,38 @@ function IssueList({ issues, project, onOpen }: { issues: IssueCard[]; project: 
     </button>
   );
   return (
-    <section className="card overflow-hidden reveal" aria-label="Project issue list">
+    <section className="card overflow-hidden reveal" aria-label={t("Project issue list")}>
       <div className="sm:hidden divide-y divide-ink-700/70">
         {rows.map((issue) => (
           <div key={issue.id} className="w-full text-left px-3.5 py-3.5 hover:bg-ink-850">
             <div className="flex items-center gap-2">
               <span className="num text-label text-ink-400">{issue.id}</span>
-              <span className={`chip ${STATUS_CHIP[issue.status] ?? "bg-ink-800 text-ink-400"}`}>{issue.status}</span>
-              <span className="num text-micro text-ink-500 ml-auto">{issue.priority}</span>
+              <span className={`chip ${STATUS_CHIP[issue.status] ?? "bg-ink-800 text-ink-400"}`}>{t(issue.status)}</span>
+              <span className="num text-micro text-ink-500 ml-auto">{t(issue.priority)}</span>
             </div>
             <Link href={issuePath(issue.project, issue.id)} className="board-issue-title block text-left text-ink-100 mt-1.5 leading-[1.4] font-medium hover:text-accent">{issue.title}</Link>
             <div className="flex flex-wrap gap-x-3 gap-y-1 mt-2 text-micro text-ink-500">
-              <span>{issue.owner ?? "unassigned"}</span>
+              <span>{issue.owner ?? t("unassigned")}</span>
               <span>{issue.component ?? "no component"}</span>
-              <span>{issue.checks.done}/{issue.checks.total} checks</span>
+              <span>{formatNumber(issue.checks.done)}/{formatNumber(issue.checks.total)} {t("checks")}</span>
               {project === "all" && <span>{issue.project}</span>}
-              <button type="button" className="board-preview-link ml-auto" aria-label={`Preview ${issue.id}`} onClick={() => onOpen(issue.id)}>Preview</button>
+              <button type="button" className="board-preview-link ml-auto" aria-label={`${t("Preview")} ${issue.id}`} onClick={() => onOpen(issue.id)}>{t("Preview")}</button>
             </div>
           </div>
         ))}
-        {rows.length === 0 && <div className="px-4 py-10 text-center text-ink-500">No issues match this view.</div>}
+        {rows.length === 0 && <div className="px-4 py-10 text-center text-ink-500">{t("No issues match this view.")}</div>}
       </div>
       <div className="hidden sm:block overflow-x-auto">
         <table className="w-full min-w-[46rem] text-label">
           <thead>
             <tr className="border-b border-ink-700 text-left">
-              <th className="slabel font-normal px-4 py-2.5">{header("id", "issue")}</th>
-              {project === "all" && <th className="slabel font-normal px-3 py-2.5">project</th>}
-              <th className="slabel font-normal px-3 py-2.5">{header("status", "status")}</th>
-              <th className="slabel font-normal px-3 py-2.5">{header("priority", "priority")}</th>
-              <th className="slabel font-normal px-3 py-2.5">{header("owner", "owner")}</th>
-              <th className="slabel font-normal px-3 py-2.5">component / tags</th>
-              <th className="slabel font-normal px-3 py-2.5 text-right">checks</th>
+              <th className="slabel font-normal px-4 py-2.5">{header("id", t("issue"))}</th>
+              {project === "all" && <th className="slabel font-normal px-3 py-2.5">{t("project")}</th>}
+              <th className="slabel font-normal px-3 py-2.5">{header("status", t("status"))}</th>
+              <th className="slabel font-normal px-3 py-2.5">{header("priority", t("priority"))}</th>
+              <th className="slabel font-normal px-3 py-2.5">{header("owner", t("owner"))}</th>
+              <th className="slabel font-normal px-3 py-2.5">{t("component / tags")}</th>
+              <th className="slabel font-normal px-3 py-2.5 text-right">{t("checks")}</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-ink-700/70">
@@ -118,15 +120,15 @@ function IssueList({ issues, project, onOpen }: { issues: IssueCard[]; project: 
                   <div className="min-w-0">
                     <span className="num text-ink-500">{issue.id}</span>
                     <Link href={issuePath(issue.project, issue.id)} className="block text-left text-ink-200 hover:text-accent truncate mt-0.5 max-w-full" title={issue.title}>{issue.title}</Link>
-                    <button type="button" className="board-preview-link mt-1" aria-label={`Preview ${issue.id}`} onClick={() => onOpen(issue.id)}>Preview</button>
+                    <button type="button" className="board-preview-link mt-1" aria-label={`${t("Preview")} ${issue.id}`} onClick={() => onOpen(issue.id)}>{t("Preview")}</button>
                   </div>
                 </td>
                 {project === "all" && <td className="px-3 py-3 align-top num text-ink-400">{issue.project}</td>}
                 <td className="px-3 py-3 align-top">
-                  <span className={`chip ${STATUS_CHIP[issue.status] ?? "bg-ink-800 text-ink-400"}`}>{issue.status}</span>
+                  <span className={`chip ${STATUS_CHIP[issue.status] ?? "bg-ink-800 text-ink-400"}`}>{t(issue.status)}</span>
                 </td>
-                <td className="px-3 py-3 align-top num text-ink-300">{issue.priority}</td>
-                <td className="px-3 py-3 align-top num text-ink-400">{issue.owner ?? "unassigned"}</td>
+                <td className="px-3 py-3 align-top num text-ink-300">{t(issue.priority)}</td>
+                <td className="px-3 py-3 align-top num text-ink-400">{issue.owner ?? t("unassigned")}</td>
                 <td className="px-3 py-3 align-top min-w-[11rem]">
                   <span className="text-ink-400">{issue.component ?? "—"}</span>
                   {(issue.tags ?? []).length > 0 && (
@@ -136,12 +138,12 @@ function IssueList({ issues, project, onOpen }: { issues: IssueCard[]; project: 
                   )}
                 </td>
                 <td className="px-3 py-3 align-top text-right num text-ink-400">
-                  {issue.checks.done}/{issue.checks.total}
-                  {issue.blocked && <span className="block text-fail text-micro">blocked</span>}
+                  {formatNumber(issue.checks.done)}/{formatNumber(issue.checks.total)}
+                  {issue.blocked && <span className="block text-fail text-micro">{t("blocked")}</span>}
                 </td>
               </tr>
             ))}
-            {rows.length === 0 && <tr><td colSpan={project === "all" ? 7 : 6} className="px-4 py-10 text-center text-ink-500">No issues match this view.</td></tr>}
+            {rows.length === 0 && <tr><td colSpan={project === "all" ? 7 : 6} className="px-4 py-10 text-center text-ink-500">{t("No issues match this view.")}</td></tr>}
           </tbody>
         </table>
       </div>
@@ -195,6 +197,7 @@ export default function Board({
   onError,
   onAgents,
 }: Props) {
+  const { t, formatNumber, locale } = useLocale();
   const block = useWriteBlock(readOnly);
   const [over, setOver] = useState<string | null>(null);
   const [newOpen, setNewOpen] = useState(false);
@@ -327,7 +330,7 @@ export default function Board({
             >
               <i className={`w-1.5 h-1.5 rounded-full ${COL_DOT[key]}`} />
               <h2 className="text-secondary font-semibold text-ink-100">
-                {name}
+                {t(name)}
               </h2>
               <span className="kicker num">
                 {doneHidden > 0 ? doneHidden : cards.length}
@@ -341,10 +344,10 @@ export default function Board({
                   onClick={() => onFilters({ ...filters, showDone: true })}
                   className="kicker px-1 py-2 text-left hover:text-accent transition-colors"
                 >
-                  {doneHidden} done hidden — show
+                  {formatNumber(doneHidden)} {t("done hidden — show")}
                 </button>
               ) : cards.length === 0 ? (
-                <p className="kicker px-1 py-2">empty</p>
+                <p className="kicker px-1 py-2">{t("empty")}</p>
               ) : (
                 cards.map((t) => (
                   <Card
@@ -377,29 +380,29 @@ export default function Board({
     <main className="issues-board px-4 lg:px-8 pt-6 pb-9 w-full">
       {health && !health.pm_present && (
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mb-5 reveal">
-          <span className="chip bg-warn/10 text-warn">no pm dir</span>
+          <span className="chip bg-warn/10 text-warn">{t("no pm dir")}</span>
           <span className="text-secondary text-ink-400">
-            Nothing at {health.pm_dir ?? "~/pm"} yet —{" "}
+            {t("Nothing at")} {health.pm_dir ?? "~/pm"} {t("yet")} —{" "}
             <span className="num">cadence issue init</span> creates it.
           </span>
         </div>
       )}
 
       {fencedAgents.length > 0 && (
-        <details className="card mb-4 px-4 py-3 border-warn/30 reveal"><summary className="text-label text-warn cursor-pointer">{fencedAgents.length} agents need attention · View details</summary><div className="flex flex-wrap items-center gap-x-4 gap-y-2 mt-3">
+        <details className="card mb-4 px-4 py-3 border-warn/30 reveal"><summary className="text-label text-warn cursor-pointer">{formatNumber(fencedAgents.length)} {t("agents need attention · View details")}</summary><div className="flex flex-wrap items-center gap-x-4 gap-y-2 mt-3">
           <span className="chip bg-fail/10 text-fail">
-            {fencedAgents.length} fenced
+            {formatNumber(fencedAgents.length)} {t("fenced")}
           </span>
           <span className="text-secondary text-ink-300 min-w-0">
             {fencedAgents.map((a) => a.alias).join(", ")} —{" "}
             {fencedAgents[0]?.recovery ??
-              "outcomes are uncertain until an operator reconciles"}
+              t("outcomes are uncertain until an operator reconciles")}
           </span>
           <button
             onClick={onAgents}
             className="chip bg-fail/10 text-fail hover:bg-fail/20 transition-colors ml-auto"
           >
-            open Agents →
+            {t("open Agents")} →
           </button>
         </div></details>
       )}
@@ -411,15 +414,29 @@ export default function Board({
         <h1 className="text-section font-semibold text-ink-100 leading-tight">
           {title}
         </h1>
-        <span className="kicker" title="epics are excluded — their status rolls up from the issues counted">
+        <span className="kicker" title={t("epics are excluded — their status rolls up from the issues counted")}>
           {loaded
-            ? `${boardHeadline(counts, visible, filters, query)} · ${visible.filter((t) => ["doing", "review"].includes(t.status)).length} active · ${visible.filter((t) => t.blocked).length} blocked`
+            ? (() => {
+                const active = visible.filter((t) => ["doing", "review"].includes(t.status)).length;
+                const blocked = visible.filter((t) => t.blocked).length;
+                if (locale === "en") return `${boardHeadline(counts, visible, filters, query)} · ${active} active · ${blocked} blocked`;
+                const narrowed = query !== "" || activeCount(filters) > 0;
+                const shownOpen = visible.filter((t) => t.status !== "done").length;
+                const parts = [narrowed
+                  ? `${formatNumber(shownOpen)} / ${formatNumber(counts.open)} ${t("open issues")}`
+                  : `${formatNumber(counts.open)} ${t("open issues")}`];
+                if (counts.done > 0) parts.push(`${formatNumber(counts.done)} ${t(filters.showDone ? "done shown" : "done hidden")}`);
+                if (counts.dropped > 0) parts.push(`${formatNumber(counts.dropped)} ${t("dropped issues")}`);
+                if (counts.containers > 0) parts.push(`${formatNumber(counts.containers)} ${t("epics")}`);
+                parts.push(`${formatNumber(active)} ${t("active issues")}`, `${formatNumber(blocked)} ${t("blocked issues")}`);
+                return parts.join(" · ");
+              })()
             : "…"}
         </span>
         <StaleChip state={issuesState} />
         <div className="ml-auto flex items-center gap-2">
-          {!readOnly && !showNewForm && <Button variant="primary" onClick={() => { setDraftSession(sessionId ?? null); setDraftProject(project); setNewOpen(true); }}>New issue</Button>}
-          <div className="flex items-center gap-1 rounded border border-ink-700 p-0.5" role="group" aria-label="Project view">
+          {!readOnly && !showNewForm && <Button variant="primary" onClick={() => { setDraftSession(sessionId ?? null); setDraftProject(project); setNewOpen(true); }}>{t("New issue")}</Button>}
+          <div className="flex items-center gap-1 rounded border border-ink-700 p-0.5" role="group" aria-label={t("Project view")}>
             {(["kanban", "list"] as const).map((mode) => (
               <button
                 key={mode}
@@ -427,7 +444,7 @@ export default function Board({
                 onClick={() => onView(mode)}
                 className={`chip !py-[.25rem] capitalize ${view === mode ? "bg-accent/10 text-accent" : "text-ink-500 hover:text-ink-200"}`}
               >
-                {mode === "kanban" ? "board" : "list"}
+                {t(mode === "kanban" ? "board" : "list")}
               </button>
             ))}
           </div>
@@ -436,8 +453,8 @@ export default function Board({
           value={query}
           onChange={(e) => onQuery(e.target.value)}
           className="field w-full sm:w-64"
-          aria-label="Search issues, owners or tags"
-          placeholder="Search issues, owners or tags"
+          aria-label={t("Search issues, owners or tags")}
+          placeholder={t("Search issues, owners or tags")}
         />
       </div>
 
@@ -445,48 +462,48 @@ export default function Board({
         <NewIssueForm key={draftSession ?? "no-session"} projects={projects} project={draftProject} readOnly={readOnly} writeReason={block} onCreated={onCreated} onError={onError} onCancel={() => setNewOpen(false)} />
       )}
 
-      <details className="mb-4"><summary className="text-label text-ink-400 cursor-pointer">Team status · {totals?.running ?? "—"} running · {totals?.queued ?? "—"} queued{fencedAgents.length > 0 ? ` · ${fencedAgents.length} need attention` : ""}</summary><div className="mt-3">      <section
+      <details className="mb-4"><summary className="text-label text-ink-400 cursor-pointer">{t("Team status")} · {totals?.running == null ? "—" : formatNumber(totals.running)} {t("running")} · {totals?.queued == null ? "—" : formatNumber(totals.queued)} {t("queued")}{fencedAgents.length > 0 ? ` · ${formatNumber(fencedAgents.length)} ${t("need attention")}` : ""}</summary><div className="mt-3">      <section
         className="card mb-4 px-4 py-2.5 flex flex-wrap items-center gap-x-5 gap-y-2 reveal"
         style={{ animationDelay: "80ms" }}
-        aria-label="Runtime"
+        aria-label={t("Runtime")}
       >
         <div className="flex items-baseline gap-x-5 gap-y-1 flex-wrap">
           <span className="flex items-baseline gap-1.5">
-            <span className="slabel">running</span>
+            <span className="slabel">{t("running")}</span>
             <span className="num text-secondary text-ink-100">
-              {totals?.running ?? "—"}
+              {totals?.running == null ? "—" : formatNumber(totals.running)}
             </span>
           </span>
           <span className="flex items-baseline gap-1.5">
-            <span className="slabel">queued</span>
+            <span className="slabel">{t("queued")}</span>
             <span className="num text-secondary text-ink-100">
-              {totals?.queued ?? "—"}
+              {totals?.queued == null ? "—" : formatNumber(totals.queued)}
             </span>
           </span>
           <span className="flex items-baseline gap-1.5">
-            <span className="slabel">fenced</span>
+            <span className="slabel">{t("fenced")}</span>
             <span
               className={`num text-secondary ${
                 (totals?.fenced ?? 0) > 0 ? "text-fail" : "text-ok"
               }`}
             >
-              {totals?.fenced ?? "—"}
+              {totals?.fenced == null ? "—" : formatNumber(totals.fenced)}
             </span>
           </span>
           <span className="flex items-baseline gap-1.5">
-            <span className="slabel">parked</span>
+            <span className="slabel">{t("parked")}</span>
             <span className="num text-secondary text-ink-100">
-              {totals?.parked ?? "—"}
+              {totals?.parked == null ? "—" : formatNumber(totals.parked)}
             </span>
           </span>
           {(totals?.inboxes ?? 0) > 0 && (
             <span
               className="flex items-baseline gap-1.5"
-              title="inbox endpoints are mailboxes, not workers"
+              title={t("inbox endpoints are mailboxes, not workers")}
             >
-              <span className="slabel">inboxes</span>
+              <span className="slabel">{t("inboxes")}</span>
               <span className="num text-secondary text-ink-400">
-                {totals?.inboxes}
+                {formatNumber(totals.inboxes)}
               </span>
             </span>
           )}
@@ -496,16 +513,16 @@ export default function Board({
           className="flex items-center gap-2 min-w-0 flex-wrap"
           title={
             agents?.daemon === "reachable"
-              ? "read from the daemon socket"
-              : "daemon socket unreachable"
+              ? t("read from the daemon socket")
+              : t("daemon socket unreachable")
           }
         >
-          <span className="slabel">agents</span>
+          <span className="slabel">{t("agents")}</span>
           <div className="flex flex-wrap gap-1.5">
             {agents?.daemon === "unreachable" && (
               <span className="chip bg-ink-800 !py-[.15rem] text-ink-500">
                 <i className="w-1.5 h-1.5 rounded-full bg-ink-600" />
-                daemon unreachable
+                {t("daemon unreachable")}
               </span>
             )}
             {activeAgents.map((a) => (
@@ -520,7 +537,7 @@ export default function Board({
                 />
                 {a.alias}
                 <span className="text-ink-500">
-                  {a.fenced ? "fenced" : "busy"}
+                  {t(a.fenced ? "fenced" : "busy")}
                 </span>
                 {a.on.map((id) => (
                   <button
@@ -542,7 +559,7 @@ export default function Board({
                   .join(", ")}
               >
                 <i className="w-1.5 h-1.5 rounded-full bg-ok" />
-                <span className="num text-ink-200">{idleCount}</span>idle
+                <span className="num text-ink-200">{formatNumber(idleCount)}</span>{t("idle")}
               </span>
             )}
             {stoppedCount > 0 && (
@@ -554,15 +571,15 @@ export default function Board({
                   .join(", ")}
               >
                 <i className="w-1.5 h-1.5 rounded-full bg-ink-600" />
-                <span className="num text-ink-200">{stoppedCount}</span>stopped
+                <span className="num text-ink-200">{formatNumber(stoppedCount)}</span>{t("stopped")}
               </span>
             )}
             {project !== "all" && globalAgents.length > 0 && (
               <span
                 className="chip bg-ink-800 !py-[.15rem] text-ink-500"
-                title="agents without an exact issue binding remain global"
+                title={t("agents without an exact issue binding remain global")}
               >
-                {globalAgents.length} global/unassigned
+                {formatNumber(globalAgents.length)} {t("global/unassigned")}
               </span>
             )}
           </div>
@@ -578,7 +595,7 @@ export default function Board({
       />
       {issuesState.status === "empty" && (
         <p className="kicker mb-4" role="status">
-          the tracker has no issues yet{readOnly ? "" : " — use New issue to create one"}
+          {t(`the tracker has no issues yet${readOnly ? "" : " — use New issue to create one"}`)}
         </p>
       )}
 
@@ -602,7 +619,7 @@ export default function Board({
             const p = epicProgress(issues, epic);
             const pct = Math.round(p.ratio * 100);
             return (
-              <section key={epic} aria-label={`Epic ${epic}`}>
+              <section key={epic} aria-label={`${t("Epic")} ${epic}`}>
                 <header className="flex flex-wrap items-center gap-x-3 gap-y-1 mb-2">
                   <button
                     className="lnk num text-label"
@@ -611,11 +628,11 @@ export default function Board({
                     {epic}
                   </button>
                   <h2 className="text-secondary font-semibold text-ink-100 min-w-0 truncate">
-                    {titleOf.get(epic) ?? "unknown epic"}
+                    {titleOf.get(epic) ?? t("unknown epic")}
                   </h2>
                   <div
                     className="ml-auto flex items-center gap-2"
-                    title={`${p.done} of ${p.total} children done (dropped excluded)`}
+                    title={`${formatNumber(p.done)} ${t("of")} ${formatNumber(p.total)} ${t("children done (dropped excluded)")}`}
                   >
                     <div
                       className="w-32 h-1.5 rounded-full bg-ink-700 overflow-hidden"
@@ -641,10 +658,10 @@ export default function Board({
               </section>
             );
           })}
-          <section aria-label="No epic">
+          <section aria-label={t("No epic")}>
             <header className="flex items-center gap-x-3 mb-2">
               <h2 className="text-secondary font-semibold text-ink-300">
-                No epic
+                {t("No epic")}
               </h2>
               <span className="kicker num">{loose.length}</span>
             </header>
@@ -654,11 +671,11 @@ export default function Board({
       )}
 
       <footer className="mt-8 pt-4 border-t border-ink-700 text-label text-ink-500 num">
-        source: {health?.pm_dir ?? "~/pm"} issue folders ·{" "}
-        /var/www/agent-notes chains · cadence daemon socket ·{" "}
+        {t("source:")} {health?.pm_dir ?? "~/pm"} {t("issue folders")} ·{" "}
+        /var/www/agent-notes {t("chains")} · {t("cadence daemon socket")} ·{" "}
         {readOnly
-          ? `writes are disabled — ${block}`
-          : `writes commit as ${actor}.`}
+          ? `${t("writes are disabled")} — ${block}`
+          : `${t("writes commit as")} ${actor}.`}
       </footer>
     </main>
   );

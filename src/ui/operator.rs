@@ -70,6 +70,10 @@ pub enum RouteClass {
     /// the path is the only credential — no session, no Origin
     /// check; the handler owns the gate.
     RecipientToken,
+    /// A signed-in user preference write. The route still runs the full
+    /// browser/session guard; its handler narrows the verified identity
+    /// and action (for example, self-only vs organization operator).
+    CallerScoped,
 }
 
 /// One write route: method, path pattern (`*` is one non-empty
@@ -95,6 +99,7 @@ const fn route(method: &'static str, pattern: &'static str, class: RouteClass) -
 /// that matches no entry is [`RouteClass::OperatorOnly`]
 /// ([`route_class`]) — a new route fails closed until it is listed.
 pub const WRITE_ROUTES: &[WriteRoute] = &[
+    route("POST", "/api/locale", RouteClass::CallerScoped),
     route("POST", "/api/approvals/approve", RouteClass::OperatorOnly),
     route("POST", "/api/approvals/*/revoke", RouteClass::OperatorOnly),
     route(

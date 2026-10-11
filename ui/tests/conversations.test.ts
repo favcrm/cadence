@@ -31,7 +31,10 @@ loader.prototype.require = function (this: unknown, id: string) {
 };
 const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
-const AppShell = require("../src/features/app-shell/AppShell").default;
+const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
+const AppShellComponent = require("../src/features/app-shell/AppShell").default;
+const AppShell = (props: React.ComponentProps<typeof AppShellComponent>) =>
+  React.createElement(LocaleProvider, null, React.createElement(AppShellComponent, props));
 const { resources } = require("../src/lib/resources") as typeof import("../src/lib/resources");
 const { parseSlash, autoSelectCampaignConversation, conversationThread, conversationList } = require("../src/features/app-shell/conversationClient") as typeof import("../src/features/app-shell/conversationClient");
 

@@ -7,6 +7,7 @@ import {
   type KeyboardEvent,
 } from "react";
 import type { ThreadRef } from "../../../lib/types";
+import { useLocale } from "../../../lib/locale";
 import { parseSlash, SLASH_COMMANDS, slashMatches, type SlashCommand } from "../../home/master";
 import { ATTACH_ACCEPT, attachMeta, unresolvedHint, type AttachDestination, type AttachItem } from "./attach";
 import {
@@ -121,11 +122,12 @@ export interface ComposerProps {
 /** The shared icon Send: one renderer for both densities (CAD-1168).
  *  Circular, monochrome, accessible; disabled while the send is held. */
 function IconSend({ disabled, title }: { disabled: boolean; title: string }) {
+  const { t } = useLocale();
   return (
-    <button type="submit" className="app-chat-send" aria-label="Send message" title={title} disabled={disabled}>
+    <button type="submit" className="app-chat-send" aria-label={t("Send message")} title={t(title)} disabled={disabled}>
       {/* Visually-hidden label keeps textContent "Send" for the tests
           and any CSS-free reader. */}
-      <span className="sr-only">Send</span>
+      <span className="sr-only">{t("Send")}</span>
       <svg viewBox="0 0 24 24" aria-hidden="true">
         <path d="M12 19V5" />
         <path d="M5 12l7-7 7 7" />
@@ -154,6 +156,7 @@ export default function Composer({
   originalUnresolved = false,
   onResolveOriginal,
 }: ComposerProps) {
+  const { t } = useLocale();
   const compact = density === "compact";
   const key = storeKey ?? "composer";
   // The draft cell is the ONE owner of text, refs, edit version and the
@@ -358,7 +361,7 @@ export default function Composer({
             role="group"
             className={`app-chat-filerow${a.status === "failed" ? " failed" : ""}`}
             data-attach-status={a.status}
-            aria-label={`${a.name}: ${a.status}${a.error ? ` — ${a.error}` : ""}`}
+            aria-label={`${a.name}: ${t(a.status)}${a.error ? ` — ${a.error}` : ""}`}
           >
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <path d="M5 3h9l5 5v13H5zM14 3v6h5M8 13h8M8 17h5" />
@@ -367,7 +370,7 @@ export default function Composer({
               <span>{a.name}</span>
               <small>
                 {attachMeta(a.name, a.size)}
-                {a.status === "uploading" ? " · Uploading…" : ""}
+                {a.status === "uploading" ? ` · ${t("Uploading…")}` : ""}
               </small>
               {a.status === "failed" && a.error && (
                 <small className="app-chat-upload-error" role="alert">
@@ -377,14 +380,14 @@ export default function Composer({
             </div>
             {a.status === "failed" && !a.permanent && (
               <button type="button" className="lnk" onClick={() => retryAttach(key, a.key)}>
-                Retry
+                {t("Retry")}
               </button>
             )}
             <button
               type="button"
               className="app-chat-remove"
-              aria-label={`Remove ${a.name}`}
-              title={`Remove ${a.name}`}
+              aria-label={`${t("Remove")} ${a.name}`}
+              title={`${t("Remove")} ${a.name}`}
               onClick={() => removeAttach(key, a.key)}
             >
               <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -405,8 +408,8 @@ export default function Composer({
       onKeyDown={onKey}
       rows={compact ? 1 : 2}
       disabled={!!block}
-      placeholder={block ? blockedPlaceholder : placeholder}
-      aria-label={ariaLabel}
+      placeholder={t(block ? blockedPlaceholder : (placeholder ?? ""))}
+      aria-label={t(ariaLabel ?? "Message to Assistant")}
       aria-expanded={matches.length > 0 || undefined}
       className={
         compact
@@ -435,9 +438,9 @@ export default function Composer({
     <button
       type="button"
       className="app-chat-attach"
-      aria-label={attachEnabled ? "Attach files" : `Attach files unavailable: ${typeof attach === "object" ? attach.reason : "unavailable"}`}
+      aria-label={attachEnabled ? t("Attach files") : `${t("Attach files unavailable")}: ${typeof attach === "object" ? attach.reason : "unavailable"}`}
       title={attachEnabled
-        ? "Attach files (txt, md, csv — up to 10 MiB each; PDF/image processing is not available yet)"
+        ? t("Attach files (txt, md, csv — up to 10 MiB each; PDF/image processing is not available yet)")
         : typeof attach === "object" ? attach.reason : "Attach is unavailable"}
       disabled={!!block || !attachEnabled}
       onClick={() => fileInput.current?.click()}
@@ -499,14 +502,14 @@ export default function Composer({
         <div className="app-chat-composer" data-density="compact">
           {textareaId && (
             <label className="sr-only" htmlFor={textareaId}>
-              {ariaLabel}
+              {t(ariaLabel ?? "Message to Assistant")}
             </label>
           )}
           {boxEl}
           <div className="app-chat-composer-tools">
             {attachInput}
             {attachButton}
-            <IconSend disabled={sendBlocked} title={sendTitle ?? "Send"} />
+            <IconSend disabled={sendBlocked} title={t(sendTitle ?? "Send")} />
           </div>
         </div>
       </form>
@@ -525,9 +528,9 @@ export default function Composer({
         submit();
       }}
     >
-      {block && <div className="text-label text-ink-300 mb-2 font-medium">Read-only conversation</div>}
+      {block && <div className="text-label text-ink-300 mb-2 font-medium">{t("Read-only conversation")}</div>}
       {matches.length > 0 && (
-        <ul className="slashmenu" role="listbox" aria-label="slash commands">
+        <ul className="slashmenu" role="listbox" aria-label={t("slash commands")}>
           {matches.map((c, i) => (
             <li key={c.name} role="option" aria-selected={i === hiClamped}>
               <button
@@ -548,7 +551,7 @@ export default function Composer({
                         : "bg-warn/10 text-warn"
                   }`}
                 >
-                  {c.kind}
+                  {t(c.kind)}
                 </span>
               </button>
             </li>
@@ -556,14 +559,14 @@ export default function Composer({
         </ul>
       )}
       {refs.length > 0 && (
-        <div className="refsrow" aria-label="cited rows" data-composer-refs>
+        <div className="refsrow" aria-label={t("cited rows")} data-composer-refs>
           <span className="text-micro text-ink-500">re:</span>
           {refs.map((r) => (
             <button
               key={`${r.kind}:${r.id}`}
               type="button"
               className="refchip num"
-              title={`remove the ${r.kind}:${r.id} reference`}
+              title={`${t("remove the")} ${r.kind}:${r.id} ${t("reference")}`}
               onClick={() => setRefs(refs.filter((x) => x !== r))}
             >
               {r.kind}:{r.id} <span aria-hidden>×</span>
@@ -580,12 +583,12 @@ export default function Composer({
             line is only for a blocked (read-only) composer. */}
         {block ? (
           <p className="text-micro text-ink-500 min-w-0 flex-1 break-words" data-composer-block="">
-            {block}
+            {t(block)}
           </p>
         ) : (
           <span className="flex-1" />
         )}
-        <IconSend disabled={sendBlocked} title={sendTitle ?? (slash ? "Run command" : "Send")} />
+        <IconSend disabled={sendBlocked} title={t(sendTitle ?? (slash ? "Run command" : "Send"))} />
       </div>
     </form>
   );

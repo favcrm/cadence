@@ -16,6 +16,7 @@ import { assertRecordId, type HostScope } from "./hostActions";
 import { isDev } from "../../env";
 import AppViewContractPreview, { contractPreviewHref, contractPreviewKey } from "./app-views/AppViewContractPreview";
 import { useChatCollapsed, type ConversationLinkRequest } from "./conversationClient";
+import { useLocale } from "../../lib/locale";
 import "./app-shell.css";
 
 type ParsedConversationLink = Omit<ConversationLinkRequest, "visit"> & { key: string };
@@ -136,6 +137,7 @@ export default function AppShell({
    *  installId to its route and compares values before storing. */
   onInstallation?: (info: ActiveInstallation | null) => void;
 }) {
+  const { t } = useLocale();
   const href = useHref();
   const query = useMemo(() => new URLSearchParams(href.split("?")[1] ?? ""), [href]);
   const parsedConversationLink = useMemo(() => parseConversationLink(href), [href]);
@@ -682,10 +684,10 @@ export default function AppShell({
     <div className="app-shell" data-app-shell-outlet={installId}>
       <div className="app-shell-crumb">
         <Link href="/apps" className="lnk text-label">
-          ← All apps
+          ← {t("All apps")}
         </Link>
         <span className="truncate text-ink-100 text-cardtitle" aria-current="page">
-          {loading ? "Loading…" : title}
+          {loading ? t("Loading…") : title}
         </span>
         <span className="flex-1" />
         {isSocial && activeIds.length > 1 && (
@@ -694,13 +696,13 @@ export default function AppShell({
           // here in the header row; 0 or 1 never shows a control.
           <select
             className="app-shell-context-pick"
-            aria-label="Context"
+            aria-label={t("Context")}
             data-social-context
             value={socialContext !== null && activeIds.includes(socialContext) ? socialContext : ""}
             onChange={(e) => e.target.value !== "" && rememberContext(installId, e.target.value)}
           >
             <option value="" disabled>
-              Choose a context
+              {t("Choose a context")}
             </option>
             {contexts
               .filter((c) => c.state === "active")
@@ -712,7 +714,7 @@ export default function AppShell({
           </select>
         )}
         <Link href="/" className="lnk text-micro app-shell-home-link" data-chat-home-link>
-          Earlier history is in Home
+          {t("Earlier history is in Home")}
         </Link>
         {isDev && installation !== null && (
           <a
@@ -724,12 +726,12 @@ export default function AppShell({
               navigate(contractPreviewHref(href, previewKey === null ? "crm" : null));
             }}
           >
-            {previewKey === null ? "Contract preview (dev)" : "Exit contract preview"}
+            {t(previewKey === null ? "Contract preview (dev)" : "Exit contract preview")}
           </a>
         )}
       </div>
 
-      <div className="app-shell-panels" role="group" aria-label="Panel">
+      <div className="app-shell-panels" role="group" aria-label={t("Panel")}>
         {(["chat", "work"] as const).map((p) => (
           <button
             key={p}
@@ -739,13 +741,13 @@ export default function AppShell({
             aria-controls={p === "chat" ? "app-shell-chat" : "app-shell-workspace"}
             onClick={() => setPanel(p)}
           >
-            {p === "chat" ? "Assistant" : "Workspace"}
+            {t(p === "chat" ? "Assistant" : "Workspace")}
           </button>
         ))}
       </div>
 
       <div className="app-shell-grid" data-chat-collapsed={chatCollapsed || undefined} data-shell-panel={panel}>
-        <div id="app-shell-chat" className="app-shell-chat" aria-label="Assistant chat">
+        <div id="app-shell-chat" className="app-shell-chat" aria-label={t("Assistant chat")}>
           <Conversation
             mode={{
               kind: "app",
@@ -771,7 +773,7 @@ export default function AppShell({
             onOpenView={openView}
           />
         </div>
-        <section id="app-shell-workspace" className="app-shell-outlet" aria-label={`${title} workspace`}>
+        <section id="app-shell-workspace" className="app-shell-outlet" aria-label={`${title} ${t("workspace")}`}>
           {cachedPreviewSnapshot?.installation.install_id === installId &&
             cachedPreviewSnapshot.installation.name === "social-content" && loading ? (
               <WorkspaceAppCachedPreview
@@ -780,19 +782,19 @@ export default function AppShell({
               />
             ) : loading ? (
               <p className="card px-4 py-5 text-secondary text-ink-400" role="status">
-                Loading this app…
+                {t("Loading this app…")}
               </p>
             ) : null}
           {loadError && (
             <p className="card px-4 py-5 text-secondary text-fail border-fail/40" role="alert">
               {loadError}{" "}
               <Button size="sm" onClick={() => location.reload()}>
-                Retry
+                {t("Retry")}
               </Button>
             </p>
           )}
           {!loading && !installation && !loadError && viewer.operator === null && (
-            <main className="card px-4 py-5" aria-label="App" role="status">
+            <main className="card px-4 py-5" aria-label={t("App")} role="status">
               <h2 className="text-cardtitle font-medium text-ink-100">
                 {title}
               </h2>
@@ -821,12 +823,12 @@ export default function AppShell({
             </main>
           )}
           {!loading && !installation && !loadError && viewer.operator === false && (
-            <main className="card px-4 py-5" aria-label="App">
+            <main className="card px-4 py-5" aria-label={t("App")}>
               <h2 className="text-cardtitle font-medium text-ink-100">
                 {title}
               </h2>
               <p className="text-secondary text-ink-400 mt-1">
-                Sign in as the operator to inspect this installation.
+                {t("Sign in as the operator to inspect this installation.")}
               </p>
               <p className="mt-2">
                 <Link href="/apps" className="lnk text-label">
@@ -851,7 +853,7 @@ export default function AppShell({
                 ) : null
               ) : (
                 <p className="num text-micro text-ink-500">
-                  {activeContexts.find((c) => c.id === contextId)?.config.label ?? "No context"} · {installation.version}
+                  {activeContexts.find((c) => c.id === contextId)?.config.label ?? t("No context")} · {installation.version}
                 </p>
               )}
               {/* Scoped entry: a multi-context install with no linked

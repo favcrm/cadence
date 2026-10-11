@@ -26,6 +26,7 @@ const { createElement, act } = require("react");
 const { createRoot } = require("react-dom/client");
 const { default: AccountMenu } = require("../src/ui/AccountMenu") as typeof import("../src/ui/AccountMenu");
 const { default: SignIn } = require("../src/features/auth/SignIn") as typeof import("../src/features/auth/SignIn");
+const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
 
 function assert(condition: unknown, message: string): void {
   if (!condition) throw new Error(message);
@@ -39,7 +40,7 @@ function mount(node: unknown) {
   const host = document.createElement("div");
   document.body.append(host);
   const root = createRoot(host);
-  act(() => root.render(node));
+  act(() => root.render(createElement(LocaleProvider, null, node)));
   return { host, done: () => { act(() => root.unmount()); host.remove(); } };
 }
 const menu = (meta: Meta | null, extra: object = {}, onChange: () => void = () => undefined) =>
