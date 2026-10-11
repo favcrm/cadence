@@ -566,12 +566,13 @@ impl Shared {
             ),
             "app_workspace_upgrade" => {
                 let id = required_str(params, "install_id")?;
+                let expected_digest = required_str(params, "expected_digest")?;
                 workspace::upgrade(
                     &pm,
                     &workspace::UpgradeRequest {
                         id,
                         source: required_str(params, "source")?,
-                        expected_digest: required_str(params, "expected_digest")?,
+                        expected_digest,
                         expected_generation: required_str(params, "expected_generation")?,
                         expected_new_digest: required_str(params, "expected_new_digest")?,
                         request_id: required_str(params, "request_id")?,
@@ -604,15 +605,16 @@ impl Shared {
                         let mut carried = std::collections::BTreeMap::new();
                         for binding in &bindings {
                             let slot = binding["slot"].as_str().unwrap_or("");
-                            if manifest
-                                .capabilities
-                                .get(slot)
-                                .and_then(|need| serde_json::to_value(need).ok())
-                                .as_ref()
-                                == Some(&binding["config"]["declaration"])
+                            if binding["config"]["bundle_digest"].as_str() == Some(expected_digest)
+                                && manifest
+                                    .capabilities
+                                    .get(slot)
+                                    .and_then(|need| serde_json::to_value(need).ok())
+                                    .as_ref()
+                                    == Some(&binding["config"]["declaration"])
                             {
-                                // CAD-1140: declaration byte-identical — the
-                                // receipt carries forward onto the new digest.
+                                // CAD-1140: only a receipt pinned to the
+                                // replaced bundle with an unchanged declaration carries.
                                 carried.insert(
                                     binding["id"].as_str().unwrap_or_default().to_string(),
                                     binding["config"].clone(),

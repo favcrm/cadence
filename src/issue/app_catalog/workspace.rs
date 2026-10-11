@@ -881,12 +881,13 @@ pub(crate) fn upgrade_check(
 
 /// The daemon owns the operator proof. `preflight` runs under the PM lock,
 /// which is also the run-creation lock, before any upgrade journal is staged.
-/// It returns the compatibility report plus, per configured binding whose
-/// slot declaration is byte-identical between the old and new bundles, the
-/// receipt to carry (CAD-1140). `deliver` runs inside `apply_upgrade`, after
-/// every journal check and under the same lock, and writes those carries in
-/// the upgrade's one store transaction — a binding that changed since
-/// preflight loses its CAS and refuses the whole delivery.
+/// It returns the compatibility report plus, per configured binding pinned
+/// to the replaced bundle whose slot declaration is byte-identical between
+/// the old and new bundles, the receipt to carry (CAD-1140). `deliver` runs
+/// inside `apply_upgrade`, after every journal check and under the same lock,
+/// and writes those carries in the upgrade's one store transaction — a row
+/// that changed since preflight loses its CAS and is skipped, leaving its old
+/// receipt on the rebind/drift path.
 pub(crate) fn upgrade(
     pm: &Pm,
     request: &UpgradeRequest<'_>,
@@ -1191,8 +1192,8 @@ fn apply_upgrade<F: FnOnce(&UpgradeJournal) -> Result<Vec<String>>>(
     // CAD-1140: with the new bundle committed, carry the journaled
     // bindings onto its digest in one store transaction — still under
     // the PM lock, so the receipts land with the publication they pin.
-    // A binding that moved since preflight fails its CAS and the whole
-    // upgrade fails; the retained journal re-runs delivery.
+    // A binding that moved since preflight is skipped by the carry CAS and
+    // stays on its old pin; recovery can safely replay the retained journal.
     if let Some(deliver) = deliver {
         deliver(journal)?;
     }

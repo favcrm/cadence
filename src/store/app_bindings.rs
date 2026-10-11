@@ -761,9 +761,10 @@ impl Store {
 
     /// CAD-1140: carry a configured binding onto an upgraded bundle only
     /// when the upgrade journal staged its exact receipt after verifying the
-    /// slot declaration is byte-identical. The caller runs this within the
-    /// journaled delivery transaction. CAS skips rows changed since staging;
-    /// revoked or missing connections are excluded by upgrade preflight.
+    /// slot declaration is byte-identical and pinned to the replaced bundle.
+    /// The caller runs this within the journaled delivery transaction. CAS
+    /// skips rows changed since staging; the current-receipt check skips rows
+    /// whose connection is no longer live.
     pub fn app_binding_upgrade_carry(
         &self,
         install: &str,
