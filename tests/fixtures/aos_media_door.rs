@@ -21,7 +21,11 @@
 //!   (`jobs.ts:31`).
 //!
 //! The artifact is a 1024x1024 noise PNG (~3 MiB): above the host's 2 MiB
-//! custody bound, inside AgenticOS's 10 MiB cap.
+//! custody bound, inside AgenticOS's 10 MiB cap. That default proves the
+//! oversized-custody re-encode path (CAD-1304). A test whose subject is not
+//! image size may instead opt into `MediaDoor::new_small()`: the same job
+//! lifecycle and descriptor/byte consistency over a deterministic 64x64 RGB
+//! PNG that fits custody as is, so the job outcome stays `image/png`.
 #![allow(dead_code)]
 
 use serde_json::{json, Value};
@@ -68,22 +72,32 @@ struct State {
 pub struct MediaDoor {
     mode: AtomicU8,
     truncate: std::sync::atomic::AtomicBool,
+    small: std::sync::atomic::AtomicBool,
     state: Mutex<State>,
 }
 
-/// A deterministic 1024x1024 RGB noise PNG, one per `n % 4`.
-pub fn noise_png(n: u8) -> &'static Vec<u8> {
-    static CACHE: [OnceLock<Vec<u8>>; 4] = [
+/// A deterministic square RGB noise PNG of `side` pixels, one per `n % 4`.
+/// Each cache slot is keyed by `side`, so the large (default) and small
+/// variants can never cross-populate even in one process.
+fn noise_png_sized(n: u8, side: u32) -> &'static Vec<u8> {
+    static LARGE: [OnceLock<Vec<u8>>; 4] = [
         OnceLock::new(),
         OnceLock::new(),
         OnceLock::new(),
         OnceLock::new(),
     ];
-    CACHE[(n % 4) as usize].get_or_init(|| {
+    static SMALL: [OnceLock<Vec<u8>>; 4] = [
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+    ];
+    let cache = if side == 64 { &SMALL } else { &LARGE };
+    cache[(n % 4) as usize].get_or_init(|| {
         use image::ImageEncoder as _;
         let mut seed =
             0x9E37_79B9_7F4A_7C15u64 ^ (n as u64 + 1).wrapping_mul(0xD1B5_4A32_D192_ED03);
-        let mut pixels = vec![0u8; 1024 * 1024 * 3];
+        let mut pixels = vec![0u8; (side * side * 3) as usize];
         for byte in pixels.iter_mut() {
             seed ^= seed << 13;
             seed ^= seed >> 7;
@@ -92,10 +106,15 @@ pub fn noise_png(n: u8) -> &'static Vec<u8> {
         }
         let mut png = Vec::new();
         image::codecs::png::PngEncoder::new(&mut png)
-            .write_image(&pixels, 1024, 1024, image::ExtendedColorType::Rgb8)
+            .write_image(&pixels, side, side, image::ExtendedColorType::Rgb8)
             .unwrap();
         png
     })
+}
+
+/// A deterministic 1024x1024 RGB noise PNG, one per `n % 4`.
+pub fn noise_png(n: u8) -> &'static Vec<u8> {
+    noise_png_sized(n, 1024)
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -122,8 +141,19 @@ impl MediaDoor {
         Self {
             mode: AtomicU8::new(Scenario::Normal as u8),
             truncate: Default::default(),
+            small: Default::default(),
             state: Mutex::default(),
         }
+    }
+
+    /// Same door whose succeeded jobs serve a deterministic 64x64 RGB PNG
+    /// that fits the host custody bound as is. For tests whose subject is
+    /// the job/digest/authorization lifecycle, not image-size custody
+    /// (which keeps `new()`). Only artifact bytes differ.
+    pub fn new_small() -> Self {
+        let door = Self::new();
+        door.small.store(true, SeqCst);
+        door
     }
 
     /// While on, a test transport serves artifacts with the full
@@ -293,7 +323,8 @@ impl MediaDoor {
                     }
                     _ if job.polls < 2 => job.status = "running",
                     _ => {
-                        let bytes = noise_png(jobs_len_hint(&job.id)).clone();
+                        let side = if self.small.load(SeqCst) { 64 } else { 1024 };
+                        let bytes = noise_png_sized(jobs_len_hint(&job.id), side).clone();
                         let digest = hex(&bytes);
                         let reference = format!("{}.{digest}", job.id);
                         job.artifact = Some((reference.clone(), digest, bytes.len()));
