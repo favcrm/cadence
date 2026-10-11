@@ -10,7 +10,7 @@
     "test:url-state": "pnpm test",
     "typecheck": "tsc --noEmit",
     "preview": "vite preview",
-    "test": "node --test scripts/check-module-names.test.mjs && tmp_dir=$(mktemp -d \"${TMPDIR:-/tmp}/cadence-ui-tests.XXXXXX\") && trap 'rm -rf \"$tmp_dir\"' EXIT && tsc -p tsconfig.tests.json --outDir \"$tmp_dir\" && for t in \"$tmp_dir\"/tests/*.test.js; do NODE_PATH=\"$PWD/node_modules\" node \"$t\" || exit 1; done && node scripts/build-app-fixtures.mjs && bash scripts/app-fixtures/drift-acceptance.sh"
+    "test": "node --test scripts/check-module-names.test.mjs && tmp_dir=$(mktemp -d \"${TMPDIR:-/tmp}/cadence-ui-tests.XXXXXX\") && trap 'rm -rf \"$tmp_dir\"' EXIT && tsc -p tsconfig.tests.json --outDir \"$tmp_dir\" && for t in \"$tmp_dir\"/tests/*.test.js; do NODE_PATH=\"$PWD/node_modules\" node \"$t\" || exit 1; done && node scripts/build-app-fixtures.mjs && for check in drift-acceptance tag-base-acceptance; do status=0; bash \"scripts/app-fixtures/$check.sh\" || status=$?; if [ \"$status\" -eq 77 ] && [ -z \"${CI:-}\" ]; then printf '%s\\n' \"SKIP $check: source or prerequisites are not in acceptance-ready state (local non-CI run)\"; elif [ \"$status\" -ne 0 ]; then exit \"$status\"; fi; done"
   },
   "dependencies": {
     "@fontsource/ibm-plex-mono": "5.3.0",

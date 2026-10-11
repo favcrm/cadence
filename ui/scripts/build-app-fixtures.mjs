@@ -26,13 +26,13 @@ function eventBase() {
     const name = process.env.GITHUB_EVENT_NAME;
     if (name === "pull_request" || name === "pull_request_target") return event.pull_request?.base?.sha ?? null;
     if (name === "merge_group") return event.merge_group?.base_sha ?? null;
-    if (name === "push") return event.before ?? null;
-    if (name === "workflow_dispatch") {
+    if (name === "push" && event.before !== "0".repeat(40)) return event.before ?? null;
+    if (name === "workflow_dispatch" || name === "push") {
       const commit = git(["cat-file", "-p", "HEAD"]);
       const parentHeader = commit.split("\n").find(line => line.startsWith("parent "));
-      if (!parentHeader) throw new Error("workflow_dispatch HEAD commit has no parent (root commit)");
+      if (!parentHeader) throw new Error(`${name} HEAD commit has no parent (root commit)`);
       const parent = /^parent ([0-9a-f]{40})$/.exec(parentHeader)?.[1];
-      if (!parent) throw new Error("workflow_dispatch HEAD commit has a malformed first parent");
+      if (!parent) throw new Error(`${name} HEAD commit has a malformed first parent`);
       return parent;
     }
     throw new Error(`unsupported CI event for trusted fixture base: ${name ?? "unknown"}`);
