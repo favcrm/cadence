@@ -130,8 +130,13 @@ def load_rates(path: Path) -> dict[str, dict[str, Any]]:
         item_id, description, unit, unit_price, currency, source_id, effective_date = row[:7]
         precision_value = row[7] if has_rounding_rules and len(row) > 7 else None
         rounding_value = row[8] if has_rounding_rules and len(row) > 8 else None
-        if not item_id or item_id in rates:
-            raise ValueError(f"missing or duplicate item_id in rate workbook row {row_number}")
+        if not isinstance(item_id, str):
+            raise ValueError(f"item_id in rate workbook row {row_number} must be non-empty text")
+        item_id = item_id.strip()
+        if not item_id:
+            raise ValueError(f"item_id in rate workbook row {row_number} must be non-empty text")
+        if item_id in rates:
+            raise ValueError(f"duplicate item_id {item_id!r} in rate workbook row {row_number}")
         if not description or not unit or not source_id or not effective_date:
             raise ValueError(f"missing description/unit/source/date in rate workbook row {row_number}")
         if not isinstance(currency, str) or not re.fullmatch(r"[A-Z]{3}", currency):
@@ -140,7 +145,7 @@ def load_rates(path: Path) -> dict[str, dict[str, Any]]:
             raise ValueError(f"formula not allowed in rate workbook row {row_number}")
         if unit_price is not None and (isinstance(unit_price, bool) or not isinstance(unit_price, (int, float, Decimal)) or not math.isfinite(float(unit_price)) or unit_price < 0):
             raise ValueError(f"invalid unit_price in rate workbook row {row_number}")
-        rates[str(item_id)] = {
+        rates[item_id] = {
             "description": str(description), "unit": str(unit),
             "unit_price": Decimal(str(unit_price)) if unit_price is not None else None,
             "currency": str(currency), "source_id": str(source_id),
@@ -353,10 +358,23 @@ def main() -> int:
             if financial:
                 rates_package = preflight_office(rates_input, "xlsx")
                 rates_package.close()
-            result = calculate(brief, load_rates(rates_input)) if financial else {
-                "items": [], "known_subtotal": None, "currency": "", "full_total": None,
-                "unresolved_mandatory": False,
-            }
+            if financial:
+                rates = load_rates(rates_input)
+                for row_number, line in enumerate(brief["price_items"], 1):
+                    if not isinstance(line, dict) or not isinstance(line.get("item_id"), str):
+                        raise ValueError(f"price_items entry {row_number} item_id must be non-empty text")
+                    item_id = line["item_id"].strip()
+                    if not item_id:
+                        raise ValueError(f"price_items entry {row_number} item_id must be non-empty text")
+                    line["item_id"] = item_id
+                    if item_id not in rates:
+                        raise ValueError(f"no approved rate row for item_id {item_id!r}")
+                result = calculate(brief, rates)
+            else:
+                result = {
+                    "items": [], "known_subtotal": None, "currency": "", "full_total": None,
+                    "unresolved_mandatory": False,
+                }
             context = dict(brief["template_fields"])
             if financial:
                 item_lines = []

@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+import datetime
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -501,7 +503,18 @@ def extract_xlsx(source: Path) -> dict:
                         count += 1
                         if count > MAX_XLSX_CELLS:
                             refuse(f"XLSX exceeds {MAX_XLSX_CELLS}-nonempty-cell limit")
-                        values.append({"cell": cell.coordinate, "value": value})
+                        record = {"cell": cell.coordinate, "value": value}
+                        if isinstance(value, datetime.datetime):
+                            record.update(value=value.isoformat(), value_type="datetime")
+                        elif isinstance(value, datetime.date):
+                            record.update(value=value.isoformat(), value_type="date")
+                        elif isinstance(value, datetime.time):
+                            record.update(value=value.isoformat(), value_type="time")
+                        elif isinstance(value, float) and not math.isfinite(value):
+                            refuse(f"unsupported non-finite XLSX value in {sheet.title}!{cell.coordinate}")
+                        elif not isinstance(value, (str, int, float, bool)):
+                            refuse(f"unsupported XLSX value type {type(value).__name__} in {sheet.title}!{cell.coordinate}")
+                        values.append(record)
                 if values:
                     rows.append({"row": row_number, "cells": values})
             sheets.append({"sheet": sheet.title, "rows": rows})
