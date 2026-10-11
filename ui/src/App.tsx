@@ -456,6 +456,10 @@ export default function App() {
     operatorKnown.current = false;
     refresh(true);
   }, [refresh]);
+  // A workspace reload uses the same hosted wake path as a page load;
+  // a metadata probe alone can report the failed relay without waking it.
+  const retryWorkspace = useCallback(() => window.location.reload(), []);
+  const checkAccess = useCallback(() => refresh(true), [refresh]);
 
   useEffect(() => {
     refresh();
@@ -920,7 +924,7 @@ export default function App() {
               health={health}
               onRefresh={refresh}
             >
-              <SignIn meta={meta} onChange={refresh} access={viewer.access} onRetryAccess={retryAccess} />
+              <SignIn meta={meta} onChange={refresh} access={viewer.access} onRetryWorkspace={retryWorkspace} onCheckAccess={checkAccess} />
               {staleBuild !== null && staleBuild !== dismissedBuild && (
                 <BuildUpdateNotice onReload={reload} onDismiss={() => setDismissedBuild(staleBuild)} />
               )}
@@ -977,7 +981,7 @@ export default function App() {
                 health={health}
                 onRefresh={refresh}
               >
-                <SignIn meta={meta} onChange={refresh} access={viewer.access} onRetryAccess={retryAccess} />
+                <SignIn meta={meta} onChange={refresh} access={viewer.access} onRetryWorkspace={retryWorkspace} onCheckAccess={checkAccess} />
               </StatusChips>
             </div>
           </div>
@@ -1311,8 +1315,8 @@ function WorkspaceAppEntry({
     return (
       <main className="px-4 lg:px-8 pt-10 pb-9">
         {viewer.access === "unavailable" ? (
-          <Notice state="access-unavailable" onRetry={viewer.onRetryAccess} retryLabel="Retry access check">
-            Access could not be confirmed. Retry the access check before opening an installed app.
+          <Notice state="access-unavailable">
+            Workspace waking or unreachable. The board is checking again for up to 60 seconds.
           </Notice>
         ) : <Loading>Checking access…</Loading>}
       </main>
