@@ -265,6 +265,50 @@ fn pi_command(env: &ProviderEnv) -> Vec<String> {
     vec!["pi".to_string()]
 }
 
+/// What [`resolve_pi_launch_command`] reports for the program the
+/// adapter would exec: `Ok(path)` is the absolute resolved executable,
+/// `Err(reason)` is the
+/// clear "not found" line the daemon start log and `doctor --host`
+/// both surface (CAD-1247).
+pub(crate) fn resolve_pi_launch_command(
+    env: &ProviderEnv,
+    path: Option<&str>,
+) -> std::result::Result<PathBuf, String> {
+    let program = pi_command(env)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| "pi".to_string());
+    let path_display = path.unwrap_or_default();
+    if !program.contains('/') {
+        let path = path.ok_or_else(|| "startup resolution is indeterminate: PATH is unavailable; configure CADENCE_PI_COMMAND as an absolute executable path".to_string())?;
+        for entry in path.split(':') {
+            if !Path::new(entry).is_absolute() {
+                return Err("startup resolution is indeterminate: PATH reaches a relative entry before a match and agents launch in their own working directories; use absolute PATH entries or CADENCE_PI_COMMAND".to_string());
+            }
+            if let Some(resolved) = crate::master::which(&program, Some(entry)) {
+                return Ok(resolved);
+            }
+        }
+        return Err(format!(
+            "command '{program}' not found on PATH ({path_display})"
+        ));
+    }
+    let candidate = PathBuf::from(&program);
+    if !candidate.is_absolute() {
+        return Err("startup resolution is indeterminate: CADENCE_PI_COMMAND is relative to each agent's working directory; configure an absolute executable path".to_string());
+    }
+    let executable = std::fs::metadata(&candidate).ok().is_some_and(|m| {
+        use std::os::unix::fs::PermissionsExt;
+        m.is_file() && m.permissions().mode() & 0o111 != 0
+    });
+    if executable {
+        std::path::absolute(&candidate)
+            .map_err(|e| format!("cannot resolve command '{program}' to an absolute path: {e}"))
+    } else {
+        Err(format!("command '{program}' is not executable"))
+    }
+}
+
 /// The master's own Pi config dir — its `PI_CODING_AGENT_DIR`: auth
 /// and extension state live here, never in the operator's `~/.pi`,
 /// mirroring [`crate::master::claude_config_dir`].
@@ -3037,6 +3081,64 @@ impl ProviderAdapter for PiAdapter {
 #[cfg(test)]
 #[path = "pi/cad1195_acceptance.rs"]
 mod cad1195_acceptance;
+
+#[cfg(test)]
+mod cad1247_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// CAD-1247: the resolver the daemon-start warning and
+    /// `doctor --host` share — bare `pi` resolves on PATH, names the
+    /// PATH when absent; `CADENCE_PI_COMMAND` names its own program.
+    #[test]
+    fn pi_launch_command_resolution() {
+        let env = ProviderEnv::default();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        assert!(resolve_pi_launch_command(&env, Some(&path)).is_err());
+        let pi = dir.path().join("pi");
+        std::fs::write(&pi, "#!/bin/sh\n").unwrap();
+        let mut mode = pi.metadata().unwrap().permissions();
+        mode.set_mode(0o755);
+        std::fs::set_permissions(&pi, mode).unwrap();
+        assert_eq!(
+            resolve_pi_launch_command(&env, Some(&path)).as_deref().ok(),
+            Some(pi.as_path())
+        );
+        let relative_dir = tempfile::Builder::new()
+            .prefix(".cad1247-resolution-")
+            .tempdir_in(".")
+            .unwrap();
+        let relative_root = Path::new(".").join(relative_dir.path().file_name().unwrap());
+        let relative_pi = relative_root.join("pi");
+        std::fs::copy(&pi, &relative_pi).unwrap();
+        let relative_path = relative_root.to_str().unwrap();
+        assert!(!relative_pi.is_absolute());
+        assert!(resolve_pi_launch_command(&env, Some(relative_path))
+            .unwrap_err()
+            .contains("indeterminate"));
+        assert_eq!(
+            resolve_pi_launch_command(&env, Some(&format!("{path}:{relative_path}"))).unwrap(),
+            pi
+        );
+        assert!(
+            resolve_pi_launch_command(&env, Some(&format!("{relative_path}:{path}")))
+                .unwrap_err()
+                .contains("indeterminate")
+        );
+        env.set("CADENCE_PI_COMMAND", relative_pi.to_str().unwrap());
+        assert!(resolve_pi_launch_command(&env, Some(&path))
+            .unwrap_err()
+            .contains("indeterminate"));
+        env.set("CADENCE_PI_COMMAND", "/missing/pi --flag");
+        assert!(resolve_pi_launch_command(&env, Some(&path)).is_err());
+        env.set("CADENCE_PI_COMMAND", "/bin/true --flag");
+        assert_eq!(
+            resolve_pi_launch_command(&env, Some(&path)).as_deref().ok(),
+            Some(Path::new("/bin/true"))
+        );
+    }
+}
 
 #[cfg(test)]
 mod cad1098_tests {
