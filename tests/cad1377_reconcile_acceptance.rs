@@ -255,6 +255,10 @@ impl Fixture {
             )
             .env_remove("CADENCE_STATE_DIR")
             .env_remove("CADENCE_ALIAS")
+            // The swept `cadence` always enumerates the real /proc:
+            // in a test-seam build an ambient CADENCE_TEST_PROC_ROOT
+            // would silently substitute a caller-provided proc view.
+            .env_remove("CADENCE_TEST_PROC_ROOT")
             .env_remove("CARGO_TARGET_DIR")
             .env_remove("CARGO_BUILD_TARGET_DIR");
         let out = cadence_agent::reaper::output(&mut cmd).expect("run real issue reconcile CLI");
@@ -453,6 +457,10 @@ fn cad1377_targeted_reconcile_acceptance() {
             .env_remove("CADENCE_PM_DIR")
             .env_remove("CADENCE_STATE_DIR")
             .env_remove("CADENCE_ALIAS")
+            // The re-exec and every CLI it spawns must prove the real
+            // proc view — an inherited test-seam root is never valid
+            // evidence for this check.
+            .env_remove("CADENCE_TEST_PROC_ROOT")
             .env_remove("CARGO_TARGET_DIR")
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
@@ -618,25 +626,40 @@ fn cad1377_targeted_reconcile_acceptance() {
 
     // 2. Targeted real run: the selected ticket reconciles — status
     // done, merged lane swept — the unrelated lane is untouched in
-    // directory, files, branch ref and status.
+    // directory, files, branch ref and status. A `finished` sweep row
+    // is required: a refused or missing row can never read as a swept
+    // lane, and the full report is the failure evidence.
     let (out, calls) = fx.reconcile(&["--issue".into(), id.clone(), "--json".into()]);
     assert!(
         out.status.success(),
         "targeted reconcile failed: {}",
         text(&out)
     );
+    let report: Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|_| panic!("--json emitted no JSON: {}", text(&out)));
     assert_eq!(
         fx.issue_status(&id),
         "done",
-        "selected ticket not reconciled"
+        "selected ticket not reconciled: {report}"
+    );
+    let finish_rows = rows_for(&report, &id);
+    assert!(
+        finish_rows
+            .iter()
+            .any(|r| r["outcome"].as_str() == Some("finished")),
+        "selected lane's sweep row did not finish: {report}"
+    );
+    assert!(
+        report["finish_refused"].as_u64() == Some(0) && report["partial"] == Value::Bool(false),
+        "targeted sweep of a proven-idle lane refused or reported partial: {report}"
     );
     assert!(
         !lane.exists(),
-        "selected merged lane survived the targeted sweep"
+        "selected merged lane survived the targeted sweep: {report}"
     );
     assert!(
         git(&fx.home, &fx.repo, &["branch", "--list", &branch]).is_empty(),
-        "selected lane branch survived the targeted sweep"
+        "selected lane branch survived the targeted sweep: {report}"
     );
     assert_eq!(
         fx.issue_status(&other_id),
@@ -733,6 +756,15 @@ fn cad1377_targeted_reconcile_acceptance() {
             report["partial"],
             Value::Bool(true),
             "guarded cleanup blocked by a live holder reported complete: {report}"
+        );
+        assert!(
+            rows_for(&report, &id3)
+                .iter()
+                .any(|r| r["outcome"].as_str() == Some("refused")
+                    && r["reason"]
+                        .as_str()
+                        .is_some_and(|why| why.contains("cwd inside"))),
+            "the held lane's row does not name the live process: {report}"
         );
     }
     drop(holder);
