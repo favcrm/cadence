@@ -38,6 +38,7 @@ export function useApproveHead(pr: string | null, head: string | null) {
     if (!repo || !number || !head) return;
     try {
       const out = await api.approvalState(repo, number, head);
+      setMember(false);
       setState(out.state);
       setApproval(out.state === "missing" ? null : (out.approval_id ?? null));
       setRevocable(out.state === "in-force" && out.board_revocable === true);
