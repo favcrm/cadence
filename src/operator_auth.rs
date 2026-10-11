@@ -574,6 +574,9 @@ struct Row {
     /// under (CAD-1412). Legacy rows deserialize to `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     scope: Option<HumanScope>,
+    /// Stable, server-registered upload account. Old sessions remain unbound.
+    #[serde(default)]
+    account_id: Option<String>,
 }
 
 impl Row {
@@ -598,6 +601,7 @@ impl Row {
             user_agent: self.user_agent.clone(),
             user: self.user.clone(),
             scope: self.scope.clone(),
+            account_id: self.account_id.clone(),
         }
     }
 }
@@ -642,6 +646,8 @@ pub struct SessionView {
     /// The verified tenancy of a scoped public session (CAD-1412).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<HumanScope>,
+    /// Non-secret durable account handle; absent on legacy sessions.
+    pub account_id: Option<String>,
 }
 
 /// A freshly opened session: the token goes to the board once, for its
@@ -680,12 +686,20 @@ pub struct Auth {
     path: PathBuf,
     sessions: Vec<Row>,
     /// nonce hash → (origin, expires_at)
-    links: HashMap<String, (Origin, i64)>,
+    links: HashMap<String, (Origin, i64, Option<String>)>,
     /// spent nonce hash → when it would have expired (pruned after)
     spent: HashMap<String, i64>,
     /// seen jti hash → its assertion's `exp` — the authoritative
     /// single-use memory for platform sign-ins (CAD-526).
     jtis: HashMap<String, i64>,
+}
+
+fn valid_account_id(id: &str) -> bool {
+    id.len() == 36
+        && id.starts_with("acu-")
+        && id[4..]
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// Printable ASCII, bounded — the user agent is shown by `ui sessions`.
@@ -755,7 +769,8 @@ impl Auth {
     fn prune(&mut self, now: i64) -> bool {
         // An expired link is kept one more TTL so its refusal can say
         // "expired" rather than "unknown".
-        self.links.retain(|_, (_, exp)| now <= *exp + LINK_TTL_SECS);
+        self.links
+            .retain(|_, (_, exp, _)| now <= *exp + LINK_TTL_SECS);
         self.spent.retain(|_, exp| now <= *exp + LINK_TTL_SECS);
         // A jti stays until its assertion's own expiry — then a replay
         // fails "expired" before the single-use check anyway.
@@ -779,7 +794,30 @@ impl Auth {
         self.prune(now);
         let nonce = random_credential()?;
         self.links
-            .insert(digest(&nonce), (origin, now + LINK_TTL_SECS));
+            .insert(digest(&nonce), (origin, now + LINK_TTL_SECS, None));
+        Ok(nonce)
+    }
+
+    /// Mint a login link bound to a durable account registered by the
+    /// caller after independent native operator authentication.
+    pub fn mint_for_account(
+        &mut self,
+        origin: Origin,
+        now: i64,
+        account_id: String,
+    ) -> Result<String> {
+        if origin == Origin::Public || account_id.is_empty() {
+            return Err(Error::invalid(
+                "invalid_request",
+                "invalid upload account binding",
+            ));
+        }
+        self.prune(now);
+        let nonce = random_credential()?;
+        self.links.insert(
+            digest(&nonce),
+            (origin, now + LINK_TTL_SECS, Some(account_id)),
+        );
         Ok(nonce)
     }
 
@@ -801,7 +839,7 @@ impl Auth {
         if self.spent.contains_key(&hash) {
             return Err(LinkRefusal::AlreadyUsed);
         }
-        let Some((minted_for, expires)) = self.links.remove(&hash) else {
+        let Some((minted_for, expires, account_id)) = self.links.remove(&hash) else {
             return Err(LinkRefusal::Unknown);
         };
         self.spent.insert(hash, expires);
@@ -811,10 +849,16 @@ impl Auth {
         if minted_for != origin {
             return Err(LinkRefusal::WrongOrigin);
         }
-        Ok(self.create(origin, user_agent, now))
+        Ok(self.create(origin, user_agent, now, account_id))
     }
 
-    fn create(&mut self, origin: Origin, user_agent: &str, now: i64) -> Result<Opened> {
+    fn create(
+        &mut self,
+        origin: Origin,
+        user_agent: &str,
+        now: i64,
+        account_id: Option<String>,
+    ) -> Result<Opened> {
         let token = random_credential()?;
         let key = random_credential()?;
         let row = Row {
@@ -830,6 +874,7 @@ impl Auth {
             realm: None,
             revoked: false,
             scope: None,
+            account_id,
         };
         let session = row.view();
         self.sessions.push(row);
@@ -858,6 +903,17 @@ impl Auth {
         origin: Origin,
         user_agent: &str,
         now: i64,
+    ) -> Result<Opened> {
+        self.open_device_account(user, origin, user_agent, now, None)
+    }
+
+    pub fn open_device_account(
+        &mut self,
+        user: BoardUser,
+        origin: Origin,
+        user_agent: &str,
+        now: i64,
+        account_id: Option<String>,
     ) -> Result<Opened> {
         self.prune(now);
         if origin == Origin::Public {
@@ -890,6 +946,7 @@ impl Auth {
             realm: None,
             revoked: false,
             scope: None,
+            account_id,
         };
         let session = row.view();
         self.sessions.push(row);
@@ -912,9 +969,14 @@ impl Auth {
         user_agent: &str,
         now: i64,
     ) -> Result<Option<Opened>> {
-        self.open_public_row(user, (jti, jti_exp), user_agent, (None, None), now, |_| {
-            Ok(())
-        })
+        self.open_public_row(
+            user,
+            (jti, jti_exp),
+            user_agent,
+            (None, None, None),
+            now,
+            |_| Ok(()),
+        )
     }
 
     /// [`Auth::open_public`] for a verified assertion, persisting the
@@ -937,7 +999,26 @@ impl Auth {
             user,
             (jti, jti_exp),
             user_agent,
-            (None, Some(scope)),
+            (None, Some(scope), None),
+            now,
+            |_| Ok(()),
+        )
+    }
+
+    pub fn open_public_account(
+        &mut self,
+        user: BoardUser,
+        jti: &str,
+        jti_exp: i64,
+        user_agent: &str,
+        now: i64,
+        account_id: Option<String>,
+    ) -> Result<Option<Opened>> {
+        self.open_public_row(
+            user,
+            (jti, jti_exp),
+            user_agent,
+            (None, None, account_id),
             now,
             |_| Ok(()),
         )
@@ -961,7 +1042,7 @@ impl Auth {
             user,
             (jti, jti_exp),
             user_agent,
-            (Some(realm), None),
+            (Some(realm), None, None),
             now,
             |_| Ok(()),
         )
@@ -991,7 +1072,7 @@ impl Auth {
             user,
             jti,
             user_agent,
-            (Some(realm), Some(scope)),
+            (Some(realm), Some(scope), None),
             now,
             intent,
         )
@@ -1002,7 +1083,7 @@ impl Auth {
         user: BoardUser,
         (jti, jti_exp): (&str, i64),
         user_agent: &str,
-        (realm, scope): (Option<PublicRealm>, Option<HumanScope>),
+        (realm, scope, account_id): (Option<PublicRealm>, Option<HumanScope>, Option<String>),
         now: i64,
         intent: impl FnOnce(&AuditTarget) -> Result<()>,
     ) -> Result<Option<Opened>> {
@@ -1031,6 +1112,7 @@ impl Auth {
             realm,
             revoked: false,
             scope,
+            account_id,
         };
         let session = row.view();
         intent(&row.audit_target())?;
@@ -1152,6 +1234,51 @@ impl Auth {
         Ok(found)
     }
 
+    /// Bind a newly issued, still-live session to its registered account
+    /// before its credentials are returned to the board. Existing bindings
+    /// cannot be changed.
+    pub fn bind_account(&mut self, token: &str, account_id: &str) -> Result<SessionView> {
+        if !well_formed(token) || !valid_account_id(account_id) {
+            return Err(Error::rejected("upload account binding is malformed"));
+        }
+        let hash = digest(token);
+        let row = self
+            .sessions
+            .iter_mut()
+            .find(|row| same_credential(&row.hash, &hash))
+            .ok_or_else(|| Error::rejected("new session disappeared before account binding"))?;
+        if row
+            .account_id
+            .as_deref()
+            .is_some_and(|existing| existing != account_id)
+        {
+            return Err(Error::rejected(
+                "session already has another account binding",
+            ));
+        }
+        row.account_id = Some(account_id.to_string());
+        let session = row.view();
+        self.persist()?;
+        Ok(session)
+    }
+
+    /// Resolve the durable account only after the full live session proof
+    /// succeeds. Public sessions use their cookie-only proof; keyed sessions
+    /// require both credentials and the exact request origin.
+    pub fn verified_session(
+        &mut self,
+        token: &str,
+        key: &str,
+        origin: Origin,
+        now: i64,
+    ) -> Result<Option<SessionView>> {
+        if origin == Origin::Public {
+            self.check_public(token, now)
+        } else {
+            self.check(token, key, origin, now)
+        }
+    }
+
     /// End the session `token` names, on any origin. `true` if it existed.
     pub fn revoke_token(&mut self, token: &str) -> Result<bool> {
         self.revoke_token_with_intent(token, |_| Ok(()))
@@ -1229,7 +1356,7 @@ impl Auth {
         }
         let gone = self.sessions.len();
         self.sessions.clear();
-        for (hash, (_, exp)) in self.links.drain() {
+        for (hash, (_, exp, _)) in self.links.drain() {
             self.spent.insert(hash, exp);
         }
         self.persist()?;
@@ -1443,6 +1570,7 @@ mod tests {
             realm: None,
             revoked: false,
             scope: None,
+            account_id: None,
         };
         let orig = mk(&"1".repeat(56));
         let collider = mk(&"2".repeat(56));

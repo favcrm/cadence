@@ -2,8 +2,9 @@
 
 The board chat composer (Home) can attach real files to a message the operator
 sends to the master's home turn. Files are **host-custodied**: the board
-streams the bytes to the daemon, the daemon retains them content-addressed
-under the daemon's authoritative workspace (`<workspace>/.cadence/chat-files/`),
+streams the bytes to the daemon, the daemon retains immutable originals
+under the daemon's captured operational workspace at
+`<CADENCE_HOME>/workspace/users/<account>/threads/<conversation>/uploads/`,
 and a turn reads them through a daemon RPC — never through a browser path, URL
 or `<img>`. Incoming `<state>/wiki-uploads/` files are transient staging only.
 
@@ -25,8 +26,8 @@ campaign. Retention and quota are described in
 - Kinds (interim allowlist, enforced by daemon byte-sniff, not the extension
   alone): `.txt`, `.md`, `.csv`. The extension must match the sniffed bytes.
 - Size: at most **10 MiB** per file; at most **5 files** per message.
-- Attachments fail closed: a symlink anywhere in the PM directory path, or a
-  group- or world-writable `.cadence` directory, makes every upload refuse.
+- Attachments fail closed: unsafe symlinks or ownership/modes in the captured
+  operational workspace path, or in legacy quota custody, make uploads refuse.
 - The composer pre-checks the same list and cap and its file picker offers
   only `.txt,.md,.csv`; the daemon's checks are the enforcement. A `.pdf`,
   `.png`, `.jpg`, `.jpeg` or `.webp` upload (by name or by sniffed bytes) is
@@ -42,20 +43,25 @@ campaign. Retention and quota are described in
    over the cap are refused before any daemon call.
 2. The board stages the bytes to a canonical name under the daemon's
    upload-staging dir (`<state>/wiki-uploads/`, the same custody dir the wiki
-   upload uses) and calls `chat_file_upload` naming only `name` and `tmp` —
-   the caller never supplies `sha256`, a destination path or a scope. The
+   upload uses) and calls `chat_file_upload` with `name`, `tmp`, the
+   revalidated session proof and optional native selectors — the caller
+   never supplies an account, `sha256`, destination path or scope. The
    staging name is created with `create_new` before it is written: an
    occupied name is refused, never truncated or deleted, and only a path
    this request created is cleaned up. The request's staging file is
    removed on every path: success, refusal or an unreachable daemon.
 3. `chat_file_upload` proves `operator_chat` (the same proof `thread_send`
-   runs), reads the source through the server-owned staging directory
+   runs), revalidates the session proof to resolve its registered account,
+   proves the exact Home or app conversation, reads the source through the server-owned staging directory
    opened once (no-follow directory descriptor; the leaf is opened relative
    to it with `O_NOFOLLOW|O_NONBLOCK`) — a caller-supplied ancestor alias
    substituted after the check cannot redirect the read, a symlink leaf is
    refused, never followed, and a FIFO/device cannot block or be read — and
    writes exactly the checked bytes into an anonymous `O_TMPFILE` inode
-   opened relative to the pinned workspace custody directory. The same
+   in the descriptor-pinned operational attachment directory, on the
+   destination filesystem. The pinned legacy custody root retains the
+   shared quota lock and census, not this staging inode. The checked inode
+   is then published within that operational attachment directory. The same
    opened inode is written, synced and bounded-read back; it has no stage
    pathname, and closing its descriptor discards it on failure. A filesystem
    without anonymous staging refuses rather than falling back to a named
@@ -67,26 +73,29 @@ campaign. Retention and quota are described in
    board route owns that cleanup and removes its own staged file on
    success, refusal and unreachable-daemon paths; a direct RPC caller
    cleans up its own source.
-4. Publication is content-addressed at `<workspace>/.cadence/chat-files/<sha256>` and
-   never overwrites: an atomic descriptor-sourced hard link from the
-   anonymous private stage either lands the blob or fails with "already exists". A racing
-   writer that landed the same digest first wins; the existing blob is then
-   digest-verified and a mismatch refuses the upload rather than replacing
-   or deleting it. A filesystem without hard links refuses rather than
-   writing directly to the final digest name, so no partial file is ever
-   visible under a content address. The row carries a daemon-minted
-   `chf-<32-hex>` id.
+4. Publication is scoped to the daemon-minted attachment id at
+   `workspace/users/<account>/threads/<conversation>/uploads/<attachment-id>/<name>`
+   and never overwrites: an atomic descriptor-sourced hard link from the
+   anonymous private stage either lands the original or fails if the target exists.
+   The quota lock serializes the idempotency lookup through metadata commit;
+   matching content in the same account, conversation and scope returns its
+   existing row. A filesystem without hard links refuses rather than writing
+   directly to the final path, so no partial original is visible. The row
+   carries a daemon-minted `chf-<32-hex>` id and its digest is verified on read.
 5. `thread_send` accepts `attachments: [{id}]` (1–5 ids, `chf-` grammar) from
    the operator chat only. **Readiness is checked against the actual bytes,
    not the row's existence**: the row must be a text kind, the blob must
    exist as a regular file, and its bounded content must still match the
    declared size and digest, sniff as an allowed text kind, decode as UTF-8
    and pass the secret gate. An altered, unreadable, oversized or
-   non-text row refuses the send before the message is queued. The blob path is derived from the validated stored digest,
-   never from request data.
+   non-text row refuses the send before the message is queued. Version-1
+   paths derive from the validated stored owner/thread/attachment tuple;
+   legacy paths derive from the validated stored digest, never request data.
 6. The resolved `{id,name,size,mime,sha256}` rows are stored on the entry's
    `payload.attachments` — the bubble shows them as metadata rows (name,
-   size, MIME), never links.
+   size, MIME), never links. New rows bind `user_id`, the exact native
+   `thread_id` and `location_version=1`; preexisting legacy rows remain
+   unowned (`location_version=0/null`) and retain their legacy semantics.
 7. The delivered prompt prepends a bounded envelope:
 
    ```
@@ -115,15 +124,17 @@ campaign. Retention and quota are described in
 
 ## Scope and retry rules
 
-- Upload params accept only `name` and `tmp`, so a caller cannot seed scope,
-  a digest or a destination. The daemon derives workspace custody from its own
-  PM directory, not from request data. Scoped app rows retain the existing
+- Upload params carry only file hints, staging path, a revalidated session
+  proof and optional native selectors; a caller cannot seed account, scope,
+  digest or destination path. The daemon captures the operational workspace
+  from its provider environment at boot, and binds new rows to the registered
+  account and exact verified conversation. Scoped app rows retain the existing
   capability, context, conversation and provenance proofs; workspace sharing
   does not grant sibling conversations access.
-- Older blobs at `<state>/chat-files/<sha256>` remain readable only when the
-  workspace digest entry is genuinely absent. Corrupt or aliased workspace
-  entries refuse and do not fall back. Legacy blobs are not copied, rewritten
-  or deleted; new writes never use state custody as a fallback.
+- Version-1 originals are read only from their operational account tree;
+  version-0 legacy rows are read only from their legacy PM custody root. A
+  missing, aliased or corrupt entry refuses without trying the other format.
+  Legacy rows are not copied, rewritten or deleted.
 - An app upload carries the verified `app` binding and its explicit
   `conversation`; the daemon proves the installation, context and the
   master's unarchived conversation and re-proves the current exact-approved
@@ -147,7 +158,8 @@ campaign. Retention and quota are described in
 ## Refused, by construction
 
 - Agent or unproven upload/read at the board **and** at the daemon.
-- Upload param fields beyond `{name, tmp}`; attachment entries beyond `{id}`.
+- Upload fields beyond the file hints, staging file, session proof and exact
+  native selectors; attachment entries beyond `{id}`.
 - `tmp` outside `<state>/wiki-uploads/`; a symlink at the tmp leaf; a
   caller-supplied ancestor alias that no longer resolves to the staging
   dir (the source is read through the server-owned staging directory, not
@@ -185,8 +197,9 @@ charged, never swept.
 
 All sums use checked arithmetic and refuse only when projected use exceeds a
 cap. Instance bytes count logical `fstat` sizes for unique `(device,inode)`
-regular files across pinned workspace chat-files, legacy state `chat-files`,
-and state `wiki-uploads`, then add proposed physical bytes. Instance units are
+regular files across legacy PM chat-file custody, the operational
+`workspace/users/**/threads/**/uploads/**` tree, and state `wiki-uploads`,
+then add proposed physical bytes. Instance units are
 unique physical inodes plus metadata rows plus one prospective physical custody
 file and its metadata row for text. Hard links count once across roots;
 copied equal-digest files count separately. Sparse files count by logical size.
@@ -199,8 +212,8 @@ scan ambiguity refuses admission.
 For the upload bucket, charge checked logical original sizes, the proposed
 logical original and metadata row, and each unique physical inode classified
 as unattributed residue. A physical original is recognized only when its
-direct basename in workspace or legacy chat-file custody is the exact
-lowercase digest and matches authoritative metadata. `wiki-uploads` entries are always residue even if their
+pinned legacy digest entry or versioned operational account/conversation
+path matches authoritative metadata. `wiki-uploads` entries are always residue even if their
 name resembles a digest. Orphaned, unmatched, malformed, unreadable, or
 wrong-size files are not free: charge them to the current upload bucket.
 Residue is not redistributed among installation/context/conversation buckets.
@@ -210,13 +223,13 @@ new scope reference still pays its logical size and row even when physical
 content already exists elsewhere. Physical inodes are deduplicated across all
 roots; any staging or unrecognized alias makes that inode residue for this
 upload. Thus currently owned upload staging remains charged before the new
-workspace copy, conservatively charging transient source plus new copy.
+operational copy, conservatively charging transient source plus new copy.
 
 ### Lock and replay
 
-Workspace puts acquire descriptor-pinned `.quota.lock` with nonblocking
-exclusive `flock` after input digest/kind/text checks and before census or
-O_TMPFILE creation. It must be regular, current-uid-owned, mode 0600 and
+Operational puts acquire descriptor-pinned `.quota.lock` in legacy custody
+with nonblocking exclusive `flock` after input digest/kind/text checks and
+before census or O_TMPFILE creation. It must be regular, current-uid-owned, mode 0600 and
 link-count one. Hold it through publication and SQLite metadata commit.
 Contention is busy and maps to HTTP 429; there is no wait queue.
 

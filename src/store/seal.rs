@@ -58,17 +58,16 @@ fn raw_lease_refusal(reason: String) -> rusqlite::Error {
 /// standalone `app_tool_claims`/`app_tool_results` tables and one retrofitted `app_run_failures` — they touch no
 /// sealed/witnessed surface, so the guard's assumptions are unchanged.
 /// v37 (CAD-1168) adds only the `chat_files` table, likewise. v38/v39
-/// (CAD-818 threads) add tables and a backfill, touching no sealed surface.
-/// v40 (CAD-1393) adds only the `business_template_*` tables and their
-/// triggers, which touch no sealed/witnessed surface.
-/// v41 (CAD-1380/AOS-216) adds the standalone `assistants`,
-/// `assist_requests` and `job_subscribers` tables, v42 adds member-request
-/// provenance columns + the `assist_stall_checks` table, and v43 adds the
-/// standalone `assist_job_shares` table, and v44 (CAD-1412) adds only the
-/// human room tables. None touch a sealed/witnessed surface, so the bound
-/// extends to 45 (v45 CAD-1365 adds only app_media_* tables).
+/// (CAD-818 threads) add participant identity, topics, subscriptions and the
+/// shared transcript, touching no sealed surface. v40 (CAD-1393) adds only the
+/// `business_template_*` tables and their triggers. v41-v43 (CAD-1380/AOS-216)
+/// add member-assistant tables and provenance; v44 (CAD-1412) adds human room
+/// tables; v45 (CAD-1365) adds only the metadata-only app_media_* tables.
+/// v46 (CAD-1337) adds nullable upload ownership/location metadata,
+/// the account registry and upload indexes. None touch a sealed/witnessed
+/// surface, so the bound extends to 46.
 #[allow(dead_code)]
-const PROTECTED_SCHEMA_MAX: i64 = 45;
+const PROTECTED_SCHEMA_MAX: i64 = 46;
 
 /// Arm level + transaction-control phase, shared between the `Store` and
 /// the connection's authorizer. Atomic because the authorizer callback must

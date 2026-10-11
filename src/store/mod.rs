@@ -78,9 +78,9 @@ pub(crate) use business_templates::SCHEMA as BUSINESS_TEMPLATE_SCHEMA;
 pub use business_templates::{BusinessDocument, TemplateVersion};
 mod chat_files;
 pub use chat_files::{
-    text_kind as chat_text_kind, valid_id as chat_file_id, ChatFile, ChatFileStorageRoots,
-    CHAT_FILE_MAX_BYTES, CHAT_FILE_MAX_PER_MESSAGE, CHAT_FILE_SCOPE_HOME, CHAT_FILE_TEXT_CAP,
-    CHAT_QUOTA_CODE,
+    text_kind as chat_text_kind, valid_id as chat_file_id, ChatFile, ChatFileOperationalRoots,
+    ChatFileStorageRoots, CHAT_FILE_MAX_BYTES, CHAT_FILE_MAX_PER_MESSAGE, CHAT_FILE_SCOPE_HOME,
+    CHAT_FILE_TEXT_CAP, CHAT_QUOTA_CODE,
 };
 mod assistants;
 pub use assistants::{AssistDispatchExpect, AssistRecipient, AssistRequest, AssistantBinding};

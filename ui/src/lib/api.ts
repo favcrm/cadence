@@ -50,6 +50,9 @@ export interface ChatFileRow {
   scope: string;
   context_id: string;
   uploader: string;
+  user_id: string;
+  thread_id: string;
+  location_version: 1;
   created: number;
 }
 
@@ -70,6 +73,9 @@ function decodeChatFileRow(value: unknown): ChatFileRow {
     typeof row.scope !== "string" || row.scope.length === 0 ||
     typeof row.context_id !== "string" ||
     typeof row.uploader !== "string" || row.uploader.length === 0 ||
+    typeof row.user_id !== "string" || !/^acu-[0-9a-f]{32}$/.test(row.user_id) ||
+    typeof row.thread_id !== "string" || row.thread_id.length === 0 ||
+    row.location_version !== 1 ||
     typeof row.created !== "number" || !Number.isFinite(row.created)
   ) {
     throw new Error("upload returned an invalid attachment receipt — retry or remove the file");
@@ -77,13 +83,12 @@ function decodeChatFileRow(value: unknown): ChatFileRow {
   return row as unknown as ChatFileRow;
 }
 
-/** Immutable native selector for an app-owned retained file. Omit the
- *  entire object for Home; omit context_id to preserve its real absence. */
-export interface ChatFileDestination {
-  install_id: string;
-  conversation: string;
-  context_id?: string;
-}
+/** Immutable native selector for a retained file. Home may carry its
+ *  real conversation id without an app binding; app destinations also
+ *  carry the install and optional context. */
+export type ChatFileDestination =
+  | { install_id: string; conversation: string; context_id?: string }
+  | { conversation: string };
 
 /** Native-served capability state; a hint only, never upload authority. */
 export interface AppFileUploadProjection {
@@ -466,9 +471,11 @@ export const api = {
       const form = new FormData();
       form.append("name", file.name);
       if (destination !== undefined) {
-        form.append("install_id", destination.install_id);
         form.append("conversation", destination.conversation);
-        if (destination.context_id !== undefined) form.append("context_id", destination.context_id);
+        if ("install_id" in destination) {
+          form.append("install_id", destination.install_id);
+          if (destination.context_id !== undefined) form.append("context_id", destination.context_id);
+        }
       }
       form.append("file", file, file.name);
       const xhr = new XMLHttpRequest();

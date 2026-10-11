@@ -62,6 +62,8 @@ fn gx_with(social_context: bool) -> Gx {
     let opts = ServeOptions::default();
     opts.provider_env
         .set("CADENCE_PM_DIR", pm.to_str().unwrap());
+    opts.provider_env
+        .set("CADENCE_HOME", dir.path().to_str().unwrap());
     let shared = Shared::new(dir.path(), &opts).unwrap();
     let cwd = dir.path().to_str().unwrap().to_string();
     for (alias, provider, kind) in [("master", "pi", "managed"), ("w1", "fake", "fake")] {
@@ -440,9 +442,8 @@ fn unknown_install_and_unproven_subject_create_nothing() {
 /// no verified app binding and any client-named scope field are refused,
 /// and no message is queued.
 ///
-/// Guards: `verify_conversation_selector` (conversations_rpc.rs), the
-/// `conversation needs a verified app binding` arm and the field
-/// allowlist in `rpc_thread_send`.
+/// Guards: `verify_conversation_selector` (conversations_rpc.rs), Home
+/// conversation resolution and the field allowlist in `rpc_thread_send`.
 #[test]
 fn thread_send_refuses_forged_and_other_install_conversations() {
     let gx = gx();
@@ -478,7 +479,7 @@ fn thread_send_refuses_forged_and_other_install_conversations() {
         "thread_send",
         json!({"alias": "master", "text": "x", "message": "m-f", "conversation": campaign}),
     ));
-    assert!(err.contains("needs a verified app binding"), "{err}");
+    assert!(err.contains("Unknown Home conversation"), "{err}");
     for field in [
         "scope",
         "subject",
@@ -1855,6 +1856,61 @@ fn cad1123_board_capability_asset_route_is_an_operator_read() {
 
 // ---------- CAD-1168 slice 2: retained chat attachments ----------
 
+/// Establish the fixture's native local-admin upload account through the
+/// production secret-gated link-mint method, using only this fixture's state.
+fn establish_upload_account(gx: &Gx) {
+    crate::operator_auth::ensure_secret(gx.dir.path()).unwrap();
+    let secret = crate::operator_auth::read_secret(gx.dir.path()).unwrap();
+    gx.operator(
+        "operator_link_mint",
+        json!({"secret": secret, "origin": "loopback"}),
+    )
+    .unwrap();
+}
+
+/// Verify a receipt is bound to its server-issued account and conversation,
+/// and that exact bytes live under the nested user tree.
+fn assert_owned_upload(gx: &Gx, row: &Value, name: &str, bytes: &[u8]) {
+    let user_id = row["user_id"].as_str().expect("account owner");
+    let thread_id = row["thread_id"].as_str().expect("native conversation");
+    assert!(
+        gx.shared
+            .store
+            .chat_upload_account_registered(user_id)
+            .unwrap(),
+        "upload owner is not registered: {row}"
+    );
+    assert_ne!(
+        user_id, "operator",
+        "owner must be a server-issued account id"
+    );
+    assert_eq!(row["uploader"], json!(user_id), "{row}");
+    let thread = gx
+        .shared
+        .store
+        .thread_by_id(thread_id)
+        .unwrap()
+        .expect("upload must name a stored native conversation");
+    assert_eq!(thread.alias, "master", "{row}");
+    assert!(!thread.archived, "upload conversation is archived: {row}");
+    assert_eq!(row["location_version"], json!(1), "{row}");
+    let stored = gx
+        .shared
+        .upload_workspace_dir
+        .join("users")
+        .join(user_id)
+        .join("threads")
+        .join(thread_id)
+        .join("uploads")
+        .join(row["id"].as_str().unwrap())
+        .join(name);
+    assert_eq!(
+        std::fs::read(stored).unwrap(),
+        bytes,
+        "nested custody bytes"
+    );
+}
+
 /// Upload a real staged file as the operator; returns the minted row.
 fn chat_upload(gx: &Gx, name: &str, bytes: &[u8]) -> Value {
     let dir = gx.dir.path().join(crate::wiki::UPLOAD_DIR);
@@ -1879,6 +1935,7 @@ fn chat_upload(gx: &Gx, name: &str, bytes: &[u8]) -> Value {
 #[test]
 fn chat_file_upload_is_operator_only_and_field_strict() {
     let gx = gx();
+    establish_upload_account(&gx);
     let staged = |bytes: &[u8]| {
         let dir = gx.dir.path().join(crate::wiki::UPLOAD_DIR);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1918,7 +1975,7 @@ fn chat_file_upload_is_operator_only_and_field_strict() {
     assert!(row["id"].as_str().unwrap().starts_with("chf-"), "{row}");
     assert_eq!(row["mime"], json!("text/plain"));
     assert_eq!(row["scope"], json!("home"));
-    assert_eq!(row["uploader"], json!("operator"));
+    assert_owned_upload(&gx, &row, "notes.txt", b"hello");
     // An agent cannot read it either — a worker caller is refused.
     let id = row["id"].as_str().unwrap();
     let err = err_text(gx.call(
@@ -2021,6 +2078,7 @@ fn board_chat_upload_is_operator_only_and_capped() {
 #[test]
 fn thread_send_attachments_resolve_refuse_and_ride() {
     let gx = gx();
+    establish_upload_account(&gx);
     // A .pdf is refused by the current explicit unsupported-type
     // check before any kind sniff — the interim allowlist is text
     // only, and a magic prefix is not processing.
@@ -2044,6 +2102,7 @@ fn thread_send_attachments_resolve_refuse_and_ride() {
 
     // A real upload, referenced on a send.
     let file = chat_upload(&gx, "brief.csv", b"name,email\nA,a@b.c");
+    assert_owned_upload(&gx, &file, "brief.csv", b"name,email\nA,a@b.c");
     let id = file["id"].as_str().unwrap().to_string();
     let sent = gx
         .operator(
@@ -2144,6 +2203,7 @@ fn thread_send_attachments_resolve_refuse_and_ride() {
 fn cad1168_independent_attachment_scope_refusals() {
     const SECRETLESS: &str = "name,email\nZed Sentinel,zed@example.test\n";
     let gx = gx();
+    establish_upload_account(&gx);
     let staged = |gx: &Gx, bytes: &[u8]| {
         let dir = gx.dir.path().join(crate::wiki::UPLOAD_DIR);
         std::fs::create_dir_all(&dir).unwrap();
@@ -2157,10 +2217,9 @@ fn cad1168_independent_attachment_scope_refusals() {
             params["app"] = json!({"install_id": install, "context_id": context});
             params["conversation"] = json!(conversation);
         }
-        gx.operator("chat_file_upload", params).unwrap()["id"]
-            .as_str()
-            .unwrap()
-            .to_string()
+        let row = gx.operator("chat_file_upload", params).unwrap();
+        assert_owned_upload(gx, &row, name, bytes);
+        row["id"].as_str().unwrap().to_string()
     };
     let send = |gx: &Gx, msg: &str, scope: Option<(&str, &str, &str)>, ids: Value| {
         let mut params = json!({"alias": "master", "text": format!("read {msg}"),
@@ -2634,6 +2693,7 @@ fn cad1168_independent_attachment_scope_refusals() {
 #[test]
 fn master_reads_attachments_on_its_live_turn_by_id_alone() {
     let gx = gx();
+    establish_upload_account(&gx);
     let staged = |bytes: &[u8]| {
         let dir = gx.dir.path().join(crate::wiki::UPLOAD_DIR);
         std::fs::create_dir_all(&dir).unwrap();
@@ -2644,14 +2704,14 @@ fn master_reads_attachments_on_its_live_turn_by_id_alone() {
     let app = json!({"install_id": gx.crm, "context_id": gx.crm_a});
     let conv = gx.conversation(&gx.crm, &gx.crm_a, json!({"general": true}));
     let app_upload = |name: &str, bytes: &[u8]| -> String {
-        gx.operator(
-            "chat_file_upload",
-            json!({"name": name, "tmp": staged(bytes), "app": app, "conversation": conv}),
-        )
-        .unwrap()["id"]
-            .as_str()
-            .unwrap()
-            .to_string()
+        let row = gx
+            .operator(
+                "chat_file_upload",
+                json!({"name": name, "tmp": staged(bytes), "app": app, "conversation": conv}),
+            )
+            .unwrap();
+        assert_owned_upload(&gx, &row, name, bytes);
+        row["id"].as_str().unwrap().to_string()
     };
     let sent = app_upload("sent.csv", b"name\nAnn");
     let unsent = app_upload("unsent.txt", b"never sent");

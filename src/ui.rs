@@ -44,6 +44,8 @@ mod approvals;
 mod apps;
 mod assist_route;
 mod business_templates;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad1337_acceptance;
 mod cli_route;
 mod connections;
 mod crm_send;

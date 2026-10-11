@@ -119,8 +119,8 @@ store/app_tools.rs	guarded-store-and-read-queries	prepare	2
 store/business_templates.rs	guarded-store-and-read-queries	execute	4
 store/business_templates.rs	guarded-store-and-read-queries	guarded_write	3
 store/business_templates.rs	guarded-store-and-read-queries	prepare	1
-store/chat_files.rs	guarded-store-and-read-queries	execute	1
-store/chat_files.rs	guarded-store-and-read-queries	guarded_write	1
+store/chat_files.rs	guarded-store-and-read-queries	execute	3
+store/chat_files.rs	guarded-store-and-read-queries	guarded_write	3
 store/chat_files.rs	guarded-store-and-read-queries	open	1
 store/chat_files.rs	guarded-store-and-read-queries	prepare	1
 store/conversations.rs	inline-test-store-fixtures	open	1
@@ -220,6 +220,7 @@ store/writer_census.rs	lexical-census-test-fixture-strings	execute	1
 store/writer_census.rs	lexical-census-test-fixture-strings	open	2
 ui/app_social_drafts.rs	read-only-store-app-view	open	1
 ui/apps.rs	read-only-store-app-view	prepare	1
+ui/cad1337_acceptance.rs	independent-http-acceptance-fixtures	open	3
 wiki/index.rs	separate-wiki-index-db	execute	5
 wiki/index.rs	separate-wiki-index-db	open	2
 wiki/index.rs	separate-wiki-index-db	prepare	2
@@ -236,6 +237,11 @@ daemon/cad1327_acceptance.rs	independent-daemon-acceptance-fixtures	execute	1
 daemon/cad1327_acceptance.rs	independent-daemon-acceptance-fixtures	open	1
 daemon/cad1415_app_actions_acceptance.rs	independent-daemon-acceptance-fixtures	execute	2
 daemon/cad1415_app_actions_acceptance.rs	independent-daemon-acceptance-fixtures	open	1
+daemon/cad1337_acceptance.rs	independent-daemon-acceptance-fixtures	execute	1
+daemon/cad1337_acceptance.rs	independent-daemon-acceptance-fixtures	open	2
+daemon/cad1337_acceptance.rs	independent-daemon-acceptance-fixtures	prepare	1
+daemon/cad1337_migration_acceptance.rs	independent-daemon-acceptance-fixtures	execute	1
+daemon/cad1337_migration_acceptance.rs	independent-daemon-acceptance-fixtures	open	4
 daemon/conversations_acceptance.rs	independent-daemon-acceptance-fixtures	execute	5
 daemon/conversations_acceptance.rs	independent-daemon-acceptance-fixtures	open	4
 daemon/campaign_clone_acceptance.rs	independent-daemon-acceptance-fixtures	open	1

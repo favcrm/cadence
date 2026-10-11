@@ -364,6 +364,7 @@ pub(super) fn post_message(
     request: &mut Request,
     state_dir: &std::path::Path,
     alias: &str,
+    session_proof: Option<Value>,
     relay: super::operator::PublicRelay,
 ) -> HttpResp {
     if !valid_alias(alias) {
@@ -378,10 +379,13 @@ pub(super) fn post_message(
         Err(resp) => return resp,
     };
     let mut params = json!({"alias": alias, "text": req.text});
-    // CAD-1374: the server-held public session bearer, never read from
-    // the request body. The daemon re-checks it before any enqueue.
-    if let super::operator::PublicRelay::Proven(proof) = relay {
-        params["public_session"] = Value::String(proof.token().to_string());
+    // The upload-account proof and public owner proof are server-held;
+    // neither identity proof is accepted from the request body.
+    if let Some(proof) = session_proof {
+        params["session"] = proof;
+    }
+    if let Err(resp) = super::operator::relay_owner_proof(&mut params, relay) {
+        return resp;
     }
     if let Some(message) = req.message {
         params["message"] = Value::String(message);
@@ -451,7 +455,14 @@ const UPLOAD_SELECTOR_FIELDS: &[&str] = &[
 /// refused, never truncated or deleted, and only a path this request
 /// created is cleaned up. The response carries the daemon's stored
 /// row — no filesystem path, cookie or raw URL.
-pub(super) fn post_upload(request: &mut Request, state_dir: &Path) -> HttpResp {
+pub(super) fn post_upload(
+    request: &mut Request,
+    state_dir: &Path,
+    session_proof: Option<Value>,
+) -> HttpResp {
+    let Some(session_proof) = session_proof else {
+        return err_response(401, "chat upload needs a live authenticated session");
+    };
     let Some(_ingress) = ChatUploadIngressPermit::try_acquire() else {
         return err_response(429, "chat upload ingress is busy; retry shortly");
     };
@@ -515,13 +526,10 @@ pub(super) fn post_upload(request: &mut Request, state_dir: &Path) -> HttpResp {
         return err_response(400, "chat upload context_id needs an install_id");
     }
     match (install, conversation) {
-        (None, None) => {}
+        (None, _) => {}
         (Some(_), Some(_)) => {}
         (Some(_), None) => {
             return err_response(400, "chat upload install_id needs its conversation");
-        }
-        (None, Some(_)) => {
-            return err_response(400, "chat upload conversation needs an install_id");
         }
     }
     // The name is the part's declared filename, or a `name` field — a
@@ -564,14 +572,16 @@ pub(super) fn post_upload(request: &mut Request, state_dir: &Path) -> HttpResp {
     // success, refusal or an unreachable daemon. Only the tmp this
     // request created is touched. The selector travels as the daemon's
     // own `app`/`conversation` shape; the daemon re-proves all of it.
-    let mut params = json!({"name": name, "tmp": tmp});
-    if let (Some(install), Some(conversation)) = (install, conversation) {
-        let mut app = json!({"install_id": install});
-        if let Some(context) = context {
-            app["context_id"] = json!(context);
-        }
-        params["app"] = app;
+    let mut params = json!({"name": name, "tmp": tmp, "session": session_proof});
+    if let Some(conversation) = conversation {
         params["conversation"] = json!(conversation);
+    }
+    if let (Some(install), Some(context)) = (install, context) {
+        let mut app = json!({"install_id": install});
+        app["context_id"] = json!(context);
+        params["app"] = app;
+    } else if let Some(install) = install {
+        params["app"] = json!({"install_id": install});
     }
     let outcome = client::rpc(state_dir, "chat_file_upload", params);
     let _ = std::fs::remove_file(&tmp);

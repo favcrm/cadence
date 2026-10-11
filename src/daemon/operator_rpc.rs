@@ -40,6 +40,12 @@ use super::{
 use crate::error::{Error, Result};
 use crate::operator_auth::{self as auth, Origin};
 
+fn authenticated_principal_hash(issuer: &str, workspace: &str, subject: &str) -> String {
+    auth::digest(&format!(
+        "cadence:authenticated-principal:v1\0{issuer}\0{workspace}\0{subject}"
+    ))
+}
+
 fn origin_param(params: &Value) -> Result<Origin> {
     let raw = required_str(params, "origin")?;
     // `public` (CAD-526) is deliberately excluded: a public session is
@@ -236,7 +242,13 @@ impl Shared {
         self.operator_with_secret("ui login", params, peer_pid)?;
         let origin = origin_param(params)?;
         let now = self.operator_now();
-        let nonce = self.operator_auth().mint(origin, now)?;
+        // This shared local account denotes the authority established by
+        // the native secret-gated login, not a guessed human or process ID.
+        let principal = auth::digest("cadence:local-administrative-authority:v1");
+        let account_id = self.store.chat_upload_account(&principal, "local-admin")?;
+        let nonce = self
+            .operator_auth()
+            .mint_for_account(origin, now, account_id)?;
         let _ = self.store.event_public(
             DAEMON_ALIAS,
             "operator_link_minted",
@@ -415,10 +427,16 @@ impl Shared {
             email: String::new(),
             name: String::new(),
             role: "operator".to_string(),
-            handle: verified.subject_id,
+            handle: verified.subject_id.clone(),
         };
         let now = self.operator_now();
-        let opened = auth.open_device(user, origin, user_agent, now)?;
+        let principal = authenticated_principal_hash(
+            &authority_now.issuer,
+            &verified.org,
+            &verified.subject_id,
+        );
+        let account_id = self.store.chat_upload_account(&principal, "device")?;
+        let opened = auth.open_device_account(user, origin, user_agent, now, Some(account_id))?;
         let _ = self.store.event_public(
             DAEMON_ALIAS,
             "operator_device_session_opened",
@@ -626,6 +644,8 @@ impl Shared {
             company: config.company.clone(),
             host: config.host.clone(),
         };
+        let principal =
+            authenticated_principal_hash(&config.issuer, &config.company, &identity.user().sub);
         // CAD-1374: a native daemon's board realm must match its captured
         // realm before any session opens; a standalone one saves the realm
         // it verified under. Captured mode is never re-read here.
@@ -674,7 +694,24 @@ impl Shared {
                     Some(company.as_str()),
                 ))
             }
-            Some(opened) => {
+            Some(mut opened) => {
+                let account_id = match self.store.chat_upload_account(&principal, "authenticated") {
+                    Ok(id) => id,
+                    Err(error) => {
+                        let _ = self.operator_auth().revoke_token(&opened.token);
+                        return Err(error);
+                    }
+                };
+                opened.session = match self
+                    .operator_auth()
+                    .bind_account(&opened.token, &account_id)
+                {
+                    Ok(session) => session,
+                    Err(error) => {
+                        let _ = self.operator_auth().revoke_token(&opened.token);
+                        return Err(error);
+                    }
+                };
                 let _ = self.store.event_public(
                     DAEMON_ALIAS,
                     "board_session_opened",

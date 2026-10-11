@@ -138,6 +138,7 @@ export function ThreadItemView({
     text: string,
     refs?: ThreadRef[],
     attachments?: { id: string }[],
+    conversation?: string,
   ) => void;
   onDiscard: (message: string) => void;
 }) {
@@ -183,6 +184,7 @@ export function ThreadItemView({
                     item.pending.text,
                     item.pending.refs,
                     item.pending.attachments,
+                    item.pending.conversation,
                   )
                 }
               >

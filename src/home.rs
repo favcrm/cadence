@@ -175,6 +175,113 @@ pub fn vault_for(tracker: &Path) -> Result<PathBuf> {
     }
 }
 
+/// Operational upload workspace: `<resolved-home>/workspace`. This is
+/// independent of tracker/state overrides and does not activate any part
+/// of the broader home-layout migration.
+pub fn workspace_dir() -> Result<PathBuf> {
+    Ok(layout()?.root.join("workspace"))
+}
+
+/// Bind operational custody to the tracker served by this daemon and refuse
+/// any lexical overlap with tracker or vault authority roots.
+pub fn workspace_for(tracker: &Path) -> Result<PathBuf> {
+    workspace_for_instance(
+        tracker,
+        std::env::var("CADENCE_HOME").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    )
+}
+
+/// Resolve an instance's workspace from its captured daemon environment,
+/// never from a request or a later process-global layout switch.
+pub fn workspace_for_instance(
+    tracker: &Path,
+    cadence_home: Option<&str>,
+    home: Option<&str>,
+) -> Result<PathBuf> {
+    let (home_root, vault) = match cadence_home {
+        Some(raw) => {
+            let root = PathBuf::from(raw);
+            if !root.is_absolute() {
+                return Err(Error::rejected("CADENCE_HOME must be an absolute path"));
+            }
+            let root = checked_root(&guard_home(root)?)?;
+            (root.clone(), root.join("vault"))
+        }
+        None => {
+            let user_home = match home {
+                Some(raw) => {
+                    let path = PathBuf::from(raw);
+                    if !path.is_absolute() {
+                        return Err(Error::rejected("HOME must be an absolute path"));
+                    }
+                    path
+                }
+                None => user_home()?,
+            };
+            let root = checked_root(&user_home.join(".cadence"))?;
+            let tracker = checked_root(tracker)?;
+            (root, tracker.join("wiki"))
+        }
+    };
+    let workspace = checked_root(&home_root.join("workspace"))?;
+    let tracker = checked_root(tracker)?;
+    let vault = checked_root(&vault)?;
+    for protected in [&tracker, &vault] {
+        if workspace.starts_with(protected) || protected.starts_with(&workspace) {
+            return Err(Error::rejected(
+                "operational upload workspace overlaps tracker or knowledge vault",
+            ));
+        }
+    }
+    Ok(workspace)
+}
+
+/// Resolve an authoritative storage root without adopting `..`, relative
+/// paths, or symlink aliases. Missing suffixes are retained lexically so a
+/// root can be validated before first use.
+fn checked_root(path: &Path) -> Result<PathBuf> {
+    use std::path::Component;
+    if !path.is_absolute() {
+        return Err(Error::rejected("storage root must be absolute"));
+    }
+    let mut checked = PathBuf::from("/");
+    let mut missing = false;
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(part) if !missing => {
+                checked.push(part);
+                match std::fs::symlink_metadata(&checked) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        return Err(Error::rejected(format!(
+                            "storage root {} contains a symlink",
+                            path.display()
+                        )));
+                    }
+                    Ok(metadata) if !metadata.is_dir() => {
+                        return Err(Error::rejected(format!(
+                            "storage root {} contains a non-directory component",
+                            path.display()
+                        )));
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => missing = true,
+                    Err(error) => {
+                        return Err(Error::rejected(format!(
+                            "cannot validate storage root {}: {error}",
+                            path.display()
+                        )));
+                    }
+                }
+            }
+            Component::Normal(part) => checked.push(part),
+            _ => return Err(Error::rejected("storage root is not normalized")),
+        }
+    }
+    Ok(checked)
+}
+
 /// Managed repo checkouts: `<home>/repos` — under the legacy layout
 /// the would-be `~/.cadence/repos` (nothing reads it until the
 /// migration creates the layout).

@@ -21,7 +21,7 @@ export const ATTACH_MAX_FILES = 5;
 export const ATTACH_UNAVAILABLE_EXTS = ["pdf", "png", "jpg", "jpeg", "webp"];
 
 export interface AttachDestination {
-  /** Absent for Home; app uploads must always carry their install and conversation. */
+  /** Absent for Home; app uploads must carry their install and conversation. */
   app?: { install_id: string; context_id?: string };
   conversation?: string;
   /** Unsaved-subject preparation captured at selection time. */

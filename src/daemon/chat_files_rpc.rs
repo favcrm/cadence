@@ -151,6 +151,7 @@ impl Shared {
         conversation: &str,
         id: &str,
         cap: u64,
+        owner: Option<&str>,
     ) -> Result<(store::ChatFile, Vec<u8>)> {
         if !store::chat_file_id(id) {
             return Err(Error::rejected(
@@ -165,9 +166,18 @@ impl Shared {
                 .chat_file(id)?
                 .ok_or_else(|| Error::rejected(format!("unknown attachment '{id}'")))?;
             file.scope_matches(install, context, conversation)?;
-            let bytes =
-                self.store
-                    .chat_file_ready_checked_in_workspace(&self.pm_dir()?, &file, cap)?;
+            if file.location_version == Some(1) {
+                file.operational_scope_matches(
+                    owner.unwrap_or_else(|| file.user_id.as_deref().unwrap_or_default()),
+                    conversation,
+                )?;
+            }
+            let bytes = self.store.chat_file_ready_checked_in_roots(
+                &self.pm_dir()?,
+                &self.upload_workspace_dir,
+                &file,
+                cap,
+            )?;
             Ok((file, bytes))
         })
     }
@@ -181,6 +191,8 @@ impl Shared {
     /// the reference path needs readiness, never the bytes.
     pub(super) fn scoped_chat_files_checked(
         &self,
+        user_id: Option<&str>,
+        session_provided: bool,
         install: &str,
         context: &str,
         conversation: &str,
@@ -197,8 +209,28 @@ impl Shared {
                     .chat_file(id)?
                     .ok_or_else(|| Error::rejected(format!("unknown attachment '{id}'")))?;
                 file.scope_matches(install, context, conversation)?;
-                self.store.chat_file_ready_checked_in_workspace(
+                if file.location_version == Some(1) {
+                    let owner = match user_id {
+                        Some(user_id) => user_id,
+                        None if !session_provided => file.user_id.as_deref().ok_or_else(|| {
+                            Error::rejected("new attachment has no authenticated owner")
+                        })?,
+                        None => {
+                            return Err(Error::rejected(
+                                "sign in again to access new-format attachments",
+                            ));
+                        }
+                    };
+                    file.operational_scope_matches(owner, conversation)?;
+                    if user_id.is_some() && file.user_id.as_deref() != user_id {
+                        return Err(Error::rejected(
+                            "attachment is not owned by this authenticated account",
+                        ));
+                    }
+                }
+                self.store.chat_file_ready_checked_in_roots(
                     &self.pm_dir()?,
+                    &self.upload_workspace_dir,
                     &file,
                     store::CHAT_FILE_MAX_BYTES,
                 )?;
@@ -217,18 +249,108 @@ impl Shared {
         })
     }
 
+    pub(super) fn chat_upload_session_account(&self, proof: &Value) -> Result<Option<String>> {
+        let proof_obj = proof
+            .as_object()
+            .ok_or_else(|| Error::rejected("chat upload session proof must be an object"))?;
+        if proof_obj
+            .keys()
+            .any(|key| !matches!(key.as_str(), "token" | "key" | "origin"))
+        {
+            return Err(Error::rejected(
+                "chat upload session proof has unknown fields",
+            ));
+        }
+        let token = required_str(proof, "token")?;
+        let key = required_str(proof, "key")?;
+        let origin = crate::operator_auth::Origin::parse(required_str(proof, "origin")?)
+            .ok_or_else(|| Error::rejected("chat upload session origin is invalid"))?;
+        let session = self
+            .operator_auth()
+            .verified_session(token, key, origin, self.operator_now())?
+            .ok_or_else(|| Error::rejected("chat upload session is no longer valid"))?;
+        if session
+            .user
+            .as_ref()
+            .is_some_and(|user| !user.is_operator())
+            || (origin == crate::operator_auth::Origin::Public
+                && !session.user.as_ref().is_some_and(|user| user.is_operator()))
+        {
+            return Err(Error::rejected(
+                "chat upload needs an authenticated operator",
+            ));
+        }
+        if let Some(account_id) = session.account_id {
+            if !self.store.chat_upload_account_registered(&account_id)? {
+                return Err(Error::rejected(
+                    "chat upload session account is not registered; sign in again",
+                ));
+            }
+            Ok(Some(account_id))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub(super) fn chat_upload_account(&self, proof: Option<&Value>) -> Result<String> {
+        match proof {
+            Some(proof) => self.chat_upload_session_account(proof)?.ok_or_else(|| {
+                Error::rejected("chat upload session predates account binding; sign in again")
+            }),
+            None => {
+                let principal =
+                    crate::operator_auth::digest("cadence:local-administrative-authority:v1");
+                Ok(self
+                    .store
+                    .existing_chat_upload_account(&principal)?
+                    .ok_or_else(|| {
+                        Error::rejected(
+                            "chat upload account is not established; run `cadence ui login` first",
+                        )
+                    })?)
+            }
+        }
+    }
+
+    /// Prove a Home conversation selector against the live Master thread.
+    /// Omission resolves to the real Home General thread; explicit IDs
+    /// must already name an unarchived Home conversation.
+    pub(super) fn prove_home_conversation(&self, selected: Option<&str>) -> Result<String> {
+        let alias = self.resolve_alias(crate::master::ALIAS)?;
+        if !crate::master::is_master(&alias) || self.store.agent_opt(&alias)?.is_none() {
+            return Err(Error::rejected(
+                "Home uploads require a registered Master conversation",
+            ));
+        }
+        let thread = match selected {
+            Some(id) => {
+                proto::identifier(id, "conversation ID")?;
+                self.store
+                    .thread_by_id(id)?
+                    .filter(|thread| {
+                        thread.alias == alias && thread.install_id.is_none() && !thread.archived
+                    })
+                    .ok_or_else(|| Error::rejected("Unknown Home conversation"))?
+            }
+            None => self.store.ensure_thread(&alias)?,
+        };
+        if thread.alias != alias || thread.install_id.is_some() || thread.archived {
+            return Err(Error::rejected(
+                "Home upload requires an unarchived Home conversation",
+            ));
+        }
+        Ok(thread.id)
+    }
+
     /// `chat_file_upload {name, tmp, app?, conversation?}` —
     /// operator-proved; the daemon mints the id and derives the stored
     /// metadata from the real bytes, never from the request (name is a
-    /// display hint the store sanitizes). Without an app the scope is
-    /// the legacy Home label. With an app the binding is the daemon's
-    /// (`thread_app` + `known_install` + `verify_conversation_selector`)
-    /// and the current exact-approved `file.upload` declaration must
-    /// hold before a byte is retained; the scope and context come from
-    /// that proof, never from a caller field.
+    /// display hint the store sanitizes). Every new upload is bound to
+    /// its authenticated account and exact verified native conversation.
     pub(super) fn rpc_chat_file_upload(&self, params: &Value, peer_pid: u32) -> Result<Value> {
-        Self::reject_chat_file_fields(params, &["name", "tmp", "app", "conversation"])?;
+        Self::reject_chat_file_fields(params, &["name", "tmp", "app", "conversation", "session"])?;
         self.operator_chat("chat file upload", peer_pid)?;
+        let account_id = self.chat_upload_account(params.get("session"))?;
         let name = required_str(params, "name")?;
         let tmp = PathBuf::from(required_str(params, "tmp")?);
         let app = match params.get("app") {
@@ -253,24 +375,23 @@ impl Shared {
             }
             Some(_) => return Err(Error::rejected("conversation must be a string id")),
         };
-        let workspace_dir = self.pm_dir()?;
+        let pm_dir = self.pm_dir()?;
+        let roots = store::ChatFileOperationalRoots {
+            state_dir: &self.state_dir,
+            legacy_workspace_dir: &pm_dir,
+            workspace_dir: &self.upload_workspace_dir,
+        };
         let file = match (app.as_ref(), conversation) {
-            (None, None) => self.store.chat_file_put_in_workspace(
-                store::ChatFileStorageRoots {
-                    state_dir: &self.state_dir,
-                    workspace_dir: &workspace_dir,
-                },
-                &tmp,
-                name,
-                store::CHAT_FILE_SCOPE_HOME,
-                "",
-                "operator",
-            )?,
-            (None, Some(_)) => {
-                return Err(Error::rejected(
-                    "conversation needs a verified app binding — a home upload is scoped \
-                     to the operator's own chat",
-                ));
+            (None, selected) => {
+                let thread_id = self.prove_home_conversation(selected)?;
+                self.store.chat_file_put_for_user(
+                    roots,
+                    &tmp,
+                    name,
+                    store::CHAT_FILE_SCOPE_HOME,
+                    "",
+                    (&account_id, &thread_id),
+                )?
             }
             (Some(_), None) => {
                 return Err(Error::rejected(
@@ -299,16 +420,13 @@ impl Shared {
                 // refuses the upload whole.
                 self.with_file_upload_capability(install, true, |_digest| {
                     self.prove_scoped_conversation(app, conversation)?;
-                    self.store.chat_file_put_in_workspace(
-                        store::ChatFileStorageRoots {
-                            state_dir: &self.state_dir,
-                            workspace_dir: &workspace_dir,
-                        },
+                    self.store.chat_file_put_for_user(
+                        roots,
                         &tmp,
                         name,
                         &scope,
                         &context,
-                        "operator",
+                        (&account_id, conversation),
                     )
                 })?
             }
@@ -325,7 +443,7 @@ impl Shared {
     /// caller is refused. The stored provenance is re-proved before any
     /// byte is served.
     pub(super) fn rpc_chat_file_read(&self, params: &Value, peer_pid: u32) -> Result<Value> {
-        Self::reject_chat_file_fields(params, &["id", "message", "token"])?;
+        Self::reject_chat_file_fields(params, &["id", "message", "token", "session"])?;
         let id = required_str(params, "id")?;
         if !store::chat_file_id(id) {
             return Err(Error::rejected(
@@ -335,6 +453,11 @@ impl Shared {
         let out = match self.caller_identity(peer_pid) {
             Ok(Caller::NoAgentIdentity) => {
                 self.proven_operator("chat file read", peer_pid)?;
+                let session_account = params
+                    .get("session")
+                    .map(|proof| self.chat_upload_session_account(proof))
+                    .transpose()?
+                    .flatten();
                 // The operator re-proves the stored provenance too: a
                 // well-formed app row needs its live master
                 // conversation, its current active stored context and
@@ -346,11 +469,39 @@ impl Shared {
                     .store
                     .chat_file(id)?
                     .ok_or_else(|| Error::rejected(format!("unknown attachment '{id}'")))?;
+                if file.location_version == Some(1)
+                    && params.get("session").is_some()
+                    && session_account.is_none()
+                {
+                    return Err(Error::rejected(
+                        "chat upload session predates account binding; sign in again",
+                    ));
+                }
                 match store::ChatFile::parse_scope(&file.scope)? {
                     None => {
                         file.home_scope()?;
-                        self.store
-                            .chat_file_read_row_in_workspace(&self.pm_dir()?, &file)?
+                        if file.location_version == Some(1) {
+                            let thread_id = file.thread_id.as_deref().unwrap_or_default();
+                            self.prove_home_conversation(Some(thread_id))?;
+                            file.operational_scope_matches(
+                                session_account
+                                    .as_deref()
+                                    .unwrap_or_else(|| file.user_id.as_deref().unwrap_or_default()),
+                                thread_id,
+                            )?;
+                            if session_account.is_some()
+                                && file.user_id.as_deref() != session_account.as_deref()
+                            {
+                                return Err(Error::rejected(
+                                    "attachment is not owned by this authenticated account",
+                                ));
+                            }
+                        }
+                        self.store.chat_file_read_row_in_roots(
+                            &self.pm_dir()?,
+                            &self.upload_workspace_dir,
+                            &file,
+                        )?
                     }
                     Some((install, conversation)) => {
                         let (file, bytes) = self.scoped_chat_file(
@@ -359,12 +510,18 @@ impl Shared {
                             conversation,
                             id,
                             store::CHAT_FILE_MAX_BYTES,
+                            session_account.as_deref(),
                         )?;
                         file.read_projection(bytes)?
                     }
                 }
             }
             Ok(Caller::Agent(v)) => {
+                if params.get("session").is_some() {
+                    return Err(Error::rejected(
+                        "agent chat file reads do not accept operator sessions",
+                    ));
+                }
                 let alias = v.agent.alias.clone();
                 if !crate::master::is_master(&alias) {
                     return Err(Error::rejected(format!(
@@ -465,9 +622,19 @@ impl Shared {
                         )
                     })?;
                 if thread.is_home() {
+                    self.prove_home_conversation(Some(&thread.id))?;
                     file.home_scope()?;
-                    self.store
-                        .chat_file_read_row_in_workspace(&self.pm_dir()?, &file)?
+                    if file.location_version == Some(1) {
+                        file.operational_scope_matches(
+                            file.user_id.as_deref().unwrap_or_default(),
+                            &thread.id,
+                        )?;
+                    }
+                    self.store.chat_file_read_row_in_roots(
+                        &self.pm_dir()?,
+                        &self.upload_workspace_dir,
+                        &file,
+                    )?
                 } else {
                     let install = thread.install_id.as_deref().unwrap_or_default();
                     let stamp = self.store.message_app_stamp(message)?.ok_or_else(|| {
@@ -524,6 +691,7 @@ impl Shared {
                         &thread.id,
                         id,
                         store::CHAT_FILE_MAX_BYTES,
+                        None,
                     )?;
                     file.read_projection(bytes)?
                 }

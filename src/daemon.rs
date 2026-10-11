@@ -77,6 +77,10 @@ mod cad1365_run_creator_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1415_app_actions_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
+mod cad1337_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad1337_migration_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
 mod cad1440_media_only_context_acceptance;
 mod caller_rule;
 #[cfg(all(test, feature = "test-seam"))]
@@ -437,6 +441,9 @@ pub struct Shared {
     shutdown_facts: Mutex<Option<ShutdownFacts>>,
     provider_log_dir: PathBuf,
     pub(crate) state_dir: PathBuf,
+    /// Captured at boot from this daemon's provider environment; upload
+    /// custody never consults a request-selected or later process root.
+    pub(crate) upload_workspace_dir: PathBuf,
     /// Captured at boot from the private per-state record. Absent means
     /// the original same-UID socket and caller rule, unchanged.
     agent_uid: Option<u32>,
@@ -812,6 +819,11 @@ impl Shared {
         // the same lease/fence the write path holds; resolved before the
         // `Arc` so `lease` can move into the struct.
         let wiki_pm_dir = pm_dir_of(&opts.provider_env)?;
+        let upload_workspace_dir = crate::home::workspace_for_instance(
+            &wiki_pm_dir,
+            opts.provider_env.var("CADENCE_HOME").as_deref(),
+            opts.provider_env.var("HOME").as_deref(),
+        )?;
         let wiki_pm_lease = lease.as_ref().map(|l| l.pm_lease());
         // CAD-1416: the document door is selected by the image-owned tuple
         // alone, never by the lifecycle lease. Trusted in-memory metadata wins
@@ -856,6 +868,7 @@ impl Shared {
             shutdown_facts: Mutex::new(None),
             provider_log_dir,
             state_dir: state_dir.to_path_buf(),
+            upload_workspace_dir,
             agent_uid: opts.agent_uid,
             open_attach: Mutex::new(HashMap::new()),
             adoptions_pending: Mutex::new(adoptions_pending),
@@ -3339,7 +3352,14 @@ fn optional_strs(params: &Value, field: &str) -> Result<Vec<String>> {
 /// aggregate is bounded explicitly at 50 MiB (five 10 MiB maxima) with
 /// checked arithmetic — an over-cap set refuses whole, never silently
 /// drops a file.
-fn thread_attachments(shared: &Shared, value: &Value, app: Option<&Value>) -> Result<Value> {
+fn thread_attachments(
+    shared: &Shared,
+    value: &Value,
+    app: Option<&Value>,
+    account_id: Option<&str>,
+    session_provided: bool,
+    home_thread_id: &str,
+) -> Result<Value> {
     let arr = value
         .as_array()
         .ok_or_else(|| Error::rejected("attachments must be an array of {\"id\":…} objects"))?;
@@ -3384,8 +3404,28 @@ fn thread_attachments(shared: &Shared, value: &Value, app: Option<&Value>) -> Re
                     .chat_file(id)?
                     .ok_or_else(|| Error::rejected(format!("unknown attachment '{id}'")))?;
                 file.home_scope()?;
-                shared.store.chat_file_ready_checked_in_workspace(
+                if file.location_version == Some(1) {
+                    let owner = match account_id {
+                        Some(account_id) => account_id,
+                        None if !session_provided => file.user_id.as_deref().ok_or_else(|| {
+                            Error::rejected("new attachment has no authenticated owner")
+                        })?,
+                        None => {
+                            return Err(Error::rejected(
+                                "sign in again to access new-format attachments",
+                            ))
+                        }
+                    };
+                    file.operational_scope_matches(owner, home_thread_id)?;
+                    if account_id.is_some() && file.user_id.as_deref() != account_id {
+                        return Err(Error::rejected(
+                            "attachment is not owned by this authenticated account",
+                        ));
+                    }
+                }
+                shared.store.chat_file_ready_checked_in_roots(
                     &shared.pm_dir()?,
+                    &shared.upload_workspace_dir,
                     &file,
                     store::CHAT_FILE_MAX_BYTES,
                 )?;
@@ -3410,7 +3450,14 @@ fn thread_attachments(shared: &Shared, value: &Value, app: Option<&Value>) -> Re
             // declaration, native conversation/context proof, exact
             // stored provenance and checked bytes for every row, with
             // the 50 MiB aggregate bounded inside the same snapshot.
-            shared.scoped_chat_files_checked(install, context, conversation, &ids)?
+            shared.scoped_chat_files_checked(
+                account_id,
+                session_provided,
+                install,
+                context,
+                conversation,
+                &ids,
+            )?
         }
     };
     Ok(Value::Array(

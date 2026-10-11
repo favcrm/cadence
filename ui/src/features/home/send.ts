@@ -16,13 +16,14 @@ export function sendToMaster(
   message = newMessageId(),
   refs?: ThreadRef[],
   attachments?: { id: string }[],
+  conversation?: string,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   const body = text.trim();
   if (!body) return Promise.resolve({ ok: false, error: "Nothing to send." });
   const store = resources.masterThread;
-  store.write((s) => addPending(s, message, body, Date.now(), refs, attachments));
+  store.write((s) => addPending(s, message, body, Date.now(), refs, attachments, undefined, conversation));
   return api
-    .threadSend(MASTER, body, message, refs, undefined, undefined, attachments)
+    .threadSend(MASTER, body, message, refs, undefined, conversation, attachments)
     .then(() => {
       store.write((s) => settlePending(s, message, { ok: true }));
       // The send queued a turn — refresh the header's state soon.
