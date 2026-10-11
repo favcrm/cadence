@@ -410,6 +410,8 @@ export default function AppShell({
         setGeneralSetup({ key: setupScopeKey, error: "CRM setup did not return an active context. Retry setup or ask an administrator to review this installation." });
         return;
       }
+      if (query.get("ctx") === null) rememberContext(installId, row.id);
+      handledQuery.current = undefined;
       setContexts((previous) => previous.some((context) => context.id === row.id) ? previous : [...previous, row]);
       setGeneralSetup(null);
     }).catch((error: unknown) => {
