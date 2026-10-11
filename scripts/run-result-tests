@@ -1,34 +1,44 @@
 #!/bin/bash
-# CAD-1090/CAD-1105/CAD-1214: run every cargo test target
-# (scripts/result-test-args), the lib unit tests and the unit tests inside
-# binary targets (`--bins`: src/bin/*/ and the cadence binary) the same way
-# in CI and in `scripts/pre-push --tests`.
+# CAD-1334: run every integration test target from scripts/result-test-args,
+# the lib suite and binary unit tests in one pinned nextest invocation. Keep
+# the exact target scope from CI and `scripts/pre-push --tests`.
 #  - --features test-seam: some targets are cfg(feature = "test-seam") and
 #    would otherwise run 0 tests and pass.
-#  - fails when any selected target reports `running 0 tests`.
-#  - --no-fail-fast: every target reports, not just the first red one; the
-#    lib suite runs even when an integration target failed.
+#  - the post-run JUnit guard rejects any selected integration target without
+#    a runnable test, an empty lib suite, or a bins selection with no tests.
+#  - the pinned cadence nextest profile disables fail-fast and retries; -j 2
+#    parallelizes across targets with bounded concurrency.
 #  - HOME/XDG/TMPDIR are private; toolchain homes pass through.
 #  - CAD-1197: every CADENCE_* variable is dropped before cargo runs, except
-#    an allowlist (CADENCE_SUITE_LOCK, which CI sets and this script
-#    defaults). A pane's CADENCE_PM_DIR/CADENCE_STATE_DIR once made the lib
-#    suite hold the production tracker's write lock. The script then refuses
-#    if any other CADENCE_* is still set or if a path the tests would use
-#    sits at or under the invoking user's real ~/pm or cadence state dir.
-#  - CARGO_TARGET_DIR is handed to cargo as CARGO_BUILD_TARGET_DIR, so the
-#    build lands in the same place but code under test that reads
-#    CARGO_TARGET_DIR (src/worktree.rs) sees a clean environment.
-#  - CAD-1214: `--bins` runs #[cfg(test)] modules inside binary targets, which
-#    neither --test nor --lib reach. Most binaries have no unit tests and
-#    print `running 0 tests`, so that step fails only when NO binary ran a
-#    test (or none reported).
-#  - the lib and bins suites run with PATH limited to the cargo toolchain dir and the
-#    system dirs, and refuses to start if a provider CLI still resolves:
-#    `doctor::run` probes every registry provider with `--version`, and a
+#    CADENCE_SUITE_LOCK. A pane's CADENCE_PM_DIR/CADENCE_STATE_DIR once made
+#    tests hold the production tracker's write lock. Refuse any path under
+#    the invoking user's real ~/pm or cadence state dir.
+#  - CARGO_TARGET_DIR is handed to cargo as CARGO_BUILD_TARGET_DIR, so code
+#    under test that reads CARGO_TARGET_DIR (src/worktree.rs) sees a clean
+#    environment while Cargo still uses the requested build directory.
+#  - test processes run with PATH limited to the cargo toolchain dir and the
+#    system dirs. `doctor::run` probes provider CLIs with --version, and a
 #    host CLI writes under HOME and makes the result depend on the host.
 set -euo pipefail
 caller_cwd=$PWD
 real_home=${HOME:-}
+original_xdg_data=${XDG_DATA_HOME:-$real_home/.local/share}
+manifest_path=
+if [ "$#" -gt 0 ]; then
+  if [ "$#" -ne 2 ] || [ "$1" != "--manifest-path" ]; then
+    echo "usage: $0 [--manifest-path CARGO_TOML]" >&2
+    exit 2
+  fi
+  manifest_path=$2
+  case $manifest_path in
+    /*) ;;
+    *) manifest_path=$caller_cwd/$manifest_path ;;
+  esac
+  if [ ! -f "$manifest_path" ]; then
+    echo "::error::manifest does not exist: $manifest_path" >&2
+    exit 2
+  fi
+fi
 # CAD-1197: allowlist of CADENCE_* variables that may reach cargo.
 cadence_env_allow=" CADENCE_SUITE_LOCK "
 for v in $(compgen -e | grep '^CADENCE_' || true); do
@@ -84,37 +94,98 @@ export HOME="$scratch/home" XDG_CONFIG_HOME="$scratch/xdg-config" \
 mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME" "$TMPDIR"
 export CADENCE_SUITE_LOCK="${CADENCE_SUITE_LOCK:-$scratch/cadence-suite.lock}"
 refuse_prod_path "scratch HOME" "$HOME"
+# Reuse only the repository-pinned tool in the original XDG data home;
+# otherwise install the trusted artifact into this run's isolated XDG data
+# directory. The nextest wrapper verifies its version and checksum either way.
+if [ -x "$original_xdg_data/cadence/tools/cadence-nextest-0.9.145/cargo-nextest" ]; then
+  export CADENCE_NEXTTEST_BIN="$original_xdg_data/cadence/tools/cadence-nextest-0.9.145/cargo-nextest"
+else
+  "$root/scripts/install-cadence-nextest"
+fi
 status=0
 
-# Fails when a target ran 0 tests (cfg-gated off?) or none reported at all.
-zero_guard() {
-  if grep -q '^running 0 tests' "$1" || ! grep -q '^running [1-9]' "$1"; then
-    echo "::error::$2: a selected test target ran 0 tests (cfg-gated off?)" >&2
+mapfile -t target_args <<< "$targets"
+integration_targets=()
+for ((i = 0; i < ${#target_args[@]}; i += 2)); do
+  if [ "${target_args[$i]}" != "--test" ] || [ -z "${target_args[$((i + 1))]:-}" ]; then
+    echo "::error::malformed integration target selection from result-test-args" >&2
+    exit 1
+  fi
+  integration_targets+=("${target_args[$((i + 1))]}")
+done
+if [ "${#integration_targets[@]}" -eq 0 ]; then
+  echo "::error::result-test-args selected no integration targets" >&2
+  exit 1
+fi
+manifest_args=()
+if [ -n "$manifest_path" ]; then
+  manifest_args=(--manifest-path "$manifest_path")
+fi
+printf 'running %d integration targets, plus lib and bins\n' "${#integration_targets[@]}"
+manifest_for_coverage=${manifest_path:-$root/Cargo.toml}
+package_name=$(python3 - "$manifest_for_coverage" <<'PY'
+import sys
+import tomllib
+with open(sys.argv[1], "rb") as manifest:
+    print(tomllib.load(manifest)["package"]["name"])
+PY
+)
+workspace_dir=$(dirname "$manifest_for_coverage")
+junit_report=$workspace_dir/target/nextest/cadence/junit.xml
+rm -f "$junit_report"
+
+# One pinned nextest invocation replaces 56 serial cargo test invocations.
+# Its JUnit report is checked against the exact target list afterward so a
+# missing or zero-test target cannot silently shrink the required CI scope.
+if ! PATH=$lib_path "$root/scripts/cadence-nextest" --locked --features test-seam \
+    "${target_args[@]}" --lib --bins "${manifest_args[@]}" \
+    -j 2 2>&1 | tee "$scratch/nextest.log"; then
+  status=1
+  printf '::error::integration target selection or test run failed: %s\n' \
+    "${integration_targets[*]}" >&2
+fi
+
+if [ ! -f "$junit_report" ]; then
+  echo "::error::nextest did not produce its required JUnit report: $junit_report" >&2
+  status=1
+else
+  if ! python3 - "$junit_report" "$package_name" "${integration_targets[@]}" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+path, package, *expected = sys.argv[1:]
+try:
+    report = ET.parse(path).getroot()
+except (OSError, ET.ParseError) as error:
+    print(f"::error::could not read nextest JUnit report: {error}", file=sys.stderr)
+    raise SystemExit(1)
+
+suites = report.findall(".//testsuite")
+def has_runnable(suite):
+    return any(case.find("skipped") is None for case in suite.findall("testcase"))
+
+failed = False
+for target in expected:
+    name = f"{package}::{target}"
+    matches = [suite for suite in suites if suite.get("name") == name]
+    if not matches or not any(has_runnable(suite) for suite in matches):
+        print(f"::error::integration target {target} has no runnable tests", file=sys.stderr)
+        failed = True
+if not any(suite.get("name") == package and has_runnable(suite) for suite in suites):
+    print("::error::lib selection has no runnable tests", file=sys.stderr)
+    failed = True
+if not any(
+    suite.get("name", "").startswith(f"{package}::bin/") and has_runnable(suite)
+    for suite in suites
+):
+    print("::error::bins selection has no runnable tests", file=sys.stderr)
+    failed = True
+if failed:
+    raise SystemExit(1)
+print(f"validated {len(expected)} integration targets and runnable lib/bin suites")
+PY
+  then
     status=1
   fi
-}
-
-# Fails only when no binary target ran any test: an individual binary with
-# no unit tests legitimately reports `running 0 tests`.
-bins_guard() {
-  if ! grep -q '^running [1-9]' "$1"; then
-    echo "::error::$2: no binary target ran any test (cfg-gated off?)" >&2
-    status=1
-  fi
-}
-
-echo "integration targets:" $(echo "$targets" | grep -v '^--test$')
-# shellcheck disable=SC2086
-cargo test --locked --features test-seam --no-fail-fast $targets -- --test-threads 2 \
-  2>&1 | tee "$scratch/integration.log" || status=1
-zero_guard "$scratch/integration.log" integration
-
-echo "lib suite PATH: $lib_path"
-PATH=$lib_path cargo test --locked --features test-seam --lib --no-fail-fast -- --test-threads 2 \
-  2>&1 | tee "$scratch/lib.log" || status=1
-zero_guard "$scratch/lib.log" lib
-
-PATH=$lib_path cargo test --locked --features test-seam --bins --no-fail-fast -- --test-threads 2 \
-  2>&1 | tee "$scratch/bins.log" || status=1
-bins_guard "$scratch/bins.log" bins
+fi
 exit "$status"

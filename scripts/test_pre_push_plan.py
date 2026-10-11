@@ -24,8 +24,9 @@ class PlanTests(unittest.TestCase):
                 # CAD-1105: the shared runner covers the lib and bin unit tests too.
                 self.assertEqual(floor[0][0], "tests integration+lib+bins")
         runner = (ROOT / "scripts/run-result-tests").read_text()
-        self.assertIn("cargo test --locked --features test-seam --lib --no-fail-fast", runner)
-        self.assertIn("cargo test --locked --features test-seam --bins --no-fail-fast", runner)
+        self.assertIn('scripts/cadence-nextest" --locked --features test-seam', runner)
+        self.assertIn('"${target_args[@]}" --lib --bins', runner)
+        self.assertIn('python3 - "$junit_report" "$package_name"', runner)
 
     def test_release_seam_proof_runs_for_rust_or_explicit_tests(self):
         for changed, with_tests in (
