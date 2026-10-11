@@ -759,6 +759,100 @@ impl Store {
         self.write_tx(|conn| Self::app_bindings_repin_context_in(&*conn, install, context))
     }
 
+    /// CAD-1140: carry a configured binding onto an upgraded bundle only
+    /// when the upgrade journal staged its exact receipt after verifying the
+    /// slot declaration is byte-identical and pinned to the replaced bundle.
+    /// The caller runs this within the journaled delivery transaction. CAS
+    /// skips rows changed since staging; the current-receipt check skips rows
+    /// whose connection is no longer live.
+    pub fn app_binding_upgrade_carry(
+        &self,
+        install: &str,
+        bundle_digest: &str,
+        workspace: &str,
+        carried: &std::collections::BTreeMap<String, Value>,
+    ) -> Result<Vec<String>> {
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let mut done = Vec::with_capacity(carried.len());
+            let mut skipped = Vec::new();
+            for (id, expected) in carried {
+                let moved = match binding_in(&tx, install, id) {
+                    Ok(row) => {
+                        row["state"] != "configured"
+                            || row["config"] != *expected
+                            || expected["bundle_digest"].as_str() == Some(bundle_digest)
+                    }
+                    Err(_) => true,
+                };
+                if moved {
+                    skipped.push(id.clone());
+                    continue;
+                }
+                let row = binding_in(&tx, install, id)?;
+                let context = row["context_id"].as_str();
+                let slot = row["slot"]
+                    .as_str()
+                    .ok_or_else(|| Error::internal("invalid binding slot"))?;
+                let proof = BindingProof {
+                    id: id.clone(),
+                    revision: row["revision"]
+                        .as_i64()
+                        .ok_or_else(|| Error::internal("invalid binding revision"))?,
+                    digest: row["digest"]
+                        .as_str()
+                        .ok_or_else(|| Error::internal("invalid binding digest"))?
+                        .to_string(),
+                    config: row["config"].clone(),
+                };
+                if !binding_current_in(&tx, install, context, slot, &proof)? {
+                    skipped.push(id.clone());
+                    continue;
+                }
+                let mut config = expected.clone();
+                config["bundle_digest"] = json!(bundle_digest);
+                validate_config(install, context, &config)?;
+                let digest = config_digest(install, context, slot, &config);
+                let updated = tx.execute("UPDATE app_bindings SET config=?,digest=?,revision=revision+1,updated=? WHERE install_id=? AND id=? AND revision=? AND state='configured'",params![config.to_string(),digest,now(),install,id,row["revision"].as_i64().unwrap_or(0)])?;
+                if updated != 1 {
+                    return Err(Error::rejected(
+                        "binding bundle carry lost its revision claim",
+                    ));
+                }
+                let next = binding_in(&tx, install, id)?;
+                if next["context_id"] != row["context_id"]
+                    || next["slot"] != row["slot"]
+                    || next["config"]["workspace_id"] != json!(workspace)
+                {
+                    return Err(Error::rejected(
+                        "binding bundle carry changed the receipt's scope",
+                    ));
+                }
+                Self::app_effect_invalidate_in(&tx, install, None, Some(id), None)?;
+                Self::event(
+                    &tx,
+                    "app_bindings",
+                    "app_binding_migrated",
+                    json!({"install_id":install,"binding_id":id,
+                           "revision":row["revision"].as_i64().unwrap_or(0)+1,
+                           "digest":digest,"from_digest":row["digest"],
+                           "changes":[json!({"field":"bundle_digest","from":expected["bundle_digest"],"to":bundle_digest})],
+                           "actor":"daemon","via":"upgrade"}),
+                )?;
+                done.push(id.clone());
+            }
+            if !skipped.is_empty() {
+                Self::event(
+                    &tx,
+                    "app_bindings",
+                    "app_binding_carry_skipped",
+                    json!({"install_id":install,"skipped":skipped,"actor":"daemon","via":"upgrade"}),
+                )?;
+            }
+            Ok(done)
+        })
+    }
+
     pub fn app_binding_revoke(&self, install: &str, id: &str, expected: i64) -> Result<Value> {
         self.write_tx(|conn| {
             let tx = &mut *conn;

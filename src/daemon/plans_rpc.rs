@@ -566,12 +566,13 @@ impl Shared {
             ),
             "app_workspace_upgrade" => {
                 let id = required_str(params, "install_id")?;
+                let expected_digest = required_str(params, "expected_digest")?;
                 workspace::upgrade(
                     &pm,
                     &workspace::UpgradeRequest {
                         id,
                         source: required_str(params, "source")?,
-                        expected_digest: required_str(params, "expected_digest")?,
+                        expected_digest,
                         expected_generation: required_str(params, "expected_generation")?,
                         expected_new_digest: required_str(params, "expected_new_digest")?,
                         request_id: required_str(params, "request_id")?,
@@ -600,23 +601,50 @@ impl Shared {
                             }
                         }
                         let bindings = self.store.app_binding_upgrade_configured(id)?;
-                        let mut rebind_required = Vec::new();
                         let mut incompatible_bindings = Vec::new();
+                        let mut carried = std::collections::BTreeMap::new();
                         for binding in &bindings {
-                            rebind_required.push(binding["id"].clone());
                             let slot = binding["slot"].as_str().unwrap_or("");
-                            if manifest
-                                .capabilities
-                                .get(slot)
-                                .and_then(|need| serde_json::to_value(need).ok())
-                                .as_ref()
-                                != Some(&binding["config"]["declaration"])
+                            if binding["config"]["bundle_digest"].as_str() == Some(expected_digest)
+                                && manifest
+                                    .capabilities
+                                    .get(slot)
+                                    .and_then(|need| serde_json::to_value(need).ok())
+                                    .as_ref()
+                                    == Some(&binding["config"]["declaration"])
                             {
+                                // CAD-1140: only a receipt pinned to the
+                                // replaced bundle with an unchanged declaration carries.
+                                carried.insert(
+                                    binding["id"].as_str().unwrap_or_default().to_string(),
+                                    binding["config"].clone(),
+                                );
+                            } else {
+                                // Anything else — a widened declaration or a
+                                // slot the new bundle dropped — follows the
+                                // ordinary rebind path; the carry never
+                                // touches it.
                                 incompatible_bindings.push(binding["id"].clone());
                             }
                         }
-                        Ok(json!({"incompatible_contexts":incompatible_contexts,
-                            "rebind_required":rebind_required,"incompatible_bindings":incompatible_bindings}))
+                        Ok((
+                            json!({"incompatible_contexts":incompatible_contexts,
+                            "rebind_required":incompatible_bindings,
+                            "incompatible_bindings":incompatible_bindings,
+                            "carried_bindings":carried.keys().collect::<Vec<_>>()}),
+                            carried,
+                        ))
+                    },
+                    |journal| {
+                        // Deliver the journaled carries, under the same PM
+                        // lock and the row CAS, in the upgrade's one store
+                        // transaction.
+                        self.store.app_binding_upgrade_carry(
+                            id,
+                            journal.new_digest(),
+                            &self.store.connection_workspace_id()?,
+                            &journal.bindings,
+                        )
                     },
                 )
             }
@@ -624,6 +652,14 @@ impl Shared {
                 &pm,
                 required_str(params, "install_id")?,
                 required_str(params, "request_id")?,
+                |journal| {
+                    self.store.app_binding_upgrade_carry(
+                        required_str(params, "install_id")?,
+                        journal.new_digest(),
+                        &self.store.connection_workspace_id()?,
+                        &journal.bindings,
+                    )
+                },
             ),
             "app_workspace_list" => workspace::list(&pm),
             "app_workspace_show" => workspace::show(&pm, required_str(params, "install_id")?),

@@ -117,7 +117,8 @@ fn cad1189_reads_never_mix_installation_states_during_upgrades() {
                 expected_new_digest: &new_digest,
                 request_id: &format!("accept-up-{version}"),
             },
-            |_, _| Ok(json!({})),
+            |_, _| Ok((json!({}), Default::default())),
+            |_| Ok(Vec::new()),
         )
         .unwrap();
     }
