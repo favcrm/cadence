@@ -92,9 +92,26 @@ separate mutation workflow still requires a deliberate assertion failure.
 Fixture daemons and boards use a short `/tmp/<lane>` root for HOME, XDG paths
 and TMPDIR: Unix socket paths cannot exceed 107 bytes. Pass through the real
 `RUSTUP_HOME` and `CARGO_HOME` so an isolated HOME can resolve the toolchain.
-Set `CADENCE_SUITE_LOCK` to the host's designated suite lock. Direct nextest
-invocations require it; the runner acquires the lock and prevents nested locking
-by test children. Do not invent a per-lane lock to bypass host serialization.
+For `scripts/run-result-tests` and direct `scripts/cadence-nextest` runs,
+set `CADENCE_SUITE_LOCK` to the host's designated **absolute** suite-lock path.
+Both runners use `scripts/suite-lock-config`; neither invents a per-run path.
+Isolated CI continues to supply its explicit runner-temp lock. On shared hosts,
+all cooperating suites must use the same file; a per-lane lock coordinates
+nothing. Do not delete or replace that file while a caller might hold it.
+
+`CADENCE_SUITE_LOCK_WAIT_SECS` bounds shell-runner acquisition: whole seconds
+from 0 to 86400, default 3600; zero refuses contention immediately. The wrapper
+reports the path/wait limit to stderr and exits 75 if acquisition times out.
+Executed commands retain their own exit status, so exit 75 alone is not proof
+of a lock timeout. The wait setting does not reach Cargo/test commands.
+
+The nextest wrapper owns the flock and prevents nested acquisition/descriptor
+leaks in children. A full `cadence review` owns its lock instead, using the
+review configuration's deadline. Nextest `list` skips the suite lock but still
+needs build admission if it compiles. Plain `cargo test` does **not** acquire
+this flock merely because the variable is set: fully isolated focused Cargo
+checks use build/test admission and fixture isolation, not an implied mutex.
+The suite lock is advisory coordination, separate from admission and identity.
 Use ports 3110–3199 for boards you start and preserve production services.
 
 ## Isolated board development
