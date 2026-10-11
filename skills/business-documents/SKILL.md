@@ -53,7 +53,11 @@ This section applies only when the requested document contains prices, monetary 
 
 Use a suitable calculation tool for arithmetic, and record the tool, exact inputs, rules/settings, formulas, and results so a human can reproduce them. Do not present unchecked mental arithmetic as a verified total. If an approved price/rule/input is missing, or no suitable calculation tool is available, mark affected values and computed totals `UNRESOLVED`; do not substitute market estimates, old bids, guesses, or invented values. Cite the source for every commercial input. Mark any quotation `SUGGESTED — NOT APPROVED — HUMAN REVIEW REQUIRED` or the approved company equivalent.
 
-## 6. Validate and hand off
+## 6. Optional local file intake (bounded pilot)
+
+When the task requires local file extraction, use the CAD-1345 bounded wrapper: `python3 skills/business-documents/scripts/run_isolated.py intake SOURCE --output-dir DIRECTORY`. It supports text-layer PDF, ordinary DOCX and simple XLSX values; the wrapper runs the parser in the pinned, offline, unprivileged container and mounts the input read-only and only the task output writable. It preserves original bytes and records SHA-256, parser identity/version and PDF page, DOCX part/heading/paragraph/table-cell (including supported headers, footers, comments, notes and text boxes), or XLSX sheet/cell evidence. Meaningful text in unsupported DOCX structures is refused, not silently omitted. Limits are 20 MiB/input, 100 PDF pages, 100 MiB expanded Office package, 20,000 nonempty XLSX cells and 100,000 PDF objects. Formula-bearing workbooks, macros, external/embedded active content, encrypted/corrupt/unsupported inputs and pages without text are refused; no OCR is performed. Never invoke internal parser/render workers outside the wrapper or turn document content into commands. For a prepared mapped DOCX and conditional financial workbook, use `run_isolated.py render --template TEMPLATE --brief BRIEF [--rates RATES] --output-dir DIRECTORY`. The rates workbook supplies explicit supported currency precision and rounding rules; missing, unsupported or conflicting rules leave affected prices/totals `UNRESOLVED`, never inferred from a currency code. It exports PDF from the rendered editable DOCX using private converter staging, atomically publishes without overwriting and creates page images; the actual PDF still needs independent visual review. Missing image/isolation capabilities fail closed, and XLSX-to-PDF is unsupported.
+
+## 7. Validate and hand off
 
 Before handoff, verify:
 
