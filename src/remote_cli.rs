@@ -30,10 +30,12 @@
 //!   (`runtime_stopped`/`not_found`/`unavailable`) and every other failure
 //!   end the command — never a redirect chase, never another org, never local.
 
+use base64::Engine;
 use serde_json::{json, Map, Value};
-use std::fs::OpenOptions;
-use std::io::Read;
-use std::os::unix::fs::OpenOptionsExt;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -97,13 +99,44 @@ pub struct RemoteTarget {
     pub org_id: String,
 }
 
-/// The `cli-<slug>.json` record `LoginGrant::save_credential` writes —
-/// re-declared here so a field mismatch fails closed at load, not at POST.
+const SESSION_VERSION: &str = "hosted-cadence-cli-session.v1";
+const CAPABILITIES: &[&str] = &["cli.read", "cli.write"];
+const RENEW_BEFORE: u64 = 60;
+const SKEW: u64 = 5;
+const RENEWAL_WAIT: Duration = Duration::from_secs(20);
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CliSession {
+    session_id: String,
+    refresh_token: String,
+    generation: u64,
+    device_label: String,
+    idle_expires_at: u64,
+    absolute_expires_at: u64,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingRenewal {
+    operation_id: String,
+    expected_generation: u64,
+}
+
+/// Legacy credential fields remain readable; only new grants have the immutable
+/// identity and renewable-session fields needed to refresh.
+#[derive(Clone)]
 struct Credential {
     organization_id: String,
+    organization_slug: Option<String>,
     audience: String,
+    issuer: Option<String>,
+    subject_id: Option<String>,
+    capabilities: Vec<String>,
     access_token: String,
     expires_at: u64,
+    cli_session: Option<CliSession>,
+    pending: Option<PendingRenewal>,
 }
 
 fn reject(message: impl Into<String>) -> Error {
@@ -121,7 +154,18 @@ fn now() -> Result<u64> {
 /// The file must still name exactly this org's workspace and endpoint — a
 /// credential recorded for another org is never sent to this host (contract
 /// I1). Expired means "run `cadence login` again", not retry.
+fn private_directory(dir: &Path) -> Result<()> {
+    let meta = fs::symlink_metadata(dir)?;
+    if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
+        return Err(reject(
+            "remote credential directory must be owned by you, mode 0700, and not a symlink",
+        ));
+    }
+    Ok(())
+}
+
 fn load_credential(dir: &Path, target: &RemoteTarget) -> Result<Credential> {
+    private_directory(dir)?;
     let path = dir.join(format!("cli-{}.json", target.org));
     let file = OpenOptions::new()
         .read(true)
@@ -135,29 +179,101 @@ fn load_credential(dir: &Path, target: &RemoteTarget) -> Result<Credential> {
             ))
         })?;
     let meta = file.metadata()?;
-    if !meta.is_file() || meta.len() > 8192 {
-        return Err(reject("remote credential is not a small regular file"));
+    if !meta.is_file()
+        || meta.uid() != unsafe { libc::geteuid() }
+        || meta.mode() & 0o077 != 0
+        || meta.len() > 8192
+    {
+        return Err(reject(
+            "remote credential must be a small private owned regular file",
+        ));
     }
     let mut raw = Vec::new();
     file.take(8193).read_to_end(&mut raw)?;
     let body: Value =
         serde_json::from_slice(&raw).map_err(|_| reject("invalid remote credential"))?;
+    let object = body
+        .as_object()
+        .ok_or_else(|| reject("invalid remote credential"))?;
+    let allowed = [
+        "version",
+        "organization_id",
+        "organization_slug",
+        "audience",
+        "issuer",
+        "subject_id",
+        "capabilities",
+        "access_token",
+        "expires_at",
+        "cli_session",
+        "pending_renewal",
+    ];
+    if ![
+        "version",
+        "organization_id",
+        "audience",
+        "access_token",
+        "expires_at",
+    ]
+    .iter()
+    .all(|key| object.contains_key(*key))
+        || object.keys().any(|key| !allowed.contains(&key.as_str()))
+        || body["version"] != "hosted-cadence-auth.v1"
+    {
+        return Err(reject("invalid remote credential"));
+    }
     let cred = Credential {
         organization_id: body["organization_id"]
             .as_str()
             .ok_or_else(|| reject("invalid remote credential"))?
-            .to_string(),
+            .to_owned(),
+        organization_slug: body
+            .get("organization_slug")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
         audience: body["audience"]
             .as_str()
             .ok_or_else(|| reject("invalid remote credential"))?
-            .to_string(),
+            .to_owned(),
+        issuer: body
+            .get("issuer")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        subject_id: body
+            .get("subject_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        capabilities: body
+            .get("capabilities")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
         access_token: body["access_token"]
             .as_str()
             .ok_or_else(|| reject("invalid remote credential"))?
-            .to_string(),
+            .to_owned(),
         expires_at: body["expires_at"]
             .as_u64()
             .ok_or_else(|| reject("invalid remote credential"))?,
+        cli_session: body
+            .get("cli_session")
+            .filter(|v| !v.is_null())
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|_| reject("invalid renewable CLI session"))?,
+        pending: body
+            .get("pending_renewal")
+            .filter(|v| !v.is_null())
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|_| reject("invalid pending CLI renewal"))?,
     };
     if cred.organization_id != target.org_id || cred.audience != target.endpoint {
         return Err(reject(
@@ -165,15 +281,350 @@ fn load_credential(dir: &Path, target: &RemoteTarget) -> Result<Credential> {
              it is never sent to another destination — run `cadence login` again",
         ));
     }
-    if !cred.access_token.starts_with("hct_") {
+    if !valid_token(&cred.access_token, "hct_") {
         return Err(reject("invalid remote credential"));
     }
-    if cred.expires_at <= now()? {
+    if cred.cli_session.is_none() && cred.expires_at <= now()? {
         return Err(reject(
             "the remote credential has expired — run `cadence login` again",
         ));
     }
     Ok(cred)
+}
+
+pub(crate) fn private_lock(dir: &Path, slug: &str, deadline: Instant) -> Result<File> {
+    private_directory(dir)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dir.join(format!(".cli-{slug}.lock")))?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
+        return Err(reject(
+            "remote credential lock must be a private owned file",
+        ));
+    }
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(file);
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::busy_coded(
+                "timeout",
+                "remote credential lock deadline elapsed",
+            ));
+        }
+        std::thread::sleep(
+            Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+}
+
+fn save_credential(dir: &Path, slug: &str, cred: &Credential) -> Result<()> {
+    private_directory(dir)?;
+    let path = dir.join(format!("cli-{slug}.json"));
+    match fs::symlink_metadata(&path) {
+        Ok(meta)
+            if meta.is_file()
+                && meta.uid() == unsafe { libc::geteuid() }
+                && meta.mode() & 0o077 == 0 => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => {
+            return Err(reject(
+                "remote credential destination must be a private owned regular file",
+            ))
+        }
+    }
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random)
+        .map_err(|_| reject("unable to create remote credential temporary path"))?;
+    let tmp = dir.join(format!(
+        ".cli-{slug}.tmp-{}-{}",
+        std::process::id(),
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random)
+    ));
+    let body = serde_json::json!({"version":"hosted-cadence-auth.v1","organization_id":cred.organization_id,
+        "organization_slug":cred.organization_slug,"audience":cred.audience,"issuer":cred.issuer,
+        "subject_id":cred.subject_id,"capabilities":cred.capabilities,"access_token":cred.access_token,
+        "expires_at":cred.expires_at,"cli_session":cred.cli_session,"pending_renewal":cred.pending});
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&tmp)
+        .map_err(|_| reject("remote credential temporary path refused"))?;
+    let result = (|| {
+        file.write_all(
+            &serde_json::to_vec(&body).map_err(|_| reject("cannot encode remote credential"))?,
+        )?;
+        file.sync_all()?;
+        fs::rename(&tmp, &path)?;
+        File::open(dir)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(tmp);
+    }
+    result
+}
+
+fn renewed_credential(dir: &Path, target: &RemoteTarget, deadline: Instant) -> Result<Credential> {
+    let _lock = private_lock(dir, &target.org, deadline)?;
+    if Instant::now() >= deadline {
+        return Err(Error::busy_coded(
+            "timeout",
+            "remote command deadline elapsed before session renewal",
+        ));
+    }
+    let mut cred = load_credential(dir, target)?;
+    let at = now()?;
+    let due = cred.pending.is_some() || cred.expires_at <= at.saturating_add(RENEW_BEFORE);
+    if !due {
+        return Ok(cred);
+    }
+    let Some(session) = cred.cli_session.clone() else {
+        return Err(reject(
+            "remote credential has no renewable session — run `cadence login` again",
+        ));
+    };
+    let issuer = cred
+        .issuer
+        .as_deref()
+        .ok_or_else(|| reject("renewable session issuer missing — run `cadence login` again"))?;
+    if cred.organization_slug.as_deref() != Some(target.org.as_str())
+        || cred.subject_id.as_deref().is_none_or(|s| !valid_id(s))
+        || !same_capabilities(&cred.capabilities, CAPABILITIES)
+        || session.idle_expires_at <= at
+        || session.absolute_expires_at <= at
+        || session.idle_expires_at > session.absolute_expires_at
+        || session.session_id.strip_prefix("hcs_").is_none_or(|v| {
+            v.len() != 36 || !v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+        || !valid_token(&session.refresh_token, "hcr_")
+        || session.device_label.is_empty()
+        || session.device_label.len() > 120
+        || session.generation == 0
+    {
+        return Err(reject(
+            "renewable CLI session is invalid or expired — run `cadence login` again",
+        ));
+    }
+    let pending = match cred.pending.clone() {
+        Some(pending) => pending,
+        None => {
+            let mut random = [0u8; 32];
+            getrandom::fill(&mut random)
+                .map_err(|_| reject("unable to create renewal operation"))?;
+            let operation_id = format!(
+                "op_{}",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random)
+            );
+            let pending = PendingRenewal {
+                operation_id,
+                expected_generation: session.generation,
+            };
+            crate::remote_enrollment::validate_cli_session_pin(dir, issuer)?;
+            cred.pending = Some(pending.clone());
+            save_credential(dir, &target.org, &cred)?;
+            pending
+        }
+    };
+    if pending.expected_generation != session.generation
+        || !valid_operation_id(&pending.operation_id)
+    {
+        return Err(reject(
+            "pending CLI renewal is inconsistent — run `cadence login` again",
+        ));
+    }
+    let request = serde_json::json!({"version":SESSION_VERSION,"session_id":session.session_id,
+        "operation_id":pending.operation_id,"expected_generation":pending.expected_generation,
+        "organization_id":cred.organization_id,"organization_slug":target.org,"audience":cred.audience,
+        "subject_id":cred.subject_id,"device_label":session.device_label,"capabilities":cred.capabilities});
+    let request_deadline = deadline.min(Instant::now() + RENEWAL_WAIT);
+    let (status, body) = crate::remote_enrollment::cli_session_post(
+        dir,
+        issuer,
+        "/v1/hosted-cadence/cli-session/renew",
+        &session.refresh_token,
+        request,
+        request_deadline,
+    )?;
+    if status != 200 {
+        return Err(reject(
+            "remote CLI session renewal refused — run `cadence login` again",
+        ));
+    }
+    validate_renewal_response(&body, &cred, target, &pending)?;
+    let next = serde_json::from_value::<CliSession>(body["cli_session"].clone())
+        .map_err(|_| reject("remote renewal returned invalid session metadata"))?;
+    cred.access_token = body["credential"]["access_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    cred.expires_at = body["credential"]["expires_at"].as_u64().unwrap();
+    cred.cli_session = Some(next);
+    cred.pending = None;
+    save_credential(dir, &target.org, &cred)?;
+    Ok(cred)
+}
+
+fn validate_renewal_response(
+    body: &Value,
+    prior: &Credential,
+    target: &RemoteTarget,
+    pending: &PendingRenewal,
+) -> Result<()> {
+    let top = body
+        .as_object()
+        .ok_or_else(|| reject("remote renewal returned invalid response"))?;
+    let allowed = [
+        "version",
+        "organization_id",
+        "organization_slug",
+        "audience",
+        "principal",
+        "capabilities",
+        "credential",
+        "cli_session",
+    ];
+    let old_session = prior
+        .cli_session
+        .as_ref()
+        .ok_or_else(|| reject("missing prior CLI session"))?;
+    if top.keys().any(|key| !allowed.contains(&key.as_str()))
+        || !(top.len() == 7 || top.len() == 8)
+        || ![
+            "version",
+            "organization_id",
+            "audience",
+            "principal",
+            "capabilities",
+            "credential",
+            "cli_session",
+        ]
+        .iter()
+        .all(|key| top.contains_key(*key))
+        || body["version"] != "hosted-cadence-auth.v1"
+        || body["organization_id"] != prior.organization_id
+        || body
+            .get("organization_slug")
+            .is_some_and(|v| v.as_str() != Some(target.org.as_str()))
+        || body["audience"] != target.endpoint
+        || !exact_object(&body["principal"], &["kind", "current_role", "subject_id"])
+        || body["principal"]["kind"] != "user"
+        || body["principal"]["current_role"] != "owner"
+        || body["principal"]["subject_id"].as_str() != prior.subject_id.as_deref()
+        || !same_capabilities_json(&body["capabilities"], CAPABILITIES)
+        || !exact_object(
+            &body["credential"],
+            &[
+                "credential_id",
+                "access_token",
+                "token_type",
+                "issued_at",
+                "expires_at",
+                "renewal",
+            ],
+        )
+        || body["credential"]["token_type"] != "Bearer"
+        || body["credential"]["renewal"] != "reexchange"
+        || body["credential"]["credential_id"]
+            .as_str()
+            .is_none_or(|v| !valid_id(v))
+        || body["credential"]["access_token"]
+            .as_str()
+            .is_none_or(|v| !valid_token(v, "hct_"))
+        || !exact_object(
+            &body["cli_session"],
+            &[
+                "session_id",
+                "refresh_token",
+                "generation",
+                "device_label",
+                "idle_expires_at",
+                "absolute_expires_at",
+            ],
+        )
+        || body["cli_session"]["session_id"] != old_session.session_id
+        || body["cli_session"]["generation"].as_u64() != pending.expected_generation.checked_add(1)
+        || body["cli_session"]["device_label"] != old_session.device_label
+        || body["cli_session"]["refresh_token"]
+            .as_str()
+            .is_none_or(|v| !valid_token(v, "hcr_") || v == old_session.refresh_token)
+    {
+        return Err(reject("remote renewal identity or scope mismatch"));
+    }
+    let issued = body["credential"]["issued_at"]
+        .as_u64()
+        .ok_or_else(|| reject("invalid renewed credential"))?;
+    let expires = body["credential"]["expires_at"]
+        .as_u64()
+        .ok_or_else(|| reject("invalid renewed credential"))?;
+    let at = now()?;
+    if issued > at.saturating_add(SKEW)
+        || expires <= at
+        || expires <= issued
+        || expires - issued > 300
+    {
+        return Err(reject("remote renewal returned an invalid access expiry"));
+    }
+    let metadata = &body["cli_session"];
+    if metadata.as_object().is_none_or(|m| m.len() != 6)
+        || metadata["idle_expires_at"]
+            .as_u64()
+            .is_none_or(|t| t <= at || t > old_session.absolute_expires_at)
+        || metadata["absolute_expires_at"] != old_session.absolute_expires_at
+    {
+        return Err(reject("remote renewal returned invalid session expiry"));
+    }
+    Ok(())
+}
+
+fn same_capabilities(values: &[String], expected: &[&str]) -> bool {
+    values.len() == expected.len()
+        && expected
+            .iter()
+            .all(|item| values.iter().filter(|v| v.as_str() == *item).count() == 1)
+}
+fn same_capabilities_json(value: &Value, expected: &[&str]) -> bool {
+    value.as_array().is_some_and(|values| {
+        values.len() == expected.len()
+            && expected
+                .iter()
+                .all(|item| values.iter().filter(|v| v.as_str() == Some(*item)).count() == 1)
+    })
+}
+fn exact_object(value: &Value, keys: &[&str]) -> bool {
+    value.as_object().is_some_and(|object| {
+        object.len() == keys.len() && keys.iter().all(|key| object.contains_key(*key))
+    })
+}
+
+fn valid_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 200
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+}
+fn valid_operation_id(value: &str) -> bool {
+    value.strip_prefix("op_").is_some_and(|s| {
+        (32..=80).contains(&s.len())
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+    })
+}
+
+fn valid_token(value: &str, prefix: &str) -> bool {
+    value.strip_prefix(prefix).is_some_and(|s| {
+        s.len() == 43
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+    })
 }
 
 /// One bounded POST to `{endpoint}{path}` with the `hct_` bearer. Redirects
@@ -360,6 +811,50 @@ pub enum RemoteAnswer {
     Conflict(Value),
 }
 
+/// Revoke one remote device/workspace session before removing its protected
+/// local authority. A failed or offline issuer request leaves the record intact.
+pub fn logout(dir: &Path, target: &RemoteTarget) -> Result<i32> {
+    let deadline = Instant::now() + RENEWAL_WAIT;
+    let _lock = private_lock(dir, &target.org, deadline)?;
+    let cred = load_credential(dir, target)?;
+    let session = cred.cli_session.as_ref().ok_or_else(|| {
+        reject("no renewable CLI session for this workspace — run `cadence login` once")
+    })?;
+    let issuer = cred
+        .issuer
+        .as_deref()
+        .ok_or_else(|| reject("renewable session issuer missing"))?;
+    let (status, body) = crate::remote_enrollment::cli_session_post(
+        dir,
+        issuer,
+        "/v1/hosted-cadence/cli-session/revoke",
+        &session.refresh_token,
+        serde_json::json!({"version":SESSION_VERSION,"session_id":session.session_id}),
+        deadline.min(Instant::now() + RENEWAL_WAIT),
+    )?;
+    if status != 200
+        || !exact_object(&body, &["version", "status", "session_id"])
+        || body["version"] != SESSION_VERSION
+        || body["status"] != "revoked"
+        || body["session_id"] != session.session_id
+    {
+        return Err(reject(
+            "remote device revocation was not confirmed; local authority retained",
+        ));
+    }
+    let path = dir.join(format!("cli-{}.json", target.org));
+    let meta = fs::symlink_metadata(&path)?;
+    if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
+        return Err(reject(
+            "remote credential changed during logout; local authority retained",
+        ));
+    }
+    fs::remove_file(path)?;
+    File::open(dir)?.sync_all()?;
+    println!("Remote CLI session revoked for {}", target.org);
+    Ok(0)
+}
+
 pub fn call_verb(
     target: &RemoteTarget,
     verb: &str,
@@ -394,9 +889,15 @@ fn call_verb_in(
             "verb '{verb}' is not in the remote allowlist — never sent"
         )));
     }
-    let cred = load_credential(dir, target)?;
     let deadline = Instant::now() + Duration::from_secs(wake_timeout);
     loop {
+        let cred = renewed_credential(dir, target, deadline)?;
+        if Instant::now() >= deadline {
+            return Err(Error::busy_coded(
+                "timeout",
+                "remote command deadline elapsed during session renewal",
+            ));
+        }
         let (status, retry_after, body) = call_once(target, &cred, verb, &arguments)?;
         match classify(status, retry_after, body) {
             Verdict::Done(result) => return result.map(RemoteAnswer::Ok),
@@ -449,7 +950,15 @@ mod tests {
         let body = json!({"version": "hosted-cadence-auth.v1",
             "organization_id": org_id, "audience": endpoint,
             "access_token": BRIDGE, "expires_at": expires_at});
-        std::fs::write(dir.join(format!("cli-{org}.json")), body.to_string()).unwrap();
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(dir.join(format!("cli-{org}.json")))
+            .unwrap();
+        file.write_all(body.to_string().as_bytes()).unwrap();
     }
     fn store_credential(dir: &Path, endpoint: &str) {
         store_credential_at(dir, ORG, ORG_ID, endpoint, now().unwrap() + 300);
@@ -830,3 +1339,7 @@ mod tests {
         assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
     }
 }
+
+#[cfg(test)]
+#[path = "remote_cli_renewal_acceptance.rs"]
+mod renewal_acceptance;
