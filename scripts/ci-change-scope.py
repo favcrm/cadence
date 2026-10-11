@@ -15,7 +15,7 @@ SHA = re.compile(r"[0-9a-f]{40}")
 DOC_POLICY = {"docs/TEAM.md", "docs/CHARTER.md"}
 # CAD-1370: a narrowed PR may touch only pre-existing top-level
 # tests/<name>.rs integration targets. [A-Za-z0-9_]+ only.
-TEST_PATH = re.compile(r"^tests/([A-Za-z0-9_]+)\.rs$")
+TEST_PATH = re.compile(r"^tests/([A-Za-z0-9_]+)\.rs\Z")
 UI_CONFIG = re.compile(r"(?:^|/)(?:package[^/]*\.json|tsconfig[^/]*\.json|"
                        r"pnpm-[^/]*\.yaml|[^/]*\.config\.[^/]+)$")
 UI_EXT = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".css", ".html", ".svg",
@@ -147,7 +147,10 @@ def classify(repo, base, head, event):
                 return result("full", "deletion, mode change or unsupported change")
             if status == "M" and old_mode != ":100644":
                 return result("full", "type or mode change")
-            categories.add(category(path))
+            kind = category(path)
+            if kind == "tests" and status != "M":
+                return result("full", "new test targets require full validation")
+            categories.add(kind)
             paths.append(path)
         if categories == {"tests"}:
             # Only M-of-100644 edits to pre-existing top-level integration

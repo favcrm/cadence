@@ -147,6 +147,9 @@ def main() -> None:
         # Refusals: stay full / refuse, never narrow.
         cases = [
             ("add",      [("w", "tests/delta.rs")]),            # new target
+            # An added file named tests/alpha.rs<LF>: an unanchored TEST_PATH
+            # $ once matched it as the existing target 'alpha' and narrowed.
+            ("add-newline-name", [("w", "tests/alpha.rs\n")]),
             ("add+edit", [("w", "tests/alpha.rs"), ("w", "tests/delta.rs")]),
             ("delete",   [("d", "tests/alpha.rs")]),
             ("rename",   [("mv", "tests/alpha.rs")]),
