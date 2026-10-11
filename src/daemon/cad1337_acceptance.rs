@@ -502,6 +502,22 @@ fn cad1337_native_account_home_and_turn_refusals() {
         "worker refusal leaked bytes"
     );
 
+    // A valid session for account A cannot read account B's real row; this
+    // reaches the account-ownership guard, not Master's envelope guard.
+    let cross_account = assert_refusal(
+        fx.call(
+            Asserted::Operator,
+            "chat_file_read",
+            json!({"id":id_a,"session":{"token":owner_b["token"],"key":"","origin":"public"}}),
+        ),
+        "attachment is not bound to this authenticated account and conversation",
+        "owner B session attempting to read owner A attachment",
+    );
+    assert!(
+        !cross_account.contains(String::from_utf8_lossy(SECRET_BYTES).as_ref()),
+        "cross-account read refusal disclosed retained bytes"
+    );
+
     // Explicit operator administration is intentionally retained: the
     // operator fixture may read either account's valid row through the same
     // checked custody path; no ordinary-agent allowance is inferred.
@@ -548,5 +564,103 @@ fn cad1337_native_account_home_and_turn_refusals() {
         fx.row_count(),
         before + 2,
         "refused cases or dedup altered the two successful account rows"
+    );
+}
+
+/// A symlink at the operational account component must be refused by the
+/// actual upload custody path, after a positive upload control. The outside
+/// target is fixture-owned and its sentinel must remain the only entry.
+#[cfg(unix)]
+#[test]
+fn cad1337_native_upload_refuses_symlinked_account_path() {
+    let fx = Fx::new();
+    let owner = fx.public_session("usr-cad1337-symlink", "owner");
+    let account = owner["session"]["account_id"].as_str().unwrap().to_owned();
+    let positive = fx
+        .upload(&owner, b"symlink positive control\n", json!({}))
+        .unwrap();
+    assert!(positive["id"].as_str().is_some());
+    let users = fx._dir.path().join("workspace/users");
+    let account_path = users.join(&account);
+    let saved = users.join(format!("{account}.saved"));
+    let outside = fx._dir.path().join("outside-sentinel");
+    std::fs::create_dir(&outside).unwrap();
+    let sentinel = outside.join("sentinel.txt");
+    std::fs::write(&sentinel, b"outside fixture sentinel\n").unwrap();
+    std::fs::rename(&account_path, &saved).unwrap();
+    std::os::unix::fs::symlink(&outside, &account_path).unwrap();
+    let before = fx.row_count();
+    assert_refusal(
+        fx.upload(&owner, b"must not escape\n", json!({})),
+        "quota accounting",
+        "upload through symlinked operational account path",
+    );
+    assert_eq!(fx.row_count(), before, "symlink refusal retained a row");
+    assert_eq!(
+        std::fs::read(&sentinel).unwrap(),
+        b"outside fixture sentinel\n"
+    );
+    assert_eq!(
+        std::fs::read_dir(&outside).unwrap().count(),
+        1,
+        "outside path gained upload bytes"
+    );
+}
+
+/// Only `users/.gitignore` is control metadata; metadata-named residue in the
+/// users tree is charged. Files are sparse, but stat size exceeds the actual
+/// per-scope cap. This is expected to fail on the unfixed implementation.
+#[test]
+fn cad1337_quota_charges_nested_metadata_named_residue() {
+    let fx = Fx::new();
+    let owner = fx.public_session("usr-cad1337-quota", "owner");
+    let account = owner["session"]["account_id"].as_str().unwrap().to_owned();
+    let uploaded = fx
+        .upload(&owner, b"positive quota control\n", json!({}))
+        .unwrap();
+    let id = uploaded["id"].as_str().unwrap();
+    let thread = &fx.master_home;
+    let users = fx._dir.path().join("workspace/users");
+    assert_eq!(std::fs::read(users.join(".gitignore")).unwrap(), b"*\n");
+    let nested = users
+        .join(&account)
+        .join("threads")
+        .join(thread)
+        .join("uploads/residue");
+    std::fs::create_dir_all(&nested).unwrap();
+    let file_size = 257 * 1024 * 1024u64 / 3 + 1;
+    for path in [
+        users.join(".quota.lock"),
+        nested.join(".gitignore"),
+        nested.join(".quota.lock"),
+    ] {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .unwrap();
+        file.set_len(file_size).unwrap();
+    }
+    let before = fx.row_count();
+    assert_refusal(
+        fx.upload(&owner, b"quota refusal attempt\n", json!({})),
+        "quota",
+        "metadata-named residue exceeding actual upload quota",
+    );
+    assert_eq!(fx.row_count(), before, "quota refusal retained metadata");
+    assert!(
+        !nested.join("ticket.txt").exists(),
+        "quota refusal published bytes"
+    );
+    assert!(
+        users
+            .join(&account)
+            .join("threads")
+            .join(thread)
+            .join("uploads")
+            .join(id)
+            .join("ticket.txt")
+            .exists(),
+        "positive upload control disappeared"
     );
 }

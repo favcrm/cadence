@@ -376,6 +376,124 @@ fn cad1337_http_upload_is_authenticated_and_home_thread_bound() {
     );
 }
 
+/// Ticket-derived HTTP-peer refusals: a distinct verified owner account may
+/// not enqueue another owner's attachment, and no-follow custody refuses an
+/// operational account symlink. The upload/readiness and message APIs run
+/// through the actual listener, session verifier, relay and native guard.
+#[cfg(unix)]
+#[test]
+fn cad1337_http_cross_account_attachment_send_and_symlink_refuse() {
+    let fx = Fx::new();
+    let (owner_a, account_a) = fx.session("usr-cad1337-http-owner-a", "owner");
+    let (owner_b, _account_b) = fx.session("usr-cad1337-http-owner-b", "owner");
+    let home = fx._home_id("master");
+    let (status, body) = fx.post_multipart(&owner_a, &[("conversation", &home)], None);
+    assert_eq!(status, 200, "owner A upload positive control: {body}");
+    let receipt: Value = serde_json::from_str(&body).unwrap();
+    let attachment = receipt["id"]
+        .as_str()
+        .expect("actual daemon attachment id")
+        .to_owned();
+
+    let post_message = |token: &str, message_id: &str| {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build()
+            .into();
+        let response = agent
+            .post(&format!("{}/api/threads/master/messages", fx.base()))
+            .header("Host", &fx.host_header())
+            .header("Origin", format!("http://{PUBLIC_HOST}"))
+            .header("X-Cadence-Board", "1")
+            .header(crate::test_seam::AS_HEADER, "operator")
+            .header(crate::test_seam::TOKEN_HEADER, &fx.seam_token)
+            .header("Cookie", format!("__Host-aos-board-session={token}"))
+            .header("Content-Type", "application/json")
+            .send(
+                serde_json::json!({
+                    "text":"send the attached file",
+                    "message":message_id,
+                    "conversation":home,
+                    "attachments":[{"id":attachment}],
+                })
+                .to_string(),
+            )
+            .unwrap();
+        let status = response.status().as_u16();
+        let mut response = response;
+        let body = response.body_mut().read_to_string().unwrap();
+        (status, body)
+    };
+    let (status, body) = post_message(&owner_a, "cad1337-http-owner-a-send");
+    assert_eq!(
+        status, 200,
+        "owner A attachment-send positive control: {body}"
+    );
+    let queued: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        queued["state"], "queued",
+        "owner A message was not queued: {body}"
+    );
+
+    let before_b = fx.row_count();
+    let (status, body) = post_message(&owner_b, "cad1337-http-owner-b-cross-send");
+    assert!(
+        !(200..300).contains(&status),
+        "owner B sent owner A's attachment: {body}"
+    );
+    assert!(
+        body.contains("attachment is not bound to this authenticated account and conversation"),
+        "wrong refusal layer: {body}"
+    );
+    assert_eq!(
+        fx.row_count(),
+        before_b,
+        "cross-account send changed attachment metadata"
+    );
+    let db = rusqlite::Connection::open(crate::rollout::db_file(&fx.state())).unwrap();
+    let b_messages: i64 = db
+        .query_row(
+            "SELECT count(*) FROM messages WHERE id=?",
+            ["cad1337-http-owner-b-cross-send"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(b_messages, 0, "refused cross-account message was queued");
+
+    // Replace only this fixture's operational account directory with a
+    // symlink to an owned outside sentinel. The real upload route must refuse
+    // and must not create any file or row at the symlink target.
+    let users = fx.root.path().join("workspace/users");
+    let account_path = users.join(&account_a);
+    let saved = users.join(format!("{account_a}.saved"));
+    let outside = fx.root.path().join("outside-sentinel");
+    std::fs::create_dir(&outside).unwrap();
+    let sentinel = outside.join("sentinel.txt");
+    std::fs::write(&sentinel, b"outside fixture sentinel\n").unwrap();
+    std::fs::rename(&account_path, &saved).unwrap();
+    std::os::unix::fs::symlink(&outside, &account_path).unwrap();
+    let before_symlink = fx.row_count();
+    let (status, body) = fx.post_multipart(&owner_a, &[("conversation", &home)], None);
+    assert!(
+        !(200..300).contains(&status),
+        "HTTP upload crossed account symlink: {body}"
+    );
+    assert_eq!(
+        fx.row_count(),
+        before_symlink,
+        "symlink refusal persisted metadata"
+    );
+    assert_eq!(
+        std::fs::read(&sentinel).unwrap(),
+        b"outside fixture sentinel\n"
+    );
+    assert_eq!(
+        std::fs::read_dir(&outside).unwrap().count(),
+        1,
+        "HTTP created outside bytes"
+    );
+}
+
 impl Fx {
     fn _home_id(&self, alias: &str) -> String {
         let db = rusqlite::Connection::open(crate::rollout::db_file(&self.state())).unwrap();

@@ -1849,10 +1849,9 @@ fn quota_scan_user_tree(root: &PinnedBlobDir) -> Result<Vec<QuotaFile>> {
                 break;
             }
             let raw = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
-            if matches!(
-                raw.to_bytes(),
-                b"." | b".." | b".gitignore" | b".quota.lock"
-            ) {
+            if matches!(raw.to_bytes(), b"." | b"..")
+                || (depth == 0 && raw.to_bytes() == b".gitignore")
+            {
                 continue;
             }
             *entries = entries
