@@ -50,7 +50,6 @@ const HANDLE: &str = "juicysuite_crm";
 const CAPTION: &str = "CAD-1332 caption";
 
 /// The fake hosted door. Every request is logged as (method, path).
-#[derive(Default)]
 struct Door {
     media: aos_media_door::MediaDoor,
     seen: Mutex<Vec<(String, String)>>,
@@ -60,6 +59,21 @@ struct Door {
     status: Mutex<String>,
     /// key -> the last publish body, so status echoes its binding.
     published: Mutex<HashMap<String, Value>>,
+}
+
+impl Default for Door {
+    /// CAD-1361: this acceptance is stored-effect/retry logic, not
+    /// image-size custody, so it uses the small real PNG artifact mode
+    /// (CAD-1304 keeps the default oversized one).
+    fn default() -> Self {
+        Self {
+            media: aos_media_door::MediaDoor::new_small(),
+            seen: Default::default(),
+            processing: Default::default(),
+            status: Default::default(),
+            published: Default::default(),
+        }
+    }
 }
 
 impl Door {
