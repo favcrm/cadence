@@ -317,6 +317,39 @@ fn resolved_bundle(
     Ok((files, validated, provenance))
 }
 
+/// CAD-1271: one immutable, descriptor-relative local snapshot validated by
+/// the same install-check path. Offline preview consumers must keep using this
+/// map rather than reopening package members after validation.
+pub(crate) fn snapshot_validated_local(
+    source: &Path,
+) -> Result<(BTreeMap<String, String>, app::Validated)> {
+    if source
+        .symlink_metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(Error::rejected(
+            "app source is a symlink — an app is a real folder",
+        ));
+    }
+    if !source.is_dir() {
+        return Err(Error::rejected("app source must be a local directory"));
+    }
+    let dir = source
+        .canonicalize()
+        .map_err(|error| Error::rejected(format!("cannot resolve app source: {error}")))?;
+    let root = Root::open(&dir)?;
+    let files = snapshot(&root, Path::new(""), true)?;
+    let validated = app::validate_texts(
+        files
+            .iter()
+            .map(|(name, text)| (name.clone(), text.clone()))
+            .collect(),
+        &Default::default(),
+        &[],
+    )?;
+    Ok((files, validated))
+}
+
 fn snapshot(root: &Root, base: &Path, source: bool) -> Result<BTreeMap<String, String>> {
     let mut budget = MAX_INVENTORY_ENTRIES;
     let mut files = BTreeMap::new();

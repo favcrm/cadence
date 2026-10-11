@@ -73,6 +73,27 @@ pub(crate) enum AppAction {
         #[command(subcommand)]
         action: RunAction,
     },
+    /// Export the exact host screen frame and kit CSS for offline previews.
+    FrameKit {
+        /// New output directory for the frame, kit CSS and metadata.
+        #[arg(long)]
+        out: PathBuf,
+        /// Optional local app bundle to mount as the validated screen entry.
+        #[arg(long)]
+        bundle: Option<PathBuf>,
+        /// Exact parent origin allowed by the frame bridge.
+        #[arg(long, default_value = "http://127.0.0.1")]
+        parent_origin: String,
+    },
+    /// Emit canonical screen PUSH fixtures from a local validated app bundle.
+    Fixtures {
+        /// Local app package directory.
+        #[arg(long)]
+        bundle: PathBuf,
+        /// Require the machine-readable fixture envelope.
+        #[arg(long)]
+        json: bool,
+    },
     /// Run a fixture-only HMR preview from an explicitly trusted local
     /// Cadence source checkout. This executes that checkout's known
     /// development harness, not an installed app or its manifest.
@@ -1924,6 +1945,20 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
                 ),
             };
             client::rpc(state_dir, method, params)?
+        }
+        AppAction::FrameKit {
+            out,
+            bundle,
+            parent_origin,
+        } => {
+            return cadence_agent::app_preview_export::write_frame_kit(
+                out,
+                bundle.as_deref(),
+                parent_origin,
+            );
+        }
+        AppAction::Fixtures { bundle, json } => {
+            return cadence_agent::app_preview_export::write_fixtures(bundle, *json);
         }
         AppAction::Dev {
             name,
