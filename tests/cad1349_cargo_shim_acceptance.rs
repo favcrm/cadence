@@ -27,6 +27,69 @@ struct Fixture {
     shim: PathBuf,
 }
 
+struct RegisteredFixtureCleanup {
+    state: PathBuf,
+    home: PathBuf,
+    xdg_state: PathBuf,
+    driver_stop: PathBuf,
+    tmux_state: PathBuf,
+    armed: bool,
+}
+
+impl RegisteredFixtureCleanup {
+    fn close(&mut self) -> Result<(), String> {
+        let stop_file = fs::write(&self.driver_stop, "stop\n")
+            .map_err(|error| format!("write fixture driver stop file: {error}"));
+        let state = self.state.to_string_lossy();
+        let mut stop_daemon = Command::new(BINARY);
+        stop_daemon
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .args(["--state-dir", state.as_ref(), "daemon", "stop"])
+            .env("HOME", &self.home)
+            .env("XDG_STATE_HOME", &self.xdg_state);
+        let stopped = cadence_agent::reaper::output(&mut stop_daemon)
+            .map_err(|error| format!("run fixture daemon stop: {error}"));
+
+        let mut kill_tmux = Command::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake_tmux.py"
+        ));
+        kill_tmux
+            .args(["-L", "isolated", "kill-server"])
+            .env("CADENCE_FAKE_TMUX_STATE", &self.tmux_state);
+        let killed = cadence_agent::reaper::output(&mut kill_tmux);
+
+        stop_file?;
+        match stopped {
+            Err(error) => Err(error),
+            Ok(output) if !output.status.success() => Err(format!(
+                "stop fixture daemon: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )),
+            Ok(_) => match killed {
+                Err(error) => Err(format!("kill fixture tmux: {error}")),
+                Ok(output) if !output.status.success() => Err(format!(
+                    "kill fixture tmux: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                )),
+                Ok(_) => {
+                    self.armed = false;
+                    Ok(())
+                }
+            },
+        }
+    }
+}
+
+impl Drop for RegisteredFixtureCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.close();
+        }
+    }
+}
+
 fn fixture(root: &Path, helper: &Path, name: &str) -> Fixture {
     let home = root.join(format!("{name}-home"));
     let repo = root.join(format!("{name}-repo"));
@@ -548,6 +611,14 @@ os.execvpe(sys.executable, [sys.executable, {}, *args], env)
     )
     .unwrap();
     fs::set_permissions(&tmux_wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut cleanup = RegisteredFixtureCleanup {
+        state: state.clone(),
+        home: home.clone(),
+        xdg_state: xdg_state.clone(),
+        driver_stop: stop.clone(),
+        tmux_state: root.join("tmux/state.json"),
+        armed: true,
+    };
     let started =
         start_registered_fixture_daemon(&state, &home, &xdg_state, root, &driver, &tmux_wrapper);
     assert!(
@@ -642,29 +713,9 @@ os.execvpe(sys.executable, [sys.executable, {}, *args], env)
     let (wrong_rc, wrong_log) = read_case("wrong-kind");
     let (incomplete_rc, incomplete_log) = read_case("incomplete");
     let (replay_rc, replay_log) = read_case("replay");
-    fs::write(&stop, "stop\n").unwrap();
-    let mut stop_daemon = Command::new(BINARY);
-    stop_daemon
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .args(["--state-dir", state.to_str().unwrap(), "daemon", "stop"])
-        .env("HOME", &home)
-        .env("XDG_STATE_HOME", &xdg_state);
-    let stopped =
-        cadence_agent::reaper::output(&mut stop_daemon).expect("stop registered fixture daemon");
-    assert!(
-        stopped.status.success(),
-        "stop fixture daemon: {}",
-        String::from_utf8_lossy(&stopped.stderr)
-    );
-    let mut kill_tmux = Command::new(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/fake_tmux.py"
-    ));
-    kill_tmux
-        .args(["-L", "isolated", "kill-server"])
-        .env("CADENCE_FAKE_TMUX_STATE", root.join("tmux/state.json"));
-    let _ = cadence_agent::reaper::output(&mut kill_tmux);
+    cleanup
+        .close()
+        .unwrap_or_else(|error| panic!("fixture cleanup failed: {error}"));
     assert_eq!(suite_rc, 0, "registered suite runner failed: {suite_log}");
     assert!(
         suite_log.contains("acquired (suite"),
