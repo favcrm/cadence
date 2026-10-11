@@ -46,16 +46,17 @@ def descriptor_digest(descriptor: int) -> str:
 
 
 @contextmanager
-def source_snapshot(path: Path):
+def source_snapshot(path: Path, allowed_suffixes: set[str] | None = None):
     unresolved = path.expanduser().absolute()
     if unresolved.is_symlink() or any(parent.is_symlink() for parent in unresolved.parents):
         refuse("source path must not contain symbolic links")
     source_name = unresolved.name
     suffix = unresolved.suffix.lower()
-    if suffix not in {".pdf", ".docx", ".xlsx", ".docm", ".xlsm", ".pptm"}:
-        refuse("unsupported format; supported extensions are .pdf, .docx and .xlsx")
     if suffix in {".docm", ".xlsm", ".pptm"}:
         refuse("unsupported macro-enabled Office extension")
+    supported = allowed_suffixes if allowed_suffixes is not None else {".pdf", ".docx", ".xlsx"}
+    if suffix not in supported:
+        refuse("unsupported source extension")
     if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "pread"):
         refuse("safe no-follow source snapshot is unavailable on this platform")
     try:

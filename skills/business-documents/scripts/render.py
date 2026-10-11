@@ -13,17 +13,19 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 import tempfile
 from typing import Any
+from contextlib import ExitStack
 
 from docxtpl import DocxTemplate, RichText
 from jinja2 import Environment, StrictUndefined
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
-from intake import preflight_office
+from intake import preflight_office, source_snapshot, verify_source_snapshot
 
 MAX_XLSX_CELLS = 20_000
 
@@ -318,122 +320,145 @@ def main() -> int:
     parser.add_argument("--output-dir", required=True, type=Path)
     args = parser.parse_args()
     output = None
+    created_paths: list[Path] = []
     try:
-        check_task_input(args.template, ".docx")
-        check_task_input(args.brief, ".json")
-        if args.rates:
-            check_task_input(args.rates, ".xlsx")
-        inputs = [args.template, args.brief] + ([args.rates] if args.rates else [])
-        output = safe_output(args.output_dir, inputs)
-        brief = json.loads(args.brief.read_text(encoding="utf-8"))
-        if not isinstance(brief, dict) or not isinstance(brief.get("price_items", []), list):
-            raise ValueError("brief must be a JSON object with a price_items list")
-        financial = bool(brief.get("financial", False))
-        if financial and not args.rates:
-            raise ValueError("financial brief requires an approved rate workbook")
-        if financial and not brief.get("price_items"):
-            raise ValueError("financial brief requires at least one explicitly sourced price item")
-        if not financial and brief.get("price_items"):
-            raise ValueError("non-financial brief must not contain price_items")
-        if financial:
-            rates_package = preflight_office(args.rates, "xlsx")
-            rates_package.close()
-        result = calculate(brief, load_rates(args.rates)) if financial else {
-            "items": [], "known_subtotal": None, "currency": "", "full_total": None,
-            "unresolved_mandatory": False,
-        }
-        context = dict(brief["template_fields"])
-        if financial:
-            item_lines = []
-            for item in result["items"]:
-                unit_price = "UNRESOLVED" if item["unit_price"] is None else f"{item['currency']} {item['unit_price']:,} per {item['unit']}"
-                item_lines.append(f"{item['description']}: quantity {item['quantity']} {item['unit']}; {unit_price}; extension {item['amount_text']}; rate {item['source_id']} effective {item['effective_date']}; input {item['input_citation']}.")
-            line_items_text = RichText()
-            for index, line in enumerate(item_lines):
-                line_items_text.add(line)
-                if index + 1 < len(item_lines):
-                    line_items_text.xml += "<w:br/>"
-        else:
-            line_items_text = RichText("Not applicable — no tender pricing or quotation requested.")
-        context.update({
-            "is_financial": financial,
-            "line_items": result["items"],
-            "line_items_text": line_items_text,
-            "known_subtotal": format_currency(result["currency"], result["known_subtotal"], result["currency_precision"]) if financial else "Not applicable — non-financial task",
-            "full_total": format_currency(result["currency"], result["full_total"], result["currency_precision"]) if financial else "Not applicable — non-financial task",
-        })
-        missing = REQUIRED_FIELDS - context.keys()
-        if missing:
-            raise ValueError("brief lacks mapped template fields: " + ", ".join(sorted(missing)))
-        check_template(args.template)
-        stem = str(brief.get("output_stem", "business-draft"))
-        if not stem or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for char in stem):
-            raise ValueError("output_stem must contain only letters, digits, hyphens or underscores")
-        docx_path = output / f"{stem}.docx"
-        pdf_path = output / f"{stem}.pdf"
-        xlsx_path = output / f"{stem}-quotation.xlsx"
-        metadata_path = output / f"{stem}.render.json"
-        reserved_paths = [docx_path, pdf_path, metadata_path] + ([xlsx_path] if financial else [])
-        created_paths: list[Path] = []
-        if any(os.path.lexists(path) for path in reserved_paths):
-            raise ValueError("an output already exists (including symlinks); refusing to overwrite")
-        template = DocxTemplate(str(args.template))
-        template.render(context, jinja_env=Environment(undefined=StrictUndefined, autoescape=True))
-        exclusive_write(docx_path, template.save)
-        created_paths.append(docx_path)
-        if financial:
-            write_xlsx(xlsx_path, result)
-            created_paths.append(xlsx_path)
-        import fitz
+        with ExitStack() as snapshots_stack:
+            snapshots = {
+                "template": snapshots_stack.enter_context(source_snapshot(args.template, {".docx"})),
+                "brief": snapshots_stack.enter_context(source_snapshot(args.brief, {".json"})),
+            }
+            if args.rates:
+                snapshots["rates"] = snapshots_stack.enter_context(source_snapshot(args.rates, {".xlsx"}))
+            template_input = snapshots["template"]["snapshot"]
+            brief_input = snapshots["brief"]["snapshot"]
+            rates_input = snapshots["rates"]["snapshot"] if "rates" in snapshots else None
+            check_task_input(template_input, ".docx")
+            check_task_input(brief_input, ".json")
+            if rates_input:
+                check_task_input(rates_input, ".xlsx")
+            for snapshot in snapshots.values():
+                verify_source_snapshot(snapshot)
+            inputs = [snapshot["resolved"] for snapshot in snapshots.values()]
+            output = safe_output(args.output_dir, inputs)
+            brief = json.loads(brief_input.read_text(encoding="utf-8"))
+            if not isinstance(brief, dict) or not isinstance(brief.get("price_items", []), list):
+                raise ValueError("brief must be a JSON object with a price_items list")
+            financial = bool(brief.get("financial", False))
+            if financial and rates_input is None:
+                raise ValueError("financial brief requires an approved rate workbook")
+            if financial and not brief.get("price_items"):
+                raise ValueError("financial brief requires at least one explicitly sourced price item")
+            if not financial and brief.get("price_items"):
+                raise ValueError("non-financial brief must not contain price_items")
+            if financial:
+                rates_package = preflight_office(rates_input, "xlsx")
+                rates_package.close()
+            result = calculate(brief, load_rates(rates_input)) if financial else {
+                "items": [], "known_subtotal": None, "currency": "", "full_total": None,
+                "unresolved_mandatory": False,
+            }
+            context = dict(brief["template_fields"])
+            if financial:
+                item_lines = []
+                for item in result["items"]:
+                    unit_price = "UNRESOLVED" if item["unit_price"] is None else f"{item['currency']} {item['unit_price']:,} per {item['unit']}"
+                    item_lines.append(f"{item['description']}: quantity {item['quantity']} {item['unit']}; {unit_price}; extension {item['amount_text']}; rate {item['source_id']} effective {item['effective_date']}; input {item['input_citation']}.")
+                line_items_text = RichText()
+                for index, line in enumerate(item_lines):
+                    line_items_text.add(line)
+                    if index + 1 < len(item_lines):
+                        line_items_text.xml += "<w:br/>"
+            else:
+                line_items_text = RichText("Not applicable — no tender pricing or quotation requested.")
+            context.update({
+                "is_financial": financial,
+                "line_items": result["items"],
+                "line_items_text": line_items_text,
+                "known_subtotal": format_currency(result["currency"], result["known_subtotal"], result["currency_precision"]) if financial else "Not applicable — non-financial task",
+                "full_total": format_currency(result["currency"], result["full_total"], result["currency_precision"]) if financial else "Not applicable — non-financial task",
+            })
+            missing = REQUIRED_FIELDS - context.keys()
+            if missing:
+                raise ValueError("brief lacks mapped template fields: " + ", ".join(sorted(missing)))
+            check_template(template_input)
+            stem = str(brief.get("output_stem", "business-draft"))
+            if not stem or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for char in stem):
+                raise ValueError("output_stem must contain only letters, digits, hyphens or underscores")
+            docx_name = f"{stem}.docx"
+            pdf_name = f"{stem}.pdf"
+            xlsx_name = f"{stem}-quotation.xlsx"
+            metadata_name = f"{stem}.render.json"
+            reserved_names = [docx_name, pdf_name, metadata_name] + ([xlsx_name] if financial else [])
+            if any(os.path.lexists(output / name) for name in reserved_names):
+                raise ValueError("an output already exists (including symlinks); refusing to overwrite")
+            import fitz
 
-        with tempfile.TemporaryDirectory(prefix="cadence-lo-", dir="/tmp") as converter_dir:
-            staged_pdf = Path(converter_dir) / f"{stem}.pdf"
-            command = ["soffice", "--headless", f"-env:UserInstallation=file://{converter_dir}/profile", "--convert-to", "pdf", "--outdir", converter_dir, str(docx_path)]
-            subprocess.run(command, check=True, capture_output=True, text=True, timeout=85)
-            if staged_pdf.is_symlink() or not staged_pdf.is_file() or staged_pdf.stat().st_size == 0:
-                raise ValueError("LibreOffice did not create the expected PDF in private staging")
-            pdf = fitz.open(staged_pdf)
-            if pdf.page_count < 1 or pdf.page_count > 100:
-                raise ValueError("rendered PDF page count is outside supported bounds")
-            for page in pdf:
-                if not page.get_text("text").strip():
-                    raise ValueError("rendered PDF contains a page without extractable text")
-            page_images = []
-            total_preview_bytes = 0
-            for page_number, page in enumerate(pdf, 1):
-                pixmap = page.get_pixmap(matrix=fitz.Matrix(1.0, 1.0), alpha=False)
-                image_bytes = pixmap.tobytes("png")
-                total_preview_bytes += len(image_bytes)
-                if total_preview_bytes > 64 * 1024 * 1024:
-                    raise ValueError("PDF page previews exceed 64 MiB output bound")
-                image_path = output / f"{stem}-page-{page_number:03d}.png"
-                if os.path.lexists(image_path):
-                    raise ValueError(f"page preview already exists; refusing to overwrite: {image_path.name}")
-                exclusive_write(image_path, lambda stream, payload=image_bytes: stream.write(payload))
-                created_paths.append(image_path)
-                page_images.append(image_path.name)
-            pdf.close()
-            pdf_path = publish_staged_file(staged_pdf, output, pdf_path.name)
-            created_paths.append(pdf_path)
-        meta = {
-            "draft": {"docx": docx_path.name, "pdf_from_docx": pdf_path.name, "docx_sha256": sha256(docx_path), "pdf_sha256": sha256(pdf_path)},
-            "template": {"filename": args.template.name, "sha256": sha256(args.template)},
-            "brief": {"filename": args.brief.name, "sha256": sha256(args.brief)},
-            "rates": ({"filename": args.rates.name, "sha256": sha256(args.rates)} if financial else None),
-            "calculation": result if financial else None,
-            "page_previews": page_images,
-            "tools": {"python": sys.version.split()[0], "docxtpl": __import__("importlib.metadata", fromlist=["version"]).version("docxtpl"), "python_docx": __import__("importlib.metadata", fromlist=["version"]).version("python-docx"), "openpyxl": __import__("importlib.metadata", fromlist=["version"]).version("openpyxl"), "pymupdf": fitz.VersionBind, "libreoffice": subprocess.run(["soffice", "--version"], check=True, capture_output=True, text=True, timeout=5).stdout.strip()},
-        }
-        exclusive_write(metadata_path, lambda stream: stream.write((json.dumps(meta, ensure_ascii=False, indent=2) + "\n").encode("utf-8")))
-        created_paths.append(metadata_path)
-        print(json.dumps({"status": "draft-rendered", "docx": str(docx_path), "pdf": str(pdf_path), "quotation": str(output / f"{stem}-quotation.xlsx") if financial else None, "render_metadata": str(metadata_path), "calculation": result if financial else None}, ensure_ascii=False))
-        return 0
+            with tempfile.TemporaryDirectory(prefix="business-render-", dir="/tmp") as staging_dir:
+                staging = Path(staging_dir)
+                staged_docx = staging / docx_name
+                staged_xlsx = staging / xlsx_name
+                staged_pdf = staging / pdf_name
+                staged_metadata = staging / metadata_name
+                template = DocxTemplate(str(template_input))
+                template.render(context, jinja_env=Environment(undefined=StrictUndefined, autoescape=True))
+                exclusive_write(staged_docx, template.save)
+                if financial:
+                    write_xlsx(staged_xlsx, result)
+                with tempfile.TemporaryDirectory(prefix="cadence-lo-", dir=staging_dir) as converter_dir:
+                    converted_pdf = Path(converter_dir) / pdf_name
+                    command = ["soffice", "--headless", f"-env:UserInstallation=file://{converter_dir}/profile", "--convert-to", "pdf", "--outdir", converter_dir, str(staged_docx)]
+                    subprocess.run(command, check=True, capture_output=True, text=True, timeout=85)
+                    if converted_pdf.is_symlink() or not converted_pdf.is_file() or converted_pdf.stat().st_size == 0:
+                        raise ValueError("LibreOffice did not create the expected PDF in private staging")
+                    shutil.copyfile(converted_pdf, staged_pdf)
+                pdf = fitz.open(staged_pdf)
+                if pdf.page_count < 1 or pdf.page_count > 100:
+                    raise ValueError("rendered PDF page count is outside supported bounds")
+                page_images = []
+                total_preview_bytes = 0
+                for page_number, page in enumerate(pdf, 1):
+                    if not page.get_text("text").strip():
+                        raise ValueError("rendered PDF contains a page without extractable text")
+                    image_bytes = page.get_pixmap(matrix=fitz.Matrix(1.0, 1.0), alpha=False).tobytes("png")
+                    total_preview_bytes += len(image_bytes)
+                    if total_preview_bytes > 64 * 1024 * 1024:
+                        raise ValueError("PDF page previews exceed 64 MiB output bound")
+                    image_name = f"{stem}-page-{page_number:03d}.png"
+                    exclusive_write(staging / image_name, lambda stream, payload=image_bytes: stream.write(payload))
+                    page_images.append(image_name)
+                pdf.close()
+                meta = {
+                    "draft": {"docx": docx_name, "pdf_from_docx": pdf_name, "docx_sha256": sha256(staged_docx), "pdf_sha256": sha256(staged_pdf)},
+                    "template": {"filename": snapshots["template"]["filename"], "sha256": snapshots["template"]["sha256"]},
+                    "brief": {"filename": snapshots["brief"]["filename"], "sha256": snapshots["brief"]["sha256"]},
+                    "rates": ({"filename": snapshots["rates"]["filename"], "sha256": snapshots["rates"]["sha256"]} if financial else None),
+                    "calculation": result if financial else None,
+                    "page_previews": page_images,
+                    "tools": {"python": sys.version.split()[0], "docxtpl": __import__("importlib.metadata", fromlist=["version"]).version("docxtpl"), "python_docx": __import__("importlib.metadata", fromlist=["version"]).version("python-docx"), "openpyxl": __import__("importlib.metadata", fromlist=["version"]).version("openpyxl"), "pymupdf": fitz.VersionBind, "libreoffice": subprocess.run(["soffice", "--version"], check=True, capture_output=True, text=True, timeout=5).stdout.strip()},
+                }
+                exclusive_write(staged_metadata, lambda stream: stream.write((json.dumps(meta, ensure_ascii=False, indent=2) + "\n").encode("utf-8")))
+                staged_files = [(staged_docx, docx_name)]
+                if financial:
+                    staged_files.append((staged_xlsx, xlsx_name))
+                staged_files.append((staged_pdf, pdf_name))
+                staged_files.extend((staging / name, name) for name in page_images)
+                staged_files.append((staged_metadata, metadata_name))
+                if any(os.path.lexists(output / name) for _, name in staged_files):
+                    raise ValueError("an output already exists (including symlinks); refusing to overwrite")
+                for snapshot in snapshots.values():
+                    verify_source_snapshot(snapshot)
+                for staged, name in staged_files:
+                    published = publish_staged_file(staged, output, name)
+                    created_paths.append(published)
+                for snapshot in snapshots.values():
+                    verify_source_snapshot(snapshot)
+            print(json.dumps({"status": "draft-rendered", "docx": str(output / docx_name), "pdf": str(output / pdf_name), "quotation": str(output / xlsx_name) if financial else None, "render_metadata": str(output / metadata_name), "calculation": result if financial else None}, ensure_ascii=False))
+            return 0
     except Exception as exc:
         print(f"Render blocked: {type(exc).__name__}: {exc}", file=sys.stderr)
-        if output and "created_paths" in locals():
-            # Remove only files created by this invocation; preserve all caller files.
-            for path in created_paths:
-                path.unlink(missing_ok=True)
+        # Remove only files published by this invocation; preserve caller files.
+        for path in created_paths:
+            path.unlink(missing_ok=True)
         return 2
 
 
