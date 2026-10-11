@@ -48,6 +48,7 @@ mod crm_smtp;
 pub mod delivery_sync;
 mod home;
 mod lane;
+mod lifecycle;
 mod login;
 mod operator;
 mod platform_account;
@@ -56,7 +57,6 @@ mod serve;
 mod setup;
 mod social_publish;
 mod stages;
-mod lifecycle;
 mod stream;
 mod tailscale;
 mod tailscale_serve;
@@ -73,19 +73,19 @@ pub use setup::{read_model_stats, setup_runs};
 // Re-export the moved sections' shared items so the sibling submodules'
 // `use super::{…}` and the tests' `super::` keep resolving — the public
 // surface of `crate::ui` is unchanged by the split.
-pub(crate) use serve::{
-    agents_payload_from, board_job_list, err_response, json_response, pct_decode,
-};
-pub(crate) use stream::{dir_mtime, event_resources, projects_payload, value_fp};
-pub use lifecycle::{detached_pid, START_BUDGET_ENV, START_BUDGET_RESTART};
-pub(crate) use lifecycle::{
-    http_get, is_cadence_exe_name, ready_file, startup_failed_file, start_quiet,
-    START_REMAINING_ENV, READY_NONCE_ENV,
-};
 #[cfg(test)]
 pub(crate) use lifecycle::{
     board_argv_state_dir, pid_file, reap_unready_child, startup_bind_in_use,
 };
+pub use lifecycle::{detached_pid, START_BUDGET_ENV, START_BUDGET_RESTART};
+pub(crate) use lifecycle::{
+    http_get, is_cadence_exe_name, ready_file, start_quiet, startup_failed_file, READY_NONCE_ENV,
+    START_REMAINING_ENV,
+};
+pub(crate) use serve::{
+    agents_payload_from, board_job_list, err_response, json_response, pct_decode,
+};
+pub(crate) use stream::{dir_mtime, event_resources, projects_payload, value_fp};
 pub(crate) use tailscale::{ts, ts_self, ts_start_quiet};
 pub(crate) use write_path::{
     agent_roots, busy_response, coded_response, guard_fail, header_value, issue_payloads,

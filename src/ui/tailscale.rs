@@ -128,7 +128,11 @@ fn mapping_matches(dns: &str, port: u16, target: &str) -> Result<bool> {
     tailscale_serve::matches(dns, port, target)
 }
 
-pub(crate) fn prepare_mapping(dns: &str, port: u16, target: &str) -> Result<tailscale_serve::PreparedUpdate> {
+pub(crate) fn prepare_mapping(
+    dns: &str,
+    port: u16,
+    target: &str,
+) -> Result<tailscale_serve::PreparedUpdate> {
     // Preserve the exact caller hard gate before any LocalAPI connection.
     crate::sandbox::refuse_global_unless_allowed("`tailscale serve`")?;
     tailscale_serve::prepare_ensure(dns, port, target)
