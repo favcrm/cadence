@@ -172,7 +172,7 @@ fn daemon_sweep(rig: &Rig, cursor: Option<&str>, pl: PrLookup<'_>, pv: PrView<'_
         cursor,
         pl,
         pv,
-        Duration::ZERO,
+        None,
     )
     .unwrap()
 }
