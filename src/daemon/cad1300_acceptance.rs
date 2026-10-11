@@ -1317,7 +1317,10 @@ fn cad1300_publish_requires_canonical_ci_run_url() {
     ];
 
     for (case, row_repo, ci_url, should_publish) in cases {
-        let root = tempfile::Builder::new().prefix("c1300ci").tempdir().unwrap();
+        let root = tempfile::Builder::new()
+            .prefix("c1300ci")
+            .tempdir()
+            .unwrap();
         let board = Board::start_cased(root.path(), REPO, row_repo);
         let gh = board.state.join("gh");
         let script = std::fs::read_to_string(&gh).unwrap();
@@ -1326,8 +1329,12 @@ fn cad1300_publish_requires_canonical_ci_run_url() {
         std::fs::write(&gh, script.replace(original, ci_url)).unwrap();
 
         let operator = board.session();
-        let (status, body) =
-            board.post("operator", Some(&operator), APPROVE, &approve_pr(PUBLISH_PR));
+        let (status, body) = board.post(
+            "operator",
+            Some(&operator),
+            APPROVE,
+            &approve_pr(PUBLISH_PR),
+        );
         assert_eq!(status, 200, "{case}: setup approval: {body}");
         let events = board.approval_events();
         let (status, body) = board.post(
