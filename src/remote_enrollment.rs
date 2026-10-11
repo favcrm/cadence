@@ -1207,6 +1207,29 @@ pub fn enroll_browser(
     dir: &Path,
     show_code: impl FnOnce(&str, &str) -> Result<()>,
 ) -> Result<EnrollmentInfo> {
+    enroll_browser_with(
+        issuer,
+        org,
+        audience,
+        client_agent,
+        dir,
+        show_code,
+        &mut RealLoginRuntime,
+    )
+}
+
+/// `enroll_browser` on an injected runtime — private, production only
+/// ever passes [`RealLoginRuntime`]; tests drive a scripted one so the
+/// poll loop's waits run on virtual time (CAD-1341).
+fn enroll_browser_with(
+    issuer: &str,
+    org: &str,
+    audience: &str,
+    client_agent: &str,
+    dir: &Path,
+    show_code: impl FnOnce(&str, &str) -> Result<()>,
+    runtime: &mut dyn LoginRuntime,
+) -> Result<EnrollmentInfo> {
     let issuer = origin(issuer, cfg!(test))?;
     let audience = origin(audience, cfg!(test))?;
     if !id(org) || !id(client_agent) {
@@ -1222,7 +1245,7 @@ pub fn enroll_browser(
     let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .encode(Sha256::digest(verifier.as_bytes()));
     confirm_access_ingress(dir, &issuer, &access)?;
-    let (status, code) = post_public_with_access(
+    let (status, code) = runtime.post_public(
         &issuer,
         "/v1/hosted-cadence/device/code",
         json!({"version":DEVICE_VERSION,"organization_id":org,"audience":audience,
@@ -1235,23 +1258,23 @@ pub fn enroll_browser(
     }
     let (device, user, verification, mut interval) = device_code(&code)?;
     show_code(verification, user)?;
-    let deadline = Instant::now() + Duration::from_secs(timestamp(&code, "expires_in")?);
+    let deadline = runtime.now() + Duration::from_secs(timestamp(&code, "expires_in")?);
     let grant = loop {
-        if Instant::now() >= deadline {
+        if runtime.now() >= deadline {
             return Err(reject("Hosted browser authorization expired; start again"));
         }
-        std::thread::sleep(Duration::from_secs(interval));
-        if Instant::now() >= deadline {
+        runtime.wait(Duration::from_secs(interval));
+        if runtime.now() >= deadline {
             return Err(reject("Hosted browser authorization expired; start again"));
         }
         confirm_access_ingress(dir, &issuer, &access)?;
-        let (status, response) = post_public_with_access(
+        let (status, response) = runtime.post_public(
             &issuer,
             "/v1/hosted-cadence/device/token",
             json!({"device_code":device,"code_verifier":verifier}),
             access.as_ref(),
         )?;
-        if Instant::now() >= deadline {
+        if runtime.now() >= deadline {
             return Err(reject("Hosted browser authorization expired; start again"));
         }
         if status == 200 {
@@ -2937,81 +2960,174 @@ mod tests {
         assert_eq!(status, 200);
     }
 
-    #[test]
-    fn browser_poll_pending_slow_down_obeys_deadline_without_child() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let issuer = format!("http://{}", listener.local_addr().unwrap());
-        let server = thread::spawn(move || {
-            let (mut code, _) = public_request(&listener, "/v1/hosted-cadence/device/code");
-            respond(&mut code, &browser_code(16));
-            for error in ["authorization_pending", "slow_down"] {
-                let (mut token, request) =
-                    public_request(&listener, "/v1/hosted-cadence/device/token");
-                assert_eq!(request["device_code"], format!("hcd_{}", "A".repeat(43)));
-                assert_eq!(request["code_verifier"].as_str().unwrap().len(), 43);
-                respond_error(&mut token, error);
+    /// Scripted enrollment issuer on the same LoginRuntime seam the
+    /// login tests use (CAD-1341): virtual monotonic clock records
+    /// every wait, `post_public` replays the token-error script, so
+    /// poll backoff/deadline behavior is exact and wall-free.
+    struct ScriptedEnroll {
+        issuer: String,
+        token_errors: Vec<&'static str>,
+        /// Fixed baseline captured at construction; `now` is
+        /// `baseline + virtual_secs` — wall time never advances it.
+        baseline: Instant,
+        virtual_secs: u64,
+        /// Every wait interval observed, in order.
+        waits: Vec<u64>,
+        /// Requests received, in order (path only).
+        requests: Vec<String>,
+        finished: bool,
+    }
+
+    impl ScriptedEnroll {
+        fn new(issuer: &str, token_errors: Vec<&'static str>) -> Self {
+            Self {
+                issuer: issuer.to_string(),
+                token_errors,
+                baseline: Instant::now(),
+                virtual_secs: 0,
+                waits: Vec::new(),
+                requests: Vec::new(),
+                finished: false,
             }
-            listener.set_nonblocking(true).unwrap();
-            listener
-        });
+        }
+    }
+
+    impl LoginRuntime for ScriptedEnroll {
+        fn now(&mut self) -> Instant {
+            self.baseline + Duration::from_secs(self.virtual_secs)
+        }
+        fn wait(&mut self, interval: Duration) {
+            self.virtual_secs += interval.as_secs();
+            self.waits.push(interval.as_secs());
+        }
+        fn post_public(
+            &mut self,
+            issuer: &str,
+            path: &str,
+            body: Value,
+            access: Option<&AccessIngress>,
+        ) -> Result<(u16, Value)> {
+            assert_eq!(issuer, self.issuer);
+            assert!(access.is_none());
+            assert!(!self.finished, "request after terminal response");
+            self.requests.push(path.to_string());
+            if path.ends_with("/device/code") {
+                assert_eq!(path, "/v1/hosted-cadence/device/code");
+                assert_eq!(body["version"], DEVICE_VERSION);
+                assert_eq!(body["organization_id"], "ws_real");
+                assert_eq!(body["audience"], "https://real.board.example.test");
+                assert_eq!(
+                    body["requested_capabilities"],
+                    json!(["bridge.enroll", "results.submit"])
+                );
+                assert_eq!(body["code_challenge"].as_str().unwrap().len(), 43);
+                return Ok((200, browser_code(16)));
+            }
+            assert_eq!(path, "/v1/hosted-cadence/device/token");
+            assert_eq!(body["device_code"], format!("hcd_{}", "A".repeat(43)));
+            assert_eq!(body["code_verifier"].as_str().unwrap().len(), 43);
+            let error = self.token_errors.remove(0);
+            self.finished = matches!(error, "access_denied" | "expired_token");
+            Ok((400, json!({"error": error})))
+        }
+    }
+
+    /// Drive `enroll_browser_with` against a bound loopback listener
+    /// as `issuer`: the scripted runtime answers every poll (it never
+    /// connects), while any request that escapes the seam — the
+    /// post-grant `enroll_child_locked` uses the real
+    /// `post_with_access` transport — lands on the real listener
+    /// instead of the open network.
+    fn run_enroll(
+        listener: &TcpListener,
+        token_errors: Vec<&'static str>,
+    ) -> (
+        Result<EnrollmentInfo>,
+        PathBuf,
+        tempfile::TempDir,
+        ScriptedEnroll,
+    ) {
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("e");
         trust(&dir, &issuer);
-        let started = Instant::now();
-        let err = enroll_browser(
+        let mut script = ScriptedEnroll::new(&issuer, token_errors);
+        let out = enroll_browser_with(
             &issuer,
             "ws_real",
             "https://real.board.example.test",
             "worker",
             &dir,
             |_, _| Ok(()),
-        )
-        .unwrap_err();
-        assert!(format!("{err}").contains("expired"));
-        assert!(started.elapsed() >= Duration::from_secs(15));
-        let listener = server.join().unwrap();
-        assert!(
-            listener.accept().is_err(),
-            "deadline allowed another token or child request"
+            &mut script,
         );
+        (out, dir, root, script)
+    }
+
+    /// Nonblocking proof that nothing escaped the scripted seam to the
+    /// real issuer listener — the original tests' terminal/deadline
+    /// "no further request" evidence, kept on the real socket.
+    fn assert_no_request(listener: &TcpListener) {
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "a request escaped the scripted runtime to the real issuer"
+        );
+    }
+
+    /// Same scenario as the retired wall-clock version: expires_in 16,
+    /// pending then slow_down. Pending keeps the 5s interval,
+    /// slow_down backs it off +5 → 10; the third wait lands on the
+    /// deadline so no third token request is made — and the real
+    /// loopback issuer sees nothing at all.
+    #[test]
+    fn browser_poll_pending_slow_down_obeys_deadline_without_child() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (out, dir, _root, script) =
+            run_enroll(&listener, vec!["authorization_pending", "slow_down"]);
+        let err = out.unwrap_err();
+        assert!(format!("{err}").contains("expired"), "{err}");
+        assert_eq!(script.waits, [5, 5, 10], "{:?}", script.waits);
+        assert_eq!(script.virtual_secs, 20);
+        assert_eq!(
+            script.requests,
+            [
+                "/v1/hosted-cadence/device/code",
+                "/v1/hosted-cadence/device/token",
+                "/v1/hosted-cadence/device/token",
+            ],
+            "deadline allowed another token request"
+        );
+        assert_no_request(&listener);
         assert!(!dir.join(RECORD).exists());
     }
 
+    /// Denial and expiry are terminal on the first token response —
+    /// the poll stops, the error class survives, no request on the
+    /// real issuer, no record.
     #[test]
     fn browser_poll_terminal_denial_and_expiry_never_create_child() {
         for error in ["access_denied", "expired_token"] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let issuer = format!("http://{}", listener.local_addr().unwrap());
-            let server = thread::spawn(move || {
-                let (mut code, _) = public_request(&listener, "/v1/hosted-cadence/device/code");
-                respond(&mut code, &browser_code(60));
-                let (mut token, _) = public_request(&listener, "/v1/hosted-cadence/device/token");
-                respond_error(&mut token, error);
-                listener.set_nonblocking(true).unwrap();
-                listener
-            });
-            let root = tempfile::tempdir().unwrap();
-            let dir = root.path().join("e");
-            trust(&dir, &issuer);
-            let err = enroll_browser(
-                &issuer,
-                "ws_real",
-                "https://real.board.example.test",
-                "worker",
-                &dir,
-                |_, _| Ok(()),
-            )
-            .unwrap_err();
+            listener.set_nonblocking(true).unwrap();
+            let (out, dir, _root, script) = run_enroll(&listener, vec![error]);
+            let err = out.unwrap_err();
             assert!(format!("{err}").contains(if error == "access_denied" {
                 "denied"
             } else {
                 "expired"
             }));
-            let listener = server.join().unwrap();
-            assert!(
-                listener.accept().is_err(),
-                "terminal response allowed child request"
+            assert_eq!(script.waits, [5]);
+            assert_eq!(
+                script.requests,
+                [
+                    "/v1/hosted-cadence/device/code",
+                    "/v1/hosted-cadence/device/token"
+                ],
+                "terminal response allowed further polling"
             );
+            assert_no_request(&listener);
             assert!(!dir.join(RECORD).exists());
         }
     }
