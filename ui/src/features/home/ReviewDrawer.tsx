@@ -291,8 +291,6 @@ function IdeaReview({ need, readOnly, index, total, onDone, onClose }: ReviewPro
         ) : (
           <>
             {lead && <p className="rv-lead">{lead}</p>}
-            <h4 className="rv-h">If you approve</h4>
-            <p className="rv-note">The work the idea proposes is created and the team can start on it.</p>
             {mode === "reject" && (
               <SendBack
                 label="Send back"
