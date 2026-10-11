@@ -270,7 +270,8 @@ class RunResultTestsRunner(unittest.TestCase):
         log = Path(root) / "cargo-test.log"
         env = {"PATH": f"{toolchain}:{host}:/usr/bin:/bin", "RUNNER_TEMP": root,
                "STUB_LOG": str(log), "CARGO_HOME": str(Path(root) / "cargo-home"),
-               "RUSTUP_HOME": str(Path(root) / "rustup-home"), "HOME": root}
+               "RUSTUP_HOME": str(Path(root) / "rustup-home"), "HOME": root,
+               "CADENCE_SUITE_LOCK": str(Path(root) / "fixture-suite.lock")}
         env.update(env_extra)
         result = subprocess.run([str(ROOT / "scripts/run-result-tests")], cwd=root,
                                 env=env, capture_output=True, text=True)

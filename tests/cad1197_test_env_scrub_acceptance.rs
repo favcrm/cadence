@@ -84,7 +84,8 @@ fn cad1197_production_routing_never_reaches_the_tests() {
     let pm = rig.home.join("pm");
     let state = rig.home.join(".local/state/cadence");
     let mut cmd = runner(&rig);
-    cmd.env("CADENCE_PM_DIR", &pm)
+    cmd.env("CADENCE_SUITE_LOCK", rig.home.join("fixture-suite.lock"))
+        .env("CADENCE_PM_DIR", &pm)
         .env("CADENCE_STATE_DIR", &state)
         .env("CADENCE_HOME", rig.home.join(".cadence"))
         .env("CADENCE_ALIAS", "pane-agent")

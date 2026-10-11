@@ -80,6 +80,12 @@ if [ -n "$selection_file" ]; then
     exit 1
   fi
 fi
+# Resolve shared lock configuration before metadata, installation or builds.
+# Capture the wait setting before the routing scrub; only nextest receives it.
+root=$(cd "$(dirname "$0")/.." && pwd)
+. "$root/scripts/suite-lock-config"
+suite_lock_config
+
 # CAD-1197: allowlist of CADENCE_* variables that may reach cargo.
 cadence_env_allow=" CADENCE_SUITE_LOCK "
 for v in $(compgen -e | grep '^CADENCE_' || true); do
@@ -107,7 +113,6 @@ refuse_prod_path() { # <label> <path>
 }
 refuse_prod_path CADENCE_SUITE_LOCK "${CADENCE_SUITE_LOCK:-}"
 refuse_prod_path TMPDIR "${TMPDIR:-}"
-root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
 targets=$("$root/scripts/result-test-args")
 export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
@@ -133,7 +138,6 @@ export HOME="$scratch/home" XDG_CONFIG_HOME="$scratch/xdg-config" \
        XDG_DATA_HOME="$scratch/xdg-data" XDG_STATE_HOME="$scratch/xdg-state" \
        XDG_CACHE_HOME="$scratch/xdg-cache" TMPDIR="$scratch/tmp"
 mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME" "$TMPDIR"
-export CADENCE_SUITE_LOCK="${CADENCE_SUITE_LOCK:-$scratch/cadence-suite.lock}"
 refuse_prod_path "scratch HOME" "$HOME"
 # Reuse only the repository-pinned tool in the original XDG data home;
 # otherwise install the trusted artifact into this run's isolated XDG data
@@ -219,7 +223,8 @@ rm -f "$junit_report"
 # One pinned nextest invocation replaces 56 serial cargo test invocations.
 # Its JUnit report is checked against the exact target list afterward so a
 # missing or zero-test target cannot silently shrink the required CI scope.
-if ! PATH=$lib_path "$root/scripts/cadence-nextest" --locked --features test-seam \
+if ! PATH=$lib_path CADENCE_SUITE_LOCK_WAIT_SECS="$SUITE_LOCK_WAIT_SECS" \
+  "$root/scripts/cadence-nextest" --locked --features test-seam \
     "${target_args[@]}" --lib --bins "${manifest_args[@]}" \
     -j 2 2>&1 | tee "$scratch/nextest.log"; then
   status=1
