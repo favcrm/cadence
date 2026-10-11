@@ -13,6 +13,64 @@ pub(super) const AGENT_GC_EVERY: Duration = Duration::from_secs(3600);
 /// disabling it applies without a daemon restart.
 const AGENT_GC_RECHECK: Duration = Duration::from_secs(60);
 
+/// The agent-gc timer's setting: `[host] agent_gc_older_than_secs`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AgentGcSetting {
+    /// The configured age in seconds; `None` (the default) is OFF.
+    pub configured_secs: Option<u64>,
+    /// Why `[host]` could not be read — the timer is then off.
+    pub config_error: Option<String>,
+}
+
+impl AgentGcSetting {
+    /// The timer on, sweeping rows idle longer than `secs`.
+    pub fn older_than(secs: u64) -> Self {
+        Self {
+            configured_secs: Some(secs),
+            config_error: None,
+        }
+    }
+
+    /// `[host]` in `<pm_dir>/pm.yaml`; no file or no key is off, and an
+    /// unusable table is off with its error — the sweep fails closed.
+    pub fn from_pm_dir(pm_dir: Option<&Path>) -> Self {
+        match pm_dir
+            .map(crate::doctor::host::read_host_overrides)
+            .transpose()
+        {
+            Ok(overrides) => Self {
+                configured_secs: overrides.flatten().and_then(|o| o.agent_gc_older_than_secs),
+                config_error: None,
+            },
+            Err(error) => Self {
+                configured_secs: None,
+                config_error: Some(error),
+            },
+        }
+    }
+
+    /// The age a sweep uses: the configured one raised to the floor.
+    /// `None` is off.
+    pub fn effective_secs(&self) -> Option<u64> {
+        self.configured_secs.map(|s| s.max(AGENT_GC_FLOOR_SECS))
+    }
+
+    /// The operator-facing warning, if any: an unreadable `[host]`, or
+    /// an age below the floor that the timer raised.
+    pub fn warning(&self) -> Option<String> {
+        if let Some(error) = &self.config_error {
+            return Some(format!("agent-gc timer off: {error}"));
+        }
+        match self.configured_secs {
+            Some(secs) if secs < AGENT_GC_FLOOR_SECS => Some(format!(
+                "[host] agent_gc_older_than_secs {secs} is below the 7-day floor; \
+                 the timer uses {AGENT_GC_FLOOR_SECS}s"
+            )),
+            _ => None,
+        }
+    }
+}
+
 /// The daemon's agent-gc timer: where its setting comes from and what
 /// it last did — `health` (`cadence daemon status`) reports both.
 pub(super) struct AgentGcTimer {
@@ -182,6 +240,134 @@ pub const AUTO_STOP_DEFAULT_SECS: u64 = 3600;
 /// A configured bound below this is raised to it, with a warning — a
 /// typo'd `60` must not stop agents between two turns of one task.
 pub const AUTO_STOP_FLOOR_SECS: u64 = 600;
+
+/// The idle auto-stop setting: `[host] auto_stop_idle_secs` and
+/// `auto_stop_idle_secs_by_provider` in pm.yaml. Per-agent params
+/// (`auto_stop=off`, `auto_stop_idle_secs`) override both.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AutoStopSetting {
+    /// `None` is the built-in [`AUTO_STOP_DEFAULT_SECS`]; `0` is off.
+    pub idle_secs: Option<u64>,
+    /// Provider → bound; `0` turns the timer off for that provider.
+    pub by_provider: std::collections::BTreeMap<String, u64>,
+    /// Why `[host]` could not be read — the timer then stops nothing.
+    pub config_error: Option<String>,
+}
+
+impl AutoStopSetting {
+    /// Off for every provider (per-agent `auto_stop_idle_secs` can still
+    /// turn one agent on). Test daemons pin this.
+    pub fn off() -> Self {
+        Self::idle_after(0)
+    }
+
+    /// On for every provider at `secs` (raised to the floor).
+    pub fn idle_after(secs: u64) -> Self {
+        Self {
+            idle_secs: Some(secs),
+            ..Self::default()
+        }
+    }
+
+    /// `[host]` in `<pm_dir>/pm.yaml`; no file or no key is the default
+    /// (ON, one hour). An unusable table stops nothing, with its error.
+    pub fn from_pm_dir(pm_dir: Option<&Path>) -> Self {
+        match pm_dir
+            .map(crate::doctor::host::read_host_overrides)
+            .transpose()
+        {
+            Ok(overrides) => {
+                let o = overrides.flatten();
+                Self {
+                    idle_secs: o.as_ref().and_then(|o| o.auto_stop_idle_secs),
+                    by_provider: o
+                        .and_then(|o| o.auto_stop_idle_secs_by_provider)
+                        .unwrap_or_default(),
+                    config_error: None,
+                }
+            }
+            Err(error) => Self {
+                config_error: Some(error),
+                ..Self::default()
+            },
+        }
+    }
+
+    fn floored(secs: u64) -> Option<u64> {
+        (secs > 0).then(|| secs.max(AUTO_STOP_FLOOR_SECS))
+    }
+
+    /// The host-wide bound (`None` = off).
+    pub fn default_bound(&self) -> Option<u64> {
+        if self.config_error.is_some() {
+            return None;
+        }
+        match self.idle_secs {
+            Some(secs) => Self::floored(secs),
+            None => Some(AUTO_STOP_DEFAULT_SECS),
+        }
+    }
+
+    /// `agent`'s idle bound and where it came from; `None` is off.
+    /// Precedence: agent `auto_stop=off`, agent `auto_stop_idle_secs`,
+    /// `[host]` by provider, `[host]` default, built-in default.
+    pub fn bound_for(&self, agent: &Agent) -> (Option<u64>, String) {
+        if self.config_error.is_some() {
+            return (None, "pm.yaml [host] unreadable".to_string());
+        }
+        let param = |key: &str| agent.params.as_ref().and_then(|p| p.get(key)).cloned();
+        if param("auto_stop").and_then(|v| v.as_str().map(str::to_string)) == Some("off".into()) {
+            return (None, "agent auto_stop=off".to_string());
+        }
+        let agent_secs = param("auto_stop_idle_secs").and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+        });
+        if let Some(secs) = agent_secs {
+            return (Self::floored(secs), "agent auto_stop_idle_secs".to_string());
+        }
+        if let Some(&secs) = self.by_provider.get(&agent.provider) {
+            return (
+                Self::floored(secs),
+                format!("[host] auto_stop_idle_secs_by_provider.{}", agent.provider),
+            );
+        }
+        match self.idle_secs {
+            Some(secs) => (
+                Self::floored(secs),
+                "[host] auto_stop_idle_secs".to_string(),
+            ),
+            None => (Some(AUTO_STOP_DEFAULT_SECS), "default".to_string()),
+        }
+    }
+
+    /// The operator-facing warning: an unreadable `[host]`, or a bound
+    /// below the floor that the timer raised.
+    pub fn warning(&self) -> Option<String> {
+        if let Some(error) = &self.config_error {
+            return Some(format!("idle auto-stop off: {error}"));
+        }
+        let mut low: Vec<String> = Vec::new();
+        if let Some(secs) = self
+            .idle_secs
+            .filter(|s| (1..AUTO_STOP_FLOOR_SECS).contains(s))
+        {
+            low.push(format!("auto_stop_idle_secs {secs}"));
+        }
+        for (provider, secs) in &self.by_provider {
+            if (1..AUTO_STOP_FLOOR_SECS).contains(secs) {
+                low.push(format!("auto_stop_idle_secs_by_provider.{provider} {secs}"));
+            }
+        }
+        (!low.is_empty()).then(|| {
+            format!(
+                "[host] {} below the {AUTO_STOP_FLOOR_SECS}s floor; the timer uses \
+                 {AUTO_STOP_FLOOR_SECS}s",
+                low.join(", ")
+            )
+        })
+    }
+}
 
 /// The timer checks at most this often (seconds of its clock).
 const AUTO_STOP_EVERY_SECS: f64 = 60.0;
