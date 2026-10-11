@@ -159,7 +159,7 @@ pub use master_rpc::MASTER_ALLOWED;
 // `pub(crate)` — the UI frame route calls it; unit tests live in the
 // module, not as a public API.
 pub(crate) use app_capabilities_rpc::operator_price_refusal;
-pub(crate) use app_screens_rpc::render_frame_html;
+pub(crate) use app_screens_rpc::{render_frame_html, SCREEN_KIT_CSS, SCREEN_KIT_VERSION};
 
 /// A `(Mutex, Condvar)` pair used for queue/event wakeups.
 ///

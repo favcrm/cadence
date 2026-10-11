@@ -166,6 +166,27 @@ pub(crate) fn run() -> Result<i32> {
     // or adopts its sandbox profile. The harness has no daemon/PM contract.
     if let Commands::App {
         action:
+            app::AppAction::FrameKit {
+                out,
+                bundle,
+                parent_origin,
+            },
+    } = &cli.command
+    {
+        return cadence_agent::app_preview_export::write_frame_kit(
+            out,
+            bundle.as_deref(),
+            parent_origin,
+        );
+    }
+    if let Commands::App {
+        action: app::AppAction::Fixtures { bundle, json },
+    } = &cli.command
+    {
+        return cadence_agent::app_preview_export::write_fixtures(bundle, *json);
+    }
+    if let Commands::App {
+        action:
             app::AppAction::Dev {
                 name,
                 source,

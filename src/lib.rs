@@ -11,6 +11,7 @@
 pub mod adapter;
 pub mod agent_uid;
 pub mod app_assistant;
+pub mod app_preview_export;
 pub mod audit;
 pub mod backup;
 pub mod board_identity;

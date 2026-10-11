@@ -362,3 +362,39 @@ core range that excludes this host refuse validation. Install and upgrade
 validate requirements before writing catalog, journal, or record state. The
 install-check and upgrade-check receipts, and catalog show description, include
 the declaration and this host's core version and supported contract majors.
+
+## Offline screen-frame previews and projection fixtures
+
+`cadence app frame-kit --out <dir> [--bundle <local-app-bundle>] [--parent-origin <origin>]`
+writes `frame.html`, `kit.css`, and `metadata.json` without contacting the
+daemon or reading organization, PM, installation, session, or app state. The
+output directory must not already exist. With a bundle, the command validates
+it locally and mounts its single matching `app-screens/v2` screen entry and
+styles; without one, it emits the empty preview frame. The document uses the
+same `render_frame_html` as the live screen RPC, and `kit.css` is the exact host
+`SCREEN_KIT_CSS` injected into that document. The default parent origin is
+`http://127.0.0.1`.
+
+`cadence app fixtures --bundle <local-app-bundle> --json` validates a local
+bundle and emits six deterministic synthetic canonical `PUSH` scenarios:
+`empty`, `loading`, `unavailable`, `ready`, `draft`, and `review`. It requires
+Node.js on `PATH` to run the bundled trusted producer; app assets are validated
+as data and are not executed. The fixture schema is
+`app-screen-projection-fixtures/1`. `caption_digest` remains the native-read
+HTTP response field and is not added to the canonical `PUSH` fixture shape.
+
+The frame uses offline placeholders for bridge nonce and generation; these are
+not a capability, session, receipt, or permission to call the host. The export
+and fixtures do not grant app authority or read installation state. During UI
+builds, CI regenerates the canonical producer and golden output from the real
+Vite dependency graph. Its checked-in baseline records content hashes for
+included repository sources, and freshness checks still require the artifact,
+golden, and complete dependency graph to match regeneration. A numeric
+fixture-contract version bump is required only when the serialized canonical
+golden changes from the trusted event base; producer or build-tool changes
+that leave that golden identical do not require one. Version downgrades are
+always refused. The golden covers these six generic host examples, not every
+possible future app-domain input path: contract review and consumer regressions
+remain necessary. CI compares against the trusted event base (fetching only
+that exact missing base commit in CI) and refuses when the base or its baseline
+is unavailable or malformed.
