@@ -402,7 +402,7 @@ export default function AppShell({
       input_defaults: {},
       request_id: `general-${installId}`,
     }).then((created) => {
-      const row = created && typeof created.id === "string" && created.state === "active"
+      const row = created && created.install_id === installId && typeof created.id === "string" && created.state === "active"
         ? created
         : null;
       if (!isCurrent()) return;
