@@ -220,7 +220,7 @@ store/writer_census.rs	lexical-census-test-fixture-strings	execute	1
 store/writer_census.rs	lexical-census-test-fixture-strings	open	2
 ui/app_social_drafts.rs	read-only-store-app-view	open	1
 ui/apps.rs	read-only-store-app-view	prepare	1
-ui/cad1337_acceptance.rs	independent-http-acceptance-fixtures	open	3
+ui/cad1337_acceptance.rs	independent-http-acceptance-fixtures	open	4
 wiki/index.rs	separate-wiki-index-db	execute	5
 wiki/index.rs	separate-wiki-index-db	open	2
 wiki/index.rs	separate-wiki-index-db	prepare	2
