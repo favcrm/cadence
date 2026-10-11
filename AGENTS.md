@@ -347,6 +347,13 @@ Only an explicit operator-approved ticket can open one; the rules are in
   existing subscription; never read, print or copy its credentials into a
   prompt, note or command. Subscription limits and usage apply; do not
   describe OpenCode Go as free.
+- **User-requested Haiku 5.5:** use `opencode-go/claude-haiku-5-5`
+  through the configured OpenCode Go subscription, not OpenRouter. Confirm
+  the exact model id in the loaded provider catalog and the worker role
+  allowlist before dispatch. If quota or authentication prevents launch,
+  report the blocker; do not silently substitute another model. This is
+  a provider clarification, not an exception to review, approval, build-slot
+  or production-safety requirements.
 - **Cursor through Pi remains blocked (CAD-603):** `cursor/*` model ids
   may appear in Pi's catalog, but `src/pi_policy.rs::require_safe_transport`
   rejects their unsafe argv prompt transport (process-argument exposure
