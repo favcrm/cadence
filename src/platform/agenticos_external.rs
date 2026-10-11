@@ -670,6 +670,17 @@ impl AgenticosExternalAdapter {
                     "AgenticOS workspace has insufficient credit",
                 ));
             }
+            409 if envelope["ok"] == false
+                && matches!(refused_code(&envelope).as_str(), "disabled" | "unpriced") =>
+            {
+                return Err(ImageFailure::refused(
+                    R::SubmitRefused,
+                    format!(
+                        "AgenticOS image submit refused: {}",
+                        refused_code(&envelope)
+                    ),
+                ));
+            }
             409 | 408 | 425 | 429 => {
                 let code = refused_code(&envelope);
                 let reason = match (status, code.as_str()) {
@@ -2449,6 +2460,67 @@ mod tests {
                 .unwrap(),
             "provider idempotency key is invalid"
         );
+    }
+
+    /// CAD-1335: AgenticOS `openMediaTool` answers a 409 `disabled` or
+    /// `unpriced` admission refusal before provider dispatch. Both are
+    /// confirmed refusals, never busy/uncertain; every other 409 shape
+    /// (uncertain, key_conflict, idempotency_in_progress, price_changed,
+    /// an unknown or missing code, or a non-refusal envelope) and every
+    /// other transient status stays uncertain. Each case issues exactly
+    /// one submit POST — no poll, no re-POST.
+    #[test]
+    fn cad1335_image_submit_admission_refusals_split_definite_from_uncertain() {
+        let proof = image_proof(media_quote());
+        for code in ["disabled", "unpriced"] {
+            let payload = json!({"ok":false,"error":{"code":code}});
+            let (base, seen, worker) = media_door(move |_| json_response(409, payload.clone()));
+            let failure = image_adapter(&base)
+                .execute_app_image(b"test-token", &proof, &json!({}), "app-call-image-1")
+                .err()
+                .expect("409 admission refusal");
+            assert!(
+                failure.not_executed,
+                "409 {code} must be a definite refusal, got {failure:?}"
+            );
+            assert!(
+                failure.detail.contains(code),
+                "{} loses the {code} detail",
+                failure.detail
+            );
+            worker.join().unwrap();
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 1, "one submit POST, no poll or re-POST");
+            assert_eq!(seen[0].method, "POST");
+            assert_eq!(seen[0].url, MEDIA_SUBMIT_PATH);
+        }
+        for (status, payload) in [
+            (409u16, json!({"ok":false,"error":{"code":"uncertain"}})),
+            (409, json!({"ok":false,"error":{"code":"key_conflict"}})),
+            (
+                409,
+                json!({"ok":false,"error":{"code":"idempotency_in_progress"}}),
+            ),
+            (409, json!({"ok":false,"error":{"code":"price_changed"}})),
+            (409, json!({"ok":false,"error":{"code":"unknown_code"}})),
+            (409, json!({"ok":false,"error":{"message":"no code"}})),
+            (409, json!({"ok":true,"data":{"job":{}}})),
+            (408, json!({"ok":false,"error":{"code":"disabled"}})),
+            (429, json!({"ok":false,"error":{"code":"unpriced"}})),
+        ] {
+            let label = payload.to_string();
+            let (base, seen, worker) = media_door(move |_| json_response(status, payload.clone()));
+            let failure = image_adapter(&base)
+                .execute_app_image(b"test-token", &proof, &json!({}), "app-call-image-1")
+                .err()
+                .expect("failure");
+            assert!(
+                !failure.not_executed,
+                "{status} {label} must stay uncertain, got {failure:?}"
+            );
+            worker.join().unwrap();
+            assert_eq!(seen.lock().unwrap().len(), 1);
+        }
     }
 
     #[test]
