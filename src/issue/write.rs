@@ -1453,6 +1453,32 @@ impl std::error::Error for DoneWriteFailure {
     }
 }
 
+/// CAD-1359: the clock/wait seam behind the lock retry loop in
+/// [`mark_done_on_merge_waiting`]. `now` feeds the deadline's
+/// remaining-time arithmetic; `sleep` is the backoff after a failed
+/// real `try_lock`. Production uses [`RealWait`]; a test runtime may
+/// report a virtual `now` that advances only through these backoff
+/// waits, so the same real refusal loop runs deterministically. The
+/// tracker lock is never mocked, the `wait` budget is never
+/// overridden, and no environment or config selects a runtime — the
+/// caller chooses it in code, intra-crate only.
+pub(crate) trait WaitClock {
+    fn now(&self) -> Instant;
+    fn sleep(&self, d: Duration);
+}
+
+/// `Instant::now` + `std::thread::sleep` — the original semantics.
+pub(crate) struct RealWait;
+
+impl WaitClock for RealWait {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+    fn sleep(&self, d: Duration) {
+        std::thread::sleep(d)
+    }
+}
+
 /// CAD-449: a merged delivery marks its ticket done — one frontmatter
 /// write and one tracker commit, `<ID>: set status=done — <why>`, whose
 /// `Actor:` trailer is `actor` (the observer and the delivery). A ticket
@@ -1491,21 +1517,39 @@ pub fn mark_done_on_merge_waiting(
     expect: Option<&str>,
     wait: Duration,
 ) -> std::result::Result<Option<String>, DoneWriteFailure> {
+    mark_done_on_merge_waiting_with(pm, id, why, actor, expect, wait, &RealWait)
+}
+
+/// [`mark_done_on_merge_waiting`] on an injected [`WaitClock`]
+/// (CAD-1359): the same real `try_lock` refusal loop and the same
+/// `wait` budget — only the clock the deadline/backoff arithmetic
+/// reads is swapped. `pub(crate)` for the reconcile shared-deadline
+/// path; production passes [`RealWait`].
+#[track_caller]
+pub(crate) fn mark_done_on_merge_waiting_with(
+    pm: &Pm,
+    id: &str,
+    why: &str,
+    actor: &str,
+    expect: Option<&str>,
+    wait: Duration,
+    clock: &dyn WaitClock,
+) -> std::result::Result<Option<String>, DoneWriteFailure> {
     let mut from = None;
     let result = (|| -> Result<Option<String>> {
-        let deadline = Instant::now() + wait;
+        let deadline = clock.now() + wait;
         let mut backoff = Duration::from_millis(50);
         let _lock = loop {
             if let Some(lock) = pm.try_lock()? {
                 break lock;
             }
-            let left = deadline.saturating_duration_since(Instant::now());
+            let left = deadline.saturating_duration_since(clock.now());
             if left.is_zero() {
                 return Err(Error::rejected(
                     "the tracker is locked by another writer (write lock)",
                 ));
             }
-            std::thread::sleep(backoff.min(left));
+            clock.sleep(backoff.min(left));
             backoff = (backoff * 2).min(Duration::from_millis(500));
         };
         let (_project, dir) = issue_dir(pm, id)?;
