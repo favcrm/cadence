@@ -96,6 +96,10 @@ shim_dir=
 case $cargo_entry in
   */cadence-hooks/bin/cargo) shim_dir=$(dirname "$cargo_entry") ;;
 esac
+if [ -n "$shim_dir" ] && [ -z "$lane_build_slot" ]; then
+  echo "::error::generated cargo shim requires exported CADENCE_BUILD_SLOT; refresh the lane with supported 'cadence issue start' or source its .env before running tests" >&2
+  exit 1
+fi
 if [ -n "$lane_build_slot" ]; then
   if [ -z "$shim_dir" ] || [ ! -x "$lane_build_slot" ] ||
      ! python3 - "$cargo_entry" "$lane_build_slot" <<'PY'
@@ -199,6 +203,17 @@ if [ -n "$lane_build_slot" ] && [ -z "$shim_dir" ]; then
   echo "::error::lane build-slot helper is set but generated cargo shim is not first on PATH" >&2
   exit 1
 fi
+# Refuse provider CLIs before checking compiler availability. Keep the lookup
+# restricted to Cargo's entry directory and the fixed system directories; do
+# not scan the ambient user PATH.
+cargo_entry_dir=$(dirname "$cargo_entry")
+provider_path="$cargo_entry_dir:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+for cli in claude codex cursor-agent cursor agent devin pi gemini; do
+  if found=$(PATH="$provider_path" command -v "$cli"); then
+    echo "::error::provider CLI $cli resolves on the lib suite PATH ($found)" >&2
+    exit 1
+  fi
+done
 # Resolve the compiler without treating the generated shim as Cargo. Prefer
 # rustup's selected toolchain; non-rustup installs use the first cargo after
 # removing only the shim directory from the caller's PATH.
@@ -237,13 +252,6 @@ mkdir -m 700 "$compiler_dir"
 ln -s "$(realpath -e -- "$compiler_cargo")" "$compiler_dir/cargo"
 ln -s "$(realpath -e -- "$compiler_rustc")" "$compiler_dir/rustc"
 lib_path="${shim_dir:+$shim_dir:}$compiler_dir:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-cargo_entry_dir=$(dirname "$cargo_entry")
-for cli in claude codex cursor-agent cursor agent devin pi gemini; do
-  if found=$(PATH="$cargo_entry_dir:$lib_path" command -v "$cli"); then
-    echo "::error::provider CLI $cli resolves on the lib suite PATH ($found)" >&2
-    exit 1
-  fi
-done
 export HOME="$scratch/home" XDG_CONFIG_HOME="$scratch/xdg-config" \
        XDG_DATA_HOME="$scratch/xdg-data" XDG_STATE_HOME="$scratch/xdg-state" \
        XDG_CACHE_HOME="$scratch/xdg-cache" TMPDIR="$scratch/tmp"

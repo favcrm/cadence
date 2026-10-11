@@ -699,16 +699,18 @@ os.execvpe(sys.executable, [sys.executable, {}, *args], env)
     (suite_log, wrong_log, incomplete_log, replay_log)
 }
 
-fn run_missing_helper(
+fn run_helper_case(
     fixture: &Fixture,
     root: &Path,
     provider: &Path,
     target: &Path,
-    helper: &Path,
+    markers: &Path,
+    helper_env: Option<&Path>,
+    prefix: &str,
 ) -> Output {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let runner_temp = root.join("missing-runner-temp");
-    let tmp = root.join("missing-tmp");
+    let runner_temp = root.join(format!("{prefix}-runner-temp"));
+    let tmp = root.join(format!("{prefix}-tmp"));
     fs::create_dir_all(&runner_temp).unwrap();
     fs::create_dir_all(&tmp).unwrap();
     fs::create_dir_all(provider).unwrap();
@@ -731,10 +733,16 @@ fn run_missing_helper(
         .env("HOME", root.join("missing-home"))
         .env("TMPDIR", &tmp)
         .env("RUNNER_TEMP", &runner_temp)
-        .env("CADENCE_BUILD_SLOT", helper)
+        .env("CAD1349_PROVIDER_DIR", provider)
+        .env("CAD1349_MARKERS", markers)
         .env("CADENCE_STATE_DIR", root.join("owned-unstarted-state"))
         .env("GIT_CONFIG_NOSYSTEM", "1");
-    cadence_agent::reaper::output(&mut command).expect("run missing-helper refusal")
+    if let Some(helper) = helper_env {
+        command.env("CADENCE_BUILD_SLOT", helper);
+    } else {
+        command.env_remove("CADENCE_BUILD_SLOT");
+    }
+    cadence_agent::reaper::output(&mut command).expect("run generated-shim refusal")
 }
 
 #[test]
@@ -805,6 +813,54 @@ fn cad1349_real_generated_shim_admits_metadata_and_refuses_missing_helper() {
         &helper,
     );
 
+    let unexported_manifest = root.path().join("unexported-helper-fixture");
+    write_fixture(&unexported_manifest, &targets);
+    let unexported_markers = root.path().join("unexported-helper-markers");
+    fs::create_dir_all(&unexported_markers).unwrap();
+    let unexported = run_helper_case(
+        &positive,
+        root.path(),
+        &root.path().join("unexported-helper-provider-bin"),
+        &unexported_manifest,
+        &unexported_markers,
+        None,
+        "unexported-helper",
+    );
+    let unexported_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&unexported.stdout),
+        String::from_utf8_lossy(&unexported.stderr)
+    );
+    assert!(
+        !unexported.status.success(),
+        "runner accepted a generated shim without its helper export: {unexported_output}"
+    );
+    assert!(
+        unexported_output.contains("generated cargo shim")
+            && unexported_output.contains("CADENCE_BUILD_SLOT")
+            && unexported_output.contains("export"),
+        "missing generated-shim helper-export diagnostic: {unexported_output}"
+    );
+    assert!(
+        !unexported_output.lines().any(|line| {
+            line.starts_with("validated ")
+                || line.starts_with("running ")
+                || line.starts_with("test result:")
+        }),
+        "runner emitted JUnit/test-execution output before refusing: {unexported_output}"
+    );
+    assert_eq!(
+        fs::read_dir(&unexported_markers).unwrap().count(),
+        0,
+        "tests executed without the generated shim helper export"
+    );
+    assert!(
+        !unexported_manifest
+            .join("target/nextest/cadence/junit.xml")
+            .exists(),
+        "runner produced a JUnit report without the generated shim helper export"
+    );
+
     let missing_helper = root.path().join("cadence-helper-removed");
     fs::copy(BINARY, &missing_helper).unwrap();
     fs::set_permissions(&missing_helper, fs::Permissions::from_mode(0o755)).unwrap();
@@ -812,12 +868,16 @@ fn cad1349_real_generated_shim_admits_metadata_and_refuses_missing_helper() {
     fs::remove_file(&missing_helper).unwrap();
     let missing_manifest = root.path().join("missing-fixture");
     write_fixture(&missing_manifest, &targets);
-    let refusal = run_missing_helper(
+    let missing_markers = root.path().join("missing-markers");
+    fs::create_dir_all(&missing_markers).unwrap();
+    let refusal = run_helper_case(
         &missing,
         root.path(),
         &root.path().join("missing-provider-bin"),
         &missing_manifest,
-        &missing_helper,
+        &missing_markers,
+        Some(&missing_helper),
+        "missing",
     );
     assert!(
         !refusal.status.success(),
