@@ -896,6 +896,17 @@ impl Fx {
     fn keys(&self) -> std::collections::BTreeSet<String> {
         self.door.media.submit_keys().into_iter().collect()
     }
+
+    /// Artifact fetches the door has seen (every request is logged on
+    /// arrival, before the reply — a truncated body still counts).
+    fn artifact_gets(&self) -> usize {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, p)| m == "GET" && p.starts_with("/v1/runtime/media/artifacts/"))
+            .count()
+    }
 }
 
 #[test]
@@ -1089,15 +1100,28 @@ fn an_unreachable_door_keeps_the_intent_pending_then_settles_uncertain_and_recov
 
 #[test]
 fn a_download_that_breaks_after_the_charge_retries_the_same_key_and_keeps_the_image() {
-    let fx = Fx::start_small();
+    // Production job window; a 100 ms retry pause so the broken fetches
+    // below are bounded by request evidence, not wall time.
+    let fx = Fx::start_small_with(0, 100);
     let source = fx.fetch();
     let draft = fx.new_draft("t1", &source);
     // The job succeeds at the door, but every artifact body is cut short.
     fx.door.media.truncate_artifacts(true);
+    let before = fx.artifact_gets();
     fx.image(&draft, "image-t1").unwrap();
     fx.wait_door("GET job");
-    // Let several fetches break: still pending, never a verdict on the job.
-    std::thread::sleep(Duration::from_secs(8));
+    // A third artifact GET can only be issued after two complete attempts
+    // were processed: each retry first sleeps its backoff, then replays the
+    // same key, polls and re-downloads — all inside one worker run. Still
+    // pending, never a verdict on the job.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while fx.artifact_gets() - before < 3 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the broken downloads never retried under the same key"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let row = fx.intent(&draft).unwrap();
     assert_eq!(row["state"], "pending", "{row}");
     assert_eq!(row["outcome"], Value::Null, "{row}");
