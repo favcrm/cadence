@@ -460,7 +460,16 @@ fn a4_b_c_reload_refused_for_copied_and_production_resolving_stores() {
     );
     let down = host.run(&["dev", "down", "dv"]);
     assert!(down.status.success(), "dev down: {}", text(&down));
-    wait_until(Duration::from_secs(15), || procs_naming(&state).is_empty());
+    // Proven stopped: every process naming the dev state dir is gone.
+    assert!(
+        wait_until(Duration::from_secs(15), || procs_naming(&state).is_empty()),
+        "dev down returned but processes still name {state:?}"
+    );
+    // The sandbox's own terminal proof is done, so the RAII pass over
+    // sandbox_names would only repeat a board-up wait and a no-op `dev down`
+    // on a stopped target; a panic before this point still gets the full
+    // path, and the broad root reaps below catch anything late.
+    c.sandbox_names.clear();
 
     // (b) copy the whole store, marker included, outside the sandbox base.
     let copy_root = host.path("elsewhere/dv");
