@@ -172,12 +172,27 @@ pub(crate) fn event_store_stats(
     })
 }
 
+/// Is `a` the same approval scope as `b`: the same PR in the same repo,
+/// whatever the letter case of the repo (a CLI record keeps the case it
+/// was sent in; the board records lowercase).
+fn same_scope(a: &Value, b: &Value) -> bool {
+    a["pr"] == b["pr"]
+        && match (a["repo"].as_str(), b["repo"].as_str()) {
+            (Some(x), Some(y)) => x.eq_ignore_ascii_case(y),
+            _ => false,
+        }
+}
+
+/// How an approval-evidence writer was authorized — the daemon's own
+/// statement, stamped on every record (CAD-217).
+pub const APPROVAL_RECORDED_VIA: &str = "operator-connection";
+
 /// CAD-1218: may the board revoke this approval record — one a board path
 /// wrote: action `merge`, `recorded_via` operator-connection, and a source
 /// ending ` via board`. The revoke target rule and the state read share it.
 pub fn board_revocable(record: &Value) -> bool {
     record["action"] == "merge"
-        && record["recorded_via"] == "operator-connection"
+        && record["recorded_via"] == APPROVAL_RECORDED_VIA
         && record["source"]
             .as_str()
             .is_some_and(|s| s.ends_with(" via board"))
@@ -665,9 +680,10 @@ impl Store {
                     Self::event(&tx, APPROVAL_STREAM, APPROVAL_RECORDED_EVENT, payload)?;
                     return Ok((true, id));
                 };
-                let same = ["source", "action", "head_sha", "scope"]
+                let same = ["source", "action", "head_sha"]
                     .iter()
-                    .all(|k| old[k] == evidence[k]);
+                    .all(|k| old[k] == evidence[k])
+                    && same_scope(&old["scope"], &evidence["scope"]);
                 let revoked = Self::approval_event(&tx, APPROVAL_REVOKED_EVENT, &id)?.is_some();
                 match (a.id.is_some(), revoked, same) {
                     (_, false, true) => return Ok((false, id)),
@@ -708,7 +724,9 @@ impl Store {
             let tx = &mut *conn;
             let stream = Self::approval_stream(&tx)?;
             let seen = stream.iter().find(|(k, p, _)| {
-                k == APPROVAL_RECORDED_EVENT && p["scope"] == scope && p["head_sha"] == a.head_sha
+                k == APPROVAL_RECORDED_EVENT
+                    && same_scope(&p["scope"], &scope)
+                    && p["head_sha"] == a.head_sha
             });
             if let Some((_, p, _)) = seen {
                 return Err(Error::rejected(format!(
@@ -725,6 +743,70 @@ impl Store {
                 "scope": scope,
                 "recorded_via": recorded_via,
             });
+            Self::append_approval(&tx, &stream, &base, payload)
+        })
+    }
+
+    /// CAD-1300: a board Publish's approval — one record per `(repo, pr,
+    /// head)` from every board path. A standing merge record is reused
+    /// (Approve then Publish, or a retry after a failed enqueue); a head
+    /// with any other record, revoked included, is refused; otherwise a
+    /// new record is appended. One transaction. Answers the approval id.
+    pub fn record_or_reuse_board_approval(
+        &self,
+        a: &NewApproval,
+        recorded_via: &str,
+        issue: &str,
+    ) -> Result<String> {
+        approval_source(a.source)?;
+        identifier(a.action, "Approval action")?;
+        approval_head(a.head_sha)?;
+        approval_repo(a.repo)?;
+        if a.pr == 0 {
+            return Err(Error::rejected("Approval PR number must be positive"));
+        }
+        let scope = json!({"repo": a.repo, "pr": a.pr});
+        let head = json!(a.head_sha);
+        self.write_tx(|conn| {
+            let tx = &mut *conn;
+            let stream = Self::approval_stream(&tx)?;
+            let revoked = Self::revoked_ids(&stream);
+            let mut on_record = stream.iter().filter(|(k, p, _)| {
+                k == APPROVAL_RECORDED_EVENT
+                    && same_scope(&p["scope"], &scope)
+                    && p["head_sha"] == head
+            });
+            let standing = on_record.clone().find_map(|(_, p, _)| {
+                let id = p["approval_id"].as_str()?;
+                (p["action"] == "merge" && !revoked.contains(id)).then(|| id.to_string())
+            });
+            if let Some(id) = standing {
+                return Ok(id);
+            }
+            if let Some((_, p, _)) = on_record.next() {
+                let was_revoked = p["approval_id"]
+                    .as_str()
+                    .is_some_and(|id| revoked.contains(id));
+                return Err(Error::rejected(if was_revoked {
+                    format!(
+                        "{issue}: this head's board approval was revoked — one approval record \
+                         per head; re-approve it with `cadence audit approve` or push a new head"
+                    )
+                } else {
+                    format!(
+                        "{issue}: this head already has an approval record that is not a board \
+                         merge approval — one approval record per head"
+                    )
+                }));
+            }
+            let payload = json!({
+                "source": a.source,
+                "action": a.action,
+                "head_sha": a.head_sha,
+                "scope": scope,
+                "recorded_via": recorded_via,
+            });
+            let base = default_approval_id(a.action, a.pr, a.head_sha);
             Self::append_approval(&tx, &stream, &base, payload)
         })
     }

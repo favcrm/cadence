@@ -460,11 +460,13 @@ pub(super) fn full_ci_green(
             && run["status"].as_str() == Some("completed")
             && run["conclusion"].as_str() == Some("success")
             && run["id"].as_u64().is_some_and(|id| id > 0)
-            && run["html_url"].as_str()
-                == run["id"]
-                    .as_u64()
-                    .map(|id| format!("https://github.com/{repo}/actions/runs/{id}"))
-                    .as_deref()
+            && run["id"].as_u64().is_some_and(|id| {
+                run["html_url"]
+                    .as_str()
+                    .and_then(|url| url.strip_prefix("https://github.com/"))
+                    .and_then(|path| path.strip_suffix(&format!("/actions/runs/{id}")))
+                    .is_some_and(|run_repo| run_repo.eq_ignore_ascii_case(repo))
+            })
     }))
 }
 

@@ -74,27 +74,27 @@ use base64::Engine;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde_json::{json, Value};
 
-const REPO: &str = "acme/widgets";
+pub(super) const REPO: &str = "acme/widgets";
 const PR: u64 = 42;
-const HEAD: &str = "1218aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+pub(super) const HEAD: &str = "1218aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const BASE: &str = "1218dddddddddddddddddddddddddddddddddddd";
 const MERGE_BASE: &str = "1218eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 const MOVED: &str = "1218bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const FORGED: &str = "1218cccccccccccccccccccccccccccccccccccc";
-const VERB: &str = "approval_record_shown";
-const APPROVE: &str = "/api/approvals/approve";
+pub(super) const VERB: &str = "approval_record_shown";
+pub(super) const APPROVE: &str = "/api/approvals/approve";
 /// The PRs the allowlist cases use, so each starts with no record.
 const TAILNET_PR: u64 = 43;
 const PUBLIC_PR: u64 = 44;
 /// This board's public AgenticOS name and the fixture platform.
-const PUBLIC_HOST: &str = "c1218.board.localhost";
-const COMPANY: &str = "c1218-company";
-const KEY_SEED: [u8; 32] = [18; 32];
+pub(super) const PUBLIC_HOST: &str = "c1218.board.localhost";
+pub(super) const COMPANY: &str = "c1218-company";
+pub(super) const KEY_SEED: [u8; 32] = [18; 32];
 /// The delivery-loop rows the Publish cases decide (round 2).
-const PUBLISH_ISSUE: &str = "WID-1";
-const PUBLISH_PR: u64 = 50;
-const PUBLISH_ISSUE_2: &str = "WID-2";
-const PUBLISH_PR_2: u64 = 51;
+pub(super) const PUBLISH_ISSUE: &str = "WID-1";
+pub(super) const PUBLISH_PR: u64 = 50;
+pub(super) const PUBLISH_ISSUE_2: &str = "WID-2";
+pub(super) const PUBLISH_PR_2: u64 = 51;
 
 struct Stop(Arc<AtomicBool>, Vec<std::thread::JoinHandle<()>>);
 
@@ -109,19 +109,19 @@ impl Drop for Stop {
 
 /// A session as the browser holds it: the HttpOnly cookie and the page key.
 #[derive(Clone)]
-struct Session {
+pub(super) struct Session {
     cookie: String,
     key: String,
 }
 
-struct Board {
-    state: std::path::PathBuf,
+pub(super) struct Board {
+    pub(super) state: std::path::PathBuf,
     live_head: std::path::PathBuf,
     agent: ureq::Agent,
     base: String,
     host: String,
     token: String,
-    issuer: String,
+    pub(super) issuer: String,
     _stop: Stop,
 }
 
@@ -188,13 +188,13 @@ if [ "$1" = repo ] && [ "$2" = view ]; then printf '{{"defaultBranchRef":{{"name
 if [ "$1" = api ]; then
   endpoint=$2
   case "$endpoint" in
-    repos/acme/widgets/compare/{BASE}...{HEAD}) printf '{{"merge_base_commit":{{"sha":"{MERGE_BASE}"}},"files":[{{"filename":"src/lib.rs","status":"modified","additions":1,"deletions":0}}]}}\n' ;;
-    repos/acme/widgets/git/trees/{MERGE_BASE}?recursive=1|repos/acme/widgets/git/trees/{HEAD}?recursive=1) printf '{{"truncated":false,"tree":[{{"path":"src/lib.rs","mode":"100644","type":"blob"}}]}}\n' ;;
-    repos/acme/widgets/contents/docs/roles/risk-paths.toml\?ref={BASE}) printf '{{"encoding":"base64","content":"{risk_content}"}}\n' ;;
-    repos/acme/widgets/contents/docs/roles/one-review-paths.toml\?ref={BASE}) printf '{{"encoding":"base64","content":"{review_content}"}}\n' ;;
-    repos/acme/widgets/rules/branches/main) printf '[{{"type":"required_status_checks","parameters":{{"required_status_checks":[{{"context":"fmt","app_id":15368}},{{"context":"clippy","app_id":15368}},{{"context":"test","app_id":15368}},{{"context":"build","app_id":15368}},{{"context":"ui","app_id":15368}}]}}}}]\n' ;;
-    repos/acme/widgets/branches/main/protection) printf '{{"required_status_checks":{{"contexts":["fmt","clippy","test","build","ui"],"checks":[]}}}}\n' ;;
-    repos/acme/widgets/actions/workflows/ci.yml/runs*) printf '{{"workflow_runs":[{{"id":1218,"head_sha":"{HEAD}","event":"pull_request","status":"completed","conclusion":"success","html_url":"https://github.com/acme/widgets/actions/runs/1218"}}]}}\n' ;;
+    repos/acme/widgets/compare/{BASE}...{HEAD}|repos/Acme/Widgets/compare/{BASE}...{HEAD}) printf '{{"merge_base_commit":{{"sha":"{MERGE_BASE}"}},"files":[{{"filename":"src/lib.rs","status":"modified","additions":1,"deletions":0}}]}}\n' ;;
+    repos/acme/widgets/git/trees/{MERGE_BASE}?recursive=1|repos/acme/widgets/git/trees/{HEAD}?recursive=1|repos/Acme/Widgets/git/trees/{MERGE_BASE}?recursive=1|repos/Acme/Widgets/git/trees/{HEAD}?recursive=1) printf '{{"truncated":false,"tree":[{{"path":"src/lib.rs","mode":"100644","type":"blob"}}]}}\n' ;;
+    repos/acme/widgets/contents/docs/roles/risk-paths.toml\?ref={BASE}|repos/Acme/Widgets/contents/docs/roles/risk-paths.toml\?ref={BASE}) printf '{{"encoding":"base64","content":"{risk_content}"}}\n' ;;
+    repos/acme/widgets/contents/docs/roles/one-review-paths.toml\?ref={BASE}|repos/Acme/Widgets/contents/docs/roles/one-review-paths.toml\?ref={BASE}) printf '{{"encoding":"base64","content":"{review_content}"}}\n' ;;
+    repos/acme/widgets/rules/branches/main|repos/Acme/Widgets/rules/branches/main) printf '[{{"type":"required_status_checks","parameters":{{"required_status_checks":[{{"context":"fmt","app_id":15368}},{{"context":"clippy","app_id":15368}},{{"context":"test","app_id":15368}},{{"context":"build","app_id":15368}},{{"context":"ui","app_id":15368}}]}}}}]\n' ;;
+    repos/acme/widgets/branches/main/protection|repos/Acme/Widgets/branches/main/protection) printf '{{"required_status_checks":{{"contexts":["fmt","clippy","test","build","ui"],"checks":[]}}}}\n' ;;
+    repos/acme/widgets/actions/workflows/ci.yml/runs*|repos/Acme/Widgets/actions/workflows/ci.yml/runs*) printf '{{"workflow_runs":[{{"id":1218,"head_sha":"{HEAD}","event":"pull_request","status":"completed","conclusion":"success","html_url":"https://github.com/acme/widgets/actions/runs/1218"}}]}}\n' ;;
     *) echo "fake gh: no API fixture for: $endpoint" >&2; exit 1 ;;
   esac
   exit 0
@@ -209,7 +209,14 @@ exit 1
 }
 
 impl Board {
-    fn start(root: &std::path::Path) -> Self {
+    pub(super) fn start(root: &std::path::Path) -> Self {
+        Self::start_cased(root, REPO, REPO)
+    }
+
+    /// [`Board::start`] with the registered checkout's origin naming
+    /// `origin_repo` and the delivery rows' PR URLs naming `row_repo` —
+    /// the same repo, possibly in another letter case (CAD-1300).
+    pub(super) fn start_cased(root: &std::path::Path, origin_repo: &str, row_repo: &str) -> Self {
         let state = root.to_path_buf();
         let pm_dir = state.join("pm");
         let pm = crate::issue::Pm::init(&pm_dir).unwrap();
@@ -222,7 +229,7 @@ impl Board {
                 "remote",
                 "add",
                 "origin",
-                "https://github.com/acme/widgets.git",
+                &format!("https://github.com/{origin_repo}.git"),
             ][..],
         ] {
             let ok = std::process::Command::new("git")
@@ -271,7 +278,7 @@ impl Board {
         for (issue, pr) in [(PUBLISH_ISSUE, PUBLISH_PR), (PUBLISH_ISSUE_2, PUBLISH_PR_2)] {
             let mut rec = crate::delivery::Record::new(issue, "widgets", "fixture-worker", 1);
             rec.state = crate::delivery::State::Passed;
-            rec.pr = Some(format!("https://github.com/{REPO}/pull/{pr}"));
+            rec.pr = Some(format!("https://github.com/{row_repo}/pull/{pr}"));
             rec.head = Some(HEAD.into());
             rec.verdict = Some(crate::delivery::VerdictRec {
                 verdict: "pass".into(),
@@ -368,7 +375,7 @@ impl Board {
     }
 
     /// A fresh operator session through the real `cadence ui login` exchange.
-    fn session(&self) -> Session {
+    pub(super) fn session(&self) -> Session {
         let secret = crate::operator_auth::read_secret(&self.state).unwrap();
         let nonce = scoped(Asserted::Operator, || {
             crate::client::rpc(
@@ -401,7 +408,13 @@ impl Board {
 
     /// One board write, byte for byte what a browser tab sends: `who` is
     /// the asserted peer identity, `session` what the request presents.
-    fn post(&self, who: &str, session: Option<&Session>, path: &str, body: &str) -> (u16, Value) {
+    pub(super) fn post(
+        &self,
+        who: &str,
+        session: Option<&Session>,
+        path: &str,
+        body: &str,
+    ) -> (u16, Value) {
         let mut request = self
             .agent
             .post(format!("{}{path}", self.base))
@@ -430,12 +443,12 @@ impl Board {
         self.audit_pr(PR, head)
     }
 
-    fn audit_pr(&self, pr: u64, head: &str) -> Value {
+    pub(super) fn audit_pr(&self, pr: u64, head: &str) -> Value {
         crate::audit::approval_check(&self.state, REPO, pr, head).0
     }
 
     /// One board read, as a tab sends it: no body, no Origin.
-    fn get(&self, who: &str, session: Option<&Session>, path: &str) -> (u16, Value) {
+    pub(super) fn get(&self, who: &str, session: Option<&Session>, path: &str) -> (u16, Value) {
         let mut request = self
             .agent
             .get(format!("{}{path}", self.base))
@@ -457,7 +470,7 @@ impl Board {
 
     /// Every `audit:approvals` event the store holds — a read must leave
     /// this exactly as it found it.
-    fn approval_events(&self) -> i64 {
+    pub(super) fn approval_events(&self) -> i64 {
         let db = rusqlite::Connection::open_with_flags(
             self.state.join("cadence.sqlite3"),
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -525,7 +538,7 @@ impl Board {
     /// GET without `body`, a POST with one. Each carries a forged
     /// `Tailscale-User-Login: mallory@example.com` — a public session must
     /// never be attributed to a tailnet login.
-    fn public(&self, path: &str, token: &str, body: Option<&str>) -> (u16, Value) {
+    pub(super) fn public(&self, path: &str, token: &str, body: Option<&str>) -> (u16, Value) {
         // `__Host-aos-board-session`: the public cookie (contract §7).
         let cookie = format!("__Host-aos-board-session={token}");
         let url = format!("{}{path}", self.base);
@@ -857,10 +870,10 @@ fn cad1218_board_pr_head_approval_refuses_agent_forged_head_and_replay() {
 //   other heads. The read writes nothing.
 // ---------------------------------------------------------------------
 
-const STATE_VERB: &str = "approval_state";
+pub(super) const STATE_VERB: &str = "approval_state";
 const CHRIS_LOGIN: &str = "chris@example.com (tailscale)";
 
-fn state_path(repo: &str, pr: u64, head: &str) -> String {
+pub(super) fn state_path(repo: &str, pr: u64, head: &str) -> String {
     format!("/api/approvals/state?repo={repo}&pr={pr}&head={head}")
 }
 
@@ -1171,13 +1184,13 @@ fn cad1218_board_approval_state_read_is_operator_only_and_leaks_nothing() {
 
 const REVOKE_VERB: &str = "approval_revoke_shown";
 const CHRIS: &str = "chris@example.com (tailscale)";
-const MALLORY: &str = "mallory@example.com (tailscale)";
+pub(super) const MALLORY: &str = "mallory@example.com (tailscale)";
 
-fn merges(board: &Board) -> String {
+pub(super) fn merges(board: &Board) -> String {
     std::fs::read_to_string(board.state.join("merges")).unwrap_or_default()
 }
 
-fn delivery_state(board: &Board, issue: &str) -> String {
+pub(super) fn delivery_state(board: &Board, issue: &str) -> String {
     crate::delivery::load(&board.state).unwrap()[issue]
         .state
         .as_str()

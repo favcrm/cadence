@@ -352,7 +352,7 @@ function MergeReview({ need, readOnly, index, total, onDone, onClose }: ReviewPr
   const [sendBack, setSendBack] = useState(false);
   const [takeBack, setTakeBack] = useState(false);
   const issue = useIssue(action.issue);
-  const a = useApproveHead(action.pr, action.sha && action.sha.trim() ? action.sha : null, !!block);
+  const a = useApproveHead(action.pr, action.sha && action.sha.trim() ? action.sha : null);
   const m = useMergeDecision(need as HomeNeed & { action: { type: "merge" } }, (t) =>
     onDone(need.key, t.startsWith("declined") ? "Sent back" : "Published"),
   );
@@ -363,7 +363,9 @@ function MergeReview({ need, readOnly, index, total, onDone, onClose }: ReviewPr
     m.head ? "Checked at the exact version you are about to publish" : null,
   ].filter((t): t is string => !!t);
   const lead = firstSentence(issue?.body);
-  const off = !!block || !m.head;
+  const off = !!block || !m.head || a.member;
+  // One line per distinct error: a repeat of the same text shows once.
+  const errors = [...new Set([a.error, m.error].filter((t): t is string => !!t))];
   return (
     <Shell
       need={need}
@@ -393,12 +395,12 @@ function MergeReview({ need, readOnly, index, total, onDone, onClose }: ReviewPr
           {a.approved && (
             <>
               <p className="rv-note">{a.revocable ? "Approved." : "Approved from your terminal."}</p>
-              {a.revocable && (
-                <button type="button" className="rv-dlnk" disabled={!!block || a.busy !== null} onClick={() => setTakeBack((t) => !t)}>
+              {a.revocable && !block && (
+                <button type="button" className="rv-dlnk" disabled={a.busy !== null} onClick={() => setTakeBack((t) => !t)}>
                   Take my approval back
                 </button>
               )}
-              {a.revocable && takeBack && (
+              {a.revocable && !block && takeBack && (
                 <SendBack
                   label="Take it back"
                   placeholder="Why are you taking it back?"
@@ -409,16 +411,12 @@ function MergeReview({ need, readOnly, index, total, onDone, onClose }: ReviewPr
             </>
           )}
           {a.revoked && <p className="rv-note">Your approval was taken back. A new version needs a fresh approval.</p>}
-          {a.error && (
-            <p className="rv-error" role="alert">
-              {a.error}
+          {a.member && <p className="rv-note">Only the board's owner can approve or publish.</p>}
+          {errors.map((text) => (
+            <p key={text} className="rv-error" role="alert">
+              {text}
             </p>
-          )}
-          {m.error && (
-            <p className="rv-error" role="alert">
-              {m.error}
-            </p>
-          )}
+          ))}
           <Details
             text={[
               action.pr ?? action.issue,
@@ -438,7 +436,7 @@ function MergeReview({ need, readOnly, index, total, onDone, onClose }: ReviewPr
           total={total}
           onClose={onClose}
           primary={
-            <Button variant="primary" loading={m.busy === "merge"} disabled={off || m.busy !== null} onClick={m.merge}>
+            <Button variant="primary" loading={m.busy === "merge"} disabled={off || m.busy !== null} onClick={() => { a.clearError(); m.merge(); }}>
               {m.busy === "merge" ? "Publishing…" : "Publish"}
             </Button>
           }
@@ -446,10 +444,10 @@ function MergeReview({ need, readOnly, index, total, onDone, onClose }: ReviewPr
             <>
               {a.available && !a.approved && !a.revoked && (
                 <Button
-                  disabled={!!block || a.busy !== null || m.busy !== null}
+                  disabled={!!block || a.member || a.busy !== null || m.busy !== null}
                   loading={a.busy === "approve"}
                   title={block ? READ_ONLY_COPY : undefined}
-                  onClick={a.approve}
+                  onClick={() => { m.clearError(); a.approve(); }}
                 >
                   Approve this version
                 </Button>
