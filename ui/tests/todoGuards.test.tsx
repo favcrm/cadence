@@ -482,7 +482,7 @@ for (const row of [
   await b.done();
 }
 
-// ---- "Take my approval back" is a write: disabled once the board turns read-only ----
+// ---- "Take my approval back" is unavailable once the board turns read-only ----
 {
   approval = { state: "in-force", approval_id: "a1", board_revocable: true };
   const v = await render([rows.merge], false);
@@ -491,7 +491,8 @@ for (const row of [
   await settle(() => assert(labelled(drawer(), "Take my approval back"), "an approval on record can be taken back"));
   assert(!isDisabled(labelled(drawer(), "Take my approval back")!), "writable: take-back is enabled");
   await v.update([rows.merge], true);
-  assert(isDisabled(labelled(drawer(), "Take my approval back")!), "read-only disables take-back");
+  assert(!labelled(drawer(), "Take my approval back"), "read-only hides take-back");
+  assert(!posts.some((p) => /^\/api\/approvals\/[^/]+\/revoke$/.test(p.path)), "read-only sends no revoke request");
   approval = { state: "missing" };
   await v.done();
 }
