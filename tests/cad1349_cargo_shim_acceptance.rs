@@ -23,6 +23,7 @@ struct Fixture {
     pm: Pm,
     repo: PathBuf,
     name: String,
+    lane: PathBuf,
     shim: PathBuf,
 }
 
@@ -137,12 +138,59 @@ fn fixture(root: &Path, helper: &Path, name: &str) -> Fixture {
         pm,
         repo,
         name: name.to_string(),
+        lane,
         shim,
     }
 }
 
 fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+}
+
+fn assert_generated_slot_env(env_file: &Path, helper: &Path) {
+    let expected = fs::canonicalize(helper).expect("canonical helper executable");
+    let generated = fs::read_to_string(env_file).expect("generated lane .env");
+    let exports: Vec<_> = generated
+        .lines()
+        .filter(|line| line.starts_with("export CADENCE_BUILD_SLOT="))
+        .collect();
+    assert_eq!(
+        exports.len(),
+        1,
+        "expected exactly one helper export: {generated:?}"
+    );
+    assert_eq!(
+        exports[0],
+        format!("export CADENCE_BUILD_SLOT={}", expected.display())
+    );
+    assert!(
+        !generated
+            .lines()
+            .any(|line| line.starts_with("CADENCE_BUILD_SLOT=")),
+        "stale unexported helper assignment remains in {}: {generated:?}",
+        env_file.display()
+    );
+
+    let mut source = Command::new("sh");
+    source
+        .args([
+            "-c",
+            ". \"$1\"; printf '%s' \"$CADENCE_BUILD_SLOT\"",
+            "cad1349-env",
+        ])
+        .arg(env_file)
+        .env_remove("CADENCE_BUILD_SLOT");
+    let sourced = cadence_agent::reaper::output(&mut source)
+        .expect("source generated lane .env in child shell");
+    assert!(
+        sourced.status.success(),
+        "sourcing generated .env failed: {}",
+        String::from_utf8_lossy(&sourced.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(sourced.stdout).unwrap(),
+        expected.display().to_string()
+    );
 }
 
 fn assert_embedded_helper(shim: &Path, input: &Path) {
@@ -690,6 +738,13 @@ fn cad1349_real_generated_shim_admits_metadata_and_refuses_missing_helper() {
     let root = Builder::new().prefix("c1349-").tempdir_in("/tmp").unwrap();
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let positive = fixture(root.path(), Path::new(BINARY), "positive-lane");
+    let env_file = positive.lane.join(".env");
+    assert_generated_slot_env(&env_file, Path::new(BINARY));
+    // The supported issue-start reuse path removes a pre-CAD-1349 assignment
+    // and leaves exactly one exported helper at its canonical path.
+    let mut env_text = fs::read_to_string(&env_file).unwrap();
+    env_text.push_str("CADENCE_BUILD_SLOT=/stale/unexported-helper\n");
+    fs::write(&env_file, env_text).unwrap();
     // A stale lane shim is refreshed by the supported issue-start reuse path.
     fs::write(&positive.shim, "#!/bin/sh\nexit 77\n").unwrap();
     let mut refresh = Command::new(BINARY);
@@ -729,6 +784,7 @@ fn cad1349_real_generated_shim_admits_metadata_and_refuses_missing_helper() {
         String::from_utf8_lossy(&refreshed.stderr)
     );
     assert_embedded_helper(&positive.shim, Path::new(BINARY));
+    assert_generated_slot_env(&env_file, Path::new(BINARY));
     let targets = integration_targets();
     let positive_manifest = root.path().join("positive-fixture");
     write_fixture(&positive_manifest, &targets);
