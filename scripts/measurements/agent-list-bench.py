@@ -17,7 +17,27 @@ Why the rows cannot launch (code paths, checked against origin/main):
   * Defence in depth: the daemon runs with a PATH whose only entries are
     stubs for claude/codex/pi/devin/cursor/tmux that log to TRIPWIRE.log
     and exit 127, so even a launch would spawn nothing real.
-Rows: state=stopped, enabled=0, no thread_id/session_id/endpoint/pid.
+Rows (CAD-1280 widened the fleet; every row is still non-launchable):
+  * stopped: state=stopped, enabled=0, no thread_id/session_id/endpoint/pid.
+  * fenced: state=attention, enabled=0, same blanks, with a recovery error.
+    `relaunch_agents` skips `enabled = 0` before anything else, and the
+    fence text exercises the board's `fenced` totals and recovery column.
+  * inbox: provider/kind `inbox`, state=idle, endpoint `inbox://<alias>`.
+    A mailbox owns no actor (`registry::has_actor("inbox","inbox")` is
+    false), and `relaunch_agents` skips every row without one. These are
+    the live (non-stopped) rows the Agents screen shows beside the fleet.
+  * no actor-kind row is ever seeded `idle`/`running`: that would need an
+    endpoint or pid, and the liveness probe on such a row runs tmux.
+  Open tasks are spread over many agents, not eight.
+
+Confinement: with the agent UID configured (`agent-uid.json` or the
+`agent-uid-mode.json` marker in the state dir), providers start through
+the setuid helper, which ignores the daemon's PATH, so the stubs would not
+fire. Every command refuses a state dir that carries either file.
+
+A/B runs: seed once PER BUILD. A build newer than the one that recorded
+the store's schema version refuses it, and a main build refuses a store a
+newer build migrated.
 
 Isolation: everything lives under --root (short /tmp path); HOME, XDG_*,
 TMPDIR, CADENCE_STATE_DIR and CADENCE_PM_DIR are set for child processes
@@ -31,6 +51,8 @@ import http.client
 import json
 import os
 import re
+import shutil
+import signal
 import socket
 import sqlite3
 import statistics
@@ -39,6 +61,8 @@ import sys
 import threading
 import time
 
+# Board pids this run started (foreground `ui run`); the abort path kills them.
+BOARD_PIDS = []
 PROVIDERS = ("claude", "codex", "pi", "devin", "cursor", "tmux")
 MIN_AVAILABLE_KIB = 6 * 1024 * 1024  # abort below 6 GiB MemAvailable
 ALIAS_RE = re.compile(r"bench-\d{4}")
@@ -94,6 +118,24 @@ def setup_dirs(root):
         with open(stub, "w") as f:
             f.write(f'#!/bin/sh\necho "$0 $*" >> {p["log"]}/TRIPWIRE.log\nexit 127\n')
         os.chmod(stub, 0o755)
+
+
+def require_no_agent_uid(root):
+    """Providers launched through the agent-UID helper never see the stub
+    PATH, so refuse any state dir that opts into (or was ever in) that mode."""
+    for name in ("agent-uid.json", "agent-uid-mode.json"):
+        if os.path.lexists(f"{paths(root)['state']}/{name}"):
+            sys.exit(f"refusing: {name} is in the state dir; agent-uid confinement "
+                     "bypasses the PATH stubs")
+
+
+def verify_stubs(root):
+    """Each provider name must resolve to OUR stub on the children's PATH."""
+    p = paths(root)
+    for name in PROVIDERS:
+        found = shutil.which(name, path=child_env(root)["PATH"])
+        if found != f"{p['stubs']}/{name}":
+            sys.exit(f"refusing: {name} resolves to {found}, not the tripwire stub")
 
 
 def cadence(binary, root, *args, timeout=120):
@@ -169,7 +211,7 @@ def descendants(table, roots):
 def environ_marks(pid, root):
     try:
         with open(f"/proc/{pid}/environ", "rb") as f:
-            return f"HOME={root}/home".encode() in f.read()
+            return f"HOME={root}/home\0".encode() in f.read()
     except OSError:
         return False
 
@@ -223,25 +265,73 @@ class Watchdog(threading.Thread):
                     reason = f"provider/tmux process from this run: {hits}"
             if reason:
                 self.tripped = reason
-                abort(self.root, self.binary, reason)
+                abort(self.root, self.binary, reason, list(BOARD_PIDS))
                 return
 
 
-def abort(root, binary, reason):
+def kill_ours(pid, root):
+    """SIGTERM then SIGKILL one process this run started. Only a pid whose
+    environment carries this run's HOME is touched: a recycled pid is not
+    ours to signal."""
+    if not environ_marks(pid, root):
+        return
+    for sig, wait in ((signal.SIGTERM, 5.0), (signal.SIGKILL, 5.0)):
+        try:
+            os.kill(pid, sig)
+        except OSError:
+            return
+        end = time.monotonic() + wait
+        while time.monotonic() < end:
+            if not os.path.exists(f"/proc/{pid}") or _is_zombie(pid):
+                return
+            time.sleep(0.1)
+
+
+def _is_zombie(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0] == "Z"
+    except (OSError, IndexError):
+        return True
+
+
+def marked_pids(root):
+    me = {os.getpid(), os.getppid()}
+    return [pid for pid in proc_table() if pid not in me and environ_marks(pid, root)]
+
+
+def sweep(root, grace=0.0):
+    """Stop whatever still carries this run's HOME (the daemon and board
+    this run started, and anything they spawned), after waiting up to
+    `grace` seconds for them to exit on their own. The HOME is unique to the
+    run, so nothing else matches; the harness itself keeps the caller's."""
+    end = time.monotonic() + grace
+    while marked_pids(root) and time.monotonic() < end:
+        time.sleep(0.5)
+    for pid in marked_pids(root):
+        kill_ours(pid, root)
+
+
+def abort(root, binary, reason, boards=()):
+    """Stop the daemon and every board this run started, then exit 3. The
+    foreground `ui run` board is not reached by `ui stop` (that stops a
+    detached board), so its pid is signalled directly."""
     print(f"WATCHDOG ABORT: {reason}", file=sys.stderr, flush=True)
-    # Stop only the daemon/board this run started (graceful, by state dir).
+    for pid in boards:
+        kill_ours(pid, root)  # boards first; the daemon stops gracefully below
     for args in (("ui", "stop"), ("daemon", "stop")):
         try:
             cadence(binary, root, *args, timeout=60)
         except Exception as e:  # noqa: BLE001
             print(f"abort: {args}: {e}", file=sys.stderr)
+    sweep(root)  # a daemon that ignored `daemon stop`, or was still starting
     os._exit(3)
 
 
 # ----------------------------------------------------------------- seed
 
 
-def seed(root, agents, msgs_per_agent, events_per_agent, jobs, tasks):
+def seed(root, agents, msgs_per_agent, events_per_agent, jobs, tasks, inbox=0, fenced=0):
     db = f"{paths(root)['state']}/cadence.sqlite3"
     c = sqlite3.connect(db)
     c.execute("PRAGMA busy_timeout=5000")
@@ -250,14 +340,40 @@ def seed(root, agents, msgs_per_agent, events_per_agent, jobs, tasks):
         sys.exit("refusing: state already has agents (use a fresh --root)")
     now = time.time()
     cwd = paths(root)["tmp"]
+    if inbox + fenced >= agents:
+        sys.exit("refusing: --inbox + --fenced must leave stopped agents")
     aliases = [f"bench-{i:04d}" for i in range(agents)]
+    stopped, rest = aliases[: agents - inbox - fenced], aliases[agents - inbox - fenced:]
+    fenced_aliases, inbox_aliases = rest[:fenced], rest[fenced:]
+    actors = stopped + fenced_aliases
     c.executemany(
         "INSERT INTO agents(alias,provider,endpoint_kind,role,cwd,sandbox,state,enabled,"
         "created,updated,params) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
         [
             (a, "claude", "pty", "worker", cwd, "workspace-write", "stopped", 0,
              now - 86400 * 30, now - 86400, json.dumps({"session": a}))
-            for a in aliases
+            for a in stopped
+        ],
+    )
+    # Fenced: attention + enabled=0 (never relaunched), with a recovery text.
+    c.executemany(
+        "INSERT INTO agents(alias,provider,endpoint_kind,role,cwd,sandbox,state,enabled,"
+        "error,created,updated,params) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        [
+            (a, "claude", "pty", "worker", cwd, "workspace-write", "attention", 0,
+             "synthetic fence: reconcile with `cadence agent unfence`",
+             now - 86400 * 30, now - 86400, json.dumps({"session": a}))
+            for a in fenced_aliases
+        ],
+    )
+    # Mailboxes: no actor exists for them (see the header).
+    c.executemany(
+        "INSERT INTO agents(alias,provider,endpoint_kind,role,cwd,sandbox,state,enabled,"
+        "endpoint,created,updated,params) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        [
+            (a, "inbox", "inbox", "worker", cwd, "workspace-write", "idle", 1,
+             f"inbox://{a}", now - 86400 * 30, now - 86400, "{}")
+            for a in inbox_aliases
         ],
     )
     c.executemany(
@@ -267,11 +383,15 @@ def seed(root, agents, msgs_per_agent, events_per_agent, jobs, tasks):
           "done" if j % 20 else "open", now - 9e5, now - 8e5) for j in range(jobs)],
     )
     # ~2% of tasks are non-terminal (what `tasks_for_assignee` returns); the
-    # rest are terminal history it must scan past (tasks has no assignee index).
+    # rest are terminal history it must scan past. The k-th open task goes to
+    # actors[(7k) % len]: 7 is coprime with the usual fleet sizes, so open
+    # tasks reach every actor agent (a few get two), not eight of them.
+    open_ids = {t: k for k, t in enumerate(range(0, tasks, 50))}
     c.executemany(
         "INSERT INTO tasks(id,job_id,title,assignee,state,created,updated) VALUES(?,?,?,?,?,?,?)",
-        [(f"task-{t:06d}", f"job-{t % jobs:05d}", f"synthetic task {t}", aliases[t % agents],
-          "assigned" if t % 50 == 0 else "done", now - 9e5, now - 8e5 + t) for t in range(tasks)],
+        [(f"task-{t:06d}", f"job-{t % jobs:05d}", f"synthetic task {t}",
+          actors[(7 * open_ids[t]) % len(actors)] if t in open_ids else aliases[t % agents],
+          "assigned" if t in open_ids else "done", now - 9e5, now - 8e5 + t) for t in range(tasks)],
     )
     # History only: every message is terminal. Nothing queued, running or held.
     body = "synthetic message body " * 8
@@ -292,16 +412,24 @@ def seed(root, agents, msgs_per_agent, events_per_agent, jobs, tasks):
     verify_non_launchable(c)
     counts = {t: c.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
               for t in ("agents", "messages", "events", "jobs", "tasks")}
+    counts["agents_by_state"] = dict(c.execute("SELECT state, COUNT(*) FROM agents GROUP BY state"))
+    counts["agents_with_open_tasks"] = c.execute(
+        "SELECT COUNT(DISTINCT assignee) FROM tasks WHERE state='assigned'").fetchone()[0]
     c.close()
     return version, counts
 
 
 def verify_non_launchable(c):
+    """Every actor-kind row is disabled and blank; the only enabled rows are
+    mailboxes (no actor). Nothing is queued, running or held."""
+    mailbox = "provider='inbox' AND endpoint_kind='inbox'"
     bad = {
-        "enabled": "SELECT COUNT(*) FROM agents WHERE enabled<>0",
-        "not stopped": "SELECT COUNT(*) FROM agents WHERE state<>'stopped'",
-        "thread/session/endpoint/pid": "SELECT COUNT(*) FROM agents WHERE thread_id IS NOT NULL "
-        "OR session_id IS NOT NULL OR endpoint IS NOT NULL OR pid IS NOT NULL",
+        "enabled actor": f"SELECT COUNT(*) FROM agents WHERE enabled<>0 AND NOT ({mailbox})",
+        "actor not stopped/attention": "SELECT COUNT(*) FROM agents WHERE "
+        f"NOT ({mailbox}) AND state NOT IN ('stopped','attention')",
+        "actor thread/session/endpoint/pid": f"SELECT COUNT(*) FROM agents WHERE NOT ({mailbox}) AND "
+        "(thread_id IS NOT NULL OR session_id IS NOT NULL OR endpoint IS NOT NULL OR pid IS NOT NULL)",
+        "mailbox not idle": f"SELECT COUNT(*) FROM agents WHERE ({mailbox}) AND state<>'idle'",
         "queued/running messages": "SELECT COUNT(*) FROM messages WHERE state NOT IN ('completed','failed')",
     }
     for name, sql in bad.items():
@@ -322,7 +450,10 @@ def start_daemon(binary, root):
 
 
 def stop_daemon(binary, root):
-    cadence(binary, root, "daemon", "stop", timeout=90)
+    try:
+        cadence(binary, root, "daemon", "stop", timeout=90)
+    finally:
+        sweep(root, grace=30)  # `daemon stop` can return before (or without) the exit
 
 
 def port_free(port):
@@ -336,49 +467,116 @@ def port_free(port):
         s.close()
 
 
-def pick_port(want):
+def pick_port(want, skip=()):
     """`want` if free, else the next free port in 3110-3199 (other lanes
     run boards there; we only ever bind, never connect to, a port we did
-    not start)."""
+    not start). Free now is not free later: `start_board` proves the
+    listener it ends up with is its own."""
     for port in [want] + list(range(3110, 3200)):
-        if port_free(port):
+        if port not in skip and 3110 <= port <= 3199 and port_free(port):
             return port
     sys.exit("no free port in 3110-3199")
 
 
-def start_board(binary, root, port):
-    p = paths(root)
-    port = pick_port(port)
-    if not port_free(port):
-        sys.exit(f"port {port} is in use")
-    log = open(f"{p['log']}/board.log", "ab")
-    proc = subprocess.Popen(
-        [binary, "ui", "run", "--port", str(port), "--dist", p["dist"]],
-        env=child_env(root), stdout=log, stderr=log, stdin=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-    for _ in range(100):
-        if proc.poll() is not None:
-            sys.exit(f"board exited early; see {p['log']}/board.log")
+def listen_inodes(port):
+    """Socket inodes in LISTEN state on `port` (any local address, v4 or v6)."""
+    found = set()
+    for name in ("/proc/net/tcp", "/proc/net/tcp6"):
         try:
-            http_get(port, "/api/health", timeout=2)
-            body = http_json(port, "/api/health")
-            if body.get("daemon") != "reachable":
-                sys.exit(f"board cannot reach the daemon: {body}")
-            proc.port = port
-            return proc
+            with open(name) as f:
+                rows = f.read().splitlines()[1:]
         except OSError:
+            continue
+        for row in rows:
+            cols = row.split()
+            if cols[3] == "0A" and int(cols[1].rsplit(":", 1)[1], 16) == port:
+                found.add(cols[9])
+    return found
+
+
+def socket_inodes(pid):
+    found = set()
+    try:
+        for fd in os.listdir(f"/proc/{pid}/fd"):
+            link = os.readlink(f"/proc/{pid}/fd/{fd}")
+            if link.startswith("socket:["):
+                found.add(link[8:-1])
+    except OSError:
+        pass
+    return found
+
+
+def port_is_ours(port, pid):
+    """True only when something listens on `port` and EVERY listener there
+    is a socket held by the board process we spawned. A foreign board that
+    holds the port (or shares it) answers HTTP just as well, so the answer
+    alone proves nothing."""
+    listeners = listen_inodes(port)
+    return bool(listeners) and listeners <= socket_inodes(pid)
+
+
+def start_board(binary, root, want, on_spawn=None, attempts=5):
+    """Start a foreground `ui run` board on a port of 3110-3199 and return
+    its Popen, with `.port` set. The port is picked free, then bound by the
+    board a moment later, so another lane can win the race: a board that
+    exits (bind lost) or that is not the listener on its port is stopped and
+    the next free port is tried. The caller learns the pid at once through
+    `on_spawn`, before the board is up, so the watchdog covers it."""
+    p = paths(root)
+    verify_stubs(root)
+    tried = set()
+    for _ in range(attempts):
+        port = pick_port(want, tried)
+        tried.add(port)
+        log = open(f"{p['log']}/board.log", "ab")
+        proc = subprocess.Popen(
+            [binary, "ui", "run", "--port", str(port), "--dist", p["dist"]],
+            env=child_env(root), stdout=log, stderr=log, stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        BOARD_PIDS.append(proc.pid)
+        if on_spawn:
+            on_spawn(proc)
+        ours = False
+        for _ in range(100):
+            if proc.poll() is not None:
+                break  # exited: usually the bind lost the race
+            if listen_inodes(port) and not port_is_ours(port, proc.pid):
+                break  # someone else listens on this port too
+            if port_is_ours(port, proc.pid):
+                ours = True
+                break
             time.sleep(0.2)
-    proc.terminate()
-    sys.exit("board did not come up")
+        if ours:
+            body = None
+            for _ in range(50):
+                try:
+                    body = http_json(port, "/api/health", timeout=10)
+                    break
+                except OSError:
+                    time.sleep(0.2)
+            if body is not None:
+                if body.get("daemon") != "reachable":
+                    stop_board(proc)
+                    sys.exit(f"board cannot reach the daemon: {body}")
+                if not port_is_ours(port, proc.pid):  # re-prove after the first answer
+                    stop_board(proc)
+                    continue
+                proc.port = port
+                return proc
+        stop_board(proc)
+        print(f"board on port {port} was not ours; trying another", file=sys.stderr)
+    sys.exit("could not start a board of our own in 3110-3199")
 
 
 def stop_board(proc):
-    proc.terminate()
+    if proc.poll() is None:
+        proc.terminate()
     try:
         proc.wait(30)
     except subprocess.TimeoutExpired:
         proc.kill()
+        proc.wait(10)
 
 
 def http_json(port, path, timeout=700):
@@ -418,43 +616,66 @@ def open_stream(port):
 # ------------------------------------------------------------ commands
 
 
+def db_state_counts(root):
+    """(agents by state, verify_non_launchable) from the store, read-only."""
+    c = sqlite3.connect(f"file:{paths(root)['state']}/cadence.sqlite3?mode=ro", uri=True)
+    try:
+        verify_non_launchable(c)
+        return dict(c.execute("SELECT state, COUNT(*) FROM agents GROUP BY state"))
+    finally:
+        c.close()
+
+
 def cmd_prepare(a):
     require_root(a.root)
     setup_dirs(a.root)
+    require_no_agent_uid(a.root)
+    verify_stubs(a.root)
     pid = start_daemon(a.cadence, a.root)  # creates the schema; empty registry
     stop_daemon(a.cadence, a.root)
-    version, counts = seed(a.root, a.agents, a.msgs, a.events, a.jobs, a.tasks)
+    require_no_agent_uid(a.root)
+    version, counts = seed(a.root, a.agents, a.msgs, a.events, a.jobs, a.tasks,
+                           a.inbox, a.fenced)
     print(json.dumps({"schema_version": version, "seeded": counts, "bootstrap_pid": pid}))
 
 
 def cmd_preflight(a):
     """Start the daemon on the seeded registry, wait past every timer, and
-    scan /proc. Exit 0 only when nothing spawned."""
+    scan /proc. Exit 0 only when nothing spawned and the daemon changed no
+    agent row (every actor row is still blank and disabled, the per-state
+    counts are the seeded ones)."""
     require_root(a.root)
-    pid = start_daemon(a.cadence, a.root)
-    roots = [pid]
-    wd = Watchdog(a.root, a.cadence, lambda: roots)
+    require_no_agent_uid(a.root)
+    verify_stubs(a.root)
+    seeded_states = db_state_counts(a.root)
+    roots = []
+    wd = Watchdog(a.root, a.cadence, lambda: list(roots))  # before the daemon
     wd.start()
     try:
+        roots.append(start_daemon(a.cadence, a.root))
         # Timers: relaunch at start; stall tick (auto_resume) every tick;
         # auto-stop sweep every 60 s. Wait a full 60 s past the slowest.
         time.sleep(a.settle)
         agents = rpc(a.root, "agent_list", {})["result"]["agents"]
-        states = sorted({x["state"] for x in agents})
+        states = {}
+        for x in agents:
+            states[x["state"]] = states.get(x["state"], 0) + 1
         hits = scan_spawned(a.root, roots, {os.getpid(), os.getppid()})
         trip = f"{paths(a.root)['log']}/TRIPWIRE.log"
         tripped = os.path.exists(trip) and os.path.getsize(trip) > 0
     finally:
         wd.stop.set()
         stop_daemon(a.cadence, a.root)
+    rows_unchanged = db_state_counts(a.root) == seeded_states and states == seeded_states
     report = {
-        "agents": len(agents), "states": states, "spawned": hits,
+        "agents": len(agents), "states": states, "seeded_states": seeded_states,
+        "rows_unchanged": rows_unchanged, "spawned": hits,
         "tripwire_fired": tripped, "watchdog": wd.tripped,
         "min_mem_available_mib": wd.min_avail // 1024, "max_load1": round(wd.max_load, 1),
         "settle_secs": a.settle,
     }
     print(json.dumps(report))
-    sys.exit(0 if not hits and not tripped and not wd.tripped and states == ["stopped"] else 1)
+    sys.exit(0 if not hits and not tripped and not wd.tripped and rows_unchanged else 1)
 
 
 def pcts(xs):
@@ -489,19 +710,19 @@ def sample_during(work, probes, interval=0.05):
 def cmd_measure(a):
     require_root(a.root)
     require_port(a.port)
-    pid = start_daemon(a.cadence, a.root)
-    roots = [pid]
-    try:
-        board = start_board(a.cadence, a.root, a.port)
-    except SystemExit:
-        stop_daemon(a.cadence, a.root)
-        raise
-    roots.append(board.pid)
-    wd = Watchdog(a.root, a.cadence, lambda: list(roots))
+    require_no_agent_uid(a.root)
+    verify_stubs(a.root)
+    db_state_counts(a.root)  # refuses a launchable store before anything starts
+    roots = []
+    wd = Watchdog(a.root, a.cadence, lambda: list(roots))  # before daemon and board
     wd.start()
+    board = None
     res = {"label": a.label, "binary": a.cadence, "load1_start": os.getloadavg()[0],
            "cpus": os.cpu_count()}
     try:
+        roots.append(start_daemon(a.cadence, a.root))
+        board = start_board(a.cadence, a.root, a.port, on_spawn=lambda pr: roots.append(pr.pid))
+        res["board_port"] = board.port
         time.sleep(a.settle)
         if wd.tripped:
             sys.exit(1)
@@ -551,9 +772,14 @@ def cmd_measure(a):
             t.join()
         stream.close()
         # Cold again, this time with a stream subscriber attached first.
+        # Re-pick and re-prove the port: the old one may be taken by now.
         stop_board(board)
-        board = start_board(a.cadence, a.root, board.port)
-        roots.append(board.pid)
+        board = start_board(a.cadence, a.root, board.port,
+                            on_spawn=lambda pr: roots.append(pr.pid))
+        res["board_port_after_restart"] = board.port
+        # Cold board, no stream: the first read after a restart pays it all.
+        res["http_agents_first_nostream_s"] = round(
+            timed(lambda: http_get(board.port, "/api/agents"))[0], 3)
         stream = open_stream(board.port)
         res["http_agents_first_with_stream_s"] = round(
             timed(lambda: http_get(board.port, "/api/agents"))[0], 3)
@@ -564,7 +790,8 @@ def cmd_measure(a):
         res["min_mem_available_mib"] = wd.min_avail // 1024
         res["max_load1"] = round(wd.max_load, 1)
         res["spawned_at_end"] = scan_spawned(a.root, roots, {os.getpid(), os.getppid()})
-        stop_board(board)
+        if board is not None:
+            stop_board(board)
         stop_daemon(a.cadence, a.root)
     print(json.dumps(res, indent=1))
     sys.exit(0 if not res["spawned_at_end"] and not wd.tripped else 1)
@@ -584,6 +811,10 @@ def main():
             p.add_argument("--events", type=int, default=1000)
             p.add_argument("--jobs", type=int, default=2000)
             p.add_argument("--tasks", type=int, default=20000)
+            p.add_argument("--inbox", type=int, default=40,
+                           help="of --agents: mailbox rows (idle, no actor)")
+            p.add_argument("--fenced", type=int, default=20,
+                           help="of --agents: attention rows (disabled, never relaunched)")
         if name == "preflight":
             p.add_argument("--settle", type=int, default=130,
                            help="seconds to wait (default 130: 60 s past the 60 s auto-stop sweep)")
