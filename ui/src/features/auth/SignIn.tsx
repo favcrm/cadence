@@ -1,4 +1,3 @@
-import { useEffect, useState } from "react";
 import type { Meta } from "../../lib/types";
 import DeviceSignIn from "./DeviceSignIn";
 import { SIGN_IN_COMMAND } from "./gate";
@@ -13,6 +12,7 @@ export default function SignIn({
   meta,
   onChange,
   access,
+  recheckFinished,
   onRetryWorkspace,
 }: {
   meta: Meta | null;
@@ -20,28 +20,22 @@ export default function SignIn({
   /** CAD-1193: how the board's access check currently reads —
    *  `"unavailable"` when a completed probe could not answer. */
   access?: "checking" | "unavailable" | null;
+  /** Shared App-level timer so opening the mobile menu cannot restart the wait. */
+  recheckFinished?: boolean;
   /** Reload the board to use the same workspace wake path as page load. */
   onRetryWorkspace?: () => void;
 }) {
-  const [recheckFinished, setRecheckFinished] = useState(false);
-  useEffect(() => {
-    if (access !== "unavailable" || meta?.read_only) {
-      setRecheckFinished(false);
-      return;
-    }
-    setRecheckFinished(false);
-    const finish = window.setTimeout(() => setRecheckFinished(true), 60_000);
-    return () => window.clearTimeout(finish);
-  }, [access, meta?.read_only]);
   // CAD-1193: `signed_in === null` is an unanswerable check —
   // unavailable, never a sign-out. It stays unavailable throughout the
   // bounded re-check and never becomes signed-out or authority.
   if (access === "unavailable" && !meta?.read_only) {
     return (
-      <span className="chip bg-warn/10 text-warn" role="status">
-        Workspace waking or unreachable. {recheckFinished ? "Retry when ready." : "Checking again for up to 60 seconds…"}
+      <span className="chip inline-flex items-center gap-1.5 bg-warn/10 text-warn" role="status" title="Workspace waking or unreachable">
+        <span className="sr-only sm:hidden">Workspace waking or unreachable.</span>
+        <span className="sm:hidden">Workspace waking</span>
+        <span className="hidden sm:inline">Workspace waking or unreachable. {recheckFinished ? "Retry when ready." : "Checking again for up to 60 seconds…"}</span>
         {recheckFinished && onRetryWorkspace && (
-          <button type="button" className="lnk text-warn" onClick={onRetryWorkspace}>
+          <button type="button" className="lnk whitespace-nowrap text-warn" onClick={onRetryWorkspace}>
             Retry workspace
           </button>
         )}
