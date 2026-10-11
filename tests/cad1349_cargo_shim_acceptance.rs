@@ -540,7 +540,7 @@ export HOME={driver_home} CARGO_HOME={cargo_home} RUSTUP_HOME={rustup_home}
 export XDG_DATA_HOME={xdg_data} TMPDIR={tmp} RUNNER_TEMP={runner_temp}
 export CARGO_TARGET_DIR={target_dir} CARGO_BUILD_JOBS=2
 export CADENCE_BUILD_SLOT={helper} CADENCE_PM_DIR={pm_dir}
-export CADENCE_STATE_DIR={state}
+export CADENCE_STATE_DIR={state} CADENCE_SUITE_LOCK={suite_lock}
 export CAD1349_DRIVER_HOME={driver_home} CAD1349_EXPECT_TARGET={target_dir}
 export CAD1349_MARKERS={markers} CAD1349_PROVIDER_DIR={provider}
 runner={runner}
@@ -582,6 +582,7 @@ while [ ! -e {stop} ]; do sleep 0.05; done
         helper = shell_quote(helper),
         pm_dir = shell_quote(&root.join("fixture-pm")),
         state = shell_quote(&state),
+        suite_lock = shell_quote(&root.join("registered-suite.lock")),
         markers = shell_quote(markers),
         provider = shell_quote(provider),
         runner = shell_quote(&repo.join("scripts/run-result-tests")),
@@ -787,6 +788,10 @@ fn run_helper_case(
         .env("CAD1349_PROVIDER_DIR", provider)
         .env("CAD1349_MARKERS", markers)
         .env("CADENCE_STATE_DIR", root.join("owned-unstarted-state"))
+        .env(
+            "CADENCE_SUITE_LOCK",
+            root.join(format!("{prefix}-suite.lock")),
+        )
         .env("GIT_CONFIG_NOSYSTEM", "1");
     if let Some(helper) = helper_env {
         command.env("CADENCE_BUILD_SLOT", helper);
