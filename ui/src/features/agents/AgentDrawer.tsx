@@ -4,7 +4,9 @@ import { fmtTime } from "../../lib/fmt";
 import { provenanceDetail } from "./modelProvenance";
 import { IconClose } from "../../ui/icons";
 import Button from "../../ui/Button";
-import { AgentActivity, AgentQueue, AgentState, WorkBlock } from "./AgentBlocks";
+import AgentAvatar, { lookFor } from "./AgentAvatar";
+import { AgentActivity, AgentQueue, WorkBlock } from "./AgentBlocks";
+import { agentHoldsWorkButDead, lifecycleOf } from "./agentView";
 import type { Agent, AgentDetail, UsageLimit } from "../../lib/types";
 
 /// A fence's recovery path — the daemon's own error text already names
@@ -265,10 +267,8 @@ export default function AgentDrawer({
   const fenced = detail?.fenced ?? observed?.fenced;
   const recovery = detail?.recovery ?? observed?.recovery;
   const resume = detail?.resume ?? observed?.resume;
-  const caps = (a?.capabilities ?? {}) as Record<string, unknown>;
-  const capList = Object.entries(caps).filter(
-    ([, v]) => v === true || typeof v === "string",
-  );
+  const lifecycle = profile ? lifecycleOf(profile) : "normal";
+  const deadHolding = profile ? agentHoldsWorkButDead(profile) : false;
 
   return (
     <dialog
@@ -291,7 +291,13 @@ export default function AgentDrawer({
           onClose();
       }}
     >
-      <header className="px-5 pt-4 pb-4 border-b border-ink-700 flex items-start gap-3 shrink-0">
+      <header className="px-5 pt-4 pb-4 border-b border-ink-700 flex items-center gap-3 shrink-0">
+        <AgentAvatar
+          slug={lookFor(alias)}
+          still={lifecycle !== "active"}
+          active={lifecycle === "active"}
+          size={52}
+        />
         <div className="min-w-0 flex-1">
           <h2
             id="agent-detail-title"
@@ -309,11 +315,6 @@ export default function AgentDrawer({
               Group: {observed.group_root ? "root" : observed.group}
               {observed.team_role ? ` · Team role: ${observed.team_role}` : ""}
             </p>
-          )}
-          {profile && (
-            <div className="mt-2">
-              <AgentState agent={profile} />
-            </div>
           )}
         </div>
         <Button
@@ -340,6 +341,24 @@ export default function AgentDrawer({
             </Button>
           </div>
         )}
+        {deadHolding && (
+          <div className="agents-banner tone-fail" role="status">
+            Agent is dead but still holds work — release the claim or
+            reassign before it stalls the ticket.
+          </div>
+        )}
+        {lifecycle === "stale-inbox" && (
+          <div className="agents-banner tone-info" role="status">
+            Mailbox only — {profile!.queued} unread, no live endpoint. Drain
+            or archive.
+          </div>
+        )}
+        {lifecycle === "idle-holding" && (
+          <div className="agents-banner tone-warn" role="status">
+            Not running but still holds a claim — resume it or release the
+            work.
+          </div>
+        )}
         {fenced && (
           <section>
             <h3 className="text-cardtitle font-semibold text-fail">
@@ -356,38 +375,63 @@ export default function AgentDrawer({
             />
           </section>
         )}
-        {observed && (
+        {(observed || (detail && a)) && (
           <section>
             <h3 className="text-cardtitle font-semibold text-ink-100 mb-2">
               Current work
             </h3>
-            <WorkBlock agent={observed} onOpenIssue={onOpenIssue} />
-            <AgentQueue agent={observed} />
-            <div className="mt-2">
-              <AgentActivity agent={observed} />
-            </div>
-          </section>
-        )}
-        {profile && (
-          <section>
-            <h3 className="text-cardtitle font-semibold text-ink-100 mb-2">
-              Model, effort & usage
-            </h3>
-            <ProfileBlock agent={profile} />
-          </section>
-        )}
-        {resume && (
-          <section>
-            <h3 className="text-cardtitle font-semibold text-ink-100 mb-2">
-              Resume command
-            </h3>
-            <p className="text-label text-ink-400 mb-2">
-              {observed?.resume_hint ??
-                "For use in a terminal by the operator."}
-            </p>
-            <pre className="agents-command num text-label text-accent bg-accent/10 rounded p-3">
-              {resume}
-            </pre>
+            {observed && (
+              <>
+                <WorkBlock agent={observed} onOpenIssue={onOpenIssue} />
+                <AgentQueue agent={observed} />
+                <div className="mt-2">
+                  <AgentActivity agent={observed} />
+                </div>
+              </>
+            )}
+            {detail && a && (
+              <>
+                {(detail.tasks?.length ?? 0) > 0 && (
+                  <div className="mt-3">
+                    <div className="flex items-baseline gap-2 mb-2">
+                      <h4 className="slabel">Tasks</h4>
+                      <span className="kicker">assigned in flight</span>
+                    </div>
+                    <ul className="border border-ink-700 rounded-lg divide-y divide-ink-700/80 bg-ink-850">
+                      {detail.tasks!.map((t) => (
+                        <li
+                          key={t}
+                          className="flex items-center gap-2.5 px-3 py-2.5"
+                        >
+                          <span className="num text-label text-ink-200 break-words">
+                            {t}
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                {(detail.on?.length ?? 0) > 0 && (
+                  <div className="mt-3">
+                    <div className="flex items-baseline gap-2 mb-2">
+                      <h4 className="slabel">Issues</h4>
+                      <span className="kicker">bound through the job</span>
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
+                      {detail.on!.map((id) => (
+                        <button
+                          key={id}
+                          className="lnk"
+                          onClick={() => onOpenIssue(id)}
+                        >
+                          {id}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </>
+            )}
           </section>
         )}
         {detail && a && (
@@ -439,56 +483,11 @@ export default function AgentDrawer({
               </dl>
             </section>
 
-            {(detail.tasks?.length ?? 0) > 0 && (
-              <section>
-                <div className="flex items-baseline gap-2 mb-2">
-                  <h3 className="text-cardtitle font-semibold text-ink-100">
-                    Tasks
-                  </h3>
-                  <span className="kicker">assigned in flight</span>
-                </div>
-                <ul className="border border-ink-700 rounded-lg divide-y divide-ink-700/80 bg-ink-850">
-                  {detail.tasks!.map((t) => (
-                    <li
-                      key={t}
-                      className="flex items-center gap-2.5 px-3 py-2.5"
-                    >
-                      <span className="num text-label text-ink-200 break-words">
-                        {t}
-                      </span>
-                    </li>
-                  ))}
-                </ul>
-              </section>
-            )}
-
-            {(detail.on?.length ?? 0) > 0 && (
-              <section>
-                <div className="flex items-baseline gap-2 mb-2">
-                  <h3 className="text-cardtitle font-semibold text-ink-100">
-                    Issues
-                  </h3>
-                  <span className="kicker">bound through the job</span>
-                </div>
-                <div className="flex flex-wrap gap-1.5">
-                  {detail.on!.map((id) => (
-                    <button
-                      key={id}
-                      className="lnk"
-                      onClick={() => onOpenIssue(id)}
-                    >
-                      {id}
-                    </button>
-                  ))}
-                </div>
-              </section>
-            )}
-
             {(detail.running.length > 0 || detail.queued > 0) && (
               <section>
                 <div className="flex items-baseline gap-2 mb-2">
                   <h3 className="text-cardtitle font-semibold text-ink-100">
-                    Messages
+                    Inbox
                   </h3>
                   <span className="kicker">
                     {detail.running.length} running · {detail.queued} queued ·{" "}
@@ -529,34 +528,14 @@ export default function AgentDrawer({
               </section>
             )}
 
-            {capList.length > 0 && (
-              <section>
-                <div className="flex items-baseline gap-2 mb-2">
-                  <h3 className="text-cardtitle font-semibold text-ink-100">
-                    Capabilities
-                  </h3>
-                  <span className="kicker">from the registry</span>
-                </div>
-                <div className="flex flex-wrap gap-1.5">
-                  {capList.map(([k, v]) => (
-                    <span
-                      key={k}
-                      className="chip bg-ink-800 text-ink-300"
-                      title={typeof v === "string" ? v : k}
-                    >
-                      {typeof v === "string" ? `${k}: ${v}` : k}
-                    </span>
-                  ))}
-                </div>
-              </section>
-            )}
-
             <section>
               <div className="flex items-baseline gap-2 mb-2">
                 <h3 className="text-cardtitle font-semibold text-ink-100">
-                  Events
+                  History
                 </h3>
-                <span className="kicker">last {detail.events.length}</span>
+                <span className="kicker">
+                  last {detail.events.length} events
+                </span>
               </div>
               {detail.events.length ? (
                 <ul className="border border-ink-700 rounded-lg divide-y divide-ink-700/80 bg-ink-850">
@@ -588,6 +567,110 @@ export default function AgentDrawer({
             </section>
           </>
         )}
+        {profile && (
+          <section>
+            <h3 className="text-cardtitle font-semibold text-ink-100 mb-2">
+              Model, effort & usage
+            </h3>
+            <ProfileBlock agent={profile} />
+          </section>
+        )}
+        {resume && (
+          <section>
+            <h3 className="text-cardtitle font-semibold text-ink-100 mb-2">
+              Resume command
+            </h3>
+            <p className="text-label text-ink-400 mb-2">
+              {observed?.resume_hint ??
+                "For use in a terminal by the operator."}
+            </p>
+            <pre className="agents-command num text-label text-accent bg-accent/10 rounded p-3">
+              {resume}
+            </pre>
+          </section>
+        )}
+        <section>
+          <div className="flex items-baseline gap-2 mb-2">
+            <h3 className="text-cardtitle font-semibold text-ink-100">
+              Actions
+            </h3>
+            <span className="kicker">read-only in this stage</span>
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            {(fenced || deadHolding || lifecycle === "idle-holding") && (
+              <>
+                <Button
+                  size="sm"
+                  disabled
+                  title="Resume is not wired from the board yet"
+                >
+                  Resume
+                </Button>
+                <Button
+                  size="sm"
+                  variant="danger"
+                  disabled
+                  title="Claim release is not wired from the board yet"
+                >
+                  Release claim
+                </Button>
+              </>
+            )}
+            {(fenced || deadHolding) && (
+              <>
+                <Button
+                  size="sm"
+                  disabled
+                  title="Reassignment is not wired from the board yet"
+                >
+                  Reassign
+                </Button>
+                <Button
+                  size="sm"
+                  variant="danger"
+                  disabled
+                  title="Unfence runs from the To do rail, where the operator records the outcome"
+                >
+                  Unfence
+                </Button>
+              </>
+            )}
+            {(lifecycle === "stale-inbox" || (profile && profile.queued > 0)) && (
+              <>
+                <Button
+                  size="sm"
+                  disabled
+                  title="Inbox draining is not wired from the board yet"
+                >
+                  Drain inbox
+                </Button>
+                <Button
+                  size="sm"
+                  variant="danger"
+                  disabled
+                  title="Archiving is not wired from the board yet"
+                >
+                  Archive
+                </Button>
+              </>
+            )}
+            {lifecycle === "active" && (
+              <Button
+                size="sm"
+                variant="danger"
+                disabled
+                title="Stopping a turn is not wired from the board yet"
+              >
+                Stop
+              </Button>
+            )}
+            {lifecycle === "normal" && !fenced && !(profile && profile.queued > 0) && (
+              <p className="text-secondary text-ink-500">
+                No lifecycle actions apply to this agent.
+              </p>
+            )}
+          </div>
+        </section>
       </div>
     </dialog>
   );
