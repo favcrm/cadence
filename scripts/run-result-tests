@@ -35,6 +35,7 @@ lane_build_slot=${CADENCE_BUILD_SLOT:-}
 original_xdg_data=${XDG_DATA_HOME:-$real_home/.local/share}
 manifest_path=
 selection_file=
+runner_args=("$@")
 while [ "$#" -gt 0 ]; do
   case $1 in
     --manifest-path|--test-selection)
@@ -87,6 +88,75 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 . "$root/scripts/suite-lock-config"
 suite_lock_config
 
+# Resolve the lane shim before trusting the helper setting. The helper may be
+# executed only when it is the absolute executable embedded in that generated
+# shim; CADENCE_BUILD_SLOT by itself is caller-controlled input.
+cargo_entry=$(command -v cargo) || { echo "::error::cargo is not on PATH" >&2; exit 1; }
+shim_dir=
+case $cargo_entry in
+  */cadence-hooks/bin/cargo) shim_dir=$(dirname "$cargo_entry") ;;
+esac
+if [ -n "$lane_build_slot" ]; then
+  if [ -z "$shim_dir" ] || [ ! -x "$lane_build_slot" ] ||
+     ! python3 - "$cargo_entry" "$lane_build_slot" <<'PY'
+import sys
+from pathlib import Path
+shim, helper = sys.argv[1:]
+if not Path(helper).is_absolute():
+    raise SystemExit(1)
+quoted = "'" + helper.replace("'", "'\\''") + "'"
+expected = "cad=" + quoted
+try:
+    lines = Path(shim).read_text(encoding="utf-8").splitlines()
+except OSError:
+    raise SystemExit(1)
+raise SystemExit(0 if lines.count(expected) == 1 else 1)
+PY
+  then
+    echo "::error::CADENCE_BUILD_SLOT does not match an executable helper embedded in the lane cargo shim" >&2
+    exit 1
+  fi
+fi
+# The lane shim's admission helper needs the caller's original XDG state.
+# Admit the whole runner before this script scrubs CADENCE_* and isolates XDG.
+# On re-entry, a slot is trusted only when the daemon's status RPC exposes the
+# exact token for this process and lane (the caller PID chain is checked by the
+# daemon); a live or supplied PID alone is never proof. CI/direct runs without
+# a lane helper retain their existing non-daemon path.
+slot_admitted=0
+if [ -n "$lane_build_slot" ]; then
+  if [ -n "${CADENCE_BUILD_SLOT_PID:-}${CADENCE_BUILD_SLOT_TOKEN:-}${CADENCE_BUILD_SLOT_LANE:-}" ]; then
+    if [ "${CADENCE_BUILD_SLOT_PID:-}" != "$$" ] ||
+       [ -z "${CADENCE_BUILD_SLOT_TOKEN:-}" ] ||
+       [ -z "${CADENCE_BUILD_SLOT_LANE:-}" ]; then
+      echo "::error::incomplete or mismatched inherited build-slot identity" >&2
+      exit 1
+    fi
+    if ! slot_status=$("$lane_build_slot" build-slot status --json \
+        --lane "$CADENCE_BUILD_SLOT_LANE" 2>/dev/null) ||
+       ! printf '%s\n' "$slot_status" | python3 -c 'import json, os, sys
+try:
+    status = json.load(sys.stdin)
+    pid = int(os.environ["CADENCE_BUILD_SLOT_PID"])
+    lane = os.environ["CADENCE_BUILD_SLOT_LANE"]
+    token = os.environ["CADENCE_BUILD_SLOT_TOKEN"]
+    suite_holds = status["pools"]["suite"]["held"]
+    valid = any(
+        row.get("kind") == "suite" and row.get("pid") == pid and
+        row.get("lane") == lane and row.get("token") == token
+        for row in suite_holds
+    )
+    raise SystemExit(0 if valid else 1)
+except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)'; then
+      echo "::error::daemon did not validate the inherited build-slot identity" >&2
+      exit 1
+    fi
+    slot_admitted=1
+  else
+    exec "$lane_build_slot" build-slot run suite -- "$0" "${runner_args[@]}"
+  fi
+fi
 # CAD-1197: allowlist of CADENCE_* variables that may reach cargo.
 cadence_env_allow=" CADENCE_SUITE_LOCK "
 for v in $(compgen -e | grep '^CADENCE_' || true); do
@@ -125,11 +195,6 @@ if [ -n "${CARGO_TARGET_DIR:-}" ]; then
   export CARGO_BUILD_TARGET_DIR
 fi
 unset CARGO_TARGET_DIR
-cargo_entry=$(command -v cargo) || { echo "::error::cargo is not on PATH" >&2; exit 1; }
-shim_dir=
-case $cargo_entry in
-  */cadence-hooks/bin/cargo) shim_dir=$(dirname "$cargo_entry") ;;
-esac
 if [ -n "$lane_build_slot" ] && [ -z "$shim_dir" ]; then
   echo "::error::lane build-slot helper is set but generated cargo shim is not first on PATH" >&2
   exit 1
@@ -162,8 +227,9 @@ compiler_dir=$scratch/cargo-toolchain
 mkdir -m 700 "$compiler_dir"
 ln -s "$(realpath -e -- "$compiler_cargo")" "$compiler_dir/cargo"
 lib_path="${shim_dir:+$shim_dir:}$compiler_dir:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+cargo_entry_dir=$(dirname "$cargo_entry")
 for cli in claude codex cursor-agent cursor agent devin pi gemini; do
-  if found=$(PATH=$lib_path command -v "$cli"); then
+  if found=$(PATH="$cargo_entry_dir:$lib_path" command -v "$cli"); then
     echo "::error::provider CLI $cli resolves on the lib suite PATH ($found)" >&2
     exit 1
   fi
@@ -257,8 +323,14 @@ rm -f "$junit_report"
 # One pinned nextest invocation replaces 56 serial cargo test invocations.
 # Its JUnit report is checked against the exact target list afterward so a
 # missing or zero-test target cannot silently shrink the required CI scope.
-if ! PATH=$lib_path CADENCE_SUITE_LOCK_WAIT_SECS="$SUITE_LOCK_WAIT_SECS" \
-  "$root/scripts/cadence-nextest" --locked --features test-seam \
+# cargo-nextest honors CARGO for its Cargo subprocess while preserving PATH for
+# test processes. Under an admitted lane run this selects the compiler symlink
+# directly; tests retain the lane shim first on PATH but receive no slot identity.
+cargo_env=("PATH=$lib_path" "CADENCE_SUITE_LOCK_WAIT_SECS=$SUITE_LOCK_WAIT_SECS")
+if [ "$slot_admitted" -eq 1 ]; then
+  cargo_env+=("CARGO=$compiler_dir/cargo")
+fi
+if ! env "${cargo_env[@]}" "$root/scripts/cadence-nextest" --locked --features test-seam \
     "${target_args[@]}" --lib --bins "${manifest_args[@]}" \
     -j 2 2>&1 | tee "$scratch/nextest.log"; then
   status=1

@@ -9,7 +9,6 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
-    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -283,7 +282,14 @@ fn write_fixture(manifest_dir: &Path, targets: &[String]) {
     .unwrap();
 }
 
-fn start_fixture_daemon(state: &Path, home: &Path, xdg_state: &Path) -> Output {
+fn start_registered_fixture_daemon(
+    state: &Path,
+    home: &Path,
+    xdg_state: &Path,
+    root: &Path,
+    driver: &Path,
+    tmux_command: &Path,
+) -> Output {
     let mut command = Command::new(BINARY);
     command
         .env_clear()
@@ -292,34 +298,87 @@ fn start_fixture_daemon(state: &Path, home: &Path, xdg_state: &Path) -> Output {
         .env("HOME", home)
         .env("XDG_STATE_HOME", xdg_state)
         .env("XDG_CONFIG_HOME", home.join("config"))
-        .env("XDG_DATA_HOME", home.join("data"))
+        .env("XDG_DATA_HOME", root.join("caller-xdg-data"))
         .env("XDG_CACHE_HOME", home.join("cache"))
-        .env_remove("CADENCE_STATE_DIR")
-        .env_remove("CADENCE_PM_DIR");
-    cadence_agent::reaper::output(&mut command).expect("start isolated fixture daemon")
+        .env("CADENCE_PM_DIR", root.join("fixture-pm"))
+        .env("CADENCE_TMUX_COMMAND", tmux_command)
+        .env("CADENCE_FAKE_TMUX_STATE", root.join("tmux/state.json"))
+        .env("CADENCE_STUB_LOCKS", root.join("stub-locks"))
+        .env(
+            "CADENCE_STUB_COMMAND",
+            format!("sh {}", shell_quote(driver)),
+        )
+        .env_remove("CADENCE_STATE_DIR");
+    cadence_agent::reaper::output(&mut command).expect("start registered fixture daemon")
 }
 
-fn run_runner(
-    fixture: &Fixture,
+fn fixture_cli(state: &Path, home: &Path, xdg_state: &Path, args: &[&str]) -> Output {
+    let mut command = Command::new(BINARY);
+    command
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .args(["--state-dir", state.to_str().unwrap()])
+        .args(args)
+        .env("HOME", home)
+        .env("XDG_STATE_HOME", xdg_state)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .env("CADENCE_PM_DIR", home.join("pm"))
+        .env_remove("CADENCE_STATE_DIR");
+    cadence_agent::reaper::output(&mut command).expect("run isolated registered-lane CLI")
+}
+
+fn wait_for_file(path: &Path, description: &str) {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !path.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {description}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn run_registered_runner_cases(
+    lane: &Fixture,
     root: &Path,
     provider: &Path,
     target: &Path,
     markers: &Path,
     helper: &Path,
-    with_daemon: bool,
-) -> (Output, Option<String>) {
+) -> (String, String, String, String) {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let runner_temp = root.join("runner-temp");
-    let tmp = root.join("tmp");
-    let driver_home = root.join("driver-home");
+    let state = root.join("registered-state");
+    let home = root.join("registered-home");
+    let xdg_state = root.join("registered-xdg-state");
+    let driver_home = root.join("registered-driver-home");
+    let runner_temp = root.join("registered-runner-temp");
+    let tmp = root.join("registered-tmp");
+    let xdg_data = root.join("caller-xdg-data");
+    let stub_locks = root.join("stub-locks");
+    let session = "cad1349-registered";
+    let alias = "positive-lane";
+    let go = root.join("registered-go");
+    let stop = root.join("registered-stop");
+    let result_dir = root.join("registered-results");
+    let tmux_wrapper = root.join("registered-tmux.py");
+    fs::create_dir_all(&state).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&xdg_state).unwrap();
+    fs::create_dir_all(&driver_home).unwrap();
     fs::create_dir_all(&runner_temp).unwrap();
     fs::create_dir_all(&tmp).unwrap();
-    fs::create_dir_all(&driver_home).unwrap();
+    fs::create_dir_all(&xdg_data).unwrap();
+    fs::create_dir_all(&stub_locks).unwrap();
+    fs::create_dir_all(&result_dir).unwrap();
+    std::os::unix::fs::symlink(&state, xdg_state.join("cadence")).unwrap();
     fs::create_dir_all(provider).unwrap();
     fs::create_dir_all(markers).unwrap();
     let provider_cli = provider.join("claude");
     fs::write(&provider_cli, "#!/bin/sh\nexit 0\n").unwrap();
     fs::set_permissions(&provider_cli, fs::Permissions::from_mode(0o755)).unwrap();
+
     let compiler_path = std::env::split_paths(&std::env::var_os("PATH").unwrap())
         .filter(|path| !path.ends_with("cadence-hooks/bin"))
         .collect::<Vec<_>>();
@@ -333,135 +392,297 @@ fn run_runner(
     let rustup_home = std::env::var_os("RUSTUP_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| original_home.join(".rustup"));
-    let path = format!(
+    let runner_path = format!(
         "{}:{}:{}",
-        fixture.shim.parent().unwrap().display(),
+        lane.shim.parent().unwrap().display(),
         provider.display(),
         compiler_path.to_string_lossy()
     );
-    let xdg_data = root.join("driver-xdg-data");
     let nextest_name = "cadence/tools/cadence-nextest-0.9.145/cargo-nextest";
     let source_data = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")));
     if let Some(source) = source_data
         .map(|data| data.join(nextest_name))
-        .filter(|p| p.is_file())
+        .filter(|path| path.is_file())
     {
         let destination = xdg_data.join(nextest_name);
         fs::create_dir_all(destination.parent().unwrap()).unwrap();
         fs::copy(source, destination).unwrap();
     }
+
+    let driver = root.join("registered-driver.sh");
+    let driver_body = format!(
+        r##"#!/bin/bash
+set -u
+exec 9>{lock}
+flock -x 9
+while [ ! -e {go} ]; do
+  if IFS= read -r -t 0.05 _; then :; else sleep 0.01; fi
+done
+export PATH={path}
+export HOME={driver_home} CARGO_HOME={cargo_home} RUSTUP_HOME={rustup_home}
+export XDG_DATA_HOME={xdg_data} TMPDIR={tmp} RUNNER_TEMP={runner_temp}
+export CARGO_TARGET_DIR={target_dir} CARGO_BUILD_JOBS=2
+export CADENCE_BUILD_SLOT={helper} CADENCE_PM_DIR={pm_dir}
+export CADENCE_STATE_DIR={state}
+export CAD1349_DRIVER_HOME={driver_home} CAD1349_EXPECT_TARGET={target_dir}
+export CAD1349_MARKERS={markers} CAD1349_PROVIDER_DIR={provider}
+runner={runner}
+manifest={manifest}
+run_case() {{
+  name=$1
+  shift
+  if timeout --signal=TERM --kill-after=5s 180s "$@" >{log_dir}/"$name.log" 2>&1; then
+    rc=0
+  else
+    rc=$?
+  fi
+  printf '%s\n' "$rc" >{log_dir}/"$name.status"
+}}
+run_case suite "$runner" --manifest-path "$manifest"
+python3 - {log_dir}/suite.log {log_dir}/suite.token <<'PYCODE'
+import re, sys
+text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+match = re.search(r"slot ([^ ]+) acquired \(suite,", text)
+if not match:
+    raise SystemExit("real suite acquisition token missing from runner output")
+open(sys.argv[2], "w").write(match.group(1))
+PYCODE
+run_case wrong-kind {helper} build-slot run build -- "$runner" --manifest-path "$manifest"
+run_case incomplete env CADENCE_BUILD_SLOT_TOKEN=forged-incomplete-token "$runner" --manifest-path "$manifest"
+run_case replay bash -c 'export CADENCE_BUILD_SLOT_PID=$$ CADENCE_BUILD_SLOT_LANE="$CADENCE_ALIAS" CADENCE_BUILD_SLOT_TOKEN="$(<"$1")"; exec "$2" --manifest-path "$3"' _ {log_dir}/suite.token "$runner" "$manifest"
+while [ ! -e {stop} ]; do sleep 0.05; done
+"##,
+        lock = shell_quote(&stub_locks.join(format!("{session}.lock"))),
+        go = shell_quote(&go),
+        path = shell_quote(Path::new(&runner_path)),
+        driver_home = shell_quote(&driver_home),
+        cargo_home = shell_quote(&cargo_home),
+        rustup_home = shell_quote(&rustup_home),
+        xdg_data = shell_quote(&xdg_data),
+        tmp = shell_quote(&tmp),
+        runner_temp = shell_quote(&runner_temp),
+        target_dir = shell_quote(&target.join("target")),
+        helper = shell_quote(helper),
+        pm_dir = shell_quote(&root.join("fixture-pm")),
+        state = shell_quote(&state),
+        markers = shell_quote(markers),
+        provider = shell_quote(provider),
+        runner = shell_quote(&repo.join("scripts/run-result-tests")),
+        manifest = shell_quote(&target.join("Cargo.toml")),
+        log_dir = shell_quote(&result_dir),
+        stop = shell_quote(&stop),
+    );
+    fs::write(&driver, driver_body).unwrap();
+    fs::set_permissions(&driver, fs::Permissions::from_mode(0o755)).unwrap();
+    Pm::init(&root.join("fixture-pm")).expect("isolated pty agent PM");
+    let original_tmux = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_tmux.py");
+    fs::write(
+        &tmux_wrapper,
+        format!(
+            r#"#!/usr/bin/env python3
+import os, sys
+env = os.environ.copy()
+args = sys.argv[1:]
+for i, arg in enumerate(args[:-1]):
+    if arg == '-e' and '=' in args[i + 1]:
+        key, value = args[i + 1].split('=', 1)
+        env[key] = value
+os.execvpe(sys.executable, [sys.executable, {}, *args], env)
+"#,
+            shell_quote(&original_tmux)
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&tmux_wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    let started =
+        start_registered_fixture_daemon(&state, &home, &xdg_state, root, &driver, &tmux_wrapper);
+    assert!(
+        started.status.success(),
+        "registered fixture daemon start failed: {}{}",
+        String::from_utf8_lossy(&started.stdout),
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let registered = fixture_cli(
+        &state,
+        &home,
+        &xdg_state,
+        &[
+            "agent",
+            "register",
+            alias,
+            "--provider",
+            "tui-stub",
+            "--endpoint",
+            "pty",
+            "--cwd",
+            root.to_str().unwrap(),
+            "--param",
+            &format!("session={session}"),
+        ],
+    );
+    assert!(
+        registered.status.success(),
+        "register temporary pty agent: {}{}",
+        String::from_utf8_lossy(&registered.stdout),
+        String::from_utf8_lossy(&registered.stderr)
+    );
+    let sent = fixture_cli(
+        &state,
+        &home,
+        &xdg_state,
+        &["send", alias, "--text", "start acceptance runner"],
+    );
+    assert!(
+        sent.status.success(),
+        "start temporary pty agent: {}{}",
+        String::from_utf8_lossy(&sent.stdout),
+        String::from_utf8_lossy(&sent.stderr)
+    );
+    let unregistered_suite = fixture_cli(
+        &state,
+        &home,
+        &xdg_state,
+        &["build-slot", "run", "suite", "--", "true"],
+    );
+    let unregistered_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&unregistered_suite.stdout),
+        String::from_utf8_lossy(&unregistered_suite.stderr)
+    );
+    assert!(
+        !unregistered_suite.status.success()
+            && unregistered_output.contains("only a build or test slot"),
+        "unregistered suite admission was not refused: {unregistered_output}"
+    );
+
+    let store = cadence_agent::store::Store::open_side(&state.join("cadence.sqlite3")).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let agent = loop {
+        let row = store.agent(alias).unwrap();
+        let session_state = root.join("tmux/state.json");
+        if row.endpoint_kind == "pty" && row.generation.is_some() && session_state.is_file() {
+            if let Some(pid) = row.pid {
+                let pane: Value =
+                    serde_json::from_slice(&fs::read(session_state).unwrap()).unwrap();
+                assert_eq!(pid as u32, pane["pid"].as_u64().unwrap() as u32);
+                break row;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "registered pty pane did not start"
+        );
+        thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(agent.alias, alias);
+    fs::write(&go, "run\n").unwrap();
+    for case in ["suite", "wrong-kind", "incomplete", "replay"] {
+        wait_for_file(&result_dir.join(format!("{case}.status")), case);
+    }
+    let read_case = |case: &str| {
+        let status = fs::read_to_string(result_dir.join(format!("{case}.status"))).unwrap();
+        let log = fs::read_to_string(result_dir.join(format!("{case}.log"))).unwrap_or_default();
+        (status.trim().parse::<i32>().unwrap(), log)
+    };
+    let (suite_rc, suite_log) = read_case("suite");
+    let (wrong_rc, wrong_log) = read_case("wrong-kind");
+    let (incomplete_rc, incomplete_log) = read_case("incomplete");
+    let (replay_rc, replay_log) = read_case("replay");
+    fs::write(&stop, "stop\n").unwrap();
+    let mut stop_daemon = Command::new(BINARY);
+    stop_daemon
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .args(["--state-dir", state.to_str().unwrap(), "daemon", "stop"])
+        .env("HOME", &home)
+        .env("XDG_STATE_HOME", &xdg_state);
+    let stopped =
+        cadence_agent::reaper::output(&mut stop_daemon).expect("stop registered fixture daemon");
+    assert!(
+        stopped.status.success(),
+        "stop fixture daemon: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    let mut kill_tmux = Command::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/fake_tmux.py"
+    ));
+    kill_tmux
+        .args(["-L", "isolated", "kill-server"])
+        .env("CADENCE_FAKE_TMUX_STATE", root.join("tmux/state.json"));
+    let _ = cadence_agent::reaper::output(&mut kill_tmux);
+    assert_eq!(suite_rc, 0, "registered suite runner failed: {suite_log}");
+    assert!(
+        suite_log.contains("acquired (suite"),
+        "suite acquisition missing: {suite_log}"
+    );
+    assert!(
+        suite_log.contains("validated "),
+        "JUnit validation missing: {suite_log}"
+    );
+    assert_eq!(wrong_rc, 1, "wrong-kind slot was not refused: {wrong_log}");
+    assert!(
+        wrong_log.contains("did not validate the inherited build-slot identity"),
+        "wrong-kind refusal missing: {wrong_log}"
+    );
+    assert_eq!(
+        incomplete_rc, 1,
+        "incomplete identity was not refused: {incomplete_log}"
+    );
+    assert!(
+        incomplete_log.contains("incomplete or mismatched inherited build-slot identity"),
+        "incomplete refusal missing: {incomplete_log}"
+    );
+    assert_eq!(replay_rc, 1, "replayed token was not refused: {replay_log}");
+    assert!(
+        replay_log.contains("did not validate the inherited build-slot identity"),
+        "replay refusal missing: {replay_log}"
+    );
+    assert_eq!(
+        fs::read_dir(markers).unwrap().count(),
+        integration_targets().len() + 2
+    );
+    (suite_log, wrong_log, incomplete_log, replay_log)
+}
+
+fn run_missing_helper(
+    fixture: &Fixture,
+    root: &Path,
+    provider: &Path,
+    target: &Path,
+    helper: &Path,
+) -> Output {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let runner_temp = root.join("missing-runner-temp");
+    let tmp = root.join("missing-tmp");
+    fs::create_dir_all(&runner_temp).unwrap();
+    fs::create_dir_all(&tmp).unwrap();
+    fs::create_dir_all(provider).unwrap();
+    let shim_dir = fixture.shim.parent().unwrap();
+    let path = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .filter(|part| !part.ends_with("cadence-hooks/bin"))
+        .collect::<Vec<_>>();
+    let path = std::env::join_paths(std::iter::once(shim_dir.to_path_buf()).chain(path)).unwrap();
     let mut command = Command::new("timeout");
     command
         .args(["--signal=TERM", "--kill-after=5s", "180s"])
         .arg(repo.join("scripts/run-result-tests"))
-        .env_clear()
         .args([
             "--manifest-path",
             target.join("Cargo.toml").to_str().unwrap(),
         ])
         .current_dir(repo)
-        .env("PATH", &path)
-        .env("HOME", &driver_home)
-        .env("XDG_DATA_HOME", &xdg_data)
-        .env("CARGO_HOME", cargo_home)
-        .env("RUSTUP_HOME", rustup_home)
+        .env_clear()
+        .env("PATH", path)
+        .env("HOME", root.join("missing-home"))
         .env("TMPDIR", &tmp)
         .env("RUNNER_TEMP", &runner_temp)
-        .env("CARGO_TARGET_DIR", target.join("target"))
-        .env("CARGO_BUILD_JOBS", "2")
         .env("CADENCE_BUILD_SLOT", helper)
-        .env("CADENCE_PM_DIR", root.join("production-looking-pm"))
-        .env("CADENCE_STATE_DIR", root.join("production-looking-state"))
-        .env("CADENCE_ALIAS", "cad1349-fixture-agent")
-        .env("CAD1349_DRIVER_HOME", &driver_home)
-        .env(
-            "CAD1349_EXPECT_TARGET",
-            target.join("target").to_str().unwrap(),
-        )
-        .env("CAD1349_MARKERS", markers)
-        .env("CAD1349_PROVIDER_DIR", provider)
-        .env_remove("CADENCE_SUITE_LOCK")
+        .env("CADENCE_STATE_DIR", root.join("owned-unstarted-state"))
         .env("GIT_CONFIG_NOSYSTEM", "1");
-
-    if !with_daemon {
-        let out = cadence_agent::reaper::output(&mut command).expect("run missing-helper refusal");
-        return (out, None);
-    }
-
-    // run-result-tests creates its XDG state directory under a random private
-    // scratch directory. Point only that fixture state location at our owned
-    // temporary daemon state so the generated absolute helper performs real
-    // slot admission without consulting any host daemon.
-    let state = root.join("admitted-state");
-    fs::create_dir_all(&state).unwrap();
-    let daemon_error = Arc::new(Mutex::new(None::<String>));
-    let error_out = daemon_error.clone();
-    let watch_root = runner_temp.clone();
-    let watch_state = state.clone();
-    let watch_home = root.join("daemon-home");
-    fs::create_dir_all(&watch_home).unwrap();
-    let watch_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let thread_stop = watch_stop.clone();
-    let daemon_thread = thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while Instant::now() < deadline && !thread_stop.load(std::sync::atomic::Ordering::Relaxed) {
-            let Ok(entries) = fs::read_dir(&watch_root) else {
-                thread::sleep(Duration::from_millis(2));
-                continue;
-            };
-            for entry in entries.flatten() {
-                let xdg = entry.path().join("xdg-state");
-                if !xdg.is_dir() {
-                    continue;
-                }
-                let state_link = xdg.join("cadence");
-                if !state_link.exists() {
-                    if let Err(error) = std::os::unix::fs::symlink(&watch_state, &state_link) {
-                        *error_out.lock().unwrap() =
-                            Some(format!("create isolated state link: {error}"));
-                        return;
-                    }
-                }
-                if !watch_state.join("cadence.sock").exists() {
-                    let output = start_fixture_daemon(&watch_state, &watch_home, &xdg);
-                    if !output.status.success() {
-                        *error_out.lock().unwrap() = Some(format!(
-                            "isolated daemon start failed: {}{}",
-                            String::from_utf8_lossy(&output.stdout),
-                            String::from_utf8_lossy(&output.stderr)
-                        ));
-                        return;
-                    }
-                }
-                return;
-            }
-            thread::sleep(Duration::from_millis(2));
-        }
-        *error_out.lock().unwrap() = Some("runner scratch state was not observed".to_string());
-    });
-
-    let output = cadence_agent::reaper::output(&mut command).expect("run real result-test runner");
-    watch_stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    daemon_thread.join().expect("join isolated daemon starter");
-    let start_error = daemon_error.lock().unwrap().clone();
-    if state.join("cadence.sock").exists() {
-        let mut stop = Command::new(BINARY);
-        stop.env_clear()
-            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-            .args(["--state-dir", state.to_str().unwrap(), "daemon", "stop"])
-            .env("HOME", root.join("daemon-home"))
-            .env_remove("CADENCE_STATE_DIR")
-            .env_remove("CADENCE_PM_DIR");
-        let stopped = cadence_agent::reaper::output(&mut stop).expect("stop owned fixture daemon");
-        assert!(
-            stopped.status.success(),
-            "isolated daemon stop failed: {}",
-            String::from_utf8_lossy(&stopped.stderr)
-        );
-    }
-    (output, start_error)
+    cadence_agent::reaper::output(&mut command).expect("run missing-helper refusal")
 }
 
 #[test]
@@ -512,46 +733,13 @@ fn cad1349_real_generated_shim_admits_metadata_and_refuses_missing_helper() {
     let positive_manifest = root.path().join("positive-fixture");
     write_fixture(&positive_manifest, &targets);
     let positive_markers = root.path().join("positive-markers");
-    let (success, daemon_error) = run_runner(
+    let _registered_results = run_registered_runner_cases(
         &positive,
         root.path(),
         &root.path().join("provider-bin"),
         &positive_manifest,
         &positive_markers,
         Path::new(BINARY),
-        true,
-    );
-    assert!(
-        daemon_error.is_none(),
-        "isolated slot daemon setup failed: {}; runner output:\n{}\n{}",
-        daemon_error.unwrap_or_default(),
-        String::from_utf8_lossy(&success.stdout),
-        String::from_utf8_lossy(&success.stderr),
-    );
-    assert!(
-        success.status.success(),
-        "supported runner recipe failed through the generated shim:\n{}\n{}",
-        String::from_utf8_lossy(&success.stdout),
-        String::from_utf8_lossy(&success.stderr)
-    );
-    let transcript = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&success.stdout),
-        String::from_utf8_lossy(&success.stderr)
-    );
-    assert!(
-        transcript.contains("acquired (build"),
-        "Cargo metadata did not reach real build-slot admission:\n{transcript}"
-    );
-    assert!(
-        transcript.contains("validated "),
-        "runner did not validate the pinned JUnit coverage:\n{transcript}"
-    );
-    let observed: Vec<_> = fs::read_dir(&positive_markers).unwrap().flatten().collect();
-    assert_eq!(
-        observed.len(),
-        targets.len() + 2,
-        "not all fixture tests executed through the runner"
     );
 
     let missing_helper = root.path().join("cadence-helper-removed");
@@ -561,23 +749,16 @@ fn cad1349_real_generated_shim_admits_metadata_and_refuses_missing_helper() {
     fs::remove_file(&missing_helper).unwrap();
     let missing_manifest = root.path().join("missing-fixture");
     write_fixture(&missing_manifest, &targets);
-    let missing_markers = root.path().join("missing-markers");
-    let (refusal, _) = run_runner(
+    let refusal = run_missing_helper(
         &missing,
         root.path(),
         &root.path().join("missing-provider-bin"),
         &missing_manifest,
-        &missing_markers,
         &missing_helper,
-        false,
     );
     assert!(
         !refusal.status.success(),
         "runner accepted a generated shim with a missing admission helper"
-    );
-    assert!(
-        fs::read_dir(&missing_markers).unwrap().next().is_none(),
-        "tests ran after helper refusal"
     );
     assert!(
         !missing_manifest
