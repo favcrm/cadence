@@ -146,7 +146,7 @@ export function ThreadItemView({
       return (
         <Bubble who="You" at={time(item.entry.created)} me density={density}>
           <div className={`inline-block text-left px-3 py-2 bg-accent/10 border border-accent/20 ${USER_BUBBLE} ${bodyText} text-ink-100 break-words`}>
-            <span className="whitespace-pre-wrap">{item.entry.text}</span>
+            <span className="whitespace-pre-wrap [overflow-wrap:anywhere]">{item.entry.text}</span>
             <AttachmentRows files={entryAttachments(item.entry.payload)} />
           </div>
           <RefChips refs={entryRefs(item.entry.payload)} />
