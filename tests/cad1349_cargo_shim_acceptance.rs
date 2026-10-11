@@ -161,7 +161,7 @@ fn assert_generated_slot_env(env_file: &Path, helper: &Path) {
     );
     assert_eq!(
         exports[0],
-        format!("export CADENCE_BUILD_SLOT={}", expected.display())
+        format!("export CADENCE_BUILD_SLOT={}", shell_quote(&expected))
     );
     assert!(
         !generated
@@ -175,7 +175,7 @@ fn assert_generated_slot_env(env_file: &Path, helper: &Path) {
     source
         .args([
             "-c",
-            ". \"$1\"; printf '%s' \"$CADENCE_BUILD_SLOT\"",
+            ". \"$1\"; sh -c 'printf %s \"$CADENCE_BUILD_SLOT\"'",
             "cad1349-env",
         ])
         .arg(env_file)
@@ -741,9 +741,10 @@ fn run_missing_helper(
 fn cad1349_real_generated_shim_admits_metadata_and_refuses_missing_helper() {
     let root = Builder::new().prefix("c1349-").tempdir_in("/tmp").unwrap();
     fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
-    let positive = fixture(root.path(), Path::new(BINARY), "positive-lane");
+    let helper = Path::new(BINARY);
+    let positive = fixture(root.path(), helper, "positive-lane");
     let env_file = positive.lane.join(".env");
-    assert_generated_slot_env(&env_file, Path::new(BINARY));
+    assert_generated_slot_env(&env_file, helper);
     // The supported issue-start reuse path removes a pre-CAD-1349 assignment
     // and leaves exactly one exported helper at its canonical path.
     let mut env_text = fs::read_to_string(&env_file).unwrap();
@@ -787,8 +788,8 @@ fn cad1349_real_generated_shim_admits_metadata_and_refuses_missing_helper() {
         "issue-start reuse failed to refresh shim: {}",
         String::from_utf8_lossy(&refreshed.stderr)
     );
-    assert_embedded_helper(&positive.shim, Path::new(BINARY));
-    assert_generated_slot_env(&env_file, Path::new(BINARY));
+    assert_embedded_helper(&positive.shim, helper);
+    assert_generated_slot_env(&env_file, helper);
     let targets = integration_targets();
     let positive_manifest = root.path().join("positive-fixture");
     write_fixture(&positive_manifest, &targets);
@@ -799,7 +800,7 @@ fn cad1349_real_generated_shim_admits_metadata_and_refuses_missing_helper() {
         &root.path().join("provider-bin"),
         &positive_manifest,
         &positive_markers,
-        Path::new(BINARY),
+        helper,
     );
 
     let missing_helper = root.path().join("cadence-helper-removed");

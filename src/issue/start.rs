@@ -1145,7 +1145,10 @@ fn write_slot_env(wt_dir: &Path, pm_dir: &Path) -> Result<PathBuf> {
         }
     }
     text.push_str(&format!("CARGO_BUILD_JOBS={jobs}\n"));
-    text.push_str(&format!("export CADENCE_BUILD_SLOT={}\n", helper.display()));
+    text.push_str(&format!(
+        "export CADENCE_BUILD_SLOT='{}'\n",
+        helper.display().to_string().replace('\'', "'\\''")
+    ));
     // `.env.tmp` sits beside the target and is excluded above too, so
     // even a SIGKILL mid-write can never leave a dirty worktree.
     let tmp = wt_dir.join(".env.tmp");
