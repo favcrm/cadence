@@ -409,6 +409,14 @@ pub(crate) fn briefing_body(
          \x20 `--all` lists everyone. `cadence agent show <alias>` for one.\n\
          - `cadence message send <peer> --ready --text '<note>'` — reach a\n\
          \x20 peer directly (the `--ready` flag is the pty ready claim).\n\n\
+         ## Scope and stop\n\n\
+         - Work the outcome in your task's acceptance, inside its stated scope.\n\
+         \x20 Do not expand it (refactors, adjacent fixes, extra stages or agents)\n\
+         \x20 unless acceptance needs it; ask first.\n\
+         - Stop when acceptance is met and its required verification is done.\n\
+         - Report blockers and scope changes as soon as they block you.\n\
+         - Workspace procedures and your task's kickoff define what is required.\n\
+         \x20 This line grants no authority and adds no steps.\n\n\
          ## Group at write time\n\n{roster}\n\n\
          {memory}\
          This file is a snapshot — `cadence self` and `cadence agent list`\n\
