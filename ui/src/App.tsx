@@ -301,6 +301,17 @@ export default function App() {
   // resolved non-operator, and never authority: only an answered probe
   // clears it.
   const [metaUnavailable, setMetaUnavailable] = useState(false);
+  const [recheckFinished, setRecheckFinished] = useState(false);
+
+  useEffect(() => {
+    if (!metaUnavailable) {
+      setRecheckFinished(false);
+      return;
+    }
+    setRecheckFinished(false);
+    const finish = window.setTimeout(() => setRecheckFinished(true), 60_000);
+    return () => window.clearTimeout(finish);
+  }, [metaUnavailable]);
 
   /** One bounded meta read. The same tab key shares one in-flight
    *  request; a different key (sign-in/sign-out) starts a fresh probe
@@ -456,7 +467,6 @@ export default function App() {
     operatorKnown.current = false;
     refresh(true);
   }, [refresh]);
-
   useEffect(() => {
     refresh();
     return () => { metaRequest.current++; };
@@ -920,7 +930,7 @@ export default function App() {
               health={health}
               onRefresh={refresh}
             >
-              <SignIn meta={meta} onChange={refresh} access={viewer.access} onRetryAccess={retryAccess} />
+              <SignIn meta={meta} onChange={refresh} access={viewer.access} recheckFinished={recheckFinished} onRetryWorkspace={reload} />
               {staleBuild !== null && staleBuild !== dismissedBuild && (
                 <BuildUpdateNotice onReload={reload} onDismiss={() => setDismissedBuild(staleBuild)} />
               )}
@@ -977,7 +987,7 @@ export default function App() {
                 health={health}
                 onRefresh={refresh}
               >
-                <SignIn meta={meta} onChange={refresh} access={viewer.access} onRetryAccess={retryAccess} />
+                <SignIn meta={meta} onChange={refresh} access={viewer.access} recheckFinished={recheckFinished} onRetryWorkspace={reload} />
               </StatusChips>
             </div>
           </div>
@@ -1177,6 +1187,8 @@ export default function App() {
             appKey={route.appKey}
             installations={installations}
             viewer={viewer}
+            recheckFinished={recheckFinished}
+            onRetryWorkspace={reload}
             onInstallation={reportInstallation}
             onBack={() => goRoute({ screen: "apps", project: null, name: null })}
           />
@@ -1298,12 +1310,16 @@ function WorkspaceAppEntry({
   appKey,
   installations,
   viewer,
+  recheckFinished,
+  onRetryWorkspace,
   onInstallation,
   onBack,
 }: {
   appKey: string;
   installations: InstallationsState;
   viewer: Viewer;
+  recheckFinished: boolean;
+  onRetryWorkspace: () => void;
   onInstallation: (installation: ActiveInstallation | null) => void;
   onBack: () => void;
 }) {
@@ -1311,8 +1327,9 @@ function WorkspaceAppEntry({
     return (
       <main className="px-4 lg:px-8 pt-10 pb-9">
         {viewer.access === "unavailable" ? (
-          <Notice state="access-unavailable" onRetry={viewer.onRetryAccess} retryLabel="Retry access check">
-            Access could not be confirmed. Retry the access check before opening an installed app.
+          <Notice state="access-unavailable">
+            <span role="status">Workspace waking or unreachable. {recheckFinished ? "Retry when ready." : "Checking again for up to 60 seconds…"}</span>
+            {recheckFinished && <button type="button" className="lnk ml-2" onClick={onRetryWorkspace}>Retry workspace</button>}
           </Notice>
         ) : <Loading>Checking access…</Loading>}
       </main>

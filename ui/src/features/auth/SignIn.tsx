@@ -12,27 +12,31 @@ export default function SignIn({
   meta,
   onChange,
   access,
-  onRetryAccess,
+  recheckFinished,
+  onRetryWorkspace,
 }: {
   meta: Meta | null;
   onChange: () => void;
   /** CAD-1193: how the board's access check currently reads —
    *  `"unavailable"` when a completed probe could not answer. */
   access?: "checking" | "unavailable" | null;
-  /** Bounded retry of the access check (the real metadata refresh). */
-  onRetryAccess?: () => void;
+  /** Shared App-level timer so opening the mobile menu cannot restart the wait. */
+  recheckFinished?: boolean;
+  /** Reload the board to use the same workspace wake path as page load. */
+  onRetryWorkspace?: () => void;
 }) {
   // CAD-1193: `signed_in === null` is an unanswerable check —
-  // unavailable, never a sign-out. A completed check that could not
-  // answer says so explicitly and offers a bounded retry of the real
-  // probe — never the sign-in flow, which cannot fix a stalled check.
+  // unavailable, never a sign-out. It stays unavailable throughout the
+  // bounded re-check and never becomes signed-out or authority.
   if (access === "unavailable" && !meta?.read_only) {
     return (
-      <span className="chip bg-warn/10 text-warn" role="status">
-        Access check unavailable
-        {onRetryAccess && (
-          <button type="button" className="lnk text-warn" onClick={onRetryAccess}>
-            Retry
+      <span className="chip inline-flex items-center gap-1.5 bg-warn/10 text-warn" role="status" title="Workspace waking or unreachable">
+        <span className="sr-only sm:hidden">Workspace waking or unreachable.</span>
+        <span className="sm:hidden">Workspace waking</span>
+        <span className="hidden sm:inline">Workspace waking or unreachable. {recheckFinished ? "Retry when ready." : "Checking again for up to 60 seconds…"}</span>
+        {recheckFinished && onRetryWorkspace && (
+          <button type="button" className="lnk whitespace-nowrap text-warn" onClick={onRetryWorkspace}>
+            Retry workspace
           </button>
         )}
       </span>
