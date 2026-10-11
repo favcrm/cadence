@@ -164,7 +164,10 @@ for (const forged of ["subject", "scope", "thread", "install_id", "is_general"])
 await type("/new");
 equal(messagePosts.length, 1, "/new is not sent as a message");
 equal(createPosts, [{ install: "install-crm", body: { context_id: "ctx-a" } }], "/new creates one conversation with no subject");
-assert(openLabel() !== "General" && openLabel() !== "Spring launch", "the fresh conversation is the open one");
+assert(openLabel() !== null, "the fresh conversation has an open-conversation label");
+const newConversationLink = host.querySelector("[data-chat-conversation-link]") as HTMLAnchorElement | null;
+assert(newConversationLink, "the fresh conversation has a shareable link");
+equal(new URL(newConversationLink.href).searchParams.get("conversation"), "new-1", "the fresh conversation is the selected conversation");
 assert((await optionLabels()).length === 3 && (await optionLabels()).includes("General"), "older conversations stay listed");
 equal(box().value, "", "the command is cleared from the composer");
 await type("/clear");
