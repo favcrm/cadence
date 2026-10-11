@@ -120,6 +120,11 @@ incremental = false
 # file:line while cutting that to ~3.2 GB and ~3.0 GB.
 debug = "line-tables-only"
 
+# CAD-1367: cached dependencies run faster in image-heavy acceptance tests.
+# Keep the workspace crate at O0 and retain test debug assertions.
+[profile.test.package."*"]
+opt-level = 1
+
 # CAD-1103: PR/merge-queue gate profile. Used ONLY by the ci.yml `build` and
 # `ui` jobs, which prove "compiles, links, no test seam, migration rehearsal",
 # not performance. opt-level 1 with many codegen units compiles the single

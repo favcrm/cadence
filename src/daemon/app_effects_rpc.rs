@@ -104,6 +104,7 @@ fn settle_social_send(
     id: &str,
     sender: &dyn crate::platform::agenticos_external::publish::PublishSender,
     authority: &Value,
+    clock: &dyn super::AppSettleClock,
     mut receipt: Value,
 ) -> Result<Value> {
     use crate::platform::agenticos_external::publish::PublishState;
@@ -111,7 +112,7 @@ fn settle_social_send(
         return Ok(receipt);
     }
     let key = required_str(authority, "idempotency_key")?;
-    let deadline = std::time::Instant::now() + SETTLE_WINDOW;
+    let deadline = clock.now() + SETTLE_WINDOW;
     loop {
         match sender.status(key) {
             Ok(o) if o.state == PublishState::Posted => {
@@ -127,12 +128,12 @@ fn settle_social_send(
             }
             _ => {}
         }
-        if std::time::Instant::now() >= deadline {
+        if clock.now() >= deadline {
             receipt["send_error"] =
                 json!("not confirmed by AgenticOS yet; check Instagram before retrying");
             return Ok(receipt);
         }
-        std::thread::sleep(SETTLE_STEP);
+        clock.wait(SETTLE_STEP);
     }
 }
 
@@ -339,7 +340,14 @@ impl Shared {
         })?;
         if sending {
             // A repeated confirm re-checks the provider; it never sends again.
-            return settle_social_send(&records, id, sender.as_ref(), &authority, shown);
+            return settle_social_send(
+                &records,
+                id,
+                sender.as_ref(),
+                &authority,
+                self.app_social_settle_clock.as_ref(),
+                shown,
+            );
         }
         let pm = self.pm_at(&self.pm_dir()?)?;
         let id_owned = id.to_owned();
@@ -466,7 +474,14 @@ impl Shared {
         )?;
         // The send call may return while AgenticOS is still `processing`;
         // the locks are released, so poll the status door for the verdict.
-        settle_social_send(&records, id, sender.as_ref(), &authority, receipt)
+        settle_social_send(
+            &records,
+            id,
+            sender.as_ref(),
+            &authority,
+            self.app_social_settle_clock.as_ref(),
+            receipt,
+        )
     }
 
     /// Accept or decline one waiting social draft effect: the bound-contract

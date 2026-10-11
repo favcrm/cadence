@@ -23,6 +23,10 @@
 //!     still reads drifted after it.
 //! (6) A send whose status never turns terminal leaves the effect `sending`
 //!     with a plain reason and no second execute.
+//!
+//! The settle poll inside those sends runs on a per-fixture scripted clock
+//! (CAD-1367): the production 10 s window / 2 s step is replayed exactly
+//! and virtually — wall time never enters the schedule.
 #![cfg(feature = "test-seam")]
 
 use cadence_agent::platform::deployments::DeploymentMetadata;
@@ -105,6 +109,71 @@ impl Door {
             .iter()
             .filter(|(m, p)| m == "GET" && p.starts_with(PREFIX) && p.ends_with("/status"))
             .count()
+    }
+}
+
+/// A settle pass may never need more waits than three full windows; a
+/// mutant loop that never stops waiting trips `overrun`, which pushes
+/// `now` past every deadline so the pass ends as a wrong result instead
+/// of an endless RPC.
+const MAX_SETTLE_WAITS: usize = 64;
+
+/// The deterministic `settle_social_send` clock (`ServeOptions::
+/// app_social_settle_clock`): `now` is a fixed virtual instant that
+/// advances ONLY inside `wait`, so the daemon's status → deadline → wait
+/// loop replays the production schedule with no real sleeping. Per
+/// fixture — no env, no shared state. `waits` is the schedule evidence:
+/// production waits a 10 s window in 2 s steps, so each settle pass below
+/// records exactly five 2 s waits and six status reads.
+struct ScriptedSettleClock {
+    inner: Mutex<ScriptedSettle>,
+}
+
+struct ScriptedSettle {
+    now: Instant,
+    waits: Vec<Duration>,
+    overrun: bool,
+}
+
+impl ScriptedSettleClock {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(ScriptedSettle {
+                now: Instant::now(),
+                waits: Vec::new(),
+                overrun: false,
+            }),
+        })
+    }
+
+    /// Every `wait` the daemon asked for, in order.
+    fn waits(&self) -> Vec<Duration> {
+        self.inner.lock().unwrap().waits.clone()
+    }
+
+    /// The wait cap tripped: the loop never stopped waiting.
+    fn overrun(&self) -> bool {
+        self.inner.lock().unwrap().overrun
+    }
+}
+
+impl daemon::AppSettleClock for ScriptedSettleClock {
+    fn now(&self) -> Instant {
+        let inner = self.inner.lock().unwrap();
+        if inner.overrun {
+            return inner.now + Duration::from_secs(3600);
+        }
+        inner.now
+    }
+
+    fn wait(&self, step: Duration) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.waits.len() >= MAX_SETTLE_WAITS {
+            inner.overrun = true;
+            return;
+        }
+        inner.waits.push(step);
+        inner.now += step;
     }
 }
 
@@ -315,6 +384,7 @@ struct Fx {
     daemon: Option<std::thread::JoinHandle<cadence_agent::Result<()>>>,
     board: Option<(u16, Arc<AtomicBool>, std::thread::JoinHandle<()>)>,
     door: Arc<Door>,
+    clock: Arc<ScriptedSettleClock>,
     install: String,
     context: String,
     session: Value,
@@ -344,6 +414,7 @@ impl Fx {
         let dir = root.path().join("s");
         std::fs::create_dir_all(&dir).unwrap();
         let (door_addr, door) = fake_door();
+        let clock = ScriptedSettleClock::new();
         let stop = Arc::new(AtomicBool::new(false));
         let env = cadence_agent::adapter::ProviderEnv::refusing_providers();
         env.set("CADENCE_PM_DIR", root.path().join("pm").to_str().unwrap());
@@ -358,6 +429,7 @@ impl Fx {
             report_router: Some(0),
             checkup: Some(0),
             provider_deployments: Some(DeploymentMetadata::parse(HOSTED.as_bytes()).unwrap()),
+            app_social_settle_clock: Some(clock.clone() as Arc<dyn daemon::AppSettleClock>),
             ..Default::default()
         };
         cadence_agent::platform::local::register_at(
@@ -389,6 +461,7 @@ impl Fx {
             daemon: Some(handle),
             board: None,
             door,
+            clock,
             install: String::new(),
             context: String::new(),
             session: Value::Null,
@@ -424,6 +497,17 @@ impl Fx {
 
     fn rpc_as(&self, who: Asserted, method: &str, params: Value) -> cadence_agent::Result<Value> {
         scoped(who, || client::rpc(&self.dir(), method, params))
+    }
+
+    /// An operator RPC bounded for the settle path: the scripted clock
+    /// makes a good pass return at once, while a mutant that stops `now`
+    /// advancing (a poll with no wait, or a wait that never yields the
+    /// deadline) would otherwise hang the handler for the client's whole
+    /// default timeout.
+    fn rpc_bounded(&self, method: &str, params: Value) -> cadence_agent::Result<Value> {
+        scoped(Asserted::Operator, || {
+            client::rpc_timeout(&self.dir(), method, params, Duration::from_secs(60))
+        })
     }
 
     fn op(&self, method: &str, params: Value) -> Value {
@@ -1025,19 +1109,58 @@ fn only_an_operator_context_save_re_pins_and_only_the_context_field() {
 }
 
 /// (4) (6): a send that never settles stays `sending` with a plain reason;
-/// repeating the confirm or Publish now never sends again. How and when the
-/// daemon re-reads status is not pinned here, only that it never re-sends.
+/// repeating the confirm or Publish now never sends again. The settle poll
+/// runs on the fixture's scripted clock, so the production schedule is
+/// pinned exactly: a 10 s window in 2 s steps, ordered status read →
+/// deadline check → wait. One `/status` GET on the door is the read
+/// evidence; each `wait` is one recorded step. A settle pass spends the
+/// whole window; a `posted` read ends it at once with no wait; a replay on
+/// `posted` neither polls nor sends.
 #[test]
 fn an_unsettled_send_stays_sending_and_a_repeat_never_sends_again() {
+    // Literal production schedule, not the private constants: a 10 s
+    // window polled in 2 s steps.
+    const WINDOW: Duration = Duration::from_secs(10);
+    const STEP: Duration = Duration::from_secs(2);
     let fx = Fx::start();
     let (id, digest) = fx.staged_draft("s");
     fx.door.processing.store(true, SeqCst);
     *fx.door.status.lock().unwrap() = "processing".into();
 
-    // The door answers `processing`: `confirm` sends once, then returns
-    // with a plain reason instead of a verdict.
+    // Asserts one settle pass spent exactly the window: waits totalling
+    // `WINDOW`, every step exactly `STEP`, and one more status read than
+    // waits — the read → deadline → wait order, with the deadline ending
+    // the pass right after the budget ran out.
+    let settle_pass = |reads_before: usize, waits_before: usize, what: &str| {
+        assert!(
+            !fx.clock.overrun(),
+            "{what}: the settle loop never stopped waiting"
+        );
+        let waits = &fx.clock.waits()[waits_before..];
+        assert_eq!(
+            waits.len() * STEP.as_secs() as usize,
+            WINDOW.as_secs() as usize,
+            "{what}: the settle pass did not spend the whole window: {waits:?}"
+        );
+        assert!(
+            waits.iter().all(|&step| step == STEP),
+            "{what}: the settle pass waited a non-production step: {waits:?}"
+        );
+        assert_eq!(
+            fx.door.status_reads() - reads_before,
+            waits.len() + 1,
+            "{what}: status reads outside the read → deadline → wait schedule"
+        );
+    };
+
+    // The door answers `processing`: `confirm` sends once, then polls
+    // status for the full window — never sending again.
+    let (reads, waits) = (fx.door.status_reads(), fx.clock.waits().len());
     let reply = fx
-        .confirm(Asserted::Operator, &id, &digest)
+        .rpc_bounded(
+            "app_effect_confirm_publish",
+            json!({"effect_id": id, "digest": digest}),
+        )
         .unwrap_or_else(|e| panic!("confirm refused: {e}"));
     assert!(
         reply["send_error"]
@@ -1048,14 +1171,14 @@ fn an_unsettled_send_stays_sending_and_a_repeat_never_sends_again() {
     assert_eq!(fx.state(&id), "sending", "{reply}");
     assert_eq!(fx.door.posts("/publish"), 1);
     let sent = fx.door.all_posts();
+    settle_pass(reads, waits, "the first confirm");
 
-    // A `Publish now` on the `sending` effect is the real recheck path:
-    // it reads status, sends nothing, and leaves the effect `sending`
-    // with a plain reason.
-    let reads = fx.door.status_reads();
+    // A `Publish now` on the `sending` effect is the real recheck path: it
+    // reads status for another full window, sends nothing, and leaves the
+    // effect `sending` with a plain reason.
+    let (reads, waits) = (fx.door.status_reads(), fx.clock.waits().len());
     let recheck = fx
-        .rpc_as(
-            Asserted::Operator,
+        .rpc_bounded(
             "app_effect_publish_now",
             json!({"effect_id": id, "digest": digest}),
         )
@@ -1067,53 +1190,69 @@ fn an_unsettled_send_stays_sending_and_a_repeat_never_sends_again() {
         "an unsettled recheck gave no plain reason: {recheck}"
     );
     assert_eq!(fx.state(&id), "sending", "{recheck}");
-    assert!(
-        fx.door.status_reads() > reads,
-        "the recheck never read status"
-    );
+    settle_pass(reads, waits, "the recheck");
     assert_eq!(
         fx.door.all_posts(),
         sent,
         "a recheck reached the door: {recheck}"
     );
 
-    // A repeated confirm on the `sending` effect: no second send.
-    let again = fx.confirm(Asserted::Operator, &id, &digest);
+    // A repeated confirm on the `sending` effect re-polls the full window
+    // too; still no second send.
+    let (reads, waits) = (fx.door.status_reads(), fx.clock.waits().len());
+    let again = fx.rpc_bounded(
+        "app_effect_confirm_publish",
+        json!({"effect_id": id, "digest": digest}),
+    );
     assert_eq!(
         fx.door.all_posts(),
         sent,
         "a repeated confirm reached the door: {again:?}"
     );
+    settle_pass(reads, waits, "the repeated confirm");
     assert_eq!(fx.state(&id), "sending", "{again:?}");
 
-    // AgenticOS settles it: a re-check (Publish now) reads status and the
-    // effect settles `posted`, still with no second send of any kind.
+    // AgenticOS settles it: a re-check reads `posted` on the first poll —
+    // no settle wait is spent — and the effect finishes `posted`, still
+    // with no second send of any kind.
     *fx.door.status.lock().unwrap() = "posted".into();
-    let reads = fx.door.status_reads();
-    let deadline = Instant::now() + Duration::from_secs(90);
-    let mut last = None;
-    while fx.state(&id) != "posted" {
-        assert!(
-            Instant::now() < deadline,
-            "a settled send never read posted: {last:?}"
-        );
-        last = Some(fx.rpc_as(
-            Asserted::Operator,
+    let (reads, waits) = (fx.door.status_reads(), fx.clock.waits().len());
+    let settled = fx
+        .rpc_bounded(
             "app_effect_publish_now",
             json!({"effect_id": id, "digest": digest}),
-        ));
-        assert_eq!(fx.door.all_posts(), sent, "a re-check reached the door");
-        let pause = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < pause && fx.state(&id) != "posted" {
-            std::thread::sleep(Duration::from_millis(200));
-        }
-    }
-    assert!(fx.door.status_reads() > reads, "status was not read");
-    assert_eq!(fx.door.all_posts(), sent, "a re-check reached the door");
+        )
+        .unwrap_or_else(|e| panic!("a settled re-check refused: {e}"));
+    assert_eq!(fx.state(&id), "posted", "{settled}");
+    assert_eq!(
+        fx.door.status_reads() - reads,
+        1,
+        "the posted verdict was not read on the first poll: {settled}"
+    );
+    assert_eq!(
+        fx.clock.waits().len(),
+        waits,
+        "a posted verdict still spent settle waits"
+    );
+    assert_eq!(
+        fx.door.all_posts(),
+        sent,
+        "a re-check reached the door: {settled}"
+    );
 
-    // And a confirm after that is a replay.
-    let replay = fx.confirm(Asserted::Operator, &id, &digest);
+    // And a confirm after that is a replay: no send, no poll, no wait.
+    let (reads, waits) = (fx.door.status_reads(), fx.clock.waits().len());
+    let replay = fx.rpc_bounded(
+        "app_effect_confirm_publish",
+        json!({"effect_id": id, "digest": digest}),
+    );
     assert_eq!(fx.door.all_posts(), sent, "{replay:?}");
+    assert_eq!(
+        fx.door.status_reads(),
+        reads,
+        "a replay on a posted effect re-polled status"
+    );
+    assert_eq!(fx.clock.waits().len(), waits, "a replay waited");
     assert_eq!(fx.state(&id), "posted");
     assert_eq!(fx.door.posts("/publish"), 1, "posted twice");
 }

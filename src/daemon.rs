@@ -238,6 +238,25 @@ const STOP_GRACE: Duration = Duration::from_secs(3);
 /// again. Enqueues wake it at once; this is the backstop.
 const IDLE_POLL: Duration = Duration::from_secs(5);
 
+/// The clock `settle_social_send` waits by — time source and sleep in
+/// one seam so a fixture advances both together. Production is the
+/// wall clock; never set from RPC, PM or env.
+pub trait AppSettleClock: Send + Sync {
+    fn now(&self) -> Instant;
+    fn wait(&self, step: Duration);
+}
+
+struct WallSettleClock;
+
+impl AppSettleClock for WallSettleClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+    fn wait(&self, step: Duration) {
+        thread::sleep(step);
+    }
+}
+
 /// How long a pty actor waits before retrying a requeued delivery: a
 /// render-miss requeue waits this long, a gate refusal backs off from it
 /// (×1, ×2, ×4, capped at ×6 — 5 → 10 → 20 → 30s). Claims and inbox
@@ -545,6 +564,10 @@ pub struct Shared {
     /// with a sender attached (the canary kill switch); otherwise it
     /// ticks at `social_publish_driver_every` while a sender is registered.
     social_publish_driver: social_publish_driver::Driver,
+    /// The clock `settle_social_send`'s status-poll loop waits by — the
+    /// wall clock in production; fixtures inject one they advance.
+    /// Never set from PM, RPC, or worker input.
+    app_social_settle_clock: Arc<dyn AppSettleClock>,
     /// CAD-979: the retained-media import client, resolved once at attach
     /// beside the sender from the same `publish.send` credential. Serves the
     /// operator `social_publish_media_import` verb; absent → `capability_unavailable`.
@@ -843,6 +866,10 @@ impl Shared {
             effect_execute_gate: opts.effect_execute_gate.clone(),
             social_publish_sender: opts.social_publish_sender.clone(),
             social_publish_driver: social_publish_driver::Driver::new(opts),
+            app_social_settle_clock: opts
+                .app_social_settle_clock
+                .clone()
+                .unwrap_or_else(|| Arc::new(WallSettleClock)),
             social_media_importer: opts.social_media_importer.clone(),
             social_media_resolver: opts.social_media_resolver.clone(),
             screen_caps: Mutex::new(HashMap::new()),
@@ -5076,6 +5103,9 @@ pub struct ServeOptions {
     /// committed claim and its send (the lease-loss window).
     #[cfg(test)]
     pub(crate) social_publish_driver_after_claim: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Test seam: the clock `settle_social_send` waits by — `None` is
+    /// the wall clock. Never set from PM, RPC, or env.
+    pub app_social_settle_clock: Option<Arc<dyn AppSettleClock>>,
     /// CAD-979: retained-media import client resolved once at attach (same
     /// credential as the sender). Never set from PM, RPC, or worker input.
     pub social_media_importer:

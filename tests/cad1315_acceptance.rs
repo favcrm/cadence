@@ -50,10 +50,17 @@ struct Door {
     submits: Mutex<Vec<(String, Vec<u8>)>>,
 }
 
+/// The media door serves the small custody-fitting artifact: both checks
+/// measure keys/jobs/exact-body and caller refusal, never image size. The
+/// oversized-custody JPEG boundary stays in
+/// `cad1304_instagram_image_publish::an_image_job_..._custody_sized_jpeg`.
 fn fake_door() -> (String, Arc<Door>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
-    let state = Arc::new(Door::default());
+    let state = Arc::new(Door {
+        media: aos_media_door::MediaDoor::new_small(),
+        ..Default::default()
+    });
     let door = state.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {

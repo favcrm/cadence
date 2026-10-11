@@ -67,11 +67,22 @@ fn hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn fake_door() -> (String, Seen, Arc<Door>) {
+/// `small_media` opts the media door into the 64x64 custody-fitting
+/// artifact: for cases whose subject is the job/digest/publish lifecycle,
+/// not image size. `false` keeps the ~3 MiB oversized default the
+/// custody-conversion case (`retains_a_custody_sized_jpeg`) needs.
+fn fake_door(small_media: bool) -> (String, Seen, Arc<Door>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let seen: Seen = Arc::default();
-    let state = Arc::new(Door::default());
+    let state = Arc::new(Door {
+        media: if small_media {
+            aos_media_door::MediaDoor::new_small()
+        } else {
+            aos_media_door::MediaDoor::new()
+        },
+        ..Default::default()
+    });
     let (log, door) = (seen.clone(), state.clone());
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
@@ -289,6 +300,20 @@ impl Fx {
     /// `window_ms` / `backoff_ms` shorten the image job's window and retry
     /// pause (`0` keeps the production values).
     fn start_with(window_ms: u64, backoff_ms: u64) -> Self {
+        Self::start_opts(window_ms, backoff_ms, false)
+    }
+
+    /// The same fixture over the small media door: for cases whose subject
+    /// is the job/digest/publish lifecycle, not image size.
+    fn start_small() -> Self {
+        Self::start_opts(0, 0, true)
+    }
+
+    fn start_small_with(window_ms: u64, backoff_ms: u64) -> Self {
+        Self::start_opts(window_ms, backoff_ms, true)
+    }
+
+    fn start_opts(window_ms: u64, backoff_ms: u64, small_media: bool) -> Self {
         for name in [
             "CADENCE_PUBLISH_SEND_URL",
             "CADENCE_PUBLISH_SEND_CREDENTIAL_FILE",
@@ -304,7 +329,7 @@ impl Fx {
         let root = tempfile::Builder::new().prefix("c1304").tempdir().unwrap();
         cadence_agent::issue::Pm::init(&root.path().join("pm")).unwrap();
         std::fs::create_dir_all(root.path().join("s")).unwrap();
-        let (door_addr, seen, door) = fake_door();
+        let (door_addr, seen, door) = fake_door(small_media);
         let mut fx = Self {
             _serial: serial,
             root,
@@ -677,7 +702,11 @@ impl Drop for Fx {
 
 #[test]
 fn an_approved_instagram_draft_with_a_generated_image_publishes_and_a_changed_one_sends_nothing() {
-    let fx = Fx::start();
+    // Publish lifecycle: image SIZE is not the subject; a changed draft is
+    // caught by digest comparison, and distinct small artifacts keep
+    // distinct digests. The oversized->custody JPEG boundary stays in
+    // `retains_a_custody_sized_jpeg` on the large door.
+    let fx = Fx::start_small();
     let source = fx.fetch();
     let (draft, revision, asset) = fx.draft_with_image("a", &source);
     let (id, digest) = fx.staged(&draft, revision, "a");
@@ -766,7 +795,7 @@ fn an_approved_instagram_draft_with_a_generated_image_publishes_and_a_changed_on
 
 #[test]
 fn a_legacy_sha256_frozen_effect_publishes_unchanged_and_a_changed_image_sends_nothing() {
-    let fx = Fx::start();
+    let fx = Fx::start_small();
     let source = fx.fetch();
     let (draft, revision, _) = fx.draft_with_image("l", &source);
     let (id, digest) = fx.legacy(&draft, revision, "ok", None);
@@ -936,7 +965,7 @@ fn an_image_job_returns_at_once_leaves_the_board_free_and_retains_a_custody_size
 
 #[test]
 fn a_restart_replays_the_same_key_and_leaves_no_image_intent_pending() {
-    let mut fx = Fx::start();
+    let mut fx = Fx::start_small();
     let source = fx.fetch();
     fx.door.media.set(Scenario::Hold);
     let draft = fx.new_draft("r1", &source);
@@ -968,7 +997,7 @@ fn a_restart_replays_the_same_key_and_leaves_no_image_intent_pending() {
 
 #[test]
 fn a_new_key_is_minted_only_after_the_old_job_is_terminal() {
-    let fx = Fx::start();
+    let fx = Fx::start_small();
     let source = fx.fetch();
 
     // An unresolved job (AgenticOS answers `uncertain`) records its reason
@@ -1028,7 +1057,7 @@ fn a_new_key_is_minted_only_after_the_old_job_is_terminal() {
 #[test]
 fn an_unreachable_door_keeps_the_intent_pending_then_settles_uncertain_and_recovers_on_the_same_key(
 ) {
-    let fx = Fx::start_with(2500, 100);
+    let fx = Fx::start_small_with(2500, 100);
     let source = fx.fetch();
     fx.door.media.set(Scenario::Hold);
     let draft = fx.new_draft("d1", &source);
@@ -1060,7 +1089,7 @@ fn an_unreachable_door_keeps_the_intent_pending_then_settles_uncertain_and_recov
 
 #[test]
 fn a_download_that_breaks_after_the_charge_retries_the_same_key_and_keeps_the_image() {
-    let fx = Fx::start();
+    let fx = Fx::start_small();
     let source = fx.fetch();
     let draft = fx.new_draft("t1", &source);
     // The job succeeds at the door, but every artifact body is cut short.
@@ -1098,7 +1127,7 @@ impl Fx {
 
 #[test]
 fn a_parked_fence_runs_one_worker_and_does_not_respawn_until_asked() {
-    let fx = Fx::start();
+    let fx = Fx::start_small();
     let source = fx.fetch();
     let draft = fx.new_draft("p1", &source);
     let before = probe::starts();
@@ -1119,7 +1148,7 @@ fn a_parked_fence_runs_one_worker_and_does_not_respawn_until_asked() {
 
 #[test]
 fn an_errored_or_panicked_worker_frees_its_slot_without_respawning() {
-    let fx = Fx::start();
+    let fx = Fx::start_small();
     let source = fx.fetch();
     for (tag, fault) in [("e1", 2u8), ("e2", 1u8)] {
         let draft = fx.new_draft(tag, &source);
@@ -1137,7 +1166,7 @@ fn an_errored_or_panicked_worker_frees_its_slot_without_respawning() {
 
 #[test]
 fn a_job_with_no_spec_runs_one_worker_at_boot_and_does_not_respawn() {
-    let mut fx = Fx::start();
+    let mut fx = Fx::start_small();
     let source = fx.fetch();
     fx.door.media.set(Scenario::Hold);
     let draft = fx.new_draft("m1", &source);
@@ -1166,7 +1195,7 @@ fn a_re_check_that_lands_before_the_slot_is_freed_is_restarted_exactly_once() {
     // the worker then sits 3 s before freeing its slot. A same-id re-check in
     // that gap finds the slot taken and spawns nothing: the worker itself must
     // restart the job, once, and it then completes.
-    let fx = Fx::start_with(1200, 100);
+    let fx = Fx::start_small_with(1200, 100);
     let source = fx.fetch();
     fx.door.media.set(Scenario::Hold);
     let draft = fx.new_draft("c1", &source);
@@ -1188,7 +1217,7 @@ fn a_re_check_that_lands_before_the_slot_is_freed_is_restarted_exactly_once() {
 /// and one confirm on the staged effect approves and sends it exactly once.
 #[test]
 fn an_operator_context_save_re_pins_and_one_confirm_posts_the_staged_draft_once() {
-    let fx = Fx::start();
+    let fx = Fx::start_small();
     let pins = || {
         let listed = fx.op(
             "app_binding_list",
