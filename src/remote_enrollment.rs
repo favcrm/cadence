@@ -742,6 +742,85 @@ fn confirm_login_access_ingress(
     confirm_access_ingress_config(dir, issuer, expected)
 }
 
+/// Session lifecycle calls use the same exact issuer pin and Access ingress
+/// checks as device login, before and after every outbound request.
+pub fn validate_cli_session_pin(dir: &Path, issuer: &str) -> Result<()> {
+    let issuer = origin(issuer, false)?;
+    private_dir(dir, false)?;
+    let access = read_access_ingress(dir, &issuer)?;
+    confirm_login_access_ingress(dir, &issuer, &access)
+}
+
+pub fn cli_session_post(
+    dir: &Path,
+    issuer: &str,
+    path: &str,
+    bearer: &str,
+    body: Value,
+    deadline: Instant,
+) -> Result<(u16, Value)> {
+    if !matches!(
+        path,
+        "/v1/hosted-cadence/cli-session/renew" | "/v1/hosted-cadence/cli-session/revoke"
+    ) {
+        return Err(reject("Hosted CLI session path refused"));
+    }
+    let issuer = origin(issuer, false)?;
+    private_dir(dir, false)?;
+    require_login_issuer(dir, &issuer)?;
+    let access = read_access_ingress(dir, &issuer)?;
+    confirm_login_access_ingress(dir, &issuer, &access)?;
+    let request_deadline = deadline.min(Instant::now() + Duration::from_secs(20));
+    if Instant::now() >= request_deadline {
+        return Err(Error::busy_coded(
+            "timeout",
+            "remote command deadline elapsed before session request",
+        ));
+    }
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(
+            request_deadline.saturating_duration_since(Instant::now()),
+        ))
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .proxy(None)
+        .build();
+    let mut request = ureq::Agent::new_with_config(config)
+        .post(format!("{issuer}{path}"))
+        .header("Authorization", &format!("Bearer {bearer}"));
+    if let Some(access) = access.as_ref() {
+        request = request
+            .header("CF-Access-Client-Id", &access.client_id)
+            .header("CF-Access-Client-Secret", &access.client_secret);
+    }
+    if Instant::now() >= request_deadline {
+        return Err(Error::busy_coded(
+            "timeout",
+            "remote command deadline elapsed before session request",
+        ));
+    }
+    let response = request
+        .send_json(body)
+        .map_err(|_| reject("Hosted CLI session request failed"))?;
+    let status = response.status().as_u16();
+    if (300..400).contains(&status) {
+        return Err(reject("Hosted issuer redirect refused"));
+    }
+    let mut bytes = Vec::new();
+    response
+        .into_body()
+        .as_reader()
+        .take(MAX_RESPONSE + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_RESPONSE {
+        return Err(reject("Hosted issuer response too large"));
+    }
+    let value = serde_json::from_slice(&bytes)
+        .map_err(|_| reject("Invalid hosted CLI session response"))?;
+    confirm_login_access_ingress(dir, &issuer, &access)?;
+    Ok((status, value))
+}
+
 fn confirm_access_ingress_config(
     dir: &Path,
     issuer: &str,
@@ -1119,6 +1198,15 @@ fn post_public_with_access(
         serde_json::from_slice(&bytes).map_err(|_| reject("Invalid hosted browser response"))?;
     Ok((status, value))
 }
+fn exact_fields(value: &Value, required: &[&str], optional: &[&str]) -> bool {
+    value.as_object().is_some_and(|fields| {
+        required.iter().all(|key| fields.contains_key(*key))
+            && fields
+                .keys()
+                .all(|key| required.contains(&key.as_str()) || optional.contains(&key.as_str()))
+    })
+}
+
 fn field<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
     value
         .get(key)
@@ -1285,7 +1373,54 @@ pub struct LoginGrant {
     pub slug: String,
     pub endpoint: String,
     pub expires_at: u64,
+    issuer: String,
+    subject_id: String,
+    capabilities: Vec<String>,
+    cli_session: Option<CliSession>,
     token: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CliSession {
+    pub session_id: String,
+    pub refresh_token: String,
+    pub generation: u64,
+    pub device_label: String,
+    pub idle_expires_at: u64,
+    pub absolute_expires_at: u64,
+}
+
+impl CliSession {
+    fn from_value(value: &Value, at: u64) -> Result<Self> {
+        let session = &value["cli_session"];
+        let result = Self {
+            session_id: field(session, "session_id")?.to_owned(),
+            refresh_token: field(session, "refresh_token")?.to_owned(),
+            generation: timestamp(session, "generation")?,
+            device_label: field(session, "device_label")?.to_owned(),
+            idle_expires_at: timestamp(session, "idle_expires_at")?,
+            absolute_expires_at: timestamp(session, "absolute_expires_at")?,
+        };
+        let fields = session
+            .as_object()
+            .ok_or_else(|| reject("Invalid CLI session metadata"))?;
+        if fields.len() != 6
+            || !result.session_id.strip_prefix("hcs_").is_some_and(|s| {
+                s.len() == 36 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            })
+            || !token(&result.refresh_token, "hcr_")
+            || result.generation != 1
+            || result.device_label.is_empty()
+            || result.device_label.len() > 120
+            || result.idle_expires_at <= at
+            || result.absolute_expires_at <= at
+            || result.idle_expires_at > result.absolute_expires_at
+        {
+            return Err(reject("Invalid CLI session metadata"));
+        }
+        Ok(result)
+    }
 }
 
 const CLOUD_SUFFIX: &str = ".cadencecloud.app";
@@ -1305,7 +1440,12 @@ fn slug(value: &str) -> bool {
 /// audience (`https://<slug>.cadencecloud.app`), with exactly the requested
 /// `cli.read` and `cli.write` capabilities. The issuer binds slug to workspace
 /// itself; the response carries no slug field.
-fn login_grant(value: &Value, org: Option<&str>, hint: Option<&str>) -> Result<LoginGrant> {
+fn login_grant(
+    value: &Value,
+    org: Option<&str>,
+    hint: Option<&str>,
+    issuer: &str,
+) -> Result<LoginGrant> {
     let at = now()?;
     let (principal, credential) = (&value["principal"], &value["credential"]);
     let organization_id = field(value, "organization_id")?;
@@ -1324,7 +1464,32 @@ fn login_grant(value: &Value, org: Option<&str>, hint: Option<&str>) -> Result<L
             .filter_map(Value::as_str)
             .collect::<BTreeSet<_>>()
             == BTreeSet::from(["cli.read", "cli.write"]);
-    if field(value, "version")? != VERSION
+    if !exact_fields(
+        value,
+        &[
+            "version",
+            "organization_id",
+            "audience",
+            "principal",
+            "capabilities",
+            "credential",
+            "cli_session",
+        ],
+        &["organization_slug"],
+    ) || !exact_fields(principal, &["kind", "current_role", "subject_id"], &[])
+        || !exact_fields(
+            credential,
+            &[
+                "token_type",
+                "access_token",
+                "credential_id",
+                "issued_at",
+                "expires_at",
+                "renewal",
+            ],
+            &[],
+        )
+        || field(value, "version")? != VERSION
         || org.is_some_and(|expected| organization_id != expected)
         || hint.is_some_and(|expected| slug_value != expected)
         || !id(organization_id)
@@ -1335,6 +1500,7 @@ fn login_grant(value: &Value, org: Option<&str>, hint: Option<&str>) -> Result<L
         || !id(field(principal, "subject_id")?)
         || !exact_cli
         || field(credential, "token_type")? != "Bearer"
+        || field(credential, "renewal")? != "reexchange"
         || !token(field(credential, "access_token")?, "hct_")
         || !id(field(credential, "credential_id")?)
         || timestamp(credential, "issued_at")? > at
@@ -1342,11 +1508,52 @@ fn login_grant(value: &Value, org: Option<&str>, hint: Option<&str>) -> Result<L
     {
         return Err(reject("Issuer grant did not match hosted login consent"));
     }
+    let issued_at = timestamp(credential, "issued_at")?;
+    let expires_at = timestamp(credential, "expires_at")?;
+    if expires_at - issued_at > 300 {
+        return Err(reject(
+            "Issuer access credential lifetime exceeded five minutes",
+        ));
+    }
+    let cli_session = Some(CliSession::from_value(value, at)?);
+    let fields = value
+        .as_object()
+        .ok_or_else(|| reject("Issuer grant response shape invalid"))?;
+    let allowed = [
+        "version",
+        "organization_id",
+        "audience",
+        "organization_slug",
+        "principal",
+        "capabilities",
+        "credential",
+        "cli_session",
+    ];
+    if fields.keys().any(|key| !allowed.contains(&key.as_str()))
+        || [
+            "version",
+            "organization_id",
+            "audience",
+            "principal",
+            "capabilities",
+            "credential",
+        ]
+        .iter()
+        .any(|key| !fields.contains_key(*key))
+        || fields.contains_key("organization_slug") && fields["organization_slug"] != slug_value
+    {
+        return Err(reject("Issuer grant response shape invalid"));
+    }
     Ok(LoginGrant {
         organization_id: organization_id.to_string(),
         slug: slug_value.to_string(),
         endpoint,
-        expires_at: timestamp(credential, "expires_at")?,
+        expires_at,
+        issuer: issuer.to_owned(),
+        subject_id: field(principal, "subject_id")?.to_owned(),
+        capabilities: serde_json::from_value(value["capabilities"].clone())
+            .map_err(|_| reject("Invalid hosted login capabilities"))?,
+        cli_session,
         token: field(credential, "access_token")?.to_string(),
     })
 }
@@ -1355,24 +1562,53 @@ impl LoginGrant {
     /// Write the `hct_` to `cli-<slug>.json` at 0600 (temp file, then
     /// rename), separate from `orgs.json`. Never printed.
     pub fn save_credential(&self, dir: &Path) -> Result<()> {
+        private_dir(dir, false)?;
         let _guard = lock(dir, true)?;
-        let tmp = dir.join(format!(".cli-{}.tmp", self.slug));
+        let destination = dir.join(format!("cli-{}.json", self.slug));
+        match fs::symlink_metadata(&destination) {
+            Ok(meta)
+                if meta.is_file()
+                    && meta.uid() == unsafe { libc::geteuid() }
+                    && meta.mode() & 0o077 == 0 => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => {
+                return Err(reject(
+                    "CLI credential destination must be a private owned regular file",
+                ))
+            }
+        }
+        let mut random = [0u8; 16];
+        getrandom::fill(&mut random)
+            .map_err(|_| reject("Unable to create CLI credential temporary path"))?;
+        let tmp = dir.join(format!(
+            ".cli-{}.tmp-{}",
+            self.slug,
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random)
+        ));
         let body = serde_json::to_vec(&json!({"version": VERSION,
-            "organization_id": self.organization_id, "audience": self.endpoint,
-            "access_token": self.token, "expires_at": self.expires_at}))
+            "organization_id": self.organization_id, "organization_slug": self.slug,
+            "audience": self.endpoint, "issuer": self.issuer, "subject_id": self.subject_id,
+            "capabilities": self.capabilities, "access_token": self.token,
+            "expires_at": self.expires_at, "cli_session": self.cli_session}))
         .map_err(|e| Error::internal(e.to_string()))?;
         let mut file = OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
             .open(&tmp)
-            .map_err(|_| reject("CLI credential path refused"))?;
-        file.write_all(&body)?;
-        file.sync_all()?;
-        fs::rename(&tmp, dir.join(format!("cli-{}.json", self.slug)))?;
-        Ok(())
+            .map_err(|_| reject("CLI credential temporary path refused"))?;
+        let result = (|| {
+            file.write_all(&body)?;
+            file.sync_all()?;
+            fs::rename(&tmp, destination)?;
+            File::open(dir)?.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(tmp);
+        }
+        result
     }
 }
 
@@ -1499,7 +1735,7 @@ fn login_device_flow(
     confirm_login_access_ingress(dir, &issuer, &access)?;
     let mut request = json!({"version":DEVICE_VERSION,
         "client_label":"cadence-cli","requested_capabilities":["cli.read","cli.write"],
-        "code_challenge":challenge});
+        "code_challenge":challenge,"cli_session":"renewable"});
     if let (Some(org), Some(hint)) = (org, hint) {
         request["organization_id"] = json!(org);
         request["audience"] = json!(format!("https://{hint}{CLOUD_SUFFIX}"));
@@ -1550,7 +1786,7 @@ fn login_device_flow(
             _ => return Err(reject("Hosted browser grant refused; start again")),
         }
     };
-    let grant = login_grant(&grant, org, hint)?;
+    let grant = login_grant(&grant, org, hint, &issuer)?;
     confirm_login_access_ingress(dir, &issuer, &access)?;
     Ok(grant)
 }
@@ -3021,8 +3257,8 @@ mod tests {
     const LOGIN_ENDPOINT: &str = "https://acme.cadencecloud.app";
 
     /// The AgenticOS device/code request contract (`requestShape` in
-    /// apps/api/src/hosted-cadence/device.ts): exactly these keys, an exact
-    /// HTTPS audience, a 43-char PKCE challenge. Anything else is a 400.
+    /// apps/api/src/hosted-cadence/device.ts): these keys plus explicit
+    /// renewable-session opt-in, an exact HTTPS audience, and PKCE.
     fn real_code_request_ok(body: &Value) -> bool {
         let keys = [
             "version",
@@ -3031,10 +3267,12 @@ mod tests {
             "client_label",
             "requested_capabilities",
             "code_challenge",
+            "cli_session",
         ];
         body.as_object().is_some_and(|o| {
             o.len() == keys.len()
                 && keys.iter().all(|k| o.contains_key(*k))
+                && body["cli_session"] == "renewable"
                 && body["version"] == DEVICE_VERSION
                 && body["audience"]
                     .as_str()
@@ -3056,7 +3294,10 @@ mod tests {
             "principal":{"kind":"user","subject_id":"user_1","current_role":"owner"},
             "capabilities":["cli.read","cli.write"],
             "credential":{"credential_id":"hcp_credential","access_token":BRIDGE,
-                "token_type":"Bearer","issued_at":at,"expires_at":at+120,"renewal":"reexchange"}})
+                "token_type":"Bearer","issued_at":at,"expires_at":at+120,"renewal":"reexchange"},
+            "cli_session":{"session_id":"hcs_00000000-0000-4000-8000-000000000001",
+                "refresh_token":format!("hcr_{}", "R".repeat(43)),"generation":1,
+                "device_label":"cadence-cli","idle_expires_at":at+2592000,"absolute_expires_at":at+7776000}})
     }
 
     /// A scripted in-memory login issuer (CAD-1124): the same request
@@ -3228,10 +3469,12 @@ mod tests {
                     "client_label",
                     "requested_capabilities",
                     "code_challenge",
+                    "cli_session",
                 ];
                 let has_slug_hint = body.get("organization_slug").is_some();
                 let request = body.as_object().unwrap();
                 assert_eq!(request.len(), keys.len() + usize::from(has_slug_hint));
+                assert_eq!(body["cli_session"], "renewable");
                 assert!(keys.iter().all(|key| request.contains_key(*key)));
                 assert_eq!(body["version"], DEVICE_VERSION);
                 assert_eq!(body["client_label"], "cadence-cli");

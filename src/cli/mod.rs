@@ -197,8 +197,11 @@ pub(crate) enum AuthAction {
         #[arg(long)]
         auth_dir: Option<PathBuf>,
     },
-    /// Remove the local credential; server revocation remains an AgenticOS action.
+    /// Remove the legacy local AgenticOS credential; remote CLI sessions use --org.
     Logout {
+        /// Revoke and remove this registered remote workspace's CLI device session.
+        #[arg(long, conflicts_with = "auth_dir")]
+        org: Option<String>,
         #[arg(long)]
         auth_dir: Option<PathBuf>,
     },

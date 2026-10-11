@@ -126,9 +126,21 @@ pub(crate) fn run() -> Result<i32> {
                     issuer.as_deref(),
                     org.as_deref(),
                 ),
-                AuthAction::Logout { auth_dir } => {
-                    let dir = cadence_agent::remote_auth::auth_dir(auth_dir.as_deref())?;
-                    cadence_agent::remote_auth::logout(&dir)
+                AuthAction::Logout { auth_dir, org } => {
+                    if let Some(org) = org {
+                        let dir = cadence_agent::remote_auth::auth_dir(None)?;
+                        match org::resolve(Some(org), None, None)? {
+                            org::Resolved::Remote(target) => {
+                                cadence_agent::remote_cli::logout(&dir, &target)
+                            }
+                            org::Resolved::Local(_) => Err(Error::rejected(
+                                "auth logout --org requires a registered remote workspace",
+                            )),
+                        }
+                    } else {
+                        let dir = cadence_agent::remote_auth::auth_dir(auth_dir.as_deref())?;
+                        cadence_agent::remote_auth::logout(&dir)
+                    }
                 }
             }
         }
