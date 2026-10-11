@@ -32,7 +32,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -480,6 +480,12 @@ fn classify(p: &Probe, pr_list: PrLookup<'_>, pr_view: PrView<'_>) -> (Verdict, 
     (verdict, detail)
 }
 
+/// One lock-wait deadline shared by every close of a CLI reconcile
+/// (CAD-1153): a busy tracker costs at most this across the whole run
+/// — not `wait` per close — so N merged tickets cannot block ~N x 30 s.
+/// The daemon path passes `None` and keeps the never-wait rule.
+const CLI_CLOSE_LOCK_WAIT: Duration = Duration::from_secs(30);
+
 /// `issue reconcile [--project P] [--dry-run] [--limit N]` — the
 /// sweep. Leaf issues whose file OR derived status is `doing`/`review`
 /// are marked done when their recorded work merged. The derived side
@@ -492,10 +498,6 @@ fn classify(p: &Probe, pr_list: PrLookup<'_>, pr_view: PrView<'_>) -> (Verdict, 
 /// `held`/`stalled` rows are reported, not moved.
 /// Then `finish --merged` sweeps the same evidence — worktree refs
 /// and branches the merge already covered get cleaned up.
-/// How long a CLI reconcile waits for a busy tracker lock before it
-/// reports a close as `error` (CAD-1150).
-const CLI_CLOSE_LOCK_WAIT: Duration = Duration::from_secs(30);
-
 pub fn run(
     pm: &Pm,
     project: Option<&str>,
@@ -514,7 +516,7 @@ pub fn run(
         None,
         &gh_list,
         &gh_view,
-        CLI_CLOSE_LOCK_WAIT,
+        Some(Instant::now() + CLI_CLOSE_LOCK_WAIT),
     )
 }
 
@@ -533,16 +535,7 @@ pub fn run(
 /// the caller's cursor untouched.
 pub fn run_daemon(pm: &Pm, actor: &str, limit: usize, cursor: Option<&str>) -> Result<Value> {
     run_inner(
-        pm,
-        None,
-        false,
-        actor,
-        None,
-        limit,
-        cursor,
-        &gh_list,
-        &gh_view,
-        Duration::ZERO,
+        pm, None, false, actor, None, limit, cursor, &gh_list, &gh_view, None,
     )
 }
 
@@ -557,7 +550,7 @@ fn run_inner(
     cursor: Option<&str>,
     pr_list: PrLookup<'_>,
     pr_view: PrView<'_>,
-    close_lock_wait: Duration,
+    close_lock_deadline: Option<Instant>,
 ) -> Result<Value> {
     let issues = board::load_all(&pm.dir, project)?;
     // Candidacy follows the derived status, not only the file field:
@@ -675,7 +668,9 @@ fn run_inner(
                         &why,
                         actor,
                         Some(&p.status),
-                        close_lock_wait,
+                        close_lock_deadline
+                            .map(|d| d.saturating_duration_since(Instant::now()))
+                            .unwrap_or(Duration::ZERO),
                     ) {
                         Ok(None) => {
                             row["outcome"] = json!("closed");
@@ -912,19 +907,7 @@ mod tests {
     }
 
     fn sweep(rig: &Rig, dry: bool, pl: PrLookup<'_>, pv: PrView<'_>) -> Value {
-        run_inner(
-            &rig.pm,
-            None,
-            dry,
-            "op",
-            None,
-            0,
-            None,
-            pl,
-            pv,
-            Duration::ZERO,
-        )
-        .unwrap()
+        run_inner(&rig.pm, None, dry, "op", None, 0, None, pl, pv, None).unwrap()
     }
 
     fn status(rig: &Rig, id: &str) -> String {
@@ -943,10 +926,6 @@ mod tests {
         assert!(out["done"].as_array().unwrap().contains(&json!(id)));
     }
 
-    /// The guard that earns the gate: an unstarted branch's empty
-    /// diff reverse-applies, so `merge_rule` alone reports it "patch"
-    /// merged — a freshly claimed ticket would read as done. CAD-754's
-    /// own lane caught this on the first live dry run.
     /// CAD-1150: a CLI close finding the tracker lock busy (a claim-sweep
     /// commit in progress) waits and closes; with no wait (the daemon
     /// path) it reports `error` at once.
@@ -973,13 +952,63 @@ mod tests {
             None,
             &no_gh,
             &no_view,
-            Duration::from_secs(10),
+            Some(Instant::now() + Duration::from_secs(10)),
         )
         .unwrap();
         releaser.join().unwrap();
         assert_eq!(status(&rig, &id), "done", "{out}");
     }
 
+    /// CAD-1153: `run` creates the shared deadline — one
+    /// `CLI_CLOSE_LOCK_WAIT` across the whole run, not per close. The
+    /// elapsed lower bound proves the configured nonzero CLI wait is
+    /// exercised (a zero-wait `CLI_CLOSE_LOCK_WAIT` would finish too
+    /// quickly); the upper bound proves both closes share its budget.
+    /// `run` returns the rows, not an Err, when closes fail.
+    #[test]
+    fn run_shares_one_close_lock_deadline() {
+        let rig = rig();
+        let state = rig.repo.join("state");
+        fs::create_dir_all(&state).unwrap();
+        let held = rig.pm.try_lock().unwrap().expect("lock free");
+        let id1 = put_issue(&rig, 60, None);
+        let id2 = put_issue(&rig, 61, None);
+        lane(&rig.repo, true);
+        let t0 = Instant::now();
+        let out = run(&rig.pm, None, false, "op", &state, 0).unwrap();
+        let elapsed = t0.elapsed();
+        drop(held);
+        assert_eq!(out["rows"].as_array().unwrap().len(), 2, "{out}");
+        assert!(
+            out["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r["outcome"] == "error"),
+            "{out}"
+        );
+        assert!(out["errors"].as_array().unwrap().len() == 2, "{out}");
+        assert!(out["finish"].is_object(), "{out}");
+        assert_eq!(status(&rig, &id1), "doing");
+        assert_eq!(status(&rig, &id2), "doing");
+        // The 25 s floor is independent of CLI_CLOSE_LOCK_WAIT, so
+        // changing that constant to ZERO cannot satisfy this check.
+        // Two closes at ~30 s each would take ~60 s; the 55 s ceiling
+        // leaves scheduler slack while proving they share one budget.
+        assert!(
+            elapsed >= Duration::from_secs(25),
+            "CLI close-lock wait was shorter than configured: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(55),
+            "shared deadline not observed: {elapsed:?}"
+        );
+    }
+
+    /// The guard that earns the gate: an unstarted branch's empty
+    /// diff reverse-applies, so `merge_rule` alone reports it "patch"
+    /// merged — a freshly claimed ticket would read as done. CAD-754's
+    /// own lane caught this on the first live dry run.
     #[test]
     fn unstarted_lane_is_not_merged() {
         let rig = rig();
@@ -1230,16 +1259,7 @@ mod tests {
         let id = put_issue(&rig, 99, None);
         lane(&rig.repo, true);
         let out = run_inner(
-            &rig.pm,
-            None,
-            false,
-            "op",
-            None,
-            5,
-            None,
-            &no_gh,
-            &no_view,
-            Duration::ZERO,
+            &rig.pm, None, false, "op", None, 5, None, &no_gh, &no_view, None,
         )
         .unwrap();
         assert_eq!(status(&rig, &id), "done", "{out}");

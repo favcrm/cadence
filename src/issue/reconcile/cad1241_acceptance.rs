@@ -163,16 +163,7 @@ fn put_lane_issue(rig: &Rig, n: u32, name: &str, claim_at: Option<&str>) -> Stri
 /// between ticks — `None` scans from the first candidate.
 fn daemon_sweep(rig: &Rig, cursor: Option<&str>, pl: PrLookup<'_>, pv: PrView<'_>) -> Value {
     run_inner(
-        &rig.pm,
-        None,
-        false,
-        "op",
-        None,
-        BATCH,
-        cursor,
-        pl,
-        pv,
-        Duration::ZERO,
+        &rig.pm, None, false, "op", None, BATCH, cursor, pl, pv, None,
     )
     .unwrap()
 }
