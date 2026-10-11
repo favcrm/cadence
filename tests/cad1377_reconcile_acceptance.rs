@@ -53,7 +53,9 @@ const PREFIX: &str = "C77";
 const ACTOR: &str = "bound-author";
 
 struct Fixture {
-    root: TempDir,
+    // Held only for its Drop: keeps the fixture root alive for the
+    // fixture's lifetime, cleaning the /tmp tree on drop.
+    _root: TempDir,
     home: PathBuf,
     state: PathBuf,
     pm: Pm,
@@ -116,7 +118,7 @@ impl Fixture {
             shim_exec(&traced_bin.join(tool));
         }
         Self {
-            root,
+            _root: root,
             home,
             state,
             pm,
@@ -271,10 +273,9 @@ impl Fixture {
 }
 
 fn which(tool: &str) -> Option<PathBuf> {
-    let out = Command::new("sh")
-        .args(["-c", &format!("command -v {tool}")])
-        .output()
-        .expect("which");
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", &format!("command -v {tool}")]);
+    let out = cadence_agent::reaper::output(&mut cmd).expect("which");
     let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (out.status.success() && !path.is_empty()).then(|| PathBuf::from(path))
 }
