@@ -1,0 +1,29 @@
+# Versioned app toolchain
+
+Cadence publishes a platform-neutral `cadence-app-toolchain-<tag>.tar.gz` asset and `.sha256` sidecar on its existing versioned GitHub Releases. It is optional starter tooling for app-owned React/Vite projects, not an SDK or an app runtime. It does not change SOC-3 app adoption or SOC-1/SOC-5 holds.
+
+## Download and verify
+
+Choose a published Cadence release tag and download both matching assets. For example:
+
+```sh
+tag=v<release-version>
+asset="cadence-app-toolchain-${tag}.tar.gz"
+gh release download -R favcrm/cadence "$tag" -p "$asset" -p "$asset.sha256"
+sha256sum -c "$asset.sha256"
+```
+
+Before consuming the archive, verify its GitHub build-provenance attestation against the exact release tag and Cadence workflow, as described in [INSTALL-AGENT.md](../INSTALL-AGENT.md). The checksum detects byte changes relative to its sidecar; it does not replace provenance verification. Releases are immutable once published.
+
+Extract into a new app-owned project directory. The archive's `toolchain.json` records schema, release tag, source commit, package manager and source-derived pins. `pnpm-lock.yaml` freezes the dependency graph. The current archive is tested with Node 22 and pnpm 12.2.1; use the exact package-manager version recorded in `toolchain.json` and run `pnpm install --frozen-lockfile`. Do not regenerate the lock during routine installation. See the packaged [`app-toolchain/README.md`](../../app-toolchain/README.md) for the minimal consumer flow.
+
+## Matching frame kit
+
+The archive's `frame-kit/frame.html`, `kit.css`, and `metadata.json` come from `cadence app frame-kit` in the matching built CLI. Use that CLI version to generate a fresh frame for the app's actual validated bundle and actual parent origin:
+
+```sh
+cadence app frame-kit --out /tmp/my-app-frame \
+  --bundle ./path/to/app-bundle --parent-origin http://127.0.0.1:5173
+```
+
+The packaged files are canonical host output, not a copied editable renderer. The default offline frame is an empty reference, not an app-mounted harness. This toolchain alone does not establish Social, native API, or frame-harness integration.
