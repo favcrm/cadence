@@ -1020,7 +1020,8 @@ fn an_unsettled_send_stays_sending_and_a_repeat_never_sends_again() {
     fx.door.processing.store(true, SeqCst);
     *fx.door.status.lock().unwrap() = "processing".into();
 
-    let started = Instant::now();
+    // The door answers `processing`: `confirm` sends once, then returns
+    // with a plain reason instead of a verdict.
     let reply = fx
         .confirm(Asserted::Operator, &id, &digest)
         .unwrap_or_else(|e| panic!("confirm refused: {e}"));
@@ -1030,14 +1031,37 @@ fn an_unsettled_send_stays_sending_and_a_repeat_never_sends_again() {
             .is_some_and(|s| !s.trim().is_empty()),
         "an unsettled send gave no plain reason: {reply}"
     );
-    // Past any settle window the daemon runs, AgenticOS never answered: the
-    // effect is still `sending`, sent exactly once.
-    while started.elapsed() < Duration::from_secs(75) {
-        std::thread::sleep(Duration::from_millis(500));
-    }
     assert_eq!(fx.state(&id), "sending", "{reply}");
     assert_eq!(fx.door.posts("/publish"), 1);
     let sent = fx.door.all_posts();
+
+    // A `Publish now` on the `sending` effect is the real recheck path:
+    // it reads status, sends nothing, and leaves the effect `sending`
+    // with a plain reason.
+    let reads = fx.door.status_reads();
+    let recheck = fx
+        .rpc_as(
+            Asserted::Operator,
+            "app_effect_publish_now",
+            json!({"effect_id": id, "digest": digest}),
+        )
+        .unwrap_or_else(|e| panic!("a recheck refused: {e}"));
+    assert!(
+        recheck["send_error"]
+            .as_str()
+            .is_some_and(|s| !s.trim().is_empty()),
+        "an unsettled recheck gave no plain reason: {recheck}"
+    );
+    assert_eq!(fx.state(&id), "sending", "{recheck}");
+    assert!(
+        fx.door.status_reads() > reads,
+        "the recheck never read status"
+    );
+    assert_eq!(
+        fx.door.all_posts(),
+        sent,
+        "a recheck reached the door: {recheck}"
+    );
 
     // A repeated confirm on the `sending` effect: no second send.
     let again = fx.confirm(Asserted::Operator, &id, &digest);
