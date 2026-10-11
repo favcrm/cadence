@@ -450,7 +450,7 @@ impl SendGrant {
                 "send grant has no uses left",
             ));
         }
-        if now_epoch < self.not_before_epoch || now_epoch > self.expires_at_epoch {
+        if now_epoch < self.not_before_epoch || now_epoch >= self.expires_at_epoch {
             return Err(Refusal::new(
                 "grant_window",
                 "send grant is outside its validity window",
