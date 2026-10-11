@@ -6,7 +6,17 @@ streams the bytes to the daemon, the daemon retains immutable originals
 under the daemon's captured operational workspace at
 `<CADENCE_HOME>/workspace/users/<account>/threads/<conversation>/uploads/`,
 and a turn reads them through a daemon RPC — never through a browser path, URL
-or `<img>`. Incoming `<state>/wiki-uploads/` files are transient staging only.
+or `<img>`. Incoming `<state>/wiki-uploads/` files are transient staging only. The
+workspace root is `<CADENCE_HOME>/workspace` when `CADENCE_HOME` is set, or
+`~/.cadence/workspace` by default; it is independent of tracker and runtime
+state overrides. It must be disjoint from both supported Master providers'
+effective read and write grants. SQLite runtime state, Git tracker tickets and
+projects, operational uploads, curated vault content and source repositories
+remain separate authorities.
+
+The local-administrative session represents one shared local-admin account,
+not distinct human users; older unbound sessions must reauthenticate. Verified
+named issuer/workspace/subject accounts remain distinct.
 
 **Availability: text, Markdown and CSV only.** The allowlist is `.txt`,
 `.md` and `.csv`. A Home message carries Home uploads; an app conversation
@@ -59,7 +69,7 @@ campaign. Retention and quota are described in
    refused, never followed, and a FIFO/device cannot block or be read — and
    writes exactly the checked bytes into an anonymous `O_TMPFILE` inode
    in the descriptor-pinned operational attachment directory, on the
-   destination filesystem. The pinned legacy custody root retains the
+   destination filesystem. The pinned legacy PM custody root retains the
    shared quota lock and census, not this staging inode. The checked inode
    is then published within that operational attachment directory. The same
    opened inode is written, synced and bounded-read back; it has no stage
@@ -134,7 +144,8 @@ campaign. Retention and quota are described in
 - Version-1 originals are read only from their operational account tree;
   version-0 legacy rows are read only from their legacy PM custody root. A
   missing, aliased or corrupt entry refuses without trying the other format.
-  Legacy rows are not copied, rewritten or deleted.
+  Legacy rows are not copied, rewritten or deleted. State-only protected legacy
+  originals remain refused; reconcile those separately with the operator.
 - An app upload carries the verified `app` binding and its explicit
   `conversation`; the daemon proves the installation, context and the
   master's unarchived conversation and re-proves the current exact-approved
@@ -198,7 +209,8 @@ charged, never swept.
 All sums use checked arithmetic and refuse only when projected use exceeds a
 cap. Instance bytes count logical `fstat` sizes for unique `(device,inode)`
 regular files across legacy PM chat-file custody, the operational
-`workspace/users/**/threads/**/uploads/**` tree, and state `wiki-uploads`,
+`workspace/users/**/threads/**/uploads/**` tree (including local-admin and
+verified named-account uploads), and state `wiki-uploads`,
 then add proposed physical bytes. Instance units are
 unique physical inodes plus metadata rows plus one prospective physical custody
 file and its metadata row for text. Hard links count once across roots;

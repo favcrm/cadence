@@ -824,6 +824,11 @@ impl Shared {
             opts.provider_env.var("CADENCE_HOME").as_deref(),
             opts.provider_env.var("HOME").as_deref(),
         )?;
+        crate::home::validate_workspace_isolated(
+            &upload_workspace_dir,
+            state_dir,
+            &opts.provider_env,
+        )?;
         let wiki_pm_lease = lease.as_ref().map(|l| l.pm_lease());
         // CAD-1416: the document door is selected by the image-owned tuple
         // alone, never by the lifecycle lease. Trusted in-memory metadata wins
@@ -832,6 +837,9 @@ impl Shared {
             .provider_deployments
             .as_ref()
             .and_then(|metadata| metadata.hosted_business_documents());
+        let provider_env = opts
+            .provider_env
+            .with_workspace(upload_workspace_dir.clone());
         // Actors consume Store candidates at open; retain an independent
         // copy until adoption succeeds, refuses, or is skipped entirely.
         let adoptions_pending = store
@@ -873,7 +881,7 @@ impl Shared {
             open_attach: Mutex::new(HashMap::new()),
             adoptions_pending: Mutex::new(adoptions_pending),
             adoptions_notify: Notify::new(),
-            provider_env: opts.provider_env.clone(),
+            provider_env,
             started_at: epoch_secs(),
             stall_sample_secs: Arc::clone(&opts.stall_sample_secs),
             stall_clock_offset: Arc::clone(&opts.stall_clock_offset),

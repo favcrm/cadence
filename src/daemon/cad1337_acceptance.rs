@@ -664,3 +664,296 @@ fn cad1337_quota_charges_nested_metadata_named_residue() {
         "positive upload control disappeared"
     );
 }
+
+/// Independent CAD-1337 root-admission acceptance: private originals must not
+/// inherit any recursive Master filesystem grant. Only the actual Shared boot
+/// constructor runs on empty disposable stores; no agent, actor, provider,
+/// listener, authentication or upload is started. The first control proves
+/// ordinary separate roots and harmless extra grants remain usable. On the
+/// unfixed baseline the negative boots succeed, and the final assertion lists
+/// every admitted unsafe configuration rather than stopping at the first one.
+#[cfg(unix)]
+#[test]
+fn cad1337_master_grant_overlap_refuses_private_workspace_boot() {
+    fn options(state: &Path, tracker: &Path, home: &Path, cadence_home: &Path) -> ServeOptions {
+        std::fs::create_dir_all(state).unwrap();
+        std::fs::create_dir_all(home).unwrap();
+        std::fs::create_dir_all(cadence_home).unwrap();
+        crate::issue::Pm::init(tracker).unwrap();
+        let opts = ServeOptions::default();
+        opts.provider_env.set("HOME", home.to_str().unwrap());
+        opts.provider_env
+            .set("CADENCE_HOME", cadence_home.to_str().unwrap());
+        opts.provider_env
+            .set("CADENCE_PM_DIR", tracker.to_str().unwrap());
+        // Override inherited extras only in this instance's captured env.
+        // These are the real configuration names consumed by both adapters.
+        opts.provider_env
+            .set(crate::master::CONFINE_EXTRA_READ_ENV, "");
+        opts.provider_env
+            .set(crate::master::CONFINE_EXTRA_WRITE_ENV, "");
+        opts
+    }
+
+    let safe = tempfile::Builder::new()
+        .prefix("c1337-g-")
+        .tempdir()
+        .unwrap();
+    let safe_state = safe.path().join("s");
+    let safe_tracker = safe.path().join("t");
+    let safe_home = safe.path().join("h");
+    let safe_private = safe.path().join("p");
+    let safe_opts = options(&safe_state, &safe_tracker, &safe_home, &safe_private);
+    for (env, leaf) in [
+        (crate::master::CONFINE_EXTRA_READ_ENV, "r"),
+        (crate::master::CONFINE_EXTRA_WRITE_ENV, "w"),
+    ] {
+        let grant = safe.path().join(leaf);
+        std::fs::create_dir(&grant).unwrap();
+        safe_opts.provider_env.set(env, grant.to_str().unwrap());
+    }
+    let shared = Shared::new(&safe_state, &safe_opts)
+        .unwrap_or_else(|error| panic!("separate private workspace boot control refused: {error}"));
+    assert_eq!(shared.upload_workspace_dir, safe_private.join("workspace"));
+    drop(shared);
+
+    let mut admitted = Vec::new();
+    for case in [
+        "master-cwd",
+        "master-tmp",
+        "master-pi",
+        "master-claude",
+        "extra-read-ancestor",
+        "extra-write-ancestor",
+        "extra-read-alias",
+        "extra-write-alias",
+    ] {
+        let fixture = tempfile::Builder::new()
+            .prefix("c1337-g-")
+            .tempdir()
+            .unwrap();
+        let state = fixture.path().join("s");
+        let tracker = fixture.path().join("t");
+        let home = fixture.path().join("h");
+        let grant_ancestor = fixture.path().join("p");
+        // Use production state-derived policy paths, not a test-side copy
+        // of a proposed isolation guard or a pretend provider command.
+        let private = match case {
+            "master-cwd" => crate::master::workdir(&state).join("private"),
+            "master-tmp" => crate::master::tmpdir(&state).join("private"),
+            "master-pi" => crate::master::provider_config_dir("pi", &state).join("private"),
+            "master-claude" => crate::master::provider_config_dir("claude", &state).join("private"),
+            _ => grant_ancestor.join("private"),
+        };
+        let opts = options(&state, &tracker, &home, &private);
+        let workspace = private.join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let sentinel = workspace.join("sentinel.txt");
+        std::fs::write(&sentinel, b"fixture-owned private sentinel\n").unwrap();
+        let extra = match case {
+            "extra-read-ancestor" | "extra-read-alias" => {
+                Some(crate::master::CONFINE_EXTRA_READ_ENV)
+            }
+            "extra-write-ancestor" | "extra-write-alias" => {
+                Some(crate::master::CONFINE_EXTRA_WRITE_ENV)
+            }
+            _ => None,
+        };
+        if let Some(env) = extra {
+            let grant = if case.ends_with("alias") {
+                let alias = fixture.path().join("grant-alias");
+                // The authority workspace path is entirely real. Only the
+                // existing Landlock grant is a symlink, so rejection cannot
+                // be credited to the old workspace-path symlink check.
+                std::os::unix::fs::symlink(&workspace, &alias).unwrap();
+                assert_eq!(alias.canonicalize().unwrap(), workspace);
+                alias
+            } else {
+                grant_ancestor
+            };
+            opts.provider_env.set(env, grant.to_str().unwrap());
+        }
+        match Shared::new(&state, &opts) {
+            Ok(shared) => {
+                assert_eq!(shared.upload_workspace_dir, workspace);
+                admitted.push(case);
+                drop(shared);
+            }
+            Err(error) => {
+                let reason = error.to_string().to_ascii_lowercase();
+                assert!(
+                    (reason.contains("workspace") || reason.contains("upload"))
+                        && (reason.contains("grant")
+                            || reason.contains("confin")
+                            || reason.contains("isolation"))
+                        && (reason.contains("overlap")
+                            || reason.contains("expos")
+                            || reason.contains("unsafe")),
+                    "{case} refused for an unrelated boot error, not private-root isolation: {error}"
+                );
+            }
+        }
+        assert_eq!(
+            std::fs::read(&sentinel).unwrap(),
+            b"fixture-owned private sentinel\n",
+            "{case} boot changed private fixture bytes"
+        );
+    }
+    assert!(
+        admitted.is_empty(),
+        "private workspace boot admitted recursive Master grant overlap: {admitted:?}"
+    );
+}
+
+/// Independently authored exact-launch-policy acceptance. A literal process
+/// alias belongs to the future confined child, not the validating daemon;
+/// traversal or ordinary symlink spellings must not turn it into daemon
+/// process authority. The checked private root remains authoritative after
+/// mutable env changes. Only the real guard consumed by both adapters runs;
+/// no actor, provider, process lookup, Landlock exec or service is started.
+#[cfg(target_os = "linux")]
+#[test]
+fn cad1337_master_launch_policy_process_alias_and_bound_root_refusals() {
+    use crate::adapter::ProviderEnv;
+    use crate::confine::Policy;
+    use std::path::PathBuf;
+
+    let fixture = tempfile::Builder::new()
+        .prefix("c1337-p-")
+        .tempdir()
+        .unwrap();
+    let tracker = fixture.path().join("t");
+    let home = fixture.path().join("h");
+    let private = fixture.path().join("p");
+    let sibling = fixture.path().join("r");
+    let sibling_write = fixture.path().join("w");
+    for dir in [&tracker, &home, &private, &sibling, &sibling_write] {
+        std::fs::create_dir(dir).unwrap();
+    }
+    let workspace = crate::home::workspace_for_instance(
+        &tracker,
+        Some(private.to_str().unwrap()),
+        Some(home.to_str().unwrap()),
+    )
+    .expect("separate private authority must resolve through the real root checker");
+    std::fs::create_dir(&workspace).unwrap();
+    let marker = workspace.join("marker.txt");
+    std::fs::write(&marker, b"original private authority marker\n").unwrap();
+    let mutable_env = ProviderEnv::default();
+    mutable_env.set("HOME", home.to_str().unwrap());
+    mutable_env.set("CADENCE_HOME", private.to_str().unwrap());
+    let bound_env = mutable_env.with_workspace(workspace.clone());
+
+    // Ordinary aliases normalize to their real sibling authority; literal
+    // child-relative /proc spellings must reach the encoded policy unchanged.
+    let harmless_alias = fixture.path().join("safe-alias");
+    std::os::unix::fs::symlink(&sibling, &harmless_alias).unwrap();
+    let policy = Policy {
+        read: vec![
+            harmless_alias,
+            PathBuf::from("/proc/self"),
+            PathBuf::from("/proc/thread-self/status"),
+        ],
+        write: vec![sibling_write.clone()],
+    };
+    let checked = crate::home::validate_policy_for_env(policy, &bound_env)
+        .expect("harmless sibling and literal child-relative policy must validate");
+    assert_eq!(
+        checked.read,
+        vec![
+            sibling,
+            PathBuf::from("/proc/self"),
+            PathBuf::from("/proc/thread-self/status"),
+        ],
+        "validation changed child-relative spelling or expanded sibling authority"
+    );
+    assert_eq!(checked.write, vec![sibling_write]);
+
+    let proc_alias = fixture.path().join("proc-alias");
+    std::os::unix::fs::symlink("/proc/self", &proc_alias).unwrap();
+    let chained_alias = fixture.path().join("proc-chain");
+    std::os::unix::fs::symlink("proc-alias", &chained_alias).unwrap();
+    let thread_alias = fixture.path().join("thread-alias");
+    std::os::unix::fs::symlink("/proc/thread-self", &thread_alias).unwrap();
+    for (case, path) in [
+        ("raw-parent-self", PathBuf::from("/tmp/../proc/self")),
+        (
+            "raw-parent-thread-status",
+            PathBuf::from("/tmp/../proc/thread-self/status"),
+        ),
+        ("ordinary-proc-symlink", proc_alias.clone()),
+        ("chained-proc-symlink", chained_alias),
+        ("qualified-proc-symlink", proc_alias.join("status")),
+        ("qualified-thread-symlink", thread_alias.join("status")),
+        (
+            "literal-process-parent-traversal",
+            PathBuf::from("/proc/self/../thread-self/status"),
+        ),
+    ] {
+        for kind in ["read", "write"] {
+            let policy = if kind == "read" {
+                Policy {
+                    read: vec![path.clone()],
+                    write: Vec::new(),
+                }
+            } else {
+                Policy {
+                    read: Vec::new(),
+                    write: vec![path.clone()],
+                }
+            };
+            let error = crate::home::validate_policy_for_env(policy, &bound_env)
+                .expect_err(&format!("{case} became accepted {kind} process authority"));
+            let reason = error.to_string().to_ascii_lowercase();
+            assert!(
+                reason.contains("process-relative") && reason.contains("workspace isolation"),
+                "{case} {kind} refused for an unrelated reason: {error}"
+            );
+        }
+    }
+
+    // `set` and `remove` affect the real shared map, including clones. Neither
+    // may replace the already-bound custody root with a recomputed location.
+    let later_home = fixture.path().join("later-h");
+    let later_private = fixture.path().join("later-p");
+    std::fs::create_dir(&later_home).unwrap();
+    std::fs::create_dir(&later_private).unwrap();
+    for change in ["replace", "remove"] {
+        if change == "replace" {
+            mutable_env.set("HOME", later_home.to_str().unwrap());
+            mutable_env.set("CADENCE_HOME", later_private.to_str().unwrap());
+        } else {
+            mutable_env.remove("HOME");
+            mutable_env.remove("CADENCE_HOME");
+        }
+        for kind in ["read", "write"] {
+            let policy = if kind == "read" {
+                Policy {
+                    read: vec![workspace.clone()],
+                    write: Vec::new(),
+                }
+            } else {
+                Policy {
+                    read: Vec::new(),
+                    write: vec![workspace.clone()],
+                }
+            };
+            let error = crate::home::validate_policy_for_env(policy, &bound_env.clone())
+                .expect_err(&format!(
+                    "{change} mutable env lost original private {kind} root"
+                ));
+            let reason = error.to_string().to_ascii_lowercase();
+            assert!(
+                reason.contains("workspace")
+                    && reason.contains("overlap")
+                    && reason.contains("filesystem grant"),
+                "{change} mutable env {kind} refused for an unrelated reason: {error}"
+            );
+        }
+    }
+    assert_eq!(
+        std::fs::read(marker).unwrap(),
+        b"original private authority marker\n",
+        "policy validation altered original private marker bytes"
+    );
+}

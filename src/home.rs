@@ -237,6 +237,206 @@ pub fn workspace_for_instance(
     Ok(workspace)
 }
 
+/// Refuse an operational workspace that overlaps any read or write root
+/// granted to either supported Master provider. The policies are built by
+/// the adapters themselves so this check follows their effective authority.
+pub(crate) fn validate_workspace_isolated(
+    workspace: &Path,
+    state_dir: &Path,
+    env: &crate::adapter::ProviderEnv,
+) -> Result<()> {
+    let workspace = checked_root(workspace)?;
+    let policies = [
+        crate::adapter::claude::master_confinement(env, state_dir).1,
+        crate::adapter::pi::pi_master_confinement(env, state_dir).1,
+    ];
+    for policy in policies {
+        validate_master_policy(&workspace, policy)?;
+    }
+    Ok(())
+}
+
+/// When a daemon-bound provider is launched, validate and freeze the exact
+/// policy that will be encoded into its `cadence confine` argv.
+pub(crate) fn validate_policy_for_env(
+    policy: crate::confine::Policy,
+    env: &crate::adapter::ProviderEnv,
+) -> Result<crate::confine::Policy> {
+    match env.workspace() {
+        Some(workspace) => validate_master_policy(workspace, policy),
+        None => Ok(policy),
+    }
+}
+
+/// Normalize every granted path to the target Landlock will follow, and
+/// reject bidirectional overlap with the immutable operational workspace.
+pub(crate) fn validate_master_policy(
+    workspace: &Path,
+    mut policy: crate::confine::Policy,
+) -> Result<crate::confine::Policy> {
+    let workspace = checked_root(workspace)?;
+    for (kind, paths) in [("read", &mut policy.read), ("write", &mut policy.write)] {
+        for path in paths.iter_mut() {
+            let authority = if process_relative_proc_authority(path).map_err(|reason| {
+                Error::rejected(format!(
+                    "cannot establish Master {kind} authority for workspace isolation at {}: {reason}",
+                    path.display()
+                ))
+            })? {
+                // `/proc/self` and `/proc/thread-self` are interpreted by
+                // the confined child, not by this daemon. Keep their spelling
+                // intact; canonicalizing here would grant the daemon's PID.
+                if workspace.starts_with("/proc") {
+                    return Err(Error::rejected(
+                        "operational upload workspace cannot be isolated from process-relative /proc authority",
+                    ));
+                }
+                path.clone()
+            } else {
+                normalize_authority(path).map_err(|reason| {
+                    Error::rejected(format!(
+                        "cannot establish Master {kind} authority for workspace isolation at {}: {reason}",
+                        path.display()
+                    ))
+                })?
+            };
+            if workspace.starts_with(&authority) || authority.starts_with(&workspace) {
+                return Err(Error::rejected(format!(
+                    "operational upload workspace overlaps effective Master {kind} filesystem grant"
+                )));
+            }
+            *path = authority;
+        }
+    }
+    Ok(policy)
+}
+
+/// Detect the kernel-relative process aliases whose meaning changes from
+/// this daemon to the Master child. Their spelling must reach Landlock intact.
+fn process_relative_proc_authority(path: &Path) -> std::result::Result<bool, &'static str> {
+    use std::path::Component;
+    if !path.is_absolute() {
+        return Ok(false);
+    }
+    let mut components = path.components();
+    if !matches!(components.next(), Some(Component::RootDir))
+        || !matches!(components.next(), Some(Component::Normal(proc)) if proc == "proc")
+    {
+        return Ok(false);
+    }
+    if !matches!(components.next(), Some(Component::Normal(alias)) if alias == "self" || alias == "thread-self")
+    {
+        return Ok(false);
+    }
+    if components.any(|component| matches!(component, Component::ParentDir)) {
+        return Err("process-relative /proc authority contains parent traversal");
+    }
+    Ok(true)
+}
+
+/// Resolve an authority path as Landlock will: follow existing symlink
+/// aliases, then retain a normalized missing suffix below its real ancestor.
+/// Unlike workspace roots, grants may name files as well as directories.
+fn normalize_authority(path: &Path) -> std::result::Result<PathBuf, &'static str> {
+    use std::{collections::VecDeque, path::Component};
+
+    fn enqueue(
+        path: &Path,
+        from_link: bool,
+        pending: &mut VecDeque<(PathBuf, bool)>,
+    ) -> std::result::Result<(), &'static str> {
+        for component in path.components() {
+            match component {
+                Component::RootDir => pending.push_back((PathBuf::from("/"), from_link)),
+                Component::CurDir => pending.push_back((PathBuf::from("."), from_link)),
+                Component::ParentDir => pending.push_back((PathBuf::from(".."), from_link)),
+                Component::Normal(part) => pending.push_back((PathBuf::from(part), from_link)),
+                Component::Prefix(_) => return Err("path has an unsupported prefix"),
+            }
+        }
+        Ok(())
+    }
+
+    fn is_process_relative_proc(path: &Path) -> bool {
+        path == Path::new("/proc/self")
+            || path.starts_with("/proc/self/")
+            || path == Path::new("/proc/thread-self")
+            || path.starts_with("/proc/thread-self/")
+    }
+
+    if !path.is_absolute() {
+        return Err("path is not absolute");
+    }
+    let mut pending = VecDeque::new();
+    enqueue(path, false, &mut pending)?;
+    let mut resolved = PathBuf::from("/");
+    let mut missing = false;
+    let mut symlink_hops = 0usize;
+
+    while let Some((component, from_link)) = pending.pop_front() {
+        if component == Path::new("/") {
+            if from_link {
+                resolved = PathBuf::from("/");
+            }
+            continue;
+        }
+        if component == Path::new(".") {
+            continue;
+        }
+        if component == Path::new("..") {
+            if missing {
+                return Err("parent traversal after a missing path component is ambiguous");
+            }
+            if resolved != Path::new("/") {
+                match std::fs::metadata(&resolved) {
+                    Ok(metadata) if metadata.is_dir() => {}
+                    _ => return Err("parent traversal does not follow a directory"),
+                }
+                resolved.pop();
+            }
+            continue;
+        }
+
+        resolved.push(&component);
+        if is_process_relative_proc(&resolved) {
+            return Err("ordinary alias resolves through process-relative /proc authority");
+        }
+        if missing {
+            if from_link {
+                return Err("symlink target is dangling");
+            }
+            continue;
+        }
+        match std::fs::symlink_metadata(&resolved) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                symlink_hops += 1;
+                if symlink_hops > 40 {
+                    return Err("symlink resolution exceeded 40 hops");
+                }
+                let target = std::fs::read_link(&resolved).map_err(|_| "symlink cannot be read")?;
+                resolved.pop();
+                if target.is_absolute() {
+                    resolved = PathBuf::from("/");
+                }
+                let mut target_components = VecDeque::new();
+                enqueue(&target, true, &mut target_components)?;
+                while let Some(item) = target_components.pop_back() {
+                    pending.push_front(item);
+                }
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if from_link {
+                    return Err("symlink target is dangling");
+                }
+                missing = true;
+            }
+            Err(_) => return Err("path cannot be inspected"),
+        }
+    }
+    Ok(resolved)
+}
+
 /// Resolve an authoritative storage root without adopting `..`, relative
 /// paths, or symlink aliases. Missing suffixes are retained lexically so a
 /// root can be validated before first use.

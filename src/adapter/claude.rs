@@ -292,6 +292,7 @@ fn launch_command(
         mcp_config,
         crate::master::Profile::Home,
     )
+    .expect("unbound adapter test launch has no workspace isolation context")
 }
 
 fn launch_command_for(
@@ -302,14 +303,20 @@ fn launch_command_for(
     resume: bool,
     mcp_config: Option<&Path>,
     profile: crate::master::Profile,
-) -> (Vec<String>, Option<crate::confine::Policy>) {
+) -> Result<(Vec<String>, Option<crate::confine::Policy>)> {
     let command = build_command_for(env, agent, session_id, resume, mcp_config, profile);
     if !master_confined(env, agent) {
-        return (command, None);
+        if crate::master::is_master(&agent.alias) && env.workspace().is_some() {
+            return Err(Error::rejected(
+                "cannot isolate operational upload workspace without effective Master confinement",
+            ));
+        }
+        return Ok((command, None));
     }
     let (confine, policy) = master_confinement(env, state_dir);
+    let policy = crate::home::validate_policy_for_env(policy, env)?;
     let argv = crate::master::confine_argv(&confine, &policy, &command);
-    (argv, Some(policy))
+    Ok((argv, Some(policy)))
 }
 
 /// The master, confined whenever this host can confine it — the stored
@@ -838,7 +845,7 @@ impl ProviderAdapter for ClaudeAdapter {
             resume,
             mcp_config.as_deref(),
             profile,
-        );
+        )?;
         if let Some(policy) = &confinement {
             self.log_confinement(policy)?;
         }
