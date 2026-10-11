@@ -793,6 +793,21 @@ impl Store {
                 let slot = row["slot"]
                     .as_str()
                     .ok_or_else(|| Error::internal("invalid binding slot"))?;
+                let proof = BindingProof {
+                    id: id.clone(),
+                    revision: row["revision"]
+                        .as_i64()
+                        .ok_or_else(|| Error::internal("invalid binding revision"))?,
+                    digest: row["digest"]
+                        .as_str()
+                        .ok_or_else(|| Error::internal("invalid binding digest"))?
+                        .to_string(),
+                    config: row["config"].clone(),
+                };
+                if !binding_current_in(&tx, install, context, slot, &proof)? {
+                    skipped.push(id.clone());
+                    continue;
+                }
                 let mut config = expected.clone();
                 config["bundle_digest"] = json!(bundle_digest);
                 validate_config(install, context, &config)?;
