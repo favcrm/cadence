@@ -289,8 +289,6 @@ impl Shared {
                     if !matches!(mime, "image/jpeg" | "image/png") {
                         return Err(Error::rejected("publish image must be JPEG or PNG"));
                     }
-                    image::load_from_memory(&bytes)
-                        .map_err(|_| Error::rejected("retained publish image cannot be decoded"))?;
                     if crate::store::app_runs::artifact_digest(&bytes) != digest {
                         return Err(Error::rejected("retained publish image digest changed"));
                     }
@@ -411,8 +409,6 @@ impl Shared {
                             "social draft image type changed since approval",
                         ));
                     }
-                    image::load_from_memory(&bytes)
-                        .map_err(|_| Error::rejected("social draft image cannot be decoded"))?;
                     let importer = self.social_media_importer.clone().ok_or_else(|| {
                         Error::rejected("capability_unavailable: no media importer configured")
                     })?;

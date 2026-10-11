@@ -262,7 +262,6 @@ impl Shared {
                 .map_err(Error::rejected)?;
             if !matches!(mime, "image/jpeg" | "image/png")
                 || bytes.len() > 2 * 1024 * 1024
-                || image::load_from_memory(&bytes).is_err()
                 || crate::store::app_runs::artifact_digest(&bytes) != digest
             {
                 return Err(Error::rejected(
