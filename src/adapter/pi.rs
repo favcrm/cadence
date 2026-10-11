@@ -280,12 +280,18 @@ pub(crate) fn resolve_pi_launch_command(
         .unwrap_or_else(|| "pi".to_string());
     let path_display = path.unwrap_or_default();
     if !program.contains('/') {
+        if path.is_some_and(|p| std::env::split_paths(p).any(|entry| !entry.is_absolute())) {
+            return Err("startup resolution is indeterminate: PATH contains a relative entry and agents launch in their own working directories; use absolute PATH entries or CADENCE_PI_COMMAND".to_string());
+        }
         let resolved = crate::master::which(&program, path)
             .ok_or_else(|| format!("command '{program}' not found on PATH ({path_display})"))?;
         return std::path::absolute(&resolved)
             .map_err(|e| format!("cannot resolve command '{program}' to an absolute path: {e}"));
     }
     let candidate = PathBuf::from(&program);
+    if !candidate.is_absolute() {
+        return Err("startup resolution is indeterminate: CADENCE_PI_COMMAND is relative to each agent's working directory; configure an absolute executable path".to_string());
+    }
     let executable = std::fs::metadata(&candidate).ok().is_some_and(|m| {
         use std::os::unix::fs::PermissionsExt;
         m.is_file() && m.permissions().mode() & 0o111 != 0
@@ -3098,16 +3104,18 @@ mod cad1247_tests {
             .prefix(".cad1247-resolution-")
             .tempdir_in(".")
             .unwrap();
-        let relative_pi = relative_dir.path().join("pi");
+        let relative_root = Path::new(".").join(relative_dir.path().file_name().unwrap());
+        let relative_pi = relative_root.join("pi");
         std::fs::copy(&pi, &relative_pi).unwrap();
-        let relative_path = relative_dir.path().to_str().unwrap();
+        let relative_path = relative_root.to_str().unwrap();
+        assert!(!relative_pi.is_absolute());
         assert!(resolve_pi_launch_command(&env, Some(relative_path))
-            .unwrap()
-            .is_absolute());
+            .unwrap_err()
+            .contains("indeterminate"));
         env.set("CADENCE_PI_COMMAND", relative_pi.to_str().unwrap());
         assert!(resolve_pi_launch_command(&env, Some(&path))
-            .unwrap()
-            .is_absolute());
+            .unwrap_err()
+            .contains("indeterminate"));
         env.set("CADENCE_PI_COMMAND", "/missing/pi --flag");
         assert!(resolve_pi_launch_command(&env, Some(&path)).is_err());
         env.set("CADENCE_PI_COMMAND", "/bin/true --flag");
