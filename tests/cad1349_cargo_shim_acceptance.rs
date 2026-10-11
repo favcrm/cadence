@@ -293,6 +293,10 @@ fn cad1349_runner_keeps_its_execution_boundary() {{
     let path: Vec<_> = env::split_paths(&env::var_os("PATH").unwrap()).collect();
     assert!(path[0].ends_with("cadence-hooks/bin"), "generated shim not first on PATH: {{path:?}}");
     assert!(path[1].ends_with("cargo-toolchain"), "compiler dir not second on PATH: {{path:?}}");
+    let rustc = path[1].join("rustc");
+    assert!(rustc.is_file(), "matching rustc missing from private compiler PATH: {{rustc:?}}");
+    let rustc_output = Command::new("rustc").arg("--version").output().expect("run rustc from private compiler PATH");
+    assert!(rustc_output.status.success(), "private rustc failed: {{}}", String::from_utf8_lossy(&rustc_output.stderr));
     assert!(!path.iter().any(|part| part == Path::new(&env::var("CAD1349_PROVIDER_DIR").unwrap())),
         "host provider CLI directory leaked into test PATH");
     assert!(Command::new("claude").arg("--version").output().is_err(),

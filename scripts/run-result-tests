@@ -203,8 +203,12 @@ fi
 # rustup's selected toolchain; non-rustup installs use the first cargo after
 # removing only the shim directory from the caller's PATH.
 compiler_cargo=
+compiler_rustc=
 if rustup_bin=$(command -v rustup 2>/dev/null); then
   compiler_cargo=$("$rustup_bin" which cargo 2>/dev/null || true)
+  if [ -n "$compiler_cargo" ] && [ -x "$compiler_cargo" ]; then
+    compiler_rustc=$("$rustup_bin" which rustc 2>/dev/null || true)
+  fi
 fi
 if [ -z "$compiler_cargo" ] || [ ! -x "$compiler_cargo" ]; then
   lookup_path=$PATH
@@ -212,9 +216,14 @@ if [ -z "$compiler_cargo" ] || [ ! -x "$compiler_cargo" ]; then
     lookup_path=$(printf '%s' "$lookup_path" | tr ':' '\n' | grep -vxF "$shim_dir" | paste -sd: -)
   fi
   compiler_cargo=$(PATH=$lookup_path command -v cargo 2>/dev/null || true)
+  compiler_rustc=$(PATH=$lookup_path command -v rustc 2>/dev/null || true)
 fi
 if [ -z "$compiler_cargo" ] || [ ! -x "$compiler_cargo" ]; then
   echo "::error::could not resolve an executable real cargo (rustup and PATH lookup failed)" >&2
+  exit 1
+fi
+if [ -z "$compiler_rustc" ] || [ ! -x "$compiler_rustc" ]; then
+  echo "::error::could not resolve an executable rustc matching the selected cargo/toolchain" >&2
   exit 1
 fi
 if [ -n "$shim_dir" ] && [ "$(realpath -e -- "$compiler_cargo")" = "$(realpath -e -- "$cargo_entry")" ]; then
@@ -226,6 +235,7 @@ trap 'rm -rf "$scratch"' EXIT
 compiler_dir=$scratch/cargo-toolchain
 mkdir -m 700 "$compiler_dir"
 ln -s "$(realpath -e -- "$compiler_cargo")" "$compiler_dir/cargo"
+ln -s "$(realpath -e -- "$compiler_rustc")" "$compiler_dir/rustc"
 lib_path="${shim_dir:+$shim_dir:}$compiler_dir:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 cargo_entry_dir=$(dirname "$cargo_entry")
 for cli in claude codex cursor-agent cursor agent devin pi gemini; do
