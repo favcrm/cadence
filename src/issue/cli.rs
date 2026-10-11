@@ -599,15 +599,28 @@ pub enum IssueAction {
     /// `history`, never widened on a guess). Merged worktree refs are
     /// swept with the same guard `finish --merged` uses.
     /// `issue sync` runs this sweep after a successful push.
+    /// `--issue <ID>` bounds the run to one ticket: it alone is
+    /// classified and only its recorded lanes face the cleanup pass —
+    /// every other in-flight ticket is neither examined nor probed.
     Reconcile {
         /// Limit the sweep to one project (all projects when omitted).
         #[arg(long)]
         project: Option<String>,
+        /// Reconcile only this issue (CAD-1377): classify it and clean
+        /// its recorded lanes — the post-merge path for one ticket.
+        /// Unknown ids and `--project` mismatches refuse before any
+        /// git/gh probe.
+        #[arg(long, value_name = "ID")]
+        issue: Option<String>,
         /// Print the classification without writing anything.
         #[arg(long)]
         dry_run: bool,
-        /// Classify at most this many issues (0 = no limit — the daemon
-        /// tick uses a bound so the rest drain over later ticks).
+        /// Classify at most this many in-scope issues (0 = no limit).
+        /// A bounded run cleans only the lanes of the issues it
+        /// actually examined and whose verdict is safe — deferred and
+        /// held candidates are reported under `deferred`/
+        /// `cleanup_deferred`, never implied reconciled. The daemon
+        /// tick uses a bound so the rest drain over later ticks.
         #[arg(long, default_value = "0")]
         limit: usize,
         /// Emit the sweep rows as JSON.
@@ -1738,12 +1751,38 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
         }
         IssueAction::Reconcile {
             project,
+            issue,
             dry_run,
             limit,
             json,
         } => {
             let pm = open_pm()?;
-            let out = reconcile::run(&pm, project.as_deref(), *dry_run, "", state_dir, *limit)?;
+            // CAD-1377: validate the selector before any probe — an
+            // unknown id or one outside `--project` refuses here, at
+            // read time, never after git/gh work started.
+            if let Some(id) = issue.as_deref() {
+                let found = board::find_issue(&pm.dir, id)?;
+                if let Some(want) = project.as_deref() {
+                    if found.project != want {
+                        return Err(Error::rejected(format!(
+                            "{id} belongs to project '{}' not '{want}'",
+                            found.project
+                        )));
+                    }
+                }
+            }
+            let out = match issue.as_deref() {
+                Some(id) => reconcile::run_selected(
+                    &pm,
+                    id,
+                    project.as_deref(),
+                    *dry_run,
+                    "",
+                    state_dir,
+                    *limit,
+                )?,
+                None => reconcile::run(&pm, project.as_deref(), *dry_run, "", state_dir, *limit)?,
+            };
             if *json {
                 print_json(&out);
             } else {
@@ -1769,6 +1808,35 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                         line.push_str(&format!(" — {e}"));
                     }
                     println!("{line}");
+                }
+                // CAD-1377: cleanup rows and refusals must be visible
+                // on the human path too — a targeted run that could
+                // not clean a lane is partial work, not silence.
+                for row in out["finish"]["rows"].as_array().into_iter().flatten() {
+                    let mut line = format!(
+                        "finish {}: {}",
+                        row["issue"].as_str().unwrap_or("?"),
+                        row["outcome"].as_str().unwrap_or("?")
+                    );
+                    if let Some(r) = row["reason"].as_str() {
+                        line.push_str(&format!("({})", r.lines().next().unwrap_or(r)));
+                    }
+                    if let Some(wt) = row["worktree"].as_str() {
+                        line.push_str(&format!(" — {wt}"));
+                    }
+                    println!("{line}");
+                }
+                let deferred = out["deferred"].as_array().map(|d| d.len()).unwrap_or(0)
+                    + out["cleanup_deferred"]
+                        .as_array()
+                        .map(|d| d.len())
+                        .unwrap_or(0);
+                if deferred > 0 || out["finish_refused"].as_u64().unwrap_or(0) > 0 {
+                    println!(
+                        "partial: {} deferred, {} cleanup refusals",
+                        deferred,
+                        out["finish_refused"].as_u64().unwrap_or(0)
+                    );
                 }
             }
             // A reconcile whose own writes failed still answers — the
