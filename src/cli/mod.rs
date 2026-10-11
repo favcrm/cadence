@@ -40,6 +40,9 @@ mod issue;
 mod job;
 mod join;
 mod launch;
+#[cfg(test)]
+#[path = "logout_auth_dir_acceptance.rs"]
+mod logout_auth_dir_acceptance;
 mod master;
 mod mcp_agent;
 mod mcp_permission;
@@ -200,7 +203,7 @@ pub(crate) enum AuthAction {
     /// Remove the legacy local AgenticOS credential; remote CLI sessions use --org.
     Logout {
         /// Revoke and remove this registered remote workspace's CLI device session.
-        #[arg(long, conflicts_with = "auth_dir")]
+        #[arg(long)]
         org: Option<String>,
         #[arg(long)]
         auth_dir: Option<PathBuf>,

@@ -1563,7 +1563,8 @@ impl LoginGrant {
     /// rename), separate from `orgs.json`. Never printed.
     pub fn save_credential(&self, dir: &Path) -> Result<()> {
         private_dir(dir, false)?;
-        let _guard = lock(dir, true)?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let _guard = crate::remote_cli::private_lock(dir, &self.slug, deadline)?;
         let destination = dir.join(format!("cli-{}.json", self.slug));
         match fs::symlink_metadata(&destination) {
             Ok(meta)
@@ -4436,3 +4437,7 @@ mod tests {
         assert!(!dir.join(RECORD).exists());
     }
 }
+
+#[cfg(test)]
+#[path = "remote_enrollment_cli_lock_acceptance.rs"]
+mod cli_lock_acceptance;

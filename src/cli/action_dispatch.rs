@@ -128,7 +128,7 @@ pub(crate) fn run() -> Result<i32> {
                 ),
                 AuthAction::Logout { auth_dir, org } => {
                     if let Some(org) = org {
-                        let dir = cadence_agent::remote_auth::auth_dir(None)?;
+                        let dir = cadence_agent::remote_auth::auth_dir(auth_dir.as_deref())?;
                         match org::resolve(Some(org), None, None)? {
                             org::Resolved::Remote(target) => {
                                 cadence_agent::remote_cli::logout(&dir, &target)

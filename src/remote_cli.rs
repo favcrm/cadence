@@ -292,7 +292,7 @@ fn load_credential(dir: &Path, target: &RemoteTarget) -> Result<Credential> {
     Ok(cred)
 }
 
-fn private_lock(dir: &Path, slug: &str, deadline: Instant) -> Result<File> {
+pub(crate) fn private_lock(dir: &Path, slug: &str, deadline: Instant) -> Result<File> {
     private_directory(dir)?;
     let file = OpenOptions::new()
         .read(true)
