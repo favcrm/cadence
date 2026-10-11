@@ -36,10 +36,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::issue::model;
 use crate::issue::time;
-use crate::issue::{board, finish, line_times::LineTimes, project, write, Pm};
+use crate::issue::{board, finish, line_times::LineTimes, project, start, write, Pm};
 use crate::proc::run_bounded;
 use crate::worktree::layout;
 
@@ -528,6 +528,43 @@ pub fn run(
     )
 }
 
+/// `run` bounded to one ticket (CAD-1377): `issue` names the only
+/// candidate the sweep classifies and the only issue whose lanes the
+/// cleanup half sweeps — every other `doing`/`review` leaf stays
+/// untouched (no probe, no row, no finish work). A `limit` still caps
+/// the selected candidates that reach classification; the rest are
+/// reported under `deferred`, never implied complete. `issue` must
+/// already exist (the CLI resolves it before the sweep, so an
+/// unknown id or a `--project` mismatch refuses ahead of any probe);
+/// a ticket whose file status is already terminal is reported
+/// `skipped`/`already-done` — done is not delete proof, its lanes
+/// still face `finish`'s guard.
+pub fn run_selected(
+    pm: &Pm,
+    issue: &str,
+    project: Option<&str>,
+    dry_run: bool,
+    actor: &str,
+    state_dir: &Path,
+    limit: usize,
+) -> Result<Value> {
+    run_inner_with_selected(
+        pm,
+        project,
+        dry_run,
+        actor,
+        Some(state_dir),
+        limit,
+        None,
+        Some(issue),
+        &gh_list,
+        &gh_view,
+        Some(Instant::now() + CLI_CLOSE_LOCK_WAIT),
+        &write::RealWait,
+        &LineTimes::load,
+    )
+}
+
 /// [`run`] on an injected [`write::WaitClock`] (CAD-1359): the same
 /// production entry — the shared close deadline is still
 /// `clock.now() + CLI_CLOSE_LOCK_WAIT`, computed once, and each close
@@ -656,6 +693,43 @@ fn run_inner_with(
     clock: &dyn write::WaitClock,
     history: HistoryLoad<'_>,
 ) -> Result<Value> {
+    run_inner_with_selected(
+        pm,
+        project,
+        dry_run,
+        actor,
+        state_dir,
+        limit,
+        cursor,
+        None,
+        pr_list,
+        pr_view,
+        close_lock_deadline,
+        clock,
+        history,
+    )
+}
+
+/// [`run_inner_with`] plus the `--issue` selector (CAD-1377):
+/// `selected` narrows the sweep — after views and the children set
+/// are derived — to exactly that issue and gates its cleanup half on
+/// a safe verdict.
+#[allow(clippy::too_many_arguments)]
+fn run_inner_with_selected(
+    pm: &Pm,
+    project: Option<&str>,
+    dry_run: bool,
+    actor: &str,
+    state_dir: Option<&Path>,
+    limit: usize,
+    cursor: Option<&str>,
+    selected: Option<&str>,
+    pr_list: PrLookup<'_>,
+    pr_view: PrView<'_>,
+    close_lock_deadline: Option<Instant>,
+    clock: &dyn write::WaitClock,
+    history: HistoryLoad<'_>,
+) -> Result<Value> {
     let issues = board::load_all(&pm.dir, project)?;
     // Candidacy follows the derived status, not only the file field:
     // a verdict note no longer fakes `done` (CAD-823), so a ticket
@@ -696,15 +770,63 @@ fn run_inner_with(
             json!({"state": "failed", "error": safe_history_error(&e)}),
         ),
     };
-    let children: HashSet<&str> = views
+    // Owned strings: the `--issue` narrowing below mutates `views`,
+    // which a borrowed set could not outlive.
+    let children: HashSet<String> = views
         .iter()
-        .filter_map(|v| v.issue.front.parent.as_deref())
+        .filter_map(|v| v.issue.front.parent.clone())
         .collect();
+    // CAD-1377: `--issue` selects one ticket. The full board is
+    // derived first so parent/container relationships stay correct,
+    // THEN the view list narrows to the selected id — every other
+    // candidate is filtered out BEFORE its probe, so its recorded
+    // lanes cost no git/gh/spawn work at all (the probe itself runs
+    // git: worktree roots and repo identity). An already-done selected
+    // ticket is no status candidate, but its lanes are still reported
+    // to the cleanup half — `done` is not delete proof.
     let mut rows = Vec::new();
+    let mut selected_has_lanes = false;
+    if let Some(sel) = selected {
+        eprintln!("reconcile: scoping to {sel}");
+        let Some(i) = views.iter().position(|v| v.issue.front.id == sel) else {
+            return Err(Error::rejected(format!(
+                "Unknown issue '{sel}' — `cadence issue ls` lists what exists"
+            )));
+        };
+        let view = views.swap_remove(i);
+        let f = &view.issue.front;
+        let in_flight = |s: &str| matches!(s, "doing" | "review");
+        let has_children = children.contains(f.id.as_str());
+        let mut candidate = !has_children && model::item_type(f, has_children) != "epic";
+        if candidate
+            && !in_flight(&f.status)
+            && !(in_flight(&view.status) && matches!(view.status_source, "job" | "notes"))
+        {
+            // Terminal or never-in-flight — the row says why the
+            // close phase skipped it. Only a file status of `done`
+            // earns the cleanup shortcut: a parked `ready`/`backlog`
+            // or a `dropped` ticket has no merge evidence behind it,
+            // so its lanes defer rather than sweep on a label.
+            let mut row = json!({"issue": f.id, "status": f.status});
+            row["detail"] = json!({});
+            row["outcome"] = json!("skipped");
+            row["reason"] = json!(if f.status == "done" {
+                "already-done"
+            } else {
+                "not-in-flight"
+            });
+            rows.push(row);
+            candidate = false;
+        }
+        selected_has_lanes = !start::open_worktrees(f).is_empty();
+        views = if candidate { vec![view] } else { Vec::new() };
+    }
     let mut done = Vec::new();
     let mut held = Vec::new();
     let mut stalled = Vec::new();
     let mut errors = Vec::new();
+    let mut deferred = Vec::new();
+    let mut cleanup_deferred = Vec::new();
     let mut classified = 0usize;
     // The id of the last evidence-bearing candidate this run examined
     // — advanced on every classify outcome (closed, held, stalled,
@@ -726,14 +848,21 @@ fn run_inner_with(
         if is_parent || model::item_type(f, is_parent) == "epic" {
             continue;
         }
+        // CAD-1377: the budget is decided BEFORE the probe — `probe`
+        // itself runs git (worktree roots, repo identity), so a
+        // deferred ticket must be counted from its refs, never
+        // probed. Ref-less candidates classify `skipped` for free and
+        // never starve real probes.
+        let evidence_bearing = f
+            .refs
+            .iter()
+            .any(|r| matches!(r.kind.as_str(), "worktree" | "branch" | "pr"));
+        if evidence_bearing && limit > 0 && classified >= limit {
+            deferred.push(f.id.clone());
+            continue;
+        }
         let p = probe(&v.issue);
-        // Only evidence-bearing candidates spend the limited budget —
-        // a ref-less one classifies `skipped` for free and must never
-        // starve real probes when a tick caps `classified`.
-        if !p.lanes.is_empty() || !p.pr_urls.is_empty() {
-            if limit > 0 && classified >= limit {
-                break;
-            }
+        if evidence_bearing {
             classified += 1;
             last_classified = Some(p.id.clone());
         }
@@ -809,18 +938,107 @@ fn run_inner_with(
         rows.push(row);
     }
 
-    // The worktree half: after status flips, sweep every merged open
-    // worktree ref in scope — the same merge evidence, one row each.
-    // Skipped entirely under the daemon (state_dir None).
+    // The worktree half: after status flips, sweep the merged open
+    // worktree refs in scope — the same merge evidence, one row each.
+    // Skipped entirely under the daemon (state_dir None). CAD-1377:
+    // a `--issue` or `limit`-bounded run sweeps ONLY the issues it
+    // actually examined and whose status verdict is safe — closed,
+    // would-close (dry run) or already done. A held, open, stalled or
+    // failed-close ticket's lanes are deferred, never implied done:
+    // its status says the work may still be live, so cleanup re-proves
+    // nothing behind the verdict's back. A `limit 0`, no-selector run
+    // keeps the full project sweep as deliberate maintenance.
+    let mut cleanup_ids: Vec<String> = Vec::new();
+    if let Some(sel) = selected {
+        if selected_has_lanes {
+            let safe = rows.iter().any(|r| {
+                r["issue"].as_str() == Some(sel)
+                    && matches!(r["outcome"].as_str(), Some("closed") | Some("would-close"))
+            }) || rows.iter().any(|r| {
+                r["issue"].as_str() == Some(sel) && r["reason"].as_str() == Some("already-done")
+            });
+            if safe {
+                cleanup_ids.push(sel.to_string());
+            } else {
+                cleanup_deferred.push(sel.to_string());
+            }
+        }
+    }
     let finish = match state_dir {
+        Some(d) if selected.is_some() => {
+            if cleanup_ids.is_empty() {
+                Some(json!({"rows": [], "refused": 0, "dry_run": dry_run}))
+            } else {
+                eprintln!(
+                    "reconcile: cleanup pass over {} issue(s) with recorded lanes",
+                    cleanup_ids.len()
+                );
+                Some(finish::sweep_selected(
+                    pm,
+                    &cleanup_ids.iter().map(String::as_str).collect::<Vec<_>>(),
+                    false,
+                    dry_run,
+                    actor,
+                    d,
+                )?)
+            }
+        }
+        Some(d) if limit > 0 => {
+            // Only a verdict-safe ticket's lanes face cleanup: closed,
+            // or would-close under dry run. Held, stalled, open and
+            // failed-close rows keep their lanes and are deferred —
+            // bounded classification must not silently become
+            // unbounded cleanup, and a live verdict never sweeps.
+            for r in &rows {
+                let Some(id) = r["issue"].as_str() else {
+                    continue;
+                };
+                match r["outcome"].as_str() {
+                    Some("closed") | Some("would-close") => cleanup_ids.push(id.to_string()),
+                    _ => {
+                        if views
+                            .iter()
+                            .find(|v| v.issue.front.id == id)
+                            .is_some_and(|v| !start::open_worktrees(&v.issue.front).is_empty())
+                        {
+                            cleanup_deferred.push(id.to_string());
+                        }
+                    }
+                }
+            }
+            eprintln!(
+                "reconcile: cleanup pass over {} safe issue(s); {} deferred",
+                cleanup_ids.len(),
+                cleanup_deferred.len()
+            );
+            if cleanup_ids.is_empty() {
+                Some(json!({"rows": [], "refused": 0, "dry_run": dry_run}))
+            } else {
+                Some(finish::sweep_selected(
+                    pm,
+                    &cleanup_ids.iter().map(String::as_str).collect::<Vec<_>>(),
+                    false,
+                    dry_run,
+                    actor,
+                    d,
+                )?)
+            }
+        }
         Some(d) => Some(finish::sweep(pm, project, false, dry_run, actor, d)?),
         None => None,
     };
+    let finish_refused = finish
+        .as_ref()
+        .and_then(|f| f["refused"].as_u64())
+        .unwrap_or(0);
 
     Ok(json!({
         "dry_run": dry_run,
         "project": project,
+        "scope": selected,
         "classified": classified,
+        "deferred": deferred,
+        "cleanup_deferred": cleanup_deferred,
         "cursor": last_classified,
         "history": history_state,
         "rows": rows,
@@ -829,6 +1047,11 @@ fn run_inner_with(
         "stalled": stalled,
         "errors": errors,
         "finish": finish,
+        "finish_refused": finish_refused,
+        "partial": !deferred.is_empty()
+            || !cleanup_deferred.is_empty()
+            || !errors.is_empty()
+            || finish_refused > 0,
     }))
 }
 

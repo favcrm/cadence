@@ -2515,6 +2515,20 @@ pub fn sweep(
     state_dir: &Path,
 ) -> Result<Value> {
     let issues = board::load_all(&pm.dir, project)?;
+    sweep_issues(pm, issues, remote, dry_run, actor, state_dir, project)
+}
+
+/// The sweep over an already-loaded issue set — shared by `sweep`
+/// (every issue in scope) and `sweep_selected` (named issues only).
+fn sweep_issues(
+    pm: &Pm,
+    issues: Vec<board::Issue>,
+    remote: bool,
+    dry_run: bool,
+    actor: &str,
+    state_dir: &Path,
+    project: Option<&str>,
+) -> Result<Value> {
     // One enumeration for the whole sweep — the task→worktree map
     // answers for every row instead of re-issuing `agent_list` +
     // `task_show`×N per issue (and twice per issue on a real sweep).
@@ -2543,6 +2557,26 @@ pub fn sweep(
         "dry_run": dry_run,
         "project": project,
     }))
+}
+
+/// `sweep` over only the named issues — the cleanup half of a
+/// targeted `issue reconcile --issue` (CAD-1377): each row runs the
+/// same resolve + guard as the project sweep and nothing outside
+/// `ids` is resolved, probed or touched. An unknown id refuses
+/// before any probe.
+pub(crate) fn sweep_selected(
+    pm: &Pm,
+    ids: &[&str],
+    remote: bool,
+    dry_run: bool,
+    actor: &str,
+    state_dir: &Path,
+) -> Result<Value> {
+    let mut issues = Vec::with_capacity(ids.len());
+    for id in ids {
+        issues.push(board::find_issue(&pm.dir, id)?);
+    }
+    sweep_issues(pm, issues, remote, dry_run, actor, state_dir, None)
 }
 
 #[cfg(test)]
