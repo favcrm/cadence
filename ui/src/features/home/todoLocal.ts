@@ -43,7 +43,7 @@ const scope = (need: HomeNeed, visit: number) => `${needFingerprint(need)}|visit
 const mark = (m: ReadonlyMap<string, string>, need: HomeNeed, fp = needFingerprint(need)) => new Map(m).set(need.key, fp);
 const unmark = (m: ReadonlyMap<string, string>, need: HomeNeed) => {
   const next = new Map(m);
-  next.delete(need.key);
+  if (next.get(need.key) === needFingerprint(need)) next.delete(need.key);
   return next;
 };
 
