@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import stat
 import sys
+import tempfile
 import zipfile
 
 MAX_INPUT = 20 * 1024 * 1024
@@ -27,37 +30,113 @@ def refuse(message: str) -> None:
     raise Refusal(f"Input refused: {message}")
 
 
-def digest(path: Path) -> str:
+def stat_signature(info: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def descriptor_digest(descriptor: int) -> str:
     value = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(CHUNK), b""):
-            value.update(block)
-    return value.hexdigest()
+    offset = 0
+    while True:
+        block = os.pread(descriptor, CHUNK, offset)
+        if not block:
+            return value.hexdigest()
+        value.update(block)
+        offset += len(block)
 
 
-def check_source(path: Path) -> Path:
+@contextmanager
+def source_snapshot(path: Path):
     unresolved = path.expanduser().absolute()
-    if unresolved.is_symlink():
-        refuse("source must not be a symbolic link")
-    try:
-        source = unresolved.resolve(strict=True)
-    except (OSError, RuntimeError) as exc:
-        refuse(f"cannot resolve source ({exc})")
-    if not source.is_file():
-        refuse("source must be a regular, non-symlink file")
-    if source.stat().st_size > MAX_INPUT:
-        refuse(f"input exceeds {MAX_INPUT // (1024 * 1024)} MiB limit")
-    if source.suffix.lower() not in {".pdf", ".docx", ".xlsx", ".docm", ".xlsm", ".pptm"}:
+    if unresolved.is_symlink() or any(parent.is_symlink() for parent in unresolved.parents):
+        refuse("source path must not contain symbolic links")
+    source_name = unresolved.name
+    suffix = unresolved.suffix.lower()
+    if suffix not in {".pdf", ".docx", ".xlsx", ".docm", ".xlsm", ".pptm"}:
         refuse("unsupported format; supported extensions are .pdf, .docx and .xlsx")
-    if source.suffix.lower() in {".docm", ".xlsm", ".pptm"}:
-        if source.suffix.lower() in {".docm", ".xlsm"}:
-            package = zip_members(source)
-            content_types = package.read("[Content_Types].xml").decode("utf-8", "replace").lower()
-            package.close()
-            if "macroenabled" in content_types or "vbaproject" in content_types:
-                refuse("macro-enabled Office file is unsupported")
+    if suffix in {".docm", ".xlsm", ".pptm"}:
         refuse("unsupported macro-enabled Office extension")
-    return source
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "pread"):
+        refuse("safe no-follow source snapshot is unavailable on this platform")
+    try:
+        source_path = unresolved.resolve(strict=True)
+        source_fd = os.open(source_path, os.O_RDONLY | os.O_NOFOLLOW)
+    except (OSError, RuntimeError) as exc:
+        refuse(f"cannot open source without following links ({exc})")
+    temporary = None
+    try:
+        temporary = tempfile.TemporaryDirectory(prefix="business-intake-", dir="/tmp")
+        before = os.fstat(source_fd)
+        if not stat.S_ISREG(before.st_mode):
+            refuse("source must be a regular file")
+        if before.st_size > MAX_INPUT:
+            refuse(f"input exceeds {MAX_INPUT // (1024 * 1024)} MiB limit")
+        try:
+            path_stat = os.stat(unresolved, follow_symlinks=False)
+        except OSError as exc:
+            refuse(f"source path changed while opening ({exc})")
+        if stat_signature(path_stat) != stat_signature(before):
+            refuse("source path was replaced while opening")
+
+        snapshot_path = Path(temporary.name) / f"input{suffix}"
+        snapshot_fd = os.open(snapshot_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        source_hash = hashlib.sha256()
+        byte_count = 0
+        try:
+            with os.fdopen(snapshot_fd, "wb") as snapshot_file:
+                while True:
+                    block = os.read(source_fd, CHUNK)
+                    if not block:
+                        break
+                    byte_count += len(block)
+                    if byte_count > MAX_INPUT:
+                        refuse(f"input exceeds {MAX_INPUT // (1024 * 1024)} MiB limit")
+                    source_hash.update(block)
+                    snapshot_file.write(block)
+                snapshot_file.flush()
+                os.fsync(snapshot_file.fileno())
+        except BaseException:
+            snapshot_path.unlink(missing_ok=True)
+            raise
+
+        after = os.fstat(source_fd)
+        snapshot_hash = source_hash.hexdigest()
+        try:
+            path_after = os.stat(unresolved, follow_symlinks=False)
+        except OSError as exc:
+            refuse(f"source path changed during snapshot ({exc})")
+        if (stat_signature(before) != stat_signature(after)
+                or stat_signature(after) != stat_signature(path_after)
+                or byte_count != after.st_size
+                or descriptor_digest(source_fd) != snapshot_hash):
+            refuse("source changed or was replaced while snapshotting")
+        snapshot_path.chmod(0o400)
+        state = {
+            "path": unresolved,
+            "resolved": source_path,
+            "filename": source_name,
+            "snapshot": snapshot_path,
+            "sha256": snapshot_hash,
+            "fd": source_fd,
+            "signature": stat_signature(after),
+        }
+        yield state
+    finally:
+        os.close(source_fd)
+        if temporary is not None:
+            temporary.cleanup()
+
+
+def verify_source_snapshot(snapshot: dict) -> None:
+    try:
+        descriptor_stat = os.fstat(snapshot["fd"])
+        path_stat = os.stat(snapshot["path"], follow_symlinks=False)
+    except OSError as exc:
+        refuse(f"source changed or was replaced during extraction ({exc})")
+    if (stat_signature(descriptor_stat) != snapshot["signature"]
+            or stat_signature(path_stat) != snapshot["signature"]
+            or descriptor_digest(snapshot["fd"]) != snapshot["sha256"]):
+        refuse("source changed or was replaced during extraction")
 
 
 def zip_members(source: Path) -> zipfile.ZipFile:
@@ -478,63 +557,69 @@ def create_output_file(directory_fd: int, name: str, payload: bytes | None = Non
     return fd
 
 
+def process_snapshot(snapshot: dict, output_dir: Path) -> None:
+    source = snapshot["resolved"]
+    snapshot_path = snapshot["snapshot"]
+    source_name = snapshot["filename"]
+    output = safe_output_dir(output_dir, source)
+    if snapshot_path.suffix == ".pdf":
+        extracted = extract_pdf(snapshot_path)
+    elif snapshot_path.suffix == ".docx":
+        extracted = extract_docx(snapshot_path)
+    else:
+        extracted = extract_xlsx(snapshot_path)
+    verify_source_snapshot(snapshot)
+
+    original_name = "source" + snapshot_path.suffix
+    provenance_name = f"{Path(source_name).stem}.provenance.json"
+    original = output / original_name
+    provenance = output / provenance_name
+    out_fd = os.open(output, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+    created: list[str] = []
+    try:
+        original_fd = create_output_file(out_fd, original_name)
+        created.append(original_name)
+        preserved_hash = hashlib.sha256()
+        with snapshot_path.open("rb") as incoming, os.fdopen(original_fd, "wb") as copied:
+            for block in iter(lambda: incoming.read(CHUNK), b""):
+                preserved_hash.update(block)
+                copied.write(block)
+            copied.flush()
+            os.fsync(copied.fileno())
+        if preserved_hash.hexdigest() != snapshot["sha256"]:
+            refuse("private source snapshot changed before preservation")
+        verify_source_snapshot(snapshot)
+        record = {
+            "source": {"filename": source_name, "sha256": snapshot["sha256"], "preserved_as": original.name},
+            "extractor": {"name": "business-document-intake", "version": "1.0", "python": sys.version.split()[0], "parser": parser_identity(extracted["format"])},
+            "evidence": extracted,
+        }
+        payload = (json.dumps(record, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        verify_source_snapshot(snapshot)
+        provenance_fd = create_output_file(out_fd, provenance_name, payload)
+        os.close(provenance_fd)
+        created.append(provenance_name)
+        verify_source_snapshot(snapshot)
+    except BaseException:
+        for name in created:
+            try:
+                os.unlink(name, dir_fd=out_fd)
+            except FileNotFoundError:
+                pass
+        raise
+    finally:
+        os.close(out_fd)
+    print(f"Extracted {source_name}; preserved original as {original}; provenance: {provenance}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     args = parser.parse_args()
     try:
-        source = check_source(args.source)
-        output = safe_output_dir(args.output_dir, source)
-        if source.suffix.lower() == ".pdf":
-            extracted = extract_pdf(source)
-        elif source.suffix.lower() == ".docx":
-            extracted = extract_docx(source)
-        else:
-            extracted = extract_xlsx(source)
-        base = source.stem
-        original_name = "source" + source.suffix.lower()
-        provenance_name = f"{base}.provenance.json"
-        original = output / original_name
-        provenance = output / provenance_name
-        out_fd = os.open(output, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
-        created: list[str] = []
-        try:
-            input_fd = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-            before = os.fstat(input_fd)
-            if not os.path.isfile(source) or before.st_size > MAX_INPUT:
-                refuse("source changed or exceeded its input bound during extraction")
-            source_hash = hashlib.sha256()
-            original_fd = create_output_file(out_fd, original_name)
-            created.append(original_name)
-            with os.fdopen(input_fd, "rb") as incoming, os.fdopen(original_fd, "wb") as copied:
-                for block in iter(lambda: incoming.read(CHUNK), b""):
-                    source_hash.update(block)
-                    copied.write(block)
-                copied.flush()
-                os.fsync(copied.fileno())
-            after = source.stat()
-            if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns or source_hash.hexdigest() != digest(source):
-                refuse("source changed while it was being processed")
-            record = {
-                "source": {"filename": source.name, "sha256": source_hash.hexdigest(), "preserved_as": original.name},
-                "extractor": {"name": "business-document-intake", "version": "1.0", "python": sys.version.split()[0], "parser": parser_identity(extracted["format"])},
-                "evidence": extracted,
-            }
-            payload = (json.dumps(record, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-            provenance_fd = create_output_file(out_fd, provenance_name, payload)
-            os.close(provenance_fd)
-            created.append(provenance_name)
-        except BaseException:
-            for name in created:
-                try:
-                    os.unlink(name, dir_fd=out_fd)
-                except FileNotFoundError:
-                    pass
-            raise
-        finally:
-            os.close(out_fd)
-        print(f"Extracted {source.name}; preserved original as {original}; provenance: {provenance}")
+        with source_snapshot(args.source) as snapshot:
+            process_snapshot(snapshot, args.output_dir)
         return 0
     except Refusal as exc:
         print(str(exc), file=sys.stderr)
