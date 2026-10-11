@@ -83,7 +83,9 @@ fn kickoff_body(
     format!(
         "read {} — {issue}: {title}. Your worktree exists: {} (branch \
          {branch}, base {sha7}). Commit trailer: Issue: {issue}. PR to \
-         main; reply to {reply_to}.{report}",
+         main; reply to {reply_to}. Company questions: read the \
+         \"Business knowledge\" section of \
+         $HOME/.agents/skills/cadence/SKILL.md.{report}",
         note.display(),
         wt_dir.display()
     )
@@ -1334,6 +1336,37 @@ mod tests {
         assert!(body.contains("s…. Your worktree exists"), "{body}");
         assert!(
             body.ends_with(&format!(" Acceptance: 1) [ ] \"{}\".", "y".repeat(200))),
+            "{body}"
+        );
+    }
+
+    /// CAD-1373: the business-knowledge pointer rides the plain kickoff.
+    /// It is short, the ceiling fit still cuts prose first, and the
+    /// acceptance tail survives a near-limit title.
+    #[test]
+    fn plain_kickoff_points_company_questions_at_the_skill_and_keeps_acceptance() {
+        let items = vec![AcceptanceItem {
+            text: "z".repeat(150),
+            checked: false,
+        }];
+        let body = plain_kickoff(
+            "D-2",
+            &"t".repeat(3800),
+            Path::new("/tmp/note.md"),
+            Path::new("/r/.cadence/wt/d-2-title"),
+            "cadence/d-2-title",
+            "0123456789abcdef",
+            "pm",
+            &items,
+            "devin",
+            "pty",
+        )
+        .unwrap();
+        check_body(&body, "fake").unwrap();
+        assert!(body.len() <= pty::MAX_BODY, "{} bytes", body.len());
+        assert!(body.contains("Business knowledge"), "{body}");
+        assert!(
+            body.ends_with(&format!(" Acceptance: 1) [ ] \"{}\".", "z".repeat(150))),
             "{body}"
         );
     }
