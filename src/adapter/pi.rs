@@ -266,8 +266,8 @@ fn pi_command(env: &ProviderEnv) -> Vec<String> {
 }
 
 /// What [`resolve_pi_launch_command`] reports for the program the
-/// adapter would exec: `Ok(path)` is the resolved executable (or the
-/// verbatim override when it carries a `/`), `Err(reason)` is the
+/// adapter would exec: `Ok(path)` is the absolute resolved executable,
+/// `Err(reason)` is the
 /// clear "not found" line the daemon start log and `doctor --host`
 /// both surface (CAD-1247).
 pub(crate) fn resolve_pi_launch_command(
@@ -280,8 +280,10 @@ pub(crate) fn resolve_pi_launch_command(
         .unwrap_or_else(|| "pi".to_string());
     let path_display = path.unwrap_or_default();
     if !program.contains('/') {
-        return crate::master::which(&program, path)
-            .ok_or_else(|| format!("command '{program}' not found on PATH ({path_display})"));
+        let resolved = crate::master::which(&program, path)
+            .ok_or_else(|| format!("command '{program}' not found on PATH ({path_display})"))?;
+        return std::path::absolute(&resolved)
+            .map_err(|e| format!("cannot resolve command '{program}' to an absolute path: {e}"));
     }
     let candidate = PathBuf::from(&program);
     let executable = std::fs::metadata(&candidate).ok().is_some_and(|m| {
@@ -289,7 +291,8 @@ pub(crate) fn resolve_pi_launch_command(
         m.is_file() && m.permissions().mode() & 0o111 != 0
     });
     if executable {
-        Ok(candidate)
+        std::path::absolute(&candidate)
+            .map_err(|e| format!("cannot resolve command '{program}' to an absolute path: {e}"))
     } else {
         Err(format!("command '{program}' is not executable"))
     }
@@ -3091,6 +3094,20 @@ mod cad1247_tests {
             resolve_pi_launch_command(&env, Some(&path)).as_deref().ok(),
             Some(pi.as_path())
         );
+        let relative_dir = tempfile::Builder::new()
+            .prefix(".cad1247-resolution-")
+            .tempdir_in(".")
+            .unwrap();
+        let relative_pi = relative_dir.path().join("pi");
+        std::fs::copy(&pi, &relative_pi).unwrap();
+        let relative_path = relative_dir.path().to_str().unwrap();
+        assert!(resolve_pi_launch_command(&env, Some(relative_path))
+            .unwrap()
+            .is_absolute());
+        env.set("CADENCE_PI_COMMAND", relative_pi.to_str().unwrap());
+        assert!(resolve_pi_launch_command(&env, Some(&path))
+            .unwrap()
+            .is_absolute());
         env.set("CADENCE_PI_COMMAND", "/missing/pi --flag");
         assert!(resolve_pi_launch_command(&env, Some(&path)).is_err());
         env.set("CADENCE_PI_COMMAND", "/bin/true --flag");

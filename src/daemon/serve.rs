@@ -827,6 +827,8 @@ fn warn_unresolved_provider_commands(state_dir: &Path, env: &ProviderEnv) {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let record = json!({
+        "pid": std::process::id(),
+        "starttime": crate::peer::proc_starttime(std::process::id()),
         "pi": {
             "resolved": outcome.as_ref().ok(),
             "reason": outcome.as_ref().err().cloned(),
