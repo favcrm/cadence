@@ -225,6 +225,10 @@ button.wa-post-card:hover {
   flex-direction: column;
   gap: 1rem;
 }
+.app-shell-outlet > .wa-screen-skeleton {
+  flex: 1 1 0%;
+  min-height: 0;
+}
 .wa-skeleton,
 .wa-skeleton * {
   pointer-events: none;
