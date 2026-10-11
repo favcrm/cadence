@@ -85,11 +85,18 @@ A classifier read from the **base revision** selects cheap PR feedback:
 | --- | --- | --- |
 | Isolated documentation guides | None; document/contracts checks still run | All current real gates |
 | Isolated UI source/assets | Frontend checks + embedded-UI build; no unrelated default Rust gates | All current real gates |
+| Edits to pre-existing independent top-level `tests/<name>.rs` only | fmt/clippy/build gates plus nextest on exactly those targets, still with lib and bins suites and zero-target guards | All current real gates |
 | Rust logic | All feature/build/test gates; embedded feature can depend on Rust | All current real gates |
 | Workflow, scripts, dependencies, governance, mixed/unknown changes | All gates | All current real gates |
 
 Deletions, renames, symlinks, bad SHAs, absent classifier or failed lookup
 fall back to full validation. PR code cannot supply its own selection policy.
+The tests scope narrows only when every changed file is a pre-existing
+top-level `tests/<name>.rs` modified in place, the base manifest has no
+explicit `[[test]]`/`autotests = false`, no `tests/<dir>/main.rs` cargo
+target exists at base, and no other tracked base `.rs` source references
+the file's name or path. `tests/fixtures/*.rs` helpers, new or deleted
+test files, mixed diffs and non-PR events never narrow.
 Required contexts explicitly report not-applicable commands, never 'built' or
 'passed tests' when they did not execute. Merge groups do not take the fast
 path: this keeps final integration coverage even when docs are read indirectly

@@ -7,12 +7,16 @@ check compiles and runs four `safety_floor` tests; green means that floor
 passed, **not** full behavior coverage. `fmt`, `clippy`, `build` and `ui`
 remain required on PRs and merge groups. CAD-1088 selects PR feedback from a
 classifier loaded from the base commit: isolated docs use no compilation;
-isolated UI code runs UI validation but not unrelated default Rust gates.
+isolated UI code runs UI validation but not unrelated default Rust gates;
+edits confined to pre-existing independent top-level `tests/<name>.rs`
+targets run the rust gates with only those integration targets (lib and
+bins suites unchanged).
 Required contexts explicitly report not-applicable commands rather than
 claiming to build. Governance, workflow, scripts, dependency manifests, mixed
 or unknown changes run all gates. Merge groups always run the full current
-validation (including the reduced floor); fast PR feedback is not evidence
-for skipping integration validation. `scripts/require-full-gates` refuses
+validation (including the reduced floor); the narrowed `tests` scope is
+pull_request feedback only and the runner refuses it on any other event.
+Fast PR feedback is not evidence for skipping integration validation. `scripts/require-full-gates` refuses
 release artifacts, candidate staging and promotion from any source SHA that
 commits `.github/reduced-gates`. CAD-1102 ended the CAD-1073 window by
 re-declaring the current gate as permanent, and removed the marker; a future

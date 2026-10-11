@@ -146,6 +146,8 @@ jobs:
       rust: ${{ steps.scope.outputs.rust }}
       ui: ${{ steps.scope.outputs.ui }}
       scope: ${{ steps.scope.outputs.scope }}
+      tests: ${{ steps.scope.outputs.tests }}
+      targets: ${{ steps.scope.outputs.targets }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         if: github.event_name == 'pull_request'
@@ -162,21 +164,31 @@ jobs:
           rust=true
           ui=true
           scope=full
+          tests=true
+          targets='[]'
           policy="$RUNNER_TEMP/ci-change-scope.py"
           result="$RUNNER_TEMP/ci-change-scope.json"
           if [ "$EVENT" = pull_request ] && git show "$BASE:scripts/ci-change-scope.py" >"$policy"; then
             if python3 -I "$policy" --repo "$GITHUB_WORKSPACE" --base "$BASE" --head "$HEAD" --event "$EVENT" >"$result"; then
-              if jq -e '(.scope == "docs" and .rust == "false" and .ui == "false") or (.scope == "ui" and .rust == "false" and .ui == "true") or (.scope == "full" and .rust == "true" and .ui == "true")' "$result" >/dev/null; then
+              # The tests scope is emitted only by a base classifier that
+              # knows the new fields; legacy docs/ui records still apply.
+              if jq -e '(.scope == "docs" and .rust == "false" and .ui == "false" and (.tests // "false") == "false") or (.scope == "ui" and .rust == "false" and .ui == "true" and (.tests // "false") == "false") or (.scope == "tests" and .rust == "true" and .ui == "false" and .tests == "true" and (.targets | type == "array") and (.targets | length) > 0 and (.targets | all(type == "string" and test("^[A-Za-z0-9_]+$")))) or (.scope == "full" and .rust == "true" and .ui == "true")' "$result" >/dev/null; then
                 rust=$(jq -r .rust "$result")
                 ui=$(jq -r .ui "$result")
                 scope=$(jq -r .scope "$result")
+                tests=$(jq -r .tests "$result")
+                if [ "$scope" = tests ]; then
+                  targets=$(jq -c .targets "$result")
+                fi
               fi
             fi
           fi
           echo "rust=$rust" >> "$GITHUB_OUTPUT"
           echo "ui=$ui" >> "$GITHUB_OUTPUT"
           echo "scope=$scope" >> "$GITHUB_OUTPUT"
-          echo "PR feedback scope: $scope; rust=$rust; ui=$ui. Merge queue always runs full integration validation." >> "$GITHUB_STEP_SUMMARY"
+          echo "tests=$tests" >> "$GITHUB_OUTPUT"
+          echo "targets=$targets" >> "$GITHUB_OUTPUT"
+          echo "PR feedback scope: $scope; rust=$rust; ui=$ui; tests=$tests; targets=$targets. Merge queue always runs full integration validation." >> "$GITHUB_STEP_SUMMARY"
 
   fmt:
     needs: [queue-evidence, change-scope]
@@ -213,6 +225,7 @@ jobs:
       - run: python3 scripts/test_pre_push_plan.py
       - run: python3 scripts/test_workflow_cleanup.py
       - run: python3 scripts/test_ci_change_scope.py
+      - run: python3 scripts/acceptance/test-cad-1370-feedback-contract.py
       - run: python3 scripts/test_ci_fast_linker.py
       - run: python3 scripts/test_release_reuse.py
       - run: python3 -m unittest scripts/test_enqueue_human_paths.py
@@ -287,6 +300,8 @@ jobs:
         env:
           CARGO_BUILD_JOBS: 4
           CADENCE_SUITE_LOCK: ${{ runner.temp }}/cadence-suite.lock
+          SCOPE: ${{ needs.change-scope.outputs.scope }}
+          TARGETS: ${{ needs.change-scope.outputs.targets }}
         run: |
           # cadence-agent-exec protected_mechanics high-fd custody seats fd
           # 70000 and fails closed unless the hard RLIMIT_NOFILE exceeds it.
@@ -295,7 +310,27 @@ jobs:
           sudo prlimit --pid $$ --nofile=1048576:1048576
           ulimit -n 1048576
           echo "RLIMIT_NOFILE hard=$(ulimit -Hn) soft=$(ulimit -n)"
-          scripts/run-result-tests
+          # CAD-1370: narrowed integration feedback only on pull_request,
+          # only when the trusted-base classifier emitted a valid tests
+          # scope, and only as a re-validated one-identifier-per-line file
+          # handed to the same run-result-tests runner — never an ambient
+          # env, a shell-joined string, or a PR-provided path. The lib and
+          # bins suites and every zero-target guard are unchanged.
+          selection=
+          if [ "${GITHUB_EVENT_NAME:-}" = pull_request ] && [ "$SCOPE" = tests ]; then
+            selection="$RUNNER_TEMP/ci-test-selection"
+            printf '%s' "$TARGETS" | jq -e 'type == "array" and length > 0 and all(.[]; type == "string" and test("^[A-Za-z0-9_]+$"))' > /dev/null
+            printf '%s' "$TARGETS" | jq -r '.[]' > "$selection"
+            test -s "$selection"
+            if grep -qvE '^[A-Za-z0-9_]+$' "$selection"; then
+              echo "::error::test selection carries a non-identifier line" >&2
+              exit 1
+            fi
+            echo "Running narrowed integration selection: $(tr '\n' ' ' < "$selection")"
+            scripts/run-result-tests --test-selection "$selection"
+          else
+            scripts/run-result-tests
+          fi
 
   build:
     needs: [queue-evidence, change-scope]

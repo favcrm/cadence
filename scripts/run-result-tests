@@ -19,17 +19,39 @@
 #  - test processes run with PATH limited to the cargo toolchain dir and the
 #    system dirs. `doctor::run` probes provider CLIs with --version, and a
 #    host CLI writes under HOME and makes the result depend on the host.
+#  - CAD-1370: --test-selection FILE narrows ONLY the integration targets
+#    (the lib and bins suites and every guard below always run). FILE is
+#    one target identifier [A-Za-z0-9_]+ per line, nonempty and distinct,
+#    and every line must be a member of the full result-test-args
+#    inventory of THIS checkout — the workflow writes it from the
+#    trusted-base classifier, and ambient scope env is never read. The
+#    flag is honored only when GITHUB_EVENT_NAME is exactly pull_request;
+#    any other event, a missing/empty file, an unknown or duplicate
+#    identifier refuses the run rather than narrowing or silently passing.
 set -euo pipefail
 caller_cwd=$PWD
 real_home=${HOME:-}
 original_xdg_data=${XDG_DATA_HOME:-$real_home/.local/share}
 manifest_path=
-if [ "$#" -gt 0 ]; then
-  if [ "$#" -ne 2 ] || [ "$1" != "--manifest-path" ]; then
-    echo "usage: $0 [--manifest-path CARGO_TOML]" >&2
-    exit 2
-  fi
-  manifest_path=$2
+selection_file=
+while [ "$#" -gt 0 ]; do
+  case $1 in
+    --manifest-path|--test-selection)
+      if [ "$#" -lt 2 ]; then
+        echo "usage: $0 [--manifest-path CARGO_TOML] [--test-selection FILE]" >&2
+        exit 2
+      fi
+      case $1 in
+        --manifest-path) manifest_path=$2 ;;
+        --test-selection) selection_file=$2 ;;
+      esac
+      shift 2 ;;
+    *)
+      echo "usage: $0 [--manifest-path CARGO_TOML] [--test-selection FILE]" >&2
+      exit 2 ;;
+  esac
+done
+if [ -n "$manifest_path" ]; then
   case $manifest_path in
     /*) ;;
     *) manifest_path=$caller_cwd/$manifest_path ;;
@@ -37,6 +59,25 @@ if [ "$#" -gt 0 ]; then
   if [ ! -f "$manifest_path" ]; then
     echo "::error::manifest does not exist: $manifest_path" >&2
     exit 2
+  fi
+fi
+if [ -n "$selection_file" ]; then
+  case $selection_file in
+    /*) ;;
+    *) selection_file=$caller_cwd/$selection_file ;;
+  esac
+  # Refuse ineligible requests before metadata, tool installation or builds.
+  if [ "${GITHUB_EVENT_NAME:-}" != "pull_request" ]; then
+    echo "::error::--test-selection is pull_request feedback only; refusing on event '${GITHUB_EVENT_NAME:-unset}'" >&2
+    exit 1
+  fi
+  if [ ! -f "$selection_file" ]; then
+    echo "::error::test selection file does not exist: $selection_file" >&2
+    exit 1
+  fi
+  if [ ! -s "$selection_file" ]; then
+    echo "::error::test selection file selected no targets" >&2
+    exit 1
   fi
 fi
 # CAD-1197: allowlist of CADENCE_* variables that may reach cargo.
@@ -116,6 +157,47 @@ done
 if [ "${#integration_targets[@]}" -eq 0 ]; then
   echo "::error::result-test-args selected no integration targets" >&2
   exit 1
+fi
+# CAD-1370: a narrowed integration selection is honored only for a real
+# pull_request event and only when every requested identifier is a
+# nonempty distinct member of THIS checkout's full inventory (validated
+# above, untrusted by callers). The lib/bins suites and the JUnit
+# zero-target guards still run; failure, a missing file, or a selection
+# that resolves to zero targets refuses rather than narrowing.
+if [ -n "$selection_file" ]; then
+  selected=()
+  while IFS= read -r line || [ -n "$line" ]; do
+    case $line in
+      "") continue ;; # tolerate trailing blank lines only
+      *[!A-Za-z0-9_]*)
+        echo "::error::test selection line is not an identifier: $line" >&2
+        exit 1 ;;
+    esac
+    match=0
+    for full in "${integration_targets[@]}"; do
+      if [ "$full" = "$line" ]; then match=1; break; fi
+    done
+    if [ "$match" -ne 1 ]; then
+      echo "::error::test selection names a target outside this checkout's inventory: $line" >&2
+      exit 1
+    fi
+    for seen in ${selected[@]+"${selected[@]}"}; do
+      if [ "$seen" = "$line" ]; then
+        echo "::error::test selection repeats a target: $line" >&2
+        exit 1
+      fi
+    done
+    selected+=("$line")
+  done < "$selection_file"
+  if [ "${#selected[@]}" -eq 0 ]; then
+    echo "::error::test selection file selected no targets" >&2
+    exit 1
+  fi
+  target_args=()
+  integration_targets=("${selected[@]}")
+  for name in "${selected[@]}"; do
+    target_args+=(--test "$name")
+  done
 fi
 manifest_args=()
 if [ -n "$manifest_path" ]; then
