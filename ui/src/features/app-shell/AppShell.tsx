@@ -3,6 +3,7 @@ import { navigate, useHref } from "../../lib/useLocation";
 import { ApiError } from "../../lib/api";
 import Button from "../../ui/Button";
 import Link from "../../ui/Link";
+import { ErrorNotice, Loading, Notice } from "./shared/States";
 import type { Viewer } from "../projects/work";
 import { dropWorkspaceAppSnapshot, readWorkspaceAppSnapshot, workspaceApps, type AppContext, type Installation } from "../workspace-apps/workspaceApps";
 import { WorkspaceAppCachedPreview } from "../workspace-apps/WorkspaceApp";
@@ -167,6 +168,8 @@ export default function AppShell({
   const [loadFailure, setLoadFailure] = useState<{ key: string; message: string } | null>(null);
   const [requestLoading, setRequestLoading] = useState(true);
   const [completedReceiptKey, setCompletedReceiptKey] = useState<string | null>(null);
+  const [generalSetup, setGeneralSetup] = useState<{ key: string; error: string | null } | null>(null);
+  const [generalSetupAttempt, setGeneralSetupAttempt] = useState(0);
   const [contextId, setContextId] = useState("");
   const [linkNotice, setLinkNotice] = useState<string | null>(null);
   // Social-content's picker owns its selection; the shell observes it
@@ -199,6 +202,7 @@ export default function AppShell({
     };
   }
   const receiptKey = JSON.stringify([readInputKey, readVersionRef.current.version]);
+  const setupScopeKey = JSON.stringify([receiptKey, query.get("ctx")]);
   const currentReceiptKeyRef = useRef(receiptKey);
   currentReceiptKeyRef.current = receiptKey;
   const currentReadComplete = completedReceiptKey === receiptKey;
@@ -355,39 +359,6 @@ export default function AppShell({
         if (!isCurrent()) return;
         setInstallation(next);
         setContexts(nextContexts);
-        // CAD-1174: a CRM installation without a scope is unusable — the
-        // record lists, the segments and the email sender all need one,
-        // and asking the operator to invent a scope is the friction this
-        // removes. Create the single `General` scope on first load;
-        // `request_id` is stable, so a second load or a race resolves to
-        // the same row instead of minting another. Apps that run without
-        // a brand context by design (Social) are untouched.
-        if (next.name === "crm" && !nextContexts.some((value) => value.state === "active")) {
-          workspaceApps
-            .createContext(installId, {
-              label: "General",
-              input_defaults: {},
-              request_id: `general-${installId}`,
-            })
-            .then((created) => {
-              // A conforming daemon always answers with the row (a refusal
-              // rejects); anything else — a method-blind mock, a proxy
-              // error page parsed as JSON — must never reach the render's
-              // `value.state` filter, so validate the shape, not just
-              // truthiness.
-              const row =
-                created && typeof created.id === "string" && typeof created.state === "string"
-                  ? created
-                  : null;
-              if (!controller.signal.aborted && row !== null) {
-                setContexts((previous) => [...previous, row]);
-              }
-            })
-            .catch(() => {
-              // The scope-entry notice below already tells the operator
-              // what to do; a failed default never blocks the app.
-            });
-        }
         setLoadFailure(null);
         setCompletedReceiptKey(receiptKey);
       })
@@ -411,6 +382,47 @@ export default function AppShell({
       controller.abort();
     };
   }, [installId, receiptKey, viewer.operator]);
+
+  // CRM's existing first-load General setup is retriable in place. The
+  // request identity is installation-stable; its result is adopted only
+  // while this verified receipt is still current.
+  useEffect(() => {
+    if (
+      !receiptReady ||
+      installation?.name !== "crm" ||
+      contexts.some((context) => context.state === "active") ||
+      viewer.operator !== true ||
+      viewer.readOnly
+    ) return;
+    let current = true;
+    const isCurrent = () => current && currentReceiptKeyRef.current === receiptKey;
+    setGeneralSetup({ key: setupScopeKey, error: null });
+    workspaceApps.createContext(installId, {
+      label: "General",
+      input_defaults: {},
+      request_id: `general-${installId}`,
+    }).then((created) => {
+      const row = created && typeof created.id === "string" && created.state === "active"
+        ? created
+        : null;
+      if (!isCurrent()) return;
+      if (row === null) {
+        setGeneralSetup({ key: setupScopeKey, error: "CRM setup did not return an active context. Retry setup or ask an administrator to review this installation." });
+        return;
+      }
+      setContexts((previous) => previous.some((context) => context.id === row.id) ? previous : [...previous, row]);
+      setGeneralSetup(null);
+    }).catch((error: unknown) => {
+      if (!isCurrent()) return;
+      setGeneralSetup({
+        key: setupScopeKey,
+        error: error instanceof Error
+          ? `CRM setup failed: ${error.message}`
+          : "CRM setup failed. Retry setup or ask an administrator to review this installation.",
+      });
+    });
+    return () => { current = false; };
+  }, [contexts, generalSetupAttempt, installation, installId, receiptKey, receiptReady, setupScopeKey, viewer.operator, viewer.readOnly]);
 
   // Board-level App menu identity: report the verified receipt (or
   // null while it is loading, failed, or belongs to another install)
@@ -470,6 +482,9 @@ export default function AppShell({
     [contexts, receiptReady],
   );
   const activeIds = useMemo(() => activeContexts.map((c) => c.id), [activeContexts]);
+  const crmNeedsSetup = receiptReady && installation?.name === "crm" && activeIds.length === 0;
+  const generalSetupError = generalSetup?.key === setupScopeKey ? generalSetup.error : null;
+  const canRetryGeneralSetup = viewer.operator === true && !viewer.readOnly;
 
   // Adopt the URL's context once contexts load, and on later external
   // URL changes (browser back). A linked context must be active here;
@@ -836,7 +851,24 @@ export default function AppShell({
             </main>
           )}
           {receiptReady && installation && (
-            <>
+            crmNeedsSetup ? (
+              generalSetupError !== null ? (
+                <ErrorNotice
+                  onRetry={canRetryGeneralSetup ? () => {
+                    setGeneralSetup({ key: setupScopeKey, error: null });
+                    setGeneralSetupAttempt((attempt) => attempt + 1);
+                  } : undefined}
+                >
+                  {generalSetupError}
+                </ErrorNotice>
+              ) : canRetryGeneralSetup ? (
+                <Loading>Setting up the General CRM context…</Loading>
+              ) : (
+                <Notice state="read-only">
+                  CRM setup is required before records can open. Setup is unavailable in this read-only view; ask an administrator to review the installation.
+                </Notice>
+              )
+            ) : <>
               {isSocial ? (
                 // The private-screen frame owns its own chrome — the
                 // shell shows no installId/version/context subtitle.
