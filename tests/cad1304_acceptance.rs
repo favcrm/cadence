@@ -801,6 +801,98 @@ fn image_publish_sends_only_the_approved_unchanged_bytes_under_one_bare_digest()
         assert!(fx.since(from).is_empty());
     }
 
+    // (b) Malformed retained bytes refused by the decode half of
+    // `image_mime` at draft attach — the guard the removed second
+    // `load_from_memory` duplicated. `app_social_draft_update` ->
+    // `verify_source` runs `image_mime` BEFORE the mime/size/digest check
+    // and has NO frozen-digest precheck, so this path isolates decode. The
+    // rewrite stores both the malformed bytes and their OWN matching
+    // `sha256:<hex>` digest (the store form), so `app_tool_asset_bytes`'
+    // custody digest check passes and the refusal can only be decode.
+    // The malformed PNG keeps the signature, IHDR dimensions and IEND but
+    // has one byte flipped mid-IDAT: `into_dimensions` parses it, only the
+    // bounded full decode rejects. Verified locally: dims_ok, decode fails.
+    let (draft_m, revision_m, asset_m) = fx.draft_with_image("malformed", &source);
+    // A small valid square PNG (under the 2 MiB custody bound, so
+    // `app_tool_asset_bytes` admits it and the size gate is not the
+    // refuser), then one byte flipped inside the first IDAT payload.
+    let mut bad = {
+        use image::ImageEncoder as _;
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut px = vec![0u8; 256 * 256 * 3];
+        for b in px.iter_mut() {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            *b = (seed >> 24) as u8;
+        }
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(&px, 256, 256, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        png
+    };
+    let idat = bad
+        .windows(4)
+        .position(|w| w == b"IDAT")
+        .expect("PNG has an IDAT chunk");
+    bad[idat + 4 + 8] ^= 0x40;
+    let bad_digest = format!("sha256:{}", hex(&bad));
+    // `app_tool_results` lives in the main store DB, not the per-install
+    // record file (cad1328 direct-record convention). The receipt's stored
+    // `result_digest` is recomputed over the asset meta, so the rewritten
+    // row stays self-consistent — the same write the store would make —
+    // and `app_tool_asset_bytes`' custody digest gate still passes.
+    let db = rusqlite::Connection::open(fx.dir().join("cadence.sqlite3")).unwrap();
+    let (req, alias, slot, bdig, idig, result): (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    ) = db
+        .query_row(
+            "SELECT request_id,alias,slot,binding_digest,input_digest,result FROM app_tool_results WHERE id=? AND install_id=?",
+            rusqlite::params![asset_m, fx.install],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        )
+        .unwrap();
+    let result_json: Value = serde_json::from_str(&result).unwrap();
+    let result_digest = cadence_agent::store::app_runs::material_digest(&json!({
+        "request_id": req, "install_id": fx.install, "alias": alias,
+        "slot": slot, "binding_digest": bdig, "input_digest": idig,
+        "result": result_json,
+        "asset": {"media_type": "image/png", "size": bad.len(), "digest": bad_digest},
+    }));
+    let changed = db
+        .execute(
+            "UPDATE app_tool_results SET asset=?, asset_type='image/png', asset_digest=?, result_digest=? WHERE id=? AND install_id=?",
+            rusqlite::params![bad, bad_digest, result_digest, asset_m, fx.install],
+        )
+        .unwrap();
+    assert_eq!(changed, 1, "the retained asset row");
+    drop(db);
+    let from = fx.mark();
+    let refused = fx
+        .screen(
+            "app_social_draft_update",
+            json!({"tool_alias": "social.draft", "request_id": "attach-malformed",
+                "draft_id": draft_m, "expected_revision": revision_m,
+                "caption": CAPTION, "asset_id": asset_m}),
+        )
+        .expect_err("(b) malformed retained image attached");
+    let refused = refused.to_string();
+    assert!(
+        refused.contains("cannot be decoded within custody limits"),
+        "(b) malformed retained bytes: {refused}"
+    );
+    assert!(
+        fx.since(from).is_empty(),
+        "(b) attach refusal reached the door: {:?}",
+        fx.since(from)
+    );
+
     // (b) The import receipt names other bytes than custody holds: the
     // import itself is the only send, never a preflight or publish.
     let (draft_l, revision_l, _) = fx.draft_with_image("lie", &source);
@@ -903,7 +995,8 @@ fn image_publish_sends_only_the_approved_unchanged_bytes_under_one_bare_digest()
     assert_eq!(fx.state(&id_e), "approved");
 
     // Only (a), the old-form (c) effect and the lying-receipt case (whose
-    // refusal can only follow the import) ever imported an image.
+    // refusal can only follow the import) ever imported an image; the
+    // malformed-custody refusal happens before any import.
     assert_eq!(
         fx.door.imports.lock().unwrap().len(),
         imports_after_a + 2,
