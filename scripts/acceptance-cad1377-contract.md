@@ -52,3 +52,22 @@ cadence issue reconcile --issue <ID> [--project <KEY>] [--dry-run] [--limit N] [
 CLI-only selection; no new RPC/HTTP/auth route; no 20 s negative-proof
 ceremony (guard deferral is proven by immediate file/branch survival,
 not by elapsed time).
+
+## Elevated CI fixture context
+
+The check needs the kernel's real proc visibility: on the hosted
+ubuntu-latest runner an unprivileged read of `2/ns/pid` fails EACCES
+and the unchanged completeness guard correctly refuses. On Linux with
+`GITHUB_ACTIONS=true` only, the outer test re-execs its own binary
+through `/usr/bin/sudo -n -- /usr/bin/env -i` with a fixed env
+(ISOLATED + ELEVATED markers, system PATH, the non-secret
+CADENCE_SUITE_LOCK path). The root child enters the existing isolated
+branch, allocates all private HOME/PM/state fixture dirs itself and
+cleans them via TempDir; the run prints euid + `self/ns/pid` +
+`2/ns/pid` link targets as proof evidence. Missing/denied sudo fails
+the check — there is no unprivileged fallback, no `sudo -E`, no
+shell, no credential or CADENCE identity forwarding, and the suite
+itself never runs elevated. Non-CI runs never elevate. This is a
+private-test fixture context only; no guard, daemon rule or
+production path changes, and CI success is confirmed only by an
+actual hosted run.

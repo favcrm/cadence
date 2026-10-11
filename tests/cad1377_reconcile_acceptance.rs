@@ -48,6 +48,7 @@ use tempfile::{Builder, TempDir};
 const BINARY: &str = env!("CARGO_BIN_EXE_cadence");
 const TEST: &str = "cad1377_targeted_reconcile_acceptance";
 const ISOLATED: &str = "CADENCE_CAD1377_ACCEPT_ISOLATED";
+const ELEVATED: &str = "CADENCE_CAD1377_ACCEPT_ELEVATED";
 const PROJECT: &str = "bound";
 const PREFIX: &str = "C77";
 const ACTOR: &str = "bound-author";
@@ -437,35 +438,94 @@ impl Drop for Holder {
     }
 }
 
+/// True only on a hosted GitHub Linux runner, where passwordless
+/// `sudo` is the supported way to give this check the kernel's real
+/// proc visibility (CAP_SYS_PTRACE reads kthreadd's ns link and every
+/// foreign cwd/fd; an unprivileged runner gets EACCES). A local or
+/// non-Linux run never elevates — including on the shared host.
+fn elevated_ci() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::env::var_os("GITHUB_ACTIONS").as_deref() == Some(std::ffi::OsStr::new("true"))
+            && unsafe { libc::geteuid() } != 0
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// Re-exec this exact test binary through the normal private-env
+/// isolation — the unprivileged path every non-CI run takes.
+fn run_isolated_child() -> Output {
+    let sandbox = Builder::new()
+        .prefix("c1377run-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let home = sandbox.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let mut cmd = Command::new(std::env::current_exe().unwrap());
+    cmd.args(["--exact", TEST, "--test-threads", "1", "--nocapture"])
+        .env(ISOLATED, "1")
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", sandbox.path().join("config"))
+        .env("XDG_DATA_HOME", sandbox.path().join("data"))
+        .env("XDG_STATE_HOME", sandbox.path().join("state"))
+        .env("XDG_CACHE_HOME", sandbox.path().join("cache"))
+        .env_remove("CADENCE_PM_DIR")
+        .env_remove("CADENCE_STATE_DIR")
+        .env_remove("CADENCE_ALIAS")
+        // The re-exec and every CLI it spawns must prove the real
+        // proc view — an inherited test-seam root is never valid
+        // evidence for this check.
+        .env_remove("CADENCE_TEST_PROC_ROOT")
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE");
+    cadence_agent::reaper::output(&mut cmd).unwrap()
+}
+
+/// CI-only bootstrap: re-exec this exact test binary as real root via
+/// `/usr/bin/sudo -n -- /usr/bin/env -i`. No shell, no `-E`, no
+/// inherited argv beyond the pinned env pairs. The scrubbed child
+/// enters the ISOLATED branch and allocates every private
+/// HOME/PM/state/fixture dir itself — nothing root-owned is created
+/// under runner-owned temp trees. `env -i` keeps credentials, SSH
+/// agent and CADENCE identity vars out; PATH is fixed to system tool
+/// dirs; the only suite variable carried through is the non-secret
+/// CADENCE_SUITE_LOCK path. A missing or refused `sudo -n` fails this
+/// check honestly — there is no unprivileged fallback that could
+/// pass. Elevation is a private-fixture context for this one check,
+/// never nextest or the suite itself. Portable: only `elevated_ci()`
+/// gates it to Linux.
+fn run_elevated() -> Output {
+    let mut cmd = Command::new("/usr/bin/sudo");
+    cmd.args(["-n", "--", "/usr/bin/env", "-i"])
+        .arg(format!("{ISOLATED}=1"))
+        .arg(format!("{ELEVATED}=1"))
+        .arg("PATH=/usr/local/bin:/usr/bin:/bin");
+    if let Some(lock) = std::env::var_os("CADENCE_SUITE_LOCK") {
+        cmd.arg(format!("CADENCE_SUITE_LOCK={}", lock.to_string_lossy()));
+    }
+    cmd.arg(std::env::current_exe().unwrap()).args([
+        "--exact",
+        TEST,
+        "--test-threads",
+        "1",
+        "--nocapture",
+    ]);
+    cadence_agent::reaper::output(&mut cmd).expect("elevated isolated run")
+}
+
 #[test]
 fn cad1377_targeted_reconcile_acceptance() {
     if std::env::var_os(ISOLATED).is_none() {
-        let sandbox = Builder::new()
-            .prefix("c1377run-")
-            .tempdir_in("/tmp")
-            .unwrap();
-        let home = sandbox.path().join("home");
-        fs::create_dir_all(&home).unwrap();
-        let mut cmd = Command::new(std::env::current_exe().unwrap());
-        cmd.args(["--exact", TEST, "--test-threads", "1", "--nocapture"])
-            .env(ISOLATED, "1")
-            .env("HOME", &home)
-            .env("XDG_CONFIG_HOME", sandbox.path().join("config"))
-            .env("XDG_DATA_HOME", sandbox.path().join("data"))
-            .env("XDG_STATE_HOME", sandbox.path().join("state"))
-            .env("XDG_CACHE_HOME", sandbox.path().join("cache"))
-            .env_remove("CADENCE_PM_DIR")
-            .env_remove("CADENCE_STATE_DIR")
-            .env_remove("CADENCE_ALIAS")
-            // The re-exec and every CLI it spawns must prove the real
-            // proc view — an inherited test-seam root is never valid
-            // evidence for this check.
-            .env_remove("CADENCE_TEST_PROC_ROOT")
-            .env_remove("CARGO_TARGET_DIR")
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE");
-        let out = cadence_agent::reaper::output(&mut cmd).unwrap();
+        let out = if elevated_ci() {
+            run_elevated()
+        } else {
+            run_isolated_child()
+        };
         assert!(out.status.success(), "isolated run failed: {}", text(&out));
         assert!(
             text(&out).contains("1 passed"),
@@ -473,6 +533,55 @@ fn cad1377_targeted_reconcile_acceptance() {
             text(&out)
         );
         return;
+    }
+
+    // An elevated child allocates its own private HOME/XDG root
+    // first — the unprivileged parent created nothing for it, so no
+    // root-owned tree is left inside runner-owned temp dirs. TempDir
+    // Drop cleans it, pass or panic.
+    let _elevated_root = if std::env::var_os(ELEVATED).is_some() {
+        // The marker is never proof of privilege — confirm the real
+        // effective uid before allocating the private root.
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            unsafe { libc::geteuid() },
+            0,
+            "elevation marker present without real root"
+        );
+        let root = Builder::new()
+            .prefix("c1377elev-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let home = root.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        std::env::set_var("HOME", &home);
+        std::env::set_var("XDG_CONFIG_HOME", root.path().join("config"));
+        std::env::set_var("XDG_DATA_HOME", root.path().join("data"));
+        std::env::set_var("XDG_STATE_HOME", root.path().join("state"));
+        std::env::set_var("XDG_CACHE_HOME", root.path().join("cache"));
+        std::env::remove_var(ELEVATED);
+        Some(root)
+    } else {
+        None
+    };
+
+    // Bounded context proof in the test log: either this check sees
+    // the real pid-2 ns link (elevated CI) or the unchanged
+    // completeness guard fails honestly. Link targets only — no env,
+    // no process contents.
+    #[cfg(target_os = "linux")]
+    {
+        let link = |p: &str| match fs::read_link(p) {
+            Ok(t) if t.as_os_str().is_empty() => "empty".to_string(),
+            Ok(t) => t.display().to_string(),
+            Err(e) => format!("unreadable:{e}"),
+        };
+        eprintln!(
+            "cad1377 proc view: euid={} self/ns/pid={} 2/ns/pid={}",
+            unsafe { libc::geteuid() },
+            link("/proc/self/ns/pid"),
+            link("/proc/2/ns/pid"),
+        );
     }
 
     // Selected ticket gets the LOWER id — board order examines it
