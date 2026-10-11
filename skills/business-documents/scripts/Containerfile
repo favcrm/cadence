@@ -1,0 +1,17 @@
+FROM ubuntu:24.04
+LABEL org.cadence.ticket="CAD-1345" org.cadence.workflow="business-documents-v1"
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3=3.12.3-0ubuntu2.1 \
+    python3-venv=3.12.3-0ubuntu2.1 \
+    libreoffice-writer=4:24.2.7-0ubuntu0.24.04.7 \
+    fonts-liberation=1:2.1.5-3 \
+    && rm -rf /var/lib/apt/lists/*
+COPY skills/business-documents/scripts/requirements.txt /tmp/requirements.txt
+RUN python3 -m venv /opt/business-venv \
+    && /opt/business-venv/bin/pip install --no-cache-dir --disable-pip-version-check -r /tmp/requirements.txt \
+    && /opt/business-venv/bin/pip check
+ENV PATH=/opt/business-venv/bin:/usr/bin:/bin
+RUN mkdir -p /inputs /outputs /app
+WORKDIR /work
