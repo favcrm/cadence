@@ -1286,3 +1286,85 @@ fn cad1300_cli_records_in_any_case_count_as_on_record() {
         assert!(merges(&board).contains(&format!("merge {pr} ")), "{repo}");
     }
 }
+
+#[test]
+fn cad1300_publish_requires_canonical_ci_run_url() {
+    let cases = [
+        (
+            "wrong repository",
+            "acme/widgets",
+            "https://github.com/attacker/widgets/actions/runs/1218",
+            false,
+        ),
+        (
+            "wrong run id",
+            "acme/widgets",
+            "https://github.com/acme/widgets/actions/runs/9999",
+            false,
+        ),
+        (
+            "wrong host",
+            "acme/widgets",
+            "https://github.example/acme/widgets/actions/runs/1218",
+            false,
+        ),
+        (
+            "mixed-case repository",
+            "Acme/Widgets",
+            "https://github.com/Acme/Widgets/actions/runs/1218",
+            true,
+        ),
+    ];
+
+    for (case, row_repo, ci_url, should_publish) in cases {
+        let root = tempfile::Builder::new().prefix("c1300ci").tempdir().unwrap();
+        let board = Board::start_cased(root.path(), REPO, row_repo);
+        let gh = board.state.join("gh");
+        let script = std::fs::read_to_string(&gh).unwrap();
+        let original = "https://github.com/acme/widgets/actions/runs/1218";
+        assert_eq!(script.matches(original).count(), 1, "{case}: fixture URL");
+        std::fs::write(&gh, script.replace(original, ci_url)).unwrap();
+
+        let operator = board.session();
+        let (status, body) =
+            board.post("operator", Some(&operator), APPROVE, &approve_pr(PUBLISH_PR));
+        assert_eq!(status, 200, "{case}: setup approval: {body}");
+        let events = board.approval_events();
+        let (status, body) = board.post(
+            "operator",
+            Some(&operator),
+            &publish_path(PUBLISH_ISSUE),
+            &publish_body(),
+        );
+
+        if should_publish {
+            assert_eq!(
+                status, 200,
+                "{case}: canonical CI run should permit Publish: {body}"
+            );
+            assert!(
+                merges(&board).contains(&format!("merge {PUBLISH_PR} ")),
+                "{case}"
+            );
+        } else {
+            assert!(
+                (400..500).contains(&status),
+                "{case}: non-canonical CI run must refuse Publish: {status} {body}"
+            );
+            assert!(
+                body.to_string().contains("canonical ci.yml run"),
+                "{case}: refusal identifies the CI evidence: {body}"
+            );
+            assert_eq!(
+                board.approval_events(),
+                events,
+                "{case}: refused Publish wrote approval"
+            );
+            assert!(
+                !merges(&board).contains(&format!("merge {PUBLISH_PR} ")),
+                "{case}"
+            );
+            assert_eq!(delivery_state(&board, PUBLISH_ISSUE), "passed", "{case}");
+        }
+    }
+}

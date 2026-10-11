@@ -188,13 +188,13 @@ if [ "$1" = repo ] && [ "$2" = view ]; then printf '{{"defaultBranchRef":{{"name
 if [ "$1" = api ]; then
   endpoint=$2
   case "$endpoint" in
-    repos/acme/widgets/compare/{BASE}...{HEAD}) printf '{{"merge_base_commit":{{"sha":"{MERGE_BASE}"}},"files":[{{"filename":"src/lib.rs","status":"modified","additions":1,"deletions":0}}]}}\n' ;;
-    repos/acme/widgets/git/trees/{MERGE_BASE}?recursive=1|repos/acme/widgets/git/trees/{HEAD}?recursive=1) printf '{{"truncated":false,"tree":[{{"path":"src/lib.rs","mode":"100644","type":"blob"}}]}}\n' ;;
-    repos/acme/widgets/contents/docs/roles/risk-paths.toml\?ref={BASE}) printf '{{"encoding":"base64","content":"{risk_content}"}}\n' ;;
-    repos/acme/widgets/contents/docs/roles/one-review-paths.toml\?ref={BASE}) printf '{{"encoding":"base64","content":"{review_content}"}}\n' ;;
-    repos/acme/widgets/rules/branches/main) printf '[{{"type":"required_status_checks","parameters":{{"required_status_checks":[{{"context":"fmt","app_id":15368}},{{"context":"clippy","app_id":15368}},{{"context":"test","app_id":15368}},{{"context":"build","app_id":15368}},{{"context":"ui","app_id":15368}}]}}}}]\n' ;;
-    repos/acme/widgets/branches/main/protection) printf '{{"required_status_checks":{{"contexts":["fmt","clippy","test","build","ui"],"checks":[]}}}}\n' ;;
-    repos/acme/widgets/actions/workflows/ci.yml/runs*) printf '{{"workflow_runs":[{{"id":1218,"head_sha":"{HEAD}","event":"pull_request","status":"completed","conclusion":"success","html_url":"https://github.com/acme/widgets/actions/runs/1218"}}]}}\n' ;;
+    repos/acme/widgets/compare/{BASE}...{HEAD}|repos/Acme/Widgets/compare/{BASE}...{HEAD}) printf '{{"merge_base_commit":{{"sha":"{MERGE_BASE}"}},"files":[{{"filename":"src/lib.rs","status":"modified","additions":1,"deletions":0}}]}}\n' ;;
+    repos/acme/widgets/git/trees/{MERGE_BASE}?recursive=1|repos/acme/widgets/git/trees/{HEAD}?recursive=1|repos/Acme/Widgets/git/trees/{MERGE_BASE}?recursive=1|repos/Acme/Widgets/git/trees/{HEAD}?recursive=1) printf '{{"truncated":false,"tree":[{{"path":"src/lib.rs","mode":"100644","type":"blob"}}]}}\n' ;;
+    repos/acme/widgets/contents/docs/roles/risk-paths.toml\?ref={BASE}|repos/Acme/Widgets/contents/docs/roles/risk-paths.toml\?ref={BASE}) printf '{{"encoding":"base64","content":"{risk_content}"}}\n' ;;
+    repos/acme/widgets/contents/docs/roles/one-review-paths.toml\?ref={BASE}|repos/Acme/Widgets/contents/docs/roles/one-review-paths.toml\?ref={BASE}) printf '{{"encoding":"base64","content":"{review_content}"}}\n' ;;
+    repos/acme/widgets/rules/branches/main|repos/Acme/Widgets/rules/branches/main) printf '[{{"type":"required_status_checks","parameters":{{"required_status_checks":[{{"context":"fmt","app_id":15368}},{{"context":"clippy","app_id":15368}},{{"context":"test","app_id":15368}},{{"context":"build","app_id":15368}},{{"context":"ui","app_id":15368}}]}}}}]\n' ;;
+    repos/acme/widgets/branches/main/protection|repos/Acme/Widgets/branches/main/protection) printf '{{"required_status_checks":{{"contexts":["fmt","clippy","test","build","ui"],"checks":[]}}}}\n' ;;
+    repos/acme/widgets/actions/workflows/ci.yml/runs*|repos/Acme/Widgets/actions/workflows/ci.yml/runs*) printf '{{"workflow_runs":[{{"id":1218,"head_sha":"{HEAD}","event":"pull_request","status":"completed","conclusion":"success","html_url":"https://github.com/acme/widgets/actions/runs/1218"}}]}}\n' ;;
     *) echo "fake gh: no API fixture for: $endpoint" >&2; exit 1 ;;
   esac
   exit 0
