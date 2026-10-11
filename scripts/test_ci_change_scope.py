@@ -90,6 +90,62 @@ class ScopeTests(unittest.TestCase):
                                    capture_output=True, text=True)
         self.assertNotEqual(malformed.returncode, 0)
 
+    MANIFEST = '[package]\nname = "scope-fixture"\nversion = "0.1.0"\n'
+
+    def base_with_tests(self, manifest=MANIFEST, extra=()):
+        """Commit a base holding a clean autodiscovery manifest + targets."""
+        self.git("reset", "--hard", self.base)
+        self.git("clean", "-fdq")
+        (self.repo / "Cargo.toml").write_text(manifest)
+        for path in ("src/lib.rs", "tests/alpha.rs", "tests/beta.rs") + extra:
+            file = self.repo / path
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_text("base-content")  # so `change` edits stay visible
+        self.base = self.commit()
+
+    def test_isolated_tests_feedback_selects_owned_targets(self):
+        self.base_with_tests()
+        result = self.scope(self.change(["tests/alpha.rs"]))
+        self.assertEqual(result["scope"], "tests", result)
+        self.assertEqual(result["rust"], "true")
+        self.assertEqual(result["ui"], "false")
+        self.assertEqual(result["tests"], "true")
+        self.assertEqual(result["targets"], ["alpha"])
+        result = self.scope(self.change(["tests/alpha.rs", "tests/beta.rs"]))
+        self.assertEqual(result["scope"], "tests", result)
+        self.assertEqual(result["targets"], ["alpha", "beta"])
+
+    def test_tests_scope_refuses_shared_new_deleted_and_mixed(self):
+        self.base_with_tests()
+        # An added test file is not a pre-existing target.
+        self.expect(self.scope(self.change(["tests/alpha.rs", "tests/gamma.rs"])), "full")
+        # Mixed tests + anything else is full.
+        self.expect(self.scope(self.change(["tests/alpha.rs", "src/lib.rs"])), "full")
+        self.expect(self.scope(self.change(["tests/alpha.rs", "docs/GUIDE.md"])), "full")
+        # A shared basename: another base .rs source references it.
+        self.base_with_tests(extra=("src/consumer.rs",))
+        (self.repo / "src/consumer.rs").write_text("// see tests/alpha.rs\n")
+        self.git("add", "src/consumer.rs")
+        self.git("commit", "-qm", "share")
+        self.base = self.git("rev-parse", "HEAD")
+        # Editing the shared target alone already forces full...
+        self.expect(self.scope(self.change(["tests/alpha.rs"])), "full")
+        # ...while the independent sibling still narrows.
+        result = self.scope(self.change(["tests/beta.rs"]))
+        self.assertEqual(result["scope"], "tests", result)
+        self.assertEqual(result["targets"], ["beta"])
+
+    def test_tests_scope_refuses_ambiguous_base_manifest(self):
+        # An explicit [[test]] table or autotests = false makes target name
+        # to file mapping ambiguous; nested tests/**/main.rs is a target too.
+        for extra in ('\n[[test]]\nname = "alpha"\npath = "tests/alpha.rs"\n',
+                      'autotests = false\n'):
+            with self.subTest(manifest=extra):
+                self.base_with_tests(manifest=self.MANIFEST + extra)
+                self.expect(self.scope(self.change(["tests/alpha.rs"])), "full")
+        self.base_with_tests(extra=("tests/nested/main.rs",))
+        self.expect(self.scope(self.change(["tests/alpha.rs"])), "full")
+
     def test_deletion_rename_symlink_and_executable_changes_require_full(self):
         self.change(["docs/old.md"])
         base = self.git("rev-parse", "HEAD")
