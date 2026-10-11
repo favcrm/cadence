@@ -1239,7 +1239,7 @@ export default function App() {
         )}
         {route.screen === "settings" && route.section === "models" && <ModelDefaults />}
         {route.screen === "settings" && route.section === "connections" && (
-          <Connections viewer={viewer} />
+          <Connections viewer={viewer} page={route.page} />
         )}
         {route.screen === "settings" && route.section === "email" && (
           <EmailSending viewer={viewer} />
