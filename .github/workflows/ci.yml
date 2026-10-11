@@ -360,8 +360,19 @@ jobs:
           SCCACHE_CI_RO_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_R2_RO_SECRET_ACCESS_KEY }}
           SCCACHE_CI_ENDPOINT: ${{ vars.SCCACHE_R2_ENDPOINT }}
         run: sh $GITHUB_WORKSPACE/scripts/ci-sccache enable
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        if: ${{ needs.change-scope.outputs.rust != 'false' }}
+        with:
+          package_json_file: ui/package.json
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: ${{ needs.change-scope.outputs.rust != 'false' }}
+        with:
+          node-version: 22
       - run: cargo build --profile ci --locked
         if: ${{ needs.change-scope.outputs.rust != 'false' }}
+      - name: Package and clean-consumer check for the app toolchain
+        if: ${{ needs.change-scope.outputs.rust != 'false' }}
+        run: scripts/app-toolchain-acceptance.sh "$GITHUB_WORKSPACE/target/ci/cadence"
       - name: Rehearse offline hosted migration with the built CLI
         if: ${{ needs.change-scope.outputs.rust != 'false' }}
         env:
@@ -986,6 +997,11 @@ jobs:
           tar -czf "dist/$asset" -C stage cadence cadence.sha256 manifest.json
           (cd dist && printf '%s  %s\n' "$(sha256 "$asset")" "$asset" > "$asset.sha256")
           cat stage/manifest.json "dist/$asset.sha256"
+          if [ "$TARGET" = x86_64-linux ]; then
+            scripts/package-app-toolchain --cadence target/release/cadence \
+              --tag "$TAG" --source-sha "$SOURCE_SHA" --out "$RUNNER_TEMP/app-toolchain-dist"
+            cp "$RUNNER_TEMP"/app-toolchain-dist/* dist/
+          fi
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-${{ github.ref_name }}-${{ matrix.target }}
@@ -1010,11 +1026,13 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      # install.sh is published as a release asset; nothing else from the
-      # repo is read, and nothing from it runs.
+      # install.sh is published as a release asset; ui/package.json is read
+      # only as pin data. No repository code runs in this privileged job.
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          sparse-checkout: scripts/install.sh
+          sparse-checkout: |
+            scripts/install.sh
+            ui/package.json
           sparse-checkout-cone-mode: false
           path: src
           persist-credentials: false
@@ -1027,6 +1045,7 @@ jobs:
         working-directory: dist
         env:
           TAG: ${{ github.ref_name }}
+          SOURCE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           for target in x86_64-linux aarch64-linux aarch64-macos; do
@@ -1035,6 +1054,48 @@ jobs:
             listing=$(tar -tzf "$asset" | sort | tr '\n' ' ')
             test "$listing" = "cadence cadence.sha256 manifest.json "
           done
+          asset="cadence-app-toolchain-$TAG.tar.gz"
+          sha256sum -c "$asset.sha256"
+          python3 - "$asset" "$TAG" "$SOURCE_SHA" ../src/ui/package.json <<'PY'
+          import json, re, sys, tarfile
+          archive, tag, source_sha, ui_manifest_path = sys.argv[1:]
+          expected = {
+              "LICENSE", "README.md", "frame-kit/frame.html", "frame-kit/kit.css",
+              "frame-kit/metadata.json", "package.json", "pnpm-lock.yaml", "toolchain.json",
+          }
+          if not re.fullmatch(r"v[0-9][0-9A-Za-z.+_-]*", tag) or not re.fullmatch(r"[0-9a-f]{40}", source_sha):
+              raise SystemExit("invalid release tag or source commit")
+          with tarfile.open(archive, "r:gz") as tar:
+              entries = tar.getmembers()
+              names = [entry.name for entry in entries]
+              if set(names) != expected or len(names) != len(expected) or any(not entry.isfile() for entry in entries):
+                  raise SystemExit("app-toolchain archive has an unexpected member list or file type")
+              if any(entry.size > 8 * 1024 * 1024 for entry in entries) or sum(entry.size for entry in entries) > 16 * 1024 * 1024:
+                  raise SystemExit("app-toolchain archive exceeds the size limit")
+              def read_json(name):
+                  return json.load(tar.extractfile(name))
+              metadata = read_json("toolchain.json")
+              package = read_json("package.json")
+          ui = json.load(open(ui_manifest_path, encoding="utf-8"))
+          ui_pins = {**ui["dependencies"], **ui["devDependencies"]}
+          pin_names = ("react", "react-dom", "vite", "@vitejs/plugin-react")
+          pins = {name: ui_pins.get(name) for name in pin_names}
+          manager = ui.get("packageManager")
+          if not isinstance(manager, str) or not re.fullmatch(r"pnpm@[0-9]+(?:\.[0-9]+){2}", manager):
+              raise SystemExit("UI package manager must be an exact pnpm major.minor.patch version")
+          if metadata != {"schema": "cadence-app-toolchain/1", "tag": tag,
+                          "source_sha": source_sha, "package_manager": manager, "pins": pins}:
+              raise SystemExit("app-toolchain version, source, schema, package manager, or pins do not match")
+          expected_package = {
+              "name": "cadence-app-toolchain", "private": True,
+              "version": tag[1:], "type": "module", "packageManager": manager,
+              "scripts": {"dev": "vite", "build": "vite build"},
+              "dependencies": {name: pins[name] for name in pin_names[:2]},
+              "devDependencies": {name: pins[name] for name in pin_names[2:]},
+          }
+          if package != expected_package:
+              raise SystemExit("app-toolchain package manifest differs from the fixed source-derived manifest")
+          PY
           cp ../src/scripts/install.sh install.sh
           ls -l
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
