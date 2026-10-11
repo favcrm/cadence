@@ -584,13 +584,16 @@ pub fn run_daemon(pm: &Pm, actor: &str, limit: usize, cursor: Option<&str>) -> R
 /// timing games. The string is the load error the sweep reports.
 type HistoryLoad<'a> = &'a dyn Fn(&Path, Duration) -> std::result::Result<LineTimes, String>;
 
-/// A `LineTimes::load` error is already bounded (git spawn/walk
-/// strings); it still passes through the argv scrubber so a
-/// credential-shaped token in a path can never reach the output, and
-/// flattens to one line — sweep rows and daemon logs are single-line.
+/// Scrub before truncating so a credential is never cut into an
+/// unrecognizable prefix. Keep one bounded, control-free diagnostic
+/// line for both sweep output and daemon logs.
 fn safe_history_error(e: &str) -> String {
     let line = e.lines().next().unwrap_or("");
     crate::doctor::host::redact_argv(&[line])
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(512)
+        .collect()
 }
 
 /// The scrubbed history-load error when the sweep's walk failed, for
