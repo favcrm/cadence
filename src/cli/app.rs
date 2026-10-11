@@ -23,6 +23,23 @@ pub(crate) enum AppAction {
         #[command(subcommand)]
         action: ContextAction,
     },
+    /// Offline install validation of a local package: the same bundle
+    /// checks `app catalog install-check` runs — entry grammar, per-file
+    /// and aggregate caps, manifest, descriptors, workflow checks and
+    /// `requires` against this build's contracts — with no daemon, no
+    /// store and no PM read or write. `<source>` is a local directory or
+    /// `builtin:<catalog id>`; a git/URL source is refused (a transport,
+    /// not bytes). Prints the JSON report; exit 0 on pass, 3 on refusal.
+    /// Catalog admission (duplicate installs, pending journals) is not
+    /// reproduced — the report says so.
+    Check {
+        /// Package directory or `builtin:<catalog id>`.
+        source: String,
+        /// The output is always the JSON report; `--json` makes the
+        /// machine-readable contract explicit for scripts.
+        #[arg(long)]
+        json: bool,
+    },
     /// Host-managed per-installation customer records with scoped revisions.
     Record {
         #[command(subcommand)]
@@ -1917,6 +1934,9 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
         } => {
             return run_dev(name, source, *port, host, allow_host);
         }
+        // CAD-1270: `check` is dispatched before org/state-dir
+        // resolution — it never reaches the daemon path.
+        AppAction::Check { .. } => unreachable!("app check dispatches before state-dir resolution"),
         AppAction::Install { source, project } => {
             let pm = cadence_agent::issue::Pm::open_default()?;
             app::install(&pm, project, source, state_dir, "")?
@@ -1984,6 +2004,19 @@ pub(super) fn run_app(state_dir: &Path, action: AppAction) -> Result<i32> {
 
 pub(super) fn run(state_dir: PathBuf, action: AppAction) -> Result<i32> {
     run_app(&state_dir, action)
+}
+
+/// CAD-1270 `cadence app check <dir|builtin:<id>>`: the offline bundle
+/// validator. Runs before org/state-dir resolution — it opens no state
+/// dir, daemon socket or PM; the only filesystem it reads is the named
+/// directory (or the embedded built-in). The JSON report prints to
+/// stdout; the exit code is the verdict (0 pass, 3 refusal — `rejected`
+/// in the kind table).
+pub(super) fn run_check(source: &str, _json: bool) -> Result<i32> {
+    let report = cadence_agent::issue::app_catalog::workspace::check_offline(source)?;
+    let ok = report["ok"].as_bool() == Some(true);
+    print_json(&report);
+    Ok(if ok { 0 } else { 3 })
 }
 
 /// No production state, PM, socket or app approval is accessed here.

@@ -33,6 +33,37 @@ authority. Install and update are operator-only and record consent for the exact
 installed digest if it passes the local execution checks; `approve` and `revoke`
 remain available for explicit operator decisions about local capabilities.
 
+## Offline byte validation: `cadence app check`
+
+`cadence app check <dir|builtin:<catalog-id>>` validates package bytes with no
+daemon, no store and no PM read or write — usable in an app repo's CI before
+anything talks to a host. It runs the same bundle snapshot and content
+validation `install-check` runs (entry grammar, per-file caps — 384 KiB for a
+screen JS/CSS asset and 256 KiB elsewhere — the 2 MiB aggregate, the manifest
+including `summary`, descriptor forbidden keys, workflow checks, the full
+`app-screens/v1|v2` declaration integrity for every `screens/<tag>/` package
+(`screens.json` body, declared↔supplied asset set, sha256+size matches — the
+same `app_screen_pkg::extract` the mount RPC re-runs), `requires`
+against this build's contract registry, and the secret guard) and reports the
+same `sha256:` bundle digest. A git/URL source is refused: fetching is a
+transport the daemon vets, not bytes in hand.
+
+The JSON report carries `ok`, a stable `refusal.code` (`app_check_transport`,
+`app_check_source`, `app_check_inventory`, `app_check_content`), `digest`,
+per-file `bytes`/`cap`, the 2 MiB aggregate position, and the `host` block and
+`compatibility` receipt (this build's core version and supported contract
+majors). Exit is 0 on pass, 3 on refusal. Pass and refusal write nothing — no
+state directory, catalog, journal or tracker file is touched.
+
+Byte validation only — stateful admission is deliberately not reproduced:
+`install-check` also enforces the catalog (a same-name workspace install,
+pending journals, an unmigrated legacy install), the tracker-self-source guard
+and the PM's `agent:` registry. Offline, the registry is empty
+(`agent_registry: "none"`), so a concrete `agent:` name is the same
+unverifiable note install-check reports on a host with no registry — never an
+offline refusal. A bundle relying on that registry still meets it when the
+daemon runs `install-check`/`install`.
+
 ## Pin the exact bytes you consented to
 
 Install is consent, so consent must be to exact bytes. Check first, then pin:

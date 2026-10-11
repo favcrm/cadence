@@ -1135,6 +1135,45 @@ fn validate_contents(
             Err(e) => errors.push(format!("{rel}: {e}")),
         }
     }
+    // CAD-1270 item 3: every `screens/<tag>/` member group is a screen
+    // package — integrity-check each through the same
+    // `app_screen_pkg::extract` → `app_screen_decl::validate_map` the
+    // mount RPC re-runs, so a malformed declaration, an
+    // undeclared/tampered asset or a tag dir without `screens.json`
+    // refuses at install, not first mount. `tags_in` additionally
+    // enforces the ≤8 declared-package bound; the member-prefix scan
+    // also collects an orphan tag dir (no screens.json), which
+    // `tags_in` cannot see. This shared check is what install,
+    // install-check and the offline `app check` all inherit — no second
+    // parser.
+    {
+        let screen_map: BTreeMap<String, String> = files.iter().cloned().collect();
+        if let Err(e) = crate::issue::app_screen_pkg::tags_in(&screen_map) {
+            errors.push(format!("screens: {e}"));
+        }
+        let mut candidates: Vec<&str> = Vec::new();
+        for rel in screen_map.keys() {
+            if let Some(rest) = rel.strip_prefix("screens/") {
+                if let Some((tag, _)) = rest.split_once('/') {
+                    if !candidates.contains(&tag) {
+                        candidates.push(tag);
+                    }
+                }
+            }
+        }
+        for tag in candidates {
+            match crate::issue::app_screen_pkg::extract(&screen_map, tag) {
+                // Same binding the mount RPC enforces: the package's
+                // declared `app` must be this bundle's manifest app —
+                // a package cannot claim a different app.
+                Ok(pkg) if pkg.app != manifest.app => errors.push(format!(
+                    "screens/{tag}: screen package declares an app that is not the installation"
+                )),
+                Err(e) => errors.push(format!("screens/{tag}: {e}")),
+                Ok(_) => {}
+            }
+        }
+    }
     // CAD-1177: an app may ship no workflows only when it is a genuine
     // standalone-tools plugin — it carries at least one integrity-checked
     // `app-screens/v2` screen whose declared `tools` map resolves every
