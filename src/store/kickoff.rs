@@ -380,10 +380,14 @@ pub fn job_kickoff(
     } else {
         kickoff_correlation(message_id)
     };
+    // CAD-1373: the discovery pointer sits before the report contract
+    // in both envelopes, so the managed full form still ends on the
+    // reminder, the managed compact form on the report contract, and
+    // the explicit form on the correlation tail.
     let discovery = KNOWLEDGE_POINTER;
     let full = format!(
-        "{head}{scope}{acceptance}{issue}{report} Do not report a SHA you have not \
-         committed.{discovery}{correlation}"
+        "{head}{scope}{acceptance}{discovery}{issue}{report} Do not report a SHA you have not \
+         committed.{correlation}"
     );
     if full.len() <= pty::MAX_BODY {
         return Ok(full);
@@ -392,7 +396,7 @@ pub fn job_kickoff(
     // shrinks to its id and the closing reminder goes — while the
     // pointers, every acceptance criterion, the report contract and
     // the correlation stay whole. If that still cannot fit, refuse.
-    let compact = format!("{head}{scope}{acceptance}{issue_short}{report}{discovery}{correlation}");
+    let compact = format!("{head}{scope}{acceptance}{discovery}{issue_short}{report}{correlation}");
     if compact.len() <= pty::MAX_BODY {
         return Ok(compact);
     }
