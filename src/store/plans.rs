@@ -413,9 +413,9 @@ impl Store {
     }
 
     /// CAD-1266: every assignee's non-terminal task ids in one pass, each
-    /// list in [`Self::tasks_for_assignee`] order. The fleet list asks once
-    /// instead of once per agent; `tasks_assignee(assignee, state)` (CAD-1280)
-    /// lets both forms skip terminal rows without fetching them.
+    /// list in [`Self::tasks_for_assignee`] order. The fleet list scans once
+    /// instead of once per agent. `tasks_assignee(assignee, state)` (CAD-1280)
+    /// serves assignee-specific reads; the fleet query may still scan tasks.
     pub fn open_task_ids_by_assignee(
         &self,
     ) -> Result<std::collections::HashMap<String, Vec<String>>> {

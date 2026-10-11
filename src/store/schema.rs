@@ -1022,9 +1022,10 @@ impl Store {
             //    ('running','submitted')`) from a scan of every message
             //    ever stored into a seek.
             //  * `tasks_assignee` serves `tasks_for_assignee`,
-            //    `assignee_tasks_bound` (`agent show`) and the fleet read
-            //    `open_task_ids_by_assignee`; `state` rides the index so
-            //    terminal rows are skipped without a table fetch.
+            //    `assignee_tasks_bound` (`agent show`); `state` rides the
+            //    index so terminal rows are skipped without a table fetch.
+            //    The fleet read `open_task_ids_by_assignee` may still scan
+            //    tasks; no index speedup is claimed for that single pass.
             {
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 tx.execute_batch(
