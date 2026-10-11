@@ -14,7 +14,6 @@ export default function SignIn({
   onChange,
   access,
   onRetryWorkspace,
-  onCheckAccess,
 }: {
   meta: Meta | null;
   onChange: () => void;
@@ -23,8 +22,6 @@ export default function SignIn({
   access?: "checking" | "unavailable" | null;
   /** Reload the board to use the same workspace wake path as page load. */
   onRetryWorkspace?: () => void;
-  /** Re-check metadata while the workspace may be waking. */
-  onCheckAccess?: () => void;
 }) {
   const [recheckFinished, setRecheckFinished] = useState(false);
   useEffect(() => {
@@ -34,12 +31,8 @@ export default function SignIn({
     }
     setRecheckFinished(false);
     const finish = window.setTimeout(() => setRecheckFinished(true), 60_000);
-    const recheck = window.setInterval(() => onCheckAccess?.(), 30_000);
-    return () => {
-      window.clearTimeout(finish);
-      window.clearInterval(recheck);
-    };
-  }, [access, meta?.read_only, onCheckAccess]);
+    return () => window.clearTimeout(finish);
+  }, [access, meta?.read_only]);
   // CAD-1193: `signed_in === null` is an unanswerable check —
   // unavailable, never a sign-out. It stays unavailable throughout the
   // bounded re-check and never becomes signed-out or authority.

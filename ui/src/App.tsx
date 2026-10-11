@@ -459,7 +459,6 @@ export default function App() {
   // A workspace reload uses the same hosted wake path as a page load;
   // a metadata probe alone can report the failed relay without waking it.
   const retryWorkspace = useCallback(() => window.location.reload(), []);
-  const checkAccess = useCallback(() => refresh(true), [refresh]);
 
   useEffect(() => {
     refresh();
@@ -924,7 +923,7 @@ export default function App() {
               health={health}
               onRefresh={refresh}
             >
-              <SignIn meta={meta} onChange={refresh} access={viewer.access} onRetryWorkspace={retryWorkspace} onCheckAccess={checkAccess} />
+              <SignIn meta={meta} onChange={refresh} access={viewer.access} onRetryWorkspace={retryWorkspace} />
               {staleBuild !== null && staleBuild !== dismissedBuild && (
                 <BuildUpdateNotice onReload={reload} onDismiss={() => setDismissedBuild(staleBuild)} />
               )}
@@ -981,7 +980,7 @@ export default function App() {
                 health={health}
                 onRefresh={refresh}
               >
-                <SignIn meta={meta} onChange={refresh} access={viewer.access} onRetryWorkspace={retryWorkspace} onCheckAccess={checkAccess} />
+                <SignIn meta={meta} onChange={refresh} access={viewer.access} onRetryWorkspace={retryWorkspace} />
               </StatusChips>
             </div>
           </div>
