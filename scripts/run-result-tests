@@ -16,9 +16,9 @@
 #  - CARGO_TARGET_DIR is handed to cargo as CARGO_BUILD_TARGET_DIR, so code
 #    under test that reads CARGO_TARGET_DIR (src/worktree.rs) sees a clean
 #    environment while Cargo still uses the requested build directory.
-#  - test processes run with PATH limited to the cargo toolchain dir and the
-#    system dirs. `doctor::run` probes provider CLIs with --version, and a
-#    host CLI writes under HOME and makes the result depend on the host.
+#  - test processes run with PATH limited to the generated cargo shim, its
+#    resolved compiler, and system dirs. `doctor::run` probes provider CLIs
+#    with --version, and a host CLI writes under HOME and makes results host-dependent.
 #  - CAD-1370: --test-selection FILE narrows ONLY the integration targets
 #    (the lib and bins suites and every guard below always run). FILE is
 #    one target identifier [A-Za-z0-9_]+ per line, nonempty and distinct,
@@ -31,6 +31,7 @@
 set -euo pipefail
 caller_cwd=$PWD
 real_home=${HOME:-}
+lane_build_slot=${CADENCE_BUILD_SLOT:-}
 original_xdg_data=${XDG_DATA_HOME:-$real_home/.local/share}
 manifest_path=
 selection_file=
@@ -124,16 +125,49 @@ if [ -n "${CARGO_TARGET_DIR:-}" ]; then
   export CARGO_BUILD_TARGET_DIR
 fi
 unset CARGO_TARGET_DIR
-cargo_bin=$(command -v cargo) || { echo "::error::cargo is not on PATH" >&2; exit 1; }
-lib_path="$(dirname "$cargo_bin"):/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+cargo_entry=$(command -v cargo) || { echo "::error::cargo is not on PATH" >&2; exit 1; }
+shim_dir=
+case $cargo_entry in
+  */cadence-hooks/bin/cargo) shim_dir=$(dirname "$cargo_entry") ;;
+esac
+if [ -n "$lane_build_slot" ] && [ -z "$shim_dir" ]; then
+  echo "::error::lane build-slot helper is set but generated cargo shim is not first on PATH" >&2
+  exit 1
+fi
+# Resolve the compiler without treating the generated shim as Cargo. Prefer
+# rustup's selected toolchain; non-rustup installs use the first cargo after
+# removing only the shim directory from the caller's PATH.
+compiler_cargo=
+if rustup_bin=$(command -v rustup 2>/dev/null); then
+  compiler_cargo=$("$rustup_bin" which cargo 2>/dev/null || true)
+fi
+if [ -z "$compiler_cargo" ] || [ ! -x "$compiler_cargo" ]; then
+  lookup_path=$PATH
+  if [ -n "$shim_dir" ]; then
+    lookup_path=$(printf '%s' "$lookup_path" | tr ':' '\n' | grep -vxF "$shim_dir" | paste -sd: -)
+  fi
+  compiler_cargo=$(PATH=$lookup_path command -v cargo 2>/dev/null || true)
+fi
+if [ -z "$compiler_cargo" ] || [ ! -x "$compiler_cargo" ]; then
+  echo "::error::could not resolve an executable real cargo (rustup and PATH lookup failed)" >&2
+  exit 1
+fi
+if [ -n "$shim_dir" ] && [ "$(realpath -e -- "$compiler_cargo")" = "$(realpath -e -- "$cargo_entry")" ]; then
+  echo "::error::cargo resolution returned the generated shim, not a compiler" >&2
+  exit 1
+fi
+scratch=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/result-tests.XXXXXX")
+trap 'rm -rf "$scratch"' EXIT
+compiler_dir=$scratch/cargo-toolchain
+mkdir -m 700 "$compiler_dir"
+ln -s "$(realpath -e -- "$compiler_cargo")" "$compiler_dir/cargo"
+lib_path="${shim_dir:+$shim_dir:}$compiler_dir:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 for cli in claude codex cursor-agent cursor agent devin pi gemini; do
   if found=$(PATH=$lib_path command -v "$cli"); then
     echo "::error::provider CLI $cli resolves on the lib suite PATH ($found)" >&2
     exit 1
   fi
 done
-scratch=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/result-tests.XXXXXX")
-trap 'rm -rf "$scratch"' EXIT
 export HOME="$scratch/home" XDG_CONFIG_HOME="$scratch/xdg-config" \
        XDG_DATA_HOME="$scratch/xdg-data" XDG_STATE_HOME="$scratch/xdg-state" \
        XDG_CACHE_HOME="$scratch/xdg-cache" TMPDIR="$scratch/tmp"

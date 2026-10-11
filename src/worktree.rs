@@ -403,8 +403,9 @@ case "${1:-}" in
         slot_kind=build ;;
 esac
 
-# `cadence` the lane recorded in its env; fall back to PATH.
-cad="${CADENCE_BUILD_SLOT:-cadence}"
+# The absolute admission helper is embedded by the lane generator; do not
+# depend on scrubbed CADENCE_* environment or fall back to ambient PATH.
+cad=@@CADENCE_BUILD_SLOT@@
 "$cad" build-slot run "$slot_kind" -- cargo "$@"
 rc=$?
 [ "$rc" -eq 0 ] || exit "$rc"
@@ -415,12 +416,27 @@ rc=$?
 /// minted before slice 3 re-heals on the next `issue start` (the reuse
 /// path calls `install_pre_push_hook`, which now calls this).
 fn install_cargo_shim(wt_dir: &Path) -> Result<PathBuf> {
+    let helper = std::env::current_exe()
+        .map_err(|e| Error::internal(format!("could not resolve lane build-slot helper: {e}")))?;
+    if !helper.is_absolute() {
+        return Err(Error::internal(format!(
+            "lane build-slot helper path is not absolute: {}",
+            helper.display()
+        )));
+    }
+    let helper = helper.to_str().ok_or_else(|| {
+        Error::internal("lane build-slot helper path is not valid UTF-8 for the shell shim")
+    })?;
+    let cargo_shim = CARGO_SHIM.replace(
+        "@@CADENCE_BUILD_SLOT@@",
+        &format!("'{}'", helper.replace('\'', "'\\''")),
+    );
     let git_dir = PathBuf::from(git(wt_dir, &["rev-parse", "--absolute-git-dir"])?);
     let bin = git_dir.join(HOOKS_DIR).join("bin");
     std::fs::create_dir_all(&bin)?;
     let shim = bin.join("cargo");
     let needs_write = match std::fs::read_to_string(&shim) {
-        Ok(existing) => existing != CARGO_SHIM,
+        Ok(existing) => existing != cargo_shim,
         Err(_) => true,
     };
     if needs_write {
@@ -433,7 +449,7 @@ fn install_cargo_shim(wt_dir: &Path) -> Result<PathBuf> {
                 .truncate(true)
                 .mode(0o755)
                 .open(&tmp)?;
-            f.write_all(CARGO_SHIM.as_bytes())?;
+            f.write_all(cargo_shim.as_bytes())?;
         }
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
         std::fs::rename(&tmp, &shim)?;
