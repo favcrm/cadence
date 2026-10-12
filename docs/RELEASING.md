@@ -115,19 +115,20 @@ delivery. Hosted remote teams and local-to-cloud production migration remain
 separate acceptance work. The public stable-release updater is not implemented;
 current update/upgrade commands use the authenticated internal CI channel.
 
-For the pilot use its explicit published tag, never stable `latest` convenience
-installation. Selecting another installer version is not a coordinated running
-daemon upgrade or compatible state rollback. No download link below is claimed
-available until the release exists and public installation is verified.
+Until stable v0.1.0 is published, use the beta.2 explicit tag; the stable
+`latest` convenience URL becomes available only after the stable release passes
+publication. Selecting another installer version is not a coordinated running
+daemon upgrade or compatible state rollback.
 
-## Evidence annex to complete for the approved candidate
+## Stable 0.1.0 evidence annex to complete for the approved candidate
 
-Use the following content in the release draft, replacing placeholders with
-verified evidence before the environment approval. The workflow can reuse an
-existing draft, upload the artifacts and publish after approval.
+Use the following content for the v0.1.0 release draft, replacing placeholders
+with evidence from the exact reviewed candidate and successful tag workflow
+before the environment approval. The workflow can reuse an existing draft,
+upload the artifacts and publish after approval.
 
 ```text
-Cadence 0.1.0-beta.2 — local CLI pilot
+Cadence 0.1.0 — stable local CLI release
 
 Native CLI and embedded board for local agent coordination. Supported assets:
 Linux x86_64, Linux ARM64 (glibc 2.35 baseline), Apple Silicon macOS.
@@ -139,11 +140,11 @@ setup, daemon and board use unsupported pending CAD-315.
 Provider CLIs/authentication and tmux for terminal providers are separate.
 List only provider/platform combinations actually verified for this candidate.
 Hosted browser login, remote local worker teams and local-to-cloud migration
-are not claimed operational. Public stable-release updater is not implemented.
+are not claimed operational. Public stable-release upgrades are not implemented.
 
 Source SHA: <copied exact SHA>
-Tag: v0.1.0-beta.2 (planned, not created)
-Classification: prerelease=true; latest=false (must verify actual release metadata)
+Tag: v0.1.0 (planned, not created)
+Classification: prerelease=false; latest=true (verify actual release metadata)
 CI run and all required gate conclusions: <links/results>
 Clean installation evidence: <platform links; distinguish pre/post-publication>
 Installer and provenance guide: <tag-pinned docs/INSTALL-AGENT.md URL>
