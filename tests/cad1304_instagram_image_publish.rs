@@ -1326,3 +1326,255 @@ fn an_operator_context_save_re_pins_and_one_confirm_posts_the_staged_draft_once(
     assert_eq!(fx.count(&format!("{PREFIX}/publish")), 1);
     assert_eq!(fx.count(&format!("{PREFIX}/media/import")), 1);
 }
+
+// ---- CAD-1398: context retention precedes observable completion ------------
+//
+// The image job worker must retain its receipt in the draft's context BEFORE
+// the intent can be observed `completed`. The test-seam observer
+// (`probe::set_before_receipt_attach_hook`) parks the REAL worker at the one
+// point immediately before native context retention (which precedes
+// settlement) — the code's own seam, filtered to this test's unique request
+// id, on bounded channels with RAII release/cleanup (no sleep proves
+// anything). While it is parked, nothing must expose a `completed` intent
+// whose receipt the context does not yet retain, and the real retention
+// guard must still refuse the un-attached receipt. After release the same
+// real attach succeeds, and the receipt stays refused in a second real
+// context.
+//
+// The second hook site (existing-receipt recovery in `image_job_run`) is the
+// same ordered block before settlement; the same hook does hold that window
+// (post-`app_tool_record`, pre-settle). It is not driven here: reaching it
+// needs a job still `active` while its receipt already exists — i.e. a crash
+// between `app_tool_record` and the settle — and the existing in-process
+// fixture cannot safely simulate that crash/restart while this worker is
+// held without forging state or a new crash mechanism. This check stays
+// scoped to the live-execution branch; the recovery branch is covered by
+// source review of the identical moved block.
+
+/// RAII: clears the seam and frees a parked worker on every exit, a failed
+/// assertion included.
+struct AttachHook {
+    release: Option<std::sync::mpsc::SyncSender<()>>,
+}
+
+impl Drop for AttachHook {
+    fn drop(&mut self) {
+        probe::set_before_receipt_attach_hook(None);
+        if let Some(tx) = self.release.take() {
+            let _ = tx.try_send(());
+        }
+    }
+}
+
+#[test]
+fn an_image_receipt_is_retained_in_context_before_the_intent_shows_completed() {
+    use std::sync::mpsc::sync_channel;
+
+    let fx = Fx::start_small();
+    let source = fx.fetch();
+    let draft = fx.new_draft("o1", &source);
+    let request = "image-o1";
+
+    // Bounded rendezvous: the real worker reports (request, receipt) the
+    // instant it reaches the pre-retention point and parks until released.
+    // The release channel carries capacity 1 so a release sent before the
+    // worker parks inside `recv_timeout` is not lost; the parked
+    // acknowledgment stays a rendezvous.
+    let (parked_tx, parked_rx) = sync_channel::<(String, String)>(0);
+    let (release_tx, release_rx) = sync_channel::<()>(1);
+    let release_rx = Mutex::new(release_rx);
+    let _hook = AttachHook {
+        release: Some(release_tx.clone()),
+    };
+    probe::set_before_receipt_attach_hook(Some(Arc::new(move |req: &str, receipt: &str| {
+        if req != request {
+            return;
+        }
+        let _ = parked_tx.send((req.to_owned(), receipt.to_owned()));
+        let _ = release_rx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .recv_timeout(Duration::from_secs(60));
+    })));
+
+    fx.image(&draft, "image-o1").unwrap();
+    let (job_request, receipt) = parked_rx
+        .recv_timeout(Duration::from_secs(120))
+        .unwrap_or_else(|e| panic!("worker never reached the pre-retention point: {e}"));
+    assert_eq!(job_request, "image-o1");
+
+    let records = RecordStore::open(&fx.dir(), &fx.install).unwrap();
+
+    // While the real worker is parked before its own context attach, the
+    // stored pair (intent state, context retention) must satisfy the
+    // invariant: an intent may be `completed` only when the receipt is
+    // already retained. Read the raw record first — the list RPC below
+    // legitimately heals a pending intent (attach + complete in one call),
+    // which is itself the invariant at work.
+    let row = fx
+        .intent(&draft)
+        .unwrap_or_else(|| panic!("no image intent for {draft}"));
+    let retained = records
+        .app_social_tool_receipt_contains(&fx.context, &receipt)
+        .unwrap();
+    assert!(
+        !retained,
+        "receipt retained before the worker's own context attach"
+    );
+    assert_ne!(
+        row["state"],
+        json!("completed"),
+        "intent exposed `completed` while the context does not retain the receipt: {row}"
+    );
+
+    // The real attach path still refuses while retention is missing.
+    let refused = fx
+        .screen(
+            "app_social_draft_update",
+            json!({"tool_alias": "social.draft", "request_id": "attach-o1-early",
+                "draft_id": draft, "expected_revision": 1, "caption": CAPTION,
+                "asset_id": receipt}),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("image receipt is not retained in this context"),
+        "{refused}"
+    );
+
+    // The real list RPC: whatever it reports, a `completed` intent implies
+    // the receipt is retained — the same invariant on the observable path.
+    let listed = fx
+        .screen(
+            "app_social_draft_list",
+            json!({"tool_alias": "social.draft"}),
+        )
+        .unwrap_or_else(|e| panic!("draft list: {e}"));
+    let row = listed["generation_intents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["request_id"] == json!("image-o1"))
+        .unwrap_or_else(|| panic!("intent not listed: {listed}"));
+    let retained = records
+        .app_social_tool_receipt_contains(&fx.context, &receipt)
+        .unwrap();
+    assert!(
+        row["state"] != json!("completed") || retained,
+        "list exposed `completed` while the context does not retain the receipt: {listed}"
+    );
+
+    // Release the real worker: it retains the receipt, settles the intent
+    // completed, and the identical attach then succeeds through the RPC.
+    release_tx
+        .try_send(())
+        .unwrap_or_else(|e| panic!("release send: {e}"));
+    let done = fx.wait_intent(&draft, "completed");
+    assert_eq!(done["receipt_id"], json!(receipt), "{done}");
+    // The agreed invariant, immediately: an observable `completed` intent
+    // means the receipt is already retained — no wait window hides a
+    // completed-but-unretained regression.
+    assert!(
+        records
+            .app_social_tool_receipt_contains(&fx.context, &receipt)
+            .unwrap(),
+        "intent completed while the context does not retain the receipt"
+    );
+    let attached = fx
+        .screen(
+            "app_social_draft_update",
+            json!({"tool_alias": "social.draft", "request_id": "attach-o1",
+                "draft_id": draft, "expected_revision": 1, "caption": CAPTION,
+                "asset_id": receipt}),
+        )
+        .unwrap_or_else(|e| panic!("attach after real retention refused: {e}"));
+    assert_eq!(attached["revision"], json!(2), "{attached}");
+
+    // Wrong context: a second real context of the same install, mounted by a
+    // second real screen. The replayed source fetch legitimately retains the
+    // SOURCE receipt there (the RPC's own attach), after which creating a
+    // draft with THIS image receipt as the asset must still hit the real
+    // retention guard.
+    let context2 = fx.op(
+        "app_context_create",
+        json!({"install_id": fx.install, "label": "EF2", "input_defaults": {},
+            "request_id": "ctx-1304-b"}),
+    );
+    let context2 = context2["context"]["id"]
+        .as_str()
+        .or_else(|| context2["id"].as_str())
+        .unwrap()
+        .to_string();
+    let connections = fx.op("connection_list", json!({}))["connections"].clone();
+    let hosted = connections
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["account"] == "hosted")
+        .unwrap_or_else(|| panic!("no hosted connection"))["id"]
+        .clone();
+    fx.op(
+        "app_binding_create",
+        json!({"install_id": fx.install, "context_id": context2, "slot": "image",
+            "connection_id": hosted, "request_id": "bind-b-image"}),
+    );
+    fx.op(
+        "app_binding_create",
+        json!({"install_id": fx.install, "context_id": context2, "slot": "source",
+            "connection_id": hosted, "request_id": "bind-b-source"}),
+    );
+    let mint2 = fx.op(
+        "app_screen_mint",
+        json!({"install_id": fx.install, "context_id": context2, "tag": "feed",
+            "token": fx.session["token"], "key": fx.session["key"],
+            "origin": "loopback", "generation": 2}),
+    );
+    fx.op(
+        "app_screen_consume",
+        json!({"nonce": mint2["mount"].as_str().unwrap().rsplit('/').next().unwrap()}),
+    );
+    let screen2 = |method: &str, mut params: Value| -> cadence_agent::Result<Value> {
+        params["action_token"] = mint2["action_token"].clone();
+        params["token"] = fx.session["token"].clone();
+        params["key"] = fx.session["key"].clone();
+        params["origin"] = json!("loopback");
+        fx.rpc_as(Asserted::Operator, method, params)
+    };
+    // The replayed fetch retains the source receipt in context2 on its own.
+    let replayed = screen2(
+        "app_tool_invoke",
+        json!({"tool_alias": "instagram.read", "input": {"handle": HANDLE},
+            "request_id": "fetch-1304"}),
+    )
+    .unwrap_or_else(|e| panic!("context2 source replay: {e}"));
+    assert_eq!(replayed["receipt"]["id"], json!(source.0), "{replayed}");
+    // Freshness needs the handle saved in context2 first, or the earlier
+    // source guard masks the image guard this case exists to hit.
+    screen2(
+        "app_social_sources_save",
+        json!({"tool_alias": "social.draft", "request_id": "sources-b",
+            "expected_revision": 0, "handles": [HANDLE]}),
+    )
+    .unwrap_or_else(|e| panic!("context2 sources save: {e}"));
+    // Re-run the real replay attach so the source receipt becomes the
+    // latest fetch for the saved handle in context2.
+    screen2(
+        "app_tool_invoke",
+        json!({"tool_alias": "instagram.read", "input": {"handle": HANDLE},
+            "request_id": "fetch-1304"}),
+    )
+    .unwrap_or_else(|e| panic!("context2 source re-replay: {e}"));
+    // The image receipt was never retained in context2: refused.
+    let refused2 = screen2(
+        "app_social_draft_create",
+        json!({"tool_alias": "social.draft", "request_id": "draft-b",
+            "caption": CAPTION, "asset_id": receipt,
+            "source": {"kind": "tool_receipt", "receipt_id": source.0, "post_id": source.1}}),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        refused2.contains("image receipt is not retained in this context"),
+        "{refused2}"
+    );
+}
