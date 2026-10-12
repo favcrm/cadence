@@ -18,9 +18,14 @@ cadence update --rollback
 cadence update --as operator:<name>                      # explicit audit label (optional)
 ```
 
-These examples use the local org. The existing default-remote-org routing
-limitation (CAD-1355) is unchanged: if your default org is remote, explicitly
-select local with `CADENCE_ORG=local cadence update`.
+`cadence update` always maintains a local install: a saved remote
+default org never routes it, and no registry row is created or switched
+to make it work. A bare run binds the `local` connection when one is
+registered, else the ambient state/tracker roots. An explicit selector
+stays deliberate: `--org <remote>` or `CADENCE_ORG=<remote>` refuses as
+local-only before any transport, credential read or container wake, and
+`--org local`/`CADENCE_ORG=local` selects the registered local
+connection. A `--state-dir` pin stays a plain local binding.
 
 `cadence update` is operator-only and proves it the same way
 `rollout claim --as` does: the process must run outside every pane and

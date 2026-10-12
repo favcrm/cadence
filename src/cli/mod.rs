@@ -86,6 +86,10 @@ mod update_args;
 mod update_identity_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod update_recovery_tests;
+// CAD-1355: independent routing acceptance for `update` ignoring a saved
+// remote default — the file is owned by its own author.
+#[cfg(all(test, feature = "test-seam"))]
+mod update_routing_acceptance;
 mod upgrade;
 mod util;
 mod wiki;

@@ -1432,7 +1432,9 @@ pub(crate) enum Commands {
     /// `--as` is an optional audit label (a bare run labels itself
     /// from the proven native OS identity). An image-managed runtime
     /// is refused — AgenticOS owns updates there. `upgrade` and
-    /// `rollout` stay the low-level commands.
+    /// `rollout` stay the low-level commands. Always local: a saved
+    /// remote default org is ignored, and an explicitly remote
+    /// `--org`/`CADENCE_ORG` refuses before any remote transport.
     Update {
         #[command(subcommand)]
         action: Option<UpdateAction>,

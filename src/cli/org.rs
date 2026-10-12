@@ -114,48 +114,7 @@ impl RegistryFile {
         Ok(Self { path, _lock: lock })
     }
     fn read(&self) -> Result<Registry> {
-        let mut file = match OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(&self.path)
-        {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Registry::default()),
-            Err(e) => return Err(e.into()),
-        };
-        let metadata = file.metadata()?;
-        if !metadata.is_file() || metadata.len() > 65536 {
-            return Err(Error::rejected(
-                "org registry must be a regular file no larger than 64 KiB",
-            ));
-        }
-        let mut raw = Vec::new();
-        (&mut file).take(65537).read_to_end(&mut raw)?;
-        if raw.len() > 65536 {
-            return Err(Error::rejected("org registry exceeds 64 KiB"));
-        }
-        let registry: Registry = serde_json::from_slice(&raw)
-            .map_err(|_| Error::rejected("invalid org registry; refusing destination selection"))?;
-        for (i, c) in registry.connections.iter().enumerate() {
-            cadence_agent::proto::identifier(&c.selection.org, "org")?;
-            validate_destination(&c.destination)?;
-            if registry.connections[..i]
-                .iter()
-                .any(|p| p.selection == c.selection)
-            {
-                return Err(Error::rejected("duplicate org in registry"));
-            }
-        }
-        if let Some(selected) = &registry.selected {
-            if !registry
-                .connections
-                .iter()
-                .any(|c| &c.selection == selected)
-            {
-                return Err(Error::rejected("selected org is missing"));
-            }
-        }
-        Ok(registry)
+        read_registry(&self.path)
     }
     fn write(&self, registry: &Registry) -> Result<()> {
         let dir = self.path.parent().expect("registry parent");
@@ -174,6 +133,55 @@ impl RegistryFile {
         File::open(dir)?.sync_all()?;
         Ok(())
     }
+}
+
+/// Read and validate `orgs.json` at `path` — the body of
+/// `RegistryFile::read` split out so a read-only caller (`cadence
+/// update` routing) shares the exact shape checks without taking the
+/// write lock or creating the lock file.
+fn read_registry(path: &Path) -> Result<Registry> {
+    let mut file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Registry::default()),
+        Err(e) => return Err(e.into()),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > 65536 {
+        return Err(Error::rejected(
+            "org registry must be a regular file no larger than 64 KiB",
+        ));
+    }
+    let mut raw = Vec::new();
+    (&mut file).take(65537).read_to_end(&mut raw)?;
+    if raw.len() > 65536 {
+        return Err(Error::rejected("org registry exceeds 64 KiB"));
+    }
+    let registry: Registry = serde_json::from_slice(&raw)
+        .map_err(|_| Error::rejected("invalid org registry; refusing destination selection"))?;
+    for (i, c) in registry.connections.iter().enumerate() {
+        cadence_agent::proto::identifier(&c.selection.org, "org")?;
+        validate_destination(&c.destination)?;
+        if registry.connections[..i]
+            .iter()
+            .any(|p| p.selection == c.selection)
+        {
+            return Err(Error::rejected("duplicate org in registry"));
+        }
+    }
+    if let Some(selected) = &registry.selected {
+        if !registry
+            .connections
+            .iter()
+            .any(|c| &c.selection == selected)
+        {
+            return Err(Error::rejected("selected org is missing"));
+        }
+    }
+    Ok(registry)
 }
 
 fn absolute(path: &Path) -> Result<()> {
@@ -509,16 +517,7 @@ pub(super) fn resolve(
         Destination::Local {
             state_dir,
             tracker_dir,
-        } => {
-            std::env::set_var("CADENCE_STATE_DIR", &state_dir);
-            std::env::set_var("CADENCE_PM_DIR", &tracker_dir);
-            eprintln!(
-                "cadence org={} local={}",
-                conn.selection.org,
-                state_dir.display()
-            );
-            Ok(Resolved::Local(state_dir))
-        }
+        } => local_resolved(&conn.selection.org, state_dir, tracker_dir),
         Destination::Remote { endpoint, org_id } => {
             // The destination is the issuer-verified endpoint recorded at
             // login — `remote_cli` refuses to send this org's credential
@@ -530,6 +529,101 @@ pub(super) fn resolve(
                 org_id,
             }))
         }
+    }
+}
+
+/// Shared `Destination::Local` routing: export the pair so state and
+/// tracker land on the org's roots, then return the state dir.
+fn local_resolved(org: &str, state_dir: PathBuf, tracker_dir: PathBuf) -> Result<Resolved> {
+    std::env::set_var("CADENCE_STATE_DIR", &state_dir);
+    std::env::set_var("CADENCE_PM_DIR", &tracker_dir);
+    eprintln!("cadence org={org} local={}", state_dir.display());
+    Ok(Resolved::Local(state_dir))
+}
+
+/// CAD-1355: `cadence update` is local maintenance — a *saved* remote
+/// default must never route it. This resolves only for the updater:
+/// managed callers and pins behave exactly as [`resolve`], explicit
+/// `--org`/`CADENCE_ORG` selectors stay deliberate (a remote one refuses
+/// with local-only guidance before any transport, credential read or
+/// container wake; a local one keeps the normal local routing), and a
+/// bare invocation ignores the registry's `selected` row entirely — it
+/// binds the canonical `local` connection when one exists, else the
+/// ambient state dir. The registry is only ever read here: no row is
+/// created, selected or switched to make updating work, and the tracker
+/// pin precedence is unchanged.
+pub(super) fn resolve_update(
+    org: Option<&str>,
+    state: Option<PathBuf>,
+    tracker: Option<PathBuf>,
+) -> Result<Resolved> {
+    // Keep existing managed bindings and pin-conflict rules in one place.
+    if std::env::var_os("CADENCE_ALIAS").is_some()
+        || state.is_some()
+        || tracker.is_some()
+        || [
+            "CADENCE_STATE_DIR",
+            "CADENCE_PM_DIR",
+            "CADENCE_HOME",
+            "CADENCE_PROFILE",
+        ]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
+    {
+        return resolve(org, state, tracker);
+    }
+    let org_env = std::env::var("CADENCE_ORG").ok();
+    // Read-only: no write lock, no lock file, no created directory — the
+    // updater never mutates the registry to reach its local install.
+    let registry = match RegistryFile::path() {
+        Ok(path) if path.exists() => read_registry(&path)?,
+        _ => Registry::default(),
+    };
+    match org.or(org_env.as_deref()) {
+        // A deliberate selector is honored or refused — never ignored.
+        Some(name) => {
+            let conn = registry
+                .connections
+                .iter()
+                .find(|c| c.selection.org == name)
+                .cloned();
+            match conn.map(|c| c.destination) {
+                Some(Destination::Local {
+                    state_dir,
+                    tracker_dir,
+                }) => local_resolved(name, state_dir, tracker_dir),
+                // `local` is first-class even without a materialized row.
+                None if name == LOCAL_ORG => {
+                    cadence_agent::client::state_dir().map(Resolved::Local)
+                }
+                None => Err(Error::rejected("unknown org")),
+                Some(Destination::Remote { .. }) => Err(Error::rejected(format!(
+                    "`cadence update` maintains a local install only — org '{name}' \
+                     is remote. Run it on the host whose install you mean to update \
+                     (a local selection such as `CADENCE_ORG=local` works there)."
+                ))),
+            }
+        }
+        // No explicit selector: the saved default is a preference for
+        // remote verbs, not for local maintenance — ignore it. Bind the
+        // canonical `local` row when it exists; otherwise the ambient
+        // state dir. Nothing is created, written or switched.
+        None => match registry
+            .connections
+            .iter()
+            .find(|c| c.selection.org == LOCAL_ORG)
+            .cloned()
+        {
+            Some(Connection {
+                selection,
+                destination:
+                    Destination::Local {
+                        state_dir,
+                        tracker_dir,
+                    },
+            }) => local_resolved(&selection.org, state_dir, tracker_dir),
+            _ => cadence_agent::client::state_dir().map(Resolved::Local),
+        },
     }
 }
 

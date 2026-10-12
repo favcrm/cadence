@@ -54,6 +54,10 @@ pub(crate) fn run() -> Result<i32> {
             return Err(Error::usage(text.strip_prefix("error: ").unwrap_or(text)));
         }
     };
+    run_cli(cli)
+}
+
+pub(super) fn run_cli(cli: Cli) -> Result<i32> {
     // Offline custody never resolves daemon, org defaults or issuer credentials.
     if let Commands::Remote { action } = &cli.command {
         if cli.state_dir.is_some() {
@@ -207,13 +211,18 @@ pub(crate) fn run() -> Result<i32> {
     {
         return app::run_check(source, *json);
     }
-    let resolved = org::resolve(
-        cli.org.as_deref(),
-        cli.state_dir.clone(),
-        std::env::var_os("CADENCE_PM_DIR")
-            .map(|d| cadence_agent::home::guard_tracker(PathBuf::from(d)))
-            .transpose()?,
-    )?;
+    let tracker = std::env::var_os("CADENCE_PM_DIR")
+        .map(|d| cadence_agent::home::guard_tracker(PathBuf::from(d)))
+        .transpose()?;
+    // CAD-1355: `update` is local install maintenance, so it resolves
+    // through the updater-only selector — a saved remote default never
+    // routes it, an explicit remote `--org`/`CADENCE_ORG` refuses with
+    // local-only guidance before any transport, credentials or wake.
+    let resolved = if matches!(cli.command, Commands::Update { .. }) {
+        org::resolve_update(cli.org.as_deref(), cli.state_dir.clone(), tracker)?
+    } else {
+        org::resolve(cli.org.as_deref(), cli.state_dir.clone(), tracker)?
+    };
     let state_dir = match resolved {
         org::Resolved::Local(state_dir) => state_dir,
         org::Resolved::Remote(target) => {
