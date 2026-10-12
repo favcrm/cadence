@@ -2,7 +2,7 @@
 declare function require(name: string): any;
 const { Window } = require("happy-dom");
 const win = new Window({ url: "http://localhost/projects/cadence/context" });
-for (const name of ["window", "document", "Node", "Element", "HTMLElement", "HTMLInputElement", "HTMLTextAreaElement", "SVGElement", "navigator", "MutationObserver", "Event", "MouseEvent", "KeyboardEvent", "location", "history", "sessionStorage"]) {
+for (const name of ["window", "document", "Node", "Element", "HTMLElement", "HTMLInputElement", "HTMLTextAreaElement", "SVGElement", "navigator", "MutationObserver", "Event", "MouseEvent", "KeyboardEvent", "FileReader", "location", "history", "sessionStorage"]) {
   Object.defineProperty(globalThis, name, { value: name === "window" ? win : win[name], configurable: true, writable: true });
 }
 for (const name of ["addEventListener", "removeEventListener"]) Object.defineProperty(globalThis, name, { value: win[name].bind(win), configurable: true });
@@ -26,6 +26,7 @@ const { navigate } = require("../src/lib/useLocation") as typeof import("../src/
 const { wiki, WikiError } = require("../src/features/wiki/api") as typeof import("../src/features/wiki/api");
 const { draftKey, stashDraft } = require("../src/features/wiki/editor") as typeof import("../src/features/wiki/editor");
 const requests: string[] = [];
+const imageFetchRequests: { path: string; headers: HeadersInit }[] = [];
 const writes: { path?: string; from?: string; to?: string; text?: string; if_rev?: string }[] = [];
 let conflict = false;
 let holdSave = false;
@@ -50,6 +51,11 @@ globalThis.fetch = async (input, init) => {
     if (path.endsWith(".md") || path.endsWith(".png")) return json({ error: "a file, not a directory" }, 400);
     if (missing) return json({ error: `wiki ls '${path}': no such directory` }, 400);
     return json({ path, entries: [{ path: `${path}/README.md`, name: "README.md", kind: "text" }, { path: `${path}/research`, name: "research", kind: "dir" }, { path: `${path}/logo.png`, name: "logo.png", kind: "blob", mime: "image/png" }] });
+  }
+  if (url.pathname.endsWith("/file") && path.endsWith(".png")) {
+    imageFetchRequests.push({ path, headers: init?.headers ?? {} });
+    const png = Uint8Array.from(atob("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/aYkAAAAASUVORK5CYII="), (byte) => byte.charCodeAt(0));
+    return new win.Response(png, { headers: { "Content-Type": "image/png" } });
   }
   if (url.pathname.endsWith("/file")) return json({ path, kind: "text", text: `# Project brief\n\nNotes for ${path}`, rev: "base-rev" });
   if (url.pathname.endsWith("/search")) return json({ matches: [
@@ -165,7 +171,13 @@ async function run() {
   assert(!host.textContent?.includes("Restore this version"), "unsupported restore is not offered");
   await go("/projects/cadence/context?file=logo.png");
   await render({ project: "assets" });
-  assert(host.querySelector("img")?.getAttribute("src")?.includes("projects%2Fassets%2Flogo.png"), "pasted blob links preview using metadata, not a JSON read of bytes");
+  sessionStorage.setItem("cadence.sessionKey", "synthetic-unit-tab-key");
+  await go("/projects/assets/context?file=logo.png");
+  await React.act(flush);
+  const image = host.querySelector("img");
+  const expectedPng = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/aYkAAAAASUVORK5CYII=";
+  assert(image?.getAttribute("src") === expectedPng, "pasted blob uses image metadata and renders the actual PNG bytes as a data URL");
+  assert(imageFetchRequests.some(({ path, headers }) => path === "projects/assets/logo.png" && new Headers(headers).get("X-Cadence-Session") === "synthetic-unit-tab-key"), "unit mock confirms the project-scoped image fetch includes this synthetic tab key (not native-auth proof)");
   await render({ project: "other" });
   assert(!host.textContent?.includes("Draft in this project"), "changing project clears prior editor state");
   const beforeInvalid = requests.length;

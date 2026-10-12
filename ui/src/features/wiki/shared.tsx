@@ -1,10 +1,11 @@
-import { createContext, useContext, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
 import type { WikiScope } from "./scope";
 import type { Route } from "../../lib/router";
 import Link from "../../ui/Link";
 import { IconFolder, IconLock, IconWiki } from "../../ui/icons";
 import { breadcrumbs } from "./paths";
-import type { WikiKind } from "./api";
+import { wikiBlob, type WikiKind } from "./api";
+import { sessionKey } from "../../lib/sessionKey";
 
 export const WIKI_ROOT_LABEL = "Wiki";
 export const WikiScopeContext = createContext<WikiScope | undefined>(undefined);
@@ -94,6 +95,44 @@ export function EmptyCard({
       {action}
     </div>
   );
+}
+
+/**
+ * An image from the authenticated file route. The fetch carries the session
+ * header; the bytes become a data URL (the CSP admits `data:` images, not
+ * `blob:`). The read is aborted and the encoded bytes dropped when its path or
+ * session key changes or the image unmounts. The loaded source is tagged with
+ * the path and session key it was fetched for, and renders only while both
+ * still match the current props and tab session, so a re-render with a new
+ * path or key never shows the previous bytes.
+ */
+export function WikiImage({ path, className, alt }: { path: string; className?: string; alt: string }) {
+  const key = sessionKey();
+  const [loaded, setLoaded] = useState<{ path: string; key: string | null; src: string } | null>(null);
+  useEffect(() => {
+    const abort = new AbortController();
+    let reader: FileReader | null = null;
+    wikiBlob(path, abort.signal)
+      .then((blob) => {
+        if (abort.signal.aborted || sessionKey() !== key) return;
+        const owned = new FileReader();
+        reader = owned;
+        owned.onload = () => {
+          const src = owned.result;
+          if (abort.signal.aborted || sessionKey() !== key || typeof src !== "string") return;
+          setLoaded({ path, key, src });
+        };
+        owned.readAsDataURL(blob);
+      })
+      .catch(() => {});
+    return () => {
+      abort.abort();
+      if (reader && reader.readyState === FileReader.LOADING) reader.abort();
+      setLoaded(null);
+    };
+  }, [path, key]);
+  const src = loaded && loaded.path === path && loaded.key === sessionKey() ? loaded.src : null;
+  return src ? <img className={className} src={src} alt={alt} /> : null;
 }
 
 export function Loading({ what }: { what: string }) {
