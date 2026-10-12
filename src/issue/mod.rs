@@ -14,6 +14,8 @@ pub mod app_chat;
 pub mod app_listing;
 pub mod app_screen_decl;
 pub mod app_screen_pkg;
+#[cfg(test)]
+mod cad811_screen_startup_acceptance;
 pub mod app_source;
 pub mod app_view;
 pub mod areas;

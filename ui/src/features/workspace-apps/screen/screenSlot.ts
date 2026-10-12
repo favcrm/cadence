@@ -22,10 +22,17 @@ export const SLOT_TTL_MS = 120_000;
 
 /** CAD-1328: what a confirm card shows, from the daemon's frozen effect material (never from the frame). */
 export interface SlotCard { target: string; caption: string; image: string | null; title?: string; detail?: string }
-/** `isCurrent` is the controller's liveness check (not closed, still this slot); a run that performs a browser effect after an await re-checks it. */
-export interface SlotPlan { label: string; run: (isCurrent?: () => boolean) => Promise<ActionResult>; card?: SlotCard }
+export interface RecordCard {
+  operation: string;
+  facts: { label: string; value: string }[];
+  input?: { field: "to_email" | "connection_id" | "resolution" | "unsubscribe_origin" | "brief"; label: string; value?: string; choices?: { value: string; label: string }[] };
+}
+/** Records consume trusted text; generic browser effects receive only a liveness callback. */
+export type SlotPlan =
+  | { records: true; label: string; run: (input?: string) => Promise<ActionResult>; card?: SlotCard; recordCard?: RecordCard }
+  | { records?: false; label: string; run: (isCurrent?: () => boolean) => Promise<ActionResult>; card?: SlotCard; recordCard?: never };
 export type Planner = (verb: SlotVerb, args: Record<string, unknown>, ui?: { actionToken?: string; isCurrent?: () => boolean }) => Promise<SlotPlan | ActionRefusal>;
-export interface SlotView { token: string; label: string; anchor: SlotAnchor; pending: boolean; card?: SlotCard }
+export interface SlotView { token: string; label: string; anchor: SlotAnchor; pending: boolean; card?: SlotCard; recordCard?: RecordCard }
 
 interface Live { id: string; key: string; verb: SlotVerb; view: SlotView; since: number; plan: SlotPlan; busy: boolean; timer: ReturnType<typeof setTimeout> }
 
@@ -67,14 +74,14 @@ export class SlotController {
     const anchor = this.planning?.anchor ?? req.anchor;
     this.planning = null;
     if (!("run" in plan)) { this.send({ v: 2, op: "slot-state", id: req.id, state: "refused", refusal: plan }); return; }
-    const timer = setTimeout(() => { if (this.live?.id === req.id && !this.live.busy) this.retire("expired"); }, SLOT_TTL_MS);
-    this.live = { id: req.id, key, verb: req.verb, view: { token: randomToken(), label: plan.label, anchor, pending: false, ...(plan.card ? { card: plan.card } : {}) }, since: this.clock(), plan, busy: false, timer };
+    const timer = setTimeout(() => { if (this.live?.id === req.id && !this.live.busy) this.retire("expired"); }, plan.records ? 60000 : SLOT_TTL_MS);
+    this.live = { id: req.id, key, verb: req.verb, view: { token: randomToken(), label: plan.label, anchor, pending: false, ...(plan.card ? { card: plan.card } : {}), ...(plan.recordCard ? { recordCard: plan.recordCard } : {}) }, since: this.clock(), plan, busy: false, timer };
     this.changed(this.live.view);
   }
 
   /** A press on the host button. `pressedAt` is the `pointerdown` time on the
    *  same clock (or now, for keyboard activation). Returns whether it fired. */
-  tap(token: string, trusted: boolean, pressedAt: number): boolean {
+  tap(token: string, trusted: boolean, pressedAt: number, input?: string): boolean {
     const live = this.live;
     if (this.closed || !live || live.busy || !trusted || token !== live.view.token) return false;
     const now = this.clock();
@@ -83,7 +90,10 @@ export class SlotController {
     live.view = { ...live.view, pending: true };
     this.send({ v: 2, op: "slot-state", id: live.id, state: "pending" });
     this.changed(live.view);
-    void live.plan.run(() => !this.closed && this.live === live).catch((): ActionResult => ({ ok: false, refusal: UNEXPECTED })).then(result => {
+    const execution = live.plan.records
+      ? live.plan.run(input)
+      : live.plan.run(() => !this.closed && this.live === live);
+    void execution.catch((): ActionResult => ({ ok: false, refusal: UNEXPECTED })).then(result => {
       if (this.closed || this.live !== live) return;
       clearTimeout(live.timer);
       this.live = null;
@@ -91,7 +101,9 @@ export class SlotController {
       // closed runtime-validated {run_id,request_id,state}; every other
       // verb's generic ActionResult.data is discarded as before.
       let message: ReplyMessage;
-      if (result.ok) {
+      if (result.ok && live.plan.records) {
+        message = { v: 2, op: "slot-state", id: live.id, state: "done", data: result.data ?? null };
+      } else if (result.ok) {
         const receipt = live.verb === "run.start" ? parseRunSlotReceipt(result.data) : null;
         message = receipt
           ? { v: 2, op: "slot-state", id: live.id, state: "done", receipt }

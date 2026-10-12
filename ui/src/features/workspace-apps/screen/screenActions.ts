@@ -6,7 +6,7 @@ import { workspaceApps, type AppContext, type CapabilityQuote, type Installation
 import { contextDefaultKeys, instagramLink } from "./screenProjection";
 import { accountLabel, connectReturnTo, publicationBinding, sendSlot } from "../socialConnect";
 import { dueLabel } from "../socialPublish";
-import { TOOL_ALIAS, mediaPublishArgs, mediaReadArgs, originalDownloadArgs, parseRunSlotReceipt, RUN_REQUEST_ID, type ActionRefusal, type ActionResult, type CallVerb, type SlotVerb } from "./screenProtocol";
+import { TOOL_ALIAS, CALL_VERBS, SLOT_VERBS, mediaPublishArgs, mediaReadArgs, originalDownloadArgs, parseRunSlotReceipt, RUN_REQUEST_ID, type ActionRefusal, type ActionResult, type CallVerb, type SlotVerb } from "./screenProtocol";
 import { downscaleToDataUrl } from "./screenAssets";
 import type { Planner, SlotPlan } from "./screenSlot";
 
@@ -269,7 +269,7 @@ async function planUseDestination(ctx: ActionContext, args: Record<string, unkno
     const contextId = ctx.contextId;
     const binding = publicationBinding(await workspaceApps.bindings(ctx.installId, contextId || undefined), slot, contextId || null, ctx.installation.digest);
     const request = randomRequest();
-    return { label: `Use ${accountLabel(chosen.label || destination)} for publishing`, run: async () => {
+    return { label: `Use ${accountLabel(chosen.label || destination)} for publishing`, run: async (): Promise<ActionResult> => {
       try {
         await workspaceApps.useDestination(ctx.installId, { destination_id: destination,
           ...(contextId ? { context_id: contextId } : {}),
@@ -298,7 +298,7 @@ async function planSavePublishSettings(ctx: ActionContext, args: Record<string, 
     const body = { destination_id: chosen.destination_id, timezone: args.timezone,
       ...(ctx.contextId ? { context_id: ctx.contextId } : {}),
       ...(binding ? { expected_revision: binding.revision } : { request_id: randomRequest() }) };
-    return { label: `Use ${accountLabel(chosen.label || chosen.destination_id)} · ${args.timezone}`, run: async () => {
+    return { label: `Use ${accountLabel(chosen.label || chosen.destination_id)} · ${args.timezone}`, run: async (): Promise<ActionResult> => {
       try {
         await workspaceApps.useDestination(ctx.installId, body);
         await ctx.onChanged();
@@ -343,7 +343,7 @@ async function planConfirmPublish(ctx: ActionContext, args: Record<string, unkno
     } else if (typeof authority.asset_id === "string") return { code: "failed", text: "That didn't work. Nothing was started." };
     const effectId = found.effect_id;
     const digest = found.digest;
-    return { label: `Post to ${target}`, card: { target, caption: authority.caption, image }, run: async () => {
+    return { label: `Post to ${target}`, card: { target, caption: authority.caption, image }, run: async (): Promise<ActionResult> => {
       try {
         const sent = await workspaceApps.confirmSocialDraftPublish(effectId, { digest });
         ctx.onChanged();
@@ -369,7 +369,8 @@ function openLink(args: Record<string, unknown>, ui: { showLink(url: string): vo
 /** The direct (non-spending) verbs. The set is closed in `screenProtocol`. */
 export function runCall(ctx: ActionContext, verb: CallVerb, args: Record<string, unknown>,
   ui: { showLink(url: string): void; navigate?: (path: string) => void; assign?: (url: string) => void; actionToken?: string; signal?: AbortSignal }): Promise<ActionResult> {
-  const table: Record<CallVerb, () => Promise<ActionResult> | ActionResult> = {
+  if (!(CALL_VERBS as readonly string[]).includes(verb)) return Promise.resolve(refuse("forbidden", "This operation requires the records service."));
+  const table: Record<(typeof CALL_VERBS)[number], () => Promise<ActionResult> | ActionResult> = {
     "read.run": () => readRun(ctx, args),
     "context.defaults.save": () => saveDefaults(ctx, args),
     "open-link": () => connectOrOpen(ctx, args, ui),
@@ -385,7 +386,7 @@ export function runCall(ctx: ActionContext, verb: CallVerb, args: Record<string,
     "media.read": () => mediaRead(args, ui),
     "media.publish": () => mediaPublish(args, ui),
   };
-  return Promise.resolve().then(table[verb]).catch((error: unknown): ActionResult => ({ ok: false, refusal: plainRefusal(error) }));
+  return Promise.resolve().then(table[verb as (typeof CALL_VERBS)[number]]).catch((error: unknown): ActionResult => ({ ok: false, refusal: plainRefusal(error) }));
 }
 
 const MAX_DRAFT_SCHEDULE_SECONDS = 366 * 24 * 60 * 60;
@@ -437,7 +438,7 @@ async function planDraftEffectChange(ctx: ActionContext, verb: SlotVerb, args: R
       card = { title: verb === "publish.draft.schedule" ? "Schedule this post?" : "Reschedule this post?",
         detail: `Scheduled for ${scheduleLabel}`, target, caption: authority.caption, image };
     }
-    return { label, ...(card ? { card } : {}), run: async () => {
+    return { label, ...(card ? { card } : {}), run: async (): Promise<ActionResult> => {
       try {
         const changed = verb === "publish.draft.schedule"
           ? await workspaceApps.scheduleSocialDraftEffect(effectId, { digest, due_epoch: dueEpoch! })
@@ -532,7 +533,7 @@ async function planRunStart(ctx: ActionContext, args: Record<string, unknown>): 
   // The frozen closure carries workflow name, inputs copy, request id,
   // install/context and the primitive quoted terms. The daemon's CAS on
   // expected_quotes refuses changed intent; the host never resubmits.
-  return { label, run: async () => {
+  return { label, run: async (): Promise<ActionResult> => {
     let run: unknown;
     try {
       run = await workspaceApps.startRun({ install_id: installId, workflow, inputs, request_id: request,
@@ -564,7 +565,7 @@ async function planOriginalDownload(get: () => ActionContext, args: Record<strin
   const assetId = checked.asset_id as string;
   const { installId, contextId, installation } = get();
   const digest = installation.digest;
-  return { label: "Download original", run: async (isCurrent) => {
+  return { label: "Download original", run: async (isCurrent?: () => boolean): Promise<ActionResult> => {
     const current = () => (isCurrent ? isCurrent() : true) && (ui?.isCurrent ? ui.isCurrent() : true) &&
       get().installId === installId && get().contextId === contextId && get().installation.digest === digest;
     let image: { bytes: ArrayBuffer; mime: string };
@@ -596,7 +597,8 @@ async function planOriginalDownload(get: () => ActionContext, args: Record<strin
 /** The spend/publish verbs. The set is closed in `screenProtocol`. */
 export function makePlanner(get: () => ActionContext): Planner {
   return (verb: SlotVerb, args, ui) => {
-    const table: Record<SlotVerb, () => Promise<SlotPlan | ActionRefusal>> = {
+    if (!(SLOT_VERBS as readonly string[]).includes(verb)) return Promise.resolve({ code: "forbidden", text: "This operation requires the records service." });
+    const table: Record<(typeof SLOT_VERBS)[number], () => Promise<SlotPlan | ActionRefusal>> = {
       "run.start": () => planRunStart(get(), args),
       "publish.destination.use": () => planUseDestination(get(), args),
       "publish.draft.confirm": () => planConfirmPublish(get(), args, ui?.actionToken),
@@ -606,6 +608,6 @@ export function makePlanner(get: () => ActionContext): Planner {
       "publish.settings.save": () => planSavePublishSettings(get(), args),
       "media.original.download": () => planOriginalDownload(get, args, ui),
     };
-    return table[verb]();
+    return table[verb as (typeof SLOT_VERBS)[number]]();
   };
 }

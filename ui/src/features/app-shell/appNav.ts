@@ -1,5 +1,6 @@
 import { CRM_SECTIONS, crmSectionHref, type AppMenuSection } from "./CrmOutlet";
 import { onPrivateSessionReset } from "../../lib/privateSession";
+import type { ScreenNavigation } from "../workspace-apps/screen/screenProtocol";
 
 /** One installed app in the board's Apps menu (CAD-1116). */
 export interface AppNavEntry {
@@ -31,6 +32,8 @@ export interface VerifiedApp {
   installId: string;
   kind: string;
   title: string;
+  /** Consumed-mount declaration, pinned to verified package bytes by the host. */
+  navigation?: ScreenNavigation | null;
 }
 
 /** Per-kind section declarations. This table is the one place that names a
@@ -55,8 +58,24 @@ const SECTIONS_BY_KIND: Record<string, KindSections> = {
 };
 
 /** The section the URL is on, for a kind that declares sections. */
-export function sectionFromSearch(kind: string, search: string): string | null {
-  return SECTIONS_BY_KIND[kind]?.fromSearch(search) ?? null;
+function declaredSections(navigation: ScreenNavigation): KindSections {
+  return {
+    sections: navigation.sections.map(s => [s.id, s.label]),
+    fromSearch: search => {
+      const selected = new URLSearchParams(search).get(navigation.section_query);
+      return navigation.sections.find(s => s.id === selected)?.id ?? navigation.default_section;
+    },
+    href: (base, section) => {
+      const [path, search] = base.split("?");
+      const q = new URLSearchParams(search ?? "");
+      if (section === navigation.default_section) q.delete(navigation.section_query); else q.set(navigation.section_query, section);
+      q.delete("appview"); q.delete("record"); q.delete("segment");
+      const next = q.toString(); return path + (next ? `?${next}` : "");
+    },
+  };
+}
+export function sectionFromSearch(kind: string, search: string, navigation?: ScreenNavigation | null): string | null {
+  return (navigation ? declaredSections(navigation) : SECTIONS_BY_KIND[kind])?.fromSearch(search) ?? null;
 }
 
 export interface LastApp {
@@ -120,7 +139,7 @@ export function buildAppNav(input: {
   const expandedId = onAppScreen ? activeId : last?.installId ?? null;
   return {
     apps: apps.map((app) => {
-      const decl = SECTIONS_BY_KIND[app.kind];
+      const decl = app.navigation ? declaredSections(app.navigation) : SECTIONS_BY_KIND[app.kind];
       const active = onAppScreen && app.installId === activeId;
       let sections: AppMenuSection[] | null = null;
       let href = active ? activeHref : installHref(app.installId);

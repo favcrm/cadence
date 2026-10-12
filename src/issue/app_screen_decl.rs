@@ -90,6 +90,234 @@ pub const MAY_MEDIA_READ: &str = "media.read";
 /// metadata mutation `app_media_publish` serves. Read rights alone
 /// never carry it, and no tools alias can hold it.
 pub const MAY_MEDIA_PUBLISH: &str = "media.publish";
+pub const HOST_CONTRACT_RECORDS: &str = "screen-records.v1";
+pub const MAY_RECORDS_CALL: &str = "records.call";
+pub const MAY_RECORDS_SLOT: &str = "records.slot";
+
+/// Closed vocabulary shared by admission and the governed service executor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, Deserialize)]
+pub enum ScreenOperation {
+    #[serde(rename = "records.list")]
+    RecordsList,
+    #[serde(rename = "records.show")]
+    RecordsShow,
+    #[serde(rename = "records.create")]
+    RecordsCreate,
+    #[serde(rename = "records.update")]
+    RecordsUpdate,
+    #[serde(rename = "records.csv.preview")]
+    RecordsCsvPreview,
+    #[serde(rename = "records.csv.import")]
+    RecordsCsvImport,
+    #[serde(rename = "records.csv.confirm")]
+    RecordsCsvConfirm,
+    #[serde(rename = "segments.list")]
+    SegmentsList,
+    #[serde(rename = "segments.show")]
+    SegmentsShow,
+    #[serde(rename = "segments.save")]
+    SegmentsSave,
+    #[serde(rename = "exclusions.list")]
+    ExclusionsList,
+    #[serde(rename = "exclusions.show")]
+    ExclusionsShow,
+    #[serde(rename = "exclusions.save")]
+    ExclusionsSave,
+    #[serde(rename = "suppressions.list")]
+    SuppressionsList,
+    #[serde(rename = "suppressions.add")]
+    SuppressionsAdd,
+    #[serde(rename = "audience.preview")]
+    AudiencePreview,
+    #[serde(rename = "audience.prepare")]
+    AudiencePrepare,
+    #[serde(rename = "audience.show")]
+    AudienceShow,
+    #[serde(rename = "content.list")]
+    ContentList,
+    #[serde(rename = "content.show")]
+    ContentShow,
+    #[serde(rename = "content.save")]
+    ContentSave,
+    #[serde(rename = "content.clone")]
+    ContentClone,
+    #[serde(rename = "content.render")]
+    ContentRender,
+    #[serde(rename = "content.approve")]
+    ContentApprove,
+    #[serde(rename = "proposals.list")]
+    ProposalsList,
+    #[serde(rename = "proposals.show")]
+    ProposalsShow,
+    #[serde(rename = "proposals.render")]
+    ProposalsRender,
+    #[serde(rename = "proposals.apply")]
+    ProposalsApply,
+    #[serde(rename = "proposals.discard")]
+    ProposalsDiscard,
+    #[serde(rename = "sender-bindings.list")]
+    SenderBindingsList,
+    #[serde(rename = "sender-bindings.show")]
+    SenderBindingsShow,
+    #[serde(rename = "sender-bindings.save")]
+    SenderBindingsSave,
+    #[serde(rename = "content.test-prepare")]
+    ContentTestPrepare,
+    #[serde(rename = "content.send-prepare")]
+    ContentSendPrepare,
+    #[serde(rename = "sends.prepare")]
+    SendsPrepare,
+    #[serde(rename = "sends.show")]
+    SendsShow,
+    #[serde(rename = "sends.list")]
+    SendsList,
+    #[serde(rename = "sends.approve")]
+    SendsApprove,
+    #[serde(rename = "sends.resolve")]
+    SendsResolve,
+    #[serde(rename = "smtp.show")]
+    SmtpShow,
+    #[serde(rename = "smtp.manage")]
+    SmtpManage,
+    #[serde(rename = "smtp.bind")]
+    SmtpBind,
+    #[serde(rename = "smtp.rebind")]
+    SmtpRebind,
+    #[serde(rename = "smtp.revoke")]
+    SmtpRevoke,
+    #[serde(rename = "smtp.test-send")]
+    SmtpTestSend,
+    #[serde(rename = "origin.show")]
+    OriginShow,
+    #[serde(rename = "origin.manage")]
+    OriginManage,
+    #[serde(rename = "chat.campaign.open")]
+    ChatCampaignOpen,
+    #[serde(rename = "chat.campaign.brief")]
+    ChatCampaignBrief,
+    #[serde(rename = "screen.preview.show")]
+    ScreenPreviewShow,
+    #[serde(rename = "screen.preview.clear")]
+    ScreenPreviewClear,
+    #[serde(rename = "screen.route.patch")]
+    ScreenRoutePatch,
+}
+
+impl ScreenOperation {
+    pub fn is_slot(self) -> bool {
+        matches!(
+            self,
+            Self::RecordsCsvImport
+                | Self::RecordsCsvConfirm
+                | Self::ContentApprove
+                | Self::SendsApprove
+                | Self::SendsResolve
+                | Self::SmtpManage
+                | Self::SmtpBind
+                | Self::SmtpRebind
+                | Self::SmtpRevoke
+                | Self::SmtpTestSend
+                | Self::OriginManage
+                | Self::ChatCampaignOpen
+                | Self::ChatCampaignBrief
+        )
+    }
+    pub fn args_limit(self) -> usize {
+        match self {
+            Self::RecordsCsvPreview | Self::RecordsCsvImport | Self::RecordsCsvConfirm => 327_680,
+            Self::RecordsCreate
+            | Self::RecordsUpdate
+            | Self::ContentSave
+            | Self::ScreenPreviewShow => 49_152,
+            _ => 16_384,
+        }
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScreenNavigation {
+    pub section_query: String,
+    pub default_section: String,
+    pub sections: Vec<ScreenSection>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScreenSection {
+    pub id: String,
+    pub label: String,
+}
+
+impl ScreenNavigation {
+    fn validate(&self) -> Result<()> {
+        // Only app-owned keys can be declared; host authority/routing keys
+        // never become a package-selected destination.
+        const RESERVED: &[&str] = &[
+            "app",
+            "install",
+            "install_id",
+            "context",
+            "context_id",
+            "actor",
+            "identity",
+            "auth",
+            "token",
+            "key",
+            "session",
+            "session_key",
+            "origin",
+            "project",
+            "workspace",
+            "conversation",
+            "thread",
+            "message",
+            "view",
+            "appview",
+            "record",
+            "record_id",
+            "segment",
+            "segment_id",
+            "screen",
+            "contract-preview",
+            "nonce",
+            "proof",
+        ];
+        let key = self.section_query.as_bytes();
+        if key.is_empty()
+            || key.len() > 32
+            || !key[0].is_ascii_lowercase()
+            || !key
+                .iter()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-'))
+            || RESERVED.contains(&self.section_query.as_str())
+        {
+            return Err(Error::rejected(
+                "navigation section_query must be an app-owned query key",
+            ));
+        }
+        if self.sections.is_empty() || self.sections.len() > 8 {
+            return Err(Error::rejected("navigation requires 1..8 sections"));
+        }
+        let mut seen = HashSet::new();
+        for section in &self.sections {
+            if !model::valid_tag(&section.id)
+                || !seen.insert(&section.id)
+                || section.label.is_empty()
+                || section.label.encode_utf16().count() > 40
+                || section.label.chars().any(char::is_control)
+            {
+                return Err(Error::rejected("invalid or duplicate navigation section"));
+            }
+        }
+        if !seen.contains(&self.default_section) {
+            return Err(Error::rejected(
+                "navigation default_section is not declared",
+            ));
+        }
+        Ok(())
+    }
+}
 /// The one entry point — pinned, and it must be a declared, supplied
 /// asset.
 const ENTRY: &str = "client.js";
@@ -139,6 +367,9 @@ pub struct IntegrityCheckedScreen {
     /// The alias is app-owned vocabulary the frame calls; the slot is
     /// the `needs.capabilities` key it resolves through. Empty on v1.
     tools: BTreeMap<String, String>,
+    operations: Vec<ScreenOperation>,
+    navigation: Option<ScreenNavigation>,
+    startup: Option<Vec<String>>,
 }
 
 impl IntegrityCheckedScreen {
@@ -164,6 +395,17 @@ impl IntegrityCheckedScreen {
     /// The declared tool alias→capability-slot map (v2 only; empty on v1).
     pub fn tools(&self) -> &BTreeMap<String, String> {
         &self.tools
+    }
+    pub fn operations(&self) -> &[ScreenOperation] {
+        &self.operations
+    }
+    pub fn navigation(&self) -> Option<&ScreenNavigation> {
+        self.navigation.as_ref()
+    }
+    /// Explicit execution order, records-v2 only; absence keeps all leaves
+    /// except the entry inert. Integrity evidence, never execution authority.
+    pub fn startup(&self) -> Option<&[String]> {
+        self.startup.as_deref()
     }
     /// The declared app tag (`model::valid_tag` grammar).
     pub fn app(&self) -> &str {
@@ -222,6 +464,12 @@ struct RawDecl {
     /// installed app declares (checked at invoke, never trusted here).
     #[serde(default)]
     tools: BTreeMap<String, String>,
+    #[serde(default)]
+    operations: Vec<ScreenOperation>,
+    #[serde(default)]
+    navigation: Option<ScreenNavigation>,
+    #[serde(default)]
+    startup: Option<Vec<String>>,
 }
 
 /// One declared asset member — closed, all four fields required.
@@ -309,6 +557,20 @@ pub fn validate_map(
     let decl: RawDecl = serde_json::from_str(manifest)
         .map_err(|e| Error::rejected(format!("manifest declaration: {e}")))?;
 
+    // Preserve the exact old v1/screen-actions schema floors: even empty
+    // new fields are records-contract-only, not a silent old-schema widening.
+    if decl.host_contract.as_deref() != Some(HOST_CONTRACT_RECORDS)
+        && value.as_object().is_some_and(|fields| {
+            fields.contains_key("operations") || fields.contains_key("navigation")
+        })
+    {
+        return Err(Error::rejected(
+            "operations/navigation require screen-records.v1",
+        ));
+    }
+    if value.get("startup").is_some() && decl.startup.is_none() {
+        return Err(Error::rejected("startup must be a non-null array"));
+    }
     check_declaration(&decl)?;
     check_assets(&decl, assets)?;
 
@@ -333,6 +595,9 @@ pub fn validate_map(
             .collect(),
         host_contract: decl.host_contract,
         tools,
+        operations: decl.operations,
+        navigation: decl.navigation,
+        startup: decl.startup,
     })
 }
 
@@ -468,9 +733,14 @@ fn check_declaration(decl: &RawDecl) -> Result<()> {
         let Some(name) = member.as_str() else {
             return Err(Error::rejected("`may` members are strings"));
         };
+        let records = decl.host_contract.as_deref() == Some(HOST_CONTRACT_RECORDS);
         let granted = is_v2
-            && (name == MAY_TOOLS_INVOKE
-                || (media_contract && (name == MAY_MEDIA_READ || name == MAY_MEDIA_PUBLISH)));
+            && if records {
+                matches!(name, MAY_RECORDS_CALL | MAY_RECORDS_SLOT)
+            } else {
+                name == MAY_TOOLS_INVOKE
+                    || (media_contract && matches!(name, MAY_MEDIA_READ | MAY_MEDIA_PUBLISH))
+            };
         if !granted {
             return Err(Error::rejected(format!(
                 "`may` method {name:?} is not a method this contract grants"
@@ -485,16 +755,24 @@ fn check_declaration(decl: &RawDecl) -> Result<()> {
     // `host_contract`/`tools` are v2-only action declarations. Declaring
     // either under v1 refuses — a v1 screen stays read-only and cannot
     // smuggle a contract it was not reviewed against.
-    if !is_v2 && (decl.host_contract.is_some() || !decl.tools.is_empty()) {
+    if !is_v2
+        && (decl.host_contract.is_some()
+            || !decl.tools.is_empty()
+            || !decl.operations.is_empty()
+            || decl.navigation.is_some())
+    {
         return Err(Error::rejected(
             "host_contract and tools require contract app-screens/v2",
         ));
     }
     if let Some(host) = &decl.host_contract {
-        if host != HOST_CONTRACT_ACTIONS && host != HOST_CONTRACT_MEDIA {
+        if host != HOST_CONTRACT_ACTIONS
+            && host != HOST_CONTRACT_MEDIA
+            && host != HOST_CONTRACT_RECORDS
+        {
             return Err(Error::rejected(format!(
                 "host_contract {host:?} — the only served contracts are \
-                 {HOST_CONTRACT_ACTIONS:?} and {HOST_CONTRACT_MEDIA:?}",
+                 {HOST_CONTRACT_ACTIONS:?}, {HOST_CONTRACT_MEDIA:?} and {HOST_CONTRACT_RECORDS:?}",
             )));
         }
     }
@@ -503,6 +781,33 @@ fn check_declaration(decl: &RawDecl) -> Result<()> {
     if (!decl.tools.is_empty() || !decl.may.is_empty()) && decl.host_contract.is_none() {
         return Err(Error::rejected(
             "a screen declaring may/tools must pin host_contract",
+        ));
+    }
+    if decl.host_contract.as_deref() == Some(HOST_CONTRACT_RECORDS) {
+        if !decl.tools.is_empty() || decl.operations.len() > 64 {
+            return Err(Error::rejected(
+                "records screens require empty tools and at most 64 operations",
+            ));
+        }
+        let mut operations = HashSet::new();
+        for op in &decl.operations {
+            let permission = if op.is_slot() {
+                MAY_RECORDS_SLOT
+            } else {
+                MAY_RECORDS_CALL
+            };
+            if !operations.insert(op) || !may_seen.contains(permission) {
+                return Err(Error::rejected(
+                    "duplicate operation or missing records permission",
+                ));
+            }
+        }
+        if let Some(nav) = &decl.navigation {
+            nav.validate()?;
+        }
+    } else if !decl.operations.is_empty() || decl.navigation.is_some() {
+        return Err(Error::rejected(
+            "operations/navigation require screen-records.v1",
         ));
     }
     // `tools` is a bounded alias→slot map (≤8, matching the app
@@ -577,6 +882,39 @@ fn check_declaration(decl: &RawDecl) -> Result<()> {
         return Err(Error::rejected(format!(
             "entry {ENTRY:?} must be one of the declared assets"
         )));
+    }
+    if let Some(startup) = &decl.startup {
+        if !is_v2 || decl.host_contract.as_deref() != Some(HOST_CONTRACT_RECORDS) {
+            return Err(Error::rejected(
+                "startup requires app-screens/v2 and screen-records.v1",
+            ));
+        }
+        if !(2..=MAX_ASSETS).contains(&startup.len())
+            || startup.last().map(String::as_str) != Some(ENTRY)
+        {
+            return Err(Error::rejected(
+                "startup requires 2..32 scripts with client.js last",
+            ));
+        }
+        let scripts: HashSet<&str> = decl
+            .assets
+            .iter()
+            .filter(|asset| asset.media_type == "text/javascript")
+            .map(|asset| asset.name.as_str())
+            .collect();
+        let mut ordered = HashSet::new();
+        for name in startup {
+            if !scripts.contains(name.as_str()) || !ordered.insert(name.as_str()) {
+                return Err(Error::rejected(
+                    "startup members must be distinct declared JavaScript leaves",
+                ));
+            }
+        }
+        if ordered != scripts {
+            return Err(Error::rejected(
+                "startup must list every declared JavaScript leaf",
+            ));
+        }
     }
     // Provenance is declared syntax — checked for shape, never
     // recomputed against a rebuild.

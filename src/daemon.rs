@@ -38,6 +38,13 @@ mod app_record_actions_rpc;
 pub use app_image_jobs::test_probe as image_job_probe;
 mod app_records_rpc;
 mod app_runs_rpc;
+mod app_screen_services_rpc;
+
+#[cfg(all(test, feature = "test-seam"))]
+mod cad811_installed_crm_qa_fixture;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad811_screen_services_acceptance;
+
 mod app_screens_rpc;
 mod app_social_drafts_rpc;
 mod app_teams_rpc;
@@ -201,7 +208,9 @@ pub use master_rpc::MASTER_ALLOWED;
 // `pub(crate)` — the UI frame route calls it; unit tests live in the
 // module, not as a public API.
 pub(crate) use app_capabilities_rpc::operator_price_refusal;
-pub(crate) use app_screens_rpc::{render_frame_html, SCREEN_KIT_CSS, SCREEN_KIT_VERSION};
+pub(crate) use app_screens_rpc::{
+    render_frame_html, render_package_frame_html, SCREEN_KIT_CSS, SCREEN_KIT_VERSION,
+};
 
 /// A `(Mutex, Condvar)` pair used for queue/event wakeups.
 ///
@@ -665,6 +674,9 @@ pub struct Shared {
     /// swept on mint. In-memory: a restart drops every live mount's action
     /// context (the frame just remounts).
     tool_contexts: Mutex<HashMap<String, app_tools_rpc::ToolContext>>,
+    screen_service_confirmations:
+        Mutex<HashMap<String, app_screen_services_rpc::ScreenServiceConfirmation>>,
+    screen_service_csv: Mutex<HashSet<String>>,
     /// Serializes an app's checked execution claim through bounded Local
     /// commit/readback against binding/context/custody mutations.
     app_release_lock: Mutex<()>,
@@ -996,6 +1008,8 @@ impl Shared {
             screen_caps: Mutex::new(HashMap::new()),
             screen_mint_rate: Mutex::new(HashMap::new()),
             tool_contexts: Mutex::new(HashMap::new()),
+            screen_service_confirmations: Mutex::new(HashMap::new()),
+            screen_service_csv: Mutex::new(HashSet::new()),
             app_release_lock: Mutex::new(()),
             host_runs_in_flight: Mutex::new(HashSet::new()),
             app_assistant_lock: Mutex::new(()),
@@ -2897,6 +2911,13 @@ impl Shared {
             }
             "app_assistant_permission_block" => {
                 self.rpc_app_assistant_operator(method, params, peer_pid)
+            }
+            "app_screen_service_call" => self.rpc_app_screen_service_call(params, peer_pid),
+            "app_screen_service_slot_prepare" => {
+                self.rpc_app_screen_service_slot_prepare(params, peer_pid)
+            }
+            "app_screen_service_slot_confirm" => {
+                self.rpc_app_screen_service_slot_confirm(params, peer_pid)
             }
             "app_screen_mint" => self.rpc_app_screen_mint(params, peer_pid),
             "app_screen_consume" => self.rpc_app_screen_consume(params, peer_pid),

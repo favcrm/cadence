@@ -1,0 +1,13 @@
+@import "tailwindcss" source(none);
+@import "./theme.css";
+@import "./controls.css";
+@import "./base.css";
+@import "./primitives.css";
+@import "./drawer-base.css";
+@import "./drawer.css";
+
+/* Generate only the utility classes used by these actual shared controls. */
+@source "../../src/features/app-shell/shared/*.tsx";
+@source "../../src/ui/Button.tsx";
+@source "../../src/ui/Link.tsx";
+@source "../../src/ui/Select.tsx";

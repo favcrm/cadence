@@ -983,6 +983,22 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
         }
         return;
     }
+    // Closed screen services use the SAME admitted OperatorOnly HTTP peer
+    // proof as the ordinary write dispatcher, on local and public surfaces.
+    if let Some(rpc) = app_screens::service_route(&path) {
+        if method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        if let Err(response) = operator::admit(&request, method.as_str(), &path, state_dir, opts) {
+            send(request, response);
+            return;
+        }
+        let response = app_screens::service(&mut request, state_dir, opts, rpc);
+        read_model::get(state_dir, pm_dir).invalidate();
+        send(request, response);
+        return;
+    }
     if public_host {
         if path.starts_with("/__platform/") {
             let resp = match (method.as_str(), path.as_str()) {

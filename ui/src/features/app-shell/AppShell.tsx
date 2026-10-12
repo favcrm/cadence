@@ -17,9 +17,14 @@ import type { ChatBinding, ChatScope } from "./chat/types";
 import { assertRecordId, type HostScope } from "./hostActions";
 import { isDev } from "../../env";
 import AppViewContractPreview, { contractPreviewHref, contractPreviewKey } from "./app-views/AppViewContractPreview";
-import { useChatCollapsed, type ConversationLinkRequest } from "./conversationClient";
+import { useChatCollapsed, selectConversation, setDraftSubject, campaignSubject, conversationList, type ConversationLinkRequest } from "./conversationClient";
 import { installedAppHref } from "../apps/appViewModel";
 import { useLocale } from "../../lib/locale";
+import { InstalledScreenOutlet } from "../workspace-apps/screen/ScreenHost";
+import type { ScreenNavigation } from "../workspace-apps/screen/screenProtocol";
+import { parseRoutePatch, type RoutePatch } from "../workspace-apps/screen/screenRoute";
+import type { HostCommand } from "../workspace-apps/screen/screenServices";
+import { purgeDisplayCache } from "../workspace-apps/screen/screenDisplayCache";
 import "./app-shell.css";
 
 type ParsedConversationLink = Omit<ConversationLinkRequest, "visit"> & { key: string };
@@ -123,6 +128,7 @@ export interface ActiveInstallation {
   installId: string;
   kind: string;
   title: string;
+  navigation?: ScreenNavigation | null;
 }
 
 export default function AppShell({
@@ -167,6 +173,8 @@ export default function AppShell({
     };
   }
   const conversationRequest = conversationRequestRef.current.request;
+  const [screenNavigation, setScreenNavigation] = useState<ScreenNavigation | null>(null);
+  useEffect(() => { if (viewer.operator !== true) purgeDisplayCache(); }, [viewer.operator]);
   const [installation, setInstallation] = useState<Installation | null>(null);
   const [contexts, setContexts] = useState<AppContext[]>([]);
   const [loadFailure, setLoadFailure] = useState<{ key: string; message: string } | null>(null);
@@ -265,6 +273,7 @@ export default function AppShell({
   // by the switch effect's `setLoadFailure(null)`.
   if (firstInstall.current !== installId && (installation !== null || contexts.length > 0 || contextId !== "" || linkNotice !== null || loadError !== null)) {
     setInstallation(null);
+    setScreenNavigation(null);
     setContexts([]);
     setContextId("");
     setLinkNotice(null);
@@ -292,6 +301,7 @@ export default function AppShell({
         conversation?: string | null;
         crm?: CrmSection | null;
         clearContractPreview?: boolean;
+        screenRoute?: { patch: RoutePatch; navigation: ScreenNavigation };
       },
       opts?: { replace?: boolean },
     ) => {
@@ -319,6 +329,24 @@ export default function AppShell({
       if (patch.crm !== undefined) {
         if (patch.crm === null || patch.crm === "customers") q.delete("crm");
         else q.set("crm", patch.crm);
+      }
+      if (patch.screenRoute) {
+        const { patch: route, navigation } = patch.screenRoute;
+        // Closed app-local selectors only. Native scope, session, conversation
+        // and recovery parameters cannot be named by this adapter.
+        const safe = parseRoutePatch({ ...route }, navigation);
+        if (!safe) return;
+        if (safe.section !== undefined) {
+          if (safe.section === navigation.default_section) q.delete(navigation.section_query);
+          else q.set(navigation.section_query, safe.section);
+        }
+        if (safe.view !== undefined) {
+          if (safe.view === "list") { q.delete("appview"); q.delete("segment"); }
+          else q.set("appview", "new");
+        }
+        for (const [field, parameter] of [["record_id", "record"], ["segment_id", "segment"]] as const) {
+          if (safe[field] !== undefined) { if (safe[field] === null) q.delete(parameter); else q.set(parameter, safe[field]); }
+        }
       }
       if (patch.clearContractPreview) {
         q.delete("contract-preview");
@@ -442,12 +470,13 @@ export default function AppShell({
         installId,
         kind: installation.name,
         title: installation.title || installation.name,
+        navigation: screenNavigation,
       });
     } else {
       onInstallation(null);
     }
     return () => onInstallation(null);
-  }, [installId, installation, onInstallation, receiptReady]);
+  }, [installId, installation, onInstallation, receiptReady, screenNavigation]);
 
   useEffect(() => {
     setSocialContext(rememberedContext(installId));
@@ -654,6 +683,23 @@ export default function AppShell({
   // never a global — so a message bound to another install or
   // context can never mint here.
 
+  const screenRoute = (patch: RoutePatch, navigation: ScreenNavigation) => {
+    if (receiptReady && contextAdoptionReady && scope.contextId && viewer.operator === true && !viewer.readOnly) writeQuery({ screenRoute: { patch, navigation } }, { replace: patch.replace });
+  };
+  const screenCommand = (command: HostCommand) => {
+    if (!receiptReady || !contextAdoptionReady || !scope.contextId || viewer.operator !== true || viewer.readOnly) return;
+    if (command.operation === "smtp.manage") { navigate("/settings/email"); return; }
+    if (command.operation === "chat.campaign.open" || command.operation === "chat.campaign.brief") {
+      const campaign = command.args.campaign_id;
+      if (typeof campaign !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(campaign)) return;
+      // Selection only. The protected server executor has already validated
+      // scope and, for a brief, enqueued the host-minted message under its fence.
+      if (command.conversation_id) selectConversation(installId, command.conversation_id);
+      else setDraftSubject(installId, campaignSubject(campaign));
+      if (command.operation === "chat.campaign.brief") void conversationList(installId).refresh();
+      setPanel("chat");
+    }
+  };
   const title = installation?.title || installation?.name || "App";
   const isSocial = installation !== null && installation.name === "social-content";
   // A non-CRM app whose approved, executable package declares one screen
@@ -983,7 +1029,10 @@ export default function AppShell({
               ) : screenOutlet && children ? (
                 children
               ) : (
-                <CrmOutlet
+                <InstalledScreenOutlet installation={installation} contexts={contexts} contextId={scope.contextId}
+                  admitted={receiptReady && contextAdoptionReady && viewer.operator === true && !viewer.readOnly}
+                  onRoute={screenRoute} onCommand={screenCommand} onNavigation={setScreenNavigation}
+                  fallback={<CrmOutlet
                   key={`${installId}:${contextId}`}
                   scope={scope}
                   installationTitle={title}
@@ -1002,7 +1051,7 @@ export default function AppShell({
                   // stale render's href, so the second would re-apply the
                   // first's pre-image and retain `appview=new` (CAD-781 F1).
                   onRecordCreated={(id) => writeQuery({ appview: null, record: id })}
-                />
+                />} />
               )}
             </>
           )}
