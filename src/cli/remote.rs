@@ -5,6 +5,7 @@
 //! in their own slice, and operator-only verbs never do.
 
 use super::*;
+use cadence_agent::wiki::cli::WikiAction;
 
 /// `cadence <verb>` → AOS-128 `(verb, arguments)`. Every returned verb is
 /// in `remote_cli::REMOTE_VERBS`; every argument value is a primitive the
@@ -12,6 +13,9 @@ use super::*;
 /// flag that cannot cross the wire faithfully — refuses locally; nothing
 /// is sent (contract I2: an allowlist, not a tunnel).
 fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String, Value>)> {
+    if let Commands::Wiki { action } = command {
+        return wiki_for(action);
+    }
     let mut args = serde_json::Map::new();
     let verb = match command {
         Commands::Status {
@@ -421,6 +425,102 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
     Ok((verb, args))
 }
 
+/// `cadence wiki …` → the contract action (CAD-1401). `ls` and `search` are
+/// `enumerate` (search carries `q`, ls does not), `cat` is `read`, a text
+/// `put` is `write`. The argument names are the local CLI's own. Blob upload,
+/// index, mkdir/mv/rm and history have no remote mapping and refuse here.
+fn wiki_for(action: &WikiAction) -> Result<(&'static str, serde_json::Map<String, Value>)> {
+    let mut args = serde_json::Map::new();
+    let verb = match action {
+        WikiAction::Ls { path } => {
+            args.insert("path".into(), json!(path.clone().unwrap_or_default()));
+            "enumerate"
+        }
+        WikiAction::Search { q, path, .. } => {
+            args.insert("q".into(), json!(q));
+            args.insert("path".into(), json!(path.clone().unwrap_or_default()));
+            "enumerate"
+        }
+        WikiAction::Cat { path, .. } => {
+            args.insert("path".into(), json!(path));
+            "read"
+        }
+        WikiAction::Put {
+            path,
+            text,
+            file,
+            blob,
+            if_rev,
+        } => {
+            if *blob {
+                return Err(Error::rejected(
+                    "remote `wiki put --blob` is not available in this build — blob upload \
+                     is out of scope; nothing was sent",
+                ));
+            }
+            // The text is read client-side, as `issue new --file` does: a
+            // remote caller has no master confinement, and `-` is stdin.
+            let body = match (text, file) {
+                (Some(t), _) => t.clone(),
+                (None, Some(f)) if f.as_os_str() == "-" => {
+                    std::io::read_to_string(std::io::stdin())?
+                }
+                (None, Some(f)) => std::fs::read_to_string(f).map_err(|e| {
+                    Error::rejected(format!(
+                        "wiki put --file {}: cannot read it locally: {e}",
+                        f.display()
+                    ))
+                })?,
+                (None, None) => std::io::read_to_string(std::io::stdin())?,
+            };
+            args.insert("path".into(), json!(path));
+            args.insert("text".into(), json!(body));
+            if let Some(rev) = if_rev {
+                args.insert("if_rev".into(), json!(rev));
+            }
+            "write"
+        }
+        _ => {
+            return Err(Error::rejected(
+                "`cadence wiki` this subcommand is not available on a remote org in this \
+                 build — remote wiki verbs are: wiki ls, wiki search, wiki cat, wiki put \
+                 (text). Use `--org local` or `cadence org switch` to run locally.",
+            ))
+        }
+    };
+    Ok((verb, args))
+}
+
+/// `wiki ls|cat|search` answers print as the host prints them. The `--json`,
+/// `--meta` and `put` forms keep the JSON body. Returns whether it printed.
+fn wiki_text(command: &Commands, body: &Value) -> bool {
+    let Commands::Wiki { action } = command else {
+        return false;
+    };
+    match action {
+        WikiAction::Ls { .. } => {
+            cadence_agent::wiki::cli::entries(body);
+            true
+        }
+        WikiAction::Cat { meta: false, .. } if body["kind"] == "text" => {
+            print!("{}", body["text"].as_str().unwrap_or(""));
+            true
+        }
+        WikiAction::Search { json: false, .. } => {
+            for m in body["matches"].as_array().cloned().unwrap_or_default() {
+                println!(
+                    "{}:{}: {}",
+                    m["path"].as_str().unwrap_or(""),
+                    m["line"].as_u64().unwrap_or(0),
+                    m["text"].as_str().unwrap_or("")
+                );
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 fn unavailable(command: &Commands) -> Error {
     // The refusal names the command so an agent can branch on it; the
     // allowlisted alternatives are the only remote surface.
@@ -428,7 +528,8 @@ fn unavailable(command: &Commands) -> Error {
         "`cadence {}` is not available on a remote org in this build — \
          remote verbs are: status, agent list, agent show, issue ls, \
          issue show, issue log, issue new, issue comment, issue set, \
-         message read, inbox (peek). \
+         message read, inbox (peek), wiki ls, wiki search, wiki cat, \
+         wiki put (text). \
          Use `--org local` or `cadence org switch` to run locally.",
         name(command)
     ))
@@ -505,6 +606,9 @@ pub(super) fn run(
         };
     match out {
         cadence_agent::remote_cli::RemoteAnswer::Ok(body) => {
+            if wiki_text(&command, &body) {
+                return Ok(0);
+            }
             println!(
                 "{}",
                 serde_json::to_string_pretty(&body).unwrap_or_default()

@@ -86,6 +86,13 @@ pub const REMOTE_VERBS: &[&str] = &[
     "issue_new",
     "issue_comment",
     "issue_set",
+    // wiki (CAD-1401): the contract actions the AgenticOS proxy maps onto the
+    // container's wiki routes. `enumerate` is `wiki ls` or `wiki search` (the
+    // arguments say which), `read` is `wiki cat`, `write` is a text `wiki put`.
+    // No delete/job_status/history and no blob upload.
+    "enumerate",
+    "read",
+    "write",
 ];
 
 /// A resolved remote org destination — pinned once per invocation from the
