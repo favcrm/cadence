@@ -30,10 +30,18 @@ the acquisition verifier's exact inventory refused it. Tag-run candidate
 x86_64-linux leg's verifier refused the artifact before installation. From
 CAD-1400 on, the tag run's own `release-install` matrix installs the exact
 candidate on all three targets automatically and `release-publish` cannot
-reach the `release` environment approval until every leg succeeds. Anonymous
-published-install verification of v0.1.0 on the three native targets is
-pending the reviewed workflow's first real run; no such result is claimed
-until then.
+reach the `release` environment approval until every leg succeeds. This new
+tag-only gate awaits its first future authorized release tag; it did not run
+retroactively on immutable v0.1.0.
+
+Anonymous public v0.1.0 installation passed on all three native targets in
+[run 38213520059, attempt 1](https://github.com/favcrm/cadence/actions/runs/38213520059),
+using consumer source `b27a8ead58d471db6a88efeea03bba8433b0f700` and package
+source/run `4066ddab844a318a85c3bc286392ec927a600a5c` / `38201476703`, attempt 1.
+Default/custom prefixes, exact version, checksums, installed manifests and
+same-version rerun stability passed. This proves public download and CLI
+installation only: full CAD-317 setup/wizard/backup acceptance, macOS
+daemon/board support and production activation are not claimed.
 
 The immutable `v0.1.0-beta.1` tag failed its macOS UI build and retains a private
 draft; it has no published installation assets. The beta.2 publication record
