@@ -169,9 +169,26 @@ export function fileQuery(path: string): string {
   return `/api/wiki/file?path=${encodeURIComponent(path)}`;
 }
 
-/** The blob URL for `<img>`/`<video>`/`<iframe>` — the cookie authenticates. */
+/**
+ * The file route's query URL for a blob page. It is a plain URL: it carries
+ * no session header, so an element that requests it directly is refused by
+ * the operator proof. Image previews use `wikiBlob`; video and PDF elements
+ * still request this URL, unchanged by CAD-1388.
+ */
 export function wikiFileUrl(path: string): string {
   return fileQuery(path);
+}
+
+/**
+ * The bytes of a blob page, fetched with the session header. An `<img>`
+ * cannot send `X-Cadence-Session`, so image previews load through this and
+ * render a local object URL instead of `wikiFileUrl`.
+ */
+export function wikiBlob(path: string, signal?: AbortSignal): Promise<Blob> {
+  return fetch(wikiFileUrl(path), { headers: sessionHeaders(), signal }).then(async (resp) => {
+    if (!resp.ok) throw wikiErrorFrom(resp.status, await resp.json().catch(() => null));
+    return resp.blob();
+  });
 }
 
 /**

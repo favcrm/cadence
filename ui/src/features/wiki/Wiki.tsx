@@ -27,6 +27,7 @@ import {
   LockIcon,
   Note,
   WIKI_ROOT_LABEL,
+  WikiImage,
   WikiScopeContext,
 } from "./shared";
 import FileExplorer from "./FileExplorer";
@@ -503,7 +504,7 @@ function BlobPane({ page, blob }: { page: WikiPage; blob: ReturnType<typeof prev
     <>
       <div className="wk-pstage">
         {blob === "image" ? (
-          <img className="wk-img" src={url} alt={name} />
+          <WikiImage className="wk-img" path={page.path} alt={name} />
         ) : blob === "video" ? (
           <video className="wk-video" src={url} controls preload="metadata">
             <track kind="captions" />

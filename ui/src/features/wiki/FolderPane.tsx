@@ -2,13 +2,13 @@ import { useEffect, useId, useRef, useState } from "react";
 import type { Route } from "../../lib/router";
 import Link from "../../ui/Link";
 import { IconFolder, IconGrid, IconList, IconMore } from "../../ui/icons";
-import { wiki, wikiFileUrl, wikiRawUrl, type WikiEntry } from "./api";
+import { wiki, wikiRawUrl, type WikiEntry } from "./api";
 import { baseName, joinPath, parentPath } from "./paths";
 import { withinScope } from "./scope";
 import { kindLabel, previewKind } from "./preview";
 import { entryOrder } from "./tree";
 import Button from "../../ui/Button";
-import { KindIcon, Loading, useWikiScope } from "./shared";
+import { KindIcon, Loading, WikiImage, useWikiScope } from "./shared";
 
 /**
  * The folder view (CAD-581): grid or list, image thumbnails, a per-item
@@ -266,7 +266,7 @@ export default function FolderPane({
                     {entry.kind === "dir" ? (
                       <KindIcon kind="dir" size={22} />
                     ) : blob === "image" ? (
-                      <img src={wikiFileUrl(entry.path)} alt="" loading="lazy" />
+                      <WikiImage path={entry.path} alt="" />
                     ) : (
                       <>
                         <KindIcon kind="page" size={22} />
