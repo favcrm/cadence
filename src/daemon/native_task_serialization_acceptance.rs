@@ -115,6 +115,17 @@ fn emit_bounds_serialization_and_skips_closed_done_or_dropped_data() {
         assert_bounded(label, allocated);
     }
 
+    // Exercise the active, not-yet-truncated event path at its tightest data
+    // budget: it must serialize only enough to distinguish overflow, not build
+    // the complete guest event before emitting the marker.
+    let mut state = StreamState::new();
+    state.bytes = 65_536 - super::TASK_OUTPUT_TRUNCATED_MARKER.len() - 4_096;
+    state.next = 4_094;
+    let allocated = allocated_by(|| {
+        emit(&control, TASK, &Mutex::new(state), &oversized_data).unwrap();
+    });
+    assert_bounded("oversized active event at exhausted data budget", allocated);
+
     let mut state = StreamState::new();
     state.truncated = true;
     let allocated = allocated_by(|| {
