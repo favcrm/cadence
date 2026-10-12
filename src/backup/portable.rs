@@ -54,6 +54,10 @@ const COORDINATION: &[&str] = &[
     "monitors",
     "monitor_tasks",
     "monitor_alerts",
+    "topics",
+    "topic_subscriptions",
+    "topic_posts",
+    "topic_deliveries",
 ];
 
 /// Live authority of the source host: nulled on the private copy.
@@ -75,7 +79,7 @@ const DISABLED: &[(&str, &str)] = &[
     ("monitors", "auto_dispatch_enabled"),
 ];
 
-/// The fixed catalog of the 49 store tables with their exact columns.
+/// The fixed catalog of the 53 store tables with their exact columns.
 /// Export and restore refuse any table or column not listed here.
 const CATALOG: &[(&str, &[&str])] = &[
     (
@@ -105,6 +109,7 @@ const CATALOG: &[(&str, &[&str])] = &[
             "team_role",
             "model_selection",
             "pid_start",
+            "uid",
         ],
     ),
     (
@@ -433,6 +438,11 @@ const CATALOG: &[(&str, &[&str])] = &[
             "priority",
             "issue",
             "worktree",
+            "sender_uid",
+            "recipient_uid",
+            "sender",
+            "recipient",
+            "origin",
         ],
     ),
     ("model_defaults", &["id", "revision", "document"]),
@@ -680,6 +690,25 @@ const CATALOG: &[(&str, &[&str])] = &[
             "title",
         ],
     ),
+    (
+        "topic_deliveries",
+        &["post_id", "uid", "alias", "message_id", "state"],
+    ),
+    (
+        "topic_posts",
+        &[
+            "seq",
+            "id",
+            "topic_id",
+            "sender_uid",
+            "sender",
+            "body",
+            "created",
+            "request_message",
+        ],
+    ),
+    ("topic_subscriptions", &["topic_id", "uid", "added"]),
+    ("topics", &["id", "type", "source", "created"]),
     (
         "verdicts",
         &[

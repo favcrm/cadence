@@ -493,11 +493,10 @@ impl Shared {
             }
         }
         if let caller_rule::Who::Agent(caller) = self.connection_caller(peer_pid)? {
-            if caller != message.alias {
+            if !self.store.agent_reads_message(&message, &caller)? {
                 return Err(Error::rejected(format!(
                     "message_read refused: agent '{caller}' cannot read another \
-                     agent's mail — '{id}' belongs to '{}' (caller rule, CAD-480)",
-                    message.alias
+                     agent's mail (caller rule, CAD-480)"
                 )));
             }
         }

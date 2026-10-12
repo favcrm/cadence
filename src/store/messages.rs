@@ -1918,6 +1918,23 @@ impl Store {
         self.message_in(&conn, id)
     }
 
+    /// Whether an agent caller may read this message body. The row must
+    /// name the alias, and a known recipient UID must be the alias's
+    /// CURRENT UID; a legacy NULL UID counts only from the current
+    /// registration on (`created >= agent.created`). Unknown alias: no.
+    pub fn agent_reads_message(&self, msg: &Message, alias: &str) -> Result<bool> {
+        let Some(agent) = self.agent_opt(alias)? else {
+            return Ok(false);
+        };
+        if msg.alias != agent.alias {
+            return Ok(false);
+        }
+        Ok(match &msg.recipient_uid {
+            Some(uid) => *uid == agent.uid,
+            None => msg.created >= agent.created,
+        })
+    }
+
     /// CAD-880: message ids starting with `prefix`, ordered — the pool a
     /// unique id prefix resolves against. The prefix is matched literally
     /// (`%`, `_` and `\` are escaped, never wildcards); at most 11 rows
@@ -1951,8 +1968,14 @@ impl Store {
             pattern.push(c);
         }
         pattern.push('%');
+        // The same predicate as `agent_reads_message`: a known recipient
+        // UID must be the alias's current UID; a NULL (legacy) UID counts
+        // only from the current registration on. An unknown alias matches
+        // nothing (NULL comparisons are false).
         let mut stmt = conn.prepare(
-            "SELECT id FROM messages WHERE id LIKE ?1 ESCAPE '\\' AND alias = ?2 \
+            "SELECT id FROM messages WHERE id LIKE ?1 ESCAPE '\\' AND alias = ?2 AND \
+             (recipient_uid = (SELECT uid FROM agents WHERE alias = ?2) OR \
+              (recipient_uid IS NULL AND created >= (SELECT created FROM agents WHERE alias = ?2))) \
              ORDER BY id LIMIT 11",
         )?;
         let rows = stmt.query_map((pattern, alias), |r| r.get(0))?;

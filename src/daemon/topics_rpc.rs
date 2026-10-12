@@ -344,6 +344,13 @@ impl Shared {
                 }));
             }
         }
+        // The one request's body names the group. Its real UTF-8 byte length
+        // is checked here, before any post insert or send, so an oversize
+        // wrapped body leaves no committed post, request or bind.
+        let body = format!("[{} {}] {}", topic.kind, topic.source, text);
+        if body.len() > store::ENQUEUE_BYTES {
+            return Err(Error::rejected("Prompt must contain 1-48000 characters"));
+        }
         // The post is written once. A retry that finds an unbound post (a
         // crash between the post and the send) falls through to the send:
         // the stable request id and envelope make that send idempotent, so
@@ -352,8 +359,7 @@ impl Shared {
             .store
             .topic_post_insert(&topic.id, client_id, None, "operator", text)?;
         // The one request, through the thread_send path (operator source,
-        // caller-derived, id-idempotent). The body names the group.
-        let body = format!("[{} {}] {}", topic.kind, topic.source, text);
+        // caller-derived, id-idempotent).
         let send =
             json!({"alias": target, "text": body, "message": request_id, "source": "operator"});
         let receipt = self.send_as(&send, &|_| Ok(crate::store::Sender::OperatorChat))?;

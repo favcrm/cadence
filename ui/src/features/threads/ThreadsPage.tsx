@@ -22,13 +22,12 @@ import {
   readWorkConversation,
   requestFromTopic,
   type ConversationListFilter,
-  type ConversationPage,
   type ConversationRow,
   type DeliveryState,
   type Participant,
   type PostDelivery,
+  type ReadPageOptions,
   type ThreadMessage,
-  type TopicPage,
   type TopicPost,
   predatesThreads,
   subscribeThreadsChanged,
@@ -78,30 +77,44 @@ export default function ThreadsPage({ operator }: { operator: boolean }) {
   const [createOpen, setCreateOpen] = useState(false);
   const threadsTick = useSyncExternalStore(subscribeThreadsChanged, threadsRevisionNow);
 
-  const loadList = useCallback(async (): Promise<ConversationRow[]> => {
+  // Only the newest list request for the current scope may publish. A slow
+  // earlier request, or one started under a scope the page has since left,
+  // is dropped and resolves to null.
+  const listRequest = useRef(0);
+  const listScope = `${operator}|${url.project ?? ""}|${url.agent ?? ""}|${url.includeSystem}`;
+  const listScopeNow = useRef(listScope);
+  const loadList = useCallback(async (): Promise<ConversationRow[] | null> => {
     if (!operator) return [];
+    const n = ++listRequest.current;
+    // Publish only the newest request; a rows result is still returned to a
+    // caller in the same scope (the send that opened a draft needs it).
+    const sameScope = () => listScope === listScopeNow.current;
+    const latest = () => n === listRequest.current && sameScope();
     try {
       const out = await listWorkConversations({
         project: url.project ?? undefined,
         agent: url.agent ?? undefined,
         include_system: url.includeSystem,
       });
-      setList({ rows: out.conversations, error: null, legacy: false });
-      return out.conversations;
+      if (latest()) setList({ rows: out.conversations, error: null, legacy: false });
+      return sameScope() ? out.conversations : null;
     } catch (e) {
-      if (predatesThreads(e)) setList({ rows: [], error: null, legacy: true });
-      else setList((s) => ({ ...s, error: e instanceof Error ? e.message : String(e) }));
-      return [];
+      if (latest()) {
+        if (predatesThreads(e)) setList({ rows: [], error: null, legacy: true });
+        else setList((s) => ({ ...s, error: e instanceof Error ? e.message : String(e) }));
+      }
+      return sameScope() ? [] : null;
     }
-  }, [operator, url.project, url.agent, url.includeSystem]);
+  }, [operator, url.project, url.agent, url.includeSystem, listScope]);
 
   // (1) Live: the existing SSE feed invalidates `agents` on every agent,
   // job and message change, and the `threads` frame names every topic and
   // message change (App.tsx). Reload the list on either.
   const agentsTick = agentsState.data;
   useEffect(() => {
+    listScopeNow.current = listScope;
     void loadList();
-  }, [loadList, agentsTick, threadsTick]);
+  }, [loadList, agentsTick, threadsTick, listScope]);
 
   const rows = list.rows ?? [];
   const visible = rows
@@ -116,6 +129,13 @@ export default function ThreadsPage({ operator }: { operator: boolean }) {
   const draftLive = draftAlias !== null && agentNames.includes(draftAlias);
   const existingDm = draftAlias !== null ? rows.find((r) => r.kind === "operator" && operatorDmAlias(r) === draftAlias) ?? null : null;
   const draft = draftLive && !existingDm && !open ? draftAlias : null;
+  // The user's selection from the URL: the draft alias while no conversation
+  // is open, else null. A late send callback reads it, so it does not follow
+  // list changes such as a newly created row.
+  const currentSelection = useRef<string | null>(null);
+  useEffect(() => {
+    currentSelection.current = url.conversation ? null : draftAlias;
+  }, [draftAlias, url.conversation]);
 
   const setUrl = (next: Partial<typeof url>) =>
     navigate(`/threads${threadsUrlSearch({ ...url, ...next })}`, { replace: true });
@@ -218,7 +238,10 @@ export default function ThreadsPage({ operator }: { operator: boolean }) {
               onSent={() => {
                 // The send created the thread: open its canonical row once listed.
                 void loadList().then((fresh) => {
-                  const row = fresh.find((r) => r.kind === "operator" && operatorDmAlias(r) === draft);
+                  // Only if the user is still on this draft: a late reply must not
+                  // pull them off a conversation or draft they chose since.
+                  if (currentSelection.current !== draft) return;
+                  const row = fresh?.find((r) => r.kind === "operator" && operatorDmAlias(r) === draft);
                   if (row) setUrl({ conversation: row.id });
                 });
               }}
@@ -423,77 +446,107 @@ function Timeline({
   const [more, setMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [tick, setTick] = useState(0);
+  const scopeKey = `${scope.project ?? ""}|${scope.agent ?? ""}|${scope.include_system ? 1 : 0}`;
 
-  useEffect(() => {
-    let live = true;
+  /** One read of this conversation in its kind's shape, ascending by seq. */
+  const pull = async (at: ReadPageOptions): Promise<Pulled> => {
     if (dm) {
       // Operator DM: the agent's home thread, read by its conversation id.
-      api
-        .thread(dm, { tail: true, limit: 50, conversation: row.id })
-        .then((p) => {
-          if (!live) return;
-          const list = threadEntries(p.entries);
-          setError(null);
-          setEntries(list);
-          setMore(p.more_before === true);
-          setBefore(list[0]?.seq ?? null);
-        })
-        .catch((e: unknown) => {
-          if (live) setError(e instanceof ApiError ? e.message : String(e));
-        });
-      return () => {
-        live = false;
+      const p = await api.thread(dm, { ...at, limit: PAGE, conversation: row.id });
+      return {
+        entries: threadEntries(p.entries),
+        cursor: p.cursor ?? at.after ?? 0,
+        more_before: p.more_before === true,
+        // Raw row count: a malformed row dropped by threadEntries is still a row the daemon sent.
+        full: p.entries.length >= PAGE,
       };
     }
-    const load = isGroup ? readTopic(row.id) : readWorkConversation(row.id, {}, scope);
-    load
-      .then((page) => {
-        if (!live) return;
-        setError(null);
-        if (isGroup) {
-          const p = page as TopicPage;
-          setPosts(p.posts);
-          setMore(p.more_before);
-          setBefore(p.posts[0]?.seq ?? null);
-        } else {
-          const p = page as ConversationPage;
-          setMessages(p.messages);
-          setMore(p.more_before);
-          setBefore(p.messages[0]?.seq ?? null);
-        }
-      })
-      .catch((e: unknown) => {
-        if (live) setError(e instanceof ApiError ? e.message : String(e));
-      });
-    return () => {
-      live = false;
+    if (isGroup) {
+      const p = await readTopic(row.id, { ...at, limit: PAGE });
+      return { posts: p.posts, cursor: p.cursor, more_before: p.more_before, full: p.posts.length >= PAGE };
+    }
+    const p = await readWorkConversation(row.id, { ...at, limit: PAGE }, scope);
+    // The daemon filters system rows after computing `cursor`, so the raw
+    // page length is unknown here: a forward read continues while the cursor advances.
+    return {
+      messages: p.messages,
+      cursor: p.cursor,
+      more_before: p.more_before,
+      full: p.cursor > (at.after ?? 0),
     };
-  }, [row.id, isGroup, tick, liveStamp, threadsTick, scope.project, scope.agent, scope.include_system]);
+  };
+  const absorb = ({ entries: e, posts: po, messages: m }: Pulled) => {
+    if (e) setEntries((cur) => mergeBySeq(cur, e));
+    if (po) setPosts((cur) => mergeBySeq(cur, po));
+    if (m) setMessages((cur) => mergeBySeq(cur, m));
+  };
+
+  // Epoch: one conversation and list scope. A change resets the timeline and
+  // drops every read of the old epoch. `live` numbers this view's own reads:
+  // only the newest one publishes, so two overlapping tail reads never merge.
+  // `loadEarlier` is gated by the epoch only, so a live tick does not drop it.
+  const epoch = useRef({ id: "", n: 0 });
+  const live = useRef(0);
+  const identity = `${row.id}|${scopeKey}`;
+  useEffect(() => {
+    const reset = epoch.current.id !== identity;
+    if (reset) {
+      epoch.current = { id: identity, n: epoch.current.n + 1 };
+      setEntries(null);
+      setPosts(null);
+      setMessages(null);
+      setBefore(null);
+      setMore(false);
+    }
+    const n = epoch.current.n;
+    const g = ++live.current;
+    const current = () => g === live.current && epoch.current.n === n;
+    const loaded = reset ? null : dm ? entries : isGroup ? posts : messages;
+    // Pages are ascending, so the window's first row is its oldest seq.
+    const oldest = loaded && loaded.length > 0 ? loaded[0].seq : null;
+    const fail = (e: unknown) => {
+      if (current()) setError(e instanceof ApiError ? e.message : String(e));
+    };
+    if (oldest === null) {
+      pull({ tail: true })
+        .then((p) => {
+          if (!current()) return;
+          absorb(p);
+          setBefore(oldestOf(p));
+          setMore(p.more_before);
+          setError(null);
+        })
+        .catch(fail);
+      return;
+    }
+    // Refresh the loaded window: forward from just below its oldest row (the
+    // `after` cursor is exclusive), to the current end. Rows already held are
+    // replaced by seq, so a queued row's later state is seen. `before` and
+    // `more_before` are left alone: they belong to earlier history.
+    const step = async (after: number): Promise<void> => {
+      const p = await pull({ after });
+      if (!current()) return;
+      absorb(p);
+      setError(null);
+      if (p.full && p.cursor > after) await step(p.cursor);
+    };
+    step(oldest - 1).catch(fail);
+  }, [identity, liveStamp, threadsTick, tick]);
 
   // (5) Earlier history: page backwards from the oldest loaded seq; a short
-  // page means the start is reached. Nothing is dropped silently.
+  // page means the start is reached. Nothing is dropped silently. A result
+  // from an old epoch is discarded.
   const loadEarlier = async () => {
     if (before === null) return;
+    const n = epoch.current.n;
     try {
-      if (dm) {
-        const p = await api.thread(dm, { before, limit: 50, conversation: row.id });
-        const list = threadEntries(p.entries);
-        setEntries((cur) => [...list, ...(cur ?? [])]);
-        setMore(p.more_before === true);
-        setBefore(list[0]?.seq ?? before);
-      } else if (isGroup) {
-        const p = await readTopic(row.id, { before, limit: 50 });
-        setPosts((cur) => [...p.posts, ...(cur ?? [])]);
-        setMore(p.more_before);
-        setBefore(p.posts[0]?.seq ?? before);
-      } else {
-        const p = await readWorkConversation(row.id, { before, limit: 50 }, scope);
-        setMessages((cur) => [...p.messages, ...(cur ?? [])]);
-        setMore(p.more_before);
-        setBefore(p.messages[0]?.seq ?? before);
-      }
+      const p = await pull({ before });
+      if (epoch.current.n !== n) return;
+      absorb(p);
+      setBefore(oldestOf(p) ?? before);
+      setMore(p.more_before);
     } catch (e) {
-      setError(e instanceof ApiError ? e.message : String(e));
+      if (epoch.current.n === n) setError(e instanceof ApiError ? e.message : String(e));
     }
   };
 
@@ -552,6 +605,32 @@ function Timeline({
 /** Parse a thread page's entries, dropping any the Home model rejects. */
 function threadEntries(raw: unknown[]): ThreadEntry[] {
   return raw.map(asEntry).filter((e): e is ThreadEntry => e !== null);
+}
+
+/** Rows per read. */
+const PAGE = 50;
+
+/** One read: the rows of this conversation's kind, and its cursors. */
+type Pulled = {
+  entries?: ThreadEntry[];
+  posts?: TopicPost[];
+  messages?: ThreadMessage[];
+  cursor: number;
+  more_before: boolean;
+  /** A forward read may have rows past `cursor`. */
+  full: boolean;
+};
+
+/** The oldest row of a page (pages are ascending): the next `before` cursor. */
+function oldestOf(p: Pulled): number | null {
+  return p.entries?.[0]?.seq ?? p.posts?.[0]?.seq ?? p.messages?.[0]?.seq ?? null;
+}
+
+/** Merge rows by seq: dedupe, keep seq order, never drop a loaded row. */
+function mergeBySeq<T extends { seq: number }>(cur: T[] | null, incoming: T[]): T[] {
+  const bySeq = new Map<number, T>();
+  for (const r of [...(cur ?? []), ...incoming]) bySeq.set(r.seq, r);
+  return [...bySeq.values()].sort((a, b) => a.seq - b.seq);
 }
 
 /** Stages the daemon's `payload.delivery` may carry and the page shows. */
