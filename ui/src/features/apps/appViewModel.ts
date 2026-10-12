@@ -390,7 +390,11 @@ export function runState(run: AppRun, needs: HomeNeed[]): RunState {
 }
 
 /** What the Apps list card says under the title: "2 in progress · 1 needs you". */
-export function runsSummary(runs: AppRun[], needs: HomeNeed[]): string | null {
+export function runsSummary(
+  runs: AppRun[],
+  needs: HomeNeed[],
+  t: (english: string) => string = (english) => english,
+): string | null {
   if (runs.length === 0) return null;
   let progress = 0;
   let waiting = 0;
@@ -400,9 +404,10 @@ export function runsSummary(runs: AppRun[], needs: HomeNeed[]): string | null {
     else if (state.text === "running") progress += 1;
   }
   const parts: string[] = [];
-  if (progress > 0) parts.push(`${progress} in progress`);
-  if (waiting > 0) parts.push(`${waiting} need${waiting === 1 ? "s" : ""} you`);
-  return parts.length > 0 ? parts.join(" · ") : "Nothing running";
+  if (progress > 0) parts.push(t("{count} in progress").replace("{count}", String(progress)));
+  if (waiting > 0)
+    parts.push(t(waiting === 1 ? "{count} needs you" : "{count} need you").replace("{count}", String(waiting)));
+  return parts.length > 0 ? parts.join(" · ") : t("Nothing running");
 }
 
 /**
@@ -581,17 +586,20 @@ export function appWorkflowRow(project: string, app: AppDetail, wf: AppWorkflow)
 }
 
 /** The approval chip for an app row — a static class per state. */
-export function appApprovalChip(row: GateRow): { text: string; cls: string } {
-  if (row.error) return { text: "broken", cls: "bg-fail/10 text-fail" };
+export function appApprovalChip(
+  row: GateRow,
+  t: (english: string) => string = (english) => english,
+): { text: string; cls: string } {
+  if (row.error) return { text: t("broken"), cls: "bg-fail/10 text-fail" };
   switch (row.approval) {
     case "approved":
-      return { text: "approved", cls: "bg-ok/15 text-ok" };
+      return { text: t("approved"), cls: "bg-ok/15 text-ok" };
     case "changed":
-      return { text: "changed since approval", cls: "bg-warn/10 text-warn" };
+      return { text: t("changed since approval"), cls: "bg-warn/10 text-warn" };
     case "unknown":
-      return { text: "approval unknown", cls: "bg-ink-800 text-ink-400" };
+      return { text: t("approval unknown"), cls: "bg-ink-800 text-ink-400" };
     default:
-      return { text: "unapproved", cls: "bg-warn/10 text-warn" };
+      return { text: t("unapproved"), cls: "bg-warn/10 text-warn" };
   }
 }
 

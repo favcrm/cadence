@@ -239,10 +239,13 @@ export const CONSENT_NOTE_MAX = 280;
 export type ConsentSetting = "granted" | "unknown" | "denied";
 
 /** Operator wording: the stored `denied` state reads as withdrawn. */
-export function consentLabel(state: string | null): string {
-  if (state === "granted") return "Granted";
-  if (state === "denied") return "Withdrawn";
-  return "Unknown";
+type Translate = (english: string) => string;
+const identity: Translate = (english) => english;
+
+export function consentLabel(state: string | null, t: Translate = identity): string {
+  if (state === "granted") return t("Granted");
+  if (state === "denied") return t("Withdrawn");
+  return t("Unknown");
 }
 
 /**
@@ -302,22 +305,22 @@ const METHOD_TEXT: Record<string, string> = {
 };
 
 /** Plain-language timeline, newest first. Ids and digests stay in Details. */
-export function activityItems(record: HostRecord): ActivityItem[] {
+export function activityItems(record: HostRecord, t: Translate = identity): ActivityItem[] {
   const consent = consentEntries(record);
   return revisionEntries(record)
     .map((rev) => {
       const here = consent.filter((c) => c.revision === rev.revision);
-      const channelName = (c: ConsentEntry) => (c.channel === "sms" ? "SMS" : "Email");
+      const channelName = (c: ConsentEntry) => t(c.channel === "sms" ? "SMS" : "Email");
       const parts = here.map((c) => {
-        const how = c.method ? ` ${METHOD_TEXT[c.method] ?? ""}`.trimEnd() : "";
+        const how = c.method ? ` ${t(METHOD_TEXT[c.method] ?? "")}`.trimEnd() : "";
         return c.state === "granted"
-          ? `${channelName(c)} consent granted${how === "" ? "" : ` (${how.trim()})`}`
+          ? `${channelName(c)} ${t("consent granted")}${how === "" ? "" : ` (${how.trim()})`}`
           : c.state === "denied"
-            ? `${channelName(c)} consent withdrawn`
-            : `${channelName(c)} consent recorded as ${c.state}`;
+            ? `${channelName(c)} ${t("consent withdrawn")}`
+            : `${channelName(c)} ${t("consent recorded as")} ${c.state}`;
       });
-      const who = rev.actor === "operator" ? "the operator" : rev.actor;
-      const lead = rev.revision === 1 ? "Created" : parts.length === 0 ? "Profile edited" : "";
+      const who = rev.actor === "operator" ? t("the operator") : rev.actor;
+      const lead = rev.revision === 1 ? t("Created") : parts.length === 0 ? t("Profile edited") : "";
       const text = [lead, ...parts].filter(Boolean).join(" · ") + ` by ${who}`;
       const note = here.find((c) => c.note)?.note;
       return { key: `r${rev.revision}`, text, ...(note ? { note } : {}), at: rev.at, agent: rev.actor !== "operator" };

@@ -6,6 +6,8 @@
  */
 
 export const ATTACH_EXTS = ["txt", "md", "csv"];
+type Translate = (english: string) => string;
+const identity: Translate = (english) => english;
 /** The file picker's accept list — both densities share it. PDF and
  *  image kinds are deliberately absent: no reviewed processing contract
  *  exists, so they are refused at selection and at the daemon. */
@@ -78,16 +80,17 @@ export function isPermanentUploadFailure(status: number | undefined): boolean {
 }
 
 /** Size and kind for a file row, e.g. `180 KB · Text`. */
-export function attachMeta(name: string, size: number): string {
+export function attachMeta(name: string, size: number, t: Translate = identity): string {
   const ext = name.toLowerCase().split(".").pop() ?? "";
-  const kind = ext === "csv" ? "CSV" : ext === "md" ? "Markdown" : ext === "txt" ? "Text" : ext ? ext.toUpperCase() : "File";
+  const kind = ext === "csv" ? "CSV" : ext === "md" ? t("Markdown") : ext === "txt" ? t("Text") : ext ? ext.toUpperCase() : t("File");
   const kb = size < 1024 ? `${size} B` : size < 1024 * 1024 ? `${Math.round(size / 1024)} KB` : `${(size / 1024 / 1024).toFixed(1)} MB`;
   return `${kb} · ${kind}`;
 }
 
 /** Whether `more` files still fit the count cap given `have` queued. */
-export function attachFits(have: number, more: number): string | null {
-  if (have + more > ATTACH_MAX_FILES) return `at most ${ATTACH_MAX_FILES} attachments per message`;
+export function attachFits(have: number, more: number, t: Translate = identity): string | null {
+  if (have + more > ATTACH_MAX_FILES)
+    return t("at most {count} attachments per message").replace("{count}", String(ATTACH_MAX_FILES));
   return null;
 }
 
@@ -114,15 +117,19 @@ export function unresolved(items: AttachItem[]): AttachItem[] {
 }
 /** The submit-time sentence for `title`/aria when a send is withheld
  *  because rows are unresolved — specific over a generic disabled. */
-export function unresolvedHint(items: AttachItem[]): string | null {
+export function unresolvedHint(items: AttachItem[], t: Translate = identity): string | null {
   const bad = unresolved(items);
   if (bad.length === 0) return null;
   const uploading = bad.filter((i) => i.status === "uploading").length;
   const failed = bad.filter((i) => i.status === "failed");
   const reasons = [...new Set(failed.map((i) => i.error).filter(Boolean))].join("; ");
   const parts = [
-    uploading > 0 ? `${uploading} file${uploading === 1 ? " is" : "s are"} still uploading` : "",
-    failed.length > 0 ? `${failed.length} file${failed.length === 1 ? "" : "s"} failed${reasons ? ` — ${reasons}` : ""}` : "",
+    uploading > 0
+      ? t(uploading === 1 ? "{count} file is still uploading" : "{count} files are still uploading").replace("{count}", String(uploading))
+      : "",
+    failed.length > 0
+      ? `${t(failed.length === 1 ? "{count} file failed" : "{count} files failed").replace("{count}", String(failed.length))}${reasons ? ` — ${reasons}` : ""}`
+      : "",
   ].filter(Boolean);
-  return `${parts.join(" · ")} — resolve or remove before sending`;
+  return `${parts.join(" · ")} ${t("— resolve or remove before sending")}`;
 }

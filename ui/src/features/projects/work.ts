@@ -44,11 +44,13 @@ export interface HealthView {
   reasons: { detail: string; next: string; owner: string | null }[];
 }
 
-const HEALTH: Record<HealthState, { label: string; tone: Tone }> = {
-  on_track: { label: "on track", tone: "ok" },
-  at_risk: { label: "at risk", tone: "warn" },
-  stalled: { label: "stalled", tone: "fail" },
+const HEALTH: Record<HealthState, { tone: Tone }> = {
+  on_track: { tone: "ok" },
+  at_risk: { tone: "warn" },
+  stalled: { tone: "fail" },
 };
+type Translate = (english: string) => string;
+const identity: Translate = (english) => english;
 
 /** How a health block reads: label, tone, time in stage, reasons + next actions. */
 export function healthView(
@@ -57,18 +59,29 @@ export function healthView(
     | null
     | undefined,
   stage?: string | null,
+  t: Translate = identity,
 ): HealthView {
   const known = health && health.state in HEALTH ? HEALTH[health.state as HealthState] : null;
   const days = health?.days_in_stage;
   const timing =
     typeof days === "number" && stage
-      ? `${days} ${days === 1 ? "day" : "days"} in ${stage}${
-          typeof health?.limit_days === "number" ? ` (limit ${health.limit_days})` : ""
+      ? `${days} ${t(days === 1 ? "day" : "days")} ${t("in")} ${stage}${
+          typeof health?.limit_days === "number"
+            ? ` ${t("(limit {limit})").replace("{limit}", String(health.limit_days))}`
+            : ""
         }`
       : null;
   return {
     state: known ? (health!.state as HealthState) : "unknown",
-    label: known?.label ?? "health unknown",
+    label: t(
+      known && health?.state === "on_track"
+        ? "on track"
+        : known && health?.state === "at_risk"
+          ? "at risk"
+          : known
+            ? "stalled"
+            : "health unknown",
+    ),
     tone: known?.tone ?? "muted",
     timing,
     reasons: (health?.reasons ?? []).map((r) => ({
@@ -95,7 +108,7 @@ export interface ProgressView {
 }
 
 /** Size-weighted progress (S=1, M=3, L=8) as the bar shows it. */
-export function progressView(p: WorkProgress | null | undefined): ProgressView {
+export function progressView(p: WorkProgress | null | undefined, t: Translate = identity): ProgressView {
   const done = p?.done_weight ?? 0;
   const total = p?.total_weight ?? 0;
   const percent = total > 0 ? Math.round((done / total) * 100) : null;
@@ -103,7 +116,7 @@ export function progressView(p: WorkProgress | null | undefined): ProgressView {
     done,
     total,
     percent,
-    label: total > 0 ? `${done}/${total} weight` : "no tasks yet",
+    label: total > 0 ? t("{done}/{total} weight").replace("{done}", String(done)).replace("{total}", String(total)) : t("no tasks yet"),
   };
 }
 
