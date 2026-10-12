@@ -15,9 +15,6 @@ use crate::{helper_image_trust, HelperImageTrust};
 mod authentication;
 #[cfg(all(debug_assertions, feature = "test-seam"))]
 pub(crate) mod diag_seam;
-#[allow(dead_code)]
-// legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
-mod envp;
 pub(crate) mod execfd;
 pub(crate) mod owner;
 pub(crate) mod service;
@@ -128,18 +125,6 @@ fn hex_decode_16(s: &str) -> Option<[u8; 16]> {
     Some(out)
 }
 
-#[allow(dead_code)]
-// legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
-/// Which slot a launch occupies — the durable per-alias layer (session,
-/// history) or the per-generation scratch layer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Layer {
-    /// `…/<alias-sha256>/durable` — persists across every generation.
-    Durable,
-    /// `…/<alias-sha256>/<generation-32hex>` — recreated per open.
-    Generation,
-}
-
 /// Whether the agent is the master or a worker — only the leaf set the guest
 /// needs differs; the protected skeleton is identical.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,11 +149,6 @@ pub(crate) struct GuestCtx {
     topo: ProtectedTopology,
     segs: Segments,
     role: Role,
-    #[allow(dead_code)]
-    // legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
-    /// The agent's routing alias — carried verbatim to `CADENCE_ALIAS` (it is
-    /// routing text, never a path segment or a principal proof).
-    alias: String,
     selection: authority::Selection,
     /// SAME authenticated supervisor control channel; actual root creates and
     /// retains the helper. Daemon receives stdio only, never executable custody.
@@ -177,24 +157,11 @@ pub(crate) struct GuestCtx {
     proof: authentication::HelperAuthorization,
 }
 
-#[allow(dead_code)]
-// legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
-/// Legacy unbound/unsupported-host probe. No operation/alias/model means no
-/// authority can be returned. Linux production uses authenticated provisioning
-/// in `establish`, never this context-free gate.
-pub(crate) fn protected_prereqs_satisfied() -> Result<()> {
-    Err(Error::rejected(
-        "protected managed-Pi prerequisites unavailable — external \
-         sealed-helper pin, namespace policy and pre-start restore lineage \
-         are not present; launch eligibility is UNKNOWN and stays refused",
-    ))
-}
-
 impl GuestCtx {
     /// Verify the whole protected launch context for `agent`'s open. Fails
     /// closed on any missing pre-requisite, any mis-owned or symlinked
-    /// topology component, or any exec digest that does not match the
-    /// compiled pin. Returns the context only when construction — not
+    /// topology component, or any image or launch authority that fails
+    /// qualification. Returns the context only when construction — not
     /// selector parsing — is sound. The owner provisions a fresh generation
     /// only after authenticating supervisor custody and current launch policy.
     pub(crate) fn establish(
@@ -256,7 +223,6 @@ impl GuestCtx {
             topo,
             segs,
             role,
-            alias: agent.alias.clone(),
             selection,
             channel,
             launch,
@@ -287,25 +253,8 @@ impl GuestCtx {
         Ok(launched)
     }
 
-    #[allow(dead_code)]
-    // legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
-    /// The verified per-launch view dirfd for `layer`.
-    pub(crate) fn view(&self, layer: Layer) -> Result<std::os::unix::io::OwnedFd> {
-        self.topo.view_dir(&self.segs, layer)
-    }
-
-    #[allow(dead_code)] // legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
-    pub(crate) fn role(&self) -> Role {
-        self.role
-    }
     pub(crate) fn segments(&self) -> &Segments {
         &self.segs
-    }
-    #[allow(dead_code)]
-    // legacy daemon-side exec path; production caller moved to root constructor in PR809; removal tracked in CAD-1188
-    /// The routing alias for `CADENCE_ALIAS`.
-    pub(crate) fn alias(&self) -> &str {
-        &self.alias
     }
 }
 
@@ -335,11 +284,5 @@ mod tests {
         // The alias dir is the sha256 of the alias — traversal text is gone.
         assert_eq!(s.alias_hex().len(), 64);
         assert!(s.alias_hex().bytes().all(|b| b.is_ascii_hexdigit()));
-    }
-
-    #[test]
-    fn protected_prereqs_is_fail_closed_unknown() {
-        let e = protected_prereqs_satisfied().unwrap_err();
-        assert!(e.to_string().contains("UNKNOWN"), "{e}");
     }
 }
