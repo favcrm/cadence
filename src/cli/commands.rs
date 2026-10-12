@@ -1221,6 +1221,17 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: cadence_agent::wiki::cli::WikiAction,
     },
+    /// CAD-1393: company document templates — versions, approval and the
+    /// digest a human approves. Drafting never issues or sends anything.
+    Template {
+        #[command(subcommand)]
+        action: TemplateAction,
+    },
+    /// CAD-1393: company document drafts created from an approved template.
+    Document {
+        #[command(subcommand)]
+        action: DocumentAction,
+    },
     /// Credential scan (CAD-109): the check `issue comment`, `report`,
     /// `memory propose` and the intake relay run before they write.
     Secret {

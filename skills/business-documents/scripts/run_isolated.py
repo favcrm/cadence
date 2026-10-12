@@ -10,8 +10,8 @@ import re
 import subprocess
 import sys
 
-IMAGE = "cadence-business-files:cad-1345-v1"
-PINNED_IMAGE_ID = "sha256:0f95114a36daad9b02f0f879eac19c616d7fbd9aec02f9aadc1499d81fb73c00"
+IMAGE = "cadence-business-files:cad-1393-dev1"
+PINNED_IMAGE_ID = "sha256:06ea75fdd2b41762d37dcf68a101703be3962976e6be1aebd2247503431cee64"
 IMAGE_LABELS = "{{.Id}}|{{index .Config.Labels \"org.cadence.ticket\"}}|{{index .Config.Labels \"org.cadence.workflow\"}}"
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -73,7 +73,7 @@ def image_id() -> str:
     return pieces[0]
 
 
-def execute(command: str, inputs: list[Path], output: Path) -> int:
+def execute(command: str, inputs: list[Path], output: Path, sample: bool = False) -> int:
     image = image_id()
     docker = [
         "docker", "run", "--rm", "--network", "none", "--read-only", "--user", f"{os.getuid()}:{os.getgid()}",
@@ -94,6 +94,10 @@ def execute(command: str, inputs: list[Path], output: Path) -> int:
     docker.extend(["--mount", f"type=bind,src={output},dst=/outputs", image, "/opt/business-venv/bin/python", f"/app/{command}.py"])
     if command == "intake":
         docker.extend([mapped[0], "--output-dir", "/outputs"])
+    elif command == "render_template":
+        docker.extend(["--template", mapped[0], "--context", mapped[1], "--output-dir", "/outputs"])
+        if sample:
+            docker.append("--sample")
     else:
         docker.extend(["--template", mapped[0], "--brief", mapped[1]])
         if len(mapped) == 3:
@@ -121,12 +125,21 @@ def main() -> int:
     render.add_argument("--brief", required=True, type=Path)
     render.add_argument("--rates", type=Path)
     render.add_argument("--output-dir", required=True, type=Path)
+    template = sub.add_parser("render-template")
+    template.add_argument("--template", required=True, type=Path)
+    template.add_argument("--context", required=True, type=Path)
+    template.add_argument("--output-dir", required=True, type=Path)
+    template.add_argument("--sample", action="store_true")
     args = parser.parse_args()
     try:
         if args.command == "intake":
             inputs = [checked_input(args.source)]
             output = checked_output(args.output_dir, inputs)
             return execute("intake", inputs, output)
+        if args.command == "render-template":
+            inputs = [checked_input(args.template), checked_input(args.context)]
+            output = checked_output(args.output_dir, inputs)
+            return execute("render_template", inputs, output, sample=args.sample)
         inputs = [checked_input(args.template), checked_input(args.brief)]
         if args.rates:
             inputs.append(checked_input(args.rates))

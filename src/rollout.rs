@@ -51,7 +51,8 @@ use crate::store::{self, Store};
 /// v36 (CAD-1282): `app_run_failures`, retrofitted for stores that passed the
 /// `version < 20` block before CAD-1171 added it — one idempotent table.
 /// v37 (CAD-1168): the retained `chat_files` table.
-pub const SCHEMA_VERSION: i64 = 39;
+/// v40 (CAD-1393): company document template versions and their drafts.
+pub const SCHEMA_VERSION: i64 = 40;
 
 /// Last schema that has no lease table. The bootstrap opt-in covers
 /// only this version.
@@ -3337,8 +3338,9 @@ mod tests {
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
         // CAD-818: v38 adds durable topic identity and v39 adds topics,
-        // part of the reviewed schema the rollout carries.
-        assert_eq!(SCHEMA_VERSION, 39);
+        // part of the reviewed schema the rollout carries. CAD-1393: v40
+        // adds the business template tables.
+        assert_eq!(SCHEMA_VERSION, 40);
     }
 
     struct MigrationHolder;

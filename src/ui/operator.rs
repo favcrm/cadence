@@ -96,6 +96,14 @@ const fn route(method: &'static str, pattern: &'static str, class: RouteClass) -
 /// ([`route_class`]) — a new route fails closed until it is listed.
 pub const WRITE_ROUTES: &[WriteRoute] = &[
     route("POST", "/api/approvals/approve", RouteClass::OperatorOnly),
+    // CAD-1393: company document templates and drafts — the approval is
+    // the operator's alone; drafting is listed operator-only on the board
+    // (agents use the daemon RPC or CLI, which share the same rules).
+    route("POST", "/api/templates/create", RouteClass::OperatorOnly),
+    route("POST", "/api/templates/revise", RouteClass::OperatorOnly),
+    route("POST", "/api/templates/approve", RouteClass::OperatorOnly),
+    route("POST", "/api/documents/create", RouteClass::OperatorOnly),
+    route("POST", "/api/templates/intake", RouteClass::OperatorOnly),
     route("POST", "/api/approvals/*/revoke", RouteClass::OperatorOnly),
     route(
         "POST",

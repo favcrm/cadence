@@ -1097,6 +1097,14 @@ impl Store {
                 tx.execute("UPDATE schema_version SET version=39", [])?;
                 tx.commit()?;
             }
+            if version < 40 {
+                // CAD-1393: company document templates (versions and their
+                // drafts). New tables only; nothing existing is rewritten.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(super::business_templates::SCHEMA)?;
+                tx.execute("UPDATE schema_version SET version=40", [])?;
+                tx.commit()?;
+            }
             if let Some(crossing) = permit.crossing {
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 Self::event(

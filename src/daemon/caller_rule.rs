@@ -404,6 +404,42 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         "approval_designate",
         Rule::Handler("operator_connection_on_agent (CAD-918)"),
     ),
+    (
+        "business_template_create",
+        Rule::Handler("connection_caller: operator or registered agent drafts a version; unproven refused (CAD-1393)"),
+    ),
+    (
+        "business_template_revise",
+        Rule::Handler("connection_caller: operator or registered agent drafts a new version from a base (CAD-1393)"),
+    ),
+    (
+        "business_template_intake",
+        Rule::Handler("connection_caller: operator or registered agent reads a reference (CAD-1393)"),
+    ),
+    (
+        "business_template_sample",
+        Rule::Handler("connection_caller: operator or registered agent previews a draft or approved version as a labelled SAMPLE; creates nothing (CAD-1393)"),
+    ),
+    (
+        "business_template_show",
+        Rule::Handler("connection_caller: proven operator or registered agent reads (CAD-1393)"),
+    ),
+    (
+        "business_template_approve",
+        Rule::Handler("operator_connection: human approval of an exact digest, never an agent (CAD-1393)"),
+    ),
+    (
+        "business_document_create",
+        Rule::Handler("connection_caller: draft from an approved version only (CAD-1393)"),
+    ),
+    (
+        "business_document_export",
+        Rule::Handler("connection_caller: export a retained draft; creates or sends nothing (CAD-1393)"),
+    ),
+    (
+        "business_document_show",
+        Rule::Handler("connection_caller: proven operator or registered agent reads (CAD-1393)"),
+    ),
     ("approval_designations", Rule::Read),
     (
         "approval_scope",
