@@ -59,8 +59,10 @@ fn raw_lease_refusal(reason: String) -> rusqlite::Error {
 /// sealed/witnessed surface, so the guard's assumptions are unchanged.
 /// v37 (CAD-1168) adds only the `chat_files` table, likewise. v38/v39
 /// (CAD-818 threads) add tables and a backfill, touching no sealed surface.
+/// v40 (CAD-1393) adds only the `business_template_*` tables and their
+/// triggers, which touch no sealed/witnessed surface.
 #[allow(dead_code)]
-const PROTECTED_SCHEMA_MAX: i64 = 39;
+const PROTECTED_SCHEMA_MAX: i64 = 40;
 
 /// Arm level + transaction-control phase, shared between the `Store` and
 /// the connection's authorizer. Atomic because the authorizer callback must
@@ -2491,12 +2493,12 @@ mod tests {
         // This is malformed metadata, not evidence of native owner authority.
         let fixture = Connection::open(&db).unwrap();
         fixture
-            .execute("UPDATE schema_version SET version=40", [])
+            .execute("UPDATE schema_version SET version=41", [])
             .unwrap();
         drop(fixture);
         store
             .propose_close(
-                &permit(&db, OwnerOp::Close, b"schema-40", "attempt-40", "art", 40),
+                &permit(&db, OwnerOp::Close, b"schema-41", "attempt-41", "art", 41),
                 "test",
             )
             .unwrap();
@@ -2520,10 +2522,10 @@ mod tests {
             .witness_commit(&permit(
                 &db,
                 OwnerOp::Witness,
-                b"schema-40",
-                "attempt-40",
+                b"schema-41",
+                "attempt-41",
                 "art",
-                40,
+                41,
             ))
             .unwrap_err();
         assert!(
