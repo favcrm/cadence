@@ -412,6 +412,7 @@ impl Shared {
         let mut out = Vec::with_capacity(posts.len());
         for post in &posts {
             let mut row = post.to_json();
+            row["body"] = json!(store::conversations::body(&post.body));
             let request = self.store.topic_post_request(&post.id)?;
             let mut receipts = Vec::new();
             if let Some(req) = &request {
