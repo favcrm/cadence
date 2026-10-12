@@ -97,7 +97,7 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
   const bareApps =
     noWorkspaceApps && noProjectApps && (home !== null || loadError !== null);
 
-  const noMatchCopy = t("No installed app matches “{query}” — try another word, or look in Explore.").replace("{query}", q);
+  const noMatchCopy = t("No installed app matches “{query}” — try another word, or look in Explore.").replace("{query}", () => q);
   const [noMatchBeforeExplore, noMatchAfterExplore] = noMatchCopy.split(/Explore|「探索」/);
   const noMatchExploreLabel = noMatchCopy.match(/Explore|「探索」/)?.[0] ?? "Explore";
 

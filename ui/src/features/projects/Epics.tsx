@@ -216,7 +216,7 @@ function EpicDetail({
       .moveStage(epic.id, to, note)
       .then((out) => {
         setNote("");
-        setResult({ ok: true, text: t("Moved {from} → {to}").replace("{from}", out.from).replace("{to}", out.to) });
+        setResult({ ok: true, text: t("Moved {from} → {to}").replace("{from}", () => out.from).replace("{to}", () => out.to) });
         void resources.issues.invalidate();
         void epicHistory(epic.id).invalidate();
         cache.invalidate("milestones");
@@ -288,7 +288,7 @@ function EpicDetail({
                     }
                     title={m.needs_operator ? t("operator decision") : undefined}
                   >
-                    {busy === m.to ? t("Moving…") : m.forward ? t("Move to {to}").replace("{to}", m.to) : t("Back to {to}").replace("{to}", m.to)}
+                    {busy === m.to ? t("Moving…") : m.forward ? t("Move to {to}").replace("{to}", () => m.to) : t("Back to {to}").replace("{to}", () => m.to)}
                     {m.needs_operator && <span className="ml-1.5 opacity-80">· {t("operator")}</span>}
                   </button>
                 ))}
@@ -310,7 +310,7 @@ function EpicDetail({
           )}
           {history.data && events.length === 0 && (
             <p className="text-label text-ink-500">
-              {t("Never moved")} — {stage ? t("reads as {id} ({source})").replace("{id}", stage.id).replace("{source}", stage.source) : t("no stage")}.
+              {t("Never moved")} — {stage ? t("reads as {id} ({source})").replace("{id}", () => stage.id).replace("{source}", () => stage.source) : t("no stage")}.
             </p>
           )}
           {events.length > 0 && (

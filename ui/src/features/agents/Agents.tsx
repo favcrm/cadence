@@ -142,7 +142,7 @@ function AgentCard({
   return (
     <article
       className={`agent-card tone-${tone}`}
-      aria-label={t("Agent {alias}").replace("{alias}", a.alias)}
+      aria-label={t("Agent {alias}").replace("{alias}", () => a.alias)}
     >
       <div className="top">
         <div className="avwrap">
@@ -165,7 +165,7 @@ function AgentCard({
               event.stopPropagation();
               onOpen();
             }}
-            aria-label={t("Open agent {alias}").replace("{alias}", a.alias)}
+            aria-label={t("Open agent {alias}").replace("{alias}", () => a.alias)}
           >
             {a.alias}
           </button>
@@ -316,9 +316,9 @@ export default function Agents({
           .replace("{current}", String(counts.current))
           .replace(
             "{total}",
-            project === "all"
+            () => project === "all"
               ? t("{count} total across all projects").replace("{count}", String(scoped.length))
-              : t("{count} total in {project}").replace("{count}", String(scoped.length)).replace("{project}", project),
+              : t("{count} total in {project}").replace("{count}", String(scoped.length)).replace("{project}", () => project),
           );
 
   return (
@@ -336,7 +336,7 @@ export default function Agents({
         issuesState.data !== null &&
         (globalAgents.length > 0 || otherProjectAgents.length > 0) && (
           <p className="text-label text-ink-500 mb-4">
-            {t("Agents working on or owning active issues in {project}.").replace("{project}", project)}{" "}
+            {t("Agents working on or owning active issues in {project}.").replace("{project}", () => project)}{" "}
             {otherProjectAgents.length > 0 &&
               t("{count} in other projects are visible in All projects.").replace("{count}", String(otherProjectAgents.length))}
           </p>

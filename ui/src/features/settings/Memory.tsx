@@ -24,11 +24,11 @@ function scopeLine(m: MemoryCard, t: (english: string) => string): string {
   const bits: string[] = [];
   if (m.scope.project) bits.push(t("Project-wide"));
   if (m.scope.components.length)
-    bits.push(t("Components: {values}").replace("{values}", m.scope.components.join(", ")));
-  if (m.scope.paths.length) bits.push(t("Paths: {values}").replace("{values}", m.scope.paths.join(", ")));
+    bits.push(t("Components: {values}").replace("{values}", () => m.scope.components.join(", ")));
+  if (m.scope.paths.length) bits.push(t("Paths: {values}").replace("{values}", () => m.scope.paths.join(", ")));
   if (m.scope.providers.length)
-    bits.push(t("Providers: {values}").replace("{values}", m.scope.providers.join(", ")));
-  if (m.scope.tags.length) bits.push(t("Tags: {values}").replace("{values}", m.scope.tags.join(", ")));
+    bits.push(t("Providers: {values}").replace("{values}", () => m.scope.providers.join(", ")));
+  if (m.scope.tags.length) bits.push(t("Tags: {values}").replace("{values}", () => m.scope.tags.join(", ")));
   return bits.join(" · ") || t("No scope recorded");
 }
 
@@ -45,7 +45,7 @@ function lessonCountLine(count: number, incomplete: boolean, query: string, t: (
       ? (one ? t("{count} readable lesson · results incomplete") : t("{count} readable lessons · results incomplete"))
       : (one ? t("{count} lesson") : t("{count} lessons"));
   }
-  return line.replace("{count}", String(count)).replace("{query}", query);
+  return line.replace("{count}", String(count)).replace("{query}", () => query);
 }
 
 function matches(m: MemoryCard, query: string): boolean {
@@ -121,7 +121,7 @@ function LessonDetail({ memory }: { memory: MemoryCard }) {
         <div className="memory-applicability">
           <h3>{t("Applies to")}</h3>
           <p>{scopeLine(detail, t)}</p>
-          {detail.supersedes && <p>{t("Supersedes {supersedes}").replace("{supersedes}", String(detail.supersedes ?? ""))}</p>}
+          {detail.supersedes && <p>{t("Supersedes {supersedes}").replace("{supersedes}", () => String(detail.supersedes ?? ""))}</p>}
         </div>
       </div>
       <aside

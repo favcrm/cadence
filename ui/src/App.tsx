@@ -1386,7 +1386,7 @@ function WorkspaceAppEntry({
     return (
       <main className="px-4 lg:px-8 pt-10 pb-9">
         <h1 className="text-section font-semibold text-ink-100">{t("App not installed")}</h1>
-        <p className="text-body text-ink-400 mt-2">{t("No active installation with app key “{appKey}” was found.").replace("{appKey}", appKey)}</p>
+        <p className="text-body text-ink-400 mt-2">{t("No active installation with app key “{appKey}” was found.").replace("{appKey}", () => appKey)}</p>
         <Link href="/apps" className="lnk">{t("All apps")}</Link>
       </main>
     );
@@ -1396,7 +1396,7 @@ function WorkspaceAppEntry({
       <main className="px-4 lg:px-8 pt-10 pb-9">
         <h1 className="text-section font-semibold text-ink-100">{t("Choose an installation")}</h1>
         <p className="text-body text-ink-400 mt-2">
-          {t("More than one active installation uses app key “{appKey}”. Choose which installation to open.").replace("{appKey}", appKey)}
+          {t("More than one active installation uses app key “{appKey}”. Choose which installation to open.").replace("{appKey}", () => appKey)}
         </p>
         <ul className="mt-4 space-y-2">
           {matches.map((installation) => (

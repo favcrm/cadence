@@ -159,7 +159,7 @@ export default function Composer({
 }: ComposerProps) {
   const { t } = useLocale();
   const compact = density === "compact";
-  const translateAttachText = compact ? t : (english: string) => english;
+  const translateAttachText = t;
   const key = storeKey ?? "composer";
   // The draft cell is the ONE owner of text, refs, edit version and the
   // in-flight handoff reservation. The box renders this snapshot, so a

@@ -351,7 +351,7 @@ function CustomerList({
               aria-label={t("Filter by source")}
             />
             {tagFilter !== "" && (
-              <button type="button" className="chip crm-chip-on" onClick={() => setTagFilter("")} aria-label={t("Clear tag filter {tag}").replace("{tag}", tagFilter)}>
+              <button type="button" className="chip crm-chip-on" onClick={() => setTagFilter("")} aria-label={t("Clear tag filter {tag}").replace("{tag}", () => tagFilter)}>
                 {t("tag")}: {tagFilter} ✕
               </button>
             )}

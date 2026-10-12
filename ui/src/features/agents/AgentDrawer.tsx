@@ -52,7 +52,7 @@ function profileModel(a: Agent, t: Translate = identity): {
       note: t("reported"),
       mismatch:
         configured && configured !== reported
-          ? t("configured {model}").replace("{model}", configured)
+          ? t("configured {model}").replace("{model}", () => configured)
           : undefined,
       provenance: provenanceText || undefined,
     };
@@ -114,10 +114,10 @@ function usageText(a: Agent, t: Translate = identity): { value: string; note: st
       value: t("stale"),
       note: [
         quota.observed_at
-          ? t("last update {time}").replace("{time}", fmtTime(quota.observed_at))
+          ? t("last update {time}").replace("{time}", () => fmtTime(quota.observed_at!))
           : t("last update unknown"),
         quota.window,
-        quota.source ? t("source {source}").replace("{source}", quota.source) : null,
+        quota.source ? t("source {source}").replace("{source}", () => String(quota.source)) : null,
       ]
         .filter(Boolean)
         .join(" · "),
@@ -153,7 +153,7 @@ function usageText(a: Agent, t: Translate = identity): { value: string; note: st
   const value =
     remaining ?? usedAgainstLimit ?? used ?? percent ?? limit ?? t("available");
   const window = quota.window ? `${quota.window}` : null;
-  const reset = quota.reset_at ? t("reset {time}").replace("{time}", fmtTime(quota.reset_at)) : null;
+  const reset = quota.reset_at ? t("reset {time}").replace("{time}", () => fmtTime(quota.reset_at!)) : null;
   const pool = quota.pool
     ? `${t("shared")}${quota.pool.label ? ` · ${quota.pool.label}` : ""}${
         quota.pool.count != null ? ` · ${t("{count} agents").replace("{count}", String(quota.pool.count))}` : ""
@@ -171,8 +171,8 @@ function usageText(a: Agent, t: Translate = identity): { value: string; note: st
         reset,
         pool,
         poolAgents,
-        lastUpdate ? t("last update {time}").replace("{time}", fmtTime(lastUpdate)) : null,
-        quota.source ? t("source {source}").replace("{source}", quota.source) : null,
+        lastUpdate ? t("last update {time}").replace("{time}", () => fmtTime(lastUpdate)) : null,
+        quota.source ? t("source {source}").replace("{source}", () => String(quota.source)) : null,
       ]
         .filter(Boolean)
         .join(" · ") || t("reported"),
@@ -512,7 +512,7 @@ export default function AgentDrawer({
                       </span>
                       {m.task && (
                         <span className="num text-micro text-ink-500">
-                          {t("task {task}").replace("{task}", m.task)}
+                          {t("task {task}").replace("{task}", () => String(m.task))}
                         </span>
                       )}
                       {m.summary && (

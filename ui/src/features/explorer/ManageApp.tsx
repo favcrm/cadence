@@ -216,7 +216,7 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
       <div className="hero mt-3">
         <AppGlyph name={inst.name} size="lg" />
         <div className="min-w-0">
-          <h1>{t("Manage {title}").replace("{title}", inst.title)}</h1>
+          <h1>{t("Manage {title}").replace("{title}", () => inst.title)}</h1>
           <p className="tag">{inst.summary}</p>
         </div>
       </div>
@@ -228,7 +228,7 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
         <div className="card mcard">
           <h3>{t("App package")}</h3>
           <p>{updateReady ? t("An update is ready to review.") : t("No update is currently flagged.")}</p>
-          <p className="mt-1">{t("Installed version {version}.").replace("{version}", inst.version)}</p>
+          <p className="mt-1">{t("Installed version {version}.").replace("{version}", () => inst.version)}</p>
           <label className="block mt-3 text-label text-ink-400">
             <span className="block mb-1">{t("App package path or Git URL")}</span>
             <input className="update-source" type="text" value={upgradeSource}
@@ -239,7 +239,7 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
             <Button className="btn-sm" disabled={checking || applying || !upgradeSource.trim()} onClick={checkPackageUpdate}>{checking ? t("Checking…") : t("Check update")}</Button>
           </div>
           {proposalMatchesCurrent && upgradeProposal && <div className="mt-3" aria-live="polite">
-            <p>{t("Proposed version {version} · {name}").replace("{version}", upgradeProposal.receipt.version).replace("{name}", upgradeProposal.receipt.name)}</p>
+            <p>{t("Proposed version {version} · {name}").replace("{version}", () => upgradeProposal.receipt.version).replace("{name}", () => upgradeProposal.receipt.name)}</p>
             <p className="hint mt-2">{t("New digest:")} <code className="break-all">{upgradeProposal.receipt.digest}</code></p>
             {(["added", "changed", "removed"] as const).map((kind) => <p className="hint mt-1" key={kind}>{kind}: {upgradeProposal.receipt.structural_diff[kind].join(", ") || "none"}</p>)}
             {upgradeProposal.receipt.compatibility != null && <CompatibilityLines receipt={upgradeProposal.receipt.compatibility} />}
@@ -251,7 +251,7 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
 
         <div className="card mcard">
           <h3>{t("Connections and setup")}</h3>
-          <p>{t("The accounts and helpers {title} uses.").replace("{title}", inst.title)}</p>
+          <p>{t("The accounts and helpers {title} uses.").replace("{title}", () => inst.title)}</p>
           {(inst.connection_slots ?? []).length === 0 ? (
             <p className="hint mt-2">{t("No outside accounts.")}</p>
           ) : (
@@ -270,7 +270,7 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
           <h3>{t("Access")}</h3>
           <div className="swrow">
             <div>
-              <p>{t("Let {title} work").replace("{title}", inst.title)}</p>
+              <p>{t("Let {title} work").replace("{title}", () => inst.title)}</p>
               <p className="hint">{removed ? t("Off — the app is removed.") : off ? t("Off — it can't run or use its connections. Its data is kept.") : t("On — it can run and use its connections.")}</p>
             </div>
             <button
@@ -286,7 +286,7 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
         <div className="card mcard">
           {removed ? (
             <>
-              <h3>{t("Restore {title}").replace("{title}", inst.title)}</h3>
+              <h3>{t("Restore {title}").replace("{title}", () => inst.title)}</h3>
               <p>{restorable ? t("Removed apps restore within 30 days, with the same data.") : t("The restore window has closed.")}</p>
               {restorable && (
                 <div className="mt-3">
@@ -296,7 +296,7 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
             </>
           ) : (
             <>
-              <h3 className="text-fail">{t("Remove {title}").replace("{title}", inst.title)}</h3>
+              <h3 className="text-fail">{t("Remove {title}").replace("{title}", () => inst.title)}</h3>
               <p>{t("Takes the app and its data out of this workspace. You'll see exactly what goes before anything is deleted.")}</p>
               <div className="mt-3">
                 <Button className="btn-danger btn-sm" onClick={openRemove}>{t("Remove app…")}</Button>
@@ -364,7 +364,7 @@ function RemoveDialog({ preview, removing, onCancel, onConfirm }: {
         <div className="flex gap-2 justify-end">
           <Button onClick={onCancel}>{t("Cancel")}</Button>
           <Button className="btn-danger-solid" disabled={removing} onClick={onConfirm}>
-            {removing ? t("Removing…") : t("Remove {title}").replace("{title}", preview.title)}
+            {removing ? t("Removing…") : t("Remove {title}").replace("{title}", () => preview.title)}
           </Button>
         </div>
       </div>

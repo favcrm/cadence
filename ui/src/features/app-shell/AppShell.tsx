@@ -939,7 +939,7 @@ export default function AppShell({
                     {contextId === ""
                       ? installation.name === "crm"
                         ? t("This CRM installation is not bound to a scope yet — administrator CRM setup is required before records open.")
-                        : t("Choose a context to open {title}'s records.").replace("{title}", title)
+                        : t("Choose a context to open {title}'s records.").replace("{title}", () => title)
                       : installation.name === "crm"
                         ? t("Scope:")
                         : t("Context:")}

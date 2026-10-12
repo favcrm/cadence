@@ -431,7 +431,7 @@ export default function ModelDefaults() {
                         <div className="model-defaults-fields">
                           <Select
                             id={`${provider.id}-baseline`}
-                            aria-label={t("{label} default model").replace("{label}", String(provider.label ?? ""))}
+                            aria-label={t("{label} default model").replace("{label}", () => String(provider.label ?? ""))}
                             disabled={frozen}
                             full
                             value={draft.baseline}
@@ -452,7 +452,7 @@ export default function ModelDefaults() {
                           {draft.baseline === "model" && (
                             <div className="model-defaults-model-input">
                               <label htmlFor={`${provider.id}-baseline-model`}>
-                                {t("{label} default model ID").replace("{label}", String(provider.label ?? ""))}</label>
+                                {t("{label} default model ID").replace("{label}", () => String(provider.label ?? ""))}</label>
                               <input
                                 id={`${provider.id}-baseline-model`}
                                 className="field"
@@ -494,7 +494,7 @@ export default function ModelDefaults() {
                                 <div className="model-defaults-fields">
                                   <Select
                                     id={`${provider.id}-${role.id}`}
-                                    aria-label={t("{label} {label2} model").replace("{label}", String(provider.label ?? "")).replace("{label2}", String(role.label ?? ""))}
+                                    aria-label={t("{label} {label2} model").replace("{label}", () => String(provider.label ?? "")).replace("{label2}", () => String(role.label ?? ""))}
                                     disabled={frozen}
                                     full
                                     value={row.choice}
@@ -530,7 +530,7 @@ export default function ModelDefaults() {
                                       <label
                                         htmlFor={`${provider.id}-${role.id}-model`}
                                       >
-                                        {t("{label} {label2} model ID").replace("{label}", String(provider.label ?? "")).replace("{label2}", String(role.label ?? ""))}</label>
+                                        {t("{label} {label2} model ID").replace("{label}", () => String(provider.label ?? "")).replace("{label2}", () => String(role.label ?? ""))}</label>
                                       <input
                                         id={`${provider.id}-${role.id}-model`}
                                         className="field"
@@ -568,7 +568,7 @@ export default function ModelDefaults() {
                           disabled={frozen || !draft.present}
                           onClick={resetProvider}
                         >
-                          {t("Reset {label} defaults").replace("{label}", String(provider.label ?? ""))}</Button>
+                          {t("Reset {label} defaults").replace("{label}", () => String(provider.label ?? ""))}</Button>
                       </footer>
                     </>
                   )}

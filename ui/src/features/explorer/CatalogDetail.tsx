@@ -126,11 +126,11 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
       )}
       {removed && (
         <div className="alert warn mt-4" role="status">
-          {t(card.restorable ? "{title} was removed. You can restore it, with the same data, for 30 days after it was removed." : "{title} was removed. The 30-day restore window has closed, so it stays removed.").replace("{title}", card.title)}
+          {t(card.restorable ? "{title} was removed. You can restore it, with the same data, for 30 days after it was removed." : "{title} was removed. The 30-day restore window has closed, so it stays removed.").replace("{title}", () => card.title)}
         </div>
       )}
       {card.state === "off" && (
-        <div className="alert warn mt-4">{t("Access is off — {title} can't run or use its connections until it's turned back on.").replace("{title}", card.title)}</div>
+        <div className="alert warn mt-4">{t("Access is off — {title} can't run or use its connections until it's turned back on.").replace("{title}", () => card.title)}</div>
       )}
 
       <div className="dgrid">

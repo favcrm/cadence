@@ -110,7 +110,7 @@ function RuleRow({
           <span>{t("Working folder")}</span> <code>{rule.cwd || t("Not recorded")}</code>
         </p>
         <div className="permission-provenance">
-          <span>{t("Saved by {by}").replace("{by}", String(rule.by || t("Not recorded")))}</span>
+          <span>{t("Saved by {by}").replace("{by}", () => String(rule.by || t("Not recorded")))}</span>
           {date ? (
             <time dateTime={date.toISOString()} title={date.toISOString()}>
               {date.toLocaleDateString(undefined, {
@@ -169,7 +169,7 @@ function RuleRow({
             aria-describedby={`${id}-confirm`}
           >
             <p id={`${id}-confirm`}>
-              {t("Revoke this {effect} rule?").replace("{effect}", String(rule.effect ?? ""))} {rule.effect === "deny" ? t("This removes this restriction; an allow rule may then apply.") : t("The master may need permission again.")}{" "}
+              {t("Revoke this {effect} rule?").replace("{effect}", () => String(rule.effect ?? ""))} {rule.effect === "deny" ? t("This removes this restriction; an allow rule may then apply.") : t("The master may need permission again.")}{" "}
               {t("Takes effect on the next check.")}
             </p>
             <div>
@@ -183,7 +183,7 @@ function RuleRow({
             size="sm"
             disabled={disabled}
             loading={busy}
-            aria-label={t("Revoke {effect} rule {id}").replace("{effect}", String(rule.effect ?? "")).replace("{id}", String(rule.id ?? ""))}
+            aria-label={t("Revoke {effect} rule {id}").replace("{effect}", () => String(rule.effect ?? "")).replace("{id}", () => String(rule.id ?? ""))}
             onClick={onRevoke}
           >
             {busy ? t("Revoking…") : t("Revoke")}
@@ -370,10 +370,10 @@ function RuleWorkspace({
       </div>
       {blocked && (
         <p className="permission-access">
-          {t("{blocked} Saved rules remain available to inspect.").replace("{blocked}", String(blocked ?? ""))}</p>
+          {t("{blocked} Saved rules remain available to inspect.").replace("{blocked}", () => String(blocked ?? ""))}</p>
       )}
       <p className="permission-feedback" role="status">
-        {notice ? t("Rule revoked: {id}. Takes effect on the next check.").replace("{id}", notice.id) : null}
+        {notice ? t("Rule revoked: {id}. Takes effect on the next check.").replace("{id}", () => notice.id) : null}
       </p>
       {actionError && (
         <p className="permission-error" role="alert">

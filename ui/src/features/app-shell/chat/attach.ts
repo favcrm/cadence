@@ -68,13 +68,13 @@ export function attachRefusal(name: string, size: number): string | null {
 export function displayAttachError(message: string, t: Translate = identity): string {
   const unavailable = /^PDF and image processing is not available yet — (\.[^ ]+) cannot be attached$/.exec(message);
   if (unavailable)
-    return t("PDF and image processing is not available yet — {ext} cannot be attached").replace("{ext}", unavailable[1]);
+    return t("PDF and image processing is not available yet — {ext} cannot be attached").replace("{ext}", () => unavailable[1]);
   const unsupported = /^(.+?) is not attachable \(txt, md, csv\)$/.exec(message);
   if (unsupported)
     return `${unsupported[1]} ${t("is not attachable (txt, md, csv)")}`;
   const count = /^at most (\d+) attachments per message$/.exec(message);
   if (count)
-    return t("at most {count} attachments per message").replace("{count}", count[1]);
+    return t("at most {count} attachments per message").replace("{count}", () => count[1]);
   return t(message);
 }
 

@@ -35,7 +35,7 @@ export function currentCheckpoints(rows: MilestoneRow[]): MilestoneRow[] {
 export function scheduleLabel(row: MilestoneRow, t: Translate = (english) => english, formatNumber: (value: number) => string = String): string | null {
   const schedule = row.schedule;
   if (!schedule) return null;
-  if (schedule.state === "overdue") return t("{days} days overdue").replace("{days}", formatNumber(Math.abs(schedule.days_remaining ?? 0)));
+  if (schedule.state === "overdue") return t("{days} days overdue").replace("{days}", () => formatNumber(Math.abs(schedule.days_remaining ?? 0)));
   if (schedule.state === "due_today") return t("Due today");
   return null;
 }

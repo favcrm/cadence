@@ -679,7 +679,7 @@ function MessageRow({ message, issueProjects }: { message: ThreadMessage; issueP
           ) : (
             <span className="threads-ref">{message.issue}</span>
           ))}
-          {message.task_id && <span className="threads-ref">{t("task {task}").replace("{task}", message.task_id)}</span>}
+          {message.task_id && <span className="threads-ref">{t("task {task}").replace("{task}", () => String(message.task_id))}</span>}
         </div>
       )}
     </article>
@@ -787,8 +787,8 @@ function OperatorComposer({
       }}
       refocusAfterSend
       attach
-      ariaLabel={t("Message to {alias}").replace("{alias}", alias)}
-      placeholder={t("Message {alias}…").replace("{alias}", alias)}
+      ariaLabel={t("Message to {alias}").replace("{alias}", () => alias)}
+      placeholder={t("Message {alias}…").replace("{alias}", () => alias)}
       className="card p-2.5 relative"
     />
   );
@@ -804,7 +804,7 @@ function ReplyBar({ row, openDm }: { row: ConversationRow; openDm: (alias: strin
       <span>{t("Agent conversation · read only.")}</span>
       {agents.map((p) => (
         <Button key={p.uid ?? p.alias ?? "agent"} variant="secondary" size="sm" onClick={() => openDm(p.alias as string)}>
-          {t("Reply to {alias}").replace("{alias}", p.alias as string)}
+          {t("Reply to {alias}").replace("{alias}", () => p.alias as string)}
         </Button>
       ))}
     </div>
@@ -846,7 +846,7 @@ function NewThread({
       <Button variant="secondary" size="sm" type="submit" disabled={writeBlock !== null || alias === ""}>
         {t("New thread")}
       </Button>
-      {current && <span className="threads-note">{t("Draft with {alias}").replace("{alias}", current)}</span>}
+      {current && <span className="threads-note">{t("Draft with {alias}").replace("{alias}", () => current)}</span>}
     </form>
   );
 }
@@ -891,7 +891,7 @@ function DraftDm({
     <div className="threads-timeline">
       <header className="threads-head">
         <div className="threads-kicker">{KIND_LABEL.operator}</div>
-        <h2>{t("You ↔ {alias}").replace("{alias}", alias)}</h2>
+        <h2>{t("You ↔ {alias}").replace("{alias}", () => alias)}</h2>
       </header>
       <div className="threads-messages" aria-live="polite">
         {error ? (

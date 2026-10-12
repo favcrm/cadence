@@ -329,6 +329,7 @@ export function entryAttachments(payload: unknown): EntryAttachment[] {
  *  name, `size · kind`. Names, sizes and MIMEs only — a card is never a
  *  link and never carries a token or path. */
 function AttachmentRows({ files }: { files: EntryAttachment[] }) {
+  const t = useTranslate();
   if (files.length === 0) return null;
   return (
     <div className="grid gap-1.5 mt-2" data-entry-attachments>
@@ -339,7 +340,7 @@ function AttachmentRows({ files }: { files: EntryAttachment[] }) {
           </svg>
           <div className="app-chat-filename">
             <span>{f.name}</span>
-            <small>{attachMeta(f.name, f.size)}</small>
+            <small>{attachMeta(f.name, f.size, t)}</small>
           </div>
         </div>
       ))}

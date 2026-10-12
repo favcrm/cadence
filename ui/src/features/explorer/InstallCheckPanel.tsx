@@ -55,8 +55,8 @@ export default function InstallCheckPanel({ source, label, install, onInstalled,
 
   const warnings = check?.secret_warnings ?? [];
   return (
-    <div className="card install-check p-4 mb-4" role="dialog" aria-label={t("Check {label} before installing").replace("{label}", label)}>
-      <h3 className="font-medium text-ink-100 mb-1">{t("Check {label} before installing").replace("{label}", label)}</h3>
+    <div className="card install-check p-4 mb-4" role="dialog" aria-label={t("Check {label} before installing").replace("{label}", () => label)}>
+      <h3 className="font-medium text-ink-100 mb-1">{t("Check {label} before installing").replace("{label}", () => label)}</h3>
       {checking && <p className="text-label text-ink-400" role="status">{t("Checking exactly what would be installed…")}</p>}
       {checkError && (
         <div className="alert fail mt-2" role="alert">

@@ -154,7 +154,7 @@ export default function Outbox({
             <div className="card outbox-notice outbox-warning" role="status">
               <div>
                 {state.asOf
-                  ? t("Refresh failed. Showing the last loaded posts from {time}.").replace("{time}", publicationTime(new Date(state.asOf).toISOString()))
+                  ? t("Refresh failed. Showing the last loaded posts from {time}.").replace("{time}", () => publicationTime(new Date(state.asOf!).toISOString()))
                   : t("Refresh failed. Showing the last loaded posts.")}
               </div>
               <Button

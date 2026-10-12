@@ -42,7 +42,7 @@ export function provenanceDetail(
   const revision = selection?.revision;
   const text = [
     provenance,
-    lookup ? t("lookup {role}").replace("{role}", lookup) : null,
+    lookup ? t("lookup {role}").replace("{role}", () => lookup) : null,
     typeof revision === "number"
       ? t("revision {number}").replace("{number}", String(revision))
       : null,

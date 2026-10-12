@@ -312,7 +312,7 @@ function ServiceSection({
   return (
     <section
       className="card px-4 py-3.5 min-w-0"
-      aria-label={t("{label} connections").replace("{label}", String(group.label ?? ""))}
+      aria-label={t("{label} connections").replace("{label}", () => String(group.label ?? ""))}
     >
       <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 mb-2">
         <h2 className="slabel">{group.label}</h2>
@@ -329,7 +329,7 @@ function ServiceSection({
             className="ml-auto"
             href={connectionAddProviderHref(group.provider)}
           >
-            {t("Set up {label}").replace("{label}", String(group.label ?? ""))}</Button>
+            {t("Set up {label}").replace("{label}", () => String(group.label ?? ""))}</Button>
         )}
       </div>
       {group.connections.length === 0 ? (
@@ -519,7 +519,7 @@ function ServiceChooser({ providers }: { providers: ConnectionProvider[] }) {
                   )}
                 </span>
                 <span className="conn-row-sub text-micro text-ink-500 break-words">
-                  {t("Connects with {shapes}").replace("{shapes}", enrollmentSupport(p).shapes.join(" or "))}
+                  {t("Connects with {shapes}").replace("{shapes}", () => enrollmentSupport(p).shapes.join(" or "))}
                 </span>
               </Link>
             </li>
@@ -871,7 +871,7 @@ export function ConnectionDetail({
   };
 
   return (
-    <section className="card px-4 py-3.5 min-w-0" aria-label={t("{connectionLabel} detail").replace("{connectionLabel}", String(connectionLabel(row) ?? ""))}>
+    <section className="card px-4 py-3.5 min-w-0" aria-label={t("{connectionLabel} detail").replace("{connectionLabel}", () => String(connectionLabel(row) ?? ""))}>
       {standalone ? (
         <h1 id="connection-detail-title" className="text-section font-medium text-ink-100 break-words">
           {connectionLabel(row)}
@@ -1137,7 +1137,7 @@ export function RotateForm({
   return (
     <form
       className="mt-3 space-y-2 border-t border-ink-700 pt-3"
-      aria-label={t("rotate {connectionLabel}").replace("{connectionLabel}", String(connectionLabel(row) ?? ""))}
+      aria-label={t("rotate {connectionLabel}").replace("{connectionLabel}", () => String(connectionLabel(row) ?? ""))}
       onSubmit={(e) => {
         e.preventDefault();
         submit();
@@ -1204,7 +1204,7 @@ export function RotateForm({
                 disabled={busy}
               >
                 {row.smtp ? (
-                  <option value="">{t("Keep current — {port} ({mode})").replace("{port}", String(row.smtp.port ?? "")).replace("{mode}", row.smtp.tls_mode === "implicit" ? t("implicit TLS") : t("STARTTLS"))}</option>
+                  <option value="">{t("Keep current — {port} ({mode})").replace("{port}", String(row.smtp.port ?? "")).replace("{mode}", () => row.smtp!.tls_mode === "implicit" ? t("implicit TLS") : t("STARTTLS"))}</option>
                 ) : (
                   <option value="">{t("Choose…")}</option>
                 )}
@@ -1346,7 +1346,7 @@ function RevokeConfirm({
   };
 
   return (
-    <div className="mt-3 space-y-2 border-t border-ink-700 pt-3" aria-label={t("disconnect {connectionLabel}").replace("{connectionLabel}", String(connectionLabel(row) ?? ""))}>
+    <div className="mt-3 space-y-2 border-t border-ink-700 pt-3" aria-label={t("disconnect {connectionLabel}").replace("{connectionLabel}", () => String(connectionLabel(row) ?? ""))}>
       <p className="text-label text-ink-200 break-words">{t("Disconnecting removes this connection's grants and its bindings and defaults, and closes its pending effects. This cannot be undone — re-enrolling the same account creates a new connection.")}</p>
       <label className="flex items-start gap-2 text-label text-ink-300">
         <input
@@ -1357,7 +1357,7 @@ function RevokeConfirm({
           className="mt-0.5"
         />
         <span>
-          {t("I understand disconnecting {connectionLabel} removes its grants and bindings and closes pending effects.").replace("{connectionLabel}", connectionLabel(row))}</span>
+          {t("I understand disconnecting {connectionLabel} removes its grants and bindings and closes pending effects.").replace("{connectionLabel}", () => connectionLabel(row))}</span>
       </label>
       {error && (
         <p className="text-label text-fail break-words" role="alert">
@@ -1705,7 +1705,7 @@ export function AddConnection({
                   <option value="" disabled>{t("Choose a service…")}</option>
                 )}
                 {unavailable && (
-                  <option value={provider}>{t("{provider} — unavailable now").replace("{provider}", String(provider ?? ""))}</option>
+                  <option value={provider}>{t("{provider} — unavailable now").replace("{provider}", () => String(provider ?? ""))}</option>
                 )}
                 {candidates.map((p) => (
                   <option key={p.provider} value={p.provider}>
@@ -1744,7 +1744,7 @@ export function AddConnection({
           )}
           {methodPending && (
             <p className="text-micro text-ink-500 break-words">
-              {t("Choose how to connect {serviceLabel} — a scoped API token, or an SMTP sender.").replace("{serviceLabel}", serviceLabel(provider))}</p>
+              {t("Choose how to connect {serviceLabel} — a scoped API token, or an SMTP sender.").replace("{serviceLabel}", () => serviceLabel(provider))}</p>
           )}
           {!methodPending && (
           <>

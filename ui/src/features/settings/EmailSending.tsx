@@ -65,9 +65,9 @@ function renderNote(note: SendNote | null, t: (english: string) => string): stri
     case "chosen": return t("Sender chosen.");
     case "changed": return t("Sender changed.");
     case "removed": return t("Sender removed.");
-    case "connected": return t("Connected. Campaigns now send from {sender}.").replace("{sender}", note.value ?? "");
+    case "connected": return t("Connected. Campaigns now send from {sender}.").replace("{sender}", () => note.value ?? "");
     case "origin-cleared": return t("Unsubscribe address cleared — sends refuse until one is set.");
-    case "origin-set": return t("Unsubscribe links now use {origin}.").replace("{origin}", note.value ?? "");
+    case "origin-set": return t("Unsubscribe links now use {origin}.").replace("{origin}", () => note.value ?? "");
   }
 }
 
@@ -245,7 +245,7 @@ function SenderCard({ scope, viewer }: { scope: HostScope; viewer: Viewer }) {
           {emailRow && !replacing ? (
             <div className="grid gap-2">
               <p className="text-label text-ink-300 break-words" data-state="email-connected">
-                {t("Connected: {account}").replace("{account}", String(emailAddress ?? emailRow.account))}
+                {t("Connected: {account}").replace("{account}", () => String(emailAddress ?? emailRow.account))}
               </p>
               <div className="crm-toolbar">
                 <Button size="sm" onClick={() => setReplacing(true)}>{t("Replace email account")}</Button>
@@ -274,8 +274,8 @@ function SenderCard({ scope, viewer }: { scope: HostScope; viewer: Viewer }) {
       {binding && live !== null && (
         <p className="text-body text-ink-100 break-words" data-state="live">
           {isHostedTransport(binding)
-            ? t("Sending via AgenticOS — {live}").replace("{live}", live)
-            : t("Sending from {live}").replace("{live}", live)}{" "}
+            ? t("Sending via AgenticOS — {live}").replace("{live}", () => live)
+            : t("Sending from {live}").replace("{live}", () => live)}{" "}
           <span aria-hidden="true">✓</span>
         </p>
       )}
@@ -296,7 +296,7 @@ function SenderCard({ scope, viewer }: { scope: HostScope; viewer: Viewer }) {
         <ul className="grid gap-1" aria-label={t("Senders that cannot be used")}>
           {unusable.map(({ row, reason }) => (
             <li key={row.id} className="text-label text-fail break-words" data-state="sender-unusable">
-              {t("{account} can't be used yet. {reason}").replace("{account}", String(row.account ?? "")).replace("{reason}", String(reason ?? ""))} <Link href="/settings/connections">{t("Fix it in Settings → Connections")}</Link>.
+              {t("{account} can't be used yet. {reason}").replace("{account}", () => String(row.account ?? "")).replace("{reason}", () => String(reason ?? ""))} <Link href="/settings/connections">{t("Fix it in Settings → Connections")}</Link>.
             </li>
           ))}
         </ul>
@@ -363,7 +363,7 @@ function SenderCard({ scope, viewer }: { scope: HostScope; viewer: Viewer }) {
         <details className="text-label text-ink-400" data-details="sender">
           <summary className="cursor-pointer">{t("Details")}</summary>
           <p className="num break-all mt-1">
-            {t("link r{linkRevision} · auth r{authRevision} · {state} ·").replace("{linkRevision}", String(binding.linkRevision ?? "")).replace("{authRevision}", String(binding.authRevision ?? "")).replace("{state}", String(binding.state ?? ""))} {binding.digest.slice(0, 18)}…
+            {t("link r{linkRevision} · auth r{authRevision} · {state} ·").replace("{linkRevision}", String(binding.linkRevision ?? "")).replace("{authRevision}", String(binding.authRevision ?? "")).replace("{state}", () => String(binding.state ?? ""))} {binding.digest.slice(0, 18)}…
           </p>
         </details>
       )}
@@ -372,7 +372,7 @@ function SenderCard({ scope, viewer }: { scope: HostScope; viewer: Viewer }) {
           title={t("Stop using this sender?")}
           body={
             <p>
-              {t("Campaigns can't send or test-send from {address} until a sender is chosen again. A prepared send loses its approval.").replace("{address}", String(binding.sender.address ?? ""))}</p>
+              {t("Campaigns can't send or test-send from {address} until a sender is chosen again. A prepared send loses its approval.").replace("{address}", () => String(binding.sender.address ?? ""))}</p>
           }
           confirmLabel={t("Stop using")}
           pending={pending}

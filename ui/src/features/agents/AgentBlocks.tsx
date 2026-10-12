@@ -155,7 +155,7 @@ export function WorkBlock({
   if (agent.state === "stopped" && agent.state_label)
     return (
       <span className="text-ink-500">
-        {t("{label} · resumable").replace("{label}", agent.state_label)}
+        {t("{label} · resumable").replace("{label}", () => String(agent.state_label))}
       </span>
     );
   if (agent.state === "stopped")
@@ -210,11 +210,11 @@ export function AgentActivity({ agent: a }: { agent: Agent }) {
       </span>
       {a.stalled ? (
         <div className="text-warn mt-1">
-          {t("Stalled · {time}").replace("{time}", fmtSilence(a.silent_secs ?? 0))}
+          {t("Stalled · {time}").replace("{time}", () => fmtSilence(a.silent_secs ?? 0))}
         </div>
       ) : (a.silent_secs ?? 0) >= 60 ? (
         <div className="text-micro text-ink-500 mt-1">
-          {t("Silent · {time}").replace("{time}", fmtSilence(a.silent_secs!))}
+          {t("Silent · {time}").replace("{time}", () => fmtSilence(a.silent_secs!))}
         </div>
       ) : null}
     </div>

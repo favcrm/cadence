@@ -314,7 +314,7 @@ export default function Update({
           />
           <div>
             <h2>{t(stateTitle)}</h2>
-            <p>{t(stateText).replace("{phase}", String(phase ?? "")).replace("{change_count}", String(report?.change_count ?? ""))}</p>
+            <p>{t(stateText).replace("{phase}", () => String(phase ?? "")).replace("{change_count}", () => String(report?.change_count ?? ""))}</p>
           </div>
         </div>
         {status && (
@@ -335,7 +335,7 @@ export default function Update({
             </dl>
             <div className="update-release-footer">
               <p>
-                {status.checked_at ? t("Last checked {time}").replace("{time}", timeLabel(status.checked_at)) : t("No completed check yet")}
+                {status.checked_at ? t("Last checked {time}").replace("{time}", () => timeLabel(status.checked_at!)) : t("No completed check yet")}
                 {fetching ? " · " : ""}{fetching ? t("Refreshing status…") : ""}
               </p>
               <div className="update-actions">
@@ -366,11 +366,11 @@ export default function Update({
             <p>{t("New turns are paused during this update.")}</p>
             <p>
               {status!.waiting.length
-                ? (status!.waiting.length === 1 ? t("waiting for {count} turn: {list}") : t("waiting for {count} turns: {list}")).replace("{count}", String(status!.waiting.length)).replace("{list}", status!.waiting.map(waiterLabel).join(", "))
+                ? (status!.waiting.length === 1 ? t("waiting for {count} turn: {list}") : t("waiting for {count} turns: {list}")).replace("{count}", String(status!.waiting.length)).replace("{list}", () => status!.waiting.map(waiterLabel).join(", "))
                 : t("No active turns reported.")}
             </p>
             <p className="update-secondary">
-              {t("Started by {by} · {timeLabel}").replace("{by}", String(pending.by ?? "")).replace("{timeLabel}", String(timeLabel(pending.since) ?? ""))}</p>
+              {t("Started by {by} · {timeLabel}").replace("{by}", () => String(pending.by ?? "")).replace("{timeLabel}", () => String(timeLabel(pending.since) ?? ""))}</p>
           </div>
         </section>
       )}
@@ -487,8 +487,8 @@ export default function Update({
                   <dt>{t("Database schema")}</dt>
                   <dd>
                     {report.schema.migration
-                      ? t("{current} → {target} · Migration covered by the pre-update backup receipt.").replace("{current}", String(report.schema.current ?? t("Unknown"))).replace("{target}", String(report.schema.target ?? t("Unknown")))
-                      : t("No migration reported · Current {current}, target {target}.").replace("{current}", String(report.schema.current ?? t("unknown"))).replace("{target}", String(report.schema.target ?? t("unknown")))}
+                      ? t("{current} → {target} · Migration covered by the pre-update backup receipt.").replace("{current}", () => String(report.schema.current ?? t("Unknown"))).replace("{target}", () => String(report.schema.target ?? t("Unknown")))
+                      : t("No migration reported · Current {current}, target {target}.").replace("{current}", () => String(report.schema.current ?? t("unknown"))).replace("{target}", () => String(report.schema.target ?? t("unknown")))}
                   </dd>
                 </div>
               </>

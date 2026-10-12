@@ -214,13 +214,13 @@ export default function Explorer({ viewer }: { viewer: Viewer }) {
           <section className="sec" aria-label={t("All apps")}>
             <div className="sechead flex items-center gap-2 mb-3">
               <h2 className="text-cardtitle font-medium text-ink-100">
-                {q ? t("Results for “{q}”").replace("{q}", q) : cat === "All" ? t("All apps") : cat}
+                {q ? t("Results for “{q}”").replace("{q}", () => q) : cat === "All" ? t("All apps") : cat}
               </h2>
               <span className="chip">{items.length}</span>
             </div>
             {items.length === 0 ? (
               <div className="card px-4 py-5 text-secondary text-ink-400">
-                <h3 className="font-medium text-ink-100 mb-1">{t("No apps match “{q}”").replace("{q}", q)}</h3>
+                <h3 className="font-medium text-ink-100 mb-1">{t("No apps match “{q}”").replace("{q}", () => q)}</h3>
                 <p>{t("Try a simpler word like “email” or “posts”.")}</p>
                 {isOp && <Button className="mt-3" onClick={() => setGitOpen(true)}>{t("Add from Git URL")}</Button>}
               </div>

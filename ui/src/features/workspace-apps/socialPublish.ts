@@ -416,7 +416,7 @@ export function refusalCopy(
     case "bad_intent":
     case "bad_revision":
     case "bad_timezone":
-      return t("An identity shape is invalid ({code}). Nothing was stored.").replace("{code}", refusal.code);
+      return t("An identity shape is invalid ({code}). Nothing was stored.").replace("{code}", () => refusal.code);
     case "approval_replay":
       return t("This approval already authorized another post. Review again to approve this one — nothing was published.");
     case "bad_approval":
@@ -426,7 +426,7 @@ export function refusalCopy(
     default:
       return refusal.message
         ? `${refusal.message} (${refusal.code}). ${t("Nothing was published.")}`
-        : t("Refused ({code}). Nothing was published.").replace("{code}", refusal.code);
+        : t("Refused ({code}). Nothing was published.").replace("{code}", () => refusal.code);
   }
 }
 

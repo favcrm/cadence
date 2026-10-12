@@ -476,7 +476,7 @@ export default function CustomerCsvImport({
               }
               onClick={runImport}
             >
-              {t("Import {count} approved {rows}").replace("{count}", String(applyCount)).replace("{rows}", t(applyCount === 1 ? "row" : "rows"))}
+              {t("Import {count} approved {rows}").replace("{count}", String(applyCount)).replace("{rows}", () => t(applyCount === 1 ? "row" : "rows"))}
             </Button>
             <Button
               size="sm"

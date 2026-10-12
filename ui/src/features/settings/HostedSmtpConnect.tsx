@@ -197,7 +197,7 @@ export default function HostedSmtpConnect({
       )}
       {preset.id !== "other" && (
         <p className="text-micro text-ink-500 num" data-server>
-          {t("{host} · port {portFor} · {mode}").replace("{host}", String(host ?? "")).replace("{portFor}", String(portFor(tls) ?? "")).replace("{mode}", tls === "implicit" ? "SSL/TLS" : "STARTTLS")}
+          {t("{host} · port {portFor} · {mode}").replace("{host}", () => String(host ?? "")).replace("{portFor}", () => String(portFor(tls) ?? "")).replace("{mode}", () => tls === "implicit" ? "SSL/TLS" : "STARTTLS")}
         </p>
       )}
       {riskNeeded && (
