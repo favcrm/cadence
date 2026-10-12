@@ -47,6 +47,7 @@ import AccountMenu from "./ui/AccountMenu";
 import VersionLine from "./ui/VersionLine";
 import ThemeToggle from "./ui/ThemeToggle";
 import BuildUpdateNotice from "./ui/BuildUpdateNotice";
+import HeaderSearch from "./ui/HeaderSearch";
 import Setup from "./features/setup/Setup";
 import SetupNudge from "./features/setup/SetupNudge";
 import Login from "./features/auth/Login";
@@ -922,6 +923,8 @@ export default function App() {
               </>
             ) : <span className="truncate text-ink-200 capitalize">{route.screen === "issue" ? route.id : SCREEN_LABEL[screen]}</span>}
           </nav>
+
+          <HeaderSearch issues={issuesState} route={route} navHref={hrefFor} />
 
           <div className="ml-auto flex items-center gap-1 shrink-0">
             <StatusChips
