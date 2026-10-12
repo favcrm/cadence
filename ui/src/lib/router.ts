@@ -37,7 +37,7 @@ import { readAppUrlState, type AppTab, type ProjectView } from "./urlState";
  */
 
 export type ProjectSection = "overview" | "issues" | "epics" | "milestones" | "context" | "workflows";
-export type SettingsSection = "models" | "memory" | "update" | "account" | "permissions" | "connections" | "email";
+export type SettingsSection = "models" | "memory" | "update" | "account" | "permissions" | "connections" | "email" | "templates";
 /** The wiki's modes; `browse` opens a path by its kind (CAD-581). */
 export type WikiMode = "browse" | "edit" | "history" | "search" | "upload";
 
@@ -253,6 +253,7 @@ export function matchRoute(pathname: string): Route {
       if (a === "account") return { screen: "settings", section: "account" };
       if (a === "permissions") return { screen: "settings", section: "permissions" };
       if (a === "email") return { screen: "settings", section: "email" };
+      if (a === "templates") return { screen: "settings", section: "templates" };
       if (a === "connections") {
         if (!b) return { screen: "settings", section: "connections" };
         // CAD-1319: the dedicated pages — the add chooser, one pinned
@@ -348,6 +349,7 @@ export function routePath(route: Route): string {
         return "/settings/connections";
       }
       if (route.section === "email") return "/settings/email";
+      if (route.section === "templates") return "/settings/templates";
       return "/settings";
     case "notFound":
       return route.path;

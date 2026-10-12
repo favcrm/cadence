@@ -39,19 +39,38 @@ impl Peer {
             .output()
             .unwrap();
         let pid: u32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
-        // The shell has exited; wait until /proc shows the new parent.
+        // Owned from here on: a panic below drops it and kills only this pid.
+        let peer = Peer(pid);
+        // The shell has exited; wait until the child is the exec'd, live
+        // `sleep` carrying the forged alias and reparented away from us.
+        let me = std::process::id().to_string();
+        let mut ready = false;
         for _ in 0..100 {
             let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
-            let ppid = stat
-                .rsplit(')')
-                .next()
-                .and_then(|r| r.split_whitespace().nth(1));
-            if ppid != Some(&std::process::id().to_string()) && ppid.is_some() {
+            let mut fields = stat.rsplit(')').next().unwrap_or("").split_whitespace();
+            let state = fields.next();
+            let ppid = fields.next();
+            let exec_ok = std::fs::read_link(format!("/proc/{pid}/exe"))
+                .ok()
+                .and_then(|p| p.file_name().map(|n| n == "sleep"))
+                .unwrap_or(false);
+            let live = !matches!(state, None | Some("Z") | Some("X"));
+            let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
+            let alias_ok = environ
+                .split(|b| *b == 0)
+                .any(|e| e == b"CADENCE_ALIAS=cc13-pm");
+            let reparented = ppid.is_some_and(|p| p != me);
+            if exec_ok && live && alias_ok && reparented {
+                ready = true;
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        Peer(pid)
+        assert!(
+            ready,
+            "detached sleep {pid} not ready within 2s (exec image, state, environ or reparent)"
+        );
+        peer
     }
 }
 

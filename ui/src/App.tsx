@@ -28,6 +28,7 @@ import ModelDefaults from "./features/settings/ModelDefaults";
 import PlatformAccount from "./features/settings/PlatformAccount";
 import Connections from "./features/settings/Connections";
 import EmailSending from "./features/settings/EmailSending";
+import Templates from "./features/templates/Templates";
 import Update from "./features/settings/Update";
 import Outbox from "./features/outbox/Outbox";
 import ThreadsPage from "./features/threads/ThreadsPage";
@@ -1247,6 +1248,7 @@ export default function App() {
               { label: "Memory", href: hrefFor({ screen: "settings", section: "memory" }), on: route.section === "memory" },
               { label: "Update", href: hrefFor({ screen: "settings", section: "update" }), on: route.section === "update" },
               ...(meta?.platform_account_configured ? [{ label: "Account", href: hrefFor({ screen: "settings", section: "account" }), on: route.section === "account" }] : []),
+              { label: "Templates", href: hrefFor({ screen: "settings", section: "templates" }), on: route.section === "templates" },
               {
                 label: "Master permissions",
                 href: hrefFor({ screen: "settings", section: "permissions" }),
@@ -1265,6 +1267,7 @@ export default function App() {
         {route.screen === "settings" && route.section === "email" && (
           <EmailSending viewer={viewer} />
         )}
+        {route.screen === "settings" && route.section === "templates" && <Templates />}
         {route.screen === "settings" && route.section === "account" && <PlatformAccount />}
         {route.screen === "settings" && route.section === "update" && (
           <Update viewer={viewer} />

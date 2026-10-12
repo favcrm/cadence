@@ -70,6 +70,9 @@ pub use messages::{
 };
 mod monitors;
 pub use monitors::{Monitor, MonitorAlert, MonitorCheck};
+mod business_templates;
+pub(crate) use business_templates::SCHEMA as BUSINESS_TEMPLATE_SCHEMA;
+pub use business_templates::{BusinessDocument, TemplateVersion};
 mod chat_files;
 pub use chat_files::{
     text_kind as chat_text_kind, valid_id as chat_file_id, ChatFile, ChatFileStorageRoots,

@@ -60,6 +60,14 @@ const COORDINATION: &[&str] = &[
     "topic_deliveries",
 ];
 
+/// Retained-template delete guards. They refuse DELETE on the store, so
+/// `project` drops these two on the private copy only, inside its own
+/// transaction, and restores their stored SQL before commit.
+const PRIVATE_DELETE_GUARDS: &[&str] = &[
+    "business_template_source_no_delete",
+    "business_template_approved_no_delete",
+];
+
 /// Live authority of the source host: nulled on the private copy.
 const NULLED: &[(&str, &str)] = &[
     ("agents", "generation"),
@@ -328,6 +336,41 @@ const CATALOG: &[(&str, &[&str])] = &[
             "version",
             "access_change_json",
             "digest",
+        ],
+    ),
+    (
+        "business_documents",
+        &[
+            "company_id",
+            "id",
+            "template_name",
+            "template_version",
+            "template_sha256",
+            "kind",
+            "input_json",
+            "context_json",
+            "created",
+        ],
+    ),
+    (
+        "business_template_sources",
+        &["company_id", "sha256", "size", "bytes", "created"],
+    ),
+    (
+        "business_template_versions",
+        &[
+            "company_id",
+            "name",
+            "version",
+            "based_on",
+            "status",
+            "kind",
+            "spec_json",
+            "content_sha256",
+            "created",
+            "approved_source",
+            "approved_at",
+            "source_sha256",
         ],
     ),
     (
@@ -963,7 +1006,63 @@ fn check_catalog(db: &Path) -> Result<()> {
             )));
         }
     }
-    Ok(())
+    check_business_guards(&conn)
+}
+
+/// Business tables whose immutability guards the export and restore rely on.
+const BUSINESS_TABLES: &[&str] = &[
+    "business_template_versions",
+    "business_template_sources",
+    "business_documents",
+];
+
+/// The business trigger set must equal the one the compiled-in schema creates.
+/// Expected rows come from a scratch in-memory database built from that DDL,
+/// so a stored guard is never trusted by its own SQL text. Runs before
+/// `project` drops or replays any guard, and on the staged store at restore.
+fn check_business_guards(conn: &Connection) -> Result<()> {
+    // A store older than v38 has no business tables; there is nothing to guard.
+    let present: i64 = conn.query_row(
+        &format!(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ({})",
+            business_list()
+        ),
+        [],
+        |r| r.get(0),
+    )?;
+    if present == 0 {
+        return Ok(());
+    }
+    let trusted = Connection::open_in_memory()?;
+    trusted.execute_batch(crate::store::BUSINESS_TEMPLATE_SCHEMA)?;
+    let expected = business_guards(&trusted)?;
+    let actual = business_guards(conn)?;
+    if expected == actual {
+        return Ok(());
+    }
+    Err(Error::rejected(
+        "portable refuses: business immutable guards do not match trusted schema",
+    ))
+}
+
+fn business_list() -> String {
+    BUSINESS_TABLES
+        .iter()
+        .map(|t| sql_string(t))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// `(name, table, sql)` of every trigger on a business table, by name.
+fn business_guards(conn: &Connection) -> Result<Vec<(String, String, String)>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT name,tbl_name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name IN ({}) ORDER BY name",
+        business_list()
+    ))?;
+    let rows: Vec<(String, String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
 }
 
 fn sql_string(s: &str) -> String {
@@ -977,6 +1076,15 @@ fn project(db: &Path) -> Result<Vec<(String, i64)>> {
     let conn = Connection::open(db)?;
     let mut omitted = Vec::new();
     let tx = conn.unchecked_transaction()?;
+    let mut guard_sql = Vec::new();
+    for name in PRIVATE_DELETE_GUARDS {
+        guard_sql.push(tx.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+            [name],
+            |r| r.get::<_, String>(0),
+        )?);
+        tx.execute(&format!("DROP TRIGGER {}", quote_ident(name)), [])?;
+    }
     for table in omitted_names() {
         let rows: i64 = tx.query_row(
             &format!("SELECT count(*) FROM {}", quote_ident(table)),
@@ -985,6 +1093,9 @@ fn project(db: &Path) -> Result<Vec<(String, i64)>> {
         )?;
         omitted.push((table.to_string(), rows));
         tx.execute(&format!("DELETE FROM {}", quote_ident(table)), [])?;
+    }
+    for sql in &guard_sql {
+        tx.execute(sql, [])?;
     }
     for (table, column) in NULLED {
         tx.execute(&format!("UPDATE {table} SET {column}=NULL"), [])?;

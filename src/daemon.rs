@@ -41,6 +41,7 @@ mod app_teams_rpc;
 mod app_tools_rpc;
 mod approvals_rpc;
 mod area_rpc;
+mod business_templates_rpc;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1184_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
@@ -2588,6 +2589,15 @@ impl Shared {
             | "app_social_draft_asset"
             | "app_social_sources_show"
             | "app_social_sources_save" => self.rpc_app_social_draft(method, params, peer_pid),
+            "business_template_create"
+            | "business_template_revise"
+            | "business_template_show"
+            | "business_template_intake"
+            | "business_template_sample"
+            | "business_template_approve"
+            | "business_document_create"
+            | "business_document_export"
+            | "business_document_show" => self.rpc_business_template(method, params, peer_pid),
             "app_tool_invoke" => self.rpc_app_tool_invoke(params, peer_pid),
             "app_tool_revoke" => self.rpc_app_tool_revoke(params, peer_pid),
             "app_tool_result" | "app_tool_results" => self.rpc_app_tool_result(params, peer_pid),

@@ -1,0 +1,84 @@
+.templates-page {
+  display: grid;
+  gap: 1.25rem;
+  max-width: 56rem;
+}
+
+.templates-page label {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.templates-page textarea,
+.templates-page input {
+  font: inherit;
+  width: 100%;
+  max-width: 100%;
+}
+
+.templates-note {
+  color: var(--muted, #5b5b5b);
+}
+
+.templates-error {
+  color: var(--danger, #b42318);
+}
+
+.templates-versions {
+  list-style: none;
+  padding: 0;
+  display: grid;
+  gap: 0.75rem;
+}
+
+.templates-digest {
+  display: grid;
+  gap: 0.2rem;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 0.8rem;
+  overflow-wrap: anywhere;
+}
+
+.templates-actions {
+  display: grid;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+@media (max-width: 40rem) {
+  .templates-page {
+    max-width: 100%;
+  }
+}
+
+.templates-reference,
+.templates-findings {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.templates-warning {
+  border-left: 3px solid var(--danger, #b42318);
+  padding-left: 0.75rem;
+}
+
+.templates-blocks {
+  max-height: 20rem;
+  overflow: auto;
+  overflow-wrap: anywhere;
+}
+
+.templates-pdf {
+  width: min(820px, 100%);
+  height: 70vh;
+  min-height: 24rem;
+  border: 1px solid var(--color-ink-700, #c8c8c8);
+  background: #fff;
+}
+
+@media (max-width: 40rem) {
+  .templates-pdf {
+    height: 60vh;
+    min-height: 18rem;
+  }
+}

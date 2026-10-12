@@ -17,9 +17,9 @@ use super::write_path::{
 };
 use super::{
     app_assistant, app_audiences, app_chat, app_content, app_contexts, app_explorer, app_records,
-    app_release, app_runs, app_screens, approvals, apps, cli_route, connections, crm_send,
-    delivery_sync, home, lane, operator, platform_account, read_model, social_publish, stages,
-    threads, topics, updates, wiki, work_conversations, workflows,
+    app_release, app_runs, app_screens, approvals, apps, business_templates, cli_route,
+    connections, crm_send, delivery_sync, home, lane, operator, platform_account, read_model,
+    social_publish, stages, threads, topics, updates, wiki, work_conversations, workflows,
 };
 use super::{
     push_device_login_config, ready_file, startup_failed_file, tailnet_url, ServeOpts,
@@ -1138,6 +1138,20 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             send(request, model_defaults_get(state_dir, opts.read_only));
         }
         "/api/platform-account" => send(request, platform_account::get(opts)),
+        // CAD-1393: operator-only reads of company templates and drafts.
+        "/api/templates/show"
+        | "/api/documents/show"
+        | "/api/documents/export"
+        | "/api/templates/sample" => {
+            let route = business_templates::route(&path).expect("route listed above");
+            match operator::admit_operator_read(&request, state_dir, opts) {
+                Ok(()) => send(
+                    request,
+                    business_templates::handle_read(state_dir, route, raw_query),
+                ),
+                Err(resp) => send(request, resp),
+            }
+        }
         // CAD-1218: whether the shown head has an approval (drawer state).
         "/api/approvals/state" => {
             let resp = approvals::state(&request, state_dir, opts, raw_query);

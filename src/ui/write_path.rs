@@ -15,9 +15,9 @@ use super::serve::{add_security_headers, err_response, json_response};
 use super::ServeOpts;
 use super::{
     app_assistant, app_audiences, app_content, app_contexts, app_explorer, app_records,
-    app_release, app_runs, app_screens, app_social_drafts, approvals, apps, connections, crm_send,
-    crm_smtp, home, lane, operator, read_model, social_publish, stages, threads, updates, wiki,
-    workflows,
+    app_release, app_runs, app_screens, app_social_drafts, approvals, apps, business_templates,
+    connections, crm_send, crm_smtp, home, lane, operator, read_model, social_publish, stages,
+    threads, updates, wiki, workflows,
 };
 use crate::adapter::registry;
 use crate::client;
@@ -1050,6 +1050,26 @@ pub(crate) fn write_route(
             return;
         }
         let resp = home::decide_plan(&mut request, state_dir, epic, verb);
+        send(request, resp);
+        return;
+    }
+    // CAD-1393: company template and draft writes — OperatorOnly in
+    // `WRITE_ROUTES`, admitted above; the handler relays the daemon RPC.
+    if let Some(route) = business_templates::route(path) {
+        // Intake is a POST that stores nothing, admitted as OperatorOnly like
+        // every other template write (WRITE_ROUTES); the daemon reads it only.
+        if *method != Method::Post
+            || !(business_templates::is_write(&route)
+                || matches!(route, business_templates::Route::Intake))
+        {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let Some(caller) = &caller else {
+            send(request, err_response(500, "unadmitted write"));
+            return;
+        };
+        let resp = business_templates::handle_write(&mut request, state_dir, caller, route);
         send(request, resp);
         return;
     }

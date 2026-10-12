@@ -7,6 +7,7 @@ import argparse
 from contextlib import contextmanager
 import datetime
 import hashlib
+import io
 import json
 import math
 import os
@@ -420,6 +421,50 @@ def extract_docx_auxiliary_part(part_name: str, payload: bytes) -> list[dict]:
     return blocks
 
 
+PLACEHOLDER = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_.]*)\s*\}\}")
+TAG = re.compile(r"\{%\s*(.*?)\s*%\}")
+
+
+def docx_structure(blocks: list[dict], main_root, names: set[str]) -> dict:
+    """Placeholders, loop tags, tables, images and styles of a DOCX reference.
+
+    Reports what the text says; it proposes nothing. Unrecognised braces are
+    listed so a reviewer sees them before any render."""
+    placeholders: list[str] = []
+    table_placeholders: list[str] = []
+    loops: list[dict] = []
+    unrecognized: list[dict] = []
+    for block in blocks:
+        text = block["text"]
+        found = PLACEHOLDER.findall(text)
+        for name in found:
+            if name not in placeholders:
+                placeholders.append(name)
+            if "table " in block["locator"] and name not in table_placeholders:
+                table_placeholders.append(name)
+        for tag in TAG.findall(text):
+            if tag.startswith(("for ", "endfor", "if ", "endif")):
+                loops.append({"locator": block["locator"], "tag": tag})
+            else:
+                unrecognized.append({"locator": block["locator"], "text": text[:200]})
+        leftover = PLACEHOLDER.sub("", TAG.sub("", text))
+        if "{" in leftover or "}" in leftover:
+            unrecognized.append({"locator": block["locator"], "text": text[:200]})
+    tables = main_root.xpath("//w:tbl[not(ancestor::w:txbxContent)]", namespaces=DOCX_NS)
+    images = main_root.xpath("//w:drawing | //w:pict", namespaces=DOCX_NS)
+    return {
+        "text_blocks": len(blocks),
+        "placeholders": placeholders,
+        "table_placeholders": table_placeholders,
+        "loops": loops,
+        "unrecognized_markers": unrecognized,
+        "tables": len(tables),
+        "images": len(images),
+        "media_parts": sorted(name for name in names if name.startswith("word/media/")),
+        "styles": sorted({block["style"] for block in blocks if block.get("style")}),
+    }
+
+
 def extract_docx(source: Path) -> dict:
     package = preflight_office(source, "docx")
     try:
@@ -473,7 +518,7 @@ def extract_docx(source: Path) -> dict:
         )
         if not blocks:
             refuse("DOCX contains no readable paragraph or table text")
-        return {"format": "docx", "blocks": blocks}
+        return {"format": "docx", "blocks": blocks, "structure": docx_structure(blocks, main_root, names)}
     except Refusal:
         raise
     except Exception as exc:
@@ -571,6 +616,32 @@ def create_output_file(directory_fd: int, name: str, payload: bytes | None = Non
     return fd
 
 
+PDF_LIMITATIONS = [
+    "Reconstructed from the PDF text layer only: table grids, fonts, logos, colours and exact positions are not reproduced.",
+    "Text order follows the PDF text stream and may not match the visual reading order.",
+    "This DOCX is a reference to rebuild a template from. It is not an approved template and needs its own review and approval.",
+]
+
+
+def pdf_reconstruction(extracted: dict, source_name: str) -> bytes:
+    """An editable DOCX holding the PDF's text per page, with its limitations."""
+    from docx import Document
+
+    document = Document()
+    document.add_heading("Reconstructed reference (not an approved template)", level=1)
+    document.add_paragraph(f"Source: {source_name}")
+    for limitation in PDF_LIMITATIONS:
+        document.add_paragraph(limitation)
+    for page in extracted["pages"]:
+        document.add_heading(f"PDF page {page['page']}", level=2)
+        for line in page["text"].splitlines():
+            if line.strip():
+                document.add_paragraph(line.strip())
+    buffer = io.BytesIO()
+    document.save(buffer)
+    return buffer.getvalue()
+
+
 def process_snapshot(snapshot: dict, output_dir: Path) -> None:
     source = snapshot["resolved"]
     snapshot_path = snapshot["snapshot"]
@@ -608,6 +679,13 @@ def process_snapshot(snapshot: dict, output_dir: Path) -> None:
             "extractor": {"name": "business-document-intake", "version": "1.0", "python": sys.version.split()[0], "parser": parser_identity(extracted["format"])},
             "evidence": extracted,
         }
+        if extracted["format"] == "pdf":
+            reconstruction_name = f"{Path(source_name).stem}.reconstruction.docx"
+            reconstruction = pdf_reconstruction(extracted, source_name)
+            reconstruction_fd = create_output_file(out_fd, reconstruction_name, reconstruction)
+            os.close(reconstruction_fd)
+            created.append(reconstruction_name)
+            record["reconstruction"] = {"file": reconstruction_name, "kind": "reference-only", "limitations": PDF_LIMITATIONS}
         payload = (json.dumps(record, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
         verify_source_snapshot(snapshot)
         provenance_fd = create_output_file(out_fd, provenance_name, payload)

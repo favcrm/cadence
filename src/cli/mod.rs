@@ -18,6 +18,7 @@ mod audit;
 mod backup;
 mod briefing;
 mod build_slot;
+mod business_templates;
 mod claude;
 mod codex;
 mod commands;
@@ -106,6 +107,7 @@ use briefing::{brief_agent, BriefMode};
 #[cfg(test)]
 use briefing::{cloud_session_prompt, ensure_agents_block, AGENTS_BEGIN, AGENTS_END};
 use build_slot::BuildSlotAction;
+use business_templates::{DocumentAction, TemplateAction};
 use cadence_agent::adapter::registry;
 use cadence_agent::client;
 use cadence_agent::error::Error;

@@ -41,6 +41,7 @@ mod app_screens;
 mod app_social_drafts;
 mod approvals;
 mod apps;
+mod business_templates;
 mod cli_route;
 mod connections;
 mod crm_send;
