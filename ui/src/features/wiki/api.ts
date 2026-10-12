@@ -182,7 +182,7 @@ export function wikiFileUrl(path: string): string {
 /**
  * The bytes of a blob page, fetched with the session header. An `<img>`
  * cannot send `X-Cadence-Session`, so image previews load through this and
- * render a local object URL instead of `wikiFileUrl`.
+ * render a data URL instead of `wikiFileUrl`.
  */
 export function wikiBlob(path: string, signal?: AbortSignal): Promise<Blob> {
   return fetch(wikiFileUrl(path), { headers: sessionHeaders(), signal }).then(async (resp) => {

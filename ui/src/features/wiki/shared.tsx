@@ -99,32 +99,39 @@ export function EmptyCard({
 
 /**
  * An image from the authenticated file route. The fetch carries the session
- * header; the object URL is owned by the effect that created it and revoked
- * when its path or session key changes or the image unmounts. The loaded URL
- * is tagged with the path and session key it was fetched for, and renders
- * only while both still match the current props and tab session, so a
- * re-render with a new path or key never shows the previous bytes.
+ * header; the bytes become a data URL (the CSP admits `data:` images, not
+ * `blob:`). The read is aborted and the encoded bytes dropped when its path or
+ * session key changes or the image unmounts. The loaded source is tagged with
+ * the path and session key it was fetched for, and renders only while both
+ * still match the current props and tab session, so a re-render with a new
+ * path or key never shows the previous bytes.
  */
 export function WikiImage({ path, className, alt }: { path: string; className?: string; alt: string }) {
   const key = sessionKey();
-  const [loaded, setLoaded] = useState<{ path: string; key: string | null; url: string } | null>(null);
+  const [loaded, setLoaded] = useState<{ path: string; key: string | null; src: string } | null>(null);
   useEffect(() => {
     const abort = new AbortController();
-    let url: string | null = null;
+    let reader: FileReader | null = null;
     wikiBlob(path, abort.signal)
       .then((blob) => {
         if (abort.signal.aborted || sessionKey() !== key) return;
-        url = URL.createObjectURL(blob);
-        setLoaded({ path, key, url });
+        const owned = new FileReader();
+        reader = owned;
+        owned.onload = () => {
+          const src = owned.result;
+          if (abort.signal.aborted || sessionKey() !== key || typeof src !== "string") return;
+          setLoaded({ path, key, src });
+        };
+        owned.readAsDataURL(blob);
       })
       .catch(() => {});
     return () => {
       abort.abort();
-      if (url) URL.revokeObjectURL(url);
+      if (reader?.readyState === FileReader.LOADING) reader.abort();
       setLoaded(null);
     };
   }, [path, key]);
-  const src = loaded && loaded.path === path && loaded.key === sessionKey() ? loaded.url : null;
+  const src = loaded && loaded.path === path && loaded.key === sessionKey() ? loaded.src : null;
   return src ? <img className={className} src={src} alt={alt} /> : null;
 }
 
