@@ -74,6 +74,54 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 
+/// The ONE process-wide lock arming `HOSTED_CADENCE_ASSISTANT_ENABLED` for
+/// the enabled-path fixtures in BOTH independent refusal modules
+/// (`daemon::team_assistants_refusal` and `ui::team_assistants_http_refusal`
+/// — the UI module imports this guard; two module-local locks would restore
+/// the var while the other module's positive case still runs). The env gate
+/// in `members_rpc::member_caller` / `assist_route::assistant_enabled` reads
+/// the PROCESS env, which `scripts/run-result-tests` scrubs — so every
+/// positive case holds this guard for its whole body: the flag is exactly
+/// `"true"` while held and the previous value is restored on drop (panic
+/// included). Flag-off child probes run in spawned processes with the var
+/// absent/`"false"`/garbage and never take this lock. Edition 2021 keeps
+/// `set_var`/`remove_var` safe; production default OFF is untouched — this
+/// is test-only process env, never a config or seam bypass.
+static ASSISTANT_FLAG_LOCK: Mutex<()> = Mutex::new(());
+
+/// Holds `HOSTED_CADENCE_ASSISTANT_ENABLED="true"` under
+/// [`ASSISTANT_FLAG_LOCK`] for the guard's lifetime, restoring the prior
+/// value (or absence) on drop.
+pub(crate) struct AssistantFlagOn {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl AssistantFlagOn {
+    /// Arms the rollout flag for ONE enabled-path test. Panics on poison
+    /// would hide a failing sibling's report — recover and still fail.
+    pub(crate) fn arm() -> Self {
+        let lock = ASSISTANT_FLAG_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os("HOSTED_CADENCE_ASSISTANT_ENABLED");
+        std::env::set_var("HOSTED_CADENCE_ASSISTANT_ENABLED", "true");
+        Self {
+            _lock: lock,
+            previous,
+        }
+    }
+}
+
+impl Drop for AssistantFlagOn {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(v) => std::env::set_var("HOSTED_CADENCE_ASSISTANT_ENABLED", v),
+            None => std::env::remove_var("HOSTED_CADENCE_ASSISTANT_ENABLED"),
+        }
+    }
+}
+
 /// The org (workspace) id this fixture's bindings live under — the
 /// `organization_id` pin of every minted envelope and the `company` of the
 /// fixture's `board-identity.json`.
@@ -790,12 +838,13 @@ fn err_text(r: Result<Value>, case: &str) -> String {
 // exactly `"true"`; absent/false/unknown is OFF. `member_caller` refuses
 // EVERY `member_*` verb BEFORE the envelope is read — a stale envelope, a
 // cached service bearer or a replayed member op can never reach a member
-// effect while the feature is off. The flag is PROCESS env: the positive
-// fixtures above run with it set in the test process (the documented
-// `HOSTED_CADENCE_ASSISTANT_ENABLED=true` invocation — never mutated
-// in-process, which would race parallel tests). The OFF cases therefore
-// run in ISOLATED CHILD PROCESSES (the coordinator's scoped-isolation
-// requirement): this binary respawned with the flag absent/false/garbage.
+// effect while the feature is off. The flag is PROCESS env: each enabled-
+// path test arms it through [`AssistantFlagOn::arm`] (the shared lock + the
+// prior value restored on drop — `scripts/run-result-tests` scrubs the var,
+// so the suite must arm it itself). The OFF cases therefore run in
+// ISOLATED CHILD PROCESSES (the coordinator's scoped-isolation
+// requirement): this binary respawned with the flag absent/false/garbage,
+// unaffected by an armed parent because each child's env is its own.
 // ============================================================================
 
 /// The child-side flag-off probe — `#[ignore]`d so it never runs inside
@@ -916,6 +965,7 @@ fn member_verbs(env: &str) -> Vec<(&'static str, Value)> {
 /// non-operator caller.
 #[test]
 fn member_verbs_refuse_agent_and_unproven_callers() {
+    let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
     let env = fx.provision("sub-alice");
     let before = fx.tree();
@@ -945,6 +995,7 @@ fn member_verbs_refuse_agent_and_unproven_callers() {
 /// envelope resolves.
 #[test]
 fn forged_member_envelope_never_resolves_a_member_effect() {
+    let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
     fx.provision("sub-alice");
     let _bob = fx.provision("sub-bob");
@@ -1012,6 +1063,7 @@ fn forged_member_envelope_never_resolves_a_member_effect() {
 /// ACL are the cross-principal guards.
 #[test]
 fn member_a_cannot_read_member_b_assistant_or_conversation() {
+    let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
     fx.provision("sub-alice");
     fx.provision("sub-bob");
@@ -1076,6 +1128,7 @@ fn member_a_cannot_read_member_b_assistant_or_conversation() {
 /// daemon verb — member scope cannot widen into operator authority.
 #[test]
 fn member_scope_never_satisfies_an_operator_only_verb() {
+    let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
     let bound = fx.provision("sub-alice");
     let before = fx.tree();
@@ -1112,6 +1165,7 @@ fn member_scope_never_satisfies_an_operator_only_verb() {
 ///       delivery would land), and every effect refuses on `is_active`.
 #[test]
 fn removed_member_queued_effect_refused_at_commit() {
+    let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
     fx.provision("sub-carol");
     // Positive control: while the member is live at the platform the member
@@ -1209,6 +1263,7 @@ fn removed_member_queued_effect_refused_at_commit() {
 /// live state and grant ceiling; the daemon must honor `allow:false`.
 #[test]
 fn withdrawn_credential_or_grant_refuses_at_commit() {
+    let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
     fx.provision("sub-erin");
     assert!(
@@ -1288,6 +1343,7 @@ fn withdrawn_credential_or_grant_refuses_at_commit() {
 ///     cannot silently adopt a different credential's mint.
 #[test]
 fn service_credential_transport_keeps_member_provenance() {
+    let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
     fx.provision("sub-fran");
     fx.enroll_service(ServiceAuthority {
@@ -1418,6 +1474,7 @@ fn service_credential_transport_keeps_member_provenance() {
 /// degrade to the member path).
 #[test]
 fn wrong_or_dead_service_credential_fails_closed() {
+    let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
     fx.provision("sub-gwen");
     let good_token = format!("hcs_{}", "b".repeat(43));
@@ -1545,6 +1602,7 @@ fn wrong_or_dead_service_credential_fails_closed() {
 /// daemon's load fails and the member effect is refused closed.
 #[test]
 fn configured_but_unloadable_custody_fails_closed() {
+    let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
     fx.provision("sub-ivy");
     // The record exists but no custody file backs it — the fail-closed
@@ -1587,6 +1645,7 @@ fn configured_but_unloadable_custody_fails_closed() {
 /// gate regardless of which transport the revalidation would ride.
 #[test]
 fn expired_proof_is_not_renewed_by_service_transport() {
+    let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
     fx.provision("sub-hank");
     fx.enroll_service(ServiceAuthority {
@@ -1621,6 +1680,7 @@ fn expired_proof_is_not_renewed_by_service_transport() {
 /// resolves its own assistant surface.
 #[test]
 fn owner_role_member_effect_resolves() {
+    let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
     fx.shared
         .store
@@ -1646,6 +1706,7 @@ fn owner_role_member_effect_resolves() {
 /// same key and the same principal's different key are distinct jobs.
 #[test]
 fn duplicate_request_key_yields_one_canonical_job() {
+    let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
     fx.provision("sub-alice");
     fx.provision("sub-bob");
@@ -1711,6 +1772,7 @@ fn duplicate_request_key_yields_one_canonical_job() {
 /// evidence or event feed — and a member's own job IS readable.
 #[test]
 fn job_evidence_acl_owner_and_subscriber_only() {
+    let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
     fx.provision("sub-alice");
     fx.provision("sub-bob");
@@ -1750,6 +1812,7 @@ fn job_evidence_acl_owner_and_subscriber_only() {
 /// the daemon is no weaker than the `/api/assist/*` route's scope gate.
 #[test]
 fn member_envelope_scope_gate_refuses_write_and_jobs_at_daemon() {
+    let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
     fx.provision("sub-alice");
     let read_only = fx.envelope("sub-alice", json!({}), json!({"scope":["assist.read"]}));
@@ -1789,6 +1852,7 @@ fn member_envelope_scope_gate_refuses_write_and_jobs_at_daemon() {
 /// verb to its own scope, never to "any assist scope".
 #[test]
 fn member_envelope_jobs_scope_does_not_cover_write() {
+    let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
     fx.provision("sub-alice");
     let jobs_only = fx.envelope("sub-alice", json!({}), json!({"scope":["assist.jobs"]}));
@@ -1950,6 +2014,7 @@ impl Fx {
 /// refused read/steer/dispatch left no effect.
 #[test]
 fn assist_agent_boundary_refuses_foreign_fleet_and_leaks() {
+    let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
     let rt = fx.member_runtime("sub-alice");
     let own = rt.alias.clone();
@@ -2082,6 +2147,7 @@ fn assist_agent_boundary_refuses_foreign_fleet_and_leaks() {
 /// closed rather than ungating the worker verbs.
 #[test]
 fn assist_binding_dead_state_never_widens_to_ordinary_worker() {
+    let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
     let rt = fx.member_runtime("sub-bob");
     let own = rt.alias.clone();
@@ -2149,6 +2215,7 @@ fn assist_binding_dead_state_never_widens_to_ordinary_worker() {
 /// root. A request field can never inject these; the daemon writes them.
 #[test]
 fn assist_runtime_profile_is_recorded_member_scoped() {
+    let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
     let rt = fx.member_runtime("sub-carol");
     let agent = fx
@@ -2242,6 +2309,7 @@ fn assist_provenance(fx: &Fx, job: &str) -> crate::store::AssistRequest {
 /// re-prove end to end under a live service credential.
 #[test]
 fn deferred_dispatch_reproves_live_authority_and_refuses_self() {
+    let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
     with_deferred_service(&fx);
     let rt = fx.member_runtime("sub-dora");
@@ -2466,6 +2534,7 @@ fn deferred_dispatch_reproves_live_authority_and_refuses_self() {
 /// member-envelope bearer path at consume time.
 #[test]
 fn deferred_dispatch_fails_closed_on_unloadable_custody() {
+    let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
     let rt = fx.member_runtime("sub-hal");
     // Group join so the dispatch reaches the deferred-authority guard.
@@ -2529,6 +2598,7 @@ fn deferred_dispatch_fails_closed_on_unloadable_custody() {
 //  member can mint now.
 #[test]
 fn deferred_dispatch_reproves_original_provenance_not_replacement() {
+    let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
     with_deferred_service(&fx);
     let rt = fx.member_runtime("sub-pat");
@@ -2615,6 +2685,7 @@ fn deferred_dispatch_reproves_original_provenance_not_replacement() {
 /// actor, never a silent global adoption.
 #[test]
 fn old_queued_dispatch_needs_job_reconcile_not_global_renewal() {
+    let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
     with_deferred_service(&fx);
     let rt = fx.member_runtime("sub-quinn");
@@ -2793,6 +2864,7 @@ fn old_queued_dispatch_needs_job_reconcile_not_global_renewal() {
 /// silently adopts a moved or replayed authority.
 #[test]
 fn member_job_reconcile_binds_expected_authority_rev() {
+    let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
     with_deferred_service(&fx);
     let rt = fx.member_runtime("sub-rhea");
@@ -2992,6 +3064,7 @@ fn age_job(fx: &Fx, job: &str, secs_ago: i64) {
 /// NEVER dispatches work or touches a non-assist-bound job.
 #[test]
 fn stall_supervisor_dedups_one_check_and_never_dispatches() {
+    let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
     let rt = fx.member_runtime("sub-ida");
     let req = fx.op(
@@ -3102,6 +3175,7 @@ fn stall_supervisor_dedups_one_check_and_never_dispatches() {
 /// (`cancelled`/`failed`) is never swept into a check.
 #[test]
 fn stall_supervisor_respects_budget_terminal_and_manual_stop() {
+    let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
     fx.member_runtime("sub-jay");
     // Fresh assist job within the 300 s budget — no check.
@@ -3247,6 +3321,7 @@ fn stall_supervisor_respects_budget_terminal_and_manual_stop() {
 /// once and idempotently — never a duplicate lane.
 #[test]
 fn job_subscribe_needs_owner_share_not_membership_alone() {
+    let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
     fx.provision("sub-ana");
     fx.provision("sub-ben");
@@ -3753,6 +3828,7 @@ fn owned(fx: &Fx, alias: &str) -> bool {
 /// verbs never claim a launch.
 #[test]
 fn member_send_claims_one_launch_on_own_alias_reads_never_launch() {
+    let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
     let rt = fx.member_runtime("sub-liv");
 
@@ -3870,6 +3946,7 @@ fn member_send_claims_one_launch_on_own_alias_reads_never_launch() {
 /// refused member never reaches it).
 #[test]
 fn member_send_never_launches_for_refused_member() {
+    let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
     let rt = fx.member_runtime("sub-mia");
     // Provision + register a second member whose alias must stay unclaimed.
@@ -3967,6 +4044,7 @@ fn member_send_never_launches_for_refused_member() {
 /// the receipt names the fence truthfully and no actor is claimed.
 #[test]
 fn fenced_assistant_send_never_relaunches() {
+    let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
     let rt = fx.member_runtime("sub-ora");
     // Seed an unreconciled `unknown` outcome on the assistant alias — the
@@ -4034,6 +4112,7 @@ fn fenced_assistant_send_never_relaunches() {
 /// assistant or a substitute model.
 #[test]
 fn confined_assistant_refuses_devin_model_at_launch_claim() {
+    let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
     // Pin a devin worker default + allow in the fixture's own pm.yaml —
     // the operator-configured policy the launch resolves (isolated pm,
@@ -4098,6 +4177,7 @@ fn confined_assistant_refuses_devin_model_at_launch_claim() {
 /// different model or an unconfined path.
 #[test]
 fn malformed_pi_policy_refuses_launch_claim_closed() {
+    let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
     let pm_yaml = fx.pm().join("pm.yaml");
     let mut text = std::fs::read_to_string(&pm_yaml).unwrap();

@@ -87,7 +87,7 @@ const DISABLED: &[(&str, &str)] = &[
     ("monitors", "auto_dispatch_enabled"),
 ];
 
-/// The fixed catalog of the 53 store tables with their exact columns.
+/// The fixed catalog of the 61 store tables with their exact columns.
 /// Export and restore refuse any table or column not listed here.
 const CATALOG: &[(&str, &[&str])] = &[
     (
@@ -338,6 +338,41 @@ const CATALOG: &[(&str, &[&str])] = &[
             "digest",
         ],
     ),
+    ("assist_job_shares", &["job", "org", "shared_by", "created"]),
+    (
+        "assist_requests",
+        &[
+            "org",
+            "sub",
+            "request_key",
+            "job",
+            "created",
+            "title",
+            "body",
+            "acceptance",
+            "credential_id",
+            "authority_rev",
+            "state",
+        ],
+    ),
+    (
+        "assist_stall_checks",
+        &["job", "revision", "state", "created", "resolved"],
+    ),
+    (
+        "assistants",
+        &[
+            "org",
+            "sub",
+            "assistant_id",
+            "alias",
+            "conversation_id",
+            "state",
+            "authority_rev",
+            "created",
+            "updated",
+        ],
+    ),
     (
         "business_documents",
         &[
@@ -441,6 +476,10 @@ const CATALOG: &[(&str, &[&str])] = &[
     (
         "events",
         &["seq", "alias", "kind", "payload", "at", "job_id", "task_id"],
+    ),
+    (
+        "job_subscribers",
+        &["job", "org", "sub", "assistant_id", "created"],
     ),
     (
         "jobs",
@@ -1641,7 +1680,7 @@ fn rename_noreplace(_src: &Path, _dst: &Path) -> Result<()> {
 
 fn exclusions() -> Vec<String> {
     [
-        "authority: platform_credentials, platform_grants, platform_defaults, platform_drafts, platform_effects, app_grants, rollout_grants, rollout_leases, staging_grants, staging_instances, daemon_build (rows deleted from the private copy)",
+        "authority: platform_credentials, platform_grants, platform_defaults, platform_drafts, platform_effects, app_grants, rollout_grants, rollout_leases, staging_grants, staging_instances, daemon_build, assistants, assist_requests, assist_stall_checks, assist_job_shares, job_subscribers (rows deleted from the private copy)",
         "live execution authority nulled: agents.generation, pid, pid_start, endpoint, thread_id, session_id, params; messages.turn_id; token-shaped values redacted by the existing scrub",
         "imported actors disabled: agents.enabled=0; monitors dispatch flags=0",
         "provenance purged: connection_metadata (source UUID recorded in the manifest only), model_defaults",

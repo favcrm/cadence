@@ -111,7 +111,7 @@ mod social_publish_rpc;
 mod social_publish_start;
 mod supervisor_grant;
 #[cfg(all(test, feature = "test-seam"))]
-mod team_assistants_refusal;
+pub(crate) mod team_assistants_refusal;
 mod test_queue_rpc;
 mod threads_rpc;
 mod timers;

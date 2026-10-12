@@ -36,6 +36,7 @@
 #![cfg(all(test, feature = "test-seam"))]
 
 use super::*;
+use crate::daemon::team_assistants_refusal::AssistantFlagOn;
 use crate::daemon::ServeOptions;
 use crate::test_seam::Seam;
 use serde_json::{json, Value};
@@ -595,6 +596,7 @@ fn tree(root: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
 /// guard.
 #[test]
 fn assist_http_admission_refuses_forged_org_aud_expired_replay_scope_operator() {
+    let _flag = AssistantFlagOn::arm();
     let rig = start(&["alice"]);
     let good = rig.envelope("alice", json!({}), json!({}));
 
@@ -748,6 +750,7 @@ fn assist_http_admission_refuses_forged_org_aud_expired_replay_scope_operator() 
 /// principal because there is no identity field it controls.
 #[test]
 fn assist_http_member_b_cannot_reach_member_a() {
+    let _flag = AssistantFlagOn::arm();
     let rig = start(&["alice", "bob"]);
     let alice = rig.envelope("alice", json!({}), json!({}));
     let bob = rig.envelope("bob", json!({}), json!({}));
@@ -790,6 +793,7 @@ fn assist_http_member_b_cannot_reach_member_a() {
 /// commit, and an unreachable/failed authority pull fails closed too.
 #[test]
 fn removed_member_after_enqueue_cannot_commit_an_effect() {
+    let _flag = AssistantFlagOn::arm();
     let rig = start(&["carol"]);
     let carol = rig.envelope("carol", json!({}), json!({}));
     let (status, body) = rig.call(
@@ -874,6 +878,7 @@ fn removed_member_after_enqueue_cannot_commit_an_effect() {
 /// private conversation.
 #[test]
 fn assist_http_job_subscribe_needs_owner_share_not_membership() {
+    let _flag = AssistantFlagOn::arm();
     let rig = start(&["ana", "ben", "cid"]);
     let ana = rig.envelope("ana", json!({}), json!({}));
     let (status, body) = rig.call(
@@ -973,11 +978,11 @@ fn assist_http_job_subscribe_needs_owner_share_not_membership() {
 // `member_caller` enforces is the FIRST refusal in `assist_route::post`:
 // disabled means 503 `capability_unavailable` BEFORE envelope verify,
 // jti consume, or daemon relay — a stale envelope or cached bearer can
-// never bypass it. The flag is PROCESS env: the positive fixtures above
-// run with it set in the test process (the documented
-// `HOSTED_CADENCE_ASSISTANT_ENABLED=true` invocation — never mutated
-// in-process, which would race parallel tests). The OFF cases run in
-// ISOLATED CHILD PROCESSES (the coordinator's scoped-isolation
+// never bypass it. The flag is PROCESS env: each enabled-path test above
+// arms it through the daemon refusal module's shared `AssistantFlagOn`
+// guard (one process-wide lock — a module-local lock could restore the
+// var while a parallel daemon-side positive still runs). The OFF cases
+// run in ISOLATED CHILD PROCESSES (the coordinator's scoped-isolation
 // requirement): this binary respawned with the flag absent/false/garbage.
 // ============================================================================
 
