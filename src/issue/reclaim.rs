@@ -1076,6 +1076,10 @@ mod tests {
         std::fs::create_dir_all(lane.join("src")).unwrap();
         std::fs::write(lane.join("src/keep.rs"), b"work").unwrap();
         age(&lane, 7 * 3600);
+        let proc_root = tmp.0.join("proc");
+        std::fs::create_dir_all(&proc_root).unwrap();
+        seed_synthetic_proc_view(&proc_root);
+        let _proc_root = process_use::use_process_proc_root_for_test(proc_root);
         for forged in [lane.clone(), lane.join("src")] {
             let r = reclaim(&tmp, &lane, forged.to_str());
             assert!(!matches!(r, Ok(Some(_))), "{} reclaimed", forged.display());
