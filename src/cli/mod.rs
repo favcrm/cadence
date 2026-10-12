@@ -80,6 +80,10 @@ mod thread;
 mod ui;
 mod update;
 mod update_args;
+// CAD-1406: independent refusal-acceptance for the update identity
+// and managed-runtime guards; the file is owned by its own author.
+#[cfg(all(test, feature = "test-seam"))]
+mod update_identity_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod update_recovery_tests;
 mod upgrade;

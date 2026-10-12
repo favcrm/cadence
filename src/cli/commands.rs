@@ -1427,9 +1427,12 @@ pub(crate) enum Commands {
     /// as the lease receipt, so no manual copy step. `--check` shows
     /// what would happen and changes nothing; `--rollback` returns to
     /// the previous release; `status` shows a pending update and what
-    /// it waits on. Operator-only: outside a pane with `--as`, never
-    /// from inside one. `upgrade` and `rollout` stay the low-level
-    /// commands.
+    /// it waits on. Operator-only: the same process proof as
+    /// `rollout claim` runs either way, never from inside a pane;
+    /// `--as` is an optional audit label (a bare run labels itself
+    /// from the proven native OS identity). An image-managed runtime
+    /// is refused — AgenticOS owns updates there. `upgrade` and
+    /// `rollout` stay the low-level commands.
     Update {
         #[command(subcommand)]
         action: Option<UpdateAction>,

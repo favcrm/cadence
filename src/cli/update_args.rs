@@ -8,9 +8,10 @@ use super::*;
 /// the flags parse on either side of the subcommand.
 #[derive(clap::Args, Default)]
 pub(crate) struct UpdateTargetArgs {
-    /// Operator identity outside a cadence pane, for example
-    /// `operator:ada`. Required outside a pane; inside one this
-    /// command is refused.
+    /// Operator identity for the audit label, for example
+    /// `operator:ada`. Optional: the operator proof runs either way
+    /// and a bare `cadence update` labels itself from the proven OS
+    /// identity. Inside a pane this command is always refused.
     #[arg(long = "as")]
     pub(super) as_identity: Option<String>,
     /// GitHub repository whose CI built and attested the binary.
