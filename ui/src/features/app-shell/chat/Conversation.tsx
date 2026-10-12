@@ -34,6 +34,7 @@ import {
 } from "../../home/thread";
 import type { Viewer } from "../../projects/work";
 import { useLocale } from "../../../lib/locale";
+import { displayUiNotice, type UiNotice } from "../campaign/useEmailDraft";
 import {
   QUEUED_NOTICE,
   conversationLabel,
@@ -326,7 +327,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   // The composer's in-place notices (unsupported slash verb, an
   // unresolved attachment holding the send) — information, not the
   // sendError alert; cleared by the next successful send.
-  const [composerNotice, setComposerNotice] = useState<string | null>(null);
+  const [composerNotice, setComposerNotice] = useState<UiNotice | null>(null);
   const [creating, setCreating] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   // CAD-1168: like Home's WINDOW — the pane renders a bounded window of
@@ -817,8 +818,8 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     if (held !== null) {
       const text =
         held.state === "failed"
-          ? t("The previous message was not sent — retry or discard it before sending again")
-          : t("Still sending the previous message — wait for it to settle");
+          ? "The previous message was not sent — retry or discard it before sending again"
+          : "Still sending the previous message — wait for it to settle";
       setComposerNotice(text);
       return Promise.reject(new Error(text));
     }
@@ -849,7 +850,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     // independently and a future failure is retained by the outbox, not
     // by pretending local ownership failed.
     if (!putOutbox(originKey, envelope)) {
-      const text = t("The previous message was not sent — retry or discard it before sending again");
+      const text = "The previous message was not sent — retry or discard it before sending again";
       setComposerNotice(text);
       return Promise.reject(new Error(text));
     }
@@ -1228,7 +1229,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       )}
       {composerNotice && (
         <p className="text-micro text-ink-400" role="status" data-chat-notice>
-          {t(composerNotice)}
+          {displayUiNotice(composerNotice, t)}
         </p>
       )}
       {failedOutbox !== null && (
@@ -1332,7 +1333,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         onSend={({ body, refs, attachments }) => send(body, refs, attachments)}
         onCommand={(name) => {
           if (name === "new" || name === "clear") startNew();
-          else setComposerNotice(t('Unsupported command "/{name}" — it was not sent').replace("{name}", name));
+          else setComposerNotice({ key: 'Unsupported command "/{name}" — it was not sent', slots: { name } });
         }}
         onNotice={setComposerNotice}
         attach={{ enabled: canAttach, reason: attachReason, destination: attachDestination }}

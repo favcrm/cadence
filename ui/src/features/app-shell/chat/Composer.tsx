@@ -10,6 +10,7 @@ import type { ThreadRef } from "../../../lib/types";
 import { useLocale } from "../../../lib/locale";
 import { parseSlash, SLASH_COMMANDS, slashMatches, type SlashCommand } from "../../home/master";
 import { ATTACH_ACCEPT, attachMeta, displayAttachError, unresolvedHint, type AttachDestination, type AttachItem } from "./attach";
+import type { UiNotice } from "../campaign/useEmailDraft";
 import {
   addFiles,
   attachHold,
@@ -107,7 +108,7 @@ export interface ComposerProps {
   /** A submission that is neither a send nor a known command surfaces
    *  this one-line notice (the unsupported-slash refusal and the
    *  unresolved-attachment hold). */
-  onNotice?: (text: string) => void;
+  onNotice?: (text: UiNotice) => void;
   /** The original submitted envelope is unresolved (a failed create kept
    *  it in the pane's outbox): an ordinary new submission is refused
    *  until the operator retries or discards it. Typing, refs and files
@@ -225,7 +226,7 @@ export default function Composer({
     // so the earlier intent can never be silently replaced. The newer
     // text, refs and files stay editable and are not discarded.
     if (originalUnresolved) {
-      onNotice?.(t("The previous message was not sent — retry or discard it before sending again"));
+      onNotice?.("The previous message was not sent — retry or discard it before sending again");
       onResolveOriginal?.();
       return;
     }
@@ -248,7 +249,7 @@ export default function Composer({
       // An unsupported slash verb is never forwarded as chat — the
       // composer refuses it in place. Full-density menus cannot reach
       // this: an exact verb already submitted above.
-      onNotice?.(t('Unsupported command "/{name}" — it was not sent').replace("{name}", cmd.name));
+      onNotice?.({ key: 'Unsupported command "/{name}" — it was not sent', slots: { name: cmd.name } });
       return;
     } else if (cmd) {
       onCommand?.(cmd.name, cmd.arg);
@@ -271,7 +272,7 @@ export default function Composer({
       // conversation while the handoff is in flight.
       const reservation = reserveDraft(key);
       if (reservation === null) {
-        onNotice?.(t("Still sending the previous message — wait for it to settle"));
+        onNotice?.("Still sending the previous message — wait for it to settle");
         return;
       }
       // The whole envelope — original key, body, refs, ready files — is
