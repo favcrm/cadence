@@ -113,6 +113,7 @@ store/chat_files.rs	guarded-store-and-read-queries	execute	1
 store/chat_files.rs	guarded-store-and-read-queries	guarded_write	1
 store/chat_files.rs	guarded-store-and-read-queries	open	1
 store/chat_files.rs	guarded-store-and-read-queries	prepare	1
+store/conversations.rs	inline-test-store-fixtures	open	1
 store/crm_sends.rs	guarded-store-and-read-queries	execute	5
 store/crm_sends.rs	guarded-store-and-read-queries	guarded_write	5
 store/crm_smtp.rs	guarded-store-and-read-queries	execute	4
@@ -128,7 +129,7 @@ store/events.rs	guarded-store-and-read-queries	prepare	7
 store/inbox.rs	guarded-store-and-read-queries	execute	2
 store/inbox.rs	guarded-store-and-read-queries	guarded_write	4
 store/inbox.rs	guarded-store-and-read-queries	prepare	1
-store/messages.rs	guarded-store-and-read-queries	execute	15
+store/messages.rs	guarded-store-and-read-queries	execute	16
 store/messages.rs	guarded-store-and-read-queries	guarded_write	10
 store/messages.rs	guarded-store-and-read-queries	prepare	9
 store/mod.rs	guarded-store-and-read-queries	guarded_write	2
@@ -139,10 +140,10 @@ store/plans.rs	guarded-store-and-read-queries	guarded_write	11
 store/plans.rs	guarded-store-and-read-queries	prepare	1
 store/platform.rs	guarded-store-and-read-queries	execute	15
 store/platform.rs	guarded-store-and-read-queries	guarded_write	11
-store/schema.rs	sqlite-schema-owner-and-restricted-recovery	execute	87
+store/schema.rs	sqlite-schema-owner-and-restricted-recovery	execute	93
 store/schema.rs	sqlite-schema-owner-and-restricted-recovery	guarded_write	2
 store/schema.rs	sqlite-schema-owner-and-restricted-recovery	open	3
-store/schema.rs	sqlite-schema-owner-and-restricted-recovery	prepare	22
+store/schema.rs	sqlite-schema-owner-and-restricted-recovery	prepare	24
 store/seal.rs	sqlite-guard-owner-and-inline-tests	execute	43
 store/seal.rs	sqlite-guard-owner-and-inline-tests	guarded_write	21
 store/seal.rs	sqlite-guard-owner-and-inline-tests	open	21
@@ -201,6 +202,8 @@ store/threads.rs	constructor-owned-v32-migration-guarded-store-and-inline-fixtur
 store/threads.rs	guarded-store-and-read-queries	guarded_write	7
 store/threads.rs	guarded-store-and-read-queries	open	15
 store/threads.rs	guarded-store-and-read-queries	prepare	4
+store/topics.rs	guarded-store-and-read-queries	execute	12
+store/topics.rs	guarded-store-and-read-queries	guarded_write	6
 store/writer_census.rs	lexical-census-test-fixture-strings	execute	1
 store/writer_census.rs	lexical-census-test-fixture-strings	open	2
 ui/app_social_drafts.rs	read-only-store-app-view	open	1

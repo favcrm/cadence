@@ -59,9 +59,9 @@ fn writer(state: &Path) -> Connection {
 fn add_agent(conn: &Connection, alias: &str, cwd: &str) {
     conn.execute(
         "INSERT INTO agents(alias,provider,endpoint_kind,role,cwd,sandbox,state,
-                            generation,pid,created,updated)
-         VALUES(?1,'codex','stdio','worker',?2,'workspace-write','idle','gen-1',4242,1,1)",
-        params![alias, cwd],
+                            generation,pid,created,updated,uid)
+         VALUES(?1,'codex','stdio','worker',?2,'workspace-write','idle','gen-1',4242,1,1,?3)",
+        params![alias, cwd, format!("agt-fixture-{alias}")],
     )
     .unwrap();
 }

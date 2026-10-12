@@ -326,6 +326,15 @@ impl Shared {
                 ));
             }
             if let Some(bound) = self.store.topic_post_request(&post)? {
+                // A retry names its target again: the bound request must have
+                // been queued to that same UID, or the retry is refused. A
+                // missing or unaddressed request fails closed.
+                let bound_uid = self.store.message(&bound)?.and_then(|m| m.recipient_uid);
+                if bound_uid.as_deref() != Some(target_uid.as_str()) {
+                    return Err(Error::rejected(
+                        "Request id was already used with a different target",
+                    ));
+                }
                 return Ok(json!({
                     "topic": topic.id,
                     "message": post,

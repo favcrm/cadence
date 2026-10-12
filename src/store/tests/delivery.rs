@@ -104,9 +104,11 @@
         let result = k.result.clone().unwrap();
         assert_eq!(result["via"], "agent_remove_forced", "{result}");
         assert_eq!(result["by"], "pm", "{result}");
-        // The unattached queued row is pruned with the rest of w1's
-        // unreferenced history; its notice already reached pm.
-        assert!(s.message("m-queued").unwrap().is_none());
+        // CAD-819: the removed alias's message rows are kept, not pruned.
+        // The unattached queued row is cancelled in place by the forced
+        // path; its notice already reached pm.
+        let queued = s.message("m-queued").unwrap().expect("row kept");
+        assert_eq!(queued.state, "cancelled");
         let pm = s.messages("pm").unwrap();
         let routed = |id: String| pm.iter().find(|m| m.id == id).cloned();
         let result_id = Uuid::new_v5(
@@ -712,7 +714,8 @@
         assert!(s.timer_gc_remove("w1", 86_400.0).unwrap().is_some());
         assert!(s.agent_opt("w1").unwrap().is_none());
         assert_eq!(s.message(&kickoff).unwrap().unwrap().state, "completed");
-        assert!(s.message("m-chat").unwrap().is_none());
+        // CAD-819: the message row is kept under the removed alias.
+        assert_eq!(s.message("m-chat").unwrap().expect("row kept").state, "completed");
         assert!(s
             .job_events("j1", 0, 100)
             .unwrap()

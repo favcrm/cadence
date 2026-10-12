@@ -57,9 +57,10 @@ fn raw_lease_refusal(reason: String) -> rusqlite::Error {
 /// protected schema is `Unknown`, never default-open. v35 and v36 add only the
 /// standalone `app_tool_claims`/`app_tool_results` tables and one retrofitted `app_run_failures` — they touch no
 /// sealed/witnessed surface, so the guard's assumptions are unchanged.
-/// v37 (CAD-1168) adds only the `chat_files` table, likewise.
+/// v37 (CAD-1168) adds only the `chat_files` table, likewise. v38/v39
+/// (CAD-818 threads) add tables and a backfill, touching no sealed surface.
 #[allow(dead_code)]
-const PROTECTED_SCHEMA_MAX: i64 = 37;
+const PROTECTED_SCHEMA_MAX: i64 = 39;
 
 /// Arm level + transaction-control phase, shared between the `Store` and
 /// the connection's authorizer. Atomic because the authorizer callback must
@@ -2490,12 +2491,12 @@ mod tests {
         // This is malformed metadata, not evidence of native owner authority.
         let fixture = Connection::open(&db).unwrap();
         fixture
-            .execute("UPDATE schema_version SET version=38", [])
+            .execute("UPDATE schema_version SET version=40", [])
             .unwrap();
         drop(fixture);
         store
             .propose_close(
-                &permit(&db, OwnerOp::Close, b"schema-38", "attempt-38", "art", 38),
+                &permit(&db, OwnerOp::Close, b"schema-40", "attempt-40", "art", 40),
                 "test",
             )
             .unwrap();
@@ -2519,10 +2520,10 @@ mod tests {
             .witness_commit(&permit(
                 &db,
                 OwnerOp::Witness,
-                b"schema-38",
-                "attempt-38",
+                b"schema-40",
+                "attempt-40",
                 "art",
-                38,
+                40,
             ))
             .unwrap_err();
         assert!(

@@ -417,32 +417,31 @@ impl Shared {
         }
         // The operator's own chat with an agent: its home thread. Under an
         // agent filter only that agent's row; under a project scope only
-        // agents whose checkout is in the project.
-        if agent.is_some() || project.is_none() {
-            for thread in self.store.home_threads()? {
-                if agent.is_some_and(|f| f != thread.alias) {
+        // agents whose checkout is in the project. Project-only filters keep
+        // these rows, so they are not skipped by the project filter.
+        for thread in self.store.home_threads()? {
+            if agent.is_some_and(|f| f != thread.alias) {
+                continue;
+            }
+            if let Some(uids) = &scope.project_uids {
+                let uid = self.store.agent_opt(&thread.alias)?.map(|a| a.uid);
+                if !uid.is_some_and(|u| uids.contains(&u)) {
                     continue;
                 }
-                if let Some(uids) = &scope.project_uids {
-                    let uid = self.store.agent_opt(&thread.alias)?.map(|a| a.uid);
-                    if !uid.is_some_and(|u| uids.contains(&u)) {
-                        continue;
-                    }
-                }
-                let uid = self.store.agent_opt(&thread.alias)?.map(|a| a.uid);
-                rows.push(json!({
-                    "id": thread.id,
-                    "kind": "operator",
-                    "participants": [
-                        {"uid": null, "alias": "operator", "kind": "operator", "removed": false},
-                        match uid {
-                            Some(uid) => self.store.participant(&uid)?,
-                            None => json!({"uid": null, "alias": thread.alias, "kind": "agent", "removed": true}),
-                        },
-                    ],
-                    "last_activity": thread.updated,
-                }));
             }
+            let uid = self.store.agent_opt(&thread.alias)?.map(|a| a.uid);
+            rows.push(json!({
+                "id": thread.id,
+                "kind": "operator",
+                "participants": [
+                    {"uid": null, "alias": "operator", "kind": "operator", "removed": false},
+                    match uid {
+                        Some(uid) => self.store.participant(&uid)?,
+                        None => json!({"uid": null, "alias": thread.alias, "kind": "agent", "removed": true}),
+                    },
+                ],
+                "last_activity": thread.updated,
+            }));
         }
         // Group rows: a topic whose source is the project (`project:<key>`)
         // or that has an in-scope subscriber. Read-only.

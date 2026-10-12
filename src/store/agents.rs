@@ -1006,9 +1006,11 @@ impl Store {
                     )));
                 }
             }
+            // A topic notice is turnless: it is never execution debt, so it
+            // neither blocks removal nor counts as open work (CAD-818).
             let open: Vec<Message> = tx
                 .query_vec(
-                    "SELECT * FROM messages WHERE alias=? AND state NOT IN
+                    "SELECT * FROM messages WHERE alias=? AND source != 'topic_notice' AND state NOT IN
                              ('completed','failed','interrupted','cancelled') ORDER BY seq",
                     [alias],
                     row_message,
@@ -1151,6 +1153,7 @@ impl Store {
                                    "by": by["by"], "by_kind": by["by_kind"]}),
                 )?;
             }
+            Self::cancel_queued_topic_notices(&tx, alias)?;
             Self::prune_agent_history(&tx, alias)?;
             tx.execute("DELETE FROM agents WHERE alias=?", [alias])?;
             Self::event(
@@ -1162,6 +1165,24 @@ impl Store {
             )?;
             Ok(notify)
         })
+    }
+
+    /// CAD-818: a removed alias's still-queued topic notices are cancelled
+    /// in the removal transaction. They were never made available, and a
+    /// re-registered alias (a new uid) must never claim its predecessor's
+    /// notice. Available and refused notices are history and stay as-is.
+    fn cancel_queued_topic_notices(tx: &impl super::StoreConn, alias: &str) -> Result<()> {
+        tx.execute(
+            "UPDATE messages SET state='cancelled',result=?,completed=?
+                     WHERE alias=? AND source='topic_notice' AND state='queued'",
+            params![
+                json!({"status": "cancelled", "via": "topic_notice", "reason": "agent_removed"})
+                    .to_string(),
+                now(),
+                alias
+            ],
+        )?;
+        Ok(())
     }
 
     /// Drops a removed alias's event history except job-scoped events
@@ -1233,8 +1254,8 @@ impl Store {
             let at = now();
             let age = at - agent.updated;
             let open_messages: i64 = tx.query_row(
-                "SELECT COUNT(*) FROM messages WHERE alias=? AND state NOT IN
-                         ('completed','failed','interrupted','cancelled')",
+                "SELECT COUNT(*) FROM messages WHERE alias=? AND source != 'topic_notice'
+                         AND state NOT IN ('completed','failed','interrupted','cancelled')",
                 [alias],
                 |r| r.get(0),
             )?;
@@ -1246,6 +1267,7 @@ impl Store {
             if !eligible {
                 return Ok(None);
             }
+            Self::cancel_queued_topic_notices(&tx, alias)?;
             Self::prune_agent_history(&tx, alias)?;
             tx.execute("DELETE FROM agents WHERE alias=?", [alias])?;
             Self::event(
@@ -1310,7 +1332,7 @@ impl Store {
             out.entry(alias).or_default().0 = at;
         }
         let mut stmt = conn.prepare(
-            "SELECT alias, COUNT(*) FROM messages WHERE state NOT IN
+            "SELECT alias, COUNT(*) FROM messages WHERE source != 'topic_notice' AND state NOT IN
              ('completed','failed','interrupted','cancelled') GROUP BY alias",
         )?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;

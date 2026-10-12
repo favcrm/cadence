@@ -162,6 +162,44 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         "conversation_create",
         Rule::Handler("operator_chat: agents refused, operator on proof (CAD-1098 I1)"),
     ),
+    // CAD-818 threads. The work list and the operator's Ask are the
+    // operator's chat (`operator_chat`). The topic verbs derive the caller
+    // with `topic_caller` (an unproven connection is refused) and then
+    // `may_use_topic` (an agent must be a subscriber; create/membership
+    // checks live in the handler). The stamp returns counters only.
+    (
+        "work_conversation_list",
+        Rule::Handler("operator_chat: agents refused, operator on proof (CAD-818)"),
+    ),
+    (
+        "work_conversation_read",
+        Rule::Handler("operator_chat: agents refused, operator on proof (CAD-818)"),
+    ),
+    (
+        "topic_request",
+        Rule::Handler("operator_chat: agents refused, operator on proof (CAD-818)"),
+    ),
+    (
+        "topic_create",
+        Rule::Handler("topic_caller: unproven refused; the handler checks the kind and creator (CAD-818)"),
+    ),
+    (
+        "topic_subscribe",
+        Rule::Handler("topic_caller: unproven refused; the handler checks membership rights (CAD-818)"),
+    ),
+    (
+        "topic_unsubscribe",
+        Rule::Handler("topic_caller: unproven refused; the handler checks membership rights (CAD-818)"),
+    ),
+    (
+        "topic_publish",
+        Rule::Handler("topic_caller + may_use_topic: an agent must be a subscriber (CAD-818)"),
+    ),
+    (
+        "topic_read",
+        Rule::Handler("topic_caller + may_use_topic: an agent must be a subscriber (CAD-818)"),
+    ),
+    ("threads_stamp", Rule::Read),
     ("agent_events", Rule::Read),
     (
         "agent_requests",

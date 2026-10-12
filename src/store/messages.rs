@@ -321,6 +321,12 @@ const TURNLESS_SOURCES_SQL: &str =
 /// whose unconfirmed paste belongs to no turn (CAD-250).
 pub(super) const FENCING_UNKNOWN_SQL: &str = "state='unknown' AND source != 'nudge'";
 
+/// CAD-818: a topic notice that the claim has made `available` or `refused`
+/// is history, not work — it never owns a turn and cannot be dispatched.
+/// Only the `topic_notice` source ends this way; every other row keeps its
+/// `state NOT IN (terminal)` classification.
+const NOTICE_ENDED_SQL: &str = "(source = 'topic_notice' AND state IN ('available','refused'))";
+
 /// Enqueue rejects a body over 48_000 bytes. The inlined spec is cut in
 /// bytes, on a char boundary, so a multibyte spec cannot blow that limit.
 pub const ENQUEUE_BYTES: usize = 48_000;
@@ -1786,12 +1792,12 @@ impl Store {
     pub fn messages(&self, alias: &str) -> Result<Vec<Message>> {
         let conn = self.conn();
         let agent = self.agent_in(&conn, alias)?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT * FROM messages WHERE alias=?1
-             AND (created >= ?2 OR state NOT IN
-                  ('completed','failed','interrupted','cancelled'))
-             ORDER BY seq",
-        )?;
+             AND (created >= ?2 OR (state NOT IN
+                  ('completed','failed','interrupted','cancelled') AND NOT {NOTICE_ENDED_SQL}))
+             ORDER BY seq"
+        ))?;
         let rows = stmt.query_map(params![alias, agent.created], row_message)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
@@ -1829,7 +1835,9 @@ impl Store {
                 }
             }
         }
-        let live = "state NOT IN ('completed','failed','interrupted','cancelled')";
+        let live = format!(
+            "state NOT IN ('completed','failed','interrupted','cancelled') AND NOT {NOTICE_ENDED_SQL}"
+        );
         let mut rows = {
             let mut stmt =
                 conn.prepare(&format!("SELECT * FROM messages WHERE alias=?1 AND {live}"))?;
@@ -1849,7 +1857,9 @@ impl Store {
         rows.extend(recent.collect::<rusqlite::Result<Vec<_>>>()?);
         rows.sort_by_key(|m| m.seq);
         let total: i64 = conn.query_row(
-            &format!("SELECT COUNT(*) FROM messages WHERE alias=?1 AND (created >= ?2 OR {live})"),
+            &format!(
+                "SELECT COUNT(*) FROM messages WHERE alias=?1 AND (created >= ?2 OR ({live}))"
+            ),
             params![alias, agent.created],
             |r| r.get(0),
         )?;
@@ -1865,7 +1875,8 @@ impl Store {
         self.agent_in(&conn, alias)?;
         let mut stmt = conn.prepare(
             "SELECT * FROM messages WHERE alias=?1
-             AND state IN ('queued','submitting','running','unknown') ORDER BY seq",
+             AND state IN ('queued','submitting','running','unknown')
+             AND source != 'topic_notice' ORDER BY seq",
         )?;
         let rows = stmt.query_map([alias], row_message)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -1889,12 +1900,14 @@ impl Store {
         let conn = self.conn();
         let agent = self.agent_in(&conn, alias)?;
         Ok(conn.query_row(
-            "SELECT COUNT(*) FROM messages WHERE alias=?1 AND state!='running'
-             AND (created >= ?2 OR state NOT IN
-                  ('completed','failed','interrupted','cancelled'))
+            &format!(
+                "SELECT COUNT(*) FROM messages WHERE alias=?1 AND state!='running'
+             AND (created >= ?2 OR (state NOT IN
+                  ('completed','failed','interrupted','cancelled') AND NOT {NOTICE_ENDED_SQL}))
              AND CASE WHEN json_valid(result)
                       THEN json_extract(result,'$.via') = 'pty_render_miss'
-                      ELSE 0 END",
+                      ELSE 0 END"
+            ),
             params![alias, agent.created],
             |row| row.get(0),
         )?)
@@ -2119,10 +2132,10 @@ impl Store {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT m.alias, m.id FROM messages m JOIN agents a ON a.alias = m.alias
-             WHERE a.state = 'stopped' AND m.state = 'queued' AND m.source != ?
+             WHERE a.state = 'stopped' AND m.state = 'queued' AND m.source NOT IN (?, ?)
              ORDER BY m.alias, m.seq",
         )?;
-        let rows = stmt.query_map([NUDGE_SOURCE], |r| {
+        let rows = stmt.query_map([NUDGE_SOURCE, crate::proto::TOPIC_NOTICE_SOURCE], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })?;
         let mut out: Vec<(String, String, i64)> = Vec::new();
