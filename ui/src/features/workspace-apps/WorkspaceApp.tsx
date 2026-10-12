@@ -1006,7 +1006,7 @@ export default function WorkspaceApp({
   if (!viewer.operator) return <main className="workspace-app" aria-label="Workspace app"><h1>Workspace app</h1><p className="wa-alert">Sign in as the operator to inspect this installation.</p><Button href="/apps">All apps</Button></main>;
   const tag = data && screenTag(data.installation);
   let projection = null;
-  if (data && tag && !accessDenied) {
+  if (data && tag && !accessDenied && !loadError) {
     try { projection = screenProjection(data.installation, tag, contextId, data.contexts, data.runs, data.effects, intentRead, screenExtras.extras); }
     catch { /* Oversized/unavailable scope retains the existing native outlet. */ }
   }
@@ -1048,6 +1048,7 @@ export default function WorkspaceApp({
         <p className="wa-kicker">Installation {installId} · version {data.installation.version}</p>
         <pre className="wa-preview">{data.installation.guide}</pre>
       </section>
+      {loadError && <p className="wa-alert" data-tone="fail" role="alert">{loadError}</p>}
       {actionError && <p className="wa-alert" data-tone="fail" role="alert">{actionError}</p>}
       <PublishToInstagram installation={data.installation} bindings={data.bindings} contextId={contextId || null}
         canWrite={canWrite} busy={busy} refreshKey={connectReturned} mutate={mutate} />
