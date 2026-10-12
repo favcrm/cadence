@@ -52,6 +52,12 @@ pub use events::{
 };
 // CAD-316: the rollup's read-only counts for `doctor --host`.
 pub(crate) use events::event_store_stats;
+pub mod conversations;
+mod topics;
+pub use topics::{
+    delivery_id as topic_delivery_id, post_id as topic_post_id, request_id as topic_request_id,
+    topic_id, Topic, TopicDelivery, TopicPost, POST_MAX_BYTES as TOPIC_POST_MAX_BYTES,
+};
 mod inbox;
 mod kickoff;
 pub use kickoff::{check_commit_sha, job_kickoff, kickoff_ceiling, omit_host_paths};

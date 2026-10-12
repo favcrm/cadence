@@ -2247,6 +2247,7 @@ mod tests {
     fn agent(params: Value) -> Agent {
         Agent {
             alias: "cloud-1".into(),
+            uid: "agt-cloud-1".into(),
             provider: "devin".into(),
             endpoint_kind: "cloud".into(),
             role: "worker".into(),

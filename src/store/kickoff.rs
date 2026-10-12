@@ -489,6 +489,7 @@ mod cad1373_kickoff_pointer_tests {
         let mut j = job(&spec);
         j.issue_id = Some("CAD-9".into());
         let worker = Agent {
+            uid: "agt-worker".into(),
             alias: "pty-1".into(),
             provider: "pi".into(),
             endpoint_kind: "pty".into(),

@@ -17,6 +17,7 @@ import { readAppUrlState, type AppTab, type ProjectView } from "./urlState";
  *   /apps[/<project>/<app>]    installed apps, optionally one app's detail (CAD-557)
  *   /apps/<app-key>            one installed app resolved by package key
  *   /agents[/:alias]           agents, optionally one agent's drawer
+ *   /threads                   Threads: agent, operator and group conversations (CAD-818); `?c=<id>` opens one
  *   /wiki[/<path>]             the wiki: folder tree + page (CAD-581)
  *   /wiki/edit|history|upload/<path>   its modes for one path
  *   /wiki/search[/<query>]     full-text search
@@ -63,6 +64,7 @@ export type Route =
   | { screen: "workspaceApp"; installId: string }
   | { screen: "workspaceAppKey"; appKey: string }
   | { screen: "agents"; alias: string | null }
+  | { screen: "threads" }
   | { screen: "wiki"; mode: WikiMode; path: string | null; query: string | null }
   | { screen: "outbox" }
   | { screen: "setup" }
@@ -75,6 +77,7 @@ export type Screen = Route["screen"];
 /** The main navigation — MVP screens only (Setup is reached from Home). */
 export const NAV: { screen: Screen; label: string; route: Route }[] = [
   { screen: "home", label: "Home", route: { screen: "home" } },
+  { screen: "threads", label: "Threads", route: { screen: "threads" } },
   { screen: "projects", label: "Projects", route: { screen: "projects", slug: null, section: "overview" } },
   { screen: "wiki", label: "Wiki", route: { screen: "wiki", mode: "browse", path: null, query: null } },
   { screen: "apps", label: "Apps", route: { screen: "apps", project: null, name: null } },
@@ -234,6 +237,7 @@ export function matchRoute(pathname: string): Route {
       const alias = segment(a);
       if (alias) return { screen: "agents", alias };
     }
+    if (head === "threads" && !a) return { screen: "threads" };
     if (head === "setup" && !a) return { screen: "setup" };
     if (head === "login" && !a) return { screen: "login" };
     if (head === "overview" && !a) return { screen: "overview" };
@@ -310,6 +314,8 @@ export function routePath(route: Route): string {
       return `/apps/manage/${encodeURIComponent(route.installId)}`;
     case "agents":
       return route.alias ? `/agents/${encodeURIComponent(route.alias)}` : "/agents";
+    case "threads":
+      return "/threads";
     case "wiki": {
       const path = route.path ? route.path.split("/").map(encodeURIComponent).join("/") : "";
       if (route.mode === "search") {

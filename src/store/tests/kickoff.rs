@@ -47,6 +47,7 @@
             updated: 0.0,
         };
         let assignee = Agent {
+            uid: "agt-assignee".into(),
             alias: "cloud-1".into(),
             provider: "devin".into(),
             endpoint_kind: "cloud".into(),

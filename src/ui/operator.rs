@@ -417,6 +417,16 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
         RouteClass::OperatorOnly,
     ),
     route("POST", "/api/threads/*/messages", RouteClass::OperatorOnly),
+    // CAD-810 / CAD-821: every topic write is the operator's. Listed so the
+    // classification is reviewed, and unlisted writes fail closed to the same class.
+    route("POST", "/api/topics", RouteClass::OperatorOnly),
+    route(
+        "POST",
+        "/api/topics/*/subscribers",
+        RouteClass::OperatorOnly,
+    ),
+    route("POST", "/api/topics/*/posts", RouteClass::OperatorOnly),
+    route("POST", "/api/topics/*/requests", RouteClass::OperatorOnly),
     // CAD-1168: the chat attachment upload — the operator's alone, like
     // the messages POST. Multipart body (the second non-JSON carve-out
     // after `/api/wiki/upload`); the daemon re-proves the caller.
@@ -2392,6 +2402,19 @@ mod tests {
             route_class("POST", "/api/plans/CAD-1/approve"),
             RouteClass::OperatorOnly
         );
+        // CAD-810 / CAD-821: every topic write is the operator's.
+        for path in [
+            "/api/topics",
+            "/api/topics/topic-abc/subscribers",
+            "/api/topics/topic-abc/posts",
+            "/api/topics/topic-abc/requests",
+        ] {
+            assert_eq!(
+                route_class("POST", path),
+                RouteClass::OperatorOnly,
+                "{path}"
+            );
+        }
         assert_eq!(
             route_class("POST", "/api/ideas/CAD-1/decide"),
             RouteClass::OperatorOnly

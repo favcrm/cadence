@@ -102,6 +102,9 @@ pub(crate) fn event_resources(name: &str) -> &'static [&'static str] {
         // app's workflow checks resolve to, so apps refetch too.
         "agents" => &["agents", "issue", "overview", "outbox", "apps", "app"],
         "monitoring" => &["overview"],
+        // CAD-818: the Threads view's own invalidation. It names only the
+        // `threads` resource, so no existing stream refetches more.
+        "threads" => &["threads"],
         _ => &[
             "issues",
             "projects",

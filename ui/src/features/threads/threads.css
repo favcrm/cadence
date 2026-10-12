@@ -1,0 +1,504 @@
+/* CAD-818 Threads page. Inbox variant 1: list | timeline | context rail.
+   The page fills the bounded workspace (App.tsx fullHeight): every pane
+   sizes from flex/grid, and the panes own their scrolling. No viewport
+   subtraction. */
+.threads-page {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0;
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+  color: var(--color-ink-100);
+}
+/* The three panes are contiguous across the available workspace width;
+   separators are hairlines, not card frames. */
+.threads-layout {
+  display: grid;
+  flex: 1 1 0;
+  min-height: 0;
+  gap: 0;
+  /* Phones: inbox above the conversation, sharing the height. */
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 2fr) minmax(0, 3fr);
+}
+/* Tablet: inbox and conversation side by side; Context opens as a dialog. */
+@media (min-width: 768px) {
+  .threads-layout {
+    grid-template-columns: minmax(0, 15rem) minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
+  }
+  .threads-list {
+    border-bottom: 0;
+    border-right: 1px solid var(--color-ink-700);
+  }
+}
+@media (min-width: 1280px) {
+  .threads-layout {
+    grid-template-columns: minmax(0, 16rem) minmax(0, 1fr) minmax(0, 15rem);
+  }
+}
+.threads-list,
+.threads-main,
+.threads-context {
+  min-width: 0;
+  min-height: 0;
+}
+.threads-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.75rem;
+  overflow-y: auto;
+  border-bottom: 1px solid var(--color-ink-700);
+}
+.threads-list-head {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+.threads-list-head h1 {
+  font-size: 1rem;
+  font-weight: 600;
+  margin-right: auto;
+}
+.threads-search {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.4rem;
+  padding: 0.3rem 0.5rem;
+  color: var(--color-ink-400);
+}
+.threads-search input {
+  width: 100%;
+  min-width: 0;
+  background: transparent;
+  border: 0;
+  outline: none;
+  color: inherit;
+  font: inherit;
+}
+.threads-rows {
+  display: grid;
+  gap: 0.125rem;
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.threads-row {
+  display: grid;
+  gap: 0.125rem;
+  border-radius: 0.4rem;
+  padding: 0.5rem 0.625rem;
+  min-width: 0;
+}
+.threads-row:hover {
+  background: var(--color-ink-850, rgba(255, 255, 255, 0.03));
+}
+.threads-row.on {
+  background: var(--color-ink-800, rgba(255, 255, 255, 0.05));
+}
+.threads-row-top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+  min-width: 0;
+}
+.threads-row-title {
+  font-size: var(--text-body);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.threads-row-kind {
+  flex: none;
+  font-size: var(--text-micro);
+  color: var(--color-ink-500);
+  white-space: nowrap;
+}
+.threads-row-meta {
+  font-size: var(--text-label);
+  color: var(--color-ink-400);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.threads-note {
+  font-size: var(--text-label);
+  color: var(--color-ink-400);
+  margin: 0;
+}
+.threads-main {
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+}
+.threads-empty {
+  display: grid;
+  place-items: center;
+  gap: 0.5rem;
+  flex: 1;
+  color: var(--color-ink-400);
+  padding: 2rem;
+}
+.threads-timeline {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1 1 auto;
+}
+.threads-timeline > :not(.threads-messages) {
+  flex: none;
+}
+.threads-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.25rem 0.75rem;
+  border-bottom: 1px solid var(--color-ink-700);
+  padding: 0.75rem 1.25rem;
+}
+.threads-head h2 {
+  font-size: 1.05rem;
+  font-weight: 600;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.threads-kicker {
+  font-size: var(--text-label);
+  color: var(--color-ink-400);
+}
+.threads-head-actions {
+  margin-left: auto;
+}
+.threads-messages {
+  display: grid;
+  align-content: start;
+  gap: 0;
+  padding: 0.5rem 1.25rem;
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
+  overscroll-behavior: contain;
+}
+/* Flat transcript: a label line, then the body; a hairline between messages. */
+.threads-msg {
+  display: grid;
+  gap: 0.2rem;
+  min-width: 0;
+  padding: 0.7rem 0;
+}
+.threads-msg + .threads-msg {
+  border-top: 1px solid var(--color-ink-800);
+}
+.threads-refs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.2rem 0.6rem;
+  padding-left: 0.25rem;
+}
+/* Outgoing rows: Home's compact body wrapper is text-left, which would pull
+   the inline-block bubble and its stage line to the left edge. Right-align
+   only this wrapper (exact child of the outgoing root); the bubble keeps its
+   own text-left so message text stays left-aligned. The bubble is capped at
+   the available column, not a readable-width cap. */
+.threads-msg [data-chat-message="user"] > .min-w-0 {
+  text-align: right;
+}
+.threads-msg [data-chat-message="user"] > .min-w-0 > .inline-block {
+  max-inline-size: 100%;
+}
+.threads-msg[data-role="operator"] .threads-refs {
+  justify-content: flex-end;
+}
+.threads-msg[data-role="operator"] .threads-receipts {
+  justify-content: flex-end;
+}
+/* Delivery stage: plain Home-style metadata text, not a chip. Queued and
+   available are never shown as delivered or seen; only completed takes the
+   success colour. */
+.threads-stage {
+  font-size: var(--text-micro);
+  color: var(--color-ink-400);
+}
+.threads-stage[data-state="completed"] {
+  color: var(--color-ok);
+}
+.threads-stage[data-state="available"],
+.threads-stage[data-state="running"],
+.threads-stage[data-state="claimed"] {
+  color: var(--color-info);
+}
+.threads-stage[data-state="refused"] {
+  color: var(--color-warn);
+}
+.threads-stage[data-state="failed"],
+.threads-stage[data-state="unknown"],
+.threads-stage[data-state="interrupted"] {
+  color: var(--color-fail);
+}
+.threads-ref {
+  font-family: var(--font-mono, monospace);
+  font-size: var(--text-label);
+  color: var(--color-ink-400);
+}
+.threads-reply,
+.threads-composer {
+  border-top: 1px solid var(--color-ink-700);
+  padding: 0.75rem 1.25rem;
+  display: grid;
+  gap: 0.5rem;
+}
+.threads-reply {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: var(--text-label);
+  color: var(--color-ink-400);
+}
+.threads-mode {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  align-items: center;
+}
+.threads-mode button {
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.35rem;
+  padding: 0.2rem 0.55rem;
+  font-size: var(--text-label);
+}
+.threads-mode button[aria-pressed="true"] {
+  border-color: var(--color-accent);
+}
+.threads-target input {
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.35rem;
+  padding: 0.2rem 0.45rem;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+}
+.threads-context {
+  display: none;
+  padding: 0.75rem;
+  overflow-y: auto;
+  border-left: 1px solid var(--color-ink-700);
+}
+@media (min-width: 1280px) {
+  .threads-context {
+    display: block;
+  }
+}
+.threads-context-title {
+  font-size: var(--text-label);
+  font-weight: 600;
+  color: var(--color-ink-400);
+  margin: 0 0 0.5rem;
+}
+.threads-roster {
+  display: grid;
+  gap: 0.35rem;
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.threads-roster li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  font-size: var(--text-body);
+  min-width: 0;
+}
+.threads-roster li[data-removed] span {
+  color: var(--color-ink-400);
+}
+/* Participant identity: the AccountMenu initial circle, on the roster only. */
+.threads-person {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 0;
+}
+.threads-person > span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.threads-avatar {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 1.5rem;
+  height: 1.5rem;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--color-accent) 15%, transparent);
+  color: var(--color-accent);
+  font-size: var(--text-micro);
+  font-weight: 500;
+  text-transform: uppercase;
+}
+.threads-add {
+  display: flex;
+  gap: 0.35rem;
+  margin-top: 0.5rem;
+}
+.threads-add input {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.35rem;
+  padding: 0.2rem 0.45rem;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+}
+.threads-context-toggle {
+  display: none;
+}
+@media (max-width: 1279px) {
+  .threads-context-toggle {
+    display: inline-flex;
+  }
+}
+.threads-create-sheet,
+.threads-context-sheet {
+  width: min(92vw, 22rem);
+  max-height: 80vh;
+  overflow-y: auto;
+  margin: auto;
+  padding: 0.75rem 1rem;
+  background: var(--color-ink-900, #111);
+  color: var(--color-ink-100);
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.5rem;
+}
+.threads-create-sheet::backdrop,
+.threads-context-sheet::backdrop {
+  background: rgba(0, 0, 0, 0.5);
+}
+.threads-create-sheet > .threads-newgroup + .threads-newgroup {
+  margin-top: 0.75rem;
+}
+.threads-context-sheet-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.5rem;
+}
+.threads-context-sheet-head h2 {
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.threads-selects {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.35rem;
+}
+.threads-selects label {
+  display: grid;
+  gap: 0.15rem;
+  min-width: 0;
+  font-size: var(--text-label);
+  color: var(--color-ink-400);
+}
+.threads-selects select,
+.threads-target select {
+  min-width: 0;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.35rem;
+  padding: 0.2rem 0.4rem;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+}
+/* Delivery feedback: quiet label metadata. The summary is the native disclosure;
+   the details box is inline so an outgoing post aligns it to the bubble's edge. */
+.threads-receipts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.35rem;
+  min-width: 0;
+  font-size: var(--text-label);
+  color: var(--color-ink-400);
+}
+.threads-receipt-details {
+  min-width: 0;
+  max-width: 100%;
+  text-align: left;
+}
+.threads-receipt-details summary {
+  cursor: pointer;
+  list-style: none;
+}
+.threads-receipt-details summary::-webkit-details-marker {
+  display: none;
+}
+.threads-receipt-details summary:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+  border-radius: 0.2rem;
+}
+.threads-receipt-note {
+  margin: 0.35rem 0 0;
+}
+.threads-receipt-list {
+  display: grid;
+  gap: 0.2rem;
+  list-style: none;
+  padding: 0;
+  margin: 0.35rem 0 0;
+}
+.threads-receipt-list li {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+  min-width: 0;
+}
+.threads-receipt-list li > .threads-stage {
+  flex: none;
+}
+.threads-receipt-name {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.threads-receipt-list .threads-receipt-name {
+  color: var(--color-ink-200);
+}
+.threads-receipt-list li[data-removed] .threads-receipt-name {
+  color: var(--color-ink-400);
+}
+@media (min-width: 1280px) {
+  .threads-context-sheet {
+    display: none;
+  }
+}
+.threads-newgroup {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  align-items: center;
+}
+.threads-newgroup input,
+.threads-newgroup select {
+  min-width: 0;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.35rem;
+  padding: 0.2rem 0.45rem;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+}
+.threads-newgroup input {
+  flex: 1 1 8rem;
+}

@@ -874,6 +874,7 @@ mod split_launch_tests {
             for alias in ["master", "fixture-worker"] {
                 let agent = Agent {
                     alias: alias.into(),
+                    uid: format!("agt-{alias}"),
                     provider: provider.into(),
                     endpoint_kind: endpoint.into(),
                     role: if alias == "master" {
@@ -931,6 +932,7 @@ mod split_launch_tests {
     fn managed_pi_constructs_but_open_fails_closed_on_prereqs() {
         let agent = Agent {
             alias: "fixture-worker".into(),
+            uid: "agt-fixture-worker".into(),
             provider: "pi".into(),
             endpoint_kind: "managed".into(),
             role: "worker".into(),

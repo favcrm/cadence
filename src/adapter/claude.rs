@@ -1155,6 +1155,7 @@ mod tests {
     fn agent(alias: &str, params: Value) -> Agent {
         Agent {
             alias: alias.into(),
+            uid: format!("agt-{alias}"),
             provider: "claude".into(),
             endpoint_kind: "managed".into(),
             role: "worker".into(),

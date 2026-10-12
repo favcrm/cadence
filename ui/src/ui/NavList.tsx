@@ -7,7 +7,7 @@ import { navMatches } from "../features/issues/model";
 import { NAV, type Route, type Screen } from "../lib/router";
 import type { IssueCard, Project } from "../lib/types";
 import Link from "./Link";
-import { IconAgents, IconApps, IconHome, IconOutbox, IconProjects, IconSettings, IconWiki } from "./icons";
+import { IconAgents, IconApps, IconHome, IconOutbox, IconProjects, IconSettings, IconWiki, IconThreads } from "./icons";
 
 const NAV_ICONS: Record<string, ReactNode> = {
   home: <IconHome size={16} />,
@@ -15,6 +15,7 @@ const NAV_ICONS: Record<string, ReactNode> = {
   wiki: <IconWiki size={16} />,
   apps: <IconApps size={16} />,
   agents: <IconAgents size={16} />,
+  threads: <IconThreads size={16} />,
   outbox: <IconOutbox size={16} />,
   settings: <IconSettings size={16} />,
 };

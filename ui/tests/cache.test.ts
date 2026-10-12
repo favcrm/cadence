@@ -224,6 +224,7 @@ async function main() {
   equal(invalidatedBy("not json"), [...RESOURCE_NAMES], "bad frame refetches all");
   equal(invalidatedBy(undefined), [...RESOURCE_NAMES], "missing data refetches all");
   equal(invalidatedBy('{"resources":[]}'), [], "explicit empty list refetches nothing");
+  equal(invalidatedBy('{"resources":["threads"]}'), ["threads"], "threads frame is kept");
 
   console.log("resource checks passed");
 }

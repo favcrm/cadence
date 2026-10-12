@@ -39,6 +39,7 @@ const paths: [string, Route][] = [
   ["/apps/cadence/studio", { screen: "apps", project: "cadence", name: "studio" }],
   ["/agents", { screen: "agents", alias: null }],
   ["/agents/cc-1", { screen: "agents", alias: "cc-1" }],
+  ["/threads", { screen: "threads" }],
   ["/setup", { screen: "setup" }],
   ["/overview", { screen: "overview" }],
   ["/settings", { screen: "settings", section: "models" }],
@@ -72,7 +73,7 @@ for (const dead of ["/overview/x", "/nope", "/projects/x/y", "/projects/cadence/
 // Main nav: MVP screens only (Wiki joined in CAD-581; Outbox left the nav in CAD-1312, its route stays).
 equal(
   NAV.map((n) => n.label),
-  ["Home", "Projects", "Wiki", "Apps", "Agents", "Settings"],
+  ["Home", "Threads", "Projects", "Wiki", "Apps", "Agents", "Settings"],
   "nav",
 );
 

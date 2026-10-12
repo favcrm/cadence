@@ -1,0 +1,100 @@
+import type { ConversationKind, ConversationRow, DeliveryState, Participant } from "./threadsClient";
+
+/**
+ * Pure view logic for the Threads page (CAD-818 / CAD-819 / CAD-820 /
+ * CAD-821). No React, no fetching: the page wires these to the real
+ * endpoints. Nothing here decides authority; the daemon does.
+ */
+
+export type ConversationFilter = "all" | "agents" | "operator" | "groups";
+
+/** `?c=<id>` names the open conversation; `?kind=`, `?project=`, `?agent=`
+ *  and `?system=1` are the list filters. Unknown values fall back to the
+ *  default, never to an error. */
+export interface ThreadsUrlState {
+  conversation: string | null;
+  kind: ConversationFilter;
+  project: string | null;
+  agent: string | null;
+  includeSystem: boolean;
+}
+
+export function readThreadsUrl(search: string): ThreadsUrlState {
+  const q = new URLSearchParams(search);
+  const kind = q.get("kind");
+  return {
+    conversation: nonEmpty(q.get("c")),
+    kind: kind === "agents" || kind === "operator" || kind === "groups" ? kind : "all",
+    project: nonEmpty(q.get("project")),
+    agent: nonEmpty(q.get("agent")),
+    includeSystem: q.get("system") === "1",
+  };
+}
+
+function nonEmpty(v: string | null): string | null {
+  return v === null || v.trim() === "" ? null : v;
+}
+
+/** The search string for a state, dropping defaults so a link stays short. */
+export function threadsUrlSearch(state: Partial<ThreadsUrlState>): string {
+  const q = new URLSearchParams();
+  if (state.conversation) q.set("c", state.conversation);
+  if (state.kind && state.kind !== "all") q.set("kind", state.kind);
+  if (state.project) q.set("project", state.project);
+  if (state.agent) q.set("agent", state.agent);
+  if (state.includeSystem) q.set("system", "1");
+  const s = q.toString();
+  return s ? `?${s}` : "";
+}
+
+/** The agent alias of the operator DM: its live non-operator participant. */
+export function operatorDmAlias(row: ConversationRow): string | null {
+  if (row.kind !== "operator") return null;
+  const agent = row.participants.find((p) => p.kind === "agent" && !p.removed && p.alias);
+  return agent?.alias ?? null;
+}
+
+/** The conversation's kind as the list and the timeline label it. */
+export function kindFilterMatches(filter: ConversationFilter, kind: ConversationKind): boolean {
+  if (filter === "all") return true;
+  if (filter === "groups") return kind === "group";
+  if (filter === "operator") return kind === "operator";
+  return kind === "pair";
+}
+
+/** A participant's display name. A removed agent keeps its alias with
+ *  "(removed)"; a legacy row with no recorded sender is "Unknown sender". */
+export function participantLabel(p: Participant | null | undefined): string {
+  if (!p) return "Unknown sender";
+  if (p.kind === "unknown" || (p.uid === null && p.kind !== "operator" && p.kind !== "daemon")) {
+    return "Unknown sender";
+  }
+  if (p.kind === "operator") return "You";
+  if (p.kind === "daemon") return "System";
+  const name = p.alias ?? "agent";
+  return p.removed ? `${name} (removed)` : name;
+}
+
+/** The conversation title: the participants, not an id. */
+export function conversationTitle(row: ConversationRow): string {
+  const names = row.participants.map(participantLabel);
+  return names.length > 0 ? names.join(" ↔ ") : "Conversation";
+}
+
+/** Delivery is a stage, never a claim. Queued is not delivered or seen. */
+const DELIVERY_LABEL: Record<DeliveryState, string> = {
+  pending: "Pending",
+  queued: "Queued",
+  available: "Available",
+  refused: "Refused",
+  claimed: "Claimed",
+  running: "Running",
+  completed: "Completed",
+  failed: "Failed",
+  unknown: "Unknown",
+  interrupted: "Interrupted",
+};
+
+export function deliveryLabel(state: DeliveryState | string): string {
+  return DELIVERY_LABEL[state as DeliveryState] ?? "Unknown";
+}

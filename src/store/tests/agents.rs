@@ -98,6 +98,7 @@
         });
         let mut agent = Agent {
             alias: "worker".into(),
+            uid: "agt-worker".into(),
             provider: "codex".into(),
             endpoint_kind: "managed-ws".into(),
             role: "worker".into(),

@@ -19,7 +19,7 @@ use super::{
     app_assistant, app_audiences, app_chat, app_content, app_contexts, app_explorer, app_records,
     app_release, app_runs, app_screens, approvals, apps, cli_route, connections, crm_send,
     delivery_sync, home, lane, operator, platform_account, read_model, social_publish, stages,
-    threads, updates, wiki, workflows,
+    threads, topics, updates, wiki, work_conversations, workflows,
 };
 use super::{
     push_device_login_config, ready_file, startup_failed_file, tailnet_url, ServeOpts,
@@ -1719,6 +1719,31 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             if path == "/api/master/state" {
                 send(request, home::master_state(state_dir));
                 return;
+            }
+            // CAD-819: the cross-agent work conversation view (read-only).
+            if let Some(id) = work_conversations::route(&path) {
+                if let Err(response) = operator::admit_operator_read(&request, state_dir, opts) {
+                    send(request, response);
+                    return;
+                }
+                if id.is_empty() {
+                    send(request, work_conversations::list(state_dir, &query));
+                } else {
+                    send(request, work_conversations::read(state_dir, id, &query));
+                }
+                return;
+            }
+            // CAD-810: a topic's transcript and per-subscriber receipts (read-only).
+            if let Some((id, None)) = topics::route(&path) {
+                if !id.is_empty() {
+                    if let Err(response) = operator::admit_operator_read(&request, state_dir, opts)
+                    {
+                        send(request, response);
+                        return;
+                    }
+                    send(request, topics::read(state_dir, id, &query));
+                    return;
+                }
             }
             // `/api/threads/<alias>[/stream]` — an agent's chat (CAD-319).
             if let Some((alias, sub)) = threads::route(&path) {

@@ -12,7 +12,7 @@ import { stepSummary, toolSteps, type ThreadEntry, type ThreadItem } from "./thr
  */
 export type Density = "full" | "compact";
 
-const USER_BUBBLE = "rounded-[10px_10px_2px_10px]";
+export const USER_BUBBLE = "rounded-[10px_10px_2px_10px]";
 
 export function time(created: string | null | undefined): string {
   if (!created) return "";
@@ -93,7 +93,7 @@ function StepsGroup({ entries }: { entries: ThreadEntry[] }) {
 /** CAD-1168 (approved mock): "You 09:32" / "Assistant 09:33" label above
  *  the body, no avatars. Home and the app panes share it; density only
  *  changes the bubble width and text size. */
-function Bubble({
+export function Bubble({
   who,
   at,
   children,

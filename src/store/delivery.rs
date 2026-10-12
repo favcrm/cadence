@@ -561,9 +561,21 @@ impl Store {
             + &payload.to_string()
             + &pointer;
         tx.execute(
-            "INSERT INTO messages(id,alias,body,reply_to,source,task_id,created)
-             VALUES(?,?,?,NULL,'worker_result',?,?)",
-            params![delivery, target, prompt, message.task_id, now()],
+            "INSERT INTO messages(id,alias,body,reply_to,source,task_id,created,
+                                  sender_uid,recipient_uid,sender,recipient,origin)
+             VALUES(?,?,?,NULL,'worker_result',?,?,?,?,?,?,?)",
+            params![
+                delivery,
+                target,
+                prompt,
+                message.task_id,
+                now(),
+                self.agent_uid_of_in(tx, &message.alias)?,
+                recipient.uid,
+                message.alias,
+                recipient.alias,
+                message.id
+            ],
         )?;
         Self::event(
             tx,
@@ -710,9 +722,21 @@ impl Store {
             }
         } + &pointer;
         tx.execute(
-            "INSERT INTO messages(id,alias,body,reply_to,source,task_id,created)
-             VALUES(?,?,?,NULL,'worker_notice',?,?)",
-            params![delivery, target, prompt, message.task_id, now()],
+            "INSERT INTO messages(id,alias,body,reply_to,source,task_id,created,
+                                  sender_uid,recipient_uid,sender,recipient,origin)
+             VALUES(?,?,?,NULL,'worker_notice',?,?,?,?,?,?,?)",
+            params![
+                delivery,
+                target,
+                prompt,
+                message.task_id,
+                now(),
+                self.agent_uid_of_in(tx, &message.alias)?,
+                self.agent_uid_of_in(tx, target)?,
+                message.alias,
+                recipient.alias,
+                message.id
+            ],
         )?;
         Self::event(
             tx,
@@ -1077,9 +1101,18 @@ impl Store {
                              "revision": task.revision, "state": new_state});
         let body = format!("Cadence job {}: {note} {payload}", job.id);
         tx.execute(
-            "INSERT INTO messages(id,alias,body,reply_to,source,task_id,created)
-             VALUES(?,?,?,NULL,'job_event',?,?)",
-            params![delivery, job.pm_alias, body, task.id, now()],
+            "INSERT INTO messages(id,alias,body,reply_to,source,task_id,created,
+                                  recipient_uid,recipient,sender)
+             VALUES(?,?,?,NULL,'job_event',?,?,?,?,'daemon')",
+            params![
+                delivery,
+                job.pm_alias,
+                body,
+                task.id,
+                now(),
+                recipient.uid,
+                recipient.alias
+            ],
         )?;
         Self::event_scoped(
             tx,
@@ -1093,6 +1126,10 @@ impl Store {
             Some(&job.id),
             Some(&task.id),
         )?;
+        // CAD-810 (additive): when the job has a `job:<id>` topic, its members
+        // also get this event as a turnless topic notice, in this transaction.
+        // The PM notify above is unchanged; a job without a topic is untouched.
+        self.job_topic_fanout_in(tx, job, &delivery, &body)?;
         Ok(true)
     }
 

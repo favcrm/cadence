@@ -33,25 +33,23 @@ impl Shared {
         )
     }
 
-    /// Who queued a message for `alias`'s thread. Only computed for an
-    /// alias that has one — the identity walk is not free. An agent
-    /// connection is that agent; an underivable caller is unattributed.
-    /// A connection tied to no agent would write into the thread as the
-    /// operator, so it must be provably the operator (CAD-384, CAD-276):
-    /// a detached child of an agent is refused, before anything is
-    /// written.
+    /// Who queued a message for `alias`. An agent connection is that
+    /// agent on every alias (CAD-819 sender_uid); an underivable caller
+    /// is unattributed. Only a connection tied to no agent that targets
+    /// an alias with a thread writes as the operator, so it must be
+    /// provably the operator (CAD-384, CAD-276): a detached child of an
+    /// agent is refused, before anything is written.
     pub(super) fn thread_sender(&self, alias: &str, peer_pid: u32) -> Result<store::Sender> {
-        match self.store.thread(alias) {
-            Ok(Some(_)) => {}
-            _ => return Ok(store::Sender::Unattributed),
-        }
+        let has_thread = matches!(self.store.thread(alias), Ok(Some(_)));
         Ok(match self.caller_identity(peer_pid) {
+            // CAD-819: an agent's sends are attributed on every alias, so
+            // the stored sender_uid never depends on the recipient's thread.
             Ok(Caller::Agent(v)) => store::Sender::Agent(v.agent.alias.clone()),
-            Ok(Caller::NoAgentIdentity) => {
+            Ok(Caller::NoAgentIdentity) if has_thread => {
                 self.proven_operator("send into an operator thread", peer_pid)?;
                 store::Sender::Operator
             }
-            Err(_) => store::Sender::Unattributed,
+            Ok(Caller::NoAgentIdentity) | Err(_) => store::Sender::Unattributed,
         })
     }
 
@@ -495,11 +493,10 @@ impl Shared {
             }
         }
         if let caller_rule::Who::Agent(caller) = self.connection_caller(peer_pid)? {
-            if caller != message.alias {
+            if !self.store.agent_reads_message(&message, &caller)? {
                 return Err(Error::rejected(format!(
                     "message_read refused: agent '{caller}' cannot read another \
-                     agent's mail — '{id}' belongs to '{}' (caller rule, CAD-480)",
-                    message.alias
+                     agent's mail (caller rule, CAD-480)"
                 )));
             }
         }

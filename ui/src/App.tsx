@@ -30,6 +30,7 @@ import Connections from "./features/settings/Connections";
 import EmailSending from "./features/settings/EmailSending";
 import Update from "./features/settings/Update";
 import Outbox from "./features/outbox/Outbox";
+import ThreadsPage from "./features/threads/ThreadsPage";
 import OverviewView from "./features/home/Overview";
 import Home from "./features/home/Home";
 import { useHomeCount } from "./features/home/todoLocal";
@@ -64,6 +65,7 @@ import { IconList } from "./ui/icons";
 import type { BoardFilters } from "./lib/filters";
 import type { UpdateBanner } from "./lib/types";
 import { RESOURCE_NAMES } from "./lib/cache";
+import { noteThreadsChanged } from "./features/threads/threadsClient";
 import { LiveUpdates, patchRows } from "./lib/liveUpdates";
 import type { Agent, AgentsPayload } from "./lib/types";
 import { cache, resources } from "./lib/resources";
@@ -112,6 +114,7 @@ const SCREEN_LABEL: Record<Screen, string> = {
   workspaceApp: "app",
   workspaceAppKey: "app",
   agents: "agents",
+  threads: "threads",
   wiki: "wiki",
   outbox: "outbox",
   setup: "setup",
@@ -131,7 +134,7 @@ export default function App() {
   const loc = useMemo(() => currentLocation(), [href]);
   const { route, view, project, openId, filters } = loc;
   const screen = route.screen;
-  const fullHeight = screen === "home" || screen === "wiki" || screen === "workspaceApp" || screen === "workspaceAppKey" ||
+  const fullHeight = screen === "home" || screen === "wiki" || screen === "workspaceApp" || screen === "workspaceAppKey" || screen === "threads" ||
     (route.screen === "projects" && route.section === "context" && Boolean(route.slug));
   const search = href.includes("?") ? href.slice(href.indexOf("?")) : "";
   /** The href of a route, carrying the scope and drawer like `goTo`. */
@@ -482,6 +485,7 @@ export default function App() {
       else cache.invalidate(key);
     }
     cache.invalidate("lane");
+    noteThreadsChanged();
     refresh();
   }, [refresh]);
 
@@ -494,6 +498,7 @@ export default function App() {
         // or jobs. Entity patches queue that through LiveUpdates; legacy
         // resource names still have to.
         if (laneFollowsStream([key])) cache.invalidate("lane");
+        if (key === "threads") noteThreadsChanged();
         if (key === "overview" && !overviewWantedRef.current) {
           resources.overview.markInvalid();
         } else cache.invalidate(key);
@@ -533,7 +538,7 @@ export default function App() {
     liveUpdates.current = updates;
     const sub = subscribeSse({
       url: "/api/stream?entities=1",
-      events: ["hello", "heartbeat", "issues", "agents", "jobs", "monitoring", "issue", "agent", "agent_meta", "plan", "aggregates"],
+      events: ["hello", "heartbeat", "issues", "agents", "jobs", "monitoring", "issue", "agent", "agent_meta", "plan", "aggregates", "threads"],
       onEvent: updates.event,
       onOpen: updates.opened,
       onError: updates.failed,
@@ -1226,6 +1231,7 @@ export default function App() {
             onToast={say}
           />
         )}
+        {route.screen === "threads" && <ThreadsPage operator={meta?.operator === true} />}
         {screen === "outbox" && <Outbox operator={meta?.operator === true} onOpenIssue={openIssue} />}
         {screen === "setup" && (
           <Setup settingsHref={hrefFor({ screen: "settings", section: "models" })} readOnly={meta ? boardReadOnly : null} />

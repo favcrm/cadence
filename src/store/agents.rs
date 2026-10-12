@@ -30,6 +30,9 @@ pub const AGENT_STATES: &[&str] = &[
 #[derive(Debug, Clone)]
 pub struct Agent {
     pub alias: String,
+    /// CAD-819: the durable participant identity, minted at registration.
+    /// The alias is a display name; a re-registered alias gets a new uid.
+    pub uid: String,
     pub provider: String,
     pub endpoint_kind: String,
     pub role: String,
@@ -99,6 +102,7 @@ pub struct ModelDefaultsSnapshot {
 fn row_agent(row: &rusqlite::Row) -> rusqlite::Result<Agent> {
     Ok(Agent {
         alias: row.get("alias")?,
+        uid: row.get("uid")?,
         provider: row.get("provider")?,
         endpoint_kind: row.get("endpoint_kind")?,
         role: row.get("role")?,
@@ -340,8 +344,8 @@ impl Store {
             };
             tx.execute(
                 "INSERT INTO agents(alias,provider,endpoint_kind,role,team_role,cwd,sandbox,
-                               instructions,params,model_selection,state,endpoint,created,updated)
-             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                               instructions,params,model_selection,state,endpoint,created,updated,uid)
+             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 params![
                     new.alias,
                     new.provider,
@@ -356,7 +360,8 @@ impl Store {
                     state,
                     endpoint,
                     now(),
-                    now()
+                    now(),
+                    format!("agt-{}", uuid::Uuid::new_v4().simple())
                 ],
             )?;
             Self::event(
@@ -1001,9 +1006,11 @@ impl Store {
                     )));
                 }
             }
+            // A topic notice is turnless: it is never execution debt, so it
+            // neither blocks removal nor counts as open work (CAD-818).
             let open: Vec<Message> = tx
                 .query_vec(
-                    "SELECT * FROM messages WHERE alias=? AND state NOT IN
+                    "SELECT * FROM messages WHERE alias=? AND source != 'topic_notice' AND state NOT IN
                              ('completed','failed','interrupted','cancelled') ORDER BY seq",
                     [alias],
                     row_message,
@@ -1146,6 +1153,7 @@ impl Store {
                                    "by": by["by"], "by_kind": by["by_kind"]}),
                 )?;
             }
+            Self::cancel_queued_topic_notices(&tx, alias)?;
             Self::prune_agent_history(&tx, alias)?;
             tx.execute("DELETE FROM agents WHERE alias=?", [alias])?;
             Self::event(
@@ -1159,19 +1167,30 @@ impl Store {
         })
     }
 
-    /// Drops a removed alias's message/event history except what job
-    /// history still resolves (CAD-284): messages attached to a task or
-    /// named as a task's `dispatch_message` or a verdict's `message`,
-    /// and job-scoped events. Those stay in place under the old alias so
-    /// `job show`/`job events`/`task show` read them unchanged.
-    fn prune_agent_history(tx: &impl super::StoreConn, alias: &str) -> Result<()> {
+    /// CAD-818: a removed alias's still-queued topic notices are cancelled
+    /// in the removal transaction. They were never made available, and a
+    /// re-registered alias (a new uid) must never claim its predecessor's
+    /// notice. Available and refused notices are history and stay as-is.
+    fn cancel_queued_topic_notices(tx: &impl super::StoreConn, alias: &str) -> Result<()> {
         tx.execute(
-            "DELETE FROM messages WHERE alias=?1 AND task_id IS NULL
-             AND id NOT IN (SELECT dispatch_message FROM tasks
-                            WHERE dispatch_message IS NOT NULL)
-             AND id NOT IN (SELECT message FROM verdicts WHERE message IS NOT NULL)",
-            [alias],
+            "UPDATE messages SET state='cancelled',result=?,completed=?
+                     WHERE alias=? AND source='topic_notice' AND state='queued'",
+            params![
+                json!({"status": "cancelled", "via": "topic_notice", "reason": "agent_removed"})
+                    .to_string(),
+                now(),
+                alias
+            ],
         )?;
+        Ok(())
+    }
+
+    /// Drops a removed alias's event history except job-scoped events
+    /// (CAD-284). CAD-819: message rows are KEPT. The participant is keyed
+    /// by its uid, so the conversation survives `agent rm` and renders as
+    /// "<alias> (removed)"; a re-registered alias gets a new uid and starts
+    /// with no history.
+    fn prune_agent_history(tx: &impl super::StoreConn, alias: &str) -> Result<()> {
         tx.execute(
             "DELETE FROM events WHERE alias=? AND job_id IS NULL",
             [alias],
@@ -1235,8 +1254,8 @@ impl Store {
             let at = now();
             let age = at - agent.updated;
             let open_messages: i64 = tx.query_row(
-                "SELECT COUNT(*) FROM messages WHERE alias=? AND state NOT IN
-                         ('completed','failed','interrupted','cancelled')",
+                "SELECT COUNT(*) FROM messages WHERE alias=? AND source != 'topic_notice'
+                         AND state NOT IN ('completed','failed','interrupted','cancelled')",
                 [alias],
                 |r| r.get(0),
             )?;
@@ -1248,6 +1267,7 @@ impl Store {
             if !eligible {
                 return Ok(None);
             }
+            Self::cancel_queued_topic_notices(&tx, alias)?;
             Self::prune_agent_history(&tx, alias)?;
             tx.execute("DELETE FROM agents WHERE alias=?", [alias])?;
             Self::event(
@@ -1312,7 +1332,7 @@ impl Store {
             out.entry(alias).or_default().0 = at;
         }
         let mut stmt = conn.prepare(
-            "SELECT alias, COUNT(*) FROM messages WHERE state NOT IN
+            "SELECT alias, COUNT(*) FROM messages WHERE source != 'topic_notice' AND state NOT IN
              ('completed','failed','interrupted','cancelled') GROUP BY alias",
         )?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
