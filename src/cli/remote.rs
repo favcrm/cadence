@@ -493,14 +493,21 @@ fn wiki_for(action: &WikiAction) -> Result<(&'static str, serde_json::Map<String
 
 /// `wiki ls|cat|search` answers print as the host prints them. The `--json`,
 /// `--meta` and `put` forms keep the JSON body. Returns whether it printed.
-fn wiki_text(command: &Commands, body: &Value) -> bool {
+/// A directory is refused for `cat` (with or without `--meta`), as the local
+/// `wiki cat` refuses it.
+fn wiki_text(command: &Commands, body: &Value) -> Result<bool> {
     let Commands::Wiki { action } = command else {
-        return false;
+        return Ok(false);
     };
-    match action {
+    Ok(match action {
         WikiAction::Ls { .. } => {
             cadence_agent::wiki::cli::entries(body);
             true
+        }
+        WikiAction::Cat { path, .. } if body["kind"] == "dir" => {
+            return Err(Error::rejected(format!(
+                "wiki cat '{path}' refused: a directory — use `wiki ls`"
+            )))
         }
         WikiAction::Cat { meta: false, .. } if body["kind"] == "text" => {
             print!("{}", body["text"].as_str().unwrap_or(""));
@@ -518,7 +525,7 @@ fn wiki_text(command: &Commands, body: &Value) -> bool {
             true
         }
         _ => false,
-    }
+    })
 }
 
 fn unavailable(command: &Commands) -> Error {
@@ -606,7 +613,7 @@ pub(super) fn run(
         };
     match out {
         cadence_agent::remote_cli::RemoteAnswer::Ok(body) => {
-            if wiki_text(&command, &body) {
+            if wiki_text(&command, &body)? {
                 return Ok(0);
             }
             println!(
@@ -625,6 +632,28 @@ pub(super) fn run(
                 serde_json::to_string_pretty(&body).unwrap_or_default()
             );
             Ok(5)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_wiki_cat_refuses_a_directory_like_local_cat() {
+        // CAD-1401 repair: a directory is a nonzero refusal (local `wiki cat`
+        // refuses it with or without --meta), never printed as JSON.
+        let dir = json!({"kind": "dir", "path": "global"});
+        for meta in [false, true] {
+            let cat = Commands::Wiki {
+                action: WikiAction::Cat {
+                    path: "global".into(),
+                    meta,
+                },
+            };
+            let err = wiki_text(&cat, &dir).unwrap_err();
+            assert!(err.to_string().contains("use `wiki ls`"), "{err}");
         }
     }
 }

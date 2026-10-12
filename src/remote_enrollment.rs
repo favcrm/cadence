@@ -1459,15 +1459,27 @@ fn slug(value: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
-/// Accept only an owner grant for exactly the requested workspace and
-/// audience (`https://<slug>.cadencecloud.app`), with exactly the requested
-/// `cli.read`, `cli.write`, `wiki.read` and `wiki.write` capabilities. The issuer binds slug to workspace
-/// itself; the response carries no slug field.
+/// The issuer may narrow the consent: a grant is the CLI pair (always) plus
+/// any unique subset of the other requested capabilities. It never names an
+/// unrequested or duplicate capability, and it never drops a CLI scope.
+fn consented_caps(caps: &[Value], requested: &[&str]) -> bool {
+    let mut seen = BTreeSet::new();
+    caps.iter().all(|c| {
+        c.as_str()
+            .is_some_and(|c| requested.contains(&c) && seen.insert(c))
+    }) && ["cli.read", "cli.write"].iter().all(|c| seen.contains(c))
+}
+
+/// Accept only an owner grant for the requested workspace and audience
+/// (`https://<slug>.cadencecloud.app`), with capabilities that
+/// [`consented_caps`] allows for `requested`. The issuer binds slug to
+/// workspace itself; the response carries no slug field.
 fn login_grant(
     value: &Value,
     org: Option<&str>,
     hint: Option<&str>,
     issuer: &str,
+    requested: &[&str],
 ) -> Result<LoginGrant> {
     let at = now()?;
     let (principal, credential) = (&value["principal"], &value["credential"]);
@@ -1481,12 +1493,7 @@ fn login_grant(
     let caps = value["capabilities"]
         .as_array()
         .ok_or_else(|| reject("Invalid hosted login capabilities"))?;
-    let exact_caps = caps.len() == 4
-        && caps
-            .iter()
-            .filter_map(Value::as_str)
-            .collect::<BTreeSet<_>>()
-            == BTreeSet::from(["cli.read", "cli.write", "wiki.read", "wiki.write"]);
+    let exact_caps = consented_caps(caps, requested);
     if !exact_fields(
         value,
         &[
@@ -1701,14 +1708,46 @@ pub fn login_browser(
     )
 }
 
+/// The capabilities one login requests. `cli` is the default pair;
+/// `wiki` (CAD-1401, `cadence login --wiki`) adds `wiki.read` and
+/// `wiki.write` to it. The issuer's grant must equal this set exactly.
+#[derive(Clone, Copy)]
+enum LoginScope {
+    Cli,
+    CliAndWiki,
+}
+
+impl LoginScope {
+    fn requested(self) -> Vec<&'static str> {
+        match self {
+            LoginScope::Cli => vec!["cli.read", "cli.write"],
+            LoginScope::CliAndWiki => vec!["cli.read", "cli.write", "wiki.read", "wiki.write"],
+        }
+    }
+}
+
 pub fn login_portal(
     issuer: &str,
     hint: Option<&str>,
     dir: &Path,
+    wiki: bool,
     show_code: impl FnOnce(&str, &str) -> Result<()>,
 ) -> Result<LoginGrant> {
     let issuer = origin(issuer, cfg!(test))?;
-    login_device_flow(&issuer, None, hint, dir, show_code, &mut RealLoginRuntime)
+    let scope = if wiki {
+        LoginScope::CliAndWiki
+    } else {
+        LoginScope::Cli
+    };
+    login_device_flow(
+        &issuer,
+        None,
+        hint,
+        dir,
+        show_code,
+        &mut RealLoginRuntime,
+        scope,
+    )
 }
 
 fn login_browser_with(
@@ -1730,6 +1769,7 @@ fn login_browser_with(
         dir,
         show_code,
         runtime,
+        LoginScope::Cli,
     )
 }
 
@@ -1740,6 +1780,7 @@ fn login_device_flow(
     dir: &Path,
     show_code: impl FnOnce(&str, &str) -> Result<()>,
     runtime: &mut dyn LoginRuntime,
+    scope: LoginScope,
 ) -> Result<LoginGrant> {
     if org.is_some_and(|value| !id(value)) || hint.is_some_and(|value| !slug(value)) {
         return Err(reject("Invalid hosted login request"));
@@ -1757,8 +1798,9 @@ fn login_device_flow(
     let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .encode(Sha256::digest(verifier.as_bytes()));
     confirm_login_access_ingress(dir, &issuer, &access)?;
+    let requested = scope.requested();
     let mut request = json!({"version":DEVICE_VERSION,
-        "client_label":"cadence-cli","requested_capabilities":["cli.read","cli.write","wiki.read","wiki.write"],
+        "client_label":"cadence-cli","requested_capabilities":requested,
         "code_challenge":challenge,"cli_session":"renewable"});
     if let (Some(org), Some(hint)) = (org, hint) {
         request["organization_id"] = json!(org);
@@ -1810,7 +1852,7 @@ fn login_device_flow(
             _ => return Err(reject("Hosted browser grant refused; start again")),
         }
     };
-    let grant = login_grant(&grant, org, hint, &issuer)?;
+    let grant = login_grant(&grant, org, hint, &issuer, &requested)?;
     confirm_login_access_ingress(dir, &issuer, &access)?;
     Ok(grant)
 }
@@ -3450,7 +3492,7 @@ mod tests {
         let at = now().unwrap();
         json!({"version":VERSION,"organization_id":"ws_real","audience":LOGIN_ENDPOINT,
             "principal":{"kind":"user","subject_id":"user_1","current_role":"owner"},
-            "capabilities":["cli.read","cli.write","wiki.read","wiki.write"],
+            "capabilities":["cli.read","cli.write"],
             "credential":{"credential_id":"hcp_credential","access_token":BRIDGE,
                 "token_type":"Bearer","issued_at":at,"expires_at":at+120,"renewal":"reexchange"},
             "cli_session":{"session_id":"hcs_00000000-0000-4000-8000-000000000001",
@@ -3530,8 +3572,7 @@ mod tests {
                 if !real_code_request_ok(&body)
                     || body["organization_id"] != "ws_real"
                     || body["audience"] != LOGIN_ENDPOINT
-                    || body["requested_capabilities"]
-                        != json!(["cli.read", "cli.write", "wiki.read", "wiki.write"])
+                    || body["requested_capabilities"] != json!(["cli.read", "cli.write"])
                 {
                     return Ok((400, json!({"error":"invalid_request"})));
                 }
@@ -3602,6 +3643,8 @@ mod tests {
         requests: Vec<(String, Value)>,
         baseline: Instant,
         elapsed: u64,
+        /// The device-code `requested_capabilities` this run must send.
+        requested: Vec<&'static str>,
     }
 
     impl LoginRuntime for PortalAcceptanceRuntime {
@@ -3637,10 +3680,7 @@ mod tests {
                 assert!(keys.iter().all(|key| request.contains_key(*key)));
                 assert_eq!(body["version"], DEVICE_VERSION);
                 assert_eq!(body["client_label"], "cadence-cli");
-                assert_eq!(
-                    body["requested_capabilities"],
-                    json!(["cli.read", "cli.write", "wiki.read", "wiki.write"])
-                );
+                assert_eq!(body["requested_capabilities"], json!(self.requested));
                 assert!(body.get("organization_id").is_none());
                 assert!(body.get("audience").is_none());
                 if has_slug_hint {
@@ -3655,6 +3695,30 @@ mod tests {
         }
     }
 
+    fn run_wiki_portal_acceptance(
+        grant: Value,
+        dir: &Path,
+    ) -> (Result<LoginGrant>, PortalAcceptanceRuntime) {
+        let mut runtime = PortalAcceptanceRuntime {
+            issuer: HOSTED_LOGIN_ISSUER.to_string(),
+            grant: Some(grant),
+            requests: Vec::new(),
+            baseline: Instant::now(),
+            elapsed: 0,
+            requested: vec!["cli.read", "cli.write", "wiki.read", "wiki.write"],
+        };
+        let out = login_device_flow(
+            HOSTED_LOGIN_ISSUER,
+            None,
+            Some("acme"),
+            dir,
+            |_, _| Ok(()),
+            &mut runtime,
+            LoginScope::CliAndWiki,
+        );
+        (out, runtime)
+    }
+
     fn run_portal_acceptance(
         hint: Option<&str>,
         grant: Value,
@@ -3666,6 +3730,7 @@ mod tests {
             requests: Vec::new(),
             baseline: Instant::now(),
             elapsed: 0,
+            requested: vec!["cli.read", "cli.write"],
         };
         let out = login_device_flow(
             HOSTED_LOGIN_ISSUER,
@@ -3674,6 +3739,7 @@ mod tests {
             dir,
             |_, _| Ok(()),
             &mut runtime,
+            LoginScope::Cli,
         );
         (out, runtime)
     }
@@ -3740,12 +3806,12 @@ mod tests {
 
     #[test]
     fn hosted_portal_requires_exact_requested_capabilities_before_storage() {
-        // The issuer may return the requested capabilities in either
-        // order, but an additional capability is outside the consent.
+        // The issuer may return the two requested capabilities in either
+        // order, but an additional CLI capability is outside the consent.
         let root = tempfile::tempdir().unwrap();
         let mut reordered = login_grant_body();
         reordered["organization_slug"] = json!("acme");
-        reordered["capabilities"] = json!(["cli.write", "wiki.write", "cli.read", "wiki.read"]);
+        reordered["capabilities"] = json!(["cli.write", "cli.read"]);
         let dir = root.path().join("reordered/auth");
         let (out, runtime) = run_portal_acceptance(None, reordered, &dir);
         assert!(
@@ -3756,23 +3822,11 @@ mod tests {
         assert_nothing_stored(&dir);
 
         for (case, capabilities) in [
-            (
-                "extra-admin",
-                json!([
-                    "cli.read",
-                    "cli.write",
-                    "wiki.read",
-                    "wiki.write",
-                    "cli.admin"
-                ]),
-            ),
-            (
-                "missing-wiki-write",
-                json!(["cli.read", "cli.write", "wiki.read"]),
-            ),
+            ("extra-admin", json!(["cli.read", "cli.write", "cli.admin"])),
+            ("missing-write", json!(["cli.read"])),
             (
                 "duplicate-read",
-                json!(["cli.read", "cli.read", "cli.write", "wiki.read"]),
+                json!(["cli.read", "cli.read", "cli.write"]),
             ),
         ] {
             let mut grant = login_grant_body();
@@ -3781,6 +3835,45 @@ mod tests {
             let dir = root.path().join(format!("{case}/auth"));
             let (out, runtime) = run_portal_acceptance(None, grant, &dir);
             assert!(out.is_err(), "issuer capability set {case} was accepted");
+            assert_eq!(runtime.requests.len(), 2);
+            assert_nothing_stored(&dir);
+        }
+    }
+
+    #[test]
+    fn hosted_portal_accepts_a_narrowed_wiki_consent_and_refuses_escalation() {
+        // CAD-1401 blocker 2: an issuer may grant a subset of the requested
+        // scopes (the CLI pair plus wiki.read for a `--wiki` login). The
+        // grant must keep both CLI scopes, may only name requested scopes,
+        // and never repeats one.
+        let root = tempfile::tempdir().unwrap();
+        let mut narrowed = login_grant_body();
+        narrowed["organization_slug"] = json!("acme");
+        narrowed["capabilities"] = json!(["cli.read", "cli.write", "wiki.read"]);
+        let dir = root.path().join("narrowed/auth");
+        let (out, runtime) = run_wiki_portal_acceptance(narrowed, &dir);
+        let grant = out.expect("a narrowed wiki consent was refused");
+        assert_eq!(runtime.requests.len(), 2);
+        assert!(grant.capabilities.iter().any(|c| c == "wiki.read"));
+        assert!(!grant.capabilities.iter().any(|c| c == "wiki.write"));
+
+        for (case, capabilities) in [
+            ("missing-cli-write", json!(["cli.read", "wiki.read"])),
+            (
+                "unrequested-admin",
+                json!(["cli.read", "cli.write", "cli.admin"]),
+            ),
+            (
+                "duplicate-wiki",
+                json!(["cli.read", "cli.write", "wiki.read", "wiki.read"]),
+            ),
+        ] {
+            let mut grant = login_grant_body();
+            grant["organization_slug"] = json!("acme");
+            grant["capabilities"] = capabilities;
+            let dir = root.path().join(format!("{case}/auth"));
+            let (out, runtime) = run_wiki_portal_acceptance(grant, &dir);
+            assert!(out.is_err(), "wiki consent case {case} was accepted");
             assert_eq!(runtime.requests.len(), 2);
             assert_nothing_stored(&dir);
         }
@@ -3797,6 +3890,7 @@ mod tests {
             requests: Vec::new(),
             baseline: Instant::now(),
             elapsed: 0,
+            requested: vec!["cli.read", "cli.write"],
         };
         let out = login_device_flow(
             HOSTED_LOGIN_ISSUER,
@@ -3805,6 +3899,7 @@ mod tests {
             &dir,
             |_, _| Ok(()),
             &mut runtime,
+            LoginScope::Cli,
         );
         assert!(out.is_err());
         assert!(runtime.requests.is_empty(), "pin conflict reached issuer");

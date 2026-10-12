@@ -49,6 +49,7 @@ use crate::error::{Error, Result};
 use crate::issue::Pm;
 
 pub mod cli;
+pub mod envelope;
 pub mod index;
 pub mod ingest;
 

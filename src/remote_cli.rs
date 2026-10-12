@@ -139,6 +139,9 @@ pub struct RemoteTarget {
 }
 
 const SESSION_VERSION: &str = "hosted-cadence-cli-session.v1";
+/// Every capability this client knows. A stored login holds a subset that
+/// includes `cli.read` and `cli.write` (the default login); a renewal keeps
+/// exactly the stored set, so a CLI-only login stays CLI-only.
 const CAPABILITIES: &[&str] = &["cli.read", "cli.write", "wiki.read", "wiki.write"];
 const RENEW_BEFORE: u64 = 60;
 const SKEW: u64 = 5;
@@ -436,7 +439,7 @@ fn renewed_credential(dir: &Path, target: &RemoteTarget, deadline: Instant) -> R
         .ok_or_else(|| reject("renewable session issuer missing — run `cadence login` again"))?;
     if cred.organization_slug.as_deref() != Some(target.org.as_str())
         || cred.subject_id.as_deref().is_none_or(|s| !valid_id(s))
-        || !same_capabilities(&cred.capabilities, CAPABILITIES)
+        || !valid_capabilities(&cred.capabilities)
         || session.idle_expires_at <= at
         || session.absolute_expires_at <= at
         || session.idle_expires_at > session.absolute_expires_at
@@ -557,7 +560,7 @@ fn validate_renewal_response(
         || body["principal"]["kind"] != "user"
         || body["principal"]["current_role"] != "owner"
         || body["principal"]["subject_id"].as_str() != prior.subject_id.as_deref()
-        || !same_capabilities_json(&body["capabilities"], CAPABILITIES)
+        || !same_capabilities_json(&body["capabilities"], &prior.capabilities)
         || !exact_object(
             &body["credential"],
             &[
@@ -623,18 +626,28 @@ fn validate_renewal_response(
     Ok(())
 }
 
-fn same_capabilities(values: &[String], expected: &[&str]) -> bool {
-    values.len() == expected.len()
-        && expected
+/// Known, unique capabilities that include the CLI pair. Wiki scopes are
+/// optional, so a CLI-only login remains valid.
+fn valid_capabilities(values: &[String]) -> bool {
+    let once = |c: &str| values.iter().filter(|v| v.as_str() == c).count() == 1;
+    values.iter().all(|v| CAPABILITIES.contains(&v.as_str()))
+        && values
             .iter()
-            .all(|item| values.iter().filter(|v| v.as_str() == *item).count() == 1)
+            .enumerate()
+            .all(|(i, v)| !values[..i].contains(v))
+        && once("cli.read")
+        && once("cli.write")
 }
-fn same_capabilities_json(value: &Value, expected: &[&str]) -> bool {
+fn same_capabilities_json(value: &Value, expected: &[String]) -> bool {
     value.as_array().is_some_and(|values| {
         values.len() == expected.len()
-            && expected
-                .iter()
-                .all(|item| values.iter().filter(|v| v.as_str() == Some(*item)).count() == 1)
+            && expected.iter().all(|item| {
+                values
+                    .iter()
+                    .filter(|v| v.as_str() == Some(item.as_str()))
+                    .count()
+                    == 1
+            })
     })
 }
 fn exact_object(value: &Value, keys: &[&str]) -> bool {
@@ -961,6 +974,23 @@ fn call_verb_in(
     let deadline = Instant::now() + Duration::from_secs(wake_timeout);
     loop {
         let cred = renewed_credential(dir, target, deadline)?;
+        // A login that records its capabilities must hold the wiki scope the
+        // action needs; a legacy login with none is left to the server's check.
+        if matches!(surface, Surface::Wiki) && !cred.capabilities.is_empty() {
+            let scope = if verb == "write" {
+                "wiki.write"
+            } else {
+                "wiki.read"
+            };
+            if !cred.capabilities.iter().any(|c| c == scope) {
+                return Err(reject(format!(
+                    "wiki {verb} needs the {scope} capability, which this remote login \
+                     lacks — nothing was sent. CLI commands are unaffected. `cadence login` \
+                     does not request wiki access by default; wiki access needs a login the \
+                     workspace owner grants with {scope}"
+                )));
+            }
+        }
         if Instant::now() >= deadline {
             return Err(Error::busy_coded(
                 "timeout",
@@ -1559,6 +1589,53 @@ mod tests {
         );
         assert!(out.unwrap_err().to_string().contains("remote call refused"));
         assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+    }
+
+    #[test]
+    fn a_cli_only_login_stays_valid_and_a_wiki_verb_needs_its_scope() {
+        // CAD-1401 repair: the stored CLI pair is a valid login and its renewal
+        // keeps exactly that set; a wiki verb on it is refused before any request.
+        let cli: Vec<String> = vec!["cli.read".into(), "cli.write".into()];
+        assert!(valid_capabilities(&cli));
+        assert!(!valid_capabilities(&["cli.read".into()]));
+        assert!(same_capabilities_json(
+            &json!(["cli.read", "cli.write"]),
+            &cli
+        ));
+        assert!(!same_capabilities_json(
+            &json!(["cli.read", "cli.write", "wiki.read"]),
+            &cli
+        ));
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            root.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let target = RemoteTarget {
+            org: ORG.into(),
+            endpoint: "http://127.0.0.1:9".into(),
+            org_id: ORG_ID.into(),
+        };
+        let body = json!({"version": "hosted-cadence-auth.v1", "organization_id": ORG_ID,
+            "audience": target.endpoint, "capabilities": cli,
+            "access_token": BRIDGE, "expires_at": now().unwrap() + 300});
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(root.path().join(format!("cli-{ORG}.json")))
+            .unwrap();
+        file.write_all(body.to_string().as_bytes()).unwrap();
+        let mut args = Map::new();
+        args.insert("path".into(), json!("global/"));
+        let err =
+            call_verb_in(&target, "enumerate", args, 10, root.path(), |_| {}, |_| {}).unwrap_err();
+        assert!(err.to_string().contains("wiki.read capability"), "{err}");
+        assert!(err.to_string().contains("nothing was sent"), "{err}");
     }
 }
 
