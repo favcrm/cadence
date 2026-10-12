@@ -590,6 +590,28 @@ Object.assign(zhTW, {
   " — the client refused a field the server never accepts.": " — 用戶端拒絕了伺服器不接受的欄位。",
 });
 
+Object.assign(zhTW, {
+  "The workspace is busy. Retrying the app list…": "工作區忙碌中，正在重試載入應用程式清單…",
+  "is not a page of this board.": "不是此看板的頁面。",
+  "Pull request": "拉取請求",
+  "Evidence": "證據",
+  "no component": "沒有元件",
+  "limit": "上限",
+  "task": "任務",
+  "{count} reason to check": "有 {count} 項待確認原因",
+  "{count} reasons to check": "有 {count} 項待確認原因",
+  "health reasons": "健康狀況原因",
+  "next": "下一步",
+  "size-weighted progress": "依工作規模加權的進度",
+  "Open issues": "未結議題",
+  "Operator role": "操作員",
+  "Member role": "成員",
+  "session": "工作階段",
+  "sections": "區段",
+  "Select": "選取",
+  "build": "建置",
+});
+
 export function useLocale(): LocaleContextValue {
   const value = useContext(LocaleContext);
   if (!value) throw new Error("useLocale must be used inside LocaleProvider");

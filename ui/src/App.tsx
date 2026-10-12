@@ -1288,8 +1288,7 @@ export default function App() {
           <main className="px-4 lg:px-8 pt-10 pb-9">
             <h1 className="text-section font-semibold text-ink-100">{t("Nothing lives here")}</h1>
             <p className="text-body text-ink-400 mt-2">
-              <span className="num break-all">{route.screen === "notFound" ? route.path : ""}</span> is
-              {t("not a page of this board.")}{" "}
+              <span className="num break-all">{route.screen === "notFound" ? route.path : ""}</span> {t("is not a page of this board.")}{" "}
               <Link href={hrefFor({ screen: "home" })} className="lnk">
                 {t("Go home")}
               </Link>

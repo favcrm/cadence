@@ -290,7 +290,7 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
                     return (
                       <div key={h.install_id} className="card itile">
                         <Link className="open" href={openHref(h)}
-                          onClick={() => opened(h.install_id)} aria-label={`Open ${h.title}`}>
+                          onClick={() => opened(h.install_id)} aria-label={`${t("Open")} ${h.title}`}>
                           <AppGlyph name={h.name} icon={h.icon} size="sm" />
                           <div className="min-w-0 flex-1">
                             <div className="nm">{h.title}</div>
@@ -307,7 +307,7 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
                           <button className={`star ${pinned ? "pinned" : ""}`} aria-pressed={pinned}
                             aria-label={`${t(pinned ? "Unpin" : "Pin")} ${h.title}`}
                             onClick={() => pin(h.install_id)}>{pinned ? "★" : "☆"}</button>
-                          {isOp && <Link className="star" href={`/apps/manage/${h.install_id}`} aria-label={`Manage ${h.title}`}>⚙</Link>}
+                          {isOp && <Link className="star" href={`/apps/manage/${h.install_id}`} aria-label={`${t("Manage")} ${h.title}`}>⚙</Link>}
                         </div>
                       </div>
                     );

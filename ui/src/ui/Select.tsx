@@ -297,7 +297,7 @@ export function Select({
         }}
       >
         <span className={selected ? "select-value" : "select-value select-placeholder"}>
-          {selected?.label ?? placeholder ?? "Select"}
+          {selected?.label ?? placeholder ?? t("Select")}
         </span>
         <IconChevron size={12} className="select-caret" />
       </button>

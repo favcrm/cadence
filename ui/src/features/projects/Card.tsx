@@ -122,7 +122,7 @@ export default function Card({
             <span
               key={`${a.alias}:${a.task}`}
               className="chip bg-ink-800 !py-[.1rem] text-ink-400"
-              title={`${a.alias} · task ${a.task} (${a.task_state})${
+              title={`${a.alias} · ${tr("task")} ${a.task} (${a.task_state})${
                 a.message ? ` · ${a.message}` : ""
               }`}
             >

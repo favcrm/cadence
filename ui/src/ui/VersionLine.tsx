@@ -26,7 +26,7 @@ export default function VersionLine({
       data-version-line
       className="num mt-1 flex justify-between gap-3 border-t border-ink-700 px-2 pt-2 pb-1.5 text-micro text-ink-500 hover:text-accent"
     >
-      <span>{release ? `v${release}` : `build ${releaseLabel(build, null)}`}</span>
+      <span>{release ? `v${release}` : `${t("build")} ${releaseLabel(build, null)}`}</span>
       {updatePending && <span className="text-ink-300">{t("What's new")}</span>}
     </Link>
   );

@@ -91,7 +91,7 @@ function IssueList({ issues, project, onOpen }: { issues: IssueCard[]; project: 
             <Link href={issuePath(issue.project, issue.id)} className="board-issue-title block text-left text-ink-100 mt-1.5 leading-[1.4] font-medium hover:text-accent">{issue.title}</Link>
             <div className="flex flex-wrap gap-x-3 gap-y-1 mt-2 text-micro text-ink-500">
               <span>{issue.owner ?? t("unassigned")}</span>
-              <span>{issue.component ?? "no component"}</span>
+              <span>{issue.component ?? t("no component")}</span>
               <span>{formatNumber(issue.checks.done)}/{formatNumber(issue.checks.total)} {t("checks")}</span>
               {project === "all" && <span>{issue.project}</span>}
               <button type="button" className="board-preview-link ml-auto" aria-label={`${t("Preview")} ${issue.id}`} onClick={() => onOpen(issue.id)}>{t("Preview")}</button>
@@ -335,7 +335,7 @@ export default function Board({
               <span className="kicker num">
                 {doneHidden > 0 ? doneHidden : cards.length}
                 {/* The WIP limit is board-wide — a lane shows its count only. */}
-                {wip && lane === "" ? ` · limit ${wip}` : ""}
+                {wip && lane === "" ? ` · ${t("limit")} ${wip}` : ""}
               </span>
             </header>
             <div className="p-2.5 space-y-2.5 flex-1">

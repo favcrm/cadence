@@ -57,7 +57,7 @@ export default function AccountMenu({
   const [languageBusy, setLanguageBusy] = useState(false);
   const [languageError, setLanguageError] = useState(false);
   const [languageSaved, setLanguageSaved] = useState(false);
-  const { userLocale, organizationLocale, isHostedUser, canSetOrganizationLocale, t, setPreference } = useLocale();
+  const { userLocale, organizationLocale, isHostedUser, canSetOrganizationLocale, locale, t, setPreference } = useLocale();
   const rootRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
@@ -134,6 +134,7 @@ export default function AccountMenu({
   const canWrite = !meta.read_only;
   const avatar = trigger === "avatar";
   const role = user?.role || "operator";
+  const roleLabel = locale !== "zh-TW" ? role : role === "operator" ? t("Operator role") : role === "member" ? t("Member role") : role;
   return (
     <div ref={rootRef} className={avatar ? "header-control-wrap shrink-0" : "relative shrink-0"} data-account-menu onKeyDown={onKeyDown} onBlur={onBlur}>
       <button
@@ -153,9 +154,9 @@ export default function AccountMenu({
         </span>
         {!avatar && (
           <>
-            <span className="flex min-w-0 flex-1 items-baseline gap-1.5 text-left" title={`${name} · ${role}`}>
+            <span className="flex min-w-0 flex-1 items-baseline gap-1.5 text-left" title={`${name} · ${roleLabel}`}>
               <span className="truncate text-label font-medium text-ink-200">{name}</span>
-              <span className="shrink-0 text-micro text-ink-500">{role}</span>
+              <span className="shrink-0 text-micro text-ink-500">{roleLabel}</span>
             </span>
             <span aria-hidden className="shrink-0 rotate-180 text-ink-500"><IconChevron /></span>
           </>
@@ -171,10 +172,10 @@ export default function AccountMenu({
           onClick={(event) => { if ((event.target as Element).closest("a")) setOpen(false); }}
           className={`absolute z-50 card p-1.5 shadow-xl ${placement === "below-end" ? "right-0 top-full mt-2 w-64" : "left-0 bottom-full mb-2 w-[max(100%,16rem)]"}`}
         >
-          <div className="px-2 py-1.5" title={meta.session ? `session ${meta.session.id}` : undefined}>
+          <div className="px-2 py-1.5" title={meta.session ? `${t("session")} ${meta.session.id}` : undefined}>
             <p className="text-secondary text-ink-100 break-words">{name}</p>
             {user?.email && user.email !== name && <p className="text-micro text-ink-500 break-all">{user.email}</p>}
-            {user?.role && <span className="chip bg-ink-800 text-ink-400 mt-1">{user.role}</span>}
+            {user?.role && <span className="chip bg-ink-800 text-ink-400 mt-1">{roleLabel}</span>}
           </div>
           {mayWrite && canWrite && (
             <p className="px-2 py-1.5 text-micro text-ink-500">
