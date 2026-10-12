@@ -111,6 +111,7 @@ mod supervisor_grant;
 mod test_queue_rpc;
 mod threads_rpc;
 mod timers;
+mod topics_rpc;
 mod watch;
 mod wiki_rpc;
 
@@ -2274,6 +2275,15 @@ impl Shared {
             "chat_file_upload" => self.rpc_chat_file_upload(params, peer_pid),
             "chat_file_read" => self.rpc_chat_file_read(params, peer_pid),
             "conversation_list" => self.rpc_conversation_list(params, peer_pid),
+            "work_conversation_list" => self.rpc_work_conversation_list(params, peer_pid),
+            "topic_create" => self.rpc_topic_create(params, peer_pid),
+            "topic_subscribe" => self.rpc_topic_membership(params, peer_pid, true),
+            "topic_unsubscribe" => self.rpc_topic_membership(params, peer_pid, false),
+            "topic_publish" => self.rpc_topic_publish(params, peer_pid),
+            "topic_read" => self.rpc_topic_read(params, peer_pid),
+            "topic_request" => self.rpc_topic_request(params, peer_pid),
+            "threads_stamp" => self.rpc_threads_stamp(),
+            "work_conversation_read" => self.rpc_work_conversation_read(params, peer_pid),
             "conversation_create" => self.rpc_conversation_create(params, peer_pid),
             "agent_events" => self.rpc_events(params),
             // CAD-886: read-only wait with `agent_show` visibility.

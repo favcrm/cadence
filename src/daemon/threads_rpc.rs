@@ -3,6 +3,46 @@
 use super::*;
 
 impl Shared {
+    /// The entries as JSON. A message-linked entry whose stored message
+    /// belongs to this alias and to the entry's own thread carries
+    /// `payload.delivery` (`state`, `started`, `completed`); its other
+    /// payload keys are kept. Anything else gets no delivery.
+    fn entries_json(&self, alias: &str, entries: &[store::ThreadEntry]) -> Result<Vec<Value>> {
+        let mut out = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let mut j = entry.to_json();
+            let Some(id) = &entry.message_id else {
+                out.push(j);
+                continue;
+            };
+            let Some(message) = self.store.message(id)?.filter(|m| m.alias == alias) else {
+                out.push(j);
+                continue;
+            };
+            let same_thread = self
+                .store
+                .message_conversation(alias, id)?
+                .is_some_and(|t| t.id == entry.thread_id);
+            let mut payload = match &entry.payload {
+                None | Some(Value::Null) => serde_json::Map::new(),
+                Some(Value::Object(obj)) => obj.clone(),
+                Some(_) => {
+                    out.push(j);
+                    continue;
+                }
+            };
+            if same_thread {
+                payload.insert(
+                    "delivery".into(),
+                    json!({"state": message.state, "started": message.started, "completed": message.completed}),
+                );
+                j["payload"] = Value::Object(payload);
+            }
+            out.push(j);
+        }
+        Ok(out)
+    }
+
     /// `thread_read` — a page of an agent's thread after `after`,
     /// optionally long-polling up to `wait` seconds (≤ 30) for the next
     /// entry, the way `agent_events` does. Read-only.
@@ -61,7 +101,7 @@ impl Shared {
             return Ok(json!({
                 "alias": alias,
                 "thread": thread.as_ref().map(store::Thread::to_json),
-                "entries": entries.iter().map(store::ThreadEntry::to_json).collect::<Vec<_>>(),
+                "entries": self.entries_json(&alias, &entries)?,
                 "cursor": cursor,
                 "more_before": more,
             }));
@@ -85,7 +125,7 @@ impl Shared {
                 return Ok(json!({
                     "alias": alias,
                     "thread": thread.as_ref().map(store::Thread::to_json),
-                    "entries": entries.iter().map(store::ThreadEntry::to_json).collect::<Vec<_>>(),
+                    "entries": self.entries_json(&alias, &entries)?,
                     "cursor": cursor,
                 }));
             }

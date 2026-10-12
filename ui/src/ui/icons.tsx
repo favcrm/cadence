@@ -6,6 +6,7 @@ import { HugeiconsIcon } from "@hugeicons/react";
 import type { ComponentProps, CSSProperties } from "react";
 import {
   Alert02Icon,
+  Comment01Icon,
   ArrowDown01Icon,
   ArrowRight01Icon,
   Cancel01Icon,
@@ -74,6 +75,10 @@ export const IconApps = ({ size = 15, ...rest }: IconProps = {}) => (
 /** Agents — panes, models and their bound work. */
 export const IconAgents = ({ size = 15, ...rest }: IconProps = {}) => (
   <Glyph icon={Robot01Icon} size={size} {...rest} />
+);
+/** Threads — agent, operator and group conversations (CAD-818). */
+export const IconThreads = ({ size = 15, ...rest }: IconProps = {}) => (
+  <Glyph icon={Comment01Icon} size={size} {...rest} />
 );
 /** Outbox — published local items. */
 export const IconOutbox = ({ size = 15, ...rest }: IconProps = {}) => (

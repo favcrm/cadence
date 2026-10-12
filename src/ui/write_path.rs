@@ -1493,6 +1493,32 @@ pub(crate) fn write_route(
         send(request, resp);
         return;
     }
+    // CAD-810 / CAD-821: the topic writes — operator-only (the admit gate
+    // above classifies each as `OperatorOnly`), relayed to the daemon's
+    // topic verbs, which re-prove the connection.
+    if path == "/api/topics" {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let resp = super::topics::create(state_dir, &mut request);
+        send(request, resp);
+        return;
+    }
+    if let Some((id, sub)) = super::topics::route(path) {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let resp = match sub {
+            Some("subscribers") => super::topics::membership(state_dir, id, &mut request),
+            Some("posts") => super::topics::publish(state_dir, id, &mut request),
+            Some("requests") => super::topics::request(state_dir, id, &mut request),
+            _ => err_response(404, "no such topic write route"),
+        };
+        send(request, resp);
+        return;
+    }
     // The Needs-you rail's snooze/dismiss (CAD-574) — operator-only,
     // relayed to the daemon's `needs_dismiss`.
     if let Some((id, verb)) = home::permission_route(path) {

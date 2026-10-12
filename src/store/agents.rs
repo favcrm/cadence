@@ -30,6 +30,9 @@ pub const AGENT_STATES: &[&str] = &[
 #[derive(Debug, Clone)]
 pub struct Agent {
     pub alias: String,
+    /// CAD-819: the durable participant identity, minted at registration.
+    /// The alias is a display name; a re-registered alias gets a new uid.
+    pub uid: String,
     pub provider: String,
     pub endpoint_kind: String,
     pub role: String,
@@ -99,6 +102,7 @@ pub struct ModelDefaultsSnapshot {
 fn row_agent(row: &rusqlite::Row) -> rusqlite::Result<Agent> {
     Ok(Agent {
         alias: row.get("alias")?,
+        uid: row.get("uid")?,
         provider: row.get("provider")?,
         endpoint_kind: row.get("endpoint_kind")?,
         role: row.get("role")?,
@@ -340,8 +344,8 @@ impl Store {
             };
             tx.execute(
                 "INSERT INTO agents(alias,provider,endpoint_kind,role,team_role,cwd,sandbox,
-                               instructions,params,model_selection,state,endpoint,created,updated)
-             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                               instructions,params,model_selection,state,endpoint,created,updated,uid)
+             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 params![
                     new.alias,
                     new.provider,
@@ -356,7 +360,8 @@ impl Store {
                     state,
                     endpoint,
                     now(),
-                    now()
+                    now(),
+                    format!("agt-{}", uuid::Uuid::new_v4().simple())
                 ],
             )?;
             Self::event(
@@ -1159,19 +1164,12 @@ impl Store {
         })
     }
 
-    /// Drops a removed alias's message/event history except what job
-    /// history still resolves (CAD-284): messages attached to a task or
-    /// named as a task's `dispatch_message` or a verdict's `message`,
-    /// and job-scoped events. Those stay in place under the old alias so
-    /// `job show`/`job events`/`task show` read them unchanged.
+    /// Drops a removed alias's event history except job-scoped events
+    /// (CAD-284). CAD-819: message rows are KEPT. The participant is keyed
+    /// by its uid, so the conversation survives `agent rm` and renders as
+    /// "<alias> (removed)"; a re-registered alias gets a new uid and starts
+    /// with no history.
     fn prune_agent_history(tx: &impl super::StoreConn, alias: &str) -> Result<()> {
-        tx.execute(
-            "DELETE FROM messages WHERE alias=?1 AND task_id IS NULL
-             AND id NOT IN (SELECT dispatch_message FROM tasks
-                            WHERE dispatch_message IS NOT NULL)
-             AND id NOT IN (SELECT message FROM verdicts WHERE message IS NOT NULL)",
-            [alias],
-        )?;
         tx.execute(
             "DELETE FROM events WHERE alias=? AND job_id IS NULL",
             [alias],

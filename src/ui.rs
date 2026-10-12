@@ -61,8 +61,10 @@ mod stream;
 mod tailscale;
 mod tailscale_serve;
 mod threads;
+mod topics;
 mod updates;
 mod wiki;
+mod work_conversations;
 mod workflows;
 mod write_path;
 

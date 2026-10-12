@@ -1,0 +1,1008 @@
+import { useCallback, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
+import { ApiError, api } from "../../lib/api";
+import { resources } from "../../lib/resources";
+import { useResource } from "../../lib/useResource";
+import { navigate, useHref } from "../../lib/useLocation";
+import { fmtTime } from "../../lib/fmt";
+import { useWriteBlock } from "../auth/WriteGate";
+import Button from "../../ui/Button";
+import Link from "../../ui/Link";
+import PageState from "../../ui/PageState";
+import { issuePath } from "../issues/model";
+import { IconClose, IconRefresh, IconSearch, IconThreads } from "../../ui/icons";
+import Composer from "../app-shell/chat/Composer";
+import { asEntry, newMessageId, type ThreadEntry } from "../home/thread";
+import { Bubble, USER_BUBBLE } from "../home/ThreadView";
+import {
+  changeSubscriber,
+  createTopic,
+  listWorkConversations,
+  postToTopic,
+  readTopic,
+  readWorkConversation,
+  requestFromTopic,
+  type ConversationListFilter,
+  type ConversationPage,
+  type ConversationRow,
+  type DeliveryState,
+  type Participant,
+  type PostDelivery,
+  type ThreadMessage,
+  type TopicPage,
+  type TopicPost,
+  predatesThreads,
+  subscribeThreadsChanged,
+  threadsRevisionNow,
+} from "./threadsClient";
+import {
+  conversationTitle,
+  deliveryLabel,
+  kindFilterMatches,
+  operatorDmAlias,
+  participantLabel,
+  readThreadsUrl,
+  threadsUrlSearch,
+  type ThreadsUrlState,
+} from "./threadsView";
+import "./threads.css";
+
+/**
+ * Threads (CAD-818): one board page for agent, operator and group
+ * conversations. Inbox variant 1: list | timeline | participants rail.
+ * The participant roster lives only in the rail; below the desktop width
+ * the same panel opens in a native dialog (Context).
+ *
+ * Authority is the daemon's. The page only issues operator requests and
+ * shows what the daemon answers. Agent pairs are read-only (Reply opens the
+ * agent's own page). A group post notifies; Ask agent sends one request to
+ * one selected member.
+ */
+
+export default function ThreadsPage({ operator }: { operator: boolean }) {
+  const href = useHref();
+  const search = href.includes("?") ? href.slice(href.indexOf("?")) : "";
+  const url = useMemo(() => readThreadsUrl(search), [search]);
+  const draftAlias = useMemo(() => readDmParam(search), [search]);
+  const writeBlock = useWriteBlock(!operator);
+  const agentsState = useResource(resources.agents);
+  const issuesState = useResource(resources.issues);
+  const issueProjects = useMemo(() => issueProjectMap(issuesState.data ?? []), [issuesState.data]);
+
+  const [list, setList] = useState<{ rows: ConversationRow[] | null; error: string | null; legacy: boolean }>({
+    rows: null,
+    error: null,
+    legacy: false,
+  });
+  const [query, setQuery] = useState("");
+  const [contextOpen, setContextOpen] = useState(false);
+  const [createOpen, setCreateOpen] = useState(false);
+  const threadsTick = useSyncExternalStore(subscribeThreadsChanged, threadsRevisionNow);
+
+  const loadList = useCallback(async (): Promise<ConversationRow[]> => {
+    if (!operator) return [];
+    try {
+      const out = await listWorkConversations({
+        project: url.project ?? undefined,
+        agent: url.agent ?? undefined,
+        include_system: url.includeSystem,
+      });
+      setList({ rows: out.conversations, error: null, legacy: false });
+      return out.conversations;
+    } catch (e) {
+      if (predatesThreads(e)) setList({ rows: [], error: null, legacy: true });
+      else setList((s) => ({ ...s, error: e instanceof Error ? e.message : String(e) }));
+      return [];
+    }
+  }, [operator, url.project, url.agent, url.includeSystem]);
+
+  // (1) Live: the existing SSE feed invalidates `agents` on every agent,
+  // job and message change, and the `threads` frame names every topic and
+  // message change (App.tsx). Reload the list on either.
+  const agentsTick = agentsState.data;
+  useEffect(() => {
+    void loadList();
+  }, [loadList, agentsTick, threadsTick]);
+
+  const rows = list.rows ?? [];
+  const visible = rows
+    .filter((r) => kindFilterMatches(url.kind, r.kind))
+    .filter((r) => (query.trim() === "" ? true : conversationTitle(r).toLowerCase().includes(query.trim().toLowerCase())));
+  const open = rows.find((r) => r.id === url.conversation) ?? null;
+  // The agents on the board: the live roster the filter and chooser name. A
+  // removed agent is absent from it.
+  const agentNames = (agentsState.data?.agents ?? []).map((a) => a.alias).sort();
+  // A draft needs a live agent, and is dropped when a real operator row for
+  // that alias already exists, so the canonical row is the one opened.
+  const draftLive = draftAlias !== null && agentNames.includes(draftAlias);
+  const existingDm = draftAlias !== null ? rows.find((r) => r.kind === "operator" && operatorDmAlias(r) === draftAlias) ?? null : null;
+  const draft = draftLive && !existingDm && !open ? draftAlias : null;
+
+  const setUrl = (next: Partial<typeof url>) =>
+    navigate(`/threads${threadsUrlSearch({ ...url, ...next })}`, { replace: true });
+  // Open a You ↔ agent conversation by alias: the existing row if one exists,
+  // else the local draft (`?dm=`), so the page never creates an empty server row.
+  const openDm = (alias: string) => {
+    const row = rows.find((r) => r.kind === "operator" && operatorDmAlias(r) === alias);
+    if (row) setUrl({ conversation: row.id });
+    else navigate(draftHref(url, alias), { replace: true });
+  };
+
+  if (!operator) {
+    return (
+      <section className="threads-page px-4 lg:px-8 py-5" aria-labelledby="threads-title">
+        <h1 id="threads-title" className="sr-only">Threads</h1>
+        <PageState title="Operator access required">
+          Threads is available to the operator. Use Sign in in the status bar if you have operator access.
+        </PageState>
+      </section>
+    );
+  }
+
+  const context = open ? (
+    <ContextPanel row={open} writeBlock={writeBlock} onChanged={() => void loadList()} />
+  ) : null;
+
+  return (
+    <section className="threads-page" aria-labelledby="threads-title">
+      <div className="threads-layout">
+        <aside className="threads-list" aria-label="Conversations">
+          <div className="threads-list-head">
+            <h1 id="threads-title">Threads</h1>
+            <Button variant="ghost" size="sm" onClick={() => void loadList()} aria-label="Refresh conversations">
+              <IconRefresh size={12} />
+            </Button>
+            <Button variant="secondary" size="sm" onClick={() => setCreateOpen(true)}>
+              Add
+            </Button>
+          </div>
+          <label className="threads-search">
+            <IconSearch size={13} />
+            <input
+              type="search"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Search conversations"
+              aria-label="Search conversations"
+            />
+          </label>
+          {list.legacy ? (
+            <p className="threads-note">This daemon predates Threads. Update it to see agent conversations.</p>
+          ) : list.error ? (
+            <p className="threads-note" role="status">Conversations could not load: {list.error}</p>
+          ) : list.rows === null ? (
+            <p className="threads-note">Loading conversations…</p>
+          ) : visible.length === 0 ? (
+            <p className="threads-note">No conversations match these filters.</p>
+          ) : (
+            <ul className="threads-rows">
+              {visible.map((row) => (
+                <li key={row.id}>
+                  <Link
+                    href={`/threads${threadsUrlSearch({ ...url, conversation: row.id })}`}
+                    aria-current={row.id === open?.id ? "true" : undefined}
+                    className={row.id === open?.id ? "threads-row on" : "threads-row"}
+                  >
+                    <span className="threads-row-top">
+                      <span className="threads-row-title">{conversationTitle(row)}</span>
+                      <span className="threads-row-kind">{KIND_LABEL[row.kind]}</span>
+                    </span>
+                    <span className="threads-row-meta">{rowDescriptor(row)}</span>
+                  </Link>
+                </li>
+              ))}
+            </ul>
+          )}
+        </aside>
+
+        <main className="threads-main" aria-label="Conversation">
+          {open ? (
+            <Timeline
+              key={open.id}
+              row={open}
+              scope={{ project: url.project ?? undefined, agent: url.agent ?? undefined, include_system: url.includeSystem }}
+              writeBlock={writeBlock}
+              liveStamp={agentsTick}
+              threadsTick={threadsTick}
+              issueProjects={issueProjects}
+              onOpenContext={() => setContextOpen(true)}
+              onChanged={() => void loadList()}
+              openDm={openDm}
+            />
+          ) : draft ? (
+            <DraftDm
+              key={draft}
+              alias={draft}
+              writeBlock={writeBlock}
+              threadsTick={threadsTick}
+              liveStamp={agentsTick}
+              onSent={() => {
+                // The send created the thread: open its canonical row once listed.
+                void loadList().then((fresh) => {
+                  const row = fresh.find((r) => r.kind === "operator" && operatorDmAlias(r) === draft);
+                  if (row) setUrl({ conversation: row.id });
+                });
+              }}
+            />
+          ) : (
+            <div className="threads-empty">
+              <span aria-hidden><IconThreads size={28} /></span>
+              <p>Select a conversation to read it.</p>
+            </div>
+          )}
+        </main>
+
+        {/* The one roster: the rail on desktop. Below the desktop width the
+            rail is hidden and Context opens the same panel. */}
+        <aside className="threads-context" aria-label="Participants">
+          {context}
+        </aside>
+      </div>
+      {open && (
+        <SheetDialog open={contextOpen} title="Context" className="threads-context-sheet" onClose={() => setContextOpen(false)}>
+          {context}
+        </SheetDialog>
+      )}
+      <SheetDialog open={createOpen} title="New thread or group" className="threads-create-sheet" onClose={() => setCreateOpen(false)}>
+        <NewGroup
+          writeBlock={writeBlock}
+          onCreated={(id) => {
+            setCreateOpen(false);
+            void loadList();
+            setUrl({ conversation: id });
+          }}
+        />
+        <NewThread
+          agents={agentNames}
+          current={draft}
+          onOpen={(alias) => {
+            setCreateOpen(false);
+            openDm(alias);
+          }}
+          writeBlock={writeBlock}
+        />
+      </SheetDialog>
+    </section>
+  );
+}
+
+/** `?dm=<alias>`: a local draft You ↔ agent conversation (no server row yet). */
+function readDmParam(search: string): string | null {
+  const v = new URLSearchParams(search).get("dm");
+  return v === null || v.trim() === "" ? null : v;
+}
+
+/** A draft's URL: the page's list state plus `dm=<alias>`. */
+function draftHref(state: Partial<ThreadsUrlState>, alias: string): string {
+  const base = threadsUrlSearch({ ...state, conversation: null });
+  return `/threads${base ? `${base}&` : "?"}dm=${encodeURIComponent(alias)}`;
+}
+
+const KIND_LABEL: Record<ConversationRow["kind"], string> = {
+  pair: "Agents",
+  operator: "You ↔ agent",
+  group: "Group",
+  unknown: "Unknown sender",
+};
+
+/** A native modal sheet (the repo's dialog pattern), closed by Escape or its button. Children stay mounted while closed, so form values survive a close and reopen. */
+function SheetDialog({
+  open,
+  title,
+  className,
+  onClose,
+  children,
+}: {
+  open: boolean;
+  title: string;
+  className: string;
+  onClose: () => void;
+  children: ReactNode;
+}) {
+  const ref = useRef<HTMLDialogElement>(null);
+  const titleId = useId();
+  useEffect(() => {
+    const dialog = ref.current;
+    if (!dialog) return;
+    if (open && !dialog.open) dialog.showModal();
+    if (!open && dialog.open) dialog.close();
+  }, [open]);
+  return (
+    <dialog
+      ref={ref}
+      className={className}
+      aria-labelledby={titleId}
+      onCancel={(event) => {
+        event.preventDefault();
+        onClose();
+      }}
+    >
+      <div className="threads-context-sheet-head">
+        <h2 id={titleId}>{title}</h2>
+        <Button variant="ghost" size="sm" onClick={onClose} aria-label={`Close ${title.toLowerCase()}`} icon={<IconClose />} />
+      </div>
+      {children}
+    </dialog>
+  );
+}
+
+/** Issue id -> project key, from the board's issue cards (the app's join). */
+type IssueProjects = Map<string, string>;
+function issueProjectMap(issues: { id: string; project: string }[]): IssueProjects {
+  return new Map(issues.map((i) => [i.id, i.project]));
+}
+
+/** A delivery stage for display, as quiet metadata text (not a chip). Queued is never shown as delivered or seen. */
+function StageLabel({ state }: { state: DeliveryState | string }) {
+  return <span className="threads-stage" data-state={state}>{deliveryLabel(state)}</span>;
+}
+
+/** One transcript turn: the Home message bubble (Bubble, with the real sender
+ *  and time). Operator turns take the Home outgoing tint and shape; agent and
+ *  system turns stay plain. Compact density drops Home's 92% cap, so the body
+ *  uses the full column. */
+function Turn({
+  who,
+  at,
+  me,
+  state,
+  children,
+}: {
+  who: string;
+  at?: string;
+  me?: boolean;
+  state?: DeliveryState | string | null;
+  children: ReactNode;
+}) {
+  return (
+    <Bubble who={who} at={at} me={me} density="compact">
+      <div
+        className={`inline-block text-left px-3 py-2 text-body text-ink-100 whitespace-pre-wrap [overflow-wrap:anywhere] ${
+          me ? `bg-accent/10 border border-accent/20 ${USER_BUBBLE}` : "text-ink-200"
+        }`}
+      >
+        {children}
+      </div>
+      {state ? (
+        <div className="mt-1">
+          <StageLabel state={state} />
+        </div>
+      ) : null}
+    </Bubble>
+  );
+}
+
+/** A row's second line from real data only: the last preview; else a group's
+ *  post and member counts; else a direct thread's label. */
+function rowDescriptor(row: ConversationRow): string {
+  if (row.last) return row.last.preview;
+  if (row.kind === "group") {
+    const members = liveMembers(row).length;
+    const parts = [`${members} ${members === 1 ? "member" : "members"}`];
+    if (row.posts !== undefined) parts.unshift(`${row.posts} ${row.posts === 1 ? "post" : "posts"}`);
+    return parts.join(" · ");
+  }
+  if (row.kind === "operator") return "Direct thread";
+  return "No messages";
+}
+
+/** The initial shown in a participant's identity circle. */
+function initialOf(label: string): string {
+  return label.trim().charAt(0).toUpperCase() || "?";
+}
+
+function Timeline({
+  row,
+  scope,
+  writeBlock,
+  liveStamp,
+  threadsTick,
+  issueProjects,
+  onOpenContext,
+  onChanged,
+  openDm,
+}: {
+  row: ConversationRow;
+  /** The list's filter context: the timeline reads the same scope. */
+  scope: ConversationListFilter;
+  writeBlock: string | null;
+  issueProjects: IssueProjects;
+  /** The live `agents` payload: a new object on every stream frame. */
+  liveStamp: unknown;
+  /** The `threads` frame revision: a topic or message change on any thread. */
+  threadsTick: number;
+  openDm: (alias: string) => void;
+  onOpenContext: () => void;
+  onChanged: () => void;
+}) {
+  const isGroup = row.kind === "group";
+  const dm = operatorDmAlias(row);
+  const [messages, setMessages] = useState<ThreadMessage[] | null>(null);
+  const [entries, setEntries] = useState<ThreadEntry[] | null>(null);
+  const [posts, setPosts] = useState<TopicPost[] | null>(null);
+  const [before, setBefore] = useState<number | null>(null);
+  const [more, setMore] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [tick, setTick] = useState(0);
+
+  useEffect(() => {
+    let live = true;
+    if (dm) {
+      // Operator DM: the agent's home thread, read by its conversation id.
+      api
+        .thread(dm, { tail: true, limit: 50, conversation: row.id })
+        .then((p) => {
+          if (!live) return;
+          const list = threadEntries(p.entries);
+          setError(null);
+          setEntries(list);
+          setMore(p.more_before === true);
+          setBefore(list[0]?.seq ?? null);
+        })
+        .catch((e: unknown) => {
+          if (live) setError(e instanceof ApiError ? e.message : String(e));
+        });
+      return () => {
+        live = false;
+      };
+    }
+    const load = isGroup ? readTopic(row.id) : readWorkConversation(row.id, {}, scope);
+    load
+      .then((page) => {
+        if (!live) return;
+        setError(null);
+        if (isGroup) {
+          const p = page as TopicPage;
+          setPosts(p.posts);
+          setMore(p.more_before);
+          setBefore(p.posts[0]?.seq ?? null);
+        } else {
+          const p = page as ConversationPage;
+          setMessages(p.messages);
+          setMore(p.more_before);
+          setBefore(p.messages[0]?.seq ?? null);
+        }
+      })
+      .catch((e: unknown) => {
+        if (live) setError(e instanceof ApiError ? e.message : String(e));
+      });
+    return () => {
+      live = false;
+    };
+  }, [row.id, isGroup, tick, liveStamp, threadsTick, scope.project, scope.agent, scope.include_system]);
+
+  // (5) Earlier history: page backwards from the oldest loaded seq; a short
+  // page means the start is reached. Nothing is dropped silently.
+  const loadEarlier = async () => {
+    if (before === null) return;
+    try {
+      if (dm) {
+        const p = await api.thread(dm, { before, limit: 50, conversation: row.id });
+        const list = threadEntries(p.entries);
+        setEntries((cur) => [...list, ...(cur ?? [])]);
+        setMore(p.more_before === true);
+        setBefore(list[0]?.seq ?? before);
+      } else if (isGroup) {
+        const p = await readTopic(row.id, { before, limit: 50 });
+        setPosts((cur) => [...p.posts, ...(cur ?? [])]);
+        setMore(p.more_before);
+        setBefore(p.posts[0]?.seq ?? before);
+      } else {
+        const p = await readWorkConversation(row.id, { before, limit: 50 }, scope);
+        setMessages((cur) => [...p.messages, ...(cur ?? [])]);
+        setMore(p.more_before);
+        setBefore(p.messages[0]?.seq ?? before);
+      }
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e));
+    }
+  };
+
+  const reload = () => {
+    setTick((t) => t + 1);
+    onChanged();
+  };
+
+  return (
+    <div className="threads-timeline">
+      <header className="threads-head">
+        <div className="threads-kicker">{KIND_LABEL[row.kind]}</div>
+        <h2>{conversationTitle(row)}</h2>
+        <div className="threads-head-actions">
+          <Button variant="ghost" size="sm" onClick={onOpenContext} className="threads-context-toggle">
+            Context
+          </Button>
+        </div>
+      </header>
+      <div className="threads-messages" aria-live="polite">
+        {error ? (
+          <p className="threads-note" role="status">This conversation could not load: {error}</p>
+        ) : (dm ? entries : isGroup ? posts : messages) === null ? (
+          <p className="threads-note">Loading…</p>
+        ) : (
+          <>
+            {more && (
+              <Button variant="ghost" size="sm" onClick={() => void loadEarlier()}>Load earlier</Button>
+            )}
+            {dm
+              ? (entries ?? []).map((e) => <EntryRow key={e.seq} entry={e} />)
+              : isGroup
+                ? (posts ?? []).map((p) => <PostRow key={p.id} post={p} />)
+                : (messages ?? []).map((m) => <MessageRow key={m.id} message={m} issueProjects={issueProjects} />)}
+            {isGroup
+              ? (posts ?? []).length === 0 && <p className="threads-note">No posts yet.</p>
+              : (dm ? entries ?? [] : messages ?? []).length === 0 && <p className="threads-note">No messages yet.</p>}
+          </>
+        )}
+      </div>
+      {row.kind === "operator" && dm && (
+        <OperatorComposer alias={dm} writeBlock={writeBlock} onSent={reload} />
+      )}
+      {row.kind === "pair" && <ReplyBar row={row} openDm={openDm} />}
+      {isGroup && (
+        <GroupComposer
+          row={row}
+          writeBlock={writeBlock}
+          onSent={reload}
+        />
+      )}
+    </div>
+  );
+}
+
+/** Parse a thread page's entries, dropping any the Home model rejects. */
+function threadEntries(raw: unknown[]): ThreadEntry[] {
+  return raw.map(asEntry).filter((e): e is ThreadEntry => e !== null);
+}
+
+/** Stages the daemon's `payload.delivery` may carry and the page shows. */
+const STAGES = new Set<string>(["queued", "running", "completed", "failed", "unknown", "refused"]);
+
+/** An operator DM entry from the agent's thread. Its stage is the daemon's
+ *  `payload.delivery.state`, present only for a message-linked entry; an
+ *  unlinked entry or an unknown state shows no stage. */
+function EntryRow({ entry }: { entry: ThreadEntry }) {
+  const who = entry.role === "operator" ? "You" : entry.role === "agent" ? "Agent" : "System";
+  const delivery = entry.payload?.delivery as { state?: unknown } | undefined;
+  const stage = typeof delivery?.state === "string" && STAGES.has(delivery.state) ? delivery.state : null;
+  return (
+    <article className="threads-msg" data-role={entry.role}>
+      <Turn who={who} at={entry.created ? fmtTime(entry.created) : undefined} me={entry.role === "operator"} state={stage}>
+        {entry.text}
+      </Turn>
+    </article>
+  );
+}
+
+function MessageRow({ message, issueProjects }: { message: ThreadMessage; issueProjects: IssueProjects }) {
+  const issueProject = message.issue ? issueProjects.get(message.issue) : undefined;
+  return (
+    <article className="threads-msg" data-role={message.sender.kind} data-state={message.state}>
+      <Turn
+        who={participantLabel(message.sender)}
+        at={fmtTime(message.created)}
+        me={message.sender.kind === "operator"}
+        state={message.state}
+      >
+        {message.body}
+      </Turn>
+      {(message.issue || message.task_id) && (
+        <div className="threads-refs">
+          {message.issue && (issueProject ? (
+            <Link href={issuePath(issueProject, message.issue)} className="threads-ref">{message.issue}</Link>
+          ) : (
+            <span className="threads-ref">{message.issue}</span>
+          ))}
+          {message.task_id && <span className="threads-ref">task {message.task_id}</span>}
+        </div>
+      )}
+    </article>
+  );
+}
+
+/** Every delivery state, in display order: attention states first. */
+const RECEIPT_ORDER: DeliveryState[] = ["failed", "refused", "interrupted", "unknown", "pending", "queued", "claimed", "running", "available", "completed"];
+
+/** A receipt's state for display: an unsupported string shows as Unknown, never a guessed stage. */
+function receiptState(state: string): DeliveryState {
+  return (RECEIPT_ORDER as string[]).includes(state) ? (state as DeliveryState) : "unknown";
+}
+
+/** A topic post: its transcript body and each recipient's real receipt. */
+function PostRow({ post }: { post: TopicPost }) {
+  const operator = post.sender.alias === "operator";
+  return (
+    <article className="threads-msg" data-role={operator ? "operator" : "agent"}>
+      <Turn who={operator ? "You" : post.sender.alias} at={fmtTime(post.created)} me={operator}>
+        {post.body}
+      </Turn>
+      {post.deliveries.length > 0 && <DeliveryFeedback deliveries={post.deliveries} />}
+    </article>
+  );
+}
+
+/** Delivery feedback from the post's real receipts only. One receipt names its
+ *  recipient and state. Several show a count summary by actual state, which
+ *  expands natively into each recipient's own row. */
+function DeliveryFeedback({ deliveries }: { deliveries: PostDelivery[] }) {
+  const counts = new Map<DeliveryState, number>();
+  for (const d of deliveries) {
+    const s = receiptState(d.state);
+    counts.set(s, (counts.get(s) ?? 0) + 1);
+  }
+  const states = RECEIPT_ORDER.filter((s) => counts.has(s));
+  const name = (d: PostDelivery) => (typeof d.alias === "string" && d.alias.trim() !== "" ? d.alias : "Unknown recipient");
+  const removed = (d: PostDelivery) => (d.removed ? " (removed)" : "");
+
+  if (deliveries.length === 1) {
+    const d = deliveries[0];
+    return (
+      <div className="threads-receipts" aria-label="Delivery to members">
+        <span className="threads-receipt-name">{`${name(d)}${removed(d)} · `}</span>
+        <StageLabel state={receiptState(d.state)} />
+      </div>
+    );
+  }
+
+  return (
+    <div className="threads-receipts" aria-label="Delivery to members">
+      <details className="threads-receipt-details">
+        <summary>
+          {states.map((s, i) => (
+            <span key={s}>
+              {i > 0 && " · "}
+              <StageLabel state={s} /> {counts.get(s)}
+            </span>
+          ))}
+        </summary>
+        {states.includes("available") && (
+          <p className="threads-note threads-receipt-note">Available in the recipient’s inbox; not read or seen.</p>
+        )}
+        <ul className="threads-receipt-list">
+          {deliveries.map((d) => (
+            <li key={`${d.uid}:${d.message ?? ""}`} data-removed={d.removed || undefined}>
+              <span className="threads-receipt-name">{`${name(d)}${removed(d)}`}</span>
+              <StageLabel state={receiptState(d.state)} />
+            </li>
+          ))}
+        </ul>
+      </details>
+    </div>
+  );
+}
+
+function OperatorComposer({
+  alias,
+  writeBlock,
+  onSent,
+}: {
+  alias: string;
+  writeBlock: string | null;
+  onSent: () => void;
+}) {
+  // One client id per logical envelope: an exact retry after a failed
+  // attempt reuses it (one DM, not two); any change to the submitted
+  // body, refs or attachments mints a new id.
+  const envelope = useRef<{ key: string; id: string } | null>(null);
+  return (
+    <Composer
+      density="full"
+      block={writeBlock}
+      storeKey={`threads:${alias}`}
+      onSend={async ({ body, refs, attachments }) => {
+        const key = JSON.stringify({ alias, body: body.trim(), refs, attachments: attachments ?? [] });
+        if (envelope.current?.key !== key) envelope.current = { key, id: newMessageId() };
+        await api.threadSend(alias, body, envelope.current.id, refs, undefined, undefined, attachments);
+        envelope.current = null;
+        onSent();
+      }}
+      refocusAfterSend
+      attach
+      ariaLabel={`Message to ${alias}`}
+      placeholder={`Message ${alias}…`}
+      className="card p-2.5 relative"
+    />
+  );
+}
+
+/** Agent-to-agent conversations have no composer. Reply opens a direct message
+ *  to one chosen participant, inside Threads. */
+function ReplyBar({ row, openDm }: { row: ConversationRow; openDm: (alias: string) => void }) {
+  const agents = row.participants.filter((p) => p.kind === "agent" && !p.removed && p.alias);
+  return (
+    <div className="threads-reply">
+      <span>Agent conversation · read only.</span>
+      {agents.map((p) => (
+        <Button key={p.uid ?? p.alias ?? "agent"} variant="secondary" size="sm" onClick={() => openDm(p.alias as string)}>
+          Reply to {p.alias}
+        </Button>
+      ))}
+    </div>
+  );
+}
+
+/** New thread: choose a live agent and open its You ↔ agent conversation. */
+function NewThread({
+  agents,
+  current,
+  onOpen,
+  writeBlock,
+}: {
+  agents: string[];
+  current: string | null;
+  onOpen: (alias: string) => void;
+  writeBlock: string | null;
+}) {
+  const [alias, setAlias] = useState("");
+  return (
+    <form
+      className="threads-newgroup"
+      aria-label="New thread"
+      onSubmit={(e) => {
+        e.preventDefault();
+        if (alias !== "") onOpen(alias);
+      }}
+    >
+      <label>
+        <span className="sr-only">Agent for new thread</span>
+        <select value={alias} onChange={(e) => setAlias(e.target.value)} aria-label="Agent for new thread">
+          <option value="">{agents.length === 0 ? "No live agents" : "Choose an agent"}</option>
+          {agents.map((a) => (
+            <option key={a} value={a}>{a}</option>
+          ))}
+        </select>
+      </label>
+      <Button variant="secondary" size="sm" type="submit" disabled={writeBlock !== null || alias === ""}>
+        New thread
+      </Button>
+      {current && <span className="threads-note">Draft with {current}</span>}
+    </form>
+  );
+}
+
+/** A local draft You ↔ agent conversation. Nothing exists on the server until
+ *  the first valid send; the empty thread read creates nothing. The send
+ *  creates the thread, and the list then offers its canonical row. */
+function DraftDm({
+  alias,
+  writeBlock,
+  threadsTick,
+  liveStamp,
+  onSent,
+}: {
+  alias: string;
+  writeBlock: string | null;
+  threadsTick: number;
+  liveStamp: unknown;
+  onSent: () => void;
+}) {
+  const [entries, setEntries] = useState<ThreadEntry[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    let live = true;
+    // No `conversation` selector: the home read of an alias with no thread is empty.
+    api
+      .thread(alias, { tail: true, limit: 50 })
+      .then((p) => {
+        if (!live) return;
+        setError(null);
+        setEntries(threadEntries(p.entries));
+      })
+      .catch((e: unknown) => {
+        if (live) setError(e instanceof ApiError ? e.message : String(e));
+      });
+    return () => {
+      live = false;
+    };
+  }, [alias, threadsTick, liveStamp]);
+  return (
+    <div className="threads-timeline">
+      <header className="threads-head">
+        <div className="threads-kicker">{KIND_LABEL.operator}</div>
+        <h2>{`You ↔ ${alias}`}</h2>
+      </header>
+      <div className="threads-messages" aria-live="polite">
+        {error ? (
+          <p className="threads-note" role="status">This conversation could not load: {error}</p>
+        ) : entries === null ? (
+          <p className="threads-note">Loading…</p>
+        ) : (
+          <>
+            {entries.map((e) => <EntryRow key={e.seq} entry={e} />)}
+            {entries.length === 0 && <p className="threads-note">No messages yet. Sending starts the thread.</p>}
+          </>
+        )}
+      </div>
+      <OperatorComposer alias={alias} writeBlock={writeBlock} onSent={onSent} />
+    </div>
+  );
+}
+
+/** Live members of a group: current subscribers, not removed. */
+function liveMembers(row: ConversationRow): Participant[] {
+  return row.participants.filter((p) => p.kind === "agent" && !p.removed && p.alias);
+}
+
+/** Logical-envelope identity for a group send: the group composer forwards
+ *  no refs or attachments, so the key is the mode, the target and the body.
+ *  Same key → same client id on retry; a change mints a new id. */
+function groupEnvelopeKey(mode: "post" | "ask", target: string, body: string): string {
+  return JSON.stringify({ mode, target: mode === "ask" ? target : "", body: body.trim() });
+}
+
+/** Group posts notify; Ask agent sends one request to one selected member. */
+function GroupComposer({
+  row,
+  writeBlock,
+  onSent,
+}: {
+  row: ConversationRow;
+  writeBlock: string | null;
+  onSent: () => void;
+}) {
+  const [mode, setMode] = useState<"post" | "ask">("post");
+  const members = liveMembers(row);
+  const [target, setTarget] = useState("");
+  const [notice, setNotice] = useState<string | null>(null);
+  // The id for the current envelope, reused on retry and reset when it changes.
+  const envelope = useRef<{ key: string; id: string } | null>(null);
+  const noMembers = members.length === 0;
+  const askBlocked = mode === "ask" && (noMembers || !members.some((m) => m.alias === target));
+
+  return (
+    <div className="threads-composer threads-group">
+      <div className="threads-mode" role="group" aria-label="Group message type">
+        <button type="button" aria-pressed={mode === "post"} onClick={() => setMode("post")}>Post</button>
+        <button type="button" aria-pressed={mode === "ask"} onClick={() => setMode("ask")}>Ask agent</button>
+        {mode === "ask" && (
+          <label className="threads-target">
+            <span className="sr-only">Member to ask</span>
+            <select value={target} onChange={(e) => setTarget(e.target.value)} aria-label="Member to ask">
+              <option value="">{noMembers ? "No current members" : "Choose a member"}</option>
+              {members.map((m) => (
+                <option key={m.uid ?? m.alias} value={m.alias as string}>{m.alias}</option>
+              ))}
+            </select>
+          </label>
+        )}
+      </div>
+      <p className="threads-note">
+        {mode === "post"
+          ? "A post notifies members. It does not start agents."
+          : "One request, to the member you choose. Nothing else is sent."}
+      </p>
+      <Composer
+        density="full"
+        block={writeBlock !== null ? writeBlock : askBlocked ? "Choose a current member to ask" : null}
+        storeKey={`threads-group:${row.id}`}
+        onSend={async ({ body }) => {
+          const key = groupEnvelopeKey(mode, target, body);
+          if (envelope.current?.key !== key) envelope.current = { key, id: newMessageId() };
+          const id = envelope.current.id;
+          if (mode === "ask") {
+            await requestFromTopic(row.id, target, body, id);
+            onSent();
+          } else {
+            await postToTopic(row.id, body, id);
+            onSent();
+          }
+          envelope.current = null;
+        }}
+        onNotice={setNotice}
+        refocusAfterSend
+        ariaLabel={mode === "post" ? "Post to group" : "Ask one member"}
+        placeholder={mode === "post" ? "Post to the group…" : "Ask one member…"}
+        className="card p-2.5 relative"
+      />
+      {notice && <p className="threads-note" role="status">{notice}</p>}
+    </div>
+  );
+}
+
+/** The participants rail / Context body: the single roster. */
+function ContextPanel({
+  row,
+  writeBlock,
+  onChanged,
+}: {
+  row: ConversationRow;
+  writeBlock: string | null;
+  onChanged: () => void;
+}) {
+  const [error, setError] = useState<string | null>(null);
+  const [alias, setAlias] = useState("");
+  const isGroup = row.kind === "group";
+  const act = async (fn: () => Promise<unknown>) => {
+    setError(null);
+    try {
+      await fn();
+      onChanged();
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e));
+    }
+  };
+  return (
+    <div className="threads-context-body">
+      <h3 className="threads-context-title">Participants</h3>
+      <ul className="threads-roster">
+        {row.participants.map((p) => (
+          <li key={p.uid ?? p.alias ?? p.kind} data-kind={p.kind} data-removed={p.removed || undefined}>
+            <span className="threads-person">
+              <span aria-hidden className="threads-avatar">{initialOf(participantLabel(p))}</span>
+              <span>{participantLabel(p)}</span>
+            </span>
+            {isGroup && p.kind === "agent" && p.alias && !p.removed && (
+              <Button
+                variant="ghost"
+                size="sm"
+                disabled={writeBlock !== null}
+                onClick={() => void act(() => changeSubscriber(row.id, "unsubscribe", p.alias as string))}
+              >
+                Remove
+              </Button>
+            )}
+          </li>
+        ))}
+      </ul>
+      {isGroup && (
+        <form
+          className="threads-add"
+          onSubmit={(e) => {
+            e.preventDefault();
+            const value = alias.trim();
+            if (!value) return;
+            void act(async () => {
+              await changeSubscriber(row.id, "subscribe", value);
+              setAlias("");
+            });
+          }}
+        >
+          <label>
+            <span className="sr-only">Add member by alias</span>
+            <input value={alias} onChange={(e) => setAlias(e.target.value)} placeholder="Add agent alias" />
+          </label>
+          <Button variant="secondary" size="sm" type="submit" disabled={writeBlock !== null || alias.trim() === ""}>Add</Button>
+        </form>
+      )}
+      {error && <p className="threads-note" role="status">{error}</p>}
+      <p className="threads-note">Workspace access applies. Linking work does not grant access.</p>
+    </div>
+  );
+}
+
+/** Operator creates a `fleet:` or `project:` topic (the CAD-810 allowlist). */
+function NewGroup({ writeBlock, onCreated }: { writeBlock: string | null; onCreated: (id: string) => void }) {
+  const [type, setType] = useState<"fleet" | "project">("project");
+  const [source, setSource] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  return (
+    <form
+      className="threads-newgroup"
+      onSubmit={(e) => {
+        e.preventDefault();
+        setError(null);
+        createTopic({ type, source })
+          .then((out) => {
+            setSource("");
+            onCreated(out.topic);
+          })
+          .catch((err: unknown) => setError(err instanceof ApiError ? err.message : String(err)));
+      }}
+    >
+      <label>
+        <span className="sr-only">Group type</span>
+        <select value={type} onChange={(e) => setType(e.target.value as "fleet" | "project")}>
+          <option value="project">project:</option>
+          <option value="fleet">fleet:</option>
+        </select>
+      </label>
+      <label>
+        <span className="sr-only">Group source</span>
+        <input value={source} onChange={(e) => setSource(e.target.value)} placeholder="New group name" />
+      </label>
+      <Button variant="secondary" size="sm" type="submit" disabled={writeBlock !== null || source.trim() === ""}>
+        New group
+      </Button>
+      {error && <p className="threads-note" role="status">{error}</p>}
+    </form>
+  );
+}

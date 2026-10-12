@@ -51,6 +51,14 @@ pub struct Message {
     pub created: f64,
     pub started: Option<f64>,
     pub completed: Option<f64>,
+    /// CAD-819: the daemon-derived sender participant (uid, label). NULL
+    /// on a legacy row, which reads as an unknown sender.
+    pub sender_uid: Option<String>,
+    pub sender: Option<String>,
+    pub recipient_uid: Option<String>,
+    pub recipient: Option<String>,
+    /// The original message a routed copy answers (CAD-819).
+    pub origin: Option<String>,
 }
 
 pub(super) fn row_message(row: &rusqlite::Row) -> rusqlite::Result<Message> {
@@ -75,6 +83,11 @@ pub(super) fn row_message(row: &rusqlite::Row) -> rusqlite::Result<Message> {
         created: row.get("created")?,
         started: row.get("started")?,
         completed: row.get("completed")?,
+        sender_uid: row.get("sender_uid")?,
+        sender: row.get("sender")?,
+        recipient_uid: row.get("recipient_uid")?,
+        recipient: row.get("recipient")?,
+        origin: row.get("origin")?,
     })
 }
 
@@ -99,6 +112,13 @@ impl Message {
     /// unconfirmed paste) never fences the agent.
     pub fn is_nudge(&self) -> bool {
         self.source == NUDGE_SOURCE
+    }
+
+    /// CAD-810: a daemon-origin topic notice. It never owns a turn and never
+    /// reaches the provider: the claim consumes it in the store (see
+    /// `take_queued_app_proven`), so `holds_turn` and `is_routed` stay false.
+    pub fn is_topic_notice(&self) -> bool {
+        self.source == crate::proto::TOPIC_NOTICE_SOURCE
     }
 
     /// CAD-250: a report-owing turn whose paste was delivered and that
@@ -294,7 +314,8 @@ impl Steer<'_> {
 
 /// Sources that never own a turn — [`Message::is_routed`] plus
 /// [`Message::is_nudge`]; they pass the one-turn hold and never hold it.
-const TURNLESS_SOURCES_SQL: &str = "('worker_result','worker_notice','job_event','nudge')";
+const TURNLESS_SOURCES_SQL: &str =
+    "('worker_result','worker_notice','job_event','nudge','topic_notice')";
 
 /// The `unknown` rows that fence an agent: every one except a nudge's,
 /// whose unconfirmed paste belongs to no turn (CAD-250).
@@ -1060,8 +1081,34 @@ impl Store {
         )
     }
 
+    /// CAD-819: the uid of a live agent row, `None` when the alias is gone
+    /// (a routed copy from a removed agent keeps its origin, not a uid).
+    pub(super) fn agent_uid_of_in(
+        &self,
+        tx: &impl super::StoreConn,
+        alias: &str,
+    ) -> Result<Option<String>> {
+        Ok(self.agent_opt_in(tx, alias)?.map(|a| a.uid))
+    }
+
+    /// CAD-819: the stored participant identity for a daemon-derived
+    /// sender: `(uid, label)`. An agent sender carries its uid and alias;
+    /// the operator stores the fixed `operator` label with no uid; an
+    /// unattributed caller stores neither (an unknown sender).
+    fn sender_identity_in(
+        &self,
+        tx: &impl super::StoreConn,
+        sender: &Sender,
+    ) -> Result<(Option<String>, Option<String>)> {
+        Ok(match sender {
+            Sender::Agent(alias) => (Some(self.agent_in(tx, alias)?.uid), Some(alias.clone())),
+            Sender::Operator | Sender::OperatorChat => (None, Some("operator".into())),
+            Sender::Unattributed => (None, None),
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
-    fn enqueue_tx_as(
+    pub(super) fn enqueue_tx_as(
         &self,
         tx: &impl super::StoreConn,
         alias: &str,
@@ -1126,9 +1173,17 @@ impl Store {
             }
             return Ok((true, old.state));
         }
+        // CAD-819: the participant identity is derived by the daemon from
+        // the connection (`sender`) and the recipient row, never a request
+        // field. An unattributed sender keeps NULL: an unknown sender.
+        let recipient = self.agent_in(tx, alias)?;
+        let recipient_uid = recipient.uid.clone();
+        let recipient_label = recipient.alias.clone();
+        let (sender_uid, sender_label) = self.sender_identity_in(tx, sender)?;
         tx.execute(
-            "INSERT INTO messages(id,alias,body,reply_to,source,task_id,issue,worktree,priority,created)
-             VALUES(?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO messages(id,alias,body,reply_to,source,task_id,issue,worktree,priority,created,
+                                  sender_uid,recipient_uid,sender,recipient)
+             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 id,
                 alias,
@@ -1139,7 +1194,11 @@ impl Store {
                 issue,
                 worktree,
                 priority.rank(),
-                now()
+                now(),
+                sender_uid,
+                recipient_uid,
+                sender_label,
+                recipient_label
             ],
         )?;
         Self::event_scoped(
@@ -1153,7 +1212,13 @@ impl Store {
                 "sender": sender.label(),
                 "recipient_identity": reply_recipient
                     .as_ref()
-                    .map(Self::agent_identity),
+                    .map(Self::agent_identity)
+                    // A topic notice binds its own recipient's identity: the
+                    // claim's alias-reuse fence compares it with the live row.
+                    .or_else(|| {
+                        (source == crate::proto::TOPIC_NOTICE_SOURCE)
+                            .then(|| Self::agent_identity(&recipient))
+                    }),
             }),
             None,
             task_id,
@@ -1423,6 +1488,14 @@ impl Store {
             };
             loop {
                 let next = tx.query_row(&next_sql, [alias], row_message).ok();
+                // CAD-810: a topic notice never reaches the actor. It is made
+                // available here, in this transaction, after its provenance and
+                // the recipient's identity are proven; the adapter, the turn
+                // slot, `busy` and `submitting` are never touched.
+                if let Some(notice) = next.as_ref().filter(|m| m.is_topic_notice()) {
+                    self.consume_topic_notice_in(&tx, &agent, notice)?;
+                    continue;
+                }
                 let Some(message) = next else {
                     // A prior routed row in this same transaction may have
                     // been failed as unresolved before the queue became empty.
@@ -1514,6 +1587,67 @@ impl Store {
                 return Ok(Take::Message(Box::new(message)));
             }
         })
+    }
+
+    /// CAD-810: make one daemon topic notice available to its recipient,
+    /// in the claim's transaction. It is never a turn: no adapter call, no
+    /// session switch, no turn slot or token, no `busy`/`submitting`.
+    ///
+    /// Provenance is required, not a source string: the message must have a
+    /// `topic_deliveries` row whose `uid` is the recipient's CURRENT uid and
+    /// whose `message_id` is this message. The enqueue-time identity fence
+    /// (the same binding routed rows use) must also still match, so a reused
+    /// alias never receives a notice queued for its predecessor. A failed
+    /// proof fails the notice closed and no turn starts.
+    ///
+    /// The notice ends `available`: it has been made readable, which is not
+    /// the same as seen. A later explicit read exposes it; nothing here
+    /// marks it completed or delivered to a turn.
+    fn consume_topic_notice_in(
+        &self,
+        tx: &impl super::StoreConn,
+        agent: &Agent,
+        notice: &Message,
+    ) -> Result<()> {
+        let delivery_uid: Option<String> = tx.query_opt(
+            "SELECT uid FROM topic_deliveries WHERE message_id=?",
+            [notice.id.as_str()],
+            |r| r.get(0),
+        )?;
+        let proven = delivery_uid.as_deref() == Some(agent.uid.as_str());
+        let fenced =
+            match self.queued_recipient_identity(tx, &agent.alias, &notice.id, &notice.source)? {
+                Some(expected) => Self::identity_matches(&expected, agent),
+                None => false,
+            };
+        let state = if proven && fenced {
+            "available"
+        } else {
+            "refused"
+        };
+        let reason = if !proven {
+            "delivery_provenance_mismatch"
+        } else if !fenced {
+            "recipient_identity_changed"
+        } else {
+            "ok"
+        };
+        tx.execute(
+            "UPDATE messages SET state=?, result=?, completed=? WHERE id=? AND state='queued'",
+            params![
+                state,
+                json!({"status": state, "via": "topic_notice", "reason": reason}).to_string(),
+                now(),
+                notice.id
+            ],
+        )?;
+        Self::event(
+            tx,
+            &agent.alias,
+            "topic_notice_available",
+            json!({"message": notice.id, "state": state, "reason": reason}),
+        )?;
+        Ok(())
     }
 
     /// Record that the provider acknowledged a turn start.

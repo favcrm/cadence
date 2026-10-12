@@ -15,7 +15,40 @@
 use super::*;
 use crate::master;
 use crate::store::app_records::RecordStore;
+use crate::store::conversations::Scope as WorkScopeRef;
 use crate::store::ConversationKind;
+
+/// The stable id of the unknown/system bucket row (the legacy bucket).
+const UNKNOWN_CONVERSATION: &str = "conv-legacy-unknown";
+
+/// The daemon's resolved filter context for one work list or read. Owns
+/// the uid and repo values so the borrowed store `Scope` can point at them.
+struct WorkScope {
+    include_system: bool,
+    agent_uid: Option<String>,
+    project_uids: Option<Vec<String>>,
+    project_repos: Option<Vec<String>>,
+}
+
+impl WorkScope {
+    fn as_scope(&self) -> WorkScopeRef<'_> {
+        WorkScopeRef {
+            include_system: self.include_system,
+            agent_uid: self.agent_uid.as_deref(),
+            project_uids: self.project_uids.as_deref(),
+            project_repos: self.project_repos.as_deref(),
+        }
+    }
+}
+
+/// A boolean request field, absent meaning `false`; a non-boolean is refused.
+fn optional_bool(params: &Value, field: &str) -> Result<bool> {
+    match params.get(field) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(_) => Err(Error::rejected(format!("{field} must be a boolean"))),
+    }
+}
 
 /// The campaign id of a `campaign:<id>` subject, in the id grammar the
 /// daemon enforces everywhere else.
@@ -37,6 +70,44 @@ fn session_key(thread: Option<&store::Thread>) -> String {
 }
 
 impl Shared {
+    /// A message's participant: an agent by its uid (live alias, or the
+    /// stored label of that uid once removed), the operator by its label,
+    /// and a legacy row with neither is `unknown` and never attributed.
+    fn message_participant(&self, uid: Option<&str>, label: Option<&str>) -> Result<Value> {
+        match (uid, label) {
+            (Some(uid), _) => self.store.participant(uid),
+            (None, Some("operator")) => {
+                Ok(json!({"uid": null, "alias": "operator", "kind": "operator", "removed": false}))
+            }
+            _ => Ok(json!({"uid": null, "alias": null, "kind": "unknown", "removed": false})),
+        }
+    }
+
+    /// A registered project's GitHub repos as lowercase `owner/name`, from
+    /// the tracker's project list (the authority for membership). An
+    /// unknown project is refused.
+    fn project_repos_of(&self, key: &str) -> Result<Vec<String>> {
+        let pm_dir = self.pm_dir()?;
+        let project = crate::issue::project::list(&pm_dir)?
+            .into_iter()
+            .find(|p| p.key == key)
+            .ok_or_else(|| Error::rejected(format!("Unknown project '{key}'")))?;
+        Ok(project
+            .repos
+            .iter()
+            .filter_map(|r| match (&r.remote, &r.path) {
+                (Some(remote), _) => crate::issue::project::normalize_remote(remote)
+                    .strip_prefix("github.com/")
+                    .map(str::to_string),
+                (None, Some(path)) => {
+                    crate::audit::origin_slug(&crate::issue::project::expand_home(path))
+                }
+                _ => None,
+            })
+            .map(|s| s.to_ascii_lowercase())
+            .collect())
+    }
+
     /// CAD-1098 I7: a provider session serves ONE conversation. Before
     /// `message` is delivered, compare its conversation with the one the
     /// last delivered message belonged to (a stored fact, so it holds
@@ -222,6 +293,341 @@ impl Shared {
             "install_id": install,
             "general": general,
             "conversations": rows.iter().map(store::Thread::to_json).collect::<Vec<_>>(),
+        }))
+    }
+
+    /// The daemon's filter context for one list or read. Every value is
+    /// resolved here from the daemon's own rows: the agent's uid from its
+    /// alias, the agents whose registered checkout is in the project, and
+    /// the project's repos. A client never names a uid or a repo.
+    fn work_scope(
+        &self,
+        include_system: bool,
+        agent: Option<&str>,
+        project: Option<&str>,
+    ) -> Result<WorkScope> {
+        let agent_uid = match agent {
+            Some(alias) => Some(
+                self.store
+                    .agent_opt(alias)?
+                    .ok_or_else(|| Error::rejected(format!("Unknown agent '{alias}'")))?
+                    .uid,
+            ),
+            None => None,
+        };
+        let (project_uids, project_repos) = match project {
+            None => (None, None),
+            Some(key) => {
+                let repos = self.project_repos_of(key)?;
+                // The authoritative cwd-to-project mapping (remote first,
+                // then the canonical registered checkout root), so a
+                // checkout with no origin still belongs to its project.
+                let pm_dir = self.pm_dir()?;
+                let mut uids = Vec::new();
+                for agent in self.store.agents()? {
+                    let in_project = crate::issue::project::key_for_cwd(
+                        &pm_dir,
+                        std::path::Path::new(&agent.cwd),
+                    )
+                    .as_deref()
+                        == Some(key);
+                    if in_project {
+                        uids.push(agent.uid);
+                    }
+                }
+                (Some(uids), Some(repos))
+            }
+        };
+        Ok(WorkScope {
+            include_system,
+            agent_uid,
+            project_uids,
+            project_repos,
+        })
+    }
+
+    /// CAD-819 `work_conversation_list {project?, agent?, include_system?}`
+    /// — the operator's cross-agent view: pair rows, the operator's own
+    /// agent row, group rows and the unknown/system bucket, each filtered
+    /// by the same scope the read uses. Operator-only and read-only.
+    pub(super) fn rpc_work_conversation_list(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        reject_unknown_fields(
+            params,
+            &["project", "agent", "include_system"],
+            "work_conversation_list",
+        )?;
+        self.operator_chat("work_conversation_list", peer_pid)?;
+        let include_system = optional_bool(params, "include_system")?;
+        let agent = optional_str(params, "agent");
+        let project = optional_str(params, "project");
+        let scope = self.work_scope(include_system, agent, project)?;
+        let scope_ref = scope.as_scope();
+        let mut rows = Vec::new();
+        for pair in self.store.work_conversation_pairs()? {
+            if !self
+                .store
+                .work_conversation_in_scope(&pair.a_uid, &pair.b_uid, &scope_ref)?
+            {
+                continue;
+            }
+            let (counts, oldest) =
+                self.store
+                    .work_conversation_counts(&pair.a_uid, &pair.b_uid, &scope_ref)?;
+            let preview =
+                match self
+                    .store
+                    .work_conversation_latest(&pair.a_uid, &pair.b_uid, &scope_ref)?
+                {
+                    Some(m) => store::conversations::preview(&m.body)?,
+                    None => String::new(),
+                };
+            // Every stored state is counted; the six named states always
+            // appear, even at zero.
+            let mut state_counts: serde_json::Map<String, Value> = [
+                "queued",
+                "claimed",
+                "running",
+                "completed",
+                "failed",
+                "unknown",
+            ]
+            .iter()
+            .map(|s| (s.to_string(), json!(0)))
+            .collect();
+            for (state, n) in counts {
+                state_counts.insert(state, json!(n));
+            }
+            let participants = [
+                self.store.participant(&pair.a_uid)?,
+                self.store.participant(&pair.b_uid)?,
+            ];
+            rows.push(json!({
+                "id": pair.id,
+                "kind": "pair",
+                "participants": participants,
+                "last": {"preview": preview, "at": pair.last_at},
+                "counts": state_counts,
+                "oldest_unhandled_at": oldest,
+                "last_activity": pair.last_at,
+            }));
+        }
+        // The operator's own chat with an agent: its home thread. Under an
+        // agent filter only that agent's row; under a project scope only
+        // agents whose checkout is in the project.
+        if agent.is_some() || project.is_none() {
+            for thread in self.store.home_threads()? {
+                if agent.is_some_and(|f| f != thread.alias) {
+                    continue;
+                }
+                if let Some(uids) = &scope.project_uids {
+                    let uid = self.store.agent_opt(&thread.alias)?.map(|a| a.uid);
+                    if !uid.is_some_and(|u| uids.contains(&u)) {
+                        continue;
+                    }
+                }
+                let uid = self.store.agent_opt(&thread.alias)?.map(|a| a.uid);
+                rows.push(json!({
+                    "id": thread.id,
+                    "kind": "operator",
+                    "participants": [
+                        {"uid": null, "alias": "operator", "kind": "operator", "removed": false},
+                        match uid {
+                            Some(uid) => self.store.participant(&uid)?,
+                            None => json!({"uid": null, "alias": thread.alias, "kind": "agent", "removed": true}),
+                        },
+                    ],
+                    "last_activity": thread.updated,
+                }));
+            }
+        }
+        // Group rows: a topic whose source is the project (`project:<key>`)
+        // or that has an in-scope subscriber. Read-only.
+        for (topic, members, posts, last_at) in self.store.topic_listing()? {
+            let subscribers = self.store.topic_subscribers(&topic.id)?;
+            if let Some(key) = project {
+                let by_source = topic.kind == "project" && topic.source == key;
+                let by_member = scope
+                    .project_uids
+                    .as_ref()
+                    .is_some_and(|uids| subscribers.iter().any(|u| uids.contains(u)));
+                if !by_source && !by_member {
+                    continue;
+                }
+            }
+            if let Some(uid) = &scope.agent_uid {
+                if !subscribers.iter().any(|u| u == uid) {
+                    continue;
+                }
+            }
+            let participants: Vec<Value> = subscribers
+                .iter()
+                .map(|uid| self.store.participant(uid))
+                .collect::<Result<_>>()?;
+            rows.push(json!({
+                "id": topic.id,
+                "kind": "group",
+                "type": topic.kind,
+                "source": topic.source,
+                "members": members,
+                "participants": participants,
+                "posts": posts,
+                "last_activity": last_at,
+            }));
+        }
+        // The unknown/system bucket: rows with no recorded sender, one
+        // explicit row, with the same scope as the read below it.
+        let (count, latest_seq, latest_at) = self.store.work_unknown_summary(&scope_ref)?;
+        if count > 0 {
+            rows.push(json!({
+                "id": UNKNOWN_CONVERSATION,
+                "kind": "unknown",
+                "participants": [],
+                "last": {"preview": "", "at": latest_at},
+                "counts": {"unknown": count},
+                "last_activity": latest_at,
+                "latest_seq": latest_seq,
+            }));
+        }
+        Ok(json!({"conversations": rows}))
+    }
+
+    /// CAD-819 `work_conversation_read {conversation, tail?|before?|after?,
+    /// limit?, project?, agent?, include_system?}` — one page of a pair, or of
+    /// the unknown bucket, under the same scope the list used. Operator-only,
+    /// read-only, never drains.
+    pub(super) fn rpc_work_conversation_read(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        reject_unknown_fields(
+            params,
+            &[
+                "conversation",
+                "tail",
+                "before",
+                "after",
+                "limit",
+                "project",
+                "agent",
+                "include_system",
+            ],
+            "work_conversation_read",
+        )?;
+        self.operator_chat("work_conversation_read", peer_pid)?;
+        let id = required_str(params, "conversation")?;
+        crate::proto::identifier(id, "conversation ID")?;
+        let before = optional_i64(params, "before");
+        let after = optional_i64(params, "after");
+        if before.is_some() && after.is_some() {
+            return Err(Error::rejected(
+                "work_conversation_read takes before or after, not both",
+            ));
+        }
+        let limit = optional_i64(params, "limit").unwrap_or(50);
+        if !(1..=store::THREAD_PAGE_MAX).contains(&limit) {
+            return Err(Error::rejected(format!(
+                "Conversation page limit must be 1-{}",
+                store::THREAD_PAGE_MAX
+            )));
+        }
+        let include_system = optional_bool(params, "include_system")?;
+        let agent = optional_str(params, "agent");
+        let project = optional_str(params, "project");
+        let scope = self.work_scope(include_system, agent, project)?;
+        let scope_ref = scope.as_scope();
+
+        // The unknown bucket: its own identity, recipient-scoped read.
+        let unknown = id == UNKNOWN_CONVERSATION;
+        let pair = if unknown {
+            None
+        } else {
+            Some(
+                self.store
+                    .work_conversation_pairs()?
+                    .into_iter()
+                    .find(|p| p.id == id)
+                    .ok_or_else(|| Error::rejected("Unknown conversation"))?,
+            )
+        };
+        let messages = match &pair {
+            Some(p) => self
+                .store
+                .work_conversation_messages(&p.a_uid, &p.b_uid, &scope_ref, before, after, limit)?,
+            None => self
+                .store
+                .work_unknown_messages(&scope_ref, before, after, limit)?,
+        };
+        let cursor = messages.last().map(|m| m.seq).unwrap_or(0);
+        let more_before = match (messages.first(), &pair) {
+            (Some(first), Some(p)) => self
+                .store
+                .work_conversation_has_before(&p.a_uid, &p.b_uid, first.seq, &scope_ref)?,
+            (Some(first), None) => !self
+                .store
+                .work_unknown_messages(&scope_ref, Some(first.seq), None, 1)?
+                .is_empty(),
+            (None, _) => false,
+        };
+        let mut out = Vec::with_capacity(messages.len());
+        for m in messages
+            .iter()
+            .filter(|m| include_system || !store::conversations::is_system(m))
+        {
+            out.push(json!({
+                "id": m.id,
+                "seq": m.seq,
+                "conversation": id,
+                "system": store::conversations::is_system(m),
+                "sender": self.message_participant(m.sender_uid.as_deref(), m.sender.as_deref())?,
+                "recipient": self.message_participant(m.recipient_uid.as_deref(), m.recipient.as_deref())?,
+                "body": store::conversations::body(&m.body),
+                "source": m.source,
+                "state": m.state,
+                "result": m.result,
+                "error": m.error,
+                "origin": m.origin,
+                "task_id": m.task_id,
+                "issue": m.issue,
+                "created": m.created,
+                "started": m.started,
+                "completed": m.completed,
+            }));
+        }
+        // Routed copies nest under the message they answer (`origin`).
+        if let Some(p) = &pair {
+            let routed = self.store.work_conversation_routed_of(
+                &p.a_uid,
+                &p.b_uid,
+                &messages.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+            )?;
+            for row in out.iter_mut() {
+                let mid = row["id"].as_str().unwrap_or_default().to_string();
+                let copies: Vec<Value> = routed
+                    .iter()
+                    .filter(|c| c["origin"].as_str() == Some(mid.as_str()))
+                    .cloned()
+                    .collect();
+                row["routed"] = Value::Array(copies);
+            }
+        }
+        let conversation = match &pair {
+            Some(p) => json!({"id": p.id, "kind": "pair",
+            "participants": [
+                self.store.participant(&p.a_uid)?,
+                self.store.participant(&p.b_uid)?,
+            ]}),
+            None => json!({"id": UNKNOWN_CONVERSATION, "kind": "unknown", "participants": []}),
+        };
+        Ok(json!({
+            "conversation": conversation,
+            "messages": out,
+            "cursor": cursor,
+            "more_before": more_before,
         }))
     }
 

@@ -549,6 +549,20 @@ impl Store {
         self.read_tx(|conn| Self::thread_in(&conn, alias))
     }
 
+    /// CAD-819 operator rows: every live home thread (the operator's own
+    /// chat with an agent, `install_id` NULL). App installation threads are
+    /// excluded by that filter, so the work view never shows app chats.
+    pub fn home_threads(&self) -> Result<Vec<Thread>> {
+        self.read_tx(|conn| {
+            Ok(conn.query_vec(
+                "SELECT * FROM threads WHERE alias IS NOT NULL AND install_id IS NULL
+                  ORDER BY updated DESC",
+                [],
+                row_thread,
+            )?)
+        })
+    }
+
     fn thread_in(conn: &impl super::StoreConn, alias: &str) -> Result<Option<Thread>> {
         Ok(conn
             .query_row(

@@ -12,6 +12,7 @@ use super::effects;
 use super::messages::{Message, FENCING_UNKNOWN_SQL};
 use super::platform;
 use super::threads;
+use super::topics;
 use super::StoreConn;
 use super::{Store, BUSY_TIMEOUT};
 
@@ -1042,6 +1043,58 @@ impl Store {
                     "CREATE INDEX IF NOT EXISTS msg_state ON messages(state);
                      CREATE INDEX IF NOT EXISTS tasks_assignee ON tasks(assignee, state);",
                 )?;
+                tx.commit()?;
+            }
+            if version < 38 {
+                // CAD-819: the durable participant identity and the
+                // daemon-derived sender/recipient/origin on each message.
+                // Column adds are skipped when present, and the uid backfill
+                // and index run in the same transaction, so a half-applied
+                // v38 converges on reopen. Old message rows stay NULL: they
+                // render as an unknown sender, never inferred from events.
+                let agent_columns: Vec<String> = conn
+                    .prepare("PRAGMA table_info(agents)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(std::result::Result::ok)
+                    .collect();
+                let message_columns: Vec<String> = conn
+                    .prepare("PRAGMA table_info(messages)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(std::result::Result::ok)
+                    .collect();
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                if !agent_columns.iter().any(|c| c == "uid") {
+                    tx.execute_batch("ALTER TABLE agents ADD COLUMN uid TEXT")?;
+                }
+                for column in [
+                    "sender_uid",
+                    "recipient_uid",
+                    "sender",
+                    "recipient",
+                    "origin",
+                ] {
+                    if !message_columns.iter().any(|c| c == column) {
+                        tx.execute_batch(&format!(
+                            "ALTER TABLE messages ADD COLUMN {column} TEXT"
+                        ))?;
+                    }
+                }
+                tx.execute_batch(
+                    "UPDATE agents SET uid='agt-' || lower(hex(randomblob(16))) WHERE uid IS NULL;
+                     CREATE UNIQUE INDEX IF NOT EXISTS agents_uid ON agents(uid);
+                     CREATE INDEX IF NOT EXISTS messages_conversation
+                       ON messages(sender_uid, recipient_uid, seq);",
+                )?;
+                tx.execute("UPDATE schema_version SET version=38", [])?;
+                tx.commit()?;
+            }
+            if version < 39 {
+                // CAD-810: topics, subscriptions and the shared transcript.
+                // New objects only, `IF NOT EXISTS`, one transaction: a
+                // half-applied v39 converges on reopen.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(topics::SCHEMA_V39)?;
+                tx.execute("UPDATE schema_version SET version=39", [])?;
                 tx.commit()?;
             }
             if let Some(crossing) = permit.crossing {
