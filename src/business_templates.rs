@@ -377,6 +377,7 @@ pub fn build_draft(spec: &TemplateSpec, data: &DocumentData) -> Result<Draft> {
             if field.required {
                 return refuse(format!("required field '{}' is missing", field.key));
             }
+            fields.insert(field.key.clone(), String::new());
             continue;
         }
         let normalized = match field.kind {
