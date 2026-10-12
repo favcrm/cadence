@@ -374,7 +374,7 @@ fn write_fixture(manifest_dir: &Path, targets: &[String]) {
     fs::create_dir_all(manifest_dir.join("src")).unwrap();
     fs::create_dir_all(manifest_dir.join("tests")).unwrap();
     let mut manifest = String::from(
-        "[package]\nname = \"cadence-agent\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[features]\ntest-seam = []\n\n[lib]\npath = \"src/lib.rs\"\n\n[[bin]]\nname = \"cadence-fixture\"\npath = \"src/main.rs\"\n",
+        "[package]\nname = \"cadence-agent\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[features]\ntest-seam = []\n\n[lib]\npath = \"src/lib.rs\"\n\n[[bin]]\nname = \"cadence-fixture\"\npath = \"src/main.rs\"\n\n[profile.test]\ndebug = false\n",
     );
     fs::write(manifest_dir.join("src/lib.rs"), rust_test_body("lib")).unwrap();
     fs::write(

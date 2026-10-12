@@ -3197,6 +3197,47 @@ mod tests {
         assert_eq!(status, 200);
     }
 
+    /// Virtual clock over the real transport (CAD-1387): `now` is a
+    /// monotonic baseline plus recorded virtual seconds, `wait` records
+    /// the interval and advances virtual time by it, and `post_public`
+    /// delegates to the exact production [`post_public_with_access`]
+    /// ingress — real loopback HTTP, PKCE, grant and access checks all
+    /// still run; only the incidental first-poll wait leaves wall time.
+    struct VirtualWaitRealTransportRuntime {
+        baseline: Instant,
+        virtual_secs: u64,
+        waits: Vec<u64>,
+    }
+
+    impl VirtualWaitRealTransportRuntime {
+        fn new() -> Self {
+            Self {
+                baseline: Instant::now(),
+                virtual_secs: 0,
+                waits: Vec::new(),
+            }
+        }
+    }
+
+    impl LoginRuntime for VirtualWaitRealTransportRuntime {
+        fn now(&mut self) -> Instant {
+            self.baseline + Duration::from_secs(self.virtual_secs)
+        }
+        fn wait(&mut self, interval: Duration) {
+            self.virtual_secs += interval.as_secs();
+            self.waits.push(interval.as_secs());
+        }
+        fn post_public(
+            &mut self,
+            issuer: &str,
+            path: &str,
+            body: Value,
+            access: Option<&AccessIngress>,
+        ) -> Result<(u16, Value)> {
+            post_public_with_access(issuer, path, body, access)
+        }
+    }
+
     /// Scripted enrollment issuer on the same LoginRuntime seam the
     /// login tests use (CAD-1341): virtual monotonic clock records
     /// every wait, `post_public` replays the token-error script, so
@@ -3960,7 +4001,8 @@ mod tests {
         let (continue_tx, continue_rx) = std::sync::mpsc::channel();
         let browser_dir = dir.clone();
         let browser = thread::spawn(move || {
-            enroll_browser(
+            let mut runtime = VirtualWaitRealTransportRuntime::new();
+            let out = enroll_browser_with(
                 &issuer,
                 "ws_real",
                 "https://real.board.example.test",
@@ -3971,7 +4013,9 @@ mod tests {
                     continue_rx.recv().unwrap();
                     Ok(())
                 },
-            )
+                &mut runtime,
+            );
+            (out, runtime.waits)
         });
         shown_rx.recv().unwrap();
         let (remove_started_tx, remove_started_rx) = std::sync::mpsc::channel();
@@ -3985,7 +4029,9 @@ mod tests {
         remove_started_rx.recv().unwrap();
         assert!(removed_rx.recv_timeout(Duration::from_millis(40)).is_err());
         continue_tx.send(()).unwrap();
-        assert!(format!("{}", browser.join().unwrap().unwrap_err()).contains("denied"));
+        let (browser_out, browser_waits) = browser.join().unwrap();
+        assert_eq!(browser_waits, [5]);
+        assert!(format!("{}", browser_out.unwrap_err()).contains("denied"));
         removing.join().unwrap();
         removed_rx.recv().unwrap().unwrap();
         let listener = server.join().unwrap();
@@ -4088,15 +4134,25 @@ mod tests {
         let dir = root.path().join("e");
         trust(&dir, &issuer);
         access_file(&dir, &issuer);
-        let info = enroll_browser(&issuer, "ws_real", audience, "worker", &dir, |url, code| {
-            assert_eq!(
-                url,
-                "https://app.agenticos.test/device/hosted-cadence?code=K7PM-2QNF"
-            );
-            assert_eq!(code, "K7PM-2QNF");
-            Ok(())
-        })
+        let mut runtime = VirtualWaitRealTransportRuntime::new();
+        let info = enroll_browser_with(
+            &issuer,
+            "ws_real",
+            audience,
+            "worker",
+            &dir,
+            |url, code| {
+                assert_eq!(
+                    url,
+                    "https://app.agenticos.test/device/hosted-cadence?code=K7PM-2QNF"
+                );
+                assert_eq!(code, "K7PM-2QNF");
+                Ok(())
+            },
+            &mut runtime,
+        )
         .unwrap();
+        assert_eq!(runtime.waits, [5]);
         server.join().unwrap();
         assert_eq!(info.subject_id(), "user_1");
         assert!(with_current(
