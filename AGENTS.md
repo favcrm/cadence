@@ -341,8 +341,8 @@ Only an explicit operator-approved ticket can open one; the rules are in
   preferences only within the applicable runtime allowlist and higher-priority
   instructions. `high` means high, not max. Agents must not change runtime
   pins, credentials or installed packages to authorize their own launch.
-  Follow [the model selection and refresh runbook](docs/AGENT-MODELS.md)
-  for exact-ID discovery, bounded recovery and owned-session changes.
+  The CLI and operator-owned runtime policy enforce launch permissions;
+  these instructions do not grant additional authority.
   A draft cannot authorize its own review; running contexts do not
   automatically reload edited instructions.
 - **OpenCode Go subscription:** the current Muse 1.3 id is

@@ -244,8 +244,8 @@ unvetted build.
 
 ### Which models to use
 
-Use [the model selection and refresh runbook](AGENT-MODELS.md) for current
-preferences, exact catalog IDs, effort, quota recovery and future updates.
+See [the repository model instructions](../AGENTS.md#pi-agents-and-models-cad-559-cad-855).
+The CLI and operator-owned runtime policy enforce launch permissions.
 An explicit authenticated operator selection takes precedence over those
 preferences, within the applicable runtime allowlist and instructions.
 Workers and reviewers use Pi; Devin is not an exclusive model transport.
