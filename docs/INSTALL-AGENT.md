@@ -3,17 +3,19 @@
 [Cadence 0.1.0](https://github.com/favcrm/cadence/releases/tag/v0.1.0)
 is the published stable local CLI release (`latest=true`), built from source
 `4066ddab844a318a85c3bc286392ec927a600a5c` by tag run `38201476703` attempt 1
-with build-provenance attestations. Anonymous published-mode installation
-verification on the three native targets is pending the reviewed CAD-1400
-workflow's first real run and is not claimed until it is recorded; the earlier
-beta.2 anonymous install run
-([36337031674](https://github.com/favcrm/cadence/actions/runs/36337031674))
-verified the same installer path against a prerelease package. Under CAD-1400
-the tag run itself now installs the exact candidate on all three targets
-(`release-install`) before the `release` environment approval can publish;
-tag-run candidate `38203278770` installed successfully on aarch64-linux and
-aarch64-macos while the x86_64-linux leg refused the artifact before
-installation (the verifier gap CAD-1400 fixes).
+with build-provenance attestations. Anonymous public downloads and native
+installation passed on Linux x86_64, Linux ARM64 and Apple Silicon macOS in
+[run 38213520059, attempt 1](https://github.com/favcrm/cadence/actions/runs/38213520059).
+The consumer workflow used reviewed main source
+`b27a8ead58d471db6a88efeea03bba8433b0f700`; the installed package remained
+pinned to the v0.1.0 source and producing run above. On every target, default
+and custom-prefix installation, exact version, archive/binary checksums,
+installed manifest equality and same-version rerun stability passed without
+Rust, Node or GitHub login in the installation environment.
+
+CAD-1400 also added a three-target `release-install` gate before publication
+approval. That tag-only gate awaits its first future authorized release tag;
+it did not run retroactively on immutable v0.1.0.
 This install-only proof does not complete CAD-317's setup, headless wizard or
 backup/restore acceptance, or establish compatibility with existing production
 state; it is not a production rollout.
