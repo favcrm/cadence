@@ -36,15 +36,6 @@ pub(super) fn open_migration_for_test(path: &Path) -> Result<Store> {
 }
 
 fn validate_chat_file_owner_shape(conn: &Connection) -> Result<()> {
-    let has_chat_files: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='chat_files')",
-        [],
-        |row| row.get(0),
-    )?;
-    if !has_chat_files {
-        return Ok(());
-    }
-
     let columns = {
         let mut stmt = conn.prepare("PRAGMA table_info(chat_files)")?;
         let rows = stmt.query_map([], |row| {
