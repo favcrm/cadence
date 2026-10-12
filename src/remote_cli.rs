@@ -96,6 +96,18 @@ pub const REMOTE_VERBS: &[&str] = &[
 /// other verb is refused locally, before a request.
 pub const WIKI_ACTIONS: &[&str] = &["enumerate", "read", "write"];
 
+/// The argument keys each wiki action may send (CAD-1401). Any other key —
+/// an authority-shaped one such as `actor` or `as` included — is refused
+/// locally, before a request. Unknown actions get no keys (fail closed).
+fn wiki_argument_keys(action: &str) -> &'static [&'static str] {
+    match action {
+        "enumerate" => &["path", "q"],
+        "read" => &["path"],
+        "write" => &["path", "text", "if_rev"],
+        _ => &[],
+    }
+}
+
 /// The hosted relay a verb rides: the cli envelope or the wiki envelope. It is
 /// chosen by the verb name on the shared path, so a wiki action never travels
 /// the cli route and a cli verb never travels the wiki route.
@@ -127,7 +139,7 @@ pub struct RemoteTarget {
 }
 
 const SESSION_VERSION: &str = "hosted-cadence-cli-session.v1";
-const CAPABILITIES: &[&str] = &["cli.read", "cli.write"];
+const CAPABILITIES: &[&str] = &["cli.read", "cli.write", "wiki.read", "wiki.write"];
 const RENEW_BEFORE: u64 = 60;
 const SKEW: u64 = 5;
 const RENEWAL_WAIT: Duration = Duration::from_secs(20);
@@ -763,9 +775,12 @@ fn call_once(
     };
     let envelope = authorize(target, cred, surface, scopes)?;
     let (relay, version) = surface.relay();
+    // A wiki body always carries `arguments` (`{}` when there are none).
     let mut body = match surface {
         Surface::Cli => json!({"version": version, "envelope": envelope, "verb": verb}),
-        Surface::Wiki => json!({"version": version, "envelope": envelope, "action": verb}),
+        Surface::Wiki => {
+            json!({"version": version, "envelope": envelope, "action": verb, "arguments": {}})
+        }
     };
     if !arguments.is_empty() {
         body["arguments"] = Value::Object(arguments.clone());
@@ -935,6 +950,14 @@ fn call_verb_in(
             "verb '{verb}' is not in the remote allowlist — never sent"
         )));
     };
+    if matches!(surface, Surface::Wiki) {
+        let allowed = wiki_argument_keys(verb);
+        if let Some(key) = arguments.keys().find(|k| !allowed.contains(&k.as_str())) {
+            return Err(reject(format!(
+                "wiki {verb} argument '{key}' is not in the allowlist — never sent"
+            )));
+        }
+    }
     let deadline = Instant::now() + Duration::from_secs(wake_timeout);
     loop {
         let cred = renewed_credential(dir, target, deadline)?;

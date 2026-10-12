@@ -1461,7 +1461,7 @@ fn slug(value: &str) -> bool {
 
 /// Accept only an owner grant for exactly the requested workspace and
 /// audience (`https://<slug>.cadencecloud.app`), with exactly the requested
-/// `cli.read` and `cli.write` capabilities. The issuer binds slug to workspace
+/// `cli.read`, `cli.write`, `wiki.read` and `wiki.write` capabilities. The issuer binds slug to workspace
 /// itself; the response carries no slug field.
 fn login_grant(
     value: &Value,
@@ -1481,12 +1481,12 @@ fn login_grant(
     let caps = value["capabilities"]
         .as_array()
         .ok_or_else(|| reject("Invalid hosted login capabilities"))?;
-    let exact_cli = caps.len() == 2
+    let exact_caps = caps.len() == 4
         && caps
             .iter()
             .filter_map(Value::as_str)
             .collect::<BTreeSet<_>>()
-            == BTreeSet::from(["cli.read", "cli.write"]);
+            == BTreeSet::from(["cli.read", "cli.write", "wiki.read", "wiki.write"]);
     if !exact_fields(
         value,
         &[
@@ -1521,7 +1521,7 @@ fn login_grant(
         || field(principal, "kind")? != "user"
         || field(principal, "current_role")? != "owner"
         || !id(field(principal, "subject_id")?)
-        || !exact_cli
+        || !exact_caps
         || field(credential, "token_type")? != "Bearer"
         || field(credential, "renewal")? != "reexchange"
         || !token(field(credential, "access_token")?, "hct_")
@@ -1758,7 +1758,7 @@ fn login_device_flow(
         .encode(Sha256::digest(verifier.as_bytes()));
     confirm_login_access_ingress(dir, &issuer, &access)?;
     let mut request = json!({"version":DEVICE_VERSION,
-        "client_label":"cadence-cli","requested_capabilities":["cli.read","cli.write"],
+        "client_label":"cadence-cli","requested_capabilities":["cli.read","cli.write","wiki.read","wiki.write"],
         "code_challenge":challenge,"cli_session":"renewable"});
     if let (Some(org), Some(hint)) = (org, hint) {
         request["organization_id"] = json!(org);
@@ -3450,7 +3450,7 @@ mod tests {
         let at = now().unwrap();
         json!({"version":VERSION,"organization_id":"ws_real","audience":LOGIN_ENDPOINT,
             "principal":{"kind":"user","subject_id":"user_1","current_role":"owner"},
-            "capabilities":["cli.read","cli.write"],
+            "capabilities":["cli.read","cli.write","wiki.read","wiki.write"],
             "credential":{"credential_id":"hcp_credential","access_token":BRIDGE,
                 "token_type":"Bearer","issued_at":at,"expires_at":at+120,"renewal":"reexchange"},
             "cli_session":{"session_id":"hcs_00000000-0000-4000-8000-000000000001",
@@ -3530,7 +3530,8 @@ mod tests {
                 if !real_code_request_ok(&body)
                     || body["organization_id"] != "ws_real"
                     || body["audience"] != LOGIN_ENDPOINT
-                    || body["requested_capabilities"] != json!(["cli.read", "cli.write"])
+                    || body["requested_capabilities"]
+                        != json!(["cli.read", "cli.write", "wiki.read", "wiki.write"])
                 {
                     return Ok((400, json!({"error":"invalid_request"})));
                 }
@@ -3638,7 +3639,7 @@ mod tests {
                 assert_eq!(body["client_label"], "cadence-cli");
                 assert_eq!(
                     body["requested_capabilities"],
-                    json!(["cli.read", "cli.write"])
+                    json!(["cli.read", "cli.write", "wiki.read", "wiki.write"])
                 );
                 assert!(body.get("organization_id").is_none());
                 assert!(body.get("audience").is_none());
@@ -3739,12 +3740,12 @@ mod tests {
 
     #[test]
     fn hosted_portal_requires_exact_requested_capabilities_before_storage() {
-        // The issuer may return the two requested capabilities in either
-        // order, but an additional CLI capability is outside the consent.
+        // The issuer may return the requested capabilities in either
+        // order, but an additional capability is outside the consent.
         let root = tempfile::tempdir().unwrap();
         let mut reordered = login_grant_body();
         reordered["organization_slug"] = json!("acme");
-        reordered["capabilities"] = json!(["cli.write", "cli.read"]);
+        reordered["capabilities"] = json!(["cli.write", "wiki.write", "cli.read", "wiki.read"]);
         let dir = root.path().join("reordered/auth");
         let (out, runtime) = run_portal_acceptance(None, reordered, &dir);
         assert!(
@@ -3755,11 +3756,23 @@ mod tests {
         assert_nothing_stored(&dir);
 
         for (case, capabilities) in [
-            ("extra-admin", json!(["cli.read", "cli.write", "cli.admin"])),
-            ("missing-write", json!(["cli.read"])),
+            (
+                "extra-admin",
+                json!([
+                    "cli.read",
+                    "cli.write",
+                    "wiki.read",
+                    "wiki.write",
+                    "cli.admin"
+                ]),
+            ),
+            (
+                "missing-wiki-write",
+                json!(["cli.read", "cli.write", "wiki.read"]),
+            ),
             (
                 "duplicate-read",
-                json!(["cli.read", "cli.read", "cli.write"]),
+                json!(["cli.read", "cli.read", "cli.write", "wiki.read"]),
             ),
         ] {
             let mut grant = login_grant_body();
