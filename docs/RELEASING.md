@@ -23,9 +23,10 @@ working public install path. The public stable updater is still not implemented;
 `cadence update`/`upgrade` continue to use the authenticated internal channel.
 
 The immutable `v0.1.0-beta.1` tag failed its macOS UI build and retains a private
-draft; it has no published installation assets. The checklist and note template
-below preserve the prepublication process for future candidates; their pending
-placeholders are historical preparation, not the beta.2 publication record.
+draft; it has no published installation assets. The beta.2 publication record
+above is complete. The stable 0.1.0 annex below is an intentionally pending
+future-candidate template; its placeholders are not release evidence or a claim
+that v0.1.0 is published.
 
 ## Historical preparation: beta.2 candidate selection
 
