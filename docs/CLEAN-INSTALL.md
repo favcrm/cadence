@@ -27,12 +27,24 @@ In `candidate` mode the helper uses a read-only token only in the acquisition
 step. It verifies the canonical repository, tag-push `ci.yml` identity, peeled
 tag, source ancestry, exact attempt, all five required checks, `release-gate`
 and all three successful native release builds. A protected publisher waiting
-for approval is supported; a failed, cancelled or skipped required job is refused.
+for approval is supported, as are sibling install legs still acquiring — the
+classifier requires no job beyond that set, so no producer-run deadlock or
+self-run bypass exists. A failed, cancelled or skipped required job is refused.
 Complete paginated inventories and a unique live artifact are required. Pending
 inventory is bounded to 20 minutes; failure is never retried into success.
 Verified archive bytes are materialized into an owned `file://` mirror because
 the installer intentionally refuses an HTTP mirror. This is pre-publication
 artifact proof, not public-download or publisher-authenticity proof.
+
+Since CAD-1400, the tag run's own `release-install` matrix reuses this
+candidate-mode acquisition plus the harness on all three native runners,
+pinned to `github.ref_name`/`github.sha`/`github.run_id`/`github.run_attempt`.
+`release-publish` needs it, so a missing or failed native install leg blocks
+the `release` environment approval automatically; the separate dispatch below
+remains for published-mode verification and ad-hoc candidate checks. The
+acquired x86 ZIP may carry the exact CAD-1272 toolchain archive/checksum pair
+(or, for pre-CAD-1272 artifacts, only the package pair); every other entry is
+refused and the pair's recorded checksum is verified, never executed.
 
 In `published` mode acquisition uses anonymous actual tag-specific GitHub release
 URLs, without `gh`, a bearer token, inherited proxies or a mirror. The supplied

@@ -1,18 +1,26 @@
 # Native installation
 
-[Cadence 0.1.0-beta.2](https://github.com/favcrm/cadence/releases/tag/v0.1.0-beta.2)
-is the published local CLI pilot. Anonymous installation, exact version,
-default/custom prefixes and same-version reruns were verified on native Ubuntu
-22.04 x86_64/ARM64 and macOS 14 Apple Silicon in the
-[anonymous published-mode validation](https://github.com/favcrm/cadence/actions/runs/36337031674).
-The immutable release notes separately record source/build and prepublication
-candidate installation evidence.
+[Cadence 0.1.0](https://github.com/favcrm/cadence/releases/tag/v0.1.0)
+is the published stable local CLI release (`latest=true`), built from source
+`4066ddab844a318a85c3bc286392ec927a600a5c` by tag run `38201476703` attempt 1
+with build-provenance attestations. Anonymous published-mode installation
+verification on the three native targets is pending the reviewed CAD-1400
+workflow's first real run and is not claimed until it is recorded; the earlier
+beta.2 anonymous install run
+([36337031674](https://github.com/favcrm/cadence/actions/runs/36337031674))
+verified the same installer path against a prerelease package. Under CAD-1400
+the tag run itself now installs the exact candidate on all three targets
+(`release-install`) before the `release` environment approval can publish;
+tag-run candidate `38203278770` installed successfully on aarch64-linux and
+aarch64-macos while the x86_64-linux leg refused the artifact before
+installation (the verifier gap CAD-1400 fixes).
 This install-only proof does not complete CAD-317's setup, headless wizard or
 backup/restore acceptance, or establish compatibility with existing production
-state. It is a prerelease, not a stable `latest` release or production rollout.
+state; it is not a production rollout.
 
 The immutable `v0.1.0-beta.1` tag failed its macOS UI build and has no
-published installation assets. Use **v0.1.0-beta.2** explicitly.
+published installation assets; `v0.1.0-beta.2` remains installable only by
+explicit tag.
 
 ## Platforms and prerequisites
 
@@ -74,22 +82,23 @@ removal is not required for rollback.
 
 ## Install an available version
 
-For a pilot prerelease, copy its exact tag from the release list. GitHub's
-`latest` endpoint excludes prereleases. Set `release_tag` to the published
-tag before running these commands:
+The published stable release installs through `latest`:
+
+```sh
+curl -fsSL https://github.com/favcrm/cadence/releases/latest/download/install.sh -o install.sh
+sh install.sh
+"$HOME/.local/bin/cadence" --version
+```
+
+For a prerelease or an older version, copy its exact tag from the release
+list. GitHub's `latest` endpoint excludes prereleases. Set `release_tag` to
+the published tag before running these commands:
 
 ```sh
 release_tag=v0.1.0-beta.2 # published local CLI pilot
 curl -fsSL "https://github.com/favcrm/cadence/releases/download/$release_tag/install.sh" -o install.sh
 sh install.sh --version "$release_tag"
 "$HOME/.local/bin/cadence" --version
-```
-
-Only after a stable release exists, the convenience path is:
-
-```sh
-curl -fsSL https://github.com/favcrm/cadence/releases/latest/download/install.sh -o install.sh
-sh install.sh
 ```
 
 The default release root is `${XDG_DATA_HOME:-$HOME/.local/share}/cadence`.

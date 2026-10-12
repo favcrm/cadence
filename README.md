@@ -29,21 +29,20 @@ For a CLI-only source build, `cargo install --path . --locked` needs just Rust.
 That binary does not embed the board; serving it also requires a built UI and
 `cadence ui start --dist /path/to/ui/dist`.
 
-[Cadence 0.1.0-beta.2](https://github.com/favcrm/cadence/releases/tag/v0.1.0-beta.2)
-is available as an explicit-tag local CLI pilot for Linux x86_64/ARM64 and Apple
+[Cadence 0.1.0](https://github.com/favcrm/cadence/releases/tag/v0.1.0)
+is published as the stable local CLI release for Linux x86_64/ARM64 and Apple
 Silicon macOS. The installer checks archive/binary digests and version; the release
-includes build-provenance attestations. Use the exact prerelease tag:
+includes build-provenance attestations:
 
 ```sh
-curl -fsSL https://github.com/favcrm/cadence/releases/download/v0.1.0-beta.2/install.sh -o install.sh
-sh install.sh --version v0.1.0-beta.2
+curl -fsSL https://github.com/favcrm/cadence/releases/latest/download/install.sh -o install.sh
+sh install.sh
 "$HOME/.local/bin/cadence" --version
 ```
 
 Linux daemon/board evaluation uses fresh, separate state. macOS supports CLI
 installation/version checks only; setup, daemon and board are unsupported pending
 CAD-315. Full clean-platform setup/backup acceptance remains open under CAD-317.
-There is no stable release: `releases/latest` does not select this prerelease.
 
 See [native installation](docs/INSTALL-AGENT.md) for supported platforms,
 explicit pilot versions and provenance verification. The
