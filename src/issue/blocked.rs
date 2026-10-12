@@ -451,8 +451,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let listener = UnixListener::bind(dir.path().join("cadence.sock")).unwrap();
         let server = std::thread::spawn(move || {
-            let (_socket, _) = listener.accept().unwrap();
-            std::thread::sleep(Duration::from_secs(5));
+            let (mut socket, _) = listener.accept().unwrap();
+            // Peer stays connected but never replies: exit on the
+            // client's EOF, with the original 5s bound as fallback.
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut sink = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut socket, &mut sink);
         });
         let start = Instant::now();
         let out = send_to(dir.path(), "holder", "needs you", "blocked-CAD-757-CAD-758");
