@@ -1792,3 +1792,29 @@ button.project-focus-preview:hover { color: var(--color-accent); }
   .checkpoint-detail-grid { grid-template-columns: minmax(0, 1fr); gap: 1.5rem; }
   .checkpoint-links button { flex-wrap: wrap; gap: .35rem .6rem; }
 }
+
+/* Header search (CAD-1396): one dialog for issues and knowledge. */
+.header-search-trigger { align-items: center; gap: .4rem; height: 1.5rem; max-width: 18rem; flex: 0 1 14rem; min-width: 0; padding: 0 .5rem; border: 1px solid var(--color-ink-700); border-radius: .3rem; background: var(--color-ink-875); color: var(--color-ink-400); font-size: var(--text-micro); white-space: nowrap; overflow: hidden; }
+.header-search-trigger span { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.header-search-trigger kbd { margin-left: auto; font-family: inherit; color: var(--color-ink-500); }
+.header-search-trigger:hover, .header-search-trigger:focus-visible { color: var(--color-ink-100); border-color: var(--color-ink-500); }
+.header-search-trigger:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
+.header-search-icon { flex-shrink: 0; }
+.header-search-wrap { position: fixed; inset: 0; z-index: 80; display: flex; justify-content: center; align-items: flex-start; padding: 4.5rem 1rem 1rem; }
+.header-search-scrim { position: absolute; inset: 0; background: rgb(0 0 0 / .45); }
+.header-search-dialog { position: relative; width: min(42rem, 100%); max-height: calc(100dvh - 6rem); overflow: auto; display: grid; gap: .75rem; padding: .85rem; }
+.header-search-controls { display: grid; gap: .5rem; }
+.header-search-input { width: 100%; min-height: 2.75rem; }
+.header-search-scope { display: flex; flex-wrap: wrap; gap: .4rem; }
+.header-search-chip { display: inline-flex; align-items: center; height: 1.75rem; padding: 0 .65rem; border: 1px solid var(--color-ink-700); border-radius: 9999px; font-size: var(--text-micro); color: var(--color-ink-400); background: transparent; cursor: pointer; }
+.header-search-chip.on { border-color: var(--color-accent); color: var(--color-accent); background: color-mix(in srgb, var(--color-accent) 8%, transparent); }
+.header-search-chip:focus-visible, .header-search-link:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
+.header-search-results { display: grid; gap: .9rem; }
+.header-search-list { display: grid; gap: .25rem; }
+.header-search-row { border-radius: .3rem; }
+.header-search-row.is-active { background: var(--color-ink-800); }
+.header-search-link { display: grid; gap: .15rem; min-height: 2.75rem; padding: .4rem .55rem; color: var(--color-ink-200); text-decoration: none; min-width: 0; }
+.header-search-title { overflow-wrap: anywhere; font-weight: 500; }
+.header-search-meta, .header-search-snippet { overflow-wrap: anywhere; }
+.header-search-snippet { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+@media (width < 640px) { .header-search-wrap { padding-top: 3.5rem; } }
