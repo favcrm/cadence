@@ -77,7 +77,17 @@ fn fake_door() -> (String, Seen, Arc<Door>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let seen: Seen = Arc::default();
-    let state = Arc::new(Door::default());
+    // The digest/authorization subject here is not image-size custody, so
+    // the door serves the existing deterministic 64x64 PNG that fits
+    // custody as is. `MediaDoor::default` never builds the 1024x1024
+    // artifact eagerly (PNG generation is lazy per job), but selecting the
+    // small variant keeps every succeeded job's artifact and digest in the
+    // small domain the logic assertions are written against. The
+    // oversized/corrupt custody-boundary cases keep the default door.
+    let state = Arc::new(Door {
+        media: aos_media_door::MediaDoor::new_small(),
+        ..Door::default()
+    });
     let (log, door) = (seen.clone(), state.clone());
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {

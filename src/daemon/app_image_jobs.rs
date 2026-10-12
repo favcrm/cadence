@@ -45,6 +45,20 @@ enum RunEnd {
 #[cfg(feature = "test-seam")]
 pub mod test_probe {
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::SeqCst};
+    type ReceiptAttachHook = std::sync::Arc<dyn Fn(&str, &str) + Send + Sync>;
+    static BEFORE_RECEIPT_ATTACH: std::sync::Mutex<Option<ReceiptAttachHook>> =
+        std::sync::Mutex::new(None);
+    /// A test observer immediately before real context retention. The callback
+    /// runs without holding the hook mutex and must release its worker boundedly.
+    pub fn set_before_receipt_attach_hook(hook: Option<ReceiptAttachHook>) {
+        *BEFORE_RECEIPT_ATTACH.lock().unwrap() = hook;
+    }
+    pub(super) fn before_receipt_attach(request: &str, receipt: &str) {
+        let hook = BEFORE_RECEIPT_ATTACH.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(request, receipt);
+        }
+    }
     static STARTS: AtomicUsize = AtomicUsize::new(0);
     static FENCE: AtomicBool = AtomicBool::new(false);
     static PAUSE_MS: AtomicU64 = AtomicU64::new(0);
@@ -175,14 +189,16 @@ impl Shared {
             return Ok(RunEnd::Held);
         };
         let settle = |settlement| records.app_social_image_job_settle(call_id, settlement);
-        // A crash between the retained receipt and the settle: finish the
-        // intent without another provider call.
+        // A crash between the stored receipt and the settle: retain it in
+        // this context before completing the intent, without another provider call.
         if let Some(receipt) = self.store.app_tool_result_for_request(&job.request_id)? {
             let id = receipt["id"].as_str().unwrap_or_default();
-            settle(ImageSettlement::Succeeded { receipt: id })?;
             if let Some(created) = receipt["created_at"].as_f64() {
+                #[cfg(feature = "test-seam")]
+                test_probe::before_receipt_attach(&job.request_id, id);
                 records.app_social_tool_receipt_attach(&job.context_id, id, created)?;
             }
+            settle(ImageSettlement::Succeeded { receipt: id })?;
             self.social_attach_image(&records, &job.context_id, &job.request_id, id);
             return Ok(RunEnd::Settled);
         }
@@ -306,13 +322,17 @@ impl Shared {
                 .map(|asset| (asset.media_type.as_str(), asset.bytes.as_slice())),
         })?;
         let id = receipt["id"].as_str().unwrap_or_default();
+        // Completed is observable immediately; its receipt must already be
+        // retained in this context for the real draft attachment guard.
+        if let Some(created) = receipt["created_at"].as_f64() {
+            #[cfg(feature = "test-seam")]
+            test_probe::before_receipt_attach(&job.request_id, id);
+            records.app_social_tool_receipt_attach(&job.context_id, id, created)?;
+        }
         records.app_social_image_job_settle(
             &job.call_id,
             ImageSettlement::Succeeded { receipt: id },
         )?;
-        if let Some(created) = receipt["created_at"].as_f64() {
-            records.app_social_tool_receipt_attach(&job.context_id, id, created)?;
-        }
         self.social_attach_image(records, &job.context_id, &job.request_id, id);
         Ok(())
     }
