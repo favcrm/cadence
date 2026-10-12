@@ -5,6 +5,8 @@ import { useResource } from "../../lib/useResource";
 import { navigate, useHref } from "../../lib/useLocation";
 import { fmtTime } from "../../lib/fmt";
 import { useWriteBlock } from "../auth/WriteGate";
+import { useTranslate } from "../../lib/locale";
+import { displayUiNotice, type UiNotice } from "../app-shell/campaign/useEmailDraft";
 import Button from "../../ui/Button";
 import Link from "../../ui/Link";
 import PageState from "../../ui/PageState";
@@ -921,7 +923,8 @@ function GroupComposer({
   const [mode, setMode] = useState<"post" | "ask">("post");
   const members = liveMembers(row);
   const [target, setTarget] = useState("");
-  const [notice, setNotice] = useState<string | null>(null);
+  const t = useTranslate();
+  const [notice, setNotice] = useState<UiNotice | null>(null);
   // The id for the current envelope, reused on retry and reset when it changes.
   const envelope = useRef<{ key: string; id: string } | null>(null);
   const noMembers = members.length === 0;
@@ -972,7 +975,7 @@ function GroupComposer({
         placeholder={mode === "post" ? "Post to the group…" : "Ask one member…"}
         className="card p-2.5 relative"
       />
-      {notice && <p className="threads-note" role="status">{notice}</p>}
+      {notice && <p className="threads-note" role="status">{displayUiNotice(notice, t)}</p>}
     </div>
   );
 }
