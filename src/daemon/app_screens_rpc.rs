@@ -54,6 +54,10 @@ pub(crate) struct ScreenCap {
     /// Host mount counter for this install — a superseded mount's mint
     /// is refused at consume.
     pub generation: u64,
+    /// Native consent epoch of the approval proven at mint. Consume and
+    /// every tool call re-compare it, so a remove+restore or revoke+reconsent
+    /// of the same digest cannot revive this cap. Internal only.
+    pub approval_epoch: i64,
     /// The DISTINCT non-authorizing bridge nonce minted here and bound
     /// into this cap; the host renders it into the bootstrap and the
     /// child echoes it in init. NOT the FrameCap bearer in the URL —
@@ -113,6 +117,7 @@ struct ToolContextBinding<'a> {
     digest: &'a str,
     tag: &'a str,
     generation: u64,
+    approval_epoch: i64,
 }
 
 impl Shared {
@@ -298,7 +303,7 @@ impl Shared {
         self.check_mint_rate(&session)?;
         let pm_dir = self.pm_dir()?;
         let pm = self.pm_at(&pm_dir)?;
-        let (digest, pkg) = self.screen_package_checked(&pm, install_id, tag)?;
+        let (digest, approval_epoch, pkg) = self.screen_package_checked(&pm, install_id, tag)?;
 
         self.sweep_screen_caps();
         let mut caps = self.screen_caps.lock().unwrap_or_else(|e| e.into_inner());
@@ -337,6 +342,7 @@ impl Shared {
                 digest: &digest,
                 tag,
                 generation,
+                approval_epoch,
             },
             &pkg,
         );
@@ -348,6 +354,7 @@ impl Shared {
                 tag: tag.to_string(),
                 session,
                 generation,
+                approval_epoch,
                 bridge_nonce: bridge_nonce.clone(),
                 issued: Instant::now(),
             },
@@ -413,10 +420,16 @@ impl Shared {
         let pm = self.pm_at(&pm_dir)?;
         // Re-verify the LIVE bundle digest + approval + package — a
         // revoke or upgrade between mint and consume refuses here.
-        let (live_digest, pkg) = self.screen_package_checked(&pm, &cap.install_id, &cap.tag)?;
+        let (live_digest, live_epoch, pkg) =
+            self.screen_package_checked(&pm, &cap.install_id, &cap.tag)?;
         if live_digest != cap.digest {
             return Err(Error::rejected(
                 "installation digest changed since mint — mount refused",
+            ));
+        }
+        if live_epoch != cap.approval_epoch {
+            return Err(Error::rejected(
+                "installation was re-approved or revoked since mint — mount refused",
             ));
         }
         // CAD-1177: activate the pending action context for THIS consumed
@@ -459,6 +472,7 @@ impl Shared {
             digest,
             tag,
             generation,
+            approval_epoch,
         } = *binding;
         if pkg.tools.is_empty() {
             return Value::Null;
@@ -478,6 +492,7 @@ impl Shared {
                 digest: digest.to_string(),
                 tag: tag.to_string(),
                 generation,
+                approval_epoch,
                 mount: None,
                 session: session.to_string(),
                 tools: pkg.tools.clone(),
@@ -498,7 +513,7 @@ impl Shared {
         pm: &crate::issue::Pm,
         install_id: &str,
         tag: &str,
-    ) -> Result<(String, app_screen_pkg::ScreenPackage)> {
+    ) -> Result<(String, i64, app_screen_pkg::ScreenPackage)> {
         use crate::issue::app_catalog::workspace;
         let store = &self.store;
         workspace::with_runtime_read(pm, install_id, |row, files| {
@@ -512,6 +527,11 @@ impl Shared {
                     "installation is not approved at its current digest",
                 ));
             }
+            // The native consent epoch of THIS approval. Fail closed when
+            // absent: an approved status without a valid epoch is refused.
+            let approval_epoch = status["epoch"]
+                .as_i64()
+                .ok_or_else(|| Error::rejected("installation approval epoch unavailable"))?;
             // The screen package's declared app must equal the installed
             // app manifest's name — a package cannot claim a different app.
             let installed_app = crate::issue::app::parse_manifest(
@@ -526,7 +546,7 @@ impl Shared {
                     "screen package declares an app that is not the installation",
                 ));
             }
-            Ok((live_digest, pkg))
+            Ok((live_digest, approval_epoch, pkg))
         })
     }
 }

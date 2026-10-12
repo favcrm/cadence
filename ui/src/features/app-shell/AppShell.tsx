@@ -8,6 +8,7 @@ import type { Viewer } from "../projects/work";
 import { dropWorkspaceAppSnapshot, readWorkspaceAppSnapshot, workspaceApps, type AppContext, type Installation } from "../workspace-apps/workspaceApps";
 import { WorkspaceAppCachedPreview } from "../workspace-apps/WorkspaceApp";
 import { chatScreenFor } from "./chatScreen";
+import { screenTag } from "../workspace-apps/screen/screenProjection";
 import { initialContext, rememberedContext, rememberContext, subscribeContext } from "../workspace-apps/contextSelection";
 import CrmOutlet, { type CrmSection, type OutletView } from "./CrmOutlet";
 import Conversation from "./chat/Conversation";
@@ -652,6 +653,11 @@ export default function AppShell({
 
   const title = installation?.title || installation?.name || "App";
   const isSocial = installation !== null && installation.name === "social-content";
+  // A non-CRM app whose approved, executable package declares one screen
+  // mounts that screen (presentation only; authorization stays in the
+  // session/epoch/digest gates). Social keeps its legacy outlet.
+  const hasPortableScreen = installation !== null && installation.name !== "crm" && screenTag(installation) !== null;
+  const screenOutlet = isSocial || hasPortableScreen;
   const cachedPreviewSnapshot = !receiptReady && viewer.operator === true && loadError === null
     ? readWorkspaceAppSnapshot(installId)
     : null;
@@ -705,7 +711,7 @@ export default function AppShell({
           {loading ? "Loading…" : title}
         </span>
         <span className="flex-1" />
-        {isSocial && activeIds.length > 1 && (
+        {screenOutlet && activeIds.length > 1 && (
           // A private screen offers no in-outlet picker (the screen is the
           // outlet's first child). With 2+ active contexts the choice lives
           // here in the header row; 0 or 1 never shows a control.
@@ -713,8 +719,19 @@ export default function AppShell({
             className="app-shell-context-pick"
             aria-label="Context"
             data-social-context
-            value={socialContext !== null && activeIds.includes(socialContext) ? socialContext : ""}
-            onChange={(e) => e.target.value !== "" && rememberContext(installId, e.target.value)}
+            value={isSocial ? (socialContext !== null && activeIds.includes(socialContext) ? socialContext : "") : contextId}
+            onChange={(e) => {
+              const next = e.target.value;
+              if (next === "") return;
+              if (isSocial) {
+                rememberContext(installId, next);
+                return;
+              }
+              if (!activeIds.includes(next)) return;
+              setContextId(next);
+              rememberContext(installId, next);
+              writeQuery({ ctx: next, appview: null, record: null });
+            }}
           >
             <option value="" disabled>
               Choose a context
@@ -770,7 +787,7 @@ export default function AppShell({
               contextName: singleScope ? null : contextLabel(activeContexts, contextId),
               scopeLabel: (singleScope ? null : contextLabel(activeContexts, contextId)) || title,
               descriptor: chatDescriptor,
-              promptLayout: isSocial ? "list" : "chips",
+              promptLayout: screenOutlet ? "list" : "chips",
               conversationRequest,
               contextProof: conversationContextProof,
               fileUpload: chatProjection.projection?.fileUpload ?? { declared: false, available: false },
@@ -868,7 +885,7 @@ export default function AppShell({
                 </Notice>
               )
             ) : <>
-              {isSocial ? (
+              {screenOutlet ? (
                 // The private-screen frame owns its own chrome — the
                 // shell shows no installId/version/context subtitle.
                 null
@@ -907,7 +924,7 @@ export default function AppShell({
                   control. Only the exceptional unbound multi-context
                   legacy install keeps the explicit entry; Social and
                   generic Apps are unchanged. */}
-              {!isSocial && activeIds.length > 1 && (installation?.name !== "crm" || contextId === "") && (
+              {!screenOutlet && activeIds.length > 1 && (installation?.name !== "crm" || contextId === "") && (
                 <nav
                   className={
                     contextId === ""
@@ -961,7 +978,7 @@ export default function AppShell({
                   exampleKey={previewKey}
                   installationKind={installation.name}
                 />
-              ) : isSocial && children ? (
+              ) : screenOutlet && children ? (
                 children
               ) : (
                 <CrmOutlet

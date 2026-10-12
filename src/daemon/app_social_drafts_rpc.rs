@@ -146,13 +146,17 @@ impl Shared {
             if required_str(bundle, "digest")? != ctx.digest {
                 return Err(Error::rejected("installation digest changed since mount"));
             }
-            if self
+            let status = self
                 .store
-                .app_capability_status(&ctx.install_id, &ctx.digest)?["state"]
-                != "approved"
-            {
+                .app_capability_status(&ctx.install_id, &ctx.digest)?;
+            if status["state"].as_str() != Some("approved") {
                 return Err(Error::rejected(
                     "installation is not approved at its current digest",
+                ));
+            }
+            if status["epoch"].as_i64() != Some(ctx.approval_epoch) {
+                return Err(Error::rejected(
+                    "installation was re-approved or revoked since mount — tool call refused",
                 ));
             }
             let manifest = crate::issue::app::parse_manifest(

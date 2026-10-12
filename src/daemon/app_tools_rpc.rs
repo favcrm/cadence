@@ -76,6 +76,10 @@ pub(crate) struct ToolContext {
     /// The host's monotonic mount counter for this install — carried so
     /// a superseded generation cannot invoke.
     pub generation: u64,
+    /// Native consent epoch proven at the checked mint. Compared against the
+    /// live approval epoch on every invoke, so a re-approved or revoked-and-
+    /// restored installation refuses an already-cloned context.
+    pub approval_epoch: i64,
     /// Server-recognized identity of the CONSUMED mount this context was
     /// activated for (`bridge_nonce`). `None` while still pending — a
     /// mint that never reached consume stays un-invocable.
@@ -230,6 +234,22 @@ impl Shared {
         if ctx.mount.is_none() {
             return Err(Error::rejected(
                 "tool action context has no live mount — the screen is not consumed",
+            ));
+        }
+        // The installation must still be approved at the consent epoch the
+        // context was minted under. A removed, restored or re-approved
+        // install moves the epoch, so an old token cannot resume authority.
+        let status = self
+            .store
+            .app_capability_status(&ctx.install_id, &ctx.digest)?;
+        if status["state"].as_str() != Some("approved") {
+            return Err(Error::rejected(
+                "installation is not approved at its current digest",
+            ));
+        }
+        if status["epoch"].as_i64() != Some(ctx.approval_epoch) {
+            return Err(Error::rejected(
+                "installation was re-approved or revoked since mount — tool call refused",
             ));
         }
         Ok(ctx)
@@ -410,6 +430,11 @@ impl Shared {
             if status["state"].as_str() != Some("approved") {
                 return Err(Error::rejected(
                     "installation is not approved at its current digest",
+                ));
+            }
+            if status["epoch"].as_i64() != Some(ctx.approval_epoch) {
+                return Err(Error::rejected(
+                    "installation was re-approved or revoked since mount — tool call refused",
                 ));
             }
             // The declared slot must be a real `needs.capabilities` key of

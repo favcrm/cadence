@@ -2,10 +2,10 @@ import type { AppChat } from "./chat/contract";
 import type { Installation } from "../workspace-apps/workspaceApps";
 import { screenTag } from "../workspace-apps/screen/screenProjection";
 
-/** The shell screen id the chat descriptor is matched against. Social
- *  Content's one private screen answers to its declared chat context (the
- *  screen tag), so the descriptor's static prompts show above the composer;
- *  an unverified installation matches nothing. Pure and unit-tested. */
+/** The shell screen id the chat descriptor is matched against. A portable
+ *  app's one declared screen answers to its screen tag; CRM keeps its
+ *  section. Social Content without an eligible screen matches nothing
+ *  (legacy). An unverified installation matches nothing. Pure and unit-tested. */
 export function chatScreenFor(
   installation: Installation | null,
   verified: boolean,
@@ -13,8 +13,10 @@ export function chatScreenFor(
   view: string,
 ): string | null {
   if (!verified || installation === null) return null;
-  if (installation.name === "social-content") return screenTag(installation);
-  return installation.name === "crm" ? crmSection : view;
+  if (installation.name === "crm") return crmSection;
+  const tag = screenTag(installation);
+  if (tag !== null) return tag;
+  return installation.name === "social-content" ? null : view;
 }
 
 /** The chip and quick prompts for the route's screen (prompts only fill the composer). */

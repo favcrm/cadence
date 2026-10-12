@@ -36,6 +36,7 @@ struct SlotRef {
 
 struct Quoted {
     digest: String,
+    approval_epoch: i64,
     source: Option<SlotRef>,
     writer: Option<SlotRef>,
     image: Option<SlotRef>,
@@ -129,13 +130,15 @@ impl Shared {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let digest = required_str(bundle, "digest")?.to_string();
-            if self.store.app_capability_status(install, &digest)?["state"].as_str()
-                != Some("approved")
-            {
+            let status = self.store.app_capability_status(install, &digest)?;
+            if status["state"].as_str() != Some("approved") {
                 return Err(Error::rejected(
                     "installation is not approved at its current digest",
                 ));
             }
+            let approval_epoch = status["epoch"]
+                .as_i64()
+                .ok_or_else(|| Error::rejected("installation approval epoch unavailable"))?;
             let manifest = crate::issue::app::parse_manifest(
                 files
                     .get("app.md")
@@ -184,6 +187,7 @@ impl Shared {
             };
             let mut quoted = Quoted {
                 digest,
+                approval_epoch,
                 source: None,
                 writer: None,
                 image: None,
@@ -500,11 +504,12 @@ impl Shared {
         Ok(json!({"operation": super::app_assistant_rpc::public_operation(done)}))
     }
 
-    fn social_ctx(install: &str, context: &str, digest: &str) -> ToolContext {
+    fn social_ctx(install: &str, context: &str, digest: &str, approval_epoch: i64) -> ToolContext {
         ToolContext {
             install_id: install.to_owned(),
             context_id: Some(context.to_owned()),
             digest: digest.to_owned(),
+            approval_epoch,
             tag: String::new(),
             generation: 0,
             mount: None,
@@ -536,7 +541,7 @@ impl Shared {
         }
         let input = json!({"handle": handle});
         let reply = self.app_tool_execute(
-            &Self::social_ctx(install, context, &quoted.digest),
+            &Self::social_ctx(install, context, &quoted.digest, quoted.approval_epoch),
             ToolCall {
                 slot: &source.slot,
                 alias: &source.alias,
@@ -631,7 +636,7 @@ impl Shared {
         )?;
         let draft_id = required_str(&draft, "draft_id")?.to_owned();
         let refs = json!([{"kind":"social_draft","id":draft_id,"label":format!("Draft: {}", clip(&selected.caption, 40))}]);
-        let ctx = Self::social_ctx(install, context, &quoted.digest);
+        let ctx = Self::social_ctx(install, context, &quoted.digest, quoted.approval_epoch);
         let style = self
             .store
             .app_context_proof(install, context)?
