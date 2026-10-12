@@ -10,21 +10,36 @@ immutable release notes are not appended after publication. This record is not
 authorization for a production rollout, stable promotion, rerun or replacement
 release.
 
+## Stable 0.1.0 preparation (unpublished)
+
+The source version is being prepared as **0.1.0**, with matching tag
+**v0.1.0** and stable classification (`prerelease=false`, `latest=true`). This
+is preparation only: a version bump or merged source does not create a tag or
+release. The candidate SHA must be selected from reviewed main after this
+preparation merges, and the tag workflow must pass every required gate and
+native package build before the configured release approval. Until then,
+`v0.1.0` is not available and the beta.2 explicit-tag install remains the
+working public install path. The public stable updater is still not implemented;
+`cadence update`/`upgrade` continue to use the authenticated internal channel.
+
 The immutable `v0.1.0-beta.1` tag failed its macOS UI build and retains a private
-draft; it has no published installation assets. The checklist and note template
-below preserve the prepublication process for future candidates; their pending
-placeholders are historical preparation, not the beta.2 publication record.
+draft; it has no published installation assets. The beta.2 publication record
+above is complete. The stable 0.1.0 annex below is an intentionally pending
+future-candidate template; its placeholders are not release evidence or a claim
+that v0.1.0 is published.
 
 ## Historical preparation: beta.2 candidate selection
 
-Cargo.toml and Cargo.lock are prepared as **0.1.0-beta.2**, with matching planned
-tag **v0.1.0-beta.2** and release title **Cadence 0.1.0-beta.2 — local CLI pilot**.
-No beta.2 release candidate SHA is selected and no beta.2 tag or release is
-created. Select a fresh reviewed exact main commit only after the version/source
-prerequisites
-land and the release evidence is accepted. A preparation PR head is not the
-publication candidate. Unmerged PRs and issuer contracts are not shipped
-capabilities.
+The original pilot preparation set Cargo.toml and Cargo.lock to
+**0.1.0-beta.2**, with matching tag **v0.1.0-beta.2** and title
+**Cadence 0.1.0-beta.2 — local CLI pilot**. That historical preparation is
+complete: the immutable beta.2 release is published from
+`181bf4dfff466b02310a4d9339a3045b61dc5705` as recorded above. The placeholder
+annex below describes the prepublication checklist, not current beta.2 status.
+For a new release, select a fresh reviewed exact main commit only after the
+version/source prerequisites land and release evidence is accepted. A
+preparation PR head is not the publication candidate. Unmerged PRs and issuer
+contracts are not shipped capabilities.
 
 The tag gate requires `v` plus Cargo.toml's exact version. The publisher sets
 `prerelease=true` and `latest=false` for the pilot on both new and reused drafts;
@@ -101,19 +116,20 @@ delivery. Hosted remote teams and local-to-cloud production migration remain
 separate acceptance work. The public stable-release updater is not implemented;
 current update/upgrade commands use the authenticated internal CI channel.
 
-For the pilot use its explicit published tag, never stable `latest` convenience
-installation. Selecting another installer version is not a coordinated running
-daemon upgrade or compatible state rollback. No download link below is claimed
-available until the release exists and public installation is verified.
+Until stable v0.1.0 is published, use the beta.2 explicit tag; the stable
+`latest` convenience URL becomes available only after the stable release passes
+publication. Selecting another installer version is not a coordinated running
+daemon upgrade or compatible state rollback.
 
-## Evidence annex to complete for the approved candidate
+## Stable 0.1.0 evidence annex to complete for the approved candidate
 
-Use the following content in the release draft, replacing placeholders with
-verified evidence before the environment approval. The workflow can reuse an
-existing draft, upload the artifacts and publish after approval.
+Use the following content for the v0.1.0 release draft, replacing placeholders
+with evidence from the exact reviewed candidate and successful tag workflow
+before the environment approval. The workflow can reuse an existing draft,
+upload the artifacts and publish after approval.
 
 ```text
-Cadence 0.1.0-beta.2 — local CLI pilot
+Cadence 0.1.0 — stable local CLI release
 
 Native CLI and embedded board for local agent coordination. Supported assets:
 Linux x86_64, Linux ARM64 (glibc 2.35 baseline), Apple Silicon macOS.
@@ -125,11 +141,11 @@ setup, daemon and board use unsupported pending CAD-315.
 Provider CLIs/authentication and tmux for terminal providers are separate.
 List only provider/platform combinations actually verified for this candidate.
 Hosted browser login, remote local worker teams and local-to-cloud migration
-are not claimed operational. Public stable-release updater is not implemented.
+are not claimed operational. Public stable-release upgrades are not implemented.
 
 Source SHA: <copied exact SHA>
-Tag: v0.1.0-beta.2 (planned, not created)
-Classification: prerelease=true; latest=false (must verify actual release metadata)
+Tag: v0.1.0 (planned, not created)
+Classification: prerelease=false; latest=true (verify actual release metadata)
 CI run and all required gate conclusions: <links/results>
 Clean installation evidence: <platform links; distinguish pre/post-publication>
 Installer and provenance guide: <tag-pinned docs/INSTALL-AGENT.md URL>
