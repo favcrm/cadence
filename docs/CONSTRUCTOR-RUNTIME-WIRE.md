@@ -38,12 +38,19 @@ JS-safe monotonic sequence, plus its exact selected fields:
 - `runtime-serving-ready`: same reference only after actual physical serving capture
 - `task-event`: task32hex, zero-based ordered part, canonical base64url bytes1..16384
   Per-task output budget (AOS accepts at most 65,536 decoded bytes in 4,096
-  consecutive parts, else it aborts the runtime): the last part and the marker's
-  bytes are reserved, so data is limited to 4,095 parts and 65,536 minus the
-  marker length in bytes. Output within that is sent unchanged. Beyond it the
-  stream is cut at a UTF-8 boundary and ends with the marker
-  `\n{"type":"output-truncated"}\n` (a whole NDJSON line); every later event is
-  dropped silently and the stream stays Ok.
+  consecutive parts, else it aborts the runtime): the marker (30 bytes),
+  TERMINAL_EVENT_MAX (4,096 bytes) and one part are reserved, so data is limited
+  to 4,094 parts and 65,536 - 30 - 4,096 bytes. Output within that is sent
+  unchanged. A terminal event (`type` result or failed) that does not fit the
+  data room but is at most TERMINAL_EVENT_MAX bytes goes out unchanged through
+  the reserve, with no marker (nothing was lost). Otherwise the first event that
+  does not fit is cut at a UTF-8 boundary and followed by the marker
+  `\n{"type":"output-truncated"}\n` (a whole NDJSON line). After truncation data
+  events are dropped silently; the first terminal event follows the marker
+  unchanged if at most TERMINAL_EVENT_MAX bytes, else a minimal line:
+  `{"type":"result","status":<status>,"truncated":true}` (`status` only if its
+  serialized value is at most 64 bytes) or `{"type":"failed","truncated":true}`.
+  Nothing is sent after the terminal line, and the stream stays Ok.
 - `task-retired`: task32hex only after actual Root family exit and daemon worker/
   adapter/stream quiescence; observation, not provider/successor retirement authority
 - `store-startup`: NO caller-selected binding/purpose/attempt; actual owner elects facts

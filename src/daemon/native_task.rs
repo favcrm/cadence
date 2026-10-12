@@ -19,6 +19,7 @@ struct StreamState {
     closed: bool,
     bytes: usize,
     truncated: bool,
+    done: bool,
 }
 impl StreamState {
     fn new() -> Self {
@@ -27,6 +28,7 @@ impl StreamState {
             closed: false,
             bytes: 0,
             truncated: false,
+            done: false,
         }
     }
 }
@@ -316,43 +318,87 @@ mod registration_acceptance;
 #[path = "native_task_budget_acceptance.rs"]
 mod budget_acceptance;
 
-fn emit(
+#[cfg(test)]
+#[path = "native_task_terminal_acceptance.rs"]
+mod terminal_acceptance;
+
+#[cfg(test)]
+#[path = "native_task_serialization_acceptance.rs"]
+mod serialization_acceptance;
+
+/// Bytes reserved after the marker for one terminal event (`result`/`failed`).
+const TERMINAL_EVENT_MAX: usize = 4_096;
+/// A `result` keeps `status` in its minimal line only if serialized <= this.
+const TERMINAL_STATUS_MAX: usize = 64;
+
+/// Terminal events are the `result` and `failed` shapes built in `Task::start`.
+fn terminal_kind(value: &Value) -> Option<&'static str> {
+    match value.get("type").and_then(Value::as_str) {
+        Some("result") => Some("result"),
+        Some("failed") => Some("failed"),
+        _ => None,
+    }
+}
+
+/// Retain at most `limit` JSON bytes, stopping serialization when it overflows.
+/// The retained prefix may end inside a UTF-8 character; emit trims that edge.
+fn bounded_json(value: &Value, limit: usize) -> Result<(Vec<u8>, bool)> {
+    struct CappedWriter {
+        bytes: Vec<u8>,
+        limit: usize,
+        overflow: bool,
+    }
+    impl std::io::Write for CappedWriter {
+        fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
+            let remaining = self.limit.saturating_sub(self.bytes.len());
+            self.bytes
+                .extend_from_slice(&input[..input.len().min(remaining)]);
+            if input.len() > remaining {
+                self.overflow = true;
+                return Err(std::io::Error::other("native event serialization capped"));
+            }
+            Ok(input.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = CappedWriter {
+        bytes: Vec::with_capacity(limit),
+        limit,
+        overflow: false,
+    };
+    if let Err(error) = serde_json::to_writer(&mut writer, value) {
+        if !writer.overflow {
+            return Err(error.into());
+        }
+    }
+    Ok((writer.bytes, !writer.overflow))
+}
+
+/// Fixed-shape fallback for a terminal event too large to send whole.
+fn minimal_terminal(kind: &str, value: &Value) -> Vec<u8> {
+    let status = value.get("status").and_then(|status| {
+        let (bytes, complete) = bounded_json(status, TERMINAL_STATUS_MAX).ok()?;
+        complete.then(|| String::from_utf8(bytes).ok()).flatten()
+    });
+    match (kind, status) {
+        ("result", Some(status)) => {
+            format!("{{\"type\":\"result\",\"status\":{status},\"truncated\":true}}\n")
+        }
+        ("result", None) => "{\"type\":\"result\",\"truncated\":true}\n".to_owned(),
+        _ => "{\"type\":\"failed\",\"truncated\":true}\n".to_owned(),
+    }
+    .into_bytes()
+}
+
+fn send_parts(
     control: &UnixDatagram,
     task: &str,
-    part: &Mutex<StreamState>,
-    value: &Value,
+    sequence: &mut StreamState,
+    bytes: &[u8],
 ) -> Result<()> {
     use base64::Engine;
-    let mut bytes = serde_json::to_vec(value)?;
-    bytes.push(b'\n');
-    let mut sequence = part
-        .lock()
-        .map_err(|_| Error::unknown("native stream poisoned"))?;
-    if sequence.closed || sequence.truncated {
-        return Ok(());
-    } // refuse late data; no retired-session mutation
-      // The last part and the marker's bytes are reserved for the marker, so it
-      // always fits AOS's budget. An event inside the data budget is sent
-      // unchanged; otherwise the stream ends with the longest UTF-8-safe prefix
-      // that fits, then the marker. Later events are dropped silently (an Err
-      // would make the caller `_exit(125)`).
-    let marker = TASK_OUTPUT_TRUNCATED_MARKER.len();
-    let parts_left = TASK_OUTPUT_MAX_PARTS
-        .saturating_sub(1)
-        .saturating_sub(sequence.next) as usize;
-    let room = TASK_OUTPUT_MAX_BYTES
-        .saturating_sub(marker)
-        .saturating_sub(sequence.bytes)
-        .min(parts_left.saturating_mul(TASK_PART_BYTES));
-    if bytes.len() > room {
-        sequence.truncated = true;
-        let mut cut = room;
-        while cut > 0 && (bytes[cut] & 0xC0) == 0x80 {
-            cut -= 1;
-        }
-        bytes.truncate(cut);
-        bytes.extend_from_slice(TASK_OUTPUT_TRUNCATED_MARKER);
-    }
     sequence.bytes += bytes.len();
     for chunk in bytes.chunks(TASK_PART_BYTES) {
         let index = sequence.next;
@@ -372,6 +418,103 @@ fn emit(
                 bytes: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(chunk),
             },
         )?;
+    }
+    Ok(())
+}
+
+/// Whether `len` bytes (one part when `len <= TASK_PART_BYTES`) still fit AOS's
+/// hard limits right now, with nothing reserved.
+fn fits_hard(sequence: &StreamState, len: usize) -> bool {
+    let parts = len.div_ceil(TASK_PART_BYTES) as u64;
+    sequence.bytes + len <= TASK_OUTPUT_MAX_BYTES && sequence.next + parts <= TASK_OUTPUT_MAX_PARTS
+}
+
+fn emit(
+    control: &UnixDatagram,
+    task: &str,
+    part: &Mutex<StreamState>,
+    value: &Value,
+) -> Result<()> {
+    let mut sequence = part
+        .lock()
+        .map_err(|_| Error::unknown("native stream poisoned"))?;
+    if sequence.closed || sequence.done {
+        return Ok(());
+    } // refuse late data; no retired-session mutation
+    let terminal = terminal_kind(value);
+    if sequence.truncated && terminal.is_none() {
+        return Ok(());
+    }
+    let marker = TASK_OUTPUT_TRUNCATED_MARKER.len();
+    let parts_left = TASK_OUTPUT_MAX_PARTS
+        .saturating_sub(2)
+        .saturating_sub(sequence.next) as usize;
+    let room = TASK_OUTPUT_MAX_BYTES
+        .saturating_sub(marker)
+        .saturating_sub(TERMINAL_EVENT_MAX)
+        .saturating_sub(sequence.bytes)
+        .min(parts_left.saturating_mul(TASK_PART_BYTES));
+    // One extra byte distinguishes an exact fit from an oversized prefix.
+    // A terminal may still fit its reserve even when no data room remains.
+    let limit = if sequence.truncated {
+        TERMINAL_EVENT_MAX
+    } else if terminal.is_some() {
+        room.max(TERMINAL_EVENT_MAX)
+    } else {
+        room
+    };
+    let (mut bytes, complete) = bounded_json(value, limit + 1)?;
+    if complete {
+        bytes.push(b'\n');
+    }
+    if sequence.truncated {
+        // Data is dropped. The FIRST terminal event ends the stream: whole if
+        // small, else the minimal line. Errors would make the caller `_exit`.
+        if let Some(kind) = terminal {
+            sequence.done = true;
+            if bytes.len() > TERMINAL_EVENT_MAX {
+                bytes = minimal_terminal(kind, value);
+            }
+            if fits_hard(&sequence, bytes.len()) {
+                send_parts(control, task, &mut sequence, &bytes)?;
+            }
+        }
+        return Ok(());
+    }
+    // The marker, TERMINAL_EVENT_MAX bytes and one part are reserved, so the
+    // marker and one terminal event always fit AOS's budget. An event inside the
+    // data budget is sent unchanged.
+    if bytes.len() <= room {
+        return send_parts(control, task, &mut sequence, &bytes);
+    }
+    // A terminal event that fits the reserve goes out whole, with no marker:
+    // nothing was lost.
+    let reserve_fits = bytes.len() <= TERMINAL_EVENT_MAX
+        && sequence.bytes + bytes.len() + marker <= TASK_OUTPUT_MAX_BYTES
+        && sequence.next + 2 <= TASK_OUTPUT_MAX_PARTS;
+    if terminal.is_some() && reserve_fits {
+        return send_parts(control, task, &mut sequence, &bytes);
+    }
+    // Truncate: the event that does not fit is cut at a UTF-8 boundary as data
+    // (unless it is a small terminal event whose reserve is spent, which is
+    // sent whole below), then the marker.
+    sequence.truncated = true;
+    if terminal.is_none() || bytes.len() > TERMINAL_EVENT_MAX {
+        let mut cut = room;
+        while cut > 0 && (bytes[cut] & 0xC0) == 0x80 {
+            cut -= 1;
+        }
+        send_parts(control, task, &mut sequence, &bytes[..cut])?;
+    }
+    send_parts(control, task, &mut sequence, TASK_OUTPUT_TRUNCATED_MARKER)?;
+    if let Some(kind) = terminal {
+        sequence.done = true;
+        if bytes.len() > TERMINAL_EVENT_MAX {
+            bytes = minimal_terminal(kind, value);
+        }
+        if fits_hard(&sequence, bytes.len()) {
+            send_parts(control, task, &mut sequence, &bytes)?;
+        }
     }
     Ok(())
 }
