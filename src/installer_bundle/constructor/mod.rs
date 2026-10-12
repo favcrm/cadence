@@ -8,6 +8,15 @@ mod children;
 mod context;
 mod custody;
 mod dispatcher;
+// CAD-1159 SEC-002: debug/test-seam-only elected PUBLIC fixture image root.
+// Absent from every other artifact; the compile_error in src/test_seam.rs
+// refuses the feature outside debug_assertions + test-seam.
+#[cfg(all(
+    debug_assertions,
+    feature = "test-seam",
+    feature = "native-fixture-admission"
+))]
+mod fixture_admission;
 mod helper;
 mod helper_process;
 mod helper_trust;
@@ -58,7 +67,59 @@ struct ImageAuthorityKey {
     version: u64,
     public_key: [u8; 32],
 }
+/// The seam-free production election: intentionally EMPTY — public
+/// bootstrap material cannot elect its own verifier. Never populated with
+/// fixture/test material; the SEC-002 gated `fixture_admission` adapter
+/// carries the only elected fixture root, in a separate debug artifact.
 const IMAGE_AUTHORITY_KEYS: &[ImageAuthorityKey] = &[];
+
+/// The compiled image-authority roots for THIS build. Production builds
+/// consult the fixed slice alone (byte-identical admission); only the gated
+/// fixture artifact widens it to the owner-elected fixture root.
+#[cfg(all(
+    debug_assertions,
+    feature = "test-seam",
+    feature = "native-fixture-admission"
+))]
+fn image_authority_keys() -> Vec<ImageAuthorityKey> {
+    fixture_admission::image_authority_keys()
+}
+#[cfg(not(all(
+    debug_assertions,
+    feature = "test-seam",
+    feature = "native-fixture-admission"
+)))]
+fn image_authority_keys() -> Vec<ImageAuthorityKey> {
+    IMAGE_AUTHORITY_KEYS
+        .iter()
+        .map(|key| ImageAuthorityKey {
+            kid: key.kid,
+            version: key.version,
+            public_key: key.public_key,
+        })
+        .collect()
+}
+
+/// Purpose/scope bound enforced after a root's signature verifies, before
+/// the manifest returns. Only the gated fixture adapter attaches a scope
+/// (exact elected `source` inside the elected window); production election
+/// machinery is its own scope and needs no second opinion here.
+#[cfg(all(
+    debug_assertions,
+    feature = "test-seam",
+    feature = "native-fixture-admission"
+))]
+fn enforce_image_scope(key: &ImageAuthorityKey, manifest: &Manifest, now_ms: u64) -> Result<()> {
+    fixture_admission::enforce_election_scope(key, manifest, now_ms)
+}
+#[cfg(not(all(
+    debug_assertions,
+    feature = "test-seam",
+    feature = "native-fixture-admission"
+)))]
+fn enforce_image_scope(_key: &ImageAuthorityKey, _manifest: &Manifest, _now_ms: u64) -> Result<()> {
+    Ok(())
+}
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -344,7 +405,8 @@ fn authenticate_image_attestation(
     if let Some(keys) = &manifest.pi_trust {
         trust(keys)?;
     }
-    let key = IMAGE_AUTHORITY_KEYS
+    let authority_keys = image_authority_keys();
+    let key = authority_keys
         .iter()
         .find(|k| k.kid == header.kid && k.version == header.key_version)
         .ok_or_else(|| {
@@ -357,6 +419,10 @@ fn authenticate_image_attestation(
     ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, key.public_key)
         .verify(&signed, &signature)
         .map_err(|_| refused())?;
+    // Signature truth alone does not return the manifest: the compiled
+    // election's purpose scope (exact source pin inside the elected window)
+    // must still hold — production scopes resolve to the no-op adapter.
+    enforce_image_scope(key, &manifest, now_ms)?;
     Ok(manifest)
 }
 

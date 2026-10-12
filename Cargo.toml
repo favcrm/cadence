@@ -59,6 +59,13 @@ e2e = []
 # and review tests can inject proc roots. The compile_error! in
 # src/test_seam.rs keeps these seams out of every release build.
 test-seam = []
+# CAD-1159 SEC-002: admit an owner-elected PUBLIC fixture image-verification
+# root into a separately labelled debug/test-seam constructor artifact. Opt-in
+# only, never a default: the compile_error! in src/test_seam.rs refuses every
+# combination other than debug_assertions + test-seam + this feature, and
+# build.rs admits only the fixed private descriptor
+# .cadence/native-fixture-public-root-v1.txt — no env/argv/request key path.
+native-fixture-admission = []
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
