@@ -386,20 +386,30 @@ fn pr_number(subject: &str) -> Option<u64> {
         .next()
 }
 
-/// `CAD-NN` issue ids mentioned anywhere in a subject.
+/// Ticket ids (`PREFIX-NN`, any registered project prefix) mentioned in
+/// `text`, deduplicated in encounter order. A token is a maximal run of
+/// ASCII letters, digits, `-` and `_`; one balanced pair of outer underscores
+/// (markdown emphasis `_AOS-225_`) is stripped, an unmatched one is not. It
+/// binds only when its prefix passes `check_prefix` (1-8 uppercase
+/// letters/digits, first a letter) and the rest is one hyphen plus nonempty
+/// ASCII digits. Lowercase, overlong, partial or suffixed runs (`xAOS-225`,
+/// `AOS-225x`, `AOS-225_suffix`, `_AOS-225`) bind nothing; other surrounding
+/// punctuation does not stop a match.
 fn issue_ids(text: &str) -> Vec<String> {
-    let mut ids = Vec::new();
-    let bytes = text.as_bytes();
-    for (i, _) in text.match_indices("CAD-") {
-        let mut end = i + 4;
-        while end < bytes.len() && bytes[end].is_ascii_digit() {
-            end += 1;
-        }
-        if end > i + 4 {
-            let id = text[i..end].to_string();
-            if !ids.contains(&id) {
-                ids.push(id);
-            }
+    let mut ids: Vec<String> = Vec::new();
+    for run in text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_')) {
+        let token = run
+            .strip_prefix('_')
+            .and_then(|r| r.strip_suffix('_'))
+            .unwrap_or(run);
+        let Some((prefix, number)) = token.split_once('-') else {
+            continue;
+        };
+        let bound = crate::issue::project_new::check_prefix(prefix).is_ok()
+            && !number.is_empty()
+            && number.bytes().all(|b| b.is_ascii_digit());
+        if bound && !ids.iter().any(|id| id == token) {
+            ids.push(token.to_string());
         }
     }
     ids
