@@ -60,6 +60,14 @@ const COORDINATION: &[&str] = &[
     "topic_deliveries",
 ];
 
+/// Retained-template delete guards. They refuse DELETE on the store, so
+/// `project` drops these two on the private copy only, inside its own
+/// transaction, and restores their stored SQL before commit.
+const PRIVATE_DELETE_GUARDS: &[&str] = &[
+    "business_template_source_no_delete",
+    "business_template_approved_no_delete",
+];
+
 /// Live authority of the source host: nulled on the private copy.
 const NULLED: &[(&str, &str)] = &[
     ("agents", "generation"),
@@ -328,6 +336,41 @@ const CATALOG: &[(&str, &[&str])] = &[
             "version",
             "access_change_json",
             "digest",
+        ],
+    ),
+    (
+        "business_documents",
+        &[
+            "company_id",
+            "id",
+            "template_name",
+            "template_version",
+            "template_sha256",
+            "kind",
+            "input_json",
+            "context_json",
+            "created",
+        ],
+    ),
+    (
+        "business_template_sources",
+        &["company_id", "sha256", "size", "bytes", "created"],
+    ),
+    (
+        "business_template_versions",
+        &[
+            "company_id",
+            "name",
+            "version",
+            "based_on",
+            "status",
+            "kind",
+            "spec_json",
+            "content_sha256",
+            "created",
+            "approved_source",
+            "approved_at",
+            "source_sha256",
         ],
     ),
     (
@@ -977,6 +1020,15 @@ fn project(db: &Path) -> Result<Vec<(String, i64)>> {
     let conn = Connection::open(db)?;
     let mut omitted = Vec::new();
     let tx = conn.unchecked_transaction()?;
+    let mut guard_sql = Vec::new();
+    for name in PRIVATE_DELETE_GUARDS {
+        guard_sql.push(tx.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+            [name],
+            |r| r.get::<_, String>(0),
+        )?);
+        tx.execute(&format!("DROP TRIGGER {}", quote_ident(name)), [])?;
+    }
     for table in omitted_names() {
         let rows: i64 = tx.query_row(
             &format!("SELECT count(*) FROM {}", quote_ident(table)),
@@ -985,6 +1037,9 @@ fn project(db: &Path) -> Result<Vec<(String, i64)>> {
         )?;
         omitted.push((table.to_string(), rows));
         tx.execute(&format!("DELETE FROM {}", quote_ident(table)), [])?;
+    }
+    for sql in &guard_sql {
+        tx.execute(sql, [])?;
     }
     for (table, column) in NULLED {
         tx.execute(&format!("UPDATE {table} SET {column}=NULL"), [])?;
