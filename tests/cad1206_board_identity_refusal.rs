@@ -429,6 +429,14 @@ fn c_board_from_a_cadence_new_build_is_stopped_by_dev_down() {
 // `cadence` and argv naming THIS store, is treated as the board and stopped.
 // Proves the refusals above are decided by identity, not by `ui.pid` being
 // ignored altogether.
+//
+// The real `ui stop` CLI runs on a scoped worker while the main thread polls
+// the OWNED child's `try_wait` under the existing 10s bound (100ms step): the
+// stranger's parent is this test, so it stays a zombie until reaped, and only
+// reaping lets the stop side's `kill(pid, 0)` liveness poll see ESRCH and
+// finish. `try_wait` only observes the exit the real signal already caused;
+// it never sends a signal, and `Cleanup` still owns the child on every path,
+// so a failed assert still kills and reaps it.
 #[test]
 fn d_control_exact_identity_is_stopped_by_ui_stop() {
     let host = Host::new();
@@ -443,11 +451,27 @@ fn d_control_exact_identity_is_stopped_by_ui_stop() {
     let pid = s.id();
     c.strangers.push(s);
     std::fs::write(state.join("ui.pid"), pid.to_string()).unwrap();
-    let out = host.run(&["--state-dir", state.to_str().unwrap(), "ui", "stop"]);
+
+    let (stop_out, observed_exit) = std::thread::scope(|scope| {
+        let worker =
+            scope.spawn(|| host.run(&["--state-dir", state.to_str().unwrap(), "ui", "stop"]));
+        // Reap the actual exit concurrently so the CLI's own liveness poll can
+        // observe the pid gone instead of waiting on a zombie we never reaped.
+        let observed_exit = wait_until(Duration::from_secs(10), || {
+            c.strangers[0].try_wait().unwrap().is_some()
+        });
+        let stop_out = worker.join().expect("ui stop worker panicked");
+        (stop_out, observed_exit)
+    });
+    assert!(
+        observed_exit,
+        "control: owned child never exited after `ui stop`: {}",
+        text(&stop_out)
+    );
     assert!(
         wait_until(Duration::from_secs(10), || !alive(pid)),
         "control: `ui stop` did not stop a process with this store's board identity: {}",
-        text(&out)
+        text(&stop_out)
     );
     drop(c);
     assert_nothing_runs_from(&host);

@@ -1910,6 +1910,127 @@ mod tests {
         (base, seen, worker)
     }
 
+    /// CAD-1392 acceptance (owned by the independent reviewer, not the
+    /// batching implementer): under the deferred-join pattern — sequential
+    /// API calls on private per-variant fixtures, every (adapter, seen,
+    /// worker) tuple retained until its worker's join — a deliberate extra
+    /// POST arriving inside the first door's UNCHANGED 500ms quiet window
+    /// must still be served and recorded. This proves only that the
+    /// physical window and retained `seen` capture the delayed extra POST
+    /// (the bad case a shortened window, closed door or early join would
+    /// miss); whether the actual batched loops keep every adapter and
+    /// context alive is checked by independently reviewing that code, not
+    /// asserted here — the injector uses its own ureq client, so an
+    /// adapter drop could never hide the injected request.
+    #[test]
+    fn cad1392_full_observation_detects_delayed_extra_post() {
+        let (base, seen, worker) = media_door(|request| {
+            if request.method == "POST" && request.url == MEDIA_SUBMIT_PATH {
+                json_response(
+                    403,
+                    json!({"ok":false,"error":{"code":"credential_revoked"}}),
+                )
+            } else {
+                json_response(
+                    400,
+                    json!({"ok":false,"error":{"code":"unexpected_request"}}),
+                )
+            }
+        });
+        // The real initial call: one submit POST refused as a confirmed
+        // credential_revoked. Its adapter, `seen` and worker are retained
+        // un-joined, exactly like a pending batch entry.
+        let adapter = image_adapter(&base);
+        let proof = image_proof(media_quote());
+        let error = adapter
+            .execute_app_capability(b"test-token", &proof, &json!({}), "app-call-image-1")
+            .err()
+            .unwrap();
+        assert!(error.contains("no longer authorized"), "{error}");
+        // The door worker pushes the record before responding, so by the
+        // time the call returned the first POST is already observed.
+        assert_eq!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.method == "POST")
+                .count(),
+            1,
+            "the first POST is recorded before its response returns"
+        );
+        // A second PRIVATE fixture runs its own real API call sequentially
+        // while the first door's 500ms quiet window is still open; its
+        // (adapter, seen, worker) tuple is likewise retained.
+        let (base2, seen2, worker2) = media_door(|request| {
+            if request.method == "POST" && request.url == MEDIA_SUBMIT_PATH {
+                json_response(
+                    403,
+                    json!({"ok":false,"error":{"code":"insufficient_scope"}}),
+                )
+            } else {
+                json_response(
+                    400,
+                    json!({"ok":false,"error":{"code":"unexpected_request"}}),
+                )
+            }
+        });
+        let adapter2 = image_adapter(&base2);
+        let error2 = adapter2
+            .execute_app_capability(b"test-token", &proof, &json!({}), "app-call-image-2")
+            .err()
+            .unwrap();
+        assert!(error2.contains("runtime draft scope"), "{error2}");
+        // A deliberate extra POST at ~250ms into the FIRST door's still-open
+        // window, over real loopback HTTP from an owned thread.
+        let injector = std::thread::spawn({
+            let base = base.clone();
+            move || {
+                std::thread::sleep(Duration::from_millis(250));
+                let agent: ureq::Agent = ureq::Agent::config_builder()
+                    .timeout_global(Some(Duration::from_secs(5)))
+                    .http_status_as_error(false)
+                    .build()
+                    .into();
+                agent
+                    .post(format!("{base}{MEDIA_SUBMIT_PATH}"))
+                    .header("idempotency-key", "app-call-injected-1")
+                    .send_json(json!({"model":"openai/gpt-image-2.5","prompt":"injected","aspectRatio":"1:1"}))
+                    .expect("the delayed extra POST must be served")
+            }
+        });
+        // Each worker is joined only after its own full quiet window closes
+        // on its own; neither door gets an early shutdown, and both
+        // adapters stayed alive through their joins.
+        worker.join().unwrap();
+        worker2.join().unwrap();
+        let response = injector.join().unwrap();
+        assert_eq!(response.status().as_u16(), 403);
+        // The bad case the original `seen.len() == 1` checks guard: the
+        // first door must show the extra POST. A fixture that joined
+        // before the full window would see one request and fail this.
+        let seen = seen.lock().unwrap();
+        let posts: Vec<&DoorRequest> = seen
+            .iter()
+            .filter(|request| request.method == "POST")
+            .collect();
+        assert_eq!(
+            posts.len(),
+            2,
+            "the delayed extra POST inside the 500ms window must be observed"
+        );
+        assert_eq!(posts[0].url, MEDIA_SUBMIT_PATH);
+        assert_eq!(posts[0].idem.as_deref(), Some("app-call-image-1"));
+        assert_eq!(posts[1].url, MEDIA_SUBMIT_PATH);
+        assert_eq!(posts[1].idem.as_deref(), Some("app-call-injected-1"));
+        drop(seen);
+        // The untouched second fixture keeps the original shape: exactly
+        // one submit POST observed after its own full window.
+        let seen2 = seen2.lock().unwrap();
+        assert_eq!(seen2.len(), 1);
+        assert_eq!(seen2[0].method, "POST");
+        assert_eq!(seen2[0].idem.as_deref(), Some("app-call-image-2"));
+    }
+
     fn price_view(charge_minor: u64, version: &str) -> Value {
         json!({"ok":true,"data":{"kind":"image","model":IMAGE_MODEL,"price":{"slug":IMAGE_TOOL,"chargeMinor":charge_minor,"currency":"USD","version":version}}})
     }
@@ -1955,9 +2076,13 @@ mod tests {
                     .unwrap();
             let out =
                 adapter.execute_app_capability_outcome(b"token", &proof, &input, "app-call-1177");
-            worker.join().unwrap();
-            out.map(|_| ())
+            // The adapter stays alive inside the pending entry through its
+            // worker's full observation window: dropping it at loop end
+            // could cancel any transport retry and weaken the no-retry
+            // proof the worker's quiet window observes.
+            (out.map(|_| ()), (worker, adapter))
         };
+        let mut pending = Vec::new();
         for (status, code) in [
             (409, "uncertain"),
             (409, "idempotency_in_progress"),
@@ -1967,27 +2092,29 @@ mod tests {
             (429, "rate_limited"),
             (503, "unavailable"),
         ] {
+            let (outcome, entry) = run(status, json!({"ok":false,"error":{"code":code}}));
             assert!(
-                matches!(
-                    run(status, json!({"ok":false,"error":{"code":code}})),
-                    Err(AppCapabilityError::Uncertain(_))
-                ),
+                matches!(outcome, Err(AppCapabilityError::Uncertain(_))),
                 "{status} {code} must be uncertain"
             );
+            pending.push(entry);
         }
         // A 200 whose result fails validation may already be charged.
-        assert!(matches!(
-            run(
-                200,
-                json!({"ok":true,"data":{"result":{"text":"","finishReason":"stop","usage":null}}})
-            ),
-            Err(AppCapabilityError::Uncertain(_))
-        ));
+        let (outcome, entry) = run(
+            200,
+            json!({"ok":true,"data":{"result":{"text":"","finishReason":"stop","usage":null}}}),
+        );
+        assert!(matches!(outcome, Err(AppCapabilityError::Uncertain(_))));
+        pending.push(entry);
         // A confirmed refusal stays a refusal.
-        assert!(matches!(
-            run(403, json!({"ok":false,"error":{"code":"forbidden"}})),
-            Err(AppCapabilityError::Refused(_))
-        ));
+        let (outcome, entry) = run(403, json!({"ok":false,"error":{"code":"forbidden"}}));
+        assert!(matches!(outcome, Err(AppCapabilityError::Refused(_))));
+        pending.push(entry);
+        // Each door keeps its own full quiet window; only the joins moved
+        // after the sequential API calls so the windows overlap.
+        for (worker, _adapter) in pending {
+            worker.join().unwrap();
+        }
     }
 
     fn hosted_adapter() -> AgenticosExternalAdapter {
@@ -2379,6 +2506,7 @@ mod tests {
 
     #[test]
     fn cad816_image_refusal_variants_never_repost() {
+        let mut pending = Vec::new();
         for (status, payload, needle) in [
             (
                 404u16,
@@ -2434,6 +2562,15 @@ mod tests {
                 .err()
                 .unwrap();
             assert!(error.contains(needle), "{error} lacks {needle}");
+            // Keep the adapter alive inside the entry until its worker's
+            // full 500ms quiet window ends: dropping it early could cancel
+            // an async retry and weaken the no-re-POST proof.
+            pending.push((worker, adapter, seen, status));
+        }
+        // All API calls above stayed sequential; only the doors' quiet
+        // windows overlap now. Each original observation runs after its own
+        // worker's full join, in the original order.
+        for (worker, _adapter, seen, status) in pending {
             worker.join().unwrap();
             let seen = seen.lock().unwrap();
             assert_eq!(seen.len(), 1, "exactly one POST for status {status}");
@@ -2472,10 +2609,12 @@ mod tests {
     #[test]
     fn cad1335_image_submit_admission_refusals_split_definite_from_uncertain() {
         let proof = image_proof(media_quote());
+        let mut pending = Vec::new();
         for code in ["disabled", "unpriced"] {
             let payload = json!({"ok":false,"error":{"code":code}});
             let (base, seen, worker) = media_door(move |_| json_response(409, payload.clone()));
-            let failure = image_adapter(&base)
+            let adapter = image_adapter(&base);
+            let failure = adapter
                 .execute_app_image(b"test-token", &proof, &json!({}), "app-call-image-1")
                 .err()
                 .expect("409 admission refusal");
@@ -2488,12 +2627,18 @@ mod tests {
                 "{} loses the {code} detail",
                 failure.detail
             );
+            pending.push((worker, adapter, seen));
+        }
+        // Sequential calls done; each door's full quiet window still ran
+        // and the original observations follow their own worker's join.
+        for (worker, _adapter, seen) in pending {
             worker.join().unwrap();
             let seen = seen.lock().unwrap();
             assert_eq!(seen.len(), 1, "one submit POST, no poll or re-POST");
             assert_eq!(seen[0].method, "POST");
             assert_eq!(seen[0].url, MEDIA_SUBMIT_PATH);
         }
+        let mut pending = Vec::new();
         for (status, payload) in [
             (409u16, json!({"ok":false,"error":{"code":"uncertain"}})),
             (409, json!({"ok":false,"error":{"code":"key_conflict"}})),
@@ -2510,7 +2655,8 @@ mod tests {
         ] {
             let label = payload.to_string();
             let (base, seen, worker) = media_door(move |_| json_response(status, payload.clone()));
-            let failure = image_adapter(&base)
+            let adapter = image_adapter(&base);
+            let failure = adapter
                 .execute_app_image(b"test-token", &proof, &json!({}), "app-call-image-1")
                 .err()
                 .expect("failure");
@@ -2518,6 +2664,9 @@ mod tests {
                 !failure.not_executed,
                 "{status} {label} must stay uncertain, got {failure:?}"
             );
+            pending.push((worker, adapter, seen));
+        }
+        for (worker, _adapter, seen) in pending {
             worker.join().unwrap();
             assert_eq!(seen.lock().unwrap().len(), 1);
         }
@@ -2527,6 +2676,7 @@ mod tests {
     fn cad816_image_terminal_failures_and_bad_artifacts_refuse() {
         let png = test_png();
         let artifact = artifact_entry("med_job1", &png);
+        let mut pending = Vec::new();
         for (status_name, artifacts) in [
             ("failed", json!([])),
             ("released", json!([])),
@@ -2549,6 +2699,9 @@ mod tests {
                 error.contains("med_job1") || status_name == "succeeded",
                 "{error}"
             );
+            pending.push((worker, adapter));
+        }
+        for (worker, _adapter) in pending {
             worker.join().unwrap();
         }
         // Artifact descriptor and bytes must agree exactly.
@@ -2562,6 +2715,7 @@ mod tests {
         // Past what AgenticOS itself imports the artifact read is refused at the cap.
         let big = vec![0u8; image::FETCH_LIMIT + 1];
         let oversized_entry = artifact_entry("med_job1", &big);
+        let mut pending = Vec::new();
         for (entry, bytes, needle) in [
             (oversized_entry, big, "import bound"),
             (wrong_digest, png.clone(), "differs from its receipt"),
@@ -2590,6 +2744,9 @@ mod tests {
                 .err()
                 .unwrap();
             assert!(error.contains(needle), "{error} lacks {needle}");
+            pending.push((worker, adapter, seen));
+        }
+        for (worker, _adapter, seen) in pending {
             worker.join().unwrap();
             let seen = seen.lock().unwrap();
             assert_eq!(seen.iter().filter(|r| r.method == "POST").count(), 1);

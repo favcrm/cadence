@@ -298,19 +298,18 @@ fn contract_reply() -> Value {
 fn another_accounts_post_in_the_grid_is_left_out_not_attributed() {
     let mut proof = proof();
     proof["inputs"]["profile_handle"] = json!("example_brand");
+    // Each fetch keeps its own private door; the door worker, the hosted
+    // adapter and `seen` all stay alive inside the returned entry until
+    // that worker's own full quiet window ends. Dropping the adapter at
+    // loop end could cancel a transport retry and weaken the no-retry
+    // observation, so the pending tuple owns it through the join.
     let fetch = |payload: Value| {
         let (base, seen, worker) = media_door(move |_| json_response(200, payload.clone()));
-        let output =
-            hosted_at(&base).execute_app_capability(b"", &proof, &json!({}), "app-call-1296");
-        worker.join().unwrap();
-        let seen = seen.lock().unwrap();
-        assert_eq!(seen.len(), 1, "one POST and no retry");
-        assert_eq!(
-            seen[0].body["query"],
-            json!({"handle":"example_brand","count":12})
-        );
-        output
+        let host = hosted_at(&base);
+        let output = host.execute_app_capability(b"", &proof, &json!({}), "app-call-1296");
+        (output, (worker, host, seen))
     };
+    let mut pending = Vec::new();
     let ids = |result: &Value| -> Vec<String> {
         result["posts"]
             .as_array()
@@ -333,7 +332,9 @@ fn another_accounts_post_in_the_grid_is_left_out_not_attributed() {
 
     // (a) The requested account's posts are kept; the foreign post is left
     // out and nothing of it is attributed to the requested handle.
-    let kept = fetch(grid.clone()).unwrap().result;
+    let (output, entry) = fetch(grid.clone());
+    pending.push(entry);
+    let kept = output.unwrap().result;
     assert_eq!(ids(&kept), ["1000000000000000001", "1000000000000000002"]);
     assert_eq!(kept["handle"], "example_brand");
     assert_eq!(kept["profile_verified"], true);
@@ -343,7 +344,9 @@ fn another_accounts_post_in_the_grid_is_left_out_not_attributed() {
     // (d) A mixed-case spelling of the requested account is the same account.
     let mut cased = grid.clone();
     cased["data"]["result"]["items"][2]["user"]["username"] = json!("Example_Brand");
-    assert_eq!(ids(&fetch(cased).unwrap().result).len(), 2);
+    let (output, entry) = fetch(cased);
+    pending.push(entry);
+    assert_eq!(ids(&output.unwrap().result).len(), 2);
 
     // (b) With the foreign post still in the grid, each identity fault refuses
     // the whole page and returns nothing.
@@ -402,7 +405,9 @@ fn another_accounts_post_in_the_grid_is_left_out_not_attributed() {
             "profile is missing",
         ),
     ] {
-        let error = fetch(payload).err().unwrap();
+        let (output, entry) = fetch(payload);
+        pending.push(entry);
+        let error = output.err().unwrap();
         assert!(error.contains(needle), "{error} lacks {needle}");
     }
 
@@ -414,7 +419,22 @@ fn another_accounts_post_in_the_grid_is_left_out_not_attributed() {
             item["user"]["username"] = json!("partner_brand");
         }
     });
-    let empty = fetch(foreign_only).unwrap().result;
+    let (output, entry) = fetch(foreign_only);
+    pending.push(entry);
+    let empty = output.unwrap().result;
     assert!(empty["posts"].as_array().unwrap().is_empty());
     assert_eq!(empty["profile_verified"], false);
+
+    // All calls above stayed sequential on private doors; only their quiet
+    // windows overlap now. Each original observation runs after its own
+    // worker's full join, in the original order.
+    for (worker, _host, seen) in pending {
+        worker.join().unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "one POST and no retry");
+        assert_eq!(
+            seen[0].body["query"],
+            json!({"handle":"example_brand","count":12})
+        );
+    }
 }
