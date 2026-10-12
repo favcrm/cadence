@@ -97,6 +97,48 @@ Local role documents or generated briefings may be stale. Follow AGENTS.md and
 the effective delivery policy; do not treat an untracked briefing as merge or
 production authority. Changed instructions do not reload running contexts.
 
+## Bounded review brief
+
+A review dispatch is a contract for one bounded inspection, not a license to
+audit the codebase. The brief states, on one page:
+
+- the exact head SHA and the diff or changed paths under review;
+- the ticket's acceptance items the reviewer is answering;
+- the concrete risks and required checks for this diff (the risk class, the
+  one-or-two-review path, any gate or security acceptance check);
+- which existing evidence is still valid to reuse (a prior PASS on the same
+  head, unchanged-head CI, earlier findings);
+- what is excluded from this review;
+- the accountable reviewer and where the verdict files (the head-pinned
+  verdict note and `cadence report file` route);
+- an agreed effort and checkpoint budget — roughly how much inspection the
+  diff justifies and when to stop and report back.
+
+The reviewer inspects whether the diff meets its acceptance and whether its
+relevant dependencies and risks hold. They do not automatically add optional
+requirements, broader audits, extra tests, extra builds, browser journeys,
+refactors or additional reviewers. Wider optional inspection is allowed, but
+only after naming a concrete failure scenario, the proposed scope and cost,
+and getting the dispatcher's permission first — it is never folded silently
+into the same verdict.
+
+Mandatory safeguards are not optional scope. A concrete security, isolation
+or approval risk the reviewer actually sees is investigated or escalated on
+the spot; missing required evidence is a blocker, never a fabricated PASS.
+None of this changes the automated gates or reviewer counts AGENTS.md and
+the effective policy already fix.
+
+The review stops when every acceptance item has a disposition and the
+required checks are done. The verdict reports PASS or REVISE on the exact
+head, the evidence read, blockers and separate non-blocking notes. If the
+agreed budget runs out first, the reviewer files a scoped blocker naming the
+remaining work — not an automatic PASS and not open-ended continuation.
+
+A new head on the same ticket goes back to the same reviewer for delta
+review; they file a fresh verdict on the new head rather than carrying the
+old PASS forward. Valid unchanged-head evidence is reused, and optional
+notes go to a follow-up ticket instead of more polish rounds.
+
 ## What #738 taught us
 
 PR #738 took more than four hours to deliver. It was not just a small update:
