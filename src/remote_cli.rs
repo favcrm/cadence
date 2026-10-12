@@ -1290,6 +1290,159 @@ mod tests {
     }
 
     #[test]
+    fn wiki_refuses_forged_authority_before_mint_and_never_uses_cli_relay() {
+        // CAD-1401 independent refusal acceptance. The worker deliberately
+        // accepts every payload: only the real client guard can refuse it.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let target = target(&listener);
+        let server = listener.try_clone().unwrap();
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<Value>>> = Default::default();
+        let requests = seen.clone();
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            while stopped.try_recv().is_err() {
+                let socket = match server.accept() {
+                    Ok((socket, _)) => socket,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(e) => panic!("fake worker accept: {e}"),
+                };
+                let (socket, req) = read_request(socket);
+                let version = if req.path.starts_with("/__platform/wiki/") {
+                    "hosted-cadence-wiki.v1"
+                } else {
+                    "hosted-cadence-cli.v1"
+                };
+                let response = if req.path.ends_with("/authorize") {
+                    json!({"version": version, "envelope": "h.e.1"})
+                } else {
+                    json!({"ok": true})
+                };
+                requests.lock().unwrap().push(json!({
+                    "path": req.path, "bearer": req.bearer, "body": req.body,
+                }));
+                answer(socket, "200 OK", "", &response);
+            }
+        });
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            root.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        store_credential(root.path(), &target.endpoint);
+        let mut failures = Vec::new();
+
+        for dir in [root.path().to_path_buf(), root.path().join("missing")] {
+            let before = seen.lock().unwrap().len();
+            let out = call_verb_in(&target, "delete", Map::new(), 10, &dir, |_| {}, |_| {});
+            if !matches!(out, Err(ref e) if e.kind() == "rejected" && e.to_string().contains("allowlist"))
+                || seen.lock().unwrap().len() != before
+            {
+                failures
+                    .push("delete was not refused before credential access/request".to_string());
+            }
+        }
+        // Observe successful calls too, so a missing route or a wrong schema
+        // cannot masquerade as a local refusal. Include an empty arguments map.
+        for (action, args) in [
+            ("enumerate", json!({"path": "global/", "q": "acceptance"})),
+            ("read", json!({"path": "global/acceptance.md"})),
+            (
+                "write",
+                json!({"path": "global/acceptance.md", "text": "acceptance", "if_rev": "none"}),
+            ),
+            ("enumerate", json!({})),
+        ] {
+            let args = args.as_object().unwrap().clone();
+            let before = seen.lock().unwrap().len();
+            let out = call_verb_in(
+                &target,
+                action,
+                args.clone(),
+                10,
+                root.path(),
+                |_| {},
+                |_| {},
+            );
+            let observed = seen.lock().unwrap();
+            let pair = &observed[before..];
+            let scope = if action == "write" {
+                "wiki.write"
+            } else {
+                "wiki.read"
+            };
+            if !matches!(out, Ok(RemoteAnswer::Ok(_)))
+                || pair.len() != 2
+                || pair[0]["path"] != "/__platform/wiki/authorize"
+                || pair[0]["bearer"] != BRIDGE
+                || pair[0]["body"]["version"] != "hosted-cadence-wiki.v1"
+                || pair[0]["body"]["organization_id"] != ORG_ID
+                || pair[0]["body"]["audience"] != target.endpoint
+                || pair[0]["body"]["requested_scopes"] != json!([scope])
+                || pair[1]["path"] != "/__platform/wiki/call"
+                || pair[1]["bearer"] != BRIDGE
+                || !exact_object(
+                    &pair[1]["body"],
+                    &["version", "envelope", "action", "arguments"],
+                )
+                || pair[1]["body"]["version"] != "hosted-cadence-wiki.v1"
+                || pair[1]["body"]["envelope"] != "h.e.1"
+                || pair[1]["body"]["action"] != action
+                || pair[1]["body"]["arguments"] != Value::Object(args)
+            {
+                failures.push(format!(
+                    "{action}: wrong wiki route, scope, or exact call body"
+                ));
+            }
+        }
+        for action in ["enumerate", "read", "write"] {
+            for field in ["actor", "role", "org", "user", "wiki_as", "as", "principal"] {
+                let mut args = json!({"path": "global/acceptance.md", "text": "acceptance"})
+                    .as_object()
+                    .unwrap()
+                    .clone();
+                args.insert(field.into(), json!("forged"));
+                let before = seen.lock().unwrap().len();
+                let out = call_verb_in(&target, action, args, 10, root.path(), |_| {}, |_| {});
+                if !matches!(out, Err(ref e) if e.kind() == "rejected")
+                    || seen.lock().unwrap().len() != before
+                {
+                    failures.push(format!(
+                        "{action}: {field} was not refused before mint/request"
+                    ));
+                }
+            }
+        }
+        stop.send(()).unwrap();
+        worker.join().unwrap();
+        let requests = seen.lock().unwrap();
+        if requests.iter().any(|r| r["path"] == "/__platform/cli/call") {
+            failures.push("a wiki action reached /__platform/cli/call".into());
+        }
+        for request in requests
+            .iter()
+            .filter(|r| r["path"] == "/__platform/wiki/call")
+        {
+            if request["body"]["arguments"]
+                .as_object()
+                .is_some_and(|args| {
+                    args.keys().any(|key| {
+                        ["actor", "role", "org", "user", "wiki_as", "as", "principal"]
+                            .contains(&key.as_str())
+                    })
+                })
+            {
+                failures.push("a wiki call carried authority in arguments".into());
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
     fn credential_for_another_org_is_never_sent_to_this_host() {
         // The stored file names ws_real/acme's endpoint; the resolved org is
         // beta — the token must not ride to a foreign host (contract I1).
