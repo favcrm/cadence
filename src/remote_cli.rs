@@ -1946,6 +1946,115 @@ mod tests {
         );
         assert!(!shown.contains("do-not-print"), "{shown}");
     }
+
+    /// CAD-913 overwrite guard: an existing destination without `--overwrite`
+    /// is refused from the listing alone. The fake records every request path.
+    /// Authorize and the listing are reads and may be sent; the test asserts
+    /// the upload endpoint is never reached.
+    #[test]
+    fn overwrite_refusal_sends_no_upload_request() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server = listener.try_clone().unwrap();
+        server.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_fake = Arc::clone(&stop);
+        let fake = thread::spawn(move || {
+            let mut paths: Vec<(String, String)> = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !stop_fake.load(Ordering::SeqCst) && Instant::now() < deadline {
+                let socket = match server.accept() {
+                    Ok((socket, _)) => socket,
+                    Err(_) => {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let path = line.split(' ').nth(1).unwrap().to_string();
+                let mut length = 0_usize;
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    let (key, value) = line.split_once(':').unwrap();
+                    if key.eq_ignore_ascii_case("content-length") {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut raw = vec![0; length];
+                reader.read_exact(&mut raw).unwrap();
+                let action = serde_json::from_slice::<Value>(&raw)
+                    .ok()
+                    .and_then(|b| b["action"].as_str().map(str::to_string))
+                    .unwrap_or_default();
+                paths.push((path.clone(), action));
+                if path == "/__platform/wiki/authorize" {
+                    answer(
+                        socket,
+                        "200 OK",
+                        "",
+                        &json!({"version": WIKI_VERSION, "envelope": "eyJhIjoxfQ.eyJiIjoyfQ.c2ln"}),
+                    );
+                } else if path == "/__platform/wiki/call" {
+                    answer(
+                        socket,
+                        "200 OK",
+                        "",
+                        &json!({"entries": [{"name": "a.pdf"}]}),
+                    );
+                } else {
+                    answer(socket, "500 X", "", &json!({}));
+                }
+            }
+            paths
+        });
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        store_credential(dir, &endpoint);
+        let target = RemoteTarget {
+            org: ORG.into(),
+            endpoint,
+            org_id: ORG_ID.into(),
+        };
+        let err = upload_file_in(
+            dir,
+            &target,
+            "sources/a.pdf",
+            "a.pdf",
+            b"%PDF-bytes",
+            false,
+            5,
+            |_| {},
+        )
+        .unwrap_err();
+        stop.store(true, Ordering::SeqCst);
+        let paths = fake.join().unwrap();
+        assert!(err.to_string().contains("already exists"), "{err}");
+        assert!(err.to_string().contains("Nothing was sent"), "{err}");
+        // Order: authorize, then the listing call. No upload request at all.
+        let order: Vec<&str> = paths.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            order,
+            ["/__platform/wiki/authorize", "/__platform/wiki/call"]
+        );
+        assert_eq!(paths[1].1, "enumerate");
+        assert!(
+            !order.iter().any(|p| p.ends_with("/upload")),
+            "upload reached: {order:?}"
+        );
+    }
 }
 
 #[cfg(test)]
