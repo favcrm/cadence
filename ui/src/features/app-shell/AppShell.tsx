@@ -818,7 +818,7 @@ export default function AppShell({
             ) : null}
           {loadError && (
             <p className="card px-4 py-5 text-secondary text-fail border-fail/40" role="alert">
-              {loadError}{" "}
+              {t(loadError)}{" "}
               <Button size="sm" onClick={() => location.reload()}>
                 {t("Retry")}
               </Button>

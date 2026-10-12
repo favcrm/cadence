@@ -450,7 +450,7 @@ export default function AssistantOperations({ installId, contextId, canDecide }:
           {visible.actions.length ? <ul>{visible.actions.map((action) => {
             const availability = availabilityLabel(action.availability);
             return <li key={action.id} data-availability={availability.available ? "available" : "unavailable"}>
-              <strong>{availability.label}: {action.id}</strong>
+              <strong>{t(availability.label)}: {action.id}</strong>
               {availability.available ? <><span>{action.description}</span><small>{action.effect} · {action.confirmation}</small></> : availability.detail && <small>{availability.detail}</small>}
             </li>;
           })}</ul> : <p className="text-micro text-ink-500">{t("No actions are available in this context.")}</p>}

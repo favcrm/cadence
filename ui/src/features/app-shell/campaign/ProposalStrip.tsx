@@ -135,7 +135,7 @@ export default function ProposalStrip({
           <p className="num text-micro text-ink-500 mt-1">
             {proposal.proposalId} · {t("actor")} {proposal.actor} · {t("origin")} {proposal.origin} · {t("source")} r
             {formatNumber(proposal.sourceRevision)}
-            {receipt !== null ? ` · receipt campaign ${receipt.campaignId}` : ""}
+            {receipt !== null ? ` · ${t("receipt campaign")} ${receipt.campaignId}` : ""}
           </p>
         </details>
       </div>

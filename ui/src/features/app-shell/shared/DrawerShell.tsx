@@ -210,7 +210,7 @@ export default function DrawerShell(props: DrawerShellProps) {
               {subtitle != null && <div className="crm-drawer-sub">{subtitle}</div>}
               {pills != null && <div className="crm-drawer-pills">{pills}</div>}
             </div>
-            <button type="button" className="btn btn-sm btn-ghost btn-icon" onClick={requestClose} aria-label={`Close ${label.toLowerCase()}`}>
+            <button type="button" className="btn btn-sm btn-ghost btn-icon" onClick={requestClose} aria-label={`${t("Close")} ${label.toLowerCase()}`}>
               ✕
             </button>
           </div>
@@ -218,7 +218,7 @@ export default function DrawerShell(props: DrawerShellProps) {
             <p className="crm-drawer-warn" data-testid="drawer-warning">{warning}</p>
           )}
           {state == null && !editing && tabs.length > 1 && (
-            <div className="crm-drawer-tabs" role="tablist" aria-label={`${label} sections`}>
+            <div className="crm-drawer-tabs" role="tablist" aria-label={`${label} ${t("sections")}`}>
               {tabs.map((t, i) => (
                 <button
                   key={t.id}
@@ -256,7 +256,7 @@ export default function DrawerShell(props: DrawerShellProps) {
                   {t("Cancel")}
                 </Button>
                 <button type="submit" form={edit.formId} className="btn btn-sm btn-primary" disabled={edit.pending} aria-busy={edit.pending || undefined}>
-                  {edit.pending ? "Saving…" : (edit.saveLabel ?? "Save")}
+                  {edit.pending ? t("Saving…") : (edit.saveLabel ?? t("Save"))}
                 </button>
               </>
             ) : foot != null ? (

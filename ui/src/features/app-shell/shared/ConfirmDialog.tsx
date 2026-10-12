@@ -58,7 +58,7 @@ export default function ConfirmDialog({
         {expect !== undefined && (
           <div className="crm-field">
             <label className="text-label text-ink-300" htmlFor="crm-confirm-input">
-              {inputLabel ?? `Type ${match} to confirm`}
+              {inputLabel ?? `${t("Type")} ${match} ${t("to confirm")}`}
             </label>
             <input
               id="crm-confirm-input"

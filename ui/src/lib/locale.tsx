@@ -612,6 +612,23 @@ Object.assign(zhTW, {
   "build": "建置",
 });
 
+Object.assign(zhTW, {
+  "Could not load this app": "無法載入此應用程式",
+  "The rendered sender selection changed while rendering — retry to refresh the preview.": "呈現期間寄件者選擇已變更 — 請重試以重新整理預覽。",
+  "The saved campaign changed to r{rev} while the preview rendered — reload the campaign to see the current email.": "預覽呈現期間已儲存的行銷活動已變更為 r{rev} — 請重新載入行銷活動以檢視目前的電子郵件。",
+  "a segment needs 1 to 8 rules": "客群需要 1 至 8 條規則",
+  "This message is no longer pending — it cannot be retried.": "此訊息已不再等待傳送 — 無法重試。",
+  "✦ Assistant draft": "✦ 助理草稿",
+  "receipt campaign": "收據行銷活動",
+  "Preview token": "預覽權杖",
+  "to confirm": "以確認",
+  "Available": "可用",
+  "Select a context": "選擇情境",
+  "Setup required": "需要設定",
+  "Unavailable": "無法使用",
+  "Availability unknown": "可用性未知",
+});
+
 export function useLocale(): LocaleContextValue {
   const value = useContext(LocaleContext);
   if (!value) throw new Error("useLocale must be used inside LocaleProvider");

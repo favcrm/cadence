@@ -335,7 +335,7 @@ export default function CustomerCsvImport({
             </p>
             <p className="text-micro text-ink-500 mt-1">
               {t("Nothing is written yet — this preview is bound to the exact CSV above; changing the text requires a new preview.")}{" "}
-              <span className="num" title={`Preview token ${preview.previewToken}`}>
+              <span className="num" title={`${t("Preview token")} ${preview.previewToken}`}>
                 {t("token")} {preview.previewToken.slice(0, 12)}…
               </span>
             </p>

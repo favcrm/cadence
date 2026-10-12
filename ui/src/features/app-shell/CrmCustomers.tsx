@@ -400,7 +400,7 @@ function CustomerList({
                 cell: (record) => (
                   <input
                     type="checkbox"
-                    aria-label={`Select ${viewProfile(record.profile).displayName}`}
+                    aria-label={`${t("Select")} ${viewProfile(record.profile).displayName}`}
                     checked={selected.has(record.id)}
                     onChange={(e) =>
                       setSelected((prev) => {
@@ -478,7 +478,7 @@ function CustomerList({
               ← {t("Previous")}
             </Button>
             <span className="num text-micro text-ink-500" aria-live="polite">
-              {shown.length === records.length ? "" : `${shown.length} of `}
+              {shown.length === records.length ? "" : `${shown.length} ${t("of")} `}
               {records.length} {t(records.length === 1 ? "row" : "rows")}
               {truncated ? ` ${t("· more on the server")}` : ""}
             </span>

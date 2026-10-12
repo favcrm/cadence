@@ -1782,7 +1782,7 @@ function CampaignWorkspace({
         const next = parseRender(value);
         if (next.bindingId !== (contentBindingId ?? "preview")) {
           setRender(null);
-          setRenderError("The rendered sender selection changed while rendering — retry to refresh the preview.");
+          setRenderError(t("The rendered sender selection changed while rendering — retry to refresh the preview."));
           return;
         }
         if (expected !== null && (next.revision !== expected.revision || next.contentDigest !== expected.digest)) {
@@ -1791,7 +1791,7 @@ function CampaignWorkspace({
           // the current editor's render.
           setRender(null);
           setRenderError(
-            `The saved campaign changed to r${next.revision} while the preview rendered — reload the campaign to see the current email.`,
+            t("The saved campaign changed to r{rev} while the preview rendered — reload the campaign to see the current email.").replace("{rev}", String(next.revision)),
           );
           return;
         }
@@ -1976,7 +1976,7 @@ function CampaignWorkspace({
           <>
             <p className="text-label text-ink-300">
               <span className="chip" title={t("Sender material is host-locked preview-only bytes")}>
-                preview-only
+                {t("preview-only")}
               </span>{" "}
               <span className="num">
                 {render.sender.name} · {render.sender.address}

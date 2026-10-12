@@ -269,7 +269,7 @@ export default function EmailPane({
               </span>{" "}
               · {t("To")} <span className="num">{sampleName.trim() === "" ? t("each recipient") : sampleName.trim()}</span>{" "}
               <span className="chip" title={t("Sender material is host-locked preview-only bytes")}>
-                preview-only
+                {t("preview-only")}
               </span>
             </p>
           </div>

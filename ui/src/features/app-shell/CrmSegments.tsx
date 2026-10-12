@@ -612,7 +612,7 @@ function SegmentNew({
           )}
           {formError && (
             <p className="text-label text-fail" role="alert">
-              {formError}
+              {t(formError)}
             </p>
           )}
           <div>
@@ -929,7 +929,7 @@ function SegmentDrawer({
       pills={
         ready && preview ? (
           <>
-            <span className="chip">{preview.baseCount} match</span>
+            <span className="chip">{preview.baseCount} {t("match")}</span>
             <span className="chip" data-tone={preview.finalCount === 0 ? "warn" : "ok"}>
               {preview.finalCount} {t("can be emailed")}
             </span>
@@ -1087,7 +1087,7 @@ function SegmentEdit({
       )}
       {formError && (
         <p className="text-label text-fail" role="alert">
-          {formError} {t("If another operator saved first, close and reopen to review their rules before retrying.")}
+          {t(formError)} {t("If another operator saved first, close and reopen to review their rules before retrying.")}
         </p>
       )}
     </form>
