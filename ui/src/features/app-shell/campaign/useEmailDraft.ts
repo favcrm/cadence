@@ -38,7 +38,10 @@ export function displayUiNotice(notice: UiNotice, t: (english: string) => string
   if (typeof notice === "string") return t(notice);
   let text = t(notice.key);
   for (const [name, value] of Object.entries(notice.slots ?? {})) {
-    text = text.replace(`{${name}}`, value);
+    // Replacement callback inserts `value` literally — a replacement
+    // string would re-interpret $& $' $` $$ sequences inside raw
+    // daemon/friendly text as special patterns.
+    text = text.replace(`{${name}}`, () => value);
   }
   return notice.detail !== undefined ? `${text}${notice.detail}` : text;
 }

@@ -63,7 +63,10 @@ export default function ChatCsvImport({
   const [requestId, setRequestId] = useState(newImportRequestId);
   const [pending, setPending] = useState<"preview" | "confirm" | null>(null);
   const [error, setError] = useState<UiNotice | null>(null);
-  const [sent, setSent] = useState<string | null>(null);
+  // UiNotice keeps notice state as the authored English key/slots so the
+  // stored message still renders in the active locale after a switch — a
+  // pre-translated string would freeze the completion-time locale.
+  const [sent, setSent] = useState<UiNotice | null>(null);
   const live = useRef<{ mounted: boolean; scope: string }>({ mounted: true, scope: "" });
   live.current.scope = `${scope.installId}:${scope.contextId}`;
   useEffect(() => {
@@ -83,7 +86,7 @@ export default function ChatCsvImport({
 
   const runPreview = () => {
     if (csvText.trim() === "") {
-      setError(t("Paste a small customer CSV first — a header row plus one row per customer."));
+      setError("Paste a small customer CSV first — a header row plus one row per customer.");
       return;
     }
     setPending("preview");
@@ -140,7 +143,7 @@ export default function ChatCsvImport({
         // Clear the plan first, then set the status — resetPlan() clears
         // `sent`, so the message is written after the reset, not before.
         resetPlan();
-        setSent(t("Confirmed — the import went to the assistant. It applies the reviewed rows; this board shows the outcome."));
+        setSent("Confirmed — the import went to the assistant. It applies the reviewed rows; this board shows the outcome.");
       } else {
         // The confirm minted but the hand-off send failed — say so
         // honestly; the operator retries the same request id, which the
@@ -204,7 +207,7 @@ export default function ChatCsvImport({
             )}
           </Field>
           {error !== null && <ErrorNotice bare>{displayUiNotice(error, t)}</ErrorNotice>}
-          {sent !== null && <Notice>{sent}</Notice>}
+          {sent !== null && <Notice>{displayUiNotice(sent, t)}</Notice>}
           <div className="crm-toolbar">
             <Button type="submit" variant="primary" size="sm" loading={pending === "preview"} disabled={pending !== null}>
               {t("Preview plan")}
