@@ -13,6 +13,9 @@ use crate::error::{Error, Result};
 
 pub(super) struct Root(File);
 
+#[cfg(test)]
+mod cad1385_acceptance;
+
 fn name(bytes: &[u8]) -> std::io::Result<CString> {
     CString::new(bytes).map_err(|_| {
         std::io::Error::new(
@@ -122,10 +125,18 @@ impl Root {
             return Err(error.into());
         }
         let file = unsafe { File::from_raw_fd(fd) };
+        #[cfg(test)]
+        cad1385_acceptance::after_open(path, &file);
         let metadata = file.metadata()?;
-        if !metadata.is_file() || metadata.nlink() != 1 || metadata.len() > cap {
+        if !metadata.is_file() || metadata.nlink() > 1 || metadata.len() > cap {
             return Err(Error::rejected(
                 "catalog requires a bounded regular file without hard links",
+            ));
+        }
+        if metadata.nlink() == 0 {
+            return Err(Error::invalid(
+                super::CATALOG_NOT_CURRENT,
+                "catalog file changed during read",
             ));
         }
         let mut bytes = Vec::new();
