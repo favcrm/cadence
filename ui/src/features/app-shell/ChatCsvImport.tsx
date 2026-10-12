@@ -16,6 +16,7 @@ import {
   type CsvRowChoice,
 } from "./csvClient";
 import { csvDecisionsDigest, toWireDecisions } from "./csvDigest";
+import { displayUiNotice, type UiNotice } from "./campaign/useEmailDraft";
 import { friendlyError, viewProfile } from "./customerProfile";
 import type { HostScope } from "./hostActions";
 
@@ -61,7 +62,7 @@ export default function ChatCsvImport({
   const [revisions, setRevisions] = useState<Map<number, string>>(new Map());
   const [requestId, setRequestId] = useState(newImportRequestId);
   const [pending, setPending] = useState<"preview" | "confirm" | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<UiNotice | null>(null);
   const [sent, setSent] = useState<string | null>(null);
   const live = useRef<{ mounted: boolean; scope: string }>({ mounted: true, scope: "" });
   live.current.scope = `${scope.installId}:${scope.contextId}`;
@@ -144,7 +145,10 @@ export default function ChatCsvImport({
         // The confirm minted but the hand-off send failed — say so
         // honestly; the operator retries the same request id, which the
         // daemon replays/redeems idempotently.
-        setError(`Confirmed, but the assistant turn did not start: ${sendError}. Retry the same preview to hand it off again.`);
+        setError({
+          key: "Confirmed, but the assistant turn did not start: {error}. Retry the same preview to hand it off again.",
+          slots: { error: sendError },
+        });
       }
     } catch (e: unknown) {
       if (live.current.mounted && live.current.scope === scopeKey) {
@@ -199,7 +203,7 @@ export default function ChatCsvImport({
               />
             )}
           </Field>
-          {error !== null && <ErrorNotice bare>{error}</ErrorNotice>}
+          {error !== null && <ErrorNotice bare>{displayUiNotice(error, t)}</ErrorNotice>}
           {sent !== null && <Notice>{sent}</Notice>}
           <div className="crm-toolbar">
             <Button type="submit" variant="primary" size="sm" loading={pending === "preview"} disabled={pending !== null}>
@@ -319,7 +323,7 @@ export default function ChatCsvImport({
               },
             ]}
           />
-          {error !== null && <ErrorNotice bare>{error}</ErrorNotice>}
+          {error !== null && <ErrorNotice bare>{displayUiNotice(error, t)}</ErrorNotice>}
           <div className="crm-toolbar">
             <Button
               variant="primary"

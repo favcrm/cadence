@@ -327,7 +327,7 @@ export function activityItems(record: HostRecord, t: Translate = identity): Acti
       });
       const who = rev.actor === "operator" ? t("the operator") : rev.actor;
       const lead = rev.revision === 1 ? t("Created") : parts.length === 0 ? t("Profile edited") : "";
-      const text = [lead, ...parts].filter(Boolean).join(" · ") + ` by ${who}`;
+      const text = [lead, ...parts].filter(Boolean).join(" · ") + ` ${t("by")} ${who}`;
       const note = here.find((c) => c.note)?.note;
       return { key: `r${rev.revision}`, text, ...(note ? { note } : {}), at: rev.at, agent: rev.actor !== "operator" };
     })

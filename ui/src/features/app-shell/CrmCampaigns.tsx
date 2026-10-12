@@ -32,6 +32,7 @@ import {
   type ProposalRenderDoc,
 } from "./campaignGrammar";
 import { contentClient } from "./contentClient";
+import { displayUiNotice, type UiNotice } from "./campaign/useEmailDraft";
 import { useMaybeResource } from "../../lib/useResource";
 import { navigate } from "../../lib/useLocation";
 import { autoSelectCampaignConversation, useActiveConversation } from "./conversationClient";
@@ -1704,7 +1705,10 @@ function CampaignWorkspace({
   const cloneDialogRef = useRef<HTMLDialogElement | null>(null);
   const [render, setRender] = useState<ContentRender | null>(null);
   const [renderPending, setRenderPending] = useState(false);
-  const [renderError, setRenderError] = useState<string | null>(null);
+  // A product-owned message is stored as its catalog key plus revision
+  // data so the display translates/interpolates in the render locale;
+  // anything else stays the raw daemon/friendly text.
+  const [renderError, setRenderError] = useState<UiNotice | null>(null);
   const [renderToken, setRenderToken] = useState(0);
   const [previewTab, setPreviewTab] = useState<"visual" | "html" | "text">("visual");
   const [sampleName, setSampleName] = useState("");
@@ -1782,7 +1786,7 @@ function CampaignWorkspace({
         const next = parseRender(value);
         if (next.bindingId !== (contentBindingId ?? "preview")) {
           setRender(null);
-          setRenderError(t("The rendered sender selection changed while rendering — retry to refresh the preview."));
+          setRenderError({ key: "The rendered sender selection changed while rendering — retry to refresh the preview." });
           return;
         }
         if (expected !== null && (next.revision !== expected.revision || next.contentDigest !== expected.digest)) {
@@ -1790,9 +1794,10 @@ function CampaignWorkspace({
           // surface the mismatch as a reload-needed state, never as
           // the current editor's render.
           setRender(null);
-          setRenderError(
-            t("The saved campaign changed to r{rev} while the preview rendered — reload the campaign to see the current email.").replace("{rev}", String(next.revision)),
-          );
+          setRenderError({
+            key: "The saved campaign changed to r{rev} while the preview rendered — reload the campaign to see the current email.",
+            slots: { rev: String(next.revision) },
+          });
           return;
         }
         setRender(next);
@@ -1956,7 +1961,7 @@ function CampaignWorkspace({
         </div>
         {renderError !== null && !renderPending && (
           <p className="text-label text-fail" role="alert">
-            {t(renderError)}{" "}
+            {displayUiNotice(renderError, t)}{" "}
             <button type="button" className="lnk" onClick={() => setRenderToken((count) => count + 1)}>
               {t("Retry")}
             </button>

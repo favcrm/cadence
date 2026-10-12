@@ -14,7 +14,7 @@ import { contentClient } from "../contentClient";
 import EmailBlocksCanvas, { AddBlockTools, MAX_BLOCKS } from "./EmailBlocksCanvas";
 import ProposalStrip from "./ProposalStrip";
 import ConfirmDialog from "../shared/ConfirmDialog";
-import { blocksFromProposal, blocksToGrammar, type EmailDraftApi } from "./useEmailDraft";
+import { blocksFromProposal, blocksToGrammar, displayUiNotice, type EmailDraftApi, type UiNotice } from "./useEmailDraft";
 
 type Mode = "visual" | "html";
 type Device = "desktop" | "mobile";
@@ -62,7 +62,7 @@ export default function EmailPane({
   doc: ContentDoc | null;
   render: ContentRender | null;
   renderPending: boolean;
-  renderError: string | null;
+  renderError: UiNotice | null;
   onRefresh: () => void;
   sampleName: string;
   onSampleName: (value: string) => void;
@@ -634,7 +634,7 @@ export default function EmailPane({
         )}
         {renderError !== null && !renderPending && draft === null && (
           <p className="text-label text-fail" role="alert">
-            {renderError}{" "}
+            {displayUiNotice(renderError, t)}{" "}
             <button type="button" className="lnk" onClick={onRefresh}>
               {t("Retry")}
             </button>
@@ -661,7 +661,7 @@ export default function EmailPane({
           <>
             {edit.note !== null && !edit.dirty && (
               <p className="text-label text-ok" role="status" data-saved-note>
-                {edit.note}
+                {displayUiNotice(edit.note, t)}
               </p>
             )}
             {edit.dirty && (
@@ -677,7 +677,7 @@ export default function EmailPane({
                   )}
                   {edit.error !== null && (
                     <span className="text-micro text-fail" role="alert">
-                      {edit.error}
+                      {displayUiNotice(edit.error, t)}
                     </span>
                   )}
                 </div>
@@ -692,7 +692,7 @@ export default function EmailPane({
             )}
             {!edit.dirty && edit.error !== null && (
               <p className="text-label text-fail" role="alert">
-                {edit.error}
+                {displayUiNotice(edit.error, t)}
               </p>
             )}
           </>

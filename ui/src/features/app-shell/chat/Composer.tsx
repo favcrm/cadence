@@ -225,7 +225,7 @@ export default function Composer({
     // so the earlier intent can never be silently replaced. The newer
     // text, refs and files stay editable and are not discarded.
     if (originalUnresolved) {
-      onNotice?.("The previous message was not sent — retry or discard it before sending again");
+      onNotice?.(t("The previous message was not sent — retry or discard it before sending again"));
       onResolveOriginal?.();
       return;
     }
@@ -248,7 +248,7 @@ export default function Composer({
       // An unsupported slash verb is never forwarded as chat — the
       // composer refuses it in place. Full-density menus cannot reach
       // this: an exact verb already submitted above.
-      onNotice?.(`Unsupported command "/${cmd.name}" — it was not sent`);
+      onNotice?.(t('Unsupported command "/{name}" — it was not sent').replace("{name}", cmd.name));
       return;
     } else if (cmd) {
       onCommand?.(cmd.name, cmd.arg);
@@ -271,7 +271,7 @@ export default function Composer({
       // conversation while the handoff is in flight.
       const reservation = reserveDraft(key);
       if (reservation === null) {
-        onNotice?.("Still sending the previous message — wait for it to settle");
+        onNotice?.(t("Still sending the previous message — wait for it to settle"));
         return;
       }
       // The whole envelope — original key, body, refs, ready files — is

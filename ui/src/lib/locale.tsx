@@ -134,9 +134,15 @@ export function LocaleProvider({ children }: { children: ReactNode }) {
   }, [locale]);
 
   const setPreference = useCallback(async (scope: Scope, value: Locale | null) => {
-    requestId.current += 1;
+    const generation = ++requestId.current;
+    const writeIdentity = identity;
     const next = await writePreference(scope, value);
-    if (identity) setStoredPreferences({ identity, value: next });
+    // A write that settled after the session or request generation moved
+    // on belongs to the old identity — it must not evict the new one's
+    // already-loaded preferences.
+    if (writeIdentity !== null && generation === requestId.current) {
+      setStoredPreferences({ identity: writeIdentity, value: next });
+    }
   }, [identity]);
 
   const context = useMemo<LocaleContextValue>(() => ({
@@ -627,6 +633,20 @@ Object.assign(zhTW, {
   "Setup required": "需要設定",
   "Unavailable": "無法使用",
   "Availability unknown": "可用性未知",
+});
+
+Object.assign(zhTW, {
+  "the operator": "操作員",
+  "The previous message was not sent — retry or discard it before sending again": "上一則訊息尚未傳送 — 請先重試或捨棄再傳送",
+  "Still sending the previous message — wait for it to settle": "仍在傳送上一則訊息 — 請等待其完成",
+  "The draft changed while the latest version was loading. Your edits are kept; discard again to reload.": "載入最新版本期間草稿已變更。你的編輯會保留；請再次捨棄以重新載入。",
+  "Reloaded latest saved version v{v}.": "已重新載入最新儲存版本 v{v}。",
+  "Could not reload the latest saved email. Your edits are kept. ": "無法重新載入最新儲存的電子郵件。你的編輯會保留：",
+  "Saved v{v} — approval reset. The preview below is the host render.": "已儲存 v{v} — 核准已重設。下方預覽為主機呈現。",
+  "Not saved — the email changed after editing began (v{source}). Your edits are kept while the latest version loads.": "尚未儲存 — 開始編輯後電子郵件已變更（v{source}）。最新版本載入期間你的編輯會保留。",
+  "Not saved — the saved email is now v{v}. Your edits are kept; choose Discard to reload the latest, or copy them out first.": "尚未儲存 — 已儲存的電子郵件目前為 v{v}。你的編輯會保留；選擇「捨棄」以重新載入最新版本，或先複製你的編輯。",
+  "Not saved — the email changed after editing began (v{source}), but the latest version could not be loaded. Your edits are kept; retry Discard to reload. ": "尚未儲存 — 開始編輯後電子郵件已變更（v{source}），但無法載入最新版本。你的編輯會保留；請重試「捨棄」以重新載入：",
+  "Confirmed, but the assistant turn did not start: {error}. Retry the same preview to hand it off again.": "已確認，但助理回合未啟動：{error}。請重試相同預覽以再次交付。",
 });
 
 export function useLocale(): LocaleContextValue {

@@ -906,7 +906,7 @@ function CustomerDrawer({
   }, [reloadToken]);
 
   const view = record ? viewProfile(record.profile) : null;
-  const timeline = record ? activityItems(record) : [];
+  const timeline = record ? activityItems(record, t) : [];
 
   const initials = view
     ? view.displayName.split(/\s+/).filter(Boolean).slice(0, 2).map((w) => w[0]?.toUpperCase()).join("")

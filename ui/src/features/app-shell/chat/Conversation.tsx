@@ -817,8 +817,8 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     if (held !== null) {
       const text =
         held.state === "failed"
-          ? "The previous message was not sent — retry or discard it before sending again"
-          : "Still sending the previous message — wait for it to settle";
+          ? t("The previous message was not sent — retry or discard it before sending again")
+          : t("Still sending the previous message — wait for it to settle");
       setComposerNotice(text);
       return Promise.reject(new Error(text));
     }
@@ -849,7 +849,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     // independently and a future failure is retained by the outbox, not
     // by pretending local ownership failed.
     if (!putOutbox(originKey, envelope)) {
-      const text = "The previous message was not sent — retry or discard it before sending again";
+      const text = t("The previous message was not sent — retry or discard it before sending again");
       setComposerNotice(text);
       return Promise.reject(new Error(text));
     }
