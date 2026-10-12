@@ -69,8 +69,8 @@ function routeProject(route: Route): string | null {
 }
 
 /** The card's real status and type, so finished, dropped and container work reads as itself. */
-function issueMeta(card: IssueCard, showProject: boolean): string {
-  const parts = [showProject ? card.project : null, card.status, card.container ? "container" : null, card.work?.type ?? null];
+function issueMeta(card: IssueCard, showProject: boolean, t: (english: string) => string): string {
+  const parts = [showProject ? card.project : null, t(card.status), card.container ? t("container") : null, card.work?.type ? t(card.work.type) : null];
   return parts.filter(Boolean).join(" · ");
 }
 
@@ -190,7 +190,7 @@ export default function HeaderSearch({
   const issueRows: Row[] = issueShown.map((card) => ({
     href: issuePath(card.project, card.id),
     title: `${card.id} ${card.title}`,
-    meta: issueMeta(card, projectKey === null),
+    meta: issueMeta(card, projectKey === null, t),
   }));
   const hitRows: Row[] = hitShown.map((hit) => {
     const project = hit.path.startsWith("projects/") ? hit.path.split("/")[1] : null;
@@ -199,7 +199,7 @@ export default function HeaderSearch({
         ? contextHref(project, { screen: "wiki", mode: "browse", path: hit.path, query: null })
         : navHref({ screen: "wiki", mode: "browse", path: hit.path, query: null }),
       title: hit.name,
-      meta: `${project ?? "wiki"} · ${hitKind(hit)} · ${hit.path}`,
+      meta: `${project ?? t("wiki")} · ${t(hitKind(hit))} · ${hit.path}`,
       snippet: hit.snippet,
     };
   });

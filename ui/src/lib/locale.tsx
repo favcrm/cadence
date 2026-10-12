@@ -660,6 +660,7 @@ Object.assign(zhTW, {
   "Knowledge search failed: {message}. Issue matches above are unaffected.": "知識庫搜尋失敗：{message}。上方的議題符合項目不受影響。",
   "Showing the first {n} of each group. Refine your search to narrow results.": "每組僅顯示前 {n} 筆。請縮小搜尋範圍以精簡結果。",
   "Type an issue ID, title word, owner or tag. Knowledge comes from the Wiki. Issue search covers card fields only, not descriptions or comments.": "輸入議題編號、標題字詞、負責人或標籤。知識庫內容來自 Wiki。議題搜尋只涵蓋卡片欄位，不含描述或留言。",
+  "container": "容器", "bug": "錯誤", "spike": "研究", "pages": "頁面", "images": "圖片", "video": "影片", "pdf": "PDF",
 });
 
 export function useLocale(): LocaleContextValue {
