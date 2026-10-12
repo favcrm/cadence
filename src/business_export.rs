@@ -40,12 +40,18 @@ pub struct Intake {
 /// Scanned, encrypted, macro or otherwise unsupported input is refused by
 /// the extractor with its own message.
 pub fn intake(file_name: &str, bytes: &[u8]) -> Result<Intake> {
+    check_reference_name(file_name)?;
     let runner = runner_dir()?;
     let root = tempfile::Builder::new()
         .prefix("cad1393-intake-")
         .tempdir_in("/tmp")
         .map_err(|e| Error::internal(format!("cannot create intake staging: {e}")))?;
     let source = root.path().join(file_name);
+    if source.parent() != Some(root.path()) {
+        return Err(Error::rejected(
+            "reference filename must be a safe bare DOCX or PDF name",
+        ));
+    }
     let out = root.path().join("out");
     std::fs::create_dir(&out).map_err(|e| Error::internal(e.to_string()))?;
     std::fs::write(&source, bytes).map_err(|e| Error::internal(e.to_string()))?;
@@ -87,6 +93,24 @@ pub fn intake(file_name: &str, bytes: &[u8]) -> Result<Intake> {
         provenance,
         reconstruction,
     })
+}
+
+/// The reference name must be one bare file name: ASCII letters, digits,
+/// dot, underscore or hyphen, no leading dot, ending in .docx or .pdf (any
+/// case). Separators, absolute or dot-relative forms and controls fail here,
+/// before any staging directory or write exists.
+fn check_reference_name(file_name: &str) -> Result<()> {
+    let bare = !file_name.starts_with('.')
+        && file_name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    let lower = file_name.to_ascii_lowercase();
+    if bare && (lower.ends_with(".docx") || lower.ends_with(".pdf")) {
+        return Ok(());
+    }
+    Err(Error::rejected(
+        "reference filename must be a safe bare DOCX or PDF name",
+    ))
 }
 
 /// Locate the lane's runner. `CADENCE_BUSINESS_SCRIPTS` lets a deployment
