@@ -926,7 +926,7 @@ export default function App() {
             <span className="hidden sm:inline text-ink-600" aria-hidden="true">/</span>
             {route.screen === "projects" && route.slug ? (
               <>
-                <Link href={hrefFor({ screen: "projects", slug: null, section: "overview" })} className="hidden sm:inline-flex">Projects</Link>
+                <Link href={hrefFor({ screen: "projects", slug: null, section: "overview" })} className="hidden sm:inline-flex">{t("Projects")}</Link>
                 <span className="hidden sm:inline text-ink-600" aria-hidden="true">/</span>
                 <span className="truncate text-ink-100" title={route.slug}>{route.slug}</span>
               </>
@@ -963,7 +963,7 @@ export default function App() {
 
         {updateBanner && (
           <details className="update-notice border-b border-amber-500/30 bg-amber-500/5 px-4 lg:px-8 py-2 text-label text-ink-300">
-            <summary className="cursor-pointer"><span className="font-medium text-ink-200">Updating Cadence</span> · {updateBanner.count > 0 ? `Waiting for ${updateBanner.count} active turn${updateBanner.count === 1 ? "" : "s"}` : "No active turns remaining"}<span className="text-ink-500 ml-3">Details</span></summary>
+            <summary className="cursor-pointer"><span className="font-medium text-ink-200">{t("Updating Cadence")}</span> · {updateBanner.count > 0 ? `Waiting for ${updateBanner.count} active turn${updateBanner.count === 1 ? "" : "s"}` : t("No active turns remaining")}<span className="text-ink-500 ml-3">{t("Details")}</span></summary>
             <p className="num text-micro text-ink-500 mt-2 break-all">{updateBanner.pending.from ?? "?"} → {updateBanner.pending.target} · {updateBanner.pending.phase} · {updateBanner.pending.by}</p>
           </details>
         )}
@@ -975,11 +975,11 @@ export default function App() {
               navHref={hrefFor}
               appMenu={appMenu}
               homeCount={homeCount}
-              label="Workspace"
+              label={t("Workspace")}
               onNavigate={() => setMenuOpen(false)}
             />
-            <div className="slabel pt-2">projects</div>
-            <nav aria-label="Projects">
+            <div className="slabel pt-2">{t("projects")}</div>
+            <nav aria-label={t("Projects")}>
               <ProjectList
                 project={navProject}
                 projectHref={projectHref}
@@ -991,8 +991,8 @@ export default function App() {
             </nav>
             {/* The header carries these as icons under lg — here they keep
                 their words, so the meaning is one tap away on touch. */}
-            <div className="slabel pt-2">board</div>
-            <div role="region" aria-label="Board" className="flex flex-wrap items-center gap-1.5">
+            <div className="slabel pt-2">{t("board")}</div>
+            <div role="region" aria-label={t("Board")} className="flex flex-wrap items-center gap-1.5">
               <StatusChips
                 variant="menu"
                 readOnly={boardReadOnly}
@@ -1286,12 +1286,12 @@ export default function App() {
         )}
         {screen === "notFound" && (
           <main className="px-4 lg:px-8 pt-10 pb-9">
-            <h1 className="text-section font-semibold text-ink-100">Nothing lives here</h1>
+            <h1 className="text-section font-semibold text-ink-100">{t("Nothing lives here")}</h1>
             <p className="text-body text-ink-400 mt-2">
               <span className="num break-all">{route.screen === "notFound" ? route.path : ""}</span> is
-              not a page of this board.{" "}
+              {t("not a page of this board.")}{" "}
               <Link href={hrefFor({ screen: "home" })} className="lnk">
-                Go home
+                {t("Go home")}
               </Link>
             </p>
           </main>

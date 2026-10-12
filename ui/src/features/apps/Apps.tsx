@@ -376,6 +376,7 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
 
 /** Workspace installations remain visible independently of the legacy project filter. */
 function WorkspaceCatalog() {
+  const { t } = useLocale();
   // CAD-1137: a revisit paints this session's last list at once and
   // refetches behind it; only the very first read shows the load line.
   const [rows, setRows] = useState<Installation[] | null>(() =>
@@ -400,23 +401,23 @@ function WorkspaceCatalog() {
     });
     return () => controller.abort();
   }, [revision]);
-  return <section aria-label="Workspace apps" className="mb-5">
-    <h2 className="text-cardtitle font-medium text-ink-100 mb-2">Workspace apps</h2>
+  return <section aria-label={t("Workspace apps")} className="mb-5">
+    <h2 className="text-cardtitle font-medium text-ink-100 mb-2">{t("Workspace apps")}</h2>
     {error && <div className="card px-4 py-3 text-label text-ink-400" role="alert">
-      {error} <Button onClick={() => setRevision(value => value + 1)}>Retry</Button>
+      {error} <Button onClick={() => setRevision(value => value + 1)}>{t("Retry")}</Button>
     </div>}
-    {rows === null ? error ? null : <p className="text-label text-ink-400" role="status">Loading workspace apps…</p> : rows.length === 0 ? <div className="card px-4 py-3 text-label text-ink-400">
-      No workspace apps installed. Install a package with <code>cadence app catalog install &lt;path|git-url&gt;</code>.
+    {rows === null ? error ? null : <p className="text-label text-ink-400" role="status">{t("Loading workspace apps…")}</p> : rows.length === 0 ? <div className="card px-4 py-3 text-label text-ink-400">
+      {t("No workspace apps installed. Install a package with")} <code>cadence app catalog install &lt;path|git-url&gt;</code>.
     </div> : <ul className="space-y-2.5">{rows.map(row => <li key={row.install_id} className="card px-3.5 py-3 min-w-0"
       onMouseEnter={() => prefetchWorkspaceApp(row.install_id)} onFocus={() => prefetchWorkspaceApp(row.install_id)}>
       <div className="app-card-layout">
         <AppIcon label={row.title || row.name} />
         <div className="min-w-0 flex-1">
           <Link href={`/app-installations/${encodeURIComponent(row.install_id)}`} className="text-cardtitle font-medium text-ink-100 hover:text-accent">{row.title || row.name}</Link>
-          {row.approved !== true && <span className="chip ml-2">Access off</span>}
+          {row.approved !== true && <span className="chip ml-2">{t("Access off")}</span>}
           <p className="text-label text-ink-400 mt-0.5 break-words">{row.summary}</p>
         </div>
-        <Button href={`/app-installations/${encodeURIComponent(row.install_id)}`} className="app-card-action">Open app</Button>
+        <Button href={`/app-installations/${encodeURIComponent(row.install_id)}`} className="app-card-action">{t("Open app")}</Button>
       </div>
     </li>)}</ul>}
   </section>;
@@ -475,7 +476,7 @@ function AppCard({
             ) : appName ? (
               <AppActivity project={row.project} name={appName} needs={needs} />
             ) : (
-              "activity unavailable"
+              t("activity unavailable")
             )}
           </p>
         </div>

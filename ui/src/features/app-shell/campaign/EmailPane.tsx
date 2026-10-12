@@ -448,7 +448,7 @@ export default function EmailPane({
                       <strong className="text-ink-100">{block.text}</strong>
                     ) : block.type === "button" ? (
                       <span className="chip" data-block="button">
-                        Button: {block.label}
+                        {t("Button:")} {block.label}
                       </span>
                     ) : (
                       block.text
@@ -470,7 +470,7 @@ export default function EmailPane({
           <p className="text-label text-fail" role="alert">
             {proposalsError}{" "}
             <button type="button" className="lnk" onClick={onRefreshDrafts}>
-              Retry
+              {t("Retry")}
             </button>
           </p>
         )}
@@ -545,7 +545,7 @@ export default function EmailPane({
           <p className="text-micro text-ink-500">
             {t("Use in editor changes only the local draft. Save creates a new revision; Discard changes nothing.")}{" "}
             <button type="button" className="lnk" onClick={onRefreshDrafts}>
-              Refresh drafts
+              {t("Refresh drafts")}
             </button>
           </p>
         )}
@@ -636,7 +636,7 @@ export default function EmailPane({
           <p className="text-label text-fail" role="alert">
             {renderError}{" "}
             <button type="button" className="lnk" onClick={onRefresh}>
-              Retry
+              {t("Retry")}
             </button>
           </p>
         )}

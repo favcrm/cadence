@@ -8,6 +8,7 @@ import {
   type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
+import { useTranslate } from "../lib/locale";
 import { IconCheck, IconChevron } from "./icons";
 import {
   closedSelect,
@@ -63,6 +64,7 @@ export function Select({
   title,
   ...rest
 }: SelectProps) {
+  const t = useTranslate();
   const ariaLabel = rest["aria-label"];
   const reactId = useId();
   const base = id ?? reactId;
@@ -216,8 +218,8 @@ export function Select({
                 ref={searchRef}
                 className="select-search"
                 value={model.query}
-                placeholder="Search"
-                aria-label="Search options"
+                placeholder={t("Search")}
+                aria-label={t("Search options")}
                 aria-controls={listId}
                 aria-activedescendant={activeId}
                 onChange={(event) => apply(reduceQuery(modelRef.current, options, event.target.value, value))}
@@ -248,7 +250,7 @@ export function Select({
                 rows
               ) : (
                 <li role="presentation" className="select-empty">
-                  No matches
+                  {t("No matches")}
                 </li>
               )}
             </ul>

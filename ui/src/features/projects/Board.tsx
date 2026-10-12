@@ -383,7 +383,7 @@ export default function Board({
           <span className="chip bg-warn/10 text-warn">{t("no pm dir")}</span>
           <span className="text-secondary text-ink-400">
             {t("Nothing at")} {health.pm_dir ?? "~/pm"} {t("yet")} —{" "}
-            <span className="num">cadence issue init</span> creates it.
+            <span className="num">cadence issue init</span> {t("creates it.")}
           </span>
         </div>
       )}

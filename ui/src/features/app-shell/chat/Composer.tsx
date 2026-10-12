@@ -441,7 +441,7 @@ export default function Composer({
       aria-label={attachEnabled ? t("Attach files") : `${t("Attach files unavailable")}: ${typeof attach === "object" ? attach.reason : "unavailable"}`}
       title={attachEnabled
         ? t("Attach files (txt, md, csv — up to 10 MiB each; PDF/image processing is not available yet)")
-        : typeof attach === "object" ? attach.reason : "Attach is unavailable"}
+        : typeof attach === "object" ? attach.reason : t("Attach is unavailable")}
       disabled={!!block || !attachEnabled}
       onClick={() => fileInput.current?.click()}
     >
@@ -560,7 +560,7 @@ export default function Composer({
       )}
       {refs.length > 0 && (
         <div className="refsrow" aria-label={t("cited rows")} data-composer-refs>
-          <span className="text-micro text-ink-500">re:</span>
+          <span className="text-micro text-ink-500">{t("re:")}</span>
           {refs.map((r) => (
             <button
               key={`${r.kind}:${r.id}`}

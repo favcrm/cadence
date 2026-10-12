@@ -272,17 +272,16 @@ function CampaignList({
           // CAD-1193: a completed unanswered check is unavailable, not
           // still checking — the retry re-runs the real access probe.
           <p className="card px-4 py-3 text-label text-ink-400" data-state="access-unavailable">
-            Access could not be confirmed — the board's access check did
-            not answer, so campaigns stay closed.{" "}
+            {t("Access could not be confirmed — the board's access check did not answer, so campaigns stay closed.")}{" "}
             {viewer.onRetryAccess && (
               <button type="button" className="lnk" onClick={viewer.onRetryAccess}>
-                Retry access check
+                {t("Retry access check")}
               </button>
             )}
           </p>
         ) : (
           <p className="card px-4 py-3 text-label text-ink-400" role="status">
-            Checking whether this session may inspect campaigns…
+            {t("Checking whether this session may inspect campaigns…")}
           </p>
         )
       )}
@@ -398,7 +397,7 @@ function CampaignList({
                   </td>
                   <td>
                     <button type="button" className="lnk" onClick={() => onSelect(campaign.campaignId)}>
-                      Open
+                      {t("Open")}
                     </button>
                   </td>
                 </tr>
@@ -851,7 +850,7 @@ function AudienceSection({
           <p className="text-label text-fail" role="alert">
             {suppressionError}{" "}
             <button type="button" className="lnk" onClick={() => setSuppressionToken((count) => count + 1)}>
-              Retry
+              {t("Retry")}
             </button>
           </p>
         ) : suppressions.length === 0 ? (
@@ -1051,7 +1050,7 @@ function AudienceSection({
           <p className="text-label text-fail" role="alert">
             {suppressionError}{" "}
             <button type="button" className="lnk" onClick={() => setSuppressionToken((count) => count + 1)}>
-              Retry
+              {t("Retry")}
             </button>
           </p>
         ) : suppressions.length === 0 ? (
@@ -1554,7 +1553,7 @@ function FinalSendPanel({
                 {binding?.sender.address ?? "—"}
                 <details>
                   <summary className="cursor-pointer text-ink-400">{t("Details")}</summary>
-                  {prepared.send.connectionId} · link r{prepared.send.linkRevision}
+                  {prepared.send.connectionId} {t("· link r")}{prepared.send.linkRevision}
                 </details>
               </dd>
             </div>
@@ -1959,7 +1958,7 @@ function CampaignWorkspace({
           <p className="text-label text-fail" role="alert">
             {t(renderError)}{" "}
             <button type="button" className="lnk" onClick={() => setRenderToken((count) => count + 1)}>
-              Retry
+              {t("Retry")}
             </button>
           </p>
         )}
@@ -1976,7 +1975,7 @@ function CampaignWorkspace({
         {render !== null && (
           <>
             <p className="text-label text-ink-300">
-              <span className="chip" title="Sender material is host-locked preview-only bytes">
+              <span className="chip" title={t("Sender material is host-locked preview-only bytes")}>
                 preview-only
               </span>{" "}
               <span className="num">
@@ -2135,7 +2134,7 @@ function CampaignWorkspace({
                   setBindingToken((count) => count + 1);
                 }}
               >
-                Retry
+                {t("Retry")}
               </button>
             </p>
           )}
@@ -2286,7 +2285,7 @@ function CampaignWorkspace({
             <p className="text-label text-fail" role="alert">
               {t(proposalsError)}{" "}
               <button type="button" className="lnk" onClick={() => setProposalToken((count) => count + 1)}>
-                Retry
+                {t("Retry")}
               </button>
             </p>
           )}
@@ -2500,19 +2499,19 @@ function CampaignWorkspace({
           />
           {approvalSection !== null && (
             <details className="crm-diag" data-overview-guard="content-approval">
-              <summary className="text-label text-ink-300">Content approval — separate decision</summary>
+              <summary className="text-label text-ink-300">{t("Content approval — separate decision")}</summary>
               {approvalSection}
             </details>
           )}
           {testSection !== null && (
             <details className="crm-diag" data-overview-guard="test-send">
-              <summary className="text-label text-ink-300">Test email — separate action</summary>
+              <summary className="text-label text-ink-300">{t("Test email — separate action")}</summary>
               {testSection}
             </details>
           )}
           {finalSend !== null && (
             <details className="crm-diag" data-overview-guard="final-send">
-              <summary className="text-label text-ink-300">Final send — separate operator review</summary>
+              <summary className="text-label text-ink-300">{t("Final send — separate operator review")}</summary>
               {finalSend}
             </details>
           )}
@@ -2628,7 +2627,7 @@ function ProposalRow({
             {t("Verified assistant draft")}
           </span>{" "}
           <span className="num text-micro text-ink-500">
-            {receipt.agent} · campaign {receipt.campaignId} · source r{receipt.sourceRevision}
+            {receipt.agent} {t("· campaign")} {receipt.campaignId} {t("· source r")}{receipt.sourceRevision}
           </span>
         </p>
       ) : (
@@ -2641,7 +2640,7 @@ function ProposalRow({
             {t("Operator-submitted")}
           </span>{" "}
           <span className="num text-micro text-ink-500">
-            actor {proposal.actor} · origin {proposal.origin} · source r{proposal.sourceRevision}
+            {t("actor")} {proposal.actor} {t("· origin")} {proposal.origin} {t("· source r")}{proposal.sourceRevision}
           </span>
         </p>
       )}
@@ -3110,7 +3109,7 @@ function CampaignDetail({
                 .finally(() => setLoading(false));
             }}
           >
-            Retry
+            {t("Retry")}
           </button>
         </p>
       )}

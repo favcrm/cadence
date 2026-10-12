@@ -1104,7 +1104,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       </div>
       {active.requestPending && (
         <p className="text-label text-ink-500" role="status" data-chat-link-pending>
-          Checking the linked conversation and its context…
+          {t("Checking the linked conversation and its context…")}
         </p>
       )}
       {active.requestError !== null && (

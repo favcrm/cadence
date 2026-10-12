@@ -835,20 +835,16 @@ export default function AppShell({
                 // the retry re-runs the real metadata probe, never a
                 // reload and never a login.
                 <p className="text-secondary text-ink-400 mt-1">
-                  Access could not be confirmed — the board's access
-                  check did not answer. Write controls stay off and no
-                  records load until it does.{" "}
+                  {t("Access could not be confirmed — the board's access check did not answer. Write controls stay off and no records load until it does.")}{" "}
                   {viewer.onRetryAccess && (
                     <Button size="sm" onClick={viewer.onRetryAccess}>
-                      Retry access check
+                      {t("Retry access check")}
                     </Button>
                   )}
                 </p>
               ) : (
                 <p className="text-secondary text-ink-400 mt-1">
-                  Checking whether this session may inspect this
-                  installation… If access was denied, the board will say so
-                  here.
+                  {t("Checking whether this session may inspect this installation… If access was denied, the board will say so here.")}
                 </p>
               )}
             </main>
@@ -863,7 +859,7 @@ export default function AppShell({
               </p>
               <p className="mt-2">
                 <Link href="/apps" className="lnk text-label">
-                  ← All apps
+                  ← {t("All apps")}
                 </Link>
               </p>
             </main>
@@ -880,10 +876,10 @@ export default function AppShell({
                   {generalSetupError}
                 </ErrorNotice>
               ) : canRetryGeneralSetup ? (
-                <Loading>Setting up the General CRM context…</Loading>
+                <Loading>{t("Setting up the General CRM context…")}</Loading>
               ) : (
                 <Notice state="read-only">
-                  CRM setup is required before records can open. Setup is unavailable in this read-only view; ask an administrator to review the installation.
+                  {t("CRM setup is required before records can open. Setup is unavailable in this read-only view; ask an administrator to review the installation.")}
                 </Notice>
               )
             ) : <>
@@ -897,7 +893,7 @@ export default function AppShell({
                 // company's records. Only the exceptional unbound
                 // ambiguous state below names a setup action.
                 contextId === "" && activeIds.length > 1 ? (
-                  <p className="text-micro text-ink-500">CRM setup is required before records open.</p>
+                  <p className="text-micro text-ink-500">{t("CRM setup is required before records open.")}</p>
                 ) : null
               ) : (
                 <p className="num text-micro text-ink-500">
@@ -933,7 +929,7 @@ export default function AppShell({
                       ? "app-shell-scope card px-4 py-4"
                       : "app-shell-switch"
                   }
-                  aria-label={contextId === "" ? "Choose a context" : "Switch context"}
+                  aria-label={contextId === "" ? t("Choose a context") : t("Switch context")}
                 >
                   <p
                     className={
@@ -942,11 +938,11 @@ export default function AppShell({
                   >
                     {contextId === ""
                       ? installation.name === "crm"
-                        ? "This CRM installation is not bound to a scope yet — administrator CRM setup is required before records open."
+                        ? t("This CRM installation is not bound to a scope yet — administrator CRM setup is required before records open.")
                         : `Choose a context to open ${title}'s records.`
                       : installation.name === "crm"
-                        ? "Scope:"
-                        : "Context:"}
+                        ? t("Scope:")
+                        : t("Context:")}
                   </p>
                   <ul
                     className={

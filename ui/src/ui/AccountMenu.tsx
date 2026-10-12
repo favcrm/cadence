@@ -212,7 +212,7 @@ export default function AccountMenu({
                 className="w-full rounded border border-ink-700 bg-ink-900 px-2 py-1.5 text-label text-ink-200"
               >
                 <option value="follow">{t("Follow organization")}{organizationLocale ? ` (${organizationLocale === "zh-TW" ? "繁體中文" : "English"})` : ""}</option>
-                <option value="en">English</option>
+                <option value="en">{t("English")}</option>
                 <option value="zh-TW">繁體中文</option>
               </select>
               {canSetOrganizationLocale && (
@@ -226,7 +226,7 @@ export default function AccountMenu({
                     className="w-full rounded border border-ink-700 bg-ink-900 px-2 py-1.5 text-label text-ink-200"
                   >
                     <option value="" disabled>{t("Not set")}</option>
-                    <option value="en">English</option>
+                    <option value="en">{t("English")}</option>
                     <option value="zh-TW">繁體中文</option>
                   </select>
                 </>

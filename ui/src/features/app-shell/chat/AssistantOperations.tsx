@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { api, ApiError } from "../../../lib/api";
+import { useTranslate } from "../../../lib/locale";
 import Button from "../../../ui/Button";
 import Link from "../../../ui/Link";
 import { resourceHref, type ResourceRef } from "../assistantResourceNavigation";
@@ -172,6 +173,7 @@ function AssistantOperationCard({ operation, installId, contextId, busy, decide 
   busy: boolean;
   decide: (operation: Operation, decision: "allow_once" | "allow_always" | "deny") => void;
 }) {
+  const t = useTranslate();
   const request = operation.permission_request;
   const requestMatches = request !== null && request.scope.install_id === installId &&
     request.scope.context_id === contextId && request.scope.action_id === operation.action_id &&
@@ -187,33 +189,33 @@ function AssistantOperationCard({ operation, installId, contextId, busy, decide 
         <span className="text-micro text-ink-400">{operation.status.replaceAll("_", " ")}</span>
       </div>
       <p className="text-label text-ink-300">{operation.summary}</p>
-      {operation.status === "pending_permission" && request === null && <p className="text-micro text-fail" role="alert">The permission request is unavailable or invalid. No decision is available.</p>}
+      {operation.status === "pending_permission" && request === null && <p className="text-micro text-fail" role="alert">{t("The permission request is unavailable or invalid. No decision is available.")}</p>}
       {operation.status === "pending_permission" && request && (
-        <div className="app-assistant-permission" role="group" aria-label="Permission request">
+        <div className="app-assistant-permission" role="group" aria-label={t("Permission request")}>
           <p className="text-label text-warn">{request.reason}</p>
-          {!requestMatches ? <p className="text-micro text-fail" role="alert">The permission scope does not match this installation and action; no decision is available.</p> : <>
-            <p className="text-micro text-ink-400">Only this action on {request.scope.resource_id} in this installation.</p>
-            {requiresTagPreview && request.preview === null && <p className="text-micro text-fail" role="alert">The required current tag-change preview is missing or invalid. No permission decision is available.</p>}
+          {!requestMatches ? <p className="text-micro text-fail" role="alert">{t("The permission scope does not match this installation and action; no decision is available.")}</p> : <>
+            <p className="text-micro text-ink-400">{t("Only this action on")} {request.scope.resource_id} {t("in this installation.")}</p>
+            {requiresTagPreview && request.preview === null && <p className="text-micro text-fail" role="alert">{t("The required current tag-change preview is missing or invalid. No permission decision is available.")}</p>}
             {requiresTagPreview && request.preview !== null && (
-              <div className="app-assistant-tag-preview" aria-label="Customer tag change preview">
+              <div className="app-assistant-tag-preview" aria-label={t("Customer tag change preview")}>
                 <strong className="text-label text-ink-100">{request.preview.customer_label}</strong>
                 <dl>
-                  <div><dt>Before</dt><dd>{request.preview.before_tags.length ? request.preview.before_tags.join(", ") : "No tags"}</dd></div>
-                  <div><dt>After</dt><dd>{request.preview.after_tags.length ? request.preview.after_tags.join(", ") : "No tags"}</dd></div>
-                  <div><dt>Record revision</dt><dd>{request.preview.expected_revision}</dd></div>
+                  <div><dt>{t("Before")}</dt><dd>{request.preview.before_tags.length ? request.preview.before_tags.join(", ") : t("No tags")}</dd></div>
+                  <div><dt>{t("After")}</dt><dd>{request.preview.after_tags.length ? request.preview.after_tags.join(", ") : t("No tags")}</dd></div>
+                  <div><dt>{t("Record revision")}</dt><dd>{request.preview.expected_revision}</dd></div>
                 </dl>
               </div>
             )}
             <div className="app-assistant-controls">
-              <Button size="sm" variant="primary" disabled={busy || !previewReady} onClick={() => decide(operation, "allow_once")}>Allow once</Button>
-              {request.allow_always && <Button size="sm" disabled={busy || !previewReady} onClick={() => decide(operation, "allow_always")}>Always allow for this customer</Button>}
-              <Button size="sm" variant="danger" disabled={busy || !previewReady} onClick={() => decide(operation, "deny")}>Deny this request</Button>
+              <Button size="sm" variant="primary" disabled={busy || !previewReady} onClick={() => decide(operation, "allow_once")}>{t("Allow once")}</Button>
+              {request.allow_always && <Button size="sm" disabled={busy || !previewReady} onClick={() => decide(operation, "allow_always")}>{t("Always allow for this customer")}</Button>}
+              <Button size="sm" variant="danger" disabled={busy || !previewReady} onClick={() => decide(operation, "deny")}>{t("Deny this request")}</Button>
             </div>
           </>}
         </div>
       )}
-      {operation.status === "running" && <p className="text-micro text-info" role="status">In progress</p>}
-      {operation.status === "denied" && <p className="text-micro text-ink-400">No standing permission was created.</p>}
+      {operation.status === "running" && <p className="text-micro text-info" role="status">{t("In progress")}</p>}
+      {operation.status === "denied" && <p className="text-micro text-ink-400">{t("No standing permission was created.")}</p>}
       {operation.status === "failed" && operation.error && <p className="text-micro text-fail" role="alert">{operation.error}</p>}
       {resultRows.length > 0 && (
         <dl className="app-assistant-result">
@@ -221,7 +223,7 @@ function AssistantOperationCard({ operation, installId, contextId, busy, decide 
         </dl>
       )}
       {operation.resource_refs.length > 0 && (
-        <ul className="app-assistant-resources" aria-label="Result resources">
+        <ul className="app-assistant-resources" aria-label={t("Result resources")}>
           {operation.resource_refs.map((ref, index) => {
             const href = resourceHref(installId, contextId, ref);
             return <li key={`${ref.kind}:${ref.id}:${index}`}>{href ? <Link className="lnk text-label" href={href}>{ref.label}</Link> : <span className="text-label text-ink-300">{ref.label}</span>}</li>;
@@ -273,6 +275,7 @@ export default function AssistantOperations({ installId, contextId, canDecide }:
   contextId: string;
   canDecide: boolean;
 }) {
+  const t = useTranslate();
   const scopeKey = JSON.stringify([installId, contextId]);
   const contextReady = installId !== "" && contextId !== "";
   const poller = useRef<Poller | null>(null);
@@ -431,37 +434,37 @@ export default function AssistantOperations({ installId, contextId, canDecide }:
 
   if (!visible.actions.length && !visible.operations.length && !visible.permissions.length && !visible.error && !visible.consent) return null;
   return (
-    <section className="app-assistant-activity" aria-label="Assistant activity">
+    <section className="app-assistant-activity" aria-label={t("Assistant activity")}>
       <div className="app-assistant-section-head">
-        <h2 className="text-label text-ink-100">Assistant activity</h2>
+        <h2 className="text-label text-ink-100">{t("Assistant activity")}</h2>
         <button type="button" className="lnk text-micro" aria-expanded={expanded} onClick={() => setExpanded((v) => !v)}>
-          {expanded ? "Hide permissions and actions" : "Actions & permissions"}
+          {expanded ? t("Hide permissions and actions") : t("Actions & permissions")}
         </button>
       </div>
-      {visible.consent && <p className="text-micro text-ink-400" role="status">Approve the app to enable assistant actions.</p>}
-      {visible.error && <p className="text-micro text-fail" role="alert">{visible.error} <button className="lnk" type="button" onClick={() => void poller.current?.refresh()}>Retry</button></p>}
+      {visible.consent && <p className="text-micro text-ink-400" role="status">{t("Approve the app to enable assistant actions.")}</p>}
+      {visible.error && <p className="text-micro text-fail" role="alert">{visible.error} <button className="lnk" type="button" onClick={() => void poller.current?.refresh()}>{t("Retry")}</button></p>}
       {visible.operations.map((operation) => <AssistantOperationCard key={operation.id} operation={operation} installId={installId} contextId={contextId} busy={busy === operation.id || !canDecide} decide={decide} />)}
       {expanded && (
         <div className="app-assistant-settings">
-          <h3 className="text-micro text-ink-300">Action discovery</h3>
+          <h3 className="text-micro text-ink-300">{t("Action discovery")}</h3>
           {visible.actions.length ? <ul>{visible.actions.map((action) => {
             const availability = availabilityLabel(action.availability);
             return <li key={action.id} data-availability={availability.available ? "available" : "unavailable"}>
               <strong>{availability.label}: {action.id}</strong>
               {availability.available ? <><span>{action.description}</span><small>{action.effect} · {action.confirmation}</small></> : availability.detail && <small>{availability.detail}</small>}
             </li>;
-          })}</ul> : <p className="text-micro text-ink-500">No actions are available in this context.</p>}
-          <h3 className="text-micro text-ink-300">Permission settings</h3>
+          })}</ul> : <p className="text-micro text-ink-500">{t("No actions are available in this context.")}</p>}
+          <h3 className="text-micro text-ink-300">{t("Permission settings")}</h3>
           {visible.permissions.length ? <ul>{visible.permissions.map((permission) => (
             <li key={permission.id} data-permission-state={permission.state}>
-              <span><strong>{permission.effect === "deny" ? "Blocked" : "Allowed"}: {permission.action_id}</strong><small>{permission.scope_label} · customer/resource {permission.resource_id}</small></span>
+              <span><strong>{permission.effect === "deny" ? t("Blocked") : t("Allowed")}: {permission.action_id}</strong><small>{permission.scope_label} · {t("customer/resource")} {permission.resource_id}</small></span>
               {canDecide && permission.state === "active" && <div className="app-assistant-controls">
-                {permission.effect === "allow" && <Button size="sm" variant="danger" disabled={busy !== null} onClick={() => void block(permission)}>Block this action</Button>}
-                <Button size="sm" disabled={busy !== null} onClick={() => void revoke(permission)}>{permission.effect === "deny" ? "Unblock" : "Revoke"}</Button>
+                {permission.effect === "allow" && <Button size="sm" variant="danger" disabled={busy !== null} onClick={() => void block(permission)}>{t("Block this action")}</Button>}
+                <Button size="sm" disabled={busy !== null} onClick={() => void revoke(permission)}>{permission.effect === "deny" ? t("Unblock") : t("Revoke")}</Button>
               </div>}
             </li>
-          ))}</ul> : <p className="text-micro text-ink-500">No standing permissions.</p>}
-          {!canDecide && <p className="text-micro text-ink-500">Permission decisions are available to the signed-in operator.</p>}
+          ))}</ul> : <p className="text-micro text-ink-500">{t("No standing permissions.")}</p>}
+          {!canDecide && <p className="text-micro text-ink-500">{t("Permission decisions are available to the signed-in operator.")}</p>}
         </div>
       )}
     </section>

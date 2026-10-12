@@ -299,11 +299,10 @@ function CustomerList({
           // CAD-1193: a completed unanswered check is unavailable, not
           // still checking — the retry re-runs the real access probe.
           <Notice state="access-unavailable" onRetry={viewer.onRetryAccess} retryLabel={t("Retry access check")}>
-            Access could not be confirmed — the board's access check did
-            not answer, so customer records stay closed.
+            {t("Access could not be confirmed — the board's access check did not answer, so customer records stay closed.")}
           </Notice>
         ) : (
-          <Notice>Checking whether this session may inspect customer records…</Notice>
+          <Notice>{t("Checking whether this session may inspect customer records…")}</Notice>
         )
       )}
       {viewer.operator === false && (
@@ -353,7 +352,7 @@ function CustomerList({
             />
             {tagFilter !== "" && (
               <button type="button" className="chip crm-chip-on" onClick={() => setTagFilter("")} aria-label={`Clear tag filter ${tagFilter}`}>
-                tag: {tagFilter} ✕
+                {t("tag")}: {tagFilter} ✕
               </button>
             )}
           </div>
@@ -372,7 +371,7 @@ function CustomerList({
           )}
           {shown.length > 0 && (
           <DataTable<HostRecord>
-            label="Customers table — scroll horizontally to reach every column"
+            label={t("Customers table — scroll horizontally to reach every column")}
             wrapClassName="crm-table-wrap"
             tableClassName="crm-table"
             rowKey={(record) => record.id}
@@ -416,7 +415,7 @@ function CustomerList({
               },
               {
                 key: "name",
-                header: "Name",
+                header: t("Name"),
                 cellClassName: "text-ink-100",
                 cell: (record) => (
                   <button type="button" className="lnk" onClick={() => onSelect(record.id)}>
@@ -426,13 +425,13 @@ function CustomerList({
               },
               {
                 key: "email",
-                header: "Email",
+                header: t("Email"),
                 cellClassName: "num text-ink-300 crm-nowrap",
                 cell: (record) => viewProfile(record.profile).email ?? "—",
               },
               {
                 key: "tags",
-                header: "Tags",
+                header: t("Tags"),
                 cell: (record) => {
                   const tags = viewProfile(record.profile).tags;
                   return tags.length > 0 ? (
@@ -450,17 +449,17 @@ function CustomerList({
               },
               {
                 key: "source",
-                header: "Source",
+                header: t("Source"),
                 cellClassName: "text-ink-300",
                 cell: (record) => viewProfile(record.profile).source ?? "—",
               },
               {
                 key: "consent",
-                header: "Email consent",
+                header: t("Email consent"),
                 cell: (record) => {
                   const state = viewProfile(record.profile).consentEmail;
                   return (
-                    <span className={`chip ${state === "granted" ? "crm-consent-ok" : ""}`} title="Email consent">
+                    <span className={`chip ${state === "granted" ? "crm-consent-ok" : ""}`} title={t("Email consent")}>
                       {consentLabel(state)}
                     </span>
                   );
@@ -476,19 +475,19 @@ function CustomerList({
               disabled={cursors.length === 0 || loading}
               onClick={() => setCursors((prev) => prev.slice(0, -1))}
             >
-              ← Previous
+              ← {t("Previous")}
             </Button>
             <span className="num text-micro text-ink-500" aria-live="polite">
               {shown.length === records.length ? "" : `${shown.length} of `}
               {records.length} row{records.length === 1 ? "" : "s"}
-              {truncated ? " · more on the server" : ""}
+              {truncated ? ` ${t("· more on the server")}` : ""}
             </span>
             <Button
               size="sm"
               disabled={!truncated || nextCursor === null || loading}
               onClick={() => nextCursor !== null && setCursors((prev) => [...prev, nextCursor])}
             >
-              Next →
+              {t("Next")} →
             </Button>
           </div>
         </>
@@ -651,20 +650,20 @@ function CustomerForm({
       )}
       {!hideConsent && consentMethod && granted && (
         <div className="crm-field-row" data-testid="create-consent-method">
-          <Field label="How was consent given? (optional)" id="crm-create-method" className="crm-field">
+          <Field label={t("How was consent given? (optional)")} id="crm-create-method" className="crm-field">
             {(c) => (
               <Select
                 id={c.id}
                 value={method}
                 onChange={(v) => { setMethod(v as ConsentMethod | ""); setFieldError(null); }}
                 options={[{ value: "", label: t("Not recorded") }, ...CONSENT_METHODS.map((option) => ({ ...option, label: t(option.label) }))]}
-                aria-label="How consent was given"
+                aria-label={t("How consent was given")}
                 full
               />
             )}
           </Field>
           {method !== "" && (
-            <Field label="Note (optional)" id="crm-create-note" className="crm-field">
+            <Field label={t("Note (optional)")} id="crm-create-note" className="crm-field">
               {(c) => (
                 <input
                   {...c}
@@ -765,20 +764,20 @@ function ConsentForm({
         </Field>
       </div>
       {granting && (
-        <Field label="How was it given?" id="crm-rc-method" hint="Kept in the customer's activity for audit" className="crm-field">
+        <Field label={t("How was it given?")} id="crm-rc-method" hint={t("Kept in the customer's activity for audit")} className="crm-field">
           {(c) => (
             <Select
               id={c.id}
               value={method}
               onChange={(v) => { setMethod(v as ConsentMethod | ""); setFieldError(null); }}
               options={[{ value: "", label: t("Choose…") }, ...CONSENT_METHODS.map((option) => ({ ...option, label: t(option.label) }))]}
-              aria-label="How consent was given"
+              aria-label={t("How consent was given")}
               full
             />
           )}
         </Field>
       )}
-      <Field label="Note (optional)" id="crm-rc-note" className="crm-field">
+      <Field label={t("Note (optional)")} id="crm-rc-note" className="crm-field">
         {(c) => (
           <input
             {...c}
@@ -953,7 +952,7 @@ function CustomerDrawer({
                   <h4>{t("Profile")}</h4>
                   <Detail
                     className="crm-detail"
-                    label="Customer fields"
+                    label={t("Customer fields")}
                     items={[
                       { key: "email", term: "Email", value: <span className="num">{view.email ?? "—"}</span> },
                       { key: "phone", term: "Phone", value: <span className="num">{view.phone ?? "—"}</span> },
@@ -997,11 +996,11 @@ function CustomerDrawer({
             panel: (
               <section aria-label={t("Record diagnostics")}>
                 <p className="text-micro text-ink-500 mb-2">
-                  Selection is chat context only — the server re-proves scope on every send.
+                  {t("Selection is chat context only — the server re-proves scope on every send.")}
                 </p>
                 <p className="num text-micro text-ink-500">
-                  Record <span className="num">{recordId}</span> · revision r{record.revision} · digest{" "}
-                  {record.digest.slice(0, 18)}… · scope <span className="num">{scope.contextId || "none"}</span>
+                  {t("Record")} <span className="num">{recordId}</span> · {t("revision")} r{record.revision} · {t("digest")}{" "}
+                  {record.digest.slice(0, 18)}… · {t("scope")} <span className="num">{scope.contextId || "none"}</span>
                 </p>
               </section>
             ),
@@ -1034,7 +1033,7 @@ function CustomerDrawer({
         view && ready ? (
           <>
             <span className="chip" title={t("Email consent")}>{t("Email")}: {t(consentLabel(view.consentEmail))}</span>
-            <span className="chip" title={t("SMS consent")}>SMS: {t(consentLabel(view.consentSms))}</span>
+            <span className="chip" title={t("SMS consent")}>{t("SMS:")} {t(consentLabel(view.consentSms))}</span>
             {view.tags.map((tag) => (
               <span key={tag} className="chip">{tag}</span>
             ))}
@@ -1052,8 +1051,8 @@ function CustomerDrawer({
       warning={
         ready && view !== null && view.consentEmail !== "granted" ? (
           <>
-            <b>{view.displayName} can't receive campaigns.</b>{" "}
-            {view.consentEmail === "denied" ? "Email consent was withdrawn." : "No email consent recorded."}
+            <b>{view.displayName} {t("can't receive campaigns.")}</b>{" "}
+            {view.consentEmail === "denied" ? t("Email consent was withdrawn.") : t("No email consent recorded.")}
           </>
         ) : undefined
       }
@@ -1110,12 +1109,12 @@ function CustomerDrawer({
           <>
             {view?.email ? (
               <Button size="sm" onClick={() => void navigator.clipboard?.writeText(view.email ?? "")}>
-                Copy email
+                {t("Copy email")}
               </Button>
             ) : null}
             {canWrite ? (
               <Button size="sm" onClick={() => { setMode("edit"); setFormError(null); }}>
-                Edit
+                {t("Edit")}
               </Button>
             ) : null}
           </>
@@ -1124,7 +1123,7 @@ function CustomerDrawer({
       primary={
         ready && canWrite ? (
           <Button size="sm" variant="primary" onClick={() => { setMode("consent"); setFormError(null); }}>
-            Record consent
+            {t("Record consent")}
           </Button>
         ) : undefined
       }

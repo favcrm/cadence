@@ -316,17 +316,16 @@ function SegmentList({
           // CAD-1193: a completed unanswered check is unavailable, not
           // still checking — the retry re-runs the real access probe.
           <p className="card px-4 py-3 text-label text-ink-400" data-state="access-unavailable">
-            Access could not be confirmed — the board's access check did
-            not answer, so saved segments stay closed.{" "}
+            {t("Access could not be confirmed — the board's access check did not answer, so saved segments stay closed.")}{" "}
             {viewer.onRetryAccess && (
               <button type="button" className="lnk" onClick={viewer.onRetryAccess}>
-                Retry access check
+                {t("Retry access check")}
               </button>
             )}
           </p>
         ) : (
           <p className="card px-4 py-3 text-label text-ink-400" role="status">
-            Checking whether this session may inspect saved segments…
+            {t("Checking whether this session may inspect saved segments…")}
           </p>
         )
       )}
@@ -586,7 +585,7 @@ function SegmentNew({
               .finally(() => setPending(false));
           }}
         >
-          <Field label="Segment name" id="seg-name" required className="crm-field">
+          <Field label={t("Segment name")} id="seg-name" required className="crm-field">
             {(c) => (
               <input
                 {...c}
@@ -607,7 +606,7 @@ function SegmentNew({
                 disabled={pending}
                 onClick={() => setRules((prev) => [...prev, { field: "tag", op: "eq", value: "" }])}
               >
-                + Add rule ({rules.length}/8)
+                {t("+ Add rule (")}{rules.length}/8)
               </button>
             </p>
           )}
@@ -618,7 +617,7 @@ function SegmentNew({
           )}
           <div>
             <Button type="submit" variant="primary" loading={pending} disabled={pending}>
-              Create segment
+              {t("Create segment")}
             </Button>
           </div>
         </form>
@@ -698,9 +697,9 @@ export function PreviewPanel({
         </div>
       </dl>
       {preview.sample.length > 0 && (
-        <section aria-label="Audience sample" className="mt-3">
+        <section aria-label={t("Audience sample")} className="mt-3">
           <h4 className="text-label font-medium text-ink-200">
-            Sample ({preview.sample.length} of {preview.finalCount})
+            {t("Sample (")}{preview.sample.length} {t("of")} {preview.finalCount})
           </h4>
           <ol className="crm-history">
             {preview.sample.map((entry) => (
@@ -878,10 +877,10 @@ function SegmentDrawer({
             id: "details",
             label: t("Details"),
             panel: (
-              <section aria-label="Record diagnostics">
+              <section aria-label={t("Record diagnostics")}>
                 <p className="num text-micro text-ink-500">
-                  Segment <span className="num">{segmentId}</span> · scope{" "}
-                  <span className="num">{scope.contextId || "none"}</span> · revision r{segment.revision} · digest{" "}
+                  {t("Segment")} <span className="num">{segmentId}</span> · {t("scope")}{" "}
+                  <span className="num">{scope.contextId || "none"}</span> · {t("revision")} r{segment.revision} · {t("digest")}{" "}
                   {segment.digest.slice(0, 18)}…
                 </p>
                 <div className="mt-3">
@@ -923,8 +922,8 @@ function SegmentDrawer({
   return (
     <DrawerShell
       kind="segment"
-      label="Segment details"
-      title={loading ? "Segment details" : (segment?.name ?? "Segment details")}
+      label={t("Segment details")}
+      title={loading ? t("Segment details") : (segment?.name ?? t("Segment details"))}
       avatar="◎"
       subtitle={segment ? `${segment.predicates.length} rule${segment.predicates.length === 1 ? "" : "s"}` : undefined}
       pills={
@@ -932,7 +931,7 @@ function SegmentDrawer({
           <>
             <span className="chip">{preview.baseCount} match</span>
             <span className="chip" data-tone={preview.finalCount === 0 ? "warn" : "ok"}>
-              {preview.finalCount} can be emailed
+              {preview.finalCount} {t("can be emailed")}
             </span>
           </>
         ) : undefined
@@ -943,12 +942,12 @@ function SegmentDrawer({
       secondary={
         ready ? (
           <>
-            <Button size="sm" onClick={duplicate} disabled={!canWrite} title={canWrite ? undefined : "Operators only"}>
-              Duplicate
+            <Button size="sm" onClick={duplicate} disabled={!canWrite} title={canWrite ? undefined : t("Operators only")}>
+              {t("Duplicate")}
             </Button>
             {canWrite ? (
               <Button size="sm" onClick={() => setEditing(true)}>
-                Edit rules
+                {t("Edit rules")}
               </Button>
             ) : null}
           </>
@@ -957,13 +956,13 @@ function SegmentDrawer({
       state={
         loading ? (
           <p className="text-secondary text-ink-400" role="status">
-            Reading the segment…
+            {t("Reading the segment…")}
           </p>
         ) : error !== null ? (
           <p className="card px-4 py-3 text-label text-fail border-fail/40" role="alert">
             {error}{" "}
             <button type="button" className="lnk" onClick={reload}>
-              Retry
+              {t("Retry")}
             </button>
           </p>
         ) : undefined
@@ -972,7 +971,7 @@ function SegmentDrawer({
         editing && canWrite && ready && segment !== null
           ? {
               formId: "crm-segment-edit",
-              title: "Edit rules — saving is refused if the segment changed since you opened it",
+              title: t("Edit rules — saving is refused if the segment changed since you opened it"),
               pending: editPending,
               onCancel: () => setEditing(false),
               body: (
@@ -993,7 +992,7 @@ function SegmentDrawer({
       primary={
         ready && canWrite ? (
           <Button size="sm" variant="primary" onClick={useInCampaign}>
-            Use in campaign
+            {t("Use in campaign")}
           </Button>
         ) : undefined
       }
@@ -1020,6 +1019,7 @@ function SegmentEdit({
   onPending: (pending: boolean) => void;
   onSaved: (segment: SegmentDoc) => void;
 }) {
+  const { t } = useLocale();
   const [name, setName] = useState(segment.name);
   const [rules, setRules] = useState<RuleDraft[]>(() =>
     segment.predicates.map((rule) => ({ field: rule.field, op: rule.op, value: rule.value })),
@@ -1060,7 +1060,7 @@ function SegmentEdit({
           });
       }}
     >
-      <Field label="Segment name" id="seg-edit-name" required disabled={pending} className="crm-field">
+      <Field label={t("Segment name")} id="seg-edit-name" required disabled={pending} className="crm-field">
         {(c) => (
           <input
             {...c}
@@ -1081,14 +1081,13 @@ function SegmentEdit({
             disabled={pending}
             onClick={() => setRules((prev) => [...prev, { field: "tag", op: "eq", value: "" }])}
           >
-            + Add rule ({rules.length}/8)
+            {t("+ Add rule (")}{rules.length}/8)
           </button>
         </p>
       )}
       {formError && (
         <p className="text-label text-fail" role="alert">
-          {formError} If another operator saved first, close and reopen to review their rules
-          before retrying.
+          {formError} {t("If another operator saved first, close and reopen to review their rules before retrying.")}
         </p>
       )}
     </form>
