@@ -808,8 +808,9 @@ fn call_once(
 }
 
 /// CAD-913: one `POST /__platform/wiki/upload` multipart request — the same
-/// bearer and a fresh `wiki.write` envelope as `call_once`, with `version`,
-/// `envelope`, `action=write_blob` and `path` as form fields and the bytes in
+/// bearer and a fresh `wiki.write` envelope as `call_once`. The envelope rides
+/// in the `X-Cadence-Wiki-Envelope` header (never logged); the body carries
+/// `version`, `action=write_blob` and `path` as form fields and the bytes in
 /// one `file` part. Returns `(status, retry_after, body)` like `post`, so the
 /// caller applies the same `classify` verdicts (wake, conflict, refusal). The
 /// refusal path never surfaces the raw body.
@@ -826,7 +827,6 @@ fn upload_once(
     let boundary = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random);
     let fields = [
         ("version", WIKI_VERSION),
-        ("envelope", envelope.as_str()),
         ("action", "write_blob"),
         ("path", logical_path),
     ];
@@ -840,6 +840,7 @@ fn upload_once(
     let response = ureq::Agent::new_with_config(config)
         .post(format!("{}/__platform/wiki/upload", target.endpoint))
         .header("Authorization", format!("Bearer {}", cred.access_token))
+        .header("X-Cadence-Wiki-Envelope", envelope.as_str())
         .header(
             "Content-Type",
             format!("multipart/form-data; boundary={boundary}"),
@@ -893,6 +894,32 @@ pub fn upload_file(
     )
 }
 
+/// CAD-913: does the parent listing show `name`? Fails closed: the listing
+/// must be a plain `entries` array, and any pagination or truncation field
+/// (`truncated`, `cursor`, `next_cursor`, `next_page`, `has_more`) that is
+/// set means the listing may be partial, so a name absent from it proves
+/// nothing. The wiki listing carries no such field today, so this guard is
+/// for a relay or daemon that starts to page or cap results.
+fn listing_taken(body: &Value, name: &str) -> std::result::Result<bool, &'static str> {
+    const PAGING: &[&str] = &[
+        "truncated",
+        "cursor",
+        "next_cursor",
+        "next_page",
+        "has_more",
+    ];
+    if PAGING.iter().any(|k| {
+        body.get(*k)
+            .is_some_and(|v| !v.is_null() && v != &json!(false))
+    }) {
+        return Err("the listing may be truncated");
+    }
+    let items = body["entries"]
+        .as_array()
+        .ok_or("the listing is not a directory listing")?;
+    Ok(items.iter().any(|e| e["name"].as_str() == Some(name)))
+}
+
 /// `upload_file` with the credential dir injectable, so the test points it at
 /// a fixture and never touches the real config dir.
 #[allow(clippy::too_many_arguments)]
@@ -922,11 +949,12 @@ fn upload_file_in(
         let RemoteAnswer::Ok(body) = listing else {
             return Err(reject("remote listing answered a conflict"));
         };
-        let taken = body["entries"].as_array().is_some_and(|items| {
-            items
-                .iter()
-                .any(|e| e["name"].as_str() == Some(name.as_str()))
-        });
+        let taken = listing_taken(&body, &name).map_err(|why| {
+            reject(format!(
+                "wiki upload refused: cannot prove '{logical_path}' is free ({why}); \
+                 pass --overwrite to replace it. Nothing was sent"
+            ))
+        })?;
         if taken {
             return Err(reject(format!(
                 "wiki upload refused: '{logical_path}' already exists; pass --overwrite \
@@ -1826,12 +1854,12 @@ mod tests {
     fn upload_fake(
         upload_status: u16,
         upload_body: &'static str,
-    ) -> (TcpListener, thread::JoinHandle<(Vec<u8>, String)>) {
+    ) -> (TcpListener, thread::JoinHandle<(Vec<u8>, String, String)>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let server = listener.try_clone().unwrap();
         server.set_nonblocking(true).unwrap();
         let handle = thread::spawn(move || {
-            let mut seen_upload = (Vec::new(), String::new());
+            let mut seen_upload = (Vec::new(), String::new(), String::new());
             // Bounded: the client may refuse before the second request, so the
             // fake gives up on its own instead of hanging the test.
             let deadline = Instant::now() + Duration::from_secs(10);
@@ -1853,6 +1881,7 @@ mod tests {
                 reader.read_line(&mut line).unwrap();
                 let path = line.split(' ').nth(1).unwrap().to_string();
                 let mut bearer = String::new();
+                let mut envelope_header = String::new();
                 let mut length = 0_usize;
                 let mut content_type = String::new();
                 loop {
@@ -1864,6 +1893,9 @@ mod tests {
                     let (key, value) = line.split_once(':').unwrap();
                     if key.eq_ignore_ascii_case("authorization") {
                         bearer = value.trim().trim_start_matches("Bearer ").to_string();
+                    }
+                    if key.eq_ignore_ascii_case("x-cadence-wiki-envelope") {
+                        envelope_header = value.trim().to_string();
                     }
                     if key.eq_ignore_ascii_case("content-length") {
                         length = value.trim().parse().unwrap();
@@ -1886,7 +1918,7 @@ mod tests {
                 } else {
                     assert_eq!(path, "/__platform/wiki/upload");
                     assert!(content_type.starts_with("multipart/form-data; boundary="));
-                    seen_upload = (raw, bearer);
+                    seen_upload = (raw, bearer, envelope_header);
                     let body: Value = serde_json::from_str(upload_body).unwrap_or(json!({}));
                     answer(socket, &format!("{upload_status} X"), "", &body);
                 }
@@ -1923,20 +1955,23 @@ mod tests {
             |_| {},
         )
         .unwrap_err();
-        let (raw, bearer) = handle.join().unwrap();
-        // The bearer rides the header, and the body carries the contract
-        // fields and the single file part with the raw bytes.
+        let (raw, bearer, envelope_header) = handle.join().unwrap();
+        // The bearer rides the Authorization header and the envelope rides
+        // X-Cadence-Wiki-Envelope. The body carries the contract fields and
+        // the single file part with the raw bytes, and no envelope field.
         assert_eq!(bearer, BRIDGE);
+        assert_eq!(envelope_header, "eyJhIjoxfQ.eyJiIjoyfQ.c2ln");
         let text = String::from_utf8_lossy(&raw);
         for needle in [
             "name=\"version\"\r\n\r\nhosted-cadence-wiki.v1",
             "name=\"action\"\r\n\r\nwrite_blob",
             "name=\"path\"\r\n\r\nsources/a.pdf",
-            "name=\"envelope\"\r\n\r\neyJhIjoxfQ.eyJiIjoyfQ.c2ln",
             "filename=\"a.pdf\"",
         ] {
             assert!(text.contains(needle), "missing {needle}");
         }
+        assert!(!text.contains("name=\"envelope\""), "envelope in body");
+        assert!(!text.contains("eyJhIjoxfQ"), "envelope in body");
         assert_eq!(text.matches("name=\"file\"").count(), 1);
         // A refusal names the status and code and never the raw body.
         let shown = err.to_string();
@@ -1945,6 +1980,27 @@ mod tests {
             "{shown}"
         );
         assert!(!shown.contains("do-not-print"), "{shown}");
+    }
+
+    /// CAD-913: the overwrite check fails closed on any listing that may be
+    /// partial, and reads a plain listing exactly.
+    #[test]
+    fn overwrite_check_fails_closed_on_a_possibly_partial_listing() {
+        let plain = json!({"path": "sources", "entries": [{"name": "a.pdf"}]});
+        assert_eq!(listing_taken(&plain, "a.pdf"), Ok(true));
+        assert_eq!(listing_taken(&plain, "b.pdf"), Ok(false));
+        for paged in [
+            json!({"path": "sources", "entries": [], "truncated": true}),
+            json!({"path": "sources", "entries": [], "next_cursor": "c2"}),
+            json!({"path": "sources", "entries": [], "has_more": true}),
+        ] {
+            assert!(listing_taken(&paged, "a.pdf").is_err(), "{paged}");
+        }
+        // A missing or non-array `entries` cannot prove the name is free.
+        assert!(listing_taken(&json!({"path": "sources"}), "a.pdf").is_err());
+        // An explicit false or null completeness field is still complete.
+        let done = json!({"entries": [], "truncated": false, "next_cursor": null});
+        assert_eq!(listing_taken(&done, "a.pdf"), Ok(false));
     }
 
     /// CAD-913 overwrite guard: an existing destination without `--overwrite`

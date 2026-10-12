@@ -76,8 +76,12 @@ pub fn check_size(len: u64, cap: u64) -> Result<()> {
 
 /// Open and read the local file as bytes, refusing before any network call:
 /// a symlink (the final component is not followed), a non-regular file, or a
-/// file over the cap. The read is bounded by `cap + 1`, so a file that grows
-/// between the stat and the read is still refused.
+/// file over the cap. The lstat gives the early, named refusals; the file is
+/// then opened with `O_NOFOLLOW | O_NONBLOCK` (so a swap to a symlink fails
+/// the open, and a swap to a FIFO or device cannot block it), and the type and
+/// size are re-checked on the opened handle with fstat. The read is bounded by
+/// `cap + 1` on that same handle, so a file that grows after the check is still
+/// refused.
 pub fn read_local_file(path: &Path, cap: u64) -> Result<Vec<u8>> {
     let meta = fs::symlink_metadata(path).map_err(|e| {
         Error::rejected(format!("wiki upload: cannot read {}: {e}", path.display()))
@@ -94,17 +98,34 @@ pub fn read_local_file(path: &Path, cap: u64) -> Result<Vec<u8>> {
             path.display()
         )));
     }
-    check_size(meta.len(), cap)?;
-    // O_NOFOLLOW closes the window between the stat and the open.
     let file: File = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .map_err(|e| {
-            Error::rejected(format!("wiki upload: cannot open {}: {e}", path.display()))
+            if e.raw_os_error() == Some(libc::ELOOP) {
+                Error::rejected(format!(
+                    "wiki upload refused: {} is a symlink; pass the real file",
+                    path.display()
+                ))
+            } else {
+                Error::rejected(format!("wiki upload: cannot open {}: {e}", path.display()))
+            }
         })?;
+    // Judge the handle we will read, not the path: a swap after the lstat
+    // is caught here.
+    let opened = file.metadata().map_err(|e| {
+        Error::rejected(format!("wiki upload: cannot read {}: {e}", path.display()))
+    })?;
+    if !opened.is_file() {
+        return Err(Error::rejected(format!(
+            "wiki upload refused: {} is not a regular file",
+            path.display()
+        )));
+    }
+    check_size(opened.len(), cap)?;
     let mut bytes = Vec::new();
-    file.take(cap + 1).read_to_end(&mut bytes)?;
+    (&file).take(cap + 1).read_to_end(&mut bytes)?;
     check_size(bytes.len() as u64, cap)?;
     Ok(bytes)
 }
@@ -186,10 +207,23 @@ mod tests {
     }
 
     #[test]
+    fn a_fifo_or_non_regular_source_is_refused_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        // A FIFO with no writer would block a plain open forever; the
+        // O_NONBLOCK open returns and the fstat type check refuses it.
+        let fifo = dir.path().join("pipe.pdf");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let err = read_local_file(&fifo, UPLOAD_CAP_BYTES).unwrap_err();
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+    }
+
+    #[test]
     fn multipart_body_has_the_contract_fields_then_one_file_part() {
+        // The envelope is not a body field: it travels in the
+        // `X-Cadence-Wiki-Envelope` header.
         let fields = [
             ("version", "hosted-cadence-wiki.v1"),
-            ("envelope", "wikienv_h.p.s"),
             ("action", "write_blob"),
             ("path", "sources/a.pdf"),
         ];
