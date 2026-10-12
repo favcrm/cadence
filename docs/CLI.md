@@ -10,12 +10,35 @@ attested build side by side, drains, switches, health-checks and releases
 the lease.
 
 ```
-cadence update --check --as operator:<name>              # what would happen
-cadence update --as operator:<name>                      # newest approved candidate
-cadence update --to <full-40-hex-sha> --as operator:<name>   # pin a commit
-cadence update --check --to <sha> --as operator:<name>   # report (and verify) that sha
-cadence update --rollback --as operator:<name>
+cadence update --check                                   # what would happen
+cadence update                                           # newest approved candidate
+cadence update --to <full-40-hex-sha>                    # pin a commit
+cadence update --check --to <sha>                        # report (and verify) that sha
+cadence update --rollback
+cadence update --as operator:<name>                      # explicit audit label (optional)
 ```
+
+These examples use the local org. The existing default-remote-org routing
+limitation (CAD-1355) is unchanged: if your default org is remote, explicitly
+select local with `CADENCE_ORG=local cadence update`.
+
+`cadence update` is operator-only and proves it the same way
+`rollout claim --as` does: the process must run outside every pane and
+managed endpoint, which an agent, a pane descendant or an unproven
+caller can never satisfy — a forged `--as` or scrubbed environment
+changes nothing. `--as operator:<name>` is now optional: it only names
+the audit label. Without it, the run is labelled from the proven local
+OS identity (the real uid and pid), never from `$USER`,
+`$CADENCE_ALIAS` or a client-supplied field.
+
+On a runtime the tracker's `pm.yaml` marks image-managed (`[hosted]`
+`lease` configured), `cadence update` refuses before touching anything:
+AgenticOS owns the binary lifecycle there and ships updates by
+replacing the container image. A `CADENCE_AGENTICOS_URL` integration or
+a container marker alone is not a managed runtime — a native host that
+talks to AgenticOS still self-updates. Updating an image-managed
+deployment means shipping a new image, not running `cadence update`
+inside it.
 
 `--to` runs the same checks as `upgrade --sha`: the sha is on main, CI's
 `test` job passed on that exact sha, the sha256 and manifest match, and the
