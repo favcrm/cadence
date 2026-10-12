@@ -172,6 +172,12 @@ pub(crate) fn handle(
             "this envelope's actor has no wiki identity on this board",
         );
     };
+    // The board's configured `--read-only` refuses every write route, as
+    // `operator::admit` does for browser writes. Checked before the daemon
+    // mutation; reads stay allowed.
+    if action == WikiAction::Write && opts.read_only {
+        return refuse(403, "read_only", "board is read-only — writes are disabled");
+    }
     match action {
         WikiAction::Enumerate => enumerate(query, state_dir, &grant, &attribution),
         WikiAction::Read => read(query, state_dir, &grant, &attribution),
