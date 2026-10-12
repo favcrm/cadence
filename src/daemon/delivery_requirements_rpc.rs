@@ -42,7 +42,7 @@ fn pr_view(shared: &Shared, slug: &str, number: u64) -> Result<Value> {
             "-R",
             slug,
             "--json",
-            "title,headRefOid,baseRefName,baseRefOid,changedFiles,state",
+            "title,headRefOid,baseRefName,baseRefOid,changedFiles,state,statusCheckRollup",
         ],
     )?;
     serde_json::from_str(&text).map_err(|e| reject(format!("unreadable PR view: {e}")))
