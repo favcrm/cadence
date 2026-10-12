@@ -2561,6 +2561,95 @@ mod tests {
     }
 
     #[test]
+    fn cad1393_schema40_owner_witness_refuses_future41() {
+        // Positive control: a real 40 database is accepted by the real guard.
+        {
+            let dir = TempDir::new().unwrap();
+            let (db, store) = open_legacy(&dir);
+            let actual: i64 = store
+                .conn()
+                .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(actual, 40, "current contract schema must be 40");
+            store
+                .propose_close(
+                    &permit(&db, OwnerOp::Close, b"c40", "a40", "art", 1),
+                    "test",
+                )
+                .unwrap();
+            store
+                .witness_commit(&permit(&db, OwnerOp::Witness, b"c40", "a40", "art", 1))
+                .expect("schema 40 must be accepted by the real guard");
+            let witnessed: i64 = store
+                .conn()
+                .query_row("SELECT db_schema FROM owner_witness", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(witnessed, 40, "positive control must record db_schema 40");
+        }
+        // Bad case: a separate store, forged schema_version 41 via raw SQLite.
+        let dir = TempDir::new().unwrap();
+        let (db, store) = open_legacy(&dir);
+        // Raw connection bypasses Store's authorizer, as the existing fixture does.
+        let fixture = Connection::open(&db).unwrap();
+        fixture
+            .execute("UPDATE schema_version SET version=41", [])
+            .unwrap();
+        drop(fixture);
+        store
+            .propose_close(
+                &permit(&db, OwnerOp::Close, b"c41", "a41", "art", 1),
+                "test",
+            )
+            .unwrap();
+        let latch_before: (i64, i64, Vec<u8>, String, Option<String>, i64) = store
+            .conn()
+            .query_row(
+                "SELECT closed,witness_done,challenge,attempt,artifact,epoch FROM closure_state WHERE id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            )
+            .unwrap();
+        assert_eq!(latch_before.0, 1, "fixture must be sealed before witness");
+        assert_eq!(latch_before.1, 0, "fixture must not already have a witness");
+        let events_before: i64 = store
+            .conn()
+            .query_row("SELECT count(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        let err = store
+            .witness_commit(&permit(&db, OwnerOp::Witness, b"c41", "a41", "art", 1))
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Rejected(message) if message == "owner witness database schema is unsupported"),
+            "forged schema 41 must fail at the actual schema guard, got: {err}"
+        );
+        let latch_after: (i64, i64, Vec<u8>, String, Option<String>, i64) = store
+            .conn()
+            .query_row(
+                "SELECT closed,witness_done,challenge,attempt,artifact,epoch FROM closure_state WHERE id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            latch_after, latch_before,
+            "refusal must retain sealed latch"
+        );
+        let witness_rows: i64 = store
+            .conn()
+            .query_row("SELECT count(*) FROM owner_witness", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(witness_rows, 0, "refusal must not commit a witness row");
+        let events_after: i64 = store
+            .conn()
+            .query_row("SELECT count(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            events_after, events_before,
+            "refusal must leave business rows unchanged"
+        );
+    }
+
+    #[test]
     fn closure_owner_authority_is_independent_of_lost_producer_lease() {
         let dir = TempDir::new().unwrap();
         let (db, store) = open_legacy(&dir);
