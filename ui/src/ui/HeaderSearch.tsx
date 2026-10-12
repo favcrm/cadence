@@ -261,16 +261,18 @@ export default function HeaderSearch({
         <span>Search issues and knowledge…</span>
         <kbd>Ctrl K</kbd>
       </button>
-      <button
-        ref={mobileTriggerRef}
-        type="button"
-        className="header-icon header-search-icon lg:hidden"
-        aria-label="Search issues and knowledge"
-        aria-expanded={open}
-        onClick={openSearch}
-      >
-        <IconSearch size={16} />
-      </button>
+      <div className="lg:hidden">
+        <button
+          ref={mobileTriggerRef}
+          type="button"
+          className="header-icon header-search-icon"
+          aria-label="Search issues and knowledge"
+          aria-expanded={open}
+          onClick={openSearch}
+        >
+          <IconSearch size={16} />
+        </button>
+      </div>
 
       {open && createPortal(
         <div className="header-search-wrap" role="presentation">
