@@ -328,14 +328,29 @@ Only an explicit operator-approved ticket can open one; the rules are in
 - If a test fails with a timeout or "daemon not reachable" while the host
   is loaded, rerun that test alone before treating the failure as real.
 
-### Pi agents and models (CAD-559)
+### Pi agents and models (CAD-559, CAD-855)
 - Workers and reviewers run on `pi` with **Devin** (`devin/*`) or the
-  configured **OpenCode Go subscription** (`opencode-go/*`) — never
+  configured **OpenCode Go subscription** (`opencode-go/*`), or an
+  authenticated operator-selected built-in `openai-codex/*` model — never
   OpenRouter. Honor an explicitly requested provider and model; do not
   silently substitute another provider. If the requested model or its
   authentication is unavailable, stop and report it. This provider choice
   does not waive independent review, head-pinned verdicts, Browser QA,
   operator approval or production-safety rules.
+- An explicit operator-selected model and effort override documented
+  preferences only within the applicable runtime allowlist and higher-priority
+  instructions. `high` means high, not max. Agents must not change runtime
+  pins, credentials or installed packages to authorize their own launch.
+  The CLI and operator-owned runtime policy enforce launch permissions;
+  these instructions do not grant additional authority. Discover exact IDs
+  with `pi --no-extensions --list-models openai-codex`; for example,
+  `openai-codex/gpt-6.1-sol` is not `openai-codex/gpt-6-1-sol`.
+  Use only an ID present in the loaded catalog and runtime role allowlist.
+  After an authorized launch, use `cadence agent show <alias>` to verify
+  `model_effective` and `effort_effective` match the requested selection;
+  configured values or catalog presence alone are not launch proof.
+  A draft cannot authorize its own review; running contexts do not
+  automatically reload edited instructions.
 - **OpenCode Go subscription:** the current Muse 1.3 id is
   `opencode-go/muse-spark-1.3-contributor`; for example:
   `cadence join <pm> pi --model opencode-go/muse-spark-1.3-contributor --effort xhigh`.
