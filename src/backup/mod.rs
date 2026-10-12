@@ -102,6 +102,20 @@ use crate::error::{Error, Result};
 use crate::rollout::{db_file, SCHEMA_VERSION};
 use crate::secret::{self, Allowlist, Severity};
 
+pub mod portable;
+pub mod portable_activate;
+pub mod portable_fence;
+pub mod portable_replace;
+
+#[cfg(test)]
+mod portable_acceptance;
+
+#[cfg(test)]
+mod portable_selftest;
+
+#[cfg(test)]
+mod portable_activate_selftest;
+
 #[cfg(test)]
 mod tests;
 

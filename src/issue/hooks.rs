@@ -44,7 +44,8 @@ branch=$(git symbolic-ref --quiet --short HEAD) || exit 0\n\
 ( git push -q origin \"$branch\" >/dev/null 2>&1 || echo \"$(date -u +%FT%TZ) push failed\" >> \"$gd/push-failures.log\" ) >/dev/null 2>&1 </dev/null &\n";
 
 /// The hooks init manages: name → content.
-const HOOKS: [(&str, &str); 2] = [("pre-commit", PRE_COMMIT), ("post-commit", POST_COMMIT)];
+pub(crate) const HOOKS: [(&str, &str); 2] =
+    [("pre-commit", PRE_COMMIT), ("post-commit", POST_COMMIT)];
 
 /// The repo's real git dir (`git rev-parse --git-dir`, resolved
 /// absolute) — `.git` may be a file when the tracker is a worktree.

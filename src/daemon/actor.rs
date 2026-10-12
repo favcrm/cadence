@@ -40,6 +40,9 @@ impl Shared {
         alias: &str,
         enable: bool,
     ) -> Result<bool> {
+        if self.execution_mode.fenced() {
+            return Err(crate::backup::portable_fence::fence_refusal("agent start"));
+        }
         // A mailbox never gets an actor — regardless of who asked.
         let a = self.store.agent(alias)?;
         if !registry::has_actor(&a.provider, &a.endpoint_kind) {

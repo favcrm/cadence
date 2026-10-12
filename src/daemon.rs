@@ -98,6 +98,7 @@ mod next_action;
 mod operator_rpc;
 mod plans_rpc;
 mod platform_rpc;
+mod portable_replace_rpc;
 mod requests_rpc;
 mod review_evidence_rpc;
 mod serve;
@@ -388,6 +389,10 @@ pub struct Shared {
     answered: Mutex<HashMap<String, (String, Value)>>,
     lifecycle: Mutex<Lifecycle>,
     closing: AtomicBool,
+    /// CAD-1163: the verified persistent execution mode, read once
+    /// before the store opens. `Fenced` blocks every execution-capable
+    /// start and RPC (see `start_actor_locked`, `dispatch_method`).
+    execution_mode: crate::backup::portable_fence::Mode,
     /// CAD-893 test seam: one pause per daemon for
     /// `CADENCE_TEST_REVALIDATE_PAUSE_MS` (see `revalidate_enrollments`).
     revalidate_pause_armed: AtomicBool,
@@ -700,7 +705,17 @@ impl Shared {
         // does not hold the lease refuses here and leaves the database
         // unchanged. `open_adopting` repeats the same check.
         crate::rollout::authorize_migration(&db_path)?;
-        let (mut store, recovered) = Store::open_adopting(&db_path, marker)?;
+        // CAD-1163: the persistent execution fence is read before the
+        // store opens. A malformed or unknown receipt refuses here, so a
+        // portable activation in manual mode can never be bypassed.
+        let execution_mode = crate::backup::portable_fence::load(state_dir)?;
+        // CAD-1163: a manual execution-disabled mode opens without the
+        // restart sweep, so pending effects stay inert from the first start.
+        let (mut store, recovered) = if execution_mode.fenced() {
+            Store::open_unrecovered(&db_path)?
+        } else {
+            Store::open_adopting(&db_path, marker)?
+        };
         store.set_shutdown_entries_hook(opts.shutdown_entries_hook.clone())?;
         if let Some(ms) = opts.shutdown_backoff_ms_for_test {
             store.shutdown_backoff_ms = ms;
@@ -770,6 +785,7 @@ impl Shared {
             answered: Mutex::new(HashMap::new()),
             lifecycle: Mutex::new(Lifecycle::default()),
             closing: AtomicBool::new(false),
+            execution_mode,
             revalidate_pause_armed: AtomicBool::new(true),
             // CAD-561: a pending update recorded by an update that is
             // still running (a restart in the middle of one) keeps the
@@ -899,28 +915,34 @@ impl Shared {
         // see which daemon opened them. The value is an instance id,
         // not a credential, and it stays in this daemon's provider env.
         shared.provider_env.set("CADENCE_DAEMON_ID", daemon_id);
-        // CAD-230b: a runner in flight when the last daemon stopped is
-        // `unknown` and incomplete — reported, never relaunched.
-        for r in crate::runner::recover(state_dir, epoch_secs()) {
-            let _ = shared.store.event_public(
-                &r.requester.lane,
-                "runner_unknown",
-                json!({"runner_id": r.runner_id, "recipe": r.recipe,
-                       "last_state": r.last_state, "reason": r.reason}),
-            );
+        // CAD-1163: a manual execution-disabled state dir runs no recovery
+        // or replay at boot. Runner, CRM, image and nudge recovery write
+        // events or relaunch effects, and in manual mode those rows stay
+        // inert until the operator leaves the fence, so none of them run.
+        if !shared.execution_mode.fenced() {
+            // CAD-230b: a runner in flight when the last daemon stopped is
+            // `unknown` and incomplete — reported, never relaunched.
+            for r in crate::runner::recover(state_dir, epoch_secs()) {
+                let _ = shared.store.event_public(
+                    &r.requester.lane,
+                    "runner_unknown",
+                    json!({"runner_id": r.runner_id, "recipe": r.recipe,
+                           "last_state": r.last_state, "reason": r.reason}),
+                );
+            }
+            // CAD-786: a campaign send in flight when the last daemon
+            // stopped resumes — `submitting` rows go `uncertain` (maybe
+            // delivered; never resent) and a worker respawns for the
+            // still-`queued` rest.
+            shared.reconcile_crm_sends();
+            // CAD-1315: an image job in flight when the last daemon stopped
+            // replays its key and settles; no intent stays `pending`.
+            shared.reconcile_image_jobs();
+            // CAD-1015: a `submitting` native nudge means the daemon died
+            // between the durable bind and the provider reply — it may have
+            // landed, so it closes non-fencing `unknown`, never replayed.
+            let _ = shared.store.orphan_submitting_nudges("crash");
         }
-        // CAD-786: a campaign send in flight when the last daemon
-        // stopped resumes — `submitting` rows go `uncertain` (maybe
-        // delivered; never resent) and a worker respawns for the
-        // still-`queued` rest.
-        shared.reconcile_crm_sends();
-        // CAD-1315: an image job in flight when the last daemon stopped
-        // replays its key and settles; no intent stays `pending`.
-        shared.reconcile_image_jobs();
-        // CAD-1015: a `submitting` native nudge means the daemon died
-        // between the durable bind and the provider reply — it may have
-        // landed, so it closes non-fencing `unknown`, never replayed.
-        let _ = shared.store.orphan_submitting_nudges("crash");
         Ok(shared)
     }
 
@@ -1783,6 +1805,9 @@ impl Shared {
         // CAD-339: what the master may never do is refused here, before
         // any method runs — a refusal leaves no write.
         self.master_policy(method, params, peer_pid)?;
+        if self.execution_mode.fenced() && !crate::backup::portable_fence::allows(method) {
+            return Err(crate::backup::portable_fence::fence_refusal(method));
+        }
         let answer = self.dispatch_method(method, params, peer_pid)?;
         Ok(self.withhold_turn_tokens(answer, peer_pid))
     }
@@ -2516,6 +2541,12 @@ impl Shared {
             "lane_reassign" => self.rpc_lane_reassign(params, peer_pid),
             "rollout_grant" => self.rpc_rollout_grant(params, peer_pid),
             "rollout_revoke" => self.rpc_rollout_revoke(params, peer_pid),
+            // CAD-1163: native-authorized replacement of an offline portable
+            // root. Preflight is a read-only digest report, not authority.
+            "portable_replace" => self.rpc_portable_replace(params, peer_pid),
+            "portable_replace_preflight" => self.rpc_portable_replace_preflight(params, peer_pid),
+            "portable_activate" => self.rpc_portable_activate(params, peer_pid),
+            "portable_activate_preflight" => self.rpc_portable_activate_preflight(params, peer_pid),
             // CAD-1024: the staging allowlist and grant store. Register and
             // delegate/revoke are operator-only; delegations is a read.
             "staging_register" => self.rpc_staging_register(params, peer_pid),
@@ -4311,6 +4342,9 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // files may be the only copy of the previous store. Every start path
     // — `daemon start`, `run`, `restart` — comes through here.
     crate::backup::refuse_interrupted_restore(state_dir)?;
+    // CAD-1163: a portable restore committed inactive must not start a
+    // daemon from any entrypoint; an unreadable marker refuses too.
+    crate::backup::portable::refuse_if_inactive(state_dir)?;
     // Once split UID mode was admitted, losing its record must not
     // restart this state dir as a legacy same-UID daemon. Persist the
     // pin before a shared socket can accept any agent frame.
@@ -4418,7 +4452,10 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
             }
         });
     }
-    let relaunch = if opts
+    // CAD-1163: a manual execution-disabled state dir relaunches nothing.
+    let relaunch = if shared.execution_mode.fenced() {
+        Ok(())
+    } else if opts
         .relaunch_fault_for_test
         .as_ref()
         .is_some_and(|f| f.load(Ordering::SeqCst))
@@ -4449,7 +4486,10 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     }
     // Stall watch: a running turn that goes silent is reported to
     // whoever waits on it — never interrupted, never replayed.
-    {
+    // CAD-1163: every execution-producing worker below is skipped in a
+    // manual execution-disabled state dir (joins become no-ops).
+    let fenced = shared.execution_mode.fenced();
+    if !fenced {
         let shared = Arc::clone(&shared);
         thread::spawn(move || shared.run_stall_watch());
     }
@@ -4458,18 +4498,18 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // Joined before `serve` returns (CAD-408): the watcher can dispatch,
     // so a stopped daemon must not leave a tick in flight against the
     // store.
-    let monitor_watch = {
+    let monitor_watch = (!fenced).then(|| {
         let shared = Arc::clone(&shared);
         thread::spawn(move || shared.run_monitor_watch())
-    };
+    });
     // WAL watch: provider stores checkpointed while their provider
     // idles — CAD-132, the 30 GiB sessions.db-wal that ate the disk.
-    {
+    if !fenced {
         let shared = Arc::clone(&shared);
         thread::spawn(move || shared.run_wal_watch());
     }
     // Slot watch (CAD-230b): strict holds end with their holder.
-    {
+    if !fenced {
         let shared = Arc::clone(&shared);
         thread::spawn(move || shared.run_slot_watch());
     }
@@ -4481,7 +4521,7 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     if let Err(e) = crate::test_queue::publish_limits(&shared.state_dir, &test_limits) {
         eprintln!("cadence: test queue limits: {e}");
     }
-    let test_watch = {
+    let test_watch = (!fenced).then(|| {
         let shared = Arc::clone(&shared);
         thread::spawn(move || {
             let runner = crate::test_queue::runner_for(&shared.state_dir);
@@ -4504,10 +4544,10 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
             }
             worker.shutdown();
         })
-    };
+    });
     // Report router (CAD-339): workers' reports and unanswered
     // questions reach the master's thread. Idle without a master.
-    {
+    if !fenced {
         let shared = Arc::clone(&shared);
         thread::spawn(move || shared.run_report_router());
     }
@@ -4516,10 +4556,10 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // Joined before `Shared::shutdown` so a tick never outlives the
     // daemon; a SIGKILL mid-send is safe by construction (the row is
     // left `processing` for the next boot's reconcile).
-    let publish_driver = {
+    let publish_driver = (!fenced).then(|| {
         let shared = Arc::clone(&shared);
         thread::spawn(move || shared.run_social_publish_driver())
-    };
+    });
 
     // CAD-719: the wiki index refresh worker — a committed wiki
     // mutation kicks one coalesced rebuild; the query-time tree check
@@ -4627,14 +4667,20 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // `closing` is set, so the watcher exits within its 100ms sub-step
     // or at the end of the tick it is in. Joining before the actors stop
     // lets a kickoff from that last tick settle into the shutdown marker.
-    let _ = monitor_watch.join();
-    let _ = test_watch.join();
+    if let Some(handle) = monitor_watch {
+        let _ = handle.join();
+    }
+    if let Some(handle) = test_watch {
+        let _ = handle.join();
+    }
     // CAD-1020: join the publish driver before `Shared::shutdown` — a
     // tick can be mid-send; one in-flight send costs driver-preflight +
     // up to 2 staged preflights + POST + status ≈ 5×DOOR_TIMEOUT ≈
     // 150s worst case (the reconcile sweep's 16 status reads are
     // interruptible between items via the fence/`closing` checks).
-    let _ = publish_driver.join();
+    if let Some(handle) = publish_driver {
+        let _ = handle.join();
+    }
     // CAD-702: the heartbeat is NOT joined here — it stays the single
     // renewal poster through the flush below. Joining it before the
     // flush would leave the final WAL checkpoint and tracker commit

@@ -122,6 +122,7 @@ fn cad314_backup_export_restore_parse() {
             source,
             repos,
             force,
+            ..
         } => {
             assert_eq!(source, PathBuf::from("/tmp/b"));
             assert_eq!(repos, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
