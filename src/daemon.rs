@@ -90,6 +90,7 @@ mod lane_rpc;
 mod master_rpc;
 mod master_session_rpc;
 mod master_wake;
+mod members_rpc;
 mod memory_rpc;
 mod messages_rpc;
 mod models_rpc;
@@ -109,6 +110,8 @@ mod social_publish_driver;
 mod social_publish_rpc;
 mod social_publish_start;
 mod supervisor_grant;
+#[cfg(all(test, feature = "test-seam"))]
+mod team_assistants_refusal;
 mod test_queue_rpc;
 mod threads_rpc;
 mod timers;
@@ -1810,6 +1813,12 @@ impl Shared {
         if self.execution_mode.fenced() && !crate::backup::portable_fence::allows(method) {
             return Err(crate::backup::portable_fence::fence_refusal(method));
         }
+        // CAD-1380: a member-bound assistant alias (`assist-*`) is
+        // likewise refused anything outside its own scoped surface —
+        // before any method runs — so a member agent never widens into
+        // generic worker verbs (other agents, issues, wiki, dispatch,
+        // operator effects).
+        self.member_assist_policy(method, params, peer_pid)?;
         let answer = self.dispatch_method(method, params, peer_pid)?;
         Ok(self.withhold_turn_tokens(answer, peer_pid))
     }
@@ -2360,6 +2369,16 @@ impl Shared {
             "message_cancel" => self.rpc_cancel(params),
             "interrupt" => self.rpc_interrupt(params, peer_pid),
             "job_new" => self.rpc_job_new(params, peer_pid),
+            "member_assist_state" => self.rpc_member_assist_state(params, peer_pid),
+            "member_assist_history" => self.rpc_member_assist_history(params, peer_pid),
+            "member_assist_send" => self.rpc_member_assist_send(params, peer_pid),
+            "member_job_request" => self.rpc_member_job_request(params, peer_pid),
+            "member_job_list" => self.rpc_member_job_list(params, peer_pid),
+            "member_job_evidence" => self.rpc_member_job_evidence(params, peer_pid),
+            "member_job_events" => self.rpc_member_job_events(params, peer_pid),
+            "member_job_subscribe" => self.rpc_member_job_subscribe(params, peer_pid),
+            "member_job_share" => self.rpc_member_job_share(params, peer_pid),
+            "member_job_reconcile" => self.rpc_member_job_reconcile(params, peer_pid),
             "job_list" => self.rpc_job_list(params),
             "job_show" => self.rpc_job_show(params),
             "job_events" => self.rpc_job_events(params),

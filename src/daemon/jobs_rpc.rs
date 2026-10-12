@@ -1,5 +1,6 @@
 //! CAD-534: `cadence daemon` jobs RPC handlers — moved verbatim from src/daemon.rs.
 
+use super::members_rpc::MemberCaller;
 use super::*;
 
 impl Shared {
@@ -302,14 +303,111 @@ impl Shared {
             .map(|a| self.resolve_alias(a))
             .transpose()?;
         let by = required_str(params, "by")?;
-        self.plan_gate_task(required_str(params, "task")?)?;
-        let pending = self.store.task(required_str(params, "task")?)?;
+        let task_id = required_str(params, "task")?;
+        self.plan_gate_task(task_id)?;
+        let pending = self.store.task(task_id)?;
+        // CAD-1380 deferred commit: an assist-bound job's dispatch
+        // re-proves the member's live authority at consume time — the
+        // approval gate alone is not the commit. The stored
+        // `assist_requests` row's `credential_id`/`authority_rev` name
+        // the provenance the consume re-proves (never the member's
+        // latest mint), while the assistant the pull binds is the
+        // CURRENT live binding's — a revoked binding fails, a re-minted
+        // one names the current principal. The final assignee — the
+        // request's `to` or the task's stored `assignee` — is checked
+        // after, never silently skipped.
+        //
+        // A store error on the provenance read propagates — the guard
+        // never silently skips the re-prove on an unreadable table. And
+        // a job in the `assist-` id family with NO provenance row is
+        // fail-closed too: its binding was deleted or corrupted, never a
+        // silent drop to an ordinary dispatch (a missing row cannot be
+        // re-proven, so the member's recorded authority is unverifiable).
+        match self.store.assist_request_for_job(&pending.job_id)? {
+            Some(assist) => {
+                let binding = self
+                    .store
+                    .assistant_binding(&assist.org, &assist.sub)?
+                    .ok_or_else(|| {
+                        Error::rejected(
+                            "task dispatch refused: the assist-bound job has no live \
+                         assistant binding for its member (CAD-1380)",
+                        )
+                    })?;
+                if !binding.is_active() {
+                    return Err(Error::rejected(format!(
+                        "task dispatch refused: the assist-bound job's member binding is '{}' — \
+                     only an active binding can dispatch (CAD-1380)",
+                        binding.state
+                    )));
+                }
+                let member = MemberCaller {
+                    org: assist.org.clone(),
+                    sub: assist.sub.clone(),
+                    assistant_id: binding.assistant_id.clone(),
+                    alias: binding.alias.clone(),
+                    conversation_id: None,
+                    state: binding.state.clone(),
+                    credential_id: assist.credential_id.clone().unwrap_or_default(),
+                };
+                self.member_authority_live(
+                    // No member envelope survives to consume time — the
+                    // deferred-commit bearer is the enrolled `hosted-board`
+                    // service credential (`assist.revalidate`); absent one,
+                    // the empty envelope produces a bearer the platform
+                    // rejects — fail closed. `operation` is the daemon's
+                    // internal deferred-commit name — admitted by the strict
+                    // revalidate schema, absent from the browser-callable
+                    // verb table (`/call` cannot mint it).
+                    "",
+                    &member,
+                    crate::daemon::members_rpc::MemberReprove {
+                        operation: "job_dispatch",
+                        scope: "assist.jobs",
+                        job_id: Some(&pending.job_id),
+                        // The queued effect's own recorded provenance — the
+                        // `assist_requests.credential_id` it committed under.
+                        // The platform re-proves THIS credential live, never
+                        // the binding's latest, so a stale dispatch denied
+                        // after revocation does NOT ride a renewal.
+                        op_credential_id: assist.credential_id.as_deref(),
+                    },
+                    "task dispatch",
+                )?;
+                // The member-assistant PM never dispatches its own bound
+                // job — that would be self-approval. Check the FINAL
+                // resolved assignee — the request's `to` OR the task's
+                // stored `assignee` — never just the optional override.
+                let final_assignee = to.as_deref().or(pending.assignee.as_deref());
+                if final_assignee == Some(binding.alias.as_str()) {
+                    return Err(Error::rejected(format!(
+                        "task dispatch refused: the assist-bound job cannot be \
+                     dispatched to its own assistant '{}' — that is \
+                     self-approval (CAD-1380)",
+                        binding.alias
+                    )));
+                }
+            }
+            // The `assist-<digest>` id family is minted ONLY by
+            // `member_job_request`; a job in that family with no
+            // provenance row cannot be re-proven — refuse rather than
+            // dispatch as though it were an ordinary job.
+            None if pending.job_id.starts_with("assist-") => {
+                return Err(Error::rejected(format!(
+                    "task dispatch refused: job '{}' is assist-bound but has no \
+                     `assist_requests` provenance — the member's authority cannot be \
+                     re-proven at commit (CAD-1380)",
+                    pending.job_id
+                )));
+            }
+            None => {}
+        }
         if let Some(alias) = to.as_deref().or(pending.assignee.as_deref()) {
             let target = self.store.agent(alias)?;
             crate::adapter::pi::refuse_confined_devin_agent(&target)?;
         }
         let (task, message, duplicate, behind_dead) = self.store.dispatch_task(
-            required_str(params, "task")?,
+            task_id,
             to.as_deref(),
             optional_str(params, "message"),
             by,

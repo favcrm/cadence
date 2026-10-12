@@ -40,6 +40,10 @@ use crate::error::{Error, Result};
 pub const ROLE_OPERATOR: &str = "operator";
 pub const ROLE_AGENT: &str = "agent";
 pub const ROLE_SYSTEM: &str = "system";
+/// CAD-1380: a verified organization member's own chat text — rendered
+/// like an operator turn but attributed to the member, never the
+/// operator, so a member message never reads as operator authority.
+pub const ROLE_MEMBER: &str = "member";
 
 pub const KIND_MESSAGE: &str = "message";
 pub const KIND_ASSISTANT_TEXT: &str = "assistant_text";
@@ -47,7 +51,7 @@ pub const KIND_TOOL_CALL: &str = "tool_call";
 pub const KIND_TOOL_RESULT: &str = "tool_result";
 pub const KIND_TURN_RESULT: &str = "turn_result";
 
-const ROLES: &[&str] = &[ROLE_OPERATOR, ROLE_AGENT, ROLE_SYSTEM];
+const ROLES: &[&str] = &[ROLE_OPERATOR, ROLE_AGENT, ROLE_SYSTEM, ROLE_MEMBER];
 const KINDS: &[&str] = &[
     KIND_MESSAGE,
     KIND_ASSISTANT_TEXT,
@@ -77,6 +81,11 @@ pub enum Sender {
     OperatorChat,
     /// A caller the daemon attributed to a registered agent.
     Agent(String),
+    /// CAD-1380: a verified organization member sending to their own
+    /// bound assistant. Carries the member's `sub` for attribution only
+    /// — it grants no operator authority and lands in the assistant
+    /// alias's own (principal-private) thread, like an ordinary send.
+    Member(String),
     /// Internal enqueues (routed results, kickoffs, monitor dispatch)
     /// and callers whose identity was not derived.
     Unattributed,
@@ -90,6 +99,7 @@ impl Sender {
         match self {
             Sender::Operator | Sender::OperatorChat => "operator",
             Sender::Agent(alias) => alias,
+            Sender::Member(_) => "member",
             Sender::Unattributed => "unattributed",
         }
     }
@@ -433,6 +443,12 @@ fn message_entry<'a>(
     let (role, mut payload) = match sender {
         Sender::Operator | Sender::OperatorChat => (ROLE_OPERATOR, json!({"source": source})),
         Sender::Agent(alias) => (ROLE_SYSTEM, json!({"source": source, "from": alias})),
+        // A member's own message reads as the member (their user id), in
+        // the assistant alias's private thread — never "operator".
+        Sender::Member(sub) => (
+            ROLE_MEMBER,
+            json!({"source": source, "from": format!("users/{sub}"), "member": sub}),
+        ),
         Sender::Unattributed => (ROLE_SYSTEM, json!({"source": source})),
     };
     if let Some(refs) = refs {

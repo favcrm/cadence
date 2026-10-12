@@ -15,6 +15,10 @@ export function recentAgentUpdates(detail: AgentDetail | null, entries: unknown[
     const labels: Record<string, string> = {
       turn_started: "Started a turn", turn_finished: "Finished a turn",
       task_done: "Task completed", task_running: "Task started", task_failed: "Task failed",
+      // CAD-1380: an assist-bound job stalled past its budget — the
+      // supervisor's own observation event, shown as a check (never a
+      // fabricated dispatch or completion).
+      assist_stall: "Supervisor check — no progress on a member job",
     };
     const label = labels[event.kind];
     if (!label) return [];

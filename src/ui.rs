@@ -41,6 +41,7 @@ mod app_screens;
 mod app_social_drafts;
 mod approvals;
 mod apps;
+mod assist_route;
 mod business_templates;
 mod cli_route;
 mod connections;
@@ -62,6 +63,8 @@ mod stages;
 mod stream;
 mod tailscale;
 mod tailscale_serve;
+#[cfg(all(test, feature = "test-seam"))]
+mod team_assistants_http_refusal;
 mod threads;
 mod topics;
 mod updates;
