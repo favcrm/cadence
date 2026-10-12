@@ -638,6 +638,61 @@ impl Shared {
         self.start_actor_locked(&mut lc, alias, true)
     }
 
+    /// Whether an operator paused `alias`: disabled, and its newest stop
+    /// marker is not the idle timer's. A fresh registration is enabled, a
+    /// timer stop stays eligible for work-driven resume, and an explicit
+    /// resume re-enables the row, so a historical manual marker never blocks it.
+    pub(super) fn assistant_stopped_by_operator(&self, alias: &str) -> Result<bool> {
+        if self.store.agent(alias)?.enabled {
+            return Ok(false);
+        }
+        let marker = self
+            .store
+            .last_event_of(alias, crate::store::AUTO_STOP_MARKER_KINDS)?;
+        Ok(!marker.is_some_and(|m| m.kind == crate::store::AUTO_STOP_EVENT))
+    }
+
+    /// The member assistant's resume (CAD-1380): the inbox, fence and start
+    /// path of `try_resume`, with the operator-stop check and the start claim
+    /// under one lifecycle lock, so a stop cannot land between them. Operator
+    /// resume and unfence keep `try_resume`. An owned alias is a live actor
+    /// that drains the queue; a stop in flight refuses.
+    pub(super) fn try_resume_assistant(self: &Arc<Self>, alias: &str) -> Result<()> {
+        let agent = self.store.agent(alias)?;
+        if !registry::has_actor(&agent.provider, &agent.endpoint_kind) {
+            return Err(Error::rejected(format!(
+                "Agent '{alias}' is an inbox — nothing to resume"
+            )));
+        }
+        let mut lc = self.lifecycle.lock().unwrap();
+        if lc.stopping.contains(alias) {
+            return Err(Error::rejected(format!(
+                "assistant '{alias}' is stopping — the message stays queued"
+            )));
+        }
+        if lc.agents.contains_key(alias) {
+            return Ok(());
+        }
+        if self.store.has_unknown(alias)? {
+            return Err(Error::rejected(format!(
+                "assistant '{alias}' is fenced by an unreconciled unknown message — \
+                 the operator reconciles before it runs again"
+            )));
+        }
+        if self.assistant_stopped_by_operator(alias)? {
+            return Err(Error::rejected(format!(
+                "assistant '{alias}' was stopped by an operator and stays stopped — \
+                 the operator resumes it; the message stays queued"
+            )));
+        }
+        if !self.start_actor_locked(&mut lc, alias, true)? {
+            return Err(Error::rejected(format!(
+                "assistant '{alias}' is fenced by an unreconciled unknown message"
+            )));
+        }
+        Ok(())
+    }
+
     /// Bounded wait for a just-started actor's `open`: live when an
     /// endpoint is published or a live state lands, over when the
     /// actor gives up (`attention`/`stopped`/`offline`). Same 30s

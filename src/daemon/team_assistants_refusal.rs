@@ -4204,3 +4204,101 @@ fn malformed_pi_policy_refuses_launch_claim_closed() {
         "a malformed policy claimed an actor"
     );
 }
+
+/// The stamped launch model on the agent row, if any.
+fn stamped_model(fx: &Fx, alias: &str) -> Option<String> {
+    fx.shared
+        .store
+        .agent(alias)
+        .ok()
+        .and_then(|a| a.params)
+        .and_then(|p| p.get("model").and_then(Value::as_str).map(str::to_string))
+}
+
+/// CAD-1380 manual-stop respect (W6/R7): a member send to an operator-stopped
+/// assistant queues the text and reports attention naming the pause and the
+/// operator resume. It must not re-enable the endpoint, claim a launch or
+/// stamp a model. Paired positive: the timer's OWN auto-stop (newest marker
+/// `AUTO_STOP_EVENT`) still resumes on the same send. The fixture model is a
+/// non-Devin fake, operator-allowlisted, so the old path reaches the launch.
+#[test]
+fn member_send_respects_manual_stop_but_resumes_auto_stop() {
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    let pm_yaml = fx.pm().join("pm.yaml");
+    let mut text = std::fs::read_to_string(&pm_yaml).unwrap();
+    text.push_str(
+        "\npi:\n  models:\n    allow:\n      - fake/c1380-safe-model\n    default:\n      worker: fake/c1380-safe-model\n",
+    );
+    std::fs::write(&pm_yaml, text).unwrap();
+
+    // Manual stop: the native operator `agent_stop` writes enabled=false and
+    // a `stop_requested` marker. The member's queued send lands AFTER it.
+    let manual = fx.member_runtime("sub-man");
+    fx.op("agent_stop", json!({"alias": manual.alias}));
+    assert!(
+        !fx.shared.store.agent(&manual.alias).unwrap().enabled,
+        "agent_stop did not disable the assistant"
+    );
+    let send = fx.op(
+        "member_assist_send",
+        json!({"member_envelope": fx.member_envelope("sub-man"), "text": "manual stop text"}),
+    );
+    assert_eq!(
+        send["queued"].as_bool(),
+        Some(true),
+        "a manually stopped send was not reported as queued: {send}"
+    );
+    let attention = send["attention"]
+        .as_str()
+        .unwrap_or_default()
+        .to_lowercase();
+    assert!(
+        attention.contains("stop") && attention.contains("resume"),
+        "the receipt does not name the operator pause: {send}"
+    );
+    assert!(
+        !fx.shared.store.agent(&manual.alias).unwrap().enabled,
+        "a member send re-enabled a manually stopped assistant"
+    );
+    assert!(
+        !owned(&fx, &manual.alias),
+        "a member send launched a manually stopped assistant"
+    );
+    assert!(
+        stamped_model(&fx, &manual.alias).is_none(),
+        "a member send stamped a model onto a manually stopped assistant"
+    );
+    assert_eq!(
+        agent_state(&fx, &manual.alias),
+        "stopped",
+        "a manual stop moved out of stopped"
+    );
+    let held = fx.shared.store.queued_head(&manual.alias).unwrap();
+    assert_eq!(
+        held.map(|m| m.body).as_deref(),
+        Some("manual stop text"),
+        "the member's text was not retained for the operator resume"
+    );
+
+    // Paired positive: the timer's own auto-stop is resumable by a send.
+    // Same order the timer writes it: `agent_stop`, then the auto-stop marker.
+    let auto = fx.member_runtime("sub-auto");
+    fx.op("agent_stop", json!({"alias": auto.alias}));
+    fx.shared
+        .store
+        .event_public(
+            &auto.alias,
+            crate::store::AUTO_STOP_EVENT,
+            json!({"resumable": true}),
+        )
+        .unwrap();
+    let _ = fx.op(
+        "member_assist_send",
+        json!({"member_envelope": fx.member_envelope("sub-auto"), "text": "auto stop text"}),
+    );
+    assert!(
+        fx.shared.store.agent(&auto.alias).unwrap().enabled || owned(&fx, &auto.alias),
+        "an auto-stopped assistant was not resumed by the member send"
+    );
+}

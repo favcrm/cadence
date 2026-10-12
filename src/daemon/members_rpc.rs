@@ -859,10 +859,13 @@ impl Shared {
     ///   the row only when the agent still carries none. A confined
     ///   `devin/*` pick refuses at `refuse_confined_devin` — the same
     ///   precondition `agent_register` enforces.
-    /// - `try_resume` carries the real guards: `lc.owned` serializes
-    ///   concurrent sends to at most one launch; an unreconciled
-    ///   `unknown` fence refuses — a fenced assistant stays fenced, the
-    ///   queued row waiting for the operator reconcile.
+    /// - an operator-stopped assistant stays stopped (CAD-1380): refused
+    ///   before the model stamp, and again under the lifecycle lock inside
+    ///   `try_resume_assistant` before the start claim. A timer stop stays
+    ///   eligible; a fresh registration is enabled. The lifecycle lock makes
+    ///   concurrent sends launch at most once; an unreconciled `unknown`
+    ///   fence refuses — a fenced assistant stays fenced, the queued row
+    ///   waiting for the operator reconcile.
     ///
     /// Returns `Err` (truthful, bounded — never a fabricated reply) when
     /// the endpoint could not start; the caller reports it on the
@@ -877,6 +880,14 @@ impl Shared {
             return Err(Error::rejected(format!(
                 "assistant '{alias}' is fenced by an unreconciled unknown outcome — \
                  the operator reconciles before it runs again"
+            )));
+        }
+        // An operator-stopped assistant stays stopped: refuse before any
+        // model stamp, so a paused row is never relaunched by a send.
+        if self.assistant_stopped_by_operator(alias)? {
+            return Err(Error::rejected(format!(
+                "assistant '{alias}' was stopped by an operator and stays stopped — \
+                 the operator resumes it; the message stays queued"
             )));
         }
         // At most one launch across concurrent sends: an owned alias is
@@ -919,23 +930,10 @@ impl Shared {
                     Error::rejected(format!("assistant launch model could not be recorded: {e}"))
                 })?;
         }
-        // Start the real managed actor — inbox check, ownership, fence
-        // and `start_actor_locked` all inside `try_resume`. A refusal
-        // surfaces truthfully; `Ok(false)` means the fence check inside
-        // `start_actor_locked` raced and fenced — still truthful.
-        match self.try_resume(alias) {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                // A concurrent send may have won the launch between the
-                // owned check and the call — owned now is a live actor,
-                // not a failure.
-                if self.lifecycle.lock().unwrap().owned(alias) {
-                    Ok(())
-                } else {
-                    Err(e)
-                }
-            }
-        }
+        // Start the real managed actor under the lifecycle lock. A refusal
+        // surfaces truthfully; a concurrent send that won the launch shows
+        // up as the owned case there, not as a failure.
+        self.try_resume_assistant(alias)
     }
 
     /// `member_job_request` — bounded shared-job request, idempotent on

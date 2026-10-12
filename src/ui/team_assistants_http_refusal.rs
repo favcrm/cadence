@@ -1064,3 +1064,73 @@ fn assist_http_flag_off_refuses_before_envelope() {
         );
     }
 }
+
+/// CAD-1380 manual-stop parity (W6/R7) over HTTP: the same member send the
+/// daemon `member_assist_send` guard refuses must not re-enable an operator-
+/// stopped assistant. The member is live and authenticated with `assist.write`,
+/// so the request reaches the launch guard (not a blind 403). The expected
+/// receipt is HTTP 200 with the text queued and attention naming the operator
+/// pause; the endpoint stays disabled, unlaunched and unstamped.
+#[test]
+fn assist_http_send_respects_manual_stop() {
+    let _flag = AssistantFlagOn::arm();
+    let rig = start(&["erin"]);
+    // Register the member's assistant agent row (lazy, first assist_state).
+    let (status, body) = rig.call(
+        "assist_state",
+        &rig.envelope("erin", json!({}), json!({})),
+        &json!({}),
+    );
+    assert_eq!(status, 200, "live member state read refused: {body}");
+    let alias = body["assistant"]["alias"]
+        .as_str()
+        .expect("assist_state bound no alias")
+        .to_string();
+
+    // Trusted state of a native operator stop: enabled=false plus the
+    // `stop_requested` marker `rpc_stop` writes. Fake non-Devin model on the
+    // operator allowlist, so the old path reaches the launch.
+    let opts = ServeOptions::default();
+    opts.provider_env
+        .set("CADENCE_PM_DIR", rig.pm.to_str().unwrap());
+    let shared = crate::daemon::Shared::new(rig._dir.path(), &opts).unwrap();
+    let mut pm_yaml = std::fs::read_to_string(rig.pm.join("pm.yaml")).unwrap_or_default();
+    pm_yaml.push_str(
+        "\npi:\n  models:\n    allow:\n      - fake/c1380-safe-model\n    default:\n      worker: fake/c1380-safe-model\n",
+    );
+    std::fs::write(rig.pm.join("pm.yaml"), pm_yaml).unwrap();
+    shared.store.set_enabled(&alias, false).unwrap();
+    shared
+        .store
+        .event_public(&alias, "stop_requested", json!({}))
+        .unwrap();
+
+    let (status, body) = rig.call(
+        "assist_send",
+        &rig.envelope("erin", json!({}), json!({})),
+        &json!({"text": "http manual stop text"}),
+    );
+    assert_eq!(
+        status, 200,
+        "a queued send was refused as a blind 403: {body}"
+    );
+    assert_eq!(body["queued"].as_bool(), Some(true), "not queued: {body}");
+    let attention = body["attention"]
+        .as_str()
+        .unwrap_or_default()
+        .to_lowercase();
+    assert!(
+        attention.contains("stop") && attention.contains("resume"),
+        "the receipt does not name the operator pause: {body}"
+    );
+    assert!(
+        !shared.store.agent(&alias).unwrap().enabled,
+        "an HTTP send re-enabled a manually stopped assistant"
+    );
+    let held = shared.store.queued_head(&alias).unwrap();
+    assert_eq!(
+        held.map(|m| m.body).as_deref(),
+        Some("http manual stop text"),
+        "the member's text was not retained"
+    );
+}
