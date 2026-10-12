@@ -342,7 +342,13 @@ Only an explicit operator-approved ticket can open one; the rules are in
   instructions. `high` means high, not max. Agents must not change runtime
   pins, credentials or installed packages to authorize their own launch.
   The CLI and operator-owned runtime policy enforce launch permissions;
-  these instructions do not grant additional authority.
+  these instructions do not grant additional authority. Discover exact IDs
+  with `pi --no-extensions --list-models openai-codex`; for example,
+  `openai-codex/gpt-6.1-sol` is not `openai-codex/gpt-6-1-sol`.
+  Use only an ID present in the loaded catalog and runtime role allowlist.
+  After an authorized launch, use `cadence agent show <alias>` to verify
+  `model_effective` and `effort_effective` match the requested selection;
+  configured values or catalog presence alone are not launch proof.
   A draft cannot authorize its own review; running contexts do not
   automatically reload edited instructions.
 - **OpenCode Go subscription:** the current Muse 1.3 id is
