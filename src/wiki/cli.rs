@@ -50,6 +50,18 @@ pub enum WikiAction {
         #[arg(long)]
         if_rev: Option<String>,
     },
+    /// CAD-913: upload a local file as a wiki blob (remote org only). The
+    /// file is read and size-checked locally before any request; a symlink
+    /// is refused. Without `--overwrite` an existing name is refused.
+    Upload {
+        /// The local file (a regular file, not a symlink).
+        file: PathBuf,
+        /// The logical wiki path to write, e.g. `sources/report.pdf`.
+        path: String,
+        /// Replace an existing file at `path`.
+        #[arg(long)]
+        overwrite: bool,
+    },
     /// Create a directory.
     Mkdir { path: String },
     /// Rename a page or directory (`from` may be a `.trash/` path the
@@ -243,6 +255,10 @@ pub fn run(action: &WikiAction, state_dir: &Path) -> Result<i32> {
             crate::issue::cli::print_json(&out);
             Ok(0)
         }
+        WikiAction::Upload { .. } => Err(Error::rejected(
+            "`wiki upload` sends a file to a remote org; select one with `--org <slug>` \
+             (the local daemon uses `wiki put --blob --file`)",
+        )),
         WikiAction::Mkdir { path } => {
             let out = rpc(state_dir, "wiki_mkdir", json!({"path": path}))?;
             crate::issue::cli::print_json(&out);

@@ -807,6 +807,187 @@ fn call_once(
     )
 }
 
+/// CAD-913: one `POST /__platform/wiki/upload` multipart request — the same
+/// bearer and a fresh `wiki.write` envelope as `call_once`, with `version`,
+/// `envelope`, `action=write_blob` and `path` as form fields and the bytes in
+/// one `file` part. Returns `(status, retry_after, body)` like `post`, so the
+/// caller applies the same `classify` verdicts (wake, conflict, refusal). The
+/// refusal path never surfaces the raw body.
+fn upload_once(
+    target: &RemoteTarget,
+    cred: &Credential,
+    logical_path: &str,
+    file_name: &str,
+    bytes: &[u8],
+) -> Result<(u16, Option<u64>, Option<Value>)> {
+    let envelope = authorize(target, cred, Surface::Wiki, &["wiki.write"])?;
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random).map_err(|_| reject("unable to create upload boundary"))?;
+    let boundary = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random);
+    let fields = [
+        ("version", WIKI_VERSION),
+        ("envelope", envelope.as_str()),
+        ("action", "write_blob"),
+        ("path", logical_path),
+    ];
+    let body = crate::wiki::upload::build_multipart(&boundary, &fields, file_name, bytes);
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(CALL_TIMEOUT))
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .proxy(None)
+        .build();
+    let response = ureq::Agent::new_with_config(config)
+        .post(format!("{}/__platform/wiki/upload", target.endpoint))
+        .header("Authorization", format!("Bearer {}", cred.access_token))
+        .header(
+            "Content-Type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .send(&body[..])
+        .map_err(|_| reject("remote request failed"))?;
+    let status = response.status().as_u16();
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    let mut bytes = Vec::new();
+    response
+        .into_body()
+        .as_reader()
+        .take(MAX_BODY + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_BODY {
+        return Err(reject("remote response too large"));
+    }
+    Ok((status, retry_after, serde_json::from_slice(&bytes).ok()))
+}
+
+/// CAD-913 `wiki upload`: send one local file (already read and size-checked
+/// by `wiki::upload::read_local_file`) to the remote wiki at `logical_path`.
+/// Without `overwrite`, the parent is listed first and an existing name is
+/// refused before any upload. The wake loop and verdicts match `call_verb`.
+/// The bearer and the envelope are never printed.
+pub fn upload_file(
+    target: &RemoteTarget,
+    logical_path: &str,
+    file_name: &str,
+    bytes: &[u8],
+    overwrite: bool,
+    wake_timeout: u64,
+    note: impl Fn(&str),
+) -> Result<Value> {
+    let dir = auth_dir(None).map_err(|_| {
+        reject("remote credential directory is unavailable — set HOME or XDG_CONFIG_HOME")
+    })?;
+    upload_file_in(
+        &dir,
+        target,
+        logical_path,
+        file_name,
+        bytes,
+        overwrite,
+        wake_timeout,
+        note,
+    )
+}
+
+/// `upload_file` with the credential dir injectable, so the test points it at
+/// a fixture and never touches the real config dir.
+#[allow(clippy::too_many_arguments)]
+fn upload_file_in(
+    dir: &Path,
+    target: &RemoteTarget,
+    logical_path: &str,
+    file_name: &str,
+    bytes: &[u8],
+    overwrite: bool,
+    wake_timeout: u64,
+    note: impl Fn(&str),
+) -> Result<Value> {
+    if !overwrite {
+        let (parent, name) = crate::wiki::upload::split_logical(logical_path);
+        let mut args = Map::new();
+        args.insert("path".into(), json!(parent));
+        let listing = call_verb_in(
+            target,
+            "enumerate",
+            args,
+            wake_timeout,
+            dir,
+            &note,
+            std::thread::sleep,
+        )?;
+        let RemoteAnswer::Ok(body) = listing else {
+            return Err(reject("remote listing answered a conflict"));
+        };
+        let taken = body["entries"].as_array().is_some_and(|items| {
+            items
+                .iter()
+                .any(|e| e["name"].as_str() == Some(name.as_str()))
+        });
+        if taken {
+            return Err(reject(format!(
+                "wiki upload refused: '{logical_path}' already exists; pass --overwrite \
+                 to replace it. Nothing was sent"
+            )));
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(wake_timeout);
+    loop {
+        let cred = renewed_credential(dir, target, deadline)?;
+        if !cred.capabilities.is_empty() && !cred.capabilities.iter().any(|c| c == "wiki.write") {
+            return Err(reject(
+                "wiki upload needs the wiki.write capability, which this remote login \
+                 lacks — nothing was sent",
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::busy_coded(
+                "timeout",
+                "remote command deadline elapsed during session renewal",
+            ));
+        }
+        let (status, retry_after, body) =
+            upload_once(target, &cred, logical_path, file_name, bytes)?;
+        // A refusal names the status and the contract's error code only: the
+        // raw body could carry anything, so it is never echoed.
+        let conflict = status == 409 && body.as_ref().is_some_and(|b| b.get("conflict").is_some());
+        if !(200..300).contains(&status) && status != 503 && !conflict {
+            let code = body
+                .as_ref()
+                .and_then(|b| b["code"].as_str())
+                .unwrap_or("unavailable")
+                .to_string();
+            if matches!(status, 401 | 403) {
+                return Err(reject(
+                    "the remote refused the credential — run `cadence login` again",
+                ));
+            }
+            return Err(reject(format!("remote upload refused ({status}, {code})")));
+        }
+        match classify(status, retry_after, body) {
+            Verdict::Done(result) => return result,
+            Verdict::Conflict(_) => return Err(reject("remote upload conflicted")),
+            Verdict::Waking(wait) => {
+                if Instant::now() + wait > deadline {
+                    return Err(Error::busy_coded(
+                        "waking",
+                        format!(
+                            "org '{}' is still waking after {}s — retry, or pass a \
+                             larger --wake-timeout",
+                            target.org, wake_timeout
+                        ),
+                    ));
+                }
+                note(&format!("waking {}… ({}s)", target.org, wait.as_secs()));
+                std::thread::sleep(wait);
+            }
+        }
+    }
+}
+
 /// Outcome of one call attempt: either the answer is final, the remote
 /// answered a checked write conflict (HTTP 409 + `{conflict,…}` — the
 /// caller resyncs, never a retry), or the remote is waking and `wait`
@@ -1636,6 +1817,134 @@ mod tests {
             call_verb_in(&target, "enumerate", args, 10, root.path(), |_| {}, |_| {}).unwrap_err();
         assert!(err.to_string().contains("wiki.read capability"), "{err}");
         assert!(err.to_string().contains("nothing was sent"), "{err}");
+    }
+
+    /// CAD-913: a fake relay that answers one authorize and one upload. It
+    /// records the upload's raw multipart bytes and bearer so the test checks
+    /// the wire form itself: the contract fields, one `file` part, the bearer,
+    /// and a refusal that prints only status and code.
+    fn upload_fake(
+        upload_status: u16,
+        upload_body: &'static str,
+    ) -> (TcpListener, thread::JoinHandle<(Vec<u8>, String)>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server = listener.try_clone().unwrap();
+        server.set_nonblocking(true).unwrap();
+        let handle = thread::spawn(move || {
+            let mut seen_upload = (Vec::new(), String::new());
+            // Bounded: the client may refuse before the second request, so the
+            // fake gives up on its own instead of hanging the test.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut answered = 0;
+            while answered < 2 && Instant::now() < deadline {
+                let socket = match server.accept() {
+                    Ok((socket, _)) => socket,
+                    Err(_) => {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let path = line.split(' ').nth(1).unwrap().to_string();
+                let mut bearer = String::new();
+                let mut length = 0_usize;
+                let mut content_type = String::new();
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    let (key, value) = line.split_once(':').unwrap();
+                    if key.eq_ignore_ascii_case("authorization") {
+                        bearer = value.trim().trim_start_matches("Bearer ").to_string();
+                    }
+                    if key.eq_ignore_ascii_case("content-length") {
+                        length = value.trim().parse().unwrap();
+                    }
+                    if key.eq_ignore_ascii_case("content-type") {
+                        content_type = value.trim().to_string();
+                    }
+                }
+                let mut raw = vec![0; length];
+                reader.read_exact(&mut raw).unwrap();
+                answered += 1;
+                if path == "/__platform/wiki/authorize" {
+                    let env = "eyJhIjoxfQ.eyJiIjoyfQ.c2ln";
+                    answer(
+                        socket,
+                        "200 OK",
+                        "",
+                        &json!({"version": WIKI_VERSION, "envelope": env}),
+                    );
+                } else {
+                    assert_eq!(path, "/__platform/wiki/upload");
+                    assert!(content_type.starts_with("multipart/form-data; boundary="));
+                    seen_upload = (raw, bearer);
+                    let body: Value = serde_json::from_str(upload_body).unwrap_or(json!({}));
+                    answer(socket, &format!("{upload_status} X"), "", &body);
+                }
+            }
+            seen_upload
+        });
+        (listener, handle)
+    }
+
+    #[test]
+    fn upload_sends_one_multipart_body_and_a_refusal_shows_only_the_code() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        // The overwrite pre-check is off here: the test drives the upload
+        // request itself, and the listing path is covered by `overwrite`.
+        let (listener, handle) =
+            upload_fake(409, r#"{"code":"too_large","secret":"do-not-print"}"#);
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        store_credential(dir, &endpoint);
+        let target = RemoteTarget {
+            org: ORG.into(),
+            endpoint,
+            org_id: ORG_ID.into(),
+        };
+        let err = upload_file_in(
+            dir,
+            &target,
+            "sources/a.pdf",
+            "a.pdf",
+            b"%PDF-bytes",
+            true,
+            5,
+            |_| {},
+        )
+        .unwrap_err();
+        let (raw, bearer) = handle.join().unwrap();
+        // The bearer rides the header, and the body carries the contract
+        // fields and the single file part with the raw bytes.
+        assert_eq!(bearer, BRIDGE);
+        let text = String::from_utf8_lossy(&raw);
+        for needle in [
+            "name=\"version\"\r\n\r\nhosted-cadence-wiki.v1",
+            "name=\"action\"\r\n\r\nwrite_blob",
+            "name=\"path\"\r\n\r\nsources/a.pdf",
+            "name=\"envelope\"\r\n\r\neyJhIjoxfQ.eyJiIjoyfQ.c2ln",
+            "filename=\"a.pdf\"",
+        ] {
+            assert!(text.contains(needle), "missing {needle}");
+        }
+        assert_eq!(text.matches("name=\"file\"").count(), 1);
+        // A refusal names the status and code and never the raw body.
+        let shown = err.to_string();
+        assert!(
+            shown.contains("409") && shown.contains("too_large"),
+            "{shown}"
+        );
+        assert!(!shown.contains("do-not-print"), "{shown}");
     }
 }
 

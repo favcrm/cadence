@@ -432,6 +432,9 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
 fn wiki_for(action: &WikiAction) -> Result<(&'static str, serde_json::Map<String, Value>)> {
     let mut args = serde_json::Map::new();
     let verb = match action {
+        WikiAction::Upload { .. } => {
+            return Err(Error::rejected("wiki upload is sent by its own path"));
+        }
         WikiAction::Ls { path } => {
             args.insert("path".into(), json!(path.clone().unwrap_or_default()));
             "enumerate"
@@ -489,6 +492,46 @@ fn wiki_for(action: &WikiAction) -> Result<(&'static str, serde_json::Map<String
         }
     };
     Ok((verb, args))
+}
+
+/// CAD-913: `wiki upload <file> <path>` on a remote org. Every local check
+/// runs before a request: the logical path, the regular-file and symlink
+/// refusal, and the 15 MiB cap. A refused file sends nothing. The reply is
+/// the remote's JSON body.
+fn upload(
+    target: &cadence_agent::remote_cli::RemoteTarget,
+    file: &std::path::Path,
+    path: &str,
+    overwrite: bool,
+    wake_timeout: u64,
+) -> Result<i32> {
+    use cadence_agent::wiki::upload::{
+        logical_upload_path, part_file_name, read_local_file, UPLOAD_CAP_BYTES,
+    };
+    let logical = logical_upload_path(path)?;
+    let bytes = read_local_file(file, UPLOAD_CAP_BYTES)?;
+    let name = part_file_name(logical.rsplit('/').next().unwrap_or("upload"));
+    let out = cadence_agent::remote_cli::upload_file(
+        target,
+        &logical,
+        &name,
+        &bytes,
+        overwrite,
+        wake_timeout,
+        |line| eprintln!("{line}"),
+    )
+    .map_err(|error| {
+        if error.kind() == "busy" && error.code() == Some("waking") {
+            eprintln!(
+                "{}",
+                serde_json::to_string(&json!({"kind": "busy", "state": "waking"}))
+                    .unwrap_or_default()
+            );
+        }
+        error
+    })?;
+    println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+    Ok(0)
 }
 
 /// `wiki ls|cat|search` answers print as the host prints them. The `--json`,
@@ -590,6 +633,17 @@ pub(super) fn run(
 ) -> Result<i32> {
     if let Commands::Org { action } = command {
         return org::run(action);
+    }
+    if let Commands::Wiki {
+        action:
+            WikiAction::Upload {
+                file,
+                path,
+                overwrite,
+            },
+    } = &command
+    {
+        return upload(&target, file, path, *overwrite, wake_timeout);
     }
     let (verb, args) = verb_for(&command)?;
     let out =
