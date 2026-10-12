@@ -65,6 +65,10 @@ impl Drop for Rig {
 
 impl Rig {
     fn start() -> Self {
+        Self::start_with_read_only(false)
+    }
+
+    fn start_with_read_only(read_only: bool) -> Self {
         let root = tempfile::Builder::new()
             .prefix("c1401-")
             .tempdir_in("/tmp")
@@ -150,6 +154,7 @@ impl Rig {
             port: rig.port,
             allow_hosts: vec![HOST.into()],
             board_public_only: true,
+            read_only,
             public: Some(ui::PublicBoard {
                 host: HOST.into(),
                 issuer: rig.issuer.clone(),
@@ -628,6 +633,71 @@ fn signed_wiki_http_boundary_intersects_native_acl_scope_prefix_and_replay() {
             .as_ref()
             .is_ok_and(|v| v["text"] == "local agent rights remain"),
         &local_read,
+    );
+    // A separate board uses the supported ui --read-only option. Seed its
+    // page through native operator setup, not a bypass of the HTTP guard.
+    drop(rig);
+    let rig = Rig::start_with_read_only(true);
+    let seeded = rig.op(
+        "wiki_write",
+        json!({"path": PAGE, "text": TEXT, "if_rev": "none"}),
+    );
+    assert_eq!(seeded["committed"], true);
+    let before = rig.page_snapshot();
+    let owner = rig.sign(&rig.claims("board-read-only-owner-put"));
+    let response = rig.call(
+        "PUT",
+        "/api/wiki/file",
+        Some(&owner),
+        &json!({"path": PAGE, "text": "read-only mutation attempted"}),
+    );
+    check(
+        &mut failures,
+        "read-only board refuses verified owner covered text PUT without side effects",
+        response.0 == 403 && rig.page_snapshot() == before,
+        &response,
+    );
+    let response = rig.call(
+        "GET",
+        "/api/wiki/file?path=global%2Fcovered%2Fordinary%20text%20%2B%20page.md",
+        Some(&rig.sign(&rig.claims("board-read-only-get"))),
+        &Value::Null,
+    );
+    check(
+        &mut failures,
+        "read-only board permits verified covered GET file",
+        response.0 == 200 && response.2["text"] == TEXT,
+        &response,
+    );
+    for (id, path, field) in [
+        ("ls", "/api/wiki/ls?path=global%2Fcovered", "entries"),
+        (
+            "search",
+            "/api/wiki/search?q=quartzboundary&path=global%2Fcovered",
+            "matches",
+        ),
+    ] {
+        let response = rig.call(
+            "GET",
+            path,
+            Some(&rig.sign(&rig.claims(&format!("board-read-only-{id}")))),
+            &Value::Null,
+        );
+        check(
+            &mut failures,
+            &format!("read-only board permits verified covered GET {id}"),
+            response.0 == 200
+                && response.2[field]
+                    .as_array()
+                    .is_some_and(|items| items.iter().any(|item| item["path"] == PAGE)),
+            &response,
+        );
+    }
+    check(
+        &mut failures,
+        "read-only board reads preserve wiki bytes and tracker HEAD",
+        rig.page_snapshot() == before,
+        (),
     );
     assert!(
         failures.is_empty(),
