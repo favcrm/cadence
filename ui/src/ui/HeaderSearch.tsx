@@ -11,11 +11,17 @@ import type { IssueCard } from "../lib/types";
 import type { ResourceState } from "../lib/cache";
 import Link from "./Link";
 import { IconSearch } from "./icons";
+import { useTranslate } from "../lib/locale";
 
 /** Results shown per group; the list discloses when it is cut. */
 const LIMIT = 8;
 /** Quiet time before a Knowledge query, so typing does not query per key. */
 const DEBOUNCE_MS = 250;
+
+/** Fills `{name}` placeholders in a catalog sentence; values are inserted literally. */
+function fill(text: string, slots: Record<string, string>): string {
+  return text.replace(/\{(\w+)\}/g, (match, name: string) => slots[name] ?? match);
+}
 
 /** The route's project (follows the current route) or every accessible project. */
 type Choice = "route" | "all";
@@ -83,6 +89,7 @@ export default function HeaderSearch({
   route: Route;
   navHref: (route: Route) => string;
 }) {
+  const t = useTranslate();
   const currentProject = routeProject(route);
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -258,7 +265,7 @@ export default function HeaderSearch({
         onClick={openSearch}
       >
         <IconSearch size={14} />
-        <span>Search issues and knowledge…</span>
+        <span>{t("Search issues and knowledge…")}</span>
         <kbd>Ctrl K</kbd>
       </button>
       <div className="lg:hidden">
@@ -266,7 +273,7 @@ export default function HeaderSearch({
           ref={mobileTriggerRef}
           type="button"
           className="header-icon header-search-icon"
-          aria-label="Search issues and knowledge"
+          aria-label={t("Search issues and knowledge")}
           aria-expanded={open}
           onClick={openSearch}
         >
@@ -282,7 +289,7 @@ export default function HeaderSearch({
             className="card header-search-dialog"
             role="dialog"
             aria-modal="true"
-            aria-label="Search issues and knowledge"
+            aria-label={t("Search issues and knowledge")}
             onKeyDown={onKeyDown}
           >
             <div className="header-search-controls">
@@ -295,12 +302,12 @@ export default function HeaderSearch({
                 aria-controls="header-search-results"
                 aria-activedescendant={rows[active] ? `header-search-row-${active}` : undefined}
                 aria-autocomplete="list"
-                aria-label="Search issues and knowledge"
-                placeholder="Search issues by ID, title, owner or tag, or knowledge…"
+                aria-label={t("Search issues and knowledge")}
+                placeholder={t("Search issues by ID, title, owner or tag, or knowledge…")}
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
               />
-              <div className="header-search-scope" role="group" aria-label="Search scope">
+              <div className="header-search-scope" role="group" aria-label={t("Search scope")}>
                 {currentProject !== null && (
                   <button
                     type="button"
@@ -317,32 +324,32 @@ export default function HeaderSearch({
                   aria-pressed={projectKey === null}
                   onClick={() => setChoice("all")}
                 >
-                  All projects
+                  {t("All projects")}
                 </button>
               </div>
             </div>
 
             {!trimmed ? (
               <p className="header-search-guide text-label text-ink-400">
-                Type an issue ID, title word, owner or tag. Knowledge comes from the Wiki. Issue search covers card fields only, not descriptions or comments.
+                {t("Type an issue ID, title word, owner or tag. Knowledge comes from the Wiki. Issue search covers card fields only, not descriptions or comments.")}
               </p>
             ) : (
               <div id="header-search-results" className="header-search-results">
                 <section aria-labelledby="header-search-issues-h">
-                  <h3 id="header-search-issues-h" className="slabel">Issues</h3>
+                  <h3 id="header-search-issues-h" className="slabel">{t("Issues")}</h3>
                   {issues.status === "failed" && issues.data === null ? (
-                    <p className="text-label text-fail" role="alert">Issues could not load{issues.error ? `: ${issues.error}` : "."}</p>
+                    <p className="text-label text-fail" role="alert">{issues.error ? fill(t("Issues could not load: {error}"), { error: issues.error }) : t("Issues could not load.")}</p>
                   ) : issues.data === null ? (
-                    <p className="text-label text-ink-400">Loading issues…</p>
+                    <p className="text-label text-ink-400">{t("Loading issues…")}</p>
                   ) : (
                     <>
                       {issues.error !== null && (
                         <p className="text-label text-fail" role="alert">
-                          Issue list could not refresh: {issues.error}. Matches below come from the last loaded list.
+                          {fill(t("Issue list could not refresh: {error}. Matches below come from the last loaded list."), { error: issues.error })}
                         </p>
                       )}
                       {issueMatches.length === 0 ? (
-                        <p className="text-label text-ink-400">No issues match “{trimmed}”{projectKey ? ` in ${projectKey}` : ""}.</p>
+                        <p className="text-label text-ink-400">{projectKey ? fill(t("No issues match “{q}” in {p}."), { q: trimmed, p: projectKey }) : fill(t("No issues match “{q}”."), { q: trimmed })}</p>
                       ) : (
                         <ResultList rows={issueRows} offset={0} active={active} onHover={setActive} onPick={choose} />
                       )}
@@ -351,22 +358,22 @@ export default function HeaderSearch({
                 </section>
 
                 <section aria-labelledby="header-search-knowledge-h">
-                  <h3 id="header-search-knowledge-h" className="slabel">Knowledge{projectKey ? ` · ${projectKey}` : ""}</h3>
+                  <h3 id="header-search-knowledge-h" className="slabel">{t("Knowledge")}{projectKey ? ` · ${projectKey}` : ""}</h3>
                   {knowledge.status === "loading" || knowledge.status === "idle" ? (
-                    <p className="text-label text-ink-400">Searching knowledge…</p>
+                    <p className="text-label text-ink-400">{t("Searching knowledge…")}</p>
                   ) : knowledge.status === "error" ? (
                     <p className="text-label text-fail" role="alert">
-                      Knowledge search failed: {knowledge.message}. Issue matches above are unaffected.
+                      {fill(t("Knowledge search failed: {message}. Issue matches above are unaffected."), { message: knowledge.message })}
                     </p>
                   ) : hitCount === 0 ? (
-                    <p className="text-label text-ink-400">No knowledge matches “{trimmed}”.</p>
+                    <p className="text-label text-ink-400">{fill(t("No knowledge matches “{q}”."), { q: trimmed })}</p>
                   ) : (
                     <ResultList rows={hitRows} offset={issueRows.length} active={active} onHover={setActive} onPick={choose} />
                   )}
                 </section>
 
                 {truncated && (
-                  <p className="text-label text-ink-400">Showing the first {LIMIT} of each group. Refine your search to narrow results.</p>
+                  <p className="text-label text-ink-400">{fill(t("Showing the first {n} of each group. Refine your search to narrow results."), { n: String(LIMIT) })}</p>
                 )}
               </div>
             )}

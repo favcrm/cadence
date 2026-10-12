@@ -649,6 +649,19 @@ Object.assign(zhTW, {
   "Confirmed, but the assistant turn did not start: {error}. Retry the same preview to hand it off again.": "已確認，但助理回合未啟動：{error}。請重試相同預覽以再次交付。",
 });
 
+Object.assign(zhTW, {
+  "Search issues and knowledge…": "搜尋議題與知識庫…", "Search issues and knowledge": "搜尋議題與知識庫",
+  "Search issues by ID, title, owner or tag, or knowledge…": "依編號、標題、負責人或標籤搜尋議題，或搜尋知識庫…", "Search scope": "搜尋範圍",
+  "Knowledge": "知識庫", "Loading issues…": "正在載入議題…", "Searching knowledge…": "正在搜尋知識庫…",
+  "Issues could not load: {error}": "無法載入議題：{error}", "Issues could not load.": "無法載入議題。",
+  "Issue list could not refresh: {error}. Matches below come from the last loaded list.": "無法重新整理議題清單：{error}。下方符合項目來自上次載入的清單。",
+  "No issues match “{q}” in {p}.": "在 {p} 中沒有符合「{q}」的議題。", "No issues match “{q}”.": "沒有符合「{q}」的議題。",
+  "No knowledge matches “{q}”.": "沒有符合「{q}」的知識庫內容。",
+  "Knowledge search failed: {message}. Issue matches above are unaffected.": "知識庫搜尋失敗：{message}。上方的議題符合項目不受影響。",
+  "Showing the first {n} of each group. Refine your search to narrow results.": "每組僅顯示前 {n} 筆。請縮小搜尋範圍以精簡結果。",
+  "Type an issue ID, title word, owner or tag. Knowledge comes from the Wiki. Issue search covers card fields only, not descriptions or comments.": "輸入議題編號、標題字詞、負責人或標籤。知識庫內容來自 Wiki。議題搜尋只涵蓋卡片欄位，不含描述或留言。",
+});
+
 export function useLocale(): LocaleContextValue {
   const value = useContext(LocaleContext);
   if (!value) throw new Error("useLocale must be used inside LocaleProvider");
