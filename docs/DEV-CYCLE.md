@@ -4,16 +4,24 @@
 
 The current day-to-day loop (AGENTS.md "Delivery workflow" is the rule text):
 
-1. One PR per feature. Small PRs review and merge fast, and a split feature
-   leaves main half-built.
-   Essentials first: the simplest change that meets the acceptance items,
-   extras to a follow-up ticket, polish in later PRs.
-   One ticket per feature too; when the PR merges the lane reconciles the
-   ticket and cleans up its scratch and processes.
-2. Put the design note in the PR description, not in a separate document.
-3. Run `scripts/pre-push` before every push. `--tests` is available as a
-   focused local diagnostic, not a blanket pre-review prerequisite; required
-   CI and the full merge-group regression floor remain unchanged.
+1. Requirement and plan: state the user outcome, observable acceptance,
+   non-goals and material unknowns in the ticket. Resolve consequential
+   ambiguity before implementation; a short ticket plan is enough for a
+   small change. One ticket and PR per end-to-end feature; split only for
+   another repository or an independently usable outcome, not per step.
+2. Implement the simplest change that meets acceptance. Reuse existing
+   conventions and modules; put a design note in the PR when AGENTS.md
+   requires it, not in a separate mandatory design-review round. Before
+   requesting review, simplify your changed lines without changing behaviour:
+   remove dead code, duplication and unnecessary abstractions. The
+   `code-simplifier` skill can help; it is not another approval stage.
+   Adjacent refactors and polish go to a follow-up ticket.
+3. Run `scripts/pre-push` before every push and show the ticket's outcome.
+   For a bug fix, show the failing case once, then fixed. Add checks only
+   under AGENTS.md's behavior-first and gates/security rules; do not restore
+   retired tests or routinely repeat suites. `--tests` is a focused local
+   diagnostic, not a blanket pre-review prerequisite; required CI and full
+   merge-group regression remain unchanged.
 4. Under strict requirements, one independent reviewer; two for auth, identity,
    secrets, the daemon trees and UI paths (`docs/roles/one-review-paths.toml`
    lists what gets one).
@@ -32,20 +40,62 @@ The current day-to-day loop (AGENTS.md "Delivery workflow" is the rule text):
    isolation and operator-owned deployment remain unchanged. No fabricated
    verdict/readiness counts as review or outcome evidence; dry-run is read-only
    and requirements must be freshly bound before queueing.
-6. Review notes never block. Findings that are not defects go in a follow-up
-   PR, not into this head.
-7. Operator approval: for a `human`-class PR the operator records ONE scope
+6. Required read-only code review may overlap CI on a stable head; pending
+   CI is not readiness and all required exact-head checks must be green
+   before enqueue. Rebase onto current main before requesting review, as
+   AGENTS.md requires; after approval, rebase only for conflicts. Review
+   correctness, security and ticket acceptance. Preserve independent refusal
+   acceptance for enforced rules and desktop/narrow Browser QA for `ui/**`.
+   REVISE only for correctness, security or ticket-requirement gaps. Other
+   findings are notes: one follow-up ticket or a recorded reason to drop them,
+   not another polish round on the reviewed head.
+7. Operator approval: for a `human`-class PR the operator may record one scope
    approval per ticket with
    `cadence audit approve --issue <ID> --action scope`. It covers the ticket
    only while it is ready, doing or review, and its body declares its risk
    triggers on exactly one `Risk:` line. It is bound to the ticket body, so
    editing the body voids it, and verdict notes state `Scope: in-scope <ID>`.
-   A per-PR approval (`--pr <n> --head <sha>`) is needed only for triggers 1
-   or 3, or for a diff outside the declared scope.
-8. Enqueue with `scripts/enqueue-reviewed <n> --head <full-sha>`; it checks the
-   scope rules above.
-9. Production: dispatch a staging promote, then the GitHub `production`
-   approval, then `cadence update --as operator:<n>`.
+   Scope approval is optional and valid only when every AGENTS.md condition
+   holds. Triggers 1/3, two-review paths, uncovered scope or invalid bindings
+   require per-head approval; conversation text is never approval evidence.
+8. Post the required exact-head ticket evidence and enqueue with
+   `scripts/enqueue-reviewed <n> --head <full-sha>`. Use the merge queue, not
+   routine `--admin` merges or duplicate local integration trains. Disable
+   auto-merge before editing an enqueued PR; a new head voids old verdicts.
+9. Follow the [artifact-specific rollout checklist](guides/rollout-checklist.md)
+   for staging, production order, pinned artifacts, verification and rollback.
+   Production deployment is operator-owned; agents never restart the live
+   daemon. Merged, installed and operationally verified are separate outcomes.
+   After merge, reconcile the ticket, leave the worktree to the sweep, and
+   clean up only your own scratch and processes.
+
+## Pragmatic design and cycle time
+
+Generic means using standard approaches and genuinely shared modules, not
+building a framework for hypothetical future callers. Keep interfaces small
+and changes local. Introduce an abstraction only when current acceptance or
+real variation needs it; do not force different workflows through one generic
+interface. When two approaches meet acceptance, choose the smaller one and
+explain why. Larger refactoring needs its own outcome and acceptance.
+
+One bounded author simplification pass precedes review. Stop when acceptance
+and required verification are complete; do not add planning documents,
+reviewers, repeated checks or handoffs merely to make the process look thorough.
+Reuse unchanged-head evidence and reviewer context as described below. Never
+trade away approval, independent review required by the effective policy,
+isolation or fail-closed guards to save time.
+
+For a slow cycle, inspect existing `cadence issue retro <ID> --json` evidence
+and CI job timings. Separate active work from waiting for scope decisions,
+resource admission, CI, review, approval, queue and rollout; unknown timings
+stay unknown. Compare similar risk tiers before changing the process. Use
+existing timestamps for median/p90 where enough comparable evidence exists;
+do not claim speed gains from one anecdote or add a mandatory evidence ledger.
+Fix the demonstrated bottleneck, not whichever gate is easiest to remove.
+
+Local role documents or generated briefings may be stale. Follow AGENTS.md and
+the effective delivery policy; do not treat an untracked briefing as merge or
+production authority. Changed instructions do not reload running contexts.
 
 ## What #738 taught us
 
@@ -113,7 +163,9 @@ scripts/pre-push --tests        # execute; stop at the first nonzero exit
 The diff selects Rust/UI/active script checks. The live doctor source
 inventory always runs. `--tests` always executes the safety floor (two test
 threads), even if its source is unchanged or diff discovery is uncertain.
-Add filtered tests for the behavior you changed; the floor is not that proof.
+Show the behavior you changed; add a focused check only when AGENTS.md requires
+it or the ticket's outcome cannot be shown without one. The floor is not
+that proof.
 Host Rust builds use four jobs and normal build-slot admission. If admission
 is unavailable, report that limitation rather than claiming local validation.
 
@@ -211,10 +263,13 @@ digest, no fresh full review for unchanged code, and no duplicate Node setup
 for cargo-only retired journeys. Measure failure-before-review rate and
 number of operator/reviewer handoffs as well as CI elapsed/runner minutes.
 
-Review count follows AGENTS.md "Review" (CAD-1099): one independent review by
-default, two for the excluded paths in `docs/roles/one-review-paths.toml`, and
-operator approval for human risk. Automating evidence collection, reviewer state,
-head-drift notifications or an operator decision UI is a separate reviewed
+Review count follows AGENTS.md "Review" and the effective delivery policy:
+eligible routine changes need no mandatory review, consequential changes one
+combined review, and sensitive/unknown cases retain strict floors. Under the
+strict path, use one independent review by default, two for excluded paths in
+`docs/roles/one-review-paths.toml` (subject to the documented solo-operator
+rule), and operator approval for human risk. Automating evidence collection,
+reviewer state, head-drift notifications or an operator decision UI is a separate reviewed
 implementation—not a license to self-approve. Likewise, consolidating required
 build/UI checks or changing branch protection requires baseline measurements
 and an operator decision. Do not change names in YAML before migrating the
