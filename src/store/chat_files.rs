@@ -1232,6 +1232,16 @@ fn workspace_users_dir(workspace: &Path, create: bool) -> Result<Option<PinnedBl
                 std::path::Component::Normal(part) => part,
                 _ => return Err(Error::rejected("operational workspace is not normalized")),
             };
+            let mut parent_stat: libc::stat = unsafe { std::mem::zeroed() };
+            let daemon_uid = unsafe { libc::geteuid() };
+            if unsafe { libc::fstat(current.as_raw_fd(), &mut parent_stat) } != 0
+                || (parent_stat.st_uid != 0 && parent_stat.st_uid != daemon_uid)
+                || (parent_stat.st_mode & 0o022 != 0 && parent_stat.st_mode & libc::S_ISVTX == 0)
+            {
+                return Err(Error::rejected(
+                    "operational workspace parent has unsafe ownership or writable mode",
+                ));
+            }
             let name = CString::new(part.as_bytes())
                 .map_err(|_| Error::rejected("operational workspace path is invalid"))?;
             let mut fd = unsafe {
@@ -1264,6 +1274,16 @@ fn workspace_users_dir(workspace: &Path, create: bool) -> Result<Option<PinnedBl
                 ));
             }
             current = unsafe { OwnedFd::from_raw_fd(fd) };
+        }
+        let mut workspace_stat: libc::stat = unsafe { std::mem::zeroed() };
+        let daemon_uid = unsafe { libc::geteuid() };
+        if unsafe { libc::fstat(current.as_raw_fd(), &mut workspace_stat) } != 0
+            || workspace_stat.st_uid != daemon_uid
+            || workspace_stat.st_mode & 0o022 != 0
+        {
+            return Err(Error::rejected(
+                "operational workspace must be daemon-owned and not group/other writable",
+            ));
         }
         let name = c"users";
         let mut fd = unsafe {

@@ -957,3 +957,135 @@ fn cad1337_master_launch_policy_process_alias_and_bound_root_refusals() {
         "policy validation altered original private marker bytes"
     );
 }
+
+/// Independent custody-parent acceptance: private children must not be
+/// replaceable through a non-sticky writable workspace or its owned parent.
+/// Only disposable fixture directories change mode. The existing signed
+/// session and native dispatcher exercise real upload custody; no actor,
+/// provider, invented UID or malicious relocation is involved.
+#[cfg(unix)]
+#[test]
+fn cad1337_upload_refuses_writable_workspace_and_parent() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let safe = Fx::new();
+    let safe_owner = safe.public_session("usr-cad1337-parent-safe", "owner");
+    let safe_workspace = safe._dir.path().join("workspace");
+    std::fs::create_dir(&safe_workspace).unwrap();
+    std::fs::set_permissions(&safe_workspace, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let safe_bytes = b"safe existing workspace custody control\n";
+    let safe_row = safe.upload(&safe_owner, safe_bytes, json!({})).unwrap();
+    let safe_original = safe_workspace
+        .join("users")
+        .join(safe_row["user_id"].as_str().unwrap())
+        .join("threads")
+        .join(&safe.master_home)
+        .join("uploads")
+        .join(safe_row["id"].as_str().unwrap())
+        .join("ticket.txt");
+    assert_eq!(std::fs::read(&safe_original).unwrap(), safe_bytes);
+    assert_eq!(
+        safe.row_count(),
+        1,
+        "safe upload did not retain exactly one row"
+    );
+    assert_eq!(
+        std::fs::metadata(safe_workspace.join("users"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o700,
+        "safe workspace must retain the existing private users boundary"
+    );
+
+    let mut admitted = Vec::new();
+    for case in ["workspace", "parent"] {
+        let fx = Fx::new();
+        let owner = fx.public_session("usr-cad1337-parent-unsafe", "owner");
+        let workspace = fx._dir.path().join("workspace");
+        assert_eq!(fx.shared.upload_workspace_dir, workspace);
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let marker = workspace.join("sentinel.txt");
+        let marker_bytes = b"preexisting fixture custody marker\n";
+        std::fs::write(&marker, marker_bytes).unwrap();
+        let writable = if case == "workspace" {
+            workspace.as_path()
+        } else {
+            fx._dir.path()
+        };
+        // Non-sticky mode: another UID could rename a private child even
+        // without access to its bytes. Never chmod /tmp or another fixture.
+        std::fs::set_permissions(writable, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let before = fx.row_count();
+        match fx.upload(
+            &owner,
+            b"unsafe parent must not retain this original\n",
+            json!({}),
+        ) {
+            Ok(_) => admitted.push(case),
+            Err(error) => {
+                let reason = error.to_string().to_ascii_lowercase();
+                assert!(
+                    (reason.contains("workspace") || reason.contains("custody"))
+                        && (reason.contains("writable")
+                            || reason.contains("mode")
+                            || reason.contains("ownership")
+                            || reason.contains("permissions")
+                            || reason.contains("daemon-owned")),
+                    "{case} refused for an unrelated account, context or storage error: {error}"
+                );
+                assert_eq!(fx.row_count(), before, "{case} refusal retained metadata");
+                assert!(
+                    !workspace.join("users").exists(),
+                    "{case} refusal created a users tree or custody residue"
+                );
+                let entries = std::fs::read_dir(&workspace)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    entries,
+                    vec![std::ffi::OsString::from("sentinel.txt")],
+                    "{case} refusal retained operational files"
+                );
+                let legacy = fx._dir.path().join("tracker/.cadence/chat-files");
+                if legacy.exists() {
+                    for entry in std::fs::read_dir(legacy).unwrap() {
+                        let name = entry.unwrap().file_name();
+                        assert!(
+                            name == ".gitignore" || name == ".quota.lock",
+                            "{case} refusal retained a legacy original or quota residue: {name:?}"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(std::fs::read(marker).unwrap(), marker_bytes);
+        assert_eq!(
+            std::fs::metadata(writable).unwrap().permissions().mode() & 0o7777,
+            0o777,
+            "{case} custody silently changed the unsafe directory mode"
+        );
+    }
+    assert_eq!(std::fs::read(safe_original).unwrap(), safe_bytes);
+    assert_eq!(
+        safe.row_count(),
+        1,
+        "unsafe cases altered the safe control metadata"
+    );
+    assert_eq!(
+        std::fs::metadata(safe_workspace)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o755,
+        "custody must not change the acceptable safe workspace mode"
+    );
+    assert!(
+        admitted.is_empty(),
+        "production upload custody admitted non-sticky writable parents: {admitted:?}"
+    );
+}
