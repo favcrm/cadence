@@ -60,6 +60,27 @@ function browserLocale(): Locale {
   return "en";
 }
 
+/** Browser-only choice for signed-out and local sign-ins (CAD-1331). Not an account write. */
+const LOCAL_LOCALE_KEY = "cadence-locale";
+
+function storedLocalLocale(): Locale | null {
+  try {
+    const value = window.localStorage.getItem(LOCAL_LOCALE_KEY);
+    return validLocale(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function storeLocalLocale(value: Locale | null): void {
+  try {
+    if (value === null) window.localStorage.removeItem(LOCAL_LOCALE_KEY);
+    else window.localStorage.setItem(LOCAL_LOCALE_KEY, value);
+  } catch {
+    // Storage unavailable: the choice still applies for this page view.
+  }
+}
+
 async function readPreferences(): Promise<Preferences> {
   const response = await fetch("/api/locale", { headers: { "X-Cadence-Board": "1" } });
   if (!response.ok) throw new Error(`Locale preferences unavailable (${response.status})`);
@@ -107,6 +128,7 @@ export function translateUiText(english: string, locale: Locale): string {
 export function LocaleProvider({ children }: { children: ReactNode }) {
   const [meta, setMeta] = useState<Meta | null>(null);
   const [storedPreferences, setStoredPreferences] = useState<{ identity: string; value: Preferences } | null>(null);
+  const [localLocale, setLocalLocale] = useState<Locale | null>(storedLocalLocale);
   const requestId = useRef(0);
   const identity = meta?.hosted === true && meta.signed_in === true && meta.session?.origin === "public" && meta.session.user?.sub
     ? `${meta.session.user.sub}:${meta.session.id}`
@@ -128,12 +150,19 @@ export function LocaleProvider({ children }: { children: ReactNode }) {
   const preferences = storedPreferences?.identity === identity ? storedPreferences.value : null;
   const locale: Locale = identity
     ? preferences?.user_locale ?? preferences?.organization_locale ?? browserLocale()
-    : browserLocale();
+    : localLocale ?? browserLocale();
   useEffect(() => {
     document.documentElement.lang = locale;
   }, [locale]);
 
   const setPreference = useCallback(async (scope: Scope, value: Locale | null) => {
+    if (identity === null) {
+      // Signed-out and local sign-ins: browser-only, no HTTP and no authority.
+      if (scope !== "user") throw new Error("Organization language needs a hosted operator");
+      storeLocalLocale(value);
+      setLocalLocale(value);
+      return;
+    }
     const generation = ++requestId.current;
     const writeIdentity = identity;
     const next = await writePreference(scope, value);
@@ -147,7 +176,7 @@ export function LocaleProvider({ children }: { children: ReactNode }) {
 
   const context = useMemo<LocaleContextValue>(() => ({
     locale,
-    userLocale: preferences?.user_locale ?? null,
+    userLocale: identity ? preferences?.user_locale ?? null : localLocale,
     organizationLocale: preferences?.organization_locale ?? null,
     isHostedUser: identity !== null,
     canSetOrganizationLocale: identity !== null && meta?.session?.user?.role === "operator",
@@ -162,7 +191,7 @@ export function LocaleProvider({ children }: { children: ReactNode }) {
       const [unit, size] = units.find(([, unitSeconds]) => Math.abs(seconds) >= unitSeconds) ?? ["second", 1];
       return new Intl.RelativeTimeFormat(locale, { numeric: "auto" }).format(Math.round(seconds / size), unit);
     },
-  }), [identity, locale, meta?.session?.user?.role, preferences, setPreference, setSession]);
+  }), [identity, locale, localLocale, meta?.session?.user?.role, preferences, setPreference, setSession]);
 
   return <LocaleContext.Provider value={context}>{children}</LocaleContext.Provider>;
 }
@@ -661,6 +690,11 @@ Object.assign(zhTW, {
   "Showing the first {n} of each group. Refine your search to narrow results.": "每組僅顯示前 {n} 筆。請縮小搜尋範圍以精簡結果。",
   "Type an issue ID, title word, owner or tag. Knowledge comes from the Wiki. Issue search covers card fields only, not descriptions or comments.": "輸入議題編號、標題字詞、負責人或標籤。知識庫內容來自 Wiki。議題搜尋只涵蓋卡片欄位，不含描述或留言。",
   "container": "容器", "bug": "錯誤", "spike": "研究", "pages": "頁面", "images": "圖片", "video": "影片", "pdf": "PDF",
+});
+
+Object.assign(zhTW, {
+  "Browser default": "瀏覽器預設",
+  "Language saved in this browser.": "語言已儲存於此瀏覽器。",
 });
 
 export function useLocale(): LocaleContextValue {

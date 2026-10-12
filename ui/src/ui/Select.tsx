@@ -147,7 +147,8 @@ export function Select({
       if (!trigger || !pop) return;
       const rect = trigger.getBoundingClientRect();
       const gap = 4;
-      const width = Math.max(rect.width, 240);
+      // The popup is never narrower than its trigger, nor wider than the viewport minus an 8px gutter.
+      const width = Math.min(Math.max(rect.width, 160), window.innerWidth - 16);
       const placement = flipPlacement(rect, pop.offsetHeight, window.innerHeight, gap);
       let left = rect.left;
       const maxLeft = window.innerWidth - width - 8;

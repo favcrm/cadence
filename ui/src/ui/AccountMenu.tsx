@@ -202,41 +202,39 @@ export default function AccountMenu({
               ))}
             </div>
           </div>
-          {isHostedUser && (
-            <div className="px-2 py-2">
-              <label htmlFor={`${panelId}-locale`} className="mb-1 block text-label text-ink-400">{t("Language")}</label>
-              <select
-                id={`${panelId}-locale`}
-                value={userLocale ?? "follow"}
-                disabled={languageBusy}
-                onChange={(event) => void saveLocale("user", event.target.value === "follow" ? null : event.target.value as "en" | "zh-TW")}
-                className="w-full rounded border border-ink-700 bg-ink-900 px-2 py-1.5 text-label text-ink-200"
-              >
-                <option value="follow">{t("Follow organization")}{organizationLocale ? ` (${organizationLocale === "zh-TW" ? "繁體中文" : "English"})` : ""}</option>
-                <option value="en">{t("English")}</option>
-                <option value="zh-TW">繁體中文</option>
-              </select>
-              {canSetOrganizationLocale && (
-                <>
-                  <label htmlFor={`${panelId}-org-locale`} className="mb-1 mt-2 block text-label text-ink-400">{t("Organization default")}</label>
-                  <select
-                    id={`${panelId}-org-locale`}
-                    value={organizationLocale ?? ""}
-                    disabled={languageBusy}
-                    onChange={(event) => void saveLocale("organization", event.target.value as "en" | "zh-TW")}
-                    className="w-full rounded border border-ink-700 bg-ink-900 px-2 py-1.5 text-label text-ink-200"
-                  >
-                    <option value="" disabled>{t("Not set")}</option>
-                    <option value="en">{t("English")}</option>
-                    <option value="zh-TW">繁體中文</option>
-                  </select>
-                </>
-              )}
-              {languageBusy && <p role="status" className="mt-1 text-micro text-ink-400">{t("Saving…")}</p>}
-              {languageSaved && <p role="status" className="mt-1 text-micro text-ink-400">{t("Language preference saved.")}</p>}
-              {languageError && <p role="alert" className="mt-1 text-micro text-red-400">{t("Could not save language preference.")}</p>}
-            </div>
-          )}
+          <div className="px-2 py-2">
+            <label htmlFor={`${panelId}-locale`} className="mb-1 block text-label text-ink-400">{t("Language")}</label>
+            <select
+              id={`${panelId}-locale`}
+              value={userLocale ?? "follow"}
+              disabled={languageBusy}
+              onChange={(event) => void saveLocale("user", event.target.value === "follow" ? null : event.target.value as "en" | "zh-TW")}
+              className="w-full rounded border border-ink-700 bg-ink-900 px-2 py-1.5 text-label text-ink-200"
+            >
+              <option value="follow">{isHostedUser ? `${t("Follow organization")}${organizationLocale ? ` (${organizationLocale === "zh-TW" ? "繁體中文" : "English"})` : ""}` : t("Browser default")}</option>
+              <option value="en">{t("English")}</option>
+              <option value="zh-TW">繁體中文</option>
+            </select>
+            {canSetOrganizationLocale && (
+              <>
+                <label htmlFor={`${panelId}-org-locale`} className="mb-1 mt-2 block text-label text-ink-400">{t("Organization default")}</label>
+                <select
+                  id={`${panelId}-org-locale`}
+                  value={organizationLocale ?? ""}
+                  disabled={languageBusy}
+                  onChange={(event) => void saveLocale("organization", event.target.value as "en" | "zh-TW")}
+                  className="w-full rounded border border-ink-700 bg-ink-900 px-2 py-1.5 text-label text-ink-200"
+                >
+                  <option value="" disabled>{t("Not set")}</option>
+                  <option value="en">{t("English")}</option>
+                  <option value="zh-TW">繁體中文</option>
+                </select>
+              </>
+            )}
+            {languageBusy && <p role="status" className="mt-1 text-micro text-ink-400">{t("Saving…")}</p>}
+            {languageSaved && <p role="status" className="mt-1 text-micro text-ink-400">{t(isHostedUser ? "Language preference saved." : "Language saved in this browser.")}</p>}
+            {languageError && <p role="alert" className="mt-1 text-micro text-red-400">{t("Could not save language preference.")}</p>}
+          </div>
           {settingsHref && (
             <Link href={settingsHref} onClick={() => setOpen(false)} className="block rounded px-2 py-1.5 text-label text-ink-200 hover:bg-ink-800">
               {t("Settings")}

@@ -49,6 +49,7 @@ import StatusChips from "./ui/StatusChips";
 import AccountMenu from "./ui/AccountMenu";
 import VersionLine from "./ui/VersionLine";
 import ThemeToggle from "./ui/ThemeToggle";
+import LocalLanguage from "./ui/LocalLanguage";
 import BuildUpdateNotice from "./ui/BuildUpdateNotice";
 import HeaderSearch from "./ui/HeaderSearch";
 import Setup from "./features/setup/Setup";
@@ -957,7 +958,7 @@ export default function App() {
               placement="below-end"
               settingsHref={hrefFor({ screen: "settings", section: "models" })}
               footer={versionLine}
-            /></div> : <ThemeToggle />}
+            /></div> : <><LocalLanguage /><ThemeToggle /></>}
           </div>
         </header>
 

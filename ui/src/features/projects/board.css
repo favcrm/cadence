@@ -29,6 +29,8 @@
 .issue-peek[open] { display: flex; }
 .issue-peek::backdrop { background: var(--color-scrim); }
 .issue-peek-close { min-width: 2.75rem; min-height: 2.75rem; }
+/* The priority select sits in a 7rem column; its trigger must not overflow the card (CAD-1331). */
+.issues-board .board-new-issue .select-trigger { min-width: 0; }
 @media (max-width: 639px) {
   .issues-board .board-issue-title { display: flex; align-items: center; min-height: 2.75rem; }
   .issues-board .board-preview-link { min-height: 2.75rem; display: inline-flex; align-items: center; }
