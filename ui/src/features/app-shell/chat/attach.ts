@@ -128,21 +128,51 @@ export function sameAttachDestination(
 export function unresolved(items: AttachItem[]): AttachItem[] {
   return items.filter((i) => i.status !== "ready");
 }
-/** The submit-time sentence for `title`/aria when a send is withheld
- *  because rows are unresolved — specific over a generic disabled. */
-export function unresolvedHint(items: AttachItem[], t: Translate = identity): string | null {
+/** The send-hold notice as a locale-neutral UiNotice: a whole-sentence
+ *  catalog key plus raw slots. Nothing is translated here, so a stored
+ *  notice follows the locale active at render. Null when nothing is
+ *  unresolved. The reason text is the last slot, so no later slot
+ *  replacement can match a brace inside it. */
+export function unresolvedHintNotice(items: AttachItem[]): { key: string; slots: Record<string, string> } | null {
   const bad = unresolved(items);
   if (bad.length === 0) return null;
   const uploading = bad.filter((i) => i.status === "uploading").length;
   const failed = bad.filter((i) => i.status === "failed");
   const reasons = [...new Set(failed.map((i) => i.error).filter(Boolean))].join("; ");
-  const parts = [
-    uploading > 0
-      ? t(uploading === 1 ? "{count} file is still uploading" : "{count} files are still uploading").replace("{count}", String(uploading))
-      : "",
-    failed.length > 0
-      ? `${t(failed.length === 1 ? "{count} file failed" : "{count} files failed").replace("{count}", String(failed.length))}${reasons ? ` — ${reasons}` : ""}`
-      : "",
-  ].filter(Boolean);
-  return `${parts.join(" · ")} ${t("— resolve or remove before sending")}`;
+  const reasonSuffix = reasons ? ` — ${reasons}` : "";
+  if (failed.length === 0)
+    return {
+      key: uploading === 1
+        ? "{count} file is still uploading — resolve or remove before sending"
+        : "{count} files are still uploading — resolve or remove before sending",
+      slots: { count: String(uploading) },
+    };
+  if (uploading === 0)
+    return {
+      key: failed.length === 1
+        ? "{count} file failed{reasonSuffix} — resolve or remove before sending"
+        : "{count} files failed{reasonSuffix} — resolve or remove before sending",
+      slots: { count: String(failed.length), reasonSuffix },
+    };
+  return {
+    key: uploading === 1
+      ? failed.length === 1
+        ? "{uploading} file is still uploading · {failed} file failed{reasonSuffix} — resolve or remove before sending"
+        : "{uploading} file is still uploading · {failed} files failed{reasonSuffix} — resolve or remove before sending"
+      : failed.length === 1
+        ? "{uploading} files are still uploading · {failed} file failed{reasonSuffix} — resolve or remove before sending"
+        : "{uploading} files are still uploading · {failed} files failed{reasonSuffix} — resolve or remove before sending",
+    slots: { uploading: String(uploading), failed: String(failed.length), reasonSuffix },
+  };
+}
+
+/** The English-or-translated hold sentence for `title`/aria. Expands the
+ *  same notice as the stored path: translate the whole key, then insert
+ *  each slot literally. */
+export function unresolvedHint(items: AttachItem[], t: Translate = identity): string | null {
+  const notice = unresolvedHintNotice(items);
+  if (notice === null) return null;
+  let text = t(notice.key);
+  for (const [name, value] of Object.entries(notice.slots)) text = text.replace(`{${name}}`, () => value);
+  return text;
 }

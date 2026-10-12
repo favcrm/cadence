@@ -662,11 +662,14 @@ Object.assign(zhTW, {
   "empty file — nothing to attach": "檔案是空的 — 沒有可附加的內容",
   "over 10 MiB — rejected": "超過 10 MiB — 已拒絕",
   "at most {count} attachments per message": "每則訊息最多可附加 {count} 個檔案",
-  "{count} file is still uploading": "有 {count} 個檔案仍在上傳",
-  "{count} files are still uploading": "有 {count} 個檔案仍在上傳",
-  "{count} file failed": "有 {count} 個檔案上傳失敗",
-  "{count} files failed": "有 {count} 個檔案上傳失敗",
-  "— resolve or remove before sending": "— 傳送前請先處理或移除",
+  "{count} file is still uploading — resolve or remove before sending": "有 {count} 個檔案仍在上傳 — 傳送前請先處理或移除",
+  "{count} files are still uploading — resolve or remove before sending": "有 {count} 個檔案仍在上傳 — 傳送前請先處理或移除",
+  "{count} file failed{reasonSuffix} — resolve or remove before sending": "有 {count} 個檔案上傳失敗{reasonSuffix} — 傳送前請先處理或移除",
+  "{count} files failed{reasonSuffix} — resolve or remove before sending": "有 {count} 個檔案上傳失敗{reasonSuffix} — 傳送前請先處理或移除",
+  "{uploading} file is still uploading · {failed} file failed{reasonSuffix} — resolve or remove before sending": "有 {uploading} 個檔案仍在上傳 · 有 {failed} 個檔案上傳失敗{reasonSuffix} — 傳送前請先處理或移除",
+  "{uploading} file is still uploading · {failed} files failed{reasonSuffix} — resolve or remove before sending": "有 {uploading} 個檔案仍在上傳 · 有 {failed} 個檔案上傳失敗{reasonSuffix} — 傳送前請先處理或移除",
+  "{uploading} files are still uploading · {failed} file failed{reasonSuffix} — resolve or remove before sending": "有 {uploading} 個檔案仍在上傳 · 有 {failed} 個檔案上傳失敗{reasonSuffix} — 傳送前請先處理或移除",
+  "{uploading} files are still uploading · {failed} files failed{reasonSuffix} — resolve or remove before sending": "有 {uploading} 個檔案仍在上傳 · 有 {failed} 個檔案上傳失敗{reasonSuffix} — 傳送前請先處理或移除",
 });
 
 Object.assign(zhTW, {

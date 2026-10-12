@@ -9,7 +9,7 @@ import {
 import type { ThreadRef } from "../../../lib/types";
 import { useLocale } from "../../../lib/locale";
 import { parseSlash, SLASH_COMMANDS, slashMatches, type SlashCommand } from "../../home/master";
-import { ATTACH_ACCEPT, attachMeta, displayAttachError, unresolvedHint, type AttachDestination, type AttachItem } from "./attach";
+import { ATTACH_ACCEPT, attachMeta, displayAttachError, unresolvedHint, unresolvedHintNotice, type AttachDestination, type AttachItem } from "./attach";
 import type { UiNotice } from "../campaign/useEmailDraft";
 import {
   addFiles,
@@ -233,7 +233,7 @@ export default function Composer({
     // A queued file that is still uploading or that failed is never
     // silently dropped: the send waits until every row is ready or
     // removed, and the notice says exactly why.
-    const hold = unresolvedHint(attachHold(key), translateAttachText);
+    const hold = unresolvedHintNotice(attachHold(key));
     if (hold !== null) {
       onNotice?.(hold);
       return;
