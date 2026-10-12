@@ -92,6 +92,7 @@ pub(crate) fn social_effect_install(id: &str) -> Option<String> {
 /// Short on purpose: the board holds its global write lock for the whole
 /// request, so a long wait would freeze every other board write. A longer
 /// wait is a repeated confirm, which re-polls.
+const MAX_SOCIAL_SCHEDULE_AHEAD_SECS: i64 = 366 * 24 * 3600;
 const SETTLE_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 const SETTLE_STEP: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -320,15 +321,256 @@ impl Shared {
         )
     }
 
+    fn schedule_social_draft(&self, id: &str, digest: &str, due_epoch: i64) -> Result<Value> {
+        let now = crate::issue::time::now_epoch();
+        if due_epoch <= now || due_epoch > now + MAX_SOCIAL_SCHEDULE_AHEAD_SECS {
+            return Err(Error::rejected(
+                "due_epoch must be in the future and within 366 days",
+            ));
+        }
+        let install = social_effect_install(id)
+            .ok_or_else(|| Error::rejected("not a social draft effect"))?;
+        let records = crate::store::app_records::RecordStore::open(&self.state_dir, &install)?;
+        let shown = records.app_social_effect_show(id)?;
+        if shown["effect"]["digest"] != digest
+            || !matches!(
+                shown["effect"]["state"].as_str(),
+                Some("waiting" | "approved")
+            )
+        {
+            return Err(Error::rejected(
+                "schedule requires the exact waiting or approved social draft effect",
+            ));
+        }
+        let authority = shown["effect"]["authority"].clone();
+        let pm = self.pm_at(&self.pm_dir()?)?;
+        workspace::with_completed_bundle_snapshot(
+            &pm,
+            &install,
+            required_str(&authority, "bundle_digest")?,
+            |bundle, files| {
+                let context = required_str(&authority, "context_id")?;
+                let slot = required_str(&authority["binding"], "slot")?;
+                let binding = self
+                    .app_binding_live(&install, Some(context), slot, bundle, files)?
+                    .ok_or_else(|| Error::rejected("social publish binding is unavailable"))?;
+                if binding.config["mapping"]["effect"] != "send"
+                    || binding.digest != authority["binding"]["digest"]
+                    || binding.revision != authority["binding"]["revision"]
+                {
+                    return Err(Error::rejected(
+                        "social publish binding changed since staging",
+                    ));
+                }
+                let draft = records
+                    .app_social_draft_show(context, required_str(&authority, "draft_id")?)?;
+                if draft["revision"].as_i64() != authority["revision"].as_i64()
+                    || draft["caption"] != authority["caption"]
+                    || crate::platform::agenticos_external::publish::caption_digest_of(
+                        authority["caption"].as_str().unwrap_or(""),
+                    ) != authority["caption_digest"].as_str().unwrap_or("")
+                {
+                    return Err(Error::rejected("social draft changed since staging"));
+                }
+                if let Some(asset) = authority["asset_id"].as_str() {
+                    let (header, digest, bytes) =
+                        self.store.app_tool_asset_bytes(&install, asset)?;
+                    let mime =
+                        crate::platform::agenticos_external::image::image_mime(&bytes, &header)
+                            .map_err(Error::rejected)?;
+                    if bytes.len() > 2 * 1024 * 1024
+                        || Some(bare_digest(&digest)) != frozen_image_digest(&authority)
+                        || Some(bytes.len() as u64) != authority["size_bytes"].as_u64()
+                        || Some(mime) != authority["mime"].as_str()
+                    {
+                        return Err(Error::rejected("social draft image changed since staging"));
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        let resolver = self.social_media_resolver.clone().ok_or_else(|| {
+            Error::rejected("capability_unavailable: no media resolver configured")
+        })?;
+        let resolved = resolver
+            .resolve(
+                required_str(&authority, "toolkit")?,
+                required_str(&authority, "destination_id")?,
+            )
+            .into_result()
+            .map_err(|e| Error::rejected(e.to_string()))?;
+        if resolved.aos_connection_id != authority["aos_connection_id"] {
+            return Err(Error::rejected("social destination changed since staging"));
+        }
+        let approval = format!("social-approval-{}", uuid::Uuid::new_v4().simple());
+        records.app_social_effect_schedule(id, digest, due_epoch, &approval)
+    }
+
+    fn verify_social_effect_workspace(&self, id: &str, shown: &Value) -> Result<()> {
+        let install = social_effect_install(id)
+            .ok_or_else(|| Error::rejected("not a social draft effect"))?;
+        if shown["effect"]["install_id"].as_str() != Some(&install)
+            || shown["effect"]["context_id"].as_str().is_none()
+        {
+            return Err(Error::rejected(
+                "social draft effect is outside its installation scope",
+            ));
+        }
+        let pm = self.pm_at(&self.pm_dir()?)?;
+        let inventory = workspace::list(&pm)?;
+        let live = inventory.as_array().into_iter().flatten().any(|row| {
+            row["install_id"].as_str() == Some(&install)
+                && row["storage_kind"] == "workspace"
+                && row["removed"].is_null()
+                && row["project"].is_null()
+        });
+        if !live {
+            return Err(Error::rejected(
+                "social draft installation is no longer active",
+            ));
+        }
+        Ok(())
+    }
+
+    fn reschedule_social_draft(
+        &self,
+        id: &str,
+        digest: &str,
+        expected_due_epoch: i64,
+        due_epoch: i64,
+    ) -> Result<Value> {
+        let now = crate::issue::time::now_epoch();
+        if due_epoch <= now || due_epoch > now + MAX_SOCIAL_SCHEDULE_AHEAD_SECS {
+            return Err(Error::rejected(
+                "due_epoch must be in the future and within 366 days",
+            ));
+        }
+        let install = social_effect_install(id)
+            .ok_or_else(|| Error::rejected("not a social draft effect"))?;
+        let records = crate::store::app_records::RecordStore::open(&self.state_dir, &install)?;
+        self.verify_social_effect_workspace(id, &records.app_social_effect_show(id)?)?;
+        let approval = format!("social-approval-{}", uuid::Uuid::new_v4().simple());
+        records.app_social_effect_reschedule(id, digest, expected_due_epoch, due_epoch, &approval)
+    }
+
+    fn cancel_social_draft(
+        &self,
+        id: &str,
+        digest: &str,
+        expected_due_epoch: i64,
+    ) -> Result<Value> {
+        let install = social_effect_install(id)
+            .ok_or_else(|| Error::rejected("not a social draft effect"))?;
+        let records = crate::store::app_records::RecordStore::open(&self.state_dir, &install)?;
+        self.verify_social_effect_workspace(id, &records.app_social_effect_show(id)?)?;
+        records.app_social_effect_cancel(id, digest, expected_due_epoch)
+    }
+
+    pub(super) fn drive_scheduled_social_drafts(
+        self: &Arc<Self>,
+        now_epoch: i64,
+        cap: usize,
+    ) -> Result<()> {
+        let pm = self.pm_at(&self.pm_dir()?)?;
+        let installs = workspace::list(&pm)?;
+        let mut left = cap;
+        for install_row in installs.as_array().into_iter().flatten() {
+            if left == 0 {
+                break;
+            }
+            if install_row["storage_kind"] != "workspace"
+                || !install_row["removed"].is_null()
+                || !install_row["project"].is_null()
+            {
+                continue;
+            }
+            let Some(install) = install_row["install_id"].as_str() else {
+                continue;
+            };
+            let records =
+                match crate::store::app_records::RecordStore::open(&self.state_dir, install) {
+                    Ok(records) => records,
+                    Err(_) => continue,
+                };
+            for effect in records.app_social_effect_due(now_epoch, left)? {
+                left -= 1;
+                let id = effect["effect_id"].as_str().unwrap_or("");
+                let digest = effect["digest"].as_str().unwrap_or("");
+                let due = effect["due_epoch"].as_i64().unwrap_or(i64::MAX);
+                if self.publish_due_social_draft(id, digest, due).is_err() {
+                    let _ = records.app_social_effect_hold_scheduled(
+                        id,
+                        digest,
+                        due,
+                        "scheduled publish revalidation failed",
+                    );
+                }
+                if left == 0 {
+                    break;
+                }
+            }
+            if left == 0 {
+                break;
+            }
+            for effect in records.app_social_effect_sending(left)? {
+                left -= 1;
+                let id = effect["effect_id"].as_str().unwrap_or("");
+                let key = effect["authority"]["idempotency_key"]
+                    .as_str()
+                    .unwrap_or("");
+                let Some(sender) = self.social_publish_sender.as_ref() else {
+                    break;
+                };
+                match sender.status(key) {
+                    Ok(outcome) if outcome.state == crate::platform::agenticos_external::publish::PublishState::Posted => {
+                        let _ = records.app_social_effect_finish(id, "posted", &outcome.evidence_json());
+                    }
+                    Ok(outcome) if matches!(outcome.state, crate::platform::agenticos_external::publish::PublishState::Refused | crate::platform::agenticos_external::publish::PublishState::ReconnectNeeded) => {
+                        let _ = records.app_social_effect_finish(id, "refused", &outcome.evidence_json());
+                    }
+                    _ => {}
+                }
+                if left == 0 {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn publish_social_draft_now(&self, id: &str, digest: &str) -> Result<Value> {
+        self.publish_social_draft(id, digest, None)
+    }
+
+    fn publish_due_social_draft(&self, id: &str, digest: &str, due_epoch: i64) -> Result<Value> {
+        self.publish_social_draft(id, digest, Some(due_epoch))
+    }
+
+    fn publish_social_draft(
+        &self,
+        id: &str,
+        digest: &str,
+        scheduled_due: Option<i64>,
+    ) -> Result<Value> {
         use crate::platform::agenticos_external::publish::{Preflight, PublishState};
         let install = social_effect_install(id)
             .ok_or_else(|| Error::rejected("not a social draft effect"))?;
         let records = crate::store::app_records::RecordStore::open(&self.state_dir, &install)?;
         let shown = records.app_social_effect_show(id)?;
         let sending = shown["effect"]["state"] == "sending";
+        let approval_id = shown["effect"]["approval_id"]
+            .as_str()
+            .unwrap_or("")
+            .to_owned();
+        let scheduled = scheduled_due.is_some_and(|due| {
+            shown["effect"]["state"] == "scheduled"
+                && shown["effect"]["due_epoch"].as_i64() == Some(due)
+                && due <= crate::issue::time::now_epoch()
+                && crate::issue::time::now_epoch() - due
+                    <= super::social_publish_rpc::SEND_NOW_MAX_LATENESS_SECS
+        });
         if shown["effect"]["digest"] != digest
-            || !(sending || shown["effect"]["state"] == "approved")
+            || !(sending || shown["effect"]["state"] == "approved" || scheduled)
         {
             return Err(Error::rejected(
                 "Publish now requires the exact approved social draft effect",
@@ -352,15 +594,11 @@ impl Shared {
         let pm = self.pm_at(&self.pm_dir()?)?;
         let id_owned = id.to_owned();
         let digest_owned = digest.to_owned();
-        let receipt = workspace::with_completed_bundle_snapshot(
+        workspace::with_completed_bundle_snapshot(
             &pm,
             &install,
             required_str(&authority, "bundle_digest")?,
             |bundle, files| {
-                let _custody = self
-                    .platform_custody_lock
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
                 let _release = self
                     .app_release_lock
                     .lock()
@@ -380,98 +618,142 @@ impl Shared {
                 }
                 let current_draft = records
                     .app_social_draft_show(context, required_str(&authority, "draft_id")?)?;
-                if current_draft["revision"].as_i64() != authority["revision"].as_i64() {
+                if current_draft["revision"].as_i64() != authority["revision"].as_i64()
+                    || current_draft["caption"] != authority["caption"]
+                    || crate::platform::agenticos_external::publish::caption_digest_of(
+                        authority["caption"].as_str().unwrap_or(""),
+                    ) != authority["caption_digest"].as_str().unwrap_or("")
+                {
                     return Err(Error::rejected("social draft changed since approval"));
                 }
-                let resolver = self.social_media_resolver.clone().ok_or_else(|| {
-                    Error::rejected("capability_unavailable: no media resolver configured")
-                })?;
-                let resolved = resolver
-                    .resolve(
-                        required_str(&authority, "toolkit")?,
-                        required_str(&authority, "destination_id")?,
-                    )
-                    .into_result()
-                    .map_err(|e| Error::rejected(e.to_string()))?;
-                if resolved.aos_connection_id != authority["aos_connection_id"] {
-                    return Err(Error::rejected("social destination changed since approval"));
-                }
-                // The owner's standing grant comes first: no grant, no media
-                // import and no claim.
-                let grant_id = owner_grant(sender.as_ref(), &authority)
-                    .map_err(|refusal| Error::rejected(refusal.to_string()))?;
-                let media_key = if let Some(asset) = authority["asset_id"].as_str() {
-                    let (header, asset_digest, bytes) =
-                        self.store.app_tool_asset_bytes(&install, asset)?;
-                    if bytes.len() > 2 * 1024 * 1024
-                        || Some(bare_digest(&asset_digest)) != frozen_image_digest(&authority)
-                        || Some(bytes.len() as u64) != authority["size_bytes"].as_u64()
-                    {
-                        return Err(Error::rejected("social draft image changed since approval"));
-                    }
-                    let mime =
-                        crate::platform::agenticos_external::image::image_mime(&bytes, &header)
-                            .map_err(Error::rejected)?;
-                    if Some(mime) != authority["mime"].as_str() {
-                        return Err(Error::rejected(
-                            "social draft image type changed since approval",
-                        ));
-                    }
-                    let importer = self.social_media_importer.clone().ok_or_else(|| {
-                        Error::rejected("capability_unavailable: no media importer configured")
-                    })?;
-                    let receipt = importer
-                        .import(&resolved.aos_connection_id, mime, &bytes)
-                        .map_err(|e| Error::rejected(e.to_string()))?;
-                    if receipt.digest != bare_digest(&asset_digest)
-                        || receipt.mime != mime
-                        || receipt.size_bytes != bytes.len()
-                        || receipt.connection_id != resolved.aos_connection_id
-                    {
-                        return Err(Error::rejected(
-                            "media import receipt does not match approved image",
-                        ));
-                    }
-                    Some(receipt.media_key)
-                } else {
-                    None
-                };
-                records.app_social_effect_media_key(&id_owned, media_key.as_deref())?;
-                let key = required_str(&authority, "idempotency_key")?;
-                let mut bound = authority.clone();
-                bound["grant_id"] = json!(grant_id);
-                bound["image_digest"] = json!(frozen_image_digest(&authority));
-                let binding = super::social_publish_rpc::sender_binding(&bound, &json!(key))
-                    .ok_or_else(|| Error::rejected("approved social publish binding is invalid"))?;
-                match sender.preflight(&binding) {
-                    Preflight::Approved => {}
-                    Preflight::Refused(r) => return Err(Error::rejected(r.to_string())),
-                    Preflight::Uncertain(r) => {
-                        return Err(Error::rejected(format!("publish preflight uncertain: {r}")))
-                    }
-                }
-                let Some(_claimed) =
-                    records.app_social_effect_claim_send(&id_owned, &digest_owned)?
-                else {
-                    return Err(Error::rejected(
-                        "social effect is no longer approved for Publish now",
-                    ));
-                };
-                match sender.execute(&binding) {
-                    Ok(outcome) if outcome.state == PublishState::Posted => records
-                        .app_social_effect_finish(&id_owned, "posted", &outcome.evidence_json()),
-                    Ok(outcome) if outcome.state == PublishState::Refused => records
-                        .app_social_effect_finish(&id_owned, "refused", &outcome.evidence_json()),
-                    Ok(_) => records.app_social_effect_show(&id_owned),
-                    Err(refusal) => records
-                        .app_social_effect_show(&id_owned)
-                        .map(|mut receipt| {
-                            receipt["send_error"] = json!(refusal.to_string());
-                            receipt
-                        }),
-                }
+                Ok(())
             },
         )?;
+        let resolver = self.social_media_resolver.clone().ok_or_else(|| {
+            Error::rejected("capability_unavailable: no media resolver configured")
+        })?;
+        let resolved = resolver
+            .resolve(
+                required_str(&authority, "toolkit")?,
+                required_str(&authority, "destination_id")?,
+            )
+            .into_result()
+            .map_err(|e| Error::rejected(e.to_string()))?;
+        if resolved.aos_connection_id != authority["aos_connection_id"] {
+            return Err(Error::rejected("social destination changed since approval"));
+        }
+        let grant_id = owner_grant(sender.as_ref(), &authority)
+            .map_err(|refusal| Error::rejected(refusal.to_string()))?;
+        let media_key = if let Some(asset) = authority["asset_id"].as_str() {
+            let (header, asset_digest, bytes) = self.store.app_tool_asset_bytes(&install, asset)?;
+            if bytes.len() > 2 * 1024 * 1024
+                || Some(bare_digest(&asset_digest)) != frozen_image_digest(&authority)
+                || Some(bytes.len() as u64) != authority["size_bytes"].as_u64()
+            {
+                return Err(Error::rejected("social draft image changed since approval"));
+            }
+            let mime = crate::platform::agenticos_external::image::image_mime(&bytes, &header)
+                .map_err(Error::rejected)?;
+            if Some(mime) != authority["mime"].as_str() {
+                return Err(Error::rejected(
+                    "social draft image type changed since approval",
+                ));
+            }
+            let importer = self.social_media_importer.clone().ok_or_else(|| {
+                Error::rejected("capability_unavailable: no media importer configured")
+            })?;
+            let receipt = importer
+                .import(&resolved.aos_connection_id, mime, &bytes)
+                .map_err(|e| Error::rejected(e.to_string()))?;
+            if receipt.digest != bare_digest(&asset_digest)
+                || receipt.mime != mime
+                || receipt.size_bytes != bytes.len()
+                || receipt.connection_id != resolved.aos_connection_id
+            {
+                return Err(Error::rejected(
+                    "media import receipt does not match approved image",
+                ));
+            }
+            Some(receipt.media_key)
+        } else {
+            None
+        };
+        records.app_social_effect_media_key(&id_owned, media_key.as_deref())?;
+        let key = required_str(&authority, "idempotency_key")?;
+        let mut bound = authority.clone();
+        bound["grant_id"] = json!(grant_id);
+        bound["image_digest"] = json!(frozen_image_digest(&authority));
+        let binding = super::social_publish_rpc::sender_binding(&bound, &json!(key))
+            .ok_or_else(|| Error::rejected("approved social publish binding is invalid"))?;
+        // A due schedule becomes non-cancellable before probing the provider.
+        // If the probe is ambiguous, it stays `sending` and later passes only
+        // reconcile status; they must never retry execute blindly.
+        let scheduled_claim = if let Some(due) = scheduled_due {
+            let Some(claimed) = records.app_social_effect_claim_scheduled_send(
+                &id_owned,
+                &digest_owned,
+                due,
+                &approval_id,
+            )?
+            else {
+                return Err(Error::rejected(
+                    "social effect is no longer scheduled for this due time",
+                ));
+            };
+            Some(claimed)
+        } else {
+            None
+        };
+        match sender.preflight(&binding) {
+            Preflight::Approved => {}
+            Preflight::Refused(r) => {
+                if scheduled_claim.is_some() {
+                    return records.app_social_effect_finish(
+                        &id_owned,
+                        "refused",
+                        &json!({"stage": "preflight", "reason": "publish preflight refused"}),
+                    );
+                }
+                return Err(Error::rejected(r.to_string()));
+            }
+            Preflight::Uncertain(r) => {
+                return Err(Error::rejected(format!("publish preflight uncertain: {r}")))
+            }
+        }
+        let claimed = match scheduled_claim {
+            Some(claimed) => Some(claimed),
+            None => records.app_social_effect_claim_send(&id_owned, &digest_owned)?,
+        };
+        let Some(_claimed) = claimed else {
+            return Err(Error::rejected(
+                "social effect is no longer approved for Publish now",
+            ));
+        };
+        if self
+            .lease
+            .as_ref()
+            .and_then(|lease| lease.fence().check())
+            .is_some()
+        {
+            return Err(Error::rejected(
+                "social publish stopped by the hosted lease fence",
+            ));
+        }
+        let receipt = match sender.execute(&binding) {
+            Ok(outcome) if outcome.state == PublishState::Posted => {
+                records.app_social_effect_finish(&id_owned, "posted", &outcome.evidence_json())
+            }
+            Ok(outcome) if outcome.state == PublishState::Refused => {
+                records.app_social_effect_finish(&id_owned, "refused", &outcome.evidence_json())
+            }
+            Ok(_) => records.app_social_effect_show(&id_owned),
+            Err(refusal) => records
+                .app_social_effect_show(&id_owned)
+                .map(|mut receipt| {
+                    receipt["send_error"] = json!(refusal.to_string());
+                    receipt
+                }),
+        }?;
         // The send call may return while AgenticOS is still `processing`;
         // the locks are released, so poll the status door for the verdict.
         settle_social_send(
@@ -609,6 +891,11 @@ impl Shared {
                 "app_effect_list" => &["install_id", "context_id"],
                 "app_effect_decide" => &["effect_id", "digest", "decision"],
                 "app_effect_publish_now" | "app_effect_confirm_publish" => &["effect_id", "digest"],
+                "app_effect_schedule" => &["effect_id", "digest", "due_epoch"],
+                "app_effect_reschedule" => {
+                    &["effect_id", "digest", "expected_due_epoch", "due_epoch"]
+                }
+                "app_effect_cancel" => &["effect_id", "digest", "expected_due_epoch"],
                 "app_effect_resolve" => &["effect_id", "digest", "resolution"],
                 _ => return Err(Error::rejected("unknown app effect method")),
             },
@@ -630,10 +917,22 @@ impl Shared {
                     self.store.app_effect_show(id)
                 }
             }
-            "app_effect_list" => self.store.app_effect_list(
-                optional_str(params, "install_id"),
-                optional_str(params, "context_id"),
-            ),
+            "app_effect_list" => {
+                let install = optional_str(params, "install_id");
+                let context = optional_str(params, "context_id");
+                let mut list = self.store.app_effect_list(install, context)?;
+                if let (Some(install), Some(context)) = (install, context) {
+                    let social =
+                        crate::store::app_records::RecordStore::open(&self.state_dir, install)?
+                            .app_social_effect_list(context)?;
+                    if let (Some(all), Some(extra)) =
+                        (list["effects"].as_array_mut(), social["effects"].as_array())
+                    {
+                        all.extend(extra.iter().cloned());
+                    }
+                }
+                Ok(list)
+            }
             "app_effect_stage" => {
                 if params.get("proof").is_some() {
                     self.stage_social_draft_effect(params, pid)
@@ -648,6 +947,34 @@ impl Shared {
             "app_effect_confirm_publish" => self.confirm_social_publish(
                 required_str(params, "effect_id")?,
                 required_str(params, "digest")?,
+            ),
+            "app_effect_schedule" => self.schedule_social_draft(
+                required_str(params, "effect_id")?,
+                required_str(params, "digest")?,
+                params
+                    .get("due_epoch")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| Error::rejected("due_epoch must be an integer"))?,
+            ),
+            "app_effect_reschedule" => self.reschedule_social_draft(
+                required_str(params, "effect_id")?,
+                required_str(params, "digest")?,
+                params
+                    .get("expected_due_epoch")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| Error::rejected("expected_due_epoch must be an integer"))?,
+                params
+                    .get("due_epoch")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| Error::rejected("due_epoch must be an integer"))?,
+            ),
+            "app_effect_cancel" => self.cancel_social_draft(
+                required_str(params, "effect_id")?,
+                required_str(params, "digest")?,
+                params
+                    .get("expected_due_epoch")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| Error::rejected("expected_due_epoch must be an integer"))?,
             ),
             "app_effect_resolve" => {
                 // Historical reconciliation deliberately needs neither a live

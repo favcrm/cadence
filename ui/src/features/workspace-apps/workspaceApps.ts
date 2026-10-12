@@ -67,7 +67,7 @@ export interface SocialDraftEffect {
   effect_id:string; install_id:string; context_id:string; draft_id:string; revision:number;
   request:string; digest:string; state:string; needs_you:boolean; approval_id:string;
   authorization_kind:"social_draft"; authority:Record<string,unknown>; record:Record<string,unknown>;
-  outcome?:unknown; created_at:number; updated_at:number;
+  outcome?:unknown; due_epoch?:number|null; timezone?:string|null; created_at:number; updated_at:number;
 }
 export interface AppBinding {
   id: string; install_id: string; context_id: string | null; slot: string;
@@ -243,7 +243,7 @@ export const workspaceApps = {
     request<{ hosted: boolean; url?: string; unavailable?: boolean }>(`${installation(id)}/publishing/connect-link`, undefined, { return_to: returnTo }),
   destinations: (id: string, signal?: AbortSignal) =>
     request<{ unavailable: boolean; destinations: PublishDestination[] }>(`${installation(id)}/publishing/destinations`, signal),
-  useDestination: (id: string, body: { destination_id: string; request_id?: string; expected_revision?: number; context_id?: string }) =>
+  useDestination: (id: string, body: { destination_id: string; timezone?: string; request_id?: string; expected_revision?: number; context_id?: string }) =>
     request<{ binding: AppBinding }>(`${installation(id)}/publishing/use`, undefined, body),
   installations: (signal?: AbortSignal) => request<Installation[]>("/api/app-installations", signal),
   detail: (id: string, signal?: AbortSignal) => request<Installation>(installation(id), signal),
@@ -307,6 +307,9 @@ export const workspaceApps = {
   /** CAD-1328: one operator tap approves and sends a screen-staged social draft effect. */
   confirmSocialDraftPublish: async (id:string,body:{digest:string})=>(await request<{effect:SocialDraftEffect}>(`${effect(id)}/confirm-publish`,undefined,body)).effect,
   publishSocialDraftNow: async (id:string,body:{digest:string})=>(await request<{effect:SocialDraftEffect}>(`${effect(id)}/publish-now`,undefined,body)).effect,
+  scheduleSocialDraftEffect: async (id:string,body:{digest:string;due_epoch:number})=>(await request<{effect:SocialDraftEffect}>(`${effect(id)}/schedule`,undefined,body)).effect,
+  rescheduleSocialDraftEffect: async (id:string,body:{digest:string;expected_due_epoch:number;due_epoch:number})=>(await request<{effect:SocialDraftEffect}>(`${effect(id)}/reschedule`,undefined,body)).effect,
+  cancelSocialDraftEffect: async (id:string,body:{digest:string;expected_due_epoch:number})=>(await request<{effect:SocialDraftEffect}>(`${effect(id)}/cancel`,undefined,body)).effect,
   resolveEffect: async (id: string, body: { digest: string; resolution: "close" | "acknowledge" }) => (await request<{ effect: AppEffect }>(`${effect(id)}/resolve`, undefined, body)).effect,
   outbox: (id: string, signal?: AbortSignal) => request<WorkspaceOutbox>(`/api/outbox?effect_id=${part(id)}`, signal),
 };

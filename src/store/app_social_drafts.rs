@@ -60,8 +60,8 @@ CREATE TABLE IF NOT EXISTS app_social_effects(\
  effect_id TEXT PRIMARY KEY, install_id TEXT NOT NULL, context_id TEXT NOT NULL,\
  draft_id TEXT NOT NULL, revision INTEGER NOT NULL, request_id TEXT NOT NULL UNIQUE,\
  digest TEXT NOT NULL, frozen_json TEXT NOT NULL, state TEXT NOT NULL \
- CHECK(state IN ('waiting','approved','declined','sending','posted','refused')) ,\
- approval_id TEXT NOT NULL, outcome_json TEXT, media_key TEXT, created REAL NOT NULL, updated REAL NOT NULL);";
+ CHECK(state IN ('waiting','approved','scheduled','cancelled','declined','sending','posted','refused')) ,\
+ approval_id TEXT NOT NULL, outcome_json TEXT, media_key TEXT, due_epoch INTEGER, timezone TEXT, created REAL NOT NULL, updated REAL NOT NULL);";
 
 pub const CAPTION_MAX_SCALARS: usize =
     crate::platform::agenticos_external::publish::DEVICE_PUBLISH_MAX_CAPTION_SCALARS;
@@ -157,6 +157,145 @@ fn valid_caption(caption: &str) -> Result<()> {
     Ok(())
 }
 
+fn migrate_social_effect_schedule_schema(conn: &rusqlite::Connection) -> Result<()> {
+    let columns = conn
+        .prepare("PRAGMA table_info(app_social_effects)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let old = [
+        "effect_id",
+        "install_id",
+        "context_id",
+        "draft_id",
+        "revision",
+        "request_id",
+        "digest",
+        "frozen_json",
+        "state",
+        "approval_id",
+        "outcome_json",
+        "media_key",
+        "created",
+        "updated",
+    ];
+    let old_media_last = [
+        "effect_id",
+        "install_id",
+        "context_id",
+        "draft_id",
+        "revision",
+        "request_id",
+        "digest",
+        "frozen_json",
+        "state",
+        "approval_id",
+        "outcome_json",
+        "created",
+        "updated",
+        "media_key",
+    ];
+    let new = [
+        "effect_id",
+        "install_id",
+        "context_id",
+        "draft_id",
+        "revision",
+        "request_id",
+        "digest",
+        "frozen_json",
+        "state",
+        "approval_id",
+        "outcome_json",
+        "media_key",
+        "due_epoch",
+        "timezone",
+        "created",
+        "updated",
+    ];
+    if columns.iter().map(String::as_str).eq(new) {
+        let sql: String = conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='app_social_effects'",
+            [],
+            |r| r.get(0),
+        )?;
+        if !sql.contains("'scheduled'") || !sql.contains("'cancelled'") {
+            return Err(Error::rejected(
+                "social effect schedule schema is partially migrated; refusing to rewrite it",
+            ));
+        }
+        return Ok(());
+    }
+    if !columns.iter().map(String::as_str).eq(old)
+        && !columns.iter().map(String::as_str).eq(old_media_last)
+    {
+        return Err(Error::rejected(
+            "social effect schema is unknown; refusing a lossy scheduling migration",
+        ));
+    }
+    let old_sql: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='app_social_effects'",
+        [],
+        |r| r.get(0),
+    )?;
+    if !old_sql.contains("'waiting'")
+        || !old_sql.contains("'approved'")
+        || !old_sql.contains("'sending'")
+        || !old_sql.contains("'posted'")
+        || !old_sql.contains("'refused'")
+        || !old_sql.contains("'declined'")
+    {
+        return Err(Error::rejected(
+            "social effect state constraint is unknown; refusing a lossy scheduling migration",
+        ));
+    }
+    let indexes = conn
+        .prepare("SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='app_social_effects' AND sql IS NOT NULL ORDER BY name")?
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let triggers = conn
+        .prepare("SELECT sql FROM sqlite_master WHERE type='trigger' AND tbl_name='app_social_effects' AND sql IS NOT NULL ORDER BY name")?
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let unknown_state: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM app_social_effects WHERE state NOT IN ('waiting','approved','declined','sending','posted','refused'))",
+        [],
+        |r| r.get(0),
+    )?;
+    if unknown_state {
+        return Err(Error::rejected(
+            "social effect rows contain an unknown state; refusing a lossy scheduling migration",
+        ));
+    }
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let migrated = (|| -> rusqlite::Result<()> {
+        conn.execute_batch("CREATE TABLE app_social_effects_schedule_new(\
+ effect_id TEXT PRIMARY KEY, install_id TEXT NOT NULL, context_id TEXT NOT NULL,\
+ draft_id TEXT NOT NULL, revision INTEGER NOT NULL, request_id TEXT NOT NULL UNIQUE,\
+ digest TEXT NOT NULL, frozen_json TEXT NOT NULL, state TEXT NOT NULL\
+ CHECK(state IN ('waiting','approved','scheduled','cancelled','declined','sending','posted','refused')),\
+ approval_id TEXT NOT NULL, outcome_json TEXT, media_key TEXT, due_epoch INTEGER, timezone TEXT,\
+ created REAL NOT NULL, updated REAL NOT NULL);
+INSERT INTO app_social_effects_schedule_new(effect_id,install_id,context_id,draft_id,revision,request_id,digest,frozen_json,state,approval_id,outcome_json,media_key,due_epoch,timezone,created,updated)
+ SELECT effect_id,install_id,context_id,draft_id,revision,request_id,digest,frozen_json,state,approval_id,outcome_json,media_key,NULL,NULL,created,updated FROM app_social_effects;
+DROP TABLE app_social_effects;
+ALTER TABLE app_social_effects_schedule_new RENAME TO app_social_effects;")?;
+        for sql in indexes.iter().chain(triggers.iter()) {
+            conn.execute_batch(sql)?;
+        }
+        Ok(())
+    })();
+    match migrated {
+        Ok(()) => conn.execute_batch("COMMIT")?,
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(Error::internal(format!(
+                "social effect scheduling migration failed: {error}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn ensure_schema(conn: &rusqlite::Connection) -> Result<()> {
     conn.execute_batch(DRAFT_SCHEMA)
         .map_err(|e| Error::internal(format!("social draft schema unavailable: {e}")))?;
@@ -165,11 +304,32 @@ pub(crate) fn ensure_schema(conn: &rusqlite::Connection) -> Result<()> {
         .query_map([], |r| r.get::<_, String>(1))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     if !columns.iter().any(|c| c == "media_key") {
+        let legacy = [
+            "effect_id",
+            "install_id",
+            "context_id",
+            "draft_id",
+            "revision",
+            "request_id",
+            "digest",
+            "frozen_json",
+            "state",
+            "approval_id",
+            "outcome_json",
+            "created",
+            "updated",
+        ];
+        if !columns.iter().map(String::as_str).eq(legacy) {
+            return Err(Error::rejected(
+                "social effect schema is unknown; refusing a lossy scheduling migration",
+            ));
+        }
         conn.execute(
             "ALTER TABLE app_social_effects ADD COLUMN media_key TEXT",
             [],
         )?;
     }
+    migrate_social_effect_schedule_schema(conn)?;
     // CAD-1303: soft discard marker. Additive; the file schema version stays.
     let draft_columns = conn
         .prepare("PRAGMA table_info(app_social_drafts)")?
@@ -348,7 +508,7 @@ impl RecordStore {
                 }));
             }
             let live: i64 = tx.query_row(
-                "SELECT COUNT(*) FROM app_social_effects WHERE install_id=? AND context_id=? AND draft_id=? AND state IN ('approved','sending','posted')",
+                "SELECT COUNT(*) FROM app_social_effects WHERE install_id=? AND context_id=? AND draft_id=? AND state IN ('approved','scheduled','sending','posted')",
                 params![self.install(), context, id],
                 |r| r.get(0),
             )?;
@@ -667,11 +827,11 @@ impl RecordStore {
     }
 
     fn social_effect_in(conn: &impl StoreConn, install: &str, id: &str) -> Result<Value> {
-        let row=conn.query_row("SELECT context_id,draft_id,revision,request_id,digest,frozen_json,state,approval_id,outcome_json,created,updated FROM app_social_effects WHERE install_id=? AND effect_id=?",params![install,id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,Option<String>>(8)?,r.get::<_,f64>(9)?,r.get::<_,f64>(10)?))).optional()?.ok_or_else(||Error::rejected("social draft effect not found"))?;
+        let row=conn.query_row("SELECT context_id,draft_id,revision,request_id,digest,frozen_json,state,approval_id,outcome_json,created,updated,due_epoch,timezone FROM app_social_effects WHERE install_id=? AND effect_id=?",params![install,id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,Option<String>>(8)?,r.get::<_,f64>(9)?,r.get::<_,f64>(10)?,r.get::<_,Option<i64>>(11)?,r.get::<_,Option<String>>(12)?))).optional()?.ok_or_else(||Error::rejected("social draft effect not found"))?;
         let frozen: Value = serde_json::from_str(&row.5)
             .map_err(|_| Error::rejected("social draft effect is corrupt"))?;
         Ok(
-            json!({"effect":{"effect_id":id,"install_id":install,"context_id":row.0,"draft_id":row.1,"revision":row.2,"request":row.3,"digest":row.4,"state":row.6,"needs_you":row.6=="waiting","approval_id":row.7,"authorization_kind":"social_draft","authority":frozen,"record":{},"outcome":row.8.and_then(|v|serde_json::from_str::<Value>(&v).ok()),"created_at":row.9,"updated_at":row.10}}),
+            json!({"effect":{"effect_id":id,"install_id":install,"context_id":row.0,"draft_id":row.1,"revision":row.2,"request":row.3,"digest":row.4,"state":row.6,"needs_you":row.6=="waiting","approval_id":row.7,"authorization_kind":"social_draft","authority":frozen,"record":{},"outcome":row.8.and_then(|v|serde_json::from_str::<Value>(&v).ok()),"due_epoch":row.11,"timezone":row.12,"created_at":row.9,"updated_at":row.10}}),
         )
     }
     pub fn app_social_effect_show(&self, id: &str) -> Result<Value> {
@@ -717,6 +877,157 @@ impl RecordStore {
             Self::social_effect_in(tx,self.install(),effect_id)
         })
     }
+    pub fn app_social_effect_schedule(
+        &self,
+        id: &str,
+        digest: &str,
+        due_epoch: i64,
+        approval_id: &str,
+    ) -> Result<Value> {
+        if due_epoch <= 0 {
+            return Err(Error::rejected("scheduled social effect time is invalid"));
+        }
+        self.write_tx(|tx| {
+            let row: Option<(String, String, String)> = tx.query_row(
+                "SELECT state,digest,frozen_json FROM app_social_effects WHERE install_id=? AND effect_id=?",
+                params![self.install(), id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            ).optional()?;
+            let Some((state, stored_digest, frozen_json)) = row else {
+                return Err(Error::rejected("social draft effect not found"));
+            };
+            if stored_digest != digest || !matches!(state.as_str(), "waiting" | "approved") {
+                return Err(Error::rejected("social effect digest is stale or effect is not schedulable"));
+            }
+            let frozen: Value = serde_json::from_str(&frozen_json)
+                .map_err(|_| Error::rejected("social draft effect is corrupt"))?;
+            let timezone = frozen["timezone"]
+                .as_str()
+                .filter(|tz| tz.parse::<chrono_tz::Tz>().is_ok())
+                .ok_or_else(|| Error::rejected("approved social effect timezone is invalid"))?;
+            tx.execute(
+                "UPDATE app_social_effects SET state='scheduled',approval_id=?,due_epoch=?,timezone=?,updated=? WHERE install_id=? AND effect_id=? AND digest=? AND state IN ('waiting','approved')",
+                params![approval_id, due_epoch, timezone, now(), self.install(), id, digest],
+            )?;
+            Self::social_effect_in(tx, self.install(), id)
+        })
+    }
+
+    pub fn app_social_effect_reschedule(
+        &self,
+        id: &str,
+        digest: &str,
+        expected_due_epoch: i64,
+        due_epoch: i64,
+        approval_id: &str,
+    ) -> Result<Value> {
+        if due_epoch <= 0 || expected_due_epoch <= 0 {
+            return Err(Error::rejected("scheduled social effect time is invalid"));
+        }
+        self.write_tx(|tx| {
+            let changed = tx.execute(
+                "UPDATE app_social_effects SET due_epoch=?,approval_id=?,updated=? WHERE install_id=? AND effect_id=? AND digest=? AND state='scheduled' AND due_epoch=? AND due_epoch<>?",
+                params![due_epoch, approval_id, now(), self.install(), id, digest, expected_due_epoch, due_epoch],
+            )?;
+            if changed == 1 {
+                return Self::social_effect_in(tx, self.install(), id);
+            }
+            let current: Option<(String, String, Option<i64>)> = tx.query_row(
+                "SELECT state,digest,due_epoch FROM app_social_effects WHERE install_id=? AND effect_id=?",
+                params![self.install(), id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            ).optional()?;
+            match current {
+                Some((state, stored, Some(due))) if state == "scheduled" && stored == digest && due == expected_due_epoch && due == due_epoch => Self::social_effect_in(tx, self.install(), id),
+                Some((state, stored, Some(due))) if state == "scheduled" && stored == digest && due != expected_due_epoch => Err(Error::conflict(due, "scheduled social effect time is stale")),
+                _ => Err(Error::rejected("social effect is not scheduled at the requested digest")),
+            }
+        })
+    }
+
+    pub fn app_social_effect_cancel(
+        &self,
+        id: &str,
+        digest: &str,
+        expected_due_epoch: i64,
+    ) -> Result<Value> {
+        let changed = self.write_tx(|tx| {
+            let changed = tx.execute(
+                "UPDATE app_social_effects SET state='cancelled',updated=? WHERE install_id=? AND effect_id=? AND digest=? AND state='scheduled' AND due_epoch=?",
+                params![now(), self.install(), id, digest, expected_due_epoch],
+            )?;
+            if changed == 1 {
+                return Ok(Some(Self::social_effect_in(tx, self.install(), id)?));
+            }
+            let current: Option<(String, String, Option<i64>)> = tx.query_row(
+                "SELECT state,digest,due_epoch FROM app_social_effects WHERE install_id=? AND effect_id=?",
+                params![self.install(), id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            ).optional()?;
+            match current {
+                Some((state, stored, Some(due))) if state == "scheduled" && stored == digest && due != expected_due_epoch => Err(Error::conflict(due, "scheduled social effect time is stale")),
+                _ => Ok(None),
+            }
+        })?;
+        changed.ok_or_else(|| Error::rejected("social effect is no longer cancellable"))
+    }
+
+    pub fn app_social_effect_due(&self, now_epoch: i64, limit: usize) -> Result<Vec<Value>> {
+        let conn = self.conn();
+        let ids = conn.prepare("SELECT effect_id FROM app_social_effects WHERE install_id=? AND state='scheduled' AND due_epoch<=? ORDER BY due_epoch,effect_id LIMIT ?")?
+            .query_map(params![self.install(), now_epoch, limit as i64], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        ids.iter()
+            .map(|id| {
+                Self::social_effect_in(&*conn, self.install(), id).map(|v| v["effect"].clone())
+            })
+            .collect()
+    }
+
+    pub fn app_social_effect_hold_scheduled(
+        &self,
+        id: &str,
+        digest: &str,
+        due_epoch: i64,
+        reason: &str,
+    ) -> Result<bool> {
+        self.write_tx(|tx| {
+            Ok(tx.execute(
+                "UPDATE app_social_effects SET state='refused',outcome_json=?,updated=? WHERE install_id=? AND effect_id=? AND digest=? AND state='scheduled' AND due_epoch=?",
+                params![serde_json::to_string(&json!({"reason":reason})).map_err(|e| Error::internal(e.to_string()))?, now(), self.install(), id, digest, due_epoch],
+            )? == 1)
+        })
+    }
+
+    pub fn app_social_effect_sending(&self, limit: usize) -> Result<Vec<Value>> {
+        let conn = self.conn();
+        let ids = conn.prepare("SELECT effect_id FROM app_social_effects WHERE install_id=? AND state='sending' ORDER BY updated,effect_id LIMIT ?")?
+            .query_map(params![self.install(), limit as i64], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        ids.iter()
+            .map(|id| {
+                Self::social_effect_in(&*conn, self.install(), id).map(|v| v["effect"].clone())
+            })
+            .collect()
+    }
+
+    pub fn app_social_effect_claim_scheduled_send(
+        &self,
+        id: &str,
+        digest: &str,
+        due_epoch: i64,
+        approval_id: &str,
+    ) -> Result<Option<Value>> {
+        self.write_tx(|tx| {
+            let changed = tx.execute(
+                "UPDATE app_social_effects SET state='sending',updated=? WHERE install_id=? AND effect_id=? AND digest=? AND state='scheduled' AND due_epoch=? AND approval_id=? AND due_epoch<=?",
+                params![now(), self.install(), id, digest, due_epoch, approval_id, crate::issue::time::now_epoch()],
+            )?;
+            if changed != 1 { return Ok(None); }
+            Ok(Some(Self::social_effect_in(tx, self.install(), id)?))
+        })
+    }
+
     pub fn app_social_effect_decide(
         &self,
         id: &str,
@@ -733,10 +1044,10 @@ impl RecordStore {
     }
     pub fn app_social_effect_media_key(&self, id: &str, key: Option<&str>) -> Result<()> {
         self.write_tx(|tx| {
-            let old: Option<Option<String>> = tx.query_row("SELECT media_key FROM app_social_effects WHERE install_id=? AND effect_id=? AND state='approved'",params![self.install(),id],|r|r.get(0)).optional()?;
+            let old: Option<Option<String>> = tx.query_row("SELECT media_key FROM app_social_effects WHERE install_id=? AND effect_id=? AND state IN ('approved','scheduled')",params![self.install(),id],|r|r.get(0)).optional()?;
             let Some(old)=old else{return Err(Error::rejected("social effect is no longer approved"));};
             if old.as_deref().is_some_and(|saved|Some(saved)!=key){return Err(Error::rejected("social effect media import key changed"));}
-            tx.execute("UPDATE app_social_effects SET media_key=?,updated=? WHERE install_id=? AND effect_id=? AND state='approved'",params![key,now(),self.install(),id])?;
+            tx.execute("UPDATE app_social_effects SET media_key=?,updated=? WHERE install_id=? AND effect_id=? AND state IN ('approved','scheduled')",params![key,now(),self.install(),id])?;
             Ok(())
         })
     }

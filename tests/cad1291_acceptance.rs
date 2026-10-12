@@ -659,3 +659,438 @@ fn standing_grant_publish_sends_only_an_approved_unchanged_effect_with_a_live_ma
     );
     assert_eq!(fx.state(&app, &ready), "posted", "{posted}");
 }
+
+// CAD-1397 independent acceptance, added separately from the unchanged
+// CAD-1291 check above. Reuses its actual hosted HTTP sender, resolver,
+// AOS-schema fake door, and RecordStore draft fixture; no legacy intent or
+// run/artifact authority is manufactured.
+mod cad1397_social_draft_schedule_acceptance {
+    use super::*;
+    use cadence_agent::test_seam::{AS_HEADER, TOKEN_HEADER};
+
+    struct Board {
+        port: u16,
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Board {
+        fn start(fx: &Fx) -> Self {
+            let port = (3110..3200)
+                .find(|port| std::net::TcpListener::bind(("127.0.0.1", *port)).is_ok())
+                .expect("free isolated test board port");
+            let (tx, rx) = std::sync::mpsc::channel();
+            let stop = Arc::new(AtomicBool::new(false));
+            let opts = cadence_agent::ui::ServeOpts {
+                host: "127.0.0.1".into(),
+                port,
+                stop: Some(stop.clone()),
+                startup: Some(tx),
+                test_seam: true,
+                ..Default::default()
+            };
+            let dir = fx.dir();
+            let pm = fx.root.path().join("pm");
+            let thread = std::thread::spawn(move || {
+                let _ = cadence_agent::ui::serve(&dir, &pm, &opts);
+            });
+            let startup = rx.recv_timeout(Duration::from_secs(10));
+            if !matches!(startup, Ok(Ok(()))) {
+                stop.store(true, SeqCst);
+                let _ = thread.join();
+                panic!("isolated test board startup failed: {startup:?}");
+            }
+            Self {
+                port,
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        fn post(
+            &self,
+            fx: &Fx,
+            who: &Asserted,
+            path: &str,
+            body: &Value,
+            session: Option<&(String, String)>,
+        ) -> (u16, String, Option<String>) {
+            let host = format!("cadence-{}.localhost:{}", self.port, self.port);
+            let agent: ureq::Agent = ureq::Agent::config_builder()
+                .http_status_as_error(false)
+                .build()
+                .into();
+            let mut request = agent
+                .post(format!("http://127.0.0.1:{}{path}", self.port))
+                .header("Host", &host)
+                .header("Content-Type", "application/json")
+                .header(AS_HEADER, who.as_str())
+                .header(TOKEN_HEADER, Seam::token_at(&fx.dir()).unwrap())
+                .header("Origin", format!("http://{host}"))
+                .header("X-Cadence-Board", "1");
+            if let Some((cookie, key)) = session {
+                request = request
+                    .header("Cookie", cookie)
+                    .header("X-Cadence-Session", key);
+            }
+            let mut response = request.send(body.to_string()).unwrap();
+            let status = response.status().as_u16();
+            let cookie = response
+                .headers()
+                .get("set-cookie")
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.split(';').next().unwrap().to_owned());
+            (
+                status,
+                response.body_mut().read_to_string().unwrap(),
+                cookie,
+            )
+        }
+    }
+
+    impl Drop for Board {
+        fn drop(&mut self) {
+            self.stop.store(true, SeqCst);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn operator_session(fx: &Fx, board: &Board) -> (String, String) {
+        cadence_agent::operator_auth::ensure_secret(&fx.dir()).unwrap();
+        let secret = cadence_agent::operator_auth::read_secret(&fx.dir()).unwrap();
+        let nonce = fx.op(
+            "operator_link_mint",
+            json!({"secret": secret, "origin": "loopback"}),
+        )["nonce"]
+            .clone();
+        let (status, body, cookie) = board.post(
+            fx,
+            &Asserted::Operator,
+            "/api/session",
+            &json!({"nonce": nonce}),
+            None,
+        );
+        assert_eq!(status, 200, "operator session exchange: {body}");
+        let key = serde_json::from_str::<Value>(&body).unwrap()["session_key"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let cookie = cookie.unwrap();
+        let (name, token) = cookie.split_once('=').expect("operator session cookie");
+        assert_eq!(name, format!("cadence_operator_{}", board.port));
+        let checked = fx
+            .rpc_as(
+                Asserted::Operator,
+                "operator_session_check",
+                json!({"token":token,"key":key,"origin":"loopback"}),
+            )
+            .unwrap();
+        assert_eq!(
+            checked["valid"], true,
+            "new operator session did not validate"
+        );
+        (cookie, key)
+    }
+
+    fn epoch() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    fn count_publish_posts(fx: &Fx) -> usize {
+        fx.sent()
+            .iter()
+            .filter(|(method, path, _)| {
+                method == "POST"
+                    && (path == &format!("{PREFIX}/publish/preflight")
+                        || path == &format!("{PREFIX}/publish"))
+            })
+            .count()
+    }
+
+    fn effect_record(fx: &Fx, app: &App, id: &str) -> Value {
+        RecordStore::open(&fx.dir(), &app.install)
+            .unwrap()
+            .app_social_effect_show(id)
+            .unwrap()["effect"]
+            .clone()
+    }
+
+    #[test]
+    fn social_draft_schedule_is_operator_cas_bound_and_dispatches_once_under_live_grant() {
+        let fx = Fx::start();
+        let app = fx.install();
+        let board = Board::start(&fx);
+        let mut session = operator_session(&fx, &board);
+        fx.grants(json!([
+            standing(|g| g["revokedAt"] = json!("2026-10-09T00:10:00.000Z")),
+            standing(|_| {}),
+        ]));
+
+        let (stale, stale_digest, stale_draft) = fx.effect(&app, "cad1397-stale", false);
+        let stale_due = epoch() + 3_600;
+        // A waiting effect does not freeze the draft against edits. Change it
+        // before approval, then use the real approval guard: it must refuse
+        // stale material, and the still-waiting effect cannot be scheduled.
+        RecordStore::open(&fx.dir(), &app.install)
+            .unwrap()
+            .app_social_draft_update(
+                fx.ctx(),
+                &stale_draft,
+                &SocialDraftEdit {
+                    expected: 1,
+                    caption: "changed while awaiting approval",
+                    asset_id: None,
+                    request_id: "cad1397-edit-waiting",
+                    actor: "session:fixture",
+                },
+            )
+            .unwrap();
+        let before = count_publish_posts(&fx);
+        assert!(
+            fx.rpc_as(
+                Asserted::Operator,
+                "app_effect_decide",
+                json!({
+                    "effect_id":stale,"digest":stale_digest,"decision":"accept"
+                })
+            )
+            .is_err(),
+            "stale waiting draft was approved"
+        );
+        assert!(
+            fx.rpc_as(
+                Asserted::Operator,
+                "app_effect_schedule",
+                json!({
+                    "effect_id":stale,"digest":stale_digest,"due_epoch":stale_due
+                })
+            )
+            .is_err(),
+            "stale unapproved effect was scheduled"
+        );
+        assert_eq!(effect_record(&fx, &app, &stale)["state"], "waiting");
+        assert_eq!(count_publish_posts(&fx), before);
+
+        let (effect, digest, _) = fx.effect(&app, "cad1397-scheduled", true);
+        let schedule_path = format!("/api/app-effects/{effect}/schedule");
+        let due = epoch() + 3_600;
+        let schedule = json!({"effect_id":effect,"digest":digest,"due_epoch":due});
+        let schedule_body = json!({"digest":digest,"due_epoch":due});
+
+        // Agent requests are refused at both real guard boundaries, including
+        // when carrying a valid operator session to the board.
+        let agent = Asserted::Agent("cad1397-worker".into());
+        assert!(
+            fx.rpc_as(agent.clone(), "app_effect_schedule", schedule.clone())
+                .is_err(),
+            "agent scheduled over RPC"
+        );
+        let (status, body, _) =
+            board.post(&fx, &agent, &schedule_path, &schedule_body, Some(&session));
+        assert_eq!(status, 403, "agent scheduled over HTTP: {body}");
+        // Presenting an operator session from an agent peer revokes it; use a
+        // fresh operator login for the owner-path assertions that follow.
+        session = operator_session(&fx, &board);
+
+        // Destination, timezone and grant are authority, not request fields.
+        for field in ["destination_id", "timezone", "grant_id"] {
+            let mut http = schedule_body.clone();
+            http[field] = json!("forged");
+            let (status, body, _) = board.post(
+                &fx,
+                &Asserted::Operator,
+                &schedule_path,
+                &http,
+                Some(&session),
+            );
+            assert!(
+                (400..500).contains(&status),
+                "HTTP forged {field}: {status} {body}"
+            );
+            let mut rpc = schedule.clone();
+            rpc[field] = json!("forged");
+            assert!(
+                fx.rpc_as(Asserted::Operator, "app_effect_schedule", rpc)
+                    .is_err(),
+                "RPC forged {field}"
+            );
+        }
+
+        // Invalid horizon and stale CAS do not change the queued effect.
+        let too_far = epoch() + 366 * 24 * 60 * 60 + 1;
+        assert!(
+            fx.rpc_as(
+                Asserted::Operator,
+                "app_effect_schedule",
+                json!({
+                    "effect_id":effect,"digest":digest,"due_epoch":too_far
+                })
+            )
+            .is_err(),
+            "schedule beyond 366 days accepted"
+        );
+        let (status, body, _) = board.post(
+            &fx,
+            &Asserted::Operator,
+            &schedule_path,
+            &schedule_body,
+            Some(&session),
+        );
+        assert_eq!(status, 200, "owner schedule: {body}");
+        let first = effect_record(&fx, &app, &effect);
+        assert_eq!(first["state"], "scheduled");
+        let replay = fx.rpc_as(Asserted::Operator, "app_effect_schedule", schedule.clone());
+        assert!(
+            replay.is_err(),
+            "schedule double-tap changed the effect: {replay:?}"
+        );
+        assert_eq!(effect_record(&fx, &app, &effect), first);
+        assert_eq!(count_publish_posts(&fx), before);
+
+        let changed_due = due + 600;
+        assert!(fx.rpc_as(Asserted::Operator, "app_effect_reschedule", json!({
+            "effect_id":effect,"digest":digest,"expected_due_epoch":due+1,"due_epoch":changed_due
+        })).is_err(), "stale CAS reschedule succeeded");
+        assert_eq!(
+            effect_record(&fx, &app, &effect),
+            first,
+            "stale CAS mutated schedule"
+        );
+        let (status, body, _) = board.post(
+            &fx,
+            &Asserted::Operator,
+            &format!("/api/app-effects/{effect}/reschedule"),
+            &json!({"digest":digest,"expected_due_epoch":due,"due_epoch":changed_due}),
+            Some(&session),
+        );
+        assert_eq!(status, 200, "owner CAS reschedule: {body}");
+        let rescheduled = effect_record(&fx, &app, &effect);
+        assert_eq!(rescheduled["state"], "scheduled");
+        assert_eq!(rescheduled["due_epoch"], changed_due);
+        let (status, body, _) = board.post(
+            &fx,
+            &Asserted::Operator,
+            &format!("/api/app-effects/{effect}/cancel"),
+            &json!({"digest":digest,"expected_due_epoch":changed_due}),
+            Some(&session),
+        );
+        assert_eq!(status, 200, "owner cancel before claim: {body}");
+        assert_eq!(effect_record(&fx, &app, &effect)["state"], "cancelled");
+        assert_eq!(count_publish_posts(&fx), before);
+
+        // A separate due effect proves the positive control uses the real
+        // hosted sender's live-grant lookup and reaches execute once. Repeat
+        // schedule/confirm after posting must only return/refuse the receipt.
+        let before_seen = fx.sent().len();
+        let (due_effect, due_digest, _) = fx.effect(&app, "cad1397-dispatch", true);
+        let due_at = epoch() + 2;
+        let due_body = json!({"digest":due_digest,"due_epoch":due_at});
+        let (status, body, _) = board.post(
+            &fx,
+            &Asserted::Operator,
+            &format!("/api/app-effects/{due_effect}/schedule"),
+            &due_body,
+            Some(&session),
+        );
+        assert_eq!(status, 200, "owner schedule for due dispatch: {body}");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while fx.state(&app, &due_effect) != "posted" {
+            assert_ne!(
+                fx.state(&app, &due_effect),
+                "refused",
+                "due effect was refused: {}; hosted requests: {:?}",
+                effect_record(&fx, &app, &due_effect),
+                fx.sent()
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "due effect did not settle: {}",
+                effect_record(&fx, &app, &due_effect)
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let sends = fx.sends_since(before_seen);
+        assert_eq!(
+            sends
+                .iter()
+                .filter(|(_, path, _)| path == &format!("{PREFIX}/publish"))
+                .count(),
+            1,
+            "due effect executed other than once: {sends:?}"
+        );
+        assert!(
+            sends
+                .iter()
+                .all(|(_, _, grant)| grant.as_deref() == Some(STANDING)),
+            "due effect did not use the live matching standing grant: {sends:?}"
+        );
+        assert!(
+            fx.sent()
+                .iter()
+                .all(|(_, _, grant)| grant.as_deref() != Some(TYPED_GRANT)),
+            "legacy typed grant reached hosted sender"
+        );
+        let after_post = count_publish_posts(&fx);
+        let _replay = fx.rpc_as(
+            Asserted::Operator,
+            "app_effect_confirm_publish",
+            json!({
+                "effect_id":due_effect,"digest":due_digest
+            }),
+        );
+        assert_eq!(
+            count_publish_posts(&fx),
+            after_post,
+            "posted-effect replay executed again"
+        );
+
+        // Revoked/mismatched consent must stop at the fresh grant lookup;
+        // this fixture's sender and AOS wire are isolated from production.
+        let (held, held_digest, _) = fx.effect(&app, "cad1397-mismatched-grant", true);
+        fx.grants(json!([
+            standing(|g| g["destinationId"] = json!(OTHER_DEST))
+        ]));
+        let from_mismatch = fx.sent().len();
+        let held_at = epoch() + 2;
+        let (status, body, _) = board.post(
+            &fx,
+            &Asserted::Operator,
+            &format!("/api/app-effects/{held}/schedule"),
+            &json!({"digest":held_digest,"due_epoch":held_at}),
+            Some(&session),
+        );
+        assert_eq!(
+            status, 200,
+            "owner schedule under mismatched live grant: {body}"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let asked = fx.sent()[from_mismatch..].iter().any(|(method, path, _)| {
+                method == "GET" && path.starts_with(&format!("{PREFIX}/publish/grants"))
+            });
+            if asked {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "due dispatcher never rechecked the grant"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(
+            count_publish_posts(&fx),
+            after_post,
+            "mismatched grant reached preflight or execute"
+        );
+        assert_ne!(
+            effect_record(&fx, &app, &held)["state"],
+            "posted",
+            "mismatched grant posted"
+        );
+    }
+}

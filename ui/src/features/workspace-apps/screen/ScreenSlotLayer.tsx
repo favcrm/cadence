@@ -53,11 +53,12 @@ export default function ScreenSlotLayer({ view, link, onTap, onCancel, onDismiss
         </div>
       )}
       {view?.card && (
-        <WorkspaceDialog title={t("Post this now?")} className="wa-confirm" onClose={() => { if (!view.pending) onCancel(view.token); }}>
+        <WorkspaceDialog title={t(view.card.title ?? "Post this now?")} className="wa-confirm" onClose={() => { if (!view.pending) onCancel(view.token); }}>
           <div className="wa-stack" data-host-confirm={view.token.slice(0, 8)}>
             {view.card.image && <img src={view.card.image} alt={t("The image that will post")} style={{ maxWidth: "100%", maxHeight: 240, objectFit: "contain", borderRadius: 8 }} />}
             <p className="wa-caption" style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{view.card.caption}</p>
             <p>{t("To")} <strong>{view.card.target}</strong></p>
+            {view.card.detail && <p>{view.card.detail}</p>}
             <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", flexWrap: "wrap" }}>
               <Button disabled={view.pending} onClick={() => onCancel(view.token)}>{t("Cancel")}</Button>
               <button type="button" className="btn btn-primary" disabled={view.pending} aria-busy={view.pending}
