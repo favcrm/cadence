@@ -459,7 +459,11 @@ async function main() {
   // ---- CAD-1166: the page groups by service (mockup C), keeps a
   // provider-list failure from blanking loaded accounts, renders the
   // built-in non-editable, and never advertises remote verification. ----
-  const { default: ConnectionsPage } = require("../src/features/settings/Connections") as typeof import("../src/features/settings/Connections");
+  const { default: ConnectionsPageView } = require("../src/features/settings/Connections") as typeof import("../src/features/settings/Connections");
+  const { LocaleProvider: PageLocale } = require("../src/lib/locale") as typeof import("../src/lib/locale");
+  // The page renders localized chips and must sit inside the locale provider (CAD-1331).
+  const ConnectionsPage = (props: import("react").ComponentProps<typeof ConnectionsPageView>) =>
+    React.createElement(PageLocale, null, React.createElement(ConnectionsPageView, props));
   const { resources } = require("../src/lib/resources") as typeof import("../src/lib/resources");
 
   const conns: any[] = [

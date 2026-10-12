@@ -92,7 +92,11 @@ async function main() {
   const React = require("react") as typeof import("react");
   act = React.act;
   const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
-  const { default: Connections } = require("../src/features/settings/Connections") as typeof import("../src/features/settings/Connections");
+  const { default: ConnectionsView } = require("../src/features/settings/Connections") as typeof import("../src/features/settings/Connections");
+  const { LocaleProvider: PageLocale } = require("../src/lib/locale") as typeof import("../src/lib/locale");
+  // Connections renders localized chips and must sit inside the locale provider (CAD-1331).
+  const Connections = (props: import("react").ComponentProps<typeof ConnectionsView>) =>
+    React.createElement(PageLocale, null, React.createElement(ConnectionsView, props));
 
   // Record every request; a private read or any mutation while the
   // operator proof is unknown fails the check.
