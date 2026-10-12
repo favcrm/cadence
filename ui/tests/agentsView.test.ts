@@ -228,7 +228,7 @@ async function click(label: string) {
   await flush();
 }
 function aliases() {
-  return Array.from(host.querySelectorAll(".agents-table .agent-name")).map(
+  return Array.from(host.querySelectorAll(".agents-grid .agent-name")).map(
     (b) => b.textContent,
   );
 }
@@ -250,24 +250,27 @@ async function main() {
     button("Current4").getAttribute("aria-pressed") === "true",
     "Current is the default when the roster contains stopped agents and mailboxes",
   );
-  assert(aliases().join() === "blocked,owner,dev,foreign", "current agents are attention-first without stopped agents or mailboxes");
+  assert(
+    aliases().join() === "dev,foreign,blocked,owner",
+    "current agents group working cards ahead of the roster",
+  );
   assert(host.textContent?.includes("28 Sep 02:21"), "numeric epoch activity is shown as a date");
   assert(
-    Array.from(host.querySelectorAll(".agents-table tr")).find((row) => row.textContent?.includes("owner"))?.textContent?.includes("No activity recorded"),
-    "invalid activity remains unavailable",
+    Array.from(host.querySelectorAll(".agents-grid .agent-card")).find((row) => row.textContent?.includes("owner"))?.textContent?.includes("queued"),
+    "invalid activity stays off the card while the queue chip renders",
   );
   await click("All6");
   assert(aliases().length === 6, "All keeps stopped workers and mailboxes discoverable");
+  assert(
+    aliases().join() === "inbox,dev,foreign,blocked,owner,stopped",
+    "lifecycle sections order the full roster",
+  );
   await click("Stopped1");
   assert(aliases().join() === "stopped", "stopped agents have an explicit view");
   await click("Current4");
   assert(
-    !host.querySelector("[role='button']"),
-    "cards do not wrap nested issue controls in simulated buttons",
-  );
-  assert(
-    host.querySelectorAll(".agents-table th[scope='col']").length === 5,
-    "five semantic columns",
+    host.querySelectorAll(".agents-triage-cell").length === 5,
+    "triage strip counts every lifecycle cell",
   );
   await click("Needs attention2");
   assert(
@@ -291,7 +294,7 @@ async function main() {
   project = "demo";
   await render();
   assert(
-    aliases().join() === "owner,dev",
+    aliases().join() === "dev,owner",
     "project keeps exact dispatch and active ownership only",
   );
   assert(button("All2"), "counts reflect scoped agents");
@@ -302,10 +305,10 @@ async function main() {
   );
   await click("Clear filters");
   await React.act(() =>
-    host.querySelector<HTMLButtonElement>(".agents-table .lnk")!.click(),
+    host.querySelector<HTMLButtonElement>(".agents-grid .lnk")!.click(),
   );
   assert(
-    openedIssue === "DEMO-13" && open === null,
+    openedIssue === "DEMO-12" && open === null,
     "issue opens without opening the agent",
   );
   project = "all";
