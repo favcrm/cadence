@@ -100,6 +100,10 @@ interface LocaleContextValue {
 
 const LocaleContext = createContext<LocaleContextValue | null>(null);
 
+export function translateUiText(english: string, locale: Locale): string {
+  return locale === "zh-TW" ? (zhTW[english] ?? english) : english;
+}
+
 export function LocaleProvider({ children }: { children: ReactNode }) {
   const [meta, setMeta] = useState<Meta | null>(null);
   const [storedPreferences, setStoredPreferences] = useState<{ identity: string; value: Preferences } | null>(null);
@@ -141,7 +145,7 @@ export function LocaleProvider({ children }: { children: ReactNode }) {
     organizationLocale: preferences?.organization_locale ?? null,
     isHostedUser: identity !== null,
     canSetOrganizationLocale: identity !== null && meta?.session?.user?.role === "operator",
-    t: (english) => locale === "zh-TW" ? (zhTW[english] ?? english) : english,
+    t: (english) => translateUiText(english, locale),
     setSession,
     setPreference,
     formatDate: (value, options) => new Intl.DateTimeFormat(locale, options).format(value instanceof Date ? value : new Date(value)),
@@ -257,6 +261,34 @@ Object.assign(zhTW, {
   "Fields": "欄位",
   "loading apps…": "正在載入應用程式…",
   "could not load apps": "無法載入應用程式",
+});
+
+Object.assign(zhTW, {
+  "backlog": "待排程",
+  "ready": "就緒",
+  "doing": "進行中",
+  "review": "審查中",
+  "dropped": "已放棄",
+  "the last refresh failed": "上次重新整理失敗",
+  "unknown error": "未知錯誤",
+  "showing data from": "顯示資料時間：",
+  "refresh failed — stale": "重新整理失敗 — 顯示舊資料",
+  "Workflows": "工作流程",
+  "epics": "史詩議題",
+  "read from the daemon socket": "從 daemon 通訊端讀取",
+  "daemon socket unreachable": "無法連線至 daemon 通訊端",
+  "Prepared counts": "已準備的數量",
+  "Sender": "寄件者",
+  "This approves send": "此操作將核准寄送",
+  "SMTP acceptance is recorded per recipient — it is not proof of inbox delivery.": "系統會逐一記錄收件者的 SMTP 接受狀態 — 這不代表郵件已送達收件匣。",
+  "blocks": "個區塊",
+  "No installed app matches “{query}” — try another word, or look in Explore.": "沒有已安裝的應用程式符合「{query}」— 請嘗試其他關鍵字，或前往「探索」。",
+  "Restore": "還原",
+  "Edit comment": "編輯留言",
+  "Posting…": "發佈中…",
+  "Run command": "執行命令",
+  "Link": "連結",
+  "Link unavailable": "無法使用連結",
 });
 
 export function useLocale(): LocaleContextValue {

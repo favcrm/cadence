@@ -1085,7 +1085,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
               title={t("Shareable link to this conversation")}
               data-chat-conversation-link
             >
-              Link
+              {t("Link")}
             </Link>
           )}
         {active.state === "ready" &&
@@ -1098,7 +1098,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
               title={t("A shareable link needs a verified context")}
               data-chat-link-unavailable
             >
-              Link unavailable
+              {t("Link unavailable")}
             </span>
           )}
       </div>
@@ -1116,7 +1116,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         <p className="text-label text-fail" role="alert">
           {t("The conversations could not be read")} — {active.error}{" "}
           <button type="button" className="lnk" onClick={active.retry}>
-            Retry
+            {t("Retry")}
           </button>
         </p>
       )}
@@ -1160,7 +1160,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         <p className="text-label text-fail" role="alert">
           {t("The thread could not be read")} — {thread.error}{" "}
           <button type="button" className="lnk" onClick={() => void store.refresh()}>
-            Retry
+            {t("Retry")}
           </button>
         </p>
       )}
