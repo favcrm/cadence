@@ -1006,7 +1006,63 @@ fn check_catalog(db: &Path) -> Result<()> {
             )));
         }
     }
-    Ok(())
+    check_business_guards(&conn)
+}
+
+/// Business tables whose immutability guards the export and restore rely on.
+const BUSINESS_TABLES: &[&str] = &[
+    "business_template_versions",
+    "business_template_sources",
+    "business_documents",
+];
+
+/// The business trigger set must equal the one the compiled-in schema creates.
+/// Expected rows come from a scratch in-memory database built from that DDL,
+/// so a stored guard is never trusted by its own SQL text. Runs before
+/// `project` drops or replays any guard, and on the staged store at restore.
+fn check_business_guards(conn: &Connection) -> Result<()> {
+    // A store older than v38 has no business tables; there is nothing to guard.
+    let present: i64 = conn.query_row(
+        &format!(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ({})",
+            business_list()
+        ),
+        [],
+        |r| r.get(0),
+    )?;
+    if present == 0 {
+        return Ok(());
+    }
+    let trusted = Connection::open_in_memory()?;
+    trusted.execute_batch(crate::store::BUSINESS_TEMPLATE_SCHEMA)?;
+    let expected = business_guards(&trusted)?;
+    let actual = business_guards(conn)?;
+    if expected == actual {
+        return Ok(());
+    }
+    Err(Error::rejected(
+        "portable refuses: business immutable guards do not match trusted schema",
+    ))
+}
+
+fn business_list() -> String {
+    BUSINESS_TABLES
+        .iter()
+        .map(|t| sql_string(t))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// `(name, table, sql)` of every trigger on a business table, by name.
+fn business_guards(conn: &Connection) -> Result<Vec<(String, String, String)>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT name,tbl_name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name IN ({}) ORDER BY name",
+        business_list()
+    ))?;
+    let rows: Vec<(String, String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
 }
 
 fn sql_string(s: &str) -> String {

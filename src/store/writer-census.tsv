@@ -5,9 +5,9 @@ backup/mod.rs	offline-private-backup-copy-and-tests	execute	4
 backup/mod.rs	offline-private-backup-copy-and-tests	open	3
 backup/mod.rs	offline-private-backup-copy-and-tests	prepare	13
 backup/mod.rs	offline-private-backup-copy-and-tests	transaction	2
-backup/portable.rs	private-portable-copy-and-staged-validation	execute	4
-backup/portable.rs	private-portable-copy-and-staged-validation	open	4
-backup/portable.rs	private-portable-copy-and-staged-validation	prepare	3
+backup/portable.rs	private-portable-copy-and-staged-validation	execute	7
+backup/portable.rs	private-portable-copy-and-staged-validation	open	5
+backup/portable.rs	private-portable-copy-and-staged-validation	prepare	4
 backup/portable.rs	private-portable-copy-and-staged-validation	transaction	1
 backup/portable_acceptance.rs	test-fixtures	execute	21
 backup/portable_acceptance.rs	test-fixtures	open	16
