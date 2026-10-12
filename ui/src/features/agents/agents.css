@@ -306,9 +306,20 @@
   border-color: var(--color-ink-600);
   background: var(--color-ink-850);
 }
-.agent-card:focus-visible {
+.agent-card:has(.agent-name:focus-visible) {
   outline: 2px solid var(--color-accent);
   outline-offset: 2px;
+}
+/* The native name button owns the full card target, including keyboard use. */
+.agent-card .agent-name::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+}
+.agent-card button:not(.agent-name) {
+  position: relative;
+  z-index: 2;
 }
 .agent-card .top {
   display: flex;

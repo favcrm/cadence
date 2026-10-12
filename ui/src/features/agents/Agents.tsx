@@ -138,7 +138,6 @@ function AgentCard({
   return (
     <article
       className={`agent-card tone-${tone}`}
-      onClick={onOpen}
       aria-label={`Agent ${a.alias}`}
     >
       <div className="top">
