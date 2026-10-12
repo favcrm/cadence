@@ -56,7 +56,7 @@ impl Shared {
     /// The job's members: its PM plus the assignees of its tasks.
     fn job_member_aliases(&self, job_id: &str) -> Result<Vec<String>> {
         let job = self.store.job(job_id)?;
-        let mut members = vec![job.pm_alias.clone()];
+        let mut members = vec![job.pm_alias];
         for task in self.store.tasks_for_job(job_id)? {
             if let Some(a) = task.assignee {
                 if !members.contains(&a) {
