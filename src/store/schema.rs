@@ -1268,7 +1268,10 @@ impl Store {
                     .collect::<rusqlite::Result<_>>()?;
                 for (name, sql) in [
                     ("user_id", "ALTER TABLE chat_files ADD COLUMN user_id TEXT"),
-                    ("thread_id", "ALTER TABLE chat_files ADD COLUMN thread_id TEXT"),
+                    (
+                        "thread_id",
+                        "ALTER TABLE chat_files ADD COLUMN thread_id TEXT",
+                    ),
                     (
                         "location_version",
                         "ALTER TABLE chat_files ADD COLUMN location_version INTEGER",
