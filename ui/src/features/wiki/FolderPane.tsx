@@ -1,6 +1,5 @@
 import { useEffect, useId, useRef, useState } from "react";
 import type { Route } from "../../lib/router";
-import { fmtBytes } from "../../lib/fmt";
 import Link from "../../ui/Link";
 import { IconFolder, IconGrid, IconList, IconMore } from "../../ui/icons";
 import { wiki, wikiFileUrl, wikiRawUrl, type WikiEntry } from "./api";
@@ -278,9 +277,6 @@ export default function FolderPane({
                   </span>
                   <span className="wk-fmeta">
                     <span className="wk-fname">{entry.name}</span>
-                    <span className="wk-fsize num">
-                      {entry.size != null ? fmtBytes(entry.size) : entry.entries ?? ""}
-                    </span>
                   </span>
                 </Link>
                 {itemMenu(entry)}
@@ -302,7 +298,6 @@ export default function FolderPane({
                 {entry.kind === "dir" ? "folder" : kindLabel(entry.name, entry.mime).toLowerCase()}
               </span>
               {entry.locked && <span className="wk-flock">locked</span>}
-              <span className="wk-fsize num">{entry.size != null ? fmtBytes(entry.size) : entry.entries ?? ""}</span>
               {itemMenu(entry)}
             </div>
           ))}
