@@ -460,10 +460,12 @@ async function main() {
   // provider-list failure from blanking loaded accounts, renders the
   // built-in non-editable, and never advertises remote verification. ----
   const { default: ConnectionsPageView } = require("../src/features/settings/Connections") as typeof import("../src/features/settings/Connections");
-  const { LocaleProvider: PageLocale } = require("../src/lib/locale") as typeof import("../src/lib/locale");
+  const { NavigationProvider } = require("../screen-ui/src/navigation") as typeof import("../screen-ui/src/navigation");
+  const { hostNavigation } = require("../src/ui/hostNavigation") as typeof import("../src/ui/hostNavigation");
   // The page renders localized chips and must sit inside the locale provider (CAD-1331).
   const ConnectionsPage = (props: import("react").ComponentProps<typeof ConnectionsPageView>) =>
-    React.createElement(PageLocale, null, React.createElement(ConnectionsPageView, props));
+    React.createElement(LocaleProvider, null,
+      React.createElement(NavigationProvider, { adapter: hostNavigation, children: React.createElement(ConnectionsPageView, props) }));
   const { resources } = require("../src/lib/resources") as typeof import("../src/lib/resources");
 
   const conns: any[] = [

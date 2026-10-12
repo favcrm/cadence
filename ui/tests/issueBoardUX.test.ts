@@ -15,10 +15,16 @@ loader.prototype.require = function (this: unknown, id: string) {
 };
 const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
+const { NavigationProvider } = require("../screen-ui/src/navigation") as typeof import("../screen-ui/src/navigation");
+const { hostNavigation } = require("../src/ui/hostNavigation") as typeof import("../src/ui/hostNavigation");
 const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
 const BoardComponent = (require("../src/features/projects/Board") as typeof import("../src/features/projects/Board")).default;
-const Board = (props: React.ComponentProps<typeof BoardComponent>) => React.createElement(LocaleProvider, null, React.createElement(BoardComponent, props));
-const Drawer = (require("../src/features/projects/Drawer") as typeof import("../src/features/projects/Drawer")).default;
+const Board = (props: React.ComponentProps<typeof BoardComponent>) => React.createElement(LocaleProvider, null,
+    React.createElement(NavigationProvider, { adapter: hostNavigation, children: React.createElement(BoardComponent, props) }));
+const DrawerComponent = (require("../src/features/projects/Drawer") as typeof import("../src/features/projects/Drawer")).default;
+const Drawer = (props: React.ComponentProps<typeof DrawerComponent>) =>
+  React.createElement(LocaleProvider, null,
+    React.createElement(NavigationProvider, { adapter: hostNavigation, children: React.createElement(DrawerComponent, props) }));
 const { api } = require("../src/lib/api") as typeof import("../src/lib/api");
 const { NO_FILTERS } = require("../src/lib/filters") as typeof import("../src/lib/filters");
 type Card = import("../src/lib/types").IssueCard;

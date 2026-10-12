@@ -23,9 +23,9 @@ export function inertDocument(preview: InertPreview, remoteImages: readonly stri
     } catch { /* Invalid URLs do not load. */ }
     return null;
   };
-  for (const element of template.content.querySelectorAll("*")) {
+  for (const element of Array.from(template.content.querySelectorAll("*"))) {
     if (element.namespaceURI !== "http://www.w3.org/1999/xhtml" || !TAGS.has(element.localName)) { element.remove(); continue; }
-    for (const attr of [...element.attributes]) {
+    for (const attr of Array.from(element.attributes)) {
       if (element.localName === "img" && attr.name === "src") {
         const allowed = image(attr.value);
         if (allowed) element.setAttribute("src", allowed); else element.removeAttribute(attr.name);

@@ -128,9 +128,12 @@ const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
 const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
 const AppShellModule = (require("../src/features/app-shell/AppShell") as typeof import("../src/features/app-shell/AppShell"));
+const { NavigationProvider } = require("../screen-ui/src/navigation") as typeof import("../screen-ui/src/navigation");
+const { hostNavigation } = require("../src/ui/hostNavigation") as typeof import("../src/ui/hostNavigation");
 const AppShellComponent = AppShellModule.default;
 const AppShell = (props: React.ComponentProps<typeof AppShellComponent>) =>
-  React.createElement(LocaleProvider, null, React.createElement(AppShellComponent, props));
+  React.createElement(LocaleProvider, null,
+    React.createElement(NavigationProvider, { adapter: hostNavigation, children: React.createElement(AppShellComponent, props) }));
 const entryApp = AppShellModule.entryApp;
 // Context moves ride real URL writes — the same `navigate` the shell
 // uses, so tests exercise adoption exactly like a pasted link.
