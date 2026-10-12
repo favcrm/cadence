@@ -54,6 +54,24 @@ struct DoorState {
     grants: Mutex<Value>,
     /// The AOS connection the destinations read reports for `DEST`.
     connection: Mutex<String>,
+    /// Inactive unless one acceptance case installs a deterministic race latch.
+    grant_latch: Mutex<Option<Arc<GrantLatch>>>,
+}
+
+struct GrantLatch {
+    entered: std::sync::mpsc::Sender<()>,
+    resume: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl GrantLatch {
+    fn pause(&self) {
+        let _ = self.entered.send(());
+        let _ = self
+            .resume
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(30));
+    }
 }
 
 /// An AOS #411 `devicePublishStandingGrantSchema` record.
@@ -136,6 +154,13 @@ fn fake_door() -> (String, Seen, Arc<DoorState>) {
                     "imageDigest": sent["grant"]["imageDigest"],
                 });
                 let route = path.split('?').next().unwrap_or("").to_string();
+                if method == "GET"
+                    && path == format!("{PREFIX}/publish/grants?destinationId={DEST}")
+                {
+                    if let Some(latch) = door.grant_latch.lock().unwrap().take() {
+                        latch.pause();
+                    }
+                }
                 let reply = if method == "GET" && route == format!("{PREFIX}/destinations") {
                     json!({"ok":true,"data":{"version":"1","destinations":[{
                         "connectionId": *door.connection.lock().unwrap(), "toolkit": "facebook",
@@ -801,6 +826,16 @@ mod cad1397_social_draft_schedule_acceptance {
             .as_secs() as i64
     }
 
+    struct ResumeGrant(std::option::Option<std::sync::mpsc::Sender<()>>);
+
+    impl Drop for ResumeGrant {
+        fn drop(&mut self) {
+            if let Some(resume) = self.0.take() {
+                let _ = resume.send(());
+            }
+        }
+    }
+
     fn count_publish_posts(fx: &Fx) -> usize {
         fx.sent()
             .iter()
@@ -944,6 +979,15 @@ mod cad1397_social_draft_schedule_acceptance {
         assert_eq!(status, 200, "owner schedule: {body}");
         let first = effect_record(&fx, &app, &effect);
         assert_eq!(first["state"], "scheduled");
+        let scheduled_list = fx.op("app_effect_list", json!({"install_id":app.install}));
+        assert!(
+            scheduled_list["effects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| { row["effect_id"] == effect && row["state"] == "scheduled" }),
+            "installation-wide list omitted scheduled social effect: {scheduled_list}"
+        );
         let replay = fx.rpc_as(Asserted::Operator, "app_effect_schedule", schedule.clone());
         assert!(
             replay.is_err(),
@@ -981,6 +1025,65 @@ mod cad1397_social_draft_schedule_acceptance {
         );
         assert_eq!(status, 200, "owner cancel before claim: {body}");
         assert_eq!(effect_record(&fx, &app, &effect)["state"], "cancelled");
+        assert_eq!(count_publish_posts(&fx), before);
+
+        // The installation-wide RPC list includes RecordStore-backed effects;
+        // a different explicit context and a foreign installation do not.
+        let listed = fx.op("app_effect_list", json!({"install_id":app.install}));
+        assert!(
+            listed["effects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| { row["effect_id"] == effect && row["state"] == "cancelled" }),
+            "installation-wide list omitted cancelled social effect: {listed}"
+        );
+        let other_context = fx.op(
+            "app_context_create",
+            json!({
+                "install_id":app.install,"label":"Other context","input_defaults":{},
+                "request_id":"cad1397-other-context"
+            }),
+        );
+        let other_context = other_context["context"]["id"].as_str().unwrap();
+        let scoped = fx.op(
+            "app_effect_list",
+            json!({
+                "install_id":app.install,"context_id":other_context
+            }),
+        );
+        assert!(
+            !scoped["effects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| { row["effect_id"] == effect }),
+            "other context exposed social effect: {scoped}"
+        );
+        let foreign_source = fx.root.path().join("foreign-app-src");
+        std::fs::create_dir_all(foreign_source.join("workflows")).unwrap();
+        std::fs::write(foreign_source.join("workflows/post.md"), WORKFLOW).unwrap();
+        std::fs::write(foreign_source.join("app.md"), "---\napp: cad1397-foreign\ntitle: Foreign\nversion: '0.1.0'\nsummary: Foreign fixture.\nneeds:\n  connections: []\n  capabilities: {}\n---\n\n# Foreign\n").unwrap();
+        let foreign = fx.op(
+            "app_workspace_install",
+            json!({
+                "source":foreign_source.to_str().unwrap()
+            }),
+        );
+        let foreign = fx.op(
+            "app_effect_list",
+            json!({
+                "install_id":foreign["install_id"]
+            }),
+        );
+        assert!(
+            !foreign["effects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| { row["effect_id"] == effect }),
+            "foreign installation exposed social effect: {foreign}"
+        );
         assert_eq!(count_publish_posts(&fx), before);
 
         // A separate due effect proves the positive control uses the real
@@ -1091,6 +1194,163 @@ mod cad1397_social_draft_schedule_acceptance {
             effect_record(&fx, &app, &held)["state"],
             "posted",
             "mismatched grant posted"
+        );
+    }
+
+    #[test]
+    fn revoke_during_live_grant_lookup_refuses_before_claim_or_send() {
+        let fx = Fx::start();
+        let app = fx.install();
+        fx.grants(json!([standing(|_| {})]));
+        let (effect, digest, _) = fx.effect(&app, "cad1397-binding-race", true);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        *fx.door.grant_latch.lock().unwrap() = Some(Arc::new(GrantLatch {
+            entered: entered_tx,
+            resume: Mutex::new(resume_rx),
+        }));
+        let from = fx.sent().len();
+        let due = epoch() + 2;
+        assert!(
+            fx.rpc_as(
+                Asserted::Operator,
+                "app_effect_schedule",
+                json!({
+                    "effect_id":effect,"digest":digest,"due_epoch":due
+                })
+            )
+            .is_ok(),
+            "valid effect did not schedule"
+        );
+        let _resume_on_exit = ResumeGrant(Some(resume_tx));
+        entered_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("dispatcher never paused at AOS standing-grant lookup");
+
+        // This is the real operator RPC, serialized against the publish
+        // decision by the production binding guard, while the network lookup
+        // remains paused outside the lock.
+        fx.op(
+            "app_binding_revoke",
+            json!({
+                "install_id":app.install,"binding_id":app.binding["id"],
+                "expected_revision":app.binding["revision"]
+            }),
+        );
+        drop(_resume_on_exit);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while effect_record(&fx, &app, &effect)["state"] == "scheduled" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "dispatcher did not settle after binding revoke"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(
+            effect_record(&fx, &app, &effect)["state"],
+            "refused",
+            "stale binding authority was not refused"
+        );
+        assert!(
+            fx.sends_since(from).is_empty(),
+            "stale binding reached preflight/execute: {:?}",
+            &fx.sent()[from..]
+        );
+    }
+
+    // The base table below is copied from the supported pre-CAD-1397
+    // DRAFT_SCHEMA in the repository history; the negative case adds exactly
+    // one unrecognized CHECK constraint to that real legacy shape.
+    fn legacy_record_db(state: &std::path::Path, install: &str, extra_check: bool) -> String {
+        let _records = RecordStore::open(state, install).unwrap();
+        let path = state.join("app-records").join(format!("{install}.sqlite3"));
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("DROP TABLE app_social_effects;")
+            .unwrap();
+        let extra = if extra_check {
+            ", CHECK(approval_id <> 'reject-migration')"
+        } else {
+            ""
+        };
+        conn.execute_batch(&format!(r#"CREATE TABLE app_social_effects(
+ effect_id TEXT PRIMARY KEY, install_id TEXT NOT NULL, context_id TEXT NOT NULL,
+ draft_id TEXT NOT NULL, revision INTEGER NOT NULL, request_id TEXT NOT NULL UNIQUE,
+ digest TEXT NOT NULL, frozen_json TEXT NOT NULL, state TEXT NOT NULL
+ CHECK(state IN ('waiting','approved','declined','sending','posted','refused')),
+ approval_id TEXT NOT NULL, outcome_json TEXT, media_key TEXT, created REAL NOT NULL, updated REAL NOT NULL{extra});
+INSERT INTO app_social_effects VALUES('legacy-effect','{install}','legacy-context','legacy-draft',1,'legacy-request','legacy-digest','{{}}','approved','legacy-approved',NULL,NULL,1.0,1.0);"#)).unwrap();
+        conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='app_social_effects'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn legacy_migration_refuses_unknown_constraints_without_rewriting_and_accepts_supported_schema()
+    {
+        let rejected_root = tempfile::tempdir().unwrap();
+        let rejected_install = "cad1397-extra-check";
+        let original_sql = legacy_record_db(rejected_root.path(), rejected_install, true);
+        let refused = RecordStore::open(rejected_root.path(), rejected_install);
+        assert!(
+            refused.is_err(),
+            "unknown same-column CHECK was silently discarded"
+        );
+        let path = rejected_root
+            .path()
+            .join("app-records")
+            .join(format!("{rejected_install}.sqlite3"));
+        let conn = rusqlite::Connection::open(path).unwrap();
+        let after_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='app_social_effects'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let row: (String, String, String) = conn
+            .query_row(
+                "SELECT effect_id,approval_id,state FROM app_social_effects",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(after_sql, original_sql, "refusal rewrote legacy table SQL");
+        assert_eq!(
+            row,
+            (
+                "legacy-effect".into(),
+                "legacy-approved".into(),
+                "approved".into()
+            ),
+            "refusal changed legacy row"
+        );
+
+        let supported_root = tempfile::tempdir().unwrap();
+        let supported_install = "cad1397-supported-legacy";
+        legacy_record_db(supported_root.path(), supported_install, false);
+        let migrated = RecordStore::open(supported_root.path(), supported_install)
+            .expect("supported historical DDL should migrate");
+        let effect = migrated.app_social_effect_show("legacy-effect").unwrap()["effect"].clone();
+        assert_eq!(effect["state"], "approved");
+        assert!(
+            effect.get("due_epoch").is_some(),
+            "migration omitted schedule column"
+        );
+        drop(migrated);
+        let reopened = RecordStore::open(supported_root.path(), supported_install)
+            .expect("migrated historical schema should reopen");
+        let reopened_effect =
+            reopened.app_social_effect_show("legacy-effect").unwrap()["effect"].clone();
+        assert_eq!(reopened_effect["effect_id"], "legacy-effect");
+        assert_eq!(reopened_effect["state"], "approved");
+        assert_eq!(reopened_effect["approval_id"], "legacy-approved");
+        assert!(
+            reopened_effect.get("due_epoch").is_some(),
+            "reopened migrated effect lost schedule column"
         );
     }
 }

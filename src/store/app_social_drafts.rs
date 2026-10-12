@@ -157,11 +157,42 @@ fn valid_caption(caption: &str) -> Result<()> {
     Ok(())
 }
 
+fn normalized_social_effect_ddl(sql: &str) -> String {
+    let mut normalized = String::with_capacity(sql.len());
+    let mut quoted = false;
+    for ch in sql.chars() {
+        if ch == '\'' {
+            quoted = !quoted;
+            normalized.push(ch);
+        } else if !quoted && ch.is_ascii_whitespace() {
+            continue;
+        } else {
+            normalized.push(if quoted { ch } else { ch.to_ascii_lowercase() });
+        }
+    }
+    normalized
+}
+
 fn migrate_social_effect_schedule_schema(conn: &rusqlite::Connection) -> Result<()> {
     let columns = conn
         .prepare("PRAGMA table_info(app_social_effects)")?
         .query_map([], |r| r.get::<_, String>(1))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    let old_without_media = [
+        "effect_id",
+        "install_id",
+        "context_id",
+        "draft_id",
+        "revision",
+        "request_id",
+        "digest",
+        "frozen_json",
+        "state",
+        "approval_id",
+        "outcome_json",
+        "created",
+        "updated",
+    ];
     let old = [
         "effect_id",
         "install_id",
@@ -212,40 +243,44 @@ fn migrate_social_effect_schedule_schema(conn: &rusqlite::Connection) -> Result<
         "created",
         "updated",
     ];
-    if columns.iter().map(String::as_str).eq(new) {
-        let sql: String = conn.query_row(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='app_social_effects'",
-            [],
-            |r| r.get(0),
-        )?;
-        if !sql.contains("'scheduled'") || !sql.contains("'cancelled'") {
-            return Err(Error::rejected(
-                "social effect schedule schema is partially migrated; refusing to rewrite it",
-            ));
-        }
-        return Ok(());
-    }
-    if !columns.iter().map(String::as_str).eq(old)
-        && !columns.iter().map(String::as_str).eq(old_media_last)
-    {
-        return Err(Error::rejected(
-            "social effect schema is unknown; refusing a lossy scheduling migration",
-        ));
-    }
     let old_sql: String = conn.query_row(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='app_social_effects'",
         [],
         |r| r.get(0),
     )?;
-    if !old_sql.contains("'waiting'")
-        || !old_sql.contains("'approved'")
-        || !old_sql.contains("'sending'")
-        || !old_sql.contains("'posted'")
-        || !old_sql.contains("'refused'")
-        || !old_sql.contains("'declined'")
+    let legacy_ddl = "CREATE TABLE app_social_effects( effect_id TEXT PRIMARY KEY, install_id TEXT NOT NULL, context_id TEXT NOT NULL, draft_id TEXT NOT NULL, revision INTEGER NOT NULL, request_id TEXT NOT NULL UNIQUE, digest TEXT NOT NULL, frozen_json TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('waiting','approved','declined','sending','posted','refused')), approval_id TEXT NOT NULL, outcome_json TEXT, media_key TEXT, created REAL NOT NULL, updated REAL NOT NULL)";
+    let legacy_without_media_ddl = "CREATE TABLE app_social_effects( effect_id TEXT PRIMARY KEY, install_id TEXT NOT NULL, context_id TEXT NOT NULL, draft_id TEXT NOT NULL, revision INTEGER NOT NULL, request_id TEXT NOT NULL UNIQUE, digest TEXT NOT NULL, frozen_json TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('waiting','approved','declined','sending','posted','refused')), approval_id TEXT NOT NULL, outcome_json TEXT, created REAL NOT NULL, updated REAL NOT NULL)";
+    let legacy_media_last_ddl = "CREATE TABLE app_social_effects( effect_id TEXT PRIMARY KEY, install_id TEXT NOT NULL, context_id TEXT NOT NULL, draft_id TEXT NOT NULL, revision INTEGER NOT NULL, request_id TEXT NOT NULL UNIQUE, digest TEXT NOT NULL, frozen_json TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('waiting','approved','declined','sending','posted','refused')), approval_id TEXT NOT NULL, outcome_json TEXT, created REAL NOT NULL, updated REAL NOT NULL, media_key TEXT)";
+    let current_ddl = "CREATE TABLE app_social_effects( effect_id TEXT PRIMARY KEY, install_id TEXT NOT NULL, context_id TEXT NOT NULL, draft_id TEXT NOT NULL, revision INTEGER NOT NULL, request_id TEXT NOT NULL UNIQUE, digest TEXT NOT NULL, frozen_json TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('waiting','approved','scheduled','cancelled','declined','sending','posted','refused')), approval_id TEXT NOT NULL, outcome_json TEXT, media_key TEXT, due_epoch INTEGER, timezone TEXT, created REAL NOT NULL, updated REAL NOT NULL)";
+    let quoted_current_ddl = current_ddl.replacen(
+        "TABLE app_social_effects(",
+        "TABLE \"app_social_effects\"(",
+        1,
+    );
+    let actual = normalized_social_effect_ddl(&old_sql);
+    if ![
+        legacy_ddl,
+        legacy_without_media_ddl,
+        legacy_media_last_ddl,
+        current_ddl,
+    ]
+    .iter()
+    .any(|ddl| actual == normalized_social_effect_ddl(ddl))
+        && actual != normalized_social_effect_ddl(&quoted_current_ddl)
     {
         return Err(Error::rejected(
-            "social effect state constraint is unknown; refusing a lossy scheduling migration",
+            "social effect table definition is unknown; refusing a lossy scheduling migration",
+        ));
+    }
+    if columns.iter().map(String::as_str).eq(new) {
+        return Ok(());
+    }
+    if !columns.iter().map(String::as_str).eq(old)
+        && !columns.iter().map(String::as_str).eq(old_media_last)
+        && !columns.iter().map(String::as_str).eq(old_without_media)
+    {
+        return Err(Error::rejected(
+            "social effect schema is unknown; refusing a lossy scheduling migration",
         ));
     }
     let indexes = conn
@@ -268,10 +303,13 @@ fn migrate_social_effect_schedule_schema(conn: &rusqlite::Connection) -> Result<
     }
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let migrated = (|| -> rusqlite::Result<()> {
+        if columns.iter().map(String::as_str).eq(old_without_media) {
+            conn.execute_batch("ALTER TABLE app_social_effects ADD COLUMN media_key TEXT")?;
+        }
         conn.execute_batch("CREATE TABLE app_social_effects_schedule_new(\
  effect_id TEXT PRIMARY KEY, install_id TEXT NOT NULL, context_id TEXT NOT NULL,\
  draft_id TEXT NOT NULL, revision INTEGER NOT NULL, request_id TEXT NOT NULL UNIQUE,\
- digest TEXT NOT NULL, frozen_json TEXT NOT NULL, state TEXT NOT NULL\
+ digest TEXT NOT NULL, frozen_json TEXT NOT NULL, state TEXT NOT NULL \
  CHECK(state IN ('waiting','approved','scheduled','cancelled','declined','sending','posted','refused')),\
  approval_id TEXT NOT NULL, outcome_json TEXT, media_key TEXT, due_epoch INTEGER, timezone TEXT,\
  created REAL NOT NULL, updated REAL NOT NULL);
@@ -299,36 +337,6 @@ ALTER TABLE app_social_effects_schedule_new RENAME TO app_social_effects;")?;
 pub(crate) fn ensure_schema(conn: &rusqlite::Connection) -> Result<()> {
     conn.execute_batch(DRAFT_SCHEMA)
         .map_err(|e| Error::internal(format!("social draft schema unavailable: {e}")))?;
-    let columns = conn
-        .prepare("PRAGMA table_info(app_social_effects)")?
-        .query_map([], |r| r.get::<_, String>(1))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    if !columns.iter().any(|c| c == "media_key") {
-        let legacy = [
-            "effect_id",
-            "install_id",
-            "context_id",
-            "draft_id",
-            "revision",
-            "request_id",
-            "digest",
-            "frozen_json",
-            "state",
-            "approval_id",
-            "outcome_json",
-            "created",
-            "updated",
-        ];
-        if !columns.iter().map(String::as_str).eq(legacy) {
-            return Err(Error::rejected(
-                "social effect schema is unknown; refusing a lossy scheduling migration",
-            ));
-        }
-        conn.execute(
-            "ALTER TABLE app_social_effects ADD COLUMN media_key TEXT",
-            [],
-        )?;
-    }
     migrate_social_effect_schedule_schema(conn)?;
     // CAD-1303: soft discard marker. Additive; the file schema version stays.
     let draft_columns = conn
@@ -838,8 +846,18 @@ impl RecordStore {
         Self::social_effect_in(&*self.conn(), self.install(), id)
     }
     pub fn app_social_effect_list(&self, context: &str) -> Result<Value> {
+        self.app_social_effect_list_scoped(Some(context))
+    }
+
+    pub fn app_social_effect_list_install(&self) -> Result<Value> {
+        self.app_social_effect_list_scoped(None)
+    }
+
+    fn app_social_effect_list_scoped(&self, context: Option<&str>) -> Result<Value> {
         let conn = self.conn();
-        let ids=conn.prepare("SELECT effect_id FROM app_social_effects WHERE install_id=? AND context_id=? AND draft_id NOT IN (SELECT draft_id FROM app_social_drafts WHERE install_id=? AND context_id=? AND discarded_at IS NOT NULL) ORDER BY created DESC,effect_id LIMIT 101")?.query_map(params![self.install(),context,self.install(),context],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let ids = conn.prepare("SELECT e.effect_id FROM app_social_effects e WHERE e.install_id=? AND (? IS NULL OR e.context_id=?) AND NOT EXISTS (SELECT 1 FROM app_social_drafts d WHERE d.install_id=e.install_id AND d.context_id=e.context_id AND d.draft_id=e.draft_id AND d.discarded_at IS NOT NULL) ORDER BY e.created DESC,e.effect_id LIMIT 101")?
+            .query_map(params![self.install(), context, context], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         if ids.len() > 100 {
             return Err(Error::rejected(
                 "social effect inventory exceeds its supported bound",

@@ -117,7 +117,7 @@ fn settle_social_send(
     loop {
         match sender.status(key) {
             Ok(o) if o.state == PublishState::Posted => {
-                return records.app_social_effect_finish(id, "posted", &o.evidence_json())
+                return records.app_social_effect_finish(id, "posted", &o.evidence_json());
             }
             Ok(o)
                 if matches!(
@@ -125,7 +125,7 @@ fn settle_social_send(
                     PublishState::Refused | PublishState::ReconnectNeeded
                 ) =>
             {
-                return records.app_social_effect_finish(id, "refused", &o.evidence_json())
+                return records.app_social_effect_finish(id, "refused", &o.evidence_json());
             }
             _ => {}
         }
@@ -685,21 +685,73 @@ impl Shared {
         bound["image_digest"] = json!(frozen_image_digest(&authority));
         let binding = super::social_publish_rpc::sender_binding(&bound, &json!(key))
             .ok_or_else(|| Error::rejected("approved social publish binding is invalid"))?;
-        // A due schedule becomes non-cancellable before probing the provider.
-        // If the probe is ambiguous, it stays `sending` and later passes only
-        // reconcile status; they must never retry execute blindly.
-        let scheduled_claim = if let Some(due) = scheduled_due {
-            let Some(claimed) = records.app_social_effect_claim_scheduled_send(
-                &id_owned,
-                &digest_owned,
-                due,
-                &approval_id,
-            )?
-            else {
-                return Err(Error::rejected(
-                    "social effect is no longer scheduled for this due time",
-                ));
-            };
+        // Reopen the completed bundle immediately before the claim. No DB/PM/
+        // release lock is held across resolver, import, or provider operations.
+        let pm = self.pm_at(&self.pm_dir()?)?;
+        let claim_guarded = || -> Result<Option<Value>> {
+            workspace::with_completed_bundle_snapshot(
+                &pm,
+                &install,
+                required_str(&authority, "bundle_digest")?,
+                |bundle, files| {
+                    let _release = self
+                        .app_release_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let context = required_str(&authority, "context_id")?;
+                    let slot = required_str(&authority["binding"], "slot")?;
+                    let current = self
+                        .app_binding_live(&install, Some(context), slot, bundle, files)?
+                        .ok_or_else(|| Error::rejected("social publish binding is unavailable"))?;
+                    if current.config["mapping"]["effect"] != "send"
+                        || current.digest != authority["binding"]["digest"]
+                        || current.revision != authority["binding"]["revision"]
+                    {
+                        return Err(Error::rejected(
+                            "social publish binding changed since approval",
+                        ));
+                    }
+                    let draft_id = required_str(&authority, "draft_id")?;
+                    let current_draft = records.app_social_draft_show(context, draft_id)?;
+                    if current_draft["revision"] != authority["revision"]
+                        || current_draft["caption"] != authority["caption"]
+                        || current_draft["asset_id"] != authority["asset_id"]
+                        || crate::platform::agenticos_external::publish::caption_digest_of(
+                            authority["caption"].as_str().unwrap_or(""),
+                        ) != authority["caption_digest"].as_str().unwrap_or("")
+                    {
+                        return Err(Error::rejected("social draft changed since approval"));
+                    }
+                    if let Some(asset) = authority["asset_id"].as_str() {
+                        let (_, asset_digest, bytes) =
+                            self.store.app_tool_asset_bytes(&install, asset)?;
+                        if bytes.len() > 2 * 1024 * 1024
+                            || Some(bare_digest(&asset_digest)) != frozen_image_digest(&authority)
+                            || Some(bytes.len() as u64) != authority["size_bytes"].as_u64()
+                        {
+                            return Err(Error::rejected(
+                                "social draft image changed since approval",
+                            ));
+                        }
+                    }
+                    match scheduled_due {
+                        Some(due) => records.app_social_effect_claim_scheduled_send(
+                            &id_owned,
+                            &digest_owned,
+                            due,
+                            &approval_id,
+                        ),
+                        None => records.app_social_effect_claim_send(&id_owned, &digest_owned),
+                    }
+                },
+            )
+        };
+        // Scheduled work remains non-cancellable before provider preflight.
+        // Ambiguous sends stay `sending`; repeat passes reconcile, never resend.
+        let scheduled_claim = if scheduled_due.is_some() {
+            let claimed = claim_guarded()?.ok_or_else(|| {
+                Error::rejected("social effect is no longer scheduled for this due time")
+            })?;
             Some(claimed)
         } else {
             None
@@ -717,12 +769,14 @@ impl Shared {
                 return Err(Error::rejected(r.to_string()));
             }
             Preflight::Uncertain(r) => {
-                return Err(Error::rejected(format!("publish preflight uncertain: {r}")))
+                return Err(Error::rejected(format!("publish preflight uncertain: {r}")));
             }
         }
+        // Manual Publish now claims after preflight; the same guarded check
+        // prevents a stale approval from crossing its in-flight boundary.
         let claimed = match scheduled_claim {
             Some(claimed) => Some(claimed),
-            None => records.app_social_effect_claim_send(&id_owned, &digest_owned)?,
+            None => claim_guarded()?,
         };
         let Some(_claimed) = claimed else {
             return Err(Error::rejected(
@@ -858,7 +912,7 @@ impl Shared {
             _ => {
                 return Err(Error::rejected(
                     "social effect is no longer waiting for confirmation",
-                ))
+                ));
             }
         }
         self.publish_social_draft_now(id, digest)
@@ -921,10 +975,13 @@ impl Shared {
                 let install = optional_str(params, "install_id");
                 let context = optional_str(params, "context_id");
                 let mut list = self.store.app_effect_list(install, context)?;
-                if let (Some(install), Some(context)) = (install, context) {
-                    let social =
-                        crate::store::app_records::RecordStore::open(&self.state_dir, install)?
-                            .app_social_effect_list(context)?;
+                if let Some(install) = install {
+                    let records =
+                        crate::store::app_records::RecordStore::open(&self.state_dir, install)?;
+                    let social = match context {
+                        Some(context) => records.app_social_effect_list(context)?,
+                        None => records.app_social_effect_list_install()?,
+                    };
                     if let (Some(all), Some(extra)) =
                         (list["effects"].as_array_mut(), social["effects"].as_array())
                     {
@@ -1000,7 +1057,7 @@ impl Shared {
                     _ => {
                         return Err(Error::rejected(
                             "app effect decision must be accept or decline",
-                        ))
+                        ));
                     }
                 };
                 if social_effect_install(id).is_some() {
