@@ -296,14 +296,6 @@ export interface ActivityItem {
   agent: boolean;
 }
 
-const METHOD_TEXT: Record<string, string> = {
-  in_person: "in person",
-  web_form: "on the website form",
-  written: "in writing",
-  imported: "from an imported list",
-  other: "another way",
-};
-
 /** Plain-language timeline, newest first. Ids and digests stay in Details. */
 export function activityItems(record: HostRecord, t: Translate = identity): ActivityItem[] {
   const consent = consentEntries(record);
@@ -312,7 +304,21 @@ export function activityItems(record: HostRecord, t: Translate = identity): Acti
       const here = consent.filter((c) => c.revision === rev.revision);
       const channelName = (c: ConsentEntry) => t(c.channel === "sms" ? "SMS" : "Email");
       const parts = here.map((c) => {
-        const how = c.method ? ` ${t(METHOD_TEXT[c.method] ?? "")}`.trimEnd() : "";
+        const how = c.method
+          ? ` ${
+              c.method === "in_person"
+                ? t("in person")
+                : c.method === "web_form"
+                  ? t("on the website form")
+                  : c.method === "written"
+                    ? t("in writing")
+                    : c.method === "imported"
+                      ? t("from an imported list")
+                      : c.method === "other"
+                        ? t("another way")
+                        : ""
+            }`.trimEnd()
+          : "";
         return c.state === "granted"
           ? `${channelName(c)} ${t("consent granted")}${how === "" ? "" : ` (${how.trim()})`}`
           : c.state === "denied"
@@ -362,19 +368,19 @@ export function consentEntries(record: HostRecord): ConsentEntry[] {
  * by design and safe to show; known shapes gain a next step. The input
  * value never appears here.
  */
-export function friendlyError(error: unknown): string {
+export function friendlyError(error: unknown, t: Translate = identity): string {
   const message = hostErrorText(error, "The customer request was refused — retry.");
   if (/stale|expected_revision|expected record revision/i.test(message)) {
-    return `${message} — someone else saved this record first. Reload and reapply your change.`;
+    return `${message} ${t("— someone else saved this record first. Reload and reapply your change.")}`;
   }
   if (/already holds different content|already used by another record/i.test(message)) {
-    return `${message} — pick a different id or address, or open the existing record.`;
+    return `${message} ${t("— pick a different id or address, or open the existing record.")}`;
   }
   if (/supported shape or bounds/i.test(message)) {
-    return `${message} — check display name, email, phone, tags and source against the field hints.`;
+    return `${message} ${t("— check display name, email, phone, tags and source against the field hints.")}`;
   }
   if (/refused app record field/i.test(message)) {
-    return `${message} — the client refused a field the server never accepts.`;
+    return `${message} ${t("— the client refused a field the server never accepts.")}`;
   }
   return message;
 }

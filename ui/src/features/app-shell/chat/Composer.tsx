@@ -9,7 +9,7 @@ import {
 import type { ThreadRef } from "../../../lib/types";
 import { useLocale } from "../../../lib/locale";
 import { parseSlash, SLASH_COMMANDS, slashMatches, type SlashCommand } from "../../home/master";
-import { ATTACH_ACCEPT, attachMeta, unresolvedHint, type AttachDestination, type AttachItem } from "./attach";
+import { ATTACH_ACCEPT, attachMeta, displayAttachError, unresolvedHint, type AttachDestination, type AttachItem } from "./attach";
 import {
   addFiles,
   attachHold,
@@ -158,6 +158,7 @@ export default function Composer({
 }: ComposerProps) {
   const { t } = useLocale();
   const compact = density === "compact";
+  const translateAttachText = compact ? t : (english: string) => english;
   const key = storeKey ?? "composer";
   // The draft cell is the ONE owner of text, refs, edit version and the
   // in-flight handoff reservation. The box renders this snapshot, so a
@@ -231,7 +232,7 @@ export default function Composer({
     // A queued file that is still uploading or that failed is never
     // silently dropped: the send waits until every row is ready or
     // removed, and the notice says exactly why.
-    const hold = unresolvedHint(attachHold(key));
+    const hold = unresolvedHint(attachHold(key), translateAttachText);
     if (hold !== null) {
       onNotice?.(hold);
       return;
@@ -361,7 +362,7 @@ export default function Composer({
             role="group"
             className={`app-chat-filerow${a.status === "failed" ? " failed" : ""}`}
             data-attach-status={a.status}
-            aria-label={`${a.name}: ${t(a.status)}${a.error ? ` — ${a.error}` : ""}`}
+            aria-label={`${a.name}: ${t(a.status)}${a.error ? ` — ${displayAttachError(a.error, translateAttachText)}` : ""}`}
           >
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <path d="M5 3h9l5 5v13H5zM14 3v6h5M8 13h8M8 17h5" />
@@ -369,12 +370,12 @@ export default function Composer({
             <div className="app-chat-filename">
               <span>{a.name}</span>
               <small>
-                {attachMeta(a.name, a.size)}
+                {attachMeta(a.name, a.size, translateAttachText)}
                 {a.status === "uploading" ? ` · ${t("Uploading…")}` : ""}
               </small>
               {a.status === "failed" && a.error && (
                 <small className="app-chat-upload-error" role="alert">
-                  {a.error}
+                  {displayAttachError(a.error, translateAttachText)}
                 </small>
               )}
             </div>
@@ -450,7 +451,7 @@ export default function Composer({
       </svg>
     </button>
   ) : null;
-  const sendHeld = unresolvedHint(attachHold(key));
+  const sendHeld = unresolvedHint(attachHold(key), translateAttachText);
   // A reservation from a previous submit (even one made before a
   // remount) keeps Send off until its settlement releases it. An
   // unresolved original submission holds Send too, until its explicit

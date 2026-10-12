@@ -447,7 +447,7 @@ function AppCard({
   showProject: boolean;
 }) {
   const { t } = useLocale();
-  const approval = appApprovalChip(row);
+  const approval = appApprovalChip(row, t);
   const title = row.title?.trim() || row.name || t("App");
   const appName = row.name;
   const legacyHref = appName ? appHref(row.project, appName) : null;
@@ -505,5 +505,5 @@ function AppActivity({
   const runs = useQuery(resources.appRuns(`${project}/${name}`));
   if (runs.status === "failed") return <>{t("activity unavailable")}</>;
   if (!runs.data) return <>{t("reading activity…")}</>;
-  return <>{runsSummary(runs.data, needs) ?? t("Nothing running yet")}</>;
+  return <>{runsSummary(runs.data, needs, t) ?? t("Nothing running yet")}</>;
 }

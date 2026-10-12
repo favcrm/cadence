@@ -979,7 +979,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           ? `New ${draftLabel} conversation (unsaved)`
           : "New conversation (unsaved)"
         : active.selected !== null
-          ? conversationLabel(active.selected, selectedIndex, subjects)
+          ? conversationLabel(active.selected, selectedIndex, subjects, t)
           : null;
 
   return (
@@ -1056,7 +1056,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
                 setHistoryOpen(false);
               }}
             >
-              {conversationLabel(c, i, subjects)}
+              {conversationLabel(c, i, subjects, t)}
             </button>
           ))}
         </div>
@@ -1109,7 +1109,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       )}
       {active.requestError !== null && (
         <p className="text-label text-fail" role="alert" data-chat-link-error>
-          {active.requestError}
+          {t(active.requestError)}
         </p>
       )}
       {active.state === "failed" && (
@@ -1218,12 +1218,12 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       )}
       {sendError && (
         <p className="text-label text-fail" role="alert">
-          {sendError}
+          {t(sendError)}
         </p>
       )}
       {binding.error !== null && binding.error !== sendError && (
         <p className="text-label text-fail" role="alert" data-chat-binding-error>
-          {binding.error}
+          {t(binding.error)}
         </p>
       )}
       {composerNotice && (
@@ -1297,7 +1297,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
                   return e instanceof ApiError ? e.message : String(e);
                 }
               },
-            })}
+            }, t)}
           </div>
         ))}
       {/* CAD-1168: the shared composer at compact density. The key

@@ -3133,7 +3133,7 @@ function CampaignDetail({
             freeze={freeze}
             tab={tab}
             onTab={setTab}
-            audienceLabel={audienceSummary(pick, audiencePreview)}
+            audienceLabel={audienceSummary(pick, audiencePreview, t)}
             activitySlot={<CampaignSends scope={scope} viewer={viewer} campaignId={campaignId} />}
             audienceSlot={
               <div className="crm-cgrid">
