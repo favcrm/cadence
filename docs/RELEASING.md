@@ -10,17 +10,30 @@ immutable release notes are not appended after publication. This record is not
 authorization for a production rollout, stable promotion, rerun or replacement
 release.
 
-## Stable 0.1.0 preparation (unpublished)
+## Stable 0.1.0 (published, immutable)
 
-The source version is being prepared as **0.1.0**, with matching tag
-**v0.1.0** and stable classification (`prerelease=false`, `latest=true`). This
-is preparation only: a version bump or merged source does not create a tag or
-release. The candidate SHA must be selected from reviewed main after this
-preparation merges, and the tag workflow must pass every required gate and
-native package build before the configured release approval. Until then,
-`v0.1.0` is not available and the beta.2 explicit-tag install remains the
-working public install path. The public stable updater is still not implemented;
-`cadence update`/`upgrade` continue to use the authenticated internal channel.
+[Cadence 0.1.0](https://github.com/favcrm/cadence/releases/tag/v0.1.0)
+is published as the stable release (`prerelease=false`, `latest=true`) from
+source `4066ddab844a318a85c3bc286392ec927a600a5c`, tag run `38201476703`
+attempt 1. Its nine published assets are `install.sh`, the three targets'
+`cadence-v0.1.0-<target>.tar.gz` plus matching `.sha256`, and the x86 leg's
+versioned `cadence-app-toolchain-v0.1.0.tar.gz` pair (CAD-1272). Its release
+notes were `--generate-notes` output only and are immutable with the release;
+this file, not those notes, records corrections. The public stable updater is
+still not implemented; `cadence update`/`upgrade` continue to use the
+authenticated internal channel.
+
+The first publication exposed an x86 artifact/verifier gap fixed under
+CAD-1400: `release-build` zips the toolchain pair into the x86 artifact but
+the acquisition verifier's exact inventory refused it. Tag-run candidate
+`38203278770` installed successfully on aarch64-linux and aarch64-macos; the
+x86_64-linux leg's verifier refused the artifact before installation. From
+CAD-1400 on, the tag run's own `release-install` matrix installs the exact
+candidate on all three targets automatically and `release-publish` cannot
+reach the `release` environment approval until every leg succeeds. Anonymous
+published-install verification of v0.1.0 on the three native targets is
+pending the reviewed workflow's first real run; no such result is claimed
+until then.
 
 The immutable `v0.1.0-beta.1` tag failed its macOS UI build and retains a private
 draft; it has no published installation assets. The beta.2 publication record
@@ -116,10 +129,10 @@ delivery. Hosted remote teams and local-to-cloud production migration remain
 separate acceptance work. The public stable-release updater is not implemented;
 current update/upgrade commands use the authenticated internal CI channel.
 
-Until stable v0.1.0 is published, use the beta.2 explicit tag; the stable
-`latest` convenience URL becomes available only after the stable release passes
-publication. Selecting another installer version is not a coordinated running
-daemon upgrade or compatible state rollback.
+Stable v0.1.0 is now published, so `releases/latest` resolves to it; the beta
+prereleases remain installable only by explicit tag. Selecting another
+installer version is not a coordinated running daemon upgrade or compatible
+state rollback.
 
 ## Stable 0.1.0 evidence annex to complete for the approved candidate
 
@@ -169,10 +182,13 @@ are not sufficient capability or compatibility notes.
    and actual gate/build results. Synthetic workflow-policy tests do not prove
    the real tag event, API side effects or release metadata.
 4. Record tag, source SHA, run URL/attempt, release URL, publisher and approval.
-   Assets must be exactly `install.sh` and each target's
-   `cadence-<tag>-<target>.tar.gz` plus matching `.tar.gz.sha256`.
-   Each archive contains `cadence`, `cadence.sha256`, `manifest.json`.
-   Record archive and installer digests and provenance verification results.
+   Assets must be exactly `install.sh`, each target's
+   `cadence-<tag>-<target>.tar.gz` plus matching `.tar.gz.sha256`, and (since
+   CAD-1272) the x86-produced `cadence-app-toolchain-<tag>.tar.gz` plus
+   `.tar.gz.sha256` — nine assets total. Each target archive contains
+   `cadence`, `cadence.sha256`, `manifest.json`. The workflow re-checks every
+   tarball and the toolchain manifest before attesting; record archive and
+   installer digests and provenance verification results.
 5. CAD-317 verifies the **public URLs** on clean supported systems, without Rust,
    Node, GitHub login or AgenticOS login. Record `--version`, default/custom
    prefix, PATH, rerun and explicit version selection. Local mirror fixtures
@@ -186,3 +202,22 @@ are not sufficient capability or compatibility notes.
 
 Release publication, installing a build, migrating organization state and
 rolling out a production daemon are separate operations with separate evidence.
+
+## Dev-to-release flow (CAD-1400)
+
+One ticket, one PR. The lane worktree passes `scripts/pre-push` locally, then
+exact-head CI and independent review on the PR; operator scope or per-head
+approval (recorded via `cadence audit approve`) precedes
+`scripts/enqueue-reviewed` into the merge queue, which retests on newest
+main. The merged head is the only release candidate: a `v*` tag matching
+Cargo.toml may be created only by the authorized operator under the tag
+ruleset. The tag's own ci.yml run reruns all five gates plus release-gate,
+builds the three native packages (`release-build`), then installs that exact
+candidate natively on all three targets (`release-install`, candidate mode of
+clean-install.py against the same run and attempt — no separate dispatch).
+Only when every leg succeeds may `release-publish` request the `release`
+environment approval, which a human grants. After publication, the published
+mode of clean-install.py verifies the anonymous public URLs on the native
+targets and its results are recorded here and in INSTALL-AGENT.md. No agent
+approves release environments; published bytes and release notes are
+immutable.
