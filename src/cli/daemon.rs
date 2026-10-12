@@ -118,6 +118,7 @@ pub(super) fn run(state_dir: PathBuf, action: DaemonAction) -> Result<i32> {
             // an empty store next to it. `serve` refuses too; this says
             // so before anything is spawned.
             cadence_agent::backup::refuse_interrupted_restore(&state_dir)?;
+            cadence_agent::backup::portable::refuse_if_inactive(&state_dir)?;
             let mut result = client::daemon_start_as(&state_dir, as_identity.as_deref())?;
             // --resume: once the daemon answers, sweep every agent
             // with a stored thread and no live endpoint.

@@ -160,6 +160,16 @@ impl Store {
         Ok((store, outcome.expect("open_adopting always recovers")))
     }
 
+    /// Open the primary store for a manual execution-disabled state dir
+    /// (CAD-1163) without restart recovery. Same gate, preflight, seal and
+    /// schema guards as `open_adopting`; only the recovery sweep is
+    /// skipped, so pending runner, CRM, image and nudge rows stay inert.
+    /// The outcome is the default: nothing was fenced, adopted or claimed.
+    pub(crate) fn open_unrecovered(path: &Path) -> Result<(Self, RecoveryOutcome)> {
+        let (store, _) = Self::open_inner(path, None, true, false, super::seal::OpenMode::Legacy)?;
+        Ok((store, RecoveryOutcome::default()))
+    }
+
     /// Open a live database for a side write that must not run restart
     /// recovery. `app remove` uses this to revoke derived grants while
     /// the daemon still holds the store — recovery would fence the

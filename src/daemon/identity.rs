@@ -326,7 +326,7 @@ impl Shared {
     /// approved command. The token is bound to that pid and that argv.
     /// A descendant, or the same token on a different command, is not
     /// the operator.
-    fn grant_exec_matches(&self, peer_pid: u32) -> bool {
+    pub(super) fn grant_exec_matches(&self, peer_pid: u32) -> bool {
         let Some(token) = peer_environ_var(peer_pid, "CADENCE_GRANT_TOKEN") else {
             return false;
         };

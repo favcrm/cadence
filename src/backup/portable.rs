@@ -1,0 +1,1995 @@
+//! CAD-1163: generic portable coordination package (export and inactive restore).
+//!
+//! Export takes a private online snapshot of the store, projects it to the
+//! coordination profile on that private copy only, runs the existing backup
+//! scrub/scan/integrity checks on it, copies a pinned clean tracker commit,
+//! and publishes the staged package with a no-replace rename only after
+//! every member and the manifest are written. The source store and tracker
+//! are only read and never written.
+//!
+//! Restore verifies every manifest member before writing, stages the core
+//! store and tracker privately, and commits inactive: no actor is enabled,
+//! no session or dispatch starts, and no default changes. Replacement and
+//! activation remain refused until native operator admission is wired.
+
+use std::ffi::CString;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Component, Path, PathBuf};
+use std::process::Command;
+
+use rusqlite::{Connection, OpenFlags};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+
+use super::{inspect, quote_ident, require_ok, scan_db, scrub, snapshot, sync_dir};
+use crate::error::{Error, Result};
+use crate::rollout::db_file;
+use crate::secret::Allowlist;
+
+pub const PORTABLE_FORMAT: &str = "cadence.portable/1";
+pub const INACTIVE_MARKER: &str = "portable-restore.json";
+const PKG_DB: &str = "cadence.sqlite3";
+const PKG_MANIFEST: &str = "manifest.json";
+const PKG_TRACKER: &str = "tracker";
+/// Where the restored tracker lives inside a destination state dir.
+const TRACKER_DIR: &str = "portable-tracker";
+
+/// Coordinator data carried by the coordination profile.
+const COORDINATION: &[&str] = &[
+    "schema_version",
+    "agents",
+    "messages",
+    "events",
+    "jobs",
+    "tasks",
+    "verdicts",
+    "threads",
+    "thread_entries",
+    "monitors",
+    "monitor_tasks",
+    "monitor_alerts",
+];
+
+/// Live authority of the source host: nulled on the private copy.
+const NULLED: &[(&str, &str)] = &[
+    ("agents", "generation"),
+    ("agents", "pid"),
+    ("agents", "pid_start"),
+    ("agents", "endpoint"),
+    ("agents", "thread_id"),
+    ("agents", "session_id"),
+    ("agents", "params"),
+    ("messages", "turn_id"),
+];
+
+/// Imported actors and dispatch flags: forced to 0 on the private copy.
+const DISABLED: &[(&str, &str)] = &[
+    ("agents", "enabled"),
+    ("monitors", "dispatch_enabled"),
+    ("monitors", "auto_dispatch_enabled"),
+];
+
+/// The fixed catalog of the 49 store tables with their exact columns.
+/// Export and restore refuse any table or column not listed here.
+const CATALOG: &[(&str, &[&str])] = &[
+    (
+        "agents",
+        &[
+            "alias",
+            "provider",
+            "endpoint_kind",
+            "role",
+            "cwd",
+            "sandbox",
+            "instructions",
+            "thread_id",
+            "session_id",
+            "model",
+            "effort",
+            "pid",
+            "state",
+            "enabled",
+            "error",
+            "created",
+            "updated",
+            "endpoint",
+            "params",
+            "generation",
+            "quota",
+            "team_role",
+            "model_selection",
+            "pid_start",
+        ],
+    ),
+    (
+        "app_bindings",
+        &[
+            "id",
+            "install_id",
+            "context_id",
+            "scope_key",
+            "slot",
+            "revision",
+            "state",
+            "config",
+            "digest",
+            "request_id",
+            "created",
+            "updated",
+        ],
+    ),
+    (
+        "app_capability_claims",
+        &[
+            "run_id",
+            "slot",
+            "step_id",
+            "request_id",
+            "binding_digest",
+            "input_digest",
+            "call_id",
+            "created",
+        ],
+    ),
+    (
+        "app_capability_epochs",
+        &["install_id", "epoch", "digest", "state", "created"],
+    ),
+    (
+        "app_capability_results",
+        &[
+            "id",
+            "run_id",
+            "step_id",
+            "message_id",
+            "turn_id",
+            "slot",
+            "request_id",
+            "binding_digest",
+            "input_digest",
+            "result",
+            "result_digest",
+            "asset_type",
+            "asset_digest",
+            "asset",
+            "created",
+            "receipt_schema",
+        ],
+    ),
+    (
+        "app_contexts",
+        &[
+            "id",
+            "install_id",
+            "request_id",
+            "revision",
+            "state",
+            "config_json",
+            "config_digest",
+            "created",
+            "updated",
+        ],
+    ),
+    (
+        "app_effect_authorizations",
+        &[
+            "effect_id",
+            "install_id",
+            "context_id",
+            "run_id",
+            "artifact_id",
+            "authority",
+            "authority_digest",
+            "input_digest",
+            "release_digest",
+        ],
+    ),
+    (
+        "app_favorites",
+        &["owner", "install_id", "position", "opened_at", "saved"],
+    ),
+    (
+        "app_grants",
+        &[
+            "app",
+            "agent",
+            "platform",
+            "account",
+            "scopes",
+            "granted_at",
+            "by",
+            "install_id",
+        ],
+    ),
+    (
+        "app_install_capabilities",
+        &["install_id", "epoch", "digest", "state", "created"],
+    ),
+    (
+        "app_install_requests",
+        &["id", "catalog_id", "requested_by", "at", "state"],
+    ),
+    (
+        "app_run_artifacts",
+        &[
+            "id",
+            "run_id",
+            "step_id",
+            "message_id",
+            "turn_id",
+            "producer",
+            "digest",
+            "media_type",
+            "content",
+            "created",
+        ],
+    ),
+    (
+        "app_run_failures",
+        &["run_id", "step_id", "kind", "reason", "created"],
+    ),
+    (
+        "app_run_reviews",
+        &[
+            "run_id",
+            "step_id",
+            "artifact_id",
+            "artifact_digest",
+            "reviewer",
+            "message_id",
+            "decision",
+            "rationale",
+            "asset_receipt_id",
+            "asset_digest",
+        ],
+    ),
+    (
+        "app_run_steps",
+        &[
+            "run_id",
+            "step_id",
+            "task_id",
+            "spec",
+            "identity_digest",
+            "state",
+            "message_id",
+            "result_digest",
+        ],
+    ),
+    (
+        "app_runs",
+        &[
+            "id",
+            "install_id",
+            "epoch",
+            "bundle_digest",
+            "snapshot",
+            "snapshot_digest",
+            "project_link",
+            "owner_pm",
+            "request_id",
+            "state",
+            "approved_digest",
+            "created",
+            "updated",
+            "context_id",
+        ],
+    ),
+    (
+        "app_tool_claims",
+        &[
+            "request_id",
+            "install_id",
+            "alias",
+            "slot",
+            "binding_digest",
+            "input_digest",
+            "call_id",
+            "created",
+        ],
+    ),
+    (
+        "app_tool_results",
+        &[
+            "id",
+            "request_id",
+            "install_id",
+            "alias",
+            "slot",
+            "binding_digest",
+            "input_digest",
+            "input",
+            "result",
+            "result_digest",
+            "asset_type",
+            "asset_digest",
+            "asset",
+            "created",
+        ],
+    ),
+    (
+        "app_update_checks",
+        &[
+            "install_id",
+            "checked_at",
+            "proposal_json",
+            "has_update",
+            "version",
+            "access_change_json",
+            "digest",
+        ],
+    ),
+    (
+        "chat_files",
+        &[
+            "id",
+            "sha256",
+            "size",
+            "mime",
+            "name",
+            "scope",
+            "context_id",
+            "uploader",
+            "created",
+        ],
+    ),
+    (
+        "cloud_dispatch_outbox",
+        &[
+            "cursor",
+            "message_id",
+            "source",
+            "task_id",
+            "task_revision",
+            "audience_agent",
+            "expected_head",
+            "payload_digest",
+            "organization_id",
+            "remote_turn_id",
+            "created",
+            "claimed",
+            "cloud_eligible",
+        ],
+    ),
+    ("connection_metadata", &["singleton", "workspace_id"]),
+    (
+        "crm_sends",
+        &[
+            "install_id",
+            "context_id",
+            "send_id",
+            "state",
+            "created",
+            "updated",
+        ],
+    ),
+    ("crm_settings", &["key", "value", "by", "updated"]),
+    (
+        "crm_smtp_links",
+        &[
+            "install_id",
+            "context_id",
+            "connection_id",
+            "auth_revision",
+            "link_revision",
+            "state",
+            "digest",
+            "request_id",
+            "created",
+            "updated",
+        ],
+    ),
+    (
+        "crm_unsubscribe_index",
+        &["token_hash", "install_id", "context_id"],
+    ),
+    ("daemon_build", &["id", "commit_sha", "recorded_at"]),
+    (
+        "events",
+        &["seq", "alias", "kind", "payload", "at", "job_id", "task_id"],
+    ),
+    (
+        "jobs",
+        &[
+            "id",
+            "title",
+            "spec_path",
+            "spec_sha256",
+            "pm_alias",
+            "issue_id",
+            "repo",
+            "base_ref",
+            "state",
+            "max_revisions",
+            "error",
+            "created",
+            "updated",
+            "stall_secs",
+        ],
+    ),
+    (
+        "messages",
+        &[
+            "seq",
+            "id",
+            "alias",
+            "body",
+            "reply_to",
+            "source",
+            "state",
+            "turn_id",
+            "result",
+            "error",
+            "created",
+            "started",
+            "completed",
+            "task_id",
+            "priority",
+            "issue",
+            "worktree",
+        ],
+    ),
+    ("model_defaults", &["id", "revision", "document"]),
+    (
+        "monitor_alerts",
+        &[
+            "seq",
+            "monitor_id",
+            "task_id",
+            "event_seq",
+            "fingerprint",
+            "kind",
+            "payload",
+            "state",
+            "attempts",
+            "last_error",
+            "created",
+            "updated",
+        ],
+    ),
+    ("monitor_tasks", &["monitor_id", "task_id"]),
+    (
+        "monitors",
+        &[
+            "id",
+            "project",
+            "owner",
+            "interval_secs",
+            "state",
+            "heartbeat_at",
+            "last_check_at",
+            "last_success_at",
+            "next_check_at",
+            "event_cursor",
+            "delivery_configured",
+            "delivery_state",
+            "dispatch_enabled",
+            "error",
+            "created",
+            "updated",
+            "auto_dispatch_enabled",
+        ],
+    ),
+    (
+        "platform_credentials",
+        &[
+            "platform",
+            "account",
+            "scopes",
+            "fingerprint",
+            "custody",
+            "exchange",
+            "enrolled_at",
+            "by",
+            "connection_id",
+            "credential_revision",
+        ],
+    ),
+    (
+        "platform_defaults",
+        &["project", "platform", "account", "set_at", "by"],
+    ),
+    (
+        "platform_drafts",
+        &[
+            "id",
+            "agent",
+            "platform",
+            "account",
+            "tool",
+            "label",
+            "input_summary",
+            "artifact",
+            "ran_at",
+        ],
+    ),
+    (
+        "platform_effects",
+        &[
+            "effect_id",
+            "request",
+            "agent",
+            "platform",
+            "account",
+            "tool",
+            "label",
+            "input",
+            "input_summary",
+            "preview",
+            "source_name",
+            "source_hash",
+            "scopes",
+            "task",
+            "state",
+            "close_reason",
+            "decision",
+            "outcome",
+            "needs_you",
+            "staged_at",
+            "updated_at",
+            "authorization_kind",
+        ],
+    ),
+    (
+        "platform_grants",
+        &["agent", "platform", "account", "scopes", "granted_at", "by"],
+    ),
+    (
+        "rollout_grants",
+        &[
+            "id",
+            "alias",
+            "granted_by",
+            "granted_at",
+            "expires_at",
+            "revoked_at",
+            "revoked_by",
+        ],
+    ),
+    (
+        "rollout_leases",
+        &[
+            "id",
+            "holder",
+            "holder_source",
+            "host_note",
+            "reason",
+            "target_commit",
+            "schema_from",
+            "schema_to",
+            "backup_path",
+            "backup_sha256",
+            "backup_schema",
+            "backup_taken_at",
+            "claimed_at",
+            "expires_at",
+            "status",
+            "previous_holder",
+            "ended_at",
+            "end_reason",
+        ],
+    ),
+    ("schema_version", &["version"]),
+    (
+        "social_publish_intents",
+        &[
+            "intent_id",
+            "request",
+            "install_id",
+            "context_id",
+            "run_id",
+            "effect_id",
+            "connection_id",
+            "destination_id",
+            "toolkit",
+            "caption_digest",
+            "image_digest",
+            "media_key",
+            "grant_id",
+            "approval_id",
+            "due_epoch",
+            "timezone",
+            "state",
+            "frozen",
+            "frozen_digest",
+            "receipt",
+            "upstream",
+            "created",
+            "updated",
+        ],
+    ),
+    (
+        "staging_grants",
+        &[
+            "id",
+            "alias",
+            "ops",
+            "state_dir",
+            "granted_by",
+            "granted_at",
+            "expires_at",
+            "revoked_at",
+            "revoked_by",
+            "last_used_at",
+        ],
+    ),
+    (
+        "staging_instances",
+        &[
+            "id",
+            "state_dir",
+            "board_port",
+            "registered_by",
+            "registered_at",
+        ],
+    ),
+    (
+        "tasks",
+        &[
+            "id",
+            "job_id",
+            "title",
+            "role",
+            "assignee",
+            "spec_path",
+            "acceptance",
+            "worktree",
+            "branch",
+            "base_sha",
+            "head_sha",
+            "state",
+            "revision",
+            "dispatch_message",
+            "error",
+            "created",
+            "updated",
+        ],
+    ),
+    (
+        "thread_entries",
+        &[
+            "seq",
+            "thread_id",
+            "role",
+            "kind",
+            "text",
+            "payload",
+            "message_id",
+            "created",
+        ],
+    ),
+    (
+        "threads",
+        &[
+            "id",
+            "alias",
+            "archived_alias",
+            "created",
+            "updated",
+            "install_id",
+            "context_id",
+            "subject",
+            "is_general",
+            "archived",
+            "title",
+        ],
+    ),
+    (
+        "verdicts",
+        &[
+            "seq", "task_id", "revision", "sha", "verdict", "reviewer", "evidence", "message",
+            "created", "verify",
+        ],
+    ),
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    /// Coordinator data and the pinned tracker. Not a full workspace.
+    Coordination,
+}
+
+#[derive(Clone, Debug)]
+pub struct PortableExportOptions {
+    pub scope: Scope,
+    /// The ordinary Git tracker checkout to pin into the package.
+    pub tracker: PathBuf,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct Member {
+    pub path: String,
+    pub bytes: u64,
+    pub sha256: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PortableManifest {
+    pub format: String,
+    pub scope: String,
+    pub full_workspace: bool,
+    pub created_at: String,
+    /// Source workspace UUID: non-authoritative provenance, never the
+    /// destination identity.
+    pub source_uuid: Option<String>,
+    pub cadence: String,
+    pub schema_version: i64,
+    pub tracker_revision: String,
+    /// PM root inside the tracker: `.` for `pm.yaml` at the root, `pm` for a
+    /// nested PM dir, `None` when the tracker holds no `pm.yaml`. Recorded
+    /// at export; restore re-validates the staged copy with `Pm::at`.
+    #[serde(default)]
+    pub pm_root: Option<String>,
+    pub tables: Vec<String>,
+    pub omitted_tables: Vec<String>,
+    /// Rows deleted from the private copy per omitted table.
+    pub omitted_rows: Vec<(String, i64)>,
+    pub nulled_columns: Vec<String>,
+    pub disabled_columns: Vec<String>,
+    pub exclusions: Vec<String>,
+    pub members: Vec<Member>,
+}
+
+/// Restore options. `destination` is the destination state dir (already a
+/// PM path for the coordinator), passed explicitly; nothing is inferred.
+#[derive(Default, Debug)]
+pub struct PortableRestoreOptions {
+    /// Replacement needs native operator admission; refused in this slice.
+    pub replace: bool,
+}
+
+/// Native operator proof for activation (not wired). Defined in
+/// `portable_replace`; re-exported so the activation signature stays.
+pub use super::portable_replace::NativeOperatorProof;
+
+// ---------- export ----------
+
+/// Write a portable coordination package into the new directory `out`.
+pub fn export_portable(
+    state_dir: &Path,
+    out: &Path,
+    opts: &PortableExportOptions,
+) -> Result<Value> {
+    let Scope::Coordination = opts.scope;
+    let live = db_file(state_dir);
+    if !live.is_file() {
+        return Err(Error::rejected(format!(
+            "no cadence database at {}",
+            live.display()
+        )));
+    }
+    refuse_existing(out)?;
+    let allow = Allowlist::load(state_dir)?;
+    let head = admit_tracker(&opts.tracker)?;
+    let staging = private_staging(out)?;
+    match build_package(&live, &staging, &opts.tracker, &head, &allow) {
+        Ok(manifest) => publish(&staging, out, &manifest),
+        Err(error) => {
+            let _ = fs::remove_dir_all(&staging);
+            Err(error)
+        }
+    }
+}
+
+/// `export_portable` with an explicit app selection. No app schema is
+/// supported by the coordination format yet, so any selected app refuses
+/// before the store, tracker or output path is touched. Names are opaque
+/// diagnostics, quoted and never interpreted as paths. An empty selection is
+/// the coordination-only export.
+pub fn export_portable_selected(
+    state_dir: &Path,
+    out: &Path,
+    opts: &PortableExportOptions,
+    apps: &[String],
+) -> Result<Value> {
+    if let Some(app) = apps.first() {
+        return Err(Error::rejected(format!(
+            "app {app:?} has no supported portable schema; the coordination format exports no app data, so nothing was written"
+        )));
+    }
+    export_portable(state_dir, out, opts)
+}
+
+fn refuse_existing(out: &Path) -> Result<()> {
+    if out.symlink_metadata().is_ok() {
+        return Err(Error::rejected(format!(
+            "{} already exists; export writes a new directory",
+            out.display()
+        )));
+    }
+    Ok(())
+}
+
+fn private_staging(out: &Path) -> Result<PathBuf> {
+    let parent = out
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::create_dir_all(parent)?;
+    let name = out
+        .file_name()
+        .ok_or_else(|| Error::rejected("export output needs a directory name"))?;
+    let staging = parent.join(format!(
+        ".{}.partial-{}",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
+    if staging.symlink_metadata().is_ok() {
+        return Err(Error::rejected(format!(
+            "{} exists from an earlier attempt; remove it after inspection",
+            staging.display()
+        )));
+    }
+    fs::DirBuilder::new().mode(0o700).create(&staging)?;
+    Ok(staging)
+}
+
+fn build_package(
+    live: &Path,
+    staging: &Path,
+    tracker: &Path,
+    head: &str,
+    allow: &Allowlist,
+) -> Result<PortableManifest> {
+    let db = staging.join(PKG_DB);
+    // Private online snapshot; the live store is only read.
+    snapshot(live, &db)?;
+    let source_uuid = read_source_uuid(&db)?;
+    check_catalog(&db)?;
+    let omitted_rows = project(&db)?;
+    // Existing redaction on the private copy, then a read-only secret scan
+    // and integrity check of the projected copy.
+    scrub(&db)?;
+    scan_db(&db, allow)?;
+    let (integrity, schema) = inspect(&db)?;
+    require_ok(&db, &integrity)?;
+    let tracker_dir = staging.join(PKG_TRACKER);
+    copy_tracker(tracker, &tracker_dir, head)?;
+    let pm_root = pm_root_of(&tracker_dir)?;
+    let mut members = vec![member_for(&db, PKG_DB)?];
+    members.extend(tracker_members(staging, &tracker_dir)?);
+    let manifest = PortableManifest {
+        pm_root,
+        format: PORTABLE_FORMAT.into(),
+        scope: "coordination".into(),
+        full_workspace: false,
+        created_at: crate::issue::time::iso(now_secs() as i64),
+        source_uuid,
+        cadence: env!("CARGO_PKG_VERSION").into(),
+        schema_version: schema,
+        tracker_revision: head.into(),
+        tables: COORDINATION.iter().map(|t| t.to_string()).collect(),
+        omitted_tables: omitted_names().iter().map(|t| t.to_string()).collect(),
+        omitted_rows,
+        nulled_columns: NULLED.iter().map(|(t, c)| format!("{t}.{c}")).collect(),
+        disabled_columns: DISABLED.iter().map(|(t, c)| format!("{t}.{c}")).collect(),
+        exclusions: exclusions(),
+        members,
+    };
+    let text = serde_json::to_string_pretty(&manifest)?;
+    write_private(&staging.join(PKG_MANIFEST), text.as_bytes())?;
+    Ok(manifest)
+}
+
+/// Every known table outside the coordination profile, in catalog order:
+/// provenance, authority, then business app data. `project` deletes exactly
+/// this set from the private copy and the manifest lists exactly this set.
+fn omitted_names() -> Vec<&'static str> {
+    CATALOG
+        .iter()
+        .map(|(t, _)| *t)
+        .filter(|t| !COORDINATION.contains(t))
+        .collect()
+}
+
+fn read_source_uuid(db: &Path) -> Result<Option<String>> {
+    let conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let has: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='connection_metadata'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has == 0 {
+        return Ok(None);
+    }
+    Ok(conn
+        .query_row(
+            "SELECT workspace_id FROM connection_metadata WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )
+        .ok())
+}
+
+/// Every table and column in the private copy must match the fixed catalog
+/// exactly. Unknown tables or columns refuse; no prefix is trusted.
+fn check_catalog(db: &Path) -> Result<()> {
+    let conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let tables: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY name")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for table in &tables {
+        let Some((_, expected)) = CATALOG.iter().find(|(t, _)| t == table) else {
+            return Err(Error::rejected(format!(
+                "portable export refuses: table {table} is not in the known store catalog"
+            )));
+        };
+        let cols: Vec<String> = conn
+            .prepare(&format!(
+                "SELECT name FROM pragma_table_info({})",
+                sql_string(table)
+            ))?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        if cols.iter().map(String::as_str).ne(expected.iter().copied()) {
+            return Err(Error::rejected(format!(
+                "portable export refuses: table {table} columns do not match the known catalog"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn sql_string(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// Project the private copy to the coordination profile. Known omitted
+/// tables are deleted here (the source is never touched) and their row
+/// counts recorded. Returns `(table, rows_removed)`.
+fn project(db: &Path) -> Result<Vec<(String, i64)>> {
+    let conn = Connection::open(db)?;
+    let mut omitted = Vec::new();
+    let tx = conn.unchecked_transaction()?;
+    for table in omitted_names() {
+        let rows: i64 = tx.query_row(
+            &format!("SELECT count(*) FROM {}", quote_ident(table)),
+            [],
+            |r| r.get(0),
+        )?;
+        omitted.push((table.to_string(), rows));
+        tx.execute(&format!("DELETE FROM {}", quote_ident(table)), [])?;
+    }
+    for (table, column) in NULLED {
+        tx.execute(&format!("UPDATE {table} SET {column}=NULL"), [])?;
+    }
+    for (table, column) in DISABLED {
+        tx.execute(&format!("UPDATE {table} SET {column}=0"), [])?;
+    }
+    tx.commit()?;
+    conn.execute_batch("VACUUM")?;
+    Ok(omitted)
+}
+
+// ---------- tracker admission and copy ----------
+
+/// Admit an ordinary Git tracker before any git reader runs. The checks are
+/// on metadata only: `.git` must be a real directory; no `objects/info/alternates`,
+/// no `commondir`/`gitdir` redirection, no `worktrees`, `modules` or `info/grafts`,
+/// no config `include`, no `hooks` entries beyond `.sample`, no symlink or
+/// hardlink inside `.git`. The tracker must be clean. Returns HEAD.
+pub fn admit_tracker(tracker: &Path) -> Result<String> {
+    let refuse =
+        |why: &str| Error::rejected(format!("tracker {} refused: {why}", tracker.display()));
+    let dotgit = tracker.join(".git");
+    let meta = fs::symlink_metadata(&dotgit)
+        .map_err(|_| refuse("not an ordinary checkout (.git missing)"))?;
+    if !meta.is_dir() {
+        return Err(refuse(
+            ".git is not a plain directory (gitfile or linked worktree)",
+        ));
+    }
+    for banned in [
+        "commondir",
+        "gitdir",
+        "objects/info/alternates",
+        "info/grafts",
+        "modules",
+        "worktrees",
+        "shallow",
+    ] {
+        if fs::symlink_metadata(dotgit.join(banned)).is_ok() {
+            return Err(refuse(&format!("{banned} is present; unsupported layout")));
+        }
+    }
+    let hooks = dotgit.join("hooks");
+    if hooks.is_dir() && has_active_hooks(&hooks)? {
+        return Err(refuse("active git hooks"));
+    }
+    check_metadata_tree(&dotgit, tracker)?;
+    check_config_keys(&dotgit.join("config"), tracker)?;
+    let status = git_plain(
+        tracker,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    )?;
+    if !status.trim().is_empty() {
+        return Err(refuse("not clean; commit or stash before export"));
+    }
+    git_plain(tracker, &["rev-parse", "--verify", "HEAD"])
+}
+
+/// Read `.git/config` as keys only, before git loads it. Includes and
+/// conditional includes refuse, as do keys that name a path or command git
+/// would run or read elsewhere. No values enter any evidence.
+fn check_config_keys(config: &Path, tracker: &Path) -> Result<()> {
+    let refuse =
+        |why: String| Error::rejected(format!("tracker {} refused: {why}", tracker.display()));
+    let text = match fs::read(config) {
+        Ok(b) => b,
+        Err(_) => return Err(refuse("unreadable .git/config".into())),
+    };
+    let text = String::from_utf8(text).map_err(|_| refuse("non-UTF-8 .git/config".into()))?;
+    let mut section = String::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some(head) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            let name = head
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if name == "include" || name == "includeif" {
+                return Err(refuse(format!("config {name} section is not supported")));
+            }
+            section = name;
+            continue;
+        }
+        let key = line
+            .split(['=', ' ', '\t'])
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        let full = format!("{section}.{key}");
+        const PATH_OR_COMMAND: &[&str] = &[
+            "core.worktree",
+            "core.hookspath",
+            "core.attributesfile",
+            "core.fsmonitor",
+            "core.gitproxy",
+            "core.sshcommand",
+            "core.askpass",
+            "core.pager",
+            "core.editor",
+            "core.alternaterefscommand",
+            "core.alternaterefsprefixes",
+            "core.excludesfile",
+            "core.commongitdir",
+        ];
+        if PATH_OR_COMMAND.contains(&full.as_str()) {
+            return Err(refuse(format!(
+                "config key {full} names a path or command; not supported"
+            )));
+        }
+        if key.starts_with("include") {
+            return Err(refuse(format!("config key {full} is an include directive")));
+        }
+    }
+    Ok(())
+}
+
+/// Walk `.git` metadata without following links. Every entry must be a
+/// regular file or directory owned by the current user; a symlink, device,
+/// hardlinked file, or foreign owner refuses.
+fn check_metadata_tree(dir: &Path, tracker: &Path) -> Result<()> {
+    let me = unsafe { libc::geteuid() };
+    let mut count = 0u64;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in fs::read_dir(&d)? {
+            let entry = entry?;
+            count += 1;
+            if count > 10_000 {
+                return Err(Error::rejected(format!(
+                    "tracker {} refused: metadata inventory exceeds 10000 entries",
+                    tracker.display()
+                )));
+            }
+            let path = entry.path();
+            let meta = path.symlink_metadata()?;
+            if meta.file_type().is_symlink() {
+                return Err(Error::rejected(format!(
+                    "tracker {} refused: symlink in .git metadata",
+                    tracker.display()
+                )));
+            }
+            if meta.uid() != me {
+                return Err(Error::rejected(format!(
+                    "tracker {} refused: foreign-owned .git metadata",
+                    tracker.display()
+                )));
+            }
+            if meta.is_dir() {
+                stack.push(path);
+            } else if !meta.is_file() || meta.nlink() > 1 {
+                return Err(Error::rejected(format!(
+                    "tracker {} refused: special or hardlinked .git entry",
+                    tracker.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Active hooks refuse, except the exact native-managed hooks that
+/// `issue init` installs (same name, same bytes, regular single-link file).
+/// Those never run here: every git call disables hooks.
+fn has_active_hooks(dir: &Path) -> Result<bool> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".sample") {
+            continue;
+        }
+        let path = entry.path();
+        let meta = path.symlink_metadata()?;
+        if !meta.is_file() || meta.nlink() > 1 {
+            return Ok(true);
+        }
+        let native = crate::issue::hooks::HOOKS
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, bytes)| bytes.as_bytes());
+        match native {
+            Some(bytes) if fs::read(&path)? == bytes => {}
+            _ => return Ok(true),
+        }
+    }
+    Ok(false)
+}
+
+/// The PM root in a copied tracker: `.` when `pm.yaml` sits at the root,
+/// `pm` when it sits in a `pm/` dir, `None` when neither. Both is ambiguous.
+fn pm_root_of(tracker_dir: &Path) -> Result<Option<String>> {
+    match (
+        tracker_dir.join("pm.yaml").is_file(),
+        tracker_dir.join("pm").join("pm.yaml").is_file(),
+    ) {
+        (true, true) => Err(Error::rejected(
+            "tracker has pm.yaml at its root and in pm/; the PM root is ambiguous",
+        )),
+        (true, false) => Ok(Some(".".into())),
+        (false, true) => Ok(Some("pm".into())),
+        (false, false) => Ok(None),
+    }
+}
+
+/// Run git against a throwaway index copy, with no user, system or global
+/// config, no hooks and no fsmonitor. The tracker's own index is never
+/// refreshed or written.
+fn git_plain(dir: &Path, args: &[&str]) -> Result<String> {
+    let out = git_bytes(dir, args)?;
+    Ok(String::from_utf8_lossy(&out).trim().to_string())
+}
+
+/// Run git and return raw stdout. No UTF-8 conversion and no trimming, so
+/// a blob's bytes (including trailing newlines and non-UTF-8 content) are
+/// exported exactly as committed.
+fn git_bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    let scratch = std::env::temp_dir().join(format!("cad1163-git-{}", nonce()));
+    fs::create_dir_all(&scratch)?;
+    let index = scratch.join("index");
+    let real_index = dir.join(".git").join("index");
+    if real_index.is_file() {
+        fs::copy(&real_index, &index)?;
+    }
+    let mut cmd = Command::new("git");
+    cmd.arg("--git-dir")
+        .arg(dir.join(".git"))
+        .arg("--work-tree")
+        .arg(dir)
+        .args([
+            "--no-optional-locks",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.splitIndex=false",
+        ])
+        .args(args)
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("GIT_INDEX_FILE", &index)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("HOME", &scratch);
+    let out = crate::reaper::output(&mut cmd)
+        .map_err(|e| Error::rejected(format!("git unavailable: {e}")));
+    let _ = fs::remove_dir_all(&scratch);
+    let out = out?;
+    if !out.status.success() {
+        return Err(Error::rejected(format!("git {} failed", args.join(" "))));
+    }
+    Ok(out.stdout)
+}
+
+/// Credential-bearing tracker files: refused by name before any blob is read,
+/// on export and again on restore. A tracker is never copied as a credential store.
+fn check_tracker_path(path: &str) -> Result<()> {
+    let name = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
+    let secret_name = name == ".env"
+        || name.starts_with(".env.")
+        || name.ends_with(".pem")
+        || name.ends_with(".key")
+        || name.ends_with(".p12")
+        || name.ends_with(".pfx")
+        || name.starts_with("id_rsa")
+        || name.starts_with("id_ed25519")
+        || name.starts_with("id_ecdsa")
+        || name.starts_with("id_dsa")
+        || matches!(
+            name.as_str(),
+            ".netrc" | ".npmrc" | ".pypirc" | ".git-credentials" | "credentials" | "auth.json"
+        );
+    if secret_name {
+        return Err(Error::rejected(format!(
+            "tracker file {path} is credential-named; the portable tracker refuses it"
+        )));
+    }
+    Ok(())
+}
+
+/// Closed decoder for a portable `pm.yaml`. It mirrors the native `PmConfig`
+/// tree in `src/issue/mod.rs` (and `ReviewRules` in `src/delivery`): the same
+/// field names and value types at every level, with `deny_unknown_fields` so an
+/// extra key at any depth refuses. Native serde ignores unknown keys, so this
+/// mirror is the only place they are rejected. Values are never copied into an
+/// error: a mismatch reports only the generic reason.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)] // validation-only: the fields close the schema, they are not read
+struct PortablePmConfig {
+    schema: u32,
+    #[serde(default)]
+    statuses: Vec<String>,
+    #[serde(default)]
+    link_types: Vec<String>,
+    #[serde(default)]
+    artifact_max_bytes: u64,
+    #[serde(default)]
+    notes_dir: String,
+    #[serde(default)]
+    wiki: PortableWiki,
+    #[serde(default)]
+    review: PortableReview,
+    #[serde(default)]
+    approvals: PortableApprovals,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)] // validation-only: the fields close the schema, they are not read
+struct PortableWiki {
+    #[serde(default)]
+    max_upload_bytes: u64,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)] // validation-only: the fields close the schema, they are not read
+struct PortableReview {
+    #[serde(default)]
+    pair: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    never: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)] // validation-only: the fields close the schema, they are not read
+struct PortableApprovals {
+    #[serde(default)]
+    tailnet_logins: Vec<String>,
+}
+
+/// Top-level `pm.yaml` keys (the closed `PortablePmConfig` field set). Only a
+/// key name is reported, never a value.
+const PM_CONFIG_KEYS: &[&str] = &[
+    "schema",
+    "statuses",
+    "link_types",
+    "artifact_max_bytes",
+    "notes_dir",
+    "wiki",
+    "review",
+    "approvals",
+];
+
+fn check_tracker_content(path: &str, bytes: &[u8]) -> Result<()> {
+    if path != "pm/pm.yaml" && path != "pm.yaml" {
+        return Ok(());
+    }
+    let refuse = |why: &str| Error::rejected(format!("tracker file {path} refused: {why}"));
+    let value: serde_yaml::Value =
+        serde_yaml::from_slice(bytes).map_err(|_| refuse("not valid YAML"))?;
+    let map = value.as_mapping().ok_or_else(|| refuse("not a mapping"))?;
+    for key in map.keys() {
+        let name = key.as_str().ok_or_else(|| refuse("non-string key"))?;
+        if !PM_CONFIG_KEYS.contains(&name) {
+            return Err(refuse(&format!(
+                "unknown top-level key {name}; credential-bearing config is not portable"
+            )));
+        }
+    }
+    serde_yaml::from_value::<PortablePmConfig>(value).map_err(|_| {
+        refuse("does not match the pm.yaml schema (unknown or mistyped key at some level)")
+    })?;
+    Ok(())
+}
+
+/// Copy the tracked regular files at HEAD (no `.git` directory is copied).
+fn copy_tracker(tracker: &Path, dst: &Path, head: &str) -> Result<()> {
+    fs::DirBuilder::new().mode(0o700).create(dst)?;
+    let listing = git_plain(tracker, &["ls-tree", "-r", "-z", "--full-tree", head])?;
+    for record in listing.split('\0').filter(|r| !r.is_empty()) {
+        let (meta, path) = record
+            .split_once('\t')
+            .ok_or_else(|| Error::rejected("malformed tracker listing"))?;
+        let mode = meta.split(' ').next().unwrap_or_default();
+        if mode != "100644" && mode != "100755" {
+            return Err(Error::rejected(format!(
+                "tracker entry {path} has mode {mode}; only regular files are exported"
+            )));
+        }
+        let rel = Path::new(path);
+        if !safe_relative(rel) {
+            return Err(Error::rejected(format!("unsafe tracker path {path}")));
+        }
+        check_tracker_path(path)?;
+        let blob = git_bytes(tracker, &["show", &format!("{head}:{path}")])?;
+        check_tracker_content(path, &blob)?;
+        let target = dst.join(rel);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        write_private_mode(&target, &blob, if mode == "100755" { 0o700 } else { 0o600 })?;
+    }
+    Ok(())
+}
+
+fn safe_relative(path: &Path) -> bool {
+    !path.as_os_str().is_empty() && path.components().all(|c| matches!(c, Component::Normal(_)))
+}
+
+fn tracker_members(root: &Path, dir: &Path) -> Result<Vec<Member>> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in fs::read_dir(&d)? {
+            let path = entry?.path();
+            let meta = path.symlink_metadata()?;
+            if meta.file_type().is_symlink() {
+                return Err(Error::rejected("tracker copy contains a symlink"));
+            }
+            if meta.is_dir() {
+                stack.push(path);
+            } else {
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .into_owned();
+                out.push(member_for(&path, &rel)?);
+            }
+        }
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
+fn member_for(file: &Path, rel: &str) -> Result<Member> {
+    let (sha256, bytes) = hash_file(file)?;
+    Ok(Member {
+        path: rel.to_string(),
+        bytes,
+        sha256,
+    })
+}
+
+fn hash_file(path: &Path) -> Result<(String, u64)> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        total += n as u64;
+    }
+    Ok((format!("{:x}", hasher.finalize()), total))
+}
+
+fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_private_mode(path, bytes, 0o600)
+}
+
+fn write_private_mode(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    f.write_all(bytes)?;
+    f.set_permissions(fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+
+// ---------- publish ----------
+
+/// Publish the staged package as `out` with a no-replace rename. A
+/// concurrently created `out` makes the rename fail rather than replace it.
+fn publish(staging: &Path, out: &Path, manifest: &PortableManifest) -> Result<Value> {
+    if let Err(e) = rename_noreplace(staging, out) {
+        let _ = fs::remove_dir_all(staging);
+        return Err(e);
+    }
+    Ok(json!({
+        "portable": true,
+        "bundle": out,
+        "format": manifest.format,
+        "scope": manifest.scope,
+        "full_workspace": manifest.full_workspace,
+        "tracker_revision": manifest.tracker_revision,
+        "schema_version": manifest.schema_version,
+        "members": manifest.members.len(),
+        "tables": manifest.tables,
+        "omitted_tables": manifest.omitted_tables,
+        "omitted_rows": manifest.omitted_rows,
+        "exclusions": manifest.exclusions,
+    }))
+}
+
+/// `renameat2(RENAME_NOREPLACE)`: fails with EEXIST when `dst` exists.
+fn rename_noreplace(src: &Path, dst: &Path) -> Result<()> {
+    let s =
+        CString::new(src.as_os_str().as_bytes()).map_err(|_| Error::rejected("path has NUL"))?;
+    let d =
+        CString::new(dst.as_os_str().as_bytes()).map_err(|_| Error::rejected("path has NUL"))?;
+    let rc = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            s.as_ptr(),
+            libc::AT_FDCWD,
+            d.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(if err.raw_os_error() == Some(libc::EEXIST) {
+            Error::rejected(format!(
+                "{} already exists; export will not replace it",
+                dst.display()
+            ))
+        } else {
+            Error::rejected(format!("cannot publish {}: {err}", dst.display()))
+        });
+    }
+    Ok(())
+}
+
+fn exclusions() -> Vec<String> {
+    [
+        "authority: platform_credentials, platform_grants, platform_defaults, platform_drafts, platform_effects, app_grants, rollout_grants, rollout_leases, staging_grants, staging_instances, daemon_build (rows deleted from the private copy)",
+        "live execution authority nulled: agents.generation, pid, pid_start, endpoint, thread_id, session_id, params; messages.turn_id; token-shaped values redacted by the existing scrub",
+        "imported actors disabled: agents.enabled=0; monitors dispatch flags=0",
+        "provenance purged: connection_metadata (source UUID recorded in the manifest only), model_defaults",
+        "business app data outside the coordination profile: app_*, crm_*, social_publish_intents, cloud_dispatch_outbox, chat_files (rows deleted from the private copy; declared omitted, not a full workspace)",
+        "local checkouts, process identity, sockets and runtime files: not included",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+fn now_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+// ---------- inactive restore ----------
+
+/// Name of the commit journal. Its presence means a restore is mid-publish
+/// and the destination must not start until recovered by the operator.
+const JOURNAL: &str = "portable-restore.journal";
+
+/// Restore a portable package into `destination`, an explicit state dir.
+///
+/// Transaction, in order:
+/// 1. Verify the package members and manifest (bytes, digests, paths, types).
+/// 2. Take the destination's `cadence.lock` (the same `flock` a daemon holds)
+///    and refuse a destination that is not empty or has leftovers.
+/// 3. Stage the core store and tracker in a fresh private directory whose
+///    name carries a random nonce, never a fixed name a caller could own.
+/// 4. Validate the staged store (catalog, exact columns, authority empty,
+///    agents disabled, live fields null, FK check, schema, integrity) and
+///    re-hash every staged member.
+/// 5. Write the journal, then rename the staged set into place, the marker
+///    last inside the staged set so `cadence.sqlite3` never appears without
+///    it. The marker is what stops a daemon from starting over inactive data.
+///
+/// Any failure before step 5 leaves the destination byte-identical.
+pub fn restore_inactive(
+    source: &Path,
+    destination: &Path,
+    opts: &PortableRestoreOptions,
+) -> Result<Value> {
+    if opts.replace {
+        return Err(Error::rejected(
+            "replacing a destination needs native operator admission, which is not wired yet; nothing was written",
+        ));
+    }
+    let manifest = verify_package(source)?;
+    refuse_nonempty(destination)?;
+    let parent = destination
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    if !parent.is_dir() {
+        return Err(Error::rejected(
+            "destination parent directory does not exist",
+        ));
+    }
+    // No parent lock: the parent is not the daemon's state dir, and a flock
+    // there would only create an unrelated `cadence.lock`. The destination
+    // is new-only, so the no-replace rename at publish is the race guard: a
+    // concurrent create makes it fail and nothing is merged.
+    refuse_nonempty(destination)?;
+    // The whole inactive set is staged beside the destination and published
+    // with one no-replace rename: DB, tracker and marker appear together or
+    // not at all.
+    let stage = parent.join(format!(".portable-stage-{}", nonce()));
+    fs::DirBuilder::new().mode(0o700).create(&stage)?;
+    if let Err(error) = stage_and_validate(source, &stage, &manifest) {
+        let _ = fs::remove_dir_all(&stage);
+        return Err(error);
+    }
+    publish_stage(&stage, destination)?;
+    Ok(json!({
+        "restored": true,
+        "state": "committed_inactive",
+        "destination": destination,
+        "pm_dir": manifest.pm_root.as_deref().map(|rel| destination.join(TRACKER_DIR).join(rel)),
+        "tracker_revision": manifest.tracker_revision,
+        "schema_version": manifest.schema_version,
+        "members": manifest.members.len(),
+    }))
+}
+
+fn nonce() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// Copy the core and tracker into `stage`, verify the copies, write the
+/// inactive marker, and re-hash every staged member before commit.
+fn stage_and_validate(source: &Path, stage: &Path, manifest: &PortableManifest) -> Result<()> {
+    stage_members_and_validate(source, stage, manifest)?;
+    // A managed root carries the daemon's zero-byte lock inode, created
+    // here by the restore that publishes it (replacement never creates it).
+    crate::backup::portable_replace::create_stage_lock(stage)?;
+    write_private(
+        &stage.join(INACTIVE_MARKER),
+        serde_json::to_string_pretty(&restore_marker(manifest))?.as_bytes(),
+    )?;
+    verify_staged_members(stage, manifest)
+}
+
+/// The inactive marker for a fresh restore. Replacement writes its own
+/// marker with a fresh generation.
+fn restore_marker(manifest: &PortableManifest) -> Value {
+    json!({
+        "state": "committed_inactive",
+        "format": manifest.format,
+        "tracker_revision": manifest.tracker_revision,
+        "source_uuid": manifest.source_uuid,
+        "schema_version": manifest.schema_version,
+        "members": manifest.members.len(),
+        "activation": "not performed; native operator admission required",
+    })
+}
+
+/// Copy and validate the core store and tracker into `stage`. No marker.
+fn stage_members_and_validate(
+    source: &Path,
+    stage: &Path,
+    manifest: &PortableManifest,
+) -> Result<()> {
+    let db = stage.join(PKG_DB);
+    copy_private_file(&source.join(PKG_DB), &db)?;
+    copy_tree(&source.join(PKG_TRACKER), &stage.join(TRACKER_DIR))?;
+    validate_staged_store(&db, manifest)?;
+    verify_tracker_content(&stage.join(TRACKER_DIR), manifest)?;
+    if let Some(rel) = manifest.pm_root.as_deref() {
+        crate::issue::Pm::at(&stage.join(TRACKER_DIR).join(rel))?;
+    }
+    Ok(())
+}
+
+/// Re-hash every staged core and tracker member immediately before commit:
+/// a source change after verify but before copy must not survive.
+fn verify_staged_members(stage: &Path, manifest: &PortableManifest) -> Result<()> {
+    for m in manifest.members.iter() {
+        let staged = match m.path.strip_prefix(&format!("{PKG_TRACKER}/")) {
+            Some(rel) => stage.join(TRACKER_DIR).join(rel),
+            None => stage.join(&m.path),
+        };
+        let (sha, bytes) = hash_file(&staged)?;
+        if sha != m.sha256 || bytes != m.bytes {
+            return Err(Error::rejected(format!(
+                "staged member {} does not match the manifest",
+                m.path
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Publish the verified stage as the destination in one no-replace rename.
+/// A destination that appears concurrently makes the rename fail, and the
+/// stage is removed; nothing is ever merged into or overwritten inside an
+/// existing destination.
+fn publish_stage(stage: &Path, destination: &Path) -> Result<()> {
+    if let Err(error) = rename_noreplace(stage, destination) {
+        let _ = fs::remove_dir_all(stage);
+        return Err(error);
+    }
+    if let Some(parent) = destination.parent() {
+        sync_dir(parent);
+    }
+    Ok(())
+}
+
+/// Read the manifest and verify every listed member: plain relative paths,
+/// the exact member set (core store plus tracker files, nothing else),
+/// exact bytes and sha256, and only regular non-linked files.
+fn verify_package(source: &Path) -> Result<PortableManifest> {
+    let text = fs::read_to_string(source.join(PKG_MANIFEST))
+        .map_err(|e| Error::rejected(format!("cannot read manifest: {e}")))?;
+    let manifest: PortableManifest = serde_json::from_str(&text)
+        .map_err(|e| Error::rejected(format!("malformed manifest: {e}")))?;
+    if manifest.format != PORTABLE_FORMAT
+        || manifest.scope != "coordination"
+        || manifest.full_workspace
+    {
+        return Err(Error::rejected(
+            "manifest is not a coordination portable package",
+        ));
+    }
+    if !matches!(manifest.pm_root.as_deref(), None | Some(".") | Some("pm")) {
+        return Err(Error::rejected(
+            "manifest pm_root is not an admitted PM root",
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for m in &manifest.members {
+        let rel = Path::new(&m.path);
+        if !safe_relative(rel) {
+            return Err(Error::rejected(format!("unsafe member path {}", m.path)));
+        }
+        if m.path != PKG_DB && !m.path.starts_with(&format!("{PKG_TRACKER}/")) {
+            return Err(Error::rejected(format!(
+                "member {} is outside the core store and tracker",
+                m.path
+            )));
+        }
+        if !seen.insert(m.path.clone()) {
+            return Err(Error::rejected(format!("duplicate member {}", m.path)));
+        }
+        if let Some(tracked) = m.path.strip_prefix(&format!("{PKG_TRACKER}/")) {
+            check_tracker_path(tracked)?;
+            let file = source.join(rel);
+            require_regular(&file)?;
+            check_tracker_content(tracked, &fs::read(&file)?)?;
+        }
+        let file = source.join(rel);
+        require_regular(&file)?;
+        let (sha, bytes) = hash_file(&file)
+            .map_err(|_| Error::rejected(format!("member {} missing or unreadable", m.path)))?;
+        if sha != m.sha256 || bytes != m.bytes {
+            return Err(Error::rejected(format!(
+                "member {} changed (digest or size mismatch)",
+                m.path
+            )));
+        }
+    }
+    if !seen.contains(PKG_DB) {
+        return Err(Error::rejected("package has no store member"));
+    }
+    let mut actual = Vec::new();
+    collect_package_members(source, source, &mut actual)?;
+    for p in &actual {
+        if p != PKG_MANIFEST && !seen.contains(p) {
+            return Err(Error::rejected(format!(
+                "package contains unlisted member {p}"
+            )));
+        }
+    }
+    Ok(manifest)
+}
+
+/// A member must be a regular file with a single link: not a symlink,
+/// device, fifo, socket or hardlink.
+fn require_regular(path: &Path) -> Result<()> {
+    let meta = path
+        .symlink_metadata()
+        .map_err(|_| Error::rejected(format!("{} is missing", path.display())))?;
+    if !meta.is_file() || meta.nlink() != 1 {
+        return Err(Error::rejected(format!(
+            "{} is not a plain single-link regular file",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn collect_package_members(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        let meta = path.symlink_metadata()?;
+        if meta.file_type().is_symlink() {
+            return Err(Error::rejected("package contains a symlink"));
+        }
+        if meta.is_dir() {
+            collect_package_members(root, &path, out)?;
+        } else {
+            out.push(
+                path.strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A destination that exists must be an empty directory. Checked before any
+/// create or lock, so a refused restore leaves a nonempty destination untouched.
+fn refuse_nonempty(destination: &Path) -> Result<()> {
+    match destination.symlink_metadata() {
+        Err(_) => Ok(()),
+        Ok(meta) if !meta.is_dir() => {
+            Err(Error::rejected("destination exists and is not a directory"))
+        }
+        Ok(_) => {
+            let any = fs::read_dir(destination)?.next().is_some();
+            if any {
+                return Err(Error::rejected(
+                    "destination is not empty; replacement needs native operator admission",
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Validate the staged store on the receiver: integrity, FK, schema, the
+/// exact closed catalog, and the cell policy. Source identity is read only
+/// from the manifest, never from the staged store.
+fn validate_staged_store(db: &Path, manifest: &PortableManifest) -> Result<()> {
+    let (integrity, schema) = inspect(db)?;
+    require_ok(db, &integrity)?;
+    if schema != manifest.schema_version {
+        return Err(Error::rejected(
+            "staged store schema does not match the manifest",
+        ));
+    }
+    if schema > crate::rollout::SCHEMA_VERSION {
+        return Err(Error::rejected("staged store is newer than this binary"));
+    }
+    check_catalog(db)?;
+    let conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let fk = conn
+        .prepare("PRAGMA foreign_key_check")?
+        .query_map([], |_| Ok(()))?
+        .count();
+    if fk > 0 {
+        return Err(Error::rejected(format!(
+            "staged store has {fk} foreign-key violation(s)"
+        )));
+    }
+    for table in omitted_names() {
+        let rows: i64 = conn.query_row(
+            &format!("SELECT count(*) FROM {}", quote_ident(table)),
+            [],
+            |r| r.get(0),
+        )?;
+        if rows > 0 {
+            return Err(Error::rejected(format!(
+                "staged store carries omitted table {table} ({rows} rows)"
+            )));
+        }
+    }
+    let enabled: i64 = conn.query_row("SELECT count(*) FROM agents WHERE enabled<>0", [], |r| {
+        r.get(0)
+    })?;
+    if enabled > 0 {
+        return Err(Error::rejected("staged store enables imported actors"));
+    }
+    for (table, column) in NULLED {
+        let live: i64 = conn.query_row(
+            &format!("SELECT count(*) FROM {table} WHERE {column} IS NOT NULL"),
+            [],
+            |r| r.get(0),
+        )?;
+        if live > 0 {
+            return Err(Error::rejected(format!(
+                "staged store carries live authority {table}.{column}"
+            )));
+        }
+    }
+    for (table, column) in DISABLED {
+        let on: i64 = conn.query_row(
+            &format!("SELECT count(*) FROM {table} WHERE {column}<>0"),
+            [],
+            |r| r.get(0),
+        )?;
+        if on > 0 {
+            return Err(Error::rejected(format!(
+                "staged store enables {table}.{column}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The tracker copy must match the manifest's tracker members: same set,
+/// same bytes, same digests, and only regular files.
+fn verify_tracker_content(tracker: &Path, manifest: &PortableManifest) -> Result<()> {
+    // Actual members are relative to the tracker dir; manifest members carry
+    // the package's `tracker/` prefix. Compare on the path below that prefix.
+    let prefix = format!("{PKG_TRACKER}/");
+    let actual = tracker_members(tracker.parent().unwrap_or(tracker), tracker)?;
+    let expected: Vec<&Member> = manifest
+        .members
+        .iter()
+        .filter(|m| m.path.starts_with(&prefix))
+        .collect();
+    if actual.len() != expected.len() {
+        return Err(Error::rejected(
+            "tracker copy member set differs from the manifest",
+        ));
+    }
+    for m in expected {
+        let rel = &m.path[prefix.len()..];
+        let want = format!("{TRACKER_DIR}/{rel}");
+        match actual.iter().find(|a| a.path == want) {
+            Some(a) if a.sha256 == m.sha256 && a.bytes == m.bytes => {}
+            _ => {
+                return Err(Error::rejected(format!(
+                    "tracker member {} does not match the manifest",
+                    m.path
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
+fn copy_private_file(src: &Path, dst: &Path) -> Result<()> {
+    require_regular(src)?;
+    let mut input = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(src)?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dst)?;
+    std::io::copy(&mut input, &mut output)?;
+    output.sync_all()?;
+    Ok(())
+}
+
+fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
+    fs::DirBuilder::new().mode(0o700).create(dst)?;
+    let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
+    while let Some((s, d)) = stack.pop() {
+        for entry in fs::read_dir(&s)? {
+            let entry = entry?;
+            let from = entry.path();
+            let to = d.join(entry.file_name());
+            let meta = from.symlink_metadata()?;
+            if meta.is_dir() {
+                fs::DirBuilder::new().mode(0o700).create(&to)?;
+                stack.push((from, to));
+            } else {
+                copy_private_file(&from, &to)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// True when the marker is an `activated` marker (its receipt is checked by
+/// the fence loader, not here).
+fn activated_root(state_dir: &Path) -> bool {
+    fs::read_to_string(state_dir.join(INACTIVE_MARKER))
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .is_some_and(|v| v["state"].as_str() == Some(crate::backup::portable_activate::ACTIVATED))
+}
+
+/// Refuse daemon start while a portable restore is inactive or mid-publish.
+/// Any journal, any marker and any unreadable or malformed marker refuses,
+/// so a damaged marker or a crash mid-publish cannot let a daemon start.
+pub fn refuse_if_inactive(state_dir: &Path) -> Result<()> {
+    // An activated, execution-disabled root is admitted here only; the
+    // fence loader (`portable_fence::load`) then requires its matching
+    // receipt and refuses any mismatch. An inactive marker still refuses.
+    if activated_root(state_dir) {
+        return Ok(());
+    }
+    if state_dir.join(JOURNAL).symlink_metadata().is_ok() {
+        return Err(Error::rejected(format!(
+            "{} holds a portable restore journal (a publish did not finish); inspect and recover before starting the daemon",
+            state_dir.display()
+        )));
+    }
+    let marker = state_dir.join(INACTIVE_MARKER);
+    match fs::symlink_metadata(&marker) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(Error::rejected(format!(
+            "cannot read {}: {e}; refusing to start",
+            marker.display()
+        ))),
+        Ok(_) => {
+            let parsed = fs::read_to_string(&marker)
+                .ok()
+                .and_then(|t| serde_json::from_str::<Value>(&t).ok());
+            let state = parsed
+                .as_ref()
+                .and_then(|v| v["state"].as_str())
+                .unwrap_or("malformed");
+            Err(Error::rejected(format!(
+                "{} holds a portable restore ({state}); activate it through the native operator path before starting the daemon",
+                state_dir.display()
+            )))
+        }
+    }
+}
+
+pub fn activate(_state_dir: &Path, _proof: &NativeOperatorProof) -> Result<Value> {
+    Err(Error::rejected(
+        "activation requires native operator admission, which is not wired yet; the restored data stays inactive",
+    ))
+}
+
+/// Closed verifier for replacement: the same package verification as
+/// [`restore_inactive`], exposed crate-internally.
+pub(crate) fn verify_package_for_replace(source: &Path) -> Result<PortableManifest> {
+    verify_package(source)
+}
+
+/// Stage and validate the complete inactive member set into the empty
+/// private `stage` dir. Writes no marker: replacement writes its own.
+pub(crate) fn stage_inactive_members(
+    source: &Path,
+    stage: &Path,
+    manifest: &PortableManifest,
+) -> Result<()> {
+    stage_members_and_validate(source, stage, manifest)?;
+    verify_staged_members(stage, manifest)
+}

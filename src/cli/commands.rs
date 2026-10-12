@@ -166,6 +166,20 @@ pub(crate) enum Commands {
         /// The bundle directory to create. It must not exist.
         #[arg(long)]
         out: PathBuf,
+        /// Write a portable `cadence.portable/1` package (coordination
+        /// data and the pinned tracker) instead of the legacy bundle.
+        /// Requires `--tracker`; not a full workspace backup.
+        #[arg(long, requires = "tracker")]
+        portable: bool,
+        /// Git tracker checkout to pin into a portable package. Only with
+        /// `--portable`.
+        #[arg(long, requires = "portable")]
+        tracker: Option<PathBuf>,
+        /// Repeatable, with `--portable`: an app whose data to include. No
+        /// app schema is supported yet, so any selection is refused before
+        /// the store or tracker is read or the output is created.
+        #[arg(long = "app", value_name = "APP", requires = "portable")]
+        apps: Vec<String>,
     },
     /// Restore a backup (its `.manifest.json`) or an export bundle (its
     /// directory) into the state dir. Refuses while a daemon holds the
@@ -183,6 +197,59 @@ pub(crate) enum Commands {
         /// it is taken into <state dir>/backups first.
         #[arg(long)]
         force: bool,
+        /// Restore a portable `cadence.portable/1` package (the `source`
+        /// directory) as an INACTIVE store at `--state-dir`. The destination
+        /// must be new and empty. `--repo` and `--force` are refused with it.
+        /// Replacement (`--replace`) and activation (`--activate`) are
+        /// separate actions that need the live controller's operator
+        /// connection.
+        #[arg(long)]
+        portable: bool,
+        /// With `--portable`: read-only preflight; changes nothing. Needs
+        /// `--controller-state`. Without `--activate` it previews a replacement
+        /// of the offline root at `--state-dir` and prints the package and
+        /// target digests and generation for `--replace`. With `--activate` it
+        /// previews activation and prints `package_digest`,
+        /// `destination_digest`, `destination_generation` and
+        /// `required_reconciliation` (copy its entries into the
+        /// `reconciliation` array of an `--activate` file).
+        #[arg(long, requires = "portable", conflicts_with = "replace")]
+        preflight: bool,
+        /// With `--portable`: replace an offline portable root at
+        /// `--state-dir`. Needs the live controller's operator connection
+        /// (`--controller-state`) and the exact `--expected-*` digests from
+        /// `cadence restore --portable --preflight`. The old root is kept as
+        /// a verified rollback sibling; nothing is deleted.
+        #[arg(long, requires = "portable", conflicts_with = "preflight")]
+        replace: bool,
+        /// With `--preflight`, `--replace` or `--activate`: the live
+        /// controller state dir whose operator connection authorizes the
+        /// request. Never inferred.
+        #[arg(long)]
+        controller_state: Option<PathBuf>,
+        /// With `--replace` or `--activate` (not `--preflight`): sha256 of the
+        /// package `manifest.json`, from the preflight output.
+        #[arg(long)]
+        expected_package_digest: Option<String>,
+        /// With `--replace` or `--activate` (not `--preflight`): sha256 digest
+        /// of the complete target set, from the preflight output.
+        #[arg(long)]
+        expected_destination_digest: Option<String>,
+        /// With `--replace` or `--activate` (not `--preflight`): the target
+        /// generation read by preflight.
+        #[arg(long)]
+        expected_generation: Option<String>,
+        /// With `--portable`: activate the inactive root at `--state-dir` in
+        /// manual mode, execution disabled. Needs `--controller-state` and the
+        /// exact `--expected-*` digests from `--activate --preflight`.
+        /// Imported actors stay disabled; nothing is scheduled or dispatched.
+        #[arg(long, requires = "portable", conflicts_with = "replace")]
+        activate: bool,
+        /// With `--activate`: JSON reconciliation file. Its `reconciliation`
+        /// array lists every non-terminal row as retained inert; the file
+        /// must name each one. Omitted means an empty list.
+        #[arg(long, requires = "activate")]
+        reconciliation: Option<PathBuf>,
     },
     /// Manage registered agents.
     Agent {
