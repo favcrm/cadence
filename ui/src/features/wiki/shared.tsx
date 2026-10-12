@@ -127,7 +127,7 @@ export function WikiImage({ path, className, alt }: { path: string; className?: 
       .catch(() => {});
     return () => {
       abort.abort();
-      if (reader?.readyState === FileReader.LOADING) reader.abort();
+      if (reader && reader.readyState === FileReader.LOADING) reader.abort();
       setLoaded(null);
     };
   }, [path, key]);
