@@ -75,6 +75,20 @@ impl Shared {
         sender_of: &dyn Fn(&str) -> Result<store::Sender>,
         steer_caller: &dyn Fn(&str) -> Result<AgentCaller>,
     ) -> Result<Value> {
+        self.send_with_human(params, sender_of, steer_caller, None)
+    }
+
+    /// [`Self::send_with`] carrying the verified human behind an owner
+    /// chat send (CAD-1374). `human` is passed by the daemon's own
+    /// `thread_send` derivation as a typed argument; no request field can
+    /// set it, and every other caller reaches this with `None`.
+    pub(super) fn send_with_human(
+        self: &Arc<Self>,
+        params: &Value,
+        sender_of: &dyn Fn(&str) -> Result<store::Sender>,
+        steer_caller: &dyn Fn(&str) -> Result<AgentCaller>,
+        human: Option<&Value>,
+    ) -> Result<Value> {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
         let text = required_str(params, "text")?;
         let target = self.store.agent_opt(&alias)?;
@@ -432,7 +446,7 @@ impl Shared {
                 "turn_id": stored.turn_id, "delivery": "native_turn_steering", "disposition": stored.result}),
             );
         }
-        let (duplicate, state) = self.store.enqueue_steered(
+        let (duplicate, state) = self.store.enqueue_steered_with_human(
             &alias,
             text,
             reply_to.as_deref(),
@@ -446,6 +460,7 @@ impl Shared {
             refs.as_ref(),
             app.as_ref(),
             attachments.as_ref(),
+            human,
         )?;
         // Each superseded row's `reply_to` got a notice in the same
         // transaction — wake those recipients like `message cancel` does.

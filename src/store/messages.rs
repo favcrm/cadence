@@ -441,6 +441,47 @@ impl Store {
         app: Option<&Value>,
         attachments: Option<&Value>,
     ) -> Result<(bool, String)> {
+        self.enqueue_steered_with_human(
+            alias,
+            body,
+            reply_to,
+            id,
+            source,
+            task_id,
+            issue,
+            worktree,
+            sender,
+            steer,
+            refs,
+            app,
+            attachments,
+            None,
+        )
+    }
+
+    /// [`Self::enqueue_steered`] with the verified human behind an owner
+    /// chat send (CAD-1374). `human` is the daemon's own derivation,
+    /// `{sub, company, session, display}`; every other caller passes
+    /// `None` through `enqueue_steered`. It lands on the thread entry and
+    /// the `queued` event in this transaction, and a retry compares it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_steered_with_human(
+        &self,
+        alias: &str,
+        body: &str,
+        reply_to: Option<&str>,
+        id: &str,
+        source: &str,
+        task_id: Option<&str>,
+        issue: Option<&str>,
+        worktree: Option<&str>,
+        sender: &Sender,
+        steer: &Steer,
+        refs: Option<&Value>,
+        app: Option<&Value>,
+        attachments: Option<&Value>,
+        human: Option<&Value>,
+    ) -> Result<(bool, String)> {
         self.write_tx(|conn| {
             let tx = &mut *conn;
             let mut named: Vec<&str> = Vec::new();
@@ -469,7 +510,7 @@ impl Store {
                     .map(|m| self.supersedable_in(&tx, alias, m))
                     .collect::<Result<Vec<_>>>()?
             };
-            let out = self.enqueue_tx(
+            let out = self.enqueue_tx_human(
                 &tx,
                 alias,
                 body,
@@ -484,6 +525,7 @@ impl Store {
                 refs,
                 app,
                 attachments,
+                human,
             )?;
             for old in &superseded {
                 self.supersede_in(&tx, old, id, steer)?;
@@ -569,6 +611,7 @@ impl Store {
                 &Sender::Unattributed,
                 Priority::Normal,
                 true,
+                None,
                 None,
                 None,
                 None,
@@ -1068,6 +1111,45 @@ impl Store {
         app: Option<&Value>,
         attachments: Option<&Value>,
     ) -> Result<(bool, String)> {
+        self.enqueue_tx_human(
+            tx,
+            alias,
+            body,
+            reply_to,
+            id,
+            source,
+            task_id,
+            issue,
+            worktree,
+            sender,
+            priority,
+            refs,
+            app,
+            attachments,
+            None,
+        )
+    }
+
+    /// [`Self::enqueue_tx`] carrying the verified human (CAD-1374).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn enqueue_tx_human(
+        &self,
+        tx: &impl super::StoreConn,
+        alias: &str,
+        body: &str,
+        reply_to: Option<&str>,
+        id: &str,
+        source: &str,
+        task_id: Option<&str>,
+        issue: Option<&str>,
+        worktree: Option<&str>,
+        sender: &Sender,
+        priority: Priority,
+        refs: Option<&Value>,
+        app: Option<&Value>,
+        attachments: Option<&Value>,
+        human: Option<&Value>,
+    ) -> Result<(bool, String)> {
         self.enqueue_tx_as(
             tx,
             alias,
@@ -1084,6 +1166,7 @@ impl Store {
             refs,
             app,
             attachments,
+            human,
         )
     }
 
@@ -1131,6 +1214,7 @@ impl Store {
         refs: Option<&Value>,
         app: Option<&Value>,
         attachments: Option<&Value>,
+        human: Option<&Value>,
     ) -> Result<(bool, String)> {
         if !daemon {
             crate::proto::caller_message(id, source)?;
@@ -1171,7 +1255,8 @@ impl Store {
                 && old.priority == priority
                 && Self::entry_refs_in(tx, id)? == refs.cloned()
                 && Self::entry_app_in(tx, id)? == app.cloned()
-                && Self::entry_attachments_in(tx, id)? == attachments.cloned();
+                && Self::entry_attachments_in(tx, id)? == attachments.cloned()
+                && Self::entry_human_in(tx, id)? == human.cloned();
             if !same {
                 return Err(Error::rejected(
                     "Message id was already used with different content",
@@ -1207,28 +1292,27 @@ impl Store {
                 recipient_label
             ],
         )?;
-        Self::event_scoped(
-            tx,
-            alias,
-            "queued",
-            json!({
-                "message": id,
-                "source": source,
-                "reply_to": reply_to,
-                "sender": sender.label(),
-                "recipient_identity": reply_recipient
-                    .as_ref()
-                    .map(Self::agent_identity)
-                    // A topic notice binds its own recipient's identity: the
-                    // claim's alias-reuse fence compares it with the live row.
-                    .or_else(|| {
-                        (source == crate::proto::TOPIC_NOTICE_SOURCE)
-                            .then(|| Self::agent_identity(&recipient))
-                    }),
-            }),
-            None,
-            task_id,
-        )?;
+        let mut queued = json!({
+            "message": id,
+            "source": source,
+            "reply_to": reply_to,
+            "sender": sender.label(),
+            "recipient_identity": reply_recipient
+                .as_ref()
+                .map(Self::agent_identity)
+                // A topic notice binds its own recipient's identity: the
+                // claim's alias-reuse fence compares it with the live row.
+                .or_else(|| {
+                    (source == crate::proto::TOPIC_NOTICE_SOURCE)
+                        .then(|| Self::agent_identity(&recipient))
+                }),
+        });
+        // CAD-1374: the verified human is recorded only when present, so a
+        // legacy enqueue keeps the exact event shape it always had.
+        if let Some(human) = human {
+            queued["human"] = human.clone();
+        }
+        Self::event_scoped(tx, alias, "queued", queued, None, task_id)?;
         if source != "app_run_dispatch" {
             Self::thread_note_enqueued(
                 tx,
@@ -1240,6 +1324,7 @@ impl Store {
                 refs,
                 app,
                 attachments,
+                human,
             )?;
         }
         Ok((false, "queued".to_string()))
@@ -2114,13 +2199,44 @@ impl Store {
     /// Bound a non-agent event stream to its newest `keep` rows — the
     /// daemon's `wal_checkpointed` stream has no agents row, so the
     /// agent-removal `DELETE` never reaches it.
+    ///
+    /// On the daemon stream an open mutation intent is not pruned: a
+    /// `prepared` row survives until its matching `finished` row exists
+    /// (same request, correlation, company, action and resource, schema 1,
+    /// a valid outcome for its kind). A `pm_mutation_prepared` row has no
+    /// SQLite finish, so it is always kept: its completion is proven only by
+    /// the Git commit trailer, which this statement cannot read. Malformed or
+    /// unmatched identity keeps the row. Protected rows are kept in addition
+    /// to the newest `keep`; ordinary rows follow the cap as before.
     pub fn prune_stream(&self, alias: &str, keep: i64) -> Result<()> {
         self.write_tx(|conn| {
             conn.execute(
                 "DELETE FROM events WHERE alias=?1 AND seq NOT IN (
                              SELECT seq FROM events WHERE alias=?1
-                             ORDER BY seq DESC LIMIT ?2)",
-                params![alias, keep],
+                             ORDER BY seq DESC LIMIT ?2)
+                 AND NOT (alias=?3 AND (
+                     kind='pm_mutation_prepared'
+                     OR (kind IN ('app_workspace_mutation_prepared','board_session_mutation_prepared')
+                         AND NOT EXISTS (SELECT 1 FROM events f
+                             WHERE f.alias=events.alias
+                             AND f.kind=CASE events.kind
+                                 WHEN 'app_workspace_mutation_prepared'
+                                 THEN 'app_workspace_mutation_finished'
+                                 ELSE 'board_session_mutation_finished' END
+                             AND CASE f.kind
+                                 WHEN 'app_workspace_mutation_finished'
+                                 THEN json_extract(f.payload,'$.outcome') IN
+                                     ('installed','removed','already_removed','restored',
+                                      'already_live_consent_recorded','already_live','refused','uncertain')
+                                 ELSE json_extract(f.payload,'$.outcome') IN ('completed','uncertain') END
+                             AND json_extract(f.payload,'$.schema_version')=1
+                             AND json_extract(events.payload,'$.schema_version')=1
+                             AND json_extract(f.payload,'$.request_id')=json_extract(events.payload,'$.request_id')
+                             AND json_extract(f.payload,'$.correlation_id')=json_extract(events.payload,'$.correlation_id')
+                             AND json_extract(f.payload,'$.company') IS json_extract(events.payload,'$.company')
+                             AND json_extract(f.payload,'$.action')=json_extract(events.payload,'$.action')
+                             AND json_extract(f.payload,'$.resource')=json_extract(events.payload,'$.resource')))))",
+                params![alias, keep, Self::DAEMON_STREAM],
             )?;
             Ok(())
         })

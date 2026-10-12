@@ -786,7 +786,14 @@ pub(crate) fn install(
 ) -> Result<Value> {
     let _ = state; // Caller must pass the daemon's connection-bound operator gate.
     let (files, validated, provenance) = resolved_bundle(pm, source)?;
-    install_resolved(pm, files, validated, provenance, expected_digest)
+    install_resolved(
+        pm,
+        files,
+        validated,
+        provenance,
+        expected_digest,
+        &|| Ok(()),
+    )
 }
 
 /// The one journaled install apply, shared by a source install and a
@@ -799,6 +806,7 @@ fn install_resolved(
     validated: app::Validated,
     provenance: app::Source,
     expected_digest: Option<&str>,
+    guard: &dyn Fn() -> Result<()>,
 ) -> Result<Value> {
     // Refuse a changed bundle before the lock, the catalog read or any write.
     if let Some(expected) = expected_digest {
@@ -847,6 +855,9 @@ fn install_resolved(
             "workspace install journal exceeds its limit",
         ));
     }
+    // CAD-1374: the fresh authority is re-proved under the PM lock, before
+    // the first mutation. A refusal here leaves no bytes or journal behind.
+    guard()?;
     root.mkdir(Path::new(".apps"))?;
     root.mkdir(Path::new(".apps/install-journals"))?;
     root.put(&journal_path(&id), &text)?;
@@ -2020,16 +2031,23 @@ fn builtin_bundle(
     Ok((files, validated, provenance))
 }
 
-/// CAD-1129/1194: install the host's embedded built-in bundle
-/// `catalog_id` — `app_workspace_install_entry` with `source`
-/// pre-resolved by the daemon. The same journaled apply and the same
-/// digest gate as `install`; `expected_digest` is the pin the
-/// `builtin:<id>` install-check returned and is not optional here, so a
-/// board install of a built-in always consents to checked bytes. A
-/// second workspace install of the same app refuses.
-pub(crate) fn install_builtin(pm: &Pm, catalog_id: &str, expected_digest: &str) -> Result<Value> {
+/// [`install_builtin`] with a guard re-run under the PM lock before the first
+/// write (CAD-1374). The guard refuses a stale human; it never grants access.
+pub(crate) fn install_builtin_guarded(
+    pm: &Pm,
+    catalog_id: &str,
+    expected_digest: &str,
+    guard: &dyn Fn() -> Result<()>,
+) -> Result<Value> {
     let (files, validated, provenance) = builtin_bundle(pm, catalog_id)?;
-    install_resolved(pm, files, validated, provenance, Some(expected_digest))
+    install_resolved(
+        pm,
+        files,
+        validated,
+        provenance,
+        Some(expected_digest),
+        guard,
+    )
 }
 
 /// CAD-1129 H4: re-check the install's recorded `source` upstream —
@@ -2141,17 +2159,16 @@ pub(crate) fn remove_preview(pm: &Pm, install_id: &str) -> Result<Value> {
     }))
 }
 
-/// CAD-1129 H5: journaled soft remove — mark the record, revoke
-/// consent, cancel queued publishes. The install stays in the catalog
-/// under `Removed` until a 30-day restore; after `restore_after` the
-/// restore refuses. Run creation refuses on the `removed` mark.
-pub(crate) fn remove(
+/// [`remove`] with a guard re-run under the PM lock before the first write
+/// (CAD-1374). A replay returns before the guard: it changes nothing.
+pub(crate) fn remove_guarded(
     pm: &Pm,
     store: &Store,
     install_id: &str,
     expected_generation: &str,
     expected_digest: &str,
     request_id: &str,
+    guard: &dyn Fn() -> Result<()>,
 ) -> Result<Value> {
     let id = InstallationId::parse(install_id)?;
     crate::proto::identifier(request_id, "remove request ID")?;
@@ -2174,8 +2191,10 @@ pub(crate) fn remove(
     if record.removed.is_some() {
         return Ok(json!({"schema":1,"install_id":&*id,"state":"removed",
             "removed":record.removed,"restore_after":record.restore_after,
-            "request_id":request_id,"replayed":true}));
+            "request_id":request_id,"replayed":true,"digest":desc["digest"]}));
     }
+    // CAD-1374: fresh authority re-proved under the PM lock, before the first write.
+    guard()?;
     let now = crate::issue::time::now_epoch();
     record.removed = Some(now);
     record.restore_after = Some(now + 30 * 24 * 3600);
@@ -2203,14 +2222,16 @@ pub(crate) fn remove(
     Ok(json!({"schema":1,"install_id":&*id,"state":"removed",
         "removed":now,"restore_after":record.restore_after,
         "cancelled_publishes":cancelled,"request_id":request_id,
-        "foreign_files":foreign}))
+        "foreign_files":foreign,"digest":desc["digest"]}))
 }
 
-/// CAD-1129 H5: clear the soft-remove mark and re-consent the same
-/// digest. Refused after `restore_after`; the record write replays
-/// idempotently. The operator's restore re-approves the exact bytes
-/// already on disk — no re-install.
-pub(crate) fn restore(pm: &Pm, install_id: &str) -> Result<Value> {
+/// [`restore`] with a guard re-run under the PM lock before the first write
+/// (CAD-1374). An already-live install returns before the guard: no effect.
+pub(crate) fn restore_guarded(
+    pm: &Pm,
+    install_id: &str,
+    guard: &dyn Fn() -> Result<()>,
+) -> Result<Value> {
     let id = InstallationId::parse(install_id)?;
     let _lock = pm.lock()?;
     let root = Root::open(&pm.dir)?;
@@ -2240,6 +2261,8 @@ pub(crate) fn restore(pm: &Pm, install_id: &str) -> Result<Value> {
             .ok_or_else(|| Error::rejected("installed bundle has no manifest"))?,
     )?;
     manifest.requires.check(&app::compat_host()?)?;
+    // CAD-1374: fresh authority re-proved under the PM lock, before the first write.
+    guard()?;
     record.removed = None;
     record.restore_after = None;
     let record_path = Path::new(".apps/installations")

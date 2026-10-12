@@ -137,6 +137,22 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         ),
     ),
     ("thread_read", Rule::Read),
+    // CAD-1374: the owner activity trail. The handler always proves the
+    // operator connection; a present public_session must also be a live
+    // board-owner session (AND, not OR). Export records its receipt after
+    // the page is built and before its bytes return.
+    (
+        "activity_query",
+        Rule::Handler("activity_owner: operator_connection AND, when public_session is present, a live verified owner session (CAD-1374)"),
+    ),
+    (
+        "activity_export",
+        Rule::Handler("activity_owner: operator_connection AND, when public_session is present, a live verified owner session (CAD-1374); prepared receipt written after the page is built, before bytes return"),
+    ),
+    (
+        "pm_activity_prepare",
+        Rule::Handler("pm_activity_prepare: agent connections refused (even app grants), operator_connection, and a live board session; a member may prepare only issue_comment_added (CAD-1374)"),
+    ),
     (
         "thread_send",
         Rule::Handler("rpc_thread_send: agents refused, operator on proof (CAD-384)"),

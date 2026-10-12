@@ -421,6 +421,7 @@ pub fn tool_result_summary(output: &Value) -> String {
 /// is the operator chat's cited needs-me rows (CAD-574) — daemon-side
 /// validation keeps it `{kind,id}` pairs; it rides the entry's payload
 /// so the board can render the citation, never the message text.
+#[allow(clippy::too_many_arguments)]
 fn message_entry<'a>(
     sender: &Sender,
     source: &str,
@@ -429,6 +430,7 @@ fn message_entry<'a>(
     refs: Option<&Value>,
     app: Option<&Value>,
     attachments: Option<&Value>,
+    human: Option<&Value>,
 ) -> NewEntry<'a> {
     let (role, mut payload) = match sender {
         Sender::Operator | Sender::OperatorChat => (ROLE_OPERATOR, json!({"source": source})),
@@ -448,6 +450,11 @@ fn message_entry<'a>(
     // the payload, so a stored row is always a real retained file.
     if let Some(attachments) = attachments {
         payload["attachments"] = attachments.clone();
+    }
+    // CAD-1374: the verified human behind an owner chat send, daemon-derived
+    // and recorded only when present.
+    if let Some(human) = human {
+        payload["human"] = human.clone();
     }
     NewEntry {
         role,
@@ -673,9 +680,24 @@ impl Store {
         context: Option<&str>,
         kind: ConversationKind,
     ) -> Result<(Thread, bool)> {
+        self.conversation_create_as(alias, install, context, kind, None)
+    }
+
+    /// CAD-1374: [`Self::conversation_create`] with the verified human
+    /// behind the write. A created conversation records one canonical
+    /// receipt in the same transaction; `None` (legacy/autonomous) records
+    /// none, so no human is invented.
+    pub fn conversation_create_as(
+        &self,
+        alias: &str,
+        install: &str,
+        context: Option<&str>,
+        kind: ConversationKind,
+        human: Option<&Value>,
+    ) -> Result<(Thread, bool)> {
         self.write_tx(|tx| {
             self.agent_in(tx, alias)?;
-            Self::conversation_make_in(tx, alias, install, context, kind)
+            Self::conversation_make_in(tx, alias, install, context, kind, human)
         })
     }
 
@@ -685,8 +707,14 @@ impl Store {
     pub fn conversation_ensure_general(&self, alias: &str, install: &str) -> Result<Thread> {
         self.write_tx(|tx| {
             self.agent_in(tx, alias)?;
-            let (thread, _) =
-                Self::conversation_make_in(tx, alias, install, None, ConversationKind::General)?;
+            let (thread, _) = Self::conversation_make_in(
+                tx,
+                alias,
+                install,
+                None,
+                ConversationKind::General,
+                None,
+            )?;
             Ok(thread)
         })
     }
@@ -697,6 +725,7 @@ impl Store {
         install: &str,
         context: Option<&str>,
         kind: ConversationKind,
+        human: Option<&Value>,
     ) -> Result<(Thread, bool)> {
         let (general, subject) = match kind {
             ConversationKind::General => (1_i64, None),
@@ -744,13 +773,25 @@ impl Store {
             }
         };
         if inserted == 1 {
-            Self::event(
-                tx,
-                alias,
-                "conversation_created",
-                json!({"thread": thread.id, "install_id": install, "subject": subject,
-                       "general": general == 1}),
-            )?;
+            let mut payload = json!({"thread": thread.id, "install_id": install,
+                                    "subject": subject, "general": general == 1});
+            if let Some(human) = human {
+                let company = human
+                    .get("company")
+                    .filter(|c| c.is_string())
+                    .ok_or_else(|| Error::internal("conversation receipt has no company"))?;
+                payload["schema_version"] = json!(1);
+                payload["action"] = json!("conversation_created");
+                payload["outcome"] = json!("created");
+                payload["reason"] = json!("conversation_created");
+                payload["company"] = company.clone();
+                payload["human"] = human.clone();
+                payload["request_id"] = json!(id);
+                payload["correlation_id"] = json!(id);
+                payload["causation_id"] = Value::Null;
+                payload["revision_or_digest"] = Value::Null;
+            }
+            Self::event(tx, alias, "conversation_created", payload)?;
         }
         Ok((thread, inserted == 1))
     }
@@ -770,8 +811,15 @@ impl Store {
     ) -> Result<Thread> {
         let thread = match selector {
             None => {
-                Self::conversation_make_in(tx, alias, install, context, ConversationKind::General)?
-                    .0
+                Self::conversation_make_in(
+                    tx,
+                    alias,
+                    install,
+                    context,
+                    ConversationKind::General,
+                    None,
+                )?
+                .0
             }
             Some(id) => Self::thread_by_id_in(tx, id)?
                 .filter(|t| t.alias == alias && t.install_id.as_deref() == Some(install))
@@ -992,8 +1040,9 @@ impl Store {
         refs: Option<&Value>,
         app: Option<&Value>,
         attachments: Option<&Value>,
+        human: Option<&Value>,
     ) -> Result<()> {
-        let entry = message_entry(sender, source, body, id, refs, app, attachments);
+        let entry = message_entry(sender, source, body, id, refs, app, attachments, human);
         // CAD-1098: a verified App binding lands the message in the
         // conversation the server resolves (the client's selector is
         // checked, never trusted). The thread is fixed here, in the
@@ -1039,6 +1088,13 @@ impl Store {
     /// side of the retry's content comparison.
     pub(super) fn entry_app_in(tx: &impl super::StoreConn, id: &str) -> Result<Option<Value>> {
         Self::entry_payload_field_in(tx, id, "app")
+    }
+
+    /// The verified human the enqueue note for `id` recorded (CAD-1374),
+    /// `None` when its payload carries none — the stored side of the
+    /// retry's comparison, so a reused id under another human conflicts.
+    pub(super) fn entry_human_in(tx: &impl super::StoreConn, id: &str) -> Result<Option<Value>> {
+        Self::entry_payload_field_in(tx, id, "human")
     }
 
     /// The delivery-time App hint for `id` (CAD-802): the send-time

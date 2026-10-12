@@ -901,3 +901,48 @@ fn cad1172_commit_reason_names_the_record_limit() {
     );
     assert_eq!(refusal_reason("anything else"), "record refused");
 }
+
+#[test]
+fn cad1374_owner_human_is_stored_on_the_revision_in_the_same_write() {
+    let dir = TempDir::new().unwrap();
+    let store = record_file(&dir, "install-a");
+    let human =
+        json!({"sub": "user-owner-a", "company": "acme", "session": "s-1", "display": "Ada"});
+    // A verified owner create/update persists its human on the row it
+    // writes; a legacy call (no human) leaves the column NULL.
+    store
+        .app_record_create_as(
+            "ctx-1",
+            "customer-a",
+            &customer("A", "a@example.com"),
+            None,
+            Some(&human),
+        )
+        .unwrap();
+    store
+        .app_record_create("ctx-1", "customer-b", &customer("B", "b@example.com"))
+        .unwrap();
+    let conn = store.conn();
+    let stored_a: Option<String> = conn
+        .query_row(
+            "SELECT human FROM app_record_revisions WHERE record_id='customer-a' AND revision=1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let stored_b: Option<String> = conn
+        .query_row(
+            "SELECT human FROM app_record_revisions WHERE record_id='customer-b' AND revision=1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&stored_a.unwrap()).unwrap(),
+        human
+    );
+    assert!(
+        stored_b.is_none(),
+        "legacy write must stay honestly unknown"
+    );
+}

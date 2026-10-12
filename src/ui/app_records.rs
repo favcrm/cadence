@@ -7,7 +7,7 @@
 //! discovery links (`project`, `project_link`), nor smuggle the URL IDs
 //! themselves. Errors are bounded generics that never echo customer
 //! content; paths and SQL never leave the daemon.
-use super::{err_response, json_response, read_body, HttpResp};
+use super::{err_response, json_response, operator, read_body, HttpResp};
 use crate::{client, error::Error};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -223,6 +223,7 @@ pub(super) fn handle(
     state: &Path,
     route: Route<'_>,
     write: bool,
+    relay: operator::PublicRelay,
 ) -> HttpResp {
     let raw_query = request
         .url()
@@ -369,6 +370,19 @@ pub(super) fn handle(
             ("app_record_csv_confirm", params)
         }
     };
+    // CAD-1374: an owner create, update or CSV import persists verified
+    // human attribution, so a public-host write must carry its session.
+    let mut params = params;
+    if write
+        && matches!(
+            method,
+            "app_record_create" | "app_record_update" | "app_record_csv_import"
+        )
+    {
+        if let Err(response) = operator::relay_owner_proof(&mut params, relay) {
+            return response;
+        }
+    }
     match client::rpc(state, method, params) {
         Ok(value) if value.to_string().len() <= RESULT_CAP => {
             let mut response = json_response(value);

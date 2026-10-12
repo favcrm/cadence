@@ -30,9 +30,13 @@
 //! No verb ever answers a stored credential, and none reads who the
 //! caller is from a request field.
 
+use std::collections::BTreeMap;
+
 use serde_json::{json, Value};
 
-use super::{optional_str, reject_operator_fields, required_str, Shared, DAEMON_ALIAS};
+use super::{
+    optional_str, public_membership, reject_operator_fields, required_str, Shared, DAEMON_ALIAS,
+};
 use crate::error::{Error, Result};
 use crate::operator_auth::{self as auth, Origin};
 
@@ -48,6 +52,140 @@ fn origin_param(params: &Value) -> Result<Origin> {
             "invalid_request",
             format!("origin must be 'loopback' or 'tailnet', not '{raw}'"),
         )),
+    }
+}
+
+/// CAD-1374: the fixed fields of one audited board-session mutation. The
+/// actor and the verified human come from the caller (a signed session, the
+/// daemon's own peer identity, or the operator secret), never from the rows.
+struct Audit {
+    action: &'static str,
+    actor_kind: &'static str,
+    human: Value,
+    company: Option<String>,
+    resource: String,
+    reason: &'static str,
+    agent: Option<String>,
+    request: String,
+}
+
+/// One prepared frame of a batch mutation: its audit record and the safe rows it names.
+type Frames = Vec<(Audit, Vec<auth::AuditTarget>)>;
+
+/// The verified human a row names: a signed-session snapshot, labelled as such.
+fn human_json(t: &auth::AuditTarget) -> Value {
+    json!({
+        "sub": t.sub,
+        "company": t.company,
+        "session": t.session,
+        "role": t.role,
+        "role_basis": t.role.as_ref().map(|_| "signed_session_snapshot"),
+    })
+}
+
+fn target_json(t: &auth::AuditTarget) -> Value {
+    json!({
+        "session": t.session,
+        "origin": t.origin.as_str(),
+        "sub": t.sub,
+        "role": t.role,
+        "role_basis": t.role.as_ref().map(|_| "signed_session_snapshot"),
+        "company": t.company,
+    })
+}
+
+/// Batch rows grouped by their verified company (`None` = local rows, never
+/// backfilled). An empty batch is one empty local group, so a mutation that
+/// voids only unexchanged links still gets its prepared/terminal pair.
+fn by_company(targets: &[auth::AuditTarget]) -> Vec<(Option<String>, Vec<auth::AuditTarget>)> {
+    let mut groups: BTreeMap<Option<String>, Vec<auth::AuditTarget>> = BTreeMap::new();
+    for t in targets {
+        groups.entry(t.company.clone()).or_default().push(t.clone());
+    }
+    if groups.is_empty() {
+        groups.insert(None, Vec::new());
+    }
+    groups.into_iter().collect()
+}
+
+fn resource_of(targets: &[auth::AuditTarget]) -> String {
+    match targets {
+        [one] => format!("session:{}", one.session),
+        _ => "board:sessions".to_string(),
+    }
+}
+
+fn open_audit(company: &str, request: &str, row: &auth::AuditTarget) -> Audit {
+    Audit {
+        action: "board_session_opened",
+        actor_kind: "human",
+        human: human_json(row),
+        company: Some(company.to_string()),
+        resource: format!("session:{}", row.session),
+        reason: "platform_sign_in",
+        agent: None,
+        request: request.to_string(),
+    }
+}
+
+fn logout_audit(
+    agent: Option<&str>,
+    company: Option<String>,
+    request: &str,
+    targets: &[auth::AuditTarget],
+) -> Audit {
+    // A registered agent peer is never human because a cookie came with it.
+    let (actor_kind, human) = match (agent, targets.first()) {
+        (Some(_), _) => ("agent", Value::Null),
+        (None, Some(t)) if t.sub.is_some() => ("human", human_json(t)),
+        _ => ("unknown", Value::Null),
+    };
+    Audit {
+        action: "board_session_logged_out",
+        actor_kind,
+        human,
+        company,
+        resource: resource_of(targets),
+        reason: "session_logout",
+        agent: agent.map(str::to_string),
+        request: request.to_string(),
+    }
+}
+
+fn stolen_audit(
+    agent: Option<&str>,
+    company: Option<String>,
+    request: &str,
+    targets: &[auth::AuditTarget],
+) -> Audit {
+    Audit {
+        action: "board_session_revoked",
+        actor_kind: if agent.is_some() { "agent" } else { "unknown" },
+        human: Value::Null,
+        company,
+        resource: resource_of(targets),
+        reason: "presented_by_agent",
+        agent: agent.map(str::to_string),
+        request: request.to_string(),
+    }
+}
+
+/// An operator-secret action on the local CLI path: never a human.
+fn operator_audit(
+    reason: &'static str,
+    company: Option<String>,
+    request: &str,
+    targets: &[auth::AuditTarget],
+) -> Audit {
+    Audit {
+        action: "board_session_revoked",
+        actor_kind: "operator",
+        human: Value::Null,
+        company,
+        resource: resource_of(targets),
+        reason,
+        agent: None,
+        request: request.to_string(),
     }
 }
 
@@ -423,6 +561,8 @@ impl Shared {
     /// refused call must not burn the real sign-in's id.
     pub(super) fn rpc_board_session_open(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         if let Some(who) = self.slot_identity(peer_pid)? {
+            let lane = who.lane().to_string();
+            self.record_security_denial("agent_connection", None, Some(&lane))?;
             return Err(Error::rejected(format!(
                 "board_session_open is the platform sign-in exchange — this connection \
                  is agent '{}'; a browser session is never minted for a pane",
@@ -431,10 +571,16 @@ impl Shared {
         }
         let assertion = required_str(params, "assertion")?;
         let user_agent = optional_str(params, "user_agent").unwrap_or_default();
-        let config = crate::board_identity::read_config(&self.state_dir)?;
+        let config = match crate::board_identity::read_config(&self.state_dir) {
+            Ok(config) => config,
+            Err(e) => {
+                self.record_security_denial("capability_unavailable", None, None)?;
+                return Err(e);
+            }
+        };
         let now = self.operator_now();
         let parsed = crate::board_identity::parse(assertion)
-            .map_err(|r| self.board_rejected(r.code, &r.message))?;
+            .map_err(|r| self.board_rejected(r.code, &r.message, Some(config.company.as_str())))?;
         // `iss` names the JWKS origin (contract §6) — only after it
         // matches the configured issuer, so a foreign assertion never
         // points the fetch at its own keys. `aud` is the cheap early
@@ -443,12 +589,14 @@ impl Shared {
             return Err(self.board_rejected(
                 "issuer_mismatch",
                 "the assertion was not issued by this board's platform",
+                Some(config.company.as_str()),
             ));
         }
         if parsed.audience() != config.host {
             return Err(self.board_rejected(
                 "audience_mismatch",
                 "the assertion was minted for another board host",
+                Some(config.company.as_str()),
             ));
         }
         let key = {
@@ -459,21 +607,57 @@ impl Shared {
                 // assertion (`assertion_invalid`); an unreachable or
                 // malformed JWKS is ours — `capability_unavailable`.
                 .map_err(|e| match e.code() {
-                    Some("assertion_invalid") => {
-                        self.board_rejected("assertion_invalid", &e.to_string())
-                    }
-                    _ => self.board_rejected("capability_unavailable", &e.to_string()),
+                    Some("assertion_invalid") => self.board_rejected(
+                        "assertion_invalid",
+                        &e.to_string(),
+                        Some(config.company.as_str()),
+                    ),
+                    _ => self.board_rejected(
+                        "capability_unavailable",
+                        &e.to_string(),
+                        Some(config.company.as_str()),
+                    ),
                 })?
         };
         let identity = crate::board_identity::verify(&parsed, &config, &key, now)
-            .map_err(|r| self.board_rejected(r.code, &r.message))?;
-        let opened = self.operator_auth().open_public(
+            .map_err(|r| self.board_rejected(r.code, &r.message, Some(config.company.as_str())))?;
+        let realm = crate::operator_auth::PublicRealm {
+            issuer: config.issuer.clone(),
+            company: config.company.clone(),
+            host: config.host.clone(),
+        };
+        // CAD-1374: a native daemon's board realm must match its captured
+        // realm before any session opens; a standalone one saves the realm
+        // it verified under. Captured mode is never re-read here.
+        self.require_realm_matches_mode(&realm)?;
+        let request = uuid::Uuid::new_v4().to_string();
+        let company = config.company.clone();
+        let mut audit = None;
+        let mut opened_row = None;
+        let result = self.operator_auth().open_public_bound_with_intent(
             identity.user(),
-            parsed.jti(),
-            parsed.exp(),
+            (parsed.jti(), parsed.exp()),
             user_agent,
+            realm,
             now,
-        )?;
+            |row| {
+                let a = open_audit(&company, &request, row);
+                self.prepare_mutation(&a, std::slice::from_ref(row))?;
+                audit = Some(a);
+                opened_row = Some(row.clone());
+                Ok(())
+            },
+        );
+        let opened = match result {
+            Ok(opened) => opened,
+            Err(e) => {
+                // Prepared accepted and the Auth write failed: uncertain.
+                if let (Some(a), Some(row)) = (audit, opened_row) {
+                    self.finish_uncertain(&a, std::slice::from_ref(&row));
+                }
+                return Err(e);
+            }
+        };
         match opened {
             None => {
                 let _ = self.store.event_public(
@@ -481,9 +665,10 @@ impl Shared {
                     "board_assertion_rejected",
                     json!({"reason": "replayed"}),
                 );
-                Err(Error::invalid(
+                Err(self.security_denied(
                     "assertion_replayed",
                     "the assertion was already exchanged",
+                    Some(company.as_str()),
                 ))
             }
             Some(opened) => {
@@ -497,6 +682,17 @@ impl Shared {
                         "role": opened.session.user.as_ref().map(|u| u.role.as_str()),
                     }),
                 );
+                if let Some(a) = audit {
+                    let row = auth::AuditTarget {
+                        session: opened.session.id.clone(),
+                        origin: Origin::Public,
+                        sub: opened.session.user.as_ref().map(|u| u.sub.clone()),
+                        role: opened.session.user.as_ref().map(|u| u.role.clone()),
+                        company: Some(company.clone()),
+                    };
+                    self.finish_terminal(&a, std::slice::from_ref(&row))
+                        .map_err(|_| self.terminal_unavailable())?;
+                }
                 Ok(json!({
                     "ok": true,
                     "token": opened.token,
@@ -512,8 +708,10 @@ impl Shared {
     /// `public` rows can match.
     pub(super) fn rpc_board_session_check(&self, params: &Value) -> Result<Value> {
         let token = required_str(params, "token")?;
-        let now = self.operator_now();
-        let session = self.operator_auth().check_public(token, now)?;
+        let session = match self.current_public_session(token)? {
+            public_membership::Authority::Granted { view, .. } => Some(*view),
+            public_membership::Authority::Denied => None,
+        };
         Ok(json!({"valid": session.is_some(), "session": session}))
     }
 
@@ -528,32 +726,226 @@ impl Shared {
     pub(super) fn rpc_board_session_member(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         self.operator_connection("board member session check", params, peer_pid)?;
         let handle = required_str(params, "handle")?;
-        let now = self.operator_now();
-        let member = self.operator_auth().check_member(handle, now)?;
+        let member = self.handle_has_current_member(handle)?;
         Ok(json!({"member": member}))
     }
 
-    /// A refused assertion is loud — `board_assertion_rejected` records
-    /// the refusal's code (never the assertion or key material).
-    fn board_rejected(&self, code: &'static str, message: &str) -> Error {
+    /// CAD-1374: one canonical board-session mutation record. `prepared` is
+    /// appended BEFORE the `Auth` write; if it fails the mutation is refused
+    /// (`audit_unavailable`). `completed` is appended after it. Stores only the
+    /// static action, the noncredential session reference, and the verified
+    /// subject and role. Never the token, key, jti, user agent or assertion.
+    fn audit_payload(&self, a: &Audit, targets: &[auth::AuditTarget], outcome: &str) -> Value {
+        json!({
+            "schema_version": 1,
+            "at": crate::issue::time::now_epoch(),
+            "company": a.company,
+            "actor_kind": a.actor_kind,
+            "human": a.human,
+            "agent": a.agent,
+            "action": a.action,
+            "resource": a.resource,
+            "outcome": outcome,
+            "reason": a.reason,
+            "request_id": a.request,
+            "correlation_id": a.request,
+            "causation_id": null,
+            "revision_or_digest": null,
+            "revision_availability": "session_state_has_no_content_revision",
+            "targets": targets.iter().map(target_json).collect::<Vec<_>>(),
+        })
+    }
+
+    /// Append `prepared` BEFORE an `Auth` write. Failure refuses the mutation
+    /// (`audit_unavailable`); nothing changed, so no terminal claim is made.
+    fn prepare_mutation(&self, a: &Audit, targets: &[auth::AuditTarget]) -> Result<()> {
+        let payload = self.audit_payload(a, targets, "prepared");
+        self.store
+            .event_public(DAEMON_ALIAS, "board_session_mutation_prepared", payload)
+            .map_err(|_| {
+                Error::invalid(
+                    "audit_unavailable",
+                    "the board session change was refused: its audit record could not be written",
+                )
+            })
+    }
+
+    /// Append the terminal record after a successful `Auth` write. Failure is
+    /// an uncertain-outcome error: the mutation may have happened, and the
+    /// prepared record is retained, never retried.
+    fn finish_terminal(&self, a: &Audit, targets: &[auth::AuditTarget]) -> Result<()> {
+        let payload = self.audit_payload(a, targets, "completed");
+        self.store
+            .event_public(DAEMON_ALIAS, "board_session_mutation_finished", payload)
+    }
+
+    /// The `Auth` write failed after `prepared` was accepted: the outcome is
+    /// unknown. Write it as uncertain (best effort) and never as a clean no-op.
+    fn finish_uncertain(&self, a: &Audit, targets: &[auth::AuditTarget]) {
+        let payload = self.audit_payload(a, targets, "uncertain");
+        let _ = self
+            .store
+            .event_public(DAEMON_ALIAS, "board_session_mutation_finished", payload);
+    }
+
+    /// Prepare one frame per company group, all BEFORE any `Auth` write. A
+    /// refused prepare returns at once, so the caller's intent refuses and no
+    /// mutation happens; earlier prepared frames stay prepared, never terminal.
+    fn prepare_groups(
+        &self,
+        targets: &[auth::AuditTarget],
+        make: impl Fn(Option<String>, &[auth::AuditTarget]) -> Audit,
+    ) -> Result<Frames> {
+        let mut frames = Vec::new();
+        for (company, rows) in by_company(targets) {
+            let a = make(company, &rows);
+            self.prepare_mutation(&a, &rows)?;
+            frames.push((a, rows));
+        }
+        Ok(frames)
+    }
+
+    /// Settle the frames of a mutation whose `Auth` call ran its intent first.
+    /// An `Auth` error marks every prepared group uncertain; success gives each
+    /// group its terminal record. A failed terminal append is the static
+    /// uncertain refusal, and nothing is retried.
+    fn settle_frames(&self, frames: Frames, result: Result<usize>) -> Result<usize> {
+        match result {
+            Err(e) => {
+                for (a, rows) in &frames {
+                    self.finish_uncertain(a, rows);
+                }
+                Err(e)
+            }
+            Ok(n) => {
+                let mut all = true;
+                for (a, rows) in &frames {
+                    all &= self.finish_terminal(a, rows).is_ok();
+                }
+                if all {
+                    Ok(n)
+                } else {
+                    Err(self.terminal_unavailable())
+                }
+            }
+        }
+    }
+
+    fn terminal_unavailable(&self) -> Error {
+        Error::invalid(
+            "state_outcome_unavailable",
+            "the session change may have happened, but its completion record could not be written; prepared record retained, not retried",
+        )
+    }
+
+    /// Append the canonical pre-auth refusal. Stores only the static reason,
+    /// the trusted configured company (or null) and the daemon-derived agent
+    /// lane. A failed append is an error, so the caller never mints.
+    fn record_security_denial(
+        &self,
+        reason: &'static str,
+        company: Option<&str>,
+        agent: Option<&str>,
+    ) -> Result<()> {
+        let request = uuid::Uuid::new_v4().to_string();
+        let payload = json!({
+            "schema_version": 1,
+            "at": crate::issue::time::now_epoch(),
+            "company": company,
+            "actor_kind": if agent.is_some() { "agent" } else { "unknown" },
+            "human": null,
+            "agent": agent,
+            "action": "board_session_security_denied",
+            "resource": "board:session_exchange",
+            "outcome": "refused",
+            "reason": reason,
+            "request_id": request,
+            "correlation_id": request,
+            "causation_id": null,
+            "revision_or_digest": null,
+            "revision_availability": "session_state_has_no_content_revision",
+            "targets": [],
+        });
+        self.store
+            .event_public(DAEMON_ALIAS, "board_session_security_denied", payload)
+            .map_err(|_| {
+                Error::invalid(
+                    "audit_unavailable",
+                    "the board sign-in was refused: its audit record could not be written",
+                )
+            })
+    }
+
+    /// The refusal a pre-auth check returns: its canonical record, or the
+    /// sanitized `audit_unavailable` refusal when that record cannot be written.
+    fn security_denied(&self, code: &'static str, message: &str, company: Option<&str>) -> Error {
+        match self.record_security_denial(code, company, None) {
+            Ok(()) => Error::invalid(code, message),
+            Err(refusal) => refusal,
+        }
+    }
+
+    /// A refused assertion is loud: the legacy `board_assertion_rejected`
+    /// notice, then the canonical denial (the original code and message are
+    /// kept when that record is written).
+    fn board_rejected(&self, code: &'static str, message: &str, company: Option<&str>) -> Error {
         let _ = self.store.event_public(
             DAEMON_ALIAS,
             "board_assertion_rejected",
             json!({"reason": code}),
         );
-        Error::invalid(code, message)
+        self.security_denied(code, message, company)
     }
 
-    pub(super) fn rpc_operator_session_logout(&self, params: &Value) -> Result<Value> {
+    /// `operator_session_logout {token}` — the cookie holder ends its own
+    /// session, whatever its authority. The company comes only from the
+    /// matched row's verified realm, never from the request body.
+    pub(super) fn rpc_operator_session_logout(
+        &self,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
         let token = required_str(params, "token")?;
-        let revoked = self.operator_auth().revoke_token(token)?;
+        let agent = self
+            .slot_identity(peer_pid)?
+            .map(|who| who.lane().to_string());
+        let request = uuid::Uuid::new_v4().to_string();
+        let mut frames = Frames::new();
+        let result = self
+            .operator_auth()
+            .revoke_token_with_intent(token, |targets| {
+                frames = self.prepare_groups(targets, |company, rows| {
+                    logout_audit(agent.as_deref(), company, &request, rows)
+                })?;
+                Ok(())
+            });
+        let revoked = self.settle_frames(frames, result.map(usize::from))? > 0;
         Ok(json!({"revoked": revoked}))
     }
 
-    pub(super) fn rpc_operator_session_stolen(&self, params: &Value) -> Result<Value> {
+    pub(super) fn rpc_operator_session_stolen(
+        &self,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
         let token = required_str(params, "token")?;
+        // The actor is the daemon's own view of the peer; the body's `agent`
+        // label is only the legacy alarm text.
         let agent = optional_str(params, "agent").unwrap_or("unknown");
-        let revoked = self.operator_auth().revoke_token(token)?;
+        let peer = self
+            .slot_identity(peer_pid)?
+            .map(|who| who.lane().to_string());
+        let request = uuid::Uuid::new_v4().to_string();
+        let mut frames = Frames::new();
+        let result = self
+            .operator_auth()
+            .revoke_token_with_intent(token, |targets| {
+                frames = self.prepare_groups(targets, |company, rows| {
+                    stolen_audit(peer.as_deref(), company, &request, rows)
+                })?;
+                Ok(())
+            });
+        let revoked = self.settle_frames(frames, result.map(usize::from))? > 0;
         let _ = self.store.event_public(
             DAEMON_ALIAS,
             "operator_session_from_agent",
@@ -564,16 +956,30 @@ impl Shared {
 
     pub(super) fn rpc_operator_sessions(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         self.operator_with_secret("ui sessions", params, peer_pid)?;
+        let request = uuid::Uuid::new_v4().to_string();
         let mut revoked = 0;
-        let mut store = self.operator_auth();
         if params.get("revoke_all").and_then(Value::as_bool) == Some(true) {
-            revoked += store.revoke_all()?;
+            let mut frames = Frames::new();
+            // `revoke_all` also voids links; the count is the sessions it ended.
+            let result = self.operator_auth().revoke_all_with_intent(|targets| {
+                frames = self.prepare_groups(targets, |company, rows| {
+                    operator_audit("operator_revoke_all", company, &request, rows)
+                })?;
+                Ok(())
+            });
+            revoked += self.settle_frames(frames, result)?;
         }
         if let Some(id) = optional_str(params, "revoke") {
-            revoked += store.revoke_id(id)?;
+            let mut frames = Frames::new();
+            let result = self.operator_auth().revoke_id_with_intent(id, |targets| {
+                frames = self.prepare_groups(targets, |company, rows| {
+                    operator_audit("operator_revoke", company, &request, rows)
+                })?;
+                Ok(())
+            });
+            revoked += self.settle_frames(frames, result)?;
         }
-        let sessions = store.list(self.operator_now())?;
-        drop(store);
+        let sessions = self.operator_auth().list(self.operator_now())?;
         if revoked > 0 {
             let _ = self.store.event_public(
                 DAEMON_ALIAS,
@@ -590,10 +996,17 @@ impl Shared {
         peer_pid: u32,
     ) -> Result<Value> {
         self.operator_with_secret("ui login --rotate", params, peer_pid)?;
+        let request = uuid::Uuid::new_v4().to_string();
+        // Under the Auth guard and before the first secret write, every company
+        // group the rotation ends is prepared (a local or empty group too, since
+        // rotation always has an effect). A refused prepare stops the rotation.
         let mut store = self.operator_auth();
-        auth::rotate_secret(&self.state_dir)?;
-        let revoked = store.revoke_all()?;
+        let frames = self.prepare_groups(&store.audit_targets(), |company, rows| {
+            operator_audit("operator_secret_rotate", company, &request, rows)
+        })?;
+        let rotated = auth::rotate_secret(&self.state_dir).and_then(|()| store.revoke_all());
         drop(store);
+        let revoked = self.settle_frames(frames, rotated)?;
         let _ = self.store.event_public(
             DAEMON_ALIAS,
             "operator_secret_rotated",

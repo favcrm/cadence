@@ -143,21 +143,18 @@ impl Shared {
         key: &str,
         origin: Origin,
     ) -> Option<(String, crate::operator_auth::SessionView)> {
+        if origin == Origin::Public {
+            return match self.current_public_session(token).ok()? {
+                crate::daemon::public_membership::Authority::Granted { hash, view, .. } => {
+                    Some((hash, *view))
+                }
+                crate::daemon::public_membership::Authority::Denied => None,
+            };
+        }
         let now = self.operator_now();
         let mut auth = self.operator_auth();
-        let hash = match origin {
-            Origin::Public => auth.public_session_hash(token, now),
-            _ => auth.session_hash(token, key, origin, now),
-        }
-        .ok()
-        .flatten()?;
-        // The same verified lookup for the public-role surface.
-        let view = match origin {
-            Origin::Public => auth.check_public(token, now),
-            _ => auth.check(token, key, origin, now),
-        }
-        .ok()
-        .flatten()?;
+        let hash = auth.session_hash(token, key, origin, now).ok().flatten()?;
+        let view = auth.check(token, key, origin, now).ok().flatten()?;
         Some((hash, view))
     }
 
@@ -170,9 +167,14 @@ impl Shared {
         if !session_hash_ok(session_hash) {
             return false;
         }
-        let now = self.operator_now();
-        let mut auth = self.operator_auth();
-        auth.live_hash(session_hash, now).unwrap_or(false)
+        match self.public_row_hash(session_hash) {
+            Some(public) => public,
+            None => {
+                let now = self.operator_now();
+                let mut auth = self.operator_auth();
+                auth.live_hash(session_hash, now).unwrap_or(false)
+            }
+        }
     }
 
     /// Rolling-window mint-rate check for one verified session. Sweeps

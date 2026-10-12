@@ -1161,6 +1161,21 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
         // requests. The board relays over its own daemon connection, so
         // the HTTP peer is admitted here — the same operator proof as
         // the decision writes.
+        // CAD-1374: the owner activity trail. The operator proof gates the
+        // local path; a public-host request also carries its server-held
+        // session, which the daemon re-checks as the owner role.
+        "/api/activity" | "/api/activity/export" => {
+            let method = if path == "/api/activity" {
+                "activity_query"
+            } else {
+                "activity_export"
+            };
+            let resp = match activity_get(&request, state_dir, opts, raw_query, method) {
+                Ok(resp) => resp,
+                Err(resp) => resp,
+            };
+            send(request, resp);
+        }
         "/api/master/permissions" => {
             if let Err(resp) = operator::admit_operator_read(&request, state_dir, opts) {
                 send(request, resp);
@@ -1546,7 +1561,13 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     send(request, response);
                     return;
                 }
-                let response = app_records::handle(&mut request, state_dir, route, false);
+                let response = app_records::handle(
+                    &mut request,
+                    state_dir,
+                    route,
+                    false,
+                    operator::PublicRelay::NotPublic,
+                );
                 send(request, response);
                 return;
             }
@@ -1559,7 +1580,13 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     send(request, response);
                     return;
                 }
-                let response = app_content::handle(&mut request, state_dir, route, false);
+                let response = app_content::handle(
+                    &mut request,
+                    state_dir,
+                    route,
+                    false,
+                    operator::PublicRelay::NotPublic,
+                );
                 send(request, response);
                 return;
             }
@@ -2133,4 +2160,83 @@ pub fn serve(state_dir: &Path, pm_dir: &Path, opts: &ServeOpts) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// CAD-1374: the owner activity GET. Refuses before any RPC unless the
+/// caller is the local operator or a live board owner. The params come only
+/// from the allowlisted query fields; the public session is server-held.
+fn activity_get(
+    request: &Request,
+    state_dir: &Path,
+    opts: &ServeOpts,
+    raw_query: &str,
+    method: &str,
+) -> std::result::Result<HttpResp, HttpResp> {
+    // A live named session (owner or member) reaches the daemon, which
+    // checks the owner role and records a member refusal. Missing, invalid
+    // or stolen proofs still fail closed in `board_caller`.
+    let what = format!(
+        "GET {}",
+        request.url().split('?').next().unwrap_or_default()
+    );
+    let caller = operator::board_caller(request, state_dir, opts, false, None)?;
+    match &caller {
+        operator::Caller::Agent(alias) => {
+            return Err(super::write_path::guard_fail(
+                "operator_only",
+                &format!(
+                    "{what} is the operator's decision — this request comes from agent '{alias}'"
+                ),
+            ))
+        }
+        operator::Caller::Operator(_) => {
+            super::home::prove_operator_peer(request, state_dir, opts, &what, None)?
+        }
+        operator::Caller::Named(_) => {}
+    }
+    let mut params = activity_params(raw_query).map_err(|e| err_response(400, e))?;
+    let relay = operator::public_relay(request, opts);
+    operator::relay_owner_proof(&mut params, relay)?;
+    match client::rpc(state_dir, method, params) {
+        Ok(out) => Ok(json_response(out)),
+        Err(e) => Err(home::rpc_err(&e, method)),
+    }
+}
+
+/// The allowlisted activity query fields, decoded from the request query.
+/// Unknown keys refuse, so nothing a browser names reaches the daemon.
+fn activity_params(raw_query: &str) -> std::result::Result<Value, &'static str> {
+    let mut out = serde_json::Map::new();
+    for raw_pair in raw_query.split('&').filter(|pair| !pair.is_empty()) {
+        let (raw_key, raw_value) = raw_pair
+            .split_once('=')
+            .ok_or("activity query values must use key=value")?;
+        let key = pct_decode(raw_key).ok_or("malformed activity query")?;
+        let value = pct_decode(raw_value).ok_or("malformed activity query")?;
+        if out.contains_key(&key) {
+            return Err("duplicate activity query field");
+        }
+        match key.as_str() {
+            "sub" | "action" | "target" | "outcome" | "cursor" => {
+                out.insert(key, Value::String(value));
+            }
+            "from" | "until" => {
+                let n: f64 = value
+                    .parse()
+                    .map_err(|_| "activity time must be a UTC epoch")?;
+                if !n.is_finite() {
+                    return Err("activity time must be a UTC epoch");
+                }
+                out.insert(key, json!(n));
+            }
+            "limit" => {
+                let n: u64 = value
+                    .parse()
+                    .map_err(|_| "activity limit must be an integer")?;
+                out.insert(key, json!(n));
+            }
+            _ => return Err("unknown activity query field"),
+        }
+    }
+    Ok(Value::Object(out))
 }

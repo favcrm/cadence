@@ -15,6 +15,7 @@ pub mod app_preview_export;
 pub mod audit;
 pub mod backup;
 pub mod board_identity;
+pub mod board_membership;
 pub mod business_export;
 pub mod business_templates;
 pub mod cli_actor;

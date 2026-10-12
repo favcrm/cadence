@@ -243,10 +243,27 @@ pub(super) fn write(
     tail: &str,
     caller: &operator::Caller,
     query: &dyn Fn(&str) -> Option<String>,
-    state_dir: &Path,
-    pm_dir: &Path,
+    dirs: (&Path, &Path),
+    relay_proof: operator::PublicRelay,
 ) -> HttpResp {
+    let (state_dir, pm_dir) = dirs;
     let wiki_as = wiki_as(caller);
+    // CAD-1374: every write attaches the server-held public session
+    // bearer (or refuses 401 on a public host with none) before any staging
+    // or RPC. Reads never reach this function.
+    let proof = match relay_proof {
+        operator::PublicRelay::Missing => {
+            return err_response(401, "board session required for this write");
+        }
+        operator::PublicRelay::NotPublic => None,
+        operator::PublicRelay::Proven(p) => Some(p.token().to_string()),
+    };
+    let with_proof = |mut params: Value| {
+        if let Some(token) = &proof {
+            params["public_session"] = Value::String(token.clone());
+        }
+        params
+    };
     match (tail, method) {
         ("file", Method::Put) => {
             let body = match read_body(request, JSON_CAP) {
@@ -267,7 +284,7 @@ pub(super) fn write(
             if let Some(rev) = req["if_rev"].as_str() {
                 params["if_rev"] = json!(rev);
             }
-            relay(state_dir, "wiki_write", params, &wiki_as)
+            relay(state_dir, "wiki_write", with_proof(params), &wiki_as)
         }
         ("mkdir", Method::Post) | ("rm", Method::Post) => {
             let body = match read_body(request, JSON_CAP) {
@@ -288,7 +305,7 @@ pub(super) fn write(
                 } else {
                     "wiki_rm"
                 },
-                json!({"path": path}),
+                with_proof(json!({"path": path})),
                 &wiki_as,
             )
         }
@@ -305,13 +322,13 @@ pub(super) fn write(
                 (Some(from), Some(to)) => relay(
                     state_dir,
                     "wiki_mv",
-                    json!({"from": from, "to": to}),
+                    with_proof(json!({"from": from, "to": to})),
                     &wiki_as,
                 ),
                 _ => err_response(400, "wiki mv needs {from,to}"),
             }
         }
-        ("upload", Method::Post) => upload(request, query, state_dir, pm_dir, &wiki_as),
+        ("upload", Method::Post) => upload(request, query, state_dir, pm_dir, &wiki_as, proof),
         ("file" | "upload" | "mkdir" | "mv" | "rm", _) => err_response(405, "method not allowed"),
         _ => err_response(404, "no such wiki write route"),
     }
@@ -328,6 +345,7 @@ fn upload(
     state_dir: &Path,
     pm_dir: &Path,
     wiki_as: &str,
+    proof: Option<String>,
 ) -> HttpResp {
     let ct = header_value(request, "Content-Type").unwrap_or_default();
     let Some(boundary) = ct
@@ -376,13 +394,12 @@ fn upload(
             Ok(text) => text,
             Err(_) => return err_response(400, "text upload is not UTF-8"),
         };
-        return relay(
-            state_dir,
-            "wiki_write",
-            json!({"path":path,"text":text,
-                   "if_rev":query("if_rev").or_else(|| fields.get("if_rev").cloned())}),
-            wiki_as,
-        );
+        let mut params = json!({"path":path,"text":text,
+                   "if_rev":query("if_rev").or_else(|| fields.get("if_rev").cloned())});
+        if let Some(token) = &proof {
+            params["public_session"] = Value::String(token.clone());
+        }
+        return relay(state_dir, "wiki_write", params, wiki_as);
     }
     let uploads = state_dir.join(crate::wiki::UPLOAD_DIR);
     if let Err(e) = std::fs::create_dir_all(&uploads) {
@@ -392,12 +409,12 @@ fn upload(
     if let Err(e) = std::fs::write(&tmp, &bytes) {
         return err_response(500, &format!("upload staging failed: {e}"));
     }
-    match client::rpc(
-        state_dir,
-        "wiki_put_blob",
-        json!({"path": path, "tmp": tmp, "wiki_as": wiki_as,
-               "if_rev": query("if_rev").or_else(|| fields.get("if_rev").cloned())}),
-    ) {
+    let mut params = json!({"path": path, "tmp": tmp, "wiki_as": wiki_as,
+               "if_rev": query("if_rev").or_else(|| fields.get("if_rev").cloned())});
+    if let Some(token) = &proof {
+        params["public_session"] = Value::String(token.clone());
+    }
+    match client::rpc(state_dir, "wiki_put_blob", params) {
         Ok(v) => json_response(v),
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);

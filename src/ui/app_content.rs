@@ -13,7 +13,7 @@
 //! bounded generics that never echo content; renders stay bounded
 //! server-side, and full customer data never leaves the daemon at
 //! all.
-use super::{err_response, json_response, read_body, HttpResp};
+use super::{err_response, json_response, operator, read_body, HttpResp};
 use crate::{client, error::Error};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -259,6 +259,7 @@ pub(super) fn handle(
     state: &Path,
     route: Route<'_>,
     write: bool,
+    relay: operator::PublicRelay,
 ) -> HttpResp {
     if request
         .url()
@@ -515,6 +516,14 @@ pub(super) fn handle(
         // read peer serves them after operator-read admission.
         _ => return err_response(405, "method not allowed"),
     };
+    // CAD-1374: an owner campaign save persists verified human attribution,
+    // so a public-host write must carry its session.
+    let mut params = params;
+    if write && method == "app_content_save" {
+        if let Err(response) = operator::relay_owner_proof(&mut params, relay) {
+            return response;
+        }
+    }
     match client::rpc(state, method, params) {
         Ok(value) if value.to_string().len() <= RESULT_CAP => {
             let mut response = json_response(value);

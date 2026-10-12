@@ -141,6 +141,15 @@ impl Shared {
         peer_pid: u32,
     ) -> Result<Value> {
         self.operator_connection("app record management", params, peer_pid)?;
+        // CAD-1374: only an owner create, update or CSV import may carry
+        // the board's public session proof. It is validated here and never
+        // forwarded; the verified human is a typed argument to the store.
+        let human = match method {
+            "app_record_create" | "app_record_update" | "app_record_csv_import" => {
+                self.verified_owner_human(params)?
+            }
+            _ => None,
+        };
         let allowed: &[&str] = match method {
             "app_record_create" => &[
                 "install_id",
@@ -148,6 +157,7 @@ impl Shared {
                 "record_id",
                 "profile",
                 "consent_provenance",
+                "public_session",
             ],
             "app_record_list" => &["install_id", "context_id", "query", "limit", "cursor"],
             "app_record_show" => &["install_id", "context_id", "record_id"],
@@ -158,6 +168,7 @@ impl Shared {
                 "expected_revision",
                 "profile",
                 "consent_provenance",
+                "public_session",
             ],
             "app_record_csv_preview" => &["install_id", "context_id", "csv_text"],
             "app_record_csv_import" => &[
@@ -167,6 +178,7 @@ impl Shared {
                 "preview_token",
                 "request_id",
                 "decisions",
+                "public_session",
             ],
             "app_record_csv_confirm" => &[
                 "install_id",
@@ -218,21 +230,23 @@ impl Shared {
             "app_record_show" => {
                 records.app_record_show(context, required_str(params, "record_id")?)
             }
-            "app_record_create" => records.app_record_create_with(
+            "app_record_create" => records.app_record_create_as(
                 context,
                 required_str(params, "record_id")?,
                 &record_profile(params)?,
                 record_provenance(params)?.as_ref(),
+                human.as_ref(),
             ),
-            "app_record_update" => records.app_record_update(
+            "app_record_update" => records.app_record_update_as(
                 context,
                 required_str(params, "record_id")?,
                 record_revision(params)?,
                 &record_profile(params)?,
                 record_provenance(params)?.as_ref(),
+                human.as_ref(),
             ),
             "app_record_csv_preview" => records.app_record_csv_preview(context, &csv_text(params)?),
-            "app_record_csv_import" => records.app_record_csv_import(
+            "app_record_csv_import" => records.app_record_csv_import_as(
                 context,
                 &csv_text(params)?,
                 required_str(params, "preview_token")?,
@@ -242,6 +256,7 @@ impl Shared {
                 // the operator connection IS the authority; the
                 // confirm receipt exists only for the delegated agent.
                 None,
+                human.as_ref(),
             ),
             // CAD-1014: the operator's explicit confirm of the exact
             // byte-bound plan — mints the host-held one-use nonce the
