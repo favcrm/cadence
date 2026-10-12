@@ -3,7 +3,7 @@ use super::*;
 
 #[test]
 fn cad690_required_context_content_default_is_nonempty_but_optional_may_be_empty() {
-    let text = include_str!("../../../apps/local-content/workflows/draft.md")
+    let text = include_str!("../../../tests/fixtures/apps/local-content/workflows/draft.md")
         .replace("source: { ask:", "source: { context_default: true, ask:");
     let defaults = std::collections::BTreeMap::from([("source".to_string(), "facts".to_string())]);
     assert!(crate::issue::workflow::check_context_defaults(&text, &defaults).is_ok());

@@ -185,7 +185,7 @@ impl Fx {
             std::fs::create_dir_all(to.parent().unwrap()).unwrap();
             std::fs::copy(
                 PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("apps/blog-post")
+                    .join("tests/fixtures/apps/blog-post")
                     .join(name),
                 to,
             )

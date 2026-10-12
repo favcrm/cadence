@@ -7,7 +7,7 @@ and history.
 
 The executor supports text production and independent text review. A reviewed
 capability call may also retain one run-scoped binary asset for the reviewer.
-The installable text-only example is `apps/local-content`, with workflow
+The installable text-only example is `tests/fixtures/apps/local-content`, with workflow
 `draft`; it needs no external connection or AgenticOS provider. A configured,
 registered worker still supplies the actual model execution.
 Use a managed Pi, Claude or Codex worker for this increment. Terminal
@@ -68,7 +68,7 @@ Use a trusted source checkout and an owned test daemon for development.
 The catalog installation command returns a stable installation ID:
 
 ```sh
-cadence app catalog install /trusted/cadence/apps/local-content
+cadence app catalog install /trusted/cadence/tests/fixtures/apps/local-content
 cadence app catalog show <installation-id>
 ```
 
