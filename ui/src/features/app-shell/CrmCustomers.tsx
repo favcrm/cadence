@@ -351,7 +351,7 @@ function CustomerList({
               aria-label={t("Filter by source")}
             />
             {tagFilter !== "" && (
-              <button type="button" className="chip crm-chip-on" onClick={() => setTagFilter("")} aria-label={`Clear tag filter ${tagFilter}`}>
+              <button type="button" className="chip crm-chip-on" onClick={() => setTagFilter("")} aria-label={t("Clear tag filter {tag}").replace("{tag}", tagFilter)}>
                 {t("tag")}: {tagFilter} ✕
               </button>
             )}
@@ -479,7 +479,7 @@ function CustomerList({
             </Button>
             <span className="num text-micro text-ink-500" aria-live="polite">
               {shown.length === records.length ? "" : `${shown.length} of `}
-              {records.length} row{records.length === 1 ? "" : "s"}
+              {records.length} {t(records.length === 1 ? "row" : "rows")}
               {truncated ? ` ${t("· more on the server")}` : ""}
             </span>
             <Button

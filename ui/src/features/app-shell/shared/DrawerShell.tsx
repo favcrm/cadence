@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import Button from "../../../ui/Button";
+import { useTranslate } from "../../../lib/locale";
 import { useDrawerClose } from "./useDrawerClose";
 
 /**
@@ -78,6 +79,7 @@ function useScrimLeft(): number {
 }
 
 function OverflowMenu({ items, open, setOpen }: { items: DrawerMenuItem[]; open: boolean; setOpen: (v: boolean) => void }) {
+  const t = useTranslate();
   const wrap = useRef<HTMLDivElement | null>(null);
   const trigger = useRef<HTMLButtonElement | null>(null);
   useEffect(() => {
@@ -103,7 +105,7 @@ function OverflowMenu({ items, open, setOpen }: { items: DrawerMenuItem[]; open:
         ref={trigger}
         type="button"
         className="btn btn-sm btn-icon"
-        aria-label="More actions"
+        aria-label={t("More actions")}
         aria-haspopup="menu"
         aria-expanded={open}
         onClick={() => setOpen(!open)}
@@ -111,7 +113,7 @@ function OverflowMenu({ items, open, setOpen }: { items: DrawerMenuItem[]; open:
         ⋯
       </button>
       {open && (
-        <div className="crm-drawer-pop" role="menu" aria-label="More actions">
+        <div className="crm-drawer-pop" role="menu" aria-label={t("More actions")}>
           {items.map((item) => (
             <button
               key={item.key}
@@ -147,6 +149,7 @@ export default function DrawerShell(props: DrawerShellProps) {
   };
   const [menuOpen, setMenuOpen] = useState(false);
   const { closing, requestClose, onTransitionEnd } = useDrawerClose(onClose);
+  const t = useTranslate();
   const scrimLeft = useScrimLeft();
   const editing = edit != null;
 
@@ -250,7 +253,7 @@ export default function DrawerShell(props: DrawerShellProps) {
               <>
                 <span className="crm-drawer-spacer" />
                 <Button size="sm" variant="ghost" onClick={edit.onCancel} disabled={edit.pending}>
-                  Cancel
+                  {t("Cancel")}
                 </Button>
                 <button type="submit" form={edit.formId} className="btn btn-sm btn-primary" disabled={edit.pending} aria-busy={edit.pending || undefined}>
                   {edit.pending ? "Saving…" : (edit.saveLabel ?? "Save")}

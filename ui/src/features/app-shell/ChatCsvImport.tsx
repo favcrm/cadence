@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { useTranslate } from "../../lib/locale";
 import Button from "../../ui/Button";
 import Select from "../../ui/Select";
 import DataTable from "./shared/DataTable";
@@ -53,6 +54,7 @@ export default function ChatCsvImport({
     cadence_csv_import: { request_id: string; confirm_token: string };
   }) => Promise<string | null>;
 }) {
+  const t = useTranslate();
   const [csvText, setCsvText] = useState("");
   const [preview, setPreview] = useState<CsvPreview | null>(null);
   const [choices, setChoices] = useState<Map<number, CsvRowChoice>>(new Map());
@@ -80,7 +82,7 @@ export default function ChatCsvImport({
 
   const runPreview = () => {
     if (csvText.trim() === "") {
-      setError("Paste a small customer CSV first — a header row plus one row per customer.");
+      setError(t("Paste a small customer CSV first — a header row plus one row per customer."));
       return;
     }
     setPending("preview");
@@ -137,7 +139,7 @@ export default function ChatCsvImport({
         // Clear the plan first, then set the status — resetPlan() clears
         // `sent`, so the message is written after the reset, not before.
         resetPlan();
-        setSent("Confirmed — the import went to the assistant. It applies the reviewed rows; this board shows the outcome.");
+        setSent(t("Confirmed — the import went to the assistant. It applies the reviewed rows; this board shows the outcome."));
       } else {
         // The confirm minted but the hand-off send failed — say so
         // honestly; the operator retries the same request id, which the
@@ -157,8 +159,8 @@ export default function ChatCsvImport({
     return (
       <Notice className="mt-2" state="read-only">
         {scope.contextId === ""
-          ? "Pick a customer context before importing through chat."
-          : "Read-only view. Customer imports through the assistant are disabled here."}
+          ? t("Pick a customer context before importing through chat.")
+          : t("Read-only view. Customer imports through the assistant are disabled here.")}
       </Notice>
     );
   }
@@ -166,21 +168,20 @@ export default function ChatCsvImport({
   const applyCount = preview === null ? 0 : csvApplyCount(preview.rows, choices);
 
   return (
-    <section aria-label="Import customers via chat" className="grid gap-2" data-chat-import>
+    <section aria-label={t("Import customers via chat")} className="grid gap-2" data-chat-import>
       <p className="text-label text-ink-400">
-        Paste a small customer CSV — review each row, then Confirm to import it with the
-        assistant. Nothing imports until you Confirm.
+        {t("Paste a small customer CSV — review each row, then Confirm to import it with the assistant. Nothing imports until you Confirm.")}
       </p>
       {preview === null && (
         <form
           className="grid gap-2"
-          aria-label="CSV source"
+          aria-label={t("CSV source")}
           onSubmit={(e) => {
             e.preventDefault();
             runPreview();
           }}
         >
-          <Field label="CSV text — header plus one row per customer" id="chat-csv-text" className="crm-field">
+          <Field label={t("CSV text — header plus one row per customer")} id="chat-csv-text" className="crm-field">
             {(c) => (
               <textarea
                 id={c.id}
@@ -202,41 +203,45 @@ export default function ChatCsvImport({
           {sent !== null && <Notice>{sent}</Notice>}
           <div className="crm-toolbar">
             <Button type="submit" variant="primary" size="sm" loading={pending === "preview"} disabled={pending !== null}>
-              Preview plan
+              {t("Preview plan")}
             </Button>
           </div>
         </form>
       )}
       {preview !== null && (
-        <section aria-label="Import preview" className="grid gap-2">
+        <section aria-label={t("Import preview")} className="grid gap-2">
           <div className="card px-3 py-2">
             <p className="text-label text-ink-200" data-preview-summary>
-              Preview of {preview.rowCount} rows — {preview.summary.create} create ·{" "}
-              {preview.summary.update} update · {preview.summary.needsRevision} need a revision ·{" "}
-              {preview.summary.skip} already current · {preview.summary.error} refused
+              {t("Preview of {count} rows — {create} create · {update} update · {revision} need a revision · {skip} already current · {error} refused")
+                .replace("{count}", String(preview.rowCount))
+                .replace("{create}", String(preview.summary.create))
+                .replace("{update}", String(preview.summary.update))
+                .replace("{revision}", String(preview.summary.needsRevision))
+                .replace("{skip}", String(preview.summary.skip))
+                .replace("{error}", String(preview.summary.error))}
             </p>
             <p className="text-micro text-ink-500 mt-1">
-              Nothing is written yet — this plan is bound to the exact CSV you pasted.
+              {t("Nothing is written yet — this plan is bound to the exact CSV you pasted.")}
             </p>
           </div>
           <DataTable
-            label="Planned rows"
+            label={t("Planned rows")}
             wrapClassName="crm-table-wrap"
             tableClassName="crm-table"
             rowKey={(row) => row.row}
             rowProps={(row) => ({ "data-plan-row": row.row })}
             rows={preview.rows}
             columns={[
-              { key: "row", header: "Row", cellClassName: "num text-ink-500", cell: (row) => row.row },
+              { key: "row", header: t("Row"), cellClassName: "num text-ink-500", cell: (row) => row.row },
               {
                 key: "record",
-                header: "Record",
+                header: t("Record"),
                 cellClassName: "num text-ink-300",
                 cell: (row) => {
                   const view = row.profile !== null ? viewProfile(row.profile) : null;
                   return (
                     <>
-                      {row.recordId !== "" ? row.recordId : <span className="text-ink-500">no record id</span>}
+                      {row.recordId !== "" ? row.recordId : <span className="text-ink-500">{t("no record id")}</span>}
                       {view !== null && <span className="text-ink-100"> — {view.displayName}</span>}
                     </>
                   );
@@ -244,16 +249,16 @@ export default function ChatCsvImport({
               },
               {
                 key: "plan",
-                header: "Plan",
+                header: t("Plan"),
                 cell: (row) => (
                   <span className="chip" data-decision={row.decision}>
-                    {row.decision === "needs_revision" ? "needs revision" : row.decision}
+                    {t(row.decision === "needs_revision" ? "Needs revision" : row.decision === "create" ? "Create" : row.decision === "update" ? "Update" : row.decision === "error" ? "Error" : row.decision === "skip" ? "Skip" : row.decision).toLowerCase()}
                   </span>
                 ),
               },
               {
                 key: "revision",
-                header: "Revision",
+                header: t("Revision"),
                 cell: (row) => {
                   const choice = choices.get(row.row) ?? csvPlanChoice(row);
                   return row.decision === "needs_revision" && choice === "apply" ? (
@@ -264,7 +269,7 @@ export default function ChatCsvImport({
                       inputMode="numeric"
                       maxLength={6}
                       autoComplete="off"
-                      aria-label={`Expected revision for row ${row.row}`}
+                      aria-label={t("Expected revision for row {row}").replace("{row}", String(row.row))}
                       placeholder={row.currentRevision !== null ? `r${row.currentRevision}` : "revision"}
                       value={revisions.get(row.row) ?? ""}
                       disabled={pending !== null}
@@ -277,12 +282,12 @@ export default function ChatCsvImport({
               },
               {
                 key: "import",
-                header: "Import",
+                header: t("import").replace(/^./, (char) => char.toUpperCase()),
                 cell: (row) => {
                   const choice = choices.get(row.row) ?? csvPlanChoice(row);
                   return row.decision === "error" ? (
                     <span className="text-label text-ink-500">
-                      skipped — {row.errors.length > 0 ? row.errors.join(" · ") : (row.reason ?? "fix the row")}
+                      {t("skipped — ")}{row.errors.length > 0 ? row.errors.join(" · ") : (row.reason ?? t("fix the row"))}
                     </span>
                   ) : (
                     <Select
@@ -300,14 +305,14 @@ export default function ChatCsvImport({
                           value: "apply",
                           label:
                             row.decision === "create"
-                              ? "Create"
+                              ? t("Create")
                               : row.decision === "needs_revision"
-                                ? "Update with revision"
-                                : "Update",
+                                ? t("Update with revision")
+                                : t("Update"),
                         },
-                        { value: "skip", label: "Skip" },
+                        { value: "skip", label: t("Skip") },
                       ]}
-                      aria-label={`Import choice for row ${row.row}`}
+                      aria-label={t("Import choice for row {row}").replace("{row}", String(row.row))}
                     />
                   );
                 },
@@ -327,17 +332,17 @@ export default function ChatCsvImport({
               }
               title={
                 applyCount === 0
-                  ? "No row is set to apply — the plan refused or skipped every row"
+                  ? t("No row is set to apply — the plan refused or skipped every row")
                   : csvDecisionsReady(preview.rows, choices, revisions)
-                    ? "Confirm this plan — the assistant imports the reviewed rows"
-                    : "Every row marked for update needs its expected revision"
+                    ? t("Confirm this plan — the assistant imports the reviewed rows")
+                    : t("Every row marked for update needs its expected revision")
               }
               onClick={confirmPlan}
             >
-              Confirm import ({applyCount})
+              {t("Confirm")} {t("import")} ({applyCount})
             </Button>
             <Button size="sm" disabled={pending !== null} onClick={resetPlan}>
-              Cancel
+              {t("Cancel")}
             </Button>
           </div>
         </section>

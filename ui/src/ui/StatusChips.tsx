@@ -33,7 +33,7 @@ export default function StatusChips({
           title={t("the server refuses every write — browsing only")}
         >
           <IconLock />
-          <span className={labelCls}>{t("Read only")}</span>
+          <span className={labelCls}>{t("Read only").toLowerCase()}</span>
         </span>
       )}
       {children}

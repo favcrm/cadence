@@ -1332,7 +1332,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         onSend={({ body, refs, attachments }) => send(body, refs, attachments)}
         onCommand={(name) => {
           if (name === "new" || name === "clear") startNew();
-          else setComposerNotice(`Unsupported command "/${name}" — it was not sent`);
+          else setComposerNotice(t('Unsupported command "/{name}" — it was not sent').replace("{name}", name));
         }}
         onNotice={setComposerNotice}
         attach={{ enabled: canAttach, reason: attachReason, destination: attachDestination }}

@@ -20,8 +20,10 @@ export default function ThemeToggle() {
     return applied === "light" || applied === "dark" ? applied : "system";
   });
   const next = nextThemePref(pref);
-  const label = t(pref === "system" ? "System" : pref === "light" ? "Light" : "Dark");
-  const nextLabel = t(next === "system" ? "System" : next === "light" ? "Light" : "Dark");
+  const label = t(pref === "system" ? "System" : pref === "light" ? "Light" : "Dark").toLowerCase();
+  const nextLabel = t(next === "system" ? "System" : next === "light" ? "Light" : "Dark").toLowerCase();
+  const themeLabel = t("Theme:");
+  const switchLabel = t("Switch to");
   return (
     <span className="header-control-wrap">
       <button
@@ -30,7 +32,7 @@ export default function ThemeToggle() {
           setPref(next);
         }}
         className="header-icon text-ink-400"
-        aria-label={`${t("Theme")}: ${label}, ${t("Switch to")} ${nextLabel}`}
+        aria-label={`${themeLabel.toLowerCase()} ${label}, ${switchLabel.toLowerCase()} ${nextLabel}`}
         aria-describedby={tooltipId}
       >
         {icons[pref]}

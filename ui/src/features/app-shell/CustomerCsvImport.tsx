@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { ApiError } from "../../lib/api";
+import { useTranslate } from "../../lib/locale";
 import Button from "../../ui/Button";
 import Select from "../../ui/Select";
 import type { Viewer } from "../projects/work";
@@ -63,6 +64,7 @@ export default function CustomerCsvImport({
   onDone: () => void;
   onCancel: () => void;
 }) {
+  const t = useTranslate();
   const canWrite = viewer.operator === true && !viewer.readOnly;
   const headRef = useRef<HTMLHeadingElement | null>(null);
   const fileRef = useRef<HTMLInputElement | null>(null);
@@ -117,7 +119,7 @@ export default function CustomerCsvImport({
     if (file.size > CSV_MAX_BYTES) {
       // Clear the input so re-picking the same file re-fires onChange.
       if (fileRef.current) fileRef.current.value = "";
-      setError(`The selected file exceeds the 256 KiB bound (${Math.round(file.size / 1024)} KiB).`);
+      setError(t("The selected file exceeds the 256 KiB bound ({size} KiB).").replace("{size}", String(Math.round(file.size / 1024))));
       return;
     }
     setError(null);
@@ -138,7 +140,7 @@ export default function CustomerCsvImport({
       })
       .catch(() => {
         if (live.current.mounted && live.current.scope === scopeKey && seq === pickSeq.current) {
-          setError("The selected file could not be read.");
+          setError(t("The selected file could not be read."));
         }
       });
   };
@@ -209,25 +211,25 @@ export default function CustomerCsvImport({
 
   if (!canWrite) {
     return (
-      <section aria-label="Import customers">
+      <section aria-label={t("Import customers")}>
         <h3 ref={headRef} className="text-cardtitle font-medium text-ink-100" tabIndex={-1} data-outlet-heading>
-          Import customers
+          {t("Import customers")}
         </h3>
         <Notice className="mt-2" state="read-only">
           {viewer.operator
-            ? "Read-only view. Customer imports are disabled on this board."
-            : "Sign in as the operator to import customer records."}
+            ? t("Read-only view. Customer imports are disabled on this board.")
+            : t("Sign in as the operator to import customer records.")}
         </Notice>
       </section>
     );
   }
   if (scope.contextId === "") {
     return (
-      <section aria-label="Import customers">
+      <section aria-label={t("Import customers")}>
         <h3 ref={headRef} className="text-cardtitle font-medium text-ink-100" tabIndex={-1} data-outlet-heading>
-          Import customers
+          {t("Import customers")}
         </h3>
-        <Notice className="mt-2">Administrator CRM setup is required before importing customers.</Notice>
+        <Notice className="mt-2">{t("Administrator CRM setup is required before importing customers.")}</Notice>
       </section>
     );
   }
@@ -235,28 +237,28 @@ export default function CustomerCsvImport({
   const applyCount = preview === null ? 0 : csvApplyCount(preview.rows, choices);
 
   return (
-    <section aria-label="Import customers" className="grid gap-3">
+    <section aria-label={t("Import customers")} className="grid gap-3">
       <div>
         <h3 ref={headRef} className="text-cardtitle font-medium text-ink-100" tabIndex={-1} data-outlet-heading>
-          Import customers
+          {t("Import customers")}
         </h3>
         <p className="text-label text-ink-400 mt-1">
           <button type="button" className="lnk" onClick={onCancel} disabled={pending === "import"}>
-            ← Customers
+            ← {t("Customers")}
           </button>{" "}
-          — the preview writes nothing; the import commits only the rows you approve below.
+          {t("— the preview writes nothing; the import commits only the rows you approve below.")}
         </p>
       </div>
 
       {receipt === null && (
         <form
           className="card px-4 py-4 grid gap-3"
-          aria-label="CSV source"
+          aria-label={t("CSV source")}
           onSubmit={(e) => {
             e.preventDefault();
             try {
               if (csvText.trim() === "") {
-                throw new ApiError("the CSV is empty — pick a file or paste rows first", 400);
+                throw new ApiError(t("the CSV is empty — pick a file or paste rows first"), 400);
               }
               runPreview();
             } catch (e: unknown) {
@@ -265,7 +267,7 @@ export default function CustomerCsvImport({
           }}
         >
           <Field
-            label="CSV file (up to 256 KiB, 500 rows)"
+            label={t("CSV file (up to 256 KiB, 500 rows)")}
             id="csv-file"
             disabled={pending !== null}
             className="crm-field"
@@ -282,7 +284,7 @@ export default function CustomerCsvImport({
             )}
           </Field>
           <Field
-            label="CSV text — header plus one row per customer"
+            label={t("CSV text — header plus one row per customer")}
             id="csv-text"
             disabled={pending !== null}
             className="crm-field"
@@ -302,9 +304,8 @@ export default function CustomerCsvImport({
             )}
           </Field>
           <p className="text-micro text-ink-500">
-            Columns: record_id (required), display_name (required), email, phone, tags
-            (semicolon-separated), source, consent_email, consent_sms, expected_revision. Empty
-            consent cells import as unknown — consent is never inferred.
+            {t("Columns:")} record_id ({t("Required").toLowerCase()}), display_name ({t("Required").toLowerCase()}), email, phone, tags
+            ({t("semicolon-separated")}), source, consent_email, consent_sms, expected_revision. {t("Empty consent cells import as unknown — consent is never inferred.")}
           </p>
           {error !== null && <ErrorNotice bare>{error}</ErrorNotice>}
           <div>
@@ -314,30 +315,33 @@ export default function CustomerCsvImport({
               loading={pending === "preview"}
               disabled={pending !== null}
             >
-              Preview plan
+              {t("Preview plan")}
             </Button>
           </div>
         </form>
       )}
 
       {preview !== null && receipt === null && (
-        <section aria-label="Import preview" className="grid gap-3">
+        <section aria-label={t("Import preview")} className="grid gap-3">
           <div className="card px-4 py-3">
             <p className="text-label text-ink-200" data-preview-summary>
-              Preview of {preview.rowCount} rows — {preview.summary.create} create ·{" "}
-              {preview.summary.update} update · {preview.summary.needsRevision} need a revision ·{" "}
-              {preview.summary.skip} already current · {preview.summary.error} refused
+              {t("Preview of {count} rows — {create} create · {update} update · {revision} need a revision · {skip} already current · {error} refused")
+                .replace("{count}", String(preview.rowCount))
+                .replace("{create}", String(preview.summary.create))
+                .replace("{update}", String(preview.summary.update))
+                .replace("{revision}", String(preview.summary.needsRevision))
+                .replace("{skip}", String(preview.summary.skip))
+                .replace("{error}", String(preview.summary.error))}
             </p>
             <p className="text-micro text-ink-500 mt-1">
-              Nothing is written yet — this preview is bound to the exact CSV above; changing the
-              text requires a new preview.{" "}
+              {t("Nothing is written yet — this preview is bound to the exact CSV above; changing the text requires a new preview.")}{" "}
               <span className="num" title={`Preview token ${preview.previewToken}`}>
-                token {preview.previewToken.slice(0, 12)}…
+                {t("token")} {preview.previewToken.slice(0, 12)}…
               </span>
             </p>
           </div>
           <DataTable
-            label="Planned rows — scroll horizontally to reach every column"
+            label={t("Planned rows — scroll horizontally to reach every column")}
             wrapClassName="crm-table-wrap"
             tableClassName="crm-table"
             rowKey={(row) => row.row}
@@ -346,13 +350,13 @@ export default function CustomerCsvImport({
             columns={[
               {
                 key: "row",
-                header: "Row",
+                header: t("Row"),
                 cellClassName: "num text-ink-500",
                 cell: (row) => row.row,
               },
               {
                 key: "record",
-                header: "Record",
+                header: t("Record"),
                 cellClassName: "num text-ink-300",
                 cell: (row) => {
                   const view = row.profile !== null ? viewProfile(row.profile) : null;
@@ -366,26 +370,26 @@ export default function CustomerCsvImport({
               },
               {
                 key: "plan",
-                header: "Plan",
+                header: t("Plan"),
                 cell: (row) => (
                   <span className="chip" data-decision={row.decision}>
-                    {row.decision === "needs_revision" ? "needs revision" : row.decision}
+                    {t(row.decision === "needs_revision" ? "Needs revision" : row.decision === "create" ? "Create" : row.decision === "update" ? "Update" : row.decision === "error" ? "Error" : row.decision === "skip" ? "Skip" : row.decision).toLowerCase()}
                   </span>
                 ),
               },
               {
                 key: "detail",
-                header: "Detail",
+                header: t("Detail"),
                 cellClassName: "text-label text-ink-300",
                 cell: (row) =>
                   row.errors.length > 0
                     ? row.errors.join(" · ")
                     : (row.reason ??
-                      (row.duplicateOf !== null ? `duplicate of ${row.duplicateOf}` : "—")),
+                      (row.duplicateOf !== null ? `${t("duplicate of")} ${row.duplicateOf}` : "—")),
               },
               {
                 key: "revision",
-                header: "Revision",
+                header: t("Revision"),
                 cell: (row) => {
                   const choice = choices.get(row.row) ?? csvPlanChoice(row);
                   return row.decision === "needs_revision" && choice === "apply" ? (
@@ -396,7 +400,7 @@ export default function CustomerCsvImport({
                       inputMode="numeric"
                       maxLength={6}
                       autoComplete="off"
-                      aria-label={`Expected revision for row ${row.row}`}
+                      aria-label={t("Expected revision for row {row}").replace("{row}", String(row.row))}
                       placeholder={
                         row.currentRevision !== null ? `r${row.currentRevision}` : "revision"
                       }
@@ -417,11 +421,11 @@ export default function CustomerCsvImport({
               },
               {
                 key: "import",
-                header: "Import",
+                header: t("import").replace(/^./, (char) => char.toUpperCase()),
                 cell: (row) => {
                   const choice = choices.get(row.row) ?? csvPlanChoice(row);
                   return row.decision === "error" ? (
-                    <span className="text-label text-ink-500">skipped — fix the row</span>
+                    <span className="text-label text-ink-500">{t("skipped — fix the row")}</span>
                   ) : (
                     <Select
                       id={`csv-choice-${row.row}`}
@@ -437,16 +441,16 @@ export default function CustomerCsvImport({
                           value: "apply",
                           label:
                             row.decision === "create"
-                              ? "Create"
+                              ? t("Create")
                               : row.decision === "needs_revision"
-                                ? "Update with revision"
+                                ? t("Update with revision")
                                 : row.decision === "update"
-                                  ? "Update"
-                                  : "Apply",
+                                  ? t("Update")
+                                  : t("Apply"),
                         },
-                        { value: "skip", label: "Skip" },
+                        { value: "skip", label: t("Skip") },
                       ]}
-                      aria-label={`Import choice for row ${row.row}`}
+                      aria-label={t("Import choice for row {row}").replace("{row}", String(row.row))}
                     />
                   );
                 },
@@ -465,14 +469,14 @@ export default function CustomerCsvImport({
               }
               title={
                 applyCount === 0
-                  ? "No row is set to write — the plan refused or skipped every row, or you skipped them all"
+                  ? t("No row is set to write — the plan refused or skipped every row, or you skipped them all")
                   : csvDecisionsReady(preview.rows, choices, revisions)
-                    ? "Commit the approved rows under this exact preview"
-                    : "Every row marked for update needs its expected revision"
+                    ? t("Commit the approved rows under this exact preview")
+                    : t("Every row marked for update needs its expected revision")
               }
               onClick={runImport}
             >
-              Import {applyCount} approved {applyCount === 1 ? "row" : "rows"}
+              {t("Import {count} approved {rows}").replace("{count}", String(applyCount)).replace("{rows}", t(applyCount === 1 ? "row" : "rows"))}
             </Button>
             <Button
               size="sm"
@@ -484,27 +488,27 @@ export default function CustomerCsvImport({
                 setError(null);
               }}
             >
-              Discard preview
+              {t("Discard preview")}
             </Button>
           </div>
         </section>
       )}
 
       {receipt !== null && (
-        <section aria-label="Import receipt" className="grid gap-3">
+        <section aria-label={t("Import receipt")} className="grid gap-3">
           <div className="card px-4 py-3" data-import-receipt>
             <p className="text-label text-ink-200">
-              {receipt.replayed ? "This import already ran — replaying its receipt. " : ""}
-              {receipt.summary.applied} applied · {receipt.summary.skipped} skipped ·{" "}
-              {receipt.summary.failed} refused
+              {receipt.replayed ? `${t("This import already ran — replaying its receipt.")} ` : ""}
+              {receipt.summary.applied} {t("applied")} · {receipt.summary.skipped} {t("skipped")} ·{" "}
+              {receipt.summary.failed} {t("refused")}
             </p>
             <p className="text-micro text-ink-500 mt-1">
-              Request {receipt.requestId} — retrying it replays this receipt, never double-applies.
+              {t("Request")} {receipt.requestId} — {t("retrying it replays this receipt, never double-applies.")}
             </p>
           </div>
           {receipt.rows.some((row) => row.outcome !== "created" && row.outcome !== "updated") && (
             <DataTable
-              label="Rows that did not apply — scroll horizontally to reach every column"
+              label={t("Rows that did not apply — scroll horizontally to reach every column")}
               wrapClassName="crm-table-wrap"
               tableClassName="crm-table"
               rowKey={(row) => row.row}
@@ -515,22 +519,22 @@ export default function CustomerCsvImport({
               columns={[
                 {
                   key: "row",
-                  header: "Row",
+                  header: t("Row"),
                   cellClassName: "num text-ink-500",
                   cell: (row) => row.row,
                 },
                 {
                   key: "record",
-                  header: "Record",
+                  header: t("Record"),
                   cellClassName: "num text-ink-300",
                   cell: (row) => row.recordId,
                 },
                 {
                   key: "outcome",
-                  header: "Outcome",
+                  header: t("Outcome"),
                   cell: (row) => (
                     <span className="chip" data-outcome={row.outcome}>
-                      {OUTCOME_LABEL[row.outcome] ?? row.outcome}
+                      {t(OUTCOME_LABEL[row.outcome] ?? row.outcome)}
                     </span>
                   ),
                 },
@@ -545,7 +549,7 @@ export default function CustomerCsvImport({
           )}
           <div className="crm-toolbar">
             <Button size="sm" variant="primary" onClick={onDone}>
-              Return to customers
+              {t("Return to customers")}
             </Button>
             <Button
               size="sm"
@@ -559,7 +563,7 @@ export default function CustomerCsvImport({
                 if (fileRef.current) fileRef.current.value = "";
               }}
             >
-              Import another file
+              {t("Import another file")}
             </Button>
           </div>
         </section>
