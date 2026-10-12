@@ -75,6 +75,24 @@ pub(crate) struct MemberCaller {
 /// The operation + scope + (optional) job + op provenance a
 /// `member_authority_live` re-prove carries — the strict revalidate
 /// body's bound fields. `op_credential_id` is the queued effect's own
+/// CAD-1380 R4: pending assist intents drained per tick (oldest first).
+pub(super) const ASSIST_NOTICE_BATCH: usize = 20;
+
+/// A bounded, single-line diagnostic for an unresolved intent (no secrets:
+/// the reason is a refusal message, never a credential).
+fn bounded_reason(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).take(240).collect()
+}
+
+/// A required string field of a stored intent; empty or absent refuses.
+fn intent_str(payload: &Value, key: &str) -> Option<String> {
+    payload
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 /// recorded `assist_requests.credential_id` — required for
 /// `job_dispatch`, absent for every assistant-resource verb.
 pub(super) struct MemberReprove<'a> {
@@ -142,6 +160,15 @@ impl Shared {
                 )));
             }
         };
+        // CAD-1380 R1: a revoked/archived binding never falls back to
+        // generic rules; it is refused for every method, before the surface.
+        if !binding.is_active() {
+            return Err(Error::rejected(format!(
+                "assist agent '{alias}' may not {method}: its assistant binding is {} — \
+                 a revoked or archived member has no surface (CAD-1380)",
+                binding.state
+            )));
+        }
         // The member-assistant verb surface — a bounded whitelist, each
         // entry carrying the per-resource check its handler needs. A
         // method absent here is refused before it runs; a method
@@ -277,6 +304,37 @@ impl Shared {
                 )));
             }
         }
+        // CAD-1380 R1: every admitted member surface re-proves the member's
+        // CURRENT platform authority via the live pull (enrolled hosted-board
+        // custody). The provenance is the binding's recorded issuing
+        // credential, because this connection carries no member envelope.
+        let (operation, scope) = match method {
+            "agent_show" | "agent_events" => ("assist_state", "assist.read"),
+            "thread_read" | "message_read" | "message_report" => ("assist_history", "assist.read"),
+            "job_show" | "task_show" => ("job_evidence", "assist.jobs"),
+            "job_events" => ("job_events", "assist.jobs"),
+            _ => ("assist_send", "assist.write"),
+        };
+        let member = MemberCaller {
+            org: binding.org.clone(),
+            sub: binding.sub.clone(),
+            assistant_id: binding.assistant_id.clone(),
+            alias: binding.alias.clone(),
+            conversation_id: binding.conversation_id.clone(),
+            state: binding.state.clone(),
+            credential_id: String::new(),
+        };
+        self.member_authority_live(
+            "",
+            &member,
+            MemberReprove {
+                operation,
+                scope,
+                job_id: None,
+                op_credential_id: None,
+            },
+            method,
+        )?;
         Ok(())
     }
 
@@ -598,6 +656,392 @@ impl Shared {
         Ok(binding.clone())
     }
 
+    /// CAD-1380 R1: re-prove a queued or admitted turn against the member
+    /// authority it runs under. The immutable binding for `message.alias` is
+    /// read for EVERY message, so a revoked bound assistant cannot execute any
+    /// source (notifications included).
+    /// - No binding and no stamp: a genuine nonmember alias, ordinary behavior.
+    /// - No binding but a stamp: fail closed.
+    /// - Binding not active: refuse.
+    /// - Stamped member send: the stamp must match the binding tuple, then the
+    ///   ORIGINAL recorded credential is re-proven for `assist_send`.
+    /// - Bound, unstamped, `member-` source: fail closed (no member provenance).
+    /// - Bound, unstamped, other source: the current binding is re-proven for
+    ///   `assist_state` under the enrolled service. No latest CID is borrowed.
+    pub(super) fn member_message_reprove(&self, message: &store::Message) -> Result<()> {
+        // CAD-1380 R4: a queued assist-job notice re-proves the subscriber's
+        // live jobs scope for the job its task names. Its original member
+        // credential is never reused.
+        if message.source == "assist_job_event" {
+            return self.assist_notice_reprove(message);
+        }
+        let stamp = self.store.message_member_authority(&message.id)?;
+        let Some(binding) = self.store.assistant_for_alias(&message.alias)? else {
+            if stamp.is_some() || message.source.starts_with("member-") {
+                return Err(Error::rejected(format!(
+                    "member message '{}' refused: its assistant binding is absent or its \
+                     member provenance is unverified",
+                    message.id
+                )));
+            }
+            return Ok(());
+        };
+        if !binding.is_active() {
+            return Err(Error::rejected(format!(
+                "message '{}' refused: the assistant binding is {}",
+                message.id, binding.state
+            )));
+        }
+        let member_lineage = message.source.starts_with("member-");
+        match stamp {
+            Some(auth) => {
+                if binding.org != auth.org
+                    || binding.sub != auth.sub
+                    || binding.assistant_id != auth.assistant_id
+                {
+                    return Err(Error::rejected(format!(
+                        "member message '{}' refused: its recorded provenance does not match the binding",
+                        message.id
+                    )));
+                }
+                let member = MemberCaller {
+                    org: auth.org,
+                    sub: auth.sub,
+                    assistant_id: auth.assistant_id,
+                    alias: binding.alias.clone(),
+                    conversation_id: None,
+                    state: binding.state.clone(),
+                    credential_id: auth.credential_id.clone(),
+                };
+                self.member_authority_live(
+                    "",
+                    &member,
+                    MemberReprove {
+                        operation: "assist_send",
+                        scope: "assist.write",
+                        job_id: None,
+                        op_credential_id: Some(&auth.credential_id),
+                    },
+                    "member message",
+                )
+            }
+            None if member_lineage => Err(Error::rejected(format!(
+                "member message '{}' has no verified member provenance — it cannot run as \
+                 ordinary work",
+                message.id
+            ))),
+            None => {
+                let member = MemberCaller {
+                    org: binding.org.clone(),
+                    sub: binding.sub.clone(),
+                    assistant_id: binding.assistant_id.clone(),
+                    alias: binding.alias.clone(),
+                    conversation_id: binding.conversation_id.clone(),
+                    state: binding.state.clone(),
+                    credential_id: String::new(),
+                };
+                self.member_authority_live(
+                    "",
+                    &member,
+                    MemberReprove {
+                        operation: "assist_state",
+                        scope: "assist.read",
+                        job_id: None,
+                        op_credential_id: None,
+                    },
+                    "member message",
+                )
+            }
+        }
+    }
+
+    /// CAD-1380 R4: drain pending assist-job intents (oldest first, bounded).
+    /// Runs from the watch loop OUTSIDE any store transaction or connection
+    /// lock. Returns the count of notices newly queued. With the rollout flag
+    /// off it returns `Ok(0)` before any read, write, HTTP call or notice, so
+    /// pending intents are retained. A terminal outcome is recorded once with
+    /// `finish_assist_job_notification`; a store failure returns an error and
+    /// the intent stays pending (never silently claimed).
+    pub(super) fn route_assist_job_notifications(self: &Arc<Self>) -> Result<usize> {
+        if std::env::var("HOSTED_CADENCE_ASSISTANT_ENABLED").as_deref() != Ok("true") {
+            return Ok(0);
+        }
+        let pending = self
+            .store
+            .pending_assist_job_notifications(ASSIST_NOTICE_BATCH)?;
+        let mut queued = 0;
+        for (seq, payload) in pending {
+            match self.route_assist_intent(seq, &payload) {
+                Ok(Some(alias)) => {
+                    queued += 1;
+                    self.notify_agent(&alias);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    // An expected refusal (`Rejected`: confinement, transport
+                    // denial, a changed tuple) is terminal and truthful. Any
+                    // other error is a store/internal failure: it propagates
+                    // and the intent stays pending, never silently claimed.
+                    let Error::Rejected(reason) = &error else {
+                        return Err(error);
+                    };
+                    let reason = bounded_reason(reason);
+                    self.store
+                        .finish_assist_job_notification(seq, "unresolved")?;
+                    eprintln!("assist notice {seq} unresolved: {reason}");
+                }
+            }
+        }
+        Ok(queued)
+    }
+
+    /// One intent: resolve the canonical job and its owner ledger, then route
+    /// by target. Returns the terminal outcome and the alias to wake after
+    /// commit. Every missing or mismatched field refuses; nothing is inferred.
+    fn route_assist_intent(self: &Arc<Self>, seq: i64, p: &Value) -> Result<Option<String>> {
+        let refuse = |store: &Store| store.finish_assist_job_notification(seq, "refused");
+        let (Some(target), Some(job), Some(task_id), Some(key), Some(state)) = (
+            intent_str(p, "target"),
+            intent_str(p, "job"),
+            intent_str(p, "task"),
+            intent_str(p, "key"),
+            intent_str(p, "state"),
+        ) else {
+            refuse(&self.store)?;
+            return Ok(None);
+        };
+        let Some(revision) = p.get("revision").and_then(Value::as_i64) else {
+            refuse(&self.store)?;
+            return Ok(None);
+        };
+        let note = intent_str(p, "note").unwrap_or_default();
+        let body =
+            format!("Cadence job {job}: task {task_id} r{revision} is now {state}. Next: {note}");
+        // A domain-separated 64-hex digest keeps the message id within the
+        // 64-char id limit and stays deterministic per intent key.
+        let id = crate::operator_auth::digest(&format!("assist-notice:{key}"));
+        let task = match self.store.task(&task_id) {
+            Ok(t) if t.job_id == job => t,
+            _ => {
+                self.store
+                    .finish_assist_job_notification(seq, "unresolved")?;
+                return Ok(None);
+            }
+        };
+        let Some(owner) = self.store.assist_request_for_job(&job)? else {
+            refuse(&self.store)?;
+            return Ok(None);
+        };
+        match target.as_str() {
+            "master" => {
+                if intent_str(p, "alias").as_deref() != Some(crate::master::ALIAS) {
+                    refuse(&self.store)?;
+                    return Ok(None);
+                }
+                if self.store.agent_opt(crate::master::ALIAS)?.is_none() {
+                    self.store
+                        .finish_assist_job_notification(seq, "unresolved")?;
+                    return Ok(None);
+                }
+                // Master uses the normal Home report path (`send_as`), which
+                // already applies the confined-Devin refusal for non-master.
+                self.send_as(
+                    &json!({"alias": crate::master::ALIAS, "text": body, "message": id, "source": "report"}),
+                    &|_| Ok(store::Sender::Unattributed),
+                )?;
+                self.store
+                    .finish_assist_job_notification(seq, "delivered")?;
+                Ok(None)
+            }
+            "author" => {
+                let Some(alias) = intent_str(p, "alias") else {
+                    refuse(&self.store)?;
+                    return Ok(None);
+                };
+                if state != "revising" || task.assignee.as_deref() != Some(alias.as_str()) {
+                    self.store
+                        .finish_assist_job_notification(seq, "unresolved")?;
+                    return Ok(None);
+                }
+                let Some(agent) = self.store.agent_opt(&alias)? else {
+                    self.store
+                        .finish_assist_job_notification(seq, "unresolved")?;
+                    return Ok(None);
+                };
+                let Some(kickoff) = self.store.task_kickoff_created(&task_id, &alias)? else {
+                    self.store
+                        .finish_assist_job_notification(seq, "unresolved")?;
+                    return Ok(None);
+                };
+                if agent.created > kickoff {
+                    self.store
+                        .finish_assist_job_notification(seq, "unresolved")?;
+                    return Ok(None);
+                }
+                crate::adapter::pi::refuse_confined_devin_agent(&agent)?;
+                // The author is an assigned worker, not a subscriber: after
+                // the checks above its notice is queued directly, and the
+                // intent is finished as delivered in the same guarded step.
+                let (duplicate, _) = self.store.enqueue_task(
+                    &alias,
+                    &body,
+                    None,
+                    &id,
+                    "job_event",
+                    Some(&task_id),
+                )?;
+                self.store
+                    .finish_assist_job_notification(seq, "delivered")?;
+                Ok((!duplicate).then_some(alias))
+            }
+            "subscriber" => {
+                let (Some(org), Some(sub), Some(assistant_id)) = (
+                    intent_str(p, "org"),
+                    intent_str(p, "sub"),
+                    intent_str(p, "assistant_id"),
+                ) else {
+                    refuse(&self.store)?;
+                    return Ok(None);
+                };
+                if owner.org != org {
+                    refuse(&self.store)?;
+                    return Ok(None);
+                }
+                let Some(binding) = self.store.assistant_by_id(&org, &assistant_id)? else {
+                    refuse(&self.store)?;
+                    return Ok(None);
+                };
+                if !binding.is_active() || binding.sub != sub {
+                    refuse(&self.store)?;
+                    return Ok(None);
+                }
+                // Live jobs-scope proof, outside any store transaction. The
+                // member's original credential is never borrowed.
+                let member = MemberCaller {
+                    org: org.clone(),
+                    sub: sub.clone(),
+                    assistant_id: binding.assistant_id.clone(),
+                    alias: binding.alias.clone(),
+                    conversation_id: binding.conversation_id.clone(),
+                    state: binding.state.clone(),
+                    credential_id: String::new(),
+                };
+                let proof = self.member_authority_live(
+                    "",
+                    &member,
+                    MemberReprove {
+                        operation: "job_events",
+                        scope: "assist.jobs",
+                        job_id: Some(&job),
+                        op_credential_id: None,
+                    },
+                    "assist notice",
+                );
+                if proof.is_err() {
+                    refuse(&self.store)?;
+                    return Ok(None);
+                }
+                crate::adapter::pi::refuse_confined_devin_agent(
+                    &self.agent_for_binding(&binding)?,
+                )?;
+                self.store.commit_assist_intent(
+                    seq,
+                    &self.intent_recipient(&job, &binding.alias, p)?,
+                    &body,
+                    &id,
+                    "assist_job_event",
+                    &task_id,
+                )
+            }
+            _ => {
+                refuse(&self.store)?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// The immutable recipient tuple of an intent, as the final commit checks it.
+    fn intent_recipient(
+        &self,
+        job: &str,
+        alias: &str,
+        p: &Value,
+    ) -> Result<store::AssistRecipient> {
+        let (Some(org), Some(sub), Some(assistant_id)) = (
+            intent_str(p, "org"),
+            intent_str(p, "sub"),
+            intent_str(p, "assistant_id"),
+        ) else {
+            return Err(Error::rejected("assist intent has no recipient tuple"));
+        };
+        Ok(store::AssistRecipient {
+            alias: alias.to_string(),
+            job: job.to_string(),
+            org,
+            sub,
+            assistant_id,
+        })
+    }
+
+    /// The agent row of an active binding, for the confinement refusal.
+    fn agent_for_binding(&self, binding: &store::AssistantBinding) -> Result<store::Agent> {
+        self.store
+            .agent_opt(&binding.alias)?
+            .ok_or_else(|| Error::rejected("assist notice: assistant alias is not registered"))
+    }
+
+    fn assist_notice_reprove(&self, message: &store::Message) -> Result<()> {
+        let refused =
+            |why: &str| Error::rejected(format!("assist notice '{}' refused: {why}", message.id));
+        let task_id = message
+            .task_id
+            .as_deref()
+            .ok_or_else(|| refused("no task"))?;
+        let job = self
+            .store
+            .task(task_id)
+            .map_err(|_| refused("task unknown"))?
+            .job_id;
+        let binding = self
+            .store
+            .assistant_for_alias(&message.alias)?
+            .filter(|b| b.is_active())
+            .ok_or_else(|| refused("binding inactive"))?;
+        let owner_ok = self
+            .store
+            .assist_request_for_job(&job)?
+            .is_some_and(|o| o.org == binding.org);
+        let member_ok = self
+            .store
+            .job_is_subscriber(&job, &binding.org, &binding.sub)?
+            || self
+                .store
+                .assist_request_owns(&binding.org, &binding.sub, &job)?;
+        if !owner_ok || !member_ok {
+            return Err(refused("not a subscriber of this job"));
+        }
+        let member = MemberCaller {
+            org: binding.org.clone(),
+            sub: binding.sub.clone(),
+            assistant_id: binding.assistant_id.clone(),
+            alias: binding.alias.clone(),
+            conversation_id: binding.conversation_id.clone(),
+            state: binding.state.clone(),
+            credential_id: String::new(),
+        };
+        self.member_authority_live(
+            "",
+            &member,
+            MemberReprove {
+                operation: "job_events",
+                scope: "assist.jobs",
+                job_id: Some(&job),
+                op_credential_id: None,
+            },
+            "member message",
+        )
+    }
+
     /// `member_caller` — admission for every `member_*` verb: proven
     /// operator relay, signed member envelope re-verify, per-verb scope
     /// gate, live binding re-bind, and the §4 live-authority pull bound
@@ -831,8 +1275,14 @@ impl Shared {
             "text": text,
             "source": format!("member-{}", member.sub),
         });
-        let mut receipt =
-            self.send_as(&send, &|_| Ok(store::Sender::Member(member.sub.clone())))?;
+        let mut receipt = self.send_as(&send, &|_| {
+            Ok(store::Sender::VerifiedMember(store::MemberAuthority {
+                org: member.org.clone(),
+                sub: member.sub.clone(),
+                assistant_id: member.assistant_id.clone(),
+                credential_id: member.credential_id.clone(),
+            }))
+        })?;
         // The send is accepted and queued. Now bring up the assistant's
         // own managed endpoint so a real confined turn drains it — the
         // ONLY member verb that may launch, for the ONE bound alias the
@@ -965,6 +1415,13 @@ impl Shared {
             ],
             "member job request",
         )?;
+        // One publication section per daemon: authority is re-proven and
+        // the request ledger re-read only after the lock, so a waiter sees
+        // the committed winner. Poison fails closed.
+        let _publication = self
+            .member_job_lock
+            .lock()
+            .map_err(|_| Error::internal("member job publication lock poisoned"))?;
         let member = self.member_caller(
             params,
             peer_pid,
@@ -1015,6 +1472,13 @@ impl Shared {
         let job_id = format!("assist-{}", &key_digest[..key_digest.len().min(24)]);
         // Persist the request's authorization provenance BEFORE creating
         // the job — the deferred commit re-proves exactly this.
+        // A job row with no ledger row is a prior partial request. Refuse
+        // before any shared-file write so its committed spec is untouched.
+        if self.store.job(&job_id).is_ok() {
+            return Err(Error::rejected(
+                "member job request is partially recorded; no artifact was changed",
+            ));
+        }
         let spec_path = self.assist_job_spec(&job_id, title, body, acceptance)?;
         let spec_sha = sha256_file(std::path::Path::new(&spec_path))
             .ok_or_else(|| Error::internal("assist job spec could not be hashed"))?;
@@ -1058,6 +1522,9 @@ impl Shared {
         // the subscriber ACL covers the requester too.
         self.store
             .job_subscribe(&bound, &member.org, &member.sub, &member.assistant_id)?;
+        // CAD-1380 R4: the inert awaiting-approval notice, after bind and the
+        // subscription. Idempotent on a retry; never approves or dispatches.
+        self.store.assist_request_notice(&bound)?;
         let record = self.store.job(&bound).ok().map(|j| j.to_json());
         Ok(json!({
             "job": bound,
@@ -1147,15 +1614,15 @@ impl Shared {
                  owns or subscribes to"
             )));
         }
-        // REAL evidence, revision-bound: the job's tasks carry the actual
-        // submitted head_sha + revision; the verdict row binds the exact
-        // reviewed sha. `reported` = a submitted revision with no verdict;
-        // `inspected` = a verdict recorded against the submitted sha
-        // (revise/blocked counted as inspected, pass as independently
-        // verified — an author-independent reviewer judged the exact
-        // revision); `unverified` = a draft/dispatched task with no
-        // submitted revision yet; `unavailable` = no task or the recorded
-        // artifact is gone. Nothing here fabricates a pass.
+        // REAL evidence, revision-bound. A task's state derives only from its
+        // server-recorded `head_sha` and the verdict current for its revision;
+        // a verdict counts only when it names that exact head. `reported` =
+        // no submitted head, or a head with no matching verdict. `unavailable`
+        // = the submitted commit is not present in the recorded worktree, even
+        // when a matching verdict exists (the verdict stays in `verdict` as
+        // audit data only). `inspected` = a revise/blocked verdict on a present
+        // artifact; `independently_verified` = a pass on a present artifact.
+        // Nothing here fabricates a pass.
         let job_row = match self.store.job(job) {
             Ok(j) => j,
             Err(_) => {
@@ -1167,31 +1634,80 @@ impl Shared {
                 }))
             }
         };
+        // Artifact custody: the submitted commit must be an object in the
+        // task's server-recorded worktree (objects are shared with the repo).
+        // Fixed argv, no shell; the sha is re-validated, and a relative
+        // worktree resolves only against the job's recorded repo, as the CLI
+        // verifier does. Any missing piece counts as not present.
+        let commit_present = |repo: Option<&str>, worktree: Option<&str>, head: &str| -> bool {
+            let Ok(sha) = store::check_commit_sha(head) else {
+                return false;
+            };
+            let Some(recorded) = worktree else {
+                return false;
+            };
+            let dir = if std::path::Path::new(recorded).is_absolute() {
+                std::path::PathBuf::from(recorded)
+            } else {
+                match repo {
+                    Some(repo) => {
+                        crate::worktree::layout::worktree_dir(std::path::Path::new(repo), recorded)
+                    }
+                    None => return false,
+                }
+            };
+            if !dir.is_dir() {
+                return false;
+            }
+            let mut cmd = std::process::Command::new("git");
+            // Local, read-only presence only: never lazily fetch a missing
+            // object from a promisor remote, and never prompt for credentials.
+            cmd.args(["cat-file", "-e", &format!("{sha}^{{commit}}")])
+                .current_dir(&dir)
+                .env("GIT_NO_LAZY_FETCH", "1")
+                .env("GIT_TERMINAL_PROMPT", "0");
+            matches!(
+                crate::proc::run_bounded(&mut cmd, std::time::Duration::from_secs(10)),
+                Ok(out) if out.status.success()
+            )
+        };
         let tasks = self.store.tasks_for_job(job)?;
+        // The job's evidence is the WEAKEST of its tasks, so one unsubmitted
+        // or unavailable task keeps the whole job from reading as verified.
+        // A job with no tasks is request-only evidence (`reported`).
+        const ORDER: [&str; 4] = [
+            "unavailable",
+            "reported",
+            "inspected",
+            "independently_verified",
+        ];
+        let rank = |s: &str| ORDER.iter().position(|o| *o == s).unwrap_or(0);
+        let mut any_state = if tasks.is_empty() {
+            "reported"
+        } else {
+            "independently_verified"
+        };
         let mut task_evidence = Vec::new();
-        let mut any_state = "reported";
         for task in &tasks {
             let verdicts = self.store.verdicts_for_task(&task.id)?;
             let current = store::current_verdict(task.revision, &verdicts);
-            let (state, sha, reviewer) = match (&task.head_sha, current) {
-                (Some(sha), Some(v)) if v.sha == *sha => (
+            let artifact = task.head_sha.as_deref().map(|head| {
+                commit_present(job_row.repo.as_deref(), task.worktree.as_deref(), head)
+            });
+            let (state, sha, reviewer) = match (task.head_sha.as_deref(), artifact, current) {
+                (None, _, _) => ("reported", None, None),
+                (Some(head), Some(false), _) => ("unavailable", Some(head.to_string()), None),
+                (Some(head), _, Some(v)) if v.sha == head => (
                     match v.verdict.as_str() {
                         "pass" => "independently_verified",
                         _ => "inspected",
                     },
-                    Some(sha.clone()),
+                    Some(head.to_string()),
                     Some(v.reviewer.clone()),
                 ),
-                (Some(sha), _) => ("reported", Some(sha.clone()), None),
-                (None, Some(v)) => ("inspected", Some(v.sha.clone()), Some(v.reviewer.clone())),
-                // A task with no submitted head and no verdict is still
-                // `reported` — the member's request itself is the
-                // evidence record. `unverified` is reserved for a
-                // stale/missing artifact on submitted work, never a
-                // fresh lane's normal state.
-                (None, None) => ("reported", None, None),
+                (Some(head), _, _) => ("reported", Some(head.to_string()), None),
             };
-            if matches!(state, "independently_verified" | "inspected") {
+            if rank(state) < rank(any_state) {
                 any_state = state;
             }
             task_evidence.push(json!({
@@ -1200,6 +1716,7 @@ impl Shared {
                 "revision": task.revision,
                 "head_sha": task.head_sha,
                 "evidence_state": state,
+                "artifact_available": artifact,
                 "verdict": current.map(|v| v.to_json()),
                 "reviewer": reviewer,
                 "sha": sha,

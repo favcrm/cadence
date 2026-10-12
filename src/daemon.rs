@@ -615,6 +615,13 @@ pub struct Shared {
     /// Serializes local CRM assistant permission checks and their bounded
     /// mutation/receipt writes. Never spans a network operation.
     app_assistant_lock: Mutex<()>,
+    /// Serializes `member_job_request` publication (authority re-proof,
+    /// ledger check, shared spec write, job create, request bind, subscribe)
+    /// so concurrent requests for one request_key cannot overwrite each
+    /// other's spec. It spans the request publication and the member's live
+    /// HTTP proof in `rpc_member_job_request`. It does not itself hold a store
+    /// connection during that HTTP call.
+    member_job_lock: Mutex<()>,
     app_release_claim_gate: Option<effect_rpc::EffectExecuteGate>,
     /// CAD-546: the `local` platform's outbox root — what
     /// `platform_outbox` lists. Set by `platform::local::register`
@@ -897,6 +904,7 @@ impl Shared {
             tool_contexts: Mutex::new(HashMap::new()),
             app_release_lock: Mutex::new(()),
             app_assistant_lock: Mutex::new(()),
+            member_job_lock: Mutex::new(()),
             app_release_claim_gate: opts.app_release_claim_gate.clone(),
             outbox_dir: opts.outbox_dir.clone(),
             smtp_test_ca: opts.smtp_test_ca_pem.clone(),

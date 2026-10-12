@@ -278,6 +278,211 @@ impl Store {
         }
     }
 
+    /// CAD-1380 R4: the inert `awaiting_approval` notice for a fresh member
+    /// request. Runs after the canonical ledger bind and the requester's
+    /// auto-subscription are committed. Subject is the job's real initial task
+    /// (`create_job` always creates one); with no task it writes nothing.
+    /// Idempotent: the intent key is the same digest a replay recomputes, so a
+    /// retry writes no duplicate. Writes intents only; never approves or
+    /// dispatches, and never changes the spec, request provenance or CID.
+    pub fn assist_request_notice(&self, job: &str) -> Result<()> {
+        self.write_tx(|tx| {
+            let initial: Option<String> = tx
+                .query_row(
+                    "SELECT id FROM tasks WHERE job_id=? ORDER BY created LIMIT 1",
+                    [job],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(task_id) = initial else {
+                return Ok(());
+            };
+            let job_row = self.job_in(tx, job)?;
+            let task = self.task_in(tx, &task_id)?;
+            self.assist_intents_for_transition(
+                tx,
+                &job_row,
+                &task,
+                "awaiting_approval",
+                "request",
+            )?;
+            Ok(())
+        })
+    }
+
+    /// CAD-1380 R4: the creation time of the kickoff (`dispatch` or
+    /// `job_dispatch`) that delivered `task` to `alias`. `None` when no such
+    /// delivery exists, so a missing birth proof fails closed.
+    pub fn task_kickoff_created(&self, task: &str, alias: &str) -> Result<Option<f64>> {
+        let conn = self.conn();
+        match conn.query_row(
+            "SELECT created FROM messages WHERE task_id=? AND alias=? \
+             AND source IN ('dispatch','job_dispatch') ORDER BY created LIMIT 1",
+            params![task, alias],
+            |r| r.get(0),
+        ) {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// CAD-1380 R4: the final commit for one assist intent. Runs in ONE
+    /// short store transaction with NO HTTP inside it. It reloads the pending
+    /// intent, requires its immutable tuple (`job`, `task`, `key`) to match the
+    /// caller's proof-selected recipient, rechecks the active binding and the
+    /// owner-org/owner-or-subscriber ACL, then enqueues through the existing
+    /// `enqueue_tx` and sets the intent's terminal status in the same commit.
+    /// Returns `Ok(Some(alias))` when a new notice was queued, `Ok(None)` when
+    /// the local authority no longer holds (intent finished as `refused`), and
+    /// `Ok(None)` for an identical replay that already exists (no new count).
+    /// `Err` only for an unexpected store failure; nothing is then finished.
+    pub fn commit_assist_intent(
+        &self,
+        seq: i64,
+        recipient: &AssistRecipient,
+        body: &str,
+        message_id: &str,
+        source: &str,
+        task_id: &str,
+    ) -> Result<Option<String>> {
+        self.write_tx(|tx| {
+            let payload: String = tx.query_row(
+                "SELECT payload FROM events WHERE seq=? AND kind='assist_intent' \
+                 AND json_extract(payload,'$.status')='pending'",
+                [seq],
+                |r| r.get(0),
+            )?;
+            let p: Value = serde_json::from_str(&payload)
+                .map_err(|_| Error::internal("assist intent payload unreadable"))?;
+            let field = |k: &str| p.get(k).and_then(Value::as_str).unwrap_or_default();
+            // The stored intent must still name this exact subscriber tuple,
+            // job and task. Any drift is refused, never rerouted.
+            if field("target") != "subscriber"
+                || field("job") != recipient.job
+                || field("task") != task_id
+                || field("org") != recipient.org
+                || field("sub") != recipient.sub
+                || field("assistant_id") != recipient.assistant_id
+            {
+                return Err(Error::rejected("assist intent tuple changed"));
+            }
+            let owner_org: Option<String> = tx
+                .query_row(
+                    "SELECT org FROM assist_requests WHERE job=? LIMIT 1",
+                    [recipient.job.as_str()],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let binding: Option<(String, String, String, String)> = tx
+                .query_row(
+                    "SELECT alias,org,sub,state FROM assistants WHERE org=? AND assistant_id=?",
+                    params![recipient.org, recipient.assistant_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .optional()?;
+            let member_ok = tx
+                .query_row(
+                    "SELECT 1 FROM job_subscribers WHERE job=? AND org=? AND sub=?",
+                    params![recipient.job, recipient.org, recipient.sub],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some()
+                || tx
+                    .query_row(
+                        "SELECT 1 FROM assist_requests WHERE job=? AND org=? AND sub=?",
+                        params![recipient.job, recipient.org, recipient.sub],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+            // The binding must still be the alias the proof and confinement
+            // check selected: a replacement alias is refused, never routed.
+            let authorized = owner_org.as_deref() == Some(recipient.org.as_str())
+                && member_ok
+                && binding.as_ref().is_some_and(|(alias, org, sub, state)| {
+                    alias == &recipient.alias
+                        && org == &recipient.org
+                        && sub == &recipient.sub
+                        && state == "active"
+                });
+            if !authorized {
+                tx.execute(
+                    "UPDATE events SET payload=json_set(payload,'$.status','refused') WHERE seq=?",
+                    [seq],
+                )?;
+                return Ok(None);
+            }
+            let alias = recipient.alias.clone();
+            let (duplicate, _) = self.enqueue_tx(
+                tx,
+                &alias,
+                body,
+                None,
+                message_id,
+                source,
+                Some(task_id),
+                None,
+                None,
+                &Sender::Unattributed,
+                Priority::default(),
+                None,
+                None,
+                None,
+            )?;
+            tx.execute(
+                "UPDATE events SET payload=json_set(payload,'$.status','delivered') WHERE seq=?",
+                [seq],
+            )?;
+            Ok((!duplicate).then_some(alias))
+        })
+    }
+
+    /// CAD-1380 R4: pending assist-job intents, oldest first, bounded. Each
+    /// entry is the intent `events.seq` and its metadata payload. Reads
+    /// only; the caller runs the drain outside any connection lock.
+    pub fn pending_assist_job_notifications(&self, limit: usize) -> Result<Vec<(i64, Value)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT seq, payload FROM events \
+             WHERE kind='assist_intent' AND json_extract(payload,'$.status')='pending' \
+             ORDER BY seq LIMIT ?",
+        )?;
+        let rows = stmt
+            .query_map([limit as i64], |r| {
+                let text: String = r.get(1)?;
+                let value: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+                Ok((r.get(0)?, value))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// CAD-1380 R4: move one pending assist intent to a terminal status
+    /// (`delivered`, `refused` or `unresolved`) in one atomic UPDATE. The
+    /// rest of the payload is preserved; only the `status` field changes,
+    /// and only while the intent is still `pending`.
+    pub fn finish_assist_job_notification(&self, seq: i64, outcome: &str) -> Result<()> {
+        if !matches!(outcome, "delivered" | "refused" | "unresolved") {
+            return Err(Error::internal("unknown assist intent outcome"));
+        }
+        self.write_tx(|tx| {
+            let n = tx.execute(
+                "UPDATE events SET payload=json_set(payload,'$.status',?) \
+                 WHERE seq=? AND kind='assist_intent' \
+                 AND json_extract(payload,'$.status')='pending'",
+                params![outcome, seq],
+            )?;
+            if n == 0 {
+                return Err(Error::rejected(format!(
+                    "assist intent {seq} is not pending"
+                )));
+            }
+            Ok(())
+        })
+    }
+
     /// Subscribers of `job` — for delivery fan-out (metadata only).
     pub fn job_subscribers(&self, job: &str) -> Result<Vec<(String, String, String)>> {
         let conn = self.conn();
@@ -708,6 +913,29 @@ impl Store {
                 if n == 0 {
                     return Ok(false); // already flagged at this watermark
                 }
+                // CAD-1380 R4: a newly flagged stall also writes inert
+                // `assist_intent` rows, keyed by this job's stall revision. The
+                // guarded drain queues any private notice. No task fabricated:
+                // the job's own initial task is the subject, else the stall
+                // stays audit-only (the raw `assist_stall` event above).
+                let initial: Option<String> = tx
+                    .query_row(
+                        "SELECT id FROM tasks WHERE job_id=? ORDER BY created LIMIT 1",
+                        [job_id.as_str()],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if let Some(task_id) = initial {
+                    let job = self.job_in(tx, &job_id)?;
+                    let task = self.task_in(tx, &task_id)?;
+                    self.assist_intents_for_transition(
+                        tx,
+                        &job,
+                        &task,
+                        "stalled",
+                        &format!("stall:{revision}"),
+                    )?;
+                }
                 Self::event_scoped(
                     tx,
                     &pm_alias,
@@ -783,4 +1011,14 @@ impl Store {
         }
         Ok(stalled)
     }
+}
+
+/// The proof-selected recipient of one assist intent, checked again inside
+/// the final commit.
+pub struct AssistRecipient {
+    pub alias: String,
+    pub job: String,
+    pub org: String,
+    pub sub: String,
+    pub assistant_id: String,
 }

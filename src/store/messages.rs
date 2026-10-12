@@ -1111,7 +1111,7 @@ impl Store {
             Sender::Operator | Sender::OperatorChat => (None, Some("operator".into())),
             // CAD-1380: a member is attributed by label only, never as the
             // operator and never with an agent uid.
-            Sender::Member(_) => (None, Some("member".into())),
+            Sender::Member(_) | Sender::VerifiedMember(_) => (None, Some("member".into())),
             Sender::Unattributed => (None, None),
         })
     }

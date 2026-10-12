@@ -2016,6 +2016,7 @@ impl Fx {
 fn assist_agent_boundary_refuses_foreign_fleet_and_leaks() {
     let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
+    with_deferred_service(&fx);
     let rt = fx.member_runtime("sub-alice");
     let own = rt.alias.clone();
 
@@ -2149,6 +2150,7 @@ fn assist_agent_boundary_refuses_foreign_fleet_and_leaks() {
 fn assist_binding_dead_state_never_widens_to_ordinary_worker() {
     let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
+    with_deferred_service(&fx);
     let rt = fx.member_runtime("sub-bob");
     let own = rt.alias.clone();
     // Positive control: while the binding is active the own-surface read works.
@@ -4301,4 +4303,1908 @@ fn member_send_respects_manual_stop_but_resumes_auto_stop() {
         fx.shared.store.agent(&auto.alias).unwrap().enabled || owned(&fx, &auto.alias),
         "an auto-stopped assistant was not resumed by the member send"
     );
+}
+
+// ============================================================================
+// CAD-1380 review fix (R2) — concurrent same-(org, sub, request_key) requests
+// with DIFFERENT title/body/acceptance must leave ONE winning canonical
+// artifact: the job's spec bytes, its persisted `spec_sha256`, the returned
+// `job_record` and the winning ledger row all describe the same request. A
+// refused partial retry (job row present, no ledger row) must not touch an
+// accepted artifact. Real `member_job_request` route, real signed envelopes
+// and the live-authority fixture; no model of the lock.
+// ============================================================================
+
+/// The spec text `assist_job_spec` writes for one request (independent of the
+/// product helper: the title/body/acceptance layout the kickoff reads).
+fn expected_spec(title: &str, body: &str, acceptance: &str) -> String {
+    format!("# {title}\n\n{body}\n\n## Acceptance\n\n{acceptance}\n")
+}
+
+/// Lowercase hex SHA-256 of raw bytes, computed here rather than through the
+/// product hasher so the persisted hash is checked against the real bytes.
+fn sha_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    format!("{:x}", sha2::Sha256::digest(bytes))
+}
+
+#[test]
+fn concurrent_same_request_key_keeps_one_winner_artifact() {
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    fx.provision("sub-alice");
+    let key = "k-race";
+    let (a_title, a_body, a_acc) = ("race ship A", "body A", "acceptance A");
+    let (b_title, b_body, b_acc) = ("race ship B", "body B", "acceptance B");
+    // Mint both single-use envelopes before the threads start.
+    let env_a = fx.member_envelope("sub-alice");
+    let env_b = fx.member_envelope("sub-alice");
+    let params_a = json!({"member_envelope": env_a, "title": a_title, "request_key": key, "body": a_body, "acceptance": a_acc});
+    let params_b = json!({"member_envelope": env_b, "title": b_title, "request_key": key, "body": b_body, "acceptance": b_acc});
+
+    let barrier = std::sync::Barrier::new(2);
+    let (ra, rb) = std::thread::scope(|s| {
+        let ha = s.spawn(|| {
+            barrier.wait();
+            fx.op_err("member_job_request", params_a.clone())
+        });
+        let hb = s.spawn(|| {
+            barrier.wait();
+            fx.op_err("member_job_request", params_b.clone())
+        });
+        (ha.join().unwrap(), hb.join().unwrap())
+    });
+    let ra = ra.unwrap_or_else(|e| panic!("concurrent request A refused: {e}"));
+    let rb = rb.unwrap_or_else(|e| panic!("concurrent request B refused: {e}"));
+
+    // Both callers receive the one canonical job; exactly one published it.
+    let job = ra["job"].as_str().unwrap().to_string();
+    assert_eq!(
+        rb["job"].as_str(),
+        Some(job.as_str()),
+        "concurrent equivalents returned different jobs: {ra} vs {rb}"
+    );
+    let mut statuses = [
+        ra["status"].as_str().unwrap_or_default().to_string(),
+        rb["status"].as_str().unwrap_or_default().to_string(),
+    ];
+    statuses.sort();
+    assert_eq!(
+        statuses,
+        ["awaiting_approval".to_string(), "existing".to_string()],
+        "expected one publisher and one replay: {ra} vs {rb}"
+    );
+
+    // The winning ledger row: which request won, and its recorded provenance.
+    let ledger = fx
+        .shared
+        .store
+        .assist_request_record(ORG, "sub-alice", key)
+        .unwrap()
+        .unwrap_or_else(|| panic!("no ledger row for {key}"));
+    assert_eq!(ledger.job, job, "ledger points at a different job");
+    let winner = if ledger.title.as_deref() == Some(a_title) {
+        (a_title, a_body, a_acc)
+    } else {
+        (b_title, b_body, b_acc)
+    };
+    assert_eq!(
+        (
+            ledger.title.as_deref(),
+            ledger.body.as_deref(),
+            ledger.acceptance.as_deref()
+        ),
+        (Some(winner.0), Some(winner.1), Some(winner.2)),
+        "ledger mixes title/body/acceptance from two requests"
+    );
+    assert_eq!(
+        ledger.credential_id.as_deref(),
+        Some("cred-sub-alice"),
+        "ledger lost its issuing credential"
+    );
+    let by_job = fx
+        .shared
+        .store
+        .assist_request_for_job(&job)
+        .unwrap()
+        .unwrap_or_else(|| panic!("no request row for job {job}"));
+    assert_eq!(by_job.request_key, key, "job maps to another request key");
+    assert_eq!(by_job.title, ledger.title, "job-keyed ledger disagrees");
+
+    // The persisted job: its spec bytes are the winner's, and its hash is the
+    // hash of THOSE bytes. Both returned records carry that same hash.
+    let stored = fx.shared.store.job(&job).unwrap();
+    let file = std::fs::read(&stored.spec_path)
+        .unwrap_or_else(|e| panic!("canonical spec unreadable: {e}"));
+    assert_eq!(
+        String::from_utf8_lossy(&file),
+        expected_spec(winner.0, winner.1, winner.2),
+        "canonical spec bytes are not the winning request's text"
+    );
+    assert_eq!(
+        stored.spec_sha256.as_deref(),
+        Some(sha_hex(&file).as_str()),
+        "persisted spec_sha256 does not match the canonical spec bytes"
+    );
+    assert_eq!(
+        stored.title.as_deref(),
+        Some(winner.0),
+        "job title is not the winner's"
+    );
+    for (name, r) in [("A", &ra), ("B", &rb)] {
+        assert_eq!(
+            r["job_record"]["spec_sha256"].as_str(),
+            stored.spec_sha256.as_deref(),
+            "request {name} returned a job_record with a different spec hash: {r}"
+        );
+        assert_eq!(
+            r["job_record"]["title"].as_str(),
+            Some(winner.0),
+            "request {name} returned a job_record with a different title: {r}"
+        );
+    }
+
+    // Partial retry (the accepted artifact must stay unchanged): a prior
+    // request left a job row with no ledger row. The retry is refused BEFORE
+    // any shared spec write, and the winner's accepted bytes do not move.
+    let partial_key = "k-partial";
+    let partial_id = format!(
+        "assist-{}",
+        &crate::operator_auth::digest(&format!("{ORG}:sub-alice:{partial_key}"))[..24]
+    );
+    let partial_spec = fx.shared.state_dir.join("assist_jobs");
+    std::fs::create_dir_all(&partial_spec).unwrap();
+    let partial_path = partial_spec.join(format!("{partial_id}.md"));
+    let sentinel = b"sentinel partial spec\n";
+    std::fs::write(&partial_path, sentinel).unwrap();
+    fx.shared
+        .store
+        .create_job(
+            &partial_id,
+            Some("partial"),
+            &partial_path.to_string_lossy(),
+            &sha_hex(sentinel),
+            "assist-agent-sub-alice",
+            None,
+            None,
+            None,
+            2,
+            None,
+            Some("partial"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("could not seed partial job: {e}"));
+    let retry = fx.op_err(
+        "member_job_request",
+        json!({"member_envelope": fx.member_envelope("sub-alice"), "title": "partial retry", "request_key": partial_key, "body": "retry body", "acceptance": "retry acc"}),
+    );
+    let refusal = err_text(retry, "partial-state retry");
+    assert!(
+        refusal.contains("partially recorded"),
+        "partial-state retry refused for the wrong reason: {refusal}"
+    );
+    assert_eq!(
+        std::fs::read(&partial_path).unwrap(),
+        sentinel,
+        "a refused partial retry overwrote the partial job's spec"
+    );
+    assert_eq!(
+        fx.shared
+            .store
+            .assist_request_job(ORG, "sub-alice", partial_key)
+            .unwrap(),
+        None,
+        "a refused partial retry bound a ledger row"
+    );
+    let winner_now = std::fs::read(&stored.spec_path).unwrap();
+    assert_eq!(
+        winner_now, file,
+        "the accepted canonical artifact changed after the partial retry"
+    );
+}
+
+// ============================================================================
+// CAD-1380 review fix (R3) — real task progress advances the assist job's
+// authority revision and stall watermark. Independent acceptance check: the
+// progress is driven through the production task RPCs, never a direct
+// rewrite of `jobs.updated`; `age_job` only sets the stalled starting state.
+// ============================================================================
+
+/// The member-visible `authority_rev` read through the real evidence path.
+fn assist_evidence_rev(fx: &Fx, env: &str, job: &str) -> String {
+    fx.op(
+        "member_job_evidence",
+        json!({"member_envelope": env, "job": job}),
+    )
+    .get("authority_rev")
+    .and_then(Value::as_str)
+    .unwrap_or_else(|| panic!("member_job_evidence returned no authority_rev"))
+    .to_string()
+}
+
+/// A legitimate assist job observed at a stalled revision. Real task create
+/// and dispatch through `task_new`/`task_dispatch` must move that revision and
+/// refresh the stall watermark. The owner's reconcile with the OLD observed rev
+/// refuses without touching the queued provenance; the fresh current rev admits
+/// under the member's current legitimate proof.
+#[test]
+fn assist_real_progress_advances_authority_rev_and_stall_watermark() {
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    let rt = fx.member_runtime("sub-nico");
+    fx.shared
+        .store
+        .fixture_write(|tx| {
+            tx.execute(
+                "UPDATE agents SET params=? WHERE alias='ordinary-worker'",
+                rusqlite::params![json!({"upstream": rt.alias}).to_string()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let req = fx.op(
+        "member_job_request",
+        json!({"member_envelope": fx.member_envelope("sub-nico"), "title": "n job", "request_key": "n-k1", "body": "b"}),
+    );
+    let job = req["job"].as_str().unwrap().to_string();
+    let prov_orig = assist_provenance(&fx, &job);
+    assert_eq!(prov_orig.credential_id.as_deref(), Some("cred-sub-nico"));
+
+    // Stalled starting point: past the 300 s assist bound, observed by the owner.
+    age_job(&fx, &job, 400);
+    let observed = assist_evidence_rev(&fx, &fx.member_envelope("sub-nico"), &job);
+    let stalled = fx
+        .shared
+        .store
+        .assist_stall_sweep(300, crate::issue::time::now_epoch() as f64)
+        .unwrap();
+    assert_eq!(stalled, 1, "the aged assist job did not read as stalled");
+
+    // REAL progress: create and dispatch a second task through the production RPCs.
+    let t2 = format!("{job}-t2");
+    fx.op(
+        "task_new",
+        json!({"job": job, "task": t2, "title": "n task 2", "assignee": rt.worker}),
+    );
+    let dispatched = fx.op(
+        "task_dispatch",
+        json!({"task": t2, "to": rt.worker, "by": "operator"}),
+    );
+    assert_eq!(
+        dispatched["task"]["id"].as_str(),
+        Some(t2.as_str()),
+        "real task dispatch refused: {dispatched}"
+    );
+
+    let moved = assist_evidence_rev(&fx, &fx.member_envelope("sub-nico"), &job);
+    assert_ne!(
+        moved, observed,
+        "real task create/dispatch did not advance the job's authority revision"
+    );
+    assert_eq!(
+        fx.shared
+            .store
+            .assist_stall_sweep(300, crate::issue::time::now_epoch() as f64)
+            .unwrap(),
+        0,
+        "recent real task progress left the job stalled"
+    );
+
+    // The OLD observed revision refuses: no effect, queued provenance unchanged.
+    let before = fx.tree();
+    let e = err_text(
+        fx.op_err(
+            "member_job_reconcile",
+            json!({"member_envelope": fx.member_envelope("sub-nico"), "job": job,
+                   "expected_authority_rev": observed}),
+        ),
+        "stale observed-rev reconcile",
+    );
+    assert!(
+        e.contains("rev") || e.contains("authority") || e.contains("mismatch"),
+        "stale observed-rev reconcile refused for another reason: {e}"
+    );
+    assert_eq!(
+        fx.tree(),
+        before,
+        "a stale observed rev committed an effect"
+    );
+    let prov_after = assist_provenance(&fx, &job);
+    assert_eq!(
+        prov_after.credential_id, prov_orig.credential_id,
+        "a stale observed rev re-pinned the queued original credential"
+    );
+
+    // The member's current legitimate proof (a renewed live credential) plus the
+    // FRESH current revision admits the owner's reconcile.
+    fx.set_member("sub-nico", |m| {
+        m.credential_live = true;
+        m.recorded_credential = "cred-sub-nico-new".to_string();
+        m.live_credentials.insert(
+            "cred-sub-nico-new".to_string(),
+            (
+                true,
+                vec![
+                    "assist.read".into(),
+                    "assist.write".into(),
+                    "assist.jobs".into(),
+                ],
+            ),
+        );
+    });
+    let renew = fx.envelope(
+        "sub-nico",
+        json!({}),
+        json!({"credential_id": "cred-sub-nico-new"}),
+    );
+    let fresh = assist_evidence_rev(&fx, &renew, &job);
+    let rec = fx.op(
+        "member_job_reconcile",
+        json!({"member_envelope": renew, "job": job, "expected_authority_rev": fresh}),
+    );
+    assert_eq!(
+        rec["reconciled"].as_str(),
+        Some("sub-nico"),
+        "fresh-rev owner reconcile refused: {rec}"
+    );
+    assert_eq!(
+        assist_provenance(&fx, &job).credential_id.as_deref(),
+        Some("cred-sub-nico-new"),
+        "fresh-rev reconcile did not re-pin to the owner's current credential"
+    );
+}
+
+// ============================================================================
+// CAD-1380 review fix (R5) — member_job_evidence grades a task only on an
+// AVAILABLE submitted artifact. Independent acceptance check, built on real
+// task submission (dispatch kickoff finished by the worker), real verdict
+// RPC and a temp LOCAL git repo. Positive/mixed/stale/missing states are
+// each asserted per task and for the whole job.
+// ============================================================================
+
+/// Run git in `dir` (local, fixed argv) and return trimmed stdout.
+fn r5_git(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_AUTHOR_NAME", "r5")
+        .env("GIT_AUTHOR_EMAIL", "r5@example.invalid")
+        .env("GIT_COMMITTER_NAME", "r5")
+        .env("GIT_COMMITTER_EMAIL", "r5@example.invalid")
+        .output()
+        .expect("git unavailable");
+    assert!(out.status.success(), "git {args:?} failed");
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+/// Commit `body` as the repo's file and return the new HEAD sha.
+fn r5_commit(dir: &std::path::Path, body: &str) -> String {
+    std::fs::write(dir.join("artifact.txt"), body).unwrap();
+    r5_git(dir, &["add", "artifact.txt"]);
+    r5_git(dir, &["commit", "-q", "-m", body]);
+    r5_git(dir, &["rev-parse", "HEAD"])
+}
+
+/// Real worker submission: dispatch the task, then the worker's kickoff
+/// completion reports `sha` through the production finish path.
+fn r5_submit(fx: &Fx, rt: &MemberRuntime, task: &str, sha: &str) {
+    fx.op(
+        "task_dispatch",
+        json!({"task": task, "to": rt.worker, "by": "operator"}),
+    );
+    let kickoff = fx
+        .shared
+        .store
+        .task(task)
+        .unwrap()
+        .dispatch_message
+        .expect("dispatch recorded no kickoff");
+    let msg = fx
+        .shared
+        .store
+        .message(&kickoff)
+        .unwrap()
+        .expect("kickoff missing");
+    fx.shared
+        .store
+        .finish(
+            &msg,
+            "completed",
+            &json!({"status": "completed", "sha": sha}),
+            None,
+        )
+        .unwrap();
+}
+
+/// The member's evidence read for `job`.
+fn r5_evidence(fx: &Fx, env: &str, job: &str) -> Value {
+    fx.op(
+        "member_job_evidence",
+        json!({"member_envelope": env, "job": job}),
+    )
+}
+
+/// The per-task evidence entry for `task` in an evidence read.
+fn r5_task<'a>(ev: &'a Value, task: &str) -> &'a Value {
+    ev["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["task"].as_str() == Some(task))
+        .unwrap_or_else(|| panic!("no evidence entry for {task}: {ev}"))
+}
+
+#[test]
+fn member_job_evidence_requires_available_submitted_artifact() {
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    let rt = fx.member_runtime("sub-nico");
+    fx.shared
+        .store
+        .fixture_write(|tx| {
+            tx.execute(
+                "UPDATE agents SET params=? WHERE alias='ordinary-worker'",
+                rusqlite::params![json!({"upstream": rt.alias}).to_string()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let env = fx.member_envelope("sub-nico");
+    let job = fx.op(
+        "member_job_request",
+        json!({"member_envelope": env, "title": "r5 job", "request_key": "r5-k1", "body": "b"}),
+    )["job"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // A real local repo: the worker's submitted commit is an object here.
+    let repo = fx.dir.path().join("r5-repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    r5_git(&repo, &["init", "-q"]);
+    let sha1 = r5_commit(&repo, "first artifact\n");
+    let repo_s = repo.to_string_lossy().to_string();
+
+    // ---- POSITIVE: one task, present artifact, independent pass. ----
+    // Adopt the task `member_job_request` already created. Its server-recorded
+    // worktree and assignee are fixture coordinator metadata only: no head,
+    // state, verdict or availability is set here.
+    let t1 = format!("{job}-t1");
+    fx.shared
+        .store
+        .fixture_write(|tx| {
+            tx.execute(
+                "UPDATE tasks SET worktree=?, assignee=? WHERE id=? AND job_id=?",
+                rusqlite::params![repo_s, rt.worker, t1, job],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    r5_submit(&fx, &rt, &t1, &sha1);
+    // The independent reviewer is the operator connection, never the worker.
+    fx.op(
+        "task_verdict",
+        json!({"task": t1, "sha": sha1, "verdict": "pass"}),
+    );
+    let ev = r5_evidence(&fx, &env, &job);
+    let t = r5_task(&ev, &t1);
+    let positive_available = t["artifact_available"].as_bool();
+    assert_eq!(
+        t["evidence_state"].as_str(),
+        Some("independently_verified"),
+        "positive task: {ev}"
+    );
+    assert_eq!(
+        ev["evidence_state"].as_str(),
+        Some("independently_verified"),
+        "positive job: {ev}"
+    );
+
+    // ---- MIXED: a second task is created but never submitted. The passed
+    // first task must not label the whole job independently_verified. ----
+    let t2 = format!("{job}-t2");
+    fx.op(
+        "task_new",
+        json!({"job": job, "task": t2, "title": "r5 t2", "assignee": rt.worker, "worktree": repo_s}),
+    );
+    let ev = r5_evidence(&fx, &env, &job);
+    assert_eq!(
+        r5_task(&ev, &t1)["evidence_state"].as_str(),
+        Some("independently_verified"),
+        "mixed first task: {ev}"
+    );
+    assert_eq!(
+        r5_task(&ev, &t2)["evidence_state"].as_str(),
+        Some("reported"),
+        "unsubmitted task: {ev}"
+    );
+    assert_ne!(
+        ev["evidence_state"].as_str(),
+        Some("independently_verified"),
+        "mixed job labelled independently_verified: {ev}"
+    );
+    assert_eq!(
+        positive_available,
+        Some(true),
+        "present artifact read as missing: {ev}"
+    );
+
+    // ---- STALE: t1 is reopened and a NEW head is submitted. The old pass
+    // names sha1, so it must not rescue sha2. ----
+    fx.shared.store.reopen_task(&t1, "operator").unwrap();
+    let sha2 = r5_commit(&repo, "second artifact\n");
+    r5_submit(&fx, &rt, &t1, &sha2);
+    let ev = r5_evidence(&fx, &env, &job);
+    let t = r5_task(&ev, &t1);
+    assert_eq!(
+        t["head_sha"].as_str(),
+        Some(sha2.as_str()),
+        "new head not recorded: {ev}"
+    );
+    assert_ne!(
+        t["evidence_state"].as_str(),
+        Some("independently_verified"),
+        "stale pass rescued the new head: {ev}"
+    );
+    assert_ne!(
+        t["evidence_state"].as_str(),
+        Some("inspected"),
+        "stale verdict inspected the new head: {ev}"
+    );
+
+    // ---- MISSING: the recorded worktree disappears. The submitted commit is
+    // no longer available, so the task is unavailable (verdict kept as audit
+    // data only), never inspected/independently_verified. ----
+    std::fs::remove_dir_all(&repo).unwrap();
+    let ev = r5_evidence(&fx, &env, &job);
+    let t = r5_task(&ev, &t1);
+    assert_eq!(
+        t["artifact_available"].as_bool(),
+        Some(false),
+        "missing artifact read as present: {ev}"
+    );
+    assert_eq!(
+        t["evidence_state"].as_str(),
+        Some("unavailable"),
+        "missing artifact task: {ev}"
+    );
+    assert_eq!(
+        ev["evidence_state"].as_str(),
+        Some("unavailable"),
+        "missing artifact job: {ev}"
+    );
+    assert_ne!(
+        ev["evidence_state"].as_str(),
+        Some("independently_verified"),
+        "missing artifact job verified: {ev}"
+    );
+}
+
+/// R1 narrow bad case: a bound assistant's own `thread_read` must stop at the
+/// platform gate once the member's issuing credential is revoked at the
+/// platform, while the LOCAL binding stays active. Real `as_assistant`
+/// (daemon-derived agent identity) and the real platform fixture; no role in
+/// params.
+#[test]
+fn assist_own_thread_read_refuses_platform_revoked_member() {
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    let sub = "sub-c1380-plat";
+    let rt = fx.member_runtime(sub);
+
+    // Positive: live platform authority admits the assistant's own thread read.
+    let live = fx.as_assistant(&rt.alias, "thread_read", json!({"alias": rt.alias}));
+    assert!(
+        live.is_ok(),
+        "live member own thread_read refused: {live:?}"
+    );
+
+    // Platform-side revocation of the member's issuing credential. The local
+    // binding is deliberately left active so only the live pull can refuse.
+    fx.set_member(sub, |m| m.credential_live = false);
+    assert!(
+        fx.shared
+            .store
+            .assistant_for_alias(&rt.alias)
+            .unwrap()
+            .is_some_and(|b| b.is_active()),
+        "the local binding must remain active for this platform-only case"
+    );
+    let refused = fx.as_assistant(&rt.alias, "thread_read", json!({"alias": rt.alias}));
+    assert!(
+        refused.is_err(),
+        "platform-revoked member read its own thread through the assistant identity: {refused:?}"
+    );
+}
+
+// ============================================================================
+// CAD-1380 review fix (R1) — a QUEUED member turn is refused by its ORIGINAL
+// credential at the claim and admission gates, not by the latest pin. Real
+// `member_assist_send`, the real `take_app_aware` / `admit_app_submission`
+// helpers and the live-authority fixture; no adapter reached on a refusal.
+// ============================================================================
+
+/// A member's send queued while live is refused once its ORIGINAL issuing
+/// credential is dead, even though the local binding is still active. The
+/// stamp keeps the original `cred-<sub>` id; the refusal retains the message
+/// body as failed and records a `member_turn_refused` event. The positive
+/// control is the same queued turn taken and admitted while the credential
+/// is live.
+#[test]
+fn queued_member_turn_refused_by_original_credential_at_claim() {
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    let sub = "sub-c1380-queued";
+    let rt = fx.member_runtime(sub);
+
+    // Live positive: send, claim and admit while the original credential is live.
+    let sent = fx.op(
+        "member_assist_send",
+        json!({"member_envelope": fx.member_envelope(sub), "text": "live turn"}),
+    );
+    let live_id = sent["message"]
+        .as_str()
+        .expect("live send has no message id");
+    let live_msg = fx
+        .shared
+        .store
+        .message(live_id)
+        .unwrap()
+        .expect("live message missing");
+    let stamp = fx
+        .shared
+        .store
+        .message_member_authority(live_id)
+        .unwrap()
+        .expect("live member message carries no member authority stamp");
+    assert_eq!(
+        stamp.credential_id,
+        format!("cred-{sub}"),
+        "the queued stamp is not the ORIGINAL issuing credential"
+    );
+    let taken = fx.shared.take_app_aware(&rt.alias).unwrap();
+    let crate::store::Take::Message(taken) = taken else {
+        panic!("live queued member turn was not taken");
+    };
+    assert_eq!(
+        taken.id, live_msg.id,
+        "took a different message than the live send"
+    );
+    fx.shared
+        .admit_app_submission(&taken)
+        .expect("live member turn refused at admission");
+    // Post-claim guard: revoke after the claim, then the real admission gate
+    // must refuse with a PreWrite error before any adapter is reached.
+    fx.set_member(sub, |m| m.credential_live = false);
+    assert!(
+        matches!(
+            fx.shared.admit_app_submission(&taken),
+            Err(crate::Error::PreWrite(_))
+        ),
+        "a revoked post-claim turn was not refused at the PreWrite admission gate"
+    );
+    fx.set_member(sub, |m| m.credential_live = true);
+    // Controlled fixture closure (not provider execution): the first row is
+    // finished through the real store so it is no longer the queue head.
+    fx.shared
+        .store
+        .finish(
+            &taken,
+            "failed",
+            &json!({"status": "failed", "text": "", "error": "fixture closure after admission guard"}),
+            Some("fixture closure after admission guard"),
+        )
+        .expect("could not close the first live fixture row");
+
+    // Second send queued while live, then the ORIGINAL credential dies. The
+    // local binding stays active, so only the original-credential re-prove
+    // can refuse it at claim.
+    let queued = fx.op(
+        "member_assist_send",
+        json!({"member_envelope": fx.member_envelope(sub), "text": "queued turn"}),
+    );
+    let queued_id = queued["message"]
+        .as_str()
+        .expect("queued send has no message id")
+        .to_string();
+    fx.set_member(sub, |m| m.credential_live = false);
+    assert!(
+        fx.shared
+            .store
+            .assistant_for_alias(&rt.alias)
+            .unwrap()
+            .is_some_and(|b| b.is_active()),
+        "the local binding must remain active for this original-credential case"
+    );
+
+    let claimed = fx.shared.take_app_aware(&rt.alias).unwrap();
+    assert!(
+        !matches!(claimed, crate::store::Take::Message(_)),
+        "a queued turn whose original credential is dead was taken as runnable"
+    );
+    let retained = fx
+        .shared
+        .store
+        .message(&queued_id)
+        .unwrap()
+        .expect("refused queued message was dropped, not retained");
+    assert!(
+        retained.state == "failed" || retained.state == "held",
+        "refused queued message is neither failed nor held: {}",
+        retained.state
+    );
+    assert!(
+        retained.body.contains("queued turn"),
+        "refused queued message lost its body"
+    );
+    let events = fx.shared.store.events(&rt.alias, 0, 500).unwrap();
+    assert!(
+        events.iter().any(|e| e.kind == "member_turn_refused"
+            && e.payload["message"].as_str() == Some(queued_id.as_str())),
+        "no truthful member_turn_refused event names the refused message"
+    );
+}
+
+// ============================================================================
+// CAD-1380 independent acceptance (r4) — a platform-revoked member must not
+// receive a NEW private job notification before a live jobs-scope proof.
+// Real `member_job_request` route, signed envelopes and the live-authority
+// fixture; the existing Store route `job_notice` is driven directly.
+// ============================================================================
+
+#[test]
+fn assist_job_notice_never_queues_private_delivery_before_live_proof() {
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    let sub = "sub-c1380-r4-notice";
+    let rt = fx.member_runtime(sub);
+
+    // Real job request through the signed member route.
+    let req = fx.op(
+        "member_job_request",
+        json!({"member_envelope": fx.member_envelope(sub), "title": "r4 notice job", "request_key": "r4-notice-k1", "body": "r4 body", "acceptance": "r4 acceptance"}),
+    );
+    let job = req["job"]
+        .as_str()
+        .expect("member_job_request returned no job id")
+        .to_string();
+    let task = fx
+        .shared
+        .store
+        .tasks_for_job(&job)
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("job has no first task");
+
+    // Record the assistant's full message set and queued head before any notice.
+    let ids_before: Vec<String> = fx
+        .shared
+        .store
+        .messages(&rt.alias)
+        .unwrap()
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    let head_before = fx
+        .shared
+        .store
+        .queued_head(&rt.alias)
+        .unwrap()
+        .map(|m| m.id);
+    assert!(
+        head_before.is_none(),
+        "fixture assistant already has a queued head: {head_before:?}"
+    );
+
+    // Platform revocation of the issuing credential; the local binding stays active.
+    fx.set_member(sub, |m| m.credential_live = false);
+    assert!(
+        fx.shared
+            .store
+            .assistant_for_alias(&rt.alias)
+            .unwrap()
+            .is_some_and(|b| b.is_active()),
+        "the local binding must remain active for this platform-only case"
+    );
+
+    // The existing Store route fires a private notice for the job's task.
+    fx.shared
+        .store
+        .job_notice(
+            &task.id,
+            "blocked",
+            "independent-r4-no-direct",
+            "PRIVATE_NOTE_MUST_NOT_FAN_OUT",
+        )
+        .expect("real job notice route failed");
+
+    // No NEW queued message may land on the revoked member's private assistant.
+    let head_after = fx
+        .shared
+        .store
+        .queued_head(&rt.alias)
+        .unwrap()
+        .map(|m| m.id);
+    assert!(
+        head_after.is_none(),
+        "a revoked member's private assistant received a new queued notice: {head_after:?}"
+    );
+    let ids_after: Vec<String> = fx
+        .shared
+        .store
+        .messages(&rt.alias)
+        .unwrap()
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    assert_eq!(
+        ids_after, ids_before,
+        "a revoked member's private assistant gained a new message row"
+    );
+}
+
+// ============================================================================
+// CAD-1380 independent acceptance (r4 drain) - the real Shared drain fans out
+// metadata-only assist notices to live, entitled subscribers only. Real
+// member_job_request / member_job_share / member_job_subscribe RPCs, real
+// Store.job_notice, the real route_assist_job_notifications drain and the real
+// admit_app_submission gate. No adapter or provider is reached.
+// ============================================================================
+
+/// Full message-id set for an alias (every state), in store order.
+fn r4d_ids(fx: &Fx, alias: &str) -> Vec<String> {
+    fx.shared
+        .store
+        .messages(alias)
+        .unwrap()
+        .into_iter()
+        .map(|m| m.id)
+        .collect()
+}
+
+#[test]
+fn assist_drain_notifies_only_live_entitled_subscribers() {
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    let owner = fx.member_runtime("sub-ana");
+    let sub = fx.member_runtime("sub-ben");
+    let control = fx.member_runtime("sub-cid");
+
+    // Owner requests the job; the request body carries a private marker.
+    let req = fx.op(
+        "member_job_request",
+        json!({"member_envelope": fx.member_envelope("sub-ana"), "title": "r4d drain job", "request_key": "r4d-k1", "body": "PRIVATE_REQUEST_BODY_R4D", "acceptance": "r4d acceptance"}),
+    );
+    let job = req["job"].as_str().unwrap().to_string();
+    let task = fx
+        .shared
+        .store
+        .tasks_for_job(&job)
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("job has no first task");
+
+    // The source also emits the inert `awaiting_approval` notice for a new
+    // request. Drain it now, while the owner is live, and check it is metadata
+    // only. Only this real drain runs: no provider, delete or finish of rows.
+    let initial = fx
+        .shared
+        .route_assist_job_notifications()
+        .expect("real drain failed (initial awaiting_approval)");
+    assert!(
+        initial >= 1,
+        "initial awaiting_approval notice was not queued"
+    );
+    for m in fx.shared.store.messages(&owner.alias).unwrap() {
+        if m.source == "assist_job_event" {
+            for private in [
+                "PRIVATE_REQUEST_BODY_R4D",
+                "r4d drain job",
+                "r4d acceptance",
+            ] {
+                assert!(
+                    !m.body.contains(private),
+                    "initial owner notice leaked {private}: {}",
+                    m.body
+                );
+            }
+        }
+    }
+
+    // Owner shares; owner and subscriber subscribe through the real RPCs.
+    fx.op(
+        "member_job_share",
+        json!({"member_envelope": fx.member_envelope("sub-ana"), "job": job}),
+    );
+    for s in ["sub-ana", "sub-ben"] {
+        fx.op(
+            "member_job_subscribe",
+            json!({"member_envelope": fx.member_envelope(s), "job": job}),
+        );
+    }
+
+    let owner_base = r4d_ids(&fx, &owner.alias);
+    let sub_base = r4d_ids(&fx, &sub.alias);
+    let control_base = r4d_ids(&fx, &control.alias);
+
+    // ---- 1. Both live: one real notice, one drain. Owner and subscriber each
+    // gain metadata-only job events; the non-subscriber gains none. ----
+    fx.shared
+        .store
+        .job_notice(
+            &task.id,
+            "blocked",
+            "r4d-a",
+            "PRIVATE_NOTE_R4D_MUST_NOT_FAN_OUT",
+        )
+        .expect("real job notice route failed (step 1)");
+    let queued = fx
+        .shared
+        .route_assist_job_notifications()
+        .expect("real drain failed (step 1)");
+    assert_eq!(queued, 2, "drain did not queue owner + subscriber notices");
+    let owner_1 = r4d_ids(&fx, &owner.alias);
+    let sub_1 = r4d_ids(&fx, &sub.alias);
+    assert_eq!(
+        owner_1.len(),
+        owner_base.len() + 1,
+        "owner did not gain one notice"
+    );
+    assert_eq!(
+        sub_1.len(),
+        sub_base.len() + 1,
+        "subscriber did not gain one notice"
+    );
+    assert_eq!(
+        r4d_ids(&fx, &control.alias),
+        control_base,
+        "non-subscriber received a job notice"
+    );
+    let sub_notice_id = sub_1
+        .iter()
+        .find(|id| !sub_base.contains(id))
+        .unwrap()
+        .clone();
+    for (alias, base) in [(&owner.alias, &owner_base), (&sub.alias, &sub_base)] {
+        for m in fx.shared.store.messages(alias).unwrap() {
+            if m.source != "assist_job_event" || base.contains(&m.id) {
+                continue;
+            }
+            assert!(
+                m.body
+                    .starts_with(&format!("Cadence job {job}: task {} r", task.id)),
+                "notice body is not the synthetic metadata form: {}",
+                m.body
+            );
+            assert!(
+                m.body.contains("is now blocked"),
+                "notice body lacks the synthetic state: {}",
+                m.body
+            );
+            for private in [
+                "PRIVATE_REQUEST_BODY_R4D",
+                "PRIVATE_NOTE_R4D",
+                "r4d drain job",
+                "r4d acceptance",
+            ] {
+                assert!(
+                    !m.body.contains(private),
+                    "notice body leaked {private}: {}",
+                    m.body
+                );
+            }
+        }
+    }
+
+    // ---- 2. Drain again with no new intents: nothing new is queued. ----
+    let again = fx
+        .shared
+        .route_assist_job_notifications()
+        .expect("second drain failed");
+    assert_eq!(again, 0, "an already-drained intent was re-queued");
+    assert_eq!(
+        r4d_ids(&fx, &owner.alias),
+        owner_1,
+        "replayed drain changed the owner"
+    );
+    assert_eq!(
+        r4d_ids(&fx, &sub.alias),
+        sub_1,
+        "replayed drain changed the subscriber"
+    );
+
+    // ---- 3. A distinct transition key is not suppressed by the first one. ----
+    fx.shared
+        .store
+        .job_notice(
+            &task.id,
+            "blocked",
+            "r4d-b",
+            "PRIVATE_NOTE_R4D_MUST_NOT_FAN_OUT",
+        )
+        .expect("real job notice route failed (step 3)");
+    let distinct = fx
+        .shared
+        .route_assist_job_notifications()
+        .expect("drain failed (step 3)");
+    assert_eq!(distinct, 2, "a distinct transition key was suppressed");
+    let owner_3 = r4d_ids(&fx, &owner.alias);
+    let sub_3 = r4d_ids(&fx, &sub.alias);
+    assert_eq!(
+        owner_3.len(),
+        owner_1.len() + 1,
+        "owner missed the distinct notice"
+    );
+    assert_eq!(
+        sub_3.len(),
+        sub_1.len() + 1,
+        "subscriber missed the distinct notice"
+    );
+
+    // ---- 4. Revoke only the subscriber's platform credential; the local binding
+    // stays active. The next notice reaches the owner only. ----
+    fx.set_member("sub-ben", |m| m.credential_live = false);
+    assert!(
+        fx.shared
+            .store
+            .assistant_for_alias(&sub.alias)
+            .unwrap()
+            .is_some_and(|b| b.is_active()),
+        "the subscriber's local binding must stay active"
+    );
+    fx.shared
+        .store
+        .job_notice(
+            &task.id,
+            "blocked",
+            "r4d-c",
+            "PRIVATE_NOTE_R4D_MUST_NOT_FAN_OUT",
+        )
+        .expect("real job notice route failed (step 4)");
+    let revoked = fx
+        .shared
+        .route_assist_job_notifications()
+        .expect("drain failed (step 4)");
+    assert_eq!(
+        revoked, 1,
+        "revoked subscriber drain count is not owner-only"
+    );
+    let owner_4 = r4d_ids(&fx, &owner.alias);
+    assert_eq!(
+        owner_4.len(),
+        owner_3.len() + 1,
+        "owner missed the post-revoke notice"
+    );
+    assert_eq!(
+        r4d_ids(&fx, &sub.alias),
+        sub_3,
+        "revoked subscriber received a new message after revocation"
+    );
+    assert_eq!(
+        r4d_ids(&fx, &control.alias),
+        control_base,
+        "non-subscriber received a job notice after revocation"
+    );
+
+    // ---- 5. The subscriber's step-1 notice was never taken. Admission at the
+    // effect-time job-scope gate must refuse it with PreWrite, keeping the
+    // original row and body. ----
+    let queued_sub = fx
+        .shared
+        .store
+        .message(&sub_notice_id)
+        .unwrap()
+        .expect("step-1 subscriber notice missing");
+    let body_before = queued_sub.body.clone();
+    let state_before = queued_sub.state.clone();
+    assert!(
+        matches!(
+            fx.shared.admit_app_submission(&queued_sub),
+            Err(crate::Error::PreWrite(_))
+        ),
+        "a revoked subscriber's queued notice was admitted at the effect gate"
+    );
+    let after = fx
+        .shared
+        .store
+        .message(&sub_notice_id)
+        .unwrap()
+        .expect("refused subscriber notice was dropped");
+    assert_eq!(after.body, body_before, "refused notice body changed");
+    assert_eq!(after.state, state_before, "refused notice state changed");
+}
+
+/// CAD-1380 R4 (drain gate + stall trigger) - the guarded drain delivers only
+/// under the exact `"true"` flag, and a real stall sweep queues a metadata-only
+/// owner notice through that same drain without dispatching the task.
+#[test]
+fn assist_drain_gate_is_exact_true_and_stall_notice_is_metadata_only() {
+    let flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    let owner = fx.member_runtime("sub-ana");
+
+    let req = fx.op(
+        "member_job_request",
+        json!({"member_envelope": fx.member_envelope("sub-ana"), "title": "r4s stall job", "request_key": "r4s-k1", "body": "PRIVATE_REQUEST_BODY_R4S", "acceptance": "r4s acceptance"}),
+    );
+    let job = req["job"].as_str().unwrap().to_string();
+    let task = fx
+        .shared
+        .store
+        .tasks_for_job(&job)
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("job has no first task");
+
+    // ---- 1. Non-enabling flag values: the drain returns 0, leaves every
+    // pending intent and job/task state unchanged, and writes no message. ----
+    let pending_before = fx
+        .shared
+        .store
+        .pending_assist_job_notifications(50)
+        .unwrap();
+    assert!(
+        !pending_before.is_empty(),
+        "the member_job_request left no pending initial intent"
+    );
+    let owner_before_gate = r4d_ids(&fx, &owner.alias);
+    let job_before = fx.shared.store.job(&job).unwrap();
+    let task_before = fx.shared.store.task(&task.id).unwrap();
+    for value in [None, Some("false"), Some("TRUE"), Some("1")] {
+        match value {
+            Some(v) => std::env::set_var("HOSTED_CADENCE_ASSISTANT_ENABLED", v),
+            None => std::env::remove_var("HOSTED_CADENCE_ASSISTANT_ENABLED"),
+        }
+        let drained = fx
+            .shared
+            .route_assist_job_notifications()
+            .expect("gated drain returned an error");
+        assert_eq!(drained, 0, "the drain ran with flag {value:?}");
+        assert_eq!(
+            fx.shared
+                .store
+                .pending_assist_job_notifications(50)
+                .unwrap(),
+            pending_before,
+            "a gated drain changed a pending intent (flag {value:?})"
+        );
+        assert_eq!(
+            r4d_ids(&fx, &owner.alias),
+            owner_before_gate,
+            "a gated drain wrote a message (flag {value:?})"
+        );
+        assert_eq!(
+            fx.shared.store.job(&job).unwrap().state,
+            job_before.state,
+            "a gated drain changed the job state (flag {value:?})"
+        );
+        assert_eq!(
+            fx.shared.store.task(&task.id).unwrap().state,
+            task_before.state,
+            "a gated drain changed the task state (flag {value:?})"
+        );
+    }
+    std::env::set_var("HOSTED_CADENCE_ASSISTANT_ENABLED", "true");
+
+    // ---- 2. Exact "true": the drain delivers the legitimate initial metadata
+    // notice to the live owner and nothing private. ----
+    let initial = fx
+        .shared
+        .route_assist_job_notifications()
+        .expect("exact-true drain failed");
+    assert!(initial >= 1, "exact-true drain queued no initial notice");
+    let owner_initial = r4d_ids(&fx, &owner.alias);
+    assert!(
+        owner_initial.len() > owner_before_gate.len(),
+        "the owner gained no initial metadata notice"
+    );
+    for m in fx.shared.store.messages(&owner.alias).unwrap() {
+        if m.source == "assist_job_event" {
+            for private in ["PRIVATE_REQUEST_BODY_R4S", "r4s acceptance"] {
+                assert!(
+                    !m.body.contains(private),
+                    "initial notice leaked {private}: {}",
+                    m.body
+                );
+            }
+        }
+    }
+
+    // ---- 3. Age the job past the assist bound and sweep. The sweep itself
+    // queues no private mail and dispatches nothing. ----
+    age_job(&fx, &job, 400);
+    let owner_pre_sweep = r4d_ids(&fx, &owner.alias);
+    let swept = fx
+        .shared
+        .store
+        .assist_stall_sweep(300, crate::issue::time::now_epoch() as f64)
+        .expect("real stall sweep failed");
+    assert_eq!(swept, 1, "the stalled assist job produced no check");
+    assert_eq!(
+        r4d_ids(&fx, &owner.alias),
+        owner_pre_sweep,
+        "the sweep alone queued a private message"
+    );
+    let stalled_drain = fx
+        .shared
+        .route_assist_job_notifications()
+        .expect("drain after stall failed");
+    assert!(stalled_drain >= 1, "the stall intent was not drained");
+    let owner_stalled = r4d_ids(&fx, &owner.alias);
+    let stall_ids: Vec<&String> = owner_stalled
+        .iter()
+        .filter(|id| !owner_pre_sweep.contains(id))
+        .collect();
+    assert_eq!(
+        stall_ids.len(),
+        1,
+        "expected exactly one new owner stall notice"
+    );
+    let stall_msg = fx
+        .shared
+        .store
+        .message(stall_ids[0])
+        .unwrap()
+        .expect("stall notice missing");
+    assert_eq!(stall_msg.source, "assist_job_event");
+    assert!(
+        stall_msg.body.contains("is now stalled"),
+        "stall notice lacks the synthetic state: {}",
+        stall_msg.body
+    );
+    for private in [
+        "PRIVATE_REQUEST_BODY_R4S",
+        "r4s stall job",
+        "r4s acceptance",
+    ] {
+        assert!(
+            !stall_msg.body.contains(private),
+            "stall notice leaked {private}: {}",
+            stall_msg.body
+        );
+    }
+    let task_after = fx.shared.store.task(&task.id).unwrap();
+    assert_eq!(
+        task_after.state, "draft",
+        "the stall sweep dispatched the task"
+    );
+    assert!(
+        task_after.dispatch_message.is_none(),
+        "the stall sweep minted a kickoff"
+    );
+
+    // ---- 4. Same-watermark sweep returns 0; a repeated drain adds no IDs. ----
+    let again_swept = fx
+        .shared
+        .store
+        .assist_stall_sweep(300, crate::issue::time::now_epoch() as f64)
+        .expect("repeat stall sweep failed");
+    assert_eq!(again_swept, 0, "a same-watermark stall was re-flagged");
+    let replay = fx
+        .shared
+        .route_assist_job_notifications()
+        .expect("repeat drain failed");
+    assert_eq!(replay, 0, "an already-drained stall intent was re-queued");
+    assert_eq!(
+        r4d_ids(&fx, &owner.alias),
+        owner_stalled,
+        "a repeated sweep or drain added message IDs"
+    );
+    drop(flag);
+}
+
+/// The ordinary worker's upstream metadata, as the R5 fixture sets it, so the
+/// operator dispatch to it is in the job's group.
+fn r4a_upstream(fx: &Fx, rt: &MemberRuntime) {
+    fx.shared
+        .store
+        .fixture_write(|tx| {
+            tx.execute(
+                "UPDATE agents SET params=? WHERE alias='ordinary-worker'",
+                rusqlite::params![json!({"upstream": rt.alias}).to_string()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// CAD-1380 R4 (author REVISE) - a real operator `revise` verdict on a
+/// submitted task notifies the assigned author with metadata only. A
+/// replacement author whose registered birth is after the real kickoff is
+/// refused at the drain and gets no notice. No provider runs; the kickoff and
+/// the verdict are real RPCs and the worker's completion is the controlled
+/// `r5_submit` finish.
+#[test]
+fn assist_revise_notifies_only_kickoff_proven_author_metadata_only() {
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    let rt = fx.member_runtime("sub-rev");
+    let env = fx.member_envelope("sub-rev");
+    let job = fx.op(
+        "member_job_request",
+        json!({"member_envelope": env, "title": "r4a revise job", "request_key": "r4a-k1", "body": "PRIVATE_REQUEST_BODY_R4A", "acceptance": "r4a acceptance"}),
+    )["job"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let repo = fx.dir.path().join("r4a-repo");
+    r4a_upstream(&fx, &rt);
+    std::fs::create_dir_all(&repo).unwrap();
+    r5_git(&repo, &["init", "-q"]);
+    let sha1 = r5_commit(&repo, "r4a artifact\n");
+    let repo_s = repo.to_string_lossy().to_string();
+
+    let t1 = format!("{job}-t1");
+    fx.shared
+        .store
+        .fixture_write(|tx| {
+            tx.execute(
+                "UPDATE tasks SET worktree=?, assignee=? WHERE id=? AND job_id=?",
+                rusqlite::params![repo_s, rt.worker, t1, job],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    // Drain the initial awaiting_approval intents, then baseline the worker.
+    fx.shared
+        .route_assist_job_notifications()
+        .expect("initial drain failed");
+    // Real submission (the kickoff), baseline AFTER it, then an independent
+    // operator REVISE with a private note.
+    r5_submit(&fx, &rt, &t1, &sha1);
+    let worker_base = r4d_ids(&fx, &rt.worker);
+    fx.op(
+        "task_verdict",
+        json!({"task": t1, "sha": sha1, "verdict": "revise", "message": "PRIVATE_QA_NOTE_R4A"}),
+    );
+    let task = fx.shared.store.task(&t1).unwrap();
+    assert_eq!(task.state, "revising", "REVISE did not reopen the task");
+    // The REVISE intent carries the stored revision; the verdict keeps it.
+    let rev = task.revision;
+
+    // ---- 1. Real drain: exactly one new author notice, metadata only. ----
+    // The owner's own subscriber notice may also queue; only the worker counts.
+    fx.shared
+        .route_assist_job_notifications()
+        .expect("REVISE drain failed");
+    let worker_1 = r4d_ids(&fx, &rt.worker);
+    let new_ids: Vec<&String> = worker_1
+        .iter()
+        .filter(|id| !worker_base.contains(id))
+        .collect();
+    assert_eq!(new_ids.len(), 1, "expected exactly one new author message");
+    let notice = fx
+        .shared
+        .store
+        .message(new_ids[0])
+        .unwrap()
+        .expect("author notice missing");
+    assert_eq!(
+        notice.source, "job_event",
+        "author notice source is not job_event"
+    );
+    assert!(
+        notice
+            .body
+            .starts_with(&format!("Cadence job {job}: task {t1} r{rev}")),
+        "author notice lacks canonical job/task/revision: {}",
+        notice.body
+    );
+    assert!(
+        notice.body.contains("is now revising"),
+        "author notice lacks the state: {}",
+        notice.body
+    );
+    for private in [
+        "PRIVATE_REQUEST_BODY_R4A",
+        "PRIVATE_QA_NOTE_R4A",
+        "r4a acceptance",
+    ] {
+        assert!(
+            !notice.body.contains(private),
+            "author notice leaked {private}"
+        );
+    }
+    assert_eq!(
+        fx.shared.store.task(&t1).unwrap().state,
+        "revising",
+        "the notice changed the task state"
+    );
+
+    // ---- 2. Replay adds no new worker IDs and no kickoff is minted. ----
+    let replay = fx
+        .shared
+        .route_assist_job_notifications()
+        .expect("replay drain failed");
+    assert_eq!(replay, 0, "an already-drained REVISE intent was re-queued");
+    assert_eq!(
+        r4d_ids(&fx, &rt.worker),
+        worker_1,
+        "a replayed REVISE drain added worker IDs"
+    );
+}
+
+/// Bad case: a replacement author whose registered birth is AFTER the real
+/// kickoff. The fixture birth is mutated after the REVISE intent exists; the
+/// drain must refuse it with no author notice, and the message stays unqueued.
+#[test]
+fn assist_revise_refuses_author_born_after_kickoff() {
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    let rt = fx.member_runtime("sub-rev2");
+    let env = fx.member_envelope("sub-rev2");
+    let job = fx.op(
+        "member_job_request",
+        json!({"member_envelope": env, "title": "r4a birth job", "request_key": "r4a-k2", "body": "PRIVATE_REQUEST_BODY_R4A2", "acceptance": "r4a2 acceptance"}),
+    )["job"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let repo = fx.dir.path().join("r4a-repo2");
+    r4a_upstream(&fx, &rt);
+    std::fs::create_dir_all(&repo).unwrap();
+    r5_git(&repo, &["init", "-q"]);
+    let sha1 = r5_commit(&repo, "r4a2 artifact\n");
+    let repo_s = repo.to_string_lossy().to_string();
+
+    let t1 = format!("{job}-t1");
+    fx.shared
+        .store
+        .fixture_write(|tx| {
+            tx.execute(
+                "UPDATE tasks SET worktree=?, assignee=? WHERE id=? AND job_id=?",
+                rusqlite::params![repo_s, rt.worker, t1, job],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    fx.shared
+        .route_assist_job_notifications()
+        .expect("initial drain failed");
+    r5_submit(&fx, &rt, &t1, &sha1);
+    fx.op(
+        "task_verdict",
+        json!({"task": t1, "sha": sha1, "verdict": "revise", "message": "PRIVATE_QA_NOTE_R4A2"}),
+    );
+    assert_eq!(fx.shared.store.task(&t1).unwrap().state, "revising");
+
+    // Negative fixture input: move the assignee's registered birth AFTER the
+    // real kickoff. This is not a permission rescue; the drain must refuse.
+    let kickoff = fx
+        .shared
+        .store
+        .task_kickoff_created(&t1, &rt.worker)
+        .unwrap()
+        .expect("no real kickoff for the worker");
+    fx.shared
+        .store
+        .fixture_write(|tx| {
+            tx.execute(
+                "UPDATE agents SET created=? WHERE alias=?",
+                rusqlite::params![kickoff + 3600.0, rt.worker],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    let pending_author = |fx: &Fx| {
+        fx.shared
+            .store
+            .pending_assist_job_notifications(50)
+            .unwrap()
+            .into_iter()
+            .filter(|(_, p)| p["target"] == "author")
+            .count()
+    };
+    assert_eq!(
+        pending_author(&fx),
+        1,
+        "the REVISE author intent was not pending before the refused drain"
+    );
+    fx.shared
+        .route_assist_job_notifications()
+        .expect("birth-refusal drain returned an error");
+    assert_eq!(
+        pending_author(&fx),
+        0,
+        "the refused author intent stayed pending (not finished)"
+    );
+    // The birth mutation hides pre-birth terminal rows from `messages()`, so
+    // compare the worker's full queued set: no new job_event row may exist.
+    let new_author_notice = fx
+        .shared
+        .store
+        .messages(&rt.worker)
+        .unwrap()
+        .into_iter()
+        .filter(|m| m.source == "job_event")
+        .count();
+    assert_eq!(
+        new_author_notice, 0,
+        "an author born after kickoff gained a job_event notice"
+    );
+
+    assert_eq!(
+        fx.shared.store.task(&t1).unwrap().state,
+        "revising",
+        "the refused drain changed the task"
+    );
+}
+
+/// CAD-1380 R4 (Master Home) acceptance: one owned `serve_with` daemon (stateB)
+/// on its own `/tmp/c1380-*` root, a real confined `master_start`, a real
+/// signed member request and the real R4 drain. `Fx` supplies only the
+/// loopback platform, signing key and member authority (its own stateA).
+/// Native commands for this case go through stateB's socket. The Pi runtime is
+/// the synthetic gateway `tests/fixtures/pi-gateway.py` (controlled evidence,
+/// not provider acceptance). stateB is stopped and joined by RAII.
+mod master_home_acceptance {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread::{self, JoinHandle};
+    use std::time::{Duration, Instant};
+
+    use serde_json::{json, Value};
+    use tempfile::{Builder, TempDir};
+
+    use super::{AssistantFlagOn, Fx, MemberAuthority, ServiceAuthority, ORG};
+    use crate::adapter::ProviderEnv;
+    use crate::{client, daemon, master};
+
+    /// The owned daemon (stateB): stop flag, join handle and the state dir.
+    struct OwnedDaemon {
+        _root: TempDir,
+        state: PathBuf,
+        stop: Arc<AtomicBool>,
+        serve: Option<JoinHandle<crate::Result<()>>>,
+    }
+
+    /// The lane's own `target/debug/cadence`, a sibling of the test binary
+    /// (`target/debug/deps/cadence_agent-*`). Never the installed binary.
+    fn lane_cadence_bin() -> PathBuf {
+        let exe = std::env::current_exe().unwrap();
+        let bin = exe.parent().unwrap().parent().unwrap().join("cadence");
+        assert!(
+            bin.is_file(),
+            "lane cadence binary missing: {}",
+            bin.display()
+        );
+        bin
+    }
+
+    impl OwnedDaemon {
+        /// Start stateB. The board config and the enrolled service credential
+        /// are written BEFORE `serve_with`, from the same `Fx` platform.
+        fn start(fx: &Fx, token: &str, sub: &str, fake_gateway: &Path) -> Self {
+            let root = Builder::new().prefix("c1380-").tempdir_in("/tmp").unwrap();
+            let [state, pm, home] = ["s", "pm", "h"].map(|d| root.path().join(d));
+            // Real PM tracker, the same supported init `Fx::new` uses.
+            crate::issue::Pm::init(&pm).unwrap();
+            // Synthetic model allowlist, ONLY in this temp pm.yaml.
+            let yaml = pm.join("pm.yaml");
+            let mut text = std::fs::read_to_string(&yaml).unwrap();
+            text.push_str(
+                "\npi:\n  models:\n    allow: [\"fake/model-1\"]\n    default: {master: \"fake/model-1\", worker: \"fake/model-1\"}\n",
+            );
+            std::fs::write(&yaml, text).unwrap();
+            // The same trust root `Fx` uses: its loopback platform host/issuer.
+            std::fs::create_dir_all(&state).unwrap();
+            crate::board_identity::write_config(
+                &state,
+                &crate::board_identity::Config {
+                    host: fx.host.clone(),
+                    issuer: fx.issuer.clone(),
+                    company: ORG.to_string(),
+                },
+            )
+            .unwrap();
+            // The enrolled `assist.revalidate` service credential, written to
+            // stateB's custody and platform_credentials row (not Fx's store).
+            Self::enroll_service(&state, &fx.host, token, sub);
+
+            let env = ProviderEnv::refusing_providers();
+            env.set(
+                "CADENCE_PI_COMMAND",
+                format!("python3 {}", fake_gateway.display()),
+            );
+            env.set("CADENCE_PM_DIR", pm.to_str().unwrap());
+            env.set("HOME", home.to_str().unwrap());
+            env.set(
+                "CADENCE_CONFINE_COMMAND",
+                lane_cadence_bin().to_string_lossy(),
+            );
+            let stop = Arc::new(AtomicBool::new(false));
+            let opts = daemon::ServeOptions {
+                provider_env: env,
+                stop: Some(stop.clone()),
+                test_seam: true,
+                ..Default::default()
+            };
+            let dir = state.clone();
+            let serve = Some(thread::spawn(move || daemon::serve_with(&dir, opts)));
+            let this = Self {
+                _root: root,
+                state,
+                stop,
+                serve,
+            };
+            this.until("daemon health", || {
+                client::rpc_timeout(&this.state, "health", json!({}), Duration::from_secs(1))
+                    .is_ok()
+            });
+            this
+        }
+
+        /// TRUSTED SYNTHETIC BOOTSTRAP FIXTURE - not a recorded operator
+        /// enrollment and not proof of supported `platform_enroll`, custody
+        /// isolation or activation. It writes the same two artifacts
+        /// `Fx::enroll_service` writes (generated dummy token in temp custody
+        /// plus a matching `platform_credentials` row) into the fresh, owned
+        /// stateB before `serve_with` starts, then closes the handle so the
+        /// daemon is the sole owner. It only seeds CONSUMER guards.
+        fn enroll_service(state: &Path, host: &str, token: &str, sub: &str) {
+            let key = crate::platform::custody::Key {
+                platform: "hosted-board",
+                account: host,
+            };
+            crate::platform::custody::Custody::open(state)
+                .unwrap()
+                .put(&key, token.as_bytes())
+                .unwrap();
+            let fingerprint = crate::secret::fingerprint(token.as_bytes());
+            // Create the schema on the exact DB file the daemon opens, then
+            // drop every handle before `serve_with` makes the daemon the owner.
+            let store = crate::store::Store::open(&state.join("cadence.sqlite3")).unwrap();
+            store
+                .assistant_bind(
+                    ORG,
+                    sub,
+                    &format!("assist_{sub}"),
+                    &format!("assist-agent-{sub}"),
+                    Some("rev0"),
+                )
+                .unwrap();
+            drop(store);
+            let conn = rusqlite::Connection::open(state.join("cadence.sqlite3")).unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO platform_credentials
+                 (platform,account,scopes,fingerprint,custody,exchange,enrolled_at,by,connection_id,credential_revision)
+                 VALUES('hosted-board',?1,'[\"assist.revalidate\"]',?2,'file','token',1.0,'trusted-fixture',
+                        'conn-hosted-board-fixture',1)",
+                rusqlite::params![host, fingerprint],
+            )
+            .unwrap();
+            drop(conn);
+        }
+
+        fn rpc(&self, method: &str, params: Value) -> Value {
+            client::rpc(&self.state, method, params).unwrap_or_else(|e| panic!("{method}: {e}"))
+        }
+
+        /// The native refusal of a call made AS the registered Master, via the
+        /// compiled test-seam assertion (`Asserted::Agent`), or `None` if it
+        /// succeeded. JSON `by` is never the caller identity.
+        fn master_err(&self, method: &str, params: Value) -> Option<String> {
+            crate::test_seam::scoped(
+                crate::test_seam::Asserted::Agent(master::ALIAS.to_string()),
+                || client::rpc(&self.state, method, params),
+            )
+            .err()
+            .map(|e| e.to_string())
+        }
+
+        /// The same request from the operator connection (control contrast).
+        fn rpc_err_operator(&self, method: &str, params: Value) -> Option<String> {
+            crate::test_seam::scoped(crate::test_seam::Asserted::Operator, || {
+                client::rpc(&self.state, method, params)
+            })
+            .err()
+            .map(|e| e.to_string())
+        }
+
+        fn until(&self, what: &str, mut done: impl FnMut() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while !done() {
+                assert!(Instant::now() < deadline, "{what}: timed out");
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+
+    impl Drop for OwnedDaemon {
+        fn drop(&mut self) {
+            // Stop only the daemon this test started: flag, then join.
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(h) = self.serve.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    #[test]
+    fn master_home_report_is_metadata_only_and_master_cannot_verdict() {
+        let _flag = AssistantFlagOn::arm();
+        let fx = Fx::new();
+        let fake = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pi-gateway.py");
+        let token = format!("hcs_{}", "e".repeat(43));
+        let sub = "sub-home";
+        // Fixture platform member authority: the live membership and recorded
+        // credential `Fx::provision` records (its binding half is on stateB).
+        fx.authority
+            .lock()
+            .unwrap()
+            .members
+            .insert(sub.to_string(), MemberAuthority::live(sub));
+        // Fixture platform authority for stateB's service bearer: the same
+        // registration `Fx::enroll_service` makes (org, audience, live cap).
+        fx.authority
+            .lock()
+            .unwrap()
+            .services
+            .push(ServiceAuthority {
+                token: token.clone(),
+                org: ORG.to_string(),
+                audience: format!("http://{}", fx.host),
+                caps: vec!["assist.revalidate".into()],
+                live: true,
+            });
+        let daemon = OwnedDaemon::start(&fx, &token, sub, &fake);
+
+        // Real confined master_start on stateB: no unconfined, no TEST_NO_LANDLOCK.
+        let started = daemon.rpc("master_start", json!({"provider": "pi"}));
+        assert_eq!(
+            started["confined"],
+            json!(true),
+            "master not confined: {started}"
+        );
+        assert_eq!(
+            started["alias"],
+            json!(master::ALIAS),
+            "master did not register: {started}"
+        );
+
+        // Real signed member request on stateB, with a private marker.
+        let env = fx.member_envelope(sub);
+        let req = daemon.rpc(
+            "member_job_request",
+            json!({"member_envelope": env, "title": "home job", "request_key": "home-k1", "body": "PRIVATE_REQUEST_BODY_HOME", "acceptance": "home acceptance"}),
+        );
+        let job = req["job"].as_str().unwrap().to_string();
+        let task = format!("{job}-t1");
+        let master_body = |d: &OwnedDaemon| -> Vec<Value> {
+            d.rpc("thread_read", json!({"alias": master::ALIAS, "limit": 500}))["entries"]
+                .as_array()
+                .unwrap()
+                .clone()
+        };
+        let report_count = |entries: &[Value]| {
+            entries
+                .iter()
+                .filter(|e| {
+                    e["text"].as_str().is_some_and(|b| {
+                        b.starts_with(&format!("Cadence job {job}: task {task} r"))
+                    })
+                })
+                .count()
+        };
+
+        // The owned daemon's own watch loop runs the real drain. Wait for the
+        // deterministic awaiting_approval report to appear on the Home thread.
+        daemon.until("master Home report", || {
+            report_count(&master_body(&daemon)) >= 1
+        });
+        let entries = master_body(&daemon);
+        let reports: Vec<&Value> = entries
+            .iter()
+            .filter(|e| {
+                e["text"]
+                    .as_str()
+                    .is_some_and(|b| b.starts_with(&format!("Cadence job {job}: task {task} r")))
+            })
+            .collect();
+        assert_eq!(
+            reports.len(),
+            1,
+            "expected exactly one Home report: {entries:?}"
+        );
+        let body = reports[0]["text"].as_str().unwrap();
+        assert!(
+            body.contains("is now awaiting_approval"),
+            "report lacks the state: {body}"
+        );
+        for private in ["PRIVATE_REQUEST_BODY_HOME", "home acceptance", "home job"] {
+            assert!(
+                !body.contains(private),
+                "Home report leaked {private}: {body}"
+            );
+        }
+
+        // Replay: a second watch-loop pass and a repeated read add no report.
+        let base = report_count(&master_body(&daemon));
+        // ASSIST_NOTICE_EVERY is 2 s: wait past at least one further watcher
+        // pass so the replay actually runs the real drain again.
+        std::thread::sleep(Duration::from_millis(2_500));
+        assert_eq!(
+            report_count(&master_body(&daemon)),
+            base,
+            "a replay duplicated the report"
+        );
+        assert_eq!(base, 1, "the report count changed after replay");
+
+        // Identity contrast: the same valid dispatch from the OPERATOR connection
+        // is not a master-policy refusal, so the `master_refused` denial below is
+        // caused by the registered Master identity, not the payload.
+        let as_operator = daemon.rpc_err_operator(
+            "task_dispatch",
+            json!({"task": task, "to": master::ALIAS, "by": "operator"}),
+        );
+        assert!(
+            as_operator
+                .as_deref()
+                .is_none_or(|e| !e.contains("the master may not call")),
+            "the operator's call was refused by the Master policy: {as_operator:?}"
+        );
+
+        // The Master's own task_dispatch and task_verdict, with a valid request
+        // shape, are refused by the MASTER POLICY (`master_refused`), not by a
+        // draft-task or zero-SHA error.
+        let task_before = daemon.rpc("task_show", json!({"task": task}));
+        let policy = |method: &str, err: Option<String>| {
+            let err = err.unwrap_or_else(|| panic!("the Master was allowed to call {method}"));
+            // The two real master-policy refusals (`master_refused`): the Home
+            // allowlist text, or the app-conversation gate text. Anything else
+            // is not the policy and fails.
+            let home = format!("the master may not call {method}");
+            let app = format!("not {method}; setup and admin work is the home thread's");
+            assert!(
+                err.contains(&home) || err.contains(&app),
+                "{method} was not refused by the master policy: {err}"
+            );
+            assert!(
+                !err.contains("draft"),
+                "{method} refused for task state, not policy: {err}"
+            );
+        };
+        let dispatch = daemon.master_err(
+            "task_dispatch",
+            json!({"task": task, "to": master::ALIAS, "by": "operator"}),
+        );
+        policy("task_dispatch", dispatch);
+        let verdict = daemon.master_err(
+            "task_verdict",
+            json!({"task": task, "sha": "0".repeat(40), "verdict": "pass"}),
+        );
+        policy("task_verdict", verdict);
+        assert_eq!(
+            daemon.rpc("task_show", json!({"task": task})),
+            task_before,
+            "a refused Master call changed the task"
+        );
+        assert_eq!(
+            report_count(&master_body(&daemon)),
+            1,
+            "a refused call wrote a Home report"
+        );
+        let _ = fake;
+    }
 }
