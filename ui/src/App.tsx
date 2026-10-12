@@ -1218,7 +1218,7 @@ export default function App() {
           <Wiki
             route={route}
             navHref={hrefFor}
-            readOnly={readOnly}
+            readOnly={readOnly || meta === null}
             actor={actor}
             onToast={say}
           />
