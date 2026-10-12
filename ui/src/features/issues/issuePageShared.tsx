@@ -10,6 +10,8 @@ export function ReadNotice<T>({
   state: ResourceState<T>;
   retry: () => void;
 }) {
+  // Successful refreshes stay silent: the retained data is the current view.
+  if (state.data !== null && !state.error) return null;
   if (!state.error && !state.inFlight && state.status !== "loading")
     return null;
   const loading = state.inFlight || state.status === "loading";
@@ -33,9 +35,7 @@ export function ReadNotice<T>({
             </p>
           </>
         ) : (
-          <span>
-            {state.data === null ? "Loading" : "Refreshing"} {name}…
-          </span>
+          <span>Loading {name}…</span>
         )}
       </div>
       {state.error && (
