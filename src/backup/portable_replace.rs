@@ -22,9 +22,11 @@
 //! never deleted here, and nothing on a failure path touches it.
 
 use std::collections::BTreeMap;
+#[cfg(target_os = "linux")]
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+#[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::io::AsRawFd;
@@ -33,6 +35,8 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+#[cfg(not(target_os = "linux"))]
+use super::portable::NO_ATOMIC_PUBLISH;
 use super::portable::{stage_inactive_members, verify_package_for_replace, INACTIVE_MARKER};
 use crate::error::{Error, Result};
 
@@ -553,16 +557,30 @@ fn verify_marker(stage: &Path, fresh: &str, replaced: &str) -> Result<()> {
 }
 
 /// Atomic two-path exchange. `RENAME_EXCHANGE` comes from the pinned libc.
+#[cfg(target_os = "linux")]
 fn exchange(a: &Path, b: &Path) -> Result<()> {
     rename2(a, b, libc::RENAME_EXCHANGE)
 }
 
 /// Rename with `RENAME_NOREPLACE`: fails instead of overwriting a foreign
 /// directory at the destination.
+#[cfg(target_os = "linux")]
 fn rename_noreplace(src: &Path, dst: &Path) -> Result<()> {
     rename2(src, dst, libc::RENAME_NOREPLACE)
 }
 
+/// Other platforms refuse before anything is exchanged or published.
+#[cfg(not(target_os = "linux"))]
+fn exchange(_a: &Path, _b: &Path) -> Result<()> {
+    Err(Error::rejected(NO_ATOMIC_PUBLISH))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn rename_noreplace(_src: &Path, _dst: &Path) -> Result<()> {
+    Err(Error::rejected(NO_ATOMIC_PUBLISH))
+}
+
+#[cfg(target_os = "linux")]
 fn rename2(src: &Path, dst: &Path, flags: libc::c_uint) -> Result<()> {
     let s =
         CString::new(src.as_os_str().as_bytes()).map_err(|_| Error::rejected("path has NUL"))?;

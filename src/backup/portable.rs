@@ -12,9 +12,11 @@
 //! no session or dispatch starts, and no default changes. Replacement and
 //! activation remain refused until native operator admission is wired.
 
+#[cfg(target_os = "linux")]
 use std::ffi::CString;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
+#[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
@@ -1457,7 +1459,13 @@ fn publish(staging: &Path, out: &Path, manifest: &PortableManifest) -> Result<Va
     }))
 }
 
+/// Refusal used on platforms without a no-replace rename. Nothing is published.
+#[cfg(not(target_os = "linux"))]
+pub(super) const NO_ATOMIC_PUBLISH: &str =
+    "atomic no-replace publication is only implemented on Linux; nothing was published";
+
 /// `renameat2(RENAME_NOREPLACE)`: fails with EEXIST when `dst` exists.
+#[cfg(target_os = "linux")]
 fn rename_noreplace(src: &Path, dst: &Path) -> Result<()> {
     let s =
         CString::new(src.as_os_str().as_bytes()).map_err(|_| Error::rejected("path has NUL"))?;
@@ -1484,6 +1492,11 @@ fn rename_noreplace(src: &Path, dst: &Path) -> Result<()> {
         });
     }
     Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn rename_noreplace(_src: &Path, _dst: &Path) -> Result<()> {
+    Err(Error::rejected(NO_ATOMIC_PUBLISH))
 }
 
 fn exclusions() -> Vec<String> {
