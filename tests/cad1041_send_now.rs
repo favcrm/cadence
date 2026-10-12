@@ -235,6 +235,67 @@ fn send_params(id: &str) -> Value {
     json!({"intent_id": id, "install_id": "install-a", "context_id": "ctx-a"})
 }
 
+/// The fake mirrors AOS's exclusive expiry while preserving not-before.
+#[test]
+fn fake_send_grant_uses_exclusive_expiry_and_inclusive_not_before() {
+    let binding = door::SendBinding {
+        key: "aaaaaaaa".into(),
+        connection_id: CONN.into(),
+        destination_id: DEST.into(),
+        toolkit: door::Toolkit::Facebook,
+        caption_digest: caption(),
+        image_digest: None,
+        source: door::PublicationSource::Run {
+            run_id: "run-1".into(),
+        },
+        cadence_effect_id: "fx-1".into(),
+        grant_id: GRANT.into(),
+    };
+    let destination = destination();
+    let ledger = door::FakePublishLedger::new();
+    let mut grant = door::SendGrant {
+        id: GRANT.into(),
+        workspace_id: "ws".into(),
+        connection_id: CONN.into(),
+        destination_id: DEST.into(),
+        toolkit: door::Toolkit::Facebook,
+        caption_digest: caption(),
+        image_digest: None,
+        cadence_approval_id: "appr-1".into(),
+        max_uses: 1,
+        remaining_uses: 1,
+        revoked: false,
+        not_before_epoch: NOW - 1,
+        expires_at_epoch: NOW,
+    };
+
+    assert!(ledger
+        .preflight(&binding, &destination, &grant, "ws", NOW - 1)
+        .is_ok());
+    assert_eq!(
+        ledger
+            .preflight(&binding, &destination, &grant, "ws", NOW)
+            .unwrap_err()
+            .code,
+        "grant_window",
+        "expiry is exclusive"
+    );
+
+    grant.not_before_epoch = NOW;
+    grant.expires_at_epoch = NOW + 1;
+    assert_eq!(
+        ledger
+            .preflight(&binding, &destination, &grant, "ws", NOW - 1)
+            .unwrap_err()
+            .code,
+        "grant_window",
+        "time before not-before is refused"
+    );
+    assert!(ledger
+        .preflight(&binding, &destination, &grant, "ws", NOW)
+        .is_ok());
+}
+
 /// R1: the operator's send-now on a queued, approved intent posts it once
 /// and the intent reads posted, its receipt verified against what the
 /// door returned. Another due intent is untouched; a second press sends
