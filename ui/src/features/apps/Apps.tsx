@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { resources } from "../../lib/resources";
 import { ApiError } from "../../lib/api";
-import { useLocale } from "../../lib/locale";
+import { useTranslate } from "../../lib/locale";
 import { prefetchWorkspaceApp, readInstallationsFresh, readInstallationsSnapshot, dropInstallationsSnapshot, appExplorer, notifyAppsChanged, type HomeInstallation, type FavoritesPayload, type Installation } from "../workspace-apps/workspaceApps";
 import { useQuery, useResource } from "../../lib/useResource";
 import type { AppRow } from "../../lib/types";
@@ -31,7 +31,7 @@ import "../explorer/explorer.css";
  * workspace-level home the ticket describes.
  */
 export default function Apps({ project, viewer }: { project: string; viewer: Viewer }) {
-  const { t } = useLocale();
+  const t = useTranslate();
   const [revision, setRevision] = useState(0);
   const [q, setQ] = useState("");
   const [sort, setSort] = useState<"recent" | "name" | "attention">("recent");
@@ -376,7 +376,7 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
 
 /** Workspace installations remain visible independently of the legacy project filter. */
 function WorkspaceCatalog() {
-  const { t } = useLocale();
+  const t = useTranslate();
   // CAD-1137: a revisit paints this session's last list at once and
   // refetches behind it; only the very first read shows the load line.
   const [rows, setRows] = useState<Installation[] | null>(() =>
@@ -446,7 +446,7 @@ function AppCard({
   needs: HomeNeed[];
   showProject: boolean;
 }) {
-  const { t } = useLocale();
+  const t = useTranslate();
   const approval = appApprovalChip(row, t);
   const title = row.title?.trim() || row.name || t("App");
   const appName = row.name;
@@ -501,7 +501,7 @@ function AppActivity({
   name: string;
   needs: HomeNeed[];
 }) {
-  const { t } = useLocale();
+  const t = useTranslate();
   const runs = useQuery(resources.appRuns(`${project}/${name}`));
   if (runs.status === "failed") return <>{t("activity unavailable")}</>;
   if (!runs.data) return <>{t("reading activity…")}</>;

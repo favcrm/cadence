@@ -8,12 +8,13 @@ export function audienceSummary(
   preview: AudiencePreview | null,
   t: (english: string) => string = (english) => english,
 ): string {
+  const base = pick.base;
   const who =
-    pick.base.mode === "all"
+    base.mode === "all"
       ? t("All customers")
-      : pick.base.mode === "segment"
-        ? `${t("Segment")} ${pick.base.segmentId}`
-        : `${pick.base.customerIds.length} ${t("chosen customers")}`;
+      : base.mode === "segment"
+        ? t("Segment {id}").replace("{id}", () => base.segmentId)
+        : t("{count} chosen customers").replace("{count}", () => String(base.customerIds.length));
   if (preview === null) return `${who} ${t("· not counted yet")}`;
-  return `${who} · ${preview.baseCount} ${t("match")} · ${preview.finalCount} ${t("can be emailed")}`;
+  return `${who} · ${t("{base} match · {final} can be emailed").replace("{base}", () => String(preview.baseCount)).replace("{final}", () => String(preview.finalCount))}`;
 }

@@ -166,6 +166,8 @@ export default function CrmCampaigns({
   );
 }
 
+const CLONE_STALE_COPY = "A selected starter setting is no longer available. Recheck it and try again.";
+
 function CampaignList({
   scope,
   viewer,
@@ -749,17 +751,17 @@ function AudienceSection({
             <div className="grid gap-3 mt-2">
       <div className="crm-field">
         <label className="text-label text-ink-300" htmlFor="aud-exclusion">
-          Saved exclusion list (applies on every base mode)
+          {t("Saved exclusion list (applies on every base mode)")}
         </label>
         <Select
           id="aud-exclusion"
           value={pick.exclusionListId ?? ""}
           onChange={(value) => onPick({ ...pick, exclusionListId: value === "" ? null : value })}
           options={[
-            { value: "", label: "No exclusion list" },
+            { value: "", label: t("No exclusion list") },
             ...exclusions.map((row) => ({ value: row.id, label: `${row.name} · ${row.id}` })),
           ]}
-          aria-label="Saved exclusion list"
+          aria-label={t("Saved exclusion list")}
           disabled={!canWrite}
           full
         />
@@ -767,7 +769,7 @@ function AudienceSection({
       {canWrite && !showExclusionForm && (
         <p>
           <button type="button" className="lnk text-label" onClick={() => setShowExclusionForm(true)}>
-            + New exclusion list
+            {t("+ New exclusion list")}
           </button>
         </p>
       )}
@@ -800,7 +802,7 @@ function AudienceSection({
           <div className="crm-field-row">
             <div className="crm-field">
               <label className="text-label text-ink-300" htmlFor="aud-exc-name">
-                List name
+                {t("List name")}
               </label>
               <input
                 id="aud-exc-name"
@@ -814,7 +816,7 @@ function AudienceSection({
             </div>
             <div className="crm-field">
               <label className="text-label text-ink-300" htmlFor="aud-exc-ids">
-                Member customer IDs
+                {t("Member customer IDs")}
               </label>
               <input
                 id="aud-exc-ids"
@@ -835,17 +837,17 @@ function AudienceSection({
           )}
           <div className="crm-toolbar">
             <Button type="submit" size="sm" loading={exclusionPending} disabled={exclusionPending}>
-              Save exclusion list
+              {t("Save exclusion list")}
             </Button>
             <button type="button" className="lnk text-label" onClick={() => setShowExclusionForm(false)}>
-              Cancel
+              {t("Cancel")}
             </button>
           </div>
         </form>
       )}
-      <section aria-label="Suppressions" className="mt-1">
+      <section aria-label={t("Suppressions")} className="mt-1">
         <h4 className="text-label font-medium text-ink-200">
-          Suppressions ({suppressions.length}) — always excluded, even from custom IDs
+          {t("Suppressions ({count}) — always excluded, even from custom IDs").replace("{count}", String(suppressions.length))}
         </h4>
         {suppressionError !== null ? (
           <p className="text-label text-fail" role="alert">
@@ -855,7 +857,7 @@ function AudienceSection({
             </button>
           </p>
         ) : suppressions.length === 0 ? (
-          <p className="text-label text-ink-400">No suppressions yet.</p>
+          <p className="text-label text-ink-400">{t("No suppressions yet.")}</p>
         ) : (
           <ol className="crm-history">
             {suppressions.slice(0, 10).map((row) => (
@@ -864,7 +866,7 @@ function AudienceSection({
               </li>
             ))}
             {suppressions.length > 10 && (
-              <li className="num text-label text-ink-500">…and {suppressions.length - 10} more</li>
+              <li className="num text-label text-ink-500">{t("…and {count} more").replace("{count}", String(suppressions.length - 10))}</li>
             )}
           </ol>
         )}
@@ -893,7 +895,7 @@ function AudienceSection({
           >
             <div className="crm-field">
               <label className="text-label text-ink-300" htmlFor="aud-suppress-email">
-                Suppress an email
+                {t("Suppress an email")}
               </label>
               <input
                 id="aud-suppress-email"
@@ -909,7 +911,7 @@ function AudienceSection({
             </div>
             <div className="crm-field">
               <label className="text-label text-ink-300" htmlFor="aud-suppress-reason">
-                Reason
+                {t("Reason")}
               </label>
               <input
                 id="aud-suppress-reason"
@@ -919,7 +921,7 @@ function AudienceSection({
                 maxLength={80}
                 autoComplete="off"
                 disabled={suppressPending}
-                placeholder="opted out by phone"
+                placeholder={t("opted out by phone")}
               />
             </div>
             {suppressError && (
@@ -929,7 +931,7 @@ function AudienceSection({
             )}
             <div>
               <Button type="submit" size="sm" loading={suppressPending} disabled={suppressPending}>
-                Add suppression
+                {t("Add suppression")}
               </Button>
             </div>
           </form>
@@ -942,17 +944,17 @@ function AudienceSection({
         <>
       <div className="crm-field">
         <label className="text-label text-ink-300" htmlFor="aud-exclusion">
-          Saved exclusion list (applies on every base mode)
+          {t("Saved exclusion list (applies on every base mode)")}
         </label>
         <Select
           id="aud-exclusion"
           value={pick.exclusionListId ?? ""}
           onChange={(value) => onPick({ ...pick, exclusionListId: value === "" ? null : value })}
           options={[
-            { value: "", label: "No exclusion list" },
+            { value: "", label: t("No exclusion list") },
             ...exclusions.map((row) => ({ value: row.id, label: `${row.name} · ${row.id}` })),
           ]}
-          aria-label="Saved exclusion list"
+          aria-label={t("Saved exclusion list")}
           disabled={!canWrite}
           full
         />
@@ -960,7 +962,7 @@ function AudienceSection({
       {canWrite && !showExclusionForm && (
         <p>
           <button type="button" className="lnk text-label" onClick={() => setShowExclusionForm(true)}>
-            + New exclusion list
+            {t("+ New exclusion list")}
           </button>
         </p>
       )}
@@ -993,7 +995,7 @@ function AudienceSection({
           <div className="crm-field-row">
             <div className="crm-field">
               <label className="text-label text-ink-300" htmlFor="aud-exc-name">
-                List name
+                {t("List name")}
               </label>
               <input
                 id="aud-exc-name"
@@ -1007,7 +1009,7 @@ function AudienceSection({
             </div>
             <div className="crm-field">
               <label className="text-label text-ink-300" htmlFor="aud-exc-ids">
-                Member customer IDs
+                {t("Member customer IDs")}
               </label>
               <input
                 id="aud-exc-ids"
@@ -1028,10 +1030,10 @@ function AudienceSection({
           )}
           <div className="crm-toolbar">
             <Button type="submit" size="sm" loading={exclusionPending} disabled={exclusionPending}>
-              Save exclusion list
+              {t("Save exclusion list")}
             </Button>
             <button type="button" className="lnk text-label" onClick={() => setShowExclusionForm(false)}>
-              Cancel
+              {t("Cancel")}
             </button>
           </div>
         </form>
@@ -1043,9 +1045,9 @@ function AudienceSection({
         onRetry={() => setPreviewToken((count) => count + 1)}
         label={t("Audience preview")}
       />
-      <section aria-label="Suppressions" className="mt-1">
+      <section aria-label={t("Suppressions")} className="mt-1">
         <h4 className="text-label font-medium text-ink-200">
-          Suppressions ({suppressions.length}) — always excluded, even from custom IDs
+          {t("Suppressions ({count}) — always excluded, even from custom IDs").replace("{count}", String(suppressions.length))}
         </h4>
         {suppressionError !== null ? (
           <p className="text-label text-fail" role="alert">
@@ -1055,7 +1057,7 @@ function AudienceSection({
             </button>
           </p>
         ) : suppressions.length === 0 ? (
-          <p className="text-label text-ink-400">No suppressions yet.</p>
+          <p className="text-label text-ink-400">{t("No suppressions yet.")}</p>
         ) : (
           <ol className="crm-history">
             {suppressions.slice(0, 10).map((row) => (
@@ -1064,7 +1066,7 @@ function AudienceSection({
               </li>
             ))}
             {suppressions.length > 10 && (
-              <li className="num text-label text-ink-500">…and {suppressions.length - 10} more</li>
+              <li className="num text-label text-ink-500">{t("…and {count} more").replace("{count}", String(suppressions.length - 10))}</li>
             )}
           </ol>
         )}
@@ -1093,7 +1095,7 @@ function AudienceSection({
           >
             <div className="crm-field">
               <label className="text-label text-ink-300" htmlFor="aud-suppress-email">
-                Suppress an email
+                {t("Suppress an email")}
               </label>
               <input
                 id="aud-suppress-email"
@@ -1109,7 +1111,7 @@ function AudienceSection({
             </div>
             <div className="crm-field">
               <label className="text-label text-ink-300" htmlFor="aud-suppress-reason">
-                Reason
+                {t("Reason")}
               </label>
               <input
                 id="aud-suppress-reason"
@@ -1119,7 +1121,7 @@ function AudienceSection({
                 maxLength={80}
                 autoComplete="off"
                 disabled={suppressPending}
-                placeholder="opted out by phone"
+                placeholder={t("opted out by phone")}
               />
             </div>
             {suppressError && (
@@ -1129,7 +1131,7 @@ function AudienceSection({
             )}
             <div>
               <Button type="submit" size="sm" loading={suppressPending} disabled={suppressPending}>
-                Add suppression
+                {t("Add suppression")}
               </Button>
             </div>
           </form>
@@ -2367,7 +2369,7 @@ function CampaignWorkspace({
       return;
     }
     if ((cloneAudience && !canCopyAudience) || (cloneSender && !canCopySender)) {
-      setCloneError("A selected starter setting is no longer available. Recheck it and try again.");
+      setCloneError(CLONE_STALE_COPY);
       return;
     }
     setClonePending(true);
@@ -2433,7 +2435,7 @@ function CampaignWorkspace({
     testEvidence: testReceipt,
   });
   const pendingProposals = proposals.filter((row) => row.state === "pending");
-  const emailBadge = pendingProposals.length > 0 ? `${formatNumber(pendingProposals.length)} ${t("draft")}` : null;
+  const emailBadge = pendingProposals.length > 0 ? t("{count} draft").replace("{count}", () => formatNumber(pendingProposals.length)) : null;
   return (
     <>
       {onCloned !== undefined && doc !== null && (
@@ -2449,7 +2451,7 @@ function CampaignWorkspace({
               setCloneOpen(true);
             }}
           >
-            Clone campaign
+            {t("Clone campaign")}
           </Button>
         </div>
       )}
@@ -2461,25 +2463,25 @@ function CampaignWorkspace({
         onClose={() => setCloneOpen(false)}
       >
         <form className="grid gap-3 p-4" onSubmit={cloneSavedCampaign}>
-          <h2 id="cmp-clone-title" className="text-cardtitle font-medium text-ink-100">Clone campaign</h2>
-          <p className="text-label text-ink-300">Creates a new draft from this campaign&apos;s saved revision. Approval, frozen recipients, proposals, test receipts, preparation and send history are not copied. Sender selection is context-shared preview metadata only; it never rebinds SMTP or authorizes sending.</p>
+          <h2 id="cmp-clone-title" className="text-cardtitle font-medium text-ink-100">{t("Clone campaign")}</h2>
+          <p className="text-label text-ink-300">{t("Creates a new draft from this campaign's saved revision. Approval, frozen recipients, proposals, test receipts, preparation and send history are not copied. Sender selection is context-shared preview metadata only; it never rebinds SMTP or authorizes sending.")}</p>
           <label className="grid gap-1 text-label text-ink-300" htmlFor="cmp-clone-name">
-            New campaign name
+            {t("New campaign name")}
             <input id="cmp-clone-name" className="field" value={cloneName} maxLength={CAMPAIGN_NAME_MAX} required disabled={clonePending} onChange={(event) => setCloneName(event.target.value)} />
           </label>
           <label className="flex items-center gap-2 text-label text-ink-300">
             <input type="checkbox" checked={cloneAudience} disabled={!canCopyAudience || clonePending} onChange={(event) => setCloneAudience(event.target.checked)} />
-            Copy audience criteria {canCopyAudience ? "from the current valid freeze" : "(no valid source freeze)"}
+            {t("Copy audience criteria")} {canCopyAudience ? t("from the current valid freeze") : t("(no valid source freeze)")}
           </label>
           <label className="flex items-center gap-2 text-label text-ink-300">
             <input type="checkbox" checked={cloneSender} disabled={!canCopySender || clonePending} onChange={(event) => setCloneSender(event.target.checked)} />
-            Copy selected sender preview {canCopySender ? `(${render?.sender.name})` : "(select a non-preview sender in Email first)"}
+            {t("Copy selected sender preview")} {canCopySender ? `(${render?.sender.name})` : t("(select a non-preview sender in Email first)")}
           </label>
-          {emailDraft.dirty && <p className="text-label text-warn" role="status">Unsaved edits are not included. Save them first if you want to clone the changes.</p>}
-          {cloneError !== null && <p className="text-label text-fail" role="alert">{cloneError}</p>}
+          {emailDraft.dirty && <p className="text-label text-warn" role="status">{t("Unsaved edits are not included. Save them first if you want to clone the changes.")}</p>}
+          {cloneError !== null && <p className="text-label text-fail" role="alert">{cloneError === CLONE_STALE_COPY ? t(CLONE_STALE_COPY) : cloneError}</p>}
           <div className="flex justify-end gap-2">
-            <Button type="button" variant="ghost" disabled={clonePending} onClick={() => setCloneOpen(false)}>Cancel</Button>
-            <Button type="submit" variant="primary" loading={clonePending} disabled={clonePending || !canWrite || doc === null}>Clone as new draft</Button>
+            <Button type="button" variant="ghost" disabled={clonePending} onClick={() => setCloneOpen(false)}>{t("Cancel")}</Button>
+            <Button type="submit" variant="primary" loading={clonePending} disabled={clonePending || !canWrite || doc === null}>{t("Clone as new draft")}</Button>
           </div>
         </form>
       </dialog>

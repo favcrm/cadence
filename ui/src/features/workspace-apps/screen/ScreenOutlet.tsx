@@ -6,6 +6,7 @@ import { type SlotView } from "./screenSlot";
 import ScreenSlotLayer from "./ScreenSlotLayer";
 import { parseDraftImageRef, type ScreenPush } from "./screenProtocol";
 import { workspaceApps } from "../workspaceApps";
+import { useTranslate } from "../../../lib/locale";
 import { downscaleToDataUrl } from "./screenAssets";
 
 /** App code lives in its independently installed bundle, never in the board. */
@@ -14,6 +15,7 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions 
   /** The operator's verbs for this frame (HP3); absent for a non-operator, so every `call`/`slot` closes it. */
   actions?: Pick<ScreenActions, "call" | "planner">;
 }) {
+  const t = useTranslate();
   const container = useRef<HTMLDivElement>(null);
   const channel = useRef<ScreenChannel | null>(null);
   const latest = useRef(projection);
@@ -113,7 +115,7 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions 
   }, [scope]);
   useEffect(() => { channel.current?.update(projection); }, [projection]);
   return <>
-    <div aria-label="Installed app screen" style={{ position: "relative", flex: "1 1 0%", minHeight: 0, height: "100%", display: state === "ready" ? "block" : "none" }}>
+    <div aria-label={t("Installed app screen")} style={{ position: "relative", flex: "1 1 0%", minHeight: 0, height: "100%", display: state === "ready" ? "block" : "none" }}>
       <div ref={container} style={{ position: "absolute", inset: 0 }} />
       <ScreenSlotLayer view={slot} link={link} onDismissLink={() => setLink(null)}
         onTap={(token, trusted, at) => { channel.current?.tapSlot(token, trusted, at); }}
@@ -121,8 +123,8 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions 
     </div>
     {/* CAD-1137: a quiet first-mount skeleton, with the blank frame hidden until handshake readiness. */}
     {state === "loading" && (
-      <div className="wa-skeleton wa-screen-skeleton" role="status" aria-label="Loading installed app" style={{ padding: "0.5rem 0.25rem" }}>
-        <span className="sr-only">Loading installed app…</span>
+      <div className="wa-skeleton wa-screen-skeleton" role="status" aria-label={t("Loading installed app")} style={{ padding: "0.5rem 0.25rem" }}>
+        <span className="sr-only">{t("Loading installed app…")}</span>
         <div className="wa-skel-tabs">
           {[3, 3.5, 4.5, 3.5].map((w, i) => (
             <span key={i} className="wa-skel wa-skel-pulse" style={{ width: `${w}rem`, height: "0.85rem" }} />

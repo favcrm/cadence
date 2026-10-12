@@ -296,38 +296,42 @@ export interface ActivityItem {
   agent: boolean;
 }
 
-/** Plain-language timeline, newest first. Ids and digests stay in Details. */
+/** Plain-language timeline, newest first. Ids and digests stay in Details.
+ *  Each sentence is one whole translated template (placeholders filled
+ *  literally), so word order can change per locale. English is unchanged. */
 export function activityItems(record: HostRecord, t: Translate = identity): ActivityItem[] {
   const consent = consentEntries(record);
   return revisionEntries(record)
     .map((rev) => {
       const here = consent.filter((c) => c.revision === rev.revision);
-      const channelName = (c: ConsentEntry) => t(c.channel === "sms" ? "SMS" : "Email");
       const parts = here.map((c) => {
-        const how = c.method
-          ? ` ${
+        const channel = t(c.channel === "sms" ? "SMS" : "Email");
+        const method = c.method
+          ? t(
               c.method === "in_person"
-                ? t("in person")
+                ? "in person"
                 : c.method === "web_form"
-                  ? t("on the website form")
+                  ? "on the website form"
                   : c.method === "written"
-                    ? t("in writing")
+                    ? "in writing"
                     : c.method === "imported"
-                      ? t("from an imported list")
+                      ? "from an imported list"
                       : c.method === "other"
-                        ? t("another way")
-                        : ""
-            }`.trimEnd()
+                        ? "another way"
+                        : "",
+            )
           : "";
         return c.state === "granted"
-          ? `${channelName(c)} ${t("consent granted")}${how === "" ? "" : ` (${how.trim()})`}`
+          ? method === ""
+            ? t("{channel} consent granted").replace("{channel}", () => channel)
+            : t("{channel} consent granted ({method})").replace("{channel}", () => channel).replace("{method}", () => method)
           : c.state === "denied"
-            ? `${channelName(c)} ${t("consent withdrawn")}`
-            : `${channelName(c)} ${t("consent recorded as")} ${c.state}`;
+            ? t("{channel} consent withdrawn").replace("{channel}", () => channel)
+            : t("{channel} consent recorded as {state}").replace("{channel}", () => channel).replace("{state}", () => c.state);
       });
       const who = rev.actor === "operator" ? t("the operator") : rev.actor;
       const lead = rev.revision === 1 ? t("Created") : parts.length === 0 ? t("Profile edited") : "";
-      const text = [lead, ...parts].filter(Boolean).join(" · ") + ` ${t("by")} ${who}`;
+      const text = [lead, ...parts].filter(Boolean).join(" · ") + ` ${t("by {who}").replace("{who}", () => who)}`;
       const note = here.find((c) => c.note)?.note;
       return { key: `r${rev.revision}`, text, ...(note ? { note } : {}), at: rev.at, agent: rev.actor !== "operator" };
     })

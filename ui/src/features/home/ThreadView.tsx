@@ -1,4 +1,5 @@
 import { useMemo, useState, type ReactNode } from "react";
+import { useTranslate } from "../../lib/locale";
 import type { ThreadRef } from "../../lib/types";
 import Md from "../../ui/Md";
 import { attachMeta } from "../app-shell/chat/attach";
@@ -27,6 +28,7 @@ export function time(created: string | null | undefined): string {
  * closing animate through the grid-rows height trick (styles.css).
  */
 function StepsGroup({ entries }: { entries: ThreadEntry[] }) {
+  const t = useTranslate();
   const [open, setOpen] = useState(false);
   const steps = useMemo(() => toolSteps(entries), [entries]);
   const refused = steps.filter((s) => s.refused).length;
@@ -45,14 +47,14 @@ function StepsGroup({ entries }: { entries: ThreadEntry[] }) {
           ›
         </span>
         <span className="shrink-0">
-          {steps.length} tool {steps.length === 1 ? "step" : "steps"}
+          {steps.length} {t("tool")} {steps.length === 1 ? t("step") : t("steps")}
         </span>
-        {running && <span className="steps-running shrink-0">· running</span>}
+        {running && <span className="steps-running shrink-0">· {t("running")}</span>}
         {failed > 0 && (
-          <span className="text-fail shrink-0">· {failed === 1 ? "error" : `${failed} errors`}</span>
+          <span className="text-fail shrink-0">· {failed === 1 ? t("error") : `${failed} ${t("errors")}`}</span>
         )}
         {refused > 0 && (
-          <span className="text-warn shrink-0">· {refused === 1 ? "refused" : `${refused} refused`}</span>
+          <span className="text-warn shrink-0">· {refused === 1 ? t("refused") : `${refused} ${t("refused")}`}</span>
         )}
         {last && <span className="num truncate min-w-0 text-ink-500">· {last.summary}</span>}
       </button>
@@ -75,8 +77,8 @@ function StepsGroup({ entries }: { entries: ThreadEntry[] }) {
                 {s.call.kind === "tool_result" ? "←" : !s.done ? "◌" : s.refused ? "⊘" : s.error ? "✕" : "✓"}
               </span>
               <span className="num min-w-0 break-all flex-1">{s.summary}</span>
-              {s.refused && <span className="step-tag text-warn shrink-0">refused</span>}
-              {s.error && !s.refused && <span className="step-tag text-fail shrink-0">error</span>}
+              {s.refused && <span className="step-tag text-warn shrink-0">{t("refused")}</span>}
+              {s.error && !s.refused && <span className="step-tag text-fail shrink-0">{t("error")}</span>}
               {s.result && s.call.kind === "tool_call" && (
                 <span className="num truncate max-w-[40%] text-ink-500" title={s.result.text}>
                   {stepSummary(s.result.text)}
@@ -139,12 +141,13 @@ export function ThreadItemView({
   ) => void;
   onDiscard: (message: string) => void;
 }) {
+  const t = useTranslate();
   const compact = density === "compact";
   const bodyText = compact ? "text-secondary" : "text-body";
   switch (item.type) {
     case "operator":
       return (
-        <Bubble who="You" at={time(item.entry.created)} me density={density}>
+        <Bubble who={t("You")} at={time(item.entry.created)} me density={density}>
           <div className={`inline-block text-left px-3 py-2 bg-accent/10 border border-accent/20 ${USER_BUBBLE} ${bodyText} text-ink-100 break-words`}>
             <span className="whitespace-pre-wrap [overflow-wrap:anywhere]">{item.entry.text}</span>
             <AttachmentRows files={entryAttachments(item.entry.payload)} />
@@ -155,8 +158,8 @@ export function ThreadItemView({
     case "pending":
       return (
         <Bubble
-          who="You"
-          at={item.pending.state === "failed" ? "not sent" : item.pending.state === "sent" ? "queued" : "sending…"}
+          who={t("You")}
+          at={item.pending.state === "failed" ? t("not sent") : item.pending.state === "sent" ? t("queued") : t("sending…")}
           me
           density={density}
         >
@@ -183,11 +186,11 @@ export function ThreadItemView({
                   )
                 }
               >
-                Retry
+                {t("Retry")}
               </button>{" "}
               ·{" "}
               <button className="lnk" onClick={() => onDiscard(item.pending.message)}>
-                Discard
+                {t("Discard")}
               </button>
             </div>
           )}
@@ -206,7 +209,7 @@ export function ThreadItemView({
       return <StepsGroup entries={item.entries} />;
     case "answer":
       return (
-        <Bubble who="Assistant" at={time(item.entry.created)} density={density}>
+        <Bubble who={t("Assistant")} at={time(item.entry.created)} density={density}>
           <div className={`issue-reader mt-0.5 ${bodyText} text-ink-200 break-words`} data-kind="answer">
             <Md text={item.entry.text} onOpen={onOpenIssue} />
           </div>
@@ -255,6 +258,7 @@ function SystemNote({
   briefing: boolean;
   onOpenIssue: (id: string) => void;
 }) {
+  const t = useTranslate();
   const [open, setOpen] = useState(false);
   return (
     <div className="steps sysnote min-w-0" data-kind={briefing ? "briefing" : "system-note"} data-open={open || undefined}>
@@ -267,7 +271,7 @@ function SystemNote({
         <span className="steps-caret num shrink-0" aria-hidden>
           ›
         </span>
-        <span className="shrink-0">{briefing ? "Session briefing" : "Details"}</span>
+        <span className="shrink-0">{briefing ? t("Session briefing") : t("Details")}</span>
         <span className="num truncate min-w-0 text-ink-500">· {stepSummary(entry.text)}</span>
       </button>
       <div className="steps-body">
@@ -284,9 +288,10 @@ function SystemNote({
 /** The subjects an operator bubble cites (CAD-574 `refs`) — one chip
  *  each under the text. */
 function RefChips({ refs }: { refs: ThreadRef[] }) {
+  const t = useTranslate();
   if (refs.length === 0) return null;
   return (
-    <span className="refsrow" aria-label="cited rows">
+    <span className="refsrow" aria-label={t("cited rows")}>
       {refs.map((r) => (
         <span key={`${r.kind}:${r.id}`} className="refchip num" title={`${r.kind}:${r.id}`}>
           {r.kind}:{r.id}

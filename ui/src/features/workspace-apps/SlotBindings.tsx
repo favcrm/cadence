@@ -11,6 +11,7 @@ import {
   type DeclaredSlot,
 } from "./bindingChoices";
 import { connectionLabel } from "../../lib/connections";
+import { useTranslate } from "../../lib/locale";
 import { workspaceApps, type AppBinding, type Connection } from "./workspaceApps";
 
 /**
@@ -48,13 +49,14 @@ export function SlotBindings({
   busy: boolean;
   mutate: (work: () => Promise<void>) => Promise<void>;
 }) {
+  const t = useTranslate();
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const typed = slots.filter((slot) => slot.declaration !== null);
   const untyped = slots.filter((slot) => slot.declaration === null);
   if (slots.length === 0) {
     return (
       <p className="wa-muted">
-        This app declares no connection slots — nothing to bind.
+        {t("This app declares no connection slots — nothing to bind.")}
       </p>
     );
   }
@@ -64,15 +66,11 @@ export function SlotBindings({
   return (
     <>
       <p className="wa-muted">
-        Re-saving the same connection changes nothing. Choosing a different connection
-        closes this slot&apos;s waiting sends; new runs pin the new binding. The daemon
-        re-checks the reviewed contract on every save.
+        {t("Re-saving the same connection changes nothing. Choosing a different connection closes this slot&apos;s waiting sends; new runs pin the new binding. The daemon re-checks the reviewed contract on every save.")}
       </p>
       {untyped.length > 0 && (
         <p className="wa-muted">
-          Legacy {untyped.length === 1 ? "slot" : "slots"} {untyped.map((slot) => slot.slot).join(", ")}{" "}
-          {untyped.length === 1 ? "binds" : "bind"} through <code>cadence app set</code> — the board binds
-          only reviewed capability slots, and an untyped slot never authorizes a connection effect.
+          {legacyNote(untyped.length, untyped.map((slot) => slot.slot).join(", "), t)}
         </p>
       )}
       {typed.map((slot) => {
@@ -90,30 +88,27 @@ export function SlotBindings({
           <section key={slot.slot} className="wa-panel wa-stack" aria-label={`${titleFor(slot.slot)} connection`}>
             <h2>{titleFor(slot.slot)}</h2>
             <p className="wa-muted">
-              Save the connection for {contextLabel ?? "runs without a brand context"}.{" "}
-              {plainRequirement(slot)} This configures future plans; it
-              doesn&apos;t release anything.
+              {t("Save the connection for")} {contextLabel ?? t("runs without a brand context")}.{" "}
+              {plainRequirement(slot, t)} {t("This configures future plans; it doesn&apos;t release anything.")}
             </p>
             {binding && health === "ok" && (
               <p className="wa-kicker">
-                Configured · revision {binding.revision} · {binding.config.account}
+                {t("Configured · revision")} {binding.revision} · {binding.config.account}
               </p>
             )}
             {binding && health === "stale-bundle" && (
               <p className="wa-alert">
-                This binding pins an older app version ({shortDigest(binding.config.bundle_digest)}).
-                Save again to rebind the current version — runs stay gated until then.
+                {t("This binding pins an older app version ({digest}). Save again to rebind the current version — runs stay gated until then.").replace("{digest}", () => shortDigest(binding.config.bundle_digest))}
               </p>
             )}
             {binding && health === "missing-connection" && (
               <p className="wa-alert">
-                Its connection ({shortId(binding.config.connection_id)}) is gone —
-                revoked or re-enrolled elsewhere. Choose another below.
+                {t("Its connection ({id}) is gone — revoked or re-enrolled elsewhere. Choose another below.").replace("{id}", () => shortId(binding.config.connection_id))}
               </p>
             )}
             {binding && health === "not-configured" && (
               <p className="wa-alert">
-                This binding is {binding.state} — save again to configure it.
+                {t("This binding is {state} — save again to configure it.").replace("{state}", () => binding.state)}
               </p>
             )}
             <div className="wa-row">
@@ -128,8 +123,8 @@ export function SlotBindings({
                     label: connectionLabel(value),
                     hint: value.id,
                   }))}
-                  placeholder={`Choose ${titleFor(slot.slot).toLowerCase()} connection`}
-                  aria-label={`${titleFor(slot.slot)} connection`}
+                  placeholder={t("Choose {slot} connection").replace("{slot}", () => titleFor(slot.slot).toLowerCase())}
+                  aria-label={t("{slot} connection").replace("{slot}", () => titleFor(slot.slot))}
                   disabled={!canWrite || busy}
                   full
                 />
@@ -161,20 +156,19 @@ export function SlotBindings({
                   })
                 }
               >
-                Save {titleFor(slot.slot).toLowerCase()} connection
+                {t("Save {slot} connection").replace("{slot}", () => titleFor(slot.slot).toLowerCase())}
               </Button>
             </div>
             {withheld > 0 && (
               <p className="wa-muted">
-                {withheld} unavailable {withheld === 1 ? "connection is" : "connections are"}{" "}
-                hidden — <Link href="/settings/connections">see Settings → Connections</Link>.
+                {t(withheld === 1 ? "{count} unavailable connection is hidden —" : "{count} unavailable connections are hidden —").replace("{count}", () => String(withheld))}{" "}
+                <Link href="/settings/connections">{t("see Settings → Connections")}</Link>.
               </p>
             )}
             {offered.length === 0 && (
               <p className="wa-alert">
-                No compatible connection is available.{" "}
-                <Link href="/settings/connections">Add one in Settings → Connections</Link>,
-                then come back — candidates re-check automatically.
+                {t("No compatible connection is available.")}{" "}
+                <Link href="/settings/connections">{t("Add one in Settings → Connections")}</Link>{t(", then come back — candidates re-check automatically.")}
               </p>
             )}
           </section>
@@ -182,6 +176,20 @@ export function SlotBindings({
       })}
     </>
   );
+}
+
+/** Legacy untyped slots: the English sentence is split around the
+ *  `cadence app set` command (a JSX element), so each piece is a whole key. */
+function legacyNote(
+  count: number,
+  slots: string,
+  t: (english: string) => string,
+) {
+  const lead = count === 1
+    ? t("Legacy slot {slots} binds through").replace("{slots}", () => slots)
+    : t("Legacy slots {slots} bind through").replace("{slots}", () => slots);
+  const tail = t("— the board binds only reviewed capability slots, and an untyped slot never authorizes a connection effect.");
+  return <>{lead} <code>cadence app set</code> {tail}</>;
 }
 
 /** "publication" → "Publication", "source" → "Source" — slot ids in plain words. */

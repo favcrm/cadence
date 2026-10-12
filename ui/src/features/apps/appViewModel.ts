@@ -724,13 +724,23 @@ export function isReadyToRun(app: AppDetail): boolean {
  * the operator's language ("Approve the app, then set the team"), never
  * the engine's "pass `--input k=v`".
  */
-export function notReadyText(app: AppDetail): string | null {
-  const gaps = readyChecklist(app).filter((i) => !i.done);
-  if (gaps.length === 0) return null;
-  const actions = { approved: "approve the app", team: "choose the team", publish: "connect publishing to Local outbox" };
-  const words = gaps.map((g) => actions[g.key]);
-  const list = words.length > 1 ? `${words.slice(0, -1).join(", ")} and ${words.at(-1)}` : words[0];
-  return `${list[0].toUpperCase()}${list.slice(1)} to start a run.`;
+export function notReadyText(
+  app: AppDetail,
+  t: (english: string) => string = (english) => english,
+): string | null {
+  const gaps = new Set(readyChecklist(app).filter((i) => !i.done).map((i) => i.key));
+  if (gaps.size === 0) return null;
+  // One whole sentence per gap set: a translation keeps its own word order.
+  const approved = gaps.has("approved");
+  const team = gaps.has("team");
+  const publish = gaps.has("publish");
+  if (approved && team && publish) return t("Approve the app, choose the team and connect publishing to Local outbox to start a run.");
+  if (approved && team) return t("Approve the app and choose the team to start a run.");
+  if (approved && publish) return t("Approve the app and connect publishing to Local outbox to start a run.");
+  if (team && publish) return t("Choose the team and connect publishing to Local outbox to start a run.");
+  if (approved) return t("Approve the app to start a run.");
+  if (team) return t("Choose the team to start a run.");
+  return t("Connect publishing to Local outbox to start a run.");
 }
 
 /**

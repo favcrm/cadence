@@ -7,7 +7,11 @@ import Button from "../../ui/Button";
 import AgentAvatar, { lookFor } from "./AgentAvatar";
 import { AgentActivity, AgentQueue, WorkBlock } from "./AgentBlocks";
 import { agentHoldsWorkButDead, lifecycleOf } from "./agentView";
+import { useTranslate } from "../../lib/locale";
 import type { Agent, AgentDetail, UsageLimit } from "../../lib/types";
+
+type Translate = (english: string) => string;
+const identity: Translate = (english) => english;
 
 /// A fence's recovery path — the daemon's own error text already names
 /// `agent unfence` / `message reconcile`; render it verbatim as code.
@@ -19,7 +23,7 @@ function RecoveryBlock({ text }: { text: string }) {
   );
 }
 
-function profileModel(a: Agent): {
+function profileModel(a: Agent, t: Translate = identity): {
   value: string;
   note: string;
   mismatch?: string;
@@ -30,24 +34,25 @@ function profileModel(a: Agent): {
   const provenanceText = provenanceDetail(
     a.model_selection,
     a.model_lookup_role,
+    t,
   );
   if (
     a.model_selection === null &&
     (a.provider === "devin" || a.provider === "inbox")
   ) {
     return {
-      value: reported ?? "unsupported",
-      note: "model selection unsupported",
+      value: reported ?? t("unsupported"),
+      note: t("model selection unsupported"),
       provenance: provenanceText || undefined,
     };
   }
   if (reported) {
     return {
       value: reported,
-      note: "reported",
+      note: t("reported"),
       mismatch:
         configured && configured !== reported
-          ? `configured ${configured}`
+          ? t("configured {model}").replace("{model}", configured)
           : undefined,
       provenance: provenanceText || undefined,
     };
@@ -55,64 +60,64 @@ function profileModel(a: Agent): {
   if (configured) {
     return {
       value: configured,
-      note: "configured",
+      note: t("configured"),
       provenance: provenanceText || undefined,
     };
   }
   if (a.model_source === "provider default") {
     return {
-      value: "provider default",
-      note: "reported model unknown",
+      value: t("provider default"),
+      note: t("reported model unknown"),
       provenance: provenanceText || undefined,
     };
   }
   return {
-    value: "unknown",
-    note: "no provider evidence",
+    value: t("unknown"),
+    note: t("no provider evidence"),
     provenance: provenanceText || undefined,
   };
 }
 
-function profileEffort(a: Agent): { value: string; note: string } {
+function profileEffort(a: Agent, t: Translate = identity): { value: string; note: string } {
   if (a.effort_applicable === false || a.effort_source === "not_applicable") {
-    return { value: "n/a", note: "provider does not report effort" };
+    return { value: "n/a", note: t("provider does not report effort") };
   }
   const effective = a.effort_reported ?? null;
-  if (effective) return { value: effective, note: "confirmed" };
-  if (a.effort) return { value: a.effort, note: "configured" };
-  return { value: "unknown", note: "no provider evidence" };
+  if (effective) return { value: effective, note: t("confirmed") };
+  if (a.effort) return { value: a.effort, note: t("configured") };
+  return { value: t("unknown"), note: t("no provider evidence") };
 }
 
 function usageFor(a: Agent): UsageLimit | null {
   return a.quota ?? a.usage_limit ?? null;
 }
 
-function usageText(a: Agent): { value: string; note: string; tone: string } {
+function usageText(a: Agent, t: Translate = identity): { value: string; note: string; tone: string } {
   const quota = usageFor(a);
   if (!quota) {
     return {
-      value: "unavailable",
-      note: "provider quota telemetry is not integrated",
+      value: t("unavailable"),
+      note: t("provider quota telemetry is not integrated"),
       tone: "text-ink-500",
     };
   }
   const state = quota.state ?? "unknown";
   if (state === "error") {
     return {
-      value: "error",
-      note: quota.message ?? quota.reason ?? "quota query failed",
+      value: t("error"),
+      note: quota.message ?? quota.reason ?? t("quota query failed"),
       tone: "text-fail",
     };
   }
   if (state === "stale") {
     return {
-      value: "stale",
+      value: t("stale"),
       note: [
         quota.observed_at
-          ? `last update ${fmtTime(quota.observed_at)}`
-          : "last update unknown",
+          ? t("last update {time}").replace("{time}", fmtTime(quota.observed_at))
+          : t("last update unknown"),
         quota.window,
-        quota.source ? `source ${quota.source}` : null,
+        quota.source ? t("source {source}").replace("{source}", quota.source) : null,
       ]
         .filter(Boolean)
         .join(" · "),
@@ -121,41 +126,41 @@ function usageText(a: Agent): { value: string; note: string; tone: string } {
   }
   if (state === "blocked") {
     return {
-      value: "blocked",
-      note: quota.reason ?? "provider reported a quota block",
+      value: t("blocked"),
+      note: quota.reason ?? t("provider reported a quota block"),
       tone: "text-fail",
     };
   }
   if (state !== "available") {
     return {
-      value: "unknown",
-      note: quota.reason ?? "allowance not reported",
+      value: t("unknown"),
+      note: quota.reason ?? t("allowance not reported"),
       tone: "text-ink-500",
     };
   }
   // Null means unavailable; zero is a real value and must remain visible.
   const unit = quota.unit ? ` ${quota.unit}` : "";
   const remaining =
-    quota.remaining != null ? `${quota.remaining}${unit} remaining` : null;
-  const used = quota.used != null ? `${quota.used}${unit} used` : null;
-  const limit = quota.limit != null ? `${quota.limit}${unit} limit` : null;
+    quota.remaining != null ? `${quota.remaining}${unit} ${t("remaining")}` : null;
+  const used = quota.used != null ? `${quota.used}${unit} ${t("used")}` : null;
+  const limit = quota.limit != null ? `${quota.limit}${unit} ${t("limit")}` : null;
   const usedAgainstLimit =
     quota.used != null && quota.limit != null
-      ? `${quota.used}/${quota.limit}${unit} used`
+      ? `${quota.used}/${quota.limit}${unit} ${t("used")}`
       : null;
   const percent =
-    quota.used_percent != null ? `${quota.used_percent}% used` : null;
+    quota.used_percent != null ? `${quota.used_percent}% ${t("used")}` : null;
   const value =
-    remaining ?? usedAgainstLimit ?? used ?? percent ?? limit ?? "available";
+    remaining ?? usedAgainstLimit ?? used ?? percent ?? limit ?? t("available");
   const window = quota.window ? `${quota.window}` : null;
-  const reset = quota.reset_at ? `reset ${fmtTime(quota.reset_at)}` : null;
+  const reset = quota.reset_at ? t("reset {time}").replace("{time}", fmtTime(quota.reset_at)) : null;
   const pool = quota.pool
-    ? `shared${quota.pool.label ? ` · ${quota.pool.label}` : ""}${
-        quota.pool.count != null ? ` · ${quota.pool.count} agents` : ""
+    ? `${t("shared")}${quota.pool.label ? ` · ${quota.pool.label}` : ""}${
+        quota.pool.count != null ? ` · ${t("{count} agents").replace("{count}", String(quota.pool.count))}` : ""
       }`
     : null;
   const poolAgents = quota.pool?.agents?.length
-    ? `agents ${quota.pool.agents.join(", ")}`
+    ? `${t("agents")} ${quota.pool.agents.join(", ")}`
     : null;
   const lastUpdate = quota.updated_at ?? quota.observed_at;
   return {
@@ -166,19 +171,20 @@ function usageText(a: Agent): { value: string; note: string; tone: string } {
         reset,
         pool,
         poolAgents,
-        lastUpdate ? `last update ${fmtTime(lastUpdate)}` : null,
-        quota.source ? `source ${quota.source}` : null,
+        lastUpdate ? t("last update {time}").replace("{time}", fmtTime(lastUpdate)) : null,
+        quota.source ? t("source {source}").replace("{source}", quota.source) : null,
       ]
         .filter(Boolean)
-        .join(" · ") || "reported",
+        .join(" · ") || t("reported"),
     tone: "text-ink-300",
   };
 }
 
 function ProfileBlock({ agent }: { agent: Agent }) {
-  const model = profileModel(agent);
-  const effort = profileEffort(agent);
-  const usage = usageText(agent);
+  const t = useTranslate();
+  const model = profileModel(agent, t);
+  const effort = profileEffort(agent, t);
+  const usage = usageText(agent, t);
   return (
     <div className="space-y-1 min-w-0 agents-profile">
       <div
@@ -188,13 +194,13 @@ function ProfileBlock({ agent }: { agent: Agent }) {
         {model.value}
       </div>
       <div className="num text-micro text-ink-500">
-        model {model.note}
+        {t("model")} {model.note}
         {model.mismatch ? ` · ${model.mismatch}` : ""}
       </div>
       {model.provenance && (
         <div className="num text-micro text-ink-500">{model.provenance}</div>
       )}
-      <div className="num text-ink-300">effort {effort.value}</div>
+      <div className="num text-ink-300">{t("effort")} {effort.value}</div>
       <div className="num text-micro text-ink-500">{effort.note}</div>
       <div className={`num text-ink-300 ${usage.tone}`}>{usage.value}</div>
       <div className="num text-micro text-ink-500" title={usage.note}>
@@ -215,6 +221,7 @@ export default function AgentDrawer({
   onClose: () => void;
   onOpenIssue: (id: string) => void;
 }) {
+  const t = useTranslate();
   const [detail, setDetail] = useState<AgentDetail | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [retry, setRetry] = useState(0);
@@ -306,20 +313,20 @@ export default function AgentDrawer({
             {alias}
           </h2>
           <p className="text-label text-ink-400 mt-1">
-            {a?.role ?? observed?.role ?? "Agent"} ·{" "}
-            {a?.provider ?? observed?.provider ?? "Loading provider"}
+            {a?.role ?? observed?.role ?? t("Agent")} ·{" "}
+            {a?.provider ?? observed?.provider ?? t("Loading provider")}
             {profile && ` / ${profile.endpoint_kind}`}
           </p>
           {observed && (
             <p className="text-micro text-ink-500 mt-1">
-              Group: {observed.group_root ? "root" : observed.group}
-              {observed.team_role ? ` · Team role: ${observed.team_role}` : ""}
+              {t("Group:")} {observed.group_root ? t("root") : observed.group}
+              {observed.team_role ? ` · ${t("Team role:")} ${observed.team_role}` : ""}
             </p>
           )}
         </div>
         <Button
           icon={<IconClose />}
-          aria-label="Close agent details"
+          aria-label={t("Close agent details")}
           className="agents-close"
           onClick={onClose}
         />
@@ -328,49 +335,46 @@ export default function AgentDrawer({
       <div className="flex-1 overflow-y-auto px-5 py-5 space-y-6">
         {!detail && !err && (
           <p role="status" className="text-label text-ink-500">
-            Loading agent details…
+            {t("Loading agent details…")}
           </p>
         )}
         {err && (
           <div className="space-y-2">
             <p role="alert" className="text-label text-fail">
-              Could not load agent details: {err}
+              {t("Could not load agent details:")} {err}
             </p>
             <Button onClick={() => setRetry((r) => r + 1)}>
-              Retry details
+              {t("Retry details")}
             </Button>
           </div>
         )}
         {deadHolding && (
           <div className="agents-banner tone-fail" role="status">
-            Agent is dead but still holds work — release the claim or
-            reassign before it stalls the ticket.
+            {t("Agent is dead but still holds work — release the claim or reassign before it stalls the ticket.")}
           </div>
         )}
         {lifecycle === "stale-inbox" && (
           <div className="agents-banner tone-info" role="status">
-            Mailbox only — {profile!.queued} unread, no live endpoint. Drain
-            or archive.
+            {t("Mailbox only — {count} unread, no live endpoint. Drain or archive.").replace("{count}", String(profile!.queued))}
           </div>
         )}
         {lifecycle === "idle-holding" && (
           <div className="agents-banner tone-warn" role="status">
-            Not running but still holds a claim — resume it or release the
-            work.
+            {t("Not running but still holds a claim — resume it or release the work.")}
           </div>
         )}
         {fenced && (
           <section>
             <h3 className="text-cardtitle font-semibold text-fail">
-              Recovery required
+              {t("Recovery required")}
             </h3>
             <p className="text-label text-ink-400 mt-1">
-              An operator must inspect the outcome before reconciling.
+              {t("An operator must inspect the outcome before reconciling.")}
             </p>
             <RecoveryBlock
               text={
                 recovery ??
-                "Recovery guidance unavailable. Refresh agent details before taking action."
+                t("Recovery guidance unavailable. Refresh agent details before taking action.")
               }
             />
           </section>
@@ -378,7 +382,7 @@ export default function AgentDrawer({
         {(observed || (detail && a)) && (
           <section>
             <h3 className="text-cardtitle font-semibold text-ink-100 mb-2">
-              Current work
+              {t("Current work")}
             </h3>
             {observed && (
               <>
@@ -394,8 +398,8 @@ export default function AgentDrawer({
                 {(detail.tasks?.length ?? 0) > 0 && (
                   <div className="mt-3">
                     <div className="flex items-baseline gap-2 mb-2">
-                      <h4 className="slabel">Tasks</h4>
-                      <span className="kicker">assigned in flight</span>
+                      <h4 className="slabel">{t("Tasks")}</h4>
+                      <span className="kicker">{t("assigned in flight")}</span>
                     </div>
                     <ul className="border border-ink-700 rounded-lg divide-y divide-ink-700/80 bg-ink-850">
                       {detail.tasks!.map((t) => (
@@ -414,8 +418,8 @@ export default function AgentDrawer({
                 {(detail.on?.length ?? 0) > 0 && (
                   <div className="mt-3">
                     <div className="flex items-baseline gap-2 mb-2">
-                      <h4 className="slabel">Issues</h4>
-                      <span className="kicker">bound through the job</span>
+                      <h4 className="slabel">{t("Issues")}</h4>
+                      <span className="kicker">{t("bound through the job")}</span>
                     </div>
                     <div className="flex flex-wrap gap-1.5">
                       {detail.on!.map((id) => (
@@ -439,7 +443,7 @@ export default function AgentDrawer({
             <section>
               <div className="flex items-baseline gap-2 mb-2">
                 <h3 className="text-cardtitle font-semibold text-ink-100">
-                  Identity
+                  {t("Identity")}
                 </h3>
               </div>
               <dl className="grid grid-cols-[7rem_minmax(0,1fr)] gap-y-1.5 text-label">
@@ -487,11 +491,13 @@ export default function AgentDrawer({
               <section>
                 <div className="flex items-baseline gap-2 mb-2">
                   <h3 className="text-cardtitle font-semibold text-ink-100">
-                    Inbox
+                    {t("Inbox")}
                   </h3>
                   <span className="kicker">
-                    {detail.running.length} running · {detail.queued} queued ·{" "}
-                    {detail.unknown} unknown
+                    {t("{running} running · {queued} queued · {unknown} unknown")
+                      .replace("{running}", String(detail.running.length))
+                      .replace("{queued}", String(detail.queued))
+                      .replace("{unknown}", String(detail.unknown))}
                   </span>
                 </div>
                 <ul className="border border-ink-700 rounded-lg divide-y divide-ink-700/80 bg-ink-850">
@@ -506,7 +512,7 @@ export default function AgentDrawer({
                       </span>
                       {m.task && (
                         <span className="num text-micro text-ink-500">
-                          task {m.task}
+                          {t("task {task}").replace("{task}", m.task)}
                         </span>
                       )}
                       {m.summary && (
@@ -531,10 +537,10 @@ export default function AgentDrawer({
             <section>
               <div className="flex items-baseline gap-2 mb-2">
                 <h3 className="text-cardtitle font-semibold text-ink-100">
-                  History
+                  {t("History")}
                 </h3>
                 <span className="kicker">
-                  last {detail.events.length} events
+                  {t("last {count} events").replace("{count}", String(detail.events.length))}
                 </span>
               </div>
               {detail.events.length ? (
@@ -562,7 +568,7 @@ export default function AgentDrawer({
                   ))}
                 </ul>
               ) : (
-                <p className="text-secondary text-ink-500">No events yet.</p>
+                <p className="text-secondary text-ink-500">{t("No events yet.")}</p>
               )}
             </section>
           </>
@@ -570,7 +576,7 @@ export default function AgentDrawer({
         {profile && (
           <section>
             <h3 className="text-cardtitle font-semibold text-ink-100 mb-2">
-              Model, effort & usage
+              {t("Model, effort & usage")}
             </h3>
             <ProfileBlock agent={profile} />
           </section>
@@ -578,11 +584,11 @@ export default function AgentDrawer({
         {resume && (
           <section>
             <h3 className="text-cardtitle font-semibold text-ink-100 mb-2">
-              Resume command
+              {t("Resume command")}
             </h3>
             <p className="text-label text-ink-400 mb-2">
               {observed?.resume_hint ??
-                "For use in a terminal by the operator."}
+                t("For use in a terminal by the operator.")}
             </p>
             <pre className="agents-command num text-label text-accent bg-accent/10 rounded p-3">
               {resume}
@@ -592,9 +598,9 @@ export default function AgentDrawer({
         <section>
           <div className="flex items-baseline gap-2 mb-2">
             <h3 className="text-cardtitle font-semibold text-ink-100">
-              Actions
+              {t("Actions")}
             </h3>
-            <span className="kicker">read-only in this stage</span>
+            <span className="kicker">{t("read-only in this stage")}</span>
           </div>
           <div className="flex flex-wrap gap-1.5">
             {(fenced || deadHolding || lifecycle === "idle-holding") && (
@@ -602,17 +608,17 @@ export default function AgentDrawer({
                 <Button
                   size="sm"
                   disabled
-                  title="Resume is not wired from the board yet"
+                  title={t("Resume is not wired from the board yet")}
                 >
-                  Resume
+                  {t("Resume")}
                 </Button>
                 <Button
                   size="sm"
                   variant="danger"
                   disabled
-                  title="Claim release is not wired from the board yet"
+                  title={t("Claim release is not wired from the board yet")}
                 >
-                  Release claim
+                  {t("Release claim")}
                 </Button>
               </>
             )}
@@ -621,17 +627,17 @@ export default function AgentDrawer({
                 <Button
                   size="sm"
                   disabled
-                  title="Reassignment is not wired from the board yet"
+                  title={t("Reassignment is not wired from the board yet")}
                 >
-                  Reassign
+                  {t("Reassign")}
                 </Button>
                 <Button
                   size="sm"
                   variant="danger"
                   disabled
-                  title="Unfence runs from the To do rail, where the operator records the outcome"
+                  title={t("Unfence runs from the To do rail, where the operator records the outcome")}
                 >
-                  Unfence
+                  {t("Unfence")}
                 </Button>
               </>
             )}
@@ -640,17 +646,17 @@ export default function AgentDrawer({
                 <Button
                   size="sm"
                   disabled
-                  title="Inbox draining is not wired from the board yet"
+                  title={t("Inbox draining is not wired from the board yet")}
                 >
-                  Drain inbox
+                  {t("Drain inbox")}
                 </Button>
                 <Button
                   size="sm"
                   variant="danger"
                   disabled
-                  title="Archiving is not wired from the board yet"
+                  title={t("Archiving is not wired from the board yet")}
                 >
-                  Archive
+                  {t("Archive")}
                 </Button>
               </>
             )}
@@ -659,14 +665,14 @@ export default function AgentDrawer({
                 size="sm"
                 variant="danger"
                 disabled
-                title="Stopping a turn is not wired from the board yet"
+                title={t("Stopping a turn is not wired from the board yet")}
               >
-                Stop
+                {t("Stop")}
               </Button>
             )}
             {lifecycle === "normal" && !fenced && !(profile && profile.queued > 0) && (
               <p className="text-secondary text-ink-500">
-                No lifecycle actions apply to this agent.
+                {t("No lifecycle actions apply to this agent.")}
               </p>
             )}
           </div>

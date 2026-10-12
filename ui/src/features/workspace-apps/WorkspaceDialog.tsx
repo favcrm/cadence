@@ -1,6 +1,7 @@
 import { useEffect, useRef, type ReactNode } from "react";
 import Button from "../../ui/Button";
 import { IconClose } from "../../ui/icons";
+import { useTranslate } from "../../lib/locale";
 
 export function WorkspaceDialog({
   title,
@@ -13,6 +14,7 @@ export function WorkspaceDialog({
   onClose: () => void;
   children: ReactNode;
 }) {
+  const t = useTranslate();
   const panel = useRef<HTMLDialogElement>(null);
   useEffect(() => {
     const dialog = panel.current;
@@ -50,10 +52,10 @@ export function WorkspaceDialog({
         <h2>{title}</h2>
         <Button
           icon={<IconClose />}
-          aria-label={`Close ${title}`}
+          aria-label={t("Close {title}").replace("{title}", () => title)}
           onClick={onClose}
         >
-          Close
+          {t("Close")}
         </Button>
       </header>
       <div className="wa-dialog-body">{children}</div>

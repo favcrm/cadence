@@ -1,5 +1,6 @@
 import Button from "../../ui/Button";
-import { readinessFor } from "./bindingChoices";
+import { useTranslate } from "../../lib/locale";
+import { readinessAction, readinessFor } from "./bindingChoices";
 import type {
   AppBinding,
   BindingChange,
@@ -35,16 +36,17 @@ export function ReadinessPanel({
   busy?: boolean;
   onConfirm?: (binding: AppBinding) => void;
 }) {
-  const rows = readinessFor(installation, bindings, connections, contextId);
+  const t = useTranslate();
+  const rows = readinessFor(installation, bindings, connections, contextId, t);
   if (rows.length === 0) return null;
   const blockers = rows.filter((row) => !row.ready);
   return (
-    <section className="wa-panel wa-stack" aria-label="Ready to run">
-      <h2>Ready to run</h2>
+    <section className="wa-panel wa-stack" aria-label={t("Ready to run")}>
+      <h2>{t("Ready to run")}</h2>
       <p className="wa-kicker" data-tone={blockers.length ? "warn" : "ok"}>
         {blockers.length
-          ? "Something still needs you before this app can run."
-          : "Every connection slot is bound and healthy."}
+          ? t("Something still needs you before this app can run.")
+          : t("Every connection slot is bound and healthy.")}
       </p>
       {blockers.map((row) => (
         // The row keeps the one-line title and status; the next action, the
@@ -56,14 +58,14 @@ export function ReadinessPanel({
               {titleFor(row.slot)} · {row.requirement}
             </span>
             <span className="wa-status" data-tone="warn">
-              Needs you
+              {t("Needs you")}
             </span>
           </div>
           <div className="wa-blocker-detail">
-            <p className="wa-muted">{row.nextAction}</p>
+            <p className="wa-muted">{readinessAction(row, t)}</p>
             {row.confirm && row.binding && (
               <>
-                <ul className="wa-diff" aria-label={`${row.slot} connection change`}>
+                <ul className="wa-diff" aria-label={t("{slot} connection change").replace("{slot}", () => row.slot)}>
                   {row.confirm.map((change) => (
                     <li key={change.field}>{describe(change)}</li>
                   ))}
@@ -76,7 +78,7 @@ export function ReadinessPanel({
                       loading={busy}
                       onClick={() => row.binding && onConfirm(row.binding)}
                     >
-                      Confirm {row.slot} change
+                      {t("Confirm {slot} change").replace("{slot}", () => row.slot)}
                     </Button>
                   </div>
                 )}

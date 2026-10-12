@@ -14,6 +14,7 @@ import type { Viewer } from "../projects/work";
 import { AppGlyph, useModal } from "./shared";
 import { appErrorCopy, appLoadErrorCopy, isUnchangedUpgradeError } from "./appErrors";
 import { Loading, Notice } from "../app-shell/shared/States";
+import { useTranslate } from "../../lib/locale";
 import "./explorer.css";
 
 /**
@@ -24,6 +25,7 @@ import "./explorer.css";
  * second layer.
  */
 export default function ManageApp({ installId, viewer }: { installId: string; viewer: Viewer }) {
+  const t = useTranslate();
   const [inst, setInst] = useState<Installation | null>(null);
   const [home, setHome] = useState<HomeInstallation | null>(null);
   const [preview, setPreview] = useState<RemovePreview | null>(null);
@@ -76,33 +78,33 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
   }, [inst]);
 
   if (viewer.operator === null) {
-    return <main className="apps-detail px-4 lg:px-8 pt-4 pb-9" aria-label="manage app">
+    return <main className="apps-detail px-4 lg:px-8 pt-4 pb-9" aria-label={t("manage app")}>
       {viewer.access === "unavailable" ? (
         <Notice state="access-unavailable" onRetry={viewer.onRetryAccess} retryLabel="Retry access check">
-          Access could not be confirmed. Retry the access check before acting.
+          {t("Access could not be confirmed. Retry the access check before acting.")}
         </Notice>
-      ) : <Loading>Checking whether this session can act…</Loading>}
+      ) : <Loading>{t("Checking whether this session can act…")}</Loading>}
     </main>;
   }
   if (!isOp) {
     return <main className="apps-detail px-4 lg:px-8 pt-4 pb-9">
       <div className="card px-4 py-5">
-        <h2 className="font-medium text-ink-100 mb-1">Manage is the operator's</h2>
-        <p className="text-label text-ink-400">Ask an admin to change access, updates or remove.</p>
+        <h2 className="font-medium text-ink-100 mb-1">{t("Manage is the operator's")}</h2>
+        <p className="text-label text-ink-400">{t("Ask an admin to change access, updates or remove.")}</p>
       </div>
     </main>;
   }
   if (error) {
     return <main className="apps-detail px-4 lg:px-8 pt-4 pb-9">
       <div className="card px-4 py-5" role="alert">
-        <h2 className="font-medium text-ink-100 mb-1">Couldn't load the app</h2>
-        <p className="text-label text-ink-400 mb-3">{error}</p>
-        <Link href="/apps" className="btn">Back to Apps</Link>
+        <h2 className="font-medium text-ink-100 mb-1">{t("Couldn't load the app")}</h2>
+        <p className="text-label text-ink-400 mb-3">{t(error)}</p>
+        <Link href="/apps" className="btn">{t("Back to Apps")}</Link>
       </div>
     </main>;
   }
   if (!inst) {
-    return <main className="apps-detail px-4 lg:px-8 pt-4 pb-9"><p className="text-label text-ink-400" role="status">Loading…</p></main>;
+    return <main className="apps-detail px-4 lg:px-8 pt-4 pb-9"><p className="text-label text-ink-400" role="status">{t("Loading…")}</p></main>;
   }
 
   // The record's own mark is authoritative; the home row only agrees with it.
@@ -210,48 +212,48 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
 
   return (
     <main className="apps-detail px-4 lg:px-8 pt-4 pb-9 min-w-0" aria-label={`Manage ${inst.title}`}>
-      <Link href="/apps" className="text-label text-ink-400 hover:text-ink-100">← Apps</Link>
+      <Link href="/apps" className="text-label text-ink-400 hover:text-ink-100">{t("← Apps")}</Link>
       <div className="hero mt-3">
         <AppGlyph name={inst.name} size="lg" />
         <div className="min-w-0">
-          <h1>Manage {inst.title}</h1>
+          <h1>{t("Manage {title}").replace("{title}", inst.title)}</h1>
           <p className="tag">{inst.summary}</p>
         </div>
       </div>
 
-      {notice && <div className="alert info mt-4" role="status">{notice}</div>}
-      {removed && <div className="alert warn mt-4" role="status">{restorable ? "Removed. Restore brings it back within its 30-day window." : "Removed. The 30-day restore window has closed, so it stays removed."}</div>}
+      {notice && <div className="alert info mt-4" role="status">{t(notice)}</div>}
+      {removed && <div className="alert warn mt-4" role="status">{restorable ? t("Removed. Restore brings it back within its 30-day window.") : t("Removed. The 30-day restore window has closed, so it stays removed.")}</div>}
 
       <div className="mgrid mt-5">
         <div className="card mcard">
-          <h3>App package</h3>
-          <p>{updateReady ? "An update is ready to review." : "No update is currently flagged."}</p>
-          <p className="mt-1">Installed version {inst.version}.</p>
+          <h3>{t("App package")}</h3>
+          <p>{updateReady ? t("An update is ready to review.") : t("No update is currently flagged.")}</p>
+          <p className="mt-1">{t("Installed version {version}.").replace("{version}", inst.version)}</p>
           <label className="block mt-3 text-label text-ink-400">
-            <span className="block mb-1">App package path or Git URL</span>
+            <span className="block mb-1">{t("App package path or Git URL")}</span>
             <input className="update-source" type="text" value={upgradeSource}
               onChange={(event) => { setUpgradeSource(event.target.value); setUpgradeProposal(null); }}
               placeholder="builtin:catalog-id, /absolute/path, or Git URL" autoComplete="off" />
           </label>
           <div className="mt-3">
-            <Button className="btn-sm" disabled={checking || applying || !upgradeSource.trim()} onClick={checkPackageUpdate}>{checking ? "Checking…" : "Check update"}</Button>
+            <Button className="btn-sm" disabled={checking || applying || !upgradeSource.trim()} onClick={checkPackageUpdate}>{checking ? t("Checking…") : t("Check update")}</Button>
           </div>
           {proposalMatchesCurrent && upgradeProposal && <div className="mt-3" aria-live="polite">
-            <p>Proposed version {upgradeProposal.receipt.version} · {upgradeProposal.receipt.name}</p>
-            <p className="hint mt-2">New digest: <code className="break-all">{upgradeProposal.receipt.digest}</code></p>
+            <p>{t("Proposed version {version} · {name}").replace("{version}", upgradeProposal.receipt.version).replace("{name}", upgradeProposal.receipt.name)}</p>
+            <p className="hint mt-2">{t("New digest:")} <code className="break-all">{upgradeProposal.receipt.digest}</code></p>
             {(["added", "changed", "removed"] as const).map((kind) => <p className="hint mt-1" key={kind}>{kind}: {upgradeProposal.receipt.structural_diff[kind].join(", ") || "none"}</p>)}
             {upgradeProposal.receipt.compatibility != null && <CompatibilityLines receipt={upgradeProposal.receipt.compatibility} />}
             {!!upgradeProposal.receipt.notes?.length && <ul className="hint mt-2">{upgradeProposal.receipt.notes.map((note, index) => <li key={index}>{note}</li>)}</ul>}
-            {!!upgradeProposal.receipt.secret_warnings?.length && <p className="alert warn mt-2">Package validation reported secret warnings; review the source before applying.</p>}
-            <div className="mt-3"><Button className="btn-primary btn-sm" disabled={!proposalMatchesCurrent || applying || !!upgradeProposal.receipt.secret_warnings?.length} onClick={applyPackageUpdate}>{applying ? "Applying…" : "Apply checked update"}</Button></div>
+            {!!upgradeProposal.receipt.secret_warnings?.length && <p className="alert warn mt-2">{t("Package validation reported secret warnings; review the source before applying.")}</p>}
+            <div className="mt-3"><Button className="btn-primary btn-sm" disabled={!proposalMatchesCurrent || applying || !!upgradeProposal.receipt.secret_warnings?.length} onClick={applyPackageUpdate}>{applying ? t("Applying…") : t("Apply checked update")}</Button></div>
           </div>}
         </div>
 
         <div className="card mcard">
-          <h3>Connections and setup</h3>
-          <p>The accounts and helpers {inst.title} uses.</p>
+          <h3>{t("Connections and setup")}</h3>
+          <p>{t("The accounts and helpers {title} uses.").replace("{title}", inst.title)}</p>
           {(inst.connection_slots ?? []).length === 0 ? (
-            <p className="hint mt-2">No outside accounts.</p>
+            <p className="hint mt-2">{t("No outside accounts.")}</p>
           ) : (
             <ul className="mt-2">
               {inst.connection_slots.map((s) => (
@@ -260,16 +262,16 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
             </ul>
           )}
           <div className="mt-3">
-            <Link className="btn btn-sm" href={`/app-installations/${inst.install_id}`}>Open its page</Link>
+            <Link className="btn btn-sm" href={`/app-installations/${inst.install_id}`}>{t("Open its page")}</Link>
           </div>
         </div>
 
         <div className="card mcard">
-          <h3>Access</h3>
+          <h3>{t("Access")}</h3>
           <div className="swrow">
             <div>
-              <p>Let {inst.title} work</p>
-              <p className="hint">{removed ? "Off — the app is removed." : off ? "Off — it can't run or use its connections. Its data is kept." : "On — it can run and use its connections."}</p>
+              <p>{t("Let {title} work").replace("{title}", inst.title)}</p>
+              <p className="hint">{removed ? t("Off — the app is removed.") : off ? t("Off — it can't run or use its connections. Its data is kept.") : t("On — it can run and use its connections.")}</p>
             </div>
             <button
               className="switch"
@@ -284,20 +286,20 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
         <div className="card mcard">
           {removed ? (
             <>
-              <h3>Restore {inst.title}</h3>
-              <p>{restorable ? "Removed apps restore within 30 days, with the same data." : "The restore window has closed."}</p>
+              <h3>{t("Restore {title}").replace("{title}", inst.title)}</h3>
+              <p>{restorable ? t("Removed apps restore within 30 days, with the same data.") : t("The restore window has closed.")}</p>
               {restorable && (
                 <div className="mt-3">
-                  <Button className="btn-primary btn-sm" disabled={restoring} onClick={restore}>{restoring ? "Restoring…" : "Restore"}</Button>
+                  <Button className="btn-primary btn-sm" disabled={restoring} onClick={restore}>{restoring ? t("Restoring…") : t("Restore")}</Button>
                 </div>
               )}
             </>
           ) : (
             <>
-              <h3 className="text-fail">Remove {inst.title}</h3>
-              <p>Takes the app and its data out of this workspace. You'll see exactly what goes before anything is deleted.</p>
+              <h3 className="text-fail">{t("Remove {title}").replace("{title}", inst.title)}</h3>
+              <p>{t("Takes the app and its data out of this workspace. You'll see exactly what goes before anything is deleted.")}</p>
               <div className="mt-3">
-                <Button className="btn-danger btn-sm" onClick={openRemove}>Remove app…</Button>
+                <Button className="btn-danger btn-sm" onClick={openRemove}>{t("Remove app…")}</Button>
               </div>
             </>
           )}
@@ -313,11 +315,12 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
 
 /** Render the daemon's compatibility receipt as one readable line per requirement. */
 function CompatibilityLines({ receipt }: { receipt: UpgradeProposal["compatibility"] }) {
+  const t = useTranslate();
   if (!receipt) return null;
-  if (!receipt.declared) return <p className="hint mt-2">No host requirements declared.</p>;
-  if (receipt.status === "unknown") return <p className="hint mt-2">Compatibility could not be determined.</p>;
-  if (receipt.checks.length === 0) return <p className="hint mt-2">Compatibility requirements could not be read.</p>;
-  return <ul className="hint mt-2" aria-label="Package compatibility">
+  if (!receipt.declared) return <p className="hint mt-2">{t("No host requirements declared.")}</p>;
+  if (receipt.status === "unknown") return <p className="hint mt-2">{t("Compatibility could not be determined.")}</p>;
+  if (receipt.checks.length === 0) return <p className="hint mt-2">{t("Compatibility requirements could not be read.")}</p>;
+  return <ul className="hint mt-2" aria-label={t("Package compatibility")}>
     {receipt.checks.map((check, index) => {
       if (check.kind === "core") {
         const required = typeof check.required === "string" ? check.required : check.required.join(", ");
@@ -342,6 +345,7 @@ function CompatibilityLines({ receipt }: { receipt: UpgradeProposal["compatibili
 function RemoveDialog({ preview, removing, onCancel, onConfirm }: {
   preview: RemovePreview; removing: boolean; onCancel: () => void; onConfirm: () => void;
 }) {
+  const t = useTranslate();
   const ref = useModal<HTMLDivElement>(true, onCancel);
   return (
     <div className="scrim fixed inset-0 bg-black/50 z-50 grid place-items-center p-4" role="presentation" onClick={onCancel}>
@@ -358,9 +362,9 @@ function RemoveDialog({ preview, removing, onCancel, onConfirm }: {
           <p className="text-label text-ink-500 mb-4">Only want to pause it? Turn access off from the app's page instead — nothing is removed.</p>
         </div>
         <div className="flex gap-2 justify-end">
-          <Button onClick={onCancel}>Cancel</Button>
+          <Button onClick={onCancel}>{t("Cancel")}</Button>
           <Button className="btn-danger-solid" disabled={removing} onClick={onConfirm}>
-            {removing ? "Removing…" : `Remove ${preview.title}`}
+            {removing ? t("Removing…") : t("Remove {title}").replace("{title}", preview.title)}
           </Button>
         </div>
       </div>

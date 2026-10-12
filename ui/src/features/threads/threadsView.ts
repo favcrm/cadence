@@ -64,21 +64,27 @@ export function kindFilterMatches(filter: ConversationFilter, kind: Conversation
 
 /** A participant's display name. A removed agent keeps its alias with
  *  "(removed)"; a legacy row with no recorded sender is "Unknown sender". */
-export function participantLabel(p: Participant | null | undefined): string {
-  if (!p) return "Unknown sender";
+export function participantLabel(
+  p: Participant | null | undefined,
+  t: (english: string) => string = (english) => english,
+): string {
+  if (!p) return t("Unknown sender");
   if (p.kind === "unknown" || (p.uid === null && p.kind !== "operator" && p.kind !== "daemon")) {
-    return "Unknown sender";
+    return t("Unknown sender");
   }
-  if (p.kind === "operator") return "You";
-  if (p.kind === "daemon") return "System";
-  const name = p.alias ?? "agent";
-  return p.removed ? `${name} (removed)` : name;
+  if (p.kind === "operator") return t("You");
+  if (p.kind === "daemon") return t("System");
+  const name = p.alias ?? t("agent");
+  return p.removed ? `${name} ${t("(removed)")}` : name;
 }
 
 /** The conversation title: the participants, not an id. */
-export function conversationTitle(row: ConversationRow): string {
-  const names = row.participants.map(participantLabel);
-  return names.length > 0 ? names.join(" ↔ ") : "Conversation";
+export function conversationTitle(
+  row: ConversationRow,
+  t: (english: string) => string = (english) => english,
+): string {
+  const names = row.participants.map((p) => participantLabel(p, t));
+  return names.length > 0 ? names.join(" ↔ ") : t("Conversation");
 }
 
 /** Delivery is a stage, never a claim. Queued is not delivered or seen. */
@@ -95,6 +101,9 @@ const DELIVERY_LABEL: Record<DeliveryState, string> = {
   interrupted: "Interrupted",
 };
 
-export function deliveryLabel(state: DeliveryState | string): string {
-  return DELIVERY_LABEL[state as DeliveryState] ?? "Unknown";
+export function deliveryLabel(
+  state: DeliveryState | string,
+  t: (english: string) => string = (english) => english,
+): string {
+  return t(DELIVERY_LABEL[state as DeliveryState] ?? "Unknown");
 }

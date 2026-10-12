@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { api, type ApiError } from "../../lib/api";
 import { resources } from "../../lib/resources";
+import { useTranslate } from "../../lib/locale";
 import type { WorkflowRow } from "../../lib/types";
 import { appFieldLabel, addMissing, slugFromTopic, slugProblem, teamRole } from "../apps/appViewModel";
 import {
@@ -69,6 +70,7 @@ export default function RunForm({
   onHome: () => void;
   app?: AppRunForm;
 }) {
+  const t = useTranslate();
   const fields = runFields(row);
   const [values, setValues] = useState<Record<string, string>>({});
   const [preview, setPreview] = useState<PreviewState>({
@@ -175,7 +177,7 @@ export default function RunForm({
       <div key={f.name}>
         <label htmlFor={`wf-${row.name}-${f.name}`} className="text-label text-ink-300 block mb-1">
           {label}
-          {f.optional && <span className="text-ink-500"> · optional</span>}
+          {f.optional && <span className="text-ink-500"> · {t("optional")}</span>}
         </label>
         <input
           id={`wf-${row.name}-${f.name}`}
@@ -207,9 +209,9 @@ export default function RunForm({
   const options = app ? more.filter((f) => teamRole(f.name) === null) : more;
 
   const previewBlock = (
-    <section className="min-w-0" aria-label={`${row.name} plan preview`}>
+    <section className="min-w-0" aria-label={`${row.name} ${t("plan preview")}`}>
       <div className="slabel mb-1.5">
-        rendered plan{preview.loading ? " · rendering…" : ""}
+        {t("rendered plan")}{preview.loading ? ` · ${t("rendering…")}` : ""}
       </div>
       {preview.error && (
         <p className="card px-3.5 py-2.5 text-label text-warn break-words" role="note">
@@ -222,7 +224,7 @@ export default function RunForm({
         </pre>
       )}
       {!preview.loading && !preview.rendered && !preview.error && (
-        <p className="text-label text-ink-500">No preview — the workflow file did not render.</p>
+        <p className="text-label text-ink-500">{t("No preview — the workflow file did not render.")}</p>
       )}
     </section>
   );
@@ -241,7 +243,7 @@ export default function RunForm({
       {blocked && <p className="text-micro text-ink-500 mt-1.5 break-words">{blocked}</p>}
       {!blocked && missing.length === 0 && viewer.operator && !app && (
         <p className="text-micro text-ink-500 mt-1.5">
-          Proposes via the daemon's plan_propose — the plan waits in Needs you.
+          {t("Proposes via the daemon's plan_propose — the plan waits in Needs you.")}
         </p>
       )}
       {result && !result.ok && (
@@ -255,7 +257,7 @@ export default function RunForm({
   const done = (p: { epic: string; tickets: number }) => (
     <div className="mt-3" role="status">
       <p className="text-label text-ok break-words">
-        plan {p.epic} proposed — {p.tickets} ticket{p.tickets === 1 ? "" : "s"} · waiting in Needs you
+        {t("plan")} {p.epic} {t("proposed")} — {p.tickets} {p.tickets === 1 ? t("ticket") : t("tickets")} · {t("waiting in Needs you")}
       </p>
       <div className="flex flex-wrap gap-2 mt-2">
         <button
@@ -263,7 +265,7 @@ export default function RunForm({
           onClick={onHome}
           className="h-8 px-3 rounded bg-accent text-on-accent text-label font-medium"
         >
-          Needs you →
+          {t("Needs you")} →
         </button>
         <button
           type="button"
@@ -281,7 +283,7 @@ export default function RunForm({
       <section className="min-w-0" aria-label={`${row.name} inputs`}>
         <div className="slabel mb-1.5">{app ? app.title : "new run"}</div>
         {fields.length === 0 && (
-          <p className="text-label text-ink-500">This workflow declares no inputs — it proposes as written.</p>
+          <p className="text-label text-ink-500">{t("This workflow declares no inputs — it proposes as written.")}</p>
         )}
         <div className="space-y-3">
           {head.map(field)}
@@ -309,7 +311,7 @@ export default function RunForm({
       </section>
       {app ? (
         <details className="min-w-0 mt-4">
-          <summary className="slabel cursor-pointer select-none">show plan</summary>
+          <summary className="slabel cursor-pointer select-none">{t("show plan")}</summary>
           <div className="mt-2.5">{previewBlock}</div>
         </details>
       ) : (

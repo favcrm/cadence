@@ -1,11 +1,16 @@
 import { useCallback, useEffect, useState } from "react";
 import Button from "../../ui/Button";
 import { navigate } from "../../lib/useLocation";
+import { useTranslate } from "../../lib/locale";
 import { retainedRequest, completeRequest } from "./requests";
 import { accountLabel, connectReturnTo, publicationBinding, sendSlot } from "./socialConnect";
 import { workspaceApps, type AppBinding, type Installation, type PublishDestination } from "./workspaceApps";
 
 type Listed = { unavailable: boolean; destinations: PublishDestination[] } | "loading";
+
+const CONNECT_UNAVAILABLE = "Instagram connect isn’t available for this workspace yet.";
+const CONNECT_FAILED = "Couldn’t open the Instagram connect page. Try again.";
+const USE_FAILED = "Couldn’t use that account for publishing. Reload and try again — nothing was changed.";
 
 /**
  * CAD-1290 — Settings > Publish to Instagram. The owner connects Instagram on
@@ -21,6 +26,7 @@ export function PublishToInstagram({ installation, bindings, contextId, canWrite
   refreshKey: number;
   mutate: (work: () => Promise<void>) => Promise<void>;
 }) {
+  const t = useTranslate();
   const installId = installation.install_id;
   const slot = sendSlot(installation);
   const binding = slot ? publicationBinding(bindings, slot, contextId, installation.digest) : null;
@@ -56,32 +62,32 @@ export function PublishToInstagram({ installation, bindings, contextId, canWrite
     try {
       const reply = await workspaceApps.connectLink(installId, connectReturnTo(window.location.origin, installId));
       if (reply.hosted && reply.url) window.location.assign(reply.url);
-      else if (reply.hosted) setNote("Instagram connect isn’t available for this workspace yet.");
+      else if (reply.hosted) setNote(CONNECT_UNAVAILABLE);
       else navigate("/settings/connections");
-    } catch { setNote("Couldn't open the Instagram connect page. Try again."); }
+    } catch { setNote(CONNECT_FAILED); }
   };
   const current = binding?.config.publish ?? null;
   const rows = listed === "loading" ? [] : listed.destinations;
   const stale = !!current && listed !== "loading" && !listed.unavailable && !rows.some(row => row.destination_id === current.destination_id);
   return (
     <section className="wa-panel wa-stack" aria-label="Publish to Instagram" data-publish-instagram>
-      <h2>Publish to Instagram</h2>
-      <p className="wa-muted">Connect your Instagram account once, then choose where this app publishes.</p>
-      {listed === "loading" && <p className="wa-muted" role="status">Checking Instagram…</p>}
+      <h2>{t("Publish to Instagram")}</h2>
+      <p className="wa-muted">{t("Connect your Instagram account once, then choose where this app publishes.")}</p>
+      {listed === "loading" && <p className="wa-muted" role="status">{t("Checking Instagram…")}</p>}
       {listed !== "loading" && listed.unavailable && (
-        <p className="wa-alert" role="alert">Couldn’t check Instagram right now. <Button size="sm" onClick={() => load()}>Try again</Button></p>
+        <p className="wa-alert" role="alert">{t("Couldn’t check Instagram right now.")} <Button size="sm" onClick={() => load()}>{t("Try again")}</Button></p>
       )}
-      {listed !== "loading" && !listed.unavailable && rows.length === 0 && !stale && <p className="wa-muted">Not connected</p>}
+      {listed !== "loading" && !listed.unavailable && rows.length === 0 && !stale && <p className="wa-muted">{t("Not connected")}</p>}
       {stale && current && (
-        <p className="wa-alert">Connection expired — {accountLabel(current.destination_label)} can’t publish until you reconnect.</p>
+        <p className="wa-alert">{t("Connection expired — {account} can’t publish until you reconnect.").replace("{account}", () => accountLabel(current.destination_label))}</p>
       )}
       <ul className="wa-stack" style={{ listStyle: "none", padding: 0, margin: 0 }}>
         {rows.map(row => {
           const using = current?.destination_id === row.destination_id;
           return (
             <li key={row.destination_id} className="wa-row" data-destination={row.destination_id}>
-              <span>Connected: <strong>{accountLabel(row.label || row.destination_id)}</strong></span>
-              {using ? <span className="wa-kicker">Publishing here</span> : (
+              <span>{t("Connected:")} <strong>{accountLabel(row.label || row.destination_id)}</strong></span>
+              {using ? <span className="wa-kicker">{t("Publishing here")}</span> : (
                 <Button size="sm" variant="primary" disabled={!canWrite || busy}
                   onClick={() => void mutate(async () => {
                     const key = JSON.stringify([installId, "use-destination", contextId, slot, row.destination_id, binding?.revision ?? 0]);
@@ -93,18 +99,18 @@ export function PublishToInstagram({ installation, bindings, contextId, canWrite
                       });
                       completeRequest(key);
                     } catch {
-                      throw new Error("Couldn’t use that account for publishing. Reload and try again — nothing was changed.");
+                      throw new Error(USE_FAILED);
                     }
-                  })}>Use for publishing</Button>
+                  })}>{t("Use for publishing")}</Button>
               )}
             </li>
           );
         })}
       </ul>
-      {note && <p className="wa-alert" role="alert">{note}</p>}
+      {note && <p className="wa-alert" role="alert">{t(note)}</p>}
       {canWrite && listed !== "loading" && (
         <div className="wa-row">
-          <Button onClick={() => void connect()} disabled={busy}>{stale ? "Reconnect" : rows.length ? "Connect another account" : "Connect Instagram"}</Button>
+          <Button onClick={() => void connect()} disabled={busy}>{stale ? t("Reconnect") : rows.length ? t("Connect another account") : t("Connect Instagram")}</Button>
         </div>
       )}
     </section>

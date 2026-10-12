@@ -107,28 +107,31 @@ export const LIFECYCLE_SECTIONS: {
 
 /** The card's bottom-left badge: lifecycle tone first, then the
  * category's own urgency for ordinary rows. */
-export function lifecycleBadge(a: Agent): {
+export function lifecycleBadge(
+  a: Agent,
+  t: (english: string) => string = (english) => english,
+): {
   label: string;
   tone: LifecycleTone;
 } {
   const lifecycle = lifecycleOf(a);
   if (lifecycle === "dead-holding") {
     const state = a.fenced ? "fenced" : a.dead ? "dead" : a.state;
-    return { label: `${state || "dead"} · holding`, tone: "fail" };
+    return { label: `${t(state || "dead")} · ${t("holding")}`, tone: "fail" };
   }
   if (lifecycle === "idle-holding")
-    return { label: `${agentStatus(a)} · holding`, tone: "warn" };
+    return { label: `${t(agentStatus(a))} · ${t("holding")}`, tone: "warn" };
   if (lifecycle === "stale-inbox")
-    return { label: "stale inbox", tone: "info" };
+    return { label: t("stale inbox"), tone: "info" };
   const status = agentStatus(a);
-  if (lifecycle === "active") return { label: status, tone: "ok" };
+  if (lifecycle === "active") return { label: t(status), tone: "ok" };
   if (["attention", "error", "quota blocked"].includes(status))
-    return { label: status, tone: "fail" };
-  if (status === "needs input") return { label: status, tone: "warn" };
+    return { label: t(status), tone: "fail" };
+  if (status === "needs input") return { label: t(status), tone: "warn" };
   if (status === "busy" || status === "queued")
-    return { label: status, tone: "info" };
-  if (status === "idle") return { label: status, tone: "ok" };
-  return { label: status, tone: "ink" };
+    return { label: t(status), tone: "info" };
+  if (status === "idle") return { label: t(status), tone: "ok" };
+  return { label: t(status), tone: "ink" };
 }
 
 export function agentStatus(a: Agent): string {

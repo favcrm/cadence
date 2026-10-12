@@ -139,7 +139,7 @@ function WorkingRow({
         </span>
       )}
       {turn.kind === "working" && turn.compacting === true && (
-        <span className="chip bg-warn/10 text-warn shrink-0">compacting</span>
+        <span className="chip bg-warn/10 text-warn shrink-0">{t("compacting")}</span>
       )}
       {turn.kind === "working" && (turn.queued ?? 0) > 0 && (
         <span className="chip bg-ink-800 text-ink-400 shrink-0">{turn.queued} queued</span>
@@ -226,9 +226,9 @@ function CmdCard({ cmd, onOpenIssue }: { cmd: CmdResult; onOpenIssue: (id: strin
         {cmd.running ? (
           <span className="steps-running text-ink-500">{t("running…")}</span>
         ) : cmd.ok === false ? (
-          <span className="text-fail">failed</span>
+          <span className="text-fail">{t("failed")}</span>
         ) : (
-          <span className="text-ink-500">done</span>
+          <span className="text-ink-500">{t("done")}</span>
         )}
       </div>
       {cmd.value !== undefined ? (
@@ -314,7 +314,7 @@ function Examples({ onPick, disabled }: { onPick: (text: string) => void; disabl
             onClick={() => onPick(ex)}
             className="text-left px-3 py-2 rounded border border-ink-700 text-secondary text-ink-200 hover:border-accent/60 hover:text-accent disabled:opacity-50 disabled:hover:border-ink-700 disabled:hover:text-ink-200"
           >
-            {ex}
+            {t(ex)}
           </button>
         ))}
       </div>
@@ -355,6 +355,7 @@ const ThreadList = memo(function ThreadList({
   liveAfter: number;
   onRetry: (message: string, text: string, refs?: ThreadRef[]) => void;
 }) {
+  const t = useTranslate();
   const { shown, hidden } = useMemo(() => visibleWindow(items, limit), [items, limit]);
   const anchors = useMemo(() => planAnchors(items), [items]);
   if (items.length === 0) return null;
@@ -363,7 +364,7 @@ const ThreadList = memo(function ThreadList({
       {(hidden > 0 || moreBefore) && (
         <div className="flex justify-center">
           <button className="lnk text-label disabled:opacity-50" disabled={loadingEarlier} onClick={onEarlier}>
-            {loadingEarlier ? "Loading…" : "Load earlier messages"}
+            {loadingEarlier ? t("Loading…") : t("Load earlier messages")}
           </button>
         </div>
       )}
@@ -806,7 +807,7 @@ export default function Home({
         />
       </aside>
 
-      <section className="min-w-0 rail:order-1 flex flex-col min-h-0 gap-4" aria-label="master thread">
+      <section className="min-w-0 rail:order-1 flex flex-col min-h-0 gap-4" aria-label={t("master thread")}>
         <SinceCard onOpenIssue={onOpenIssue} />
 
         {/* CAD-600: the conversation panel — the master's header, the

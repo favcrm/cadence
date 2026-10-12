@@ -1340,7 +1340,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         originalUnresolved={originalUnresolved !== null}
         onResolveOriginal={() => outboxRef.current?.scrollIntoView?.({ block: "nearest" })}
         textareaId="app-shell-chat-box"
-        ariaLabel="Message to Assistant"
+        ariaLabel={t("Message to Assistant")}
         placeholder={t("Message Assistant…")}
         className="app-chat-form"
       />

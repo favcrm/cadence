@@ -4,6 +4,7 @@ import { useHref } from "../../lib/useLocation";
 import Wiki, { type WikiProps } from "../wiki/Wiki";
 import { contextHref, contextRoute, projectWikiRoot } from "./contextRoute";
 import Link from "../../ui/Link";
+import { useTranslate } from "../../lib/locale";
 
 interface ContextProps {
   project: string;
@@ -20,15 +21,16 @@ export default function Context({
   onToast,
   navHref,
 }: ContextProps) {
+  const t = useTranslate();
   const href = useHref();
   const scope = useMemo(() => ({ root: projectWikiRoot(project), label: "Context" }), [project]);
   const route = contextRoute(project, href);
   const wikiHref = (next: Route) => next.screen === "wiki" ? contextHref(project, next, href) : navHref(next);
   return (
     <main className="context-workspace" aria-label={`${project} context`}>
-      {project === "all" ? <div className="p-5 text-secondary text-ink-400">Choose a project to open its context.</div> : route ? (
+      {project === "all" ? <div className="p-5 text-secondary text-ink-400">{t("Choose a project to open its context.")}</div> : route ? (
         <Wiki key={project} scope={scope} route={route} navHref={wikiHref} readOnly={readOnly} actor={actor} onToast={onToast} />
-      ) : <div className="p-5" role="alert">This page is outside the project’s context. <Link className="lnk" href={`/projects/${encodeURIComponent(project)}/context`}>Open project context</Link></div>}
+      ) : <div className="p-5" role="alert">{t("This page is outside the project’s context.")} <Link className="lnk" href={`/projects/${encodeURIComponent(project)}/context`}>{t("Open project context")}</Link></div>}
     </main>
   );
 }

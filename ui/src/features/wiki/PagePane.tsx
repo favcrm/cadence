@@ -4,6 +4,7 @@ import Md from "../../ui/Md";
 import type { WikiPage } from "./api";
 import { relTime } from "./history";
 import { WikiToolbar } from "./shared";
+import { useTranslate } from "../../lib/locale";
 
 /** The same document toolbar and reader in Wiki and project Context. */
 export default function PagePane({ page, navHref, readOnly }: {
@@ -11,21 +12,22 @@ export default function PagePane({ page, navHref, readOnly }: {
   navHref: (route: Route) => string;
   readOnly: boolean;
 }) {
+  const t = useTranslate();
   return (
     <>
       <WikiToolbar path={page.path} navHref={navHref} actions={<>
-          <Button href={navHref({ screen: "wiki", mode: "search", path: null, query: null })}>Search</Button>
-          <Button href={navHref({ screen: "wiki", mode: "history", path: page.path, query: null })}>History</Button>
+          <Button href={navHref({ screen: "wiki", mode: "search", path: null, query: null })}>{t("Search")}</Button>
+          <Button href={navHref({ screen: "wiki", mode: "history", path: page.path, query: null })}>{t("History")}</Button>
           <Button variant="primary" disabled={readOnly}
-            title={readOnly ? "Sign in with editing access to edit" : undefined}
-            href={readOnly ? undefined : navHref({ screen: "wiki", mode: "edit", path: page.path, query: null })}>Edit</Button>
+            title={readOnly ? t("Sign in with editing access to edit") : undefined}
+            href={readOnly ? undefined : navHref({ screen: "wiki", mode: "edit", path: page.path, query: null })}>{t("Edit")}</Button>
       </>} />
       {(page.edited_by || page.mtime) && <p className="wk-meta mb-4">
-        {page.edited_by && <>Edited by <b>{page.edited_by}</b></>}
+        {page.edited_by && <>{t("Edited by")} <b>{page.edited_by}</b></>}
         {page.edited_by && page.mtime && " · "}{relTime(page.mtime)}
       </p>}
       <article className="md wk-md issue-reader">
-        {page.text?.trim() ? <Md text={page.text} /> : <p className="text-ink-500">This page is empty.</p>}
+        {page.text?.trim() ? <Md text={page.text} /> : <p className="text-ink-500">{t("This page is empty.")}</p>}
       </article>
     </>
   );

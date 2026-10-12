@@ -1,10 +1,12 @@
 import { useMemo, useState } from "react";
 import Link from "../../ui/Link";
 import Button from "../../ui/Button";
+import { useTranslate } from "../../lib/locale";
 import { appExplorer, notifyAppsChanged, type CatalogCard } from "../workspace-apps/workspaceApps";
 import type { Viewer } from "../projects/work";
 import { AppGlyph, TrustChip, InstallStateChip, useEscape } from "./shared";
 import { appErrorCopy, appLoadErrorCopy } from "./appErrors";
+import { displayUiNotice, type UiNotice } from "../app-shell/campaign/useEmailDraft";
 import InstallCheckPanel from "./InstallCheckPanel";
 import { Loading, Notice } from "../app-shell/shared/States";
 import { navigate } from "../../lib/useLocation";
@@ -23,15 +25,18 @@ const openDetail = (id: string) => navigate(`/apps/catalog/${encodeURIComponent(
  * as an "unverified app" card, never a catalog row.
  */
 export default function Explorer({ viewer }: { viewer: Viewer }) {
+  const t = useTranslate();
   const [revision, setRevision] = useState(0);
   const [q, setQ] = useState("");
   const [cat, setCat] = useState("All");
   const [gitOpen, setGitOpen] = useState(false);
   const [busy, setBusy] = useState<Record<string, boolean>>({});
-  const [notice, setNotice] = useState<string | null>(null);
+  const [notice, setNotice] = useState<UiNotice | null>(null);
   const [reviewing, setReviewing] = useState<{ id: string; title: string } | null>(null);
 
   const isOp = viewer.operator === true && !viewer.readOnly;
+  // Split around the bold "Ask an admin" so the sentence keeps one key.
+  const askNote = t("You can browse and open installed apps. Installing is up to your admin — tap {ask} on any app.").split("{ask}");
 
   // CAD-1189: the catalog and the request list load with the shared busy
   // backoff, keep their last good answer on a failed refresh and never
@@ -79,7 +84,7 @@ export default function Explorer({ viewer }: { viewer: Viewer }) {
     const id = card.id;
     setBusy((b) => ({ ...b, [id]: true }));
     void appExplorer.restore(card.install_id)
-      .then(() => { setNotice(`Restored — ${card.title} is live again.`); setRevision((r) => r + 1); notifyAppsChanged(); })
+      .then(() => { setNotice({ key: "Restored — {title} is live again.", slots: { title: card.title } }); setRevision((r) => r + 1); notifyAppsChanged(); })
       .catch((e: unknown) => setNotice(appErrorCopy(e, "Restore didn't finish. Try again in a moment.")))
       .finally(() => setBusy((b) => ({ ...b, [id]: false })));
   };
@@ -87,12 +92,12 @@ export default function Explorer({ viewer }: { viewer: Viewer }) {
   if (viewer.operator === null) {
     return (
       <main className="apps-explore px-4 lg:px-8 pt-4 pb-9 min-w-0" aria-label="explore apps">
-        <h1 className="text-section font-semibold text-ink-100 mb-4">Explore apps</h1>
+        <h1 className="text-section font-semibold text-ink-100 mb-4">{t("Explore apps")}</h1>
         {viewer.access === "unavailable" ? (
           <Notice state="access-unavailable" onRetry={viewer.onRetryAccess} retryLabel="Retry access check">
             Access could not be confirmed. Retry the access check before acting.
           </Notice>
-        ) : <Loading>Checking whether this session can act…</Loading>}
+        ) : <Loading>{t("Checking whether this session can act…")}</Loading>}
       </main>
     );
   }
@@ -100,7 +105,7 @@ export default function Explorer({ viewer }: { viewer: Viewer }) {
   return (
     <main className="apps-explore px-4 lg:px-8 pt-4 pb-9 min-w-0" aria-label="explore apps">
       <div className="ohead flex flex-wrap items-center gap-3 mb-2">
-        <h1 className="text-section font-semibold text-ink-100">Explore apps</h1>
+        <h1 className="text-section font-semibold text-ink-100">{t("Explore apps")}</h1>
         <span className="grow" />
         <div className="popwrap relative">
           <Button className="btn-sm" onClick={() => setGitOpen((v) => !v)} aria-expanded={gitOpen}>
@@ -110,7 +115,7 @@ export default function Explorer({ viewer }: { viewer: Viewer }) {
             <div className="pmenu" role="menu">
               {isOp ? (
                 <button className="w-full text-left" onClick={() => setGitOpen(false)} data-git>
-                  Add from Git URL…<small className="block text-ink-500">For custom apps your team built</small>
+                  {t("Add from Git URL…")}<small className="block text-ink-500">{t("For custom apps your team built")}</small>
                 </button>
               ) : (
                 <button className="w-full text-left opacity-50" disabled>
@@ -123,7 +128,7 @@ export default function Explorer({ viewer }: { viewer: Viewer }) {
         </div>
       </div>
       <p className="text-secondary text-ink-400 mb-4">
-        Apps add new skills to your workspace. Each one says what it can see before you install.
+        {t("Apps add new skills to your workspace. Each one says what it can see before you install.")}
       </p>
 
       {isOp && gitOpen && (
@@ -144,33 +149,33 @@ export default function Explorer({ viewer }: { viewer: Viewer }) {
         />
       )}
 
-      {notice && <div className="alert info mb-4" role="status">{notice}</div>}
+      {notice && <div className="alert info mb-4" role="status">{displayUiNotice(notice, t)}</div>}
 
       {isOp && requests && requests.length > 0 && (
         <div className="alert info mb-4" role="status">
-          {requests.length} {requests.length === 1 ? "teammate asked" : "teammates asked"} for an app — see the request count on its card.
+          {t(requests.length === 1 ? "{count} teammate asked for an app — see the request count on its card." : "{count} teammates asked for an app — see the request count on its card.").replace("{count}", String(requests.length))}
         </div>
       )}
 
       {error !== null && (
         <div className="err card px-4 py-3 mb-4 text-label text-ink-400" role="alert">
-          <b className="text-ink-100">Couldn't load the app catalog.</b> {error} <Button onClick={() => setRevision((r) => r + 1)}>Try again</Button>
+          <b className="text-ink-100">{t("Couldn't load the app catalog.")}</b> {t(error)} <Button onClick={() => setRevision((r) => r + 1)}>{t("Try again")}</Button>
         </div>
       )}
-      {catalogLoad.retrying && <p className="text-label text-ink-400 mb-2" role="status">The workspace is busy. Retrying…</p>}
+      {catalogLoad.retrying && <p className="text-label text-ink-400 mb-2" role="status">{t("The workspace is busy. Retrying…")}</p>}
       {catalog === null ? (
-        error === null && !catalogLoad.retrying && <p className="text-label text-ink-400" role="status">Loading the catalog…</p>
+        error === null && !catalogLoad.retrying && <p className="text-label text-ink-400" role="status">{t("Loading the catalog…")}</p>
       ) : (
         <>
           <div className="flex flex-wrap items-center gap-3 mb-5">
             <input
               className="field flex-1 min-w-[220px]"
-              placeholder="Search apps, e.g. “email”, “bookings”"
+              placeholder={t("Search apps, e.g. “email”, “bookings”")}
               value={q}
               onChange={(e) => setQ(e.target.value)}
-              aria-label="Search apps"
+              aria-label={t("Search apps")}
             />
-            <div className="cats flex flex-wrap gap-1.5" role="group" aria-label="Categories">
+            <div className="cats flex flex-wrap gap-1.5" role="group" aria-label={t("Categories")}>
               {cats.map((c) => (
                 <button key={c} className={`cat ${cat === c ? "on" : ""}`} onClick={() => setCat(c)} aria-pressed={cat === c}>{c}</button>
               ))}
@@ -179,19 +184,19 @@ export default function Explorer({ viewer }: { viewer: Viewer }) {
 
           {!isOp && (
             <div className="alert info mb-4">
-              You can browse and open installed apps. Installing is up to your admin — tap <b>Ask an admin</b> on any app.
+              {askNote[0]}<b>{t("Ask an admin")}</b>{askNote[1]}
             </div>
           )}
 
           {!q && cat === "All" && featured.length > 0 && (
-            <section className="sec mb-6" aria-label="Featured">
-              <h2 className="text-cardtitle font-medium text-ink-100 mb-2">Made for your business</h2>
+            <section className="sec mb-6" aria-label={t("Featured")}>
+              <h2 className="text-cardtitle font-medium text-ink-100 mb-2">{t("Made for your business")}</h2>
               <div className="feat grid gap-3 md:grid-cols-2">
                 {featured.map((c) => (
                   <div key={c.id} className="card fcard p-4 cursor-pointer" role="button" tabIndex={0}
                     onClick={() => openDetail(c.id)}
                     onKeyDown={(e) => e.key === "Enter" && openDetail(c.id)}>
-                    <span className="why text-micro text-ink-500">Popular with shops like yours</span>
+                    <span className="why text-micro text-ink-500">{t("Popular with shops like yours")}</span>
                     <div className="flex items-center gap-3 mt-1">
                       <AppGlyph name={c.name} icon={c.listing?.icon} size="sm" />
                       <h3 className="text-cardtitle font-medium text-ink-100">{c.title}</h3>
@@ -206,18 +211,18 @@ export default function Explorer({ viewer }: { viewer: Viewer }) {
             </section>
           )}
 
-          <section className="sec" aria-label="All apps">
+          <section className="sec" aria-label={t("All apps")}>
             <div className="sechead flex items-center gap-2 mb-3">
               <h2 className="text-cardtitle font-medium text-ink-100">
-                {q ? `Results for “${q}”` : cat === "All" ? "All apps" : cat}
+                {q ? t("Results for “{q}”").replace("{q}", q) : cat === "All" ? t("All apps") : cat}
               </h2>
               <span className="chip">{items.length}</span>
             </div>
             {items.length === 0 ? (
               <div className="card px-4 py-5 text-secondary text-ink-400">
-                <h3 className="font-medium text-ink-100 mb-1">No apps match “{q}”</h3>
-                <p>Try a simpler word like “email” or “posts”.</p>
-                {isOp && <Button className="mt-3" onClick={() => setGitOpen(true)}>Add from Git URL</Button>}
+                <h3 className="font-medium text-ink-100 mb-1">{t("No apps match “{q}”").replace("{q}", q)}</h3>
+                <p>{t("Try a simpler word like “email” or “posts”.")}</p>
+                {isOp && <Button className="mt-3" onClick={() => setGitOpen(true)}>{t("Add from Git URL")}</Button>}
               </div>
             ) : (
               <div className="cgrid grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
@@ -266,7 +271,8 @@ function CatalogCardView({ card, isOp, busy, onInstall, onRequest, onRestore }: 
 function CardAction({ card, isOp, busy, onInstall, onRequest, onRestore }: {
   card: CatalogCard; isOp: boolean; busy?: boolean; onInstall: () => void; onRequest: () => void; onRestore: () => void;
 }) {
-  if (busy) return <Button className="btn-sm btn-primary" disabled>Working…</Button>;
+  const t = useTranslate();
+  if (busy) return <Button className="btn-sm btn-primary" disabled>{t("Working…")}</Button>;
   if (card.removed) {
     if (!isOp) return <span className="text-micro text-ink-500">Removed</span>;
     return card.restorable
@@ -277,10 +283,10 @@ function CardAction({ card, isOp, busy, onInstall, onRequest, onRestore }: {
     return <Link className="btn btn-sm" href={`/app-installations/${card.install_id}`} onClick={(e) => e.stopPropagation()}>Open</Link>;
   }
   if (card.state === "requested" || card.requested_by_me) {
-    return <Button className="btn-sm" disabled>Asked</Button>;
+    return <Button className="btn-sm" disabled>{t("Asked")}</Button>;
   }
   if (!isOp) {
-    return <Button className="btn-sm" onClick={(e) => { e.stopPropagation(); onRequest(); }}>Ask an admin</Button>;
+    return <Button className="btn-sm" onClick={(e) => { e.stopPropagation(); onRequest(); }}>{t("Ask an admin")}</Button>;
   }
   return <Button className="btn-sm btn-primary" onClick={(e) => { e.stopPropagation(); onInstall(); }}>Install</Button>;
 }
@@ -291,6 +297,7 @@ function CardAction({ card, isOp, busy, onInstall, onRequest, onRestore }: {
  * sends that digest. Never a catalog row: it ships nothing to the
  * built-in list. */
 function GitAdd({ onDone, onClose }: { onDone: () => void; onClose: () => void }) {
+  const t = useTranslate();
   const [url, setUrl] = useState("");
   const [checking, setChecking] = useState(false);
   const [found, setFound] = useState<CatalogCard | null>(null);
@@ -304,15 +311,15 @@ function GitAdd({ onDone, onClose }: { onDone: () => void; onClose: () => void }
       .finally(() => setChecking(false));
   };
   return (
-    <div className="card p-4 mb-4" role="group" aria-label="Add from Git URL">
-      <h3 className="font-medium text-ink-100 mb-2">Add from Git URL</h3>
+    <div className="card p-4 mb-4" role="group" aria-label={t("Add from Git URL")}>
+      <h3 className="font-medium text-ink-100 mb-2">{t("Add from Git URL")}</h3>
       <input className="field w-full" placeholder="https://github.com/your-team/app" value={url}
-        onChange={(e) => { setUrl(e.target.value); setFound(null); }} aria-label="Git URL" />
+        onChange={(e) => { setUrl(e.target.value); setFound(null); }} aria-label={t("Git URL")} />
       <div className="flex gap-2 mt-3">
         <Button className="btn-sm btn-primary" disabled={checking || !url.startsWith("https://")} onClick={check}>
-          {checking ? "Checking…" : "Check it"}
+          {checking ? t("Checking…") : t("Check it")}
         </Button>
-        <Button className="btn-sm" onClick={onClose}>Close</Button>
+        <Button className="btn-sm" onClick={onClose}>{t("Close")}</Button>
       </div>
       {err && <div className="alert fail mt-3" role="alert">{err}</div>}
       {found && (
@@ -324,7 +331,7 @@ function GitAdd({ onDone, onClose }: { onDone: () => void; onClose: () => void }
               <div className="text-micro text-ink-500"><TrustChip trust="unreviewed" /> · {found.version}</div>
             </div>
           </div>
-          <div className="alert warn mb-2">Added from a Git URL by your team. Cadence checked its file list but hasn't reviewed what it does.</div>
+          <div className="alert warn mb-2">{t("Added from a Git URL by your team. Cadence checked its file list but hasn't reviewed what it does.")}</div>
           <InstallCheckPanel
             key={`${url}@${found.commit}`}
             source={url}

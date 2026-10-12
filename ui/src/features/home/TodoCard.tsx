@@ -18,6 +18,7 @@ import {
   type UnfenceChoice,
 } from "./needs";
 import { sendToMaster } from "./send";
+import { useTranslate } from "../../lib/locale";
 import { marksFor, sendingTodo, settleTodo, useTodoLocal } from "./todoLocal";
 
 const ICON: Record<string, string[]> = {
@@ -94,17 +95,18 @@ function YesNo({
   onDone: (text: string) => void;
   onError: (message: string | null) => void;
 }) {
+  const t = useTranslate();
   const { send, busy, error } = useAnswer(need, onDone);
   useEffect(() => onError(error), [error, onError]);
   return (
-    <span className="todo-yn" role="group" aria-label="your answer">
+    <span className="todo-yn" role="group" aria-label={t("your answer")}>
       {need.action.options.map((o) => (
         <button
           key={o}
           type="button"
           className="btn btn-sm"
           disabled={!!block || busy}
-          title={block ? READ_ONLY_COPY : `Answer: ${o}`}
+          title={block ? t(READ_ONLY_COPY) : `${t("Answer")}: ${o}`}
           onClick={() => send(o)}
         >
           {shortOption(o)}
@@ -149,6 +151,7 @@ export default function TodoCard({
   hitRef: RefCallback<HTMLElement>;
 }) {
   const block = useWriteBlock(readOnly);
+  const t = useTranslate();
   const spec = kindSpec(need);
   const issueTitle = useIssueTitle(need);
   // The kind table's template is the fallback; "Fix it" always sends the
@@ -235,8 +238,8 @@ export default function TodoCard({
   };
 
   const ask = (
-    <button type="button" className="btn btn-sm btn-ghost" disabled={!!block} title={block ? READ_ONLY_COPY : undefined} onClick={() => onAsk(need)}>
-      Ask Master
+    <button type="button" className="btn btn-sm btn-ghost" disabled={!!block} title={block ? t(READ_ONLY_COPY) : undefined} onClick={() => onAsk(need)}>
+      {t("Ask Master")}
     </button>
   );
 
@@ -257,40 +260,40 @@ export default function TodoCard({
     } else if (need.kind === "fenced" && need.agent) {
       inside = (
         <div className="mt-2 space-y-2">
-          <p className="text-label text-ink-400">How did its last piece of work end?</p>
-          <div className="flex flex-wrap gap-1.5" role="group" aria-label="how the work ended">
+          <p className="text-label text-ink-400">{t("How did its last piece of work end?")}</p>
+          <div className="flex flex-wrap gap-1.5" role="group" aria-label={t("how the work ended")}>
             {UNFENCE_CHOICES.map((c) => (
               <button
                 key={c.status}
                 type="button"
                 className="btn btn-sm"
                 disabled={!!block || busy}
-                title={block ? READ_ONLY_COPY : c.blurb}
+                title={block ? t(READ_ONLY_COPY) : c.blurb}
                 onClick={() => agentAct("unfence", c.status)}
               >
                 {c.plain}
               </button>
             ))}
           </div>
-          {block && <p className="text-micro text-ink-500">{READ_ONLY_COPY}</p>}
+          {block && <p className="text-micro text-ink-500">{t(READ_ONLY_COPY)}</p>}
         </div>
       );
     } else if (stopped) {
       inside = (
         <div className="mt-2 space-y-2">
-          <p className="text-label text-ink-400">It stopped with work still waiting.</p>
+          <p className="text-label text-ink-400">{t("It stopped with work still waiting.")}</p>
           <div className="flex flex-wrap gap-1.5">
-            <button type="button" className="btn btn-sm btn-primary" disabled={!!block || busy} title={block ? READ_ONLY_COPY : undefined} onClick={() => agentAct("resume")}>
-              {busy ? "Working…" : "Start it again"}
+            <button type="button" className="btn btn-sm btn-primary" disabled={!!block || busy} title={block ? t(READ_ONLY_COPY) : undefined} onClick={() => agentAct("resume")}>
+              {busy ? t("Working…") : t("Start it again")}
             </button>
           </div>
-          {block && <p className="text-micro text-ink-500">{READ_ONLY_COPY}</p>}
+          {block && <p className="text-micro text-ink-500">{t(READ_ONLY_COPY)}</p>}
         </div>
       );
     } else {
       inside = (
         <div className="mt-2 space-y-2">
-          <p className="text-label text-ink-400">Master can walk you through this and take it from there.</p>
+          <p className="text-label text-ink-400">{t("Master can walk you through this and take it from there.")}</p>
           <div className="flex flex-wrap gap-1.5">{ask}</div>
         </div>
       );
@@ -301,7 +304,7 @@ export default function TodoCard({
     (action.type === "permission" || answer) && open ? (
       <div className="mt-1 flex flex-wrap gap-1">
         <button type="button" className="btn btn-sm btn-ghost" onClick={() => setOpen(false)}>
-          Not now
+          {t("Not now")}
         </button>
         {ask}
       </div>
@@ -310,14 +313,14 @@ export default function TodoCard({
   const controlButton = yesNo ? (
     <YesNo need={yesNo} block={block} onDone={(t) => onDone(need, `Answered: ${t}`)} onError={setError} />
   ) : sent ? (
-    <span className="text-micro text-ok">Sent to Master</span>
+    <span className="text-micro text-ok">{t("Sent to Master")}</span>
   ) : (
     <button
       type="button"
       className={`btn btn-sm ${spec.control === "Allow" ? "btn-primary" : ""}`}
       aria-expanded={spec.place === "inline" ? open : undefined}
       disabled={spec.place !== "drawer" && (!!block || sending)}
-      title={spec.place !== "drawer" && block ? READ_ONLY_COPY : undefined}
+      title={spec.place !== "drawer" && block ? t(READ_ONLY_COPY) : undefined}
       onClick={control}
     >
       {spec.control}
@@ -361,7 +364,7 @@ export default function TodoCard({
         <div className="todo-act">
           {showControl && controlButton}
           {!done && (
-            <button type="button" className="needmore" aria-label="more actions" aria-expanded={menu} onClick={() => setMenu((m) => !m)}>
+            <button type="button" className="needmore" aria-label={t("more actions")} aria-expanded={menu} onClick={() => setMenu((m) => !m)}>
               ⋯
             </button>
           )}
@@ -371,7 +374,7 @@ export default function TodoCard({
       {menu && (
         <NeedMenu
           need={need}
-          block={block ? READ_ONLY_COPY : null}
+          block={block ? t(READ_ONLY_COPY) : null}
           busy={busy}
           onOpenIssue={(id) => {
             setMenu(false);

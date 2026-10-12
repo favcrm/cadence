@@ -165,20 +165,22 @@ export function visibleMoves(stage: WorkStage | null | undefined, viewer: Viewer
 }
 
 /** Why no move is offered — the line shown in place of the buttons. */
-export function noMoveReason(stage: WorkStage | null | undefined, viewer: Viewer): string | null {
+export function noMoveReason(stage: WorkStage | null | undefined, viewer: Viewer, t: Translate = identity): string | null {
   if (!stage) return null;
-  if (!stage.moves) return "This board's server does not list stage moves.";
+  if (!stage.moves) return t("This board's server does not list stage moves.");
   if (stage.moves.length === 0) {
-    return stage.source === "plan" ? "The plan decides this stage until it is approved." : "No stage move is open.";
+    return t(stage.source === "plan" ? "The plan decides this stage until it is approved." : "No stage move is open.");
   }
-  if (viewer.readOnly) return "The board is read-only.";
+  if (viewer.readOnly) return t("The board is read-only.");
   if (viewer.operator === null) {
-    return viewer.access === "unavailable"
-      ? "The access check could not confirm this session — stage moves stay off until it answers."
-      : "Checking whether this session may move stages…";
+    return t(
+      viewer.access === "unavailable"
+        ? "The access check could not confirm this session — stage moves stay off until it answers."
+        : "Checking whether this session may move stages…",
+    );
   }
   if (!viewer.operator) {
-    return "Stage moves on the board are the operator's. Agents move a stage with `cadence issue epic stage`.";
+    return t("Stage moves on the board are the operator's. Agents move a stage with `cadence issue epic stage`.");
   }
   return null;
 }
@@ -224,8 +226,8 @@ export function childrenOf(cards: IssueCard[], epic: string): IssueCard[] {
 }
 
 /** `build` → `2/5 build`: the stage's place in the project's list. */
-export function stageLabel(stage: WorkStage | null | undefined): string {
-  if (!stage) return "no stage";
+export function stageLabel(stage: WorkStage | null | undefined, t: Translate = identity): string {
+  if (!stage) return t("no stage");
   const i = stage.stages.indexOf(stage.id);
   return i === -1 ? stage.id : `${stage.id} ${i + 1}/${stage.stages.length}`;
 }

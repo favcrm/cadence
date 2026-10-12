@@ -3,6 +3,7 @@ import type { Agent } from "../../lib/types";
 import { navigate, useHref } from "../../lib/useLocation";
 import type { Viewer } from "../projects/work";
 import { ApiError } from "../../lib/api";
+import { useTranslate } from "../../lib/locale";
 import { StoredDraftCard } from "./StoredDraftCard";
 import Button from "../../ui/Button";
 import Select from "../../ui/Select";
@@ -76,6 +77,7 @@ export function WorkspaceAppCachedPreview({
   snapshot: Snapshot;
   contextId: string | null;
 }) {
+  const t = useTranslate();
   const context = contextId === null
     ? null
     : snapshot.contexts.find((value) =>
@@ -85,8 +87,8 @@ export function WorkspaceAppCachedPreview({
     ? snapshot.runs.filter((run) => run.install_id === snapshot.installation.install_id && run.context_id === context.id).slice(0, 3)
     : [];
   return (
-    <section className="card px-4 py-5" aria-label="Cached workspace preview" role="status">
-      <p className="text-micro text-ink-500">Previously viewed · verifying access</p>
+    <section className="card px-4 py-5" aria-label={t("Cached workspace preview")} role="status">
+      <p className="text-micro text-ink-500">{t("Previously viewed · verifying access")}</p>
       <h2 className="mt-1 text-cardtitle font-medium text-ink-100">
         {snapshot.installation.title || snapshot.installation.name}
       </h2>
@@ -94,7 +96,7 @@ export function WorkspaceAppCachedPreview({
         <>
           <p className="mt-1 text-micro text-ink-500">{context.config.label}</p>
           {runs.length > 0 ? (
-            <ul className="mt-4 space-y-2" aria-label="Previously viewed runs">
+            <ul className="mt-4 space-y-2" aria-label={t("Previously viewed runs")}>
               {runs.map((run) => (
                 <li key={run.id} className="rounded border border-line/50 px-3 py-2">
                   <span className="text-label text-ink-200">{run.snapshot.workflow.title}</span>
@@ -103,11 +105,11 @@ export function WorkspaceAppCachedPreview({
               ))}
             </ul>
           ) : (
-            <p className="mt-3 text-label text-ink-400">No recent activity in this context.</p>
+            <p className="mt-3 text-label text-ink-400">{t("No recent activity in this context.")}</p>
           )}
         </>
       ) : (
-        <p className="mt-3 text-label text-ink-400">Workspace details will appear after access is verified.</p>
+        <p className="mt-3 text-label text-ink-400">{t("Workspace details will appear after access is verified.")}</p>
       )}
     </section>
   );
@@ -233,6 +235,7 @@ export default function WorkspaceApp({
   onBack?: () => void;
   appKey?: string;
 }) {
+  const t = useTranslate();
   // CAD-1137: a revisit mounts with the last session's snapshot already
   // painted (stale-while-revalidate); only the very first load skeletons.
   const [data, setData] = useState<Snapshot | null>(() => readWorkspaceAppSnapshot(installId));
@@ -988,22 +991,21 @@ export default function WorkspaceApp({
     // metadata refresh — never a sign-in and never authority.
     return (
       <main className="workspace-app" aria-label="Workspace app" role="status">
-        <h1>Workspace app</h1>
+        <h1>{t("Workspace app")}</h1>
         {viewer.access === "unavailable" ? (
           <p className="wa-alert">
-            Access could not be confirmed — the board's access check did
-            not answer. This installation stays closed until it does.{" "}
+            {t("Access could not be confirmed — the board's access check did not answer. This installation stays closed until it does.")}{" "}
             {viewer.onRetryAccess && (
-              <Button onClick={viewer.onRetryAccess}>Retry access check</Button>
+              <Button onClick={viewer.onRetryAccess}>{t("Retry access check")}</Button>
             )}
           </p>
         ) : (
-          <p className="wa-alert">Checking whether this session may inspect this installation…</p>
+          <p className="wa-alert">{t("Checking whether this session may inspect this installation…")}</p>
         )}
       </main>
     );
   }
-  if (!viewer.operator) return <main className="workspace-app" aria-label="Workspace app"><h1>Workspace app</h1><p className="wa-alert">Sign in as the operator to inspect this installation.</p><Button href="/apps">All apps</Button></main>;
+  if (!viewer.operator) return <main className="workspace-app" aria-label={t("Workspace app")}><h1>{t("Workspace app")}</h1><p className="wa-alert">{t("Sign in as the operator to inspect this installation.")}</p><Button href="/apps">{t("All apps")}</Button></main>;
   const tag = data && screenTag(data.installation);
   let projection = null;
   if (data && tag && !accessDenied && !loadError) {
@@ -1044,8 +1046,8 @@ export default function WorkspaceApp({
       <header className="wa-header"><h1>{data.installation.title || data.installation.name}</h1><Button href="/apps">All apps</Button></header>
       <section className="wa-panel wa-stack">
         <p>{data.installation.summary}</p>
-        <p className="wa-muted">This installation has no supported board workspace yet. Use its installed guide and the app commands to inspect supported workflows.</p>
-        <p className="wa-kicker">Installation {installId} · version {data.installation.version}</p>
+        <p className="wa-muted">{t("This installation has no supported board workspace yet. Use its installed guide and the app commands to inspect supported workflows.")}</p>
+        <p className="wa-kicker">{t("Installation {id} · version {version}").replace("{id}", () => installId).replace("{version}", () => data.installation.version)}</p>
         <pre className="wa-preview">{data.installation.guide}</pre>
       </section>
       {loadError && <p className="wa-alert" data-tone="fail" role="alert">{loadError}</p>}
@@ -1064,33 +1066,32 @@ export default function WorkspaceApp({
           <div>
               <h1>{data?.installation.title || "Workspace app"}</h1>
             <p className="wa-kicker">
-              Workspace app · reviewed drafts and Local release
+              {t("Workspace app · reviewed drafts and Local release")}
             </p>
           </div>
         </div>
         <div className="wa-row">
-          {onBack && <Button onClick={onBack}>All apps</Button>}
+          {onBack && <Button onClick={onBack}>{t("All apps")}</Button>}
           <Button
             icon={<IconRefresh />}
             loading={loading && !data}
             onClick={() => void refresh()}
           >
-            Refresh
+            {t("Refresh")}
           </Button>
           {refreshing && (
             <span
               className="wa-live-dot"
               role="status"
-              title="Refreshing in the background"
-              aria-label="Refreshing in the background"
+              title={t("Refreshing in the background")}
+              aria-label={t("Refreshing in the background")}
             />
           )}
         </div>
       </header>
       {!canWrite && (
         <p className="wa-alert">
-          <IconLock /> Read-only view. A verified operator can configure the
-          app, approve runs and release drafts.
+          <IconLock /> {t("Read-only view. A verified operator can configure the app, approve runs and release drafts.")}
         </p>
       )}
       {loadError && (
@@ -1112,8 +1113,8 @@ export default function WorkspaceApp({
       {loading && !data && (
         // The first load only: a quiet skeleton in the page's real shape,
         // never a spinner — a revisit paints the snapshot before this.
-        <div className="wa-skeleton" role="status" aria-label="Loading this workspace app">
-          <span className="sr-only">Loading this workspace app…</span>
+        <div className="wa-skeleton" role="status" aria-label={t("Loading this workspace app")}>
+          <span className="sr-only">{t("Loading this workspace app…")}</span>
           <div className="wa-skel-head">
             <span className="wa-skel wa-skel-pulse" style={{ width: "2.5rem", height: "2.5rem", borderRadius: "0.5rem" }} />
             <span className="wa-skel wa-skel-pulse" style={{ width: "10rem", height: "1.25rem" }} />
@@ -1182,20 +1183,19 @@ export default function WorkspaceApp({
                 disabled={!canWrite}
                 loading={busy}
               >
-                Restore access
+                {t("Restore access")}
               </Button>
             </div>
           )}
           {!binding && (
             <div className="wa-alert">
-              Choose and save a Local destination in Settings before creating a
-              run. The destination is frozen into its plan.{" "}
+              {t("Choose and save a Local destination in Settings before creating a run. The destination is frozen into its plan.")}{" "}
               <Button size="sm" onClick={() => setSection("Settings")}>
-                Set destination
+                {t("Set destination")}
               </Button>
             </div>
           )}
-          <nav className="wa-tabs" aria-label="App sections">
+          <nav className="wa-tabs" aria-label={t("App sections")}>
             {(
               [
                 "Board",
@@ -1229,7 +1229,7 @@ export default function WorkspaceApp({
           </nav>
           <div className="wa-content">
             {section === "Board" && (
-              <HorizontalStrip label="Post board" className="wa-board">
+              <HorizontalStrip label={t("Post board")} className="wa-board">
                 {lanes.map((lane) => (
                   <section key={lane.id} className="wa-lane">
                     <header className="wa-lane-head">
@@ -1241,7 +1241,7 @@ export default function WorkspaceApp({
                         lane.rows.map(card)
                       ) : (
                         <p className="wa-empty">
-                          No posts in {lane.label.toLowerCase()}.
+                          {t("No posts in {lane}.").replace("{lane}", () => lane.label.toLowerCase())}
                         </p>
                       )}
                     </div>
@@ -1300,12 +1300,12 @@ export default function WorkspaceApp({
             {section === "Settings" && (
               <div className="wa-stack">
                 <section className="wa-panel wa-stack">
-                  <h2>App package</h2>
-                  <p className="wa-muted">Installed version {data.installation.version}. Check a new package from a path on this Cadence host or a Git URL. The check shows the exact digest and changed files before you apply it. Completed drafts and retained source posts keep their original version.</p>
+                  <h2>{t("App package")}</h2>
+                  <p className="wa-muted">{t("Installed version {version}. Check a new package from a path on this Cadence host or a Git URL. The check shows the exact digest and changed files before you apply it. Completed drafts and retained source posts keep their original version.").replace("{version}", () => data.installation.version)}</p>
                   <label className="wa-field">
-                    <span>Package path or Git URL</span>
+                    <span>{t("Package path or Git URL")}</span>
                     <input className="wa-input" type="text" value={upgradeSource} onChange={event => { setUpgradeSource(event.target.value); setUpgradeProposal(null); }}
-                      placeholder="/absolute/path/to/app or https://github.com/owner/repo"
+                      placeholder={t("/absolute/path/to/app or https://github.com/owner/repo")}
                       autoComplete="off" disabled={!canWrite || busy} />
                   </label>
                   <div className="wa-row">
@@ -1317,16 +1317,16 @@ export default function WorkspaceApp({
                           expected_generation: data.installation.catalog_generation,
                         });
                         setUpgradeProposal({ source, receipt });
-                      })}>Check update</Button>
+                      })}>{t("Check update")}</Button>
                   </div>
                   {upgradeProposal && <div className="wa-stack" aria-live="polite">
-                    <p className="wa-kicker">Proposed version {upgradeProposal.receipt.version} · {upgradeProposal.receipt.name}</p>
-                    <p className="wa-muted">New digest: <code>{upgradeProposal.receipt.digest}</code></p>
+                    <p className="wa-kicker">{t("Proposed version {version} · {name}").replace("{version}", () => upgradeProposal.receipt.version).replace("{name}", () => upgradeProposal.receipt.name)}</p>
+                    <p className="wa-muted">{t("New digest:")} <code>{upgradeProposal.receipt.digest}</code></p>
                     {(["added", "changed", "removed"] as const).map(kind => <p key={kind} className="wa-muted">
                       {kind}: {upgradeProposal.receipt.structural_diff[kind].join(", ") || "none"}
                     </p>)}
-                    {!!upgradeProposal.receipt.secret_warnings?.length && <p className="wa-alert">Package validation reported secret warnings; review the source before applying.</p>}
-                    <p className="wa-muted">Applying preserves this installation, contexts, version-pinned bindings and completed work. Applying it approves the new version. New-version runs need new bindings.</p>
+                    {!!upgradeProposal.receipt.secret_warnings?.length && <p className="wa-alert">{t("Package validation reported secret warnings; review the source before applying.")}</p>}
+                    <p className="wa-muted">{t("Applying preserves this installation, contexts, version-pinned bindings and completed work. Applying it approves the new version. New-version runs need new bindings.")}</p>
                     <Button variant="primary" disabled={!canWrite || busy || !!upgradeProposal.receipt.secret_warnings?.length} loading={busy}
                       onClick={() => void mutate(async () => {
                         const { source, receipt } = upgradeProposal;
@@ -1340,7 +1340,7 @@ export default function WorkspaceApp({
                         completeRequest(requestKey);
                         setUpgradeProposal(null);
                         setUpgradeSource("");
-                      })}>Apply checked update</Button>
+                      })}>{t("Apply checked update")}</Button>
                   </div>}
                 </section>
                 <ReadinessPanel
@@ -1393,12 +1393,12 @@ export default function WorkspaceApp({
                   mutate={mutate}
                 />
                 <section className="wa-panel wa-stack">
-                  <h2>Brand contexts</h2>
+                  <h2>{t("Brand contexts")}</h2>
                   <p className="wa-muted">
-                    A brand is optional app context. {supportsContentPrompt ? "Save prompt defaults here; each new post can override them without changing these settings. " : "This installed bundle needs an upgrade before prompt defaults are available. "}A project isn’t required.
+                    {supportsContentPrompt ? t("A brand is optional app context. Save prompt defaults here; each new post can override them without changing these settings. A project isn’t required.") : t("A brand is optional app context. This installed bundle needs an upgrade before prompt defaults are available. A project isn’t required.")}
                   </p>
                   {selectedContext && <div className="wa-row">
-                    <p className="wa-kicker">Selected: {selectedContext.config.label} · revision {selectedContext.revision}</p>
+                    <p className="wa-kicker">{t("Selected: {label} · revision {revision}").replace("{label}", () => selectedContext.config.label).replace("{revision}", () => String(selectedContext.revision))}</p>
                     <Button disabled={!canWrite || busy} onClick={() => {
                       setEditingContextId(selectedContext.id);
                       setBrandName(selectedContext.config.label);
@@ -1407,7 +1407,7 @@ export default function WorkspaceApp({
                       setContentPrompt(selectedContext.config.input_defaults.content_prompt ?? "");
                       setImagePrompt(selectedContext.config.input_defaults.image_prompt ?? "");
                       setActionError(null);
-                    }}>Edit saved defaults</Button>
+                    }}>{t("Edit saved defaults")}</Button>
                   </div>}
                   <form
                     className="wa-stack"
@@ -1473,24 +1473,24 @@ export default function WorkspaceApp({
                     </div>
                     {(supportsContentPrompt || supportsImagePrompt) && <div className="wa-fields">
                       {supportsContentPrompt && <div className="wa-field">
-                        <label htmlFor="wa-default-content-prompt">Content prompt default</label>
+                        <label htmlFor="wa-default-content-prompt">{t("Content prompt default")}</label>
                         <textarea id="wa-default-content-prompt" name="content_prompt" className="wa-input wa-prompt-input"
                           value={contentPrompt} onChange={event => setContentPrompt(event.target.value)} maxLength={512}
                           placeholder="Leave empty to use the app default" disabled={!canWrite || busy} />
-                        <p className="wa-kicker">Guides caption wording. One line, up to 512 characters.</p>
+                        <p className="wa-kicker">{t("Guides caption wording. One line, up to 512 characters.")}</p>
                       </div>}
                       {supportsImagePrompt && <div className="wa-field">
-                        <label htmlFor="wa-default-image-prompt">Image prompt default</label>
+                        <label htmlFor="wa-default-image-prompt">{t("Image prompt default")}</label>
                         <textarea id="wa-default-image-prompt" name="image_prompt" className="wa-input wa-prompt-input"
                           value={imagePrompt} onChange={event => setImagePrompt(event.target.value)} maxLength={512}
                           placeholder="Leave empty to use the app default" disabled={!canWrite || busy} />
-                        <p className="wa-kicker">Guides the one generated draft image; provider and safety constraints stay fixed.</p>
+                        <p className="wa-kicker">{t("Guides the one generated draft image; provider and safety constraints stay fixed.")}</p>
                       </div>}
                     </div>}
                     <div className="wa-fields">
                       <div className="wa-field">
                         <label htmlFor="wa-brand-voice">
-                          Brand voice (optional)
+                          {t("Brand voice (optional)")}
                         </label>
                         <input
                           id="wa-brand-voice"
@@ -1506,7 +1506,7 @@ export default function WorkspaceApp({
                       </div>
                       <div className="wa-field">
                         <label htmlFor="wa-protected-terms">
-                          Protected terms (optional)
+                          {t("Protected terms (optional)")}
                         </label>
                         <input
                           id="wa-protected-terms"
@@ -1522,7 +1522,7 @@ export default function WorkspaceApp({
                       </div>
                     </div>
                     <p className="wa-kicker">
-                      Use one line for each default. New plans freeze their effective values; editing this context cannot change an existing plan.
+                      {t("Use one line for each default. New plans freeze their effective values; editing this context cannot change an existing plan.")}
                     </p>
                     <Button type="submit" disabled={!canWrite} loading={busy}>
                       {editingContextId ? "Save brand defaults" : "Add brand"}
@@ -1530,16 +1530,16 @@ export default function WorkspaceApp({
                     {editingContextId && <Button disabled={busy} onClick={() => {
                       setEditingContextId(""); setBrandName(""); setBrandVoice(""); setProtectedTerms("");
                       setContentPrompt(""); setImagePrompt(""); setActionError(null);
-                    }}>Cancel editing</Button>}
+                    }}>{t("Cancel editing")}</Button>}
                   </form>
                 </section>
                 <section className="wa-panel wa-stack">
-                  <h2>Available in this version</h2>
+                  <h2>{t("Available in this version")}</h2>
                   <p className="wa-muted">
-                    {imageEnabled ? "Retained Instagram source → priced caption and image plan → independent review of text and bytes → explicit Local release. External publishing and scheduling are unavailable." : sourceEnabled ? "Retained public Instagram source or pasted facts → writer → independent review → explicit Local release. Image generation, external publishing and scheduling are unavailable." : "Pasted text → actual writer → independent review → explicit Local release. Remote sources, image generation, external publishing and scheduling are unavailable."}
+                    {imageEnabled ? t("Retained Instagram source → priced caption and image plan → independent review of text and bytes → explicit Local release. External publishing and scheduling are unavailable.") : sourceEnabled ? t("Retained public Instagram source or pasted facts → writer → independent review → explicit Local release. Image generation, external publishing and scheduling are unavailable.") : t("Pasted text → actual writer → independent review → explicit Local release. Remote sources, image generation, external publishing and scheduling are unavailable.")}
                   </p>
                   <details className="wa-details">
-                    <summary>Installation details</summary>
+                    <summary>{t("Installation details")}</summary>
                     <p className="wa-digest">
                       {installId}
                       <br />
@@ -1590,21 +1590,21 @@ export default function WorkspaceApp({
         />
       )}
       {run && isSourceRun(run) && (
-        <WorkspaceDialog title={`Read @${run.snapshot.inputs.profile_handle}`} onClose={() => { if (!busy) setSelectedRun(null); }}>
+        <WorkspaceDialog title={t("Read @{handle}").replace("{handle}", () => run.snapshot.inputs.profile_handle)} onClose={() => { if (!busy) setSelectedRun(null); }}>
           <div className="wa-stack">
             {actionError && <p className="wa-alert" data-tone="fail" role="alert">{actionError}</p>}
             <div className="wa-row"><span className="wa-status" data-tone={statusTone(run.state)}>{statusText(run.state)}</span><span className="wa-kicker">{run.id}</span></div>
             {run.failure && !actionError && <p className="wa-alert" data-tone="fail" role="status">{run.failure.kind === "uncertain" ? "The provider outcome is uncertain; no automatic retry was made." : "This source read was refused."} {run.failure.reason}</p>}
             <p className="wa-muted">This run reads public posts from the frozen @{run.snapshot.inputs.profile_handle} profile. It cannot publish or generate an image.</p>
-            {run.snapshot.quotes?.source?.currency === "USD" && Number.isSafeInteger(run.snapshot.quotes.source.total_price_micros) ? <p className="wa-alert">Frozen provider charge: <strong>USD {(run.snapshot.quotes.source.total_price_micros / 1_000_000).toFixed(6)}</strong> for one read. Binding {run.snapshot.capabilities?.source?.digest || "unavailable"}. A changed quote or binding stops dispatch.</p> : <p className="wa-alert" data-tone="fail">This source plan has no verified provider quote. It cannot be approved.</p>}
-            <details className="wa-details"><summary>Inspect the exact source plan</summary><pre>{JSON.stringify(run.snapshot, null, 2)}</pre><p className="wa-digest">{run.snapshot_digest}</p></details>
+            {run.snapshot.quotes?.source?.currency === "USD" && Number.isSafeInteger(run.snapshot.quotes.source.total_price_micros) ? <p className="wa-alert">{t("Frozen provider charge: {amount} for one read. Binding {digest}. A changed quote or binding stops dispatch.").replace("{amount}", () => `USD ${(run.snapshot.quotes!.source!.total_price_micros / 1_000_000).toFixed(6)}`).replace("{digest}", () => run.snapshot.capabilities?.source?.digest || t("unavailable"))}</p> : <p className="wa-alert" data-tone="fail">{t("This source plan has no verified provider quote. It cannot be approved.")}</p>}
+            <details className="wa-details"><summary>{t("Inspect the exact source plan")}</summary><pre>{JSON.stringify(run.snapshot, null, 2)}</pre><p className="wa-digest">{run.snapshot_digest}</p></details>
             {/* CAD-1171: a host run already carries its consent — the click
                 that created it. Only an agent run shows the approve round. */}
-            {run.state === "awaiting_approval" && run.snapshot.workflow.execution !== "host" && <Button variant="primary" disabled={!canWrite || !run.snapshot.quotes?.source || !run.snapshot.capabilities?.source} loading={busy} onClick={() => void mutate(async () => { await workspaceApps.approveRun(run.id, run.snapshot_digest); })}>Approve source plan</Button>}
-            {run.state === "approved" && run.snapshot.workflow.execution !== "host" && <Button variant="primary" disabled={!canWrite || !run.snapshot.quotes?.source || !run.snapshot.capabilities?.source} loading={busy} onClick={() => void mutate(async () => { await workspaceApps.dispatchRun(run.id); })}>Start source reader</Button>}
+            {run.state === "awaiting_approval" && run.snapshot.workflow.execution !== "host" && <Button variant="primary" disabled={!canWrite || !run.snapshot.quotes?.source || !run.snapshot.capabilities?.source} loading={busy} onClick={() => void mutate(async () => { await workspaceApps.approveRun(run.id, run.snapshot_digest); })}>{t("Approve source plan")}</Button>}
+            {run.state === "approved" && run.snapshot.workflow.execution !== "host" && <Button variant="primary" disabled={!canWrite || !run.snapshot.quotes?.source || !run.snapshot.capabilities?.source} loading={busy} onClick={() => void mutate(async () => { await workspaceApps.dispatchRun(run.id); })}>{t("Start source reader")}</Button>}
             {run.state === "running" && <p className="wa-muted" role="status">{run.snapshot.workflow.execution === "host" ? "The host is calling the frozen source binding and storing the provider receipt. Refresh Sources to see retained posts." : "Waiting for the assigned reader and provider receipt. Refresh Sources to see retained posts."}</p>}
-            {run.state === "failed" && <p className="wa-alert" data-tone="fail">The source run failed. No posts will be fabricated. Inspect its exact plan and stored run for details.</p>}
-            {run.state === "succeeded" && <p className="wa-muted">The provider receipt is available in Sources. Choose one post there to start a caption.</p>}
+            {run.state === "failed" && <p className="wa-alert" data-tone="fail">{t("The source run failed. No posts will be fabricated. Inspect its exact plan and stored run for details.")}</p>}
+            {run.state === "succeeded" && <p className="wa-muted">{t("The provider receipt is available in Sources. Choose one post there to start a caption.")}</p>}
           </div>
         </WorkspaceDialog>
       )}
@@ -1630,10 +1630,10 @@ export default function WorkspaceApp({
             {run.failure && !actionError && <p className="wa-alert" data-tone="fail" role="status">{run.failure.kind === "uncertain" ? "The provider outcome is uncertain; no automatic retry was made." : "This capability was refused."} {run.failure.reason}</p>}
             <p className="wa-muted">{run.snapshot.inputs.source}</p>
             {isImageRun(run) && (imagePlanPriced
-              ? <p className="wa-alert">Current rate at approval: <strong>USD {(imageQuote!.total_price_micros / 1_000_000).toFixed(6)}</strong> per image — billed at the provider's actual charge. This covers one square image draft from {run.snapshot.source ? "the selected post" : "pasted facts"}. Binding {run.snapshot.capabilities?.image?.digest}. A changed rate or binding stops dispatch.</p>
-              : <p className="wa-alert" data-tone="fail">This image plan has no verified one-image quote and cannot be approved.</p>)}
+              ? <p className="wa-alert">{t("Current rate at approval: {amount} per image — billed at the provider's actual charge. This covers one square image draft from {source}. Binding {digest}. A changed rate or binding stops dispatch.").replace("{amount}", () => `USD ${(imageQuote!.total_price_micros / 1_000_000).toFixed(6)}`).replace("{source}", () => run.snapshot.source ? t("the selected post") : t("pasted facts")).replace("{digest}", () => run.snapshot.capabilities?.image?.digest ?? "")}</p>
+              : <p className="wa-alert" data-tone="fail">{t("This image plan has no verified one-image quote and cannot be approved.")}</p>)}
             <section className="wa-stack">
-              <h3>Frozen plan</h3>
+              <h3>{t("Frozen plan")}</h3>
               {run.snapshot.workflow.steps.map((step) => (
                 <div key={step.id} className="wa-step">
                   <span>
@@ -1651,19 +1651,18 @@ export default function WorkspaceApp({
                 </div>
               ))}
               <p className="wa-kicker">
-                Responsible PM: {run.snapshot.owner_pm}. Destination and brand
-                context are frozen into this plan.
+                {t("Responsible PM: {pm}. Destination and brand context are frozen into this plan.").replace("{pm}", () => run.snapshot.owner_pm)}
               </p>
               {(run.snapshot.inputs.content_prompt || run.snapshot.inputs.image_prompt) && <div className="wa-stack">
-                <h4>Frozen prompts</h4>
+                <h4>{t("Frozen prompts")}</h4>
                 {(["content_prompt", "image_prompt"] as const).map(name => run.snapshot.inputs[name] && <div key={name} className="wa-field">
                   <span>{name === "content_prompt" ? "Content prompt" : "Image prompt"} · {run.snapshot.input_origins?.[name] === "run_override" ? "this post’s override" : run.snapshot.input_origins?.[name] === "context_default" ? "saved brand default" : run.snapshot.input_origins?.[name] === "app_default" ? "app default" : "frozen value"}</span>
                   <p className="wa-preview">{run.snapshot.inputs[name]}</p>
                 </div>)}
-                <p className="wa-kicker">These values were frozen when the plan was created. Source facts and provider settings are separate.</p>
+                <p className="wa-kicker">{t("These values were frozen when the plan was created. Source facts and provider settings are separate.")}</p>
               </div>}
               <details className="wa-details">
-                <summary>Inspect the exact plan</summary>
+                <summary>{t("Inspect the exact plan")}</summary>
                 <pre>{JSON.stringify(run.snapshot, null, 2)}</pre>
                 <p className="wa-digest">{run.snapshot_digest}</p>
               </details>
@@ -1712,7 +1711,7 @@ export default function WorkspaceApp({
                 <p className="wa-digest">{review.artifact_digest}</p>
                 {isImageRun(run) && (review.asset_receipt_id && review.asset_digest
                   ? <p className="wa-digest">Retained image {review.asset_receipt_id}<br />{review.asset_digest}</p>
-                  : <p className="wa-alert" data-tone="fail">This review has no pinned retained image. Caption and image release is unavailable.</p>)}
+                  : <p className="wa-alert" data-tone="fail">{t("This review has no pinned retained image. Caption and image release is unavailable.")}</p>)}
               </div>
             ))}
             {run.artifacts.length > 1 && (
@@ -1739,7 +1738,7 @@ export default function WorkspaceApp({
             )}
             {artifact && (
               <section className="wa-stack">
-                <h3>Stored text</h3>
+                <h3>{t("Stored text")}</h3>
                 <pre className="wa-preview">{artifact.text}</pre>
                 <p className="wa-digest">{artifact.digest}</p>
                 {run.state === "succeeded" &&
@@ -1795,7 +1794,7 @@ export default function WorkspaceApp({
             )}
             {selectedEffect && (
               <section className="wa-stack">
-                <h3>Local release</h3>
+                <h3>{t("Local release")}</h3>
                 <span
                   className="wa-status"
                   data-tone={statusTone(selectedEffect.state)}
@@ -1803,7 +1802,7 @@ export default function WorkspaceApp({
                   {statusText(selectedEffect.state)}
                 </span>
                 <p className="wa-muted">
-                  Inspect the server’s exact release receipt before deciding.
+                  {t("Inspect the server’s exact release receipt before deciding.")}
                   This writes only to the configured Local destination.
                 </p>
                 {selectedEffect.record.preview && (
@@ -1820,7 +1819,7 @@ export default function WorkspaceApp({
                       : "No confirmed verification is recorded yet."}
                 </p>
                 <details className="wa-details">
-                  <summary>Exact release receipt</summary>
+                  <summary>{t("Exact release receipt")}</summary>
                   <pre>{JSON.stringify(selectedEffect.record, null, 2)}</pre>
                   <p className="wa-digest">{selectedEffect.digest}</p>
                 </details>
@@ -1859,7 +1858,7 @@ export default function WorkspaceApp({
                         })
                       }
                     >
-                      Close without releasing
+                      {t("Close without releasing")}
                     </Button>
                   </div>
                 )}
@@ -1885,7 +1884,7 @@ export default function WorkspaceApp({
                         })
                       }
                     >
-                      Close after checking outcome
+                      {t("Close after checking outcome")}
                     </Button>
                   </>
                 )}
@@ -1906,17 +1905,17 @@ export default function WorkspaceApp({
                         })
                       }
                     >
-                      Acknowledge this outcome
+                      {t("Acknowledge this outcome")}
                     </Button>
                   )}
                 {outboxError && (
                   <p className="wa-alert" data-tone="fail" role="alert">
-                    Could not read the Local outbox: {outboxError}
+                    {t("Could not read the Local outbox:")} {outboxError}
                   </p>
                 )}
                 {outbox !== null && (
                   <div className="wa-stack">
-                    <h3>Actual Local item</h3>
+                    <h3>{t("Actual Local item")}</h3>
                     <p className="wa-muted">
                       {outbox.item.title} · {outbox.item.published_at}
                     </p>
@@ -1924,7 +1923,7 @@ export default function WorkspaceApp({
                       <pre className="wa-preview">{outbox.item.post}</pre>
                     )}
                     <details className="wa-details">
-                      <summary>Persisted outbox receipt</summary>
+                      <summary>{t("Persisted outbox receipt")}</summary>
                       <pre>{JSON.stringify(outbox, null, 2)}</pre>
                     </details>
                     <p className="wa-kicker">

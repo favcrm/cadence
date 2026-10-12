@@ -18,10 +18,10 @@ export function checkpointDate(date: string | null | undefined, locale: Locale =
   return value.toLocaleDateString(locale, { month: "short", day: "numeric", year: "numeric", timeZone: "UTC" });
 }
 
-export function checkpointWork(row: MilestoneRow): string {
+export function checkpointWork(row: MilestoneRow, t: Translate = (english) => english): string {
   const counts = row.progress.counts;
   const total = Math.max(0, (counts.total ?? 0) - (counts.dropped ?? 0));
-  return total ? `${counts.done ?? 0} of ${total} tasks complete` : "No delivery scope yet";
+  return total ? `${counts.done ?? 0} ${t("of")} ${total} ${t("tasks complete")}` : t("No delivery scope yet");
 }
 
 /** Explicitly active checkpoints first. Upcoming uses declared roadmap order. */

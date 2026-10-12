@@ -1,5 +1,6 @@
 import SafeLink from "../../ui/SafeLink";
 import type { HomeNeed } from "./needs";
+import { useTranslate } from "../../lib/locale";
 
 /** One row of a rail's inline menu (the `…` overflow and the Unfence
  *  reconcile choice share it). */
@@ -44,6 +45,7 @@ export function NeedMenu({
   onDetails?: () => void;
 }) {
   const item = MENU_ITEM;
+  const t = useTranslate();
   return (
     <>
       <button
@@ -53,15 +55,15 @@ export function NeedMenu({
         className="fixed inset-0 z-20 cursor-default"
         onClick={onClose}
       />
-      <div className="needmenu" role="menu" aria-label="more actions">
+      <div className="needmenu" role="menu" aria-label={t("more actions")}>
         {need.link && (
           <SafeLink className={`${item} block`} warnClassName={`${item} block`} href={need.link} role="menuitem">
-            Open
+            {t("Open")}
           </SafeLink>
         )}
         {!need.link && need.issue && (
           <button className={item} role="menuitem" onClick={() => onOpenIssue(need.issue!)}>
-            Open
+            {t("Open")}
           </button>
         )}
         <button
@@ -71,7 +73,7 @@ export function NeedMenu({
           title={block ?? undefined}
           onClick={() => onDecide("snooze", SNOOZE_24H)}
         >
-          Snooze 24h
+          {t("Snooze 24h")}
         </button>
         <button
           className={item}
@@ -80,7 +82,7 @@ export function NeedMenu({
           title={block ?? undefined}
           onClick={() => onDecide("snooze", SNOOZE_7D)}
         >
-          Snooze 7d
+          {t("Snooze 7d")}
         </button>
         <button
           className={`${item} text-fail`}
@@ -89,7 +91,7 @@ export function NeedMenu({
           title={block ?? undefined}
           onClick={() => onDecide("dismiss")}
         >
-          Dismiss
+          {t("Dismiss")}
         </button>
         {onDetails && (
           <button
@@ -100,7 +102,7 @@ export function NeedMenu({
               onClose();
             }}
           >
-            Details
+            {t("Details")}
           </button>
         )}
         <button
@@ -111,7 +113,7 @@ export function NeedMenu({
             onClose();
           }}
         >
-          Copy command
+          {t("Copy command")}
         </button>
       </div>
     </>

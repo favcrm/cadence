@@ -4,6 +4,9 @@ import Select, { type SelectOption } from "../../ui/Select";
 import { WorkspaceDialog } from "./WorkspaceDialog";
 import { ApiError } from "../../lib/api";
 import { workspaceApps, type CapabilityQuote } from "./workspaceApps";
+import { useTranslate } from "../../lib/locale";
+
+const CONNECTION_CHANGED = "The source connection changed or is unavailable. Refresh Settings before creating a plan.";
 
 export interface SourceImportValues {
   profileHandle: string;
@@ -25,6 +28,7 @@ export function SourceImport({ installId, contextId, bindingDigest, workers, man
   onClose: () => void;
   onCreate: (values: SourceImportValues) => void;
 }) {
+  const t = useTranslate();
   const [profileHandle, setProfileHandle] = useState("");
   const [ownerPm, setOwnerPm] = useState("");
   const [writer, setWriter] = useState("");
@@ -37,7 +41,7 @@ export function SourceImport({ installId, contextId, bindingDigest, workers, man
     void workspaceApps.bindingQuote(installId, "source", contextId, controller.signal).then(value => {
       if (controller.signal.aborted) return;
       if (value.slot !== "source" || value.binding_digest !== bindingDigest || value.quote.schema !== 1 || value.quote.currency !== "USD" || !Number.isSafeInteger(value.quote.total_price_micros) || value.quote.total_price_micros <= 0) {
-        setQuoteError("The source connection changed or is unavailable. Refresh Settings before creating a plan."); return;
+        setQuoteError(CONNECTION_CHANGED); return;
       }
       setQuote(value);
     }).catch(reason => {
@@ -63,29 +67,29 @@ export function SourceImport({ installId, contextId, bindingDigest, workers, man
     setValidation(invalid);
     if (!invalid && !busy && quote) onCreate({ profileHandle: handle, ownerPm, writer });
   };
-  return <WorkspaceDialog title="Find Instagram source" onClose={onClose}>
+  return <WorkspaceDialog title={t("Find Instagram source")} onClose={onClose}>
     <form className="wa-stack" onSubmit={submit}>
       <p className="wa-muted">{host
-        ? "Read recent public posts through this app’s Instagram source connection. This click starts the read — no team and no separate plan approval."
-        : "Read recent public posts through this app’s Instagram source connection. You approve the frozen plan before a worker starts."}</p>
-      {quote ? <p className="wa-alert">The source connection is ready{host ? "." : " — the plan needs your approval before the read starts."}</p> : !quoteError && <p className="wa-muted" role="status">Checking the source connection…</p>}
-      {quoteError && <p className="wa-alert" data-tone="fail" role="alert">{quoteError}</p>}
-      {(error || validation) && <p className="wa-alert" data-tone="fail" role="alert">{error || validation}</p>}
+        ? t("Read recent public posts through this app’s Instagram source connection. This click starts the read — no team and no separate plan approval.")
+        : t("Read recent public posts through this app’s Instagram source connection. You approve the frozen plan before a worker starts.")}</p>
+      {quote ? <p className="wa-alert">{host ? t("The source connection is ready.") : t("The source connection is ready — the plan needs your approval before the read starts.")}</p> : !quoteError && <p className="wa-muted" role="status">{t("Checking the source connection…")}</p>}
+      {quoteError && <p className="wa-alert" data-tone="fail" role="alert">{quoteError === CONNECTION_CHANGED ? t(CONNECTION_CHANGED) : quoteError}</p>}
+      {(error || validation) && <p className="wa-alert" data-tone="fail" role="alert">{error || t(validation ?? "")}</p>}
       <div className="wa-field">
-        <label htmlFor="wa-profile-handle">Public Instagram handle</label>
+        <label htmlFor="wa-profile-handle">{t("Public Instagram handle")}</label>
         <input id="wa-profile-handle" className="wa-input" value={profileHandle} onChange={event => setProfileHandle(event.target.value)} placeholder="juicysuite_crm" maxLength={31} required disabled={busy} />
       </div>
       {!host && <div className="wa-fields">
         <div className="wa-field">
-          <label htmlFor="wa-source-owner">Responsible PM</label>
-          <Select id="wa-source-owner" value={ownerPm} onChange={value => { setOwnerPm(value); setWriter(""); }} options={managers} placeholder="Choose PM" disabled={busy} full />
+          <label htmlFor="wa-source-owner">{t("Responsible PM")}</label>
+          <Select id="wa-source-owner" value={ownerPm} onChange={value => { setOwnerPm(value); setWriter(""); }} options={managers} placeholder={t("Choose PM")} disabled={busy} full />
         </div>
         <div className="wa-field">
-          <label htmlFor="wa-source-reader">Reader</label>
-          <Select id="wa-source-reader" value={writer} onChange={setWriter} options={eligibleWorkers} placeholder={ownerPm ? "Choose reader" : "Choose a PM first"} disabled={busy || !ownerPm} full />
+          <label htmlFor="wa-source-reader">{t("Reader")}</label>
+          <Select id="wa-source-reader" value={writer} onChange={setWriter} options={eligibleWorkers} placeholder={ownerPm ? t("Choose reader") : t("Choose a PM first")} disabled={busy || !ownerPm} full />
         </div>
       </div>}
-      <Button type="submit" variant="primary" disabled={!quote} loading={busy}>Create source plan</Button>
+      <Button type="submit" variant="primary" disabled={!quote} loading={busy}>{t("Create source plan")}</Button>
     </form>
   </WorkspaceDialog>;
 }

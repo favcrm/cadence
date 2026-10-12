@@ -29,7 +29,7 @@ import {
 export function describeRule(rule: SegmentPredicate, translate: (value: string) => string = (value) => value): string {
   const field = SEGMENT_FIELDS.find((f) => f.value === rule.field)?.label ?? rule.field;
   const op = SEGMENT_OPS.find((o) => o.value === rule.op)?.label ?? rule.op;
-  return `${translate(field)} ${translate(op)} ${rule.value}`;
+  return translate("{field} {op} {value}").replace("{field}", () => translate(field)).replace("{op}", () => translate(op)).replace("{value}", () => rule.value);
 }
 
 /** Rule as a sentence of tokens: "Customers where [tag] [is] [vip]". */
@@ -76,8 +76,8 @@ export function eligibilityFunnel(p: AudiencePreview, translate: (value: string)
   const top = causes.filter(([n]) => n > 0).sort((a, b) => b[0] - a[0])[0];
   let reason: string | null = null;
   if (p.baseCount === 0) reason = translate("No customers match this rule yet.");
-  else if (p.finalCount === 0 && top) reason = `${translate("Nobody can be emailed:")} ${top[0]} ${top[1]}.`;
-  else if (p.finalCount < p.baseCount && top) reason = `${top[0]} ${translate(top[0] === 1 ? "customer" : "customers")} ${top[1]}.`;
+  else if (p.finalCount === 0 && top) reason = translate("Nobody can be emailed: {count} {cause}.").replace("{count}", () => String(top[0])).replace("{cause}", () => top[1]);
+  else if (p.finalCount < p.baseCount && top) reason = translate("{count} {unit} {cause}.").replace("{count}", () => String(top[0])).replace("{unit}", () => translate(top[0] === 1 ? "customer" : "customers")).replace("{cause}", () => top[1]);
   return { steps, reason };
 }
 
