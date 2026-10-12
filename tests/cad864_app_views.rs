@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// A descriptor-bearing (or plain) `apps/blog-post` source tree, a
+/// A descriptor-bearing (or plain) `tests/fixtures/apps/blog-post` source tree, a
 /// private PM dir and one seam-armed in-process daemon serving it.
 struct Workspace {
     _root: tempfile::TempDir,
@@ -52,7 +52,7 @@ impl Workspace {
             std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
             std::fs::copy(
                 PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("apps/blog-post")
+                    .join("tests/fixtures/apps/blog-post")
                     .join(name),
                 destination,
             )

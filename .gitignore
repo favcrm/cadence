@@ -1,4 +1,5 @@
 /target/
+/.devin/
 /.worktrees/
 .state/
 /ui/node_modules

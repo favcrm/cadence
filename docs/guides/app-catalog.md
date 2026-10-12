@@ -69,8 +69,8 @@ daemon runs `install-check`/`install`.
 Install is consent, so consent must be to exact bytes. Check first, then pin:
 
 ```sh
-cadence app catalog install-check ./apps/blog-post      # returns "digest"
-cadence app catalog install ./apps/blog-post --expected-digest 'sha256:…'
+cadence app catalog install-check ./tests/fixtures/apps/blog-post      # returns "digest"
+cadence app catalog install ./tests/fixtures/apps/blog-post --expected-digest 'sha256:…'
 ```
 
 The digest is the same bundle digest `upgrade-check`/`upgrade
@@ -105,7 +105,7 @@ test workspace and the current directory is a trusted Cadence checkout. They
 describe commands, not a production rollout.
 
 ```sh
-cadence app catalog install ./apps/blog-post
+cadence app catalog install ./tests/fixtures/apps/blog-post
 cadence app catalog install ./apps/social-content
 cadence app catalog ls
 ```
@@ -133,7 +133,7 @@ any other structural change; the verified `app catalog show` receipt serves
 the validated descriptor as `view_descriptor` (plus `view_descriptor_digest`),
 or `null` on bundles without one. Descriptors are declarations only — they do
 not render live data or carry actions. See the existing
-[Blog post bundle](../../apps/blog-post/app.md) and
+[Blog post bundle](../../tests/fixtures/apps/blog-post/app.md) and
 [Social Content bundle](../../apps/social-content/app.md).
 
 The React fixture preview at `app-previews/social-content` is **not** an
@@ -157,7 +157,7 @@ For a particular commit of a repository containing nested bundles, use a trusted
 local checkout already detached at the verified commit and pass the bundle's
 folder. The receipt remains local-path provenance; it does not claim the catalog
 selected or verified that Git revision. A Cadence repository root URL is not a
-shortcut for its nested `apps/blog-post` or `apps/social-content` folder.
+shortcut for its nested `tests/fixtures/apps/blog-post` or `apps/social-content` folder.
 
 ## IDs, repeats, and result fields
 
