@@ -8,7 +8,7 @@ use super::*;
 use cadence_agent::wiki::cli::WikiAction;
 
 /// `cadence <verb>` → AOS-128 `(verb, arguments)`. Every returned verb is
-/// in `remote_cli::REMOTE_VERBS`; every argument value is a primitive the
+/// in `remote_cli::REMOTE_VERBS` or `remote_cli::WIKI_ACTIONS`; every argument value is a primitive the
 /// server's `arguments` object accepts. A command outside the set — or a
 /// flag that cannot cross the wire faithfully — refuses locally; nothing
 /// is sent (contract I2: an allowlist, not a tunnel).

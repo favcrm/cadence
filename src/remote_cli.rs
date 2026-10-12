@@ -1,7 +1,8 @@
 //! CAD-1019 slice 2: the remote CLI transport — allowlisted verbs over the
 //! AgenticOS `POST /__platform/cli/{authorize,call}` relay (AOS-128, contract
-//! `docs/design/remote-cli.md`). A selected `Remote` org routes a command
-//! here instead of the local daemon socket; there is no local fallback.
+//! `docs/design/remote-cli.md`) and the `POST /__platform/wiki/{authorize,call}`
+//! wiki relay for the wiki actions (CAD-1401). A selected `Remote` org routes a
+//! command here instead of the local daemon socket; there is no local fallback.
 //!
 //! Wire contract (pinned to `origin/cadence/aos-128-hosted-cadence-cli-allowlisted-p`,
 //! `hosted-cadence-auth.ts` + `board/routes.ts` + `hosted-cadence/wiki.ts`):
@@ -43,6 +44,7 @@ use crate::error::{Error, Result};
 use crate::remote_auth::auth_dir;
 
 const CLI_VERSION: &str = "hosted-cadence-cli.v1";
+const WIKI_VERSION: &str = "hosted-cadence-wiki.v1";
 /// `ttl_seconds` ceiling (`HOSTED_CADENCE_MAX_TTL_SECONDS`): the server also
 /// clamps to the live credential's expiry, so asking the maximum is exact.
 const MAX_TTL: u64 = 300;
@@ -86,14 +88,32 @@ pub const REMOTE_VERBS: &[&str] = &[
     "issue_new",
     "issue_comment",
     "issue_set",
-    // wiki (CAD-1401): the contract actions the AgenticOS proxy maps onto the
-    // container's wiki routes. `enumerate` is `wiki ls` or `wiki search` (the
-    // arguments say which), `read` is `wiki cat`, `write` is a text `wiki put`.
-    // No delete/job_status/history and no blob upload.
-    "enumerate",
-    "read",
-    "write",
 ];
+
+/// The wiki actions this build sends over `/__platform/wiki/call` (CAD-1401):
+/// `enumerate` is `wiki ls` or `wiki search`, `read` is `wiki cat`, `write` is
+/// a text `wiki put`. No delete/job_status/history and no blob upload. Any
+/// other verb is refused locally, before a request.
+pub const WIKI_ACTIONS: &[&str] = &["enumerate", "read", "write"];
+
+/// The hosted relay a verb rides: the cli envelope or the wiki envelope. It is
+/// chosen by the verb name on the shared path, so a wiki action never travels
+/// the cli route and a cli verb never travels the wiki route.
+#[derive(Clone, Copy)]
+enum Surface {
+    Cli,
+    Wiki,
+}
+
+impl Surface {
+    /// The relay path prefix and its protocol version.
+    fn relay(self) -> (&'static str, &'static str) {
+        match self {
+            Surface::Cli => ("/__platform/cli", CLI_VERSION),
+            Surface::Wiki => ("/__platform/wiki", WIKI_VERSION),
+        }
+    }
+}
 
 /// A resolved remote org destination — pinned once per invocation from the
 /// registry (`cli::org::resolve`). `org` is the registry name (the
@@ -675,19 +695,26 @@ fn post(
     Ok((status, retry_after, value))
 }
 
-/// `POST /__platform/cli/authorize` — exchange the live `hct_` for one
-/// cli-scoped actor envelope. The request is the strict AOS-128 shape;
-/// the answer must echo the version and carry a compact-JWS envelope.
-fn authorize(target: &RemoteTarget, cred: &Credential) -> Result<String> {
+/// `POST /__platform/{cli,wiki}/authorize` — exchange the live `hct_` for one
+/// actor envelope scoped to `scopes`. The request is the strict AOS-128 /
+/// AOS-122 shape; the answer must echo the version and carry a compact-JWS
+/// envelope.
+fn authorize(
+    target: &RemoteTarget,
+    cred: &Credential,
+    surface: Surface,
+    scopes: &[&str],
+) -> Result<String> {
+    let (relay, version) = surface.relay();
     let (status, _, body) = post(
         &target.endpoint,
-        "/__platform/cli/authorize",
+        &format!("{relay}/authorize"),
         &cred.access_token,
         &json!({
-            "version": CLI_VERSION,
+            "version": version,
             "organization_id": target.org_id,
             "audience": target.endpoint,
-            "requested_scopes": ["cli.read", "cli.write"],
+            "requested_scopes": scopes,
             "ttl_seconds": MAX_TTL,
         }),
         AUTH_TIMEOUT,
@@ -701,7 +728,7 @@ fn authorize(target: &RemoteTarget, cred: &Credential) -> Result<String> {
                     && p.bytes()
                         .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
             }) && envelope.split('.').count() == 3;
-            if body["version"].as_str() != Some(CLI_VERSION) || !compact_jws {
+            if body["version"].as_str() != Some(version) || !compact_jws {
                 return Err(reject("remote authorize returned an invalid envelope"));
             }
             Ok(envelope.to_string())
@@ -717,27 +744,35 @@ fn authorize(target: &RemoteTarget, cred: &Credential) -> Result<String> {
     }
 }
 
-/// One `POST /__platform/cli/call` attempt: fresh envelope, strict body,
-/// never an authority-shaped key. `arguments` carries only the verb's own
-/// payload (identity/org/destination live only in the verified envelope).
+/// One `POST /__platform/{cli,wiki}/call` attempt: fresh envelope, strict
+/// body, never an authority-shaped key. A wiki envelope requests only the
+/// scope its action needs (`write` → `wiki.write`, else `wiki.read`).
+/// `arguments` carries only the verb's own payload (identity/org/destination
+/// live only in the verified envelope).
 fn call_once(
     target: &RemoteTarget,
     cred: &Credential,
+    surface: Surface,
     verb: &str,
     arguments: &Map<String, Value>,
 ) -> Result<(u16, Option<u64>, Option<Value>)> {
-    let envelope = authorize(target, cred)?;
-    let mut body = json!({
-        "version": CLI_VERSION,
-        "envelope": envelope,
-        "verb": verb,
-    });
+    let scopes: &[&str] = match surface {
+        Surface::Cli => &["cli.read", "cli.write"],
+        Surface::Wiki if verb == "write" => &["wiki.write"],
+        Surface::Wiki => &["wiki.read"],
+    };
+    let envelope = authorize(target, cred, surface, scopes)?;
+    let (relay, version) = surface.relay();
+    let mut body = match surface {
+        Surface::Cli => json!({"version": version, "envelope": envelope, "verb": verb}),
+        Surface::Wiki => json!({"version": version, "envelope": envelope, "action": verb}),
+    };
     if !arguments.is_empty() {
         body["arguments"] = Value::Object(arguments.clone());
     }
     post(
         &target.endpoint,
-        "/__platform/cli/call",
+        &format!("{relay}/call"),
         &cred.access_token,
         &body,
         CALL_TIMEOUT,
@@ -801,9 +836,9 @@ fn classify(status: u16, retry_after: Option<u64>, body: Option<Value>) -> Verdi
     }
 }
 
-/// Run one allowlisted remote verb. The verb must already be in
-/// [`REMOTE_VERBS`] (a bug in the caller is a local refusal, never a
-/// request). The credential is loaded and checked against `target` before
+/// Run one allowlisted remote verb: a [`REMOTE_VERBS`] cli verb or a
+/// [`WIKI_ACTIONS`] wiki action. The verb must be in one of them (a bug in
+/// the caller is a local refusal, never a request). The credential is loaded and checked against `target` before
 /// the first byte is sent; wake retries re-mint the envelope per attempt
 /// and are bounded by `wake_timeout` seconds. Progress goes to `note`
 /// (stderr at the call site); the returned Value is the remote's JSON body.
@@ -891,11 +926,15 @@ fn call_verb_in(
     sleep: impl Fn(Duration),
 ) -> Result<RemoteAnswer> {
     // I2: an unlisted verb is refused before a credential is even loaded.
-    if !REMOTE_VERBS.contains(&verb) {
+    let surface = if REMOTE_VERBS.contains(&verb) {
+        Surface::Cli
+    } else if WIKI_ACTIONS.contains(&verb) {
+        Surface::Wiki
+    } else {
         return Err(reject(format!(
             "verb '{verb}' is not in the remote allowlist — never sent"
         )));
-    }
+    };
     let deadline = Instant::now() + Duration::from_secs(wake_timeout);
     loop {
         let cred = renewed_credential(dir, target, deadline)?;
@@ -905,7 +944,7 @@ fn call_verb_in(
                 "remote command deadline elapsed during session renewal",
             ));
         }
-        let (status, retry_after, body) = call_once(target, &cred, verb, &arguments)?;
+        let (status, retry_after, body) = call_once(target, &cred, surface, verb, &arguments)?;
         match classify(status, retry_after, body) {
             Verdict::Done(result) => return result.map(RemoteAnswer::Ok),
             Verdict::Conflict(body) => return Ok(RemoteAnswer::Conflict(body)),
