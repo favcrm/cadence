@@ -75,11 +75,11 @@ mod cad1365_original_transfer_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1365_run_creator_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
-mod cad1415_app_actions_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
 mod cad1337_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1337_migration_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad1415_app_actions_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1440_media_only_context_acceptance;
 mod caller_rule;
