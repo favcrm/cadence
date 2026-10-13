@@ -520,7 +520,7 @@ fn upload(
         wake_timeout,
         |line| eprintln!("{line}"),
     )
-    .map_err(|error| {
+    .inspect_err(|error| {
         if error.kind() == "busy" && error.code() == Some("waking") {
             eprintln!(
                 "{}",
@@ -528,7 +528,6 @@ fn upload(
                     .unwrap_or_default()
             );
         }
-        error
     })?;
     println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
     Ok(0)
