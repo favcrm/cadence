@@ -57,7 +57,10 @@ loader.prototype.require = function (this: unknown, id: string) {
 };
 const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
-const App = (require("../src/App") as typeof import("../src/App")).default;
+const AppView = (require("../src/App") as typeof import("../src/App")).default;
+const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
+// main.tsx renders <LocaleProvider><App /></LocaleProvider>; the test mounts the same tree (CAD-1331).
+const App = () => React.createElement(LocaleProvider, null, React.createElement(AppView));
 const { sessionKey, setSessionKey } = require("../src/lib/sessionKey") as typeof import("../src/lib/sessionKey");
 const json = (data: unknown) => new Response(JSON.stringify(data), { headers: { "Content-Type": "application/json" } });
 const calls: { path: string; method: string }[] = [];

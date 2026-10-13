@@ -1,5 +1,6 @@
 import { useId, useState, type ReactNode } from "react";
 import { nextThemePref, setThemePref, type ThemePref } from "../lib/theme";
+import { useTranslate } from "../lib/locale";
 import { IconMoon, IconSun, IconTheme } from "./icons";
 
 const icons: Record<ThemePref, ReactNode> = {
@@ -10,6 +11,7 @@ const icons: Record<ThemePref, ReactNode> = {
 
 /** Header button cycling system → light → dark; the pick persists per browser. */
 export default function ThemeToggle() {
+  const t = useTranslate();
   const tooltipId = useId();
   // What is applied (initTheme ran before the first render), so a pick
   // that could not be stored still shows correctly.
@@ -18,6 +20,10 @@ export default function ThemeToggle() {
     return applied === "light" || applied === "dark" ? applied : "system";
   });
   const next = nextThemePref(pref);
+  const label = t(pref === "system" ? "System" : pref === "light" ? "Light" : "Dark").toLowerCase();
+  const nextLabel = t(next === "system" ? "System" : next === "light" ? "Light" : "Dark").toLowerCase();
+  const themeLabel = t("Theme:");
+  const switchLabel = t("Switch to");
   return (
     <span className="header-control-wrap">
       <button
@@ -26,12 +32,12 @@ export default function ThemeToggle() {
           setPref(next);
         }}
         className="header-icon text-ink-400"
-        aria-label={`theme: ${pref}, switch to ${next}`}
+        aria-label={`${themeLabel.toLowerCase()} ${label}, ${switchLabel.toLowerCase()} ${nextLabel}`}
         aria-describedby={tooltipId}
       >
         {icons[pref]}
       </button>
-      <span id={tooltipId} role="tooltip" className="header-tooltip">Theme: {pref} · Switch to {next}</span>
+      <span id={tooltipId} role="tooltip" className="header-tooltip">{t("Theme:")} {label} · {t("Switch to")} {nextLabel}</span>
     </span>
   );
 }

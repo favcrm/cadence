@@ -38,7 +38,9 @@ loader.prototype.require = function (this: unknown, id: string) {
 };
 const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
-const AppShell = (require("../src/features/app-shell/AppShell") as typeof import("../src/features/app-shell/AppShell")).default;
+const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
+const AppShellComponent = (require("../src/features/app-shell/AppShell") as typeof import("../src/features/app-shell/AppShell")).default;
+const AppShell = (props: React.ComponentProps<typeof AppShellComponent>) => React.createElement(LocaleProvider, null, React.createElement(AppShellComponent, props));
 
 const install = {
   install_id: "install-crm", title: "CRM", name: "crm", version: "0.1.0",

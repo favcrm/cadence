@@ -23,8 +23,13 @@ loader.prototype.require = function (this: unknown, id: string) {
 };
 const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
-const Apps = (require("../src/features/apps/Apps") as typeof import("../src/features/apps/Apps")).default;
-const Explorer = (require("../src/features/explorer/Explorer") as typeof import("../src/features/explorer/Explorer")).default;
+const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
+const AppsComponent = (require("../src/features/apps/Apps") as typeof import("../src/features/apps/Apps")).default;
+const Apps = (props: React.ComponentProps<typeof AppsComponent>) =>
+  React.createElement(LocaleProvider, null, React.createElement(AppsComponent, props));
+const ExplorerComponent = (require("../src/features/explorer/Explorer") as typeof import("../src/features/explorer/Explorer")).default;
+const Explorer = (props: React.ComponentProps<typeof ExplorerComponent>) =>
+  React.createElement(LocaleProvider, null, React.createElement(ExplorerComponent, props));
 
 const json = (value: unknown) => new Response(JSON.stringify(value), { status: 200, headers: { "Content-Type": "application/json" } });
 // Shapes copied from the daemon: `app_home`, `app_favorites_get`, `app_catalog_list`.

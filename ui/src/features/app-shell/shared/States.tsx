@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import { SESSION_EXPIRED_TEXT } from "./hostErrors";
+import { useTranslate } from "../../../lib/locale";
 
 /**
  * Shared record/form state blocks (CAD-866): the loading, error,
@@ -90,6 +91,7 @@ export function ErrorNotice({
   bare?: boolean;
   className?: string;
 }) {
+  const t = useTranslate();
   return (
     <p
       className={[
@@ -110,7 +112,7 @@ export function ErrorNotice({
           {children === SESSION_EXPIRED_TEXT ? (
             // A top-level navigation re-authenticates; a retried fetch cannot.
             <button type="button" className="lnk" onClick={() => window.location.reload()}>
-              Reload
+              {t("Reload")}
             </button>
           ) : (
             <button type="button" className="lnk" onClick={onRetry}>

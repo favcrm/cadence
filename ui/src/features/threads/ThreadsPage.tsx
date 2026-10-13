@@ -5,6 +5,8 @@ import { useResource } from "../../lib/useResource";
 import { navigate, useHref } from "../../lib/useLocation";
 import { fmtTime } from "../../lib/fmt";
 import { useWriteBlock } from "../auth/WriteGate";
+import { useTranslate } from "../../lib/locale";
+import { displayUiNotice, type UiNotice } from "../app-shell/campaign/useEmailDraft";
 import Button from "../../ui/Button";
 import Link from "../../ui/Link";
 import PageState from "../../ui/PageState";
@@ -63,6 +65,7 @@ export default function ThreadsPage({ operator }: { operator: boolean }) {
   const url = useMemo(() => readThreadsUrl(search), [search]);
   const draftAlias = useMemo(() => readDmParam(search), [search]);
   const writeBlock = useWriteBlock(!operator);
+  const t = useTranslate();
   const agentsState = useResource(resources.agents);
   const issuesState = useResource(resources.issues);
   const issueProjects = useMemo(() => issueProjectMap(issuesState.data ?? []), [issuesState.data]);
@@ -150,9 +153,9 @@ export default function ThreadsPage({ operator }: { operator: boolean }) {
   if (!operator) {
     return (
       <section className="threads-page px-4 lg:px-8 py-5" aria-labelledby="threads-title">
-        <h1 id="threads-title" className="sr-only">Threads</h1>
-        <PageState title="Operator access required">
-          Threads is available to the operator. Use Sign in in the status bar if you have operator access.
+        <h1 id="threads-title" className="sr-only">{t("Threads")}</h1>
+        <PageState title={t("Operator access required")}>
+          {t("Threads is available to the operator. Use Sign in in the status bar if you have operator access.")}
         </PageState>
       </section>
     );
@@ -165,14 +168,14 @@ export default function ThreadsPage({ operator }: { operator: boolean }) {
   return (
     <section className="threads-page" aria-labelledby="threads-title">
       <div className="threads-layout">
-        <aside className="threads-list" aria-label="Conversations">
+        <aside className="threads-list" aria-label={t("Conversations")}>
           <div className="threads-list-head">
-            <h1 id="threads-title">Threads</h1>
-            <Button variant="ghost" size="sm" onClick={() => void loadList()} aria-label="Refresh conversations">
+            <h1 id="threads-title">{t("Threads")}</h1>
+            <Button variant="ghost" size="sm" onClick={() => void loadList()} aria-label={t("Refresh conversations")}>
               <IconRefresh size={12} />
             </Button>
             <Button variant="secondary" size="sm" onClick={() => setCreateOpen(true)}>
-              Add
+              {t("Add")}
             </Button>
           </div>
           <label className="threads-search">
@@ -181,18 +184,18 @@ export default function ThreadsPage({ operator }: { operator: boolean }) {
               type="search"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="Search conversations"
-              aria-label="Search conversations"
+              placeholder={t("Search conversations")}
+              aria-label={t("Search conversations")}
             />
           </label>
           {list.legacy ? (
-            <p className="threads-note">This daemon predates Threads. Update it to see agent conversations.</p>
+            <p className="threads-note">{t("This daemon predates Threads. Update it to see agent conversations.")}</p>
           ) : list.error ? (
-            <p className="threads-note" role="status">Conversations could not load: {list.error}</p>
+            <p className="threads-note" role="status">{t("Conversations could not load:")} {list.error}</p>
           ) : list.rows === null ? (
-            <p className="threads-note">Loading conversations…</p>
+            <p className="threads-note">{t("Loading conversations…")}</p>
           ) : visible.length === 0 ? (
-            <p className="threads-note">No conversations match these filters.</p>
+            <p className="threads-note">{t("No conversations match these filters.")}</p>
           ) : (
             <ul className="threads-rows">
               {visible.map((row) => (
@@ -203,10 +206,10 @@ export default function ThreadsPage({ operator }: { operator: boolean }) {
                     className={row.id === open?.id ? "threads-row on" : "threads-row"}
                   >
                     <span className="threads-row-top">
-                      <span className="threads-row-title">{conversationTitle(row)}</span>
-                      <span className="threads-row-kind">{KIND_LABEL[row.kind]}</span>
+                      <span className="threads-row-title">{conversationTitle(row, t)}</span>
+                      <span className="threads-row-kind">{t(KIND_LABEL[row.kind])}</span>
                     </span>
-                    <span className="threads-row-meta">{rowDescriptor(row)}</span>
+                    <span className="threads-row-meta">{rowDescriptor(row, t)}</span>
                   </Link>
                 </li>
               ))}
@@ -214,7 +217,7 @@ export default function ThreadsPage({ operator }: { operator: boolean }) {
           )}
         </aside>
 
-        <main className="threads-main" aria-label="Conversation">
+        <main className="threads-main" aria-label={t("Conversation")}>
           {open ? (
             <Timeline
               key={open.id}
@@ -249,14 +252,14 @@ export default function ThreadsPage({ operator }: { operator: boolean }) {
           ) : (
             <div className="threads-empty">
               <span aria-hidden><IconThreads size={28} /></span>
-              <p>Select a conversation to read it.</p>
+              <p>{t("Select a conversation to read it.")}</p>
             </div>
           )}
         </main>
 
         {/* The one roster: the rail on desktop. Below the desktop width the
             rail is hidden and Context opens the same panel. */}
-        <aside className="threads-context" aria-label="Participants">
+        <aside className="threads-context" aria-label={t("Participants")}>
           {context}
         </aside>
       </div>
@@ -323,6 +326,7 @@ function SheetDialog({
 }) {
   const ref = useRef<HTMLDialogElement>(null);
   const titleId = useId();
+  const t = useTranslate();
   useEffect(() => {
     const dialog = ref.current;
     if (!dialog) return;
@@ -340,8 +344,8 @@ function SheetDialog({
       }}
     >
       <div className="threads-context-sheet-head">
-        <h2 id={titleId}>{title}</h2>
-        <Button variant="ghost" size="sm" onClick={onClose} aria-label={`Close ${title.toLowerCase()}`} icon={<IconClose />} />
+        <h2 id={titleId}>{t(title)}</h2>
+        <Button variant="ghost" size="sm" onClick={onClose} aria-label={t(`Close ${title.toLowerCase()}`)} icon={<IconClose />} />
       </div>
       {children}
     </dialog>
@@ -356,7 +360,8 @@ function issueProjectMap(issues: { id: string; project: string }[]): IssueProjec
 
 /** A delivery stage for display, as quiet metadata text (not a chip). Queued is never shown as delivered or seen. */
 function StageLabel({ state }: { state: DeliveryState | string }) {
-  return <span className="threads-stage" data-state={state}>{deliveryLabel(state)}</span>;
+  const t = useTranslate();
+  return <span className="threads-stage" data-state={state}>{deliveryLabel(state, t)}</span>;
 }
 
 /** One transcript turn: the Home message bubble (Bubble, with the real sender
@@ -396,16 +401,16 @@ function Turn({
 
 /** A row's second line from real data only: the last preview; else a group's
  *  post and member counts; else a direct thread's label. */
-function rowDescriptor(row: ConversationRow): string {
+function rowDescriptor(row: ConversationRow, t: (english: string) => string = (english) => english): string {
   if (row.last) return row.last.preview;
   if (row.kind === "group") {
     const members = liveMembers(row).length;
-    const parts = [`${members} ${members === 1 ? "member" : "members"}`];
-    if (row.posts !== undefined) parts.unshift(`${row.posts} ${row.posts === 1 ? "post" : "posts"}`);
+    const parts = [`${members} ${t(members === 1 ? "member" : "members")}`];
+    if (row.posts !== undefined) parts.unshift(`${row.posts} ${t(row.posts === 1 ? "post" : "posts")}`);
     return parts.join(" · ");
   }
-  if (row.kind === "operator") return "Direct thread";
-  return "No messages";
+  if (row.kind === "operator") return t("Direct thread");
+  return t("No messages");
 }
 
 /** The initial shown in a participant's identity circle. */
@@ -439,6 +444,7 @@ function Timeline({
 }) {
   const isGroup = row.kind === "group";
   const dm = operatorDmAlias(row);
+  const t = useTranslate();
   const [messages, setMessages] = useState<ThreadMessage[] | null>(null);
   const [entries, setEntries] = useState<ThreadEntry[] | null>(null);
   const [posts, setPosts] = useState<TopicPost[] | null>(null);
@@ -558,23 +564,23 @@ function Timeline({
   return (
     <div className="threads-timeline">
       <header className="threads-head">
-        <div className="threads-kicker">{KIND_LABEL[row.kind]}</div>
-        <h2>{conversationTitle(row)}</h2>
+        <div className="threads-kicker">{t(KIND_LABEL[row.kind])}</div>
+        <h2>{conversationTitle(row, t)}</h2>
         <div className="threads-head-actions">
           <Button variant="ghost" size="sm" onClick={onOpenContext} className="threads-context-toggle">
-            Context
+            {t("Context")}
           </Button>
         </div>
       </header>
       <div className="threads-messages" aria-live="polite">
         {error ? (
-          <p className="threads-note" role="status">This conversation could not load: {error}</p>
+          <p className="threads-note" role="status">{t("This conversation could not load:")} {error}</p>
         ) : (dm ? entries : isGroup ? posts : messages) === null ? (
-          <p className="threads-note">Loading…</p>
+          <p className="threads-note">{t("Loading…")}</p>
         ) : (
           <>
             {more && (
-              <Button variant="ghost" size="sm" onClick={() => void loadEarlier()}>Load earlier</Button>
+              <Button variant="ghost" size="sm" onClick={() => void loadEarlier()}>{t("Load earlier")}</Button>
             )}
             {dm
               ? (entries ?? []).map((e) => <EntryRow key={e.seq} entry={e} />)
@@ -582,8 +588,8 @@ function Timeline({
                 ? (posts ?? []).map((p) => <PostRow key={p.id} post={p} />)
                 : (messages ?? []).map((m) => <MessageRow key={m.id} message={m} issueProjects={issueProjects} />)}
             {isGroup
-              ? (posts ?? []).length === 0 && <p className="threads-note">No posts yet.</p>
-              : (dm ? entries ?? [] : messages ?? []).length === 0 && <p className="threads-note">No messages yet.</p>}
+              ? (posts ?? []).length === 0 && <p className="threads-note">{t("No posts yet.")}</p>
+              : (dm ? entries ?? [] : messages ?? []).length === 0 && <p className="threads-note">{t("No messages yet.")}</p>}
           </>
         )}
       </div>
@@ -640,7 +646,8 @@ const STAGES = new Set<string>(["queued", "running", "completed", "failed", "unk
  *  `payload.delivery.state`, present only for a message-linked entry; an
  *  unlinked entry or an unknown state shows no stage. */
 function EntryRow({ entry }: { entry: ThreadEntry }) {
-  const who = entry.role === "operator" ? "You" : entry.role === "agent" ? "Agent" : "System";
+  const t = useTranslate();
+  const who = entry.role === "operator" ? t("You") : entry.role === "agent" ? t("Agent") : t("System");
   const delivery = entry.payload?.delivery as { state?: unknown } | undefined;
   const stage = typeof delivery?.state === "string" && STAGES.has(delivery.state) ? delivery.state : null;
   return (
@@ -653,11 +660,12 @@ function EntryRow({ entry }: { entry: ThreadEntry }) {
 }
 
 function MessageRow({ message, issueProjects }: { message: ThreadMessage; issueProjects: IssueProjects }) {
+  const t = useTranslate();
   const issueProject = message.issue ? issueProjects.get(message.issue) : undefined;
   return (
     <article className="threads-msg" data-role={message.sender.kind} data-state={message.state}>
       <Turn
-        who={participantLabel(message.sender)}
+        who={participantLabel(message.sender, t)}
         at={fmtTime(message.created)}
         me={message.sender.kind === "operator"}
         state={message.state}
@@ -671,7 +679,7 @@ function MessageRow({ message, issueProjects }: { message: ThreadMessage; issueP
           ) : (
             <span className="threads-ref">{message.issue}</span>
           ))}
-          {message.task_id && <span className="threads-ref">task {message.task_id}</span>}
+          {message.task_id && <span className="threads-ref">{t("task {task}").replace("{task}", () => String(message.task_id))}</span>}
         </div>
       )}
     </article>
@@ -688,10 +696,11 @@ function receiptState(state: string): DeliveryState {
 
 /** A topic post: its transcript body and each recipient's real receipt. */
 function PostRow({ post }: { post: TopicPost }) {
+  const t = useTranslate();
   const operator = post.sender.alias === "operator";
   return (
     <article className="threads-msg" data-role={operator ? "operator" : "agent"}>
-      <Turn who={operator ? "You" : post.sender.alias} at={fmtTime(post.created)} me={operator}>
+      <Turn who={operator ? t("You") : post.sender.alias} at={fmtTime(post.created)} me={operator}>
         {post.body}
       </Turn>
       {post.deliveries.length > 0 && <DeliveryFeedback deliveries={post.deliveries} />}
@@ -703,19 +712,20 @@ function PostRow({ post }: { post: TopicPost }) {
  *  recipient and state. Several show a count summary by actual state, which
  *  expands natively into each recipient's own row. */
 function DeliveryFeedback({ deliveries }: { deliveries: PostDelivery[] }) {
+  const t = useTranslate();
   const counts = new Map<DeliveryState, number>();
   for (const d of deliveries) {
     const s = receiptState(d.state);
     counts.set(s, (counts.get(s) ?? 0) + 1);
   }
   const states = RECEIPT_ORDER.filter((s) => counts.has(s));
-  const name = (d: PostDelivery) => (typeof d.alias === "string" && d.alias.trim() !== "" ? d.alias : "Unknown recipient");
-  const removed = (d: PostDelivery) => (d.removed ? " (removed)" : "");
+  const name = (d: PostDelivery) => (typeof d.alias === "string" && d.alias.trim() !== "" ? d.alias : t("Unknown recipient"));
+  const removed = (d: PostDelivery) => (d.removed ? ` ${t("(removed)")}` : "");
 
   if (deliveries.length === 1) {
     const d = deliveries[0];
     return (
-      <div className="threads-receipts" aria-label="Delivery to members">
+      <div className="threads-receipts" aria-label={t("Delivery to members")}>
         <span className="threads-receipt-name">{`${name(d)}${removed(d)} · `}</span>
         <StageLabel state={receiptState(d.state)} />
       </div>
@@ -723,7 +733,7 @@ function DeliveryFeedback({ deliveries }: { deliveries: PostDelivery[] }) {
   }
 
   return (
-    <div className="threads-receipts" aria-label="Delivery to members">
+    <div className="threads-receipts" aria-label={t("Delivery to members")}>
       <details className="threads-receipt-details">
         <summary>
           {states.map((s, i) => (
@@ -734,7 +744,7 @@ function DeliveryFeedback({ deliveries }: { deliveries: PostDelivery[] }) {
           ))}
         </summary>
         {states.includes("available") && (
-          <p className="threads-note threads-receipt-note">Available in the recipient’s inbox; not read or seen.</p>
+          <p className="threads-note threads-receipt-note">{t("Available in the recipient’s inbox; not read or seen.")}</p>
         )}
         <ul className="threads-receipt-list">
           {deliveries.map((d) => (
@@ -762,6 +772,7 @@ function OperatorComposer({
   // attempt reuses it (one DM, not two); any change to the submitted
   // body, refs or attachments mints a new id.
   const envelope = useRef<{ key: string; id: string } | null>(null);
+  const t = useTranslate();
   return (
     <Composer
       density="full"
@@ -776,8 +787,8 @@ function OperatorComposer({
       }}
       refocusAfterSend
       attach
-      ariaLabel={`Message to ${alias}`}
-      placeholder={`Message ${alias}…`}
+      ariaLabel={t("Message to {alias}").replace("{alias}", () => alias)}
+      placeholder={t("Message {alias}…").replace("{alias}", () => alias)}
       className="card p-2.5 relative"
     />
   );
@@ -786,13 +797,14 @@ function OperatorComposer({
 /** Agent-to-agent conversations have no composer. Reply opens a direct message
  *  to one chosen participant, inside Threads. */
 function ReplyBar({ row, openDm }: { row: ConversationRow; openDm: (alias: string) => void }) {
+  const t = useTranslate();
   const agents = row.participants.filter((p) => p.kind === "agent" && !p.removed && p.alias);
   return (
     <div className="threads-reply">
-      <span>Agent conversation · read only.</span>
+      <span>{t("Agent conversation · read only.")}</span>
       {agents.map((p) => (
         <Button key={p.uid ?? p.alias ?? "agent"} variant="secondary" size="sm" onClick={() => openDm(p.alias as string)}>
-          Reply to {p.alias}
+          {t("Reply to {alias}").replace("{alias}", () => p.alias as string)}
         </Button>
       ))}
     </div>
@@ -812,28 +824,29 @@ function NewThread({
   writeBlock: string | null;
 }) {
   const [alias, setAlias] = useState("");
+  const t = useTranslate();
   return (
     <form
       className="threads-newgroup"
-      aria-label="New thread"
+      aria-label={t("New thread")}
       onSubmit={(e) => {
         e.preventDefault();
         if (alias !== "") onOpen(alias);
       }}
     >
       <label>
-        <span className="sr-only">Agent for new thread</span>
-        <select value={alias} onChange={(e) => setAlias(e.target.value)} aria-label="Agent for new thread">
-          <option value="">{agents.length === 0 ? "No live agents" : "Choose an agent"}</option>
+        <span className="sr-only">{t("Agent for new thread")}</span>
+        <select value={alias} onChange={(e) => setAlias(e.target.value)} aria-label={t("Agent for new thread")}>
+          <option value="">{agents.length === 0 ? t("No live agents") : t("Choose an agent")}</option>
           {agents.map((a) => (
             <option key={a} value={a}>{a}</option>
           ))}
         </select>
       </label>
       <Button variant="secondary" size="sm" type="submit" disabled={writeBlock !== null || alias === ""}>
-        New thread
+        {t("New thread")}
       </Button>
-      {current && <span className="threads-note">Draft with {current}</span>}
+      {current && <span className="threads-note">{t("Draft with {alias}").replace("{alias}", () => current)}</span>}
     </form>
   );
 }
@@ -856,6 +869,7 @@ function DraftDm({
 }) {
   const [entries, setEntries] = useState<ThreadEntry[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const t = useTranslate();
   useEffect(() => {
     let live = true;
     // No `conversation` selector: the home read of an alias with no thread is empty.
@@ -877,7 +891,7 @@ function DraftDm({
     <div className="threads-timeline">
       <header className="threads-head">
         <div className="threads-kicker">{KIND_LABEL.operator}</div>
-        <h2>{`You ↔ ${alias}`}</h2>
+        <h2>{t("You ↔ {alias}").replace("{alias}", () => alias)}</h2>
       </header>
       <div className="threads-messages" aria-live="polite">
         {error ? (
@@ -887,7 +901,7 @@ function DraftDm({
         ) : (
           <>
             {entries.map((e) => <EntryRow key={e.seq} entry={e} />)}
-            {entries.length === 0 && <p className="threads-note">No messages yet. Sending starts the thread.</p>}
+            {entries.length === 0 && <p className="threads-note">{t("No messages yet. Sending starts the thread.")}</p>}
           </>
         )}
       </div>
@@ -921,7 +935,8 @@ function GroupComposer({
   const [mode, setMode] = useState<"post" | "ask">("post");
   const members = liveMembers(row);
   const [target, setTarget] = useState("");
-  const [notice, setNotice] = useState<string | null>(null);
+  const t = useTranslate();
+  const [notice, setNotice] = useState<UiNotice | null>(null);
   // The id for the current envelope, reused on retry and reset when it changes.
   const envelope = useRef<{ key: string; id: string } | null>(null);
   const noMembers = members.length === 0;
@@ -929,14 +944,14 @@ function GroupComposer({
 
   return (
     <div className="threads-composer threads-group">
-      <div className="threads-mode" role="group" aria-label="Group message type">
-        <button type="button" aria-pressed={mode === "post"} onClick={() => setMode("post")}>Post</button>
-        <button type="button" aria-pressed={mode === "ask"} onClick={() => setMode("ask")}>Ask agent</button>
+      <div className="threads-mode" role="group" aria-label={t("Group message type")}>
+        <button type="button" aria-pressed={mode === "post"} onClick={() => setMode("post")}>{t("Post")}</button>
+        <button type="button" aria-pressed={mode === "ask"} onClick={() => setMode("ask")}>{t("Ask agent")}</button>
         {mode === "ask" && (
           <label className="threads-target">
-            <span className="sr-only">Member to ask</span>
-            <select value={target} onChange={(e) => setTarget(e.target.value)} aria-label="Member to ask">
-              <option value="">{noMembers ? "No current members" : "Choose a member"}</option>
+            <span className="sr-only">{t("Member to ask")}</span>
+            <select value={target} onChange={(e) => setTarget(e.target.value)} aria-label={t("Member to ask")}>
+              <option value="">{noMembers ? t("No current members") : t("Choose a member")}</option>
               {members.map((m) => (
                 <option key={m.uid ?? m.alias} value={m.alias as string}>{m.alias}</option>
               ))}
@@ -968,11 +983,11 @@ function GroupComposer({
         }}
         onNotice={setNotice}
         refocusAfterSend
-        ariaLabel={mode === "post" ? "Post to group" : "Ask one member"}
-        placeholder={mode === "post" ? "Post to the group…" : "Ask one member…"}
+        ariaLabel={mode === "post" ? t("Post to group") : t("Ask one member")}
+        placeholder={mode === "post" ? t("Post to the group…") : t("Ask one member…")}
         className="card p-2.5 relative"
       />
-      {notice && <p className="threads-note" role="status">{notice}</p>}
+      {notice && <p className="threads-note" role="status">{displayUiNotice(notice, t)}</p>}
     </div>
   );
 }
@@ -987,6 +1002,7 @@ function ContextPanel({
   writeBlock: string | null;
   onChanged: () => void;
 }) {
+  const t = useTranslate();
   const [error, setError] = useState<string | null>(null);
   const [alias, setAlias] = useState("");
   const isGroup = row.kind === "group";
@@ -1001,13 +1017,13 @@ function ContextPanel({
   };
   return (
     <div className="threads-context-body">
-      <h3 className="threads-context-title">Participants</h3>
+      <h3 className="threads-context-title">{t("Participants")}</h3>
       <ul className="threads-roster">
         {row.participants.map((p) => (
           <li key={p.uid ?? p.alias ?? p.kind} data-kind={p.kind} data-removed={p.removed || undefined}>
             <span className="threads-person">
-              <span aria-hidden className="threads-avatar">{initialOf(participantLabel(p))}</span>
-              <span>{participantLabel(p)}</span>
+              <span aria-hidden className="threads-avatar">{initialOf(participantLabel(p, t))}</span>
+              <span>{participantLabel(p, t)}</span>
             </span>
             {isGroup && p.kind === "agent" && p.alias && !p.removed && (
               <Button
@@ -1016,7 +1032,7 @@ function ContextPanel({
                 disabled={writeBlock !== null}
                 onClick={() => void act(() => changeSubscriber(row.id, "unsubscribe", p.alias as string))}
               >
-                Remove
+                {t("Remove")}
               </Button>
             )}
           </li>
@@ -1036,20 +1052,21 @@ function ContextPanel({
           }}
         >
           <label>
-            <span className="sr-only">Add member by alias</span>
-            <input value={alias} onChange={(e) => setAlias(e.target.value)} placeholder="Add agent alias" />
+            <span className="sr-only">{t("Add member by alias")}</span>
+            <input value={alias} onChange={(e) => setAlias(e.target.value)} placeholder={t("Add agent alias")} />
           </label>
-          <Button variant="secondary" size="sm" type="submit" disabled={writeBlock !== null || alias.trim() === ""}>Add</Button>
+          <Button variant="secondary" size="sm" type="submit" disabled={writeBlock !== null || alias.trim() === ""}>{t("Add")}</Button>
         </form>
       )}
       {error && <p className="threads-note" role="status">{error}</p>}
-      <p className="threads-note">Workspace access applies. Linking work does not grant access.</p>
+      <p className="threads-note">{t("Workspace access applies. Linking work does not grant access.")}</p>
     </div>
   );
 }
 
 /** Operator creates a `fleet:` or `project:` topic (the CAD-810 allowlist). */
 function NewGroup({ writeBlock, onCreated }: { writeBlock: string | null; onCreated: (id: string) => void }) {
+  const t = useTranslate();
   const [type, setType] = useState<"fleet" | "project">("project");
   const [source, setSource] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -1068,18 +1085,18 @@ function NewGroup({ writeBlock, onCreated }: { writeBlock: string | null; onCrea
       }}
     >
       <label>
-        <span className="sr-only">Group type</span>
+        <span className="sr-only">{t("Group type")}</span>
         <select value={type} onChange={(e) => setType(e.target.value as "fleet" | "project")}>
           <option value="project">project:</option>
           <option value="fleet">fleet:</option>
         </select>
       </label>
       <label>
-        <span className="sr-only">Group source</span>
-        <input value={source} onChange={(e) => setSource(e.target.value)} placeholder="New group name" />
+        <span className="sr-only">{t("Group source")}</span>
+        <input value={source} onChange={(e) => setSource(e.target.value)} placeholder={t("New group name")} />
       </label>
       <Button variant="secondary" size="sm" type="submit" disabled={writeBlock !== null || source.trim() === ""}>
-        New group
+        {t("New group")}
       </Button>
       {error && <p className="threads-note" role="status">{error}</p>}
     </form>

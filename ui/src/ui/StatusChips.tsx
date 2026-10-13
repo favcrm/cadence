@@ -1,5 +1,6 @@
 import { useId, type ReactNode } from "react";
 import type { Health } from "../lib/types";
+import { useTranslate } from "../lib/locale";
 import { IconConnection, IconLock, IconRefresh, IconWarning } from "./icons";
 
 /** Quiet icon controls in the header; the phone menu keeps readable labels. */
@@ -17,21 +18,22 @@ export default function StatusChips({
   variant: "header" | "menu";
   children?: ReactNode;
 }) {
+  const t = useTranslate();
   const header = variant === "header";
   const statusId = useId();
   const refreshId = useId();
   const labelCls = header ? "sr-only" : undefined;
   const reachable = health?.daemon === "reachable";
-  const connection = !health ? "Checking connection…" : reachable ? "Daemon connected" : "Daemon disconnected — live activity is unavailable";
+  const connection = !health ? t("Checking connection…") : reachable ? t("Daemon connected") : t("Daemon disconnected — live activity is unavailable");
   return (
     <>
       {readOnly && (
         <span
           className={header ? "header-state cursor-default" : "chip bg-ink-800 text-ink-400"}
-          title="the server refuses every write — browsing only"
+          title={t("the server refuses every write — browsing only")}
         >
           <IconLock />
-          <span className={labelCls}>read only</span>
+          <span className={labelCls}>{t("Read only").toLowerCase()}</span>
         </span>
       )}
       {children}
@@ -47,10 +49,10 @@ export default function StatusChips({
           </span>
           <span className="header-control-wrap">
             <button type="button" onClick={onRefresh} className="header-icon text-ink-400"
-              aria-label="Refresh board" aria-describedby={refreshId}>
+              aria-label={t("Refresh board")} aria-describedby={refreshId}>
               <IconRefresh size={14} />
             </button>
-            <span id={refreshId} role="tooltip" className="header-tooltip">Refresh board</span>
+            <span id={refreshId} role="tooltip" className="header-tooltip">{t("Refresh board")}</span>
           </span>
         </>
       ) : (
@@ -59,7 +61,7 @@ export default function StatusChips({
             {reachable ? <IconConnection /> : <IconWarning />}<span>{connection}</span>
           </span>}
           <button type="button" onClick={onRefresh} className="chip bg-accent/10 text-accent hover:bg-accent/20 transition-colors">
-            <IconRefresh /><span>Refresh board</span>
+            <IconRefresh /><span>{t("Refresh board")}</span>
           </button>
         </>
       )}

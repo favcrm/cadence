@@ -25,6 +25,7 @@ moduleLoader.prototype.require = function (this: unknown, id: string) {
 const { createElement, act } = require("react");
 const { createRoot } = require("react-dom/client");
 const { default: AccountMenu } = require("../src/ui/AccountMenu") as typeof import("../src/ui/AccountMenu");
+const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
 const { default: VersionLine } = require("../src/ui/VersionLine") as typeof import("../src/ui/VersionLine");
 const { releaseLabel, runningRelease } = require("../src/lib/fmt") as typeof import("../src/lib/fmt");
 const { routePath } = require("../src/lib/router") as typeof import("../src/lib/router");
@@ -36,7 +37,7 @@ function mount(node: unknown) {
   const host = document.createElement("div");
   document.body.append(host);
   const root = createRoot(host);
-  act(() => root.render(node));
+  act(() => root.render(createElement(LocaleProvider, null, node)));
   return { host, done: () => { act(() => root.unmount()); host.remove(); } };
 }
 const href = routePath({ screen: "settings", section: "update" });

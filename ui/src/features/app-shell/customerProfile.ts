@@ -239,10 +239,13 @@ export const CONSENT_NOTE_MAX = 280;
 export type ConsentSetting = "granted" | "unknown" | "denied";
 
 /** Operator wording: the stored `denied` state reads as withdrawn. */
-export function consentLabel(state: string | null): string {
-  if (state === "granted") return "Granted";
-  if (state === "denied") return "Withdrawn";
-  return "Unknown";
+type Translate = (english: string) => string;
+const identity: Translate = (english) => english;
+
+export function consentLabel(state: string | null, t: Translate = identity): string {
+  if (state === "granted") return t("Granted");
+  if (state === "denied") return t("Withdrawn");
+  return t("Unknown");
 }
 
 /**
@@ -293,32 +296,42 @@ export interface ActivityItem {
   agent: boolean;
 }
 
-const METHOD_TEXT: Record<string, string> = {
-  in_person: "in person",
-  web_form: "on the website form",
-  written: "in writing",
-  imported: "from an imported list",
-  other: "another way",
-};
-
-/** Plain-language timeline, newest first. Ids and digests stay in Details. */
-export function activityItems(record: HostRecord): ActivityItem[] {
+/** Plain-language timeline, newest first. Ids and digests stay in Details.
+ *  Each sentence is one whole translated template (placeholders filled
+ *  literally), so word order can change per locale. English is unchanged. */
+export function activityItems(record: HostRecord, t: Translate = identity): ActivityItem[] {
   const consent = consentEntries(record);
   return revisionEntries(record)
     .map((rev) => {
       const here = consent.filter((c) => c.revision === rev.revision);
-      const channelName = (c: ConsentEntry) => (c.channel === "sms" ? "SMS" : "Email");
       const parts = here.map((c) => {
-        const how = c.method ? ` ${METHOD_TEXT[c.method] ?? ""}`.trimEnd() : "";
+        const channel = t(c.channel === "sms" ? "SMS" : "Email");
+        const method = c.method
+          ? t(
+              c.method === "in_person"
+                ? "in person"
+                : c.method === "web_form"
+                  ? "on the website form"
+                  : c.method === "written"
+                    ? "in writing"
+                    : c.method === "imported"
+                      ? "from an imported list"
+                      : c.method === "other"
+                        ? "another way"
+                        : "",
+            )
+          : "";
         return c.state === "granted"
-          ? `${channelName(c)} consent granted${how === "" ? "" : ` (${how.trim()})`}`
+          ? method === ""
+            ? t("{channel} consent granted").replace("{channel}", () => channel)
+            : t("{channel} consent granted ({method})").replace("{channel}", () => channel).replace("{method}", () => method)
           : c.state === "denied"
-            ? `${channelName(c)} consent withdrawn`
-            : `${channelName(c)} consent recorded as ${c.state}`;
+            ? t("{channel} consent withdrawn").replace("{channel}", () => channel)
+            : t("{channel} consent recorded as {state}").replace("{channel}", () => channel).replace("{state}", () => c.state);
       });
-      const who = rev.actor === "operator" ? "the operator" : rev.actor;
-      const lead = rev.revision === 1 ? "Created" : parts.length === 0 ? "Profile edited" : "";
-      const text = [lead, ...parts].filter(Boolean).join(" · ") + ` by ${who}`;
+      const who = rev.actor === "operator" ? t("the operator") : rev.actor;
+      const lead = rev.revision === 1 ? t("Created") : parts.length === 0 ? t("Profile edited") : "";
+      const text = [lead, ...parts].filter(Boolean).join(" · ") + ` ${t("by {who}").replace("{who}", () => who)}`;
       const note = here.find((c) => c.note)?.note;
       return { key: `r${rev.revision}`, text, ...(note ? { note } : {}), at: rev.at, agent: rev.actor !== "operator" };
     })
@@ -359,19 +372,19 @@ export function consentEntries(record: HostRecord): ConsentEntry[] {
  * by design and safe to show; known shapes gain a next step. The input
  * value never appears here.
  */
-export function friendlyError(error: unknown): string {
+export function friendlyError(error: unknown, t: Translate = identity): string {
   const message = hostErrorText(error, "The customer request was refused — retry.");
   if (/stale|expected_revision|expected record revision/i.test(message)) {
-    return `${message} — someone else saved this record first. Reload and reapply your change.`;
+    return `${message} ${t("— someone else saved this record first. Reload and reapply your change.")}`;
   }
   if (/already holds different content|already used by another record/i.test(message)) {
-    return `${message} — pick a different id or address, or open the existing record.`;
+    return `${message} ${t("— pick a different id or address, or open the existing record.")}`;
   }
   if (/supported shape or bounds/i.test(message)) {
-    return `${message} — check display name, email, phone, tags and source against the field hints.`;
+    return `${message} ${t("— check display name, email, phone, tags and source against the field hints.")}`;
   }
   if (/refused app record field/i.test(message)) {
-    return `${message} — the client refused a field the server never accepts.`;
+    return `${message} ${t("— the client refused a field the server never accepts.")}`;
   }
   return message;
 }

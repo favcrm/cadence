@@ -4,22 +4,25 @@ export interface ModelSelectionView {
   revision?: number | null;
 }
 
-function provenanceLabel(source: string | null | undefined): string | null {
+type Translate = (english: string) => string;
+const identity: Translate = (english) => english;
+
+function provenanceLabel(source: string | null | undefined, t: Translate): string | null {
   switch (source) {
     case "explicit":
-      return "explicit launch model";
+      return t("explicit launch model");
     case "explicit_provider_default":
-      return "explicit provider-native";
+      return t("explicit provider-native");
     case "role_default":
-      return "role default";
+      return t("role default");
     case "provider_baseline":
-      return "provider baseline";
+      return t("provider baseline");
     case "provider_default":
-      return "provider-native default";
+      return t("provider-native default");
     case "legacy_configured":
-      return "saved before model defaults";
+      return t("saved before model defaults");
     case "legacy_provider_default":
-      return "saved before model defaults";
+      return t("saved before model defaults");
     default:
       return null;
   }
@@ -32,14 +35,17 @@ function provenanceLabel(source: string | null | undefined): string | null {
 export function provenanceDetail(
   selection: ModelSelectionView | null | undefined,
   lookupRole?: string | null,
+  t: Translate = identity,
 ): string | null {
-  const provenance = provenanceLabel(selection?.source);
+  const provenance = provenanceLabel(selection?.source, t);
   const lookup = lookupRole ?? selection?.lookup_role;
   const revision = selection?.revision;
   const text = [
     provenance,
-    lookup ? `lookup ${lookup}` : null,
-    typeof revision === "number" ? `revision ${revision}` : null,
+    lookup ? t("lookup {role}").replace("{role}", () => lookup) : null,
+    typeof revision === "number"
+      ? t("revision {number}").replace("{number}", String(revision))
+      : null,
   ]
     .filter(Boolean)
     .join(" · ");

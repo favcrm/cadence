@@ -350,7 +350,10 @@ globalThis.fetch = (async (input: unknown) => {
   assert(receipt !== null, `unexpected fixture read ${url}`);
   return new Response(JSON.stringify(receipt), { status: 200 });
 }) as typeof fetch;
-const AppShell = (require("../src/features/app-shell/AppShell") as typeof import("../src/features/app-shell/AppShell")).default;
+const AppShellComponent = (require("../src/features/app-shell/AppShell") as typeof import("../src/features/app-shell/AppShell")).default;
+const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
+const AppShell = (props: React.ComponentProps<typeof AppShellComponent>) =>
+  React.createElement(LocaleProvider, null, React.createElement(AppShellComponent, props));
 const { navigate } = require("../src/lib/useLocation") as typeof import("../src/lib/useLocation");
 const { contextNavigationSearch } = require("../src/features/projects/contextRoute") as typeof import("../src/features/projects/contextRoute");
 history.replaceState(null, "", "/app-installations/install-a?contract-preview=crm");

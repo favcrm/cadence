@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError, type WriteResp } from "./lib/api";
+import { useLocale } from "./lib/locale";
 import Agents from "./features/agents/Agents";
 import Apps from "./features/apps/Apps";
 import { installedAppHref } from "./features/apps/appViewModel";
@@ -48,6 +49,7 @@ import StatusChips from "./ui/StatusChips";
 import AccountMenu from "./ui/AccountMenu";
 import VersionLine from "./ui/VersionLine";
 import ThemeToggle from "./ui/ThemeToggle";
+import LocalLanguage from "./ui/LocalLanguage";
 import BuildUpdateNotice from "./ui/BuildUpdateNotice";
 import HeaderSearch from "./ui/HeaderSearch";
 import Setup from "./features/setup/Setup";
@@ -129,6 +131,7 @@ const SCREEN_LABEL: Record<Screen, string> = {
 const overviewOn = (s: Screen) => s === "home" || s === "overview";
 
 export default function App() {
+  const { setSession, t } = useLocale();
   // App selection lives in the URL — the route (`/projects/cadence`) plus
   // `?view=list&issue=CAD-16` — so a refresh or pasted link restores it.
   const href = useHref();
@@ -168,6 +171,7 @@ export default function App() {
   const [health, setHealth] = useState<Health | null>(null);
   const [meta, setMeta] = useState<Meta | null>(null);
   const [updateBanner, setUpdateBanner] = useState<UpdateBanner | null>(null);
+  useEffect(() => setSession(meta), [meta, setSession]);
   // The open drawer's detail, cached per id: reopening a drawer paints
   // the last payload while it revalidates.
   const detailState = useMaybeResource(openId ? resources.issue(openId) : null);
@@ -910,24 +914,24 @@ export default function App() {
           <button
             onClick={() => setMenuOpen((o) => !o)}
             className="header-menu header-icon -ml-1 shrink-0 gap-1 text-ink-200"
-            aria-label="Open navigation"
+            aria-label={t("Open navigation")}
             aria-expanded={menuOpen}
             aria-controls="mobile-navigation"
           >
             <IconList size={16} />
           </button>
-          <nav className="header-breadcrumb min-w-0 flex-1" aria-label="Breadcrumb">
+          <nav className="header-breadcrumb min-w-0 flex-1" aria-label={t("Breadcrumb")}>
             {/* The organisation's display name, or the board's neutral
                 label — never a hostname or project mistaken for an org. */}
-            <span className="header-org truncate font-medium text-ink-100" title={orgName}>{orgName}</span>
+            <span className="header-org hidden truncate font-medium text-ink-100 sm:inline" title={orgName}>{orgName}</span>
             <span className="hidden sm:inline text-ink-600" aria-hidden="true">/</span>
             {route.screen === "projects" && route.slug ? (
               <>
-                <Link href={hrefFor({ screen: "projects", slug: null, section: "overview" })} className="hidden sm:inline-flex">Projects</Link>
+                <Link href={hrefFor({ screen: "projects", slug: null, section: "overview" })} className="hidden sm:inline-flex">{t("Projects")}</Link>
                 <span className="hidden sm:inline text-ink-600" aria-hidden="true">/</span>
                 <span className="truncate text-ink-100" title={route.slug}>{route.slug}</span>
               </>
-            ) : <span className="truncate text-ink-200 capitalize">{route.screen === "issue" ? route.id : SCREEN_LABEL[screen]}</span>}
+            ) : <span className="truncate text-ink-200 capitalize">{route.screen === "issue" ? route.id : t(SCREEN_LABEL[screen])}</span>}
           </nav>
 
           <HeaderSearch issues={issuesState} route={route} navHref={hrefFor} />
@@ -954,13 +958,13 @@ export default function App() {
               placement="below-end"
               settingsHref={hrefFor({ screen: "settings", section: "models" })}
               footer={versionLine}
-            /></div> : <ThemeToggle />}
+            /></div> : <><LocalLanguage /><ThemeToggle /></>}
           </div>
         </header>
 
         {updateBanner && (
           <details className="update-notice border-b border-amber-500/30 bg-amber-500/5 px-4 lg:px-8 py-2 text-label text-ink-300">
-            <summary className="cursor-pointer"><span className="font-medium text-ink-200">Updating Cadence</span> · {updateBanner.count > 0 ? `Waiting for ${updateBanner.count} active turn${updateBanner.count === 1 ? "" : "s"}` : "No active turns remaining"}<span className="text-ink-500 ml-3">Details</span></summary>
+            <summary className="cursor-pointer"><span className="font-medium text-ink-200">{t("Updating Cadence")}</span> · {updateBanner.count > 0 ? `Waiting for ${updateBanner.count} active turn${updateBanner.count === 1 ? "" : "s"}` : t("No active turns remaining")}<span className="text-ink-500 ml-3">{t("Details")}</span></summary>
             <p className="num text-micro text-ink-500 mt-2 break-all">{updateBanner.pending.from ?? "?"} → {updateBanner.pending.target} · {updateBanner.pending.phase} · {updateBanner.pending.by}</p>
           </details>
         )}
@@ -972,11 +976,11 @@ export default function App() {
               navHref={hrefFor}
               appMenu={appMenu}
               homeCount={homeCount}
-              label="Workspace"
+              label={t("Workspace")}
               onNavigate={() => setMenuOpen(false)}
             />
-            <div className="slabel pt-2">projects</div>
-            <nav aria-label="Projects">
+            <div className="slabel pt-2">{t("projects")}</div>
+            <nav aria-label={t("Projects")}>
               <ProjectList
                 project={navProject}
                 projectHref={projectHref}
@@ -988,8 +992,8 @@ export default function App() {
             </nav>
             {/* The header carries these as icons under lg — here they keep
                 their words, so the meaning is one tap away on touch. */}
-            <div className="slabel pt-2">board</div>
-            <div role="region" aria-label="Board" className="flex flex-wrap items-center gap-1.5">
+            <div className="slabel pt-2">{t("board")}</div>
+            <div role="region" aria-label={t("Board")} className="flex flex-wrap items-center gap-1.5">
               <StatusChips
                 variant="menu"
                 readOnly={boardReadOnly}
@@ -1283,12 +1287,11 @@ export default function App() {
         )}
         {screen === "notFound" && (
           <main className="px-4 lg:px-8 pt-10 pb-9">
-            <h1 className="text-section font-semibold text-ink-100">Nothing lives here</h1>
+            <h1 className="text-section font-semibold text-ink-100">{t("Nothing lives here")}</h1>
             <p className="text-body text-ink-400 mt-2">
-              <span className="num break-all">{route.screen === "notFound" ? route.path : ""}</span> is
-              not a page of this board.{" "}
+              <span className="num break-all">{route.screen === "notFound" ? route.path : ""}</span> {t("is not a page of this board.")}{" "}
               <Link href={hrefFor({ screen: "home" })} className="lnk">
-                Go home
+                {t("Go home")}
               </Link>
             </p>
           </main>
@@ -1335,42 +1338,43 @@ function WorkspaceAppEntry({
   onInstallation: (installation: ActiveInstallation | null) => void;
   onBack: () => void;
 }) {
+  const { t } = useLocale();
   if (viewer.operator === null) {
     return (
       <main className="px-4 lg:px-8 pt-10 pb-9">
         {viewer.access === "unavailable" ? (
           <Notice state="access-unavailable">
-            <span role="status">Workspace waking or unreachable. {recheckFinished ? "Retry when ready." : "Checking again for up to 60 seconds…"}</span>
-            {recheckFinished && <button type="button" className="lnk ml-2" onClick={onRetryWorkspace}>Retry workspace</button>}
+            <span role="status">{t("Workspace waking or unreachable.")} {recheckFinished ? t("Retry when ready.") : t("Checking again for up to 60 seconds…")}</span>
+            {recheckFinished && <button type="button" className="lnk ml-2" onClick={onRetryWorkspace}>{t("Retry workspace")}</button>}
           </Notice>
-        ) : <Loading>Checking access…</Loading>}
+        ) : <Loading>{t("Checking access…")}</Loading>}
       </main>
     );
   }
   if (viewer.operator !== true) {
     return (
       <main className="px-4 lg:px-8 pt-10 pb-9">
-        <h1 className="text-section font-semibold text-ink-100">App unavailable</h1>
-        <p className="text-body text-ink-400 mt-2">Sign in as the operator to resolve an installed app.</p>
-        <Link href="/apps" className="lnk">All apps</Link>
+        <h1 className="text-section font-semibold text-ink-100">{t("App unavailable")}</h1>
+        <p className="text-body text-ink-400 mt-2">{t("Sign in as the operator to resolve an installed app.")}</p>
+        <Link href="/apps" className="lnk">{t("All apps")}</Link>
       </main>
     );
   }
   if (installations.error !== null) {
     return (
       <main className="px-4 lg:px-8 pt-10 pb-9">
-        <h1 className="text-section font-semibold text-ink-100">Couldn’t load installed apps</h1>
+        <h1 className="text-section font-semibold text-ink-100">{t("Couldn’t load installed apps")}</h1>
         <p className="text-body text-ink-400 mt-2" role="alert">
-          {appLoadErrorCopy(installations.error, "The installed-app list is unavailable.")}
+          {t(appLoadErrorCopy(installations.error, "The installed-app list is unavailable."))}
         </p>
-        <button type="button" className="lnk mt-3" onClick={installations.retry}>Retry</button>
+        <button type="button" className="lnk mt-3" onClick={installations.retry}>{t("Retry")}</button>
       </main>
     );
   }
   if (installations.list === null) {
     return (
       <main className="px-4 lg:px-8 pt-10 pb-9">
-        <p className="text-body text-ink-400" role="status">Loading installed apps…</p>
+        <p className="text-body text-ink-400" role="status">{t("Loading installed apps…")}</p>
       </main>
     );
   }
@@ -1381,18 +1385,18 @@ function WorkspaceAppEntry({
   if (matches.length === 0) {
     return (
       <main className="px-4 lg:px-8 pt-10 pb-9">
-        <h1 className="text-section font-semibold text-ink-100">App not installed</h1>
-        <p className="text-body text-ink-400 mt-2">No active installation with app key “{appKey}” was found.</p>
-        <Link href="/apps" className="lnk">All apps</Link>
+        <h1 className="text-section font-semibold text-ink-100">{t("App not installed")}</h1>
+        <p className="text-body text-ink-400 mt-2">{t("No active installation with app key “{appKey}” was found.").replace("{appKey}", () => appKey)}</p>
+        <Link href="/apps" className="lnk">{t("All apps")}</Link>
       </main>
     );
   }
   if (matches.length > 1) {
     return (
       <main className="px-4 lg:px-8 pt-10 pb-9">
-        <h1 className="text-section font-semibold text-ink-100">Choose an installation</h1>
+        <h1 className="text-section font-semibold text-ink-100">{t("Choose an installation")}</h1>
         <p className="text-body text-ink-400 mt-2">
-          More than one active installation uses app key “{appKey}”. Choose which installation to open.
+          {t("More than one active installation uses app key “{appKey}”. Choose which installation to open.").replace("{appKey}", () => appKey)}
         </p>
         <ul className="mt-4 space-y-2">
           {matches.map((installation) => (

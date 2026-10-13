@@ -138,8 +138,11 @@ loader.prototype.require = function (this: unknown, id: string) {
 };
 const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
+const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
 const AppShellModule = (require("../src/features/app-shell/AppShell") as typeof import("../src/features/app-shell/AppShell"));
-const AppShell = AppShellModule.default;
+const AppShellComponent = AppShellModule.default;
+const AppShell = (props: React.ComponentProps<typeof AppShellComponent>) =>
+  React.createElement(LocaleProvider, null, React.createElement(AppShellComponent, props));
 const entryApp = AppShellModule.entryApp;
 // Context moves ride real URL writes — the same `navigate` the shell
 // uses, so tests exercise adoption exactly like a pasted link.
@@ -270,7 +273,7 @@ async function settle(check: () => void) {
 win.sessionStorage.clear();
 history.pushState(null, "", "/app-installations/install-shell");
 await React.act(async () => {
-  root.render(React.createElement(AppShell, { installId: "install-shell", viewer: { operator: true, readOnly: false } }));
+  root.render(React.createElement(LocaleProvider, null, React.createElement(AppShell, { installId: "install-shell", viewer: { operator: true, readOnly: false } })));
 });
 await flush(); await flush(); await flush();
 assert(text().includes("All apps") && text().includes("Reports"), "← All apps back-link plus installed App title, deduped");
@@ -503,7 +506,7 @@ assert(text().includes("names no context"), "scopeless record link explains itse
 // Installation switch: outlet query stripped, chat draft and stream kept.
 history.pushState(null, "", "/app-installations/install-second?ctx=ctx-only&record=rec-1");
 await React.act(async () => {
-  root.render(React.createElement(AppShell, { installId: "install-second", viewer: { operator: true, readOnly: false } }));
+  root.render(React.createElement(LocaleProvider, null, React.createElement(AppShell, { installId: "install-second", viewer: { operator: true, readOnly: false } })));
 });
 await flush(); await flush(); await flush();
 assert(!location.search.includes("record=") && !location.search.includes("ctx="), "install switch strips stale outlet query");
@@ -547,11 +550,11 @@ function StubPicker({ installId }: { installId: string }) {
 // A stale remembered scope blocks the send before anything posts.
 win.sessionStorage.setItem("cadence.workspace-app.context.install-social", "ctx-gone");
 await React.act(async () => {
-  root.render(React.createElement(AppShell, {
+  root.render(React.createElement(LocaleProvider, null, React.createElement(AppShell, {
     installId: "install-social",
     viewer: { operator: true, readOnly: false },
     children: React.createElement(StubPicker, { installId: "install-social" }),
-  }));
+  })));
 });
 await flush(); await flush(); await flush();
 assert(!host.querySelector('[aria-label="App context"]'), "no shell selector — social workspace owns its own");
@@ -601,7 +604,7 @@ equal(socialPost?.body.app, { install_id: "install-social", context_id: "ctx-bet
 // Switching installation clears the stale social scope: the next
 // install sends its own scope, never the social one.
 await React.act(async () => {
-  root.render(React.createElement(AppShell, { installId: "install-second", viewer: { operator: true, readOnly: false } }));
+  root.render(React.createElement(LocaleProvider, null, React.createElement(AppShell, { installId: "install-second", viewer: { operator: true, readOnly: false } })));
 });
 await settle(() => assert(
   host.textContent?.includes("Only"),

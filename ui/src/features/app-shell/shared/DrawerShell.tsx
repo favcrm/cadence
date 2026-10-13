@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import Button from "../../../ui/Button";
+import { useTranslate } from "../../../lib/locale";
 import { useDrawerClose } from "./useDrawerClose";
 
 /**
@@ -78,6 +79,7 @@ function useScrimLeft(): number {
 }
 
 function OverflowMenu({ items, open, setOpen }: { items: DrawerMenuItem[]; open: boolean; setOpen: (v: boolean) => void }) {
+  const t = useTranslate();
   const wrap = useRef<HTMLDivElement | null>(null);
   const trigger = useRef<HTMLButtonElement | null>(null);
   useEffect(() => {
@@ -103,7 +105,7 @@ function OverflowMenu({ items, open, setOpen }: { items: DrawerMenuItem[]; open:
         ref={trigger}
         type="button"
         className="btn btn-sm btn-icon"
-        aria-label="More actions"
+        aria-label={t("More actions")}
         aria-haspopup="menu"
         aria-expanded={open}
         onClick={() => setOpen(!open)}
@@ -111,7 +113,7 @@ function OverflowMenu({ items, open, setOpen }: { items: DrawerMenuItem[]; open:
         ⋯
       </button>
       {open && (
-        <div className="crm-drawer-pop" role="menu" aria-label="More actions">
+        <div className="crm-drawer-pop" role="menu" aria-label={t("More actions")}>
           {items.map((item) => (
             <button
               key={item.key}
@@ -147,6 +149,7 @@ export default function DrawerShell(props: DrawerShellProps) {
   };
   const [menuOpen, setMenuOpen] = useState(false);
   const { closing, requestClose, onTransitionEnd } = useDrawerClose(onClose);
+  const t = useTranslate();
   const scrimLeft = useScrimLeft();
   const editing = edit != null;
 
@@ -207,7 +210,7 @@ export default function DrawerShell(props: DrawerShellProps) {
               {subtitle != null && <div className="crm-drawer-sub">{subtitle}</div>}
               {pills != null && <div className="crm-drawer-pills">{pills}</div>}
             </div>
-            <button type="button" className="btn btn-sm btn-ghost btn-icon" onClick={requestClose} aria-label={`Close ${label.toLowerCase()}`}>
+            <button type="button" className="btn btn-sm btn-ghost btn-icon" onClick={requestClose} aria-label={`${t("Close")} ${label.toLowerCase()}`}>
               ✕
             </button>
           </div>
@@ -215,7 +218,7 @@ export default function DrawerShell(props: DrawerShellProps) {
             <p className="crm-drawer-warn" data-testid="drawer-warning">{warning}</p>
           )}
           {state == null && !editing && tabs.length > 1 && (
-            <div className="crm-drawer-tabs" role="tablist" aria-label={`${label} sections`}>
+            <div className="crm-drawer-tabs" role="tablist" aria-label={`${label} ${t("sections")}`}>
               {tabs.map((t, i) => (
                 <button
                   key={t.id}
@@ -250,10 +253,10 @@ export default function DrawerShell(props: DrawerShellProps) {
               <>
                 <span className="crm-drawer-spacer" />
                 <Button size="sm" variant="ghost" onClick={edit.onCancel} disabled={edit.pending}>
-                  Cancel
+                  {t("Cancel")}
                 </Button>
                 <button type="submit" form={edit.formId} className="btn btn-sm btn-primary" disabled={edit.pending} aria-busy={edit.pending || undefined}>
-                  {edit.pending ? "Saving…" : (edit.saveLabel ?? "Save")}
+                  {edit.pending ? t("Saving…") : (edit.saveLabel ?? t("Save"))}
                 </button>
               </>
             ) : foot != null ? (

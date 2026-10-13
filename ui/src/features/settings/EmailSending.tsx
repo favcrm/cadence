@@ -26,6 +26,7 @@ import {
   senderLine,
   sendingFrom,
 } from "./emailSendingView";
+import { useTranslate } from "../../lib/locale";
 
 /**
  * Settings → Email sending (CAD-1059, CAD-1063 slice 2): the one place
@@ -56,7 +57,22 @@ async function loadTargets(signal: AbortSignal): Promise<Target[]> {
   return out;
 }
 
+// Stored status note: a UI-owned key (plus data), translated at render.
+type SendNote = { key: "chosen" | "changed" | "removed" | "connected" | "origin-cleared" | "origin-set"; value?: string };
+function renderNote(note: SendNote | null, t: (english: string) => string): string | null {
+  if (!note) return null;
+  switch (note.key) {
+    case "chosen": return t("Sender chosen.");
+    case "changed": return t("Sender changed.");
+    case "removed": return t("Sender removed.");
+    case "connected": return t("Connected. Campaigns now send from {sender}.").replace("{sender}", () => note.value ?? "");
+    case "origin-cleared": return t("Unsubscribe address cleared — sends refuse until one is set.");
+    case "origin-set": return t("Unsubscribe links now use {origin}.").replace("{origin}", () => note.value ?? "");
+  }
+}
+
 export default function EmailSending({ viewer }: { viewer: Viewer }) {
+  const t = useTranslate();
   const [targets, setTargets] = useState<Target[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [picked, setPicked] = useState(0);
@@ -80,58 +96,42 @@ export default function EmailSending({ viewer }: { viewer: Viewer }) {
   const target = targets?.[picked] ?? null;
   return (
     <section className="px-4 lg:px-8 py-5 min-w-0" aria-labelledby="email-sending-title">
-      <h1 id="email-sending-title" className="text-section font-medium text-ink-100">
-        Email sending
-      </h1>
-      <p className="text-label text-ink-400 mt-1 mb-4 break-words">
-        Choose where CRM campaign email is sent from. Campaigns use this sender; nothing is sent
-        until an operator approves a campaign.
-      </p>
+      <h1 id="email-sending-title" className="text-section font-medium text-ink-100">{t("Email sending")}</h1>
+      <p className="text-label text-ink-400 mt-1 mb-4 break-words">{t("Choose where CRM campaign email is sent from. Campaigns use this sender; nothing is sent until an operator approves a campaign.")}</p>
       {viewer.operator === null ? (
-        <PageState title={viewer.access === "unavailable" ? "Access could not be confirmed" : "Checking access…"}>
+        <PageState title={viewer.access === "unavailable" ? t("Access could not be confirmed") : t("Checking access…")}>
           {viewer.access === "unavailable" ? (
             <>
-              The board's access check did not answer, so email sending stays closed.{" "}
+              {t("The board's access check did not answer, so email sending stays closed.")}{" "}
               {viewer.onRetryAccess && (
-                <Button size="sm" onClick={viewer.onRetryAccess}>
-                  Retry access check
-                </Button>
+                <Button size="sm" onClick={viewer.onRetryAccess}>{t("Retry access check")}</Button>
               )}
             </>
           ) : (
-            "Checking whether this session may manage email sending…"
+            t("Checking whether this session may manage email sending…")
           )}
         </PageState>
       ) : !viewer.operator ? (
-        <PageState title="Operator access required">
-          Email sending is available to the operator. Use Sign in in the status bar if you
-          have operator access.
-        </PageState>
+        <PageState title={t("Operator access required")}>{t("Email sending is available to the operator. Use Sign in in the status bar if you have operator access.")}</PageState>
       ) : error !== null ? (
         <p className="text-label text-fail" role="alert">
           {error}
         </p>
       ) : targets === null ? (
-        <p className="text-label text-ink-400" role="status">
-          Loading…
-        </p>
+        <p className="text-label text-ink-400" role="status">{t("Loading…")}</p>
       ) : target === null ? (
-        <p className="text-label text-ink-400" data-state="no-crm">
-          No CRM is installed in this workspace, so there is nothing to send from yet.
-        </p>
+        <p className="text-label text-ink-400" data-state="no-crm">{t("No CRM is installed in this workspace, so there is nothing to send from yet.")}</p>
       ) : (
         <div className="grid gap-3 min-w-0">
           {targets.length > 1 && (
             <div className="crm-field">
-              <label className="text-label text-ink-300" htmlFor="email-sending-target">
-                CRM context
-              </label>
+              <label className="text-label text-ink-300" htmlFor="email-sending-target">{t("CRM context")}</label>
               <Select
                 id="email-sending-target"
                 value={String(picked)}
                 onChange={(v) => setPicked(Number(v))}
                 options={targets.map((t, i) => ({ value: String(i), label: t.label }))}
-                aria-label="CRM context"
+                aria-label={t("CRM context")}
                 full
               />
             </div>
@@ -145,6 +145,7 @@ export default function EmailSending({ viewer }: { viewer: Viewer }) {
 }
 
 function SenderCard({ scope, viewer }: { scope: HostScope; viewer: Viewer }) {
+  const t = useTranslate();
   const canWrite = viewer.operator === true && !viewer.readOnly;
   const [rows, setRows] = useState<Connection[] | null>(null);
   const [hostedSmtp, setHostedSmtp] = useState(false);
@@ -153,7 +154,7 @@ function SenderCard({ scope, viewer }: { scope: HostScope; viewer: Viewer }) {
   const [error, setError] = useState<string | null>(null);
   const [picked, setPicked] = useState("");
   const [pending, setPending] = useState(false);
-  const [note, setNote] = useState<string | null>(null);
+  const [note, setNote] = useState<SendNote | null>(null);
   const [confirmRevoke, setConfirmRevoke] = useState(false);
 
   useEffect(() => {
@@ -177,7 +178,7 @@ function SenderCard({ scope, viewer }: { scope: HostScope; viewer: Viewer }) {
   const choice = usable.find((r) => r.id === picked) ?? usable.find((r) => binding && r.id === binding.connectionId) ?? usable[0];
   const chosenId = choice?.id ?? "";
 
-  const run = (action: () => Promise<SmtpBinding | null>, ok: string) => {
+  const run = (action: () => Promise<SmtpBinding | null>, ok: SendNote) => {
     setPending(true);
     setError(null);
     setNote(null);
@@ -228,7 +229,7 @@ function SenderCard({ scope, viewer }: { scope: HostScope; viewer: Viewer }) {
         ? await sendClient.smtpRebind(scope, id, fresh.linkRevision)
         : await sendClient.smtpBind(scope, id, newAudienceId("bind"));
       setBinding(parseSmtpBinding(bound));
-      setNote(`Connected. Campaigns now send from ${d.sender}.`);
+      setNote({ key: "connected", value: d.sender });
     } catch (e: unknown) {
       setError(friendlySendError(e));
     }
@@ -236,28 +237,23 @@ function SenderCard({ scope, viewer }: { scope: HostScope; viewer: Viewer }) {
 
   const live = sendingFrom(binding);
   return (
-    <section aria-label="Sender" className="card px-4 py-4 grid gap-3 min-w-0">
-      <h2 className="text-cardtitle font-medium text-ink-100">Sender</h2>
+    <section aria-label={t("Sender")} className="card px-4 py-4 grid gap-3 min-w-0">
+      <h2 className="text-cardtitle font-medium text-ink-100">{t("Sender")}</h2>
       {hostedSmtp && canWrite && rows !== null && (
         <div className="grid gap-2 min-w-0" data-section="connect-email">
-          <h3 className="text-body font-medium text-ink-100">Connect your email (SMTP)</h3>
+          <h3 className="text-body font-medium text-ink-100">{t("Connect your email (SMTP)")}</h3>
           {emailRow && !replacing ? (
             <div className="grid gap-2">
               <p className="text-label text-ink-300 break-words" data-state="email-connected">
-                Connected: {emailAddress ?? emailRow.account}
+                {t("Connected: {account}").replace("{account}", () => String(emailAddress ?? emailRow.account))}
               </p>
               <div className="crm-toolbar">
-                <Button size="sm" onClick={() => setReplacing(true)}>
-                  Replace email account
-                </Button>
+                <Button size="sm" onClick={() => setReplacing(true)}>{t("Replace email account")}</Button>
               </div>
             </div>
           ) : (
             <>
-              <p className="text-label text-ink-400 break-words">
-                Send campaigns from your own email account. Pick your provider, then paste an
-                app password. We check the login before saving anything.
-              </p>
+              <p className="text-label text-ink-400 break-words">{t("Send campaigns from your own email account. Pick your provider, then paste an app password. We check the login before saving anything.")}</p>
               <HostedSmtpConnect
                 connected={emailAddress}
                 onConnect={connectEmail}
@@ -268,27 +264,23 @@ function SenderCard({ scope, viewer }: { scope: HostScope; viewer: Viewer }) {
         </div>
       )}
       {binding === undefined && error === null && (
-        <p className="text-label text-ink-400" role="status">
-          Reading the sender…
-        </p>
+        <p className="text-label text-ink-400" role="status">{t("Reading the sender…")}</p>
       )}
       {binding === null && (
         <p className="text-label text-ink-400" data-state="unbound">
-          {hostedSmtp ? "No sender chosen yet." : "No sender chosen yet. Pick one below."}
+          {hostedSmtp ? t("No sender chosen yet.") : t("No sender chosen yet. Pick one below.")}
         </p>
       )}
       {binding && live !== null && (
         <p className="text-body text-ink-100 break-words" data-state="live">
           {isHostedTransport(binding)
-            ? `Sending via AgenticOS — ${live}`
-            : `Sending from ${live}`}{" "}
+            ? t("Sending via AgenticOS — {live}").replace("{live}", () => live)
+            : t("Sending from {live}").replace("{live}", () => live)}{" "}
           <span aria-hidden="true">✓</span>
         </p>
       )}
       {binding && live === null && (
-        <p className="text-label text-fail" role="alert" data-state="stale">
-          The chosen sender needs re-checking. Choose it again below to continue sending.
-        </p>
+        <p className="text-label text-fail" role="alert" data-state="stale">{t("The chosen sender needs re-checking. Choose it again below to continue sending.")}</p>
       )}
       {error && (
         <p className="text-label text-fail break-words" role="alert">
@@ -297,37 +289,34 @@ function SenderCard({ scope, viewer }: { scope: HostScope; viewer: Viewer }) {
       )}
       {note && (
         <p className="text-label text-ok" role="status">
-          {note}
+          {renderNote(note, t)}
         </p>
       )}
       {rows !== null && unusable.length > 0 && (
-        <ul className="grid gap-1" aria-label="Senders that cannot be used">
+        <ul className="grid gap-1" aria-label={t("Senders that cannot be used")}>
           {unusable.map(({ row, reason }) => (
             <li key={row.id} className="text-label text-fail break-words" data-state="sender-unusable">
-              {row.account} can't be used yet. {reason}{" "}
-              <Link href="/settings/connections">Fix it in Settings → Connections</Link>.
+              {t("{account} can't be used yet. {reason}").replace("{account}", () => String(row.account ?? "")).replace("{reason}", () => String(reason ?? ""))} <Link href="/settings/connections">{t("Fix it in Settings → Connections")}</Link>.
             </li>
           ))}
         </ul>
       )}
       {rows !== null && !hostedSmtp && usable.length === 0 && unusable.length === 0 && (
         <p className="text-label text-ink-500">
-          No email sender is available. Add an SMTP sender under{" "}
-          <Link href="/settings/connections">Settings → Connections</Link>.
+          {t("No email sender is available. Add an SMTP sender under")}{" "}
+          <Link href="/settings/connections">{t("Settings → Connections")}</Link>.
         </p>
       )}
       {canWrite && usable.length > 0 && !(hostedSmtp && usable.length === 1 && emailRow && live !== null) && (
         <div className="crm-field-row">
           <div className="crm-field">
-            <label className="text-label text-ink-300" htmlFor="email-sender">
-              Send campaign email from
-            </label>
+            <label className="text-label text-ink-300" htmlFor="email-sender">{t("Send campaign email from")}</label>
             <Select
               id="email-sender"
               value={chosenId}
               onChange={setPicked}
               options={usable.map((r) => ({ value: r.id, label: senderLine(r) }))}
-              aria-label="Send campaign email from"
+              aria-label={t("Send campaign email from")}
               disabled={pending}
               full
             />
@@ -342,12 +331,10 @@ function SenderCard({ scope, viewer }: { scope: HostScope; viewer: Viewer }) {
                 onClick={() =>
                   run(
                     () => sendClient.smtpBind(scope, chosenId, newAudienceId("bind")).then(parseSmtpBinding),
-                    "Sender chosen.",
+                    { key: "chosen" },
                   )
                 }
-              >
-                Use this sender
-              </Button>
+              >{t("Use this sender")}</Button>
             ) : (
               binding && (
                 <>
@@ -359,15 +346,13 @@ function SenderCard({ scope, viewer }: { scope: HostScope; viewer: Viewer }) {
                     onClick={() =>
                       run(
                         () => sendClient.smtpRebind(scope, chosenId, binding.linkRevision).then(parseSmtpBinding),
-                        "Sender changed.",
+                        { key: "changed" },
                       )
                     }
                   >
-                    {live === null || chosenId !== binding.connectionId ? "Switch to this sender" : "Current sender"}
+                    {live === null || chosenId !== binding.connectionId ? t("Switch to this sender") : t("Current sender")}
                   </Button>
-                  <Button size="sm" variant="danger" disabled={pending} onClick={() => setConfirmRevoke(true)}>
-                    Stop using
-                  </Button>
+                  <Button size="sm" variant="danger" disabled={pending} onClick={() => setConfirmRevoke(true)}>{t("Stop using")}</Button>
                 </>
               )
             )}
@@ -376,23 +361,20 @@ function SenderCard({ scope, viewer }: { scope: HostScope; viewer: Viewer }) {
       )}
       {binding && (
         <details className="text-label text-ink-400" data-details="sender">
-          <summary className="cursor-pointer">Details</summary>
+          <summary className="cursor-pointer">{t("Details")}</summary>
           <p className="num break-all mt-1">
-            link r{binding.linkRevision} · auth r{binding.authRevision} · {binding.state} ·{" "}
-            {binding.digest.slice(0, 18)}…
+            {t("link r{linkRevision} · auth r{authRevision} · {state} ·").replace("{linkRevision}", String(binding.linkRevision ?? "")).replace("{authRevision}", String(binding.authRevision ?? "")).replace("{state}", () => String(binding.state ?? ""))} {binding.digest.slice(0, 18)}…
           </p>
         </details>
       )}
       {confirmRevoke && binding && (
         <ConfirmDialog
-          title="Stop using this sender?"
+          title={t("Stop using this sender?")}
           body={
             <p>
-              Campaigns can't send or test-send from {binding.sender.address} until a sender is
-              chosen again. A prepared send loses its approval.
-            </p>
+              {t("Campaigns can't send or test-send from {address} until a sender is chosen again. A prepared send loses its approval.").replace("{address}", () => String(binding.sender.address ?? ""))}</p>
           }
-          confirmLabel="Stop using"
+          confirmLabel={t("Stop using")}
           pending={pending}
           error={null}
           onCancel={() => setConfirmRevoke(false)}
@@ -401,7 +383,7 @@ function SenderCard({ scope, viewer }: { scope: HostScope; viewer: Viewer }) {
             run(async () => {
               await sendClient.smtpRevoke(scope, binding.linkRevision);
               return null;
-            }, "Sender removed.");
+            }, { key: "removed" });
           }}
         />
       )}
@@ -411,13 +393,14 @@ function SenderCard({ scope, viewer }: { scope: HostScope; viewer: Viewer }) {
 
 /** The daemon-wide unsubscribe origin — set once; every campaign uses it. */
 function OriginCard({ viewer }: { viewer: Viewer }) {
+  const t = useTranslate();
   const canWrite = viewer.operator === true && !viewer.readOnly;
   const [origin, setOrigin] = useState<string | null | undefined>(undefined);
   const [stored, setStored] = useState(false);
   const [input, setInput] = useState("");
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [note, setNote] = useState<string | null>(null);
+  const [note, setNote] = useState<SendNote | null>(null);
 
   const apply = (value: unknown) => {
     const receipt = parseOriginReceipt(value);
@@ -440,8 +423,8 @@ function OriginCard({ viewer }: { viewer: Viewer }) {
         const receipt = apply(value2);
         setNote(
           receipt.unsubscribeOrigin === null
-            ? "Unsubscribe address cleared — sends refuse until one is set."
-            : `Unsubscribe links now use ${receipt.unsubscribeOrigin}.`,
+            ? { key: "origin-cleared" }
+            : { key: "origin-set", value: receipt.unsubscribeOrigin },
         );
       })
       .catch((e: unknown) => setError(friendlySendError(e)))
@@ -449,17 +432,15 @@ function OriginCard({ viewer }: { viewer: Viewer }) {
   };
 
   return (
-    <section aria-label="Unsubscribe origin" className="card px-4 py-4 grid gap-3 min-w-0">
-      <h2 className="text-cardtitle font-medium text-ink-100">Unsubscribe address</h2>
+    <section aria-label={t("Unsubscribe origin")} className="card px-4 py-4 grid gap-3 min-w-0">
+      <h2 className="text-cardtitle font-medium text-ink-100">{t("Unsubscribe address")}</h2>
       {origin === undefined && error === null ? (
-        <p className="text-label text-ink-400" role="status">
-          Reading…
-        </p>
+        <p className="text-label text-ink-400" role="status">{t("Reading…")}</p>
       ) : (
         <p className="text-label text-ink-300 break-words">
-          Every email's unsubscribe link is built on{" "}
-          <span className="num">{origin ?? "nothing — sends refuse until one is set"}</span>
-          {stored ? " (set here)" : origin ? " (server default)" : ""}.
+          {t("Every email's unsubscribe link is built on")}{" "}
+          <span className="num">{origin ?? t("nothing — sends refuse until one is set")}</span>
+          {stored ? t("(set here)") : origin ? t("(server default)") : ""}.
         </p>
       )}
       {error && (
@@ -469,7 +450,7 @@ function OriginCard({ viewer }: { viewer: Viewer }) {
       )}
       {note && (
         <p className="text-label text-ok" role="status">
-          {note}
+          {renderNote(note, t)}
         </p>
       )}
       {canWrite && (
@@ -481,9 +462,7 @@ function OriginCard({ viewer }: { viewer: Viewer }) {
           }}
         >
           <div className="crm-field">
-            <label className="text-label text-ink-300" htmlFor="email-origin">
-              Origin (https; http on a loopback host)
-            </label>
+            <label className="text-label text-ink-300" htmlFor="email-origin">{t("Origin (https; http on a loopback host)")}</label>
             <input
               id="email-origin"
               className="field"
@@ -496,13 +475,9 @@ function OriginCard({ viewer }: { viewer: Viewer }) {
             />
           </div>
           <div className="crm-toolbar" style={{ alignSelf: "end" }}>
-            <Button type="submit" size="sm" loading={pending} disabled={pending}>
-              Save
-            </Button>
+            <Button type="submit" size="sm" loading={pending} disabled={pending}>{t("Save")}</Button>
             {stored && (
-              <Button size="sm" disabled={pending} onClick={() => save(null)}>
-                Clear
-              </Button>
+              <Button size="sm" disabled={pending} onClick={() => save(null)}>{t("Clear")}</Button>
             )}
           </div>
         </form>

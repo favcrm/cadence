@@ -5,6 +5,7 @@ import type { Agent, Overview } from "../../lib/types";
 import { kindSpec, metaLine, todoSplit, updateTitle, type HomeNeed } from "./needs";
 import AgentUpdates from "./AgentUpdates";
 import type { AgentUpdate } from "./agentUpdateModel";
+import { useTranslate } from "../../lib/locale";
 import { READ_ONLY_COPY } from "./AnswerForm";
 import ReviewDrawer from "./ReviewDrawer";
 import TodoCard from "./TodoCard";
@@ -49,6 +50,7 @@ export default function NeedsRail({
 }) {
   const [tab, setTab] = useState<"todo" | "updates">("todo");
   const block = useWriteBlock(readOnly);
+  const t = useTranslate();
   const { todo, updates, decided } = todoSplit(overview.data?.needs_me);
   const [drawer, setDrawer] = useState(false);
   const local = useTodoLocal();
@@ -97,15 +99,15 @@ export default function NeedsRail({
 
   const todoBody = (
     <>
-      {block && <p className="todo-note">{READ_ONLY_COPY}</p>}
+      {block && <p className="todo-note">{t(READ_ONLY_COPY)}</p>}
       {!overview.data && overview.status === "failed" && (
-        <p className="px-3 py-2.5 text-label text-fail break-words">The list couldn't be loaded. It will try again.</p>
+        <p className="px-3 py-2.5 text-label text-fail break-words">{t("The list couldn't be loaded. It will try again.")}</p>
       )}
       {!overview.data && overview.status !== "failed" && (
-        <p className="px-3 py-2.5 text-label text-ink-500">Reading what needs you…</p>
+        <p className="px-3 py-2.5 text-label text-ink-500">{t("Reading what needs you…")}</p>
       )}
       {overview.data && cards.length === 0 && (
-        <p className="px-3 py-3 text-label text-ink-400">Nothing needs you. The team is working.</p>
+        <p className="px-3 py-3 text-label text-ink-400">{t("Nothing needs you. The team is working.")}</p>
       )}
       <ul className="todo-list">
         {cards.map((n, i) => (
@@ -134,14 +136,14 @@ export default function NeedsRail({
           />
         ))}
       </ul>
-      {cards.length > 0 && <p className="todo-hint">Tap a card to see more. “Fix it” hands the problem to Master.</p>}
+      {cards.length > 0 && <p className="todo-hint">{t("Tap a card to see more. “Fix it” hands the problem to Master.")}</p>}
       {decided.length > 0 && (
         <section className="todo-decided" data-todo-decided>
           <button type="button" className="todo-decided-h" aria-expanded={showDecided} onClick={() => setShowDecided((s) => !s)}>
             <span className="steps-caret num" aria-hidden>
               ›
             </span>
-            Recently decided ({decided.length})
+            {t("Recently decided")} ({decided.length})
           </button>
           {showDecided && (
             <>
@@ -156,7 +158,7 @@ export default function NeedsRail({
                 ))}
               </ul>
               <Link href={permissionsHref} className="lnk text-label" onClick={() => setDrawer(false)}>
-                Standing rules are in Settings
+                {t("Standing rules are in Settings")}
               </Link>
             </>
           )}
@@ -188,19 +190,19 @@ export default function NeedsRail({
   );
 
   const tabs = (drawerMode: boolean) => (
-    <div className="todo-tabs" role="group" aria-label="Home rail">
+    <div className="todo-tabs" role="group" aria-label={t("Home rail")}>
       <button aria-pressed={tab === "todo"} onClick={() => setTab("todo")}>
-        To do <span className={`todo-count ${count ? "on" : ""}`}>{overview.data ? count : "…"}</span>
+        {t("To do")} <span className={`todo-count ${count ? "on" : ""}`}>{overview.data ? count : "…"}</span>
       </button>
       <button aria-pressed={tab === "updates"} onClick={() => setTab("updates")}>
-        Updates
+        {t("Updates")}
       </button>
       <span className="todo-tools">
         <Link href={overviewHref} className="lnk text-label" onClick={() => setDrawer(false)}>
-          Team overview
+          {t("Team overview")}
         </Link>
         {drawerMode ? (
-          <button type="button" className="lnk text-label" aria-label="close the rail" onClick={() => setDrawer(false)}>
+          <button type="button" className="lnk text-label" aria-label={t("close the rail")} onClick={() => setDrawer(false)}>
             ✕
           </button>
         ) : (
@@ -228,19 +230,19 @@ export default function NeedsRail({
           <button
             type="button"
             className="slimrail card"
-            aria-label={`to do — ${count} waiting; expand the rail`}
+            aria-label={t("to do — {count} waiting; expand the rail").replace("{count}", String(count))}
             onClick={onToggleCollapse}
           >
             <span className={`chip ${count ? "bg-warn/10 text-warn" : "bg-ok/15 text-ok"}`}>
               {overview.data ? count : "…"}
             </span>
-            <span className="vert text-label text-ink-400">To do</span>
+            <span className="vert text-label text-ink-400">{t("To do")}</span>
             <span className="text-ink-500" aria-hidden>
               «
             </span>
           </button>
         ) : (
-          <section className="card needsrail overflow-hidden" aria-label="to do" data-collapsed="false">
+          <section className="card needsrail overflow-hidden" aria-label={t("to do")} data-collapsed="false">
             {tabs(false)}
             <div className="rail-scroll min-h-0">{panelBody}</div>
           </section>
@@ -252,9 +254,9 @@ export default function NeedsRail({
         type="button"
         className="needbtn rail:hidden"
         onClick={() => setDrawer(true)}
-        aria-label={`to do — ${count} waiting; open the list`}
+        aria-label={t("to do — {count} waiting; open the list").replace("{count}", String(count))}
       >
-        To do
+        {t("To do")}
         <span className={`chip ${count ? "bg-warn/15 text-warn" : "bg-ok/15 text-ok"}`}>
           {overview.data ? count : "…"}
         </span>
@@ -262,7 +264,7 @@ export default function NeedsRail({
       {drawer && (
         <>
           <div className="needsscrim rail:hidden" onClick={() => setDrawer(false)} />
-          <section className="needsdrawer rail:hidden" role="dialog" aria-label="to do" aria-modal="true">
+          <section className="needsdrawer rail:hidden" role="dialog" aria-label={t("to do")} aria-modal="true">
             {tabs(true)}
             <div className="rail-scroll min-h-0 flex-1">{panelBody}</div>
           </section>

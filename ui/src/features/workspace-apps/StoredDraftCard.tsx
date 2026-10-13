@@ -2,9 +2,11 @@ import { useEffect, useState } from "react";
 import { plainTitle } from "./presentation";
 import { workspaceApps, type WorkspaceRun } from "./workspaceApps";
 import { ApiError } from "../../lib/api";
+import { useTranslate } from "../../lib/locale";
 
 /** Library previews come from the accepted artifact, never the source brief. */
 export function StoredDraftCard({ run, onOpen, onDenied }: { run: WorkspaceRun; onOpen: () => void; onDenied: () => void }) {
+  const t = useTranslate();
   const receipt = run.artifacts.find(item => run.reviews.some(review => review.artifact_digest === item.digest && review.decision === "approve"));
   const [text, setText] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -24,9 +26,9 @@ export function StoredDraftCard({ run, onOpen, onDenied }: { run: WorkspaceRun; 
     return () => controller.abort();
   }, [receipt?.id, receipt?.digest, onDenied]);
   return <button type="button" className="wa-post-card" onClick={onOpen}>
-    <span className="wa-status" data-tone="ok">Accepted text</span>
+    <span className="wa-status" data-tone="ok">{t("Accepted text")}</span>
     <strong>{plainTitle(run.snapshot.inputs, run.snapshot.workflow.title)}</strong>
-    <p>{error || (text === null ? "Loading stored draft…" : text.slice(0, 320))}</p>
-    <span className="wa-kicker">Open draft and review</span>
+    <p>{error || (text === null ? t("Loading stored draft…") : text.slice(0, 320))}</p>
+    <span className="wa-kicker">{t("Open draft and review")}</span>
   </button>;
 }

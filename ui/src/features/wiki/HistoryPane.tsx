@@ -5,6 +5,7 @@ import { wiki } from "./api";
 import { versionRows, versionWho, type WikiVersion } from "./history";
 import { diffLabel, unifiedDiffLines } from "./diff";
 import { DiffLines } from "./EditorPane";
+import { useTranslate } from "../../lib/locale";
 import Button from "../../ui/Button";
 import { Failure, Loading, Note, WikiToolbar } from "./shared";
 
@@ -27,6 +28,7 @@ export default function HistoryPane({
   onToast: (kind: "ok" | "err" | "warn", text: string) => void;
   onChanged: () => void;
 }) {
+  const t = useTranslate();
   const [entries, setEntries] = useState<WikiVersion[] | null>(null);
   const [currentRev, setCurrentRev] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
@@ -98,26 +100,26 @@ export default function HistoryPane({
 
   return (
     <>
-      <WikiToolbar path={path} navHref={navHref} label="History" actions={<>
-          <Button href={navHref({ screen: "wiki", mode: "browse", path, query: null })}>Back to page</Button>
+      <WikiToolbar path={path} navHref={navHref} label={t("History")} actions={<>
+          <Button href={navHref({ screen: "wiki", mode: "browse", path, query: null })}>{t("Back to page")}</Button>
           {canCompare && <Button
             variant="primary"
             disabled={readOnly || busy || !selected || selected === currentRev}
-            title={readOnly ? "writes are disabled — sign in as the operator" : undefined}
+            title={readOnly ? t("writes are disabled — sign in as the operator") : undefined}
             onClick={() => void restore()}
           >
-            Restore this version
+            {t("Restore this version")}
           </Button>}
       </>} />
 
-      {readOnly && canCompare && <Note warn>writes are disabled on this board — restore needs the operator.</Note>}
+      {readOnly && canCompare && <Note warn>{t("writes are disabled on this board — restore needs the operator.")}</Note>}
 
       {error !== null ? (
         <Failure what="could not load the history" error={error} />
       ) : entries === null ? (
         <Loading what="loading the history…" />
       ) : rows.length === 0 ? (
-        <Note>no history yet — the first save commits one revision.</Note>
+        <Note>{t("no history yet — the first save commits one revision.")}</Note>
       ) : (
         <div className={canCompare ? "wk-hsplit" : "wk-history-log"}>
           <div className="wk-ver">
@@ -142,12 +144,12 @@ export default function HistoryPane({
           </div>
           {canCompare && <div className="min-w-0">
             <div className="slabel wk-difflabel">
-              {selected && currentRev ? diffLabel(selected, currentRev) : "pick a revision to diff"}
+              {selected && currentRev ? diffLabel(selected, currentRev) : t("pick a revision to diff")}
             </div>
             {diff === null ? (
-              <Note>select a revision on the left to see what changed since.</Note>
+              <Note>{t("select a revision on the left to see what changed since.")}</Note>
             ) : diff === "" ? (
-              <Note>no textual difference between these revisions.</Note>
+              <Note>{t("no textual difference between these revisions.")}</Note>
             ) : (
               <DiffLines lines={unifiedDiffLines(diff)} />
             )}

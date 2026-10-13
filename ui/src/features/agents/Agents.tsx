@@ -8,6 +8,7 @@ import {
   type IssueIndex,
 } from "../../lib/scope";
 import { agentsEmptyCopy } from "../../lib/uxCopy";
+import { useTranslate } from "../../lib/locale";
 import { ResourceGate, StaleChip } from "../../ui/ResourceStatus";
 import { IconSearch } from "../../ui/icons";
 import Button from "../../ui/Button";
@@ -38,12 +39,13 @@ function RelatedIssues({
   index: IssueIndex;
   onOpenIssue: (id: string) => void;
 }) {
+  const t = useTranslate();
   const viaTask = new Set(activeTasks(agent).map((task) => task.issue));
   const ids = agentIssueIds(agent, index).filter((id) => !viaTask.has(id));
   if (ids.length === 0) return null;
   return (
     <div className="num text-micro text-ink-500 mt-1 flex flex-wrap items-center gap-x-1.5">
-      Issues
+      {t("Issues")}
       {ids.map((id) => (
         <button
           key={id}
@@ -69,6 +71,7 @@ function CardWork({
   agent: Agent;
   onOpenIssue: (id: string) => void;
 }) {
+  const t = useTranslate();
   const task = activeTasks(agent)[0];
   if (!task)
     return (
@@ -104,15 +107,15 @@ function CardWork({
         </span>
       </div>
       <div className="num text-micro text-ink-500 pl-3">
-        {live ? "running" : task.task_state}
+        {live ? t("running") : task.task_state}
         {task.job_title
           ? ` · ${task.job_title}`
           : task.job
             ? ` · ${task.job}`
             : ""}
-        {task.job_state ? ` · stage ${task.job_state}` : ""}
+        {task.job_state ? ` · ${t("stage")} ${task.job_state}` : ""}
         {activeTasks(agent).length > 1
-          ? ` · +${activeTasks(agent).length - 1} more`
+          ? ` · ${t("+{count} more").replace("{count}", String(activeTasks(agent).length - 1))}`
           : ""}
       </div>
     </div>
@@ -132,13 +135,14 @@ function AgentCard({
   onOpen: () => void;
   onOpenIssue: (id: string) => void;
 }) {
+  const t = useTranslate();
   const lifecycle = lifecycleOf(a);
   const tone = LIFECYCLE_SECTIONS.find((s) => s.key === lifecycle)!.tone;
-  const badge = lifecycleBadge(a);
+  const badge = lifecycleBadge(a, t);
   return (
     <article
       className={`agent-card tone-${tone}`}
-      aria-label={`Agent ${a.alias}`}
+      aria-label={t("Agent {alias}").replace("{alias}", () => a.alias)}
     >
       <div className="top">
         <div className="avwrap">
@@ -148,7 +152,7 @@ function AgentCard({
             still={lifecycle !== "active"}
           />
           {agentHoldsWorkButDead(a) && (
-            <span className="agent-hold" title="Dead but still holds work">
+            <span className="agent-hold" title={t("Dead but still holds work")}>
               !
             </span>
           )}
@@ -161,13 +165,13 @@ function AgentCard({
               event.stopPropagation();
               onOpen();
             }}
-            aria-label={`Open agent ${a.alias}`}
+            aria-label={t("Open agent {alias}").replace("{alias}", () => a.alias)}
           >
             {a.alias}
           </button>
           <p className="meta break-words">
-            {a.role ?? "Agent"} · {a.provider} ·{" "}
-            {a.group_root ? "root" : a.group}
+            {a.role ?? t("Agent")} · {a.provider} ·{" "}
+            {a.group_root ? t("root") : a.group}
           </p>
         </div>
       </div>
@@ -182,7 +186,7 @@ function AgentCard({
           {badge.label}
         </span>
         <span className={`agent-qchip${a.queued >= 100 ? " hot" : ""}`}>
-          {a.queued} queued
+          {t("{count} queued").replace("{count}", String(a.queued))}
         </span>
       </div>
     </article>
@@ -248,6 +252,7 @@ export default function Agents({
   onRetry: () => void;
   onRetryAssignments: () => void;
 }) {
+  const t = useTranslate();
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<AgentFilter>("current");
   const payload = state.data;
@@ -294,39 +299,46 @@ export default function Agents({
   };
   const emptyCopy =
     scoped.length === 0
-      ? agentsEmptyCopy(project)
+      ? t(agentsEmptyCopy(project))
       : filter === "current" && counts.current === 0 && !query.trim()
-        ? "No current agents. Select All, Stopped, or Mailboxes to see the full roster."
-      : "No agents match these filters.";
+        ? t("No current agents. Select All, Stopped, or Mailboxes to see the full roster.")
+      : t("No agents match these filters.");
   const agent = allAgents.find((a) => a.alias === open);
   const summary = !payload
     ? state.status === "failed"
-      ? "Agents unavailable"
-      : "Loading agents…"
+      ? t("Agents unavailable")
+      : t("Loading agents…")
     : scopeUnavailable
       ? issuesState.status === "failed"
-        ? "Assignments unavailable"
-        : "Loading assignments…"
-      : `${counts.current} current · ${scoped.length} ${project === "all" ? "total across all projects" : `total in ${project}`}`;
+        ? t("Assignments unavailable")
+        : t("Loading assignments…")
+      : t("{current} current · {total}")
+          .replace("{current}", String(counts.current))
+          .replace(
+            "{total}",
+            () => project === "all"
+              ? t("{count} total across all projects").replace("{count}", String(scoped.length))
+              : t("{count} total in {project}").replace("{count}", String(scoped.length)).replace("{project}", () => project),
+          );
 
   return (
     <main className="agents-page px-4 lg:px-8 pt-6 pb-9 w-full">
       <div className="flex flex-wrap items-center gap-3 mb-2">
-        <h1 className="text-section font-semibold text-ink-100">Agents</h1>
+        <h1 className="text-section font-semibold text-ink-100">{t("Agents")}</h1>
         <span className="text-label text-ink-500">{summary}</span>
         <StaleChip state={state} />
       </div>
       <p className="text-label text-ink-400 mb-5">
-        Current work, agent status, and recent activity.
+        {t("Current work, agent status, and recent activity.")}
       </p>
 
       {project !== "all" &&
         issuesState.data !== null &&
         (globalAgents.length > 0 || otherProjectAgents.length > 0) && (
           <p className="text-label text-ink-500 mb-4">
-            Agents working on or owning active issues in {project}.{" "}
+            {t("Agents working on or owning active issues in {project}.").replace("{project}", () => project)}{" "}
             {otherProjectAgents.length > 0 &&
-              `${otherProjectAgents.length} in other projects are visible in All projects.`}
+              t("{count} in other projects are visible in All projects.").replace("{count}", String(otherProjectAgents.length))}
           </p>
         )}
       {payload?.daemon === "unreachable" && (
@@ -334,7 +346,7 @@ export default function Agents({
           className="card mb-4 px-4 py-3 text-label text-warn border-warn/40"
           role="status"
         >
-          Daemon unavailable. Showing the last known agent state.
+          {t("Daemon unavailable. Showing the last known agent state.")}
         </div>
       )}
       <ResourceGate
@@ -347,17 +359,17 @@ export default function Agents({
         <div className="text-label text-warn mb-4 space-y-2">
           <p role={issuesState.status === "failed" ? "alert" : "status"}>
             {issuesState.status === "failed"
-              ? "Project issue assignments could not be loaded. Select All projects to see every agent."
-              : "Loading project issue assignments…"}
+              ? t("Project issue assignments could not be loaded. Select All projects to see every agent.")
+              : t("Loading project issue assignments…")}
           </p>
           {issuesState.status === "failed" && (
-            <Button onClick={onRetryAssignments}>Retry assignments</Button>
+            <Button onClick={onRetryAssignments}>{t("Retry assignments")}</Button>
           )}
         </div>
       )}
       {project !== "all" && issuesState.status === "stale" && (
         <p role="status" className="text-label text-warn mb-4">
-          Project issue assignments may be out of date.
+          {t("Project issue assignments may be out of date.")}
         </p>
       )}
 
@@ -366,7 +378,7 @@ export default function Agents({
           <div
             className="agents-triage"
             role="group"
-            aria-label="Agent lifecycle triage"
+            aria-label={t("Agent lifecycle triage")}
           >
             {TRIAGE.map((cell) => (
               <button
@@ -379,7 +391,7 @@ export default function Agents({
                 <span className="agents-triage-n">
                   {scoped.filter(cell.count).length}
                 </span>
-                <span className="agents-triage-t">{cell.label}</span>
+                <span className="agents-triage-t">{t(cell.label)}</span>
               </button>
             ))}
           </div>
@@ -387,7 +399,7 @@ export default function Agents({
             <div
               className="agents-filters"
               role="group"
-              aria-label="Filter agents by status"
+              aria-label={t("Filter agents by status")}
             >
               {AGENT_FILTERS.filter(
                 (f) =>
@@ -400,30 +412,32 @@ export default function Agents({
                   aria-pressed={filter === value}
                   onClick={() => setFilter(value)}
                 >
-                  {label}
+                  {t(label)}
                   <span className="num">{counts[value]}</span>
                 </button>
               ))}
             </div>
             <label className="agents-search" htmlFor="agents-search">
               <IconSearch />
-              <span className="sr-only">Search agents</span>
+              <span className="sr-only">{t("Search agents")}</span>
               <input
                 id="agents-search"
                 type="search"
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
-                placeholder="Search agents, work, or issues"
+                placeholder={t("Search agents, work, or issues")}
               />
             </label>
           </div>
           {filtered && (
             <div className="flex items-center gap-3 mb-3 text-label text-ink-500">
               <span role="status">
-                Showing {agents.length} of {scoped.length} agents
+                {t("Showing {shown} of {total} agents")
+                  .replace("{shown}", String(agents.length))
+                  .replace("{total}", String(scoped.length))}
               </span>
               <Button variant="ghost" size="sm" onClick={reset}>
-                Clear filters
+                {t("Clear filters")}
               </Button>
             </div>
           )}
@@ -435,7 +449,7 @@ export default function Agents({
             sections.map((section) => (
               <section key={section.key}>
                 <div className="agents-sec">
-                  <h2>{section.title}</h2>
+                  <h2>{t(section.title)}</h2>
                   <span className="cnt">{section.agents.length}</span>
                   <span className="rule" aria-hidden="true" />
                 </div>
@@ -458,10 +472,10 @@ export default function Agents({
             globalAgents.length > 0 && (
               <details className="mt-5 agents-unassigned">
                 <summary className="text-label text-ink-500 cursor-pointer">
-                  Global or unassigned agents · {globalAgents.length}
+                  {t("Global or unassigned agents · {count}").replace("{count}", String(globalAgents.length))}
                 </summary>
                 <p className="text-label text-ink-500 my-2">
-                  These agents have no issue assignment to a project.
+                  {t("These agents have no issue assignment to a project.")}
                 </p>
                 <div className="flex flex-wrap gap-2">
                   {globalAgents.map((a) => (

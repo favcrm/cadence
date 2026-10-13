@@ -5,6 +5,7 @@ import { WorkspaceDialog } from "./WorkspaceDialog";
 import { ApiError } from "../../lib/api";
 import { workspaceApps, type CapabilityQuote } from "./workspaceApps";
 import { effectivePrompt, promptDefault, promptError } from "./promptFields";
+import { useTranslate } from "../../lib/locale";
 
 export interface NewPostValues {
   title: string;
@@ -62,6 +63,7 @@ export function NewPost({
   contextDefaults?: Record<string, string>;
   contextLabel?: string;
 }) {
+  const t = useTranslate();
   const [title, setTitle] = useState("");
   const [source, setSource] = useState(selectedSource?.caption ?? "");
   const [sourceChoice, setSourceChoice] = useState(selectedSource ?? null);
@@ -110,8 +112,8 @@ export function NewPost({
   const imageDefault = promptDefault("image_prompt", workflowInputs[workflow], contextDefaults);
   const contentEffective = effectivePrompt(contentPrompt, contentDefault);
   const imageEffective = effectivePrompt(imagePrompt, imageDefault);
-  const promptValidation = promptError(contentEffective.value, "Content prompt") ||
-    (imageWorkflow ? promptError(imageEffective.value, "Image prompt") : null);
+  const promptValidation = promptError(contentEffective.value, "Content prompt", t) ||
+    (imageWorkflow ? promptError(imageEffective.value, "Image prompt", t) : null);
   useEffect(() => {
     setContentPrompt(contentDefault.value);
     setImagePrompt(imageDefault.value);
@@ -166,26 +168,26 @@ export function NewPost({
     });
   };
   return (
-    <WorkspaceDialog title="New post" onClose={onClose}>
+    <WorkspaceDialog title={t("New post")} onClose={onClose}>
       <form className="wa-stack" onSubmit={submit}>
         <p className="wa-muted">
-          {sourceChoice ? "Review the chosen retained Instagram post before making a new caption. An image option appears when a draft provider is bound." : "Paste the facts your team should use. You’ll review the frozen plan"}
-          {!sourceChoice && " before the writer starts. Releasing the accepted text is a separate decision."}
+          {sourceChoice ? t("Review the chosen retained Instagram post before making a new caption. An image option appears when a draft provider is bound.") : t("Paste the facts your team should use. You’ll review the frozen plan")}
+          {!sourceChoice && t(" before the writer starts. Releasing the accepted text is a separate decision.")}
         </p>
         {(error || validation) && (
           <p className="wa-alert" data-tone="fail" role="alert">
-            {error || validation}
+            {t(error || validation || "")}
           </p>
         )}
         {imageSupported && (!imageBindingDigest
-          ? <p className="wa-alert">To add an image, choose a ready image generation connection in Cadence Settings.</p>
+          ? <p className="wa-alert">{t("To add an image, choose a ready image generation connection in Cadence Settings.")}</p>
           : imageQuote
-            ? <p className="wa-alert">The image option is ready — the frozen plan needs your approval before the writer starts.</p>
+            ? <p className="wa-alert">{t("The image option is ready — the frozen plan needs your approval before the writer starts.")}</p>
             : imageQuoteError
-              ? <p className="wa-alert" data-tone="fail" role="alert">{imageQuoteError}</p>
-              : <p className="wa-muted" role="status">Checking the image option…</p>)}
+              ? <p className="wa-alert" data-tone="fail" role="alert">{t(imageQuoteError)}</p>
+              : <p className="wa-muted" role="status">{t("Checking the image option…")}</p>)}
         <div className="wa-field">
-          <label htmlFor="wa-post-title">Post title</label>
+          <label htmlFor="wa-post-title">{t("Post title")}</label>
           <input
             id="wa-post-title"
             name="title"
@@ -198,7 +200,7 @@ export function NewPost({
           />
         </div>
         <div className="wa-field">
-          <label htmlFor="wa-post-source">Source facts</label>
+          <label htmlFor="wa-post-source">{t("Source facts")}</label>
           <textarea
             id="wa-post-source"
             name="source"
@@ -212,24 +214,24 @@ export function NewPost({
             aria-describedby="wa-source-help"
           />
           <p id="wa-source-help" className="wa-kicker">
-            {sourceChoice ? <>From @{sourceChoice.handle} · <a href={sourceChoice.permalink} target="_blank" rel="noopener noreferrer">View original post</a> · receipt {sourceChoice.receiptId}. The selected text cannot be edited while linked to this receipt.</> : "Paste one paragraph without line breaks. A ready image connection also allows a separate image draft from these facts."}
+            {sourceChoice ? <>{t("From @{handle}").replace("{handle}", () => sourceChoice.handle)} · <a href={sourceChoice.permalink} target="_blank" rel="noopener noreferrer">{t("View original post")}</a> · {t("receipt {receipt}").replace("{receipt}", () => sourceChoice.receiptId)}{t(". The selected text cannot be edited while linked to this receipt.")}</> : t("Paste one paragraph without line breaks. A ready image connection also allows a separate image draft from these facts.")}
           </p>
-          {sourceChoice && <Button onClick={() => { setSourceChoice(null); setSource(""); if (workflow === "image-instagram") setWorkflow(""); }}>Use pasted facts instead</Button>}
+          {sourceChoice && <Button onClick={() => { setSourceChoice(null); setSource(""); if (workflow === "image-instagram") setWorkflow(""); }}>{t("Use pasted facts instead")}</Button>}
         </div>
         <div className="wa-field">
-          <label htmlFor="wa-workflow">Workflow</label>
+          <label htmlFor="wa-workflow">{t("Workflow")}</label>
           <Select
             id="wa-workflow"
             value={workflow}
             onChange={setWorkflow}
             options={availableWorkflows}
-            placeholder="Choose workflow"
+            placeholder={t("Choose workflow")}
             disabled={busy}
             full
           />
         </div>
         <div className="wa-field">
-          <label htmlFor="wa-content-prompt">Content prompt</label>
+          <label htmlFor="wa-content-prompt">{t("Content prompt")}</label>
           <textarea
             id="wa-content-prompt"
             name="content_prompt"
@@ -241,13 +243,13 @@ export function NewPost({
             aria-describedby="wa-content-prompt-help"
           />
           <p id="wa-content-prompt-help" className="wa-kicker">
-            {contentEffective.origin === "run_override" ? "This post overrides " : "Using "}
-            {contentDefault.origin === "context_default" ? `${contextLabel || "brand"}’s saved default` : "the app default"}.
-            Clear the field to use that default. This guides wording; source facts and review rules still apply.
+            {contentEffective.origin === "run_override" ? t("This post overrides") : t("Using")}{" "}
+            {contentDefault.origin === "context_default" ? t("{brand}’s saved default").replace("{brand}", () => contextLabel || t("brand")) : t("the app default")}.{" "}
+            {t("Clear the field to use that default. This guides wording; source facts and review rules still apply.")}
           </p>
         </div>
         <div className="wa-field">
-          <label htmlFor="wa-image-prompt">Image prompt</label>
+          <label htmlFor="wa-image-prompt">{t("Image prompt")}</label>
           <textarea
             id="wa-image-prompt"
             name="image_prompt"
@@ -260,19 +262,19 @@ export function NewPost({
           />
           <p id="wa-image-prompt-help" className="wa-kicker">
             {imageWorkflow && imageQuote
-              ? <>{imageEffective.origin === "run_override" ? "This post overrides " : "Using "}{imageDefault.origin === "context_default" ? `${contextLabel || "brand"}’s saved default` : "the app default"}. Clear the field to use that default. The provider and asset rules stay fixed.</>
-              : "Choose an image workflow with a ready generated image connection to edit this prompt."}
+              ? <>{imageEffective.origin === "run_override" ? t("This post overrides") : t("Using")}{" "}{imageDefault.origin === "context_default" ? t("{brand}’s saved default").replace("{brand}", () => contextLabel || t("brand")) : t("the app default")}. {t("Clear the field to use that default. The provider and asset rules stay fixed.")}</>
+              : t("Choose an image workflow with a ready generated image connection to edit this prompt.")}
           </p>
         </div>
-        {workflow && <section className="wa-panel wa-stack" aria-label="Effective prompts for this plan">
-          <h3>Effective prompts for this plan</h3>
-          <p><strong>Content · {contentEffective.origin === "run_override" ? "this post’s override" : contentEffective.origin === "context_default" ? "saved brand default" : "app default"}</strong><br />{contentEffective.value || "No prompt default is installed for this workflow."}</p>
-          {imageWorkflow && <p><strong>Image · {imageEffective.origin === "run_override" ? "this post’s override" : imageEffective.origin === "context_default" ? "saved brand default" : "app default"}</strong><br />{imageEffective.value || "No prompt default is installed for this workflow."}</p>}
-          <p className="wa-kicker">The effective text is frozen when you create the plan. A later default edit cannot change that plan.</p>
+        {workflow && <section className="wa-panel wa-stack" aria-label={t("Effective prompts for this plan")}>
+          <h3>{t("Effective prompts for this plan")}</h3>
+          <p><strong>{t("Content")} · {contentEffective.origin === "run_override" ? t("this post’s override") : contentEffective.origin === "context_default" ? t("saved brand default") : t("app default")}</strong><br />{contentEffective.value || "No prompt default is installed for this workflow."}</p>
+          {imageWorkflow && <p><strong>{t("Image")} · {imageEffective.origin === "run_override" ? "this post’s override" : imageEffective.origin === "context_default" ? "saved brand default" : "app default"}</strong><br />{imageEffective.value || "No prompt default is installed for this workflow."}</p>}
+          <p className="wa-kicker">{t("The effective text is frozen when you create the plan. A later default edit cannot change that plan.")}</p>
         </section>}
         <div className="wa-fields">
           <div className="wa-field">
-            <label htmlFor="wa-owner">Responsible PM</label>
+            <label htmlFor="wa-owner">{t("Responsible PM")}</label>
             <Select
               id="wa-owner"
               value={ownerPm}
@@ -282,13 +284,13 @@ export function NewPost({
                 setReviewer("");
               }}
               options={managers}
-              placeholder="Choose PM"
+              placeholder={t("Choose PM")}
               disabled={busy}
               full
             />
           </div>
           <div className="wa-field">
-            <label htmlFor="wa-writer">Writer</label>
+            <label htmlFor="wa-writer">{t("Writer")}</label>
             <Select
               id="wa-writer"
               value={writer}
@@ -297,13 +299,13 @@ export function NewPost({
                 if (value === reviewer) setReviewer("");
               }}
               options={eligibleWorkers}
-              placeholder={ownerPm ? "Choose writer" : "Choose a PM first"}
+              placeholder={ownerPm ? t("Choose writer") : t("Choose a PM first")}
               disabled={busy || !ownerPm}
               full
             />
           </div>
           <div className="wa-field">
-            <label htmlFor="wa-reviewer">Independent reviewer</label>
+            <label htmlFor="wa-reviewer">{t("Independent reviewer")}</label>
             <Select
               id="wa-reviewer"
               value={reviewer}
@@ -312,7 +314,7 @@ export function NewPost({
                 ...option,
                 disabled: option.disabled || option.value === writer,
               }))}
-              placeholder={ownerPm ? "Choose reviewer" : "Choose a PM first"}
+              placeholder={ownerPm ? t("Choose reviewer") : t("Choose a PM first")}
               disabled={busy || !ownerPm}
               full
             />
@@ -320,23 +322,21 @@ export function NewPost({
         </div>
         {!workers.length && (
           <p className="wa-alert">
-            No registered workers are available. Set up a writer and reviewer
-            before creating a post.
+            {t("No registered workers are available. Set up a writer and reviewer before creating a post.")}
           </p>
         )}
         {ownerPm && eligibleWorkers.length < 2 && (
           <p className="wa-alert">
-            This PM needs two different registered workers for writing and
-            review.
+            {t("This PM needs two different registered workers for writing and review.")}
           </p>
         )}
         {!managers.length && (
           <p className="wa-alert">
-            No registered PM is available to own this run.
+            {t("No registered PM is available to own this run.")}
           </p>
         )}
         <Button type="submit" variant="primary" loading={busy}>
-          Create plan
+          {t("Create plan")}
         </Button>
       </form>
     </WorkspaceDialog>

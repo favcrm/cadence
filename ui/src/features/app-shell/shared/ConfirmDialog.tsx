@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type React from "react";
 import Button from "../../../ui/Button";
+import { useTranslate } from "../../../lib/locale";
 
 /** A modal confirm: the operator's typed `expect` must equal
  *  `match` before `confirmLabel` enables. Esc cancels, the input
@@ -30,6 +31,7 @@ export default function ConfirmDialog({
   onConfirm: () => void;
   onCancel: () => void;
 }) {
+  const t = useTranslate();
   const [typed, setTyped] = useState("");
   const inputRef = useRef<HTMLInputElement | null>(null);
   useEffect(() => {
@@ -56,7 +58,7 @@ export default function ConfirmDialog({
         {expect !== undefined && (
           <div className="crm-field">
             <label className="text-label text-ink-300" htmlFor="crm-confirm-input">
-              {inputLabel ?? `Type ${match} to confirm`}
+              {inputLabel ?? `${t("Type")} ${match} ${t("to confirm")}`}
             </label>
             <input
               id="crm-confirm-input"
@@ -78,7 +80,7 @@ export default function ConfirmDialog({
         )}
         <div className="crm-toolbar">
           <Button size="sm" onClick={onCancel} disabled={pending}>
-            Cancel
+            {t("Cancel")}
           </Button>
           <Button
             size="sm"
