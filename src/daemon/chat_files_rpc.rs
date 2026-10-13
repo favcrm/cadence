@@ -265,16 +265,32 @@ impl Shared {
         let key = required_str(proof, "key")?;
         let origin = crate::operator_auth::Origin::parse(required_str(proof, "origin")?)
             .ok_or_else(|| Error::rejected("chat upload session origin is invalid"))?;
-        let session = self
-            .operator_auth()
-            .verified_session(token, key, origin, self.operator_now())?
-            .ok_or_else(|| Error::rejected("chat upload session is no longer valid"))?;
-        if session
-            .user
-            .as_ref()
-            .is_some_and(|user| !user.is_operator())
-            || (origin == crate::operator_auth::Origin::Public
-                && !session.user.as_ref().is_some_and(|user| user.is_operator()))
+        let session = if origin == crate::operator_auth::Origin::Public {
+            match self.current_public_session(token)? {
+                crate::daemon::public_membership::Authority::Granted { role, view, .. }
+                    if role.is_operator() =>
+                {
+                    *view
+                }
+                crate::daemon::public_membership::Authority::Granted { .. } => {
+                    return Err(Error::rejected(
+                        "chat upload needs an authenticated operator",
+                    ));
+                }
+                crate::daemon::public_membership::Authority::Denied => {
+                    return Err(Error::rejected("chat upload session is no longer valid"));
+                }
+            }
+        } else {
+            self.operator_auth()
+                .verified_session(token, key, origin, self.operator_now())?
+                .ok_or_else(|| Error::rejected("chat upload session is no longer valid"))?
+        };
+        if origin != crate::operator_auth::Origin::Public
+            && session
+                .user
+                .as_ref()
+                .is_some_and(|user| !user.is_operator())
         {
             return Err(Error::rejected(
                 "chat upload needs an authenticated operator",

@@ -505,3 +505,5 @@ impl Fx {
         .unwrap()
     }
 }
+
+include!("cad1337_repair_acceptance.rs");

@@ -1089,3 +1089,5 @@ fn cad1337_upload_refuses_writable_workspace_and_parent() {
         "production upload custody admitted non-sticky writable parents: {admitted:?}"
     );
 }
+
+include!("cad1337_repair_acceptance.rs");

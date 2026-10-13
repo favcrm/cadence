@@ -78,6 +78,8 @@ struct Audit {
 /// One prepared frame of a batch mutation: its audit record and the safe rows it names.
 type Frames = Vec<(Audit, Vec<auth::AuditTarget>)>;
 
+const UPLOAD_ACCOUNT_SETUP_COMPENSATION_REASON: &str = "upload_account_setup_compensation";
+
 /// The verified human a row names: a signed-session snapshot, labelled as such.
 fn human_json(t: &auth::AuditTarget) -> Value {
     json!({
@@ -172,6 +174,25 @@ fn stolen_audit(
         resource: resource_of(targets),
         reason: "presented_by_agent",
         agent: agent.map(str::to_string),
+        request: request.to_string(),
+    }
+}
+
+/// A server-side compensation for a public session whose upload-account
+/// setup failed after the prepared open was durably applied.
+fn upload_account_setup_compensation_audit(
+    company: Option<String>,
+    request: &str,
+    targets: &[auth::AuditTarget],
+) -> Audit {
+    Audit {
+        action: "board_session_revoked",
+        actor_kind: "system",
+        human: Value::Null,
+        company,
+        resource: resource_of(targets),
+        reason: UPLOAD_ACCOUNT_SETUP_COMPENSATION_REASON,
+        agent: None,
         request: request.to_string(),
     }
 }
@@ -676,7 +697,12 @@ impl Shared {
             Err(e) => {
                 // Prepared accepted and the Auth write failed: uncertain.
                 if let (Some(a), Some(row)) = (audit, opened_row) {
-                    self.finish_uncertain(&a, std::slice::from_ref(&row));
+                    if self
+                        .finish_uncertain(&a, std::slice::from_ref(&row))
+                        .is_err()
+                    {
+                        return Err(self.terminal_unavailable());
+                    }
                 }
                 return Err(e);
             }
@@ -695,20 +721,37 @@ impl Shared {
                 ))
             }
             Some(mut opened) => {
-                let account_id = match self.store.chat_upload_account(&principal, "authenticated") {
-                    Ok(id) => id,
-                    Err(error) => {
-                        let _ = self.operator_auth().revoke_token(&opened.token);
-                        return Err(error);
-                    }
-                };
-                opened.session = match self
-                    .operator_auth()
-                    .bind_account(&opened.token, &account_id)
-                {
+                let account_binding = self
+                    .store
+                    .chat_upload_account(&principal, "authenticated")
+                    .and_then(|account_id| {
+                        self.operator_auth()
+                            .bind_account(&opened.token, &account_id)
+                    });
+                opened.session = match account_binding {
                     Ok(session) => session,
                     Err(error) => {
-                        let _ = self.operator_auth().revoke_token(&opened.token);
+                        // The public open already changed durable Auth state. Keep
+                        // its prepared frame uncertain, then compensate through
+                        // the same audited intent/settlement path as other revokes.
+                        let open_uncertain = match audit.as_ref().zip(opened_row.as_ref()) {
+                            Some((a, row)) => self.finish_uncertain(a, std::slice::from_ref(row)),
+                            None => Err(self.terminal_unavailable()),
+                        };
+                        let mut frames = Frames::new();
+                        let cleanup = self.operator_auth().revoke_token_with_intent(
+                            &opened.token,
+                            |targets| {
+                                frames = self.prepare_groups(targets, |company, rows| {
+                                    upload_account_setup_compensation_audit(company, &request, rows)
+                                })?;
+                                Ok(())
+                            },
+                        );
+                        let cleanup = self.settle_frames(frames, cleanup.map(usize::from));
+                        if open_uncertain.is_err() || !matches!(cleanup, Ok(1)) {
+                            return Err(self.terminal_unavailable());
+                        }
                         return Err(error);
                     }
                 };
@@ -873,12 +916,11 @@ impl Shared {
     }
 
     /// The `Auth` write failed after `prepared` was accepted: the outcome is
-    /// unknown. Write it as uncertain (best effort) and never as a clean no-op.
-    fn finish_uncertain(&self, a: &Audit, targets: &[auth::AuditTarget]) {
+    /// unknown. Record uncertainty and never claim a clean no-op.
+    fn finish_uncertain(&self, a: &Audit, targets: &[auth::AuditTarget]) -> Result<()> {
         let payload = self.audit_payload(a, targets, "uncertain");
-        let _ = self
-            .store
-            .event_public(DAEMON_ALIAS, "board_session_mutation_finished", payload);
+        self.store
+            .event_public(DAEMON_ALIAS, "board_session_mutation_finished", payload)
     }
 
     /// Prepare one frame per company group, all BEFORE any `Auth` write. A
@@ -905,10 +947,17 @@ impl Shared {
     fn settle_frames(&self, frames: Frames, result: Result<usize>) -> Result<usize> {
         match result {
             Err(e) => {
+                let mut recorded = true;
                 for (a, rows) in &frames {
-                    self.finish_uncertain(a, rows);
+                    if self.finish_uncertain(a, rows).is_err() {
+                        recorded = false;
+                    }
                 }
-                Err(e)
+                if recorded {
+                    Err(e)
+                } else {
+                    Err(self.terminal_unavailable())
+                }
             }
             Ok(n) => {
                 let mut all = true;
@@ -927,7 +976,7 @@ impl Shared {
     fn terminal_unavailable(&self) -> Error {
         Error::invalid(
             "state_outcome_unavailable",
-            "the session change may have happened, but its completion record could not be written; prepared record retained, not retried",
+            "the session change may have happened, but its durable outcome could not be confirmed; prepared record retained, not retried",
         )
     }
 
