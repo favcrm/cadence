@@ -2607,10 +2607,10 @@ fn cad1337_acc_export_refuses_unapproved_chat_files_owner_column() {
         git(&tracker, &["status", "--porcelain=v1", "--untracked-files=all"]);
     let control_out = root.join("known-schema-control");
     export_portable(&state, &control_out, &opts(&tracker))
-        .expect("known schema-40 fixture exports successfully");
+        .expect("known schema-41 fixture exports successfully");
     assert!(
         control_out.is_dir() && no_partial(&control_out),
-        "known schema-40 control export succeeds without partial staging"
+        "known schema-41 control export succeeds without partial staging"
     );
     {
         let conn = Connection::open(db_file(&state)).unwrap();

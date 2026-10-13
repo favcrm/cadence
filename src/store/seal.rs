@@ -2513,7 +2513,7 @@ mod tests {
         drop(fixture);
         store
             .propose_close(
-                &permit(&db, OwnerOp::Close, b"schema-44", "attempt-44", "art", 44),
+                &permit(&db, OwnerOp::Close, b"schema-45", "attempt-45", "art", 44),
                 "test",
             )
             .unwrap();
@@ -2537,8 +2537,8 @@ mod tests {
             .witness_commit(&permit(
                 &db,
                 OwnerOp::Witness,
-                b"schema-44",
-                "attempt-44",
+                b"schema-45",
+                "attempt-45",
                 "art",
                 44,
             ))
@@ -2576,8 +2576,8 @@ mod tests {
     }
 
     #[test]
-    fn current_schema45_owner_witness_refuses_future46() {
-        // Positive control: a real current (45) database is accepted by the real guard.
+    fn current_schema44_owner_witness_refuses_future45() {
+        // Positive control: a real current (46) database is accepted by the real guard.
         {
             let dir = TempDir::new().unwrap();
             let (db, store) = open_legacy(&dir);
@@ -2585,35 +2585,35 @@ mod tests {
                 .conn()
                 .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(actual, 45, "current contract schema must be 45");
+            assert_eq!(actual, 46, "current contract schema must be 46");
             store
                 .propose_close(
-                    &permit(&db, OwnerOp::Close, b"c44", "a44", "art", 1),
+                    &permit(&db, OwnerOp::Close, b"c45", "a45", "art", 1),
                     "test",
                 )
                 .unwrap();
             store
-                .witness_commit(&permit(&db, OwnerOp::Witness, b"c44", "a44", "art", 1))
-                .expect("schema 44 must be accepted by the real guard");
+                .witness_commit(&permit(&db, OwnerOp::Witness, b"c45", "a45", "art", 1))
+                .expect("schema 46 must be accepted by the real guard");
             let witnessed: i64 = store
                 .conn()
                 .query_row("SELECT db_schema FROM owner_witness", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(witnessed, 45, "positive control must record db_schema 45");
+            assert_eq!(witnessed, 46, "positive control must record db_schema 46");
         }
-        // Bad case: a separate store, forged schema_version 46 (above
+        // Bad case: a separate store, forged schema_version 47 (above
         // PROTECTED_SCHEMA_MAX) via raw SQLite.
         let dir = TempDir::new().unwrap();
         let (db, store) = open_legacy(&dir);
         // Raw connection bypasses Store's authorizer, as the existing fixture does.
         let fixture = Connection::open(&db).unwrap();
         fixture
-            .execute("UPDATE schema_version SET version=46", [])
+            .execute("UPDATE schema_version SET version=47", [])
             .unwrap();
         drop(fixture);
         store
             .propose_close(
-                &permit(&db, OwnerOp::Close, b"c44", "a44", "art", 1),
+                &permit(&db, OwnerOp::Close, b"c45", "a45", "art", 1),
                 "test",
             )
             .unwrap();
@@ -2632,11 +2632,11 @@ mod tests {
             .query_row("SELECT count(*) FROM events", [], |r| r.get(0))
             .unwrap();
         let err = store
-            .witness_commit(&permit(&db, OwnerOp::Witness, b"c44", "a44", "art", 1))
+            .witness_commit(&permit(&db, OwnerOp::Witness, b"c45", "a45", "art", 1))
             .unwrap_err();
         assert!(
             matches!(&err, Error::Rejected(message) if message == "owner witness database schema is unsupported"),
-            "forged schema 46 must fail at the actual schema guard, got: {err}"
+            "forged schema 47 must fail at the actual schema guard, got: {err}"
         );
         let latch_after: (i64, i64, Vec<u8>, String, Option<String>, i64) = store
             .conn()
