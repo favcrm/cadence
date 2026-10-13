@@ -1,4 +1,4 @@
-import type { ActionRefusal, ActionResult, ReplyMessage, SlotAnchor, SlotRequest, SlotVerb } from "./screenProtocol";
+import { parseRunSlotReceipt, type ActionRefusal, type ActionResult, type ReplyMessage, type SlotAnchor, type SlotRequest, type SlotVerb } from "./screenProtocol";
 
 /**
  * CAD-1123 HP3 — the host-drawn approval slot (decision Q6). A frame may ask
@@ -22,11 +22,12 @@ export const SLOT_TTL_MS = 120_000;
 
 /** CAD-1328: what a confirm card shows, from the daemon's frozen effect material (never from the frame). */
 export interface SlotCard { target: string; caption: string; image: string | null; title?: string; detail?: string }
-export interface SlotPlan { label: string; run: () => Promise<ActionResult>; card?: SlotCard }
-export type Planner = (verb: SlotVerb, args: Record<string, unknown>, ui?: { actionToken?: string }) => Promise<SlotPlan | ActionRefusal>;
+/** `isCurrent` is the controller's liveness check (not closed, still this slot); a run that performs a browser effect after an await re-checks it. */
+export interface SlotPlan { label: string; run: (isCurrent?: () => boolean) => Promise<ActionResult>; card?: SlotCard }
+export type Planner = (verb: SlotVerb, args: Record<string, unknown>, ui?: { actionToken?: string; isCurrent?: () => boolean }) => Promise<SlotPlan | ActionRefusal>;
 export interface SlotView { token: string; label: string; anchor: SlotAnchor; pending: boolean; card?: SlotCard }
 
-interface Live { id: string; key: string; view: SlotView; since: number; plan: SlotPlan; busy: boolean; timer: ReturnType<typeof setTimeout> }
+interface Live { id: string; key: string; verb: SlotVerb; view: SlotView; since: number; plan: SlotPlan; busy: boolean; timer: ReturnType<typeof setTimeout> }
 
 const sameAnchor = (a: SlotAnchor, b: SlotAnchor) => a === b ||
   (typeof a === "object" && typeof b === "object" && a.x === b.x && a.y === b.y && a.w === b.w && a.h === b.h);
@@ -67,7 +68,7 @@ export class SlotController {
     this.planning = null;
     if (!("run" in plan)) { this.send({ v: 2, op: "slot-state", id: req.id, state: "refused", refusal: plan }); return; }
     const timer = setTimeout(() => { if (this.live?.id === req.id && !this.live.busy) this.retire("expired"); }, SLOT_TTL_MS);
-    this.live = { id: req.id, key, view: { token: randomToken(), label: plan.label, anchor, pending: false, ...(plan.card ? { card: plan.card } : {}) }, since: this.clock(), plan, busy: false, timer };
+    this.live = { id: req.id, key, verb: req.verb, view: { token: randomToken(), label: plan.label, anchor, pending: false, ...(plan.card ? { card: plan.card } : {}) }, since: this.clock(), plan, busy: false, timer };
     this.changed(this.live.view);
   }
 
@@ -82,12 +83,23 @@ export class SlotController {
     live.view = { ...live.view, pending: true };
     this.send({ v: 2, op: "slot-state", id: live.id, state: "pending" });
     this.changed(live.view);
-    void live.plan.run().catch((): ActionResult => ({ ok: false, refusal: UNEXPECTED })).then(result => {
+    void live.plan.run(() => !this.closed && this.live === live).catch((): ActionResult => ({ ok: false, refusal: UNEXPECTED })).then(result => {
       if (this.closed || this.live !== live) return;
       clearTimeout(live.timer);
       this.live = null;
-      this.send(result.ok ? { v: 2, op: "slot-state", id: live.id, state: "done" }
-        : { v: 2, op: "slot-state", id: live.id, state: "refused", refusal: result.refusal });
+      // CAD-1365: only a run.start slot may forward a receipt, and only the
+      // closed runtime-validated {run_id,request_id,state}; every other
+      // verb's generic ActionResult.data is discarded as before.
+      let message: ReplyMessage;
+      if (result.ok) {
+        const receipt = live.verb === "run.start" ? parseRunSlotReceipt(result.data) : null;
+        message = receipt
+          ? { v: 2, op: "slot-state", id: live.id, state: "done", receipt }
+          : { v: 2, op: "slot-state", id: live.id, state: "done" };
+      } else {
+        message = { v: 2, op: "slot-state", id: live.id, state: "refused", refusal: result.refusal };
+      }
+      this.send(message);
       this.changed(null);
     });
     return true;

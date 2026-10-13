@@ -14,7 +14,7 @@ use tiny_http::{Header, Method, Request, Response, StatusCode};
 use super::serve::{add_security_headers, err_response, json_response};
 use super::ServeOpts;
 use super::{
-    app_assistant, app_audiences, app_content, app_contexts, app_explorer, app_records,
+    app_assistant, app_audiences, app_content, app_contexts, app_explorer, app_media, app_records,
     app_release, app_runs, app_screens, app_social_drafts, approvals, apps, business_templates,
     connections, crm_send, crm_smtp, home, lane, operator, read_model, social_publish, stages,
     threads, updates, wiki, workflows,
@@ -1273,7 +1273,8 @@ pub(crate) fn write_route(
             return;
         }
         let relay = operator::public_relay(&request, opts);
-        let response = app_runs::handle_with_relay(&mut request, state_dir, route, true, relay);
+        let response =
+            app_runs::handle_with_relay(&mut request, state_dir, route, true, relay, opts);
         send(request, response);
         return;
     }
@@ -1437,6 +1438,47 @@ pub(crate) fn write_route(
             return;
         }
         let response = app_screens::tool_revoke(&mut request, state_dir, opts);
+        send(request, response);
+        return;
+    }
+    // CAD-1365: the media catalog read — OperatorOnly write route (the
+    // unlisted fail-closed default), relays the request's proven session
+    // + mount action token to `app_media_read`. Closed body
+    // `{action_token, input}`; a body credential/scope field is 400.
+    if app_media::read_route(path) {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let response = app_media::media_read(&mut request, state_dir, opts);
+        send(request, response);
+        return;
+    }
+    // CAD-1365: the media catalog publish — the same unlisted
+    // OperatorOnly write-route fallback, relays the request's proven
+    // session + mount action token to `app_media_publish`. Closed body
+    // `{action_token, asset_id, expected_revision, request_id}`; a body
+    // credential/scope field is 400.
+    if app_media::publish_route(path) {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let response = app_media::media_publish(&mut request, state_dir, opts);
+        send(request, response);
+        return;
+    }
+    // CAD-1365: the original download — the same unlisted OperatorOnly
+    // write-route fallback, relays the request's proven session + mount
+    // action token to `app_media_original` and streams the verified
+    // bytes back. Closed body `{action_token, asset_id}`; a body
+    // credential/ref/scope field is 400 before dispatch.
+    if app_media::original_route(path) {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let response = app_media::media_original(&mut request, state_dir, opts);
         send(request, response);
         return;
     }

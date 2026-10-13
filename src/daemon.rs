@@ -33,6 +33,7 @@ pub(crate) mod app_effects_rpc;
 mod app_explorer_rpc;
 mod app_image_jobs;
 mod app_record_actions_rpc;
+mod app_media_rpc;
 #[cfg(feature = "test-seam")]
 pub use app_image_jobs::test_probe as image_job_probe;
 mod app_records_rpc;
@@ -62,6 +63,17 @@ mod cad1314_approval_acceptance;
 mod cad1327_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1415_app_actions_acceptance;
+mod cad1365_generation_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad1365_media_publish_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad1365_media_read_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad1365_mount_authority_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad1365_original_transfer_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad1365_run_creator_acceptance;
 mod caller_rule;
 #[cfg(all(test, feature = "test-seam"))]
 mod campaign_clone_acceptance;
@@ -2666,6 +2678,8 @@ impl Shared {
             | "business_document_export"
             | "business_document_show" => self.rpc_business_template(method, params, peer_pid),
             "app_tool_invoke" => self.rpc_app_tool_invoke(params, peer_pid),
+            "app_media_read" => self.rpc_app_media_read(params, peer_pid),
+            "app_media_publish" => self.rpc_app_media_publish(params, peer_pid),
             "app_tool_revoke" => self.rpc_app_tool_revoke(params, peer_pid),
             "app_tool_result" | "app_tool_results" => self.rpc_app_tool_result(params, peer_pid),
             "app_run_capability_call" => self.rpc_app_capability(method, params, peer_pid),

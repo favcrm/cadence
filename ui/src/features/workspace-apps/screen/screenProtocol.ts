@@ -59,12 +59,25 @@ export type ChildToHost =
  *  port. `call` verbs never spend or publish; every spend or publish verb is a
  *  `slot` verb and waits for a tap on a host-drawn button. The `publish.*` slot
  *  verbs arrive with HP4: add them here and in the host's dispatch table. */
-export const CALL_VERBS = ["read.run", "context.defaults.save", "open-link", "social.drafts.list", "social.drafts.show", "social.drafts.create", "social.drafts.update", "social.drafts.discard", "social.drafts.publish.stage", "social.sources.show", "social.sources.save", "social.destinations.list"] as const;
-export const SLOT_VERBS = ["run.start", "publish.destination.use", "publish.draft.confirm", "publish.draft.schedule", "publish.draft.reschedule", "publish.draft.cancel", "publish.settings.save"] as const;
+export const CALL_VERBS = ["read.run", "context.defaults.save", "open-link", "social.drafts.list", "social.drafts.show", "social.drafts.create", "social.drafts.update", "social.drafts.discard", "social.drafts.publish.stage", "social.sources.show", "social.sources.save", "social.destinations.list", "media.read", "media.publish"] as const;
+export const SLOT_VERBS = ["run.start", "publish.destination.use", "publish.draft.confirm", "publish.draft.schedule", "publish.draft.reschedule", "publish.draft.cancel", "publish.settings.save", "media.original.download"] as const;
+/** CAD-1365 — the protected original download slot. Qualified per mount
+ *  (screen-media.v1 + media.read + live token); never a generic action verb. */
+export const ORIGINAL_DOWNLOAD_VERB = "media.original.download" as const;
 export type CallVerb = (typeof CALL_VERBS)[number];
 export type SlotVerb = (typeof SLOT_VERBS)[number];
-/** The verbs a screen.v2 PUSH advertises in `actions`. */
-export const ACTION_VERBS: string[] = [...CALL_VERBS, ...SLOT_VERBS];
+/** CAD-1365 — the media contract's verbs parse on the closed call
+ *  envelope but are NEVER in the generic advertised set: they are
+ *  appended per-mount, only to a media-opted-in child whose minted
+ *  receipt declares them. */
+export const MEDIA_VERBS = ["media.read", "media.publish"] as const;
+export type MediaVerb = (typeof MEDIA_VERBS)[number];
+export const isMediaVerb = (verb: string): verb is MediaVerb =>
+  (MEDIA_VERBS as readonly string[]).includes(verb);
+/** The verbs a screen.v2 PUSH advertises in `actions` — media verbs are
+ *  deliberately absent; the channel appends a mount's declared media
+ *  rights itself. */
+export const ACTION_VERBS: string[] = [...CALL_VERBS.filter(v => !(MEDIA_VERBS as readonly string[]).includes(v)), ...SLOT_VERBS.filter(v => v !== ORIGINAL_DOWNLOAD_VERB)];
 export const ACTION_ID = /^[A-Za-z0-9_-]{1,64}$/;
 /** A v2 tool alias grammar: lowercase words joined by dots (matches the
  *  declaration). The alias is app vocabulary, never a route/provider name. */
@@ -90,12 +103,40 @@ export interface ToolRequest { v: 2; op: "tool"; id: string; alias: string; inpu
 export interface ActionRefusal { code: string; text: string }
 export type ActionResult = { ok: true; data: unknown } | { ok: false; refusal: ActionRefusal };
 export type SlotStateName = "pending" | "done" | "refused";
+/** CAD-1365 — the bounded run-start receipt a `run.start` slot may forward
+ *  on `slot-state` done: exactly the native run id, the request id the tap
+ *  was planned with, and the native run state (failed/cancelled stay
+ *  truthful — done is transport completion, never generation success).
+ *  No snapshot, quote, prompt, ref or bytes ever cross this seam. */
+export interface RunSlotReceipt {
+  run_id: string;
+  request_id: string;
+  state: "awaiting_approval" | "approved" | "running" | "succeeded" | "failed" | "cancelled";
+}
+const RUN_SLOT_STATES = ["awaiting_approval", "approved", "running", "succeeded", "failed", "cancelled"] as const;
+const RUN_ID = /^run-[0-9a-f]{32}$/;
+/** The native request-id grammar: lowercase ASCII alnum/hyphen, non-leading
+ *  dash, at most 64 chars — the same bound the tool request id enforces. */
+export const RUN_REQUEST_ID = /^[a-z0-9][a-z0-9-]{0,63}$/;
+/** Runtime check for a closed receipt: exactly the three fields under the
+ *  native grammars. A malformed or extra field is `null` — never silently
+ *  stripped into a valid-looking receipt. */
+export function parseRunSlotReceipt(value: unknown): RunSlotReceipt | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const r = value as Record<string, unknown>;
+  if (Object.keys(r).sort().join() !== "request_id,run_id,state") return null;
+  if (typeof r.run_id !== "string" || !RUN_ID.test(r.run_id)) return null;
+  if (typeof r.request_id !== "string" || !RUN_REQUEST_ID.test(r.request_id)) return null;
+  if (typeof r.state !== "string" || !(RUN_SLOT_STATES as readonly string[]).includes(r.state)) return null;
+  return { run_id: r.run_id, request_id: r.request_id, state: r.state as RunSlotReceipt["state"] };
+}
 export type ReplyMessage =
   | { v: 2; op: "reply"; id: string; ok: true; data: unknown }
   | { v: 2; op: "reply"; id: string; ok: false; refusal: ActionRefusal }
   | { v: 2; op: "tool-reply"; id: string; ok: true; data: unknown }
   | { v: 2; op: "tool-reply"; id: string; ok: false; refusal: ActionRefusal }
-  | { v: 2; op: "slot-state"; id: string; state: SlotStateName; refusal?: ActionRefusal };
+  | { v: 2; op: "slot-state"; id: string; state: "done"; receipt?: RunSlotReceipt }
+  | { v: 2; op: "slot-state"; id: string; state: "pending" | "refused"; refusal?: ActionRefusal };
 
 /** CAD-1123 HP1 — the generic read projection v2. A child opts in with
  *  `{v:1, op:"ready", accepts:["screen.v2"]}` (it may also list
@@ -107,7 +148,12 @@ export const SCREEN_V2 = "screen.v2";
  *  `host_contract: "screen-actions.v1"`. A child opts in by listing it in
  *  `accepts` alongside `screen.v2`; only then may it send `{v:2,op:"tool"}`. */
 export const SCREEN_ACTIONS_V1 = "screen-actions.v1";
-export type Accept = typeof PUBLISH_INTENTS_V1 | typeof SCREEN_V2 | typeof SCREEN_ACTIONS_V1;
+/** CAD-1365 — the media catalog/curation channel a media-contract
+ *  screen's child opts into alongside `screen.v2`. Opting in grants
+ *  nothing: dispatch still needs the minted receipt's declared
+ *  `media.may` permission and its action token. */
+export const SCREEN_MEDIA_V1 = "screen-media.v1";
+export type Accept = typeof PUBLISH_INTENTS_V1 | typeof SCREEN_V2 | typeof SCREEN_ACTIONS_V1 | typeof SCREEN_MEDIA_V1;
 /** The negotiated PUSH shape: the exact CAD-1006 v1, v1 plus
  *  publish-intents.v1, or the v2 projection. */
 export type Shape = "v1" | "intents" | "v2";
@@ -118,9 +164,52 @@ export function shapeOf(accepts: Accept[] | [typeof CHAT_DIRECTIVE_V1] | undefin
   if (accepts.some(a => a === CHAT_DIRECTIVE_V1)) return null;
   return accepts.some(a => a === SCREEN_V2) ? "v2" : "intents";
 }
-/** Whether a ready opt-in includes the tool/action channel. */
+/** Whether a ready opt-in includes the tool/action channel. The media
+ *  contract keeps the declared tool/action handshake, so a media opt-in
+ *  counts as the action channel too. */
 export function wantsActions(accepts: readonly string[] | undefined): boolean {
-  return !!accepts && accepts.includes(SCREEN_ACTIONS_V1);
+  return !!accepts && (accepts.includes(SCREEN_ACTIONS_V1) || accepts.includes(SCREEN_MEDIA_V1));
+}
+/** Whether a ready opt-in includes the media channel (screen.v2 is
+ *  required anyway — media never negotiates under an older shape). */
+export function wantsMedia(accepts: readonly string[] | undefined): boolean {
+  return !!accepts && accepts.includes(SCREEN_MEDIA_V1);
+}
+
+/** CAD-1365 — closed media.call arg parsers. `kind:"asset"` detail and
+ *  `media.generate` are recognized-but-unadmitted: they refuse here, so
+ *  nothing strips or forwards them. Any extra field — including a
+ *  forged authority/scope selector — refuses outright, never silently
+ *  strips. Exported so the dispatcher re-validates a direct call.
+ *  `kind:"catalog"` only: `{kind}` or `{kind,limit,cursor}` with
+ *  `limit` a safe integer 1..20 and `cursor` a string <= 160 chars. */
+export function mediaReadArgs(args: ActionArgs): ActionArgs | null {
+  const keys = Object.keys(args).sort().join();
+  if (keys !== "kind" && keys !== "kind,limit" && keys !== "cursor,kind" && keys !== "cursor,kind,limit") return null;
+  if (args.kind !== "catalog") return null;
+  if ("limit" in args && (typeof args.limit !== "number" || !Number.isSafeInteger(args.limit) || args.limit < 1 || args.limit > 20)) return null;
+  if ("cursor" in args && (typeof args.cursor !== "string" || args.cursor.length > 160)) return null;
+  return args;
+}
+const MEDIA_ASSET_ID = /^med-[0-9a-f]{32}$/;
+const MEDIA_REQUEST_ID = /^[A-Za-z0-9_-]{1,128}$/;
+/** `media.original.download` args are EXACTLY `{asset_id}`, a canonical id. */
+export function originalDownloadArgs(args: ActionArgs): ActionArgs | null {
+  if (Object.keys(args).join() !== "asset_id") return null;
+  if (typeof args.asset_id !== "string" || !MEDIA_ASSET_ID.test(args.asset_id)) return null;
+  return args;
+}
+/** `media.publish` args are EXACTLY `{asset_id,expected_revision,
+ *  request_id}` under the frozen publication contract — a canonical
+ *  `med-` + 32-hex asset id, a positive safe-integer revision, an ASCII
+ *  alnum/-/_ request id 1..128. No frame-supplied token, scope, creator,
+ *  session or URL field ever parses. */
+export function mediaPublishArgs(args: ActionArgs): ActionArgs | null {
+  if (Object.keys(args).sort().join() !== "asset_id,expected_revision,request_id") return null;
+  if (typeof args.asset_id !== "string" || !MEDIA_ASSET_ID.test(args.asset_id)) return null;
+  if (typeof args.expected_revision !== "number" || !Number.isSafeInteger(args.expected_revision) || args.expected_revision < 1) return null;
+  if (typeof args.request_id !== "string" || !MEDIA_REQUEST_ID.test(args.request_id)) return null;
+  return args;
 }
 /** An asset ref is host-minted (`image:<run id>`), never a receipt id. */
 export const ASSET_REF = /^(?:image:[A-Za-z0-9_-]{1,128}|draft-image:[A-Za-z0-9_-]{1,128}:[a-z][a-z0-9]{0,31}(?:\.[a-z][a-z0-9]{0,31}){0,3})$/;
@@ -304,6 +393,15 @@ export interface ScreenPush {
   readiness?: { ok: boolean; blockers: string[] };
   /** screen.v2 only: verbs this host lets this viewer's frame use (none for a non-operator). */
   actions?: string[];
+  /** screen.v2 only, host-derived: `1` tells the child this mount's slot
+   *  replies may carry a `RunSlotReceipt` for a `run.start` it sends. Set
+   *  only by the sender when a real planner and a projected `run.start`
+   *  action exist — never forwarded from input, and stripped for a
+   *  legacy/intents child. */
+  run_receipts?: 1;
+  /** screen.v2 only, host-derived like `run_receipts`: `1` when this mount may
+   *  use the original download slot. Support only, never permission. */
+  original_downloads?: 1;
   /** Server epoch seconds for day-row alignment. */
   now: number;
   /** The child's own last `state` snapshot, replayed on remount. */
@@ -380,7 +478,7 @@ export function parseChild(data: unknown): ChildToHost | null {
     Object.keys(d).sort().join() === "accepts,op,v" && d.v === 1 && d.op === "ready" &&
     Array.isArray(d.accepts) && d.accepts.length >= 1 && d.accepts.length <= 3 &&
     new Set(d.accepts).size === d.accepts.length &&
-    d.accepts.every(a => a === PUBLISH_INTENTS_V1 || a === SCREEN_V2 || a === SCREEN_ACTIONS_V1)
+    d.accepts.every(a => a === PUBLISH_INTENTS_V1 || a === SCREEN_V2 || a === SCREEN_ACTIONS_V1 || a === SCREEN_MEDIA_V1)
   ) {
     return { v: 1, op: "ready", accepts: [...d.accepts] as Accept[] };
   }
@@ -390,14 +488,26 @@ export function parseChild(data: unknown): ChildToHost | null {
   }
   if (d.v === 2 && d.op === "call" && Object.keys(d).sort().join() === "args,id,op,v,verb") {
     const args = actionArgs(d.args);
-    if (typeof d.id === "string" && ACTION_ID.test(d.id) && (CALL_VERBS as readonly unknown[]).includes(d.verb) && args)
-      return { v: 2, op: "call", id: d.id, verb: d.verb as CallVerb, args };
-    return null;
+    if (typeof d.id !== "string" || !ACTION_ID.test(d.id) || !args ||
+        !(CALL_VERBS as readonly unknown[]).includes(d.verb)) return null;
+    // Media verbs carry their own CLOSED arg shapes — parsed exactly,
+    // refused outright otherwise (unadmitted kinds, unbounded values and
+    // forged authority fields never reach the channel's call path).
+    if (d.verb === "media.read") {
+      const checked = mediaReadArgs(args);
+      return checked ? { v: 2, op: "call", id: d.id, verb: "media.read", args: checked } : null;
+    }
+    if (d.verb === "media.publish") {
+      const checked = mediaPublishArgs(args);
+      return checked ? { v: 2, op: "call", id: d.id, verb: "media.publish", args: checked } : null;
+    }
+    return { v: 2, op: "call", id: d.id, verb: d.verb as CallVerb, args };
   }
   if (d.v === 2 && d.op === "slot" && Object.keys(d).sort().join() === "anchor,args,id,op,v,verb") {
     const args = actionArgs(d.args);
     const anchor = slotAnchor(d.anchor);
-    if (typeof d.id === "string" && ACTION_ID.test(d.id) && (SLOT_VERBS as readonly unknown[]).includes(d.verb) && args && anchor)
+    if (typeof d.id === "string" && ACTION_ID.test(d.id) && (SLOT_VERBS as readonly unknown[]).includes(d.verb) && args && anchor &&
+        (d.verb !== ORIGINAL_DOWNLOAD_VERB || originalDownloadArgs(args)))
       return { v: 2, op: "slot", id: d.id, verb: d.verb as SlotVerb, args, anchor };
     return null;
   }
@@ -429,7 +539,7 @@ export function parseChild(data: unknown): ChildToHost | null {
   return null;
 }
 
-const V2_TOP = ["sources", "defaults", "readiness", "actions"] as const;
+const V2_TOP = ["sources", "defaults", "readiness", "actions", "run_receipts", "original_downloads"] as const;
 const V2_RUN = ["created", "closed", "phase", "steps", "inputs_used", "caption_excerpt", "artifact_id",
   "review", "approved", "source_post_id", "refusal", "image_ref"] as const;
 /** The publish-intents.v1 shape: every screen.v2 field is removed. */

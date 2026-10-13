@@ -101,9 +101,10 @@ impl Shared {
     /// own: it binds exactly the snapshot digest this call just created.
     fn start_app_run(self: &Arc<Self>, params: &Value, human: Option<&Value>) -> Result<Value> {
         let install = required_str(params, "install_id")?;
-        let team = super::app_teams_rpc::team_of(&self.state_dir, install)?.ok_or_else(|| {
-            Error::rejected("installation has no default team; set one in Settings")
-        })?;
+        // CAD-1171: a host-execution run has no owner, so it needs no
+        // default team. `create_app_run` applies the floor only when the
+        // installed workflow actually declares `execution: agent`.
+        let team = super::app_teams_rpc::team_of(&self.state_dir, install)?;
         let expected = params
             .get("expected_quotes")
             .filter(|value| value.is_object())
@@ -115,7 +116,7 @@ impl Shared {
         }) {
             return Err(Error::rejected("inputs must be a string map"));
         }
-        let created = self.create_app_run_as(params, Some(&team), Some(expected), human)?;
+        let created = self.create_app_run_as(params, team.as_ref(), Some(expected), human)?;
         let id = created["id"]
             .as_str()
             .ok_or_else(|| Error::internal("created run has no id"))?
@@ -178,6 +179,64 @@ impl Shared {
         }
     }
 
+    /// CAD-1365: the verified native creator of this run, frozen into
+    /// the immutable snapshot. The trusted host relays the request's
+    /// real session credential on `token`/`key`/`origin`; a
+    /// credential-less operator connection is honestly
+    /// `{kind:"operator"}`. If ANY credential field is present the
+    /// complete proof must classify and verify through the existing
+    /// `tool_session` seam — a partial, malformed or dead credential
+    /// refuses, never an operator fallback. A verified named public
+    /// session freezes `{kind:"user", id:<BoardUser.sub>}` and must
+    /// carry the operator role, the same public-surface floor
+    /// `app_screen_mint` and the media verbs keep. A supplied `key`
+    /// must be a string when present; on the public surface the
+    /// session check ignores it (`tool_session`'s contract), on
+    /// loopback/tailnet a wrong or absent key fails the session proof.
+    /// Body-selected creator/user/actor fields never reach here — the
+    /// closed field list refuses them.
+    fn run_creator(&self, params: &Value) -> Result<Value> {
+        let relayed = ["token", "key", "origin"]
+            .iter()
+            .any(|field| params.get(field).is_some());
+        if !relayed {
+            return Ok(json!({"kind": "operator"}));
+        }
+        let token = params
+            .get("token")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::rejected("run creation needs a session credential token"))?;
+        let key = match params.get("key") {
+            None => "",
+            Some(value) => value
+                .as_str()
+                .ok_or_else(|| Error::rejected("run session credential key must be a string"))?,
+        };
+        let origin = params
+            .get("origin")
+            .and_then(Value::as_str)
+            .and_then(crate::operator_auth::Origin::parse)
+            .ok_or_else(|| Error::rejected("run creation needs a classified session origin"))?;
+        let (_session, view) = self.tool_session(token, key, origin).ok_or_else(|| {
+            Error::rejected("run creation needs a live operator session credential")
+        })?;
+        if origin == crate::operator_auth::Origin::Public {
+            let operator = view
+                .user
+                .as_ref()
+                .is_some_and(crate::operator_auth::BoardUser::is_operator);
+            if !operator {
+                return Err(Error::rejected(
+                    "run creation needs an operator-role public session",
+                ));
+            }
+        }
+        Ok(match &view.user {
+            Some(user) => json!({"kind": "user", "id": user.sub}),
+            None => json!({"kind": "operator"}),
+        })
+    }
+
     /// The one run-creation path: `app_run_create` (owner and workers named by
     /// the caller) and `app_run_start` (owner and workers from the install's
     /// default team, quotes checked against `expected`). Operator proof is the
@@ -192,10 +251,15 @@ impl Shared {
         // CAD-1171: a host-execution run names no owner PM — the operator's
         // own click executes its capability steps. An agent run still needs
         // one, from the caller or the install's default team.
-        let owner_pm = match team {
-            Some(team) => Some(team.owner_pm.clone()),
-            None => optional_str(params, "owner_pm").map(str::to_string),
-        };
+        // CAD-1365: resolve the native creator BEFORE any workflow,
+        // quote or provider work. A credential-less operator
+        // connection (the caller gate already ran) is honestly
+        // `{kind:"operator"}`; a relayed credential must fully verify
+        // through `tool_session` — partial or invalid proofs refuse,
+        // never an operator fallback.
+        let creator = self.run_creator(params)?;
+        // Owner resolution needs the installed template's declared
+        // execution, so it happens inside the runtime snapshot below.
         if params.get("source_receipt_id").is_some() != params.get("selected_post_id").is_some() {
             return Err(Error::rejected(
                 "source receipt and selected post must be supplied together",
@@ -249,7 +313,29 @@ impl Shared {
             }
             let template = crate::issue::workflow::parse_template(text)
                 .map_err(|_| Error::rejected("installed workflow declarations refused"))?;
-            if let Some(team) = team {
+            // CAD-1171/CAD-1365: only an agent workflow needs a team and
+            // an owner PM. A host-execution run names no owner — the
+            // operator's own click executes the capability — so its
+            // effective team is none: `app_run_start` on a host workflow
+            // must not require or apply an installation default team,
+            // and any supplied `owner_pm` (rejected by the store's
+            // host-forbids-owner rule) must not be silently adopted.
+            let effective_team = match template.execution {
+                crate::issue::workflow::Execution::Host => None,
+                crate::issue::workflow::Execution::Agent => {
+                    if expected.is_some() && team.is_none() {
+                        return Err(Error::rejected(
+                            "installation has no default team; set one in Settings",
+                        ));
+                    }
+                    team
+                }
+            };
+            let owner_pm = match effective_team {
+                Some(team) => Some(team.owner_pm.clone()),
+                None => optional_str(params, "owner_pm").map(str::to_string),
+            };
+            if let Some(team) = effective_team {
                 // The team is the only source of worker aliases: a
                 // caller-supplied value for a team role is a forgery.
                 for (role, alias) in &team.roles {
@@ -388,7 +474,7 @@ impl Shared {
                     ));
                 }
             }
-            self.store.app_run_create_with_capabilities(
+            self.store.app_run_create_attributed(
                 LocalRunRequest {
                     install_id: id,
                     bundle_digest: row["digest"].as_str().unwrap(),
@@ -408,6 +494,7 @@ impl Shared {
                     input_origins: &input_origins,
                     human,
                 },
+                Some(&creator),
             )
         })
     }
@@ -514,6 +601,11 @@ impl Shared {
             "app_local_install_approve" | "app_local_install_revoke" => {
                 &["install_id", "digest", "public_session"]
             }
+            // CAD-1365: create/start additionally admit the trusted
+            // host's relayed session credential (token/key/origin) —
+            // resolved natively before any run work, never a
+            // body-selected identity. Other lifecycle verbs keep their
+            // exact field sets.
             "app_run_create" => &[
                 "install_id",
                 "workflow",
@@ -525,6 +617,9 @@ impl Shared {
                 "source_receipt_id",
                 "selected_post_id",
                 "public_session",
+                "token",
+                "key",
+                "origin",
             ],
             "app_run_start" => &[
                 "install_id",
@@ -536,6 +631,9 @@ impl Shared {
                 "selected_post_id",
                 "expected_quotes",
                 "public_session",
+                "token",
+                "key",
+                "origin",
             ],
             "app_run_approve" => &["run_id", "digest", "public_session"],
             "app_run_cancel" | "app_run_dispatch" => &["run_id", "public_session"],

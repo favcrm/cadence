@@ -563,6 +563,11 @@ impl Store {
             },
         )
     }
+    /// Internal legacy callers keep this signature: the runs it
+    /// records carry NO `creator` member, which reads as unknown
+    /// attribution — never a claimed operator. Only the native daemon
+    /// creation path supplies a daemon-verified creator, through
+    /// `app_run_create_attributed`.
     pub fn app_run_create_with_capabilities(
         &self,
         request: LocalRunRequest<'_>,
@@ -571,6 +576,35 @@ impl Store {
         capabilities: &BTreeMap<String, super::app_bindings::BindingProof>,
         quotes: &BTreeMap<String, crate::platform::AppCapabilityQuote>,
         provenance: LocalRunProvenance<'_>,
+    ) -> Result<Value> {
+        self.app_run_create_attributed(
+            request,
+            context,
+            binding,
+            capabilities,
+            quotes,
+            provenance,
+            None,
+        )
+    }
+    /// CAD-1365: the creator-bearing creation path. `creator` is the
+    /// daemon-verified actor json (`{kind:"operator"}` or
+    /// `{kind:"user",id:<sub>}`) frozen INSIDE the snapshot before
+    /// `material_digest`, so the digest covers it and it can never be
+    /// mutated after creation. `None` leaves the member absent — the
+    /// honest unknown attribution of the internal legacy callers.
+    /// There is no creator setter: the only way a creator lands is a
+    /// verified argument at creation.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn app_run_create_attributed(
+        &self,
+        request: LocalRunRequest<'_>,
+        context: Option<&super::app_contexts::ContextProof>,
+        binding: Option<&super::app_bindings::BindingProof>,
+        capabilities: &BTreeMap<String, super::app_bindings::BindingProof>,
+        quotes: &BTreeMap<String, crate::platform::AppCapabilityQuote>,
+        provenance: LocalRunProvenance<'_>,
+        creator: Option<&Value>,
     ) -> Result<Value> {
         let LocalRunProvenance {
             selected_source,
@@ -812,6 +846,12 @@ impl Store {
                         snapshot["quotes"] = json!(quotes);
                         snapshot["workflow"]["capability_slots"] = json!(workflow.capability_slots);
                         snapshot["source"] = source;
+                    }
+                    // CAD-1365: freeze the verified creator inside
+                    // the snapshot BEFORE the digest covers it —
+                    // attribution, never authorization.
+                    if let Some(creator) = creator {
+                        snapshot["creator"] = creator.clone();
                     }
                     let digest = material_digest(&snapshot);
                     if let Some((id, existing)) = tx

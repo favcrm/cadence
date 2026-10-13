@@ -1205,6 +1205,17 @@ impl Store {
                 tx.execute("UPDATE schema_version SET version=44", [])?;
                 tx.commit()?;
             }
+            if version < 45 {
+                // CAD-1365: the workspace media catalog - metadata-only
+                // tables (id/title/kind/state/revision/creator/timestamps;
+                // no locators, secrets, prompts or bytes). New tables only;
+                // no existing row is read or rewritten, and `IF NOT EXISTS`
+                // converges a half-applied store on reopen.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(super::app_media::SCHEMA)?;
+                tx.execute("UPDATE schema_version SET version=45", [])?;
+                tx.commit()?;
+            }
             if let Some(crossing) = permit.crossing {
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 Self::event(

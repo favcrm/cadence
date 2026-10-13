@@ -220,6 +220,34 @@ const run = (id: string) => `/api/app-runs/${part(id)}`;
 const effect = (id: string) => `/api/app-effects/${part(id)}`;
 
 /** Reads are abortable and uncached so receipts never outlive an operator session. */
+/** CAD-1365: the original's byte bound and the parent fetch lifetime (the metadata timeout is unchanged). */
+export const ORIGINAL_MEDIA_BYTES_MAX = 10 * 1024 * 1024;
+const ORIGINAL_MEDIA_TIMEOUT_MS = 60_000;
+const ORIGINAL_MIME = ["image/png", "image/jpeg", "image/webp"];
+
+/** Read a response body, refusing (and cancelling) past the byte bound or a Content-Length mismatch. */
+async function readBounded(response: Response): Promise<ArrayBuffer> {
+  const invalid = () => new ApiError("The server returned an invalid original image", 502);
+  const declared = response.headers.get("Content-Length");
+  if (declared !== null && (!/^\d+$/.test(declared) || Number(declared) > ORIGINAL_MEDIA_BYTES_MAX)) throw invalid();
+  const reader = response.body?.getReader();
+  if (!reader) throw invalid();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > ORIGINAL_MEDIA_BYTES_MAX) { await reader.cancel().catch(() => {}); throw invalid(); }
+    chunks.push(value);
+  }
+  if (declared !== null && Number(declared) !== total) throw invalid();
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const chunk of chunks) { out.set(chunk, at); at += chunk.byteLength; }
+  return out.buffer as ArrayBuffer;
+}
+
 async function request<T>(path: string, signal?: AbortSignal, body?: object): Promise<T> {
   const response = await fetch(path, {
     method: body === undefined ? "GET" : "POST", signal,
@@ -289,6 +317,17 @@ export const workspaceApps = {
     request<{ revoked: boolean }>("/api/app-screen-tools/revoke", undefined, body),
   /** The retained receipts for one installation (operator read). */
   toolResults: async (id: string, contextId?: string, signal?: AbortSignal) => (await request<{ results: ToolReceipt[] }>(`/api/app-screen-tools/results?install_id=${part(id)}${contextId?`&context_id=${part(contextId)}`:""}`, signal)).results,
+  /** CAD-1365: `media.read` relay for a live `screen-media.v1` mount —
+   *  the workspace catalog's bounded metadata page. The body is exactly
+   *  `{action_token, input}`; the route refuses any scope/credential
+   *  field and adds the proven session itself. */
+  mediaRead: (body: { action_token: string; input: Record<string, unknown> }) =>
+    request<{ assets: Record<string, unknown>[]; next_cursor: string | null; current_actor: Record<string, unknown> }>(
+      "/api/app-media/read", undefined, body),
+  /** CAD-1365: `media.publish` relay — the frozen curation intent
+   *  `{action_token, asset_id, expected_revision, request_id}` only. */
+  mediaPublish: (body: { action_token: string; asset_id: string; expected_revision: number; request_id: string }) =>
+    request<Record<string, unknown>>("/api/app-media/publish", undefined, body),
   socialDraftAction: (operation: "create"|"list"|"show"|"update"|"discard"|"sources/show"|"sources/save"|"effect-stage", body: Record<string, unknown> & { alias: string }) =>
     request<Record<string, unknown>>(`/api/app-social-drafts/${operation}`, undefined, toolActionBody(body)),
   socialDraftAsset: async (body:{action_token:string;alias:string;draft_id:string}):Promise<{bytes:ArrayBuffer;mime:string}> => {
@@ -298,6 +337,20 @@ export const workspaceApps = {
     const mime=response.headers.get("Content-Type")??"";
     if(!["image/jpeg","image/png"].includes(mime)) throw new ApiError("The server returned an invalid social image",502);
     return {bytes:await response.arrayBuffer(),mime};
+  },
+  /** CAD-1365: the native original bytes for `{action_token, asset_id}` only. The response is bounded
+   *  (10 MiB, allowlisted image MIME) and the request lifetime is capped; the caller owns the bytes. */
+  originalMedia: async (body: { action_token: string; asset_id: string }): Promise<{ bytes: ArrayBuffer; mime: string }> => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), ORIGINAL_MEDIA_TIMEOUT_MS);
+    try {
+      const response = await fetch("/api/app-media/original", { method: "POST", credentials: "same-origin", cache: "no-store", signal: controller.signal,
+        headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() }, body: JSON.stringify(body) });
+      if (!response.ok) { const value = await response.json().catch(() => null); throw new ApiError(value?.error ?? `${response.status} ${response.statusText}`, response.status, typeof value?.code === "string" ? { code: value.code } : undefined); }
+      const mime = response.headers.get("Content-Type") ?? "";
+      if (!ORIGINAL_MIME.includes(mime)) throw new ApiError("The server returned an invalid original image", 502);
+      return { bytes: await readBounded(response), mime };
+    } finally { clearTimeout(timer); }
   },
   artifact: (id: string, signal?: AbortSignal) => request<TextArtifact>(`/api/app-run-artifacts/${part(id)}`, signal),
   stageEffect: async (id: string, body: { artifact_id: string; slot: string; request_id: string; title: string }) => (await request<{ effect: AppEffect }>(`${run(id)}/effects`, undefined, body)).effect,

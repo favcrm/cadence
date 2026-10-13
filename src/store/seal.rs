@@ -66,9 +66,9 @@ fn raw_lease_refusal(reason: String) -> rusqlite::Error {
 /// provenance columns + the `assist_stall_checks` table, and v43 adds the
 /// standalone `assist_job_shares` table, and v44 (CAD-1412) adds only the
 /// human room tables. None touch a sealed/witnessed surface, so the bound
-/// extends to 44.
+/// extends to 45 (v45 CAD-1365 adds only app_media_* tables).
 #[allow(dead_code)]
-const PROTECTED_SCHEMA_MAX: i64 = 44;
+const PROTECTED_SCHEMA_MAX: i64 = 45;
 
 /// Arm level + transaction-control phase, shared between the `Store` and
 /// the connection's authorizer. Atomic because the authorizer callback must
@@ -1445,6 +1445,16 @@ impl Store {
             if !(1..=PROTECTED_SCHEMA_MAX).contains(db_schema) {
                 return Err(Error::rejected("owner witness database schema is unsupported"));
             }
+            if *db_schema == 41 {
+                let media_tables: i64 = wtx.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('app_media_assets','app_media_publish_requests','app_media_asset_origins')",
+                    [],
+                    |r| r.get(0),
+                )?;
+                if media_tables != 3 {
+                    return Err(Error::rejected("owner witness database schema is unsupported"));
+                }
+            }
             wtx.execute(
                 "INSERT INTO owner_witness(challenge,attempt,artifact_identity,epoch,db_schema,committed_at)
                  VALUES(?,?,?,?,?,?)",
@@ -2571,7 +2581,7 @@ mod tests {
         // Positive control: a real current (44) database is accepted by the real guard.
         {
             let dir = TempDir::new().unwrap();
-            let (db, store) = open_legacy(&dir);
+            let (db, store) = cad1365_s41_v40_fixture(&dir);
             let actual: i64 = store
                 .conn()
                 .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
@@ -2595,7 +2605,7 @@ mod tests {
         // Bad case: a separate store, forged schema_version 45 (above
         // PROTECTED_SCHEMA_MAX) via raw SQLite.
         let dir = TempDir::new().unwrap();
-        let (db, store) = open_legacy(&dir);
+        let (db, store) = cad1365_s41_v40_fixture(&dir);
         // Raw connection bypasses Store's authorizer, as the existing fixture does.
         let fixture = Connection::open(&db).unwrap();
         fixture
@@ -3042,4 +3052,6 @@ mod tests {
             *GATE.lock().unwrap() = None;
         }
     }
+
+    include!("cad1365_schema41_acceptance.rs");
 }

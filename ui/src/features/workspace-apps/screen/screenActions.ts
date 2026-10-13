@@ -5,7 +5,7 @@ import { workspaceApps, type AppContext, type CapabilityQuote, type Installation
 import { contextDefaultKeys, instagramLink } from "./screenProjection";
 import { accountLabel, connectReturnTo, publicationBinding, sendSlot } from "../socialConnect";
 import { dueLabel } from "../socialPublish";
-import { TOOL_ALIAS, type ActionRefusal, type ActionResult, type CallVerb, type SlotVerb } from "./screenProtocol";
+import { TOOL_ALIAS, mediaPublishArgs, mediaReadArgs, originalDownloadArgs, parseRunSlotReceipt, RUN_REQUEST_ID, type ActionRefusal, type ActionResult, type CallVerb, type SlotVerb } from "./screenProtocol";
 import { downscaleToDataUrl } from "./screenAssets";
 import type { Planner, SlotPlan } from "./screenSlot";
 
@@ -87,6 +87,46 @@ export function plainRefusal(error: unknown): ActionRefusal {
 }
 
 const randomRequest = () => Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, "0")).join("");
+
+/** CAD-1365 — `media.read`: the workspace catalog metadata page through
+ *  the mount's own action token (never a frame-supplied credential).
+ *  Re-validates the closed input even though the port parser already
+ *  did — the table may be invoked on a direct call path. The reply is
+ *  the daemon's bounded projection: catalog rows, `next_cursor` and the
+ *  tagged `current_actor` — never original locators, bytes or secrets. */
+async function mediaRead(args: Record<string, unknown>, ui: { actionToken?: string }): Promise<ActionResult> {
+  const checked = mediaReadArgs(args);
+  const actionToken = ui.actionToken;
+  if (!checked || typeof actionToken !== "string" || !/^[a-f0-9]{64}$/.test(actionToken))
+    return refuse("bad_args", "That request is not valid.");
+  try {
+    const out = await workspaceApps.mediaRead({ action_token: actionToken, input: checked });
+    return { ok: true, data: out };
+  } catch (error) { return { ok: false, refusal: plainRefusal(error) }; }
+}
+
+/** CAD-1365 — `media.publish`: the frozen catalog curation intent
+ *  `{asset_id, expected_revision, request_id}` only. It mutates the
+ *  workspace catalog's own metadata (draft → published) — no external
+ *  posting, provider work or charge, so it rides the call surface like
+ *  the other metadata verbs rather than a host-drawn slot. The daemon
+ *  re-proves the mount, the declared `media.publish` permission and the
+ *  atomic replay/CAS on every call. */
+async function mediaPublish(args: Record<string, unknown>, ui: { actionToken?: string }): Promise<ActionResult> {
+  const checked = mediaPublishArgs(args);
+  const actionToken = ui.actionToken;
+  if (!checked || typeof actionToken !== "string" || !/^[a-f0-9]{64}$/.test(actionToken))
+    return refuse("bad_args", "That request is not valid.");
+  try {
+    const out = await workspaceApps.mediaPublish({
+      action_token: actionToken,
+      asset_id: checked.asset_id as string,
+      expected_revision: checked.expected_revision as number,
+      request_id: checked.request_id as string,
+    });
+    return { ok: true, data: out };
+  } catch (error) { return { ok: false, refusal: plainRefusal(error) }; }
+}
 
 async function readRun(ctx: ActionContext, args: Record<string, unknown>): Promise<ActionResult> {
   if (!exact(args, ["run_id"]) || typeof args.run_id !== "string") return refuse("bad_args", "That request is not valid.");
@@ -331,6 +371,8 @@ export function runCall(ctx: ActionContext, verb: CallVerb, args: Record<string,
     "social.drafts.publish.stage": () => socialDraftCall(verb,args,ui),
     "social.sources.show": () => socialDraftCall(verb,args,ui),
     "social.sources.save": () => socialDraftCall(verb,args,ui),
+    "media.read": () => mediaRead(args, ui),
+    "media.publish": () => mediaPublish(args, ui),
   };
   return Promise.resolve().then(table[verb]).catch((error: unknown): ActionResult => ({ ok: false, refusal: plainRefusal(error) }));
 }
@@ -403,13 +445,43 @@ async function planDraftEffectChange(ctx: ActionContext, verb: SlotVerb, args: R
 const LABEL_MAX = 40;
 const INPUT_MAX = 16;
 const VALUE_MAX = 8192;
+/** CAD-1365 — a native start whose reply or outcome cannot be confirmed is
+ *  honestly uncertain, never a claim that nothing started. */
+const UNCONFIRMED: ActionRefusal = { code: "unconfirmed", text: "Cadence could not confirm this run. Check the library before trying again." };
+/** One native quote's terms, checked before any confirmation or start and
+ *  copied to primitives (never the SDK's mutable object): schema 1 USD,
+ *  safe-integer non-negative micros, units >= 1, unit*units == total, and a
+ *  bounded non-empty price_revision. `null` refuses — no label, no start. */
+function checkedQuote(quote: CapabilityQuote["quote"]): CapabilityQuote["quote"] | null {
+  if (!isObject(quote)) return null;
+  const q = quote as Record<string, unknown>;
+  if (q.schema !== 1 || q.currency !== "USD") return null;
+  const { unit_price_micros: unit, units, total_price_micros: total, price_revision: revision } = q;
+  if (typeof unit !== "number" || !Number.isSafeInteger(unit) || unit < 0) return null;
+  if (typeof units !== "number" || !Number.isSafeInteger(units) || units < 1) return null;
+  if (typeof total !== "number" || !Number.isSafeInteger(total) || total < 0 || unit * units !== total) return null;
+  if (typeof revision !== "string" || revision.length === 0 || revision.length > 128) return null;
+  return { schema: 1, currency: "USD", unit_price_micros: unit, units, total_price_micros: total, price_revision: revision };
+}
+/** Integer micros to `USD d.mmmmmm` — quotient and 6-digit remainder, never
+ *  floating-point rounding. */
+const usdLabel = (micros: number): string =>
+  `USD ${Math.floor(micros / 1_000_000)}.${String(micros % 1_000_000).padStart(6, "0")}`;
 /** `run.start`: validate against the installed workflow, fetch the quotes the
  *  daemon will compare with the run's frozen ones, and name the work with the
- *  workflow's own label. No amount is shown or sent to the frame. */
+ *  workflow's own label plus the quoted USD total (host label only — no
+ *  amount or quote object ever reaches the frame). A frame-supplied
+ *  `request_id` is the immutable-intent replay key; unlisted fields —
+ *  actor, scope, approval, quote, token, run selectors — refuse outright. */
 async function planRunStart(ctx: ActionContext, args: Record<string, unknown>): Promise<SlotPlan | ActionRefusal> {
   const keys = Object.keys(args).sort().join();
-  if (!["inputs,workflow", "inputs,selected_post_id,source_receipt_id,workflow"].includes(keys) ||
+  if (!["inputs,workflow", "inputs,request_id,workflow", "inputs,selected_post_id,source_receipt_id,workflow",
+       "inputs,request_id,selected_post_id,source_receipt_id,workflow"].includes(keys) ||
       typeof args.workflow !== "string" || !isObject(args.inputs)) return { code: "bad_args", text: "That request is not valid." };
+  // A present request_id must meet the native identifier grammar; absent
+  // keeps the host-generated id. `null` is present, not absent.
+  if ("request_id" in args && (typeof args.request_id !== "string" || !RUN_REQUEST_ID.test(args.request_id)))
+    return { code: "bad_args", text: "That request is not valid." };
   const flow = ctx.installation.workflows?.find(value => value.name === args.workflow);
   if (!flow) return { code: "unknown_workflow", text: "That isn't available." };
   const declared = new Set(flow.inputs.map(input => input.name));
@@ -423,27 +495,94 @@ async function planRunStart(ctx: ActionContext, args: Record<string, unknown>): 
       ? { source_receipt_id: args.source_receipt_id, selected_post_id: args.selected_post_id } : null)
     : {};
   if (!source) return { code: "bad_args", text: "That request is not valid." };
-  const slots = flow.capability_slots ?? [];
-  const expected: Record<string, CapabilityQuote["quote"]> = {};
-  try {
-    for (const slot of slots)
-      expected[slot] = (await workspaceApps.bindingQuote(ctx.installId, slot, ctx.contextId || undefined)).quote;
-  } catch (error) { return plainRefusal(error); }
-  const label = (flow.label ?? "").replace(/\s+/g, " ").trim().slice(0, LABEL_MAX) || "Start";
-  const request = randomRequest();
+  // Freeze the intent BEFORE the first quote await: workflow name, request
+  // id, install/context, the label base and a copy of the slot list, so a
+  // mutable installation/context mid-await cannot change what was planned.
+  const workflow = flow.name;
+  const labelBase = (flow.label ?? "").replace(/\s+/g, " ").trim().slice(0, LABEL_MAX) || "Start";
+  const slots = [...(flow.capability_slots ?? [])];
+  const request = "request_id" in args ? args.request_id as string : randomRequest();
   const installId = ctx.installId;
   const contextId = ctx.contextId;
+  const expected: Record<string, CapabilityQuote["quote"]> = {};
+  let totalMicros = 0;
+  try {
+    for (const slot of slots) {
+      const quote = checkedQuote((await workspaceApps.bindingQuote(installId, slot, contextId || undefined)).quote);
+      // A malformed or unsafe quote number refuses the slot itself — no
+      // confirmation is drawn and no start can ever be attempted.
+      if (!quote) return { code: "bad_quote", text: "That isn't available right now. Try again." };
+      expected[slot] = quote;
+      totalMicros += quote.total_price_micros;
+      if (!Number.isSafeInteger(totalMicros)) return { code: "bad_quote", text: "That isn't available right now. Try again." };
+    }
+  } catch (error) { return plainRefusal(error); }
+  const label = labelBase + (slots.length > 0 ? ` · ${usdLabel(totalMicros)}` : "");
+  // The frozen closure carries workflow name, inputs copy, request id,
+  // install/context and the primitive quoted terms. The daemon's CAS on
+  // expected_quotes refuses changed intent; the host never resubmits.
   return { label, run: async () => {
+    let run: unknown;
     try {
-      await workspaceApps.startRun({ install_id: installId, workflow: flow.name, inputs, request_id: request,
+      run = await workspaceApps.startRun({ install_id: installId, workflow, inputs, request_id: request,
         expected_quotes: expected, ...(contextId ? { context_id: contextId } : {}), ...source });
-      ctx.onChanged();
-      return { ok: true, data: {} };
-    } catch (error) { return { ok: false, refusal: plainRefusal(error) }; }
+    } catch {
+      // The start call's outcome is ambiguous — it may have landed.
+      return { ok: false, refusal: UNCONFIRMED };
+    }
+    // A non-object reply (null, primitive) cannot confirm a started run.
+    if (!isObject(run)) return { ok: false, refusal: UNCONFIRMED };
+    // Only id/state cross, pinned to the request id this tap planned; the
+    // closed runtime check makes a malformed reply uncertain, never a claim.
+    const receipt = parseRunSlotReceipt({ run_id: run.id, request_id: request, state: run.state });
+    if (!receipt) return { ok: false, refusal: UNCONFIRMED };
+    ctx.onChanged();
+    return { ok: true, data: receipt };
   } };
 }
 
-/** The spend/publish verbs. HP4 adds `publish.*` here; the set is closed in `screenProtocol`. */
+/** CAD-1365 — the original download slot. The host label is static; the run
+ *  captures install/context and the action token before its one await, then
+ *  creates a Blob and a parent-owned link only while the slot is still current. */
+const ORIGINAL_EXT: Record<string, string> = { "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp" };
+async function planOriginalDownload(get: () => ActionContext, args: Record<string, unknown>, ui?: { actionToken?: string; isCurrent?: () => boolean }): Promise<SlotPlan | ActionRefusal> {
+  const checked = originalDownloadArgs(args);
+  const actionToken = ui?.actionToken;
+  if (!checked || typeof actionToken !== "string" || actionToken.length === 0 || actionToken.length > 256)
+    return { code: "bad_args", text: "That request is not valid." };
+  const assetId = checked.asset_id as string;
+  const { installId, contextId, installation } = get();
+  const digest = installation.digest;
+  return { label: "Download original", run: async (isCurrent) => {
+    const current = () => (isCurrent ? isCurrent() : true) && (ui?.isCurrent ? ui.isCurrent() : true) &&
+      get().installId === installId && get().contextId === contextId && get().installation.digest === digest;
+    let image: { bytes: ArrayBuffer; mime: string };
+    try {
+      image = await workspaceApps.originalMedia({ action_token: actionToken, asset_id: assetId });
+    } catch (error) {
+      // A checked HTTP refusal is a refusal; a lost or aborted request is uncertain, never a claim.
+      if (error instanceof ApiError) return { ok: false, refusal: plainRefusal(error) };
+      return { ok: false, refusal: { code: "unconfirmed", text: "Cadence could not confirm this download. Check your downloads before trying again." } };
+    }
+    const ext = ORIGINAL_EXT[image.mime];
+    if (!ext) return refuse("failed", "That didn't work. Nothing was started.");
+    if (!current()) return refuse("stale", "That changed somewhere else. Reload and try again.");
+    const url = URL.createObjectURL(new Blob([image.bytes], { type: image.mime }));
+    try {
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `${assetId}.${ext}`;
+      document.body.appendChild(link);
+      try { link.click(); } finally { link.remove(); }
+    } finally {
+      // Revoke after the browser has had its tick to start the download.
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+    }
+    return { ok: true, data: {} };
+  } };
+}
+
+/** The spend/publish verbs. The set is closed in `screenProtocol`. */
 export function makePlanner(get: () => ActionContext): Planner {
   return (verb: SlotVerb, args, ui) => {
     const table: Record<SlotVerb, () => Promise<SlotPlan | ActionRefusal>> = {
@@ -454,6 +593,7 @@ export function makePlanner(get: () => ActionContext): Planner {
       "publish.draft.reschedule": () => planDraftEffectChange(get(), verb, args, ui?.actionToken),
       "publish.draft.cancel": () => planDraftEffectChange(get(), verb, args, ui?.actionToken),
       "publish.settings.save": () => planSavePublishSettings(get(), args),
+      "media.original.download": () => planOriginalDownload(get, args, ui),
     };
     return table[verb]();
   };
