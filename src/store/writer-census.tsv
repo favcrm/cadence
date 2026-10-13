@@ -1,6 +1,7 @@
 # Conservative lexical call-count inventory. Updating counts requires source review.
 # path	owner classification	call class	count
 audit.rs	read-only-store-audit	prepare	3
+store/activity.rs	read-only-store-activity-observation	prepare	4
 backup/mod.rs	offline-private-backup-copy-and-tests	execute	4
 backup/mod.rs	offline-private-backup-copy-and-tests	open	3
 backup/mod.rs	offline-private-backup-copy-and-tests	prepare	13
@@ -92,10 +93,10 @@ store/app_effects.rs	guarded-store-and-read-queries	execute	7
 store/app_effects.rs	guarded-store-and-read-queries	guarded_write	4
 store/app_explorer.rs	guarded-store-and-read-queries	execute	12
 store/app_explorer.rs	guarded-store-and-read-queries	guarded_write	9
-store/app_records.rs	separate-app-records-db-and-guarded-store	execute	37
+store/app_records.rs	separate-app-records-db-and-guarded-store	execute	39
 store/app_records.rs	separate-app-records-db-and-guarded-store	guarded_write	4
 store/app_records.rs	separate-app-records-db-and-guarded-store	open	2
-store/app_records.rs	separate-app-records-db-and-guarded-store	prepare	11
+store/app_records.rs	separate-app-records-db-and-guarded-store	prepare	12
 store/app_records.rs	separate-app-records-db-and-guarded-store	transaction	5
 store/app_runs.rs	guarded-store-and-read-queries	execute	41
 store/app_runs.rs	guarded-store-and-read-queries	guarded_write	8

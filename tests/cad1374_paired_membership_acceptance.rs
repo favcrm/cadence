@@ -18,7 +18,21 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::{Builder, TempDir};
 
-const API_DIR: &str = "/home/ubuntu/Project/agenticos-stack/worktrees/agenticos-v2-aos-218-browser-authority/apps/api";
+fn paired_api_dir() -> std::path::PathBuf {
+    let path = std::env::var_os("CAD1374_PAIRED_API_DIR")
+        .map(std::path::PathBuf::from)
+        .expect("CAD1374_PAIRED_API_DIR must point to the pinned AgenticOS apps/api checkout");
+    assert!(
+        path.is_absolute(),
+        "CAD1374_PAIRED_API_DIR must be absolute"
+    );
+    assert!(path.is_dir(), "CAD1374_PAIRED_API_DIR must be a directory");
+    assert!(
+        path.join("node_modules/.bin/vitest").is_file(),
+        "CAD1374_PAIRED_API_DIR must contain the installed Vitest CLI"
+    );
+    path
+}
 const DRIVER: &str = "src/runtime/cad1374-paired-membership.fixture.test.ts";
 const WAIT: Duration = Duration::from_secs(90);
 const BODY_CAP: usize = 1024 * 1024;
@@ -60,7 +74,8 @@ struct Driver {
 
 impl Driver {
     fn start(port: u16, public_host: &str, ready: &Path, token: String) -> Self {
-        let mut command = Command::new(Path::new(API_DIR).join("node_modules/.bin/vitest"));
+        let api_dir = paired_api_dir();
+        let mut command = Command::new(api_dir.join("node_modules/.bin/vitest"));
         command
             .args([
                 "run",
@@ -69,13 +84,13 @@ impl Driver {
                 "--maxWorkers=1",
                 "--no-file-parallelism",
             ])
-            .current_dir(API_DIR)
+            .current_dir(&api_dir)
             .env("CAD1374_FIXTURE_PORT", port.to_string())
             .env("CAD1374_FIXTURE_READY", ready)
             .env("CAD1374_PUBLIC_HOST", public_host)
             .env("CAD1374_FIXTURE_TOKEN", &token)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
         let child = cadence_agent::reaper::spawn(&mut command)
             .expect("start owned paired-membership Vitest child");
         Self { child, port, token }

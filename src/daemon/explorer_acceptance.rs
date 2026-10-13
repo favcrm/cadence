@@ -53,6 +53,15 @@ mod tests {
             let dir = tempfile::Builder::new().prefix("c1129a").tempdir().unwrap();
             let pm = dir.path().join("pm");
             crate::issue::Pm::init(&pm).unwrap();
+            crate::board_identity::write_config(
+                dir.path(),
+                &crate::board_identity::Config {
+                    host: "cad1374.example.test".to_string(),
+                    issuer: "https://platform.example.test".to_string(),
+                    company: "cad1374-test-company".to_string(),
+                },
+            )
+            .unwrap();
             let opts = ServeOptions::default();
             opts.provider_env
                 .set("CADENCE_PM_DIR", pm.to_str().unwrap());
@@ -81,9 +90,15 @@ mod tests {
                 role: role.to_string(),
                 handle: handle.to_string(),
             };
+            let config = crate::board_identity::read_config(self.dir.path()).unwrap();
+            let realm = crate::operator_auth::PublicRealm {
+                issuer: config.issuer,
+                company: config.company,
+                host: config.host,
+            };
             self.shared
                 .operator_auth()
-                .open_public(user, &format!("jti-{handle}"), now + 60, "ua", now)
+                .open_public_bound(user, &format!("jti-{handle}"), now + 60, "ua", realm, now)
                 .unwrap()
                 .expect("fresh jti");
         }
