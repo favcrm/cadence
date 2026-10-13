@@ -2603,8 +2603,10 @@ fn cad1337_acc_export_refuses_unapproved_chat_files_owner_column() {
     let root = root("cad1337-forged-chat-files-owner");
     let tracker = make_tracker(&root);
     let state = make_state(&root, false);
-    let tracker_status_before =
-        git(&tracker, &["status", "--porcelain=v1", "--untracked-files=all"]);
+    let tracker_status_before = git(
+        &tracker,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    );
     let control_out = root.join("known-schema-control");
     export_portable(&state, &control_out, &opts(&tracker))
         .expect("known schema-41 fixture exports successfully");
@@ -2634,7 +2636,10 @@ fn cad1337_acc_export_refuses_unapproved_chat_files_owner_column() {
         "refusal leaves no output or partial staging"
     );
     assert_eq!(
-        git(&tracker, &["status", "--porcelain=v1", "--untracked-files=all"]),
+        git(
+            &tracker,
+            &["status", "--porcelain=v1", "--untracked-files=all"]
+        ),
         tracker_status_before,
         "tracker status unchanged"
     );
