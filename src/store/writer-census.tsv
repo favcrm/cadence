@@ -249,6 +249,7 @@ daemon/cad1365_media_publish_acceptance.rs	test-fixtures	execute	1
 daemon/cad1365_media_publish_acceptance.rs	test-fixtures	guarded_write	2
 daemon/cad1365_media_publish_acceptance.rs	test-fixtures	open	2
 daemon/cad1365_mount_authority_acceptance.rs	test-fixtures	open	1
+daemon/cad1365_original_fence_acceptance.rs	test-fixtures	open	1
 daemon/cad1365_original_transfer_acceptance.rs	test-fixtures	execute	1
 daemon/cad1365_original_transfer_acceptance.rs	test-fixtures	guarded_write	1
 daemon/cad1365_original_transfer_acceptance.rs	test-fixtures	open	1
