@@ -573,7 +573,10 @@ receipt and runs the `upgrade --sha` checks instead.
 
 Never relay `rollout claim|backup|handoff|grant` or `upgrade` recipes;
 those are recovery internals (docs/CLI.md). If `--check` refuses, report
-the refusal text and stop. For dev work use `cadence dev up|reload|down`
+the refusal text and stop. If `--check` shows `available` older than
+`current`, or a `blocked:` line naming an older build or unproven
+ancestry, report it and stop: the approved candidate
+is stale (CAD-1235). For dev work use `cadence dev up|reload|down`
 on a disposable instance, never production.
 
 ## Refresh a delegated staging instance
