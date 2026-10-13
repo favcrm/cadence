@@ -197,7 +197,7 @@ fn assert_refused_before_effects(host: &SyntheticHost, target: &str, schema: i64
     let check = update::check(host).unwrap();
     let lines = check.lines().join("\n");
     assert!(
-        lines.contains(&format!("blocked:")),
+        lines.contains("blocked:"),
         "--check must report blocked: {lines}"
     );
     assert!(
