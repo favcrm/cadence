@@ -11,6 +11,20 @@ use super::plans::{Job, Task};
 use super::StoreConn;
 use super::{now, Store};
 
+/// CAD-1380 R4: the constant next-action instruction carried by an assist
+/// intent. No member text; the drain delivers it verbatim.
+const ASSIST_NEXT_ACTION: &str =
+    "Review the job's current state and report next steps through the normal worker path.";
+
+/// One recipient of an assist intent before it is written as a payload.
+struct AssistTarget {
+    target: &'static str,
+    alias: Option<String>,
+    org: Option<String>,
+    sub: Option<String>,
+    assistant_id: Option<String>,
+}
+
 pub(super) const UNKNOWN_EVENT_REASON_CHARS: usize = 512;
 
 /// Keep the provider's uncertainty account useful to an operator without
@@ -1082,6 +1096,13 @@ impl Store {
         {
             return Ok(false);
         }
+        // CAD-1380 R4: an assist-bound job routes ONLY through inert
+        // canonical intents, never the legacy PM queue below. The PM of an
+        // assist job is the assistant, so the legacy path would bypass the
+        // live jobs-scope proof the drain requires.
+        if self.assist_intents_for_transition(tx, job, task, new_state, dedupe)? {
+            return Ok(true);
+        }
         let recipient = self.agent_opt_in(tx, &job.pm_alias)?;
         let Some(recipient) = recipient else {
             self.handoff_unresolved(
@@ -1130,6 +1151,115 @@ impl Store {
         // also get this event as a turnless topic notice, in this transaction.
         // The PM notify above is unchanged; a job without a topic is untouched.
         self.job_topic_fanout_in(tx, job, &delivery, &body)?;
+        Ok(true)
+    }
+
+    /// CAD-1380 R4: write one inert `assist_intent` event per recipient for
+    /// an assist-bound job's transition, in the caller's transaction. Returns
+    /// `false` when the job has no `assist_requests` ledger (ordinary routing
+    /// proceeds unchanged). Metadata only: job/task/revision/state and a
+    /// constant next-action note. No member title, body, acceptance or raw
+    /// verdict text. Targets: the Master (metadata only), the REVISE author
+    /// (`new_state == "revising"`, only the actual assignee), and every
+    /// `job_subscribers` row (owner included). No alias is fabricated. The
+    /// live eligibility check happens in the guarded drain, not here.
+    pub(crate) fn assist_intents_for_transition(
+        &self,
+        tx: &impl super::StoreConn,
+        job: &Job,
+        task: &Task,
+        new_state: &str,
+        dedupe: &str,
+    ) -> Result<bool> {
+        let bound: bool = tx
+            .query_row(
+                "SELECT 1 FROM assist_requests WHERE job=? LIMIT 1",
+                [job.id.as_str()],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !bound {
+            return Ok(false);
+        }
+        let mut targets: Vec<AssistTarget> = vec![AssistTarget {
+            target: "master",
+            alias: Some(crate::master::ALIAS.to_string()),
+            org: None,
+            sub: None,
+            assistant_id: None,
+        }];
+        if new_state == "revising" {
+            if let Some(assignee) = task.assignee.clone() {
+                targets.push(AssistTarget {
+                    target: "author",
+                    alias: Some(assignee),
+                    org: None,
+                    sub: None,
+                    assistant_id: None,
+                });
+            }
+        }
+        let subs: Vec<(String, String, String)> = tx.query_vec(
+            "SELECT org, sub, assistant_id FROM job_subscribers WHERE job=? ORDER BY created",
+            [job.id.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        for (org, sub, assistant_id) in subs {
+            targets.push(AssistTarget {
+                target: "subscriber",
+                alias: None,
+                org: Some(org),
+                sub: Some(sub),
+                assistant_id: Some(assistant_id),
+            });
+        }
+        for AssistTarget {
+            target,
+            alias,
+            org,
+            sub,
+            assistant_id,
+        } in targets
+        {
+            let key_src = format!(
+                "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                job.id,
+                task.id,
+                task.revision,
+                new_state,
+                dedupe,
+                target,
+                alias.as_deref().unwrap_or(""),
+                org.as_deref().unwrap_or(""),
+                sub.as_deref().unwrap_or(""),
+                assistant_id.as_deref().unwrap_or(""),
+            );
+            let key = crate::operator_auth::digest(&key_src);
+            let payload = json!({
+                "key": key,
+                "status": "pending",
+                "job": job.id,
+                "task": task.id,
+                "revision": task.revision,
+                "state": new_state,
+                "dedupe": dedupe,
+                "target": target,
+                "alias": alias,
+                "org": org,
+                "sub": sub,
+                "assistant_id": assistant_id,
+                "note": ASSIST_NEXT_ACTION,
+            });
+            tx.execute(
+                "INSERT INTO events(alias,kind,payload,job_id,task_id,at)
+                 SELECT 'daemon','assist_intent',?,?,?,?
+                 WHERE NOT EXISTS (
+                   SELECT 1 FROM events WHERE kind='assist_intent'
+                   AND json_extract(payload,'$.key')=?)",
+                params![payload.to_string(), job.id, task.id, now(), key],
+            )?;
+        }
         Ok(true)
     }
 

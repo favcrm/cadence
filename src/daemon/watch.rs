@@ -28,6 +28,13 @@ pub(super) const NUDGE_MAX_CHARS: usize = 500;
 
 /// `stall_secs` when neither the job nor the agent sets one.
 const DEFAULT_STALL_SECS: u64 = 1800;
+/// The member-assist supervisor's stall bound — the agreed feature
+/// interval, independent of the generic PM turn's 1800 s default. A
+/// job's own `stall_secs` overrides it; a supervisor check never
+/// dispatches work.
+const ASSIST_STALL_SECS: u64 = 300;
+/// CAD-1380 R4: how often the assist-notice drain runs.
+const ASSIST_NOTICE_EVERY: Duration = Duration::from_secs(2);
 
 /// `silent_end_secs` when the agent doesn't set one: ten minutes of
 /// probe-verified idle pane on a running message before
@@ -335,6 +342,8 @@ impl Shared {
         let mut checkup_at: Option<Instant> = None;
         let mut events_rolled: Option<Instant> = None;
         let mut reconcile_at: Option<Instant> = None;
+        let mut assist_stalls_swept: Option<Instant> = None;
+        let mut assist_notices_routed: Option<Instant> = None;
         // CAD-1241: in-memory continuation for the bounded reconcile —
         // the last candidate the previous tick classified. In-memory
         // only: a daemon restart restarts the sweep at the head (the
@@ -372,6 +381,39 @@ impl Shared {
                         Some(Instant::now())
                     }
                 };
+            }
+            // CAD-1380: member-assistant job supervision — an assist-
+            // bound job whose progress watermark has not moved past its
+            // bound is marked stalled (one `assist_stall` job event,
+            // dedup'd per watermark via `assist_stall_checks`). It
+            // never dispatches; the same stall budget semantics the PM
+            // checkup uses apply.
+            if assist_stalls_swept
+                .is_none_or(|at| at.elapsed() >= screen_sample(&self.stall_sample_secs))
+            {
+                // The member-assist stall supervisor: one bounded sweep
+                // over assist-bound jobs; a moved watermark resets the
+                // check, so the same stall never re-fires. Failures log
+                // only — a supervisor error never stops the watch.
+                match self
+                    .store
+                    .assist_stall_sweep(ASSIST_STALL_SECS as i64, epoch_secs())
+                {
+                    Ok(0) => {}
+                    Ok(n) => eprintln!("assist stall watch: flagged {n} stalled job(s)"),
+                    Err(e) => eprintln!("assist stall watch: {e}"),
+                }
+                assist_stalls_swept = Some(Instant::now());
+            }
+            // CAD-1380 R4: drain pending assist-job notices. Outside any store
+            // transaction; a failure logs only and the intents stay pending.
+            if assist_notices_routed.is_none_or(|at| at.elapsed() >= ASSIST_NOTICE_EVERY) {
+                match self.route_assist_job_notifications() {
+                    Ok(0) => {}
+                    Ok(n) => eprintln!("assist notice watch: queued {n} notice(s)"),
+                    Err(e) => eprintln!("assist notice watch: {e}"),
+                }
+                assist_notices_routed = Some(Instant::now());
             }
             // CAD-199: off unless configured; sweeps at most hourly.
             self.agent_gc_tick();

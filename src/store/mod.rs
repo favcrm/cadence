@@ -29,6 +29,7 @@ pub use effects::{
     EFFECT_EXECUTED_EVENT, EFFECT_FAILED_EVENT, EFFECT_NEEDS_YOU_EVENT, EFFECT_REQUESTED_EVENT,
 };
 mod threads;
+pub use threads::MemberAuthority;
 pub use threads::{
     tool_result_summary, tool_summary, ConversationKind, NewEntry, Sender, Thread, ThreadEntry,
     CONVERSATION_LIMIT, KIND_ASSISTANT_TEXT, KIND_MESSAGE, KIND_TOOL_CALL, KIND_TOOL_RESULT,
@@ -79,6 +80,8 @@ pub use chat_files::{
     CHAT_FILE_MAX_BYTES, CHAT_FILE_MAX_PER_MESSAGE, CHAT_FILE_SCOPE_HOME, CHAT_FILE_TEXT_CAP,
     CHAT_QUOTA_CODE,
 };
+mod assistants;
+pub use assistants::{AssistDispatchExpect, AssistRecipient, AssistRequest, AssistantBinding};
 pub mod app_audiences;
 pub use app_audiences::{AudienceBase, Predicate};
 pub mod app_content;

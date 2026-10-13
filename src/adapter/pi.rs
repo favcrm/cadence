@@ -644,7 +644,18 @@ fn launch_command(
     // Opt-in confinement cannot quietly lapse: `--confine` on a host
     // that cannot confine is an error, not a plain launch.
     crate::master::confinement_available(env)?;
-    let (confine, policy) = pi_worker_confinement(env, state_dir, agent);
+    // CAD-1380: a member-bound personal assistant (`params.assist`) gets
+    // the member-boundary policy — its own principal-owned subdir and
+    // worker dir only, never the tracker (`pm_dir`), the worktree/git
+    // targets, the toolchain caches or `$HOME` the generic worker grant
+    // carries. A member assistant is read-mostly; a build/fleet write
+    // set would let one member's chat read another lane's store.
+    let params = agent.params.clone().unwrap_or(Value::Null);
+    let (confine, policy) = if params.get("assist").is_some() {
+        pi_assistant_confinement(env, state_dir, agent)
+    } else {
+        pi_worker_confinement(env, state_dir, agent)
+    };
     let argv = crate::master::confine_argv(&confine, &policy, &command);
     Ok((argv, Some(policy)))
 }
@@ -1234,6 +1245,103 @@ pub fn pi_worker_confinement(
     }
     read.extend(split_paths(env.var(CONFINE_WORKER_EXTRA_READ_ENV)));
     write.extend(split_paths(env.var(CONFINE_WORKER_EXTRA_WRITE_ENV)));
+    (confine_command(env), crate::confine::Policy { read, write })
+}
+
+/// CAD-1380: the member-assistant confinement policy — the narrowest
+/// worker profile. The caller-bound assistant (`params.assist` = the
+/// member's `sub`, set by the daemon's own `ensure_assistant_runtime`,
+/// never a request field) gets:
+///
+/// - **write**: ONLY its own principal-owned cwd
+///   (`state_dir/assistants/<sub>` — the registered `agent.cwd`) and
+///   its private worker dir under the state dir (config, session, tmp).
+///   No PM tracker (`pm_dir`), no worktree/git dir, no cargo/sccache
+///   caches — a member assistant never writes a lane's issue, a build
+///   artifact or a shared dep cache.
+/// - **read**: the system trees, the launch programs (pi, cadence,
+///   confine), its briefing file and sandbox marker, its own turn
+///   guard, the pinned `[pi].providers` package dirs, and its own cwd.
+///   No `$HOME` reads at all — no ssh files, no `.config`, no cargo
+///   config: a member assistant does not push over ssh or compile, so
+///   the non-secret grants the worker carries are dropped wholesale.
+///   The daemon store and every other member's `assistants/<sub>` dir
+///   stay denied by omission.
+///
+/// The policy is derived from the daemon-owned registration —
+/// `agent.cwd` is the subdir `ensure_assistant_runtime` created — so an
+/// immutable `(org, sub)` binding, not a caller field, picks it.
+fn pi_assistant_confinement(
+    env: &ProviderEnv,
+    state_dir: &Path,
+    agent: &Agent,
+) -> (String, crate::confine::Policy) {
+    use crate::master::{program_dirs, which, with_interpreter};
+    let path = env.var("PATH");
+    let command = pi_command(env);
+    let cwd = PathBuf::from(&agent.cwd);
+
+    let mut read: Vec<PathBuf> = crate::master::CONFINE_SYSTEM_READ
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+    let mut write: Vec<PathBuf> = crate::master::CONFINE_SYSTEM_WRITE
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+
+    // Programs only: pi + its interpreter/package, cadence (the
+    // assistant's own `message report`/`thread read`), confine.
+    let mut programs = Vec::new();
+    if let Some(p) = command.first().and_then(|c| which(c, path.as_deref())) {
+        programs.extend(with_interpreter(&p, path.as_deref()));
+        if let Some(root) = package_root(&p) {
+            programs.push(root);
+        }
+    }
+    if let Some(p) = which("cadence", path.as_deref()) {
+        programs.push(p);
+    }
+    programs.push(PathBuf::from(confine_command(env)));
+    for program in &programs {
+        for dir in program_dirs(program) {
+            if !read.contains(&dir) {
+                read.push(dir);
+            }
+        }
+    }
+
+    let params = agent.params.clone().unwrap_or(Value::Null);
+    if let Ok(path) = pi_turn_guard_path(state_dir, &agent.alias) {
+        read.push(path);
+    }
+    read.push(crate::client::briefing_path(
+        state_dir,
+        &params,
+        &agent.alias,
+    ));
+    if let Some(marker) = crate::sandbox::marker_for(state_dir) {
+        read.push(marker);
+    }
+    // Read its own cwd (the member's principal-owned dir) so the
+    // assistant reads what it wrote; write it too.
+    read.push(cwd.clone());
+    write.push(cwd);
+    // Its private worker dir under the state dir (config/session/tmp).
+    if let Ok(dir) = pi_worker_dir(state_dir, &agent.alias) {
+        write.push(dir);
+    }
+    if let Ok(cache) = pi_worker_config_dir(state_dir, &agent.alias).map(|d| d.join("cache")) {
+        write.push(cache);
+    }
+    // Pinned `[pi].providers` package dirs, read-only.
+    if let Ok(packages) = provider_packages(env) {
+        for pkg in packages {
+            if !read.contains(&pkg.dir) {
+                read.push(pkg.dir);
+            }
+        }
+    }
     (confine_command(env), crate::confine::Policy { read, write })
 }
 

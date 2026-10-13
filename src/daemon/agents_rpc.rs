@@ -217,14 +217,33 @@ impl Shared {
         Ok(json!({"alias": alias, "state": "starting", "provider": provider}))
     }
 
-    pub(super) fn rpc_events(self: &Arc<Self>, params: &Value) -> Result<Value> {
+    pub(super) fn rpc_events(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
         let raw = required_str(params, "alias")?;
         // The daemon stream has no agents row — read-only, so a plain
         // match suffices; every other RPC keeps resolving to an agent.
-        let alias = if raw == DAEMON_ALIAS {
+        let daemon = raw == DAEMON_ALIAS;
+        let alias = if daemon {
             raw.to_string()
         } else {
             self.resolve_alias(raw)?
+        };
+        // CAD-1380: daemon `assist_intent` rows are member-private routing. Only
+        // the operator reads them from the shared stream; every other caller gets
+        // the same page with those rows removed, cursors unchanged.
+        let hide_intents = daemon
+            && !matches!(
+                self.connection_caller(peer_pid)?,
+                caller_rule::Who::Operator
+            );
+        let visible = |events: Vec<crate::store::Event>| -> Vec<crate::store::Event> {
+            if hide_intents {
+                events
+                    .into_iter()
+                    .filter(|e| e.kind != "assist_intent")
+                    .collect()
+            } else {
+                events
+            }
         };
         let after = optional_i64(params, "after").unwrap_or(0);
         if after < 0 {
@@ -242,9 +261,10 @@ impl Shared {
             if has_older {
                 events.remove(0);
             }
+            let cursor = events.last().map(|e| e.seq).unwrap_or(0);
             return Ok(json!({
-                "events": events.iter().map(crate::store::Event::to_json).collect::<Vec<_>>(),
-                "cursor": events.last().map(|e| e.seq).unwrap_or(0),
+                "events": visible(events).iter().map(crate::store::Event::to_json).collect::<Vec<_>>(),
+                "cursor": cursor,
                 "has_older": has_older,
             }));
         }
@@ -254,7 +274,7 @@ impl Shared {
             if !events.is_empty() || self.closing.load(Ordering::SeqCst) {
                 let cursor = events.last().map(|e| e.seq).unwrap_or(after);
                 return Ok(json!({
-                    "events": events.iter().map(crate::store::Event::to_json).collect::<Vec<_>>(),
+                    "events": visible(events).iter().map(crate::store::Event::to_json).collect::<Vec<_>>(),
                     "cursor": cursor,
                 }));
             }
@@ -636,6 +656,63 @@ impl Shared {
         // Enable only after the ownership/fence checks pass — a
         // rejected resume must leave no side effects behind.
         self.start_actor_locked(&mut lc, alias, true)
+    }
+
+    /// Whether an operator paused `alias`: disabled, and its newest stop
+    /// marker is not the idle timer's. A fresh registration is enabled, a
+    /// timer stop stays eligible for work-driven resume, and an explicit
+    /// resume re-enables the row, so a historical manual marker never blocks it.
+    pub(super) fn assistant_stopped_by_operator(&self, alias: &str) -> Result<bool> {
+        if self.store.agent(alias)?.enabled {
+            return Ok(false);
+        }
+        let marker = self
+            .store
+            .last_event_of(alias, crate::store::AUTO_STOP_MARKER_KINDS)?;
+        Ok(!marker.is_some_and(|m| m.kind == crate::store::AUTO_STOP_EVENT))
+    }
+
+    /// The member assistant's resume (CAD-1380): the inbox, fence and start
+    /// path of `try_resume`, with the operator-stop check and the start claim
+    /// under one lifecycle lock, so a stop cannot land between them. Operator
+    /// resume and unfence keep `try_resume`. An owned alias is a live actor
+    /// that drains the queue; a stop in flight refuses.
+    pub(super) fn try_resume_assistant(self: &Arc<Self>, alias: &str) -> Result<()> {
+        let agent = self.store.agent(alias)?;
+        if !registry::has_actor(&agent.provider, &agent.endpoint_kind) {
+            return Err(Error::rejected(format!(
+                "Agent '{alias}' is an inbox — nothing to resume"
+            )));
+        }
+        let mut lc = self.lifecycle.lock().unwrap();
+        if lc.stopping.contains(alias) {
+            return Err(Error::rejected(format!(
+                "assistant '{alias}' is stopping — the message stays queued"
+            )));
+        }
+        if lc.agents.contains_key(alias) {
+            // CAD-1380: the owned no-op resume still gates on the cwd invariant.
+            self.assistant_start_guard(alias)?;
+            return Ok(());
+        }
+        if self.store.has_unknown(alias)? {
+            return Err(Error::rejected(format!(
+                "assistant '{alias}' is fenced by an unreconciled unknown message — \
+                 the operator reconciles before it runs again"
+            )));
+        }
+        if self.assistant_stopped_by_operator(alias)? {
+            return Err(Error::rejected(format!(
+                "assistant '{alias}' was stopped by an operator and stays stopped — \
+                 the operator resumes it; the message stays queued"
+            )));
+        }
+        if !self.start_actor_locked(&mut lc, alias, true)? {
+            return Err(Error::rejected(format!(
+                "assistant '{alias}' is fenced by an unreconciled unknown message"
+            )));
+        }
+        Ok(())
     }
 
     /// Bounded wait for a just-started actor's `open`: live when an

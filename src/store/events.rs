@@ -286,6 +286,28 @@ pub(super) fn row_event(row: &rusqlite::Row) -> rusqlite::Result<Event> {
     })
 }
 
+/// CAD-1380 R3: the real task transitions that advance an assist-bound
+/// job's `updated` watermark when `event_scoped_raw` writes them. Each
+/// is emitted inside the same transaction as its task write. Excluded:
+/// `queued`, `assist_stall`, reads/polls, `turn_unknown` (evidence, not
+/// progress) and job-level `job_cancelled`/`job_closed`, which already
+/// set `jobs.updated` in their own UPDATE.
+const ASSIST_PROGRESS_KINDS: &[&str] = &[
+    "task_created",
+    "task_dispatched",
+    "task_running",
+    "task_reported",
+    "task_sha_recorded",
+    "verdict_recorded",
+    "task_blocked",
+    "task_revising",
+    "task_done",
+    "task_reopened",
+    "task_failed",
+    "task_cancelled",
+    "task_unassigned",
+];
+
 impl Event {
     pub fn to_json(&self) -> Value {
         json!({
@@ -341,6 +363,19 @@ impl Store {
              VALUES(?,?,?,?,?,?)",
             params![alias, kind, payload.to_string(), job_id, task_id, now()],
         )?;
+        if let Some(job) = job_id.filter(|_| ASSIST_PROGRESS_KINDS.contains(&kind)) {
+            // CAD-1380 R3: the assist watermark is `jobs.updated` (ms
+            // truncated by `rev_millis`). Advance it in THIS transaction,
+            // strictly past the stored millisecond, and only for an
+            // assist-bound job. `+0.5` ms keeps the stored f64 on the
+            // intended millisecond after truncation.
+            tx.execute(
+                "UPDATE jobs SET updated=(MAX(CAST(?1 AS INTEGER),
+                     CAST(updated*1000 AS INTEGER)+1)+0.5)/1000.0
+                 WHERE id=?2 AND EXISTS(SELECT 1 FROM assist_requests WHERE job=?2)",
+                params![(now() * 1000.0) as i64, job],
+            )?;
+        }
         Ok(())
     }
 
