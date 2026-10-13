@@ -174,6 +174,10 @@ impl Shared {
                 }
                 actions.push(json!({"id":id,"description":row["description"],"input_schema":meta.input_schema,"effect":meta.effect,"confirmation":meta.confirmation,"availability":"available"}));
             }
+            actions.extend(super::app_record_actions_rpc::declared_record_actions(
+                self,
+                &scoped.install,
+            )?);
             return Ok(
                 json!({"contract":crate::issue::app_assistant::CONTRACT,"actions":actions,"descriptor_digest":descriptor_digest}),
             );
@@ -183,6 +187,19 @@ impl Shared {
             .get("input")
             .filter(|v| v.is_object())
             .ok_or_else(|| Error::rejected("assistant action input must be an object"))?;
+        // CAD-1415: a package-declared record action (not a host-registry id)
+        // parks its own pending operation; the host registry is unchanged.
+        if crate::app_assistant::registered_action(action_id).is_none() {
+            let operation_id = required_str(params, "operation_id")?;
+            return super::app_record_actions_rpc::invoke_record_action(
+                self,
+                &records,
+                &scoped,
+                operation_id,
+                action_id,
+                input,
+            );
+        }
         let meta = crate::app_assistant::registered_action(action_id)
             .ok_or_else(|| Error::rejected("unknown assistant action"))?;
         if !descriptor["actions"]
@@ -548,6 +565,9 @@ impl Shared {
                         }
                     }
                 }
+                actions.extend(super::app_record_actions_rpc::declared_record_actions(
+                    self, install,
+                )?);
                 Ok(
                     json!({"contract":crate::issue::app_assistant::CONTRACT,"actions":actions,"descriptor_digest":digest}),
                 )
@@ -666,6 +686,21 @@ impl Shared {
             return Ok(json!({"operation":result}));
         }
         let action = required_str(&op, "action_id")?;
+        // CAD-1415: a declared record action executes only as allow-once.
+        if crate::app_assistant::registered_action(action).is_none() {
+            if decision != "allow_once" {
+                return Err(Error::rejected("record actions are allowed one time only"));
+            }
+            return super::app_record_actions_rpc::decide_record_action(
+                self,
+                records,
+                install,
+                context,
+                &op,
+                operation_id,
+                expected,
+            );
+        }
         if action != "customer.tags.update" && !crate::app_assistant::is_social(action) {
             return Err(Error::rejected(
                 "no operator decision handler is registered for this action",
