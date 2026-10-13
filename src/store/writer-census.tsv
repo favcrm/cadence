@@ -240,3 +240,5 @@ daemon/conversations_acceptance.rs	independent-daemon-acceptance-fixtures	execut
 daemon/conversations_acceptance.rs	independent-daemon-acceptance-fixtures	open	4
 daemon/campaign_clone_acceptance.rs	independent-daemon-acceptance-fixtures	open	1
 store/social_publish.rs	guarded-store-and-read-queries	prepare	2
+update.rs	isolated-update-test-fixtures	open	1
+update.rs	isolated-update-test-fixtures	execute	1
