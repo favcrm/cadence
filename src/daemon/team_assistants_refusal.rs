@@ -113,6 +113,36 @@ impl AssistantFlagOn {
     }
 }
 
+/// Holds the rollout flag UNSET (feature OFF) under the same process lock as
+/// [`AssistantFlagOn`], restoring the prior value on drop.
+pub(crate) struct FlagOffGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl FlagOffGuard {
+    pub(crate) fn new() -> Self {
+        let lock = ASSISTANT_FLAG_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os("HOSTED_CADENCE_ASSISTANT_ENABLED");
+        std::env::remove_var("HOSTED_CADENCE_ASSISTANT_ENABLED");
+        Self {
+            _lock: lock,
+            previous,
+        }
+    }
+}
+
+impl Drop for FlagOffGuard {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(v) => std::env::set_var("HOSTED_CADENCE_ASSISTANT_ENABLED", v),
+            None => std::env::remove_var("HOSTED_CADENCE_ASSISTANT_ENABLED"),
+        }
+    }
+}
+
 impl Drop for AssistantFlagOn {
     fn drop(&mut self) {
         match self.previous.take() {
@@ -485,29 +515,24 @@ impl Fx {
                     | "job_share"
                     | "job_reconcile"
             );
-        // Op-bound provenance for `job_dispatch`: the request names the
-        // queued effect's recorded `credential_id`; the platform re-proves
-        // THAT credential live (`liveBridge` on the op's own
-        // `assist_requests.credential_id`), never the binding's latest —
-        // a member whose recorded op credential is dead stays denied even
-        // after a global renewal re-pins the assistant binding.
-        let op_provenance_ok = if input.operation == "job_dispatch" {
-            let cred = input.resource.credential_id.as_deref();
-            // Required for job_dispatch — a deferred dispatch with no
-            // recorded provenance fails closed.
-            match cred {
-                None => false,
-                Some(cred) => {
-                    let guard = authority.lock().unwrap();
-                    guard
-                        .members
-                        .get(&input.sub)
-                        .and_then(|m| m.live_credentials.get(cred))
-                        .is_some_and(|(live, caps)| *live && caps.iter().any(|c| c == &input.scope))
-                }
+        // Op-bound provenance: when the request names an op's own credential
+        // (the queued dispatch's `assist_requests` row, or the verified incoming
+        // envelope credential on a member verb), the platform re-proves THAT
+        // credential live with the requested scope in its grant ceiling. It is
+        // never the binding's latest pin and never a fallback, so a revoked C1
+        // stays denied after a renewal re-pins the binding to C2. `job_dispatch`
+        // MUST name one (fail closed). A no-CID native background check keeps
+        // the current-binding rule below.
+        let op_provenance_ok = match input.resource.credential_id.as_deref() {
+            None => input.operation != "job_dispatch",
+            Some(cred) => {
+                let guard = authority.lock().unwrap();
+                guard
+                    .members
+                    .get(&input.sub)
+                    .and_then(|m| m.live_credentials.get(cred))
+                    .is_some_and(|(live, caps)| *live && caps.iter().any(|c| c == &input.scope))
             }
-        } else {
-            true
         };
 
         let bearer = request
@@ -1946,7 +1971,7 @@ impl Fx {
         let wthread = self.shared.store.ensure_thread("ordinary-worker").unwrap();
         let foreign_msg = {
             let msg_id = format!("foreign-msg-{sub}");
-            let (dup, id) = self
+            let (dup, _state) = self
                 .shared
                 .store
                 .enqueue(
@@ -1958,8 +1983,16 @@ impl Fx {
                 )
                 .unwrap();
             assert!(!dup, "foreign message id collided");
+            assert!(
+                self.shared
+                    .store
+                    .message(&msg_id)
+                    .unwrap()
+                    .is_some_and(|m| m.alias == "ordinary-worker"),
+                "foreign message {msg_id} was not stored for ordinary-worker"
+            );
             let _ = wthread;
-            id
+            msg_id
         };
         // A foreign job + task the member neither owns nor subscribes.
         let spec = self.dir.path().join(format!("foreign-spec-{sub}.md"));
@@ -2286,6 +2319,559 @@ fn assist_runtime_profile_is_recorded_member_scoped() {
 /// daemon's `platform_credentials` custody + the fixture platform — the
 /// deferred-commit bearer path (the member envelope cannot survive to
 /// consume time).
+/// CAD-1380 acceptance 1 (target-side isolation). A registered ORDINARY
+/// worker (a non-assist agent, asserted through the real caller seam) must
+/// not read a member's private assistant thread, agent row, agent events,
+/// job or task records. The owner's own thread read stays positive and an
+/// ordinary nonmember control on its own thread stays allowed.
+#[test]
+fn ordinary_worker_cannot_read_member_private_thread_job_or_task() {
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    let rt = fx.member_runtime("sub-alice");
+    let own = rt.alias.clone();
+    let worker = Asserted::Agent("ordinary-worker".to_string());
+
+    // A REAL member-owned job: the canonical request binds it to the member's
+    // assistant as PM and records the assist-request owner row.
+    let req = fx.op(
+        "member_job_request",
+        json!({"member_envelope": fx.member_envelope("sub-alice"), "title": "private boundary", "request_key": "ordinary-private-boundary", "body": "private request"}),
+    );
+    let private_job = req["job"].as_str().unwrap().to_string();
+    let private_task = fx
+        .shared
+        .store
+        .tasks_for_job(&private_job)
+        .unwrap()
+        .first()
+        .expect("member job created no task")
+        .id
+        .clone();
+    assert_eq!(
+        req["job_record"]["pm"].as_str(),
+        Some(own.as_str()),
+        "member job PM is not the member's assistant"
+    );
+    assert!(
+        fx.shared
+            .store
+            .assist_request_owns(ORG, "sub-alice", &private_job)
+            .unwrap(),
+        "member job has no member-owned assist request row"
+    );
+    assert_ne!(
+        req["job_record"]["pm"].as_str(),
+        Some("ordinary-worker"),
+        "ordinary worker is the member job's PM"
+    );
+    assert!(
+        !fx.shared
+            .store
+            .job_is_subscriber(&private_job, ORG, "ordinary-worker")
+            .unwrap(),
+        "ordinary worker is a subscriber of the member job"
+    );
+
+    // Positive control: the member's own assistant reads its own thread.
+    assert!(
+        fx.as_assistant(&own, "thread_read", json!({"alias": own}))
+            .is_ok(),
+        "owner could not read its own private thread"
+    );
+    // Control: the ordinary worker reads its OWN nonmember thread.
+    assert!(
+        fx.call(
+            worker.clone(),
+            "thread_read",
+            json!({"alias": "ordinary-worker"})
+        )
+        .is_ok(),
+        "ordinary worker could not read its own thread"
+    );
+    // Control: the ordinary worker is the PM of the ORIGINAL foreign job, so
+    // its job/task reads stay allowed (normal nonmember behaviour).
+    for (method, params) in [
+        ("job_show", json!({"job": rt.foreign_job})),
+        ("task_show", json!({"task": rt.foreign_task})),
+    ] {
+        assert!(
+            fx.call(worker.clone(), method, params).is_ok(),
+            "ordinary worker PM could not {method} its own foreign job"
+        );
+    }
+
+    let before = fx.tree();
+    let probes: [(&str, Value); 5] = [
+        ("thread_read", json!({"alias": own})),
+        ("agent_show", json!({"alias": own})),
+        ("agent_events", json!({"alias": own})),
+        ("job_show", json!({"job": private_job})),
+        ("task_show", json!({"task": private_task})),
+    ];
+    for (method, params) in probes {
+        let r = fx.call(worker.clone(), method, params);
+        assert!(
+            r.is_err(),
+            "ordinary worker read member-private {method} of '{own}' (job {private_job}): {r:?}"
+        );
+    }
+    assert_eq!(
+        fx.tree(),
+        before,
+        "an ordinary worker read moved the tracker"
+    );
+}
+
+/// CAD-1380 privacy (list filter). A member-private assist job must stay out of
+/// an ordinary worker's generic `job_list`. The owner member's share and the
+/// subscribing member's live grant keep the job visible to THAT member.
+#[test]
+fn ordinary_job_list_hides_member_private_job_until_shared() {
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    fx.provision("sub-ada");
+    fx.provision("sub-ben");
+    let req = fx.op(
+        "member_job_request",
+        json!({"member_envelope": fx.member_envelope("sub-ada"), "title": "private list", "request_key": "list-private-1", "body": "private"}),
+    );
+    let private_job = req["job"].as_str().unwrap().to_string();
+    let worker = Asserted::Agent("ordinary-worker".to_string());
+    let generic_lists_job = |who: &Asserted| -> bool {
+        let v = fx
+            .call(who.clone(), "job_list", json!({"all": true}))
+            .unwrap_or_else(|e| panic!("job_list refused: {e}"));
+        v["jobs"].as_array().is_some_and(|a| {
+            a.iter()
+                .any(|j| j["id"].as_str() == Some(private_job.as_str()))
+        })
+    };
+    // Unshared: the ordinary worker's generic list must not contain it.
+    assert!(
+        !generic_lists_job(&worker),
+        "ordinary worker's job_list exposed a member-private job before any share"
+    );
+    // The owner's share plus the subscriber's live grant make it visible to B.
+    fx.op(
+        "member_job_share",
+        json!({"member_envelope": fx.member_envelope("sub-ada"), "job": private_job}),
+    );
+    fx.op(
+        "member_job_subscribe",
+        json!({"member_envelope": fx.member_envelope("sub-ben"), "job": private_job}),
+    );
+    let ben_jobs = fx.op(
+        "member_job_list",
+        json!({"member_envelope": fx.member_envelope("sub-ben")}),
+    );
+    assert!(
+        ben_jobs["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|j| j.as_str() == Some(private_job.as_str())),
+        "subscribed member lost its shared job from member_job_list"
+    );
+    // Positive: the subscribed assistant's own generic job read stays allowed.
+    assert!(
+        fx.as_assistant(
+            "assist-agent-sub-ben",
+            "job_show",
+            json!({"job": private_job})
+        )
+        .is_ok(),
+        "subscribed assistant's generic job_show was refused under a live grant"
+    );
+    // Withdrawal: the owner withdraws the share; a fresh subscribe is refused.
+    fx.op(
+        "member_job_share",
+        json!({"member_envelope": fx.member_envelope("sub-ada"), "job": private_job, "enabled": false}),
+    );
+    fx.provision("sub-cid");
+    assert!(
+        fx.op_err(
+            "member_job_subscribe",
+            json!({"member_envelope": fx.member_envelope("sub-cid"), "job": private_job}),
+        )
+        .is_err(),
+        "a subscribe after share withdrawal was accepted"
+    );
+}
+
+/// CAD-1380 acceptance 2 (durable notification intent). A real pending
+/// `assist_intent` written by a real `member_job_request` must survive the
+/// daemon stream's real 200-row retention (`prune_stream("daemon", 200)`)
+/// after more than 200 ordinary daemon events. The committed dedupe key of
+/// the retained job must not be recreated by a repeat of the same request.
+/// (Feature-OFF queue retention is not covered here; see the coverage note.)
+#[test]
+fn pending_assist_intent_survives_daemon_stream_retention() {
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    fx.provision("sub-ivy");
+    let req = fx.op(
+        "member_job_request",
+        json!({"member_envelope": fx.member_envelope("sub-ivy"), "title": "retain me", "request_key": "ret-k1", "body": "b"}),
+    );
+    let job = req["job"].as_str().unwrap().to_string();
+    let pending_before = fx
+        .shared
+        .store
+        .pending_assist_job_notifications(500)
+        .unwrap();
+    let pending_for_job = |rows: &[(i64, Value)]| {
+        rows.iter()
+            .filter(|(_, p)| p["job"].as_str() == Some(job.as_str()))
+            .count()
+    };
+    assert!(
+        pending_for_job(&pending_before) >= 1,
+        "the real request left no pending intent for job {job}"
+    );
+
+    // 210 ordinary daemon events, then the real watcher retention pass.
+    for i in 0..210 {
+        fx.shared
+            .store
+            .event_public("daemon", "wal_checkpointed", json!({"n": i}))
+            .unwrap();
+    }
+    fx.shared.store.prune_stream("daemon", 200).unwrap();
+
+    let pending_after = fx
+        .shared
+        .store
+        .pending_assist_job_notifications(500)
+        .unwrap();
+    assert!(
+        pending_for_job(&pending_after) >= 1,
+        "daemon-stream retention deleted the pending assist intent for job {job}"
+    );
+    // Dedupe: re-emitting the EXACT canonical transition (same request key)
+    // must not recreate a pending intent for the retained job.
+    let _ = fx.op(
+        "member_job_request",
+        json!({"member_envelope": fx.member_envelope("sub-ivy"), "title": "retain me", "request_key": "ret-k1", "body": "b"}),
+    );
+    let again = fx
+        .shared
+        .store
+        .pending_assist_job_notifications(500)
+        .unwrap();
+    assert_eq!(
+        pending_for_job(&again),
+        pending_for_job(&pending_after),
+        "a repeated transition re-created an intent for job {job}"
+    );
+}
+
+/// CAD-1380 acceptance 2c (feature-OFF drain must not alter pending intents).
+/// With the rollout flag unset, the real drain must return without dispatching,
+/// must leave the pending intent row byte-identical, and must never expose the
+/// private request body or the service custody token to any notice.
+#[test]
+fn feature_off_drain_leaves_pending_intent_unchanged() {
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    fx.provision("sub-fay");
+    // Create the pending intent with the flag ON (a real canonical request).
+    {
+        let _flag = AssistantFlagOn::arm();
+        let _ = fx.op(
+            "member_job_request",
+            json!({"member_envelope": fx.member_envelope("sub-fay"), "title": "off drain", "request_key": "off-k1", "body": "PRIVATE_OFF_BODY"}),
+        );
+    }
+    let pending_before = fx
+        .shared
+        .store
+        .pending_assist_job_notifications(500)
+        .unwrap();
+    assert!(!pending_before.is_empty(), "no pending intent to probe");
+    let before = fx.tree();
+
+    // Flag unset: the drain must be a no-op. Held under the same process lock
+    // as every enabled fixture, so no sibling test observes the flipped flag.
+    let queued = {
+        let _off = FlagOffGuard::new();
+        fx.shared.route_assist_job_notifications()
+    };
+    assert_eq!(queued.unwrap(), 0, "feature-OFF drain dispatched work");
+
+    let pending_after = fx
+        .shared
+        .store
+        .pending_assist_job_notifications(500)
+        .unwrap();
+    assert_eq!(
+        pending_before.len(),
+        pending_after.len(),
+        "feature-OFF drain altered pending intents"
+    );
+    assert_eq!(fx.tree(), before, "feature-OFF drain changed the tracker");
+    for m in fx.shared.store.messages("assist-agent-sub-fay").unwrap() {
+        assert!(
+            !m.body.contains("PRIVATE_OFF_BODY"),
+            "private request body reached a notice while the feature is OFF"
+        );
+        assert!(
+            !m.body.contains(&format!("hcs_{}", "d".repeat(43))),
+            "service custody token leaked into a notice"
+        );
+    }
+}
+
+/// CAD-1380 acceptance 2b (terminal dedupe retention). The terminal dedupe
+/// row of a LIVE canonical job must survive the real 200-row daemon-stream
+/// prune after more than 200 ordinary events, and re-emitting the exact same
+/// canonical request must not recreate a second terminal row.
+#[test]
+fn terminal_dedupe_for_live_canonical_job_survives_retention() {
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    fx.provision("sub-tia");
+    let req = fx.op(
+        "member_job_request",
+        json!({"member_envelope": fx.member_envelope("sub-tia"), "title": "terminal live", "request_key": "tlk-1", "body": "b"}),
+    );
+    let job = req["job"].as_str().unwrap().to_string();
+    let seq = fx
+        .shared
+        .store
+        .pending_assist_job_notifications(500)
+        .unwrap()
+        .into_iter()
+        .find(|(_, p)| p["job"].as_str() == Some(job.as_str()))
+        .expect("live job has no pending intent")
+        .0;
+    fx.shared
+        .store
+        .finish_assist_job_notification(seq, "delivered")
+        .unwrap();
+
+    let db = fx.dir.path().join("cadence.sqlite3");
+    let terminal = |j: &str| -> i64 {
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE alias='daemon' AND kind='assist_intent' \
+                 AND json_extract(payload,'$.job')=?1 AND json_extract(payload,'$.status')!='pending'",
+                [j],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    let before = terminal(&job);
+    assert!(before >= 1, "no terminal dedupe row before retention");
+
+    for i in 0..210 {
+        fx.shared
+            .store
+            .event_public("daemon", "wal_checkpointed", json!({"n": i}))
+            .unwrap();
+    }
+    fx.shared.store.prune_stream("daemon", 200).unwrap();
+    assert!(
+        terminal(&job) >= before,
+        "daemon-stream retention deleted the terminal dedupe row of live job {job}"
+    );
+
+    let _ = fx.op(
+        "member_job_request",
+        json!({"member_envelope": fx.member_envelope("sub-tia"), "title": "terminal live", "request_key": "tlk-1", "body": "b"}),
+    );
+    assert_eq!(
+        terminal(&job),
+        before,
+        "a repeated transition re-created a terminal row for live job {job}"
+    );
+}
+
+/// CAD-1380 acceptance 3 (confined principal grants). Distinct verified
+/// subjects must never share one confined read/write cwd. Two subjects that
+/// share their first 48 characters (the `sub_safe` truncation) must each get
+/// a DISTINCT assistant cwd when lazily registered through the real
+/// `member_assist_state` path. Alias-legal subjects only: the agent alias
+/// grammar (`[a-z0-9-]`, <=64) gates registration before the cwd step.
+#[test]
+fn distinct_member_subjects_never_share_one_confined_cwd() {
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    let shared = "p".repeat(48);
+    let (x, y) = (shared.clone(), format!("{shared}-t"));
+    for sub in [&x, &y] {
+        fx.provision(sub);
+        let _ = fx.op(
+            "member_assist_state",
+            json!({"member_envelope": fx.member_envelope(sub)}),
+        );
+    }
+    let cwd_of = |sub: &str| {
+        fx.shared
+            .store
+            .agent(&format!("assist-agent-{sub}"))
+            .unwrap()
+            .cwd
+    };
+    assert_ne!(
+        cwd_of(&x),
+        cwd_of(&y),
+        "distinct subjects sharing a 48-char prefix share one confined cwd"
+    );
+}
+
+/// CAD-1380 acceptance 4 (own-turn report resolution). A bound assistant's
+/// own held turn, reported with NO message id (the caller-bound form) or a
+/// unique id PREFIX, must reach the existing `report_target` resolver rather
+/// than being refused by the member policy's exact lookup. A forged
+/// reference to a foreign member's message (exact id) stays refused.
+#[test]
+fn assistant_own_held_turn_report_reaches_existing_resolver() {
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    let rt = fx.member_runtime("sub-dana");
+    let own = rt.alias.clone();
+    let other = fx.member_runtime("sub-eli");
+
+    // Hold the assistant's own turn through the real store turn marker.
+    fx.shared
+        .store
+        .enqueue(&own, "own work", None, "own-held-1", "test")
+        .unwrap();
+    let own_msg = fx
+        .shared
+        .store
+        .messages(&own)
+        .unwrap()
+        .into_iter()
+        .find(|m| m.body == "own work")
+        .expect("own message not stored")
+        .id;
+    fx.shared
+        .store
+        .mark_running(&own_msg, "own-held-turn")
+        .unwrap();
+
+    // Forged foreign reference: the other member's exact message id.
+    let forged = err_text(
+        fx.as_assistant(
+            &own,
+            "message_report",
+            json!({"message": other.foreign_msg, "result": "x"}),
+        ),
+        "forged foreign message_report",
+    );
+    assert!(
+        !forged.is_empty(),
+        "a forged foreign message_report was not refused"
+    );
+
+    // Own held turn, id-less: the resolver must run past the member policy.
+    // Token/generation/state refusals downstream are acceptable here; a
+    // member-policy refusal naming the message as "not its own" is not.
+    let idless = fx.as_assistant(&own, "message_report", json!({"result": "done"}));
+    if let Err(e) = &idless {
+        assert!(
+            !e.to_string().contains("is not its own"),
+            "id-less own-turn report blocked by the member policy: {e}"
+        );
+    }
+
+    // Own held turn, unique id prefix: the same policy must not refuse it.
+    let prefix = &own_msg[..own_msg.len().min(8)];
+    let by_prefix = fx.as_assistant(
+        &own,
+        "message_report",
+        json!({"message": prefix, "token": "own-held-turn", "result": "done"}),
+    );
+    if let Err(e) = &by_prefix {
+        assert!(
+            !e.to_string().contains("is not its own"),
+            "unique-prefix own-turn report blocked by the member policy: {e}"
+        );
+    }
+}
+
+/// CAD-1380 acceptance 5 (service-transport original credential). Under
+/// enrolled service transport, a member-initiated call whose signed envelope
+/// names revoked credential C1 must be refused even though the binding has
+/// been reconciled to a live C2. The current-C2 call stays positive, and the
+/// revalidation body must carry the incoming verified credential, not a
+/// binding borrow.
+#[test]
+fn service_transport_keeps_incoming_credential_provenance() {
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    fx.provision("sub-gus");
+
+    // C1 is the credential the envelope is signed under (`cred-sub-gus`).
+    let c1_envelope = fx.envelope(
+        "sub-gus",
+        json!({}),
+        json!({"credential_id": "cred-sub-gus"}),
+    );
+
+    // Positive control: C1 live, service transport, member read succeeds.
+    assert!(
+        fx.op_err(
+            "member_assist_state",
+            json!({"member_envelope": c1_envelope.clone()}),
+        )
+        .is_ok(),
+        "live C1 member refused under service transport"
+    );
+
+    // Revoke C1 at the platform and re-pin the binding to a live C2 (a renewal
+    // reconcile). The C1-signed envelope must now be refused.
+    fx.set_member("sub-gus", |m| {
+        m.recorded_credential = "cred-sub-gus-renewed".to_string();
+        m.credential_live = true;
+    });
+    // C1 stays revoked in the per-credential map (the old credential is dead).
+    fx.set_member("sub-gus", |m| {
+        m.live_credentials
+            .insert("cred-sub-gus".to_string(), (false, Vec::new()));
+    });
+    let before = fx.tree();
+    let e = err_text(
+        fx.op_err(
+            "member_assist_state",
+            json!({"member_envelope": c1_envelope}),
+        ),
+        "revoked-C1 envelope under service transport",
+    );
+    assert!(
+        e.contains("revalidation")
+            || e.contains("authority")
+            || e.contains("refused")
+            || e.contains("member"),
+        "revoked-C1 envelope refused for another reason: {e}"
+    );
+    assert_eq!(fx.tree(), before, "a revoked-C1 call moved the tracker");
+
+    // Current-C2 control: a fresh envelope under the live C2 stays positive.
+    let c2_envelope = fx.envelope(
+        "sub-gus",
+        json!({}),
+        json!({"credential_id": "cred-sub-gus-renewed"}),
+    );
+    let c2 = fx.op_err(
+        "member_assist_state",
+        json!({"member_envelope": c2_envelope}),
+    );
+    assert!(
+        c2.is_ok(),
+        "live C2 member refused under service transport: {c2:?}"
+    );
+}
+
 fn with_deferred_service(fx: &Fx) {
     fx.enroll_service(ServiceAuthority {
         token: format!("hcs_{}", "d".repeat(43)),
@@ -5942,16 +6528,33 @@ mod master_home_acceptance {
             };
             let dir = state.clone();
             let serve = Some(thread::spawn(move || daemon::serve_with(&dir, opts)));
-            let this = Self {
+            let mut this = Self {
                 _root: root,
                 state,
                 stop,
                 serve,
             };
-            this.until("daemon health", || {
-                client::rpc_timeout(&this.state, "health", json!({}), Duration::from_secs(1))
+            // Same 60 s deadline. A serve thread that ends first is a startup
+            // failure: take its real `serve_with` Result and report it.
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                if client::rpc_timeout(&this.state, "health", json!({}), Duration::from_secs(1))
                     .is_ok()
-            });
+                {
+                    break;
+                }
+                if this.serve.as_ref().is_some_and(|h| h.is_finished()) {
+                    let result = this
+                        .serve
+                        .take()
+                        .expect("serve handle present")
+                        .join()
+                        .expect("serve_with thread panicked");
+                    panic!("owned daemon startup failed: serve_with returned {result:?}");
+                }
+                assert!(Instant::now() < deadline, "daemon health: timed out");
+                thread::sleep(Duration::from_millis(50));
+            }
             this
         }
 

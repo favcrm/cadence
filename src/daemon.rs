@@ -2061,6 +2061,12 @@ impl Shared {
                     if !states.is_empty() && !states.contains(&agent.state) {
                         continue;
                     }
+                    // CAD-1380: a member-private assistant row is withheld from
+                    // every caller but its owner and the operator, before it is
+                    // serialized or counted into `live`.
+                    if self.member_agent_row_withheld(&agent.alias, peer_pid)? {
+                        continue;
+                    }
                     if !providers.is_empty() && !providers.contains(&agent.provider) {
                         continue;
                     }
@@ -2387,7 +2393,7 @@ impl Shared {
             "member_job_subscribe" => self.rpc_member_job_subscribe(params, peer_pid),
             "member_job_share" => self.rpc_member_job_share(params, peer_pid),
             "member_job_reconcile" => self.rpc_member_job_reconcile(params, peer_pid),
-            "job_list" => self.rpc_job_list(params),
+            "job_list" => self.rpc_job_list(params, peer_pid),
             "job_show" => self.rpc_job_show(params),
             "job_events" => self.rpc_job_events(params),
             "job_cancel" => self.rpc_job_cancel(params),

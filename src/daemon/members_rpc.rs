@@ -136,6 +136,11 @@ impl Shared {
         if method.starts_with("member_") {
             return Ok(());
         }
+        // CAD-1380 target-side privacy: a member-owned read is refused for an
+        // ordinary or unproven caller BEFORE the handler runs, keyed on the
+        // canonical target from the real store (never a raw prefix or request
+        // claim). Operator and bound-owner access stay on their own rules.
+        self.member_target_read_guard(method, params, peer_pid)?;
         let alias = match self.caller_identity(peer_pid) {
             Ok(Caller::Agent(v)) => v.agent.alias.clone(),
             _ => return Ok(()),
@@ -206,9 +211,35 @@ impl Shared {
                     )));
                 }
             }
-            // Own messages only — `message_read`/`message_report` name a
-            // message id; bound to this alias's message row.
-            "message_read" | "message_report" => {
+            // Own messages only. `message_report` resolves its target through
+            // the existing caller-bound resolver (its own held turn when no id
+            // is named, or an explicit id/prefix limited to this alias), then
+            // asserts the resolved message belongs to this alias. Downstream
+            // token/generation/state gates still run in the handler.
+            "message_report" => {
+                // Every form resolves through the caller-bound resolver first
+                // (exact id, unique own prefix, or the held turn), so ownership
+                // is checked on the CANONICAL id, never a raw prefix.
+                let id = match params.get("message").and_then(Value::as_str) {
+                    Some(named) => self.resolve_message_id_for(peer_pid, named)?,
+                    None => self.report_target(params, peer_pid)?.0,
+                };
+                let own = self
+                    .store
+                    .message(&id)
+                    .ok()
+                    .flatten()
+                    .map(|m| m.alias == alias)
+                    .unwrap_or(false);
+                if !own {
+                    return Err(Error::rejected(format!(
+                        "assist agent '{alias}' may not {method} '{id}' — the message is not \
+                         its own (CAD-1380)"
+                    )));
+                }
+            }
+            // `message_read` names an id; bound to this alias's message row.
+            "message_read" => {
                 let id = params
                     .get("message")
                     .and_then(Value::as_str)
@@ -336,6 +367,184 @@ impl Shared {
             method,
         )?;
         Ok(())
+    }
+
+    /// CAD-1380 target-side guard for the reachable member-owned READS. A
+    /// member-private target (an assistant alias, its thread/events, or a job
+    /// or task bound to a member) is refused for every caller except the
+    /// operator and the bound owner. Jobs and tasks additionally admit their
+    /// canonical PM and assigned task author through existing explicit
+    /// assignment. Ordinary nonmember targets are untouched.
+    fn member_target_read_guard(&self, method: &str, params: &Value, peer_pid: u32) -> Result<()> {
+        let (alias_arg, job_arg, task_arg) = match method {
+            "thread_read" | "agent_show" | "agent_events" => {
+                (params.get("alias").and_then(Value::as_str), None, None)
+            }
+            "job_show" | "job_events" => (None, params.get("job").and_then(Value::as_str), None),
+            "task_show" => (None, None, params.get("task").and_then(Value::as_str)),
+            _ => return Ok(()),
+        };
+        // Resolve the CANONICAL target before any ownership decision, so an
+        // alias prefix, conversation or task form cannot dodge the check.
+        if let Some(raw) = alias_arg {
+            let Ok(canonical) = self.resolve_alias(raw) else {
+                return Ok(());
+            };
+            let Some(binding) = self.store.assistant_for_alias(&canonical)? else {
+                return Ok(());
+            };
+            return self.member_owner_or_operator(
+                method,
+                peer_pid,
+                Some(&binding),
+                &binding.org,
+                None,
+            );
+        }
+        // A job or task read names its job through the real store. An
+        // unknown id is not member-private (the handler errors for it); any
+        // real store error propagates (fail closed), never a silent Ok.
+        let (job, task) = match (job_arg, task_arg) {
+            (Some(job), _) => (job.to_string(), None),
+            (None, Some(task)) => match self.store.task(task) {
+                Ok(t) => (t.job_id, Some(task.to_string())),
+                Err(crate::Error::Rejected(_)) => return Ok(()),
+                Err(e) => return Err(e),
+            },
+            (None, None) => return Ok(()),
+        };
+        let owner = match self.store.assist_request_for_job(&job) {
+            Ok(Some(owner)) => owner,
+            Ok(None) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        // The job has a member-owned ledger row, so it is member-private. A
+        // missing owner binding can never drop it to ordinary rules.
+        let binding = self.store.assistant_binding(&owner.org, &owner.sub)?;
+        self.member_owner_or_operator(
+            method,
+            peer_pid,
+            binding.as_ref(),
+            &owner.org,
+            Some((&job, task.as_deref())),
+        )
+    }
+
+    /// The shared decision for a member-owned target: the operator and the
+    /// bound assistant that owns it pass; an explicitly assigned job PM or
+    /// task author passes for a job (never for member-private chat); anyone
+    /// else (ordinary worker, unproven) is refused.
+    /// `binding` is the owner's live binding, or `None` when the ledger row
+    /// names an owner with no binding (never dropped to ordinary rules).
+    /// `job` is `Some((job_id, requested_task))` for a job or task read.
+    fn member_owner_or_operator(
+        &self,
+        method: &str,
+        peer_pid: u32,
+        binding: Option<&crate::store::AssistantBinding>,
+        org: &str,
+        job: Option<(&str, Option<&str>)>,
+    ) -> Result<()> {
+        let refuse = |who: &str| {
+            Err(Error::rejected(format!(
+                "{method} refused: '{who}' cannot read a member-private target \
+                 (CAD-1380 target-side privacy)"
+            )))
+        };
+        match self.connection_caller(peer_pid)? {
+            caller_rule::Who::Operator => Ok(()),
+            caller_rule::Who::Agent(caller) => {
+                if binding.is_some_and(|b| caller == b.alias) {
+                    return Ok(());
+                }
+                if let Some((job, task)) = job {
+                    if self.caller_holds_job_authority(&caller, job, task)? {
+                        return Ok(());
+                    }
+                    // A subscribing member's bound assistant may read a shared
+                    // job's record and events. The caller must be its own active
+                    // binding in the same org with a live subscriber row for this
+                    // job, and the owner must still share it. Never private chat.
+                    if self.caller_is_active_subscriber(&caller, job, org)? {
+                        return Ok(());
+                    }
+                }
+                refuse(&caller)
+            }
+            caller_rule::Who::Unproven(why) => Err(Error::rejected(format!(
+                "{method} refused: an unproven caller cannot read a member-private target \
+                 ({why}) (CAD-1380 target-side privacy)"
+            ))),
+        }
+    }
+
+    /// Is the caller an ACTIVE bound assistant in `org` whose principal is a
+    /// live subscriber of `job`, while the owner still shares the job?
+    fn caller_is_active_subscriber(&self, caller: &str, job: &str, org: &str) -> Result<bool> {
+        let Some(me) = self.store.assistant_for_alias(caller)? else {
+            return Ok(false);
+        };
+        Ok(me.is_active()
+            && me.org == org
+            && self.store.job_is_subscriber(job, org, &me.sub)?
+            && self.store.assist_job_is_shared(job, org)?)
+    }
+
+    /// CAD-1380 list filter for `agent_list`. Returns `true` when the row must
+    /// be withheld from this caller because it is a member-private assistant
+    /// row the caller is not the owner of. The operator sees every row, a bound
+    /// assistant sees its own row, and nonmember rows are never withheld.
+    pub(super) fn member_agent_row_withheld(&self, alias: &str, peer_pid: u32) -> Result<bool> {
+        let Some(binding) = self.store.assistant_for_alias(alias)? else {
+            return Ok(false);
+        };
+        Ok(match self.connection_caller(peer_pid)? {
+            caller_rule::Who::Operator => false,
+            caller_rule::Who::Agent(caller) => caller != binding.alias,
+            caller_rule::Who::Unproven(_) => true,
+        })
+    }
+
+    /// CAD-1380 list filter for `job_list`. Returns `true` when the job must be
+    /// withheld: it is bound to a member's assistant and the caller is neither
+    /// the operator nor an authorized job actor (canonical PM or the assignee
+    /// of a task of this job). Nonmember jobs are never withheld.
+    pub(super) fn member_job_row_withheld(&self, job: &str, peer_pid: u32) -> Result<bool> {
+        let Some(owner) = self.store.assist_request_for_job(job)? else {
+            return Ok(false);
+        };
+        let binding = self.store.assistant_binding(&owner.org, &owner.sub)?;
+        match self.connection_caller(peer_pid)? {
+            caller_rule::Who::Operator => Ok(false),
+            caller_rule::Who::Agent(caller) => {
+                if binding.as_ref().is_some_and(|b| caller == b.alias) {
+                    return Ok(false);
+                }
+                if self.caller_holds_job_authority(&caller, job, None)? {
+                    return Ok(false);
+                }
+                Ok(!self.caller_is_active_subscriber(&caller, job, &owner.org)?)
+            }
+            caller_rule::Who::Unproven(_) => Ok(true),
+        }
+    }
+
+    /// Job-level authority: the canonical job PM (the whole job context), or
+    /// the assignee of the single task the caller asked for. Another task's
+    /// assignee, and any generic worker, gets nothing here.
+    fn caller_holds_job_authority(
+        &self,
+        caller: &str,
+        job: &str,
+        requested_task: Option<&str>,
+    ) -> Result<bool> {
+        if self.store.job(job)?.pm_alias == caller {
+            return Ok(true);
+        }
+        match requested_task {
+            Some(task) => Ok(self.store.task(task)?.assignee.as_deref() == Some(caller)),
+            None => Ok(false),
+        }
     }
 
     /// Re-verify the member's signed envelope at the daemon. The config is
@@ -587,35 +796,45 @@ impl Shared {
     /// downstream surfaces can tell it is a member assistant, not an
     /// ordinary worker — the assistant never inherits the Master's global
     /// tool allowlist (that is profile-keyed on the master alias).
+    /// The principal's dedicated confined cwd: `state_dir/assistants/<digest>`.
+    /// The digest covers the canonical `(org, sub)` pair, length-prefixed so
+    /// `("a|b", "c")` and `("a", "b|c")` can never encode alike. Distinct
+    /// principals therefore never share one confined read/write directory.
+    fn assistant_principal_cwd(&self, org: &str, sub: &str) -> std::path::PathBuf {
+        let canonical = format!("{}:{org}|{}:{sub}", org.len(), sub.len());
+        self.state_dir
+            .join("assistants")
+            .join(crate::operator_auth::digest(&canonical))
+    }
+
     fn ensure_assistant_runtime(
         &self,
         binding: &crate::store::AssistantBinding,
     ) -> Result<crate::store::AssistantBinding> {
         // Register the assistant agent lazily. Its cwd is a DEDICATED
-        // principal-owned subdirectory — `state_dir/assistants/<sub>`,
-        // never the daemon state root — so a confined read-only worker
-        // reads/writes only inside its own principal's subtree. `sub` is
-        // server-verified and sanitized into the dir name (same charset
-        // as the alias); a member can never name a path outside it.
-        if self.store.agent_opt(&binding.alias)?.is_none() {
+        // principal-owned subdirectory, `state_dir/assistants/<digest>`, where
+        // the digest is a collision-resistant hash of the canonical (org, sub)
+        // pair. The hash keeps raw subjects out of the path, is stable across
+        // credential rotation, and never truncates or lossily maps characters.
+        let principal_cwd = self.assistant_principal_cwd(&binding.org, &binding.sub);
+        if let Some(existing) = self.store.agent_opt(&binding.alias)? {
+            // An existing registered runtime must sit in its own principal's
+            // dedicated root. A mismatch is refused, never silently reused or
+            // repointed, so no other principal's confined grant is inherited.
+            if existing.cwd != principal_cwd.to_str().unwrap_or_default() {
+                return Err(Error::rejected(format!(
+                    "member assist refused: registered runtime '{}' is not in its \
+                     principal's dedicated cwd; repair it explicitly (CAD-1380)",
+                    binding.alias
+                )));
+            }
+        } else {
             // The registered alias is the STORED binding alias — derived
             // at mint from the member, never a caller field. The agent-
             // class gate (`member_assist_policy`) keys on that alias
             // family, so a registered member assistant is always caught
             // by the member boundary.
-            let sub_safe: String = binding
-                .sub
-                .chars()
-                .map(|c| {
-                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                        c
-                    } else {
-                        '-'
-                    }
-                })
-                .take(48)
-                .collect();
-            let cwd = self.state_dir.join("assistants").join(&sub_safe);
+            let cwd = principal_cwd;
             std::fs::create_dir_all(&cwd).map_err(|e| {
                 Error::rejected(format!(
                     "member assist refused: the assistant's principal cwd cannot be created: {e}"
@@ -1138,9 +1357,9 @@ impl Shared {
             state: binding.state.clone(),
             credential_id,
         };
-        // Member-initiated ops re-prove under the member's own envelope —
-        // no `assist_requests` op provenance applies, so `job_dispatch`-
-        // style `resource.credential_id` is absent (`None`).
+        // Member-initiated ops re-prove the VERIFIED incoming envelope's
+        // credential (`member_call.credential_id`), even when a service bearer
+        // is preferred. A binding's latest CID is never borrowed for this call.
         self.member_authority_live(
             envelope,
             &member_call,
@@ -1148,7 +1367,7 @@ impl Shared {
                 operation,
                 scope: want_scope,
                 job_id,
-                op_credential_id: None,
+                op_credential_id: Some(&member_call.credential_id),
             },
             verb,
         )?;

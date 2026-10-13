@@ -46,7 +46,7 @@ daemon/effect_rpc.rs	non-sqlite-platform-adapter-execution	execute	2
 daemon/social_publish_rpc.rs	non-sqlite-platform-publish-execution	execute	1
 daemon/team_assistants_refusal.rs	independent-cad1380-acceptance-fixture	execute	22
 daemon/team_assistants_refusal.rs	independent-cad1380-acceptance-fixture	guarded_write	21
-daemon/team_assistants_refusal.rs	independent-cad1380-acceptance-fixture	open	2
+daemon/team_assistants_refusal.rs	independent-cad1380-acceptance-fixture	open	3
 daemon/watch.rs	provider-owned-db-checkpoint-and-tests	open	1
 doctor.rs	private-doctor-probe-store	open	1
 doctor/host/pane_identity.rs	read-only-store-host-observation	prepare	2

@@ -500,6 +500,21 @@ impl Shared {
                 )));
             }
         }
+        // CAD-1380 target-side privacy: a member assistant's stored message is
+        // readable only by the operator or that assistant itself. An unproven
+        // caller is refused, never served the body.
+        if self.store.assistant_for_alias(&message.alias)?.is_some() {
+            match self.connection_caller(peer_pid)? {
+                caller_rule::Who::Operator => {}
+                caller_rule::Who::Agent(caller) if caller == message.alias => {}
+                _ => {
+                    return Err(Error::rejected(
+                        "message_read refused: a member assistant's message is private \
+                         to its assistant (CAD-1380 target-side privacy)",
+                    ))
+                }
+            }
+        }
         let offset = optional_u64(params, "offset").unwrap_or(0) as usize;
         let limit = optional_u64(params, "limit")
             .unwrap_or(MESSAGE_READ_LIMIT as u64)
@@ -996,7 +1011,7 @@ impl Shared {
     /// resolved from the connection caller. Exactly one of the two is a
     /// refusal — a token without its message names nothing, and a message
     /// without its token proves nothing.
-    fn report_target(&self, params: &Value, peer_pid: u32) -> Result<(String, String)> {
+    pub(super) fn report_target(&self, params: &Value, peer_pid: u32) -> Result<(String, String)> {
         let id = optional_str(params, "message");
         let token = optional_str(params, "token");
         match (id, token) {
@@ -1023,7 +1038,7 @@ impl Shared {
     /// operator, and not at all for unproven callers (exact id only —
     /// possession still works, prefix fishing does not). Resolution never
     /// bypasses the token/generation/state gates below (I4).
-    fn resolve_message_id_for(&self, peer_pid: u32, id: &str) -> Result<String> {
+    pub(super) fn resolve_message_id_for(&self, peer_pid: u32, id: &str) -> Result<String> {
         if self.store.message(id)?.is_some() {
             return Ok(id.to_string());
         }

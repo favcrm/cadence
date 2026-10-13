@@ -2117,12 +2117,26 @@ impl Store {
     /// Bound a non-agent event stream to its newest `keep` rows — the
     /// daemon's `wal_checkpointed` stream has no agents row, so the
     /// agent-removal `DELETE` never reaches it.
+    ///
+    /// CAD-1380: daemon `assist_intent` rows are durable assist work, not
+    /// ordinary events. They sit outside the `keep` window (so they never
+    /// displace ordinary rows), and a row is dropped only when it is terminal
+    /// (`delivered`/`refused`/`unresolved`), has a `job_id`, and its canonical
+    /// `jobs` row no longer exists. Pending, NULL, unknown or malformed status,
+    /// and a missing job association are all kept.
     pub fn prune_stream(&self, alias: &str, keep: i64) -> Result<()> {
         self.write_tx(|conn| {
             conn.execute(
-                "DELETE FROM events WHERE alias=?1 AND seq NOT IN (
-                             SELECT seq FROM events WHERE alias=?1
-                             ORDER BY seq DESC LIMIT ?2)",
+                "DELETE FROM events WHERE alias=?1 AND (
+                   (kind='assist_intent' AND alias='daemon' AND job_id IS NOT NULL
+                    AND CASE WHEN json_valid(payload)
+                          THEN json_extract(payload,'$.status') END
+                        IN ('delivered','refused','unresolved')
+                    AND NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.id=events.job_id))
+                   OR (NOT (kind='assist_intent' AND alias='daemon') AND seq NOT IN (
+                        SELECT seq FROM events
+                        WHERE alias=?1 AND NOT (kind='assist_intent' AND alias='daemon')
+                        ORDER BY seq DESC LIMIT ?2)))",
                 params![alias, keep],
             )?;
             Ok(())

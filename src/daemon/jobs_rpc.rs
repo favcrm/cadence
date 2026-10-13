@@ -54,7 +54,7 @@ impl Shared {
         Ok(json!({"job": job.to_json(), "duplicate": duplicate}))
     }
 
-    pub(super) fn rpc_job_list(self: &Arc<Self>, params: &Value) -> Result<Value> {
+    pub(super) fn rpc_job_list(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
         // CAD-437: `states` is the repeatable any-of form; the singular
         // `state` stays accepted and merges into it.
         let mut states = optional_strs(params, "states")?;
@@ -88,6 +88,12 @@ impl Shared {
         let mut summary = self.store.job_task_summary(detail.then_some(open_only))?;
         let mut out = Vec::new();
         for job in jobs {
+            // CAD-1380: a member-private job is withheld from every caller
+            // except the operator, its owner, an authorized actor, or a
+            // subscriber, before it is serialized.
+            if self.member_job_row_withheld(&job.id, peer_pid)? {
+                continue;
+            }
             let mut j = job.to_json();
             j["tasks"] = json!(summary.counts.remove(&job.id).unwrap_or_default());
             if detail {
