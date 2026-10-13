@@ -572,6 +572,8 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("app_assistant_permission_revoke", Rule::Handler("operator_connection (CAD-1184)")),
     ("app_assistant_permission_block", Rule::Handler("operator_connection (CAD-1184)")),
     ("app_screen_mint", Rule::Handler("operator_connection (CAD-1006)")),
+    ("app_media_read", Rule::Handler("operator_connection + consumed live mount + declared media.read (CAD-1365)")),
+    ("app_media_publish", Rule::Handler("operator_connection + consumed live mount + declared media.publish (CAD-1365)")),
     // The frame-GET peer: authority is the burned one-use nonce, not a
     // connection class — the handler binds it to the consuming session.
     ("app_screen_consume", Rule::Handler("operator_connection + burned one-use frame capability + stored-session liveness (CAD-1006)")),

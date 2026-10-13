@@ -1641,6 +1641,65 @@
     /// content-addressed under `<workspace>/.cadence/chat-files/`, never
     /// in the table. `IF NOT EXISTS`, so a v36 store migrates in place and a
     /// half-applied v37 converges; pre-v37 rows are preserved.
+    /// CAD-1365 acceptance: a genuine v40 store (the three media tables
+    /// absent) migrates to v41 with the exact media table columns, keeps
+    /// its pre-v41 rows, and reopens idempotently.
+    #[test]
+    fn cad1365_migration_v40_to_v41_adds_media_tables() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("t.sqlite3");
+        std::fs::create_dir(dir.path().join("w")).unwrap();
+        {
+            let s = Store::open(&db).unwrap();
+            reg(&s, "a1", &dir.path().join("w"));
+        }
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE app_media_asset_origins;
+                 DROP TABLE app_media_publish_requests;
+                 DROP TABLE app_media_assets;
+                 UPDATE schema_version SET version=40;",
+            )
+            .unwrap();
+        let columns = |table: &str| -> Vec<String> {
+            Connection::open(&db)
+                .unwrap()
+                .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        let version = || -> i64 {
+            Connection::open(&db)
+                .unwrap()
+                .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert!(columns("app_media_assets").is_empty());
+        {
+            let s = Store::open_for_schema_tests(&db).unwrap();
+            assert_eq!(version(), 41);
+            assert_eq!(
+                columns("app_media_assets"),
+                ["id", "install_id", "title", "kind", "lifecycle", "revision", "creator", "created", "updated"]
+            );
+            assert_eq!(
+                columns("app_media_publish_requests"),
+                ["request_id", "asset_id", "expected_revision", "result", "created"]
+            );
+            assert_eq!(columns("app_media_asset_origins"), ["asset_id", "receipt_id"]);
+            // Pre-v41 rows survive the migration.
+            assert_eq!(s.agent("a1").unwrap().alias, "a1");
+        }
+        {
+            Store::open_for_schema_tests(&db).unwrap();
+        }
+        assert_eq!(version(), 41);
+    }
+
     #[test]
     fn migration_v36_to_v37_adds_chat_files() {
         let dir = TempDir::new().unwrap();

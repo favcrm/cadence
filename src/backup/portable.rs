@@ -87,7 +87,7 @@ const DISABLED: &[(&str, &str)] = &[
     ("monitors", "auto_dispatch_enabled"),
 ];
 
-/// The fixed catalog of the 61 store tables with their exact columns.
+/// The fixed catalog of the store tables with their exact columns.
 /// Export and restore refuse any table or column not listed here.
 const CATALOG: &[(&str, &[&str])] = &[
     (
@@ -118,6 +118,31 @@ const CATALOG: &[(&str, &[&str])] = &[
             "model_selection",
             "pid_start",
             "uid",
+        ],
+    ),
+    ("app_media_asset_origins", &["asset_id", "receipt_id"]),
+    (
+        "app_media_assets",
+        &[
+            "id",
+            "install_id",
+            "title",
+            "kind",
+            "lifecycle",
+            "revision",
+            "creator",
+            "created",
+            "updated",
+        ],
+    ),
+    (
+        "app_media_publish_requests",
+        &[
+            "request_id",
+            "asset_id",
+            "expected_revision",
+            "result",
+            "created",
         ],
     ),
     (

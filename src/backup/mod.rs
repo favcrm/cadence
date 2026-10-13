@@ -111,6 +111,9 @@ pub mod portable_replace;
 mod portable_acceptance;
 
 #[cfg(test)]
+mod cad1365_media_catalog_acceptance;
+
+#[cfg(test)]
 mod portable_selftest;
 
 #[cfg(test)]
