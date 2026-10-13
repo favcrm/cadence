@@ -287,6 +287,9 @@ impl Shared {
                         &slot,
                         required_str(bundle, "digest")?,
                     )?;
+                    // CAD-1374: the sealed approving human bound at approval
+                    // time. Null for a legacy approval (no human recorded).
+                    let sealed_human = run["approval"]["human"].clone();
                     let quote = self.app_capability_quote(&proof)?;
                     if run["snapshot"]["quotes"][&slot] != json!(quote) {
                         return Err(Error::rejected(
@@ -361,6 +364,31 @@ impl Shared {
                         "call_id":call_id,
                     });
                     let credential = self.app_capability_credential(config)?;
+                    // CAD-1374: a NEW external call re-proves the approving
+                    // human after the durable claim and before any provider
+                    // bytes leave. A revoked/demoted human refuses here; the
+                    // claim stays as an honest prepared intent, never resent.
+                    if sealed_human.is_object() {
+                        self.fresh_run_human(&sealed_human)?;
+                    }
+                    // Re-read the live run and active assigned turn after the
+                    // fresh I/O. The approval human binding and the turn must
+                    // still be the ones proven above.
+                    let (current, current_step, current_proof) = self.store.app_capability_turn(
+                        &alias,
+                        message,
+                        turn,
+                        &slot,
+                        required_str(bundle, "digest")?,
+                    )?;
+                    if current["approval"]["human"] != sealed_human
+                        || current_step != step
+                        || current_proof.digest != proof.digest
+                    {
+                        return Err(Error::rejected(
+                            "capability approval or turn changed before the external call",
+                        ));
+                    }
                     let output = adapter
                         .execute_app_capability(&credential, &authority, input, &call_id)
                         .map_err(Error::rejected)?;

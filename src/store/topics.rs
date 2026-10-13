@@ -332,6 +332,7 @@ impl Store {
                 None,
                 None,
                 None,
+                None,
             )?;
             tx.execute(
                 "UPDATE topic_deliveries SET message_id=?, state='queued' WHERE post_id=? AND uid=?",
@@ -469,6 +470,7 @@ impl Store {
                     &Sender::Unattributed,
                     Priority::Normal,
                     true,
+                    None,
                     None,
                     None,
                     None,

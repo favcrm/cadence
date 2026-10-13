@@ -14,6 +14,139 @@ pub const RUN_ARTIFACT_BYTES: usize = 1024 * 1024;
 /// CAD-1123 R4: the stream that keeps each app run's approval record.
 /// Not an agent alias and not the pruned daemon stream, so it survives.
 pub const APP_RUN_APPROVAL_STREAM: &str = "app-run-approvals";
+
+/// CAD-1374: a domain-specific HUMAN receipt. `None` (autonomous or local
+/// operator) returns the legacy payload unchanged. The helper never copies
+/// params, inputs, cookies or hashes.
+fn human_receipt(
+    payload: Value,
+    human: Option<&Value>,
+    operation: &str,
+    action: &str,
+    resource: &str,
+    outcome: &str,
+) -> Value {
+    match human {
+        Some(human) => canonical_receipt(
+            payload,
+            human.clone(),
+            human["company"].clone(),
+            operation,
+            action,
+            resource,
+            outcome,
+        ),
+        None => payload,
+    }
+}
+
+/// CAD-1374: the canonical receipt frame every app-run owner audit row carries.
+/// `request_id` and `correlation_id` are the mutation's one server operation
+/// UUID, and `causation_id` is null. `revision_or_digest` is the existing
+/// snapshot or install digest from the payload. The reason is the action.
+fn canonical_receipt(
+    mut payload: Value,
+    human: Value,
+    company: Value,
+    operation: &str,
+    action: &str,
+    resource: &str,
+    outcome: &str,
+) -> Value {
+    let revision = payload
+        .get("snapshot_digest")
+        .or_else(|| payload.get("digest"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    if let Some(map) = payload.as_object_mut() {
+        map.insert("schema_version".into(), json!(1));
+        map.insert("request_id".into(), json!(operation));
+        map.insert("correlation_id".into(), json!(operation));
+        map.insert("causation_id".into(), Value::Null);
+        map.insert("company".into(), company);
+        map.insert("human".into(), human);
+        map.insert("action".into(), json!(action));
+        map.insert("resource".into(), json!(resource));
+        map.insert("outcome".into(), json!(outcome));
+        map.insert("reason".into(), json!(action));
+        map.insert("revision_or_digest".into(), revision);
+    }
+    payload
+}
+
+/// CAD-1374: the receipt for one dispatched step. `acting` is the manual owner
+/// who clicked, or null for an automatic advance (`actor_kind` "system"). The
+/// sealed approver is kept as `initiating_human` and is never credited as the
+/// executing human. With neither a sealed approver nor an actor (legacy) no
+/// human is invented and the payload stays unchanged.
+fn dispatch_receipt(
+    mut payload: Value,
+    initiating: Option<&Value>,
+    acting: Option<&Value>,
+    operation: &str,
+    resource: &str,
+    outcome: &str,
+) -> Value {
+    let Some(company) = acting.or(initiating).map(|h| h["company"].clone()) else {
+        return payload;
+    };
+    let (actor_kind, human) = match acting {
+        Some(acting) => ("human", acting.clone()),
+        None => ("system", Value::Null),
+    };
+    if let Some(map) = payload.as_object_mut() {
+        map.insert(
+            "initiating_human".into(),
+            initiating.cloned().unwrap_or(Value::Null),
+        );
+        map.insert("actor_kind".into(), json!(actor_kind));
+    }
+    canonical_receipt(
+        payload,
+        human,
+        company,
+        operation,
+        "app_run_step_dispatched",
+        resource,
+        outcome,
+    )
+}
+
+/// CAD-1374: the human a stored approval recorded. Missing or null is a
+/// genuine legacy approval. A present value must be a complete canonical
+/// human (`sub`, `company`, `session` non-empty strings, a `role` of
+/// `operator` or `member`, and a nullable `display`). Anything else fails
+/// closed: no partial proof is ever read as legacy.
+fn approval_human(recorded: Option<&Value>) -> Result<Value> {
+    let Some(human) = recorded.and_then(|v| v.get("human")) else {
+        return Ok(Value::Null);
+    };
+    if human.is_null() {
+        return Ok(Value::Null);
+    }
+    let text = |key: &str| {
+        human[key]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| Error::internal("approval human binding is malformed"))
+    };
+    text("sub")?;
+    text("company")?;
+    text("session")?;
+    if !matches!(human["role"].as_str(), Some("operator" | "member")) {
+        return Err(Error::internal("approval human binding is malformed"));
+    }
+    if !human["display"].is_null() && !human["display"].is_string() {
+        return Err(Error::internal("approval human binding is malformed"));
+    }
+    Ok(json!({
+        "sub": human["sub"],
+        "company": human["company"],
+        "session": human["session"],
+        "role": human["role"],
+        "display": human["display"],
+    }))
+}
 pub fn artifact_digest(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
@@ -246,6 +379,7 @@ CREATE TABLE IF NOT EXISTS app_run_reviews(
 pub struct LocalRunProvenance<'a> {
     pub selected_source: Option<(&'a str, &'a str)>,
     pub input_origins: &'a BTreeMap<String, String>,
+    pub human: Option<&'a Value>,
 }
 
 impl Store {
@@ -272,7 +406,32 @@ impl Store {
         Ok(())
     }
     pub fn app_capability_decide(&self, id: &str, digest: &str, approve: bool) -> Result<Value> {
-        self.app_capability_decide_audited(id, digest, approve, json!({}))
+        self.app_capability_decide_as(id, digest, approve, None)
+    }
+    /// CAD-1374: the install approval or revocation, stamped with the verified
+    /// human when the owner's board made it. Same transaction as before.
+    pub fn app_capability_decide_as(
+        &self,
+        id: &str,
+        digest: &str,
+        approve: bool,
+        human: Option<&Value>,
+    ) -> Result<Value> {
+        let operation = uuid::Uuid::new_v4().to_string();
+        let (action, outcome) = if approve {
+            ("app_install_capability_approved", "approved")
+        } else {
+            ("app_install_capability_revoked", "revoked")
+        };
+        let audit = human_receipt(
+            json!({"digest":digest}),
+            human,
+            &operation,
+            action,
+            &format!("install:{id}"),
+            outcome,
+        );
+        self.app_capability_decide_audited(id, digest, approve, audit)
     }
     /// CAD-1119: installing or updating an app is the operator's consent.
     /// The operator install/upgrade path records the approval of exactly
@@ -400,6 +559,7 @@ impl Store {
             LocalRunProvenance {
                 selected_source: None,
                 input_origins: &BTreeMap::new(),
+                human: None,
             },
         )
     }
@@ -415,7 +575,9 @@ impl Store {
         let LocalRunProvenance {
             selected_source,
             input_origins,
+            human,
         } = provenance;
+        let operation = uuid::Uuid::new_v4().to_string();
         let LocalRunRequest {
             install_id,
             bundle_digest,
@@ -712,7 +874,7 @@ impl Store {
                         &tx,
                         Self::DAEMON_STREAM,
                         "app_run_created",
-                        json!({"run_id":id,"install_id":install_id,"snapshot_digest":digest,"actor":"operator"}),
+                        human_receipt(json!({"run_id":id,"install_id":install_id,"snapshot_digest":digest,"actor":"operator"}), human, &operation, "app_run_created", &format!("app-run:{id}"), "created"),
                     )?;
                     Self::app_run_show_in(&*tx, &id)
         })
@@ -745,11 +907,19 @@ impl Store {
             )
             .optional()?
         {
-            let by = serde_json::from_str::<Value>(&payload)
-                .ok()
-                .and_then(|v| v["by"].as_str().map(str::to_string))
+            // CAD-1374: an unreadable approval payload is a refusal, never a
+            // silent legacy downgrade. Only a missing human is a legacy approval.
+            let recorded: Value = serde_json::from_str(&payload)
+                .map_err(|_| Error::internal("approval record is unreadable"))?;
+            if !recorded.is_object() {
+                return Err(Error::internal("approval record is unreadable"));
+            }
+            let by = recorded["by"]
+                .as_str()
+                .map(str::to_string)
                 .unwrap_or_else(|| "operator".into());
-            value["approval"] = json!({"by": by, "at": at as i64});
+            let human = approval_human(Some(&recorded))?;
+            value["approval"] = json!({"by": by, "at": at as i64, "human": human});
         }
         if let Some((kind, reason, step_id)) = conn
             .query_row(
@@ -816,6 +986,17 @@ impl Store {
         cancel: bool,
         current_bundle: Option<&str>,
     ) -> Result<Value> {
+        self.app_run_decide_as(id, digest, cancel, current_bundle, None)
+    }
+    pub fn app_run_decide_as(
+        &self,
+        id: &str,
+        digest: Option<&str>,
+        cancel: bool,
+        current_bundle: Option<&str>,
+        human: Option<&Value>,
+    ) -> Result<Value> {
+        let operation = uuid::Uuid::new_v4().to_string();
         self.write_tx(|conn| {
 
                     let tx = &mut *conn;
@@ -854,7 +1035,7 @@ impl Store {
                             &tx,
                             APP_RUN_APPROVAL_STREAM,
                             "app_run_approved",
-                            json!({"run_id":id,"digest":run["snapshot_digest"],"by":"operator"}),
+                            human_receipt(json!({"run_id":id,"digest":run["snapshot_digest"],"by":"operator"}), human, &operation, "app_run_approved", &format!("app-run:{id}"), "approved"),
                             Some(id),
                             None,
                         )?;
@@ -867,7 +1048,7 @@ impl Store {
                         } else {
                             "app_run_execution_approved"
                         },
-                        json!({"run_id":id,"digest":run["snapshot_digest"],"actor":"operator"}),
+                        human_receipt(json!({"run_id":id,"digest":run["snapshot_digest"],"actor":"operator"}), human, &operation, if cancel { "app_run_cancelled" } else { "app_run_approved" }, &format!("app-run:{id}"), if cancel { "cancelled" } else { "approved" }),
                     )?;
                     Self::app_run_show_in(&tx, id)
         })
@@ -1276,11 +1457,28 @@ impl Store {
     }
 
     pub fn app_run_dispatch(&self, id: &str, current_bundle: &str) -> Result<Value> {
+        self.app_run_dispatch_as(id, current_bundle, None, None)
+    }
+    /// CAD-1374: `approved_by` is the human the caller fenced the approval
+    /// under (`None` for a local or legacy approval). It must still be the
+    /// latest approval inside this transaction, so a swapped approval cannot
+    /// reuse a proof checked for the earlier one.
+    pub fn app_run_dispatch_as(
+        &self,
+        id: &str,
+        current_bundle: &str,
+        approved_by: Option<&Value>,
+        acting: Option<&Value>,
+    ) -> Result<Value> {
+        let operation = uuid::Uuid::new_v4().to_string();
         self.write_tx(|conn| {
 
                     let tx = &mut *conn;
                     let run = Self::app_run_show_in(&tx, id)?;
                     Self::app_current_in(&tx, &run, current_bundle)?;
+                    if run["approval"]["human"] != approved_by.cloned().unwrap_or(Value::Null) {
+                        return Err(Error::gate_coded("approval_changed", "the run approval changed since its owner was checked; dispatch is refused"));
+                    }
                     if !matches!(run["state"].as_str(), Some("approved" | "running"))
                         || run["approved_digest"] != run["snapshot_digest"]
                     {
@@ -1319,14 +1517,14 @@ impl Store {
                         // without a message — the daemon runs it
                         // in-process for the operator's own click.
                         if step.kind == "capability" {
-                            tx.execute("UPDATE tasks SET state='dispatched',revision=1,updated=? WHERE id=? AND state='draft'",params![now(),task_id])?;
-                            tx.execute("UPDATE app_run_steps SET state='dispatched' WHERE run_id=? AND step_id=? AND state='pending'",params![id,step_id])?;
                             Self::event(
                                 &tx,
                                 Self::DAEMON_STREAM,
                                 "app_run_step_dispatched",
-                                json!({"run_id":id,"step_id":step_id,"host":true}),
+                                dispatch_receipt(json!({"run_id":id,"step_id":step_id,"host":true,"snapshot_digest":run["snapshot_digest"]}), approved_by, acting, &operation, &format!("app-run:{id}/step:{step_id}/outcome"), "prepared"),
                             )?;
+                            tx.execute("UPDATE tasks SET state='dispatched',revision=1,updated=? WHERE id=? AND state='draft'",params![now(),task_id])?;
+                            tx.execute("UPDATE app_run_steps SET state='dispatched' WHERE run_id=? AND step_id=? AND state='pending'",params![id,step_id])?;
                             continue;
                         }
                         let worker = self.agent_in(&tx, &step.assignee)?;
@@ -1358,7 +1556,18 @@ impl Store {
                                 "encoded app kickoff exceeds transport byte limit",
                             ));
                         }
-                        self.enqueue_tx(
+                        // CAD-1374: the dispatch receipt is written in this
+                        // transaction BEFORE the enqueue, so a failed enqueue rolls
+                        // it back too. The sealed approver is the queue initiator;
+                        // the sender stays unattributed and the executing worker
+                        // is the assignee, unchanged.
+                        Self::event(
+                            &tx,
+                            Self::DAEMON_STREAM,
+                            "app_run_step_dispatched",
+                            dispatch_receipt(json!({"run_id":id,"step_id":step_id,"message_id":message,"snapshot_digest":run["snapshot_digest"],"assignee":step.assignee}), approved_by, acting, &operation, &format!("app-run:{id}/step:{step_id}/outcome"), "dispatched"),
+                        )?;
+                        self.enqueue_tx_human(
                             &tx,
                             &step.assignee,
                             &body,
@@ -1373,15 +1582,10 @@ impl Store {
                             None,
                             None,
                             None,
+                            approved_by,
                         )?;
                         tx.execute("UPDATE tasks SET state='dispatched',revision=1,dispatch_message=?,updated=? WHERE id=? AND state='draft'",params![message,now(),task_id])?;
                         tx.execute("UPDATE app_run_steps SET state='dispatched',message_id=? WHERE run_id=? AND step_id=? AND state='pending'",params![message,id,step_id])?;
-                        Self::event(
-                            &tx,
-                            Self::DAEMON_STREAM,
-                            "app_run_step_dispatched",
-                            json!({"run_id":id,"step_id":step_id,"message_id":message,"snapshot_digest":run["snapshot_digest"],"assignee":step.assignee}),
-                        )?;
                     }
                     tx.execute(
                         "UPDATE app_runs SET state='running',updated=? WHERE id=?",

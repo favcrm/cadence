@@ -746,6 +746,70 @@ pub(super) struct Named {
     pub operator: bool,
 }
 
+/// CAD-1374: the public session bearer a named board write relays to the
+/// daemon so the daemon re-checks it. A transient credential: no derived
+/// `Debug`, no `Display`, no serialization — it can only be read as the
+/// request's opaque `public_session` value.
+pub(super) struct PublicProof(String);
+
+impl PublicProof {
+    pub(super) fn token(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for PublicProof {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PublicProof(<redacted>)")
+    }
+}
+
+/// How a board write's public origin relates to its session proof.
+pub(super) enum PublicRelay {
+    /// Not the public host: a local/tailnet operator write, unchanged.
+    NotPublic,
+    /// A public-host write carrying its session bearer.
+    Proven(PublicProof),
+    /// A public-host write with no session bearer. Never relayed: the
+    /// board refuses it rather than fall back to an anonymous operator.
+    Missing,
+}
+
+/// CAD-1374: attach the public session bearer to a daemon params object
+/// for an owner write that persists human attribution. A public-host write
+/// with no bearer is refused before any RPC; a local/tailnet write is left
+/// unchanged, and so is any write that does not persist attribution.
+pub(super) fn relay_owner_proof(
+    params: &mut Value,
+    relay: PublicRelay,
+) -> Result<(), super::HttpResp> {
+    match relay {
+        PublicRelay::NotPublic => Ok(()),
+        PublicRelay::Proven(proof) => {
+            params["public_session"] = Value::String(proof.token().to_string());
+            Ok(())
+        }
+        PublicRelay::Missing => Err(super::err_response(
+            401,
+            "board session required for this write",
+        )),
+    }
+}
+
+/// The origin of a board write and, on the public host, its session
+/// bearer re-read from the cookie. The board decides origin from the
+/// Host it was reached on (`request_origin`), never from a request
+/// field. The daemon re-checks the bearer against its own row.
+pub(super) fn public_relay(request: &Request, opts: &ServeOpts) -> PublicRelay {
+    match request_origin(request, opts) {
+        ReqOrigin::Known(Origin::Public) => match session_cookie(request, opts, Origin::Public) {
+            Some(token) => PublicRelay::Proven(PublicProof(token)),
+            None => PublicRelay::Missing,
+        },
+        _ => PublicRelay::NotPublic,
+    }
+}
+
 /// A board write's caller, once [`board_caller`] has decided.
 pub(super) enum Caller {
     /// Holds a live operator session: `actor` is `operator (ui)` or a

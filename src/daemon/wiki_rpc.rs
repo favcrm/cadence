@@ -78,6 +78,96 @@ impl Shared {
         }
     }
 
+    /// CAD-1374: the human a wiki write is attributed to. Absent
+    /// `public_session` is the legacy path (`None`). A present one must be a
+    /// non-empty token that is live, fresh and owner-or-member as the caller
+    /// allows: a named `User` must be the session's own handle, an operator
+    /// caller must be the owner, and an agent or public caller takes no proof.
+    fn wiki_human(&self, params: &Value, caller: &Caller, verb: &str) -> Result<Option<Value>> {
+        let token = match params.get("public_session") {
+            None => return Ok(None),
+            Some(Value::String(token)) if !token.is_empty() => token,
+            Some(_) => {
+                return Err(Error::rejected(format!(
+                    "{verb} refused: the board session proof is malformed"
+                )))
+            }
+        };
+        if matches!(caller, Caller::Agent { .. } | Caller::Public) {
+            return Err(Error::rejected(format!(
+                "{verb} refused: an agent or public caller carries no board session"
+            )));
+        }
+        let (role, realm, view, sub, display) = match self.current_public_session(token)? {
+            crate::daemon::public_membership::Authority::Granted {
+                role,
+                realm,
+                view,
+                sub,
+                display,
+                ..
+            } => (role, realm, view, sub, display),
+            crate::daemon::public_membership::Authority::Denied => {
+                return Err(Error::rejected(format!(
+                    "{verb} refused: the board session is not live"
+                )))
+            }
+        };
+        match caller {
+            Caller::User(who) => {
+                let handle = view.user.as_ref().map(|u| u.handle.as_str());
+                if handle != Some(who.as_str()) {
+                    return Err(Error::rejected(format!(
+                        "{verb} refused: the board session is not user '{who}'"
+                    )));
+                }
+            }
+            Caller::Operator if !role.is_operator() => {
+                return Err(Error::rejected(format!(
+                    "{verb} refused: the board owner session proof is missing or is a member's"
+                )))
+            }
+            _ => {}
+        }
+        Ok(Some(json!({
+            "company": realm.company,
+            "sub": sub,
+            "session": view.id,
+            "display": display,
+            "role": role.as_str(),
+        })))
+    }
+
+    /// CAD-1374: before a wiki mutation touches the tree, check the EXISTING
+    /// allowlist for every path it touches (`wiki::allowed`), then — only for
+    /// a proven human — prepare the activity receipt and attach it to the PM.
+    /// A forbidden mutation never reaches the receipt. A legacy write with no
+    /// proof returns the PM unchanged.
+    fn wiki_receipt(
+        &self,
+        pm: crate::issue::Pm,
+        caller: &Caller,
+        human: Option<&Value>,
+        action: &str,
+        paths: &[&str],
+    ) -> Result<crate::issue::Pm> {
+        let mut resource = String::new();
+        for path in paths {
+            let norm = wiki::normalize(path)?;
+            let segs: Vec<&str> = norm.split('/').collect();
+            wiki::allowed(caller, wiki::Op::Write, &segs)?;
+            if !resource.is_empty() {
+                resource.push_str(" -> ");
+            }
+            resource.push_str(&format!("wiki:{norm}"));
+        }
+        let Some(human) = human else {
+            return Ok(pm);
+        };
+        let receipt = self.prepare_pm_activity_receipt(action, &resource, human)?;
+        pm.with_activity_receipt(&receipt)
+    }
+
     /// `reject_identity_fields` plus `wiki_as` — the fields the table
     /// checks are connection-bound, and `wiki_as` is admitted only as
     /// the caller rule describes (handled in [`Self::wiki_caller`],
@@ -109,7 +199,9 @@ impl Shared {
         let path = Self::wiki_path(params)?;
         let text = required_str(params, "text")?;
         let if_rev = optional_str(params, "if_rev");
-        let out = wiki::write(&self.pm()?, &caller, path, text, if_rev)?;
+        let human = self.wiki_human(params, &caller, "wiki write")?;
+        let pm = self.wiki_receipt(self.pm()?, &caller, human.as_ref(), "wiki_written", &[path])?;
+        let out = wiki::write(&pm, &caller, path, text, if_rev)?;
         // CAD-719: a committed write schedules the coalesced refresh —
         // an `if_rev` conflict (no commit) kicks nothing.
         if out["committed"] == true {
@@ -130,7 +222,14 @@ impl Shared {
         let tmp = PathBuf::from(required_str(params, "tmp")?);
         let sha256 = optional_str(params, "sha256");
         let if_rev = optional_str(params, "if_rev");
-        let pm = self.pm()?;
+        let human = self.wiki_human(params, &caller, "wiki put_blob")?;
+        let pm = self.wiki_receipt(
+            self.pm()?,
+            &caller,
+            human.as_ref(),
+            "wiki_blob_uploaded",
+            &[path],
+        )?;
         let mut out = wiki::put_blob(&pm, &self.state_dir, &caller, path, &tmp, sha256, if_rev)?;
         let committed = out["rev"].is_string();
         if out["mime"] == "application/pdf" {
@@ -149,7 +248,16 @@ impl Shared {
     pub(super) fn rpc_wiki_mkdir(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         Self::reject_wiki_fields(params)?;
         let caller = self.wiki_caller(params, peer_pid, "wiki mkdir")?;
-        let out = wiki::mkdir(&self.pm()?, &caller, Self::wiki_path(params)?)?;
+        let path = Self::wiki_path(params)?;
+        let human = self.wiki_human(params, &caller, "wiki mkdir")?;
+        let pm = self.wiki_receipt(
+            self.pm()?,
+            &caller,
+            human.as_ref(),
+            "wiki_directory_created",
+            &[path],
+        )?;
+        let out = wiki::mkdir(&pm, &caller, path)?;
         // CAD-719: a created dir commits a .gitkeep — the tree moved.
         if out["created"] == true {
             self.wiki_index.kick();
@@ -162,7 +270,15 @@ impl Shared {
         let caller = self.wiki_caller(params, peer_pid, "wiki mv")?;
         let from = required_str(params, "from")?;
         let to = required_str(params, "to")?;
-        let pm = self.pm()?;
+        let human = self.wiki_human(params, &caller, "wiki mv")?;
+        // A `.trash/` source is an operator-only restore that `wiki::mv`
+        // gates itself; only a real source path needs the ACL check here.
+        let sources: Vec<&str> = if from.starts_with(".trash/") {
+            vec![to]
+        } else {
+            vec![from, to]
+        };
+        let pm = self.wiki_receipt(self.pm()?, &caller, human.as_ref(), "wiki_moved", &sources)?;
         let mut out = wiki::mv(&pm, &caller, from, to)?;
         let moved_flag = out["moved"] == true;
         let destination = out["to"].as_str().unwrap_or(to).to_string();
@@ -209,7 +325,8 @@ impl Shared {
         Self::reject_wiki_fields(params)?;
         let caller = self.wiki_caller(params, peer_pid, "wiki rm")?;
         let path = Self::wiki_path(params)?;
-        let pm = self.pm()?;
+        let human = self.wiki_human(params, &caller, "wiki rm")?;
+        let pm = self.wiki_receipt(self.pm()?, &caller, human.as_ref(), "wiki_removed", &[path])?;
         let pdf = wiki::read(&pm, &caller, path)
             .ok()
             .is_some_and(|v| v["mime"] == "application/pdf");

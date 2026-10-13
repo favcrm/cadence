@@ -52,6 +52,23 @@ fn relay(state_dir: &Path, method: &str, mut params: Value, member: Option<&str>
     }
 }
 
+/// `relay` for a body-less attributed write: the server-held proof rides
+/// alongside the path-derived params; no body is read.
+fn relay_session(
+    state_dir: &Path,
+    method: &str,
+    mut params: Value,
+    proof: Option<&str>,
+) -> HttpResp {
+    if let Some(proof) = proof {
+        params["public_session"] = json!(proof);
+    }
+    match client::rpc(state_dir, method, params) {
+        Ok(v) => json_response(v),
+        Err(e) => super::home::rpc_err(&e, method),
+    }
+}
+
 fn board_caller(
     request: &Request,
     state_dir: &Path,
@@ -116,6 +133,7 @@ pub(super) fn write(
     method: &Method,
     path: &str,
     caller: Option<&operator::Caller>,
+    proof_relay: operator::PublicRelay,
     state_dir: &Path,
 ) -> HttpResp {
     if *method != Method::Post {
@@ -130,13 +148,18 @@ pub(super) fn write(
     };
     match path {
         // The operator-only writes relay over the board's own connection.
-        "/api/app-catalog/install" => body_rpc(
-            request,
-            state_dir,
-            "app_workspace_install_entry",
-            &["catalog_id", "expected_digest"],
-            None,
-        ),
+        "/api/app-catalog/install" => match public_proof(proof_relay) {
+            Ok(proof) => relay_body(
+                request,
+                state_dir,
+                "app_workspace_install_entry",
+                json!({}),
+                &["catalog_id", "expected_digest"],
+                None,
+                proof.as_deref(),
+            ),
+            Err(resp) => resp,
+        },
         "/api/app-catalog/git-check" => body_rpc(
             request,
             state_dir,
@@ -167,37 +190,54 @@ pub(super) fn write(
                     json!({"install_id": id}),
                     None,
                 ),
-                "remove" => body_rpc_install(
-                    request,
-                    state_dir,
-                    "app_workspace_remove",
-                    id,
-                    &["expected_generation", "expected_digest", "request_id"],
-                ),
-                "restore" => relay(
-                    state_dir,
-                    "app_workspace_restore",
-                    json!({"install_id": id}),
-                    None,
-                ),
+                "remove" => match public_proof(proof_relay) {
+                    Ok(proof) => body_rpc_install(
+                        request,
+                        state_dir,
+                        "app_workspace_remove",
+                        id,
+                        &["expected_generation", "expected_digest", "request_id"],
+                        proof.as_deref(),
+                    ),
+                    Err(resp) => resp,
+                },
+                "restore" => match public_proof(proof_relay) {
+                    Ok(proof) => relay_session(
+                        state_dir,
+                        "app_workspace_restore",
+                        json!({"install_id": id}),
+                        proof.as_deref(),
+                    ),
+                    Err(resp) => resp,
+                },
                 _ => err_response(404, "no such app-installation route"),
             }
         }
         // Member verbs: favorites + requests (AgentAllowed).
-        "/api/app-favorites" => body_rpc(
-            request,
-            state_dir,
-            "app_favorites_put",
-            &["install_ids"],
-            member.as_deref(),
-        ),
-        "/api/app-favorites/default" => body_rpc(
-            request,
-            state_dir,
-            "app_favorites_put_default",
-            &["install_ids"],
-            None,
-        ),
+        "/api/app-favorites" => match public_proof(proof_relay) {
+            Ok(proof) => relay_body(
+                request,
+                state_dir,
+                "app_favorites_put",
+                json!({}),
+                &["install_ids"],
+                member.as_deref(),
+                proof.as_deref(),
+            ),
+            Err(resp) => resp,
+        },
+        "/api/app-favorites/default" => match public_proof(proof_relay) {
+            Ok(proof) => relay_body(
+                request,
+                state_dir,
+                "app_favorites_put_default",
+                json!({}),
+                &["install_ids"],
+                None,
+                proof.as_deref(),
+            ),
+            Err(resp) => resp,
+        },
         "/api/app-favorites/opened" => body_rpc(
             request,
             state_dir,
@@ -205,27 +245,51 @@ pub(super) fn write(
             &["install_id"],
             member.as_deref(),
         ),
-        "/api/app-catalog/request" => body_rpc(
-            request,
-            state_dir,
-            "app_install_request",
-            &["catalog_id"],
-            member.as_deref(),
-        ),
-        "/api/app-requests/dismiss" => body_rpc(
-            request,
-            state_dir,
-            "app_install_request_dismiss",
-            &["id"],
-            None,
-        ),
+        "/api/app-catalog/request" => match public_proof(proof_relay) {
+            Ok(proof) => relay_body(
+                request,
+                state_dir,
+                "app_install_request",
+                json!({}),
+                &["catalog_id"],
+                member.as_deref(),
+                proof.as_deref(),
+            ),
+            Err(resp) => resp,
+        },
+        "/api/app-requests/dismiss" => match public_proof(proof_relay) {
+            Ok(proof) => relay_body(
+                request,
+                state_dir,
+                "app_install_request_dismiss",
+                json!({}),
+                &["id"],
+                None,
+                proof.as_deref(),
+            ),
+            Err(resp) => resp,
+        },
         _ => err_response(404, "no such app explorer write"),
+    }
+}
+
+/// CAD-1374: the public session proof an attributed verb relays. A
+/// public-host write with no bearer is refused before any RPC; a local
+/// write carries none and the daemon names no human for it.
+fn public_proof(relay: operator::PublicRelay) -> Result<Option<String>, HttpResp> {
+    match relay {
+        operator::PublicRelay::NotPublic => Ok(None),
+        operator::PublicRelay::Proven(proof) => Ok(Some(proof.token().to_string())),
+        operator::PublicRelay::Missing => {
+            Err(err_response(401, "board session required for this write"))
+        }
     }
 }
 
 /// Read a bounded JSON body, forward its allow-listed fields onto `base`
 /// (a path-derived id, or empty), plus the caller's `member_as` when the
-/// route admits a member. Unknown body fields are dropped.
+/// route admits a member and the attributed verb's `public_session` proof.
+/// Unknown body fields are dropped.
 fn relay_body(
     request: &mut Request,
     state_dir: &Path,
@@ -233,6 +297,7 @@ fn relay_body(
     base: Value,
     fields: &[&str],
     member: Option<&str>,
+    proof: Option<&str>,
 ) -> HttpResp {
     let bytes = match read_body(request, BODY_CAP) {
         Ok(b) => b,
@@ -253,6 +318,9 @@ fn relay_body(
     if let Some(member) = member {
         params["member_as"] = json!(member);
     }
+    if let Some(proof) = proof {
+        params["public_session"] = json!(proof);
+    }
     match client::rpc(state_dir, method, params) {
         Ok(v) => json_response(v),
         Err(e) => super::home::rpc_err(&e, method),
@@ -266,7 +334,7 @@ fn body_rpc(
     fields: &[&str],
     member: Option<&str>,
 ) -> HttpResp {
-    relay_body(request, state_dir, method, json!({}), fields, member)
+    relay_body(request, state_dir, method, json!({}), fields, member, None)
 }
 
 /// Like `body_rpc`, but `install_id` comes from the path, not the
@@ -277,6 +345,7 @@ fn body_rpc_install(
     method: &str,
     install_id: &str,
     fields: &[&str],
+    proof: Option<&str>,
 ) -> HttpResp {
     relay_body(
         request,
@@ -285,6 +354,7 @@ fn body_rpc_install(
         json!({"install_id": install_id}),
         fields,
         None,
+        proof,
     )
 }
 

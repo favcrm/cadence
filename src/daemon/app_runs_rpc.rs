@@ -99,7 +99,7 @@ impl Shared {
     /// CAD-1123 HP2: create, approve and dispatch in one operator call. The
     /// operator proof was taken by the caller. The approval is the daemon's
     /// own: it binds exactly the snapshot digest this call just created.
-    fn start_app_run(self: &Arc<Self>, params: &Value) -> Result<Value> {
+    fn start_app_run(self: &Arc<Self>, params: &Value, human: Option<&Value>) -> Result<Value> {
         let install = required_str(params, "install_id")?;
         let team = super::app_teams_rpc::team_of(&self.state_dir, install)?.ok_or_else(|| {
             Error::rejected("installation has no default team; set one in Settings")
@@ -115,7 +115,7 @@ impl Shared {
         }) {
             return Err(Error::rejected("inputs must be a string map"));
         }
-        let created = self.create_app_run(params, Some(&team), Some(expected))?;
+        let created = self.create_app_run_as(params, Some(&team), Some(expected), human)?;
         let id = created["id"]
             .as_str()
             .ok_or_else(|| Error::internal("created run has no id"))?
@@ -126,7 +126,7 @@ impl Shared {
             let digest = required_str(&run, "snapshot_digest")?.to_string();
             let approved = self.with_app_run_current(&id, |bundle| {
                 self.store
-                    .app_run_decide(&id, Some(&digest), false, Some(bundle))
+                    .app_run_decide_as(&id, Some(&digest), false, Some(bundle), human)
             });
             // A concurrent start of the same request may have approved first.
             run = match approved {
@@ -142,7 +142,7 @@ impl Shared {
             };
         }
         if matches!(run["state"].as_str(), Some("approved" | "running")) {
-            run = self.dispatch_started_run(&id, replayed)?;
+            run = self.dispatch_started_run_as(&id, replayed, human)?;
             self.auto_resume_tick();
         }
         Ok(run)
@@ -155,8 +155,18 @@ impl Shared {
     /// For a replay that is the answer the caller would have got a moment
     /// later, so return the run as it now stands. A first start that is
     /// refused still fails.
+    #[cfg(test)]
     fn dispatch_started_run(&self, id: &str, replayed: bool) -> Result<Value> {
-        match self.dispatch_app_run(id) {
+        self.dispatch_started_run_as(id, replayed, None)
+    }
+
+    fn dispatch_started_run_as(
+        &self,
+        id: &str,
+        replayed: bool,
+        human: Option<&Value>,
+    ) -> Result<Value> {
+        match self.dispatch_app_run_as(id, human) {
             Err(error) if replayed => {
                 let shown = self.store.app_run_show(id)?;
                 match shown["state"].as_str() {
@@ -172,11 +182,12 @@ impl Shared {
     /// the caller) and `app_run_start` (owner and workers from the install's
     /// default team, quotes checked against `expected`). Operator proof is the
     /// caller's job.
-    pub(super) fn create_app_run(
+    pub(super) fn create_app_run_as(
         &self,
         params: &Value,
         team: Option<&super::app_teams_rpc::Team>,
         expected: Option<&Value>,
+        human: Option<&Value>,
     ) -> Result<Value> {
         // CAD-1171: a host-execution run names no owner PM — the operator's
         // own click executes its capability steps. An agent run still needs
@@ -395,6 +406,7 @@ impl Shared {
                     selected_source: optional_str(params, "source_receipt_id")
                         .zip(optional_str(params, "selected_post_id")),
                     input_origins: &input_origins,
+                    human,
                 },
             )
         })
@@ -416,6 +428,53 @@ impl Shared {
         digest: &str,
         via: &str,
     ) -> Value {
+        match self.record_install_consent_checked(pm, install, digest, via, &|| Ok(())) {
+            Ok(Ok(_)) => json!({"recorded": true, "via": via, "digest": digest}),
+            Ok(Err(error)) | Err(error) => json!({"recorded": false, "via": via, "digest": digest,
+                "reason": error.to_string()}),
+        }
+    }
+
+    /// CAD-1374: the attributed owner's consent. `guard` re-proves the human
+    /// immediately before the consent mutation, after the snapshot and contract
+    /// I/O. A guard refusal is an `Err` the caller must propagate; it is never
+    /// reported as a recorded consent. `changed` is false when the same digest
+    /// was already approved, so no authority changed.
+    pub(super) fn record_install_consent_guarded(
+        &self,
+        pm: &crate::issue::Pm,
+        install: &str,
+        digest: &str,
+        via: &str,
+        guard: &dyn Fn() -> Result<()>,
+    ) -> Result<(Value, bool)> {
+        Ok(
+            match self.record_install_consent_checked(pm, install, digest, via, guard)? {
+                Ok(changed) => (
+                    json!({"recorded": true, "via": via, "digest": digest}),
+                    changed,
+                ),
+                Err(error) => (
+                    json!({"recorded": false, "via": via, "digest": digest,
+                        "reason": error.to_string()}),
+                    false,
+                ),
+            },
+        )
+    }
+
+    /// The consent write. The outer `Err` is a guard refusal, which must not
+    /// become success. The inner `Err` is a contract or I/O refusal, which keeps
+    /// the existing warning behavior of [`Self::record_install_consent`].
+    fn record_install_consent_checked(
+        &self,
+        pm: &crate::issue::Pm,
+        install: &str,
+        digest: &str,
+        via: &str,
+        guard: &dyn Fn() -> Result<()>,
+    ) -> Result<std::result::Result<bool, Error>> {
+        let mut stale = None;
         let outcome = workspace::with_runtime_snapshot(pm, install, |row, files| {
             let _release = self
                 .app_release_lock
@@ -429,14 +488,20 @@ impl Shared {
             let manifest = local_execution_contract(files)?;
             let capabilities = serde_json::to_value(&manifest.capabilities)
                 .map_err(|e| Error::internal(e.to_string()))?;
+            // Fresh authority, read after the I/O above and right before the write.
+            if let Err(error) = guard() {
+                stale = Some(error);
+                return Err(Error::rejected(
+                    "the board session changed; the consent was not recorded",
+                ));
+            }
             self.store
                 .app_install_consent(install, digest, via, &capabilities)
         });
-        match outcome {
-            Ok(_) => json!({"recorded": true, "via": via, "digest": digest}),
-            Err(error) => json!({"recorded": false, "via": via, "digest": digest,
-                "reason": error.to_string()}),
+        if let Some(error) = stale {
+            return Err(error);
         }
+        Ok(outcome.map(|changed| changed.is_some()))
     }
 
     pub(super) fn rpc_app_local(
@@ -446,7 +511,9 @@ impl Shared {
         peer_pid: u32,
     ) -> Result<Value> {
         let allowed: &[&str] = match method {
-            "app_local_install_approve" | "app_local_install_revoke" => &["install_id", "digest"],
+            "app_local_install_approve" | "app_local_install_revoke" => {
+                &["install_id", "digest", "public_session"]
+            }
             "app_run_create" => &[
                 "install_id",
                 "workflow",
@@ -457,6 +524,7 @@ impl Shared {
                 "context_id",
                 "source_receipt_id",
                 "selected_post_id",
+                "public_session",
             ],
             "app_run_start" => &[
                 "install_id",
@@ -467,9 +535,11 @@ impl Shared {
                 "source_receipt_id",
                 "selected_post_id",
                 "expected_quotes",
+                "public_session",
             ],
-            "app_run_approve" => &["run_id", "digest"],
-            "app_run_cancel" | "app_run_dispatch" | "app_run_show" => &["run_id"],
+            "app_run_approve" => &["run_id", "digest", "public_session"],
+            "app_run_cancel" | "app_run_dispatch" => &["run_id", "public_session"],
+            "app_run_show" => &["run_id"],
             "app_run_list" => &["install_id", "context_id"],
             "app_run_artifact" => &["artifact_id", "message", "token"],
             _ => return Err(Error::rejected("unknown app lifecycle method")),
@@ -513,6 +583,48 @@ impl Shared {
             );
         }
         self.operator_connection("app local lifecycle", params, peer_pid)?;
+        // CAD-1374: a board owner's write is attributed to its verified human.
+        // Only the owner lifecycle verbs may carry a public proof; an agent
+        // grant holder never does (a present proof is a refused attempt).
+        let human = match (method, params.get("public_session")) {
+            (_, None) => None,
+            (
+                "app_local_install_approve"
+                | "app_local_install_revoke"
+                | "app_run_approve"
+                | "app_run_cancel"
+                | "app_run_dispatch"
+                | "app_run_start"
+                | "app_run_create",
+                Some(_),
+            ) => {
+                // An agent (registered pane or managed endpoint) never carries
+                // a human proof, even through the grant exception.
+                if self.slot_identity(peer_pid)?.is_some() {
+                    return Err(Error::rejected(
+                        "agent connections cannot carry a board owner's proof",
+                    ));
+                }
+                // The canonical verified human: stable identity, company, session
+                // reference, the effective role and the display label. Only
+                // the verified human is stamped, never the request's own fields.
+                self.verified_owner_human(params)?.map(|human| {
+                    json!({
+                        "sub": human["sub"],
+                        "company": human["company"],
+                        "session": human["session"],
+                        "role": human["role"],
+                        "display": human["display"],
+                    })
+                })
+            }
+            _ => {
+                return Err(Error::rejected(
+                    "app lifecycle payload has unsupported fields",
+                ))
+            }
+        };
+        let human = human.as_ref();
         match method {
             "app_local_install_approve" | "app_local_install_revoke" => {
                 let pm = self.pm_at(&self.pm_dir()?)?;
@@ -531,24 +643,26 @@ impl Shared {
                         if method == "app_local_install_approve" {
                             local_execution_contract(files)?;
                         }
-                        self.store.app_capability_decide(
+                        self.store.app_capability_decide_as(
                             required_str(params, "install_id")?,
                             digest,
                             method == "app_local_install_approve",
+                            human,
                         )
                     },
                 )
             }
-            "app_run_create" => self.create_app_run(params, None, None),
-            "app_run_start" => self.start_app_run(params),
+            "app_run_create" => self.create_app_run_as(params, None, None, human),
+            "app_run_start" => self.start_app_run(params, human),
             "app_run_approve" => {
                 let id = required_str(params, "run_id")?;
                 self.with_app_run_current(id, |current_bundle| {
-                    self.store.app_run_decide(
+                    self.store.app_run_decide_as(
                         id,
                         Some(required_str(params, "digest")?),
                         false,
                         Some(current_bundle),
+                        human,
                     )
                 })
             }
@@ -557,11 +671,16 @@ impl Shared {
                     .app_release_lock
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                self.store
-                    .app_run_decide(required_str(params, "run_id")?, None, true, None)
+                self.store.app_run_decide_as(
+                    required_str(params, "run_id")?,
+                    None,
+                    true,
+                    None,
+                    human,
+                )
             }
             "app_run_dispatch" => {
-                let run = self.dispatch_app_run(required_str(params, "run_id")?)?;
+                let run = self.dispatch_app_run_as(required_str(params, "run_id")?, human)?;
                 // CAD-1120: a kickoff queued for a worker the idle timer
                 // parked wakes it now, through the CAD-413 auto-resume
                 // (which re-checks that the timer's stop is still the
@@ -663,8 +782,31 @@ impl Shared {
         Ok(())
     }
     pub(super) fn dispatch_app_run(&self, id: &str) -> Result<Value> {
-        let result =
-            self.with_app_run_current(id, |digest| self.store.app_run_dispatch(id, digest))?;
+        self.dispatch_app_run_as(id, None)
+    }
+    /// CAD-1374: dispatch under the approving human's fence. The human's
+    /// freshness is re-proven BEFORE any new privileged step is enqueued, and
+    /// the transaction re-checks that the approval is still the one proven.
+    /// An owner-less (legacy/local) approval skips the fence; a human-attributed
+    /// run whose approver is no longer a live owner refuses here.
+    pub(super) fn dispatch_app_run_as(&self, id: &str, human: Option<&Value>) -> Result<Value> {
+        let run = self.store.app_run_show(id)?;
+        let approved_by = run["approval"]["human"]
+            .as_object()
+            .map(|_| run["approval"]["human"].clone());
+        if let Some(sealed) = &approved_by {
+            self.fresh_run_human(sealed)?;
+        }
+        let result = self.with_app_run_current(id, |digest| {
+            // CAD-1374: the bundle and capability quote I/O above can be slow,
+            // so the sealed approver is re-proven here, after it and right before
+            // the store transaction. No store or auth lock is held over network.
+            if let Some(sealed) = &approved_by {
+                self.fresh_run_human(sealed)?;
+            }
+            self.store
+                .app_run_dispatch_as(id, digest, approved_by.as_ref(), human)
+        })?;
         if result["snapshot"]["workflow"]["execution"].as_str() == Some("host") {
             // CAD-1171: the operator's own click executes the capability;
             // no worker is kicked and no message is created.
@@ -786,6 +928,16 @@ impl Shared {
                     self.store
                         .app_run_host_step_failed(run_id, &step_id, "uncertain", reason)?;
                     return Err(Error::unknown(reason));
+                }
+                // CAD-1374: re-prove the sealed approver after the claim shows
+                // a NEW call and before any provider bytes leave. A revoked or
+                // demoted approver refuses this step; the claim stays for an
+                // honest, non-retried outcome.
+                if let Some(sealed) = run["approval"]["human"]
+                    .as_object()
+                    .map(|_| &run["approval"]["human"])
+                {
+                    self.fresh_run_human(sealed)?;
                 }
                 let output = match adapter.execute_app_capability_outcome(
                     &credential,
@@ -929,6 +1081,23 @@ impl Shared {
             }
         }
         if let Some(message) = head.filter(|m| m.source == "app_run_dispatch") {
+            // CAD-1374: a queued app step is a new execution, so its sealed
+            // approver is re-proven first, with no store or auth lock held. A
+            // refusal or outage only defers the take: nothing is rejected or
+            // cancelled, and no external success is reported.
+            let Some((run_id, _)) = self.store.app_message_installation(&message.id)? else {
+                self.store.reject_app_submission(&message.id)?;
+                return Ok(Take::Empty);
+            };
+            let checked = self.store.app_run_show(&run_id)?;
+            if let Some(sealed) = checked["approval"]["human"]
+                .as_object()
+                .map(|_| &checked["approval"]["human"])
+            {
+                if self.fresh_run_human(sealed).is_err() {
+                    return Ok(Take::Empty);
+                }
+            }
             let admission = (|| {
                 let (run_id, install) = self
                     .store
@@ -944,7 +1113,13 @@ impl Shared {
                         .app_release_lock
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
-                    self.app_run_binding_current(&self.store.app_run_show(&run_id)?, row, files)?;
+                    let run = self.store.app_run_show(&run_id)?;
+                    self.app_run_binding_current(&run, row, files)?;
+                    // CAD-1374: the approval must still be the one freshly checked
+                    // above. A changed binding refuses without laundering it.
+                    if run["approval"]["human"] != checked["approval"]["human"] {
+                        return Err(Error::gate_coded("approval_changed", "the run approval changed since its owner was checked; the queued step is refused"));
+                    }
                     self.store.take_queued_app_proven(
                         alias,
                         Some((&message.id, row["digest"].as_str().unwrap())),

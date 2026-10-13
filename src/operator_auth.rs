@@ -503,6 +503,25 @@ impl BoardUser {
 /// store's 200-character source limit.
 const ACTOR_MAX: usize = 190;
 
+/// CAD-1374: the platform realm a public session was verified under —
+/// the board's issuer, the company it serves and its public host. Saved
+/// from the same config the assertion was checked against, never re-read.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicRealm {
+    pub issuer: String,
+    pub company: String,
+    pub host: String,
+}
+
+/// CAD-1374: a stored public row's identity, with no authority claim.
+/// `revoked` lets a denial be audited against a withdrawn session.
+pub(crate) struct PublicSnapshot {
+    pub hash: String,
+    pub view: SessionView,
+    pub realm: Option<PublicRealm>,
+    pub revoked: bool,
+}
+
 /// The verified platform tenancy a public session was opened under
 /// (CAD-1412): the assertion's `iss` and `company`, which the daemon
 /// checked against the configured board identity before this value
@@ -542,6 +561,15 @@ struct Row {
     /// operator's loopback/tailnet sessions.
     #[serde(default)]
     user: Option<BoardUser>,
+    /// CAD-1374: the realm a public row was verified under. `None` on
+    /// legacy public rows and on every local session.
+    #[serde(default)]
+    realm: Option<PublicRealm>,
+    /// CAD-1374: the platform authority of a public row is withdrawn. The
+    /// row keeps its identity until its normal TTL, so a denial can name
+    /// who was refused, but no authority lookup returns it.
+    #[serde(default)]
+    revoked: bool,
     /// The verified issuer and organization a public session was opened
     /// under (CAD-1412). Legacy rows deserialize to `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -570,6 +598,31 @@ impl Row {
             user_agent: self.user_agent.clone(),
             user: self.user.clone(),
             scope: self.scope.clone(),
+        }
+    }
+}
+
+/// CAD-1374: the safe identity of one session row an audited mutation touches:
+/// the display id, the verified subject and its snapshot role, the realm
+/// company and the origin. Never the token, key, hash, jti or user agent.
+#[derive(Clone, Debug)]
+pub(crate) struct AuditTarget {
+    pub session: String,
+    pub origin: Origin,
+    pub sub: Option<String>,
+    pub role: Option<String>,
+    pub company: Option<String>,
+}
+
+impl Row {
+    /// CAD-1374: this row's safe audit identity (see [`AuditTarget`]).
+    fn audit_target(&self) -> AuditTarget {
+        AuditTarget {
+            session: self.id().to_string(),
+            origin: self.origin,
+            sub: self.user.as_ref().map(|u| u.sub.clone()),
+            role: self.user.as_ref().map(|u| u.role.clone()),
+            company: self.realm.as_ref().map(|r| r.company.clone()),
         }
     }
 }
@@ -774,6 +827,8 @@ impl Auth {
             user_agent: clean_user_agent(user_agent),
             max_idle_secs: default_idle_secs(),
             user: None,
+            realm: None,
+            revoked: false,
             scope: None,
         };
         let session = row.view();
@@ -832,6 +887,8 @@ impl Auth {
             user_agent: clean_user_agent(user_agent),
             max_idle_secs: crate::device_login::REMOTE_IDLE_SECS,
             user: Some(user),
+            realm: None,
+            revoked: false,
             scope: None,
         };
         let session = row.view();
@@ -855,13 +912,18 @@ impl Auth {
         user_agent: &str,
         now: i64,
     ) -> Result<Option<Opened>> {
-        self.open_public_inner(user, None, jti, jti_exp, user_agent, now)
+        self.open_public_row(user, (jti, jti_exp), user_agent, (None, None), now, |_| {
+            Ok(())
+        })
     }
 
     /// [`Auth::open_public`] for a verified assertion, persisting the
     /// verified `scope` with the row (CAD-1412). Call only after the
     /// daemon has verified the assertion against the configured board
-    /// identity; `scope` is never read from request params.
+    /// identity; `scope` is never read from request params. The row
+    /// carries no realm: a caller without a verified [`PublicRealm`]
+    /// gets no fabricated one — a bound open derives its scope from the
+    /// realm instead (CAD-1374).
     pub fn open_public_scoped(
         &mut self,
         user: BoardUser,
@@ -871,31 +933,88 @@ impl Auth {
         user_agent: &str,
         now: i64,
     ) -> Result<Option<Opened>> {
-        self.open_public_inner(user, Some(scope), jti, jti_exp, user_agent, now)
+        self.open_public_row(
+            user,
+            (jti, jti_exp),
+            user_agent,
+            (None, Some(scope)),
+            now,
+            |_| Ok(()),
+        )
     }
 
-    fn open_public_inner(
+    /// CAD-1374: `open_public` that also saves the platform realm the
+    /// assertion was verified under. The daemon passes the same config it
+    /// checked the assertion against. The row's `scope` (CAD-1412) is
+    /// derived from that typed realm — verified issuer and company,
+    /// never a request field.
+    pub fn open_public_bound(
         &mut self,
         user: BoardUser,
-        scope: Option<HumanScope>,
         jti: &str,
         jti_exp: i64,
         user_agent: &str,
+        realm: PublicRealm,
         now: i64,
     ) -> Result<Option<Opened>> {
-        self.prune(now);
+        self.open_public_row(
+            user,
+            (jti, jti_exp),
+            user_agent,
+            (Some(realm), None),
+            now,
+            |_| Ok(()),
+        )
+    }
+
+    /// CAD-1374: `open_public_bound` with a durable intent callback. The
+    /// callback sees only the candidate row's safe view and runs BEFORE any
+    /// `Auth` mutation (prune, JTI spend, session replacement, persist). If it
+    /// fails, no session is created and no JTI is spent. The verified
+    /// [`HumanScope`] is derived from the same typed realm.
+    pub(crate) fn open_public_bound_with_intent(
+        &mut self,
+        user: BoardUser,
+        jti: (&str, i64),
+        user_agent: &str,
+        realm: PublicRealm,
+        now: i64,
+        intent: impl FnOnce(&AuditTarget) -> Result<()>,
+    ) -> Result<Option<Opened>> {
+        // Scope derives from the realm `verify` matched against this
+        // board's config — issuer and company, never request params.
+        let scope = HumanScope {
+            issuer: realm.issuer.clone(),
+            organization_id: realm.company.clone(),
+        };
+        self.open_public_row(
+            user,
+            jti,
+            user_agent,
+            (Some(realm), Some(scope)),
+            now,
+            intent,
+        )
+    }
+
+    fn open_public_row(
+        &mut self,
+        user: BoardUser,
+        (jti, jti_exp): (&str, i64),
+        user_agent: &str,
+        (realm, scope): (Option<PublicRealm>, Option<HumanScope>),
+        now: i64,
+        intent: impl FnOnce(&AuditTarget) -> Result<()>,
+    ) -> Result<Option<Opened>> {
         // The authoritative single-use check (contract §4/§9): verified
         // jtis persist until `exp` — a restart inside the 60 s window
-        // still knows the assertion is spent.
-        if self.jtis.contains_key(&digest(jti)) {
+        // still knows the assertion is spent. Non-mutating: a jti is spent
+        // exactly while its `exp` has not passed, the set `prune` keeps.
+        if self.jtis.get(&digest(jti)).is_some_and(|exp| now <= *exp) {
             return Ok(None);
         }
         let token = random_credential()?;
-        // One session per `sub` (contract §9): a fresh sign-in ends the
-        // user's earlier one — named users never stack sessions.
-        self.sessions.retain(|r| {
-            !(r.origin == Origin::Public && r.user.as_ref().is_some_and(|u| u.sub == user.sub))
-        });
+        let sub = user.sub.clone();
         let row = Row {
             hash: digest(&token),
             // The cookie alone is the credential on the public surface —
@@ -909,9 +1028,18 @@ impl Auth {
             user_agent: clean_user_agent(user_agent),
             max_idle_secs: default_idle_secs(),
             user: Some(user),
+            realm,
+            revoked: false,
             scope,
         };
         let session = row.view();
+        intent(&row.audit_target())?;
+        self.prune(now);
+        // One session per `sub` (contract §9): a fresh sign-in ends the
+        // user's earlier one — named users never stack sessions.
+        self.sessions.retain(|r| {
+            !(r.origin == Origin::Public && r.user.as_ref().is_some_and(|u| u.sub == sub))
+        });
         self.sessions.push(row);
         self.jtis.insert(digest(jti), jti_exp);
         self.persist()?;
@@ -941,7 +1069,12 @@ impl Auth {
         Ok(self
             .sessions
             .iter()
-            .find(|r| r.origin == Origin::Public && same_credential(&r.hash, &hash) && r.live(now))
+            .find(|r| {
+                r.origin == Origin::Public
+                    && !r.revoked
+                    && same_credential(&r.hash, &hash)
+                    && r.live(now)
+            })
             .and_then(|r| match (&r.scope, &r.user) {
                 (Some(scope), Some(user)) => Some((scope.clone(), user.clone())),
                 _ => None,
@@ -964,7 +1097,7 @@ impl Auth {
         let found = self
             .sessions
             .iter_mut()
-            .find(|r| r.origin == Origin::Public && same_credential(&r.hash, &hash))
+            .find(|r| r.origin == Origin::Public && !r.revoked && same_credential(&r.hash, &hash))
             .map(|row| {
                 if now - row.last_used >= TOUCH_EVERY_SECS {
                     row.last_used = now;
@@ -1021,32 +1154,79 @@ impl Auth {
 
     /// End the session `token` names, on any origin. `true` if it existed.
     pub fn revoke_token(&mut self, token: &str) -> Result<bool> {
+        self.revoke_token_with_intent(token, |_| Ok(()))
+    }
+
+    /// CAD-1374: `revoke_token` with a durable intent callback. The callback
+    /// runs only when a row matches, with that row's safe view, BEFORE the
+    /// removal. A failed callback leaves the session in place.
+    pub(crate) fn revoke_token_with_intent(
+        &mut self,
+        token: &str,
+        intent: impl FnOnce(&[AuditTarget]) -> Result<()>,
+    ) -> Result<bool> {
         if !well_formed(token) {
             return Ok(false);
         }
         let hash = digest(token);
-        let before = self.sessions.len();
-        self.sessions.retain(|r| r.hash != hash);
-        let gone = before != self.sessions.len();
-        if gone {
-            self.persist()?;
+        let targets: Vec<AuditTarget> = self
+            .sessions
+            .iter()
+            .filter(|r| r.hash == hash)
+            .map(Row::audit_target)
+            .collect();
+        if targets.is_empty() {
+            return Ok(false);
         }
-        Ok(gone)
+        intent(&targets)?;
+        self.sessions.retain(|r| r.hash != hash);
+        self.persist()?;
+        Ok(true)
     }
 
     /// End every session whose display id is `id`.
     pub fn revoke_id(&mut self, id: &str) -> Result<usize> {
-        let before = self.sessions.len();
-        self.sessions.retain(|r| r.id() != id);
-        let gone = before - self.sessions.len();
-        if gone > 0 {
-            self.persist()?;
+        self.revoke_id_with_intent(id, |_| Ok(()))
+    }
+
+    /// CAD-1374: `revoke_id` with a durable intent callback. It runs only when
+    /// rows match, with exactly those rows, BEFORE the removal.
+    pub(crate) fn revoke_id_with_intent(
+        &mut self,
+        id: &str,
+        intent: impl FnOnce(&[AuditTarget]) -> Result<()>,
+    ) -> Result<usize> {
+        let targets: Vec<AuditTarget> = self
+            .sessions
+            .iter()
+            .filter(|r| r.id() == id)
+            .map(Row::audit_target)
+            .collect();
+        if targets.is_empty() {
+            return Ok(0);
         }
-        Ok(gone)
+        intent(&targets)?;
+        self.sessions.retain(|r| r.id() != id);
+        self.persist()?;
+        Ok(targets.len())
     }
 
     /// End every session and void every unexchanged link.
     pub fn revoke_all(&mut self) -> Result<usize> {
+        self.revoke_all_with_intent(|_| Ok(()))
+    }
+
+    /// CAD-1374: `revoke_all` with a durable intent callback. It runs when a
+    /// session or an unexchanged link is about to be voided (zero sessions
+    /// still voids links), BEFORE any change.
+    pub(crate) fn revoke_all_with_intent(
+        &mut self,
+        intent: impl FnOnce(&[AuditTarget]) -> Result<()>,
+    ) -> Result<usize> {
+        let targets = self.audit_targets();
+        if !targets.is_empty() || !self.links.is_empty() {
+            intent(&targets)?;
+        }
         let gone = self.sessions.len();
         self.sessions.clear();
         for (hash, (_, exp)) in self.links.drain() {
@@ -1054,6 +1234,12 @@ impl Auth {
         }
         self.persist()?;
         Ok(gone)
+    }
+
+    /// CAD-1374: the safe identity of every stored session row, as the
+    /// audited revocations name them.
+    pub(crate) fn audit_targets(&self) -> Vec<AuditTarget> {
+        self.sessions.iter().map(Row::audit_target).collect()
     }
 
     /// Whether a live session with this display `id` exists right now.
@@ -1064,7 +1250,7 @@ impl Auth {
         if self.prune(now) {
             self.persist()?;
         }
-        Ok(self.sessions.iter().any(|r| r.id() == id))
+        Ok(self.sessions.iter().any(|r| r.id() == id && !r.revoked))
     }
 
     /// Whether a live row carries this FULL credential hash. `crate`-
@@ -1077,7 +1263,10 @@ impl Auth {
         if self.prune(now) {
             self.persist()?;
         }
-        Ok(self.sessions.iter().any(|r| r.hash == hash && r.live(now)))
+        Ok(self
+            .sessions
+            .iter()
+            .any(|r| r.hash == hash && r.live(now) && !r.revoked))
     }
 
     /// The verified row's FULL credential hash for `token` (+ `key` on a
@@ -1108,38 +1297,93 @@ impl Auth {
             .map(|r| r.hash.clone()))
     }
 
-    /// The verified public row's FULL credential hash for `token` — the
-    /// cookie-only public surface has no `key`. `crate`-private.
-    pub(crate) fn public_session_hash(&mut self, token: &str, now: i64) -> Result<Option<String>> {
+    /// CAD-1374: a stored public row's identity by its raw cookie, for a
+    /// denial audit or a fresh authority check. It claims no authority: it
+    /// returns revoked rows too, and does not touch the idle clock.
+    pub(crate) fn public_snapshot(&self, token: &str, now: i64) -> Option<PublicSnapshot> {
         if !well_formed(token) {
-            return Ok(None);
+            return None;
         }
-        let hash = digest(token);
-        Ok(self
-            .sessions
-            .iter()
-            .find(|r| r.origin == Origin::Public && same_credential(&r.hash, &hash) && r.live(now))
-            .map(|r| r.hash.clone()))
+        self.public_snapshot_by_hash(&digest(token), now)
     }
 
-    /// Does a live public session exist whose named member's handle is
-    /// exactly `handle` (CAD-1129)? `member_as` is the board's claim,
-    /// never the credential: this proves the handle names a live public
-    /// session's `member`-role user, so a forged `member_as` cannot
-    /// borrow another person's favorites or request attribution. The
-    /// daemon reaches this only after `operator_connection` has admitted
-    /// the caller (the board relays over its own connection).
-    pub(crate) fn check_member(&mut self, handle: &str, now: i64) -> Result<bool> {
-        if self.prune(now) {
+    /// CAD-1374: the identity of the single live public row with this session
+    /// reference (its display id). An ambiguous id answers `None`, so a
+    /// reference can never select the wrong row. No authority is claimed.
+    pub(crate) fn public_snapshot_by_session_id(
+        &self,
+        id: &str,
+        now: i64,
+    ) -> Option<PublicSnapshot> {
+        let mut matches = self
+            .sessions
+            .iter()
+            .filter(|r| r.origin == Origin::Public && r.id() == id && r.live(now));
+        let row = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(PublicSnapshot {
+            hash: row.hash.clone(),
+            view: row.view(),
+            realm: row.realm.clone(),
+            revoked: row.revoked,
+        })
+    }
+
+    /// CAD-1374: the identity of the public row with this FULL credential
+    /// hash, as [`Auth::public_snapshot`] reads it.
+    pub(crate) fn public_snapshot_by_hash(&self, hash: &str, now: i64) -> Option<PublicSnapshot> {
+        self.sessions
+            .iter()
+            .find(|r| r.origin == Origin::Public && same_credential(&r.hash, hash) && r.live(now))
+            .map(|r| PublicSnapshot {
+                hash: r.hash.clone(),
+                view: r.view(),
+                realm: r.realm.clone(),
+                revoked: r.revoked,
+            })
+    }
+
+    /// CAD-1374: the live public rows whose named member's handle is exactly
+    /// `handle`, as identities. Any role; the caller re-checks authority.
+    pub(crate) fn public_snapshots_for_handle(
+        &self,
+        handle: &str,
+        now: i64,
+    ) -> Vec<PublicSnapshot> {
+        self.sessions
+            .iter()
+            .filter(|r| {
+                r.origin == Origin::Public
+                    && r.live(now)
+                    && r.user.as_ref().is_some_and(|u| u.handle == handle)
+            })
+            .map(|r| PublicSnapshot {
+                hash: r.hash.clone(),
+                view: r.view(),
+                realm: r.realm.clone(),
+                revoked: r.revoked,
+            })
+            .collect()
+    }
+
+    /// CAD-1374: withdraw the platform authority of the live public row
+    /// with this FULL hash. Its identity stays for denial audit until its
+    /// TTL. The caller appends the durable audit intent BEFORE this call,
+    /// so a failed append leaves the row authoritative.
+    pub(crate) fn revoke_public(&mut self, hash: &str, now: i64) -> Result<bool> {
+        let mut changed = false;
+        for row in self.sessions.iter_mut() {
+            if row.origin == Origin::Public && row.hash == hash && row.live(now) && !row.revoked {
+                row.revoked = true;
+                changed = true;
+            }
+        }
+        if changed {
             self.persist()?;
         }
-        Ok(self.sessions.iter().any(|r| {
-            r.origin == Origin::Public
-                && r.live(now)
-                && r.user
-                    .as_ref()
-                    .is_some_and(|u| u.handle == handle && !u.is_operator())
-        }))
+        Ok(changed)
     }
 
     /// The live sessions, oldest first.
@@ -1147,7 +1391,12 @@ impl Auth {
         if self.prune(now) {
             self.persist()?;
         }
-        Ok(self.sessions.iter().map(Row::view).collect())
+        Ok(self
+            .sessions
+            .iter()
+            .filter(|r| !r.revoked)
+            .map(Row::view)
+            .collect())
     }
 }
 
@@ -1191,6 +1440,8 @@ mod tests {
             user_agent: String::new(),
             max_idle_secs: IDLE_SECS,
             user: None,
+            realm: None,
+            revoked: false,
             scope: None,
         };
         let orig = mk(&"1".repeat(56));

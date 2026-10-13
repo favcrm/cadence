@@ -16,6 +16,7 @@
 // wakeups, constants, RPC dispatch and test suites stay here; actor
 // execution lives in src/daemon/actor.rs.
 
+mod activity_rpc;
 mod actor;
 mod agent_wait;
 mod agents_rpc;
@@ -105,7 +106,9 @@ mod next_action;
 mod operator_rpc;
 mod plans_rpc;
 mod platform_rpc;
+mod pm_activity_rpc;
 mod portable_replace_rpc;
+mod public_membership;
 mod requests_rpc;
 mod review_evidence_rpc;
 mod serve;
@@ -522,6 +525,9 @@ pub struct Shared {
     /// against — short-lived cache, refetched on an unknown `kid`
     /// ([`crate::board_identity::JwksCache`]).
     board_jwks: Mutex<crate::board_identity::JwksCache>,
+    /// CAD-1374: the platform membership mode, captured once at startup
+    /// from the same `hosted` value the lease was acquired with.
+    membership_mode: public_membership::MembershipMode,
     /// CAD-366: where enrolled platform credential bytes live — the
     /// host's keychain when usable, else the daemon-owned `0600`
     /// store under the state dir (ADR 0006 §5.3).
@@ -697,8 +703,12 @@ impl Shared {
         // CAD-538: a configured hosted lease must be held before the
         // store opens — `recover` writes at open. A daemon that cannot
         // take the lease refuses here having written nothing.
-        let lease = crate::lease::acquire(state_dir, &hosted_config(opts)?)?;
-        Self::new_leased(state_dir, opts, hot, lease, seam)
+        let hosted = hosted_config(opts)?;
+        let lease = crate::lease::acquire(state_dir, &hosted)?;
+        let membership = public_membership::MembershipMode::capture(&hosted, &|name| {
+            opts.provider_env.var(name)
+        });
+        Self::new_leased(state_dir, opts, hot, lease, seam, membership)
     }
 
     /// `new_hot` over an already-resolved lease and seam — `serve`
@@ -710,6 +720,7 @@ impl Shared {
         hot: HotStart,
         lease: Option<Arc<crate::lease::LeaseCtl>>,
         seam: Option<crate::test_seam::Seam>,
+        membership: public_membership::MembershipMode,
     ) -> Result<Arc<Self>> {
         // Backstop for the armed-fixture seal applied at the entry
         // points (`new_hot` above, `serve_with`): idempotent — an
@@ -876,6 +887,7 @@ impl Shared {
                 .clone()
                 .unwrap_or_else(|| Arc::new(crate::issue::time::now_epoch)),
             board_jwks: Mutex::new(crate::board_identity::JwksCache::default()),
+            membership_mode: membership,
             platform_custody: crate::platform::Custody::open(state_dir)?,
             platform_custody_lock: Box::leak(Box::new(Mutex::new(()))),
             crm_send_workers: Mutex::new(std::collections::HashSet::new()),
@@ -2314,6 +2326,9 @@ impl Shared {
             "agent_send" => self.rpc_send_from(params, peer_pid),
             "agent_ask" => self.rpc_ask(params, peer_pid),
             "thread_read" => self.rpc_thread_read(params),
+            "activity_query" => self.rpc_activity_query(params, peer_pid),
+            "activity_export" => self.rpc_activity_export(params, peer_pid),
+            "pm_activity_prepare" => self.rpc_pm_activity_prepare(params, peer_pid),
             "thread_send" => self.rpc_thread_send(params, peer_pid),
             "chat_file_upload" => self.rpc_chat_file_upload(params, peer_pid),
             "chat_file_read" => self.rpc_chat_file_read(params, peer_pid),
@@ -2865,8 +2880,8 @@ impl Shared {
             "human_agents_list" => self.rpc_human_agents_list(params, peer_pid),
             "human_room_ask" => self.rpc_human_room_ask(params, peer_pid),
             "board_session_member" => self.rpc_board_session_member(params, peer_pid),
-            "operator_session_logout" => self.rpc_operator_session_logout(params),
-            "operator_session_stolen" => self.rpc_operator_session_stolen(params),
+            "operator_session_logout" => self.rpc_operator_session_logout(params, peer_pid),
+            "operator_session_stolen" => self.rpc_operator_session_stolen(params, peer_pid),
             "device_login_config" => self.rpc_device_login_config(),
             "operator_device_login_set" => self.rpc_operator_device_login_set(params, peer_pid),
             "operator_device_login_clear" => self.rpc_operator_device_login_clear(params, peer_pid),
@@ -4482,7 +4497,9 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
         .as_ref()
         .map(|lease| serve::LeaseHeartbeat::start(state_dir, lease));
     let hot = hot_restart_begin(state_dir);
-    let shared = Shared::new_leased(state_dir, &opts, hot, lease, seam)?;
+    let membership =
+        public_membership::MembershipMode::capture(&hosted, &|name| opts.provider_env.var(name));
+    let shared = Shared::new_leased(state_dir, &opts, hot, lease, seam, membership)?;
     if let Some(heartbeat) = &lease_heartbeat {
         heartbeat.attach(&shared);
     }

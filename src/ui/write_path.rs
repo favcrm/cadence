@@ -825,6 +825,38 @@ pub(crate) fn model_defaults_post(request: &mut Request, state_dir: &Path) -> Ht
     }
 }
 
+/// CAD-1374: attach the human-attributed activity receipt to the PM for one
+/// mutation. The daemon proves the server-held public session bearer (read
+/// from the cookie, never a body field), persists the prepared receipt and
+/// returns its canonical context, which the PM carries into the commit. A
+/// local (non-public) write passes through unchanged. A public-host write
+/// with no bearer is refused as 401, never an anonymous fallback.
+pub(crate) fn activity_pm(
+    pm: Pm,
+    request: &Request,
+    opts: &ServeOpts,
+    state_dir: &Path,
+    action: &str,
+    resource: &str,
+) -> std::result::Result<Pm, HttpResp> {
+    let proof = match operator::public_relay(request, opts) {
+        operator::PublicRelay::NotPublic => return Ok(pm),
+        operator::PublicRelay::Proven(proof) => proof,
+        operator::PublicRelay::Missing => {
+            return Err(err_response(401, "board session required for this write"));
+        }
+    };
+    let params = json!({
+        "action": action,
+        "resource": resource,
+        "public_session": proof.token(),
+    });
+    let receipt =
+        client::rpc(state_dir, "pm_activity_prepare", params).map_err(|e| write_err(&e))?;
+    pm.with_activity_receipt(&receipt)
+        .map_err(|e| write_err(&e))
+}
+
 /// Dispatch POST/PATCH/DELETE on the write routes. Every route passes
 /// `write_guard` before reading a body or touching the PM dir, and every
 /// op goes through `issue::write` — one write path for CLI and API.
@@ -1172,7 +1204,8 @@ pub(crate) fn write_route(
             send(request, err_response(405, "method not allowed"));
             return;
         }
-        let response = app_records::handle(&mut request, state_dir, route, true);
+        let relay = operator::public_relay(&request, opts);
+        let response = app_records::handle(&mut request, state_dir, route, true, relay);
         send(request, response);
         return;
     }
@@ -1182,7 +1215,8 @@ pub(crate) fn write_route(
             send(request, err_response(405, "method not allowed"));
             return;
         }
-        let response = app_content::handle(&mut request, state_dir, route, true);
+        let relay = operator::public_relay(&request, opts);
+        let response = app_content::handle(&mut request, state_dir, route, true, relay);
         send(request, response);
         return;
     }
@@ -1238,7 +1272,8 @@ pub(crate) fn write_route(
             send(request, err_response(405, "method not allowed"));
             return;
         }
-        let response = app_runs::handle(&mut request, state_dir, route, true);
+        let relay = operator::public_relay(&request, opts);
+        let response = app_runs::handle_with_relay(&mut request, state_dir, route, true, relay);
         send(request, response);
         return;
     }
@@ -1264,11 +1299,13 @@ pub(crate) fn write_route(
             send(request, err_response(405, "method not allowed"));
             return;
         }
+        let relay = operator::public_relay(&request, opts);
         let resp = threads::post_conversation(
             &mut request,
             state_dir,
             crate::master::ALIAS,
             Some(install),
+            relay,
         );
         send(request, resp);
         return;
@@ -1290,7 +1327,15 @@ pub(crate) fn write_route(
                 || path.ends_with("/remove")
                 || path.ends_with("/restore"))
     {
-        let response = app_explorer::write(&mut request, method, path, caller.as_ref(), state_dir);
+        let relay = operator::public_relay(&request, opts);
+        let response = app_explorer::write(
+            &mut request,
+            method,
+            path,
+            caller.as_ref(),
+            relay,
+            state_dir,
+        );
         send(request, response);
         return;
     }
@@ -1515,9 +1560,19 @@ pub(crate) fn write_route(
             return;
         }
         let resp = if sub == Some("conversations") {
-            threads::post_conversation(&mut request, state_dir, alias, None)
+            let relay = operator::public_relay(&request, opts);
+            threads::post_conversation(&mut request, state_dir, alias, None, relay)
         } else {
-            threads::post_message(&mut request, state_dir, alias)
+            match operator::public_relay(&request, opts) {
+                operator::PublicRelay::Missing => {
+                    send(
+                        request,
+                        err_response(401, "board session required for this chat"),
+                    );
+                    return;
+                }
+                relay => threads::post_message(&mut request, state_dir, alias, relay),
+            }
         };
         send(request, resp);
         return;
@@ -1602,14 +1657,15 @@ pub(crate) fn write_route(
             send(request, err_response(500, "unadmitted write"));
             return;
         };
+        let relay = operator::public_relay(&request, opts);
         let resp = wiki::write(
             &mut request,
             method,
             tail,
             &caller,
             query,
-            state_dir,
-            pm_dir,
+            (state_dir, pm_dir),
+            relay,
         );
         send(request, resp);
         return;
@@ -1688,6 +1744,24 @@ pub(crate) fn write_route(
             );
             return;
         }
+        let Ok(project) = model::check_key(&req.project) else {
+            send(request, err_response(400, "bad project key"));
+            return;
+        };
+        let pm = match activity_pm(
+            pm,
+            &request,
+            opts,
+            state_dir,
+            "issue_created",
+            &format!("project:{project}"),
+        ) {
+            Ok(pm) => pm,
+            Err(resp) => {
+                send(request, resp);
+                return;
+            }
+        };
         match issue_write::new_issue(
             &pm,
             &pm.dir,
@@ -1738,6 +1812,20 @@ pub(crate) fn write_route(
                 return;
             }
         };
+        let pm = match activity_pm(
+            pm,
+            &request,
+            opts,
+            state_dir,
+            "issue_artifact_added",
+            &format!("issue:{id}"),
+        ) {
+            Ok(pm) => pm,
+            Err(resp) => {
+                send(request, resp);
+                return;
+            }
+        };
         match issue_write::attach_bytes(&pm, &id, &name, &bytes, false, &actor) {
             Ok(out) => send(request, write_reply(&pm, state_dir, &id, out, false)),
             Err(e) => send(request, write_err(&e)),
@@ -1752,40 +1840,69 @@ pub(crate) fn write_route(
             return;
         }
     };
-    let out = match (sub, method) {
+    let resource = format!("issue:{id}");
+    // Each arm parses and validates its body first, then prepares the
+    // activity receipt, then writes. The prepared PM feeds the reply too.
+    let (pm, out) = match (sub, method) {
         (None, &Method::Patch) => match parse_json::<PatchReq>(&bytes) {
-            Ok(req) => issue_write::patch_issue(
-                &pm,
-                &id,
-                &issue_write::IssuePatch {
-                    status: req.status,
-                    priority: req.priority,
-                    owner: req.owner,
-                    component: req.component,
-                    title: req.title,
-                    body: req.body,
-                    tags: req.tags,
-                },
-                req.if_rev.as_deref(),
-                &actor,
-                Some(state_dir),
-            ),
+            Ok(req) => match activity_pm(pm, &request, opts, state_dir, "issue_updated", &resource)
+            {
+                Ok(pm) => {
+                    let out = issue_write::patch_issue(
+                        &pm,
+                        &id,
+                        &issue_write::IssuePatch {
+                            status: req.status,
+                            priority: req.priority,
+                            owner: req.owner,
+                            component: req.component,
+                            title: req.title,
+                            body: req.body,
+                            tags: req.tags,
+                        },
+                        req.if_rev.as_deref(),
+                        &actor,
+                        Some(state_dir),
+                    );
+                    (pm, out)
+                }
+                Err(resp) => {
+                    send(request, resp);
+                    return;
+                }
+            },
             Err(resp) => {
                 send(request, resp);
                 return;
             }
         },
         (Some("links"), m) => match parse_json::<LinkReq>(&bytes) {
-            Ok(req) => issue_write::link(
-                &pm,
-                &id,
-                &req.kind,
-                &req.target,
-                m == &Method::Delete,
-                req.if_rev.as_deref(),
-                &actor,
-                Some(state_dir),
-            ),
+            Ok(req) => match activity_pm(
+                pm,
+                &request,
+                opts,
+                state_dir,
+                "issue_link_changed",
+                &resource,
+            ) {
+                Ok(pm) => {
+                    let out = issue_write::link(
+                        &pm,
+                        &id,
+                        &req.kind,
+                        &req.target,
+                        m == &Method::Delete,
+                        req.if_rev.as_deref(),
+                        &actor,
+                        Some(state_dir),
+                    );
+                    (pm, out)
+                }
+                Err(resp) => {
+                    send(request, resp);
+                    return;
+                }
+            },
             Err(resp) => {
                 send(request, resp);
                 return;
@@ -1803,17 +1920,26 @@ pub(crate) fn write_route(
                         return;
                     }
                 };
-                issue_write::add_ref(
-                    &pm,
-                    &id,
-                    &req.kind,
-                    &target,
-                    req.label.as_deref(),
-                    None,
-                    None,
-                    req.if_rev.as_deref(),
-                    &actor,
-                )
+                match activity_pm(pm, &request, opts, state_dir, "issue_ref_added", &resource) {
+                    Ok(pm) => {
+                        let out = issue_write::add_ref(
+                            &pm,
+                            &id,
+                            &req.kind,
+                            &target,
+                            req.label.as_deref(),
+                            None,
+                            None,
+                            req.if_rev.as_deref(),
+                            &actor,
+                        );
+                        (pm, out)
+                    }
+                    Err(resp) => {
+                        send(request, resp);
+                        return;
+                    }
+                }
             }
             Err(resp) => {
                 send(request, resp);
@@ -1821,15 +1947,31 @@ pub(crate) fn write_route(
             }
         },
         (Some("comments"), _) => match parse_json::<CommentReq>(&bytes) {
-            Ok(req) => issue_write::add_comment(
-                &pm,
-                &id,
-                &req.body,
-                Some(caller.author()),
-                Some("ui"),
-                req.if_rev.as_deref(),
-                &actor,
-            ),
+            Ok(req) => match activity_pm(
+                pm,
+                &request,
+                opts,
+                state_dir,
+                "issue_comment_added",
+                &resource,
+            ) {
+                Ok(pm) => {
+                    let out = issue_write::add_comment(
+                        &pm,
+                        &id,
+                        &req.body,
+                        Some(caller.author()),
+                        Some("ui"),
+                        req.if_rev.as_deref(),
+                        &actor,
+                    );
+                    (pm, out)
+                }
+                Err(resp) => {
+                    send(request, resp);
+                    return;
+                }
+            },
             Err(resp) => {
                 send(request, resp);
                 return;

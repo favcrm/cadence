@@ -364,6 +364,7 @@ pub(super) fn post_message(
     request: &mut Request,
     state_dir: &std::path::Path,
     alias: &str,
+    relay: super::operator::PublicRelay,
 ) -> HttpResp {
     if !valid_alias(alias) {
         return err_response(400, "bad agent alias");
@@ -377,6 +378,11 @@ pub(super) fn post_message(
         Err(resp) => return resp,
     };
     let mut params = json!({"alias": alias, "text": req.text});
+    // CAD-1374: the server-held public session bearer, never read from
+    // the request body. The daemon re-checks it before any enqueue.
+    if let super::operator::PublicRelay::Proven(proof) = relay {
+        params["public_session"] = Value::String(proof.token().to_string());
+    }
     if let Some(message) = req.message {
         params["message"] = Value::String(message);
     }
@@ -613,6 +619,7 @@ pub(super) fn post_conversation(
     state_dir: &std::path::Path,
     alias: &str,
     path_install: Option<&str>,
+    relay: super::operator::PublicRelay,
 ) -> HttpResp {
     if !valid_alias(alias) {
         return err_response(400, "bad agent alias");
@@ -645,6 +652,10 @@ pub(super) fn post_conversation(
     }
     if let Some(general) = req.general {
         params["general"] = Value::Bool(general);
+    }
+    // CAD-1374: the server-held public session bearer, never a body field.
+    if let Err(resp) = super::operator::relay_owner_proof(&mut params, relay) {
+        return resp;
     }
     match client::rpc(state_dir, "conversation_create", params) {
         Ok(created) => json_response(created),

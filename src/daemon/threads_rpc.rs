@@ -43,6 +43,56 @@ impl Shared {
         Ok(out)
     }
 
+    /// CAD-1374: the verified human behind an owner write. The board
+    /// sends `public_session` only for a public-host request, and refuses
+    /// a public-host request that carries none, so an absent bearer is the
+    /// operator's local write and gets no human. A present bearer is
+    /// re-checked against the daemon's own live row, which must map to the
+    /// owner role; the subject/session/company come from that row only.
+    /// `public_session` is never a source of authority on its own.
+    pub(super) fn verified_owner_human(&self, params: &Value) -> Result<Option<Value>> {
+        // Only an ABSENT field means the local operator chat. A present
+        // null, non-string or empty proof is malformed and refused, never
+        // read as absent (that would downgrade a hosted request).
+        let token = match params.get("public_session") {
+            None => return Ok(None),
+            Some(Value::String(token)) if !token.is_empty() => token.as_str(),
+            Some(_) => {
+                return Err(Error::rejected(
+                    "thread send refused: the board session proof is malformed",
+                ))
+            }
+        };
+        let granted = match self.current_public_session(token)? {
+            crate::daemon::public_membership::Authority::Granted {
+                sub,
+                role,
+                realm,
+                display,
+                view,
+                ..
+            } => (sub, role, realm, display, view),
+            crate::daemon::public_membership::Authority::Denied => {
+                return Err(Error::rejected(
+                    "thread send refused: the board session is not live",
+                ))
+            }
+        };
+        let (sub, role, realm, display, view) = granted;
+        if !role.is_operator() {
+            return Err(Error::rejected(
+                "thread send is the board owner's chat; this session is a member",
+            ));
+        }
+        Ok(Some(json!({
+            "sub": sub,
+            "company": realm.company,
+            "session": view.id,
+            "role": role.as_str(),
+            "display": display,
+        })))
+    }
+
     /// `thread_read` — a page of an agent's thread after `after`,
     /// optionally long-polling up to `wait` seconds (≤ 30) for the next
     /// entry, the way `agent_events` does. Read-only.
@@ -155,7 +205,14 @@ impl Shared {
             if let Some(field) = obj.keys().find(|k| {
                 !matches!(
                     k.as_str(),
-                    "alias" | "text" | "message" | "refs" | "app" | "conversation" | "attachments"
+                    "alias"
+                        | "text"
+                        | "message"
+                        | "refs"
+                        | "app"
+                        | "conversation"
+                        | "attachments"
+                        | "public_session"
                 )
             }) {
                 return Err(Error::rejected(format!(
@@ -169,6 +226,7 @@ impl Shared {
         // be provably the operator (CAD-276); the board relays browser
         // writes from its own operator process (CAD-313 gap).
         self.operator_chat("thread send", peer_pid)?;
+        let human = self.verified_owner_human(params)?;
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
         // CAD-802: a raw `app` binding rides through; `send_as`
         // proves it against the store and stamps the normalized form
@@ -177,8 +235,21 @@ impl Shared {
         send["alias"] = json!(alias);
         send["source"] = json!("operator");
         // The thread starts inside the enqueue transaction: a refused
-        // message leaves no thread and no `thread_created` event.
-        let mut receipt = self.send_as(&send, &|_| Ok(store::Sender::OperatorChat))?;
+        // message leaves no thread and no `thread_created` event. The
+        // daemon-derived human is a typed argument, never a field of `send`.
+        if let Some(obj) = send.as_object_mut() {
+            obj.remove("public_session");
+        }
+        let mut receipt = self.send_with_human(
+            &send,
+            &|_| Ok(store::Sender::OperatorChat),
+            &|verb| {
+                Err(Error::rejected(format!(
+                    "{verb} refused: this send carries no caller to steer with"
+                )))
+            },
+            human.as_ref(),
+        )?;
         // The thread the message landed in: its conversation, which is
         // home for an unbound send (CAD-1098).
         let landed = match receipt.get("message").and_then(Value::as_str) {

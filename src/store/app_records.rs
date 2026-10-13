@@ -138,7 +138,7 @@ CREATE TABLE IF NOT EXISTS app_record_revisions(
  context_id TEXT NOT NULL, record_id TEXT NOT NULL,
  revision INTEGER NOT NULL CHECK(revision>0),
  body TEXT NOT NULL, body_digest TEXT NOT NULL,
- actor TEXT NOT NULL, at REAL NOT NULL,
+ actor TEXT NOT NULL, at REAL NOT NULL, human TEXT,
  PRIMARY KEY(context_id, record_id, revision));
 CREATE TABLE IF NOT EXISTS app_record_consent_provenance(
  context_id TEXT NOT NULL, record_id TEXT NOT NULL,
@@ -149,7 +149,7 @@ CREATE TABLE IF NOT EXISTS app_record_csv_imports(
  request_id TEXT PRIMARY KEY, context_id TEXT NOT NULL,
  preview_token TEXT NOT NULL, result TEXT NOT NULL,
  decisions_digest TEXT NOT NULL DEFAULT '',
- state TEXT NOT NULL, at REAL NOT NULL);
+ state TEXT NOT NULL, at REAL NOT NULL, human TEXT);
 CREATE TABLE IF NOT EXISTS app_segments(
  context_id TEXT NOT NULL, id TEXT NOT NULL,
  revision INTEGER NOT NULL CHECK(revision>0),
@@ -199,7 +199,7 @@ CREATE TABLE IF NOT EXISTS app_content_revisions(
  subject TEXT NOT NULL, preheader TEXT NOT NULL,
  blocks TEXT NOT NULL, content_digest TEXT NOT NULL,
  actor TEXT NOT NULL, origin TEXT NOT NULL CHECK(origin IN ('operator','proposal')),
- proposal_id TEXT, at REAL NOT NULL, html TEXT, text_override TEXT,
+ proposal_id TEXT, at REAL NOT NULL, html TEXT, text_override TEXT, human TEXT,
  PRIMARY KEY(context_id, campaign_id, revision));
 CREATE TABLE IF NOT EXISTS app_content_proposals(
  context_id TEXT NOT NULL, proposal_id TEXT NOT NULL,
@@ -579,6 +579,18 @@ impl RecordStore {
                  state TEXT NOT NULL, at REAL NOT NULL)",
             )
             .map_err(|e| busy_or(&e, Error::internal(e.to_string())))?;
+            // CAD-1374: the revision table the human column joins. Its
+            // columns match the base SCHEMA exactly; it is created only
+            // when absent, so an existing file's rows are untouched.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS app_record_revisions(\
+                 context_id TEXT NOT NULL, record_id TEXT NOT NULL,\
+                 revision INTEGER NOT NULL CHECK(revision>0),\
+                 body TEXT NOT NULL, body_digest TEXT NOT NULL,\
+                 actor TEXT NOT NULL, at REAL NOT NULL,\
+                 PRIMARY KEY(context_id, record_id, revision))",
+            )
+            .map_err(|e| busy_or(&e, Error::internal(e.to_string())))?;
             // The probe classifies by code: contention retries
             // through the bounded wait instead of misreading BUSY as
             // a missing column and dying on a duplicate-column ALTER.
@@ -935,6 +947,27 @@ impl RecordStore {
                     .map_err(|e| busy_or(&e, Error::internal(e.to_string())))?;
                 }
             }
+            // CAD-1374: the verified human behind an owner write, stored
+            // on the receipt it names. Older files gain the nullable
+            // column; their rows stay NULL, honestly unknown.
+            for table in [
+                "app_content_revisions",
+                "app_record_revisions",
+                "app_record_csv_imports",
+            ] {
+                let probe = format!("SELECT human FROM {table} LIMIT 0");
+                let missing = match conn.prepare(&probe) {
+                    Ok(_) => false,
+                    Err(error) if is_contention(&error) => {
+                        return Err(Error::internal("record file is busy"));
+                    }
+                    Err(_) => true,
+                };
+                if missing {
+                    conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN human TEXT"))
+                        .map_err(|e| busy_or(&e, Error::internal(e.to_string())))?;
+                }
+            }
         }
         super::app_social_drafts::ensure_schema(&conn)?;
         Ok(Self {
@@ -1117,6 +1150,20 @@ impl RecordStore {
         profile: &CustomerProfile,
         provenance: Option<&ConsentProvenance>,
     ) -> Result<Value> {
+        self.app_record_create_as(context, record_id, profile, provenance, None)
+    }
+
+    /// [`Self::app_record_create_with`] carrying the verified human behind
+    /// an owner write (CAD-1374). `human` is daemon-derived, never request
+    /// text; it is stored on the revision row in this same transaction.
+    pub fn app_record_create_as(
+        &self,
+        context: &str,
+        record_id: &str,
+        profile: &CustomerProfile,
+        provenance: Option<&ConsentProvenance>,
+        human: Option<&Value>,
+    ) -> Result<Value> {
         crate::proto::identifier(context, "context ID")?;
         let unset = CustomerConsent {
             email: ConsentState::Unknown,
@@ -1168,8 +1215,8 @@ impl RecordStore {
             )
             .map_err(|e| Error::internal(e.to_string()))?;
             tx.execute(
-                "INSERT INTO app_record_revisions(context_id,record_id,revision,body,body_digest,actor,at) VALUES(?, ?, 1, ?, ?, 'operator', ?)",
-                params![context, record_id, body, digest, now()],
+                "INSERT INTO app_record_revisions(context_id,record_id,revision,body,body_digest,actor,at,human) VALUES(?, ?, 1, ?, ?, 'operator', ?, ?)",
+                params![context, record_id, body, digest, now(), human.map(Value::to_string)],
             )
             .map_err(|e| Error::internal(e.to_string()))?;
             if let Some(provenance) = provenance {
@@ -1282,11 +1329,27 @@ impl RecordStore {
         profile: &CustomerProfile,
         provenance: Option<&ConsentProvenance>,
     ) -> Result<Value> {
-        self.update_record(context, record_id, expected, profile, provenance, false)
+        self.app_record_update_as(context, record_id, expected, profile, provenance, None)
+    }
+
+    /// [`Self::app_record_update`] carrying the verified human (CAD-1374).
+    pub fn app_record_update_as(
+        &self,
+        context: &str,
+        record_id: &str,
+        expected: i64,
+        profile: &CustomerProfile,
+        provenance: Option<&ConsentProvenance>,
+        human: Option<&Value>,
+    ) -> Result<Value> {
+        self.update_record(
+            context, record_id, expected, profile, provenance, false, human,
+        )
     }
 
     /// `from_import`: a CSV update row that grants consent is recorded
     /// with the implied `imported` method instead of refused.
+    #[allow(clippy::too_many_arguments)]
     fn update_record(
         &self,
         context: &str,
@@ -1295,6 +1358,7 @@ impl RecordStore {
         profile: &CustomerProfile,
         provenance: Option<&ConsentProvenance>,
         from_import: bool,
+        human: Option<&Value>,
     ) -> Result<Value> {
         crate::proto::identifier(context, "context ID")?;
         crate::proto::identifier(record_id, "record ID")?;
@@ -1341,8 +1405,8 @@ impl RecordStore {
                 return Err(Error::rejected("record revision is stale"));
             }
             tx.execute(
-                "INSERT INTO app_record_revisions(context_id,record_id,revision,body,body_digest,actor,at) VALUES(?, ?, ?, ?, ?, 'operator', ?)",
-                params![context, record_id, revision, body, digest, now()],
+                "INSERT INTO app_record_revisions(context_id,record_id,revision,body,body_digest,actor,at,human) VALUES(?, ?, ?, ?, ?, 'operator', ?, ?)",
+                params![context, record_id, revision, body, digest, now(), human.map(Value::to_string)],
             )
             .map_err(|e| Error::internal(e.to_string()))?;
             if let Some(provenance) = provenance {
@@ -2641,6 +2705,31 @@ impl RecordStore {
         decisions: Option<Vec<CsvDecision>>,
         confirm: Option<(&str, &str)>,
     ) -> Result<Value> {
+        self.app_record_csv_import_as(
+            context,
+            csv_text,
+            preview_token,
+            request_id,
+            decisions,
+            confirm,
+            None,
+        )
+    }
+
+    /// [`Self::app_record_csv_import`] carrying the verified human behind
+    /// an owner import (CAD-1374). `human` lands on the import receipt and
+    /// every row revision the import applies.
+    #[allow(clippy::too_many_arguments)]
+    pub fn app_record_csv_import_as(
+        &self,
+        context: &str,
+        csv_text: &str,
+        preview_token: &str,
+        request_id: &str,
+        decisions: Option<Vec<CsvDecision>>,
+        confirm: Option<(&str, &str)>,
+        human: Option<&Value>,
+    ) -> Result<Value> {
         crate::proto::identifier(context, "context ID")?;
         crate::proto::identifier(request_id, "request ID")?;
         if preview_token.len() > 128 || !preview_token.starts_with("sha256:") {
@@ -2826,8 +2915,8 @@ impl RecordStore {
                 }
             }
             match tx.execute(
-                "INSERT INTO app_record_csv_imports(request_id,context_id,preview_token,result,decisions_digest,state,at) VALUES(?,?,?,?,?,?,?)",
-                params![request_id, context, token, "", decisions_digest, "pending", now()],
+                "INSERT INTO app_record_csv_imports(request_id,context_id,preview_token,result,decisions_digest,state,at,human) VALUES(?,?,?,?,?,?,?,?)",
+                params![request_id, context, token, "", decisions_digest, "pending", now(), human.map(Value::to_string)],
             ) {
                 Ok(_) => {}
                 Err(_) => match Self::import_receipt_in(&tx, request_id)? {
@@ -2874,7 +2963,8 @@ impl RecordStore {
                     ("skipped", Some(*why))
                 }
                 Apply::Create(profile) => {
-                    let stored = self.app_record_create(context, &row.record_id, profile);
+                    let stored =
+                        self.app_record_create_as(context, &row.record_id, profile, None, human);
                     match stored {
                         Ok(_) => {
                             applied += 1;
@@ -2887,8 +2977,15 @@ impl RecordStore {
                     }
                 }
                 Apply::Update(profile, revision) => {
-                    let stored =
-                        self.update_record(context, &row.record_id, *revision, profile, None, true);
+                    let stored = self.update_record(
+                        context,
+                        &row.record_id,
+                        *revision,
+                        profile,
+                        None,
+                        true,
+                        human,
+                    );
                     match stored {
                         Ok(_) => {
                             applied += 1;

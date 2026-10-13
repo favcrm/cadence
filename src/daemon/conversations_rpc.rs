@@ -651,10 +651,19 @@ impl Shared {
     ) -> Result<Value> {
         reject_unknown_fields(
             params,
-            &["alias", "install_id", "context_id", "subject", "general"],
+            &[
+                "alias",
+                "install_id",
+                "context_id",
+                "subject",
+                "general",
+                "public_session",
+            ],
             "conversation create",
         )?;
         self.operator_chat("conversation create", peer_pid)?;
+        // CAD-1374: the verified owner human, or `None` for the local operator.
+        let human = self.verified_owner_human(params)?;
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
         let install = required_str(params, "install_id")?;
         self.known_install(install)?;
@@ -685,9 +694,9 @@ impl Shared {
             }
             (false, None) => ConversationKind::Fresh,
         };
-        let (thread, created) = self
-            .store
-            .conversation_create(&alias, install, context, kind)?;
+        let (thread, created) =
+            self.store
+                .conversation_create_as(&alias, install, context, kind, human.as_ref())?;
         self.wake();
         Ok(json!({"conversation": thread.to_json(), "created": created}))
     }

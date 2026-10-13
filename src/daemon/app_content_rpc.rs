@@ -163,6 +163,14 @@ impl Shared {
         peer_pid: u32,
     ) -> Result<Value> {
         self.operator_connection("app content management", params, peer_pid)?;
+        // CAD-1374: only an owner save may carry the board's public session
+        // proof; it is stripped before the store sees the params, and the
+        // verified human is a typed argument, never a params field.
+        let human = if method == "app_content_save" {
+            self.verified_owner_human(params)?
+        } else {
+            None
+        };
         // Receipt-shaped fields are refused everywhere: assistant
         // attribution requires a CAD-784 chat receipt, and no such
         // receipt exists yet, so any present receipt is forged.
@@ -200,6 +208,7 @@ impl Shared {
                 "html",
                 "text",
                 "expected_revision",
+                "public_session",
             ],
             "app_content_show" => &["install_id", "context_id", "campaign_id"],
             "app_content_clone" => &[
@@ -325,11 +334,12 @@ impl Shared {
                     }
                     crate::store::app_content_html::refuse_host_unsubscribe(html, &endpoints)?;
                 }
-                records.app_content_save(
+                records.app_content_save_as(
                     context,
                     required_str(params, "campaign_id")?,
                     content_expected(params)?,
                     &draft,
+                    human.as_ref(),
                 )
             }
             "app_content_show" => {

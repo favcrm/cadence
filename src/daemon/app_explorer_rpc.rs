@@ -244,10 +244,11 @@ impl Shared {
         self: &Arc<Self>,
         catalog_id: &str,
         expected_digest: &str,
+        guard: &dyn Fn() -> Result<()>,
     ) -> Result<Value> {
         let pm_dir = self.pm_dir()?;
         let pm = self.pm_at(&pm_dir)?;
-        let result = workspace::install_builtin(&pm, catalog_id, expected_digest)?;
+        let result = workspace::install_builtin_guarded(&pm, catalog_id, expected_digest, guard)?;
         // Install = consent (CAD-1119): record the approval for the
         // digest this install committed, like the CLI install.
         if let (Some(id), Some(digest)) = (
@@ -255,8 +256,10 @@ impl Shared {
             result["digest"].as_str().map(str::to_owned),
         ) {
             let mut row = result;
-            row["consent"] = self.record_install_consent(&pm, &id, &digest, "install");
+            let consent = self.record_install_consent_guarded(&pm, &id, &digest, "install", guard);
+            // The install is committed: its request closes whatever the consent says.
             self.store.app_install_requests_close(catalog_id)?;
+            row["consent"] = consent?.0;
             return Ok(row);
         }
         self.store.app_install_requests_close(catalog_id)?;
@@ -406,33 +409,149 @@ impl Shared {
 
     /// `app_workspace_remove` — journaled soft remove: marks the
     /// record, revokes consent, refuses runs, cancels publishes.
-    fn rpc_app_workspace_remove(self: &Arc<Self>, params: &Value) -> Result<Value> {
+    fn rpc_app_workspace_remove(
+        self: &Arc<Self>,
+        params: &Value,
+        guard: &dyn Fn() -> Result<()>,
+    ) -> Result<Value> {
         let pm_dir = self.pm_dir()?;
         let pm = self.pm_at(&pm_dir)?;
         let install_id = required_str(params, "install_id")?;
         let expected_generation = required_str(params, "expected_generation")?;
         let expected_digest = required_str(params, "expected_digest")?;
         let request_id = required_str(params, "request_id")?;
-        workspace::remove(
+        workspace::remove_guarded(
             &pm,
             &self.store,
             install_id,
             expected_generation,
             expected_digest,
             request_id,
+            guard,
         )
     }
 
     /// `app_workspace_restore` — clear the mark and re-consent the
     /// same digest; refused after `purge_after`.
-    fn rpc_app_workspace_restore(self: &Arc<Self>, install_id: &str) -> Result<Value> {
+    fn rpc_app_workspace_restore(
+        self: &Arc<Self>,
+        install_id: &str,
+        guard: &dyn Fn() -> Result<()>,
+    ) -> Result<Value> {
         let pm_dir = self.pm_dir()?;
         let pm = self.pm_at(&pm_dir)?;
-        let out = workspace::restore(&pm, install_id)?;
+        let mut out = workspace::restore_guarded(&pm, install_id, guard)?;
         if let Some(digest) = out["digest"].as_str().map(str::to_owned) {
-            let _ = self.record_install_consent(&pm, install_id, &digest, "restore");
+            // CAD-1374: the consent write re-proves the human before its own
+            // mutation, so a revoked session cannot re-approve the digest.
+            let (_, changed) =
+                self.record_install_consent_guarded(&pm, install_id, &digest, "restore", guard)?;
+            out["consent_changed"] = json!(changed);
         }
         Ok(out)
+    }
+
+    /// CAD-1374: the owner effect's durable intent and outcome. The sealed
+    /// `prepared` frame is written before anything else. `effect` receives a
+    /// guard the workspace owner re-runs under its PM lock before its first
+    /// write: it re-reads the live session and requires the same verified
+    /// human as the prepared intent. A stale session refuses before any write.
+    /// A failed effect is `uncertain`, never a claimed rollback, and nothing
+    /// retries. The original error is always returned.
+    fn audited_workspace_effect(
+        &self,
+        params: &Value,
+        action: &str,
+        resource: &str,
+        effect: impl FnOnce(&dyn Fn() -> Result<()>) -> Result<Value>,
+    ) -> Result<Value> {
+        let human = self.explorer_human(params, None)?;
+        let request = uuid::Uuid::new_v4().to_string();
+        let prepared = workspace_frame(
+            &request,
+            human.as_ref(),
+            action,
+            resource,
+            "prepared",
+            Value::Null,
+            "not_available_before_effect",
+        );
+        self.store
+            .event_public(DAEMON_ALIAS, "app_workspace_mutation_prepared", prepared)?;
+        // `passed`: a guard has accepted the human, so a write may have begun.
+        // `refused`: a guard has refused. Only a refusal before any pass is a
+        // no-effect outcome; a later refusal is uncertain.
+        let passed = std::cell::Cell::new(false);
+        let refused = std::cell::Cell::new(false);
+        let guard = || -> Result<()> {
+            match self.explorer_human(params, None) {
+                Ok(live) if live == human => {
+                    passed.set(true);
+                    Ok(())
+                }
+                Ok(_) => {
+                    refused.set(true);
+                    Err(Error::rejected(
+                        "the board session changed; the workspace change was not made",
+                    ))
+                }
+                Err(error) => {
+                    refused.set(true);
+                    Err(error)
+                }
+            }
+        };
+        match effect(&guard) {
+            Ok(out) => {
+                let (outcome, digest, reason) = workspace_outcome(action, &out);
+                let mut finished = workspace_frame(
+                    &request,
+                    human.as_ref(),
+                    action,
+                    resource,
+                    outcome,
+                    digest,
+                    reason,
+                );
+                if let Some(id) = out["install_id"].as_str() {
+                    finished["install_id"] = json!(id);
+                }
+                self.store
+                    .event_public(DAEMON_ALIAS, "app_workspace_mutation_finished", finished)
+                    .map_err(|_| {
+                        Error::internal(
+                            "the workspace change completed but its outcome could not be recorded; it was not retried",
+                        )
+                    })?;
+                Ok(out)
+            }
+            Err(error) => {
+                let outcome = if refused.get() && !passed.get() {
+                    "refused"
+                } else {
+                    "uncertain"
+                };
+                let finished = workspace_frame(
+                    &request,
+                    human.as_ref(),
+                    action,
+                    resource,
+                    outcome,
+                    Value::Null,
+                    "outcome_not_confirmed",
+                );
+                if self
+                    .store
+                    .event_public(DAEMON_ALIAS, "app_workspace_mutation_finished", finished)
+                    .is_err()
+                {
+                    return Err(Error::internal(
+                        "workspace operation returned an error; its final outcome is unavailable; prepared intent retained; it was not retried",
+                    ));
+                }
+                Err(error)
+            }
+        }
     }
 
     /// The Explorer RPC family. `member_as` is the board's named-member
@@ -451,19 +570,26 @@ impl Shared {
             "app_catalog_git_check" => &["url", "git_ref", "dir"],
             "app_home" => &["member_as"],
             "app_favorites_get" => &["member_as"],
-            "app_favorites_put" => &["install_ids", "member_as"],
-            "app_favorites_put_default" => &["install_ids"],
+            "app_favorites_put" => &["install_ids", "member_as", "public_session"],
+            "app_favorites_put_default" => &["install_ids", "public_session"],
             "app_favorites_opened" => &["install_id", "member_as"],
-            "app_install_request" => &["catalog_id", "member_as"],
+            "app_install_request" => &["catalog_id", "member_as", "public_session"],
             "app_install_requests_list" => &["member_as"],
-            "app_install_request_dismiss" => &["id"],
-            "app_workspace_install_entry" => &["catalog_id", "expected_digest"],
+            "app_install_request_dismiss" => &["id", "public_session"],
+            "app_workspace_install_entry" => &["catalog_id", "expected_digest", "public_session"],
             "app_workspace_update_check" => &["install_id"],
-            "app_workspace_remove_preview" | "app_workspace_remove" | "app_workspace_restore" => &[
+            "app_workspace_remove_preview" => &[
                 "install_id",
                 "expected_generation",
                 "expected_digest",
                 "request_id",
+            ],
+            "app_workspace_remove" | "app_workspace_restore" => &[
+                "install_id",
+                "expected_generation",
+                "expected_digest",
+                "request_id",
+                "public_session",
             ],
             _ => return Err(Error::rejected("unknown app explorer method")),
         };
@@ -490,6 +616,13 @@ impl Shared {
         // relays over its own. A `member_as` claim additionally proves
         // the named member's session is live; it only ever narrows the
         // rows the board returns, never widens who may call.
+        // A registered agent never carries a human's proof: the human in an
+        // attributed write must come from a board session, not an agent slot.
+        if object.contains_key("public_session") && self.slot_identity(peer_pid)?.is_some() {
+            return Err(Error::rejected(
+                "a board session proof is refused from an agent connection",
+            ));
+        }
         self.operator_connection("workspace app explorer", params, peer_pid)?;
         if member.is_some() {
             if !member_method {
@@ -549,7 +682,8 @@ impl Shared {
                     }
                 }
                 let owner = member.as_deref().unwrap_or("operator");
-                self.store.app_favorites_put(owner, &ids)
+                let human = self.explorer_human(params, member.as_deref())?;
+                self.store.app_favorites_put_as(owner, &ids, human.as_ref())
             }
             "app_favorites_put_default" => {
                 let ids: Vec<String> = params["install_ids"]
@@ -562,7 +696,9 @@ impl Shared {
                             .ok_or_else(|| Error::rejected("install_ids holds strings"))
                     })
                     .collect::<Result<Vec<_>>>()?;
-                self.store.app_favorites_put_default(&ids)
+                let human = self.explorer_human(params, None)?;
+                self.store
+                    .app_favorites_put_default_as(&ids, human.as_ref())
             }
             "app_favorites_opened" => {
                 let id = required_str(params, "install_id")?;
@@ -579,29 +715,57 @@ impl Shared {
                 if crate::issue::app_catalog::builtin::get(catalog_id)?.is_none() {
                     return Err(Error::rejected("unknown catalog entry"));
                 }
-                self.store.app_install_request(catalog_id, who)
+                let human = self.explorer_human(params, Some(who))?;
+                self.store
+                    .app_install_request_as(catalog_id, who, human.as_ref())
             }
             "app_install_requests_list" => {
                 Ok(json!({"requests": self.store.app_install_requests_open()?}))
             }
             "app_install_request_dismiss" => {
+                let human = self.explorer_human(params, None)?;
                 self.store
-                    .app_install_request_dismiss(required_str(params, "id")?)?;
+                    .app_install_request_dismiss_as(required_str(params, "id")?, human.as_ref())?;
                 Ok(json!({"ok": true}))
             }
-            "app_workspace_install_entry" => self.rpc_app_workspace_install_entry(
-                required_str(params, "catalog_id")?,
-                required_str(params, "expected_digest")?,
-            ),
+            "app_workspace_install_entry" => {
+                let catalog_id = required_str(params, "catalog_id")?;
+                let expected = required_str(params, "expected_digest")?;
+                if app_catalog::builtin::get(catalog_id)?.is_none() {
+                    return Err(Error::rejected("unknown catalog entry"));
+                }
+                self.audited_workspace_effect(
+                    params,
+                    "app_workspace_installed",
+                    &format!("catalog:{catalog_id}"),
+                    |guard| self.rpc_app_workspace_install_entry(catalog_id, expected, guard),
+                )
+            }
             "app_workspace_update_check" => {
                 self.rpc_app_workspace_update_check(required_str(params, "install_id")?)
             }
             "app_workspace_remove_preview" => {
                 self.rpc_app_workspace_remove_preview(required_str(params, "install_id")?)
             }
-            "app_workspace_remove" => self.rpc_app_workspace_remove(params),
+            "app_workspace_remove" => {
+                let install_id = required_str(params, "install_id")?;
+                app_catalog::InstallationId::parse(install_id)?;
+                self.audited_workspace_effect(
+                    params,
+                    "app_workspace_removed",
+                    &format!("install:{install_id}"),
+                    |guard| self.rpc_app_workspace_remove(params, guard),
+                )
+            }
             "app_workspace_restore" => {
-                self.rpc_app_workspace_restore(required_str(params, "install_id")?)
+                let install_id = required_str(params, "install_id")?;
+                app_catalog::InstallationId::parse(install_id)?;
+                self.audited_workspace_effect(
+                    params,
+                    "app_workspace_restored",
+                    &format!("install:{install_id}"),
+                    |guard| self.rpc_app_workspace_restore(install_id, guard),
+                )
             }
             _ => Err(Error::rejected("unknown app explorer method")),
         }
@@ -670,8 +834,7 @@ impl Shared {
     /// public session is live. The board relays it only when
     /// `board_caller` resolved `Named`; a forged value never resolves.
     fn member_connection(&self, member: &str, _peer_pid: u32) -> Result<()> {
-        let now = self.operator_now();
-        if self.operator_auth().check_member(member, now)? {
+        if self.handle_has_current_member(member)? {
             Ok(())
         } else {
             Err(Error::rejected(
@@ -679,6 +842,116 @@ impl Shared {
             ))
         }
     }
+
+    /// CAD-1374: the verified human behind an attributed explorer write. The
+    /// board's `public_session` proof is re-checked against the live row; it
+    /// attributes the write and never grants it, so the connection guards
+    /// above still decide. An absent proof is the legacy local path and names
+    /// no human. A present proof must be a live granted session whose role
+    /// fits the write: the named member's `member_as`, else the owner.
+    fn explorer_human(&self, params: &Value, member: Option<&str>) -> Result<Option<Value>> {
+        let token = match params.get("public_session") {
+            None => return Ok(None),
+            Some(Value::String(token)) if !token.is_empty() => token.as_str(),
+            Some(_) => return Err(Error::rejected("the board session proof is malformed")),
+        };
+        let granted = match self.current_public_session(token)? {
+            crate::daemon::public_membership::Authority::Granted {
+                sub,
+                role,
+                realm,
+                display,
+                view,
+                ..
+            } => (sub, role, realm, display, view),
+            crate::daemon::public_membership::Authority::Denied => {
+                return Err(Error::rejected("the board session is not live"))
+            }
+        };
+        let (sub, role, realm, display, view) = granted;
+        let fits = match member {
+            Some(who) => {
+                role == crate::board_identity::Role::Member
+                    && view.user.as_ref().is_some_and(|u| u.handle == who)
+            }
+            None => role.is_operator(),
+        };
+        if !fits {
+            return Err(Error::rejected(
+                "the board session does not match this write's member scope",
+            ));
+        }
+        Ok(Some(json!({
+            "sub": sub,
+            "company": realm.company,
+            "session": view.id,
+            "display": display,
+            "role": role.as_str(),
+        })))
+    }
+}
+
+/// CAD-1374: one canonical workspace-effect frame. `human` is the verified
+/// board human (or `null` for the legacy local path, which names no human).
+/// `reason` is the validated action; `outcome` names the real state.
+fn workspace_frame(
+    request: &str,
+    human: Option<&Value>,
+    action: &str,
+    resource: &str,
+    outcome: &str,
+    digest: Value,
+    digest_unavailable_reason: &str,
+) -> Value {
+    let digest_unavailable = if digest.is_null() {
+        json!(digest_unavailable_reason)
+    } else {
+        Value::Null
+    };
+    json!({
+        "schema_version": 1,
+        "request_id": request,
+        "correlation_id": request,
+        "causation_id": null,
+        "at": crate::issue::time::now_epoch(),
+        "company": human.map_or(Value::Null, |h| h["company"].clone()),
+        "human": human.cloned().unwrap_or(Value::Null),
+        "action": action,
+        "resource": resource,
+        "outcome": outcome,
+        "reason": action,
+        "revision_or_digest": digest,
+        "revision_or_digest_unavailable_reason": digest_unavailable,
+    })
+}
+
+/// The terminal outcome of a completed workspace effect, read from its real
+/// result. A replayed remove or an already-live restore changed nothing new,
+/// and says so. The digest is the validated operation value, or an explicit
+/// unavailable reason; it is never a caller value or a later PM HEAD.
+fn workspace_outcome(action: &str, out: &Value) -> (&'static str, Value, &'static str) {
+    let outcome = match action {
+        "app_workspace_installed" => "installed",
+        "app_workspace_removed" if out["replayed"] == true => "already_removed",
+        "app_workspace_removed" => "removed",
+        _ if out["restored"] == true => "restored",
+        _ if out["consent_changed"] == true => "already_live_consent_recorded",
+        _ => "already_live",
+    };
+    match out["digest"].as_str().filter(|d| is_sha256_digest(d)) {
+        Some(d) => (outcome, json!(d), ""),
+        None => (outcome, Value::Null, "operation_result_has_no_digest"),
+    }
+}
+
+/// `sha256:` then exactly 64 lowercase hex digits, the form `bundle_digest` writes.
+fn is_sha256_digest(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
 }
 
 /// What the manifest's `listing.data` declares: `(holds_records,

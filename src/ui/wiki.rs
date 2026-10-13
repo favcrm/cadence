@@ -243,10 +243,27 @@ pub(super) fn write(
     tail: &str,
     caller: &operator::Caller,
     query: &dyn Fn(&str) -> Option<String>,
-    state_dir: &Path,
-    pm_dir: &Path,
+    dirs: (&Path, &Path),
+    relay_proof: operator::PublicRelay,
 ) -> HttpResp {
+    let (state_dir, pm_dir) = dirs;
     let wiki_as = wiki_as(caller);
+    // CAD-1374: every write attaches the server-held public session
+    // bearer (or refuses 401 on a public host with none) before any staging
+    // or RPC. Reads never reach this function.
+    let proof = match relay_proof {
+        operator::PublicRelay::Missing => {
+            return err_response(401, "board session required for this write");
+        }
+        operator::PublicRelay::NotPublic => None,
+        operator::PublicRelay::Proven(p) => Some(p.token().to_string()),
+    };
+    let with_proof = |mut params: Value| {
+        if let Some(token) = &proof {
+            params["public_session"] = Value::String(token.clone());
+        }
+        params
+    };
     match (tail, method) {
         ("file", Method::Put) => {
             let body = match read_body(request, JSON_CAP) {
@@ -267,7 +284,7 @@ pub(super) fn write(
             if let Some(rev) = req["if_rev"].as_str() {
                 params["if_rev"] = json!(rev);
             }
-            relay(state_dir, "wiki_write", params, &wiki_as)
+            relay(state_dir, "wiki_write", with_proof(params), &wiki_as)
         }
         ("mkdir", Method::Post) | ("rm", Method::Post) => {
             let body = match read_body(request, JSON_CAP) {
@@ -288,7 +305,7 @@ pub(super) fn write(
                 } else {
                     "wiki_rm"
                 },
-                json!({"path": path}),
+                with_proof(json!({"path": path})),
                 &wiki_as,
             )
         }
@@ -305,13 +322,13 @@ pub(super) fn write(
                 (Some(from), Some(to)) => relay(
                     state_dir,
                     "wiki_mv",
-                    json!({"from": from, "to": to}),
+                    with_proof(json!({"from": from, "to": to})),
                     &wiki_as,
                 ),
                 _ => err_response(400, "wiki mv needs {from,to}"),
             }
         }
-        ("upload", Method::Post) => upload(request, query, state_dir, pm_dir, &wiki_as),
+        ("upload", Method::Post) => upload(request, query, state_dir, pm_dir, &wiki_as, proof),
         ("file" | "upload" | "mkdir" | "mv" | "rm", _) => err_response(405, "method not allowed"),
         _ => err_response(404, "no such wiki write route"),
     }
@@ -328,6 +345,7 @@ fn upload(
     state_dir: &Path,
     pm_dir: &Path,
     wiki_as: &str,
+    proof: Option<String>,
 ) -> HttpResp {
     let ct = header_value(request, "Content-Type").unwrap_or_default();
     let Some(boundary) = ct
@@ -363,12 +381,13 @@ fn upload(
     let Some(bytes) = file else {
         return err_response(400, "wiki upload needs a 'file' part");
     };
-    match store_upload(
+    match store_upload_with_proof(
         state_dir,
         &path,
         bytes,
         query("if_rev").or_else(|| fields.get("if_rev").cloned()),
         wiki_as,
+        proof.as_deref(),
     ) {
         Ok(v) => json_response(v),
         Err(resp) => resp,
@@ -384,6 +403,29 @@ pub(super) fn store_upload(
     if_rev: Option<String>,
     wiki_as: &str,
 ) -> Result<Value, HttpResp> {
+    store_upload_with_proof(state_dir, path, bytes, if_rev, wiki_as, None)
+}
+
+/// `store_upload` with the browser's trusted public-session relay token.
+/// `proof` only ever comes from the server's own `PublicRelay` decision
+/// upstream — never from the request — so a `None` caller cannot name a
+/// session. Both RPC branches forward it as `public_session` so the daemon
+/// re-checks membership and audits the verified actor before any effect.
+fn store_upload_with_proof(
+    state_dir: &Path,
+    path: &str,
+    bytes: Vec<u8>,
+    if_rev: Option<String>,
+    wiki_as: &str,
+    proof: Option<&str>,
+) -> Result<Value, HttpResp> {
+    // Fold the server-held bearer into RPC params only when one was proven.
+    let with_proof = |mut params: Value| {
+        if let Some(token) = proof {
+            params["public_session"] = Value::String(token.to_string());
+        }
+        params
+    };
     if bytes.is_empty() {
         return Err(err_response(400, "wiki upload: the file part is empty"));
     }
@@ -400,7 +442,7 @@ pub(super) fn store_upload(
         return client::rpc(
             state_dir,
             "wiki_write",
-            json!({"path":path,"text":text,"if_rev":if_rev,"wiki_as":wiki_as}),
+            with_proof(json!({"path":path,"text":text,"if_rev":if_rev,"wiki_as":wiki_as})),
         )
         .map_err(|e| write_err(&e));
     }
@@ -418,7 +460,7 @@ pub(super) fn store_upload(
     client::rpc(
         state_dir,
         "wiki_put_blob",
-        json!({"path": path, "tmp": tmp.path(), "wiki_as": wiki_as,"if_rev": if_rev}),
+        with_proof(json!({"path": path, "tmp": tmp.path(), "wiki_as": wiki_as,"if_rev": if_rev})),
     )
     .map_err(|e| write_err(&e))
 }
