@@ -214,3 +214,23 @@ for (const density of ["full", "compact"] as const) {
   ok((pendingRefs.match(/class="refchip/g) ?? []).length === 1 && pendingRefs.includes(">issue:CAD-9<"), `${density}: pending refs render`);
   ok(!render(items.pending, density).includes("refchip"), `${density}: pending without refs has no chips`);
 }
+
+// CAD-1419: a failed turn renders its reason, not an empty Assistant bubble.
+// The error string is the daemon's real payload.error for a 503 billing
+// refusal, as the live thread API returned it (status failed, empty text).
+{
+  const billingError =
+    '503: {"message":"This company has no billing account yet; its owner sets one up.","type":"server_error","code":"billing_unavailable"}';
+  const failed = render(
+    {
+      type: "answer",
+      key: "tf",
+      entry: entry({ kind: "turn_result", role: "assistant", text: "", payload: { status: "failed", error: billingError } }),
+    },
+    "full",
+  );
+  ok(failed.includes('data-kind="turn-failure"') && failed.includes('role="alert"'), "failed turn: alert row");
+  ok(failed.includes("billing is not set up") && failed.includes("owner needs to set up billing"), "failed turn: billing reason");
+  ok(!failed.includes("data-kind=\"answer\""), "failed turn: no empty answer body");
+  ok(!failed.includes("Retry"), "failed turn: no retry on an executed turn");
+}

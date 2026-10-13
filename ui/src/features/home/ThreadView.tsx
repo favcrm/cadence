@@ -207,14 +207,25 @@ export function ThreadItemView({
       );
     case "tools":
       return <StepsGroup entries={item.entries} />;
-    case "answer":
+    case "answer": {
+      // A failed turn carries its reason in payload.error and no text: say
+      // why, instead of an empty bubble. No Retry here — the turn ran.
+      const failure = turnFailure(item.entry, t);
       return (
         <Bubble who={t("Assistant")} at={time(item.entry.created)} density={density}>
-          <div className={`issue-reader mt-0.5 ${bodyText} text-ink-200 break-words`} data-kind="answer">
-            <Md text={item.entry.text} onOpen={onOpenIssue} />
-          </div>
+          {failure && (
+            <div className={`mt-0.5 ${bodyText} text-fail break-words`} role="alert" data-kind="turn-failure">
+              {failure}
+            </div>
+          )}
+          {item.entry.text.trim() !== "" && (
+            <div className={`issue-reader mt-0.5 ${bodyText} text-ink-200 break-words`} data-kind="answer">
+              <Md text={item.entry.text} onOpen={onOpenIssue} />
+            </div>
+          )}
         </Bubble>
       );
+    }
     case "system": {
       const e = item.entry;
       if (e.payload?.source === "permission") {
@@ -299,6 +310,18 @@ function RefChips({ refs }: { refs: ThreadRef[] }) {
       ))}
     </span>
   );
+}
+
+/** The reason a `turn_result` failed (its `payload.error`), or null when
+ *  the turn did not fail. `billing_unavailable` names the owner's action;
+ *  other reasons are shown as the daemon gave them. */
+function turnFailure(entry: ThreadEntry, t: (english: string) => string): string | null {
+  const p = entry.payload;
+  const error = typeof p?.error === "string" ? p.error.trim() : "";
+  if (p?.status !== "failed" && !error) return null;
+  if (error.includes("billing_unavailable"))
+    return t("Assistant could not run: billing is not set up for this company. The company owner needs to set up billing.");
+  return error ? `${t("Assistant could not finish this turn")}: ${error}` : t("Assistant could not finish this turn.");
 }
 
 /** CAD-1168: `payload.attachments` as typed rows — a malformed value

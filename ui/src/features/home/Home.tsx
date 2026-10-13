@@ -93,16 +93,40 @@ function appOriginHref(origin: MasterAppOrigin | null): string | null {
   return `/app-installations/${encodeURIComponent(install_id)}?${ctx}conversation=${encodeURIComponent(conversation_id)}`;
 }
 
+/** CAD-1419: the Assistant name row's live state while the turn works
+ *  and has not produced its reply yet. Elapsed time from the same turn
+ *  start as the dock row; no Stop here (Stop stays in the dock). */
+function AssistantActivity({ since }: { since: number | null }) {
+  const t = useTranslate();
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+  const elapsed = since !== null && Number.isFinite(since) ? fmtElapsed(Math.max(0, Math.floor(now / 1000 - since))) : null;
+  return (
+    <div className="flex gap-2 items-center text-micro text-ink-400 min-w-0" data-assistant-activity>
+      <span className="text-ink-100 font-medium">{t("Assistant")}</span>
+      <span className="workdot live" aria-hidden />
+      <span className="text-ink-300">{t("Working")}</span>
+      {elapsed !== null && <span className="num text-ink-500">{elapsed}</span>}
+    </div>
+  );
+}
+
 function WorkingRow({
   turn,
   appOrigin,
   step,
   onStop,
+  nameRow,
 }: {
   turn: TurnState;
   appOrigin: MasterAppOrigin | null;
   step: ThreadEntry | null;
   onStop: () => void;
+  /** The Assistant name row shows Working + elapsed for this turn. */
+  nameRow: boolean;
 }) {
   const t = useTranslate();
   const appHref = appOriginHref(appOrigin);
@@ -115,6 +139,7 @@ function WorkingRow({
   if (turn.kind === "idle") return null;
   const stepText = step ? stepSummary(step.text) : null;
   const elapsed =
+    !nameRow &&
     turn.kind === "working" &&
     typeof turn.since === "number" &&
     Number.isFinite(turn.since)
@@ -122,8 +147,8 @@ function WorkingRow({
       : null;
   return (
     <div className="workrow" role="status" aria-live="polite" data-turn={turn.kind}>
-      <span className={`workdot${turn.kind === "working" ? " live" : ""}`} aria-hidden />
-      {turn.kind === "working" && (
+      {!nameRow && <span className={`workdot${turn.kind === "working" ? " live" : ""}`} aria-hidden />}
+      {turn.kind === "working" && !nameRow && (
         <span className="text-ink-200 font-medium shrink-0">{t("Working")}</span>
       )}
       {elapsed !== null && <span className="num text-ink-500 shrink-0">{elapsed}</span>}
@@ -344,6 +369,7 @@ const ThreadList = memo(function ThreadList({
   onOpenIssue,
   liveAfter,
   onRetry,
+  working,
 }: {
   items: ThreadItem[];
   limit: number;
@@ -354,10 +380,13 @@ const ThreadList = memo(function ThreadList({
   onOpenIssue: (id: string) => void;
   liveAfter: number;
   onRetry: (message: string, text: string, refs?: ThreadRef[]) => void;
+  /** The live turn's start (epoch s) while it works; null otherwise. */
+  working: { since: number | null } | null;
 }) {
   const t = useTranslate();
   const { shown, hidden } = useMemo(() => visibleWindow(items, limit), [items, limit]);
   const anchors = useMemo(() => planAnchors(items), [items]);
+  const lastKey = items.length ? items[items.length - 1].key : "";
   if (items.length === 0) return null;
   return (
     <>
@@ -381,6 +410,8 @@ const ThreadList = memo(function ThreadList({
             <div className="ml-8">
               <PlanCard epic={anchors.get(item.key)!} readOnly={readOnly} onOpenIssue={onOpenIssue} />
             </div>
+          ) : working && item.key === lastKey && item.type !== "answer" ? (
+            <AssistantActivity since={working.since} />
           ) : null
         }
       />
@@ -437,6 +468,8 @@ export default function Home({
   const [loadingEarlier, setLoadingEarlier] = useState(false);
   const [cmds, setCmds] = useState<CmdResult[]>([]);
   const [unseen, setUnseen] = useState(0);
+  // Same-row growth while the reader is in history (no count to show).
+  const [activity, setActivity] = useState(false);
   const [glideTick, setGlideTick] = useState(0);
   const cmdSeq = useRef(0);
   const follow = useRef<Follow>(initialFollow());
@@ -485,6 +518,10 @@ export default function Home({
       ? serverTurn.app_origin
       : null;
   const step = useMemo(() => openStep(thread.data?.entries ?? []), [thread.data]);
+  // The Assistant name row carries Working for this turn when the turn is
+  // live and no reply row has landed after the operator's message (the
+  // ThreadList rule). The dock row then keeps only Stop and the step.
+  const nameRowShown = turn.kind === "working" && items.length > 0 && items[items.length - 1].type !== "answer";
 
   // Live entries: the store opened on the newest page, so the stream
   // resumes after its last seq — never a replay of the history. On a
@@ -564,6 +601,7 @@ export default function Home({
     const next = onSend(follow.current);
     follow.current = next.state;
     setUnseen(0);
+    setActivity(false);
     setGlideTick((n) => n + 1);
   }, []);
   const onRetrySend = useCallback(
@@ -577,6 +615,7 @@ export default function Home({
     const el = scrollRef.current;
     if (!el) return;
     const near = atTail(el.scrollTop, el.scrollHeight, el.clientHeight);
+    if (near) setActivity(false);
     applyFollow(onViewportScroll(follow.current, near));
   }, []);
 
@@ -587,6 +626,7 @@ export default function Home({
     const onScrollEnd = () => {
       const settled = onScrollSettled(follow.current, nearNow());
       applyFollow(settled.state);
+      if (settled.state.pinned) setActivity(false);
       if (settled.scroll === "jump") scrollPanel("jump");
     };
     // Only an in-flight send glide is cancelled here. Once it has
@@ -629,6 +669,29 @@ export default function Home({
       removeEventListener("keydown", onKey);
     };
   }, [scrollPanel]);
+
+  // Same-row growth (a streamed reply, a tool step, the name row's
+  // working line) keeps `items.length` and `lastKey` unchanged, so the
+  // tail effect below does not run for it. Observe the thread's own
+  // content box and follow only while pinned: a reader in history keeps
+  // its position and the pill counts nothing here.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    let last = el.scrollHeight;
+    const ro = new ResizeObserver(() => {
+      const h = el.scrollHeight;
+      const grew = h > last;
+      last = h;
+      if (!grew || follow.current.programmatic) return;
+      if (follow.current.pinned) scrollPanel("jump");
+      else setActivity(true);
+    });
+    // Observe every direct child so growth in any block (the reply row,
+    // the working line, a tool group) reaches the observer.
+    for (const child of Array.from(el.children)) ro.observe(child);
+    return () => ro.disconnect();
+  }, [scrollPanel, items.length, nameRowShown, turn.kind, cmds.length]);
 
   // The dock's measured height is the thread's bottom padding and the
   // pill's floor (`--dock-h`, styles.css); while pinned, a growing dock
@@ -694,6 +757,7 @@ export default function Home({
     const next = onPill(follow.current);
     follow.current = next.state;
     setUnseen(0);
+    setActivity(false);
     scrollPanel(next.scroll);
   };
 
@@ -876,14 +940,21 @@ export default function Home({
               onOpenIssue={onOpenIssue}
               liveAfter={liveAfter.current ?? 0}
               onRetry={onRetrySend}
+              working={nameRowShown ? { since: typeof turn.since === "number" ? turn.since : null } : null}
             />
             {cmds.map((c) => (
               <CmdCard key={c.id} cmd={c} onOpenIssue={onOpenIssue} />
             ))}
-            <WorkingRow turn={turn} appOrigin={turnOrigin} step={step} onStop={() => runCommand("stop", "")} />
+            <WorkingRow
+              turn={turn}
+              appOrigin={turnOrigin}
+              step={step}
+              onStop={() => runCommand("stop", "")}
+              nameRow={nameRowShown}
+            />
           </div>
 
-          {unseen > 0 && (
+          {(unseen > 0 || activity) && (
             <button type="button" className="newpill num" onClick={jumpToLatest} data-jump-to-latest>
               ↓ {jumpLabel(unseen)}
             </button>
