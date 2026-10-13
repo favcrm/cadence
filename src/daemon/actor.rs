@@ -43,6 +43,9 @@ impl Shared {
         if self.execution_mode.fenced() {
             return Err(crate::backup::portable_fence::fence_refusal("agent start"));
         }
+        // CAD-1380: a bound runtime with a foreign or unsafe cwd refuses before
+        // any enable/state write or spawn. Ordinary aliases are unchanged.
+        self.assistant_start_guard(alias)?;
         // A mailbox never gets an actor — regardless of who asked.
         let a = self.store.agent(alias)?;
         if !registry::has_actor(&a.provider, &a.endpoint_kind) {
@@ -306,6 +309,11 @@ impl Shared {
 
     fn actor_inner(self: &Arc<Self>, alias: &str, ctl: &Arc<AgentCtl>) -> Result<()> {
         let agent = self.store.agent(alias)?;
+        // CAD-1380: the exact snapshot about to open must be the principal's
+        // canonical root before any adapter grant is built.
+        if let Some(binding) = self.store.assistant_for_alias(alias)? {
+            self.assistant_cwd_matches(&binding, Some(&agent))?;
+        }
         // A lost poll on a live Devin Cloud session is not a dead
         // process. Finish the message unknown and keep the actor and
         // endpoint; do not fence.

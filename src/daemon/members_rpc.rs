@@ -377,7 +377,7 @@ impl Shared {
     /// assignment. Ordinary nonmember targets are untouched.
     fn member_target_read_guard(&self, method: &str, params: &Value, peer_pid: u32) -> Result<()> {
         let (alias_arg, job_arg, task_arg) = match method {
-            "thread_read" | "agent_show" | "agent_events" => {
+            "thread_read" | "agent_show" | "agent_events" | "agent_wait" => {
                 (params.get("alias").and_then(Value::as_str), None, None)
             }
             "job_show" | "job_events" => (None, params.get("job").and_then(Value::as_str), None),
@@ -807,6 +807,61 @@ impl Shared {
             .join(crate::operator_auth::digest(&canonical))
     }
 
+    /// CAD-1380 private-cwd invariant, shared by every path that can grant a
+    /// bound runtime filesystem authority (provision, resume, open, admission).
+    /// A registered runtime for an ACTIVE binding must sit exactly at its
+    /// principal's dedicated root. Unsafe, missing or erroring rows refuse;
+    /// nothing repoints, migrates or widens the grant. Ordinary aliases with no
+    /// binding are untouched (the caller never invokes this for them).
+    pub(super) fn assistant_runtime_cwd_guard(
+        &self,
+        binding: &crate::store::AssistantBinding,
+    ) -> Result<()> {
+        let live = self.store.agent_opt(&binding.alias)?;
+        self.assistant_cwd_matches(binding, live.as_ref())
+    }
+
+    /// Start/resume gate for a bound alias: an ACTIVE bound binding must pass
+    /// the cwd invariant before any state, enable or spawn write. Ordinary
+    /// aliases (no binding) are untouched.
+    pub(super) fn assistant_start_guard(&self, alias: &str) -> Result<()> {
+        match self.store.assistant_for_alias(alias)? {
+            Some(binding) => self.assistant_runtime_cwd_guard(&binding),
+            None => Ok(()),
+        }
+    }
+
+    /// The same invariant against one runtime snapshot (the row the actor is
+    /// about to open). `None` means the bound runtime is missing: refuse.
+    pub(super) fn assistant_cwd_matches(
+        &self,
+        binding: &crate::store::AssistantBinding,
+        runtime: Option<&crate::store::Agent>,
+    ) -> Result<()> {
+        // An inactive or revoked binding never receives a filesystem grant.
+        if !binding.is_active() {
+            return Err(Error::rejected(format!(
+                "member assist refused: runtime '{}' has an {} binding (CAD-1380)",
+                binding.alias, binding.state
+            )));
+        }
+        let expected = self.assistant_principal_cwd(&binding.org, &binding.sub);
+        let Some(runtime) = runtime else {
+            return Err(Error::rejected(format!(
+                "member assist refused: bound runtime '{}' is not registered (CAD-1380)",
+                binding.alias
+            )));
+        };
+        if expected.to_str().is_none() || runtime.cwd != expected.to_string_lossy() {
+            return Err(Error::rejected(format!(
+                "member assist refused: registered runtime '{}' is not in its \
+                 principal's dedicated cwd; repair it explicitly (CAD-1380)",
+                binding.alias
+            )));
+        }
+        Ok(())
+    }
+
     fn ensure_assistant_runtime(
         &self,
         binding: &crate::store::AssistantBinding,
@@ -817,17 +872,8 @@ impl Shared {
         // pair. The hash keeps raw subjects out of the path, is stable across
         // credential rotation, and never truncates or lossily maps characters.
         let principal_cwd = self.assistant_principal_cwd(&binding.org, &binding.sub);
-        if let Some(existing) = self.store.agent_opt(&binding.alias)? {
-            // An existing registered runtime must sit in its own principal's
-            // dedicated root. A mismatch is refused, never silently reused or
-            // repointed, so no other principal's confined grant is inherited.
-            if existing.cwd != principal_cwd.to_str().unwrap_or_default() {
-                return Err(Error::rejected(format!(
-                    "member assist refused: registered runtime '{}' is not in its \
-                     principal's dedicated cwd; repair it explicitly (CAD-1380)",
-                    binding.alias
-                )));
-            }
+        if self.store.agent_opt(&binding.alias)?.is_some() {
+            self.assistant_runtime_cwd_guard(binding)?;
         } else {
             // The registered alias is the STORED binding alias — derived
             // at mint from the member, never a caller field. The agent-
@@ -888,14 +934,19 @@ impl Shared {
     /// - Bound, unstamped, other source: the current binding is re-proven for
     ///   `assist_state` under the enrolled service. No latest CID is borrowed.
     pub(super) fn member_message_reprove(&self, message: &store::Message) -> Result<()> {
+        let stamp = self.store.message_member_authority(&message.id)?;
+        let binding = self.store.assistant_for_alias(&message.alias)?;
         // CAD-1380 R4: a queued assist-job notice re-proves the subscriber's
         // live jobs scope for the job its task names. Its original member
-        // credential is never reused.
+        // credential is never reused. The private-cwd invariant runs first, on
+        // the bound runtime that would receive the notice.
         if message.source == "assist_job_event" {
+            if let Some(b) = binding.as_ref() {
+                self.assistant_runtime_cwd_guard(b)?;
+            }
             return self.assist_notice_reprove(message);
         }
-        let stamp = self.store.message_member_authority(&message.id)?;
-        let Some(binding) = self.store.assistant_for_alias(&message.alias)? else {
+        let Some(binding) = binding else {
             if stamp.is_some() || message.source.starts_with("member-") {
                 return Err(Error::rejected(format!(
                     "member message '{}' refused: its assistant binding is absent or its \
@@ -911,6 +962,7 @@ impl Shared {
                 message.id, binding.state
             )));
         }
+        self.assistant_runtime_cwd_guard(&binding)?;
         let member_lineage = message.source.starts_with("member-");
         match stamp {
             Some(auth) => {

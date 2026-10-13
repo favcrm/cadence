@@ -2309,7 +2309,7 @@ impl Shared {
             "threads_stamp" => self.rpc_threads_stamp(),
             "work_conversation_read" => self.rpc_work_conversation_read(params, peer_pid),
             "conversation_create" => self.rpc_conversation_create(params, peer_pid),
-            "agent_events" => self.rpc_events(params),
+            "agent_events" => self.rpc_events(params, peer_pid),
             // CAD-886: read-only wait with `agent_show` visibility.
             "agent_wait" => self.rpc_wait(params, peer_pid),
             "agent_requests" => {

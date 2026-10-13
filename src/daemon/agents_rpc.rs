@@ -217,14 +217,33 @@ impl Shared {
         Ok(json!({"alias": alias, "state": "starting", "provider": provider}))
     }
 
-    pub(super) fn rpc_events(self: &Arc<Self>, params: &Value) -> Result<Value> {
+    pub(super) fn rpc_events(self: &Arc<Self>, params: &Value, peer_pid: u32) -> Result<Value> {
         let raw = required_str(params, "alias")?;
         // The daemon stream has no agents row — read-only, so a plain
         // match suffices; every other RPC keeps resolving to an agent.
-        let alias = if raw == DAEMON_ALIAS {
+        let daemon = raw == DAEMON_ALIAS;
+        let alias = if daemon {
             raw.to_string()
         } else {
             self.resolve_alias(raw)?
+        };
+        // CAD-1380: daemon `assist_intent` rows are member-private routing. Only
+        // the operator reads them from the shared stream; every other caller gets
+        // the same page with those rows removed, cursors unchanged.
+        let hide_intents = daemon
+            && !matches!(
+                self.connection_caller(peer_pid)?,
+                caller_rule::Who::Operator
+            );
+        let visible = |events: Vec<crate::store::Event>| -> Vec<crate::store::Event> {
+            if hide_intents {
+                events
+                    .into_iter()
+                    .filter(|e| e.kind != "assist_intent")
+                    .collect()
+            } else {
+                events
+            }
         };
         let after = optional_i64(params, "after").unwrap_or(0);
         if after < 0 {
@@ -242,9 +261,10 @@ impl Shared {
             if has_older {
                 events.remove(0);
             }
+            let cursor = events.last().map(|e| e.seq).unwrap_or(0);
             return Ok(json!({
-                "events": events.iter().map(crate::store::Event::to_json).collect::<Vec<_>>(),
-                "cursor": events.last().map(|e| e.seq).unwrap_or(0),
+                "events": visible(events).iter().map(crate::store::Event::to_json).collect::<Vec<_>>(),
+                "cursor": cursor,
                 "has_older": has_older,
             }));
         }
@@ -254,7 +274,7 @@ impl Shared {
             if !events.is_empty() || self.closing.load(Ordering::SeqCst) {
                 let cursor = events.last().map(|e| e.seq).unwrap_or(after);
                 return Ok(json!({
-                    "events": events.iter().map(crate::store::Event::to_json).collect::<Vec<_>>(),
+                    "events": visible(events).iter().map(crate::store::Event::to_json).collect::<Vec<_>>(),
                     "cursor": cursor,
                 }));
             }
@@ -671,6 +691,8 @@ impl Shared {
             )));
         }
         if lc.agents.contains_key(alias) {
+            // CAD-1380: the owned no-op resume still gates on the cwd invariant.
+            self.assistant_start_guard(alias)?;
             return Ok(());
         }
         if self.store.has_unknown(alias)? {

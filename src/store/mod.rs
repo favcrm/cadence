@@ -81,7 +81,7 @@ pub use chat_files::{
     CHAT_QUOTA_CODE,
 };
 mod assistants;
-pub use assistants::{AssistRecipient, AssistRequest, AssistantBinding};
+pub use assistants::{AssistDispatchExpect, AssistRecipient, AssistRequest, AssistantBinding};
 pub mod app_audiences;
 pub use app_audiences::{AudienceBase, Predicate};
 pub mod app_content;

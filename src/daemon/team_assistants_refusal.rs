@@ -280,6 +280,13 @@ struct Authority {
     malformed_next: bool,
     /// Answer a non-200 status.
     status: u16,
+    /// Hold the next revalidate request until released (deterministic
+    /// barrier for a commit racing an in-flight pull). HTTP side only.
+    hold_next: bool,
+    /// Set by the server when a held request has arrived.
+    held: bool,
+    /// Released by the test; the held request then answers from state.
+    released: bool,
 }
 
 /// The claims the fixture platform recovers from a `wikienv_` member
@@ -320,6 +327,8 @@ struct Fx {
     issuer: String,
     host: String,
     authority: Arc<Mutex<Authority>>,
+    /// Wakes a held revalidate pull when the test releases the barrier.
+    barrier: Arc<std::sync::Condvar>,
     stop: Arc<AtomicBool>,
     _platform: std::thread::JoinHandle<()>,
 }
@@ -349,9 +358,11 @@ impl Fx {
             ..Authority::default()
         }));
         let stop = Arc::new(AtomicBool::new(false));
+        let barrier = Arc::new(std::sync::Condvar::new());
         let platform_thread = {
             let stop = stop.clone();
             let authority = authority.clone();
+            let barrier = barrier.clone();
             let issuer = issuer.clone();
             let host = host.clone();
             std::thread::spawn(move || {
@@ -367,6 +378,7 @@ impl Fx {
                         Self::answer_platform(
                             request,
                             &authority,
+                            &barrier,
                             &issuer,
                             &host,
                             &public_key,
@@ -392,9 +404,16 @@ impl Fx {
             issuer,
             host,
             authority,
+            barrier,
             stop,
             _platform: platform_thread,
         }
+    }
+
+    /// Release the held pull and wake the server thread.
+    fn release_barrier(&self) {
+        self.authority.lock().unwrap().released = true;
+        self.barrier.notify_all();
     }
 
     /// The fixture platform: `GET /.well-known/agenticos-board-jwks.json`
@@ -410,6 +429,7 @@ impl Fx {
     fn answer_platform(
         mut request: tiny_http::Request,
         authority: &Mutex<Authority>,
+        barrier: &std::sync::Condvar,
         issuer: &str,
         host: &str,
         jwks_public: &str,
@@ -436,6 +456,18 @@ impl Fx {
         if path != "/__platform/assistant/revalidate" {
             respond(request, 404, json!({"ok":false,"code":"not_found"}));
             return;
+        }
+        // Deterministic barrier: park this pull until the test releases it,
+        // so a commit can land while the HTTP answer is still in flight.
+        {
+            let mut guard = authority.lock().unwrap();
+            if guard.hold_next {
+                guard.hold_next = false;
+                guard.held = true;
+                // Event-driven: wait on the release signal, no polling.
+                guard = barrier.wait_while(guard, |g| !g.released).unwrap();
+                guard.released = false;
+            }
         }
         // Forced failure modes — the daemon must fail closed on each.
         {
@@ -6482,7 +6514,10 @@ mod master_home_acceptance {
         /// Start stateB. The board config and the enrolled service credential
         /// are written BEFORE `serve_with`, from the same `Fx` platform.
         fn start(fx: &Fx, token: &str, sub: &str, fake_gateway: &Path) -> Self {
-            let root = Builder::new().prefix("c1380-").tempdir_in("/tmp").unwrap();
+            // The process temp root (respects TMPDIR), the same root
+            // `test_seam::confine` checks. A hardcoded `/tmp` is refused on
+            // runners whose temp root differs.
+            let root = Builder::new().prefix("c1380-").tempdir().unwrap();
             let [state, pm, home] = ["s", "pm", "h"].map(|d| root.path().join(d));
             // Real PM tracker, the same supported init `Fx::new` uses.
             crate::issue::Pm::init(&pm).unwrap();
@@ -6809,5 +6844,484 @@ mod master_home_acceptance {
             "a refused call wrote a Home report"
         );
         let _ = fake;
+    }
+}
+
+/// CAD-1380 independent refusal acceptance (review-sol cad7dcd, rules 1-4).
+/// Authored by the acceptance author, NOT the implementer. Each bad case is
+/// paired with a positive control in the same test. A red result here is a
+/// real source defect for the implementer to fix, never a reason to weaken.
+mod cad1380_rereview_refusal {
+    use super::*;
+
+    /// Rule 1: an EXISTING registered runtime whose cwd is another principal's
+    /// root must be refused BEFORE the adapter is granted it, on the real
+    /// resume path. The positive control proves the canonical cwd is not a
+    /// blanket deny.
+    #[test]
+    fn existing_foreign_cwd_refused_before_resume_grant() {
+        let _flag = AssistantFlagOn::arm();
+        let fx = Fx::new();
+        // Two independent members. The POSITIVE (canonical root) and the BAD
+        // (foreign root) runtimes are separate aliases, so the bad alias has
+        // no actor before its stored cwd is changed.
+        let good = fx.member_runtime("sub-cwd-good");
+        let bad = fx.member_runtime("sub-cwd-bad");
+        let foreign = fx.dir.path().join("foreign-principal-root");
+        std::fs::create_dir_all(&foreign).unwrap();
+        // Positive control: the canonical root passes the cwd guard on the REAL
+        // resume path. Provider/launch outcomes may vary, so the only property
+        // asserted is that the refusal never names the principal cwd.
+        match fx.shared.try_resume_assistant(&good.alias) {
+            Ok(()) => assert!(
+                fx.shared.lifecycle.lock().unwrap().owned(&good.alias),
+                "canonical resume returned Ok without a live actor"
+            ),
+            Err(e) => assert!(
+                !e.to_string().contains("principal's dedicated cwd"),
+                "canonical cwd was blanket-refused: {e}"
+            ),
+        }
+        // Tear the positive actor down through the public agent_stop path and
+        // assert it left the lifecycle table, so nothing from it runs during
+        // the bad case.
+        if fx.shared.lifecycle.lock().unwrap().owned(&good.alias) {
+            fx.op("agent_stop", json!({"alias": good.alias}));
+            assert!(
+                !fx.shared.lifecycle.lock().unwrap().owned(&good.alias),
+                "the canonical actor survived agent_stop"
+            );
+        }
+        // Bad case: the BAD alias is still unowned; repoint its stored cwd.
+        assert!(
+            !fx.shared.lifecycle.lock().unwrap().owned(&bad.alias),
+            "bad alias already owned before the cwd change"
+        );
+        // Bad case: the BAD alias is still unowned; repoint its stored cwd.
+        assert!(
+            !fx.shared.lifecycle.lock().unwrap().owned(&bad.alias),
+            "bad alias already owned before the cwd change"
+        );
+        fx.shared
+            .store
+            .fixture_write(|tx| {
+                tx.execute(
+                    "UPDATE agents SET cwd=? WHERE alias=?",
+                    rusqlite::params![foreign.to_str().unwrap(), bad.alias],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let err = fx
+            .shared
+            .try_resume_assistant(&bad.alias)
+            .expect_err("resume accepted a foreign principal's cwd");
+        assert!(
+            err.to_string().contains("principal") && err.to_string().contains("cwd"),
+            "foreign cwd refused for another reason: {err}"
+        );
+        assert!(
+            !fx.shared.lifecycle.lock().unwrap().owned(&bad.alias),
+            "a refused resume still started an actor"
+        );
+    }
+
+    /// Rule 2: an ordinary worker reading the global daemon stream must not
+    /// receive a member-private `assist_intent` row. The operator tail is the
+    /// positive control: the same row IS visible to the operator, so this is
+    /// not a blanket deny of the stream.
+    #[test]
+    fn ordinary_worker_daemon_stream_hides_member_intent() {
+        let _flag = AssistantFlagOn::arm();
+        let fx = Fx::new();
+        with_deferred_service(&fx);
+        let rt = fx.member_runtime("sub-tail");
+        let req = fx.op(
+            "member_job_request",
+            json!({"member_envelope": fx.member_envelope("sub-tail"), "title": "tail", "request_key": "t-k1", "body": "b"}),
+        );
+        let job = req["job"].as_str().unwrap().to_string();
+        // Positive control: the operator tail sees the private intent.
+        let op_tail = fx
+            .op("agent_events", json!({"alias": "daemon", "tail": true}))
+            .to_string();
+        assert!(
+            op_tail.contains("assist_intent") && op_tail.contains(&job),
+            "operator daemon tail lost its private intent for {job}: {op_tail}"
+        );
+        // Positive control on the SAME ordinary read: a public stream row is
+        // visible, so the read genuinely succeeded (not a blanket denial).
+        fx.shared
+            .store
+            .event_public("daemon", "wal_checkpointed", json!({"n": 1}))
+            .unwrap();
+        let worker_tail = fx
+            .call(
+                Asserted::Agent(rt.worker.clone()),
+                "agent_events",
+                json!({"alias": "daemon", "tail": true}),
+            )
+            .unwrap_or_else(|e| panic!("ordinary daemon tail was denied outright: {e}"));
+        let worker_text = worker_tail.to_string();
+        assert!(
+            worker_text.contains("wal_checkpointed"),
+            "ordinary daemon tail hid the public stream row: {worker_text}"
+        );
+        // Bad case: the member's private job/intent must be absent from it.
+        assert!(
+            !worker_text.contains(&job) && !worker_text.contains("assist_intent"),
+            "ordinary worker read member-private assist_intent for job {job}: {worker_text}"
+        );
+    }
+
+    /// Rule 2 (wait): an ordinary/unproven caller must not wait on a member
+    /// assistant alias. The non-member wait is the positive control.
+    #[test]
+    fn ordinary_worker_cannot_wait_on_member_assistant() {
+        let _flag = AssistantFlagOn::arm();
+        let fx = Fx::new();
+        let rt = fx.member_runtime("sub-wait");
+        // Make the ordinary worker's state a real, idle fixture value so a
+        // non-member `until:idle` wait has a genuine successful answer.
+        fx.shared
+            .store
+            .set_agent_state(&rt.worker, "idle", None)
+            .unwrap();
+        // Positive control: the non-member wait returns the actual idle answer.
+        let ok = fx
+            .call(
+                Asserted::Agent(rt.worker.clone()),
+                "agent_wait",
+                json!({"alias": rt.worker, "until": "idle", "timeout": 0}),
+            )
+            .unwrap_or_else(|e| panic!("non-member idle wait did not answer: {e}"));
+        assert_eq!(ok["reason"], json!("idle"), "non-member wait: {ok}");
+        assert_eq!(ok["alias"], json!(rt.worker), "non-member wait: {ok}");
+        // Bad case: the same ordinary worker waits on the member assistant. It
+        // must be refused by the member PRIVACY/ownership gate, with that
+        // specific reason, not a generic timeout, malformed or endpoint error.
+        let waited = fx.call(
+            Asserted::Agent(rt.worker.clone()),
+            "agent_wait",
+            json!({"alias": rt.alias, "until": "idle", "timeout": 0}),
+        );
+        let text = waited
+            .as_ref()
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| format!("answered: {:?}", waited));
+        assert!(
+            waited.is_err()
+                && (text.contains("assist")
+                    || text.contains("principal")
+                    || text.contains("private")
+                    || text.contains("own")),
+            "member assistant idle wait not refused by the privacy gate: {text}"
+        );
+        assert!(
+            !text.contains("timed out"),
+            "member wait refused only by timeout, not the privacy gate: {text}"
+        );
+    }
+
+    /// Rule 3: a binding revoked while the HTTP dispatch pull is in flight must
+    /// refuse the kickoff commit. The pull is held at a deterministic barrier
+    /// (no sleep). The revoke commits through the real fenced store. The pull
+    /// is then released still answering ALLOW (remote C1 remains valid), so
+    /// only the locally committed revocation can refuse the commit.
+    #[test]
+    fn revoke_during_inflight_dispatch_pull_refuses_kickoff() {
+        let _flag = AssistantFlagOn::arm();
+        let fx = Fx::new();
+        with_deferred_service(&fx);
+        let rt = fx.member_runtime("sub-race");
+        let join_group = |pm: &str| {
+            fx.shared
+                .store
+                .fixture_write(|tx| {
+                    tx.execute(
+                        "UPDATE agents SET params=? WHERE alias='ordinary-worker'",
+                        rusqlite::params![json!({"upstream": pm}).to_string()],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+        };
+        join_group(&rt.alias);
+        let req = fx.op(
+            "member_job_request",
+            json!({"member_envelope": fx.member_envelope("sub-race"), "title": "race", "request_key": "r-k1", "body": "b"}),
+        );
+        let job = req["job"].as_str().unwrap().to_string();
+        let task = format!("{job}-t1");
+        let task_before = fx.shared.store.task(&task).unwrap();
+        let tree_before = fx.tree();
+
+        // Hold the NEXT revalidate pull (the dispatch's live authority pull).
+        fx.authority.lock().unwrap().hold_next = true;
+        let dispatch_shared = fx.shared.clone();
+        let dispatch_task = task.clone();
+        let worker = rt.worker.clone();
+        let handle = std::thread::spawn(move || {
+            scoped(Asserted::Operator, || {
+                dispatch_shared.dispatch(
+                    "task_dispatch",
+                    &json!({"task": dispatch_task, "to": worker, "by": "operator"}),
+                    std::process::id(),
+                )
+            })
+        });
+        // Wait until the pull is parked at the barrier. A dispatch that never
+        // reaches the live pull is a test failure, not a hang.
+        {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let mut guard = fx.authority.lock().unwrap();
+            while !guard.held {
+                assert!(
+                    Instant::now() < deadline,
+                    "dispatch never reached the live revalidate pull (no barrier hit)"
+                );
+                let (g, _) = fx
+                    .barrier
+                    .wait_timeout(guard, Duration::from_millis(100))
+                    .unwrap_or_else(|e| e.into_inner());
+                guard = g;
+            }
+        }
+        // Commit the local revocation through the real fenced store while the
+        // remote answer is still in flight.
+        assert!(
+            fx.shared.store.assistant_revoke(ORG, "sub-race").unwrap(),
+            "revoke did not commit"
+        );
+        // Release the pull; the remote still answers ALLOW.
+        fx.release_barrier();
+        let result = handle.join().expect("dispatch thread panicked");
+
+        assert!(
+            result.is_err(),
+            "kickoff committed after a local revocation landed mid-pull: {result:?}"
+        );
+        assert_eq!(
+            fx.shared.store.task(&task).unwrap().revision,
+            task_before.revision,
+            "a refused kickoff advanced the task revision"
+        );
+        assert_eq!(
+            fx.shared.store.task(&task).unwrap().state,
+            task_before.state,
+            "a refused kickoff changed the task state"
+        );
+        assert_eq!(
+            fx.tree(),
+            tree_before,
+            "a refused kickoff left a dispatch effect"
+        );
+    }
+
+    /// Rule 3 control: the same barrier-held dispatch with NO revoke must
+    /// commit the kickoff under live authority. Proves the race refusal above
+    /// is a stale-binding refusal, not a blanket dispatch denial.
+    #[test]
+    fn unrevoked_inflight_dispatch_pull_commits_kickoff() {
+        let _flag = AssistantFlagOn::arm();
+        let fx = Fx::new();
+        with_deferred_service(&fx);
+        let rt = fx.member_runtime("sub-ctrl");
+        fx.shared
+            .store
+            .fixture_write(|tx| {
+                tx.execute(
+                    "UPDATE agents SET params=? WHERE alias='ordinary-worker'",
+                    rusqlite::params![json!({"upstream": rt.alias}).to_string()],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let req = fx.op(
+            "member_job_request",
+            json!({"member_envelope": fx.member_envelope("sub-ctrl"), "title": "ctrl", "request_key": "c-k1", "body": "b"}),
+        );
+        let job = req["job"].as_str().unwrap().to_string();
+        let task = format!("{job}-t1");
+        fx.authority.lock().unwrap().hold_next = true;
+        let shared = fx.shared.clone();
+        let (t, w) = (task.clone(), rt.worker.clone());
+        let handle = std::thread::spawn(move || {
+            scoped(Asserted::Operator, || {
+                shared.dispatch(
+                    "task_dispatch",
+                    &json!({"task": t, "to": w, "by": "operator"}),
+                    std::process::id(),
+                )
+            })
+        });
+        {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let mut guard = fx.authority.lock().unwrap();
+            while !guard.held {
+                assert!(
+                    Instant::now() < deadline,
+                    "control never reached the live pull"
+                );
+                let (g, _) = fx
+                    .barrier
+                    .wait_timeout(guard, Duration::from_millis(100))
+                    .unwrap_or_else(|e| e.into_inner());
+                guard = g;
+            }
+        }
+        fx.release_barrier();
+        let result = handle.join().expect("control dispatch thread panicked");
+        assert!(
+            result.is_ok(),
+            "unrevoked live dispatch was refused (control broken): {result:?}"
+        );
+    }
+
+    /// Rule 4 (evidence): the assistant's OWN running turn, reported by id-less
+    /// and prefix `ack` through the real handler, succeeds; a wrong token, a
+    /// stale generation and a foreign message are each refused for their
+    /// specific reason. `ack` mutates only the report field (no outcome) and is
+    /// the only valid form for a `pi` managed endpoint (`result` completes the
+    /// turn). A registry-minted token is used, never a hand-written one.
+    #[test]
+    fn own_running_turn_ack_by_idless_and_prefix_is_exact() {
+        let _flag = AssistantFlagOn::arm();
+        let fx = Fx::new();
+        with_deferred_service(&fx);
+        let rt = fx.member_runtime("sub-ack");
+        let other = fx.member_runtime("sub-ack2");
+        let gen = "0123456789abcdef0123456789abcdef";
+        let token = crate::adapter::registry::PI_MANAGED_TURN_TOKENS.mint(gen);
+        // Install the agent's current generation and a running turn through
+        // the store (the same columns the real endpoint-open path writes).
+        fx.shared
+            .store
+            .fixture_write(|tx| {
+                tx.execute(
+                    "UPDATE agents SET generation=? WHERE alias=?",
+                    rusqlite::params![gen, rt.alias],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        fx.shared
+            .store
+            .enqueue(&rt.alias, "own turn", None, "own-ack-1", "test")
+            .unwrap();
+        let own_msg = fx
+            .shared
+            .store
+            .messages(&rt.alias)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.body == "own turn")
+            .expect("own message not stored")
+            .id;
+        fx.shared.store.mark_running(&own_msg, &token).unwrap();
+
+        // Bad 1: wrong token for the same running message.
+        let wrong = fx.as_assistant(
+            &rt.alias,
+            "message_report",
+            json!({"message": own_msg, "token": "pi-0123456789abcdef0123456789abcdef-ffffffffffffffffffffffffffffffff", "kind": "ack"}),
+        );
+        let wrong_text = wrong
+            .as_ref()
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            wrong.is_err() && wrong_text.contains("Token does not match"),
+            "wrong token not refused by the submission-token gate: {wrong:?}"
+        );
+        // Bad 2: a foreign member's message id, even with its real token.
+        let foreign = fx.as_assistant(
+            &rt.alias,
+            "message_report",
+            json!({"message": other.foreign_msg, "kind": "ack"}),
+        );
+        let foreign_text = foreign
+            .as_ref()
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            foreign.is_err() && foreign_text.contains("not its own"),
+            "foreign message not refused by ownership: {foreign:?}"
+        );
+        // Positive: prefix ack of its own running turn, through the real resolver.
+        let prefix = &own_msg[..own_msg.len().min(8)];
+        let by_prefix = fx
+            .as_assistant(
+                &rt.alias,
+                "message_report",
+                json!({"message": prefix, "token": token, "kind": "ack"}),
+            )
+            .unwrap_or_else(|e| panic!("own prefix ack refused: {e}"));
+        assert!(
+            by_prefix.is_object(),
+            "prefix ack not an answer: {by_prefix}"
+        );
+        // The ack changes only the report field; the outcome stays running.
+        assert_eq!(
+            fx.shared.store.message(&own_msg).unwrap().unwrap().state,
+            "running",
+            "an ack changed the message outcome"
+        );
+        // Stale generation: the same token under a different stored generation.
+        fx.shared
+            .store
+            .fixture_write(|tx| {
+                tx.execute(
+                    "UPDATE agents SET generation=? WHERE alias=?",
+                    rusqlite::params!["fedcba9876543210fedcba9876543210", rt.alias],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let stale = fx.as_assistant(
+            &rt.alias,
+            "message_report",
+            json!({"message": own_msg, "token": token, "kind": "ack"}),
+        );
+        let stale_text = stale
+            .as_ref()
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            stale.is_err() && stale_text.contains("stale endpoint generation"),
+            "stale generation not refused: {stale:?}"
+        );
+    }
+
+    /// Rule 4: a forged reference to ANOTHER member's message must be refused
+    /// by the member policy with an ownership reason, not accepted or passed
+    /// through to the generic resolver. Only the refusal shape is pinned; a
+    /// valid own-report positive needs a live generation this fixture cannot
+    /// construct without a source hook (reported as a scope gap).
+    #[test]
+    fn forged_foreign_message_report_refused_by_ownership() {
+        let _flag = AssistantFlagOn::arm();
+        let fx = Fx::new();
+        with_deferred_service(&fx);
+        let rt = fx.member_runtime("sub-rep");
+        let other = fx.member_runtime("sub-rep2");
+        let forged = fx.as_assistant(
+            &rt.alias,
+            "message_report",
+            json!({"message": other.foreign_msg, "kind": "ack"}),
+        );
+        let text = forged
+            .as_ref()
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            forged.is_err() && text.contains("not its own"),
+            "forged foreign message_report not refused by ownership: {forged:?}"
+        );
     }
 }

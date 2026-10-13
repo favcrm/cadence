@@ -329,6 +329,9 @@ impl Shared {
         // fail-closed too: its binding was deleted or corrupted, never a
         // silent drop to an ordinary dispatch (a missing row cannot be
         // re-proven, so the member's recorded authority is unverifiable).
+        // The local provenance this preflight proved; the fenced commit below
+        // re-reads it under the write lock (CAD-1380 dispatch-local revocation).
+        let mut expect: Option<crate::store::AssistDispatchExpect> = None;
         match self.store.assist_request_for_job(&pending.job_id)? {
             Some(assist) => {
                 let binding = self
@@ -380,6 +383,14 @@ impl Shared {
                     },
                     "task dispatch",
                 )?;
+                expect = Some(crate::store::AssistDispatchExpect {
+                    org: assist.org.clone(),
+                    sub: assist.sub.clone(),
+                    assistant_id: binding.assistant_id.clone(),
+                    alias: binding.alias.clone(),
+                    credential_id: assist.credential_id.clone(),
+                    job: pending.job_id.clone(),
+                });
                 // The member-assistant PM never dispatches its own bound
                 // job — that would be self-approval. Check the FINAL
                 // resolved assignee — the request's `to` OR the task's
@@ -412,12 +423,21 @@ impl Shared {
             let target = self.store.agent(alias)?;
             crate::adapter::pi::refuse_confined_devin_agent(&target)?;
         }
-        let (task, message, duplicate, behind_dead) = self.store.dispatch_task(
-            task_id,
-            to.as_deref(),
-            optional_str(params, "message"),
-            by,
-        )?;
+        let (task, message, duplicate, behind_dead) = match &expect {
+            Some(expect) => self.store.dispatch_task_expecting(
+                task_id,
+                to.as_deref(),
+                optional_str(params, "message"),
+                by,
+                expect,
+            )?,
+            None => self.store.dispatch_task(
+                task_id,
+                to.as_deref(),
+                optional_str(params, "message"),
+                by,
+            )?,
+        };
         if let Some(assignee) = &task.assignee {
             self.notify_agent(assignee);
         }

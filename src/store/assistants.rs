@@ -83,6 +83,21 @@ fn row_binding(row: &rusqlite::Row) -> rusqlite::Result<AssistantBinding> {
     })
 }
 
+/// The local provenance a preflight captured for an assist-bound dispatch.
+/// Carried into the fenced transaction so a revocation, removal or re-mint
+/// between preflight and commit refuses, never silently kicks off.
+#[derive(Debug, Clone)]
+pub struct AssistDispatchExpect {
+    pub org: String,
+    pub sub: String,
+    pub assistant_id: String,
+    pub alias: String,
+    /// The ORIGINAL ledger credential (`assist_requests.credential_id`).
+    /// Never borrowed from the current binding.
+    pub credential_id: Option<String>,
+    pub job: String,
+}
+
 impl AssistantBinding {
     /// Live iff `active` — `archived`/`revoked` bindings refuse effects but
     /// keep history.
@@ -106,6 +121,53 @@ impl AssistantBinding {
 }
 
 impl Store {
+    /// Re-read the ledger row and binding inside the caller's fenced
+    /// transaction. Every field of the captured tuple must still match and the
+    /// binding must be active; otherwise refuse without writing.
+    pub(super) fn assist_expect_in(
+        &self,
+        conn: &impl StoreConn,
+        expect: &AssistDispatchExpect,
+    ) -> Result<()> {
+        let refused = |why: &str| {
+            Error::rejected(format!(
+                "task dispatch refused: the assist-bound job's {why} changed or was revoked \
+                 between preflight and commit (CAD-1380)"
+            ))
+        };
+        let ledger = conn
+            .query_opt(
+                "SELECT org, sub, credential_id FROM assist_requests WHERE job=? \
+                 ORDER BY created LIMIT 1",
+                [&expect.job],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )?
+            .ok_or_else(|| refused("ledger row"))?;
+        if ledger.0 != expect.org || ledger.1 != expect.sub || ledger.2 != expect.credential_id {
+            return Err(refused("ledger provenance"));
+        }
+        let binding = conn
+            .query_opt(
+                "SELECT * FROM assistants WHERE org=? AND sub=?",
+                params![expect.org, expect.sub],
+                row_binding,
+            )?
+            .ok_or_else(|| refused("binding"))?;
+        if !binding.is_active()
+            || binding.assistant_id != expect.assistant_id
+            || binding.alias != expect.alias
+        {
+            return Err(refused("binding"));
+        }
+        Ok(())
+    }
+
     /// The binding for `(org, sub)`, or `None`.
     pub fn assistant_binding(&self, org: &str, sub: &str) -> Result<Option<AssistantBinding>> {
         let conn = self.conn();

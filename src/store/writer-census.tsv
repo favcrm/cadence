@@ -44,8 +44,8 @@ daemon/app_runs_rpc/cad1156_summary_tests.rs	independent-cad1156-read-only-summa
 daemon/app_runs_rpc/cad1156_summary_adapter.rs	independent-cad1156-non-sqlite-adapter-delegation	execute	1
 daemon/effect_rpc.rs	non-sqlite-platform-adapter-execution	execute	2
 daemon/social_publish_rpc.rs	non-sqlite-platform-publish-execution	execute	1
-daemon/team_assistants_refusal.rs	independent-cad1380-acceptance-fixture	execute	22
-daemon/team_assistants_refusal.rs	independent-cad1380-acceptance-fixture	guarded_write	21
+daemon/team_assistants_refusal.rs	independent-cad1380-acceptance-fixture	execute	27
+daemon/team_assistants_refusal.rs	independent-cad1380-acceptance-fixture	guarded_write	26
 daemon/team_assistants_refusal.rs	independent-cad1380-acceptance-fixture	open	3
 daemon/watch.rs	provider-owned-db-checkpoint-and-tests	open	1
 doctor.rs	private-doctor-probe-store	open	1
