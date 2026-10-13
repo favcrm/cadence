@@ -1010,8 +1010,15 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
         // browser request has no such bearer and takes the unchanged path.
         if let Some(tail) = path.strip_prefix("/api/wiki/") {
             if wiki_envelope::is_envelope_request(&request) {
-                let resp =
-                    wiki_envelope::handle(&mut request, &method, tail, &query, state_dir, opts);
+                let resp = wiki_envelope::handle(
+                    &mut request,
+                    &method,
+                    tail,
+                    &query,
+                    state_dir,
+                    pm_dir,
+                    opts,
+                );
                 send(request, resp);
                 return;
             }
