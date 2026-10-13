@@ -109,9 +109,9 @@ store/app_runs.rs	guarded-store-and-read-queries	prepare	2
 store/app_sends.rs	guarded-store-and-read-queries	execute	11
 store/app_sends.rs	guarded-store-and-read-queries	guarded_write	6
 store/app_sends.rs	guarded-store-and-read-queries	prepare	5
-store/app_social_drafts.rs	guarded-store-and-read-queries	execute	33
-store/app_social_drafts.rs	guarded-store-and-read-queries	guarded_write	17
-store/app_social_drafts.rs	guarded-store-and-read-queries	prepare	9
+store/app_social_drafts.rs	guarded-store-and-read-queries	execute	43
+store/app_social_drafts.rs	guarded-store-and-read-queries	guarded_write	22
+store/app_social_drafts.rs	guarded-store-and-read-queries	prepare	13
 store/app_tools.rs	guarded-store-and-read-queries	execute	2
 store/app_tools.rs	guarded-store-and-read-queries	guarded_write	2
 store/app_tools.rs	guarded-store-and-read-queries	prepare	2

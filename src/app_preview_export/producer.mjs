@@ -95,7 +95,11 @@ var CALL_VERBS = [
 var SLOT_VERBS = [
 	"run.start",
 	"publish.destination.use",
-	"publish.draft.confirm"
+	"publish.draft.confirm",
+	"publish.draft.schedule",
+	"publish.draft.reschedule",
+	"publish.draft.cancel",
+	"publish.settings.save"
 ];
 /** The verbs a screen.v2 PUSH advertises in `actions`. */
 var ACTION_VERBS = [...CALL_VERBS, ...SLOT_VERBS];
@@ -616,7 +620,7 @@ function screenProjection(installation, tag, contextId, contexts, runs, effects,
 //#region scripts/app-fixtures/producer.ts
 var MAX_INPUT = 1048576;
 var MAX_OUTPUT = 8388608;
-var CONTRACT = "app-screen-projection-fixtures/1";
+var CONTRACT = "app-screen-projection-fixtures/2";
 var NOW = 1799999e3;
 var SCENARIOS = [
 	"empty",

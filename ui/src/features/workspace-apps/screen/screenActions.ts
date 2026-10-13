@@ -4,6 +4,7 @@ import { rememberContext } from "../contextSelection";
 import { workspaceApps, type AppContext, type CapabilityQuote, type Installation, type WorkspaceRun } from "../workspaceApps";
 import { contextDefaultKeys, instagramLink } from "./screenProjection";
 import { accountLabel, connectReturnTo, publicationBinding, sendSlot } from "../socialConnect";
+import { dueLabel } from "../socialPublish";
 import { TOOL_ALIAS, type ActionRefusal, type ActionResult, type CallVerb, type SlotVerb } from "./screenProtocol";
 import { downscaleToDataUrl } from "./screenAssets";
 import type { Planner, SlotPlan } from "./screenSlot";
@@ -229,6 +230,33 @@ async function planUseDestination(ctx: ActionContext, args: Record<string, unkno
   } catch (error) { return plainRefusal(error); }
 }
 
+async function planSavePublishSettings(ctx: ActionContext, args: Record<string, unknown>): Promise<SlotPlan | ActionRefusal> {
+  if (!exact(args, ["destination_id", "timezone"]) || typeof args.destination_id !== "string" ||
+      typeof args.timezone !== "string" || args.timezone.length === 0 || args.timezone.length > 64)
+    return { code: "bad_args", text: "That request is not valid." };
+  try { new Intl.DateTimeFormat("en", { timeZone: args.timezone }); }
+  catch { return { code: "bad_timezone", text: "Choose a valid time zone." }; }
+  const slot = sendSlot(ctx.installation);
+  if (!slot) return { code: "unknown_slot", text: "That isn't available." };
+  try {
+    const listed = await workspaceApps.destinations(ctx.installId);
+    const chosen = listed.destinations.find(value => value.destination_id === args.destination_id);
+    if (!chosen || listed.unavailable) return { code: "unknown_destination", text: "That publishing account isn't available." };
+    const binding = publicationBinding(await workspaceApps.bindings(ctx.installId, ctx.contextId || undefined), slot,
+      ctx.contextId || null, ctx.installation.digest);
+    const body = { destination_id: chosen.destination_id, timezone: args.timezone,
+      ...(ctx.contextId ? { context_id: ctx.contextId } : {}),
+      ...(binding ? { expected_revision: binding.revision } : { request_id: randomRequest() }) };
+    return { label: `Use ${accountLabel(chosen.label || chosen.destination_id)} · ${args.timezone}`, run: async () => {
+      try {
+        await workspaceApps.useDestination(ctx.installId, body);
+        await ctx.onChanged();
+        return { ok: true, data: {} };
+      } catch (error) { return { ok: false, refusal: plainRefusal(error) }; }
+    } };
+  } catch (error) { return plainRefusal(error); }
+}
+
 const hex = (bytes: ArrayBuffer) => Array.from(new Uint8Array(bytes), b => b.toString(16).padStart(2, "0")).join("");
 const bareDigest = (digest: string) => digest.replace(/^sha256:/, "");
 /** The image the card shows is the draft's own, and must be the bytes the daemon froze. */
@@ -253,7 +281,7 @@ async function planConfirmPublish(ctx: ActionContext, args: Record<string, unkno
     const found = await workspaceApps.socialDraftEffect(args.effect_id);
     const authority = found.authority;
     if (found.authorization_kind !== "social_draft" || found.effect_id !== args.effect_id || found.install_id !== ctx.installId ||
-        (ctx.contextId && found.context_id !== ctx.contextId) || typeof authority.caption !== "string")
+        found.context_id !== ctx.contextId || typeof authority.caption !== "string")
       return { code: "not_found", text: "That item is not available." };
     if (!["waiting", "approved"].includes(found.state)) return { code: "handled", text: "That post was already handled." };
     const target = accountLabel(String(authority.destination_label ?? authority.destination_id ?? ""));
@@ -307,6 +335,71 @@ export function runCall(ctx: ActionContext, verb: CallVerb, args: Record<string,
   return Promise.resolve().then(table[verb]).catch((error: unknown): ActionResult => ({ ok: false, refusal: plainRefusal(error) }));
 }
 
+const MAX_DRAFT_SCHEDULE_SECONDS = 366 * 24 * 60 * 60;
+
+/** Schedule controls name a RecordStore draft effect, never a caller-built run/artifact. */
+async function planDraftEffectChange(ctx: ActionContext, verb: SlotVerb, args: Record<string, unknown>, actionToken?: string): Promise<SlotPlan | ActionRefusal> {
+  const hasDue = verb !== "publish.draft.cancel";
+  const expectedKeys = hasDue ? ["alias", "due_epoch", "effect_id"] : ["alias", "effect_id"];
+  if (!exact(args, expectedKeys) || typeof args.alias !== "string" || !TOOL_ALIAS.test(args.alias) ||
+      typeof args.effect_id !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(args.effect_id) ||
+      (hasDue && (!Number.isSafeInteger(args.due_epoch) || (args.due_epoch as number) <= 0)))
+    return { code: "bad_args", text: "That request is not valid." };
+  try {
+    const found = await workspaceApps.socialDraftEffect(args.effect_id);
+    const authority = found.authority;
+    if (found.authorization_kind !== "social_draft" || found.effect_id !== args.effect_id ||
+        found.install_id !== ctx.installId || found.context_id !== ctx.contextId ||
+        !/^sha256:[a-f0-9]{64}$/.test(found.digest) ||
+        typeof authority.caption !== "string" || authority.effect_id !== found.effect_id ||
+        typeof authority.draft_id !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(authority.draft_id) ||
+        !Number.isSafeInteger(authority.revision) || (authority.revision as number) < 1 ||
+        typeof authority.timezone !== "string" || authority.timezone.length === 0)
+      return { code: "not_found", text: "That item is not available." };
+    const scheduled = found.state === "scheduled" && Number.isSafeInteger(found.due_epoch) && (found.due_epoch as number) > 0;
+    if (verb === "publish.draft.schedule" && !["waiting", "approved"].includes(found.state))
+      return { code: "handled", text: "That post is no longer ready to schedule." };
+    if (verb !== "publish.draft.schedule" && !scheduled)
+      return { code: "handled", text: "That post is no longer scheduled." };
+    const dueEpoch = hasDue ? args.due_epoch as number : undefined;
+    const now = Math.floor(Date.now() / 1000);
+    if (dueEpoch !== undefined && (dueEpoch <= now || dueEpoch > now + MAX_DRAFT_SCHEDULE_SECONDS))
+      return { code: "bad_due_epoch", text: "Choose a future time within 366 days." };
+    const effectId = found.effect_id;
+    const digest = found.digest;
+    const expectedDue = scheduled ? found.due_epoch as number : undefined;
+    const target = accountLabel(String(authority.destination_label ?? authority.destination_id ?? ""));
+    const scheduleLabel = dueEpoch === undefined ? "" : dueLabel(dueEpoch, authority.timezone);
+    const label = verb === "publish.draft.schedule" ? `Schedule ${target} · ${scheduleLabel}`
+      : verb === "publish.draft.reschedule" ? `Reschedule ${target} · ${scheduleLabel}` : `Cancel ${target} scheduled post`;
+    let card: SlotPlan["card"];
+    if (verb !== "publish.draft.cancel") {
+      let image: string | null = null;
+      if (actionToken) {
+        try { image = await frozenImage(actionToken, args.alias, authority); }
+        catch { return { code: "stale", text: "That changed somewhere else. Reload and try again." }; }
+      } else if (typeof authority.asset_id === "string") {
+        return { code: "failed", text: "That didn't work. Nothing was started." };
+      }
+      card = { title: verb === "publish.draft.schedule" ? "Schedule this post?" : "Reschedule this post?",
+        detail: `Scheduled for ${scheduleLabel}`, target, caption: authority.caption, image };
+    }
+    return { label, ...(card ? { card } : {}), run: async () => {
+      try {
+        const changed = verb === "publish.draft.schedule"
+          ? await workspaceApps.scheduleSocialDraftEffect(effectId, { digest, due_epoch: dueEpoch! })
+          : verb === "publish.draft.reschedule"
+            ? await workspaceApps.rescheduleSocialDraftEffect(effectId, { digest, expected_due_epoch: expectedDue!, due_epoch: dueEpoch! })
+            : await workspaceApps.cancelSocialDraftEffect(effectId, { digest, expected_due_epoch: expectedDue! });
+        if (changed.effect_id !== effectId || changed.digest !== digest || changed.install_id !== ctx.installId || changed.context_id !== ctx.contextId)
+          return { ok: false, refusal: { code: "unconfirmed", text: "The schedule change is not confirmed. Refresh before trying again." } };
+        await ctx.onChanged();
+        return { ok: true, data: { effect_id: effectId, state: changed.state, due_epoch: changed.due_epoch, timezone: authority.timezone, destination: target } };
+      } catch (error) { return { ok: false, refusal: plainRefusal(error) }; }
+    } };
+  } catch (error) { return plainRefusal(error); }
+}
+
 const LABEL_MAX = 40;
 const INPUT_MAX = 16;
 const VALUE_MAX = 8192;
@@ -357,6 +450,10 @@ export function makePlanner(get: () => ActionContext): Planner {
       "run.start": () => planRunStart(get(), args),
       "publish.destination.use": () => planUseDestination(get(), args),
       "publish.draft.confirm": () => planConfirmPublish(get(), args, ui?.actionToken),
+      "publish.draft.schedule": () => planDraftEffectChange(get(), verb, args, ui?.actionToken),
+      "publish.draft.reschedule": () => planDraftEffectChange(get(), verb, args, ui?.actionToken),
+      "publish.draft.cancel": () => planDraftEffectChange(get(), verb, args, ui?.actionToken),
+      "publish.settings.save": () => planSavePublishSettings(get(), args),
     };
     return table[verb]();
   };

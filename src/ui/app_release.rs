@@ -21,6 +21,9 @@ pub(super) enum Route<'a> {
     PublishNow(&'a str),
     /// CAD-1328: the board's one-tap confirm of a screen-staged social draft effect.
     ConfirmPublish(&'a str),
+    Schedule(&'a str),
+    Reschedule(&'a str),
+    Cancel(&'a str),
     Resolve(&'a str),
     /// CAD-1290: `destinations` is an operator read; `connect-link` and `use` are POST writes.
     Publishing(&'a str, &'a str),
@@ -43,6 +46,9 @@ pub(super) fn route(path: &str) -> Option<Route<'_>> {
             [id, "decide"] if segment(id) => Some(Route::Decide(id)),
             [id, "publish-now"] if segment(id) => Some(Route::PublishNow(id)),
             [id, "confirm-publish"] if segment(id) => Some(Route::ConfirmPublish(id)),
+            [id, "schedule"] if segment(id) => Some(Route::Schedule(id)),
+            [id, "reschedule"] if segment(id) => Some(Route::Reschedule(id)),
+            [id, "cancel"] if segment(id) => Some(Route::Cancel(id)),
             [id, "resolve"] if segment(id) => Some(Route::Resolve(id)),
             _ => None,
         };
@@ -111,6 +117,9 @@ impl Route<'_> {
                 | Self::Decide(_)
                 | Self::PublishNow(_)
                 | Self::ConfirmPublish(_)
+                | Self::Schedule(_)
+                | Self::Reschedule(_)
+                | Self::Cancel(_)
                 | Self::Resolve(_)
                 | Self::Publishing(_, "connect-link" | "use")
         )
@@ -153,6 +162,12 @@ struct UseDestination {
         skip_serializing_if = "Option::is_none"
     )]
     context_id: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "nonnull_context",
+        skip_serializing_if = "Option::is_none"
+    )]
+    timezone: Option<String>,
 }
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -189,6 +204,25 @@ struct Decision {
 #[serde(deny_unknown_fields)]
 struct PublishNow {
     digest: String,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Schedule {
+    digest: String,
+    due_epoch: i64,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Reschedule {
+    digest: String,
+    expected_due_epoch: i64,
+    due_epoch: i64,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Cancel {
+    digest: String,
+    expected_due_epoch: i64,
 }
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -285,6 +319,21 @@ pub(super) fn handle(
                 let mut params = typed::<PublishNow>(request)?;
                 params["effect_id"] = json!(effect);
                 ("app_effect_confirm_publish", params)
+            }
+            Route::Schedule(effect) => {
+                let mut params = typed::<Schedule>(request)?;
+                params["effect_id"] = json!(effect);
+                ("app_effect_schedule", params)
+            }
+            Route::Reschedule(effect) => {
+                let mut params = typed::<Reschedule>(request)?;
+                params["effect_id"] = json!(effect);
+                ("app_effect_reschedule", params)
+            }
+            Route::Cancel(effect) => {
+                let mut params = typed::<Cancel>(request)?;
+                params["effect_id"] = json!(effect);
+                ("app_effect_cancel", params)
             }
             Route::Resolve(effect) => {
                 let mut params = typed::<Resolve>(request)?;

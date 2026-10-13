@@ -157,6 +157,7 @@ impl Shared {
                 "destination_id",
                 "request_id",
                 "expected_revision",
+                "timezone",
             ],
         )?;
         let install = required_str(params, "install_id")?;
@@ -171,6 +172,16 @@ impl Shared {
             }
         };
         let destination = required_str(params, "destination_id")?;
+        let timezone = match params.get("timezone") {
+            None => TIMEZONE,
+            Some(Value::String(timezone)) => {
+                timezone
+                    .parse::<chrono_tz::Tz>()
+                    .map_err(|_| Error::rejected("timezone must be a valid IANA timezone"))?;
+                timezone.as_str()
+            }
+            Some(_) => return Err(Error::rejected("timezone must be a valid IANA timezone")),
+        };
         let resolver = self
             .social_media_resolver
             .clone()
@@ -195,7 +206,7 @@ impl Shared {
             "destination_id": destination,
             "destination_label": if label.is_empty() { destination } else { label },
             "toolkit": TOOLKIT,
-            "timezone": TIMEZONE,
+            "timezone": timezone,
         });
         PublishTarget::parse_hosted(&publish)?;
         let expected = params.get("expected_revision");
