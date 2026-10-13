@@ -10,8 +10,8 @@ backup/portable.rs	private-portable-copy-and-staged-validation	execute	11
 backup/portable.rs	private-portable-copy-and-staged-validation	open	5
 backup/portable.rs	private-portable-copy-and-staged-validation	prepare	4
 backup/portable.rs	private-portable-copy-and-staged-validation	transaction	1
-backup/portable_acceptance.rs	test-fixtures	execute	21
-backup/portable_acceptance.rs	test-fixtures	open	16
+backup/portable_acceptance.rs	test-fixtures	execute	22
+backup/portable_acceptance.rs	test-fixtures	open	17
 backup/portable_acceptance.rs	test-fixtures	prepare	4
 backup/portable_activate.rs	read-only-portable-activation-inventory	open	1
 backup/portable_activate.rs	read-only-portable-activation-inventory	prepare	1

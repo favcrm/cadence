@@ -2597,3 +2597,45 @@ fn cad1163_acc_replace_then_activate_rpc_sequence_refuses_stale_and_activates_fr
         "replay leaves the activated root unchanged"
     );
 }
+
+#[test]
+fn cad1337_acc_export_refuses_unapproved_chat_files_owner_column() {
+    let root = root("cad1337-forged-chat-files-owner");
+    let tracker = make_tracker(&root);
+    let state = make_state(&root, false);
+    let tracker_status_before =
+        git(&tracker, &["status", "--porcelain=v1", "--untracked-files=all"]);
+    let control_out = root.join("known-schema-control");
+    export_portable(&state, &control_out, &opts(&tracker))
+        .expect("known schema-40 fixture exports successfully");
+    assert!(
+        control_out.is_dir() && no_partial(&control_out),
+        "known schema-40 control export succeeds without partial staging"
+    );
+    {
+        let conn = Connection::open(db_file(&state)).unwrap();
+        conn.execute(
+            "ALTER TABLE chat_files ADD COLUMN cad1337_forged_owner TEXT",
+            [],
+        )
+        .unwrap();
+    }
+    let out = root.join("package");
+    let error = export_portable(&state, &out, &opts(&tracker))
+        .expect_err("unapproved private ownership columns must be refused");
+
+    assert_eq!(
+        error.to_string(),
+        "portable export refuses: table chat_files columns do not match the known catalog",
+        "the real known-catalog guard must refuse the forged ownership column"
+    );
+    assert!(
+        !out.exists() && no_partial(&out),
+        "refusal leaves no output or partial staging"
+    );
+    assert_eq!(
+        git(&tracker, &["status", "--porcelain=v1", "--untracked-files=all"]),
+        tracker_status_before,
+        "tracker status unchanged"
+    );
+}
