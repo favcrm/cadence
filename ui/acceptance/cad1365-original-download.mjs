@@ -89,6 +89,7 @@ stub("features/workspace-apps/socialConnect.js",
 stub("features/workspace-apps/screen/screenAssets.js",
   `exports.downscaleToDataUrl = async () => "data:image/png;base64,x";\n`);
 
+emit("features/workspace-apps/socialPublish.ts");
 emit("features/workspace-apps/workspaceApps.ts");
 const { workspaceApps } = require(featureRootRel("features/workspace-apps/workspaceApps.js"));
 Object.assign(workspaceApps, { bindingQuote: workspaceAppsStub.bindingQuote, startRun: workspaceAppsStub.startRun });

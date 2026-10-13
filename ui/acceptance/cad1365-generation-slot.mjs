@@ -60,6 +60,7 @@ for (const rel of [
   "features/workspace-apps/screen/screenProtocol.ts",
   "features/workspace-apps/screen/screenSlot.ts",
   "features/workspace-apps/screen/screenActions.ts",
+  "features/workspace-apps/socialPublish.ts",
 ]) emit(rel);
 const featureRoot = OUT;
 const featureRootRel = p => path.join(featureRoot, p);
@@ -85,6 +86,7 @@ const workspaceAppsStub = {
 stub("lib/api.js", `exports.ApiError = class ApiError extends Error { constructor(m, s, e) { super(m); this.status = s; this.code = e && e.code; } };\n`);
 stub("lib/useLocation.js", `exports.navigate = () => {};\n`);
 stub("features/workspace-apps/contextSelection.js", `exports.rememberContext = () => {};\n`);
+stub("lib/sessionKey.js", `exports.sessionHeaders = () => ({ "X-Cadence-Session": "test-key" }); exports.sessionKey = () => "test-key";\n`);
 stub("features/workspace-apps/workspaceApps.js",
   `exports.workspaceApps = ${JSON.stringify(null)};\n`);
 // The workspaceApps counter must be live-callable, so write a real module.
