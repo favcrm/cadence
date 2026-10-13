@@ -894,29 +894,21 @@ pub fn upload_file(
     )
 }
 
-/// CAD-913: does the parent listing show `name`? Fails closed: the listing
-/// must be a plain `entries` array, and any pagination or truncation field
-/// (`truncated`, `cursor`, `next_cursor`, `next_page`, `has_more`) that is
-/// set means the listing may be partial, so a name absent from it proves
-/// nothing. The wiki listing carries no such field today, so this guard is
-/// for a relay or daemon that starts to page or cap results.
+/// CAD-913: does the parent listing show `name`? Fails closed on an allowlist:
+/// the listing is complete only when it is an object whose keys are exactly
+/// `path` and `entries`, with `entries` an array. Any other key (a paging or
+/// truncation field such as `next_token`, which a denylist would miss), a
+/// missing `entries`, or a non-object body means the listing may be partial,
+/// so a name absent from it proves nothing. The error never includes the
+/// listing contents.
 fn listing_taken(body: &Value, name: &str) -> std::result::Result<bool, &'static str> {
-    const PAGING: &[&str] = &[
-        "truncated",
-        "cursor",
-        "next_cursor",
-        "next_page",
-        "has_more",
-    ];
-    if PAGING.iter().any(|k| {
-        body.get(*k)
-            .is_some_and(|v| !v.is_null() && v != &json!(false))
-    }) {
-        return Err("the listing may be truncated");
+    const KNOWN: &[&str] = &["path", "entries"];
+    const INCOMPLETE: &str = "the listing may be incomplete";
+    let object = body.as_object().ok_or(INCOMPLETE)?;
+    if object.len() != KNOWN.len() || object.keys().any(|k| !KNOWN.contains(&k.as_str())) {
+        return Err(INCOMPLETE);
     }
-    let items = body["entries"]
-        .as_array()
-        .ok_or("the listing is not a directory listing")?;
+    let items = object["entries"].as_array().ok_or(INCOMPLETE)?;
     Ok(items.iter().any(|e| e["name"].as_str() == Some(name)))
 }
 
@@ -1998,9 +1990,14 @@ mod tests {
         }
         // A missing or non-array `entries` cannot prove the name is free.
         assert!(listing_taken(&json!({"path": "sources"}), "a.pdf").is_err());
-        // An explicit false or null completeness field is still complete.
-        let done = json!({"entries": [], "truncated": false, "next_cursor": null});
-        assert_eq!(listing_taken(&done, "a.pdf"), Ok(false));
+        // Any extra key is refused, even one that reads as "complete".
+        let done = json!({"path": "sources", "entries": [], "truncated": false});
+        assert!(listing_taken(&done, "a.pdf").is_err());
+        // An unknown paging key that carries an existing name is refused too.
+        let token = json!({"path": "sources", "entries": [], "next_token": "t2"});
+        assert!(listing_taken(&token, "a.pdf").is_err());
+        // A non-object body cannot prove the name is free.
+        assert!(listing_taken(&json!([{"name": "a.pdf"}]), "a.pdf").is_err());
     }
 
     /// CAD-913 overwrite guard: an existing destination without `--overwrite`
@@ -2009,6 +2006,41 @@ mod tests {
     /// the upload endpoint is never reached.
     #[test]
     fn overwrite_refusal_sends_no_upload_request() {
+        let (message, order) = refused_listing_fixture(json!({
+            "path": "sources",
+            "entries": [{"name": "a.pdf"}]
+        }));
+        assert!(message.contains("already exists"), "{message}");
+        assert!(message.contains("Nothing was sent"), "{message}");
+        // Order: authorize, then the listing call. No upload request at all.
+        assert_eq!(
+            order.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(),
+            ["/__platform/wiki/authorize", "/__platform/wiki/call"]
+        );
+        assert_eq!(order[1].1, "enumerate");
+    }
+
+    /// CAD-913: an unknown paging key on the listing refuses the upload even
+    /// when the existing name is on that page, and sends no upload request.
+    #[test]
+    fn unknown_paging_key_refuses_without_sending_upload() {
+        let (message, order) = refused_listing_fixture(json!({
+            "path": "sources",
+            "entries": [{"name": "a.pdf"}],
+            "next_token": "page-2"
+        }));
+        assert!(message.contains("may be incomplete"), "{message}");
+        assert!(message.contains("Nothing was sent"), "{message}");
+        assert!(!message.contains("page-2"), "{message}");
+        assert!(
+            !order.iter().any(|(p, _)| p.ends_with("/upload")),
+            "upload reached: {order:?}"
+        );
+    }
+
+    /// Runs `upload_file_in` without `--overwrite` against a fake whose listing
+    /// answer is `listing`. Returns the refusal message and every request seen.
+    fn refused_listing_fixture(listing: Value) -> (String, Vec<(String, String)>) {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
         let root = tempfile::tempdir().unwrap();
@@ -2065,12 +2097,7 @@ mod tests {
                         &json!({"version": WIKI_VERSION, "envelope": "eyJhIjoxfQ.eyJiIjoyfQ.c2ln"}),
                     );
                 } else if path == "/__platform/wiki/call" {
-                    answer(
-                        socket,
-                        "200 OK",
-                        "",
-                        &json!({"entries": [{"name": "a.pdf"}]}),
-                    );
+                    answer(socket, "200 OK", "", &listing);
                 } else {
                     answer(socket, "500 X", "", &json!({}));
                 }
@@ -2097,19 +2124,7 @@ mod tests {
         .unwrap_err();
         stop.store(true, Ordering::SeqCst);
         let paths = fake.join().unwrap();
-        assert!(err.to_string().contains("already exists"), "{err}");
-        assert!(err.to_string().contains("Nothing was sent"), "{err}");
-        // Order: authorize, then the listing call. No upload request at all.
-        let order: Vec<&str> = paths.iter().map(|(p, _)| p.as_str()).collect();
-        assert_eq!(
-            order,
-            ["/__platform/wiki/authorize", "/__platform/wiki/call"]
-        );
-        assert_eq!(paths[1].1, "enumerate");
-        assert!(
-            !order.iter().any(|p| p.ends_with("/upload")),
-            "upload reached: {order:?}"
-        );
+        (err.to_string(), paths)
     }
 }
 
