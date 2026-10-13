@@ -774,11 +774,10 @@ impl Shared {
         // CAD-1416: the document door is selected by the image-owned tuple
         // alone, never by the lifecycle lease. Trusted in-memory metadata wins
         // over the root-owned file, as for the other image-owned assertions.
-        let hosted_business_documents = match &opts.provider_deployments {
-            Some(metadata) => metadata.hosted_business_documents(),
-            None => crate::platform::deployments::load()?
-                .and_then(|metadata| metadata.hosted_business_documents()),
-        };
+        let hosted_business_documents = opts
+            .provider_deployments
+            .as_ref()
+            .and_then(|metadata| metadata.hosted_business_documents());
         // Actors consume Store candidates at open; retain an independent
         // copy until adoption succeeds, refuses, or is skipped entirely.
         let adoptions_pending = store

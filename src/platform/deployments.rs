@@ -175,6 +175,7 @@ impl DeploymentMetadata {
                 .ok_or_else(refused)?;
             if !seen.insert(&entry.provider)
                 || (entry.provider != crate::platform::agenticos_external::PLATFORM
+                    && entry.provider != BUSINESS_DOCUMENTS_PROVIDER
                     && crate::proto::identifier(&entry.provider, "Provider").is_err())
                 || !valid_authority(authority)
                 // A transport assertion admits exactly its own reviewed
