@@ -69,6 +69,8 @@ mod cad1365_media_read_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1365_mount_authority_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
+mod cad1365_original_fence_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
 mod cad1365_original_transfer_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1365_run_creator_acceptance;

@@ -302,6 +302,15 @@ pub(super) fn handle_conn(shared: Arc<Shared>, stream: UnixStream) {
                     let params = frame.get("params").cloned().unwrap_or(json!({}));
                     let _scope = crate::test_seam::scope_frame(shared.seam.as_ref(), &frame)?;
                     shared.master_policy("app_media_original", &params, peer.pid)?;
+                    // Same portable-execution fence `Shared::dispatch` applies;
+                    // this binary branch does not go through `dispatch`.
+                    if shared.execution_mode.fenced()
+                        && !crate::backup::portable_fence::allows("app_media_original")
+                    {
+                        return Err(crate::backup::portable_fence::fence_refusal(
+                            "app_media_original",
+                        ));
+                    }
                     // The byte delivery runs against ONE absolute
                     // deadline in the existing artifact bound.
                     let deadline = Instant::now() + Duration::from_secs(60);
