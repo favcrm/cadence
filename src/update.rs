@@ -816,53 +816,49 @@ pub fn check(host: &dyn UpdateHost) -> Result<CheckReport> {
     } else {
         src.schema_version(&target).unwrap_or(None)
     };
-    // CAD-1235: `update` only moves forward. Ancestry comes from the same
-    // GitHub compare the changes list uses; an answer that is not "ahead"
-    // refuses, and a compare that fails or knows nothing refuses too
-    // (fail closed). `--rollback` is the one way back.
+    // CAD-1235: `update` only moves forward. With target as base and
+    // current as head, "behind" means the target is newer; "ahead" means
+    // it is older. Unproven ancestry fails closed when current is known.
+    // `--rollback` is the one way back.
     let mut refusals = Vec::new();
     let mut older = false;
     if let (Some(from), false) = (&current_sha, up_to_date) {
-        let how = || {
-            format!(
-                "{target} (schema {}) is older than the running build {from} (store schema {}) \
-                 — `cadence update` only moves forward. Approve a newer staging candidate, or \
-                 use `cadence update --rollback` for an intended rollback",
-                schema_target.map_or("unknown".to_string(), |v| v.to_string()),
-                schema_current.map_or("unknown".to_string(), |v| v.to_string()),
-            )
-        };
+        let builds = format!(
+            "target {target} (schema {}) vs running build {from} (store schema {})",
+            schema_target.map_or("unknown".to_string(), |v| v.to_string()),
+            schema_current.map_or("unknown".to_string(), |v| v.to_string()),
+        );
         match src.compare(&target, from) {
             Ok(Some(status)) if status == "behind" => {}
             Ok(Some(status)) if status == "ahead" => {
                 older = true;
-                refusals.push(how());
+                refusals.push(format!(
+                    "{builds}: target is older than current — `cadence update` only moves \
+                     forward. Approve a newer staging candidate, or use `cadence update \
+                     --rollback` for an intended rollback"
+                ));
             }
             Ok(Some(status)) => refusals.push(format!(
-                "{target} is not a descendant of the running build {from} (compare status: \
-                 {status}) — `cadence update` only moves forward. Approve a newer staging \
-                 candidate, or use `cadence update --rollback` for an intended rollback"
+                "{builds}: target is not a descendant of current (compare status: {status}) \
+                 — `cadence update` only moves forward. Approve a newer staging candidate, \
+                 or use `cadence update --rollback` for an intended rollback"
             )),
             Ok(None) | Err(_) => refusals.push(format!(
-                "cannot prove {target} is newer than the running build {from}: GitHub gave no \
-                 ancestry answer (schema {} vs store {}). Refusing rather than guessing — retry, \
-                 or use `cadence update --rollback` for an intended rollback",
-                schema_target.map_or("unknown".to_string(), |v| v.to_string()),
-                schema_current.map_or("unknown".to_string(), |v| v.to_string()),
+                "{builds}: cannot prove target is newer than current: GitHub gave no ancestry \
+                 answer. Refusing rather than guessing — retry or approve a newer staging \
+                 candidate, or use `cadence update --rollback` for an intended rollback"
             )),
         }
     }
     if let (Some(from), Some(to), false) = (schema_current, schema_target, up_to_date) {
         if to < from {
             older = true;
-            if refusals.is_empty() {
-                refusals.push(format!(
-                    "{target} has schema {to}, older than the store's {from} (running build {}) \
-                     — `cadence update` only moves forward. Approve a newer staging candidate, \
-                     or use `cadence update --rollback` for an intended rollback",
-                    current_sha.as_deref().unwrap_or("none")
-                ));
-            }
+            refusals.push(format!(
+                "{target} has schema {to}, older than the store's {from} (running build {}) \
+                 — `cadence update` only moves forward. Approve a newer staging candidate, \
+                 or use `cadence update --rollback` for an intended rollback",
+                current_sha.as_deref().unwrap_or("none")
+            ));
         }
     }
     let changes = match (&current_sha, up_to_date, older) {
@@ -1764,7 +1760,9 @@ mod tests {
         fn on_main(&self, _: &str) -> Result<OnMain> {
             Ok(OnMain::Yes)
         }
-        fn compare(&self, _: &str, _: &str) -> Result<Option<String>> {
+        fn compare(&self, base: &str, head: &str) -> Result<Option<String>> {
+            assert_eq!(base, self.target);
+            assert_eq!(head, CUR);
             match &self.compare {
                 Ok(v) => Ok(v.clone()),
                 Err(e) => Err(Error::internal(e.to_string())),
@@ -1801,6 +1799,7 @@ mod tests {
         state: PathBuf,
         layout: Layout,
         src: Src,
+        pin: Option<String>,
         lines: RefCell<Vec<String>>,
     }
 
@@ -1831,6 +1830,7 @@ mod tests {
                 _dir: dir,
                 layout: Layout { releases, link },
                 src,
+                pin: None,
                 lines: RefCell::new(Vec::new()),
             }
         }
@@ -1878,6 +1878,12 @@ mod tests {
         }
         fn board_running(&self) -> bool {
             false
+        }
+        fn start_board(&self, _: &Path) -> Result<()> {
+            panic!("a refused update or no-op must not start the board")
+        }
+        fn pin(&self) -> Option<&str> {
+            self.pin.as_deref()
         }
         fn now(&self) -> f64 {
             std::time::SystemTime::now()
@@ -1936,7 +1942,7 @@ mod tests {
     }
 
     #[test]
-    fn an_older_schema_target_is_blocked_even_when_ancestry_says_ahead() {
+    fn an_older_schema_target_is_blocked_even_when_target_is_newer() {
         let host = Host::new(src(NEW, "behind", 32), 33);
         assert_named(&refused(&host), NEW, "32");
         let err = run(&host, &Options::default()).unwrap_err().to_string();
@@ -1946,7 +1952,13 @@ mod tests {
 
     #[test]
     fn ancestry_that_cannot_be_determined_fails_closed() {
-        for compare in [Ok(None), Err(Error::internal("gh down"))] {
+        for compare in [
+            Ok(None),
+            Err(Error::internal("gh down")),
+            Ok(Some("diverged".into())),
+            Ok(Some("identical".into())),
+            Ok(Some("unknown".into())),
+        ] {
             let host = Host::new(
                 Src {
                     target: NEW.into(),
@@ -1957,12 +1969,44 @@ mod tests {
             );
             let blocked = refused(&host).join("\n");
             assert!(
-                blocked.contains("ancestry") && blocked.contains(NEW),
+                (blocked.contains("ancestry") || blocked.contains("not a descendant"))
+                    && blocked.contains(NEW),
                 "{blocked}"
             );
             assert!(run(&host, &Options::default()).is_err());
             assert!(!host.installed(NEW));
         }
+    }
+
+    #[test]
+    fn pinned_targets_have_the_same_downgrade_refusals() {
+        for (target, compare) in [(OLD, "ahead"), (NEW, "behind")] {
+            let mut host = Host::new(src(target, compare, 32), 33);
+            host.pin = Some(target.into());
+            assert_named(&refused(&host), target, "32");
+            assert!(run(&host, &Options::default()).is_err());
+            assert!(!host.installed(target));
+        }
+    }
+
+    #[test]
+    fn current_target_is_a_noop_without_ancestry() {
+        let host = Host::new(src(CUR, "unknown", 32), 33);
+        let report = run(&host, &Options::default()).unwrap();
+        assert!(report.check.up_to_date);
+        assert!(report.check.refusals.is_empty());
+        assert!(report.install.is_none());
+        assert!(report.lease.is_none());
+        assert!(report.backup.is_none());
+    }
+
+    #[test]
+    fn no_known_current_build_does_not_require_ancestry() {
+        let host = Host::new(src(NEW, "unknown", 33), 33);
+        std::fs::remove_file(&host.layout.link).unwrap();
+        let report = check(&host).unwrap();
+        assert!(report.current.is_none());
+        assert!(report.refusals.is_empty());
     }
 
     #[test]
