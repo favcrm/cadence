@@ -58,6 +58,10 @@ interface Permission {
 }
 
 const statuses = new Set(["pending_permission", "running", "succeeded", "denied", "failed", "unknown"]);
+/** Statuses that stay visible outside the completed-history disclosure:
+ *  anything still actionable, in flight, failed or indeterminate. */
+const ACTIVE_STATUSES = new Set(["pending_permission", "running", "failed", "unknown"]);
+const isActiveOperation = (operation: Operation): boolean => ACTIVE_STATUSES.has(operation.status);
 function record(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
 }
@@ -369,6 +373,10 @@ export default function AssistantOperations({ installId, contextId, canDecide }:
   const [expanded, setExpanded] = useState(false);
   const visible = data.scopeKey === scopeKey ? data : emptyData(scopeKey);
   const busy = busyState.scopeKey === scopeKey ? busyState.id : null;
+  // Current activity stays inline; completed succeeded/denied receipts sit
+  // behind an explicit count-labelled history disclosure, all reachable.
+  const activeOperations = visible.operations.filter(isActiveOperation);
+  const completedOperations = visible.operations.filter((operation) => !isActiveOperation(operation));
 
   useEffect(() => {
     // An unresolved context owns no poller and sends no assistant requests.
@@ -528,7 +536,15 @@ export default function AssistantOperations({ installId, contextId, canDecide }:
       </div>
       {visible.consent && <p className="text-micro text-ink-400" role="status">{t("Approve the app to enable assistant actions.")}</p>}
       {visible.error && <p className="text-micro text-fail" role="alert">{visible.error} <button className="lnk" type="button" onClick={() => void poller.current?.refresh()}>{t("Retry")}</button></p>}
-      {visible.operations.map((operation) => <AssistantOperationCard key={operation.id} operation={operation} installId={installId} contextId={contextId} busy={busy === operation.id || !canDecide} decide={decide} />)}
+      {activeOperations.map((operation) => <AssistantOperationCard key={operation.id} operation={operation} installId={installId} contextId={contextId} busy={busy === operation.id || !canDecide} decide={decide} />)}
+      {completedOperations.length > 0 && (
+        <details className="app-assistant-history">
+          <summary className="text-micro">{t("Completed activity")} ({completedOperations.length})</summary>
+          <div className="app-assistant-history-list">
+            {completedOperations.map((operation) => <AssistantOperationCard key={operation.id} operation={operation} installId={installId} contextId={contextId} busy={busy === operation.id || !canDecide} decide={decide} />)}
+          </div>
+        </details>
+      )}
       {expanded && (
         <div className="app-assistant-settings">
           <h3 className="text-micro text-ink-300">{t("Action discovery")}</h3>
