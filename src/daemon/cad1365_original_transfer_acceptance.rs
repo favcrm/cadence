@@ -350,6 +350,15 @@ impl Fx {
         let (state, pm) = (dir.path().join("s"), dir.path().join("pm"));
         std::fs::create_dir_all(&state).unwrap();
         crate::issue::Pm::init(&pm).unwrap();
+        crate::board_identity::write_config(
+            &state,
+            &crate::board_identity::Config {
+                host: "cad1365.example.test".to_string(),
+                issuer: "https://platform.example.test".to_string(),
+                company: "cad1365-test-company".to_string(),
+            },
+        )
+        .unwrap();
         crate::store::Store::open(&state.join("cadence.sqlite3"))
             .unwrap()
             .register_agent(&crate::store::NewAgent {
@@ -1178,10 +1187,16 @@ fn cad1365_original_transfer_a_different_permitted_public_actor_reads() {
     // `Auth` through the real `open_public` — a verified platform user,
     // never a faked or body-selected identity.
     let now = fx.shared.operator_now();
+    let config = crate::board_identity::read_config(&fx.state).unwrap();
+    let realm = crate::operator_auth::PublicRealm {
+        issuer: config.issuer,
+        company: config.company,
+        host: config.host,
+    };
     let public_token = fx
         .shared
         .operator_auth()
-        .open_public(
+        .open_public_bound(
             crate::operator_auth::BoardUser {
                 sub: "usr-collab-reader".to_string(),
                 email: "collab@example.test".to_string(),
@@ -1192,6 +1207,7 @@ fn cad1365_original_transfer_a_different_permitted_public_actor_reads() {
             &format!("jti-collab-{}", std::process::id()),
             now + 60,
             "cad1365-acceptance",
+            realm,
             now,
         )
         .unwrap()

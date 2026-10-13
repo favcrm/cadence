@@ -281,6 +281,15 @@ impl LocalFx {
         let opts = ServeOptions::default();
         opts.provider_env
             .set("CADENCE_PM_DIR", pm.to_str().unwrap());
+        crate::board_identity::write_config(
+            dir.path(),
+            &crate::board_identity::Config {
+                host: "cad1365.example.test".to_string(),
+                issuer: "https://platform.example.test".to_string(),
+                company: "cad1365-test-company".to_string(),
+            },
+        )
+        .unwrap();
         let shared = Shared::new(dir.path(), &opts).unwrap();
         register_team(&shared.store, dir.path().to_str().unwrap());
         let app = write_package(dir.path());
@@ -324,9 +333,15 @@ impl LocalFx {
     /// body-selected identity.
     fn public_session(&self, sub: &str, role: &str) -> String {
         let now = self.shared.operator_now();
+        let config = crate::board_identity::read_config(self._dir.path()).unwrap();
+        let realm = crate::operator_auth::PublicRealm {
+            issuer: config.issuer,
+            company: config.company,
+            host: config.host,
+        };
         self.shared
             .operator_auth()
-            .open_public(
+            .open_public_bound(
                 BoardUser {
                     sub: sub.to_string(),
                     email: format!("{sub}@example.test"),
@@ -337,6 +352,7 @@ impl LocalFx {
                 &format!("jti-{sub}-{}", std::process::id()),
                 now + 60,
                 "cad1365-acceptance",
+                realm,
                 now,
             )
             .unwrap()
