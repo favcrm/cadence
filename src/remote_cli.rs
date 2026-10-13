@@ -1,7 +1,8 @@
 //! CAD-1019 slice 2: the remote CLI transport — allowlisted verbs over the
 //! AgenticOS `POST /__platform/cli/{authorize,call}` relay (AOS-128, contract
-//! `docs/design/remote-cli.md`). A selected `Remote` org routes a command
-//! here instead of the local daemon socket; there is no local fallback.
+//! `docs/design/remote-cli.md`) and the `POST /__platform/wiki/{authorize,call}`
+//! wiki relay for the wiki actions (CAD-1401). A selected `Remote` org routes a
+//! command here instead of the local daemon socket; there is no local fallback.
 //!
 //! Wire contract (pinned to `origin/cadence/aos-128-hosted-cadence-cli-allowlisted-p`,
 //! `hosted-cadence-auth.ts` + `board/routes.ts` + `hosted-cadence/wiki.ts`):
@@ -43,6 +44,7 @@ use crate::error::{Error, Result};
 use crate::remote_auth::auth_dir;
 
 const CLI_VERSION: &str = "hosted-cadence-cli.v1";
+const WIKI_VERSION: &str = "hosted-cadence-wiki.v1";
 /// `ttl_seconds` ceiling (`HOSTED_CADENCE_MAX_TTL_SECONDS`): the server also
 /// clamps to the live credential's expiry, so asking the maximum is exact.
 const MAX_TTL: u64 = 300;
@@ -88,6 +90,43 @@ pub const REMOTE_VERBS: &[&str] = &[
     "issue_set",
 ];
 
+/// The wiki actions this build sends over `/__platform/wiki/call` (CAD-1401):
+/// `enumerate` is `wiki ls` or `wiki search`, `read` is `wiki cat`, `write` is
+/// a text `wiki put`. No delete/job_status/history and no blob upload. Any
+/// other verb is refused locally, before a request.
+pub const WIKI_ACTIONS: &[&str] = &["enumerate", "read", "write"];
+
+/// The argument keys each wiki action may send (CAD-1401). Any other key —
+/// an authority-shaped one such as `actor` or `as` included — is refused
+/// locally, before a request. Unknown actions get no keys (fail closed).
+fn wiki_argument_keys(action: &str) -> &'static [&'static str] {
+    match action {
+        "enumerate" => &["path", "q"],
+        "read" => &["path"],
+        "write" => &["path", "text", "if_rev"],
+        _ => &[],
+    }
+}
+
+/// The hosted relay a verb rides: the cli envelope or the wiki envelope. It is
+/// chosen by the verb name on the shared path, so a wiki action never travels
+/// the cli route and a cli verb never travels the wiki route.
+#[derive(Clone, Copy)]
+enum Surface {
+    Cli,
+    Wiki,
+}
+
+impl Surface {
+    /// The relay path prefix and its protocol version.
+    fn relay(self) -> (&'static str, &'static str) {
+        match self {
+            Surface::Cli => ("/__platform/cli", CLI_VERSION),
+            Surface::Wiki => ("/__platform/wiki", WIKI_VERSION),
+        }
+    }
+}
+
 /// A resolved remote org destination — pinned once per invocation from the
 /// registry (`cli::org::resolve`). `org` is the registry name (the
 /// issuer-verified slug); `endpoint`/`org_id` came only from the verified
@@ -100,7 +139,10 @@ pub struct RemoteTarget {
 }
 
 const SESSION_VERSION: &str = "hosted-cadence-cli-session.v1";
-const CAPABILITIES: &[&str] = &["cli.read", "cli.write"];
+/// Every capability this client knows. A stored login holds a subset that
+/// includes `cli.read` and `cli.write` (the default login); a renewal keeps
+/// exactly the stored set, so a CLI-only login stays CLI-only.
+const CAPABILITIES: &[&str] = &["cli.read", "cli.write", "wiki.read", "wiki.write"];
 const RENEW_BEFORE: u64 = 60;
 const SKEW: u64 = 5;
 const RENEWAL_WAIT: Duration = Duration::from_secs(20);
@@ -397,7 +439,7 @@ fn renewed_credential(dir: &Path, target: &RemoteTarget, deadline: Instant) -> R
         .ok_or_else(|| reject("renewable session issuer missing — run `cadence login` again"))?;
     if cred.organization_slug.as_deref() != Some(target.org.as_str())
         || cred.subject_id.as_deref().is_none_or(|s| !valid_id(s))
-        || !same_capabilities(&cred.capabilities, CAPABILITIES)
+        || !valid_capabilities(&cred.capabilities)
         || session.idle_expires_at <= at
         || session.absolute_expires_at <= at
         || session.idle_expires_at > session.absolute_expires_at
@@ -518,7 +560,7 @@ fn validate_renewal_response(
         || body["principal"]["kind"] != "user"
         || body["principal"]["current_role"] != "owner"
         || body["principal"]["subject_id"].as_str() != prior.subject_id.as_deref()
-        || !same_capabilities_json(&body["capabilities"], CAPABILITIES)
+        || !same_capabilities_json(&body["capabilities"], &prior.capabilities)
         || !exact_object(
             &body["credential"],
             &[
@@ -584,18 +626,28 @@ fn validate_renewal_response(
     Ok(())
 }
 
-fn same_capabilities(values: &[String], expected: &[&str]) -> bool {
-    values.len() == expected.len()
-        && expected
+/// Known, unique capabilities that include the CLI pair. Wiki scopes are
+/// optional, so a CLI-only login remains valid.
+fn valid_capabilities(values: &[String]) -> bool {
+    let once = |c: &str| values.iter().filter(|v| v.as_str() == c).count() == 1;
+    values.iter().all(|v| CAPABILITIES.contains(&v.as_str()))
+        && values
             .iter()
-            .all(|item| values.iter().filter(|v| v.as_str() == *item).count() == 1)
+            .enumerate()
+            .all(|(i, v)| !values[..i].contains(v))
+        && once("cli.read")
+        && once("cli.write")
 }
-fn same_capabilities_json(value: &Value, expected: &[&str]) -> bool {
+fn same_capabilities_json(value: &Value, expected: &[String]) -> bool {
     value.as_array().is_some_and(|values| {
         values.len() == expected.len()
-            && expected
-                .iter()
-                .all(|item| values.iter().filter(|v| v.as_str() == Some(*item)).count() == 1)
+            && expected.iter().all(|item| {
+                values
+                    .iter()
+                    .filter(|v| v.as_str() == Some(item.as_str()))
+                    .count()
+                    == 1
+            })
     })
 }
 fn exact_object(value: &Value, keys: &[&str]) -> bool {
@@ -668,19 +720,26 @@ fn post(
     Ok((status, retry_after, value))
 }
 
-/// `POST /__platform/cli/authorize` — exchange the live `hct_` for one
-/// cli-scoped actor envelope. The request is the strict AOS-128 shape;
-/// the answer must echo the version and carry a compact-JWS envelope.
-fn authorize(target: &RemoteTarget, cred: &Credential) -> Result<String> {
+/// `POST /__platform/{cli,wiki}/authorize` — exchange the live `hct_` for one
+/// actor envelope scoped to `scopes`. The request is the strict AOS-128 /
+/// AOS-122 shape; the answer must echo the version and carry a compact-JWS
+/// envelope.
+fn authorize(
+    target: &RemoteTarget,
+    cred: &Credential,
+    surface: Surface,
+    scopes: &[&str],
+) -> Result<String> {
+    let (relay, version) = surface.relay();
     let (status, _, body) = post(
         &target.endpoint,
-        "/__platform/cli/authorize",
+        &format!("{relay}/authorize"),
         &cred.access_token,
         &json!({
-            "version": CLI_VERSION,
+            "version": version,
             "organization_id": target.org_id,
             "audience": target.endpoint,
-            "requested_scopes": ["cli.read", "cli.write"],
+            "requested_scopes": scopes,
             "ttl_seconds": MAX_TTL,
         }),
         AUTH_TIMEOUT,
@@ -694,7 +753,7 @@ fn authorize(target: &RemoteTarget, cred: &Credential) -> Result<String> {
                     && p.bytes()
                         .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
             }) && envelope.split('.').count() == 3;
-            if body["version"].as_str() != Some(CLI_VERSION) || !compact_jws {
+            if body["version"].as_str() != Some(version) || !compact_jws {
                 return Err(reject("remote authorize returned an invalid envelope"));
             }
             Ok(envelope.to_string())
@@ -710,27 +769,38 @@ fn authorize(target: &RemoteTarget, cred: &Credential) -> Result<String> {
     }
 }
 
-/// One `POST /__platform/cli/call` attempt: fresh envelope, strict body,
-/// never an authority-shaped key. `arguments` carries only the verb's own
-/// payload (identity/org/destination live only in the verified envelope).
+/// One `POST /__platform/{cli,wiki}/call` attempt: fresh envelope, strict
+/// body, never an authority-shaped key. A wiki envelope requests only the
+/// scope its action needs (`write` → `wiki.write`, else `wiki.read`).
+/// `arguments` carries only the verb's own payload (identity/org/destination
+/// live only in the verified envelope).
 fn call_once(
     target: &RemoteTarget,
     cred: &Credential,
+    surface: Surface,
     verb: &str,
     arguments: &Map<String, Value>,
 ) -> Result<(u16, Option<u64>, Option<Value>)> {
-    let envelope = authorize(target, cred)?;
-    let mut body = json!({
-        "version": CLI_VERSION,
-        "envelope": envelope,
-        "verb": verb,
-    });
+    let scopes: &[&str] = match surface {
+        Surface::Cli => &["cli.read", "cli.write"],
+        Surface::Wiki if verb == "write" => &["wiki.write"],
+        Surface::Wiki => &["wiki.read"],
+    };
+    let envelope = authorize(target, cred, surface, scopes)?;
+    let (relay, version) = surface.relay();
+    // A wiki body always carries `arguments` (`{}` when there are none).
+    let mut body = match surface {
+        Surface::Cli => json!({"version": version, "envelope": envelope, "verb": verb}),
+        Surface::Wiki => {
+            json!({"version": version, "envelope": envelope, "action": verb, "arguments": {}})
+        }
+    };
     if !arguments.is_empty() {
         body["arguments"] = Value::Object(arguments.clone());
     }
     post(
         &target.endpoint,
-        "/__platform/cli/call",
+        &format!("{relay}/call"),
         &cred.access_token,
         &body,
         CALL_TIMEOUT,
@@ -794,9 +864,9 @@ fn classify(status: u16, retry_after: Option<u64>, body: Option<Value>) -> Verdi
     }
 }
 
-/// Run one allowlisted remote verb. The verb must already be in
-/// [`REMOTE_VERBS`] (a bug in the caller is a local refusal, never a
-/// request). The credential is loaded and checked against `target` before
+/// Run one allowlisted remote verb: a [`REMOTE_VERBS`] cli verb or a
+/// [`WIKI_ACTIONS`] wiki action. The verb must be in one of them (a bug in
+/// the caller is a local refusal, never a request). The credential is loaded and checked against `target` before
 /// the first byte is sent; wake retries re-mint the envelope per attempt
 /// and are bounded by `wake_timeout` seconds. Progress goes to `note`
 /// (stderr at the call site); the returned Value is the remote's JSON body.
@@ -884,21 +954,50 @@ fn call_verb_in(
     sleep: impl Fn(Duration),
 ) -> Result<RemoteAnswer> {
     // I2: an unlisted verb is refused before a credential is even loaded.
-    if !REMOTE_VERBS.contains(&verb) {
+    let surface = if REMOTE_VERBS.contains(&verb) {
+        Surface::Cli
+    } else if WIKI_ACTIONS.contains(&verb) {
+        Surface::Wiki
+    } else {
         return Err(reject(format!(
             "verb '{verb}' is not in the remote allowlist — never sent"
         )));
+    };
+    if matches!(surface, Surface::Wiki) {
+        let allowed = wiki_argument_keys(verb);
+        if let Some(key) = arguments.keys().find(|k| !allowed.contains(&k.as_str())) {
+            return Err(reject(format!(
+                "wiki {verb} argument '{key}' is not in the allowlist — never sent"
+            )));
+        }
     }
     let deadline = Instant::now() + Duration::from_secs(wake_timeout);
     loop {
         let cred = renewed_credential(dir, target, deadline)?;
+        // A login that records its capabilities must hold the wiki scope the
+        // action needs; a legacy login with none is left to the server's check.
+        if matches!(surface, Surface::Wiki) && !cred.capabilities.is_empty() {
+            let scope = if verb == "write" {
+                "wiki.write"
+            } else {
+                "wiki.read"
+            };
+            if !cred.capabilities.iter().any(|c| c == scope) {
+                return Err(reject(format!(
+                    "wiki {verb} needs the {scope} capability, which this remote login \
+                     lacks — nothing was sent. CLI commands are unaffected. `cadence login` \
+                     does not request wiki access by default; wiki access needs a login the \
+                     workspace owner grants with {scope}"
+                )));
+            }
+        }
         if Instant::now() >= deadline {
             return Err(Error::busy_coded(
                 "timeout",
                 "remote command deadline elapsed during session renewal",
             ));
         }
-        let (status, retry_after, body) = call_once(target, &cred, verb, &arguments)?;
+        let (status, retry_after, body) = call_once(target, &cred, surface, verb, &arguments)?;
         match classify(status, retry_after, body) {
             Verdict::Done(result) => return result.map(RemoteAnswer::Ok),
             Verdict::Conflict(body) => return Ok(RemoteAnswer::Conflict(body)),
@@ -1221,6 +1320,159 @@ mod tests {
     }
 
     #[test]
+    fn wiki_refuses_forged_authority_before_mint_and_never_uses_cli_relay() {
+        // CAD-1401 independent refusal acceptance. The worker deliberately
+        // accepts every payload: only the real client guard can refuse it.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let target = target(&listener);
+        let server = listener.try_clone().unwrap();
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<Value>>> = Default::default();
+        let requests = seen.clone();
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            while stopped.try_recv().is_err() {
+                let socket = match server.accept() {
+                    Ok((socket, _)) => socket,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(e) => panic!("fake worker accept: {e}"),
+                };
+                let (socket, req) = read_request(socket);
+                let version = if req.path.starts_with("/__platform/wiki/") {
+                    "hosted-cadence-wiki.v1"
+                } else {
+                    "hosted-cadence-cli.v1"
+                };
+                let response = if req.path.ends_with("/authorize") {
+                    json!({"version": version, "envelope": "h.e.1"})
+                } else {
+                    json!({"ok": true})
+                };
+                requests.lock().unwrap().push(json!({
+                    "path": req.path, "bearer": req.bearer, "body": req.body,
+                }));
+                answer(socket, "200 OK", "", &response);
+            }
+        });
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            root.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        store_credential(root.path(), &target.endpoint);
+        let mut failures = Vec::new();
+
+        for dir in [root.path().to_path_buf(), root.path().join("missing")] {
+            let before = seen.lock().unwrap().len();
+            let out = call_verb_in(&target, "delete", Map::new(), 10, &dir, |_| {}, |_| {});
+            if !matches!(out, Err(ref e) if e.kind() == "rejected" && e.to_string().contains("allowlist"))
+                || seen.lock().unwrap().len() != before
+            {
+                failures
+                    .push("delete was not refused before credential access/request".to_string());
+            }
+        }
+        // Observe successful calls too, so a missing route or a wrong schema
+        // cannot masquerade as a local refusal. Include an empty arguments map.
+        for (action, args) in [
+            ("enumerate", json!({"path": "global/", "q": "acceptance"})),
+            ("read", json!({"path": "global/acceptance.md"})),
+            (
+                "write",
+                json!({"path": "global/acceptance.md", "text": "acceptance", "if_rev": "none"}),
+            ),
+            ("enumerate", json!({})),
+        ] {
+            let args = args.as_object().unwrap().clone();
+            let before = seen.lock().unwrap().len();
+            let out = call_verb_in(
+                &target,
+                action,
+                args.clone(),
+                10,
+                root.path(),
+                |_| {},
+                |_| {},
+            );
+            let observed = seen.lock().unwrap();
+            let pair = &observed[before..];
+            let scope = if action == "write" {
+                "wiki.write"
+            } else {
+                "wiki.read"
+            };
+            if !matches!(out, Ok(RemoteAnswer::Ok(_)))
+                || pair.len() != 2
+                || pair[0]["path"] != "/__platform/wiki/authorize"
+                || pair[0]["bearer"] != BRIDGE
+                || pair[0]["body"]["version"] != "hosted-cadence-wiki.v1"
+                || pair[0]["body"]["organization_id"] != ORG_ID
+                || pair[0]["body"]["audience"] != target.endpoint
+                || pair[0]["body"]["requested_scopes"] != json!([scope])
+                || pair[1]["path"] != "/__platform/wiki/call"
+                || pair[1]["bearer"] != BRIDGE
+                || !exact_object(
+                    &pair[1]["body"],
+                    &["version", "envelope", "action", "arguments"],
+                )
+                || pair[1]["body"]["version"] != "hosted-cadence-wiki.v1"
+                || pair[1]["body"]["envelope"] != "h.e.1"
+                || pair[1]["body"]["action"] != action
+                || pair[1]["body"]["arguments"] != Value::Object(args)
+            {
+                failures.push(format!(
+                    "{action}: wrong wiki route, scope, or exact call body"
+                ));
+            }
+        }
+        for action in ["enumerate", "read", "write"] {
+            for field in ["actor", "role", "org", "user", "wiki_as", "as", "principal"] {
+                let mut args = json!({"path": "global/acceptance.md", "text": "acceptance"})
+                    .as_object()
+                    .unwrap()
+                    .clone();
+                args.insert(field.into(), json!("forged"));
+                let before = seen.lock().unwrap().len();
+                let out = call_verb_in(&target, action, args, 10, root.path(), |_| {}, |_| {});
+                if !matches!(out, Err(ref e) if e.kind() == "rejected")
+                    || seen.lock().unwrap().len() != before
+                {
+                    failures.push(format!(
+                        "{action}: {field} was not refused before mint/request"
+                    ));
+                }
+            }
+        }
+        stop.send(()).unwrap();
+        worker.join().unwrap();
+        let requests = seen.lock().unwrap();
+        if requests.iter().any(|r| r["path"] == "/__platform/cli/call") {
+            failures.push("a wiki action reached /__platform/cli/call".into());
+        }
+        for request in requests
+            .iter()
+            .filter(|r| r["path"] == "/__platform/wiki/call")
+        {
+            if request["body"]["arguments"]
+                .as_object()
+                .is_some_and(|args| {
+                    args.keys().any(|key| {
+                        ["actor", "role", "org", "user", "wiki_as", "as", "principal"]
+                            .contains(&key.as_str())
+                    })
+                })
+            {
+                failures.push("a wiki call carried authority in arguments".into());
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
     fn credential_for_another_org_is_never_sent_to_this_host() {
         // The stored file names ws_real/acme's endpoint; the resolved org is
         // beta — the token must not ride to a foreign host (contract I1).
@@ -1337,6 +1589,53 @@ mod tests {
         );
         assert!(out.unwrap_err().to_string().contains("remote call refused"));
         assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+    }
+
+    #[test]
+    fn a_cli_only_login_stays_valid_and_a_wiki_verb_needs_its_scope() {
+        // CAD-1401 repair: the stored CLI pair is a valid login and its renewal
+        // keeps exactly that set; a wiki verb on it is refused before any request.
+        let cli: Vec<String> = vec!["cli.read".into(), "cli.write".into()];
+        assert!(valid_capabilities(&cli));
+        assert!(!valid_capabilities(&["cli.read".into()]));
+        assert!(same_capabilities_json(
+            &json!(["cli.read", "cli.write"]),
+            &cli
+        ));
+        assert!(!same_capabilities_json(
+            &json!(["cli.read", "cli.write", "wiki.read"]),
+            &cli
+        ));
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            root.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let target = RemoteTarget {
+            org: ORG.into(),
+            endpoint: "http://127.0.0.1:9".into(),
+            org_id: ORG_ID.into(),
+        };
+        let body = json!({"version": "hosted-cadence-auth.v1", "organization_id": ORG_ID,
+            "audience": target.endpoint, "capabilities": cli,
+            "access_token": BRIDGE, "expires_at": now().unwrap() + 300});
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(root.path().join(format!("cli-{ORG}.json")))
+            .unwrap();
+        file.write_all(body.to_string().as_bytes()).unwrap();
+        let mut args = Map::new();
+        args.insert("path".into(), json!("global/"));
+        let err =
+            call_verb_in(&target, "enumerate", args, 10, root.path(), |_| {}, |_| {}).unwrap_err();
+        assert!(err.to_string().contains("wiki.read capability"), "{err}");
+        assert!(err.to_string().contains("nothing was sent"), "{err}");
     }
 }
 

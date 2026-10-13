@@ -97,7 +97,7 @@ fn rpc(state_dir: &Path, method: &str, params: Value) -> Result<Value> {
     client::rpc(state_dir, method, params)
 }
 
-fn entries(out: &Value) {
+pub fn entries(out: &Value) {
     let path = out["path"].as_str().unwrap_or("");
     println!("{path}:");
     for e in out["entries"].as_array().cloned().unwrap_or_default() {
