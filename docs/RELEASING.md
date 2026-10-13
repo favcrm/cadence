@@ -1,4 +1,128 @@
-# First public release handoff (CAD-661)
+# Cadence release and production handoff
+
+Two different publication paths exist. A native host can take an approved
+main-SHA build without a new public version tag. A numbered GitHub Release is
+for public installation; it does not replace production-candidate promotion.
+Neither path authorizes an agent to approve or restart production. Follow
+[AGENTS.md](../AGENTS.md#production-safety) and the
+[artifact checklist](guides/rollout-checklist.md); image-managed hosts use the runtime
+image path instead of self-update.
+
+## Native host: checkpoints, not one “shipped” status
+
+| State | Evidence to check before reporting it |
+| --- | --- |
+| Merged | PR merge commit is on main; queue acceptance is not merge proof. |
+| Artifact ready | Exact main `ci.yml` push run and attested `cadence-<sha>-x86_64-linux` artifact; verify source SHA/run attempt/digest, not just a green job name. |
+| Staged | Successful `stage` job and staging evidence for the selected artifact and installed baseline. |
+| Promoted | Successful manual `staging.yml` dispatch, successful `promote` job after GitHub `production` approval, and matching `production-candidate.json` in the `production-candidate` artifact. |
+| Installed | Operator update result and installed/running build match the intended SHA. |
+| Operationally verified | Read-only health/status and affected behavior checked on that build; fixture QA is not live verification. |
+
+Record existing run/receipt links and actual results on the ticket; no new
+ledger is required. Reconcile the ticket after merge as usual, but do not
+reinterpret `done` from merge evidence as installed or operationally verified.
+Report any remaining operator rollout work explicitly.
+
+### Prepare and promote the exact candidate
+
+1. Select a successful **main push** CI run containing the intended merged
+   changes and its attested artifact. A manual `ci.yml` dispatch is a benchmark
+   and does not run the main-push artifact/attestation jobs.
+2. Identify the installed baseline from operator-provided update/version
+   evidence and its approved candidate receipt's `ci_run_id`. Do not assume
+   the preceding main commit or the public `latest` release is that baseline.
+3. Dispatch `staging.yml` from `main`, supplying `ci_run_id` and
+   `baseline_ci_run_id`. Example syntax (replace both with verified run IDs):
+
+   ```sh
+   gh workflow run staging.yml -R favcrm/cadence --ref main \
+     -f ci_run_id=<CANDIDATE_MAIN_CI_RUN> \
+     -f baseline_ci_run_id=<INSTALLED_BASELINE_MAIN_CI_RUN>
+   ```
+
+4. Check the selected SHA/digest and staging outcome on that run. The operator
+   approves the GitHub `production` job; agents may prepare/dispatch on request,
+   but never record approval. Wait for `promote` to succeed and verify the
+   receipt matches the candidate, CI run/attempt and promotion run/attempt.
+   PR merge approval and GitHub production approval are different decisions.
+5. Only then relay the two supported operator update commands from AGENTS.md.
+   The operator runs the check first and proceeds only if it permits the
+   intended target. Installation, drain, backup and health checks remain in
+   the supported update flow, not a hand-built restart recipe.
+
+**Scheduled and `workflow_run` staging cannot promote.** Their successful
+runs may have `promote: skipped`; that means staged, not production-approved.
+The default updater selects the last successful approved manual promotion,
+not the newest green main artifact.
+
+### Stop conditions
+
+- `current = available` at an older SHA means the default selected candidate
+  did not advance to the intended build. Inspect the promotion run/receipt;
+  do not repeatedly update, label it deployed, or silently add `--to`.
+- If `--check` reports a refusal or an in-flight-turn drain blocker, report it
+  and stop. Do not interrupt another lane, force a switch or bypass a lease.
+- A later promotion can change the default candidate. If the reported target
+  differs from the agreed SHA, stop and resolve it with the operator. A
+  specific `--to` pin is permitted only when explicitly requested by the
+  operator; it uses its own main/CI/digest/manifest/attestation checks rather
+  than the production-candidate receipt.
+- On update failure/regression, the operator decides rollback through supported
+  recovery procedures. Do not improvise a symlink/store rollback or relay
+  internal rollout/upgrade recipes.
+
+## Numbered public releases
+
+A tag is a deliberate operator-owned release batch, not a tag per PR. Cadence
+has no automatic patch/minor policy or anonymous stable-release updater;
+see [public installation](INSTALL-AGENT.md). Do not substitute the public
+`latest` tag for the native host's approved main-SHA candidate.
+
+Version-selection guidance for the operator's release decision:
+
+| Change | Suggested version choice |
+| --- | --- |
+| Backward-compatible fixes or packaging corrections | Patch; documentation-only changes need no automatic binary release. |
+| Additive user-facing features | Minor, with a clear release summary. |
+| Compatibility-breaking CLI/API/data changes | Explicit compatibility/migration decision; major after 1.0. While 0.x, explicitly disclose breaks rather than imply a minor bump guarantees compatibility. |
+| Preview not ready for stable users | Prerelease such as `-beta.N`; prereleases are not GitHub `latest`. |
+
+These are selection guidance, not new runtime enforcement. The operator owns
+release timing/version and approves compatibility exceptions. Reviewed release
+scope and notes must describe actual delivered changes and known limitations.
+Do not batch an unverified breaking change into a “routine patch.”
+
+1. Put the intended `Cargo.toml` version bump and any corresponding lockfile
+   update through the normal ticket/PR/review/approval/merge path. Do not edit
+   main directly. Installed app-bundle versions are independent of the host
+   version. The app-toolchain archive published by this tag workflow is explicitly
+   bound to the host tag; do not infer version coupling for other packages.
+2. An authorized operator creates a **new** protected `v<version>` tag on the
+   selected merged main commit. The tag must exactly match Cargo's version;
+   existing tags/releases are immutable, including a failed historical tag.
+3. The tag-push `ci.yml` run requires all five gates (`fmt`, `clippy`, `test`,
+   `build`, `ui`), main ancestry/version checks and full-gate eligibility.
+   It builds x86_64 Linux, aarch64 Linux and aarch64 macOS packages, then runs
+   native `release-install` checks on all three before publication.
+4. The operator approves the separate protected GitHub **`release`** environment
+   job. It verifies and attests the assets, then publishes the GitHub Release;
+   this is not the `production` approval for a main-SHA host candidate.
+5. Verify the published tag, source SHA, assets/checksums/attestations and release
+   classification. Stable releases become `latest`; prereleases do not. Never
+   move a published tag or replace published bytes: fix forward with a new
+   reviewed version. A draft left by a failed publish was never public and
+   may be retried only through the workflow's own guarded retry behavior.
+
+Source of enforced behavior: `.github/workflows/ci.yml`,
+`.github/workflows/staging.yml`, `src/upgrade.rs` and `src/update.rs`.
+This guide does not grant approval, override GitHub protections or change
+native authorization, release gates or production safety.
+
+## Historical first public release handoff (CAD-661)
+
+The records and detailed publication checks below retain their original scope;
+placeholder annexes are historical templates, not fresh release evidence.
 
 [Cadence 0.1.0-beta.2](https://github.com/favcrm/cadence/releases/tag/v0.1.0-beta.2)
 is published as a local CLI prerelease (`prerelease=true`, `latest=false`). Its
