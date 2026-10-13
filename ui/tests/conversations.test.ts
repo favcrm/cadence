@@ -68,7 +68,7 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   const method = init?.method ?? "GET";
   // The CRM package's own descriptor, served pinned to the install's digest.
   if (url.pathname === "/api/app-installations/install-crm/chat-descriptor") {
-    return json({ descriptor: JSON.parse(require("fs").readFileSync(require("path").join(process.cwd(), "..", "workspace-apps", "crm", "app-chat.json"), "utf8")), digest: "d", app: "crm" });
+    return json({ descriptor: JSON.parse(require("fs").readFileSync(require("path").join(process.cwd(), "..", "tests", "fixtures", "apps", "crm", "app-chat.json"), "utf8")), digest: "d", app: "crm" });
   }
   if (url.pathname === "/api/app-installations/install-social/chat-descriptor") {
     return json({ descriptor: { contract: "app-chat/v1", app: "social-content", contexts: [{ id: "main", label: "Social Content", prompts: ["Fetch posts"] }], attachments: [], directives: [], subjects: [] }, digest: "d", app: "social-content" });

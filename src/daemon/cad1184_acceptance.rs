@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::Arc;
 use std::time::Duration;
 
-const CRM_SOURCE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/workspace-apps/crm");
+const CRM_SOURCE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/apps/crm");
 const MASTER_GENERATION: &str = "0123456789abcdef0123456789abcdef";
 
 struct Fx {

@@ -25,7 +25,7 @@ mod aos_media_door;
 const HOSTED: &str = r#"{"schema":1,"providers":[{"provider":"agenticos_external","origin":"http://api.internal","manifest_pin":"agenticos-external-provider-tools@4","transport":"hosted-media-lease@1"}]}"#;
 const HANDLE: &str = "juicysuite_crm";
 const MASTER_GENERATION: &str = "0123456789abcdef0123456789abcdef";
-const CRM_SOURCE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/workspace-apps/crm");
+const CRM_SOURCE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/apps/crm");
 
 /// The three registered Social Content actions, exactly as the registry
 /// owns them (the descriptor may not change handler, effect or scope).
@@ -392,7 +392,10 @@ impl Fx {
     fn social_package(&self, name: &str, descriptor: &str) -> std::path::PathBuf {
         let app = self.dir.path().join(name);
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        copy_dir(&manifest_dir.join("workspace-apps/social-content"), &app);
+        copy_dir(
+            &manifest_dir.join("tests/fixtures/apps/social-content"),
+            &app,
+        );
         std::fs::copy(
             manifest_dir.join("tests/fixtures/apps/social-content-writer/app.md"),
             app.join("app.md"),

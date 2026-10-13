@@ -23,7 +23,7 @@ use crate::test_seam::{scoped, Asserted};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
-const CRM_SOURCE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/workspace-apps/crm");
+const CRM_SOURCE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/apps/crm");
 const MASTER_GENERATION: &str = "0123456789abcdef0123456789abcdef";
 
 struct Fx {

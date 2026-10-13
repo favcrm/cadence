@@ -42,11 +42,13 @@ const home = {
   ],
 };
 let favorites: unknown = { owner: "operator", is_default: false, favorites: [{ install_id: "inst-a", position: 0, opened_at: null }] };
+// Exact tombstone projection from `Shared::retired_catalog_row` in
+// `src/daemon/app_explorer_rpc.rs` (CAD-1422), wrapped as the HTTP catalog response.
 const catalog = {
   catalog: [
-    { id: "crm", source_kind: "builtin", name: "crm", title: "CRM", version: "0.1.0", digest: "sha256:" + "0".repeat(64), trust: "cadence",
-      featured: true, state: "available", request_count: 0,
-      listing: { tagline: "Draft one reviewed email brief", category: "customers" }, access: [], never: "" },
+    { id: "crm", source_kind: "builtin", retired: true,
+      retired_reason: "The built-in app catalog was retired (CAD-1422) — this app now lives in its own repository and the AgenticOS marketplace.",
+      name: "crm", title: "crm", trust: "cadence", featured: false, state: "available", request_count: 0 },
   ],
 };
 const writes: { path: string; body: unknown }[] = [];
@@ -123,11 +125,18 @@ async function main() {
       `clicking a catalog card opens /apps/catalog/crm; location is ${location.pathname}${location.hash}`,
     );
   });
-  // 4. The featured row shows for the daemon's `featured: true`.
-  await check("featured row", async () => {
+  // 4. Retired catalog discovery hands off to the verified AgenticOS marketplace.
+  await check("retired catalog marketplace handoff", async () => {
     await React.act(() => root.render(React.createElement(Explorer, { viewer: operator })));
     await flush();
-    assert(host.querySelector(".feat .fcard"), "the daemon's featured entry (featured: true) renders in the Featured row");
+    const handoff = host.querySelector("a[href='https://app-v2.agenticos.hk/apps']") as HTMLAnchorElement | null;
+    assert(handoff instanceof HTMLElement, "the exact AgenticOS Apps marketplace URL is linked");
+    assert(handoff.target === "_blank", `marketplace opens in a new tab; target is ${handoff.target}`);
+    assert(handoff.rel.split(/\s+/).includes("noopener") && handoff.rel.split(/\s+/).includes("noreferrer"),
+      `new-tab marketplace link is protected with noopener noreferrer; rel is ${handoff.rel}`);
+    assert(!host.querySelector(".feat, .fcard"), "the retired catalog has no featured row");
+    assert(!Array.from(host.querySelectorAll("button, a")).some((action) => action.textContent?.trim() === "Install"),
+      "a retired tombstone offers no Install action");
   });
   if (failures.length) throw new Error(failures.join("\n"));
 }

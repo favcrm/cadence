@@ -33,7 +33,7 @@ use std::time::Duration;
 #[path = "cad1415_runtime_fixture.rs"]
 mod runtime_fixture;
 
-const CRM_SOURCE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/workspace-apps/crm");
+const CRM_SOURCE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/apps/crm");
 const MASTER_GENERATION: &str = "0123456789abcdef0123456789abcdef";
 const CREATE: &str = "crm.customer.create";
 const UPDATE: &str = "crm.customer.update";

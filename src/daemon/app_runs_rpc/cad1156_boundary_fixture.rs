@@ -215,7 +215,7 @@ impl Fx {
 
     pub(super) fn install_social(&self, connection: &str) -> (String, String) {
         let source = format!(
-            "{}/workspace-apps/social-content",
+            "{}/tests/fixtures/apps/social-content",
             env!("CARGO_MANIFEST_DIR")
         );
         let installed = self.op("app_workspace_install", json!({"source": source}));

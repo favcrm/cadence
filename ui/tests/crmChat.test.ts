@@ -39,7 +39,7 @@ const { navigate } = require("../src/lib/useLocation") as typeof import("../src/
 const { matchDirective, hideIds } = require("../src/features/app-shell/chat/directive") as typeof import("../src/features/app-shell/chat/directive");
 const { parseAppChat } = require("../src/features/app-shell/chat/contract") as typeof import("../src/features/app-shell/chat/contract");
 // The descriptor under test is the package's own file, not a copy.
-const crmDescriptor = JSON.parse(require("fs").readFileSync(require("path").join(process.cwd(), "..", "workspace-apps", "crm", "app-chat.json"), "utf8"));
+const crmDescriptor = JSON.parse(require("fs").readFileSync(require("path").join(process.cwd(), "..", "tests", "fixtures", "apps", "crm", "app-chat.json"), "utf8"));
 const crmChat = parseAppChat(crmDescriptor);
 
 const SECRET = ["tok", "en-", "abcdef0123456789"].join("");

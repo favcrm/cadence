@@ -208,7 +208,10 @@ fn cad1405_native_remove_restore_retires_mount_authority() {
     let pm = root.path().join("pm");
     let fixture = root.path().join("app");
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    copy_dir(&manifest_dir.join("workspace-apps/social-content"), &fixture);
+    copy_dir(
+        &manifest_dir.join("tests/fixtures/apps/social-content"),
+        &fixture,
+    );
     copy_dir(
         &manifest_dir.join("tests/fixtures/apps/ig-tools-fixture/screens"),
         &fixture.join("screens"),

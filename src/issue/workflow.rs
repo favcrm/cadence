@@ -2109,7 +2109,8 @@ mod tests {
 
     #[test]
     fn cad742_manual_image_workflow_retains_prompt_guidance_for_both_steps() {
-        let text = include_str!("../../workspace-apps/social-content/workflows/image-manual.md");
+        let text =
+            include_str!("../../tests/fixtures/apps/social-content/workflows/image-manual.md");
         let template = parse_template(text).unwrap();
         assert_eq!(template.capability_slots, vec!["image"]);
         assert_eq!(template.required_asset_slot.as_deref(), Some("image"));

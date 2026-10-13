@@ -40,7 +40,7 @@ fn pid() -> u32 {
 }
 
 fn install(shared: &Arc<Shared>, app: &str) -> String {
-    let source = format!("{}/workspace-apps/{app}", env!("CARGO_MANIFEST_DIR"));
+    let source = format!("{}/tests/fixtures/apps/{app}", env!("CARGO_MANIFEST_DIR"));
     let out = scoped(Asserted::Operator, || {
         shared.dispatch("app_workspace_install", &json!({"source": source}), pid())
     })
@@ -1704,7 +1704,7 @@ fn install_refuses_a_package_with_an_invalid_chat_descriptor() {
         })
     };
     let root = tempfile::Builder::new().prefix("c1110").tempdir().unwrap();
-    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("workspace-apps/crm");
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/apps/crm");
     let good: Value =
         serde_json::from_str(&std::fs::read_to_string(source.join("app-chat.json")).unwrap())
             .unwrap();

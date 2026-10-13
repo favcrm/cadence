@@ -324,10 +324,15 @@ export function notifyAppsChanged(): void {
 }
 
 
-/** One catalog card (a built-in, or the operator's checked Git entry). */
+/** One catalog card. The built-in catalog is retired (CAD-1422): a
+ *  daemon row is a tombstone (`retired`, `retired_reason`) for a
+ *  catalog id a historical install or open request still names; the
+ *  only live card is the operator's checked Git entry. */
 export interface CatalogCard {
   id: string; source_kind: "builtin" | "git"; name: string; title: string;
-  version: string; tagline?: string; digest?: string; trust: "cadence" | "unreviewed";
+  version?: string; tagline?: string; digest?: string; trust: "cadence" | "unreviewed";
+  /** CAD-1422: the built-in source is retired — `retired_reason` says why. */
+  retired?: boolean; retired_reason?: string;
   state?: "available" | "installed" | "off" | "requested" | "removed";
   install_id?: string; removed?: boolean; restorable?: boolean; requested_by_me?: boolean; request_count?: number;
   update_available?: boolean; featured?: boolean;
@@ -412,13 +417,11 @@ export const appExplorer = {
   home: (signal?: AbortSignal) => request<{ installations: HomeInstallation[] }>("/api/app-home", signal),
   favorites: async (signal?: AbortSignal) => favoritesFromDaemon(await request<DaemonFavorites>("/api/app-favorites", signal)),
   requests: (signal?: AbortSignal) => request<{ requests: InstallRequest[] }>("/api/app-requests", signal),
-  /** CAD-1194: the read-only install proposal. `source` is a path, a Git
-   * URL or `builtin:<catalog id>`; the returned `digest` is the pin every
-   * install below must carry. */
+  /** CAD-1194: the read-only install proposal. `source` is a path or a
+   * Git URL (`builtin:<catalog id>` is the retired source form and is
+   * refused); the returned `digest` is the pin every install below must
+   * carry. */
   installCheck: (source: string) => request<InstallCheck>("/api/app-installations/check", undefined, { source }),
-  /** Install a built-in, pinned to the digest `installCheck("builtin:<id>")` returned. */
-  installEntry: (catalogId: string, expectedDigest: string) =>
-    request<Installation>("/api/app-catalog/install", undefined, { catalog_id: catalogId, expected_digest: expectedDigest }),
   /** Install a checked source (a Git URL) — the workspace install route,
    * pinned to the checked digest so changed bytes are refused. */
   installSource: (source: string, expectedDigest: string) =>

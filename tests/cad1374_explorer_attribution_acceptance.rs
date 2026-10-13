@@ -561,8 +561,29 @@ fn explorer_writes_are_session_attributed_and_receipts_share_the_state_transacti
     );
     assert!(sql_favorites(&fx, "operator").is_empty());
 
-    // Find an actual builtin entry, then exercise the existing member-only
-    // request capability and state transitions through the real HTTP routes.
+    // CAD-1422: the built-in catalog is retired, so an install request
+    // resolves against a tombstone — a catalog id a historical
+    // `Source::Builtin` install still names. Rewrite the synthetic
+    // install's record to builtin provenance, exactly as a pre-retire
+    // install stored it, then exercise the existing member-only request
+    // capability and state transitions through the real HTTP routes.
+    {
+        let record = fx
+            .root
+            .path()
+            .join("pm/.apps/installations")
+            .join(&install_id)
+            .join("record.yaml");
+        let mut value: Value =
+            serde_yaml::from_str(&std::fs::read_to_string(&record).unwrap()).unwrap();
+        assert_eq!(value["source"]["kind"].as_str(), Some("path"));
+        value["source"] = json!({
+            "kind": "builtin",
+            "id": "retired-cat-app",
+            "digest": installed["digest"].as_str().unwrap(),
+        });
+        std::fs::write(&record, serde_yaml::to_string(&value).unwrap()).unwrap();
+    }
     let (catalog_status, catalog_response) = fx.http("GET", "/api/app-catalog", Some(&member), "");
     assert_eq!(
         catalog_status, 200,
@@ -574,6 +595,12 @@ fn explorer_writes_are_session_attributed_and_receipts_share_the_state_transacti
         .as_str()
         .unwrap()
         .to_string();
+    assert_eq!(catalog_id, "retired-cat-app", "tombstone id: {catalog}");
+    assert_eq!(
+        catalog["catalog"][0]["retired"],
+        json!(true),
+        "the resolved entry is the retired tombstone: {catalog}"
+    );
     let (owner_request, _) = fx.http(
         "POST",
         "/api/app-catalog/request",

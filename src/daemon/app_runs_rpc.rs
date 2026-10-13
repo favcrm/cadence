@@ -1194,7 +1194,7 @@ mod cad742_tests {
     #[test]
     fn frozen_prompt_resolution_records_origin_and_ignores_later_context_edits() {
         let template = crate::issue::workflow::parse_template(include_str!(
-            "../../workspace-apps/social-content/workflows/image-manual.md"
+            "../../tests/fixtures/apps/social-content/workflows/image-manual.md"
         ))
         .unwrap();
         let saved = crate::store::app_contexts::ContextConfig::new(

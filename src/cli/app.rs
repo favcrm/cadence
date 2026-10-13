@@ -27,13 +27,14 @@ pub(crate) enum AppAction {
     /// checks `app catalog install-check` runs — entry grammar, per-file
     /// and aggregate caps, manifest, descriptors, workflow checks and
     /// `requires` against this build's contracts — with no daemon, no
-    /// store and no PM read or write. `<source>` is a local directory or
-    /// `builtin:<catalog id>`; a git/URL source is refused (a transport,
-    /// not bytes). Prints the JSON report; exit 0 on pass, 3 on refusal.
+    /// store and no PM read or write. `<source>` is a local directory; a
+    /// git/URL source is refused (a transport, not bytes) and the
+    /// `builtin:<catalog id>` form is retired (CAD-1422). Prints the JSON
+    /// report; exit 0 on pass, 3 on refusal.
     /// Catalog admission (duplicate installs, pending journals) is not
     /// reproduced — the report says so.
     Check {
-        /// Package directory or `builtin:<catalog id>`.
+        /// Package directory.
         source: String,
         /// The output is always the JSON report; `--json` makes the
         /// machine-readable contract explicit for scripts.
@@ -788,11 +789,19 @@ pub(crate) enum EffectAction {
         digest: String,
     },
 }
-/// The source the daemon installs from: URLs and `builtin:` sources pass
-/// through, a local path is made absolute because the daemon refuses relative
-/// ones. Shared by `install`, `install-check`, `upgrade-check`.
+/// The source the daemon installs from: URLs pass through, a local path
+/// is made absolute because the daemon refuses relative ones. A
+/// `builtin:` source is refused here — the built-in catalog is retired
+/// (CAD-1422); the daemon refuses it too, but the CLI names the retired
+/// form instead of passing it through. Shared by `install`,
+/// `install-check`, `upgrade-check`.
 fn install_source(source: &str) -> Result<String> {
-    if source.contains("://") || source.starts_with("git@") || source.starts_with("builtin:") {
+    if source.starts_with("builtin:") {
+        return Err(Error::rejected(
+            "builtin: sources are retired (CAD-1422) — install from the app's detached repository (a path or Git URL)",
+        ));
+    }
+    if source.contains("://") || source.starts_with("git@") {
         return Ok(source.to_string());
     }
     Ok(std::fs::canonicalize(source)
@@ -2041,12 +2050,12 @@ pub(super) fn run(state_dir: PathBuf, action: AppAction) -> Result<i32> {
     run_app(&state_dir, action)
 }
 
-/// CAD-1270 `cadence app check <dir|builtin:<id>>`: the offline bundle
-/// validator. Runs before org/state-dir resolution — it opens no state
-/// dir, daemon socket or PM; the only filesystem it reads is the named
-/// directory (or the embedded built-in). The JSON report prints to
-/// stdout; the exit code is the verdict (0 pass, 3 refusal — `rejected`
-/// in the kind table).
+/// CAD-1270 `cadence app check <dir>`: the offline bundle validator.
+/// Runs before org/state-dir resolution — it opens no state dir, daemon
+/// socket or PM; the only filesystem it reads is the named directory. A
+/// `builtin:` source gets the retired refusal (CAD-1422). The JSON
+/// report prints to stdout; the exit code is the verdict (0 pass, 3
+/// refusal — `rejected` in the kind table).
 pub(super) fn run_check(source: &str, _json: bool) -> Result<i32> {
     let report = cadence_agent::issue::app_catalog::workspace::check_offline(source)?;
     let ok = report["ok"].as_bool() == Some(true);

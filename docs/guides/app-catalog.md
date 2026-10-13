@@ -35,9 +35,10 @@ remain available for explicit operator decisions about local capabilities.
 
 ## Offline byte validation: `cadence app check`
 
-`cadence app check <dir|builtin:<catalog-id>>` validates package bytes with no
+`cadence app check <dir>` validates package bytes with no
 daemon, no store and no PM read or write — usable in an app repo's CI before
-anything talks to a host. It runs the same bundle snapshot and content
+anything talks to a host. The `builtin:<catalog-id>` source form is retired
+(CAD-1422) and refused at the source stage (`app_check_source`). It runs the same bundle snapshot and content
 validation `install-check` runs (entry grammar, per-file caps — 384 KiB for a
 screen JS/CSS asset and 256 KiB elsewhere — the 2 MiB aggregate, the manifest
 including `summary`, descriptor forbidden keys, workflow checks, the full
@@ -86,10 +87,16 @@ never unpinned: it calls `POST /api/app-installations/check` first, shows the
 name, version, digest, file list, notes and secret warnings, and then installs
 with the checked digest. The check route takes exactly `{"source"}` (a repeated
 or unknown key is refused), is operator-only like install, and relays
-`app_workspace_install_check`; it creates no catalog. A built-in is checked as
-source `builtin:<catalog id>` and installed through `POST /api/app-catalog/install`
-`{catalog_id, expected_digest}`, where the digest is required. A bundle that
+`app_workspace_install_check`; it creates no catalog. A bundle that
 changed after the check is refused and the review asks for a fresh check.
+
+CAD-1422: the host's embedded built-in catalog is retired — `POST
+/api/app-catalog/install` and `builtin:<id>` sources refuse, and catalog
+discovery/marketplace installs moved to the AgenticOS Apps page
+(`https://app-v2.agenticos.hk/apps`). `GET /api/app-catalog*` still
+answers for the catalog ids a historical `Source::Builtin` install or an
+open install request names — a tombstone row with the retired reason and
+the install's real state — and refuses anything else.
 
 Legacy rule: while no workspace catalog exists, any unmigrated legacy
 `<project>/apps/<name>` installation blocks every workspace install, not only
@@ -284,29 +291,34 @@ card and detail page offer Restore (never Install) while the window is open.
 
 In the board, `/apps` is the installed-app home. Its **Explore apps** button
 opens `/apps/explore`; attention rows offer **Review update**, **Finish setup**,
-or **Manage access** to the operator. From `/apps/explore`, operators can use
-**Install** on a catalog card or detail page, or **More ▾ → Add from Git URL…**
-for a custom bundle. Members can browse, but see **Ask an admin to install**;
-that sends an install request for the operator to review. These install controls
-are operator-only.
+or **Manage access** to the operator. `/apps/explore` hands discovery and
+marketplace installs to the AgenticOS Apps page (CAD-1422 — the built-in
+catalog is retired); the operator's **More ▾ → Add from Git URL…** remains for
+a custom bundle, checked and digest-pinned as before. Catalog ids a historical
+install or an open request still names show as retired tombstones with their
+real install state (Open / Restore), never an Install control. These install
+controls are operator-only.
 
 A verified operator in a writable session can check and apply updates for any
 installed app at `/apps/manage/<id>`. Enter a package source, choose **Check
 update**, review the proposed version, digest, changed files and compatibility
-notes, then choose **Apply checked update**. Built-in installs are prefilled
-with `builtin:<catalog_id>`, Git installs with their recorded Git URL, and path
-installs start empty so the operator can enter an absolute path or Git URL. The
+notes, then choose **Apply checked update**. Git installs are prefilled with
+their recorded Git URL, and other installs start empty so the operator can
+enter an absolute path or Git URL — a historical built-in install updates from
+its detached repository checkout. The
 Social Content **Settings → App package** panel remains available as well.
 
 The `cadence app catalog upgrade-check` and `cadence app catalog upgrade`
-commands accept absolute paths, Git URLs, and `builtin:<catalog_id>` sources.
+commands accept absolute paths and Git URLs; `builtin:<catalog_id>` is
+retired (CAD-1422) and refused.
 The existing board upgrade-check and upgrade routes use the same pins and
 refuse stale proposals. The remote CLI (`cadence --org …`) remains limited to
 status, agent/issue/message reads, and issue create/comment/set; it has no
 app-management verbs, so hosted operators use the Manage page for updates.
 
-Built-in apps and their catalog index are embedded in the Cadence binary. A new
-built-in app version therefore arrives with a new Cadence build. An Explorer
+The built-in catalog is retired (CAD-1422): the binary embeds no app bundles
+or catalog index, and canonical apps ship from their own repositories' release
+artifacts through the AgenticOS marketplace. An Explorer
 `update_available` flag is shown only to operators and means an update check for
 that installation found a different bundle digest and cached `has_update: true`;
 it is not a general notice that a build exists.
@@ -317,10 +329,10 @@ else is the operator's. Agents are refused on every one.
 
 | Route | Who | Purpose |
 | --- | --- | --- |
-| `GET /api/app-catalog`, `/api/app-catalog/<id>` | operator, member | Built-in catalog rows with install state (`available`, `installed`, `off`; a soft-removed app stays `available` with `removed: true`, its `install_id` and `restorable`). Members get no `digest`, `request_count` or `update_available`. |
-| `POST /api/app-catalog/install` | operator | Install a built-in: `{catalog_id, expected_digest}`; the digest is required. |
+| `GET /api/app-catalog`, `/api/app-catalog/<id>` | operator, member | Retired-catalog tombstones (CAD-1422) for the ids a historical `Source::Builtin` install or an open request still names, with the install's real state (`available`, `installed`, `off`; a soft-removed app stays `available` with `removed: true`, its `install_id` and `restorable`) and `retired`/`retired_reason`. Members get no `digest`, `request_count` or `update_available`. |
+| `POST /api/app-catalog/install` | operator | Retired (CAD-1422): always refused — the built-in catalog is gone. |
 | `POST /api/app-catalog/git-check` | operator | Check a public https Git repository: `{url, git_ref?, dir?}`. |
-| `POST /api/app-catalog/request` | member | Ask the operator to install a built-in. |
+| `POST /api/app-catalog/request` | member | Ask the operator to install; resolves only a catalog id a historical install or open request still names. |
 | `GET /api/app-home` | operator, member | One row per installation with its attention state. |
 | `GET/POST /api/app-favorites`, `/opened`, `/default` | operator, member (`default`: operator) | Pinned apps per person. |
 | `GET /api/app-requests`, `POST /api/app-requests/dismiss` | operator | Install requests. |

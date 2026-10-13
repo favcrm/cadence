@@ -4,29 +4,33 @@ import Button from "../../ui/Button";
 import { appExplorer, notifyAppsChanged, type CatalogCard } from "../workspace-apps/workspaceApps";
 import type { Viewer } from "../projects/work";
 import { AppGlyph, TrustChip } from "./shared";
-import InstallCheckPanel from "./InstallCheckPanel";
 import { appErrorCopy, appLoadErrorCopy } from "./appErrors";
 import { Loading, Notice } from "../app-shell/shared/States";
 import { useTranslate } from "../../lib/locale";
 import "./explorer.css";
 
+/** The marketplace hand-off the retired page points at (CAD-1422). */
+const MARKETPLACE_URL = "https://app-v2.agenticos.hk/apps";
+
 /**
- * One catalog app's detail (CAD-1129, `/apps/catalog/<id>`): the
- * OS-style page — hero, screenshots, "What it can do", "What it can
- * access" and the never-line. An installed app gets a Manage tab; a
- * member sees the same access sentences and "Ask an admin", never the
- * operator's internals.
+ * One catalog app's detail (CAD-1129, `/apps/catalog/<id>`). The
+ * built-in catalog is retired (CAD-1422): the daemon now answers a
+ * tombstone (`retired`, `retired_reason`) for the catalog ids a
+ * historical install or an open request still names, so this page shows
+ * the retired reason and the install's real state — Open or Restore —
+ * and hands fresh installs to the AgenticOS marketplace. It never shows
+ * the old store page or an Install action for a retired source.
  */
 export default function CatalogDetail({ id, viewer }: { id: string; viewer: Viewer }) {
   const t = useTranslate();
   const [card, setCard] = useState<CatalogCard | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [reviewing, setReviewing] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const isOp = viewer.operator === true && !viewer.readOnly;
   const installed = card?.state === "installed" || card?.state === "off";
   const removed = card?.removed === true;
+  const retired = card?.retired === true;
 
   useEffect(() => {
     if (viewer.operator === null) return;
@@ -38,17 +42,6 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
     return () => controller.abort();
   }, [id, viewer.operator]);
 
-  // The install starts with a check (CAD-1194); the panel installs the
-  // checked digest.
-  const install = () => { setNotice(null); setReviewing(true); };
-  const requestInstall = () => {
-    if (!card) return;
-    setBusy(true);
-    void appExplorer.requestInstall(card.id)
-      .then(() => { setCard({ ...card, requested_by_me: true, state: "requested" }); setNotice("Asked — your admin will see the request."); })
-      .catch((e: unknown) => setNotice(appErrorCopy(e, "Could not send the request. Try again in a moment.")))
-      .finally(() => setBusy(false));
-  };
   const restore = () => {
     if (!card?.install_id) return;
     setBusy(true); setNotice(null);
@@ -109,18 +102,14 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
         </div>
       </div>
 
-      {isOp && reviewing && !installed && !removed && (
-        <div className="mt-4">
-          <InstallCheckPanel
-            source={`builtin:${card.id}`}
-            label={card.title}
-            install={(digest) => appExplorer.installEntry(card.id, digest)}
-            onInstalled={() => { setReviewing(false); setNotice("Installed — it's in your apps now."); setCard({ ...card, state: "installed" }); notifyAppsChanged(); }}
-            onClose={() => setReviewing(false)}
-          />
+      {notice && <div className="alert info mt-4" role="status">{t(notice)}</div>}
+      {retired && (
+        <div className="alert warn mt-4" role="status">
+          {card.retired_reason
+            ? t(card.retired_reason)
+            : t("This built-in catalog app was retired — the host no longer ships it. The app now lives in its own repository and the AgenticOS marketplace.")}
         </div>
       )}
-      {notice && <div className="alert info mt-4" role="status">{t(notice)}</div>}
       {card.source_kind === "git" && (
         <div className="alert warn mt-4">{t("Added from a Git URL by your team. Cadence checked its file list but hasn't reviewed what it does.")}</div>
       )}
@@ -217,28 +206,33 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
             ) : (
               <span className="text-micro text-ink-500">{isOp ? "The restore window has closed." : "This app was removed. Ask an admin."}</span>
             )
+          ) : retired ? (
+            <>
+              <a className="btn btn-primary btn-lg" href={MARKETPLACE_URL} target="_blank" rel="noopener noreferrer">
+                {t("Find it in the AgenticOS marketplace")}
+              </a>
+              <span className="text-micro text-ink-500">
+                {isOp
+                  ? t("The built-in source is retired — install the current release from the marketplace or a trusted Git checkout.")
+                  : t("The built-in source is retired — ask an admin about the current release.")}
+              </span>
+            </>
           ) : card.requested_by_me || card.state === "requested" ? (
             <>
               <Button className="btn-lg" disabled>Asked</Button>
               <span className="text-micro text-ink-500">Your admin will see the request.</span>
             </>
-          ) : isOp ? (
-            <>
-              <Button className="btn-primary btn-lg" disabled={busy || reviewing} onClick={install}>Install</Button>
-              <p className="text-micro text-ink-500">
-                Installing lets {card.title} use what's listed under <b>What it can access</b>. You can turn its access off or remove it at any time.
-              </p>
-            </>
           ) : (
             <>
-              <Button className="btn-lg" disabled={busy} onClick={requestInstall}>{busy ? "Asking…" : "Ask an admin to install"}</Button>
-              <span className="text-micro text-ink-500">Only admins can install apps.</span>
+              <Button className="btn-lg" disabled>{t("Install unavailable")}</Button>
+              <span className="text-micro text-ink-500">{t("This catalog entry is retired — see the notice above.")}</span>
             </>
           )}
           <dl className="dl mt-3">
             <dt>Made by</dt><dd><TrustChip trust={card.trust} /></dd>
-            <dt>Version</dt><dd>{card.version}</dd>
-            <dt>Category</dt><dd>{card.listing?.category ?? "App"}</dd>
+            {card.version && <><dt>Version</dt><dd>{card.version}</dd></>}
+            {card.listing?.category && <><dt>Category</dt><dd>{card.listing.category}</dd></>}
+            {retired && <><dt>Source</dt><dd>{t("Retired built-in catalog")}</dd></>}
             {isOp && card.digest && <><dt>Digest</dt><dd className="num break-all">{card.digest}</dd></>}
           </dl>
         </aside>

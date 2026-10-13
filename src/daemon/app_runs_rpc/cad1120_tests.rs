@@ -81,7 +81,7 @@ impl Fx {
                 })
                 .unwrap();
         }
-        let source = format!("{}/workspace-apps/crm", env!("CARGO_MANIFEST_DIR"));
+        let source = format!("{}/tests/fixtures/apps/crm", env!("CARGO_MANIFEST_DIR"));
         let mut fx = Self {
             _dir: dir,
             shared,

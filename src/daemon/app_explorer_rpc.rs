@@ -71,73 +71,115 @@ fn installed_by_app(
 }
 
 impl Shared {
-    /// The catalog entry a builtin app.md declares, plus host-computed
-    /// fields: trust chip, access sentences, version, digest.
-    fn catalog_entry_row(
+    /// The retired host catalog (CAD-1422) ships no distributions:
+    /// discovery and marketplace installs live on the AgenticOS Apps
+    /// page, and a local install keeps working from Apps. Every entry
+    /// id that still resolves — a catalog id named by a live or
+    /// soft-removed `Source::Builtin` install's record, or by an open
+    /// install request — gets a tombstone row: the retired reason plus
+    /// the install's real state, so an old detail link explains why its
+    /// source is gone instead of refusing as unknown or faking an
+    /// up-to-date listing. Anything else is `unknown catalog entry`.
+    fn retired_catalog_row(
         &self,
-        entry: &crate::issue::app_catalog::builtin::Builtin,
-        manifest: &crate::issue::app::Manifest,
-        digest: &str,
+        id: &str,
         installed: Option<&Installed>,
         member: bool,
     ) -> Result<Value> {
-        let (holds_records, personal) = data_flags(manifest);
-        let access = app_access::access_rows(
-            manifest,
-            manifest
-                .listing
-                .as_ref()
-                .and_then(|l| l.value["access_notes"].as_object()),
-            holds_records,
-            personal,
-        );
         let mut row = json!({
-            "id": entry.id,
+            "id": id,
             "source_kind": "builtin",
-            "name": manifest.app,
-            "title": manifest.title,
-            "version": manifest.version,
-            "digest": digest,
+            "retired": true,
+            "retired_reason": "The built-in app catalog was retired (CAD-1422) — this app now lives in its own repository and the AgenticOS marketplace.",
+            "name": id,
+            "title": id,
             "trust": "cadence",
-            "featured": entry.featured,
-            "listing": manifest.listing.as_ref().map(|l| l.value.clone()),
-            "access": access["access"],
-            "never": access["never"],
+            "featured": false,
+            "state": "available",
         });
         if let Some(installed) = installed {
             row["install_id"] = json!(installed.install_id);
             if installed.removed {
-                // Not installed (`available`), but the card knows the
-                // soft-removed install so it offers Restore, never Install.
-                row["state"] = json!("available");
                 row["removed"] = json!(true);
                 row["restorable"] = json!(installed.restorable);
             } else {
                 row["state"] = json!("installed");
             }
-        } else {
-            row["state"] = json!("available");
         }
         if !member {
-            row["request_count"] = self
-                .store
-                .app_install_request_count(entry.id)
-                .unwrap_or(0)
-                .into();
+            row["request_count"] = self.store.app_install_request_count(id).unwrap_or(0).into();
         }
         Ok(row)
     }
 
-    /// `app_catalog_list` — one row per built-in, with install state.
-    /// `member` is the board's re-checked claim; the operator's own
-    /// reads pass `false` so counts stay.
+    /// Every catalog id the retired surface still resolves: the
+    /// `source.id` of each `Source::Builtin` workspace install, plus
+    /// the catalog ids open install requests name.
+    fn retired_catalog_ids(&self, pm: &crate::issue::Pm) -> Vec<String> {
+        let catalog = app_catalog::Catalog::load(&pm.dir).unwrap_or_default();
+        let mut ids = Vec::new();
+        for (id, entry) in catalog.entries() {
+            if entry.storage != app_catalog::Storage::Workspace {
+                continue;
+            }
+            let Ok(desc) = workspace::describe_id(pm, &catalog, id) else {
+                continue;
+            };
+            if desc["record"]["source"]["kind"].as_str() == Some("builtin") {
+                if let Some(cat_id) = desc["record"]["source"]["id"].as_str() {
+                    ids.push(cat_id.to_string());
+                }
+            }
+        }
+        for request in self.store.app_install_requests_open().unwrap_or_default() {
+            if let Some(cat_id) = request["catalog_id"].as_str() {
+                ids.push(cat_id.to_string());
+            }
+        }
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
+    /// The tombstone's install: the `Source::Builtin` install whose
+    /// record names this catalog id (the app name alone no longer
+    /// resolves — there is no embedded manifest to parse).
+    fn retired_install(
+        installed: &BTreeMap<String, Installed>,
+        pm: &crate::issue::Pm,
+        catalog: &app_catalog::Catalog,
+        id: &str,
+    ) -> Option<Installed> {
+        for (install_id, entry) in catalog.entries() {
+            if entry.storage != app_catalog::Storage::Workspace {
+                continue;
+            }
+            let Ok(desc) = workspace::describe_id(pm, catalog, install_id) else {
+                continue;
+            };
+            if desc["record"]["source"]["kind"].as_str() == Some("builtin")
+                && desc["record"]["source"]["id"].as_str() == Some(id)
+            {
+                return installed.get(&entry.app).map(|i| Installed {
+                    install_id: i.install_id.clone(),
+                    removed: i.removed,
+                    restorable: i.restorable,
+                });
+            }
+        }
+        None
+    }
+
+    /// `app_catalog_list` — the retired catalog's tombstones, with the
+    /// member/operator projection intact (members never see
+    /// `request_count` or update state).
     fn rpc_app_catalog_list(&self, member: bool, member_name: Option<&str>) -> Result<Value> {
         let pm_dir = self.pm_dir()?;
         let pm = self.pm_at(&pm_dir)?;
         let catalog = app_catalog::Catalog::load(&pm.dir).unwrap_or_default();
         let installed = installed_by_app(&pm, &catalog);
         let pending = self.store.app_updates_pending().unwrap_or_default();
-        let requested: Vec<String> = if member {
+        let member_requested: Vec<String> = if member {
             member_name
                 .map(|who| self.store.app_install_requests_of(who).unwrap_or_default())
                 .unwrap_or_default()
@@ -145,33 +187,15 @@ impl Shared {
             Vec::new()
         };
         let mut rows = Vec::new();
-        for entry in app_catalog::builtin::list()? {
-            let app_md = entry
-                .files
-                .get("app.md")
-                .ok_or_else(|| Error::internal("built-in bundle lacks app.md"))?;
-            let manifest = crate::issue::app::parse_manifest(app_md)?;
-            let files: BTreeMap<String, String> = entry.files.clone();
-            let digest = workspace::bundle_digest(&files);
-            let mut row = self.catalog_entry_row(
-                &entry,
-                &manifest,
-                &digest,
-                installed.get(&manifest.app),
-                member,
-            )?;
-            if member {
-                // Members never see the digest or a request count.
-                row.as_object_mut().unwrap().remove("digest");
-                row.as_object_mut().unwrap().remove("request_count");
-                if requested.iter().any(|r| r == entry.id) {
-                    row["requested_by_me"] = json!(true);
-                }
+        for id in self.retired_catalog_ids(&pm) {
+            let inst = Self::retired_install(&installed, &pm, &catalog, &id);
+            let mut row = self.retired_catalog_row(&id, inst.as_ref(), member)?;
+            if member && member_requested.contains(&id) {
+                row["requested_by_me"] = json!(true);
             }
-            // Members never see update state (the member projection).
             if !member
-                && installed
-                    .get(&manifest.app)
+                && inst
+                    .as_ref()
                     .is_some_and(|i| !i.removed && pending.contains(&i.install_id))
             {
                 row["update_available"] = json!(true);
@@ -181,55 +205,38 @@ impl Shared {
         Ok(json!({"catalog": rows}))
     }
 
-    /// `app_catalog_show` — one entry plus `about`, `can`,
-    /// `screenshots`, `setup`, `data` and its access sentences.
+    /// `app_catalog_show` — the retired entry's tombstone (CAD-1422):
+    /// the retired reason and its install state. The retired catalog
+    /// ships no bundles, so the listing payloads (`about`, `can`,
+    /// `screenshots`, `setup`, `data`) are absent, never invented. An
+    /// id nothing historical names is `unknown catalog entry`.
     fn rpc_app_catalog_show(
         &self,
         id: &str,
         member: bool,
         member_name: Option<&str>,
     ) -> Result<Value> {
-        let entry = crate::issue::app_catalog::builtin::get(id)?
-            .ok_or_else(|| Error::rejected("unknown catalog entry"))?;
-        let app_md = entry
-            .files
-            .get("app.md")
-            .ok_or_else(|| Error::internal("built-in bundle lacks app.md"))?;
-        let manifest = crate::issue::app::parse_manifest(app_md)?;
         let pm_dir = self.pm_dir()?;
         let pm = self.pm_at(&pm_dir)?;
         let catalog = app_catalog::Catalog::load(&pm.dir).unwrap_or_default();
+        if !self.retired_catalog_ids(&pm).iter().any(|i| i == id) {
+            return Err(Error::rejected("unknown catalog entry"));
+        }
         let installed = installed_by_app(&pm, &catalog);
-        let digest = workspace::bundle_digest(&entry.files);
-        let mut row = self.catalog_entry_row(
-            &entry,
-            &manifest,
-            &digest,
-            installed.get(&manifest.app),
-            member,
-        )?;
-        if member {
-            row.as_object_mut().unwrap().remove("digest");
-            row.as_object_mut().unwrap().remove("request_count");
-            if member_name
+        let inst = Self::retired_install(&installed, &pm, &catalog, id);
+        let mut row = self.retired_catalog_row(id, inst.as_ref(), member)?;
+        if member
+            && member_name
                 .map(|who| {
                     self.store
                         .app_install_requests_of(who)
                         .unwrap_or_default()
-                        .contains(&entry.id.to_string())
+                        .iter()
+                        .any(|r| r == id)
                 })
                 .unwrap_or(false)
-            {
-                row["requested_by_me"] = json!(true);
-            }
-        }
-        // The show-only fields: `listing`'s detail payload.
-        if let Some(listing) = &manifest.listing {
-            row["about"] = listing.value["about"].clone();
-            row["can"] = listing.value["can"].clone();
-            row["screenshots"] = listing.value["screenshots"].clone();
-            row["setup"] = listing.value["setup"].clone();
-            row["data"] = listing.value["data"].clone();
+        {
+            row["requested_by_me"] = json!(true);
         }
         Ok(row)
     }
@@ -711,8 +718,17 @@ impl Shared {
                     .as_deref()
                     .ok_or_else(|| Error::rejected("a request needs a named requester"))?;
                 let catalog_id = required_str(params, "catalog_id")?;
-                // The entry must exist in the built-in catalog.
-                if crate::issue::app_catalog::builtin::get(catalog_id)?.is_none() {
+                // CAD-1422: the built-in catalog is retired — a request
+                // resolves only against an id a historical install or an
+                // open request still names (a tombstone), never a fresh
+                // catalog lookup.
+                let pm_dir = self.pm_dir()?;
+                let pm = self.pm_at(&pm_dir)?;
+                if !self
+                    .retired_catalog_ids(&pm)
+                    .iter()
+                    .any(|i| i == catalog_id)
+                {
                     return Err(Error::rejected("unknown catalog entry"));
                 }
                 let human = self.explorer_human(params, Some(who))?;
@@ -731,9 +747,9 @@ impl Shared {
             "app_workspace_install_entry" => {
                 let catalog_id = required_str(params, "catalog_id")?;
                 let expected = required_str(params, "expected_digest")?;
-                if app_catalog::builtin::get(catalog_id)?.is_none() {
-                    return Err(Error::rejected("unknown catalog entry"));
-                }
+                // CAD-1422: `builtin::get` is the retired refusal —
+                // catalog install always refuses, before any effect.
+                app_catalog::builtin::get(catalog_id)?;
                 self.audited_workspace_effect(
                     params,
                     "app_workspace_installed",

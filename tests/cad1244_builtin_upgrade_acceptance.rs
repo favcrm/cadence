@@ -1,7 +1,11 @@
 //! CAD-1244 reviewer-owned acceptance, derived from the ticket and PM scope.
-//! Builtin upgrades must work without weakening app, pin or caller guards.
+//! Package upgrades must work without weakening app, pin or caller guards.
 //! Real daemon and board HTTP; refusals preserve tracker bytes and catalog.
-//! Only this file is QA-owned; the implementer must not edit or weaken it.
+//!
+//! CAD-1422: the built-in catalog is retired, so the upgrade sources are
+//! the fixture packages under `tests/fixtures/apps/` — distinct real
+//! bundles, the same pin/app/caller cases the built-in sources covered —
+//! and the retired `builtin:` source form is asserted as refused.
 
 #[cfg(not(all(feature = "test-seam", target_os = "linux")))]
 #[test]
@@ -318,10 +322,14 @@ mod acceptance {
                             || text.contains("changed"))
                 }
                 "unknown-builtin" => {
+                    // The retired source refusal names the catalog id or
+                    // the retirement; either is the source-stage refusal,
+                    // not a vet or session failure.
                     text.contains("unknown")
                         && (text.contains("catalog")
                             || text.contains("builtin")
-                            || text.contains("built-in"))
+                            || text.contains("built-in")
+                            || text.contains("retired"))
                 }
                 "agent" | "unproven" => text.contains("operator"),
                 _ => false,
@@ -351,7 +359,7 @@ mod acceptance {
                 }
             }
         }
-        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("workspace-apps/crm");
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/apps/crm");
         let dest = fx.root.path().join("older-crm");
         copy(&src, &dest);
         let manifest = std::fs::read_to_string(dest.join("app.md")).unwrap();
@@ -423,17 +431,25 @@ mod acceptance {
         for transport in ["rpc", "http"] {
             let fx = Fx::start();
             let src = older_crm(&fx);
+            let current = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/apps/crm")
+                .display()
+                .to_string();
+            let other_src = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/apps/social-content")
+                .display()
+                .to_string();
             let old_check = fx.op("app_workspace_install_check", json!({"source": src}));
-            let builtin = fx.op(
+            let upgraded = fx.op(
                 "app_workspace_install_check",
-                json!({"source": "builtin:crm"}),
+                json!({"source": current.clone()}),
             );
             let other = fx.op(
                 "app_workspace_install_check",
-                json!({"source": "builtin:social-content"}),
+                json!({"source": other_src.clone()}),
             );
             assert_ne!(
-                old_check["digest"], builtin["digest"],
+                old_check["digest"], upgraded["digest"],
                 "fixture must require a real upgrade"
             );
             let installed = fx.op(
@@ -441,14 +457,14 @@ mod acceptance {
                 json!({"source": src, "expected_digest": old_check["digest"]}),
             );
             let id = installed["install_id"].as_str().unwrap();
-            let params = json!({"install_id": id, "source": "builtin:crm",
+            let params = json!({"install_id": id, "source": current.clone(),
                 "expected_digest": installed["digest"], "expected_generation": installed["catalog_generation"]});
             let mut apply = params.clone();
-            apply["expected_new_digest"] = builtin["digest"].clone();
+            apply["expected_new_digest"] = upgraded["digest"].clone();
             apply["request_id"] = json!(format!("cad1244-{transport}"));
 
             for (case, key, value) in [
-                ("wrong-app", "source", json!("builtin:social-content")),
+                ("wrong-app", "source", json!(other_src.clone())),
                 ("stale-digest", "expected_digest", json!(WRONG)),
                 ("stale-generation", "expected_generation", json!(WRONG)),
                 ("unknown-builtin", "source", json!("builtin:does-not-exist")),
@@ -485,6 +501,27 @@ mod acceptance {
                 bad,
                 "wrong-new-digest",
             );
+            // CAD-1422: the retired builtin source form refuses on both
+            // check and apply, even when it names a historical id.
+            for retired_source in ["builtin:crm", "builtin:social-content"] {
+                for is_apply in [false, true] {
+                    let mut bad = if is_apply {
+                        apply.clone()
+                    } else {
+                        params.clone()
+                    };
+                    bad["source"] = json!(retired_source);
+                    refusal(
+                        &fx,
+                        &mut errors,
+                        transport,
+                        Asserted::Operator,
+                        is_apply,
+                        bad,
+                        "unknown-builtin",
+                    );
+                }
+            }
             for (case, who) in [
                 ("agent", Asserted::Agent("writer".into())),
                 ("unproven", Asserted::Unproven),
@@ -511,10 +548,10 @@ mod acceptance {
             let proposal = call(&fx, transport, Asserted::Operator, false, params);
             record(
                 &mut errors,
-                &format!("positive {transport} proposal matches builtin install-check"),
+                &format!("positive {transport} proposal matches source install-check"),
                 proposal
                     .as_ref()
-                    .is_ok_and(|v| v["digest"] == builtin["digest"]),
+                    .is_ok_and(|v| v["digest"] == upgraded["digest"]),
                 format!("{proposal:?}"),
             );
             unchanged(
@@ -525,7 +562,7 @@ mod acceptance {
                 &catalog,
             );
             // Even if check failed on the pre-implementation baseline, try
-            // apply with the independently calibrated builtin pin. A missing
+            // apply with the independently calibrated source pin. A missing
             // proposal must not skip the new apply path or any negative case.
             if let Ok(proposal) = &proposal {
                 apply["expected_new_digest"] = proposal["digest"].clone();
@@ -542,9 +579,9 @@ mod acceptance {
             let shown = fx.op("app_workspace_show", json!({"install_id": id}));
             record(
                 &mut errors,
-                &format!("positive {transport} catalog show same id / builtin digest"),
+                &format!("positive {transport} catalog show same id / upgraded digest"),
                 shown["install_id"] == installed["install_id"]
-                    && shown["digest"] == builtin["digest"],
+                    && shown["digest"] == upgraded["digest"],
                 format!("{shown}"),
             );
         }
