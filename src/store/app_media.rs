@@ -34,7 +34,7 @@ use serde_json::{json, Value};
 use super::{Store, StoreConn, WriteTxn};
 use crate::error::{Error, Result};
 
-/// The schema (v41): one row per cataloged workspace media asset,
+/// The schema (v45): one row per cataloged workspace media asset,
 /// plus the accepted publish intents — one ACCEPTED request id, its
 /// frozen `(asset_id, expected_revision)` terms and the exact accepted
 /// result JSON. Metadata only — no locator, byte, secret or prompt

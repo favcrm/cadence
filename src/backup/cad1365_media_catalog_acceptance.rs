@@ -5,7 +5,7 @@
 //! catalog source. Do not weaken it.
 //!
 //! One test, real product entrypoint: `export_portable` runs the real
-//! `check_catalog` guard on a private snapshot of a real current (v41)
+//! `check_catalog` guard on a private snapshot of a real current (v45)
 //! store. Positive control: the untouched store exports. Bad case: the
 //! same store with one extra column on `app_media_assets` must refuse
 //! with the exact catalog error, write no output directory and leave the
@@ -66,7 +66,7 @@ fn make_tracker(root: &Path) -> PathBuf {
     tracker
 }
 
-/// A real current-schema store (v41) under `root/state`.
+/// A real current-schema store (v45) under `root/state`.
 fn make_state(root: &Path) -> PathBuf {
     let state = root.join("state");
     fs::create_dir_all(&state).unwrap();
@@ -92,11 +92,11 @@ fn cad1365_catalog_admits_known_media_tables_and_refuses_unknown_media_column() 
     let tracker = make_tracker(&root);
     let state = make_state(&root);
 
-    // Positive control: the real v41 store with the three known media
+    // Positive control: the real v45 store with the three known media
     // tables exports through the closed catalog.
     let good = root.join("package-good");
     export_portable(&state, &good, &opts(&tracker))
-        .expect("known v41 media schema must pass the closed catalog");
+        .expect("known v45 media schema must pass the closed catalog");
     assert!(good.is_dir(), "positive control publishes the package");
 
     // Bad case: one unknown column on a known media table refuses.
