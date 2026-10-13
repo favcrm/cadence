@@ -1709,8 +1709,9 @@ pub fn login_browser(
 }
 
 /// The capabilities one login requests. `cli` is the default pair;
-/// `wiki` (CAD-1401, `cadence login --wiki`) adds `wiki.read` and
-/// `wiki.write` to it. The issuer's grant must equal this set exactly.
+/// `wiki` (the default portal login) adds `wiki.read` and `wiki.write` to it.
+/// The org-flag browser login stays CLI-only. The issuer's grant must equal
+/// the requested set, narrowed only by the issuer's own ceiling.
 #[derive(Clone, Copy)]
 enum LoginScope {
     Cli,
@@ -1730,15 +1731,9 @@ pub fn login_portal(
     issuer: &str,
     hint: Option<&str>,
     dir: &Path,
-    wiki: bool,
     show_code: impl FnOnce(&str, &str) -> Result<()>,
 ) -> Result<LoginGrant> {
     let issuer = origin(issuer, cfg!(test))?;
-    let scope = if wiki {
-        LoginScope::CliAndWiki
-    } else {
-        LoginScope::Cli
-    };
     login_device_flow(
         &issuer,
         None,
@@ -1746,7 +1741,7 @@ pub fn login_portal(
         dir,
         show_code,
         &mut RealLoginRuntime,
-        scope,
+        LoginScope::CliAndWiki,
     )
 }
 
@@ -3843,7 +3838,7 @@ mod tests {
     #[test]
     fn hosted_portal_accepts_a_narrowed_wiki_consent_and_refuses_escalation() {
         // CAD-1401 blocker 2: an issuer may grant a subset of the requested
-        // scopes (the CLI pair plus wiki.read for a `--wiki` login). The
+        // scopes (the CLI pair plus wiki.read for a portal login). The
         // grant must keep both CLI scopes, may only name requested scopes,
         // and never repeats one.
         let root = tempfile::tempdir().unwrap();
