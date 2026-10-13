@@ -9,6 +9,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
+use super::human_threads;
 use super::setup::{board_boot_agent_uid, setup_get, setup_refusal, WRITE_LOCK};
 use super::stream::stream_events;
 use super::write_path::{
@@ -1025,6 +1026,24 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             let resp = assist_route::post(&mut request, &method, tail, state_dir, pm_dir, opts);
             send(request, resp);
             return;
+        }
+        // CAD-1412: the human-rooms family owns its own guards. It runs
+        // before the generic write route so POST/DELETE reach its CSRF
+        // header check and member-role rules, and it does not widen the
+        // generic write gate for any other path.
+        if let Some(rest) = path.strip_prefix("/api/human-threads") {
+            if rest.is_empty() || rest.starts_with('/') {
+                let resp = human_threads::dispatch(
+                    &mut request,
+                    &method,
+                    &path,
+                    raw_query,
+                    state_dir,
+                    opts,
+                );
+                send(request, resp);
+                return;
+            }
         }
         if is_write {
             let send_write = |req: Request, resp: HttpResp| {

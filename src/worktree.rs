@@ -290,6 +290,8 @@ exit $rc
 /// pre-push` (0755) under the worktree's OWN git dir, enable
 /// `extensions.worktreeConfig` on the shared config once, then point
 /// this worktree's `config.worktree` `core.hooksPath` at that dir.
+/// Also sets this worktree's `core.editor` to `true` so commits in the lane
+/// never open an interactive editor; an explicit `GIT_EDITOR` still overrides.
 /// Idempotent — a re-start re-heals; an identical hook is left alone.
 /// Fail-closed: `issue start` treats a failed install as a failed lane
 /// (same rollback as `configure_cargo_target`), because a lane that
@@ -333,6 +335,9 @@ pub fn install_pre_push_hook(wt_dir: &Path) -> Result<PathBuf> {
             &hooks.to_string_lossy(),
         ],
     )?;
+    // Lane-local noninteractive commit messages: a sentinel or interactive
+    // editor must not block `git commit`. An explicit GIT_EDITOR still wins.
+    git(wt_dir, &["config", "--worktree", "core.editor", "true"])?;
     install_cargo_shim(wt_dir)?;
     Ok(script)
 }

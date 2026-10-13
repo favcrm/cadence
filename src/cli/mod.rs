@@ -78,6 +78,7 @@ mod test_cmd;
 #[cfg(test)]
 mod tests;
 mod thread;
+mod topic;
 mod ui;
 mod update;
 mod update_args;
@@ -156,6 +157,7 @@ use std::process::Command;
 use std::time::Duration;
 use std::time::Instant;
 use thread::ThreadAction;
+use topic::TopicAction;
 use update::UpdateAction;
 #[cfg(test)]
 use update_args::{daemon_build_or_absent, fd_is_path};

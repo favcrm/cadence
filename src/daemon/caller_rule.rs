@@ -987,6 +987,60 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         ),
     ),
     ("board_session_check", Rule::Bearer),
+    // CAD-1412: the human-actor proof. The connection is the operator's
+    // own (`operator_connection` refuses agents); the token is the
+    // cookie-only credential, and the handler reads no identity field.
+    (
+        "human_actor_check",
+        Rule::Handler("operator_connection + public session token (CAD-1412)"),
+    ),
+    // CAD-1412: every human room method names the verified human through
+    // the same gate (operator connection + stored verified scope) and the
+    // store's room ACL. None grants operator, approval or agent power.
+    (
+        "human_roster_scope",
+        Rule::Handler("operator_connection + verified human session (CAD-1412)"),
+    ),
+    (
+        "human_rooms_list",
+        Rule::Handler("operator_connection + verified human session (CAD-1412)"),
+    ),
+    (
+        "human_dm_open",
+        Rule::Handler("operator_connection + verified human session (CAD-1412)"),
+    ),
+    (
+        "human_group_create",
+        Rule::Handler("operator_connection + verified human session (CAD-1412)"),
+    ),
+    (
+        "human_room_read",
+        Rule::Handler("operator_connection + verified human session (CAD-1412)"),
+    ),
+    (
+        "human_room_post",
+        Rule::Handler("operator_connection + verified human session (CAD-1412)"),
+    ),
+    (
+        "human_room_mark_read",
+        Rule::Handler("operator_connection + verified human session (CAD-1412)"),
+    ),
+    (
+        "human_room_add",
+        Rule::Handler("operator_connection + verified human session (CAD-1412)"),
+    ),
+    (
+        "human_room_remove",
+        Rule::Handler("operator_connection + verified human session (CAD-1412)"),
+    ),
+    (
+        "human_agents_list",
+        Rule::Handler("operator_connection + verified human session (CAD-1412)"),
+    ),
+    (
+        "human_room_ask",
+        Rule::Handler("operator_chat + verified human operator session (CAD-1412)"),
+    ),
     // CAD-1129: a member's public session the board opens for
     // `member_as` re-proof. The board relays it over its own operator
     // connection, so it is gated by `operator_connection` — a bearer

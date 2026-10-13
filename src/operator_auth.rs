@@ -522,6 +522,18 @@ pub(crate) struct PublicSnapshot {
     pub revoked: bool,
 }
 
+/// The verified platform tenancy a public session was opened under
+/// (CAD-1412): the assertion's `iss` and `company`, which the daemon
+/// checked against the configured board identity before this value
+/// existed. Absent on every legacy or non-public session, so a session
+/// without it can never authorize a human-threads actor.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HumanScope {
+    pub issuer: String,
+    pub organization_id: String,
+}
+
 /// One stored session: the token's hash and what `ui sessions` shows.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Row {
@@ -558,6 +570,10 @@ struct Row {
     /// who was refused, but no authority lookup returns it.
     #[serde(default)]
     revoked: bool,
+    /// The verified issuer and organization a public session was opened
+    /// under (CAD-1412). Legacy rows deserialize to `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scope: Option<HumanScope>,
 }
 
 impl Row {
@@ -581,6 +597,7 @@ impl Row {
             expires_at: self.expires_at,
             user_agent: self.user_agent.clone(),
             user: self.user.clone(),
+            scope: self.scope.clone(),
         }
     }
 }
@@ -622,6 +639,9 @@ pub struct SessionView {
     pub user_agent: String,
     /// The platform-asserted user a `public` session names (CAD-526).
     pub user: Option<BoardUser>,
+    /// The verified tenancy of a scoped public session (CAD-1412).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<HumanScope>,
 }
 
 /// A freshly opened session: the token goes to the board once, for its
@@ -809,6 +829,7 @@ impl Auth {
             user: None,
             realm: None,
             revoked: false,
+            scope: None,
         };
         let session = row.view();
         self.sessions.push(row);
@@ -868,6 +889,7 @@ impl Auth {
             user: Some(user),
             realm: None,
             revoked: false,
+            scope: None,
         };
         let session = row.view();
         self.sessions.push(row);
@@ -890,12 +912,42 @@ impl Auth {
         user_agent: &str,
         now: i64,
     ) -> Result<Option<Opened>> {
-        self.open_public_row(user, (jti, jti_exp), user_agent, None, now, |_| Ok(()))
+        self.open_public_row(user, (jti, jti_exp), user_agent, (None, None), now, |_| {
+            Ok(())
+        })
+    }
+
+    /// [`Auth::open_public`] for a verified assertion, persisting the
+    /// verified `scope` with the row (CAD-1412). Call only after the
+    /// daemon has verified the assertion against the configured board
+    /// identity; `scope` is never read from request params. The row
+    /// carries no realm: a caller without a verified [`PublicRealm`]
+    /// gets no fabricated one — a bound open derives its scope from the
+    /// realm instead (CAD-1374).
+    pub fn open_public_scoped(
+        &mut self,
+        user: BoardUser,
+        scope: HumanScope,
+        jti: &str,
+        jti_exp: i64,
+        user_agent: &str,
+        now: i64,
+    ) -> Result<Option<Opened>> {
+        self.open_public_row(
+            user,
+            (jti, jti_exp),
+            user_agent,
+            (None, Some(scope)),
+            now,
+            |_| Ok(()),
+        )
     }
 
     /// CAD-1374: `open_public` that also saves the platform realm the
     /// assertion was verified under. The daemon passes the same config it
-    /// checked the assertion against.
+    /// checked the assertion against. The row's `scope` (CAD-1412) is
+    /// derived from that typed realm — verified issuer and company,
+    /// never a request field.
     pub fn open_public_bound(
         &mut self,
         user: BoardUser,
@@ -905,15 +957,21 @@ impl Auth {
         realm: PublicRealm,
         now: i64,
     ) -> Result<Option<Opened>> {
-        self.open_public_row(user, (jti, jti_exp), user_agent, Some(realm), now, |_| {
-            Ok(())
-        })
+        self.open_public_row(
+            user,
+            (jti, jti_exp),
+            user_agent,
+            (Some(realm), None),
+            now,
+            |_| Ok(()),
+        )
     }
 
     /// CAD-1374: `open_public_bound` with a durable intent callback. The
     /// callback sees only the candidate row's safe view and runs BEFORE any
     /// `Auth` mutation (prune, JTI spend, session replacement, persist). If it
-    /// fails, no session is created and no JTI is spent.
+    /// fails, no session is created and no JTI is spent. The verified
+    /// [`HumanScope`] is derived from the same typed realm.
     pub(crate) fn open_public_bound_with_intent(
         &mut self,
         user: BoardUser,
@@ -923,7 +981,13 @@ impl Auth {
         now: i64,
         intent: impl FnOnce(&AuditTarget) -> Result<()>,
     ) -> Result<Option<Opened>> {
-        self.open_public_row(user, jti, user_agent, Some(realm), now, intent)
+        // Scope derives from the realm `verify` matched against this
+        // board's config — issuer and company, never request params.
+        let scope = HumanScope {
+            issuer: realm.issuer.clone(),
+            organization_id: realm.company.clone(),
+        };
+        self.open_public_row(user, jti, user_agent, (Some(realm), Some(scope)), now, intent)
     }
 
     fn open_public_row(
@@ -931,7 +995,7 @@ impl Auth {
         user: BoardUser,
         (jti, jti_exp): (&str, i64),
         user_agent: &str,
-        realm: Option<PublicRealm>,
+        (realm, scope): (Option<PublicRealm>, Option<HumanScope>),
         now: i64,
         intent: impl FnOnce(&AuditTarget) -> Result<()>,
     ) -> Result<Option<Opened>> {
@@ -959,6 +1023,7 @@ impl Auth {
             user: Some(user),
             realm,
             revoked: false,
+            scope,
         };
         let session = row.view();
         intent(&row.audit_target())?;
@@ -976,6 +1041,37 @@ impl Auth {
             key: String::new(),
             session,
         }))
+    }
+
+    /// The verified human scope of the live public session `token` names
+    /// (CAD-1412), and its named user. `None` for a missing, expired, legacy
+    /// unscoped or non-public session: the human-threads proof fails
+    /// closed on `None`. Cookie-only, like [`Auth::check_public`].
+    pub(crate) fn verified_human_scope(
+        &mut self,
+        token: &str,
+        now: i64,
+    ) -> Result<Option<(HumanScope, BoardUser)>> {
+        if self.prune(now) {
+            self.persist()?;
+        }
+        if !well_formed(token) {
+            return Ok(None);
+        }
+        let hash = digest(token);
+        Ok(self
+            .sessions
+            .iter()
+            .find(|r| {
+                r.origin == Origin::Public
+                    && !r.revoked
+                    && same_credential(&r.hash, &hash)
+                    && r.live(now)
+            })
+            .and_then(|r| match (&r.scope, &r.user) {
+                (Some(scope), Some(user)) => Some((scope.clone(), user.clone())),
+                _ => None,
+            }))
     }
 
     /// The live public session `token` names, touching its idle clock.
@@ -1339,6 +1435,7 @@ mod tests {
             user: None,
             realm: None,
             revoked: false,
+            scope: None,
         };
         let orig = mk(&"1".repeat(56));
         let collider = mk(&"2".repeat(56));

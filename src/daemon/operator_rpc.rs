@@ -630,6 +630,9 @@ impl Shared {
         // realm before any session opens; a standalone one saves the realm
         // it verified under. Captured mode is never re-read here.
         self.require_realm_matches_mode(&realm)?;
+        // CAD-1412: the bound open also persists the verified `HumanScope`
+        // (issuer + company), derived from this typed realm inside
+        // `open_public_bound_with_intent` — never a request field.
         let request = uuid::Uuid::new_v4().to_string();
         let company = config.company.clone();
         let mut audit = None;
@@ -700,6 +703,59 @@ impl Shared {
                 }))
             }
         }
+    }
+
+    /// `human_actor_check {token}` (CAD-1412) — the board's relay asks
+    /// which verified human a public session names, for human-threads
+    /// identity. It answers the derived principal id and display name only.
+    /// It grants no operator, approval or room authority, and it runs
+    /// only on the operator's own connection (agent callers refused by
+    /// `operator_connection`). Missing, expired, legacy-unscoped or
+    /// non-public sessions fail closed.
+    pub(super) fn rpc_human_actor_check(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        let token = required_str(params, "token")?;
+        let (_, _, actor) = self.verified_human_session(token, params, peer_pid)?;
+        Ok(json!({"human": {"id": actor.id, "name": actor.name}}))
+    }
+
+    /// Native, narrow: the [`crate::store::human_threads::VerifiedHuman`] a
+    /// live public session names (CAD-1412). The operator's own connection
+    /// is required (`operator_connection` refuses agent and identity-field
+    /// callers), so a registered agent can never resolve a human. Only a
+    /// session stored with a verified `issuer`/`organization_id` scope
+    /// yields an actor; the principal is the verified issuer, org and exact
+    /// `sub`, never the handle or email.
+    pub(crate) fn verified_human_session(
+        &self,
+        token: &str,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<(
+        auth::HumanScope,
+        String,
+        crate::store::human_threads::VerifiedHuman,
+    )> {
+        self.operator_connection("human actor check", params, peer_pid)?;
+        let now = self.operator_now();
+        let found = self.operator_auth().verified_human_scope(token, now)?;
+        let (scope, user) = found.ok_or_else(|| {
+            Error::invalid(
+                "human_session_required",
+                "no live verified human session: sign in again",
+            )
+        })?;
+        let name = if user.name.is_empty() {
+            user.sub.clone()
+        } else {
+            user.name.clone()
+        };
+        let actor = crate::store::human_threads::VerifiedHuman::with_name(
+            &scope.issuer,
+            &scope.organization_id,
+            &user.sub,
+            &name,
+        )?;
+        Ok((scope, user.sub, actor))
     }
 
     /// `board_session_check {token}` — the board, on every public-host

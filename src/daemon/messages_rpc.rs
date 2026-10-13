@@ -75,7 +75,7 @@ impl Shared {
         sender_of: &dyn Fn(&str) -> Result<store::Sender>,
         steer_caller: &dyn Fn(&str) -> Result<AgentCaller>,
     ) -> Result<Value> {
-        self.send_with_human(params, sender_of, steer_caller, None)
+        self.send_with_human_expected(params, sender_of, steer_caller, None, None)
     }
 
     /// [`Self::send_with`] carrying the verified human behind an owner
@@ -88,6 +88,35 @@ impl Shared {
         sender_of: &dyn Fn(&str) -> Result<store::Sender>,
         steer_caller: &dyn Fn(&str) -> Result<AgentCaller>,
         human: Option<&Value>,
+    ) -> Result<Value> {
+        self.send_with_human_expected(params, sender_of, steer_caller, human, None)
+    }
+
+    /// CAD-1412: `send_with` with an optional expected recipient uid. The
+    /// same guards run for every caller (confinement, PTY, control
+    /// characters, delivery, steering); the uid is checked only by the
+    /// enqueue transaction. `None` is the ordinary path, unchanged.
+    pub(super) fn send_with_expected(
+        self: &Arc<Self>,
+        params: &Value,
+        sender_of: &dyn Fn(&str) -> Result<store::Sender>,
+        steer_caller: &dyn Fn(&str) -> Result<AgentCaller>,
+        expected_uid: Option<&str>,
+    ) -> Result<Value> {
+        self.send_with_human_expected(params, sender_of, steer_caller, None, expected_uid)
+    }
+
+    /// The one send body (CAD-1374 + CAD-1412): the optional verified
+    /// human (typed, daemon-derived) and the optional expected recipient
+    /// uid are independent derivations — neither is a request field, and
+    /// the recipient uid is never treated as the human performer.
+    fn send_with_human_expected(
+        self: &Arc<Self>,
+        params: &Value,
+        sender_of: &dyn Fn(&str) -> Result<store::Sender>,
+        steer_caller: &dyn Fn(&str) -> Result<AgentCaller>,
+        human: Option<&Value>,
+        expected_uid: Option<&str>,
     ) -> Result<Value> {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
         let text = required_str(params, "text")?;
@@ -446,8 +475,9 @@ impl Shared {
                 "turn_id": stored.turn_id, "delivery": "native_turn_steering", "disposition": stored.result}),
             );
         }
-        let (duplicate, state) = self.store.enqueue_steered_with_human(
+        let (duplicate, state) = self.store.enqueue_steered_with_human_for(
             &alias,
+            expected_uid,
             text,
             reply_to.as_deref(),
             &message,

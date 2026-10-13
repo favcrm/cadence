@@ -933,7 +933,7 @@ pub(super) fn request_origin_kind(request: &Request, opts: &ServeOpts) -> Option
 /// native `check`/`check_public`, so the *daemon* proves the session and
 /// binds the frame capability to the resolved id. Never logged, never
 /// sent to the frame. `None` when the request carries no such cookie.
-pub(super) fn session_token_for(
+pub(crate) fn session_token_for(
     request: &Request,
     opts: &ServeOpts,
     origin: Origin,

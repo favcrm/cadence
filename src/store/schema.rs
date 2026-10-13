@@ -1197,6 +1197,14 @@ impl Store {
                 tx.execute("UPDATE schema_version SET version=43", [])?;
                 tx.commit()?;
             }
+            if version < 44 {
+                // CAD-1412: human principals, rooms, membership and read
+                // markers. New objects only, `IF NOT EXISTS`, one transaction.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(super::human_threads::SCHEMA_V44)?;
+                tx.execute("UPDATE schema_version SET version=44", [])?;
+                tx.commit()?;
+            }
             if let Some(crossing) = permit.crossing {
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 Self::event(

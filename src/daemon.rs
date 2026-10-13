@@ -84,6 +84,8 @@ mod installer_client;
 mod installer_enrollment_wire;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) use installer_enrollment_wire::InstallerRecord as InstallerProcessRecord;
+mod human_current;
+mod human_threads_rpc;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) mod installer_enrolled;
 mod jobs_rpc;
@@ -2859,6 +2861,18 @@ impl Shared {
             "operator_session_check" => self.rpc_operator_session_check(params),
             "board_session_open" => self.rpc_board_session_open(params, peer_pid),
             "board_session_check" => self.rpc_board_session_check(params),
+            "human_actor_check" => self.rpc_human_actor_check(params, peer_pid),
+            "human_roster_scope" => self.rpc_human_roster_scope(params, peer_pid),
+            "human_rooms_list" => self.rpc_human_rooms_list(params, peer_pid),
+            "human_dm_open" => self.rpc_human_dm_open(params, peer_pid),
+            "human_group_create" => self.rpc_human_group_create(params, peer_pid),
+            "human_room_read" => self.rpc_human_room_read(params, peer_pid),
+            "human_room_post" => self.rpc_human_room_post(params, peer_pid),
+            "human_room_mark_read" => self.rpc_human_room_mark_read(params, peer_pid),
+            "human_room_add" => self.rpc_human_room_add(params, peer_pid),
+            "human_room_remove" => self.rpc_human_room_remove(params, peer_pid),
+            "human_agents_list" => self.rpc_human_agents_list(params, peer_pid),
+            "human_room_ask" => self.rpc_human_room_ask(params, peer_pid),
             "board_session_member" => self.rpc_board_session_member(params, peer_pid),
             "operator_session_logout" => self.rpc_operator_session_logout(params, peer_pid),
             "operator_session_stolen" => self.rpc_operator_session_stolen(params, peer_pid),
