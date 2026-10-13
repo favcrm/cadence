@@ -211,11 +211,26 @@ impl Fx {
             _stop: stop,
             _dir: dir,
         };
-        // Social Content with the tools screen fixture — same package
-        // recipe the hosted-source host tests install.
+        // Generic synthetic consumer package: the smallest bundle the
+        // install validator accepts — one declared read capability slot
+        // (`source`), one workflow file, and the generic tools-screen stub.
         let app = fx._dir.path().join("app");
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        copy_dir(&manifest_dir.join("workspace-apps/social-content"), &app);
+        std::fs::create_dir_all(app.join("workflows")).unwrap();
+        std::fs::write(
+            app.join("app.md"),
+            "---\napp: social-content\ntitle: Synthetic host consumer\nversion: '0.1.0'\nneeds:\n  connections: []\n  capabilities:\n    source:\n      schema: 1\n      capability: social.read\n      version: 1\n      action: list_posts\n      resource_kind: connection_account\n      effect: read\n---\nSynthetic host-contract fixture; no app behaviour.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("workflows/source.md"),
+            "---\ntitle: \"Synthetic source read\"\ngoal: \"Exercise the host capability path\"\n\
+             label: Source read\ncapability_slots: [source]\nexecution: host\n---\n\n\
+             ## Source read\nsize: S\naction: local.capability.call\n\n\
+             Host-only synthetic step; no worker and no provider.\n\n\
+             ### Acceptance\n- [ ] The synthetic host path is exercised.\n",
+        )
+        .unwrap();
         copy_dir(
             &manifest_dir.join("tests/fixtures/apps/ig-tools-fixture/screens"),
             &app.join("screens"),
