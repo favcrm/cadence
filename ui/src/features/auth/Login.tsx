@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { SIGN_IN_COMMAND } from "./gate";
 import { captureLoginNonce, openSession, takeLoginNonce } from "./session";
+import { useLocale } from "../../lib/locale";
 
 type State = { kind: "working" } | { kind: "done" } | { kind: "failed"; why: string };
 
@@ -12,13 +13,14 @@ type State = { kind: "working" } | { kind: "done" } | { kind: "failed"; why: str
  * follows: a `hashchange` listener captures, strips and exchanges it.
  */
 export default function Login({ onSignedIn }: { onSignedIn: () => void }) {
+  const { t } = useLocale();
   const [state, setState] = useState<State>({ kind: "working" });
   const sent = useRef(false);
 
   const exchange = useCallback(
     (nonce: string | null) => {
       if (!nonce) {
-        setState({ kind: "failed", why: "This page needs a sign-in link, and it has none (or it was already used here)." });
+        setState({ kind: "failed", why: t("This page needs a sign-in link, and it has none (or it was already used here).") });
         return;
       }
       setState({ kind: "working" });
@@ -29,7 +31,7 @@ export default function Login({ onSignedIn }: { onSignedIn: () => void }) {
         })
         .catch((e) => setState({ kind: "failed", why: String(e?.message ?? e) }));
     },
-    [onSignedIn],
+    [onSignedIn, t],
   );
 
   useEffect(() => {
@@ -50,15 +52,14 @@ export default function Login({ onSignedIn }: { onSignedIn: () => void }) {
 
   return (
     <section className="mx-auto max-w-lg px-4 py-10 space-y-3" aria-live="polite">
-      <h1 className="text-section font-semibold text-ink-100">Sign in</h1>
-      {state.kind === "working" && <p className="text-secondary text-ink-400">Signing this browser in…</p>}
-      {state.kind === "done" && <p className="text-secondary text-ok">Signed in as the operator.</p>}
+      <h1 className="text-section font-semibold text-ink-100">{t("Sign in")}</h1>
+      {state.kind === "working" && <p className="text-secondary text-ink-400">{t("Signing this browser in…")}</p>}
+      {state.kind === "done" && <p className="text-secondary text-ok">{t("Signed in as the operator.")}</p>}
       {state.kind === "failed" && (
         <>
           <p className="text-secondary text-warn">{state.why}</p>
           <p className="text-secondary text-ink-400">
-            Run <code className="num text-ink-200">{SIGN_IN_COMMAND}</code> in your own shell on the host and open the
-            new link within two minutes. Each link works once.
+            {t("Run")} <code className="num text-ink-200">{SIGN_IN_COMMAND}</code> {t("in your own shell on the host and open the new link within two minutes. Each link works once.")}
           </p>
         </>
       )}

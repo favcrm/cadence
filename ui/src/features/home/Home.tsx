@@ -5,6 +5,7 @@ import type { ResourceState } from "../../lib/cache";
 import { resources, threadReader } from "../../lib/resources";
 import { streamInto, type SseErrorState } from "../../lib/sse";
 import { useQuery, useResource } from "../../lib/useResource";
+import { useTranslate } from "../../lib/locale";
 import type { MasterAppOrigin, MasterCommandResult, Overview, ThreadRef } from "../../lib/types";
 import Link from "../../ui/Link";
 import Md from "../../ui/Md";
@@ -103,12 +104,13 @@ function WorkingRow({
   step: ThreadEntry | null;
   onStop: () => void;
 }) {
+  const t = useTranslate();
   const appHref = appOriginHref(appOrigin);
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     if (turn.kind !== "working") return;
-    const t = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(t);
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
   }, [turn.kind]);
   if (turn.kind === "idle") return null;
   const stepText = step ? stepSummary(step.text) : null;
@@ -122,22 +124,22 @@ function WorkingRow({
     <div className="workrow" role="status" aria-live="polite" data-turn={turn.kind}>
       <span className={`workdot${turn.kind === "working" ? " live" : ""}`} aria-hidden />
       {turn.kind === "working" && (
-        <span className="text-ink-200 font-medium shrink-0">Working</span>
+        <span className="text-ink-200 font-medium shrink-0">{t("Working")}</span>
       )}
       {elapsed !== null && <span className="num text-ink-500 shrink-0">{elapsed}</span>}
       {turn.kind === "queued" && (
         <span className="text-ink-400 min-w-0">
-          Queued{turn.summary ? ` — ${stepSummary(turn.summary)}` : ""}
+          {t("Queued")}{turn.summary ? ` — ${stepSummary(turn.summary)}` : ""}
         </span>
       )}
-      {turn.kind === "submitting" && <span className="text-ink-400">Sending…</span>}
+      {turn.kind === "submitting" && <span className="text-ink-400">{t("Sending…")}</span>}
       {turn.kind === "working" && stepText && (
         <span key={stepText} className="stepfade num text-ink-500 truncate min-w-0">
           · {stepText}
         </span>
       )}
       {turn.kind === "working" && turn.compacting === true && (
-        <span className="chip bg-warn/10 text-warn shrink-0">compacting</span>
+        <span className="chip bg-warn/10 text-warn shrink-0">{t("compacting")}</span>
       )}
       {turn.kind === "working" && (turn.queued ?? 0) > 0 && (
         <span className="chip bg-ink-800 text-ink-400 shrink-0">{turn.queued} queued</span>
@@ -145,7 +147,7 @@ function WorkingRow({
       <span className="flex-1" />
       {appHref && (turn.kind === "working" || turn.kind === "queued") && (
         <Link href={appHref} className="lnk text-micro shrink-0">
-          Open its conversation <span aria-hidden>↗</span>
+          {t("Open its conversation")} <span aria-hidden>↗</span>
         </Link>
       )}
       {turn.kind === "working" && (
@@ -153,9 +155,9 @@ function WorkingRow({
           type="button"
           className="stopbtn shrink-0"
           onClick={onStop}
-          title="Interrupt the running turn (same as /stop)"
+          title={t("Interrupt the running turn (same as /stop)")}
         >
-          Stop
+          {t("Stop")}
         </button>
       )}
     </div>
@@ -213,6 +215,7 @@ function CmdJson({ value }: { value: unknown }) {
 }
 
 function CmdCard({ cmd, onOpenIssue }: { cmd: CmdResult; onOpenIssue: (id: string) => void }) {
+  const t = useTranslate();
   return (
     <div className="cmdcard card px-3 py-2 ml-8 min-w-0" data-cmd={cmd.name}>
       <div className="flex items-center gap-2 text-micro">
@@ -221,11 +224,11 @@ function CmdCard({ cmd, onOpenIssue }: { cmd: CmdResult; onOpenIssue: (id: strin
           {cmd.arg ? ` ${cmd.arg}` : ""}
         </span>
         {cmd.running ? (
-          <span className="steps-running text-ink-500">running…</span>
+          <span className="steps-running text-ink-500">{t("running…")}</span>
         ) : cmd.ok === false ? (
-          <span className="text-fail">failed</span>
+          <span className="text-fail">{t("failed")}</span>
         ) : (
-          <span className="text-ink-500">done</span>
+          <span className="text-ink-500">{t("done")}</span>
         )}
       </div>
       {cmd.value !== undefined ? (
@@ -260,35 +263,36 @@ function fmtCommandResult(r: MasterCommandResult): { text?: string; value?: unkn
 }
 
 function NotStarted({ status, hosted }: { status: MasterStatus; hosted: boolean | null }) {
+  const t = useTranslate();
   const stopped = status.kind === "stopped";
   return (
     <div className="card px-4 py-4 space-y-3" data-empty="master">
       <h2 className="text-cardtitle font-semibold text-ink-100">
-        {hosted === null ? "Checking assistant availability…" : hosted ? "Your assistant is unavailable" : stopped ? "The master is stopped" : "Start the master to chat"}
+        {hosted === null ? t("Checking assistant availability…") : hosted ? t("Your assistant is unavailable") : stopped ? t("The master is stopped") : t("Start the master to chat")}
       </h2>
       <p className="text-secondary text-ink-400">
-        {hosted === null ? "Checking this board’s session and assistant state." : hosted ? "Your workspace administrator can check the assistant’s setup and restore it. You can send messages once it is available." : "The master is the agent you talk to here. It plans work with you and hands approved tickets to your agents. Start or resume it from a terminal on this machine:"}
+        {hosted === null ? t("Checking this board’s session and assistant state.") : hosted ? t("Your workspace administrator can check the assistant’s setup and restore it. You can send messages once it is available.") : t("The master is the agent you talk to here. It plans work with you and hands approved tickets to your agents. Start or resume it from a terminal on this machine:")}
       </p>
       {hosted === false && <pre className="num text-secondary text-ink-200 bg-ink-800 rounded px-3 py-2 overflow-x-auto">
         {stopped ? RESUME_COMMAND : START_COMMAND}
       </pre>}
       <div className="grid sm:grid-cols-2 gap-3 text-label">
         <div>
-          <div className="slabel mb-1">it can</div>
+          <div className="slabel mb-1">{t("it can")}</div>
           <ul className="list-disc pl-4 space-y-0.5 text-ink-300">
-            <li>read the tracker, reports and what agents are doing</li>
-            <li>propose a plan — tickets with size and acceptance</li>
-            <li>dispatch tickets of a plan you approved</li>
-            <li>answer workers' questions, and bring you the ones it can't</li>
+            <li>{t("read the tracker, reports and what agents are doing")}</li>
+            <li>{t("propose a plan — tickets with size and acceptance")}</li>
+            <li>{t("dispatch tickets of a plan you approved")}</li>
+            <li>{t("answer workers' questions, and bring you the ones it can't")}</li>
           </ul>
         </div>
         <div>
-          <div className="slabel mb-1">it can't</div>
+          <div className="slabel mb-1">{t("it can't")}</div>
           <ul className="list-disc pl-4 space-y-0.5 text-ink-300">
-            <li>approve its own plans — only you do, here or with `cadence plan approve`</li>
-            <li>start work outside an approved plan</li>
-            <li>merge, push or reach your git credentials</li>
-            <li>change settings or other agents</li>
+            <li>{t("approve its own plans — only you do, here or with `cadence plan approve`")}</li>
+            <li>{t("start work outside an approved plan")}</li>
+            <li>{t("merge, push or reach your git credentials")}</li>
+            <li>{t("change settings or other agents")}</li>
           </ul>
         </div>
       </div>
@@ -297,10 +301,11 @@ function NotStarted({ status, hosted }: { status: MasterStatus; hosted: boolean 
 }
 
 function Examples({ onPick, disabled }: { onPick: (text: string) => void; disabled: boolean }) {
+  const t = useTranslate();
   return (
     <div className="card px-4 py-4" data-empty="thread">
-      <h2 className="text-cardtitle font-semibold text-ink-100">Ask the master for work</h2>
-      <p className="text-secondary text-ink-400 mt-1">No conversation yet. Try one of these:</p>
+      <h2 className="text-cardtitle font-semibold text-ink-100">{t("Ask the master for work")}</h2>
+      <p className="text-secondary text-ink-400 mt-1">{t("No conversation yet. Try one of these:")}</p>
       <div className="mt-3 grid gap-2">
         {EXAMPLES.map((ex) => (
           <button
@@ -309,7 +314,7 @@ function Examples({ onPick, disabled }: { onPick: (text: string) => void; disabl
             onClick={() => onPick(ex)}
             className="text-left px-3 py-2 rounded border border-ink-700 text-secondary text-ink-200 hover:border-accent/60 hover:text-accent disabled:opacity-50 disabled:hover:border-ink-700 disabled:hover:text-ink-200"
           >
-            {ex}
+            {t(ex)}
           </button>
         ))}
       </div>
@@ -350,6 +355,7 @@ const ThreadList = memo(function ThreadList({
   liveAfter: number;
   onRetry: (message: string, text: string, refs?: ThreadRef[]) => void;
 }) {
+  const t = useTranslate();
   const { shown, hidden } = useMemo(() => visibleWindow(items, limit), [items, limit]);
   const anchors = useMemo(() => planAnchors(items), [items]);
   if (items.length === 0) return null;
@@ -358,7 +364,7 @@ const ThreadList = memo(function ThreadList({
       {(hidden > 0 || moreBefore) && (
         <div className="flex justify-center">
           <button className="lnk text-label disabled:opacity-50" disabled={loadingEarlier} onClick={onEarlier}>
-            {loadingEarlier ? "Loading…" : "Load earlier messages"}
+            {loadingEarlier ? t("Loading…") : t("Load earlier messages")}
           </button>
         </div>
       )}
@@ -415,6 +421,7 @@ export default function Home({
    *  keeps the workspace's top edge. */
   setupNotice?: ReactNode;
 }) {
+  const t = useTranslate();
   const thread = useQuery(resources.masterThread);
   const agents = useResource(resources.agents);
   const master = useQuery(resources.masterState);
@@ -800,7 +807,7 @@ export default function Home({
         />
       </aside>
 
-      <section className="min-w-0 rail:order-1 flex flex-col min-h-0 gap-4" aria-label="master thread">
+      <section className="min-w-0 rail:order-1 flex flex-col min-h-0 gap-4" aria-label={t("master thread")}>
         <SinceCard onOpenIssue={onOpenIssue} />
 
         {/* CAD-600: the conversation panel — the master's header, the
@@ -810,7 +817,7 @@ export default function Home({
         <div className="relative flex-1 min-h-0 flex flex-col" data-chat-panel>
           <div className="master-heading flex items-center gap-2 flex-wrap pb-2.5 border-b border-ink-700/70">
             <span className="text-accent text-section" aria-hidden>✳</span>
-            <h1 className="text-section font-semibold text-ink-100">Assistant</h1>
+            <h1 className="text-section font-semibold text-ink-100">{t("Assistant")}</h1>
             <span
               className={`chip ${
                 status.kind === "running"
@@ -820,11 +827,11 @@ export default function Home({
                     : "bg-warn/10 text-warn"
               }`}
             >
-              {status.kind === "running" ? status.state : status.kind === "absent" ? "not started" : status.kind}
+              {status.kind === "running" ? status.state : status.kind === "absent" ? t("not started") : status.kind}
             </span>
             <MasterChips master={master.data} row={masterRow} readOnly={readOnly} />
             {link && link !== "live" && status.kind === "running" && (
-              <span className="text-micro text-ink-500">{link === "stopped" ? "stream stopped" : "reconnecting…"}</span>
+              <span className="text-micro text-ink-500">{link === "stopped" ? t("stream stopped") : t("reconnecting…")}</span>
             )}
           </div>
 
@@ -832,14 +839,14 @@ export default function Home({
 
           {thread.status === "failed" && (
             <div className="card px-3.5 py-3 mt-3 text-label text-fail break-words" role="alert">
-              The thread could not be read — {thread.error}{" "}
+              {t("The thread could not be read —")} {thread.error}{" "}
               <button className="lnk" onClick={() => void resources.masterThread.refresh()}>
-                Retry
+                {t("Retry")}
               </button>
             </div>
           )}
           {!loaded && thread.status !== "failed" && (
-            <p className="text-label text-ink-500 pt-3">Reading the thread…</p>
+            <p className="text-label text-ink-500 pt-3">{t("Reading the thread…")}</p>
           )}
 
           <div

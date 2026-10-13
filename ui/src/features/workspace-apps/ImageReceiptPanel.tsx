@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { ApiError } from "../../lib/api";
 import { workspaceApps, type ImageReceipt, type WorkspaceRun } from "./workspaceApps";
+import { useTranslate } from "../../lib/locale";
 
 const imageTypes = new Set(["image/png", "image/jpeg", "image/webp"]);
 const assetLimit = 2 * 1024 * 1024;
@@ -40,6 +41,7 @@ export function imageSubject(run: WorkspaceRun) {
 export type VerifiedImage = { runId: string; receiptId: string; digest: string; subject: string };
 
 export function ImageReceiptPanel({ run, onDenied, onVerified }: { run: WorkspaceRun; onDenied: () => void; onVerified: (image: VerifiedImage | null) => void }) {
+  const t = useTranslate();
   const [receipt, setReceipt] = useState<ImageReceipt | null>(null);
   const [image, setImage] = useState<string | null>(null);
   const [verifiedSubject, setVerifiedSubject] = useState<string | null>(null);
@@ -79,16 +81,16 @@ export function ImageReceiptPanel({ run, onDenied, onVerified }: { run: Workspac
   const visibleImage = verifiedSubject === subject ? image : null;
   const approved = visibleReceipt && run.reviews.some(review => review.decision === "approve"
     && review.asset_receipt_id === visibleReceipt.id && review.asset_digest === visibleReceipt.asset?.digest);
-  return <section className="wa-stack" aria-label="Retained generated image">
-    <h3>Generated image</h3>
-    {run.state === "failed" && <p className="wa-alert" data-tone="fail" role="status">This run did not complete. Any retained image remains available for inspection, but Local release is blocked.</p>}
-    {loading && <p className="wa-muted" role="status">Checking retained image bytes…</p>}
+  return <section className="wa-stack" aria-label={t("Retained generated image")}>
+    <h3>{t("Generated image")}</h3>
+    {run.state === "failed" && <p className="wa-alert" data-tone="fail" role="status">{t("This run did not complete. Any retained image remains available for inspection, but Local release is blocked.")}</p>}
+    {loading && <p className="wa-muted" role="status">{t("Checking retained image bytes…")}</p>}
     {error && <p className="wa-alert" data-tone="fail" role="alert">{error}</p>}
-    {!loading && !visibleReceipt && !error && <p className="wa-muted">No image asset has been retained yet. A provider URL or worker description cannot stand in for one.</p>}
+    {!loading && !visibleReceipt && !error && <p className="wa-muted">{t("No image asset has been retained yet. A provider URL or worker description cannot stand in for one.")}</p>}
     {visibleImage && visibleReceipt?.asset && <figure className="wa-retained-image">
-      <img src={visibleImage} alt={run.snapshot.source ? "Generated draft awaiting review against the selected source" : "Generated draft awaiting review against the pasted facts"} width="512" height="512" />
-      <figcaption>{visibleReceipt.asset.media_type} · {visibleReceipt.asset.size.toLocaleString()} bytes · {approved ? "Independent review pinned these bytes" : "Awaiting independent review"}</figcaption>
+      <img src={visibleImage} alt={run.snapshot.source ? t("Generated draft awaiting review against the selected source") : t("Generated draft awaiting review against the pasted facts")} width="512" height="512" />
+      <figcaption>{t("{mediaType} · {size} bytes · {review}").replace("{mediaType}", () => visibleReceipt.asset!.media_type).replace("{size}", () => visibleReceipt.asset!.size.toLocaleString()).replace("{review}", () => approved ? t("Independent review pinned these bytes") : t("Awaiting independent review"))}</figcaption>
     </figure>}
-    {visibleReceipt?.asset && <p className="wa-digest">Receipt {visibleReceipt.id}<br />{visibleReceipt.asset.digest}</p>}
+    {visibleReceipt?.asset && <p className="wa-digest">{t("Receipt {id}").replace("{id}", () => visibleReceipt.id)}<br />{visibleReceipt.asset.digest}</p>}
   </section>;
 }

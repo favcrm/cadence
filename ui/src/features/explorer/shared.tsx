@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import { useTranslate } from "../../lib/locale";
 /**
  * The Explorer's shared bits (CAD-1129): the app glyph, trust chip and
  * install-state chip every screen reuses — so a card, the detail hero
@@ -23,21 +24,23 @@ export function AppGlyph({ name, icon, size }: { name: string; icon?: string; si
 
 /** Cadence-shipped vs an unreviewed Git app — the trust chip. */
 export function TrustChip({ trust }: { trust?: "cadence" | "unreviewed" }) {
+  const t = useTranslate();
   if (trust === "cadence") return <span className="chip ok">Cadence</span>;
-  return <span className="chip warn">Not reviewed by Cadence</span>;
+  return <span className="chip warn">{t("Not reviewed by Cadence")}</span>;
 }
 
 /** Installed / off / requested / removed — the state a card wears. */
 export function InstallStateChip({ state }: { state?: string }) {
+  const t = useTranslate();
   switch (state) {
     case "installed":
-      return <span className="chip ok">Installed</span>;
+      return <span className="chip ok">{t("Installed")}</span>;
     case "off":
-      return <span className="chip">Access off</span>;
+      return <span className="chip">{t("Access off")}</span>;
     case "requested":
-      return <span className="chip">Requested</span>;
+      return <span className="chip">{t("Requested")}</span>;
     case "removed":
-      return <span className="chip">Removed</span>;
+      return <span className="chip">{t("Removed")}</span>;
     default:
       return null;
   }

@@ -6,8 +6,12 @@ import { IconRefresh, IconWarning } from "../../ui/icons";
 import { fmtTime, releaseLabel } from "../../lib/fmt";
 import type { UpdateStatus, WaitingTurn } from "../../lib/types";
 import "./update.css";
+import { useTranslate } from "../../lib/locale";
 
 /** `swe-554 (12m)` — the same rendering the CLI's drain shows. */
+// Stored read-error fallback: UI-owned, translated at render (never stored translated).
+const UI_READ_FALLBACK = "Could not read the update status.";
+
 export function waiterLabel(w: WaitingTurn): string {
   const age =
     w.age_secs >= 60 ? `${Math.floor(w.age_secs / 60)}m` : `${w.age_secs}s`;
@@ -75,6 +79,7 @@ export default function Update({
     onRetryAccess?: () => void;
   };
 }) {
+  const t = useTranslate();
   const [status, setStatus] = useState<UpdateStatus | null>(null);
   const [readError, setReadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -117,7 +122,7 @@ export default function Update({
         setReadError(
           err instanceof ApiError
             ? err.message
-            : "Could not read the update status.",
+            : UI_READ_FALLBACK,
         );
     } finally {
       if (alive.current && id === request.current) {
@@ -232,7 +237,7 @@ export default function Update({
         : active
           ? (phases[phase ?? ""] ??
             (phase
-              ? `Current phase: ${phase}`
+              ? "Current phase: {phase}"
               : "The update process is running."))
           : checking
             ? "Finding the latest approved release. The previous check remains below."
@@ -244,22 +249,22 @@ export default function Update({
                   ? "No release check is available yet. Status refreshes automatically."
                   : report.up_to_date
                     ? "The latest approved release is installed."
-                    : `${report.change_count} change${report.change_count === 1 ? "" : "s"} since the installed release.`;
+                    : report.change_count === 1
+                      ? "1 change since the installed release."
+                      : "{change_count} changes since the installed release.";
 
   return (
     <main className="update-workspace">
       <header className="update-heading">
         <div>
-          <h1>Update</h1>
-          <p>Review the latest release and follow its installation.</p>
+          <h1>{t("Update")}</h1>
+          <p>{t("Review the latest release and follow its installation.")}</p>
         </div>
         <Button
           icon={<IconRefresh />}
           onClick={() => void load()}
           disabled={busy !== null}
-        >
-          Refresh status
-        </Button>
+        >{t("Refresh status")}</Button>
       </header>
       {blocked && (
         <p className="update-access">
@@ -268,7 +273,7 @@ export default function Update({
             // CAD-1193: retry the real access check, not a reload.
             <>
               {" "}
-              <Button size="sm" onClick={viewer.onRetryAccess}>Retry access check</Button>
+              <Button size="sm" onClick={viewer.onRetryAccess}>{t("Retry access check")}</Button>
             </>
           )}
         </p>
@@ -276,21 +281,19 @@ export default function Update({
       {readError && (
         <div className="update-notice" data-tone="fail" role="alert">
           <div>
-            <strong>Could not refresh status</strong>
+            <strong>{t("Could not refresh status")}</strong>
             <p>
-              {readError}
-              {status
-                ? " Last known information is shown below; refresh before updating."
-                : " Try again to read the release status."}
+              {readError === UI_READ_FALLBACK ? t(readError) : readError}
+              {" "}{status ? t("Last known information is shown below; refresh before updating.") : t("Try again to read the release status.")}
             </p>
           </div>
-          <Button onClick={() => void load()}>Retry status</Button>
+          <Button onClick={() => void load()}>{t("Retry status")}</Button>
         </div>
       )}
       {actionError && (
         <div className="update-notice" data-tone="fail" role="alert">
           <div>
-            <strong>Request failed</strong>
+            <strong>{t("Request failed")}</strong>
             <p>{actionError}</p>
           </div>
         </div>
@@ -310,36 +313,30 @@ export default function Update({
             }
           />
           <div>
-            <h2>{stateTitle}</h2>
-            <p>{stateText}</p>
+            <h2>{t(stateTitle)}</h2>
+            <p>{t(stateText).replace("{phase}", () => String(phase ?? "")).replace("{change_count}", () => String(report?.change_count ?? ""))}</p>
           </div>
         </div>
         {status && (
           <>
             <dl className="update-versions">
               <div>
-                <dt>Installed release</dt>
+                <dt>{t("Installed release")}</dt>
                 <dd>
-                  {current
-                    ? releaseLabel(current.version, current.sha)
-                    : "Installation unavailable"}
+                  {current ? releaseLabel(current.version, current.sha) : t("Installation unavailable")}
                 </dd>
               </div>
               <div>
-                <dt>Latest approved release</dt>
+                <dt>{t("Latest approved release")}</dt>
                 <dd>
-                  {report
-                    ? releaseLabel(report.target_version, report.target)
-                    : "Not checked yet"}
+                  {report ? releaseLabel(report.target_version, report.target) : t("Not checked yet")}
                 </dd>
               </div>
             </dl>
             <div className="update-release-footer">
               <p>
-                {status.checked_at
-                  ? `Last checked ${timeLabel(status.checked_at)}`
-                  : "No completed check yet"}
-                {fetching ? " · Refreshing status…" : ""}
+                {status.checked_at ? t("Last checked {time}").replace("{time}", () => timeLabel(status.checked_at!)) : t("No completed check yet")}
+                {fetching ? " · " : ""}{fetching ? t("Refreshing status…") : ""}
               </p>
               <div className="update-actions">
                 <Button
@@ -347,7 +344,7 @@ export default function Update({
                   loading={checking}
                   onClick={() => void run("check")}
                 >
-                  {checking ? "Checking…" : "Check for updates"}
+                  {checking ? t("Checking…") : t("Check for updates")}
                 </Button>
                 <Button
                   variant="primary"
@@ -355,13 +352,7 @@ export default function Update({
                   loading={busy === "update" || active}
                   onClick={() => void run("update")}
                 >
-                  {busy === "update"
-                    ? "Starting…"
-                    : requested
-                      ? "Update requested"
-                      : active
-                        ? "Updating…"
-                        : "Update"}
+                  {busy === "update" ? t("Starting…") : requested ? t("Update requested") : active ? t("Updating…") : t("Update")}
                 </Button>
               </div>
             </div>
@@ -371,16 +362,15 @@ export default function Update({
       {pending && (
         <section className="update-notice" data-tone="info">
           <div>
-            <h2>Agent activity</h2>
-            <p>New turns are paused during this update.</p>
+            <h2>{t("Agent activity")}</h2>
+            <p>{t("New turns are paused during this update.")}</p>
             <p>
               {status!.waiting.length
-                ? waitingLabel(status!.waiting)
-                : "No active turns reported."}
+                ? (status!.waiting.length === 1 ? t("waiting for {count} turn: {list}") : t("waiting for {count} turns: {list}")).replace("{count}", String(status!.waiting.length)).replace("{list}", () => status!.waiting.map(waiterLabel).join(", "))
+                : t("No active turns reported.")}
             </p>
             <p className="update-secondary">
-              Started by {pending.by} · {timeLabel(pending.since)}
-            </p>
+              {t("Started by {by} · {timeLabel}").replace("{by}", () => String(pending.by ?? "")).replace("{timeLabel}", () => String(timeLabel(pending.since) ?? ""))}</p>
           </div>
         </section>
       )}
@@ -388,16 +378,13 @@ export default function Update({
         <section className="update-notice" data-tone="warn">
           <IconWarning size={18} />
           <div>
-            <h2>Before updating</h2>
+            <h2>{t("Before updating")}</h2>
             <ul>
               {report.blockers.map((b, i) => (
                 <li key={i}>{b}</li>
               ))}
             </ul>
-            <p className="update-secondary">
-              Active turns can finish during the drain. The updater checks the
-              release lease before proceeding.
-            </p>
+            <p className="update-secondary">{t("Active turns can finish during the drain. The updater checks the release lease before proceeding.")}</p>
           </div>
         </section>
       )}
@@ -408,17 +395,17 @@ export default function Update({
           role="status"
         >
           <div>
-            <h2>{result.title}</h2>
-            <p>{result.text}</p>
+            <h2>{t(result.title)}</h2>
+            <p>{t(result.text)}</p>
           </div>
         </section>
       )}
       {report && (
         <details className="update-disclosure">
           <summary>
-            What’s changed{" "}
+            {t("What’s changed")}{" "}
             <span>
-              {report.change_count} change{report.change_count === 1 ? "" : "s"}
+              {report.change_count === 1 ? t("{change_count} change").replace("{change_count}", String(report.change_count)) : t("{change_count} changes").replace("{change_count}", String(report.change_count))}
             </span>
           </summary>
           <div className="update-disclosure-body">
@@ -429,7 +416,7 @@ export default function Update({
                 ))}
               </ul>
             ) : (
-              <p>No change summary was provided by this check.</p>
+              <p>{t("No change summary was provided by this check.")}</p>
             )}
           </div>
         </details>
@@ -441,15 +428,13 @@ export default function Update({
           onToggle={(e) => setLogOpen(e.currentTarget.open)}
         >
           <summary>
-            Progress log{" "}
-            <span>{active ? "Live" : `${status.lines.length} lines`}</span>
+            {t("Progress log")}{" "}
+            <span>{active ? t("Live") : status.lines.length === 1 ? t("{count} line").replace("{count}", "1") : t("{count} lines").replace("{count}", String(status.lines.length))}</span>
           </summary>
           <div className="update-disclosure-body">
             <div className="update-log-heading">
               <p>
-                {following
-                  ? "Following new progress"
-                  : "Reading earlier progress"}
+                {following ? t("Following new progress") : t("Reading earlier progress")}
               </p>
               <Button
                 size="sm"
@@ -459,14 +444,12 @@ export default function Update({
                   const node = linesRef.current;
                   if (node) node.scrollTop = node.scrollHeight;
                 }}
-              >
-                Jump to latest
-              </Button>
+              >{t("Jump to latest")}</Button>
             </div>
             <pre
               ref={linesRef}
               tabIndex={0}
-              aria-label="Update progress log"
+              aria-label={t("Update progress log")}
               onScroll={(e) => {
                 const node = e.currentTarget;
                 const atEnd =
@@ -475,46 +458,44 @@ export default function Update({
                 setFollowing(atEnd);
               }}
             >
-              {status.lines.length
-                ? status.lines.join("\n")
-                : "Waiting for progress from the update process…"}
+              {status.lines.length ? status.lines.join("\n") : t("Waiting for progress from the update process…")}
             </pre>
           </div>
         </details>
       )}
       {status && (
         <details className="update-disclosure">
-          <summary>Release details</summary>
+          <summary>{t("Release details")}</summary>
           <dl className="update-disclosure-body update-technical">
             <div>
-              <dt>Installed commit</dt>
+              <dt>{t("Installed commit")}</dt>
               <dd>
                 <code>
-                  {current?.sha ?? (current ? "Not installed" : "Unavailable")}
+                  {current?.sha ?? (current ? t("Not installed") : t("Unavailable"))}
                 </code>
               </dd>
             </div>
             {report && (
               <>
                 <div>
-                  <dt>Target commit</dt>
+                  <dt>{t("Target commit")}</dt>
                   <dd>
                     <code>{report.target}</code>
                   </dd>
                 </div>
                 <div>
-                  <dt>Database schema</dt>
+                  <dt>{t("Database schema")}</dt>
                   <dd>
                     {report.schema.migration
-                      ? `${report.schema.current ?? "Unknown"} → ${report.schema.target ?? "Unknown"} · Migration covered by the pre-update backup receipt.`
-                      : `No migration reported · Current ${report.schema.current ?? "unknown"}, target ${report.schema.target ?? "unknown"}.`}
+                      ? t("{current} → {target} · Migration covered by the pre-update backup receipt.").replace("{current}", () => String(report.schema.current ?? t("Unknown"))).replace("{target}", () => String(report.schema.target ?? t("Unknown")))
+                      : t("No migration reported · Current {current}, target {target}.").replace("{current}", () => String(report.schema.current ?? t("unknown"))).replace("{target}", () => String(report.schema.target ?? t("unknown")))}
                   </dd>
                 </div>
               </>
             )}
             {pending && (
               <div>
-                <dt>Pending target</dt>
+                <dt>{t("Pending target")}</dt>
                 <dd>
                   <code>{pending.target}</code>
                 </dd>

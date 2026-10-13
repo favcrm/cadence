@@ -111,6 +111,8 @@ async function main() {
   const React = require("react") as typeof import("react");
   act = React.act;
   const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
+  const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
+  const withLocale = (node: unknown) => React.createElement(LocaleProvider, null, node as import("react").ReactNode);
   const { AddConnection } = require("../src/features/settings/Connections") as typeof import("../src/features/settings/Connections");
 
   const host = document.createElement("div");
@@ -152,12 +154,12 @@ async function main() {
   const root = createRoot(host);
   act(() => {
     root.render(
-      React.createElement(AddConnection, {
+      withLocale(React.createElement(AddConnection, {
         providers,
         existing: [],
         onClose: () => {},
         onAdded: () => {},
-      }),
+      })),
     );
   });
   await settle(() => assert(host.querySelector('section[aria-label="add connection"]'), "add connection renders"));
@@ -301,7 +303,7 @@ async function main() {
     });
   };
   act(() => {
-    root2.render(React.createElement(RotateForm, { row: smtpRow, onDone: () => {}, onClose: () => {} }));
+    root2.render(withLocale(React.createElement(RotateForm, { row: smtpRow, onDone: () => {}, onClose: () => {} })));
   });
   await settle(() => assert(field2("New SMTP password"), "rotate is password-primary"), 30000);
   // No raw scopes box for SMTP, and no independent raw tls_mode field.
@@ -373,7 +375,7 @@ async function main() {
 
   // Detail: readable settings show host, port+security, login and sender.
   act(() => {
-    root3.render(React.createElement(ConnectionDetail, { row: { ...smtpRow, smtp_sender: true, smtp_error: null }, capabilities: null, canWrite: true, onChanged: () => {}, onRevoked: () => {} }));
+    root3.render(withLocale(React.createElement(ConnectionDetail, { row: { ...smtpRow, smtp_sender: true, smtp_error: null }, capabilities: null, canWrite: true, onChanged: () => {}, onRevoked: () => {} })));
   });
   await settle(() => {
     const t = host3.textContent ?? "";
@@ -389,7 +391,7 @@ async function main() {
     ["withheld_leak", "different password or app password"],
   ] as const) {
     act(() => {
-      root3.render(React.createElement(ConnectionDetail, { row: unreadableRow(code), capabilities: null, canWrite: true, onChanged: () => {}, onRevoked: () => {} }));
+      root3.render(withLocale(React.createElement(ConnectionDetail, { row: unreadableRow(code), capabilities: null, canWrite: true, onChanged: () => {}, onRevoked: () => {} })));
     });
     await settle(() => {
       const err = host3.querySelector(`[data-smtp-error="${code}"]`);
@@ -423,7 +425,7 @@ async function main() {
     });
   };
   act(() => {
-    root4.render(React.createElement(RotateForm, { row: unreadableRow("custody_corrupt"), onDone: () => {}, onClose: () => {} }));
+    root4.render(withLocale(React.createElement(RotateForm, { row: unreadableRow("custody_corrupt"), onDone: () => {}, onClose: () => {} })));
   });
   await settle(() => assert(field4("New SMTP password"), "unreadable sender rotates with the SMTP password form"));
   assert(!field4("New token") && !field4("Scopes"), "no generic token form or scopes box");
@@ -457,7 +459,11 @@ async function main() {
   // ---- CAD-1166: the page groups by service (mockup C), keeps a
   // provider-list failure from blanking loaded accounts, renders the
   // built-in non-editable, and never advertises remote verification. ----
-  const { default: ConnectionsPage } = require("../src/features/settings/Connections") as typeof import("../src/features/settings/Connections");
+  const { default: ConnectionsPageView } = require("../src/features/settings/Connections") as typeof import("../src/features/settings/Connections");
+  const { LocaleProvider: PageLocale } = require("../src/lib/locale") as typeof import("../src/lib/locale");
+  // The page renders localized chips and must sit inside the locale provider (CAD-1331).
+  const ConnectionsPage = (props: import("react").ComponentProps<typeof ConnectionsPageView>) =>
+    React.createElement(PageLocale, null, React.createElement(ConnectionsPageView, props));
   const { resources } = require("../src/lib/resources") as typeof import("../src/lib/resources");
 
   const conns: any[] = [
@@ -497,7 +503,7 @@ async function main() {
   const groupLabel = (el: Element) => el.getAttribute("aria-label") ?? "";
 
   act(() => {
-    root5.render(React.createElement(ConnectionsPage, { viewer: { operator: true, readOnly: false } }));
+    root5.render(withLocale(React.createElement(ConnectionsPage, { viewer: { operator: true, readOnly: false } })));
   });
   // Drive the two resources through their real stores.
   await act(async () => {

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import Button from "../../ui/Button";
+import { useTranslate } from "../../lib/locale";
 import { appExplorer, type InstallCheck } from "../workspace-apps/workspaceApps";
 import { appErrorCopy } from "./appErrors";
 import "./explorer.css";
@@ -22,6 +23,7 @@ export default function InstallCheckPanel({ source, label, install, onInstalled,
   onInstalled: () => void;
   onClose: () => void;
 }) {
+  const t = useTranslate();
   const [check, setCheck] = useState<InstallCheck | null>(null);
   const [checking, setChecking] = useState(true);
   const [installing, setInstalling] = useState(false);
@@ -53,13 +55,13 @@ export default function InstallCheckPanel({ source, label, install, onInstalled,
 
   const warnings = check?.secret_warnings ?? [];
   return (
-    <div className="card install-check p-4 mb-4" role="dialog" aria-label={`Check ${label} before installing`}>
-      <h3 className="font-medium text-ink-100 mb-1">Check {label} before installing</h3>
-      {checking && <p className="text-label text-ink-400" role="status">Checking exactly what would be installed…</p>}
+    <div className="card install-check p-4 mb-4" role="dialog" aria-label={t("Check {label} before installing").replace("{label}", () => label)}>
+      <h3 className="font-medium text-ink-100 mb-1">{t("Check {label} before installing").replace("{label}", () => label)}</h3>
+      {checking && <p className="text-label text-ink-400" role="status">{t("Checking exactly what would be installed…")}</p>}
       {checkError && (
         <div className="alert fail mt-2" role="alert">
           {checkError}
-          <div className="mt-2"><Button className="btn-sm" onClick={() => runCheck()}>Check again</Button></div>
+          <div className="mt-2"><Button className="btn-sm" onClick={() => runCheck()}>{t("Check again")}</Button></div>
         </div>
       )}
       {check && (
@@ -68,10 +70,10 @@ export default function InstallCheckPanel({ source, label, install, onInstalled,
             <dt>App</dt><dd>{check.name}</dd>
             <dt>Version</dt><dd>{check.version}</dd>
             <dt>Digest</dt><dd><code className="ic-digest" title={check.digest}>{check.digest}</code></dd>
-            <dt>Files</dt><dd>{check.files.length}</dd>
+            <dt>{t("Files")}</dt><dd>{check.files.length}</dd>
           </dl>
           <details className="mt-2">
-            <summary className="text-label text-ink-400 cursor-pointer">Show the {check.files.length} files</summary>
+            <summary className="text-label text-ink-400 cursor-pointer">{t("Show the {count} files").replace("{count}", String(check.files.length))}</summary>
             <ul className="ic-files text-micro text-ink-400">{check.files.map((f) => <li key={f}><code>{f}</code></li>)}</ul>
           </details>
           {check.notes.length > 0 && (
@@ -79,25 +81,25 @@ export default function InstallCheckPanel({ source, label, install, onInstalled,
           )}
           {warnings.length > 0 && (
             <div className="alert warn mt-2" role="alert">
-              {warnings.length} possible secret{warnings.length === 1 ? "" : "s"} found in this app’s files:
-              <ul>{warnings.map((w) => <li key={`${w.rule}:${w.line}:${w.column}`}>{w.rule} at line {w.line} ({w.redacted})</li>)}</ul>
+              {t(warnings.length === 1 ? "{count} possible secret found in this app’s files:" : "{count} possible secrets found in this app’s files:").replace("{count}", String(warnings.length))}
+              <ul>{warnings.map((w) => <li key={`${w.rule}:${w.line}:${w.column}`}>{w.rule} {t("at line")} {w.line} ({w.redacted})</li>)}</ul>
             </div>
           )}
-          <p className="text-micro text-ink-500 mt-2">Installing records your approval of exactly this digest.</p>
+          <p className="text-micro text-ink-500 mt-2">{t("Installing records your approval of exactly this digest.")}</p>
         </>
       )}
       {installError && (
         <div className="alert fail mt-2" role="alert">
           {installError}
-          <div className="mt-1 text-micro">Nothing was installed. Check again to review the current version.</div>
-          <div className="mt-2"><Button className="btn-sm" onClick={() => runCheck()}>Check again</Button></div>
+          <div className="mt-1 text-micro">{t("Nothing was installed. Check again to review the current version.")}</div>
+          <div className="mt-2"><Button className="btn-sm" onClick={() => runCheck()}>{t("Check again")}</Button></div>
         </div>
       )}
       <div className="flex gap-2 mt-3">
         <Button className="btn-sm btn-primary" disabled={!check || installing || !!installError} onClick={doInstall}>
-          {installing ? "Installing…" : "Install and record approval"}
+          {installing ? t("Installing…") : t("Install and record approval")}
         </Button>
-        <Button className="btn-sm" onClick={onClose}>Cancel</Button>
+        <Button className="btn-sm" onClick={onClose}>{t("Cancel")}</Button>
       </div>
     </div>
   );

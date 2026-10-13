@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { sessionHeaders } from "../../../lib/sessionKey";
+import { useTranslate } from "../../../lib/locale";
 import { parseMount } from "../../workspace-apps/screen/screenLifecycle";
 import { ChatChannel, type FrameDirective } from "./chatChannel";
 import type { FrameSize } from "./contract";
@@ -30,6 +31,7 @@ export default function ChatFrame({
   directive: FrameDirective;
   onFail: (tag: string) => void;
 }) {
+  const t = useTranslate();
   const container = useRef<HTMLDivElement>(null);
   const channel = useRef<ChatChannel | null>(null);
   const latest = useRef(directive);
@@ -92,7 +94,7 @@ export default function ChatFrame({
   useEffect(() => { channel.current?.update(directive); }, [directive]);
   return (
     <div data-chat-frame={tag} data-state={state} className="app-chat-frame">
-      {state === "loading" && <p className="text-micro text-ink-500" role="status">Loading preview…</p>}
+      {state === "loading" && <p className="text-micro text-ink-500" role="status">{t("Loading preview…")}</p>}
       <div ref={container} style={{ height: HEIGHT[size], display: state === "ready" ? "block" : "none" }} />
     </div>
   );

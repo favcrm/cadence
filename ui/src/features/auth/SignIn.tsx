@@ -2,6 +2,7 @@ import type { Meta } from "../../lib/types";
 import DeviceSignIn from "./DeviceSignIn";
 import { SIGN_IN_COMMAND } from "./gate";
 import { IconLock } from "../../ui/icons";
+import { useLocale } from "../../lib/locale";
 
 /**
  * The header's sign-in state: "Sign in with `cadence ui login`" when this
@@ -25,18 +26,19 @@ export default function SignIn({
   /** Reload the board to use the same workspace wake path as page load. */
   onRetryWorkspace?: () => void;
 }) {
+  const { t } = useLocale();
   // CAD-1193: `signed_in === null` is an unanswerable check —
   // unavailable, never a sign-out. It stays unavailable throughout the
   // bounded re-check and never becomes signed-out or authority.
   if (access === "unavailable" && !meta?.read_only) {
     return (
-      <span className="chip inline-flex items-center gap-1.5 bg-warn/10 text-warn" role="status" title="Workspace waking or unreachable">
-        <span className="sr-only sm:hidden">Workspace waking or unreachable.</span>
-        <span className="sm:hidden">Workspace waking</span>
-        <span className="hidden sm:inline">Workspace waking or unreachable. {recheckFinished ? "Retry when ready." : "Checking again for up to 60 seconds…"}</span>
+      <span className="chip inline-flex items-center gap-1.5 bg-warn/10 text-warn" role="status" title={t("Workspace waking or unreachable")}>
+        <span className="sr-only sm:hidden">{t("Workspace waking or unreachable.")}</span>
+        <span className="sm:hidden">{t("Workspace waking")}</span>
+        <span className="hidden sm:inline">{t("Workspace waking or unreachable.")} {recheckFinished ? t("Retry when ready.") : t("Checking again for up to 60 seconds…")}</span>
         {recheckFinished && onRetryWorkspace && (
           <button type="button" className="lnk whitespace-nowrap text-warn" onClick={onRetryWorkspace}>
-            Retry workspace
+            {t("Retry workspace")}
           </button>
         )}
       </span>
@@ -50,24 +52,24 @@ export default function SignIn({
       <details className="relative text-label">
         {/* CAD-1312: unsigned-in browsing is a neutral state, not a warning —
             the quiet pill carries the lock, "Read only" and the accent action. */}
-        <summary className="header-auth-target header-state" aria-label="Read-only. Sign in to make changes">
+        <summary className="header-auth-target header-state" aria-label={t("Read-only. Sign in to make changes")}>
           <IconLock size={11} />
-          <span className="hidden sm:inline">Read only<span className="text-ink-600" aria-hidden> · </span><span className="header-state-action">Sign in</span></span>
-          <span className="sm:hidden">Sign in</span>
+          <span className="hidden sm:inline">{t("Read only")}<span className="text-ink-600" aria-hidden> · </span><span className="header-state-action">{t("Sign in")}</span></span>
+          <span className="sm:hidden">{t("Sign in")}</span>
         </summary>
         <div className={`absolute right-0 top-full mt-2 z-50 card p-4 shadow-xl ${device ? "w-80" : "w-72"}`}>
           {device ? (
             <>
-              <p className="text-label text-ink-200 mb-2">Sign in remotely</p>
+              <p className="text-label text-ink-200 mb-2">{t("Sign in remotely")}</p>
               <div className="mb-3">
                 <DeviceSignIn onSignedIn={onChange} />
               </div>
-              <p className="text-label text-ink-400 mb-2">Or, on the host:</p>
+              <p className="text-label text-ink-400 mb-2">{t("Or, on the host:")}</p>
             </>
           ) : (
-            <p className="text-label text-ink-200 mb-2">Sign in to send messages and make decisions.</p>
+            <p className="text-label text-ink-200 mb-2">{t("Sign in to send messages and make decisions.")}</p>
           )}
-          <p className="text-label text-ink-400 mb-2">Run this command on the host, then open the link it prints in this tab.</p>
+          <p className="text-label text-ink-400 mb-2">{t("Run this command on the host, then open the link it prints in this tab.")}</p>
           <code className="num text-label text-accent break-words select-all">{cmd}</code>
         </div>
       </details>

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import Button from "../../ui/Button";
 import { workspaceApps, type Agent, type InstallTeam, type Installation } from "./workspaceApps";
+import { useTranslate } from "../../lib/locale";
 
 /** The input names that must be distinct registered workers: the roles the
  *  installed workflows declare. Generic: read from the bundle, never named here. */
@@ -20,6 +21,7 @@ export function TeamSettings({ installation, managers, workers, canWrite, busy, 
   installation: Installation; managers: Agent[]; workers: Agent[]; canWrite: boolean; busy: boolean;
   mutate: (work: () => Promise<void>) => Promise<void>;
 }) {
+  const t = useTranslate();
   const installId = installation.install_id;
   const roles = teamRoles(installation);
   const [team, setTeam] = useState<InstallTeam | null | undefined>(undefined);
@@ -40,16 +42,16 @@ export function TeamSettings({ installation, managers, workers, canWrite, busy, 
   const complete = !!owner && roles.every(role => !!picked[role] && candidates.some(agent => agent.alias === picked[role]));
   const distinct = new Set(roles.map(role => picked[role])).size === roles.length;
   return (
-    <section className="wa-panel wa-stack" aria-label="Team">
-      <h2>Team</h2>
+    <section className="wa-panel wa-stack" aria-label={t("Team")}>
+      <h2>{t("Team")}</h2>
       <p className="wa-muted">
-        {team ? "Actions in this app start with this team." : "Choose who works on this app's runs. Actions stay unavailable until a team is set."}
+        {team ? t("Actions in this app start with this team.") : t("Choose who works on this app's runs. Actions stay unavailable until a team is set.")}
       </p>
       <label className="wa-field">
-        <span>Project manager</span>
+        <span>{t("Project manager")}</span>
         <select value={owner} disabled={!canWrite || busy}
           onChange={event => { setOwner(event.target.value); setPicked({}); }}>
-          <option value="">Choose…</option>
+          <option value="">{t("Choose…")}</option>
           {managers.map(agent => <option key={agent.alias} value={agent.alias}>{agent.alias}</option>)}
         </select>
       </label>
@@ -58,12 +60,12 @@ export function TeamSettings({ installation, managers, workers, canWrite, busy, 
           <span>{role.replace(/_/g, " ")}</span>
           <select value={picked[role] ?? ""} disabled={!canWrite || busy || !owner}
             onChange={event => setPicked({ ...picked, [role]: event.target.value })}>
-            <option value="">Choose…</option>
+            <option value="">{t("Choose…")}</option>
             {candidates.map(agent => <option key={agent.alias} value={agent.alias}>{agent.alias}</option>)}
           </select>
         </label>
       ))}
-      {!distinct && complete && <p className="wa-alert">Each role needs a different worker.</p>}
+      {!distinct && complete && <p className="wa-alert">{t("Each role needs a different worker.")}</p>}
       {error && <p className="wa-alert" role="alert">{error}</p>}
       <Button variant="primary" disabled={!canWrite || busy || !complete || !distinct || team === undefined}
         onClick={() => void mutate(async () => {
@@ -71,7 +73,7 @@ export function TeamSettings({ installation, managers, workers, canWrite, busy, 
             const saved = await workspaceApps.setTeam(installId, { owner_pm: owner, roles: picked, expected_revision: team?.revision ?? 0 });
             setTeam(saved); setError(null);
           } catch { setError("The team was not saved. Reload and try again."); }
-        })}>Save team</Button>
+        })}>{t("Save team")}</Button>
     </section>
   );
 }

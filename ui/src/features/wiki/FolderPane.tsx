@@ -9,6 +9,7 @@ import { kindLabel, previewKind } from "./preview";
 import { entryOrder } from "./tree";
 import Button from "../../ui/Button";
 import { KindIcon, Loading, WikiImage, useWikiScope } from "./shared";
+import { useTranslate } from "../../lib/locale";
 
 /**
  * The folder view (CAD-581): grid or list, image thumbnails, a per-item
@@ -30,6 +31,7 @@ export default function FolderPane({
   onToast: (kind: "ok" | "err" | "warn", text: string) => void;
   onFail: (error: unknown, verb: string) => void;
 }) {
+  const t = useTranslate();
   const scope = useWikiScope();
   const [view, setView] = useState<"grid" | "list">("list");
   const [menu, setMenu] = useState<string | null>(null);
@@ -113,9 +115,9 @@ export default function FolderPane({
     return (
       <div className="wk-empty card">
         <IconFolder size={34} />
-        <div className="wk-etitle">This folder is empty</div>
+        <div className="wk-etitle">{t("This folder is empty")}</div>
         <div className="wk-ebody">
-          {readOnly ? "nothing here yet — and writes are disabled for this board." : "start with New page, or drop files to upload."}
+          {readOnly ? t("nothing here yet — and writes are disabled for this board.") : t("start with New page, or drop files to upload.")}
         </div>
       </div>
     );
@@ -143,15 +145,15 @@ export default function FolderPane({
             {entry.kind === "page" && (
               <>
                 <button type="button" onClick={() => { setMenu(null); setDialog({ kind: "rename", entry, value: entry.name }); }} disabled={readOnly}>
-                  Rename
+                  {t("Rename")}
                 </button>
                 <button type="button" onClick={() => { setMenu(null); setDialog({ kind: "move", entry, value: entry.path }); }} disabled={readOnly}>
-                  Move
+                  {t("Move")}
                 </button>
               </>
             )}
-            {entry.kind === "page" ? <button type="button" onClick={() => void downloadPage(entry)}>Download</button> : entry.kind === "file" && <a href={wikiRawUrl(entry.path)} download onClick={() => setMenu(null)}>
-              Download
+            {entry.kind === "page" ? <button type="button" onClick={() => void downloadPage(entry)}>{t("Download")}</button> : entry.kind === "file" && <a href={wikiRawUrl(entry.path)} download onClick={() => setMenu(null)}>
+              {t("Download")}
             </a>}
             <button
               type="button"
@@ -159,7 +161,7 @@ export default function FolderPane({
               disabled={readOnly}
               onClick={() => { setMenu(null); setConfirm(entry.path); }}
             >
-              Delete
+              {t("Delete")}
             </button>
           </div>
         </>
@@ -171,12 +173,12 @@ export default function FolderPane({
     <>
       <div className="wk-viewrow">
         <span className="text-label text-ink-500">{rows.length} {rows.length === 1 ? "item" : "items"}</span>
-        <span className="wk-vt" role="group" aria-label="Folder view">
+        <span className="wk-vt" role="group" aria-label={t("Folder view")}>
           <button
             type="button"
             className={view === "grid" ? "on" : ""}
-            title="Grid view"
-            aria-label="Grid view"
+            title={t("Grid view")}
+            aria-label={t("Grid view")}
             aria-pressed={view === "grid"}
             onClick={() => setView("grid")}
           >
@@ -185,8 +187,8 @@ export default function FolderPane({
           <button
             type="button"
             className={view === "list" ? "on" : ""}
-            title="List view"
-            aria-label="List view"
+            title={t("List view")}
+            aria-label={t("List view")}
             aria-pressed={view === "list"}
             onClick={() => setView("list")}
           >
@@ -206,9 +208,9 @@ export default function FolderPane({
             if (event.key === "Escape" && !busy) closeDialog();
           }}
         >
-          <h2 className="wk-dialog-title">{dialog.kind === "rename" ? "Rename" : "Move"} {dialog.entry.name}</h2>
-          <label className="slabel" htmlFor={fieldId}>{dialog.kind === "rename" ? "File name" : "Destination path"}</label>
-          {dialog.kind === "move" && <p id={`${fieldId}-hint`} className="wk-dialog-hint">Include the file name{scope ? " and keep it inside this project’s context" : " relative to Wiki"}.</p>}
+          <h2 className="wk-dialog-title">{dialog.kind === "rename" ? t("Rename") : t("Move")} {dialog.entry.name}</h2>
+          <label className="slabel" htmlFor={fieldId}>{dialog.kind === "rename" ? t("File name") : t("Destination path")}</label>
+          {dialog.kind === "move" && <p id={`${fieldId}-hint`} className="wk-dialog-hint">{t("Include the file name")}{scope ? ` ${t("and keep it inside this project’s context")}` : ` ${t("relative to Wiki")}`}.</p>}
           <input
             id={fieldId}
             name={dialog.kind === "rename" ? "name" : "destination"}
@@ -224,18 +226,18 @@ export default function FolderPane({
           />
           <div className="wk-tools">
             <Button type="submit" variant="primary" loading={busy} disabled={readOnly}>
-              {dialog.kind === "rename" ? "Rename" : "Move"}
+              {dialog.kind === "rename" ? t("Rename") : t("Move")}
             </Button>
-            <Button disabled={busy} onClick={closeDialog}>Cancel</Button>
+            <Button disabled={busy} onClick={closeDialog}>{t("Cancel")}</Button>
           </div>
         </form>
       )}
 
       {confirm && (
         <div className="wk-dialog card">
-          <h2 className="wk-dialog-title">Delete {baseName(confirm)}?</h2>
+          <h2 className="wk-dialog-title">{t("Delete")} {baseName(confirm)}?</h2>
           <div className="text-secondary text-ink-300">
-            This item moves to Trash. It can be restored later.
+            {t("This item moves to Trash. It can be restored later.")}
           </div>
           <div className="wk-tools">
             <Button
@@ -246,9 +248,9 @@ export default function FolderPane({
                 if (entry) void remove(entry);
               }}
             >
-              Move to Trash
+              {t("Move to Trash")}
             </Button>
-            <Button disabled={busy} onClick={() => setConfirm(null)}>Cancel</Button>
+            <Button disabled={busy} onClick={() => setConfirm(null)}>{t("Cancel")}</Button>
           </div>
         </div>
       )}

@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { useTranslate } from "../../../lib/locale";
 import type { ContentDoc, ContentRender, ProposalDoc } from "../campaignGrammar";
 import type { SmtpBinding } from "../sendClient";
 
@@ -27,35 +28,36 @@ export default function ActivityPane({
   /** The sends-history panel. */
   sends: ReactNode;
 }) {
+  const t = useTranslate();
   const pending = proposals.filter((row) => row.state === "pending");
   const decided = proposals.filter((row) => row.state !== "pending");
   const approved = doc !== null && doc.approval.valid && doc.approval.revision === doc.revision;
   const who = (row: ProposalDoc) =>
-    row.actor === "assistant" && row.assistantReceipt !== null ? "Assistant" : "An operator";
+    row.actor === "assistant" && row.assistantReceipt !== null ? t("Assistant") : t("An operator");
   return (
     <>
-      <section aria-label="Campaign timeline" className="card px-4 py-4 grid gap-3">
-        <h4 className="text-cardtitle font-medium text-ink-100">Timeline</h4>
+      <section aria-label={t("Campaign timeline")} className="card px-4 py-4 grid gap-3">
+        <h4 className="text-cardtitle font-medium text-ink-100">{t("Timeline")}</h4>
         <ol className="crm-timeline" data-timeline>
           {pending.map((row) => (
             <li key={row.proposalId} data-event="proposal-pending" data-accent>
               <span className="crm-dot" aria-hidden="true" />
               <span>
-                {who(row)} drafted “{row.subject}” — waiting for your review
+                {who(row)} {t("drafted “")}{row.subject}{t("” — waiting for your review")}
               </span>
             </li>
           ))}
           {doc !== null && (
             <li data-event="approval">
               <span className="crm-dot" aria-hidden="true" />
-              <span>{approved ? `Content approved at r${doc.revision}` : `r${doc.revision} is not approved`}</span>
+              <span>{approved ? <>{t("Content approved at r")}{doc.revision}</> : <>r{doc.revision} {t("is not approved")}</>}</span>
             </li>
           )}
           {doc !== null && (
             <li data-event="revision">
               <span className="crm-dot" aria-hidden="true" />
               <span>
-                Latest saved version is r{doc.revision}: “{doc.subject}”
+                {t("Latest saved version is r")}{doc.revision}: “{doc.subject}”
               </span>
             </li>
           )}
@@ -63,42 +65,42 @@ export default function ActivityPane({
             <li key={row.proposalId} data-event={`proposal-${row.state}`}>
               <span className="crm-dot" aria-hidden="true" />
               <span>
-                {who(row)}&apos;s draft “{row.subject}” was {row.state}
+                {who(row)}{t("'s draft “")}{row.subject}{t("” was")}{" "}{t(row.state)}
               </span>
             </li>
           ))}
           {doc === null && pending.length === 0 && decided.length === 0 && (
             <li data-event="empty">
               <span className="crm-dot" aria-hidden="true" />
-              <span>No versions or drafts yet.</span>
+              <span>{t("No versions or drafts yet.")}</span>
             </li>
           )}
         </ol>
         <details className="crm-diag" data-technical>
-          <summary className="text-micro text-ink-500">Technical details</summary>
+          <summary className="text-micro text-ink-500">{t("Technical details")}</summary>
           <dl className="sdetail mt-1">
             <div>
-              <dt>Campaign id</dt>
+              <dt>{t("Campaign id")}</dt>
               <dd className="num">{campaignId}</dd>
             </div>
             <div>
-              <dt>Workspace</dt>
+              <dt>{t("Workspace")}</dt>
               <dd className="num">{contextId || "none"}</dd>
             </div>
             {doc !== null && (
               <>
                 <div>
-                  <dt>Revision</dt>
+                  <dt>{t("Revision")}</dt>
                   <dd className="num">
                     r{doc.revision} · {doc.contentDigest}
                   </dd>
                 </div>
                 <div>
-                  <dt>Approval</dt>
+                  <dt>{t("Approval")}</dt>
                   <dd className="num">
                     {doc.approval.valid
                       ? `r${doc.approval.revision} · ${doc.approval.digest ?? "—"} (${doc.approval.scope})`
-                      : "none on this revision"}
+                      : t("none on this revision")}
                   </dd>
                 </div>
               </>
@@ -106,31 +108,31 @@ export default function ActivityPane({
             {render !== null && (
               <>
                 <div>
-                  <dt>Preview binding</dt>
+                  <dt>{t("Preview binding")}</dt>
                   <dd className="num">
-                    {render.bindingId} · preview-only
-                    {render.previewOnly ? "" : " (unexpected — reported)"}
+                    {render.bindingId} {t("· preview-only")}
+                    {render.previewOnly ? "" : ` ${t("(unexpected — reported)")}`}
                   </dd>
                 </div>
                 <div>
-                  <dt>Unsubscribe link</dt>
+                  <dt>{t("Unsubscribe link")}</dt>
                   <dd className="num">{render.unsubscribeUrl}</dd>
                 </div>
               </>
             )}
             {binding != null && (
               <div>
-                <dt>Sender link</dt>
+                <dt>{t("Sender link")}</dt>
                 <dd className="num">
-                  {binding.connectionId} · link r{binding.linkRevision} · {binding.digest}
+                  {binding.connectionId} {t("· link r")}{binding.linkRevision} · {binding.digest}
                 </dd>
               </div>
             )}
             {proposals.map((row) => (
               <div key={row.proposalId}>
-                <dt>Proposal</dt>
+                <dt>{t("Proposal")}</dt>
                 <dd className="num">
-                  {row.proposalId} · {row.state} · actor {row.actor} · origin {row.origin} · source r
+                  {row.proposalId} · {t(row.state)} · {t("actor")} {row.actor} · {t("origin")} {row.origin} · {t("source r")}
                   {row.sourceRevision}
                 </dd>
               </div>

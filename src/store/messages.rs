@@ -1192,6 +1192,9 @@ impl Store {
         Ok(match sender {
             Sender::Agent(alias) => (Some(self.agent_in(tx, alias)?.uid), Some(alias.clone())),
             Sender::Operator | Sender::OperatorChat => (None, Some("operator".into())),
+            // CAD-1380: a member is attributed by label only, never as the
+            // operator and never with an agent uid.
+            Sender::Member(_) | Sender::VerifiedMember(_) => (None, Some("member".into())),
             Sender::Unattributed => (None, None),
         })
     }
@@ -2200,20 +2203,29 @@ impl Store {
     /// daemon's `wal_checkpointed` stream has no agents row, so the
     /// agent-removal `DELETE` never reaches it.
     ///
-    /// On the daemon stream an open mutation intent is not pruned: a
-    /// `prepared` row survives until its matching `finished` row exists
-    /// (same request, correlation, company, action and resource, schema 1,
-    /// a valid outcome for its kind). A `pm_mutation_prepared` row has no
-    /// SQLite finish, so it is always kept: its completion is proven only by
-    /// the Git commit trailer, which this statement cannot read. Malformed or
-    /// unmatched identity keeps the row. Protected rows are kept in addition
-    /// to the newest `keep`; ordinary rows follow the cap as before.
+    /// Daemon `assist_intent` rows sit outside the `keep` window and are
+    /// dropped only when terminal (`delivered`/`refused`/`unresolved`), with a
+    /// `job_id` whose canonical `jobs` row is gone; pending, NULL, unknown or
+    /// malformed status and a missing job association are kept. On the daemon
+    /// stream an open mutation intent is not pruned: a `prepared` row survives
+    /// until its matching `finished` row exists (same request, correlation,
+    /// company, action and resource, schema 1, a valid outcome for its kind).
+    /// A `pm_mutation_prepared` row has no SQLite finish, so it is always kept.
+    /// Malformed or unmatched identity keeps the row. Protected rows are kept
+    /// in addition to the newest `keep`; ordinary rows follow the cap as before.
     pub fn prune_stream(&self, alias: &str, keep: i64) -> Result<()> {
         self.write_tx(|conn| {
             conn.execute(
-                "DELETE FROM events WHERE alias=?1 AND seq NOT IN (
-                             SELECT seq FROM events WHERE alias=?1
-                             ORDER BY seq DESC LIMIT ?2)
+                "DELETE FROM events WHERE alias=?1 AND (
+                   (kind='assist_intent' AND alias='daemon' AND job_id IS NOT NULL
+                    AND CASE WHEN json_valid(payload)
+                          THEN json_extract(payload,'$.status') END
+                        IN ('delivered','refused','unresolved')
+                    AND NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.id=events.job_id))
+                   OR (NOT (kind='assist_intent' AND alias='daemon') AND seq NOT IN (
+                        SELECT seq FROM events
+                        WHERE alias=?1 AND NOT (kind='assist_intent' AND alias='daemon')
+                        ORDER BY seq DESC LIMIT ?2)
                  AND NOT (alias=?3 AND (
                      kind='pm_mutation_prepared'
                      OR (kind IN ('app_workspace_mutation_prepared','board_session_mutation_prepared')
@@ -2235,7 +2247,8 @@ impl Store {
                              AND json_extract(f.payload,'$.correlation_id')=json_extract(events.payload,'$.correlation_id')
                              AND json_extract(f.payload,'$.company') IS json_extract(events.payload,'$.company')
                              AND json_extract(f.payload,'$.action')=json_extract(events.payload,'$.action')
-                             AND json_extract(f.payload,'$.resource')=json_extract(events.payload,'$.resource')))))",
+                             AND json_extract(f.payload,'$.resource')=json_extract(events.payload,'$.resource'))))))
+                 )",
                 params![alias, keep, Self::DAEMON_STREAM],
             )?;
             Ok(())

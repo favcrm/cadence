@@ -5,6 +5,7 @@ import { resources } from "../../lib/resources";
 import { plainFailure, type HomeNeed } from "./needs";
 import Button from "../../ui/Button";
 import { ReasonBlock } from "./PermissionCard";
+import { useTranslate } from "../../lib/locale";
 
 /** What a blocked action says: one plain line, no command. */
 export const READ_ONLY_COPY = "You're viewing read-only.";
@@ -49,27 +50,28 @@ export default function AnswerForm({
 }) {
   const { options, impact, body } = need.action;
   const block = useWriteBlock(readOnly);
+  const t = useTranslate();
   const [text, setText] = useState("");
   const { send, busy, error } = useAnswer(need, onDone);
   return (
     <div className="mt-2 space-y-2">
       {/* The title is a short label; the whole summary is read here. */}
-      {need.summary && <ReasonBlock reason={need.summary} label="Master's summary:" />}
+      {need.summary && <ReasonBlock reason={need.summary} label={t("Master's summary:")} />}
       {(body || impact) && (
         <details>
-          <summary className="text-micro text-ink-500 cursor-pointer">the question in full</summary>
-          {impact && <p className="mt-1 text-micro text-ink-500 break-words">Impact: {impact}</p>}
+          <summary className="text-micro text-ink-500 cursor-pointer">{t("the question in full")}</summary>
+          {impact && <p className="mt-1 text-micro text-ink-500 break-words">{t("Impact:")} {impact}</p>}
           {body && <pre className="mt-1 whitespace-pre-wrap break-words text-micro text-ink-400">{body}</pre>}
         </details>
       )}
       {block ? (
-        <p className="text-micro text-ink-500">{READ_ONLY_COPY}</p>
+        <p className="text-micro text-ink-500">{t(READ_ONLY_COPY)}</p>
       ) : (
         <>
           {options.length > 0 && (
             <div className="flex flex-wrap gap-1.5">
               {options.map((o) => (
-                <Button key={o} size="sm" disabled={busy} onClick={() => send(o)} title={`answer: ${o}`}>
+                <Button key={o} size="sm" disabled={busy} onClick={() => send(o)} title={`${t("answer")}: ${o}`}>
                   {o}
                 </Button>
               ))}
@@ -80,11 +82,11 @@ export default function AnswerForm({
             onChange={(e) => setText(e.target.value)}
             rows={2}
             className="field w-full text-secondary"
-            placeholder="Or write an answer…"
-            aria-label="your answer"
+            placeholder={t("Or write an answer…")}
+            aria-label={t("your answer")}
           />
           <Button variant="primary" size="sm" disabled={busy} loading={busy} onClick={() => send(text)}>
-            {busy ? "Sending…" : "Send answer"}
+            {busy ? t("Sending…") : t("Send answer")}
           </Button>
         </>
       )}

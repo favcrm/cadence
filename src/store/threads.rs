@@ -40,6 +40,10 @@ use crate::error::{Error, Result};
 pub const ROLE_OPERATOR: &str = "operator";
 pub const ROLE_AGENT: &str = "agent";
 pub const ROLE_SYSTEM: &str = "system";
+/// CAD-1380: a verified organization member's own chat text — rendered
+/// like an operator turn but attributed to the member, never the
+/// operator, so a member message never reads as operator authority.
+pub const ROLE_MEMBER: &str = "member";
 
 pub const KIND_MESSAGE: &str = "message";
 pub const KIND_ASSISTANT_TEXT: &str = "assistant_text";
@@ -47,7 +51,7 @@ pub const KIND_TOOL_CALL: &str = "tool_call";
 pub const KIND_TOOL_RESULT: &str = "tool_result";
 pub const KIND_TURN_RESULT: &str = "turn_result";
 
-const ROLES: &[&str] = &[ROLE_OPERATOR, ROLE_AGENT, ROLE_SYSTEM];
+const ROLES: &[&str] = &[ROLE_OPERATOR, ROLE_AGENT, ROLE_SYSTEM, ROLE_MEMBER];
 const KINDS: &[&str] = &[
     KIND_MESSAGE,
     KIND_ASSISTANT_TEXT,
@@ -64,6 +68,16 @@ pub const TOOL_SUMMARY_CAP: usize = 160;
 /// Largest page one read returns.
 pub const PAGE_MAX: i64 = 500;
 
+/// CAD-1380 R1: the daemon-verified member authority a member send carried,
+/// retained on its enqueue thread entry. Ids only, never a token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberAuthority {
+    pub org: String,
+    pub sub: String,
+    pub assistant_id: String,
+    pub credential_id: String,
+}
+
 /// Who queued a message, for its thread entry. Only the daemon decides
 /// this, from the connection — never a request field.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +91,15 @@ pub enum Sender {
     OperatorChat,
     /// A caller the daemon attributed to a registered agent.
     Agent(String),
+    /// CAD-1380: a verified organization member sending to their own
+    /// bound assistant. Carries the member's `sub` for attribution only
+    /// — it grants no operator authority and lands in the assistant
+    /// alias's own (principal-private) thread, like an ordinary send.
+    Member(String),
+    /// CAD-1380 R1: a member send whose ORIGINAL envelope authority was
+    /// re-verified at the daemon. Built only from `member_caller`; the
+    /// authority rides the enqueue entry so a queued turn re-proves it.
+    VerifiedMember(MemberAuthority),
     /// Internal enqueues (routed results, kickoffs, monitor dispatch)
     /// and callers whose identity was not derived.
     Unattributed,
@@ -90,6 +113,7 @@ impl Sender {
         match self {
             Sender::Operator | Sender::OperatorChat => "operator",
             Sender::Agent(alias) => alias,
+            Sender::Member(_) | Sender::VerifiedMember(_) => "member",
             Sender::Unattributed => "unattributed",
         }
     }
@@ -435,6 +459,18 @@ fn message_entry<'a>(
     let (role, mut payload) = match sender {
         Sender::Operator | Sender::OperatorChat => (ROLE_OPERATOR, json!({"source": source})),
         Sender::Agent(alias) => (ROLE_SYSTEM, json!({"source": source, "from": alias})),
+        // A member's own message reads as the member (their user id), in
+        // the assistant alias's private thread — never "operator".
+        Sender::Member(sub) => (
+            ROLE_MEMBER,
+            json!({"source": source, "from": format!("users/{sub}"), "member": sub}),
+        ),
+        Sender::VerifiedMember(auth) => (
+            ROLE_MEMBER,
+            json!({"source": source, "from": format!("users/{}", auth.sub), "member": auth.sub,
+                   "member_authority": {"org": auth.org, "sub": auth.sub,
+                       "assistant_id": auth.assistant_id, "credential_id": auth.credential_id}}),
+        ),
         Sender::Unattributed => (ROLE_SYSTEM, json!({"source": source})),
     };
     if let Some(refs) = refs {
@@ -1284,6 +1320,64 @@ impl Store {
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
+        }
+    }
+
+    /// CAD-1380 R1: the member authority the ORIGINAL enqueue of `message_id`
+    /// recorded. Only a member-role message entry in the message's own alias
+    /// thread counts; a malformed stamp is an error, never a guess.
+    pub fn message_member_authority(&self, message_id: &str) -> Result<Option<MemberAuthority>> {
+        let conn = self.conn();
+        let row = conn.query_row(
+            "SELECT e.role,e.kind,e.payload FROM thread_entries e \
+             JOIN threads t ON t.id=e.thread_id \
+             JOIN messages m ON m.id=e.message_id AND m.alias=t.alias \
+             WHERE e.message_id=? ORDER BY e.seq LIMIT 1",
+            [message_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            },
+        );
+        let (role, kind, payload) = match row {
+            Ok(v) => v,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        if role != ROLE_MEMBER || kind != KIND_MESSAGE {
+            return Ok(None);
+        }
+        let stamp = payload
+            .and_then(|p| serde_json::from_str::<Value>(&p).ok())
+            .and_then(|v| v.get("member_authority").cloned());
+        let field = |k: &str| {
+            stamp
+                .as_ref()
+                .and_then(|s| s.get(k))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        match (
+            field("org"),
+            field("sub"),
+            field("assistant_id"),
+            field("credential_id"),
+        ) {
+            (Some(org), Some(sub), Some(assistant_id), Some(credential_id)) => {
+                Ok(Some(MemberAuthority {
+                    org,
+                    sub,
+                    assistant_id,
+                    credential_id,
+                }))
+            }
+            _ => Err(Error::rejected(format!(
+                "member message '{message_id}' carries no verified member authority"
+            ))),
         }
     }
 

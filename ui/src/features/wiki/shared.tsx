@@ -6,6 +6,7 @@ import { IconFolder, IconLock, IconWiki } from "../../ui/icons";
 import { breadcrumbs } from "./paths";
 import { wikiBlob, type WikiKind } from "./api";
 import { sessionKey } from "../../lib/sessionKey";
+import { useTranslate } from "../../lib/locale";
 
 export const WIKI_ROOT_LABEL = "Wiki";
 export const WikiScopeContext = createContext<WikiScope | undefined>(undefined);
@@ -25,12 +26,13 @@ export function LockIcon({ size = 11 }: { size?: number }) {
 
 /** Breadcrumbs for a path; every ancestor is a link, the leaf is bold. */
 export function Crumbs({ path, hrefFor }: { path: string; hrefFor: (path: string) => string }) {
+  const t = useTranslate();
   const scope = useWikiScope();
   const root = scope?.root ?? "";
   const trail = breadcrumbs(path).filter((crumb) => crumb.path !== root && (!root || crumb.path.startsWith(`${root}/`)));
   return (
     <div className="wk-crumbs">
-      <Link href={hrefFor(root)}>{scope?.label ?? WIKI_ROOT_LABEL}</Link>
+      <Link href={hrefFor(root)}>{scope?.label ?? t(WIKI_ROOT_LABEL)}</Link>
       {trail.map((crumb, i) => (
         <span key={crumb.path} className="wk-crumb">
           <span className="wk-sep">/</span>
@@ -136,18 +138,20 @@ export function WikiImage({ path, className, alt }: { path: string; className?: 
 }
 
 export function Loading({ what }: { what: string }) {
+  const t = useTranslate();
   return (
     <div className="wk-loading" role="status">
-      {what}
+      {t(what)}
     </div>
   );
 }
 
 export function Failure({ what, error, onRetry }: { what: string; error: string; onRetry?: () => void }) {
+  const t = useTranslate();
   return (
     <div className="wk-failure" role="alert">
       <span className="min-w-0">
-        {what} — {error}
+        {t(what)} — {error}
       </span>
       {onRetry && (
         <button type="button" className="chip bg-fail/10 text-fail hover:bg-fail/20 ml-auto" onClick={onRetry}>

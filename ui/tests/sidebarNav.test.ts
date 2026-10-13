@@ -25,6 +25,7 @@ loader.prototype.require = function (this: unknown, id: string) {
 const React = require("react") as typeof import("react");
 const { renderToStaticMarkup } = require("react-dom/server") as typeof import("react-dom/server");
 const { NavList, ProjectList } = require("../src/ui/NavList") as typeof import("../src/ui/NavList");
+const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
 const { NAV } = require("../src/lib/router") as typeof import("../src/lib/router");
 const fs = require("fs");
 
@@ -43,7 +44,7 @@ const appMenu = {
   ],
 };
 const nav = (screen: string, menu: typeof appMenu | null, label?: string) =>
-  renderToStaticMarkup(React.createElement(NavList, { screen, navHref, appMenu: menu, label } as any));
+  renderToStaticMarkup(React.createElement(LocaleProvider, null, React.createElement(NavList, { screen, navHref, appMenu: menu, label } as any)));
 
 // Same items, whichever landmark hosts the list (desktop "Primary", phone "Workspace").
 equal(hrefs(nav("home", null)), hrefs(nav("home", null, "Workspace")), "desktop and phone render the same rows");
@@ -78,7 +79,7 @@ assert(!nav("home", appMenu).includes("data-parent-current") && !nav("home", app
 // Projects: empty list shows a plain line instead of the All projects row.
 const state = (data: unknown[] | null, status = "ready") => ({ data, status, error: null }) as any;
 const projectList = (projects: unknown[], extra: object = {}) =>
-  renderToStaticMarkup(React.createElement(ProjectList, { project: null, projectHref: (k: string) => `/p/${k}`, projects, issues: state([]), ...extra } as any));
+  renderToStaticMarkup(React.createElement(LocaleProvider, null, React.createElement(ProjectList, { project: null, projectHref: (k: string) => `/p/${k}`, projects, issues: state([]), ...extra } as any)));
 const empty = projectList([]);
 assert(empty.includes("No projects yet"), "empty list says so");
 assert(!empty.includes("All projects") && hrefs(empty).length === 0, "empty list has no All projects row or link");

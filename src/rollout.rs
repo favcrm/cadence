@@ -52,7 +52,12 @@ use crate::store::{self, Store};
 /// `version < 20` block before CAD-1171 added it — one idempotent table.
 /// v37 (CAD-1168): the retained `chat_files` table.
 /// v40 (CAD-1393): company document template versions and their drafts.
-pub const SCHEMA_VERSION: i64 = 40;
+/// v41 (CAD-1380/AOS-216): the `assistants`, `assist_requests` and
+/// `job_subscribers` tables — standalone, new objects only.
+/// v42 (CAD-1380/AOS-216): member job-request provenance columns on
+/// `assist_requests` and the `assist_stall_checks` table.
+/// v43 (CAD-1380/AOS-216): the owner-granted `assist_job_shares` table.
+pub const SCHEMA_VERSION: i64 = 43;
 
 /// Last schema that has no lease table. The bootstrap opt-in covers
 /// only this version.
@@ -3339,8 +3344,12 @@ mod tests {
         assert_eq!(version, SCHEMA_VERSION);
         // CAD-818: v38 adds durable topic identity and v39 adds topics,
         // part of the reviewed schema the rollout carries. CAD-1393: v40
-        // adds the business template tables.
-        assert_eq!(SCHEMA_VERSION, 40);
+        // adds the business template tables. CAD-1380/AOS-216: v41 adds
+        // the `assistants`, `assist_requests` and `job_subscribers`
+        // tables; v42 adds the member-request provenance columns and
+        // `assist_stall_checks`; v43 adds the owner-granted
+        // `assist_job_shares` entitlement.
+        assert_eq!(SCHEMA_VERSION, 43);
     }
 
     struct MigrationHolder;

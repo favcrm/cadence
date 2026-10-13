@@ -17,12 +17,17 @@ export interface CapabilityContext {
   sendIntent: (intent: { cadence_csv_import: { request_id: string; confirm_token: string } }) => Promise<string | null>;
 }
 
-export function renderCapability(id: HostAttachmentId, label: string | null, ctx: CapabilityContext): ReactNode {
+export function renderCapability(
+  id: HostAttachmentId,
+  label: string | null,
+  ctx: CapabilityContext,
+  t: (english: string) => string = (english) => english,
+): ReactNode {
   switch (id) {
     case "csv-import":
       return (
         <details className="app-chat-import" data-chat-attachment={id}>
-          <summary className="text-label text-ink-300">{label ?? "Import a customer list"}</summary>
+          <summary className="text-label text-ink-300">{label ?? t("Import a customer list")}</summary>
           <ChatCsvImport
             // CAD-1016: a context change remounts the import, so a pending
             // plan, preview or choices from the prior scope never bleed over.

@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::agents::Agent;
+use super::assistants::AssistDispatchExpect;
 use super::kickoff::{check_commit_sha, criteria_too_long, flatten_controls, kickoff_body};
 use super::messages::{row_message, Message, Priority};
 use super::StoreConn;
@@ -718,11 +719,69 @@ impl Store {
         message_id: Option<&str>,
         by: &str,
     ) -> Result<(Task, String, bool, bool)> {
+        self.dispatch_task_inner(task_id, to, message_id, by, None)
+    }
+
+    /// `dispatch_task` for an assist-bound job: the fenced transaction first
+    /// re-reads the local provenance the caller's preflight captured. A changed,
+    /// revoked, deleted or missing row refuses before any task, enqueue or event
+    /// write. The remote authority proof stays outside this lock.
+    pub fn dispatch_task_expecting(
+        &self,
+        task_id: &str,
+        to: Option<&str>,
+        message_id: Option<&str>,
+        by: &str,
+        expect: &AssistDispatchExpect,
+    ) -> Result<(Task, String, bool, bool)> {
+        self.dispatch_task_inner(task_id, to, message_id, by, Some(expect))
+    }
+
+    fn dispatch_task_inner(
+        &self,
+        task_id: &str,
+        to: Option<&str>,
+        message_id: Option<&str>,
+        by: &str,
+        expect: Option<&AssistDispatchExpect>,
+    ) -> Result<(Task, String, bool, bool)> {
         self.write_tx(|conn| {
             let tx = &mut *conn;
             Self::refuse_app_task(&tx, task_id)?;
             let task = self.task_in(&tx, task_id)?;
             let job = self.job_in(&tx, &task.job_id)?;
+            match expect {
+                Some(expect) => {
+                    // The captured tuple must name THIS task's job before its
+                    // provenance is compared.
+                    if expect.job != task.job_id {
+                        return Err(Error::rejected(
+                            "task dispatch refused: the captured assist provenance names a \
+                             different job (CAD-1380)",
+                        ));
+                    }
+                    self.assist_expect_in(&tx, expect)?;
+                }
+                // Ordinary dispatch of an assist-bound job fails closed in this
+                // same transaction, never reaching the plain wrapper unchecked.
+                None => {
+                    let bound = task.job_id.starts_with("assist-")
+                        || tx
+                            .query_opt(
+                                "SELECT 1 FROM assist_requests WHERE job=?",
+                                [task.job_id.as_str()],
+                                |_| Ok(()),
+                            )?
+                            .is_some();
+                    if bound {
+                        return Err(Error::rejected(format!(
+                            "task dispatch refused: job '{}' is assist-bound and needs its \
+                             member provenance re-proven (CAD-1380)",
+                            task.job_id
+                        )));
+                    }
+                }
+            }
             if job.state != "open" {
                 return Err(Error::rejected(format!(
                     "Job '{}' is '{}' — dispatch needs an open job",

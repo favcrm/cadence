@@ -6,6 +6,8 @@
  */
 
 export const ATTACH_EXTS = ["txt", "md", "csv"];
+type Translate = (english: string) => string;
+const identity: Translate = (english) => english;
 /** The file picker's accept list — both densities share it. PDF and
  *  image kinds are deliberately absent: no reviewed processing contract
  *  exists, so they are refused at selection and at the daemon. */
@@ -63,6 +65,19 @@ export function attachRefusal(name: string, size: number): string | null {
 
 /** The daemon words a refusal "chat_file_upload refused 'x.txt': …"; the
  *  operator reads only the reason, never the RPC name or the file again. */
+export function displayAttachError(message: string, t: Translate = identity): string {
+  const unavailable = /^PDF and image processing is not available yet — (\.[^ ]+) cannot be attached$/.exec(message);
+  if (unavailable)
+    return t("PDF and image processing is not available yet — {ext} cannot be attached").replace("{ext}", () => unavailable[1]);
+  const unsupported = /^(.+?) is not attachable \(txt, md, csv\)$/.exec(message);
+  if (unsupported)
+    return `${unsupported[1]} ${t("is not attachable (txt, md, csv)")}`;
+  const count = /^at most (\d+) attachments per message$/.exec(message);
+  if (count)
+    return t("at most {count} attachments per message").replace("{count}", () => count[1]);
+  return t(message);
+}
+
 export function userUploadError(message: string): string {
   const reason = message
     .replace(/^chat_file_upload(?: refused)?(?: '[^']*')?:\s*/, "")
@@ -78,16 +93,17 @@ export function isPermanentUploadFailure(status: number | undefined): boolean {
 }
 
 /** Size and kind for a file row, e.g. `180 KB · Text`. */
-export function attachMeta(name: string, size: number): string {
+export function attachMeta(name: string, size: number, t: Translate = identity): string {
   const ext = name.toLowerCase().split(".").pop() ?? "";
-  const kind = ext === "csv" ? "CSV" : ext === "md" ? "Markdown" : ext === "txt" ? "Text" : ext ? ext.toUpperCase() : "File";
+  const kind = ext === "csv" ? "CSV" : ext === "md" ? t("Markdown") : ext === "txt" ? t("Text") : ext ? ext.toUpperCase() : t("File");
   const kb = size < 1024 ? `${size} B` : size < 1024 * 1024 ? `${Math.round(size / 1024)} KB` : `${(size / 1024 / 1024).toFixed(1)} MB`;
   return `${kb} · ${kind}`;
 }
 
 /** Whether `more` files still fit the count cap given `have` queued. */
-export function attachFits(have: number, more: number): string | null {
-  if (have + more > ATTACH_MAX_FILES) return `at most ${ATTACH_MAX_FILES} attachments per message`;
+export function attachFits(have: number, more: number, t: Translate = identity): string | null {
+  if (have + more > ATTACH_MAX_FILES)
+    return t("at most {count} attachments per message").replace("{count}", String(ATTACH_MAX_FILES));
   return null;
 }
 
@@ -112,17 +128,51 @@ export function sameAttachDestination(
 export function unresolved(items: AttachItem[]): AttachItem[] {
   return items.filter((i) => i.status !== "ready");
 }
-/** The submit-time sentence for `title`/aria when a send is withheld
- *  because rows are unresolved — specific over a generic disabled. */
-export function unresolvedHint(items: AttachItem[]): string | null {
+/** The send-hold notice as a locale-neutral UiNotice: a whole-sentence
+ *  catalog key plus raw slots. Nothing is translated here, so a stored
+ *  notice follows the locale active at render. Null when nothing is
+ *  unresolved. The reason text is the last slot, so no later slot
+ *  replacement can match a brace inside it. */
+export function unresolvedHintNotice(items: AttachItem[]): { key: string; slots: Record<string, string> } | null {
   const bad = unresolved(items);
   if (bad.length === 0) return null;
   const uploading = bad.filter((i) => i.status === "uploading").length;
   const failed = bad.filter((i) => i.status === "failed");
   const reasons = [...new Set(failed.map((i) => i.error).filter(Boolean))].join("; ");
-  const parts = [
-    uploading > 0 ? `${uploading} file${uploading === 1 ? " is" : "s are"} still uploading` : "",
-    failed.length > 0 ? `${failed.length} file${failed.length === 1 ? "" : "s"} failed${reasons ? ` — ${reasons}` : ""}` : "",
-  ].filter(Boolean);
-  return `${parts.join(" · ")} — resolve or remove before sending`;
+  const reasonSuffix = reasons ? ` — ${reasons}` : "";
+  if (failed.length === 0)
+    return {
+      key: uploading === 1
+        ? "{count} file is still uploading — resolve or remove before sending"
+        : "{count} files are still uploading — resolve or remove before sending",
+      slots: { count: String(uploading) },
+    };
+  if (uploading === 0)
+    return {
+      key: failed.length === 1
+        ? "{count} file failed{reasonSuffix} — resolve or remove before sending"
+        : "{count} files failed{reasonSuffix} — resolve or remove before sending",
+      slots: { count: String(failed.length), reasonSuffix },
+    };
+  return {
+    key: uploading === 1
+      ? failed.length === 1
+        ? "{uploading} file is still uploading · {failed} file failed{reasonSuffix} — resolve or remove before sending"
+        : "{uploading} file is still uploading · {failed} files failed{reasonSuffix} — resolve or remove before sending"
+      : failed.length === 1
+        ? "{uploading} files are still uploading · {failed} file failed{reasonSuffix} — resolve or remove before sending"
+        : "{uploading} files are still uploading · {failed} files failed{reasonSuffix} — resolve or remove before sending",
+    slots: { uploading: String(uploading), failed: String(failed.length), reasonSuffix },
+  };
+}
+
+/** The English-or-translated hold sentence for `title`/aria. Expands the
+ *  same notice as the stored path: translate the whole key, then insert
+ *  each slot literally. */
+export function unresolvedHint(items: AttachItem[], t: Translate = identity): string | null {
+  const notice = unresolvedHintNotice(items);
+  if (notice === null) return null;
+  let text = t(notice.key);
+  for (const [name, value] of Object.entries(notice.slots)) text = text.replace(`{${name}}`, () => value);
+  return text;
 }

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useTranslate } from "../../lib/locale";
 import Link from "../../ui/Link";
 import { useQuery } from "../../lib/useResource";
 import { routePath } from "../../lib/router";
@@ -24,6 +25,7 @@ export default function SetupNudge({ readOnly }: { readOnly: boolean | null }) {
 }
 
 function Nudge() {
+  const t = useTranslate();
   const state = useQuery(setupResource);
   const [dismissed, setDismissed] = useState(() => readNudgeDismissed(browserStorage()));
   if (dismissed || !state.data) return null;
@@ -42,19 +44,19 @@ function Nudge() {
         role="status"
       >
         <span className="min-w-0 flex-1 text-secondary text-ink-300">
-          <span className="font-medium text-ink-100">Setup isn't finished</span> — still to do:{" "}
+          <span className="font-medium text-ink-100">{t("Setup isn't finished")}</span> — {t("still to do:")}{" "}
           {missing.map(checkLabel).join(", ")}.
         </span>
         <Link href={routePath({ screen: "setup" })} className="lnk text-secondary font-medium">
-          Open setup →
+          {t("Open setup →")}
         </Link>
         <button
           type="button"
           onClick={dismiss}
           className="chip py-1 bg-ink-800 text-ink-400 hover:text-ink-100"
-          aria-label="dismiss the setup reminder"
+          aria-label={t("dismiss the setup reminder")}
         >
-          dismiss
+          {t("dismiss")}
         </button>
       </div>
     </div>

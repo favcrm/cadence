@@ -69,6 +69,18 @@ removing a PDF cleans up its generated page. Moving a folder rewrites the
 from search until corrected. A failed conversion remains visible as an
 extraction status, with the raw source still available.
 
+### Operator file import (`wiki upload`)
+
+`cadence wiki upload <file> <path> [--overwrite]` imports one local file into
+the remote knowledge wiki for retrieval. It is an explicit, user-invoked import:
+nothing uploads automatically, and chat attachments never use this path (they
+stay in the user's thread workspace). Limits: 15 MiB per file, regular files
+only (symlinks and FIFOs are refused), no chunking yet.
+
+Without `--overwrite`, the parent folder is listed first and an existing name is
+refused. That check is not atomic: a file created between the listing and the
+upload can still be replaced. Use `--overwrite` only for files you control.
+
 ## Index health and repair
 
 An operator can inspect the derived index without triggering a rebuild:

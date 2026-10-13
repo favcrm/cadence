@@ -1105,6 +1105,98 @@ impl Store {
                 tx.execute("UPDATE schema_version SET version=40", [])?;
                 tx.commit()?;
             }
+            if version < 41 {
+                // CAD-1380/AOS-216: member personal-assistant bindings.
+                // One row per verified (org, member sub) → daemon-owned
+                // agent alias + principal-scoped conversation. The daemon
+                // binds a relayed `member_as` to this row; a request field
+                // never sets it. `authority_rev` is the platform
+                // membership/authority revision the binding last proved
+                // against — effect-time revalidation reads it. New table
+                // only; nothing moved or rewritten.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS assistants(
+                    org TEXT NOT NULL, sub TEXT NOT NULL,
+                    assistant_id TEXT NOT NULL,
+                    alias TEXT NOT NULL,
+                    conversation_id TEXT,
+                    state TEXT NOT NULL DEFAULT 'active',
+                    authority_rev TEXT,
+                    created REAL NOT NULL, updated REAL NOT NULL,
+                    PRIMARY KEY (org, sub));
+                 CREATE UNIQUE INDEX IF NOT EXISTS assistants_alias
+                    ON assistants(org, assistant_id);
+                 CREATE TABLE IF NOT EXISTS job_subscribers(
+                    job TEXT NOT NULL, org TEXT NOT NULL, sub TEXT NOT NULL,
+                    assistant_id TEXT NOT NULL, created REAL NOT NULL,
+                    PRIMARY KEY (job, org, sub));
+                 CREATE TABLE IF NOT EXISTS assist_requests(
+                    org TEXT NOT NULL, sub TEXT NOT NULL,
+                    request_key TEXT NOT NULL, job TEXT NOT NULL,
+                    created REAL NOT NULL,
+                    PRIMARY KEY (org, sub, request_key));",
+                )?;
+                tx.execute("UPDATE schema_version SET version=41", [])?;
+                tx.commit()?;
+            }
+            if version < 42 {
+                // CAD-1380/AOS-216: a member job request carries its
+                // title/body/acceptance + the authorization provenance a
+                // deferred commit re-proves (the issuing credential and
+                // the authority revision it was minted under). The
+                // deferred consumer re-proves THIS credential, not the
+                // member's latest — a queued request keeps its recorded
+                // provenance. Plus one deduplicated unresolved stall
+                // check per (job, revision).
+                // Column-checked like every additive ALTER above: a
+                // half-applied or version-rolled-back store converges
+                // instead of erroring on a duplicate column.
+                let assist_columns: Vec<String> = conn
+                    .prepare("PRAGMA table_info(assist_requests)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(std::result::Result::ok)
+                    .collect();
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                for (column, definition) in [
+                    ("title", "title TEXT"),
+                    ("body", "body TEXT"),
+                    ("acceptance", "acceptance TEXT"),
+                    ("credential_id", "credential_id TEXT"),
+                    ("authority_rev", "authority_rev TEXT"),
+                    ("state", "state TEXT NOT NULL DEFAULT 'requested'"),
+                ] {
+                    if !assist_columns.iter().any(|c| c == column) {
+                        tx.execute_batch(&format!(
+                            "ALTER TABLE assist_requests ADD COLUMN {definition}"
+                        ))?;
+                    }
+                }
+                tx.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS assist_stall_checks(
+                    job TEXT NOT NULL, revision INTEGER NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'open',
+                    created REAL NOT NULL, resolved REAL,
+                    PRIMARY KEY (job, revision));",
+                )?;
+                tx.execute("UPDATE schema_version SET version=42", [])?;
+                tx.commit()?;
+            }
+            if version < 43 {
+                // CAD-1380/AOS-216: an assist job is shared only when its
+                // OWNING member explicitly says so — `member_job_share`
+                // writes one row per job; `member_job_subscribe` requires
+                // it, so a second member's subscription rides an
+                // authenticated owner grant, never org membership alone.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS assist_job_shares(
+                    job TEXT PRIMARY KEY, org TEXT NOT NULL,
+                    shared_by TEXT NOT NULL, created REAL NOT NULL);",
+                )?;
+                tx.execute("UPDATE schema_version SET version=43", [])?;
+                tx.commit()?;
+            }
             if let Some(crossing) = permit.crossing {
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 Self::event(

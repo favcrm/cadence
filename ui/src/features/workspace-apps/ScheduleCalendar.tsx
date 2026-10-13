@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ApiError } from "../../lib/api";
 import Button from "../../ui/Button";
+import { useTranslate } from "../../lib/locale";
 import type { WorkspaceRun, AppEffect } from "./workspaceApps";
 import {
   socialPublish,
@@ -322,6 +323,7 @@ export default function ScheduleCalendar({
   );
   const atCap = scoped.intents !== null && rawCount >= LIST_CAP;
 
+  const t = useTranslate();
   const dayLabel = (date: string) => {
     const [y, m, d] = date.split("-").map(Number);
     const day = new Date(Date.UTC(y, m - 1, d));
@@ -340,11 +342,11 @@ export default function ScheduleCalendar({
         className="wa-post-card wa-cal-card"
         data-tone={publishStateTone(intent.state)}
         onClick={() => run && onOpenRun(run)}
-        aria-label={`${publishStateText(intent.state)} · ${plainTitle(run?.snapshot.inputs ?? {}, intent.run_id)}`}
+        aria-label={`${publishStateText(intent.state, t)} · ${plainTitle(run?.snapshot.inputs ?? {}, intent.run_id)}`}
       >
         <div className="wa-card-meta">
           <span className="wa-status" data-tone={publishStateTone(intent.state)}>
-            {publishStateText(intent.state)}
+            {publishStateText(intent.state, t)}
           </span>
           <span className="wa-kicker">{intent.channel}</span>
         </div>
@@ -378,11 +380,11 @@ export default function ScheduleCalendar({
       className="wa-post-card wa-cal-card"
       data-tone="muted"
       onClick={() => onOpenRun(run)}
-      aria-label={`${projection?.unplannedDefinite ? "Unplanned" : "Schedule unknown"} · ${plainTitle(run.snapshot.inputs, run.id)}`}
+      aria-label={`${t(projection?.unplannedDefinite ? "Unplanned" : "Schedule unknown")} · ${plainTitle(run.snapshot.inputs, run.id)}`}
     >
       <div className="wa-card-meta">
         <span className="wa-status" data-tone="muted">
-          {projection?.unplannedDefinite ? "Unplanned" : "Schedule unknown"}
+          {t(projection?.unplannedDefinite ? "Unplanned" : "Schedule unknown")}
         </span>
         <span className="wa-kicker">{run.state}</span>
       </div>
@@ -398,20 +400,20 @@ export default function ScheduleCalendar({
   if (scoped.loading) {
     return (
       <section className="wa-panel wa-stack">
-        <h2>Schedule</h2>
-        <p className="wa-empty" role="status">Loading planned posts…</p>
+        <h2>{t("Schedule")}</h2>
+        <p className="wa-empty" role="status">{t("Loading planned posts…")}</p>
       </section>
     );
   }
   if (scoped.loadError !== null) {
     return (
       <section className="wa-panel wa-stack">
-        <h2>Schedule</h2>
+        <h2>{t("Schedule")}</h2>
         <p className="wa-alert" data-tone="fail" role="alert">
-          Could not load the schedule: {scoped.loadError}
+          {t("Could not load the schedule: {error}").replace("{error}", () => scoped.loadError ?? "")}
         </p>
         <div>
-          <Button onClick={() => setRefetchKey((k) => k + 1)}>Retry</Button>
+          <Button onClick={() => setRefetchKey((k) => k + 1)}>{t("Retry")}</Button>
         </div>
       </section>
     );
@@ -421,48 +423,44 @@ export default function ScheduleCalendar({
   return (
     <section className="wa-panel wa-stack">
       <div className="wa-row">
-        <h2>Schedule</h2>
+        <h2>{t("Schedule")}</h2>
         <span className="wa-kicker">
-          {contextId ? "Selected context" : "No brand context"} · local plans
-          {canWrite ? "" : " · read-only"}
+          {contextId ? t("Selected context") : t("No brand context")} · {t("local plans")}
+          {canWrite ? "" : t(" · read-only")}
         </span>
       </div>
       {atCap && (
         <p className="wa-alert" data-tone="warn" role="status">
-          Schedule history may be incomplete (up to {LIST_CAP} records shown).
+          {t("Schedule history may be incomplete (up to {count} records shown).").replace("{count}", () => String(LIST_CAP))}
         </p>
       )}
       {projection.conflictingIds.length > 0 && (
         <p className="wa-alert" data-tone="fail" role="alert">
-          {projection.conflictingIds.length} publish intent id
-          {projection.conflictingIds.length === 1 ? "" : "s"} appear more than
-          once and were withheld — the schedule was not guessed.
+          {t(projection.conflictingIds.length === 1 ? "{count} publish intent id appears more than once and was withheld — the schedule was not guessed." : "{count} publish intent ids appear more than once and were withheld — the schedule was not guessed.").replace("{count}", () => String(projection.conflictingIds.length))}
         </p>
       )}
       {projection.days.length === 0 && projection.malformed.length === 0 && projection.unplanned.length === 0 && projection.conflictingIds.length === 0 ? (
         projection.unplannedDefinite ? (
           <p className="wa-empty" role="status">
-            No posts are planned. Accepted text stays in Library until it is
-            scheduled; runs without a publish intent have no planned date.
+            {t("No posts are planned. Accepted text stays in Library until it is scheduled; runs without a publish intent have no planned date.")}
           </p>
         ) : (
           <p className="wa-empty" role="status">
-            No matching plans in the returned history — the full schedule is
-            unknown (history is bounded).
+            {t("No matching plans in the returned history — the full schedule is unknown (history is bounded).")}
           </p>
         )
       ) : (
-        <div className="wa-cal-agenda" role="region" aria-label="Planned posts by day">
+        <div className="wa-cal-agenda" role="region" aria-label={t("Planned posts by day")}>
           {projection.days.map((day) => (
             <section className="wa-cal-day" key={`${day.date}::${day.timezone}`} data-date={day.date}>
               <header className="wa-cal-head">
                 <span className="wa-kicker">{dayLabel(day.date)}</span>
                 <strong>{day.date.slice(8)}</strong>
                 <span className="wa-status">
-                  {day.intents.length} {day.intents.length === 1 ? "post" : "posts"}
+                  {t(day.intents.length === 1 ? "{count} post" : "{count} posts").replace("{count}", () => String(day.intents.length))}
                 </span>
               </header>
-              <HorizontalStrip label={`Posts planned for ${day.date}`} className="wa-cal-posts" scrollStep={248}>
+              <HorizontalStrip label={t("Posts planned for {date}").replace("{date}", () => day.date)} className="wa-cal-posts" scrollStep={248}>
                 {day.intents.map(intentCard)}
               </HorizontalStrip>
             </section>
@@ -470,7 +468,7 @@ export default function ScheduleCalendar({
           {projection.malformed.length > 0 && (
             <section className="wa-cal-day wa-cal-malformed">
               <header className="wa-cal-head">
-                <span className="wa-kicker">Unresolved</span>
+                <span className="wa-kicker">{t("Unresolved")}</span>
                 <strong>!</strong>
                 <span className="wa-status" data-tone="fail">{projection.malformed.length}</span>
               </header>
@@ -478,7 +476,7 @@ export default function ScheduleCalendar({
                 {projection.malformed.map(({ intent, reason }) => (
                   <div key={intent.intent_id} className="wa-post-card wa-cal-card" data-tone="fail">
                     <div className="wa-card-meta">
-                      <span className="wa-status" data-tone="fail">Unresolved plan</span>
+                      <span className="wa-status" data-tone="fail">{t("Unresolved plan")}</span>
                       <span className="wa-kicker">{intent.intent_id}</span>
                     </div>
                     <strong>{intent.run_id}</strong>
@@ -492,10 +490,10 @@ export default function ScheduleCalendar({
             <section className="wa-cal-day wa-cal-unplanned" data-unplanned="true">
               <header className="wa-cal-head">
                 <span className="wa-kicker">—</span>
-                <strong>{projection.unplannedDefinite ? "Unplanned" : "Schedule unknown"}</strong>
+                <strong>{t(projection.unplannedDefinite ? "Unplanned" : "Schedule unknown")}</strong>
                 <span className="wa-status">{projection.unplanned.length}</span>
               </header>
-              <HorizontalStrip label="Runs with no planned date" className="wa-cal-posts" scrollStep={248}>
+              <HorizontalStrip label={t("Runs with no planned date")} className="wa-cal-posts" scrollStep={248}>
                 {projection.unplanned.map(runCard)}
               </HorizontalStrip>
             </section>

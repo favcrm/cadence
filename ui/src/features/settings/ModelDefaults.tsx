@@ -15,6 +15,7 @@ import type {
   ModelRoleInfo,
   ProviderModelDefaults,
 } from "../../lib/types";
+import { useTranslate } from "../../lib/locale";
 
 type BaselineChoice = "provider_default" | "model";
 type RoleChoice = "inherit" | "provider_default" | "model";
@@ -92,6 +93,11 @@ function configFrom(
   return { schema: 1, providers: stored };
 }
 
+// Stored UI-owned fallbacks: kept English in state, translated at render.
+const UI_LOAD_FALLBACK = "Could not load model defaults.";
+const UI_SAVE_FALLBACK = "Save failed. The draft is unchanged.";
+const UI_REVISION_CHANGED = "The server revision changed. This draft is still here. Reload discards it.";
+
 function statusCopy(status: number, code?: string): string {
   if (status === 503 || code === "daemon_unavailable") {
     return "The daemon is not reachable. Settings stay unchanged until it answers.";
@@ -103,6 +109,7 @@ function statusCopy(status: number, code?: string): string {
 }
 
 export default function ModelDefaults() {
+  const t = useTranslate();
   const [selectedProvider, setSelectedProvider] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
   const [snapshot, setSnapshot] = useState<ModelDefaultsSnapshot | null>(null);
@@ -142,7 +149,7 @@ export default function ModelDefaults() {
         }
       } catch (err) {
         const apiErr = err instanceof ApiError ? err : null;
-        setLoadError(apiErr?.message ?? "Could not load model defaults.");
+        setLoadError(apiErr?.message ?? UI_LOAD_FALLBACK);
         setLoadStatus(apiErr?.status ?? null);
         setLoadCode(apiErr?.code);
       } finally {
@@ -217,11 +224,9 @@ export default function ModelDefaults() {
       const apiErr = err instanceof ApiError ? err : null;
       if (apiErr?.status === 409 || apiErr?.code === "revision_conflict") {
         setConflictRevision(apiErr.revision ?? null);
-        setSaveError(
-          "The server revision changed. This draft is still here. Reload discards it.",
-        );
+        setSaveError(UI_REVISION_CHANGED);
       } else {
-        setSaveError(apiErr?.message ?? "Save failed. The draft is unchanged.");
+        setSaveError(apiErr?.message ?? UI_SAVE_FALLBACK);
       }
     } finally {
       setSaving(false);
@@ -279,23 +284,17 @@ export default function ModelDefaults() {
     <section className="model-defaults-page" aria-busy={loading || saving}>
       <header className="model-defaults-heading">
         <div>
-          <h1>Model defaults</h1>
-          <p>
-            Choose the default model for new agents across all projects.
-            Existing agents keep their saved model.
-          </p>
+          <h1>{t("Model defaults")}</h1>
+          <p>{t("Choose the default model for new agents across all projects. Existing agents keep their saved model.")}</p>
         </div>
         {snapshot && (
           <span className="model-defaults-revision">
-            Saved revision {snapshot.revision}
-          </span>
+            {t("Saved revision {revision}").replace("{revision}", String(snapshot.revision ?? ""))}</span>
         )}
       </header>
 
       {loading && !snapshot && (
-        <p role="status" className="text-secondary text-ink-400">
-          Loading model defaults…
-        </p>
+        <p role="status" className="text-secondary text-ink-400">{t("Loading model defaults…")}</p>
       )}
 
       {loadError && (
@@ -304,16 +303,14 @@ export default function ModelDefaults() {
           role="alert"
         >
           <div>
-            <p>{banner || "Could not load model defaults."}</p>
-            <p className="text-secondary text-ink-400">{loadError}</p>
+            <p>{banner ? t(banner) : t("Could not load model defaults.")}</p>
+            <p className="text-secondary text-ink-400">{loadError === UI_LOAD_FALLBACK ? t(loadError) : loadError}</p>
           </div>
           <Button
             loading={loading}
             icon={<IconRefresh />}
             onClick={() => void load(true)}
-          >
-            Retry
-          </Button>
+          >{t("Retry")}</Button>
         </div>
       )}
 
@@ -321,9 +318,7 @@ export default function ModelDefaults() {
         <>
           {readOnly && (
             <p className="model-defaults-access">
-              {snapshot.read_only || gate === READ_ONLY_REASON
-                ? "This board is read-only. You can inspect model defaults here."
-                : "Sign in using the top bar to edit model defaults."}
+              {snapshot.read_only || gate === READ_ONLY_REASON ? t("This board is read-only. You can inspect model defaults here.") : t("Sign in using the top bar to edit model defaults.")}
             </p>
           )}
 
@@ -333,19 +328,15 @@ export default function ModelDefaults() {
               role="alert"
             >
               <div>
-                <p>{saveError}</p>
+                <p>{saveError === UI_REVISION_CHANGED || saveError === UI_SAVE_FALLBACK ? t(saveError) : saveError}</p>
                 <p className="text-secondary text-ink-400">
-                  Current server revision: {conflictRevision}. Reloading
-                  replaces all unsaved provider changes.
-                </p>
+                  {t("Current server revision: {conflictRevision}. Reloading replaces all unsaved provider changes.").replace("{conflictRevision}", String(conflictRevision ?? ""))}</p>
               </div>
               <Button
                 disabled={saving}
                 loading={loading}
                 onClick={() => void load(true)}
-              >
-                Reload server copy
-              </Button>
+              >{t("Reload server copy")}</Button>
             </div>
           )}
           {saveError && conflictRevision === null && (
@@ -353,13 +344,13 @@ export default function ModelDefaults() {
               className="model-defaults-notice model-defaults-error"
               role="alert"
             >
-              {saveError}
+              {saveError === UI_REVISION_CHANGED || saveError === UI_SAVE_FALLBACK ? t(saveError) : saveError}
             </p>
           )}
           {problems.length > 0 && (
             <ul
               className="model-defaults-notice model-defaults-error model-defaults-problems"
-              aria-label="Model validation errors"
+              aria-label={t("Model validation errors")}
             >
               {problems.map((problem) => (
                 <li key={problem}>{problem}</li>
@@ -369,23 +360,21 @@ export default function ModelDefaults() {
 
           {snapshot.providers.length === 0 ? (
             <div className="card model-defaults-empty">
-              <h2>No model providers available</h2>
-              <p>The server returned no providers to configure.</p>
+              <h2>{t("No model providers available")}</h2>
+              <p>{t("The server returned no providers to configure.")}</p>
               <Button
                 loading={loading}
                 icon={<IconRefresh />}
                 onClick={() => void load(true)}
-              >
-                Refresh providers
-              </Button>
+              >{t("Refresh providers")}</Button>
             </div>
           ) : (
             <div className="model-defaults-workspace">
               <nav
                 className="model-defaults-providers"
-                aria-label="Model providers"
+                aria-label={t("Model providers")}
               >
-                <p className="slabel">Provider</p>
+                <p className="slabel">{t("Provider")}</p>
                 {snapshot.providers.map((item) => {
                   const changed = changedProviders.some(
                     (row) => row.id === item.id,
@@ -401,18 +390,14 @@ export default function ModelDefaults() {
                     >
                       <span>{item.label}</span>
                       {changed ? (
-                        <span className="model-provider-state">Unsaved</span>
+                        <span className="model-provider-state">{t("Unsaved")}</span>
                       ) : !item.eligible ? (
-                        <span className="model-provider-state">
-                          Unavailable
-                        </span>
+                        <span className="model-provider-state">{t("Unavailable")}</span>
                       ) : null}
                     </button>
                   );
                 })}
-                <p className="model-defaults-nav-hint">
-                  Switching providers keeps your draft.
-                </p>
+                <p className="model-defaults-nav-hint">{t("Switching providers keeps your draft.")}</p>
               </nav>
 
               {provider && draft && (
@@ -424,10 +409,8 @@ export default function ModelDefaults() {
                   <header className="model-provider-heading">
                     <h2 id="model-provider-title">{provider.label}</h2>
                     <p>
-                      {provider.eligible
-                        ? "Set a default model, then override it for individual team roles when needed."
-                        : provider.limitation ||
-                          "Model selection is unavailable for this provider."}
+                      {provider.eligible ? t("Set a default model, then override it for individual team roles when needed.") : provider.limitation ||
+                          t("Model selection is unavailable for this provider.")}
                     </p>
                   </header>
                   {provider.eligible && (
@@ -442,17 +425,13 @@ export default function ModelDefaults() {
                           <label
                             htmlFor={`${provider.id}-baseline`}
                             className="model-defaults-label"
-                          >
-                            Default model
-                          </label>
-                          <p className="model-defaults-help">
-                            Used by roles that inherit this default.
-                          </p>
+                          >{t("Default model")}</label>
+                          <p className="model-defaults-help">{t("Used by roles that inherit this default.")}</p>
                         </div>
                         <div className="model-defaults-fields">
                           <Select
                             id={`${provider.id}-baseline`}
-                            aria-label={`${provider.label} default model`}
+                            aria-label={t("{label} default model").replace("{label}", () => String(provider.label ?? ""))}
                             disabled={frozen}
                             full
                             value={draft.baseline}
@@ -465,22 +444,21 @@ export default function ModelDefaults() {
                             options={[
                               {
                                 value: "provider_default",
-                                label: fallbackLabel,
+                                label: t(fallbackLabel),
                               },
-                              { value: "model", label: "Specific model" },
+                              { value: "model", label: t("Specific model") },
                             ]}
                           />
                           {draft.baseline === "model" && (
                             <div className="model-defaults-model-input">
                               <label htmlFor={`${provider.id}-baseline-model`}>
-                                {provider.label} default model ID
-                              </label>
+                                {t("{label} default model ID").replace("{label}", () => String(provider.label ?? ""))}</label>
                               <input
                                 id={`${provider.id}-baseline-model`}
                                 className="field"
                                 list={listId}
                                 disabled={frozen}
-                                placeholder="Enter a model ID"
+                                placeholder={t("Enter a model ID")}
                                 value={draft.baselineModel}
                                 onChange={(event) =>
                                   update(provider.id, (row) => ({
@@ -497,8 +475,8 @@ export default function ModelDefaults() {
                         className="model-defaults-roles"
                         aria-labelledby="model-role-title"
                       >
-                        <h3 id="model-role-title">Team role overrides</h3>
-                        <p className="model-defaults-help">{inheritanceHelp}</p>
+                        <h3 id="model-role-title">{t("Team role overrides")}</h3>
+                        <p className="model-defaults-help">{t(inheritanceHelp)}</p>
                         <div className="model-defaults-role-list">
                           {snapshot.roles.map((role) => {
                             const row = draft.roles[role.id] ?? roleDraft();
@@ -516,7 +494,7 @@ export default function ModelDefaults() {
                                 <div className="model-defaults-fields">
                                   <Select
                                     id={`${provider.id}-${role.id}`}
-                                    aria-label={`${provider.label} ${role.label} model`}
+                                    aria-label={t("{label} {label2} model").replace("{label}", () => String(provider.label ?? "")).replace("{label2}", () => String(role.label ?? ""))}
                                     disabled={frozen}
                                     full
                                     value={row.choice}
@@ -535,15 +513,15 @@ export default function ModelDefaults() {
                                     options={[
                                       {
                                         value: "inherit",
-                                        label: "Inherit default model",
+                                        label: t("Inherit default model"),
                                       },
                                       {
                                         value: "provider_default",
-                                        label: fallbackLabel,
+                                        label: t(fallbackLabel),
                                       },
                                       {
                                         value: "model",
-                                        label: "Specific model",
+                                        label: t("Specific model"),
                                       },
                                     ]}
                                   />
@@ -552,14 +530,13 @@ export default function ModelDefaults() {
                                       <label
                                         htmlFor={`${provider.id}-${role.id}-model`}
                                       >
-                                        {provider.label} {role.label} model ID
-                                      </label>
+                                        {t("{label} {label2} model ID").replace("{label}", () => String(provider.label ?? "")).replace("{label2}", () => String(role.label ?? ""))}</label>
                                       <input
                                         id={`${provider.id}-${role.id}-model`}
                                         className="field"
                                         list={listId}
                                         disabled={frozen}
-                                        placeholder="Enter a model ID"
+                                        placeholder={t("Enter a model ID")}
                                         value={row.model}
                                         onChange={(event) =>
                                           update(provider.id, (current) => ({
@@ -591,8 +568,7 @@ export default function ModelDefaults() {
                           disabled={frozen || !draft.present}
                           onClick={resetProvider}
                         >
-                          Reset {provider.label} defaults
-                        </Button>
+                          {t("Reset {label} defaults").replace("{label}", () => String(provider.label ?? ""))}</Button>
                       </footer>
                     </>
                   )}
@@ -604,26 +580,16 @@ export default function ModelDefaults() {
           {snapshot.providers.length > 0 && (
             <footer className="model-defaults-savebar">
               <p role="status">
-                {saving
-                  ? "Saving defaults…"
-                  : dirty
-                    ? `Unsaved changes in ${changedProviders.length} provider${changedProviders.length === 1 ? "" : "s"}. Save applies all provider changes.`
-                    : saved
-                      ? "Model defaults saved."
-                      : "No unsaved changes."}
+                {saving ? t("Saving defaults…") : dirty ? (changedProviders.length === 1 ? t("Unsaved changes in {count} provider. Save applies all provider changes.") : t("Unsaved changes in {count} providers. Save applies all provider changes.")).replace("{count}", String(changedProviders.length)) : saved ? t("Model defaults saved.") : t("No unsaved changes.")}
               </p>
               <div className="model-defaults-actions">
-                <Button disabled={frozen || !dirty} onClick={discard}>
-                  Discard changes
-                </Button>
+                <Button disabled={frozen || !dirty} onClick={discard}>{t("Discard changes")}</Button>
                 <Button
                   variant="primary"
                   disabled={frozen || !dirty || problems.length > 0}
                   loading={saving}
                   onClick={() => void save()}
-                >
-                  Save defaults
-                </Button>
+                >{t("Save defaults")}</Button>
               </div>
             </footer>
           )}

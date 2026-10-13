@@ -17,6 +17,7 @@ import {
 } from "./upload";
 import Button from "../../ui/Button";
 import { KindIcon, Note, WikiToolbar } from "./shared";
+import { useTranslate } from "../../lib/locale";
 
 /**
  * The upload pane (CAD-581): a drag-and-drop overlay plus the multi-file
@@ -84,15 +85,16 @@ export default function UploadPane({
   const tally = counts(items);
   const active = items.some((item) => item.state === "queued" || item.state === "uploading");
   const browseHref = navHref({ screen: "wiki", mode: "browse", path: dir || null, query: null });
+  const t = useTranslate();
 
   return (
     <>
-      <WikiToolbar path={dir} navHref={navHref} label="Upload" actions={<>
-          <Button href={browseHref}>Done</Button>
+      <WikiToolbar path={dir} navHref={navHref} label={t("Upload")} actions={<>
+          <Button href={browseHref}>{t("Done")}</Button>
       </>} />
 
       {readOnly && (
-        <Note warn>writes are disabled on this board — sign in as the operator to upload.</Note>
+        <Note warn>{t("writes are disabled on this board — sign in as the operator to upload.")}</Note>
       )}
 
       <div
@@ -114,14 +116,14 @@ export default function UploadPane({
       >
         <div className="wk-drop">
           <IconUpload />
-          <div className="wk-etitle">Drop files to upload</div>
+          <div className="wk-etitle">{t("Drop files to upload")}</div>
           <div className="kicker">
-            Up to {capLabel()} per file
+            {t("Up to")} {capLabel()} {t("per file")}
           </div>
-          <Button disabled={readOnly} onClick={() => fileInput.current?.click()}>Choose files</Button>
+          <Button disabled={readOnly} onClick={() => fileInput.current?.click()}>{t("Choose files")}</Button>
           <input
             ref={fileInput}
-            aria-label="Files to upload"
+            aria-label={t("Files to upload")}
             type="file"
             multiple
             className="wk-fileinput"
@@ -135,8 +137,8 @@ export default function UploadPane({
         {drag > 0 && !readOnly && (
           <div className="wk-ovr">
             <div className="wk-ovrbox">
-              <div className="wk-etitle">Drop files to upload</div>
-              <div className="kicker">release to queue them</div>
+              <div className="wk-etitle">{t("Drop files to upload")}</div>
+              <div className="kicker">{t("release to queue them")}</div>
             </div>
           </div>
         )}
@@ -186,7 +188,7 @@ export default function UploadPane({
                 files.current.clear();
               }}
             >
-              Clear completed uploads
+              {t("Clear completed uploads")}
             </Button>
           </div>
         </div>

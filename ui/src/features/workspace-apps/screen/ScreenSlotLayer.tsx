@@ -3,6 +3,7 @@ import Button from "../../../ui/Button";
 import { WorkspaceDialog } from "../WorkspaceDialog";
 import { linkTarget } from "./screenActions";
 import { slotBox, type SlotView } from "./screenSlot";
+import { useTranslate } from "../../../lib/locale";
 
 /**
  * The host-drawn parts over a mounted frame (CAD-1123 HP3), rendered in the
@@ -16,6 +17,7 @@ export default function ScreenSlotLayer({ view, link, onTap, onCancel, onDismiss
   view: SlotView | null; link: string | null;
   onTap: (token: string, trusted: boolean, pressedAt: number) => void; onCancel: (token: string) => void; onDismissLink: () => void;
 }) {
+  const t = useTranslate();
   const layer = useRef<HTMLDivElement>(null);
   const pressed = useRef(0);
   const [size, setSize] = useState({ w: 0, h: 0 });
@@ -51,13 +53,13 @@ export default function ScreenSlotLayer({ view, link, onTap, onCancel, onDismiss
         </div>
       )}
       {view?.card && (
-        <WorkspaceDialog title="Post this now?" className="wa-confirm" onClose={() => { if (!view.pending) onCancel(view.token); }}>
+        <WorkspaceDialog title={t("Post this now?")} className="wa-confirm" onClose={() => { if (!view.pending) onCancel(view.token); }}>
           <div className="wa-stack" data-host-confirm={view.token.slice(0, 8)}>
-            {view.card.image && <img src={view.card.image} alt="The image that will post" style={{ maxWidth: "100%", maxHeight: 240, objectFit: "contain", borderRadius: 8 }} />}
+            {view.card.image && <img src={view.card.image} alt={t("The image that will post")} style={{ maxWidth: "100%", maxHeight: 240, objectFit: "contain", borderRadius: 8 }} />}
             <p className="wa-caption" style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{view.card.caption}</p>
-            <p>To <strong>{view.card.target}</strong></p>
+            <p>{t("To")} <strong>{view.card.target}</strong></p>
             <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", flexWrap: "wrap" }}>
-              <Button disabled={view.pending} onClick={() => onCancel(view.token)}>Cancel</Button>
+              <Button disabled={view.pending} onClick={() => onCancel(view.token)}>{t("Cancel")}</Button>
               <button type="button" className="btn btn-primary" disabled={view.pending} aria-busy={view.pending}
                 onPointerDown={event => { pressed.current = event.timeStamp; }}
                 onClick={event => {
@@ -65,20 +67,20 @@ export default function ScreenSlotLayer({ view, link, onTap, onCancel, onDismiss
                   pressed.current = 0;
                   onTap(view.token, event.isTrusted, at);
                 }}>
-                {view.pending ? "Posting…" : view.label}
+                {view.pending ? t("Posting…") : view.label}
               </button>
             </div>
           </div>
         </WorkspaceDialog>
       )}
       {link && (
-        <WorkspaceDialog title="Open this link?" className="wa-confirm" onClose={onDismissLink}>
+        <WorkspaceDialog title={t("Open this link?")} className="wa-confirm" onClose={onDismissLink}>
           <div className="wa-stack">
-            <p>This app wants to open a page on another site. It will open in a new tab.</p>
+            <p>{t("This app wants to open a page on another site. It will open in a new tab.")}</p>
             <p><code className="num break-all" data-link-target>{linkTarget(link)}</code></p>
             <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
-              <Button onClick={onDismissLink}>Cancel</Button>
-              <Button variant="primary" onClick={() => { window.open(link, "_blank", "noopener,noreferrer"); onDismissLink(); }}>Open</Button>
+              <Button onClick={onDismissLink}>{t("Cancel")}</Button>
+              <Button variant="primary" onClick={() => { window.open(link, "_blank", "noopener,noreferrer"); onDismissLink(); }}>{t("Open")}</Button>
             </div>
           </div>
         </WorkspaceDialog>

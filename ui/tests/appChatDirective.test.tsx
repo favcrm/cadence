@@ -36,6 +36,7 @@ loader.prototype.require = function (this: unknown, id: string) {
 const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
 const Conversation = require("../src/features/app-shell/chat/Conversation").default;
+const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
 const { loadAppChat } = require("../src/features/app-shell/chat/descriptorClient") as typeof import("../src/features/app-shell/chat/descriptorClient");
 
 const INSTALL = "install-notes";
@@ -97,7 +98,7 @@ document.body.append(host);
 const root = createRoot(host);
 const flush = () => React.act(async () => { await new Promise((r) => setTimeout(r, 0)); });
 await React.act(async () => {
-  root.render(React.createElement(Conversation, {
+  root.render(React.createElement(LocaleProvider, null, React.createElement(Conversation, {
     mode: { kind: "app", installId: INSTALL, contextId: "", screen: null, recordOpen: false, contextName: null, descriptor: chat },
     density: "compact",
     viewer: { operator: true, readOnly: false },
@@ -105,7 +106,7 @@ await React.act(async () => {
     collapsed: false,
     onCollapsed: () => undefined,
     onOpenView: (view: string) => { opened.push(view); },
-  }));
+  })));
 });
 for (let i = 0; i < 8; i++) await flush();
 

@@ -1293,6 +1293,11 @@ pub fn attach(opts: &mut crate::daemon::ServeOptions) -> Result<()> {
         Some(value) => Some(value.clone()),
         None => super::deployments::load()?,
     };
+    // CAD-1416: cache the already-validated owned metadata so `Shared` and the
+    // other readers see the same assertions without a second root read.
+    if opts.provider_deployments.is_none() {
+        opts.provider_deployments = metadata.clone();
+    }
     if let Some(admission) = metadata.as_ref().and_then(|value| value.hosted_media()) {
         if std::env::var_os("CADENCE_AGENTICOS_EXTERNAL_URL").is_some() {
             return Err(Error::rejected(

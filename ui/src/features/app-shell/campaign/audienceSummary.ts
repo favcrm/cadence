@@ -6,13 +6,15 @@ import type { AudiencePreview } from "../CrmSegments";
 export function audienceSummary(
   pick: { base: AudienceBaseInput; exclusionListId: string | null },
   preview: AudiencePreview | null,
+  t: (english: string) => string = (english) => english,
 ): string {
+  const base = pick.base;
   const who =
-    pick.base.mode === "all"
-      ? "All customers"
-      : pick.base.mode === "segment"
-        ? `Segment ${pick.base.segmentId}`
-        : `${pick.base.customerIds.length} chosen customers`;
-  if (preview === null) return `${who} · not counted yet`;
-  return `${who} · ${preview.baseCount} match · ${preview.finalCount} can be emailed`;
+    base.mode === "all"
+      ? t("All customers")
+      : base.mode === "segment"
+        ? t("Segment {id}").replace("{id}", () => base.segmentId)
+        : t("{count} chosen customers").replace("{count}", () => String(base.customerIds.length));
+  if (preview === null) return `${who} ${t("· not counted yet")}`;
+  return `${who} · ${t("{base} match · {final} can be emailed").replace("{base}", () => String(preview.baseCount)).replace("{final}", () => String(preview.finalCount))}`;
 }

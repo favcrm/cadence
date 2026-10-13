@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api, ApiError, type MasterPermissionRequest } from "../../lib/api";
+import { useTranslate } from "../../lib/locale";
 import { resources } from "../../lib/resources";
 
 const listeners = new Set<() => void>();
@@ -81,6 +82,7 @@ export default function PermissionCard({
    *  Always / Deny. The command and folder live under Details. */
   compact?: boolean;
 }) {
+  const t = useTranslate();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [alwaysOpen, setAlwaysOpen] = useState(false);
@@ -112,7 +114,7 @@ export default function PermissionCard({
       )}
       {compact && card.risk !== "low" ? (
         <p className="text-micro text-warn" data-permission-risk={card.risk}>
-          {card.risk === "high" ? "High risk" : "Some risk"}: Master wants to run a command that can change or delete things.
+          {card.risk === "high" ? t("High risk") : t("Some risk")}: {t("Master wants to run a command that can change or delete things.")}
         </p>
       ) : null}
       {card.reason ? <ReasonBlock reason={card.reason} /> : null}
@@ -128,7 +130,7 @@ export default function PermissionCard({
             disabled={readOnly || busy}
             onClick={() => run(() => api.permissionAllowOnce(card.id), "Allowed once")}
           >
-            Allow once
+            {t("Allow once")}
           </button>
           <button
             type="button"
@@ -140,7 +142,7 @@ export default function PermissionCard({
               setAlwaysOpen((v) => !v);
             }}
           >
-            {compact ? "Always ▾" : "Always allow ▾"}
+            {compact ? t("Always ▾") : t("Always allow ▾")}
           </button>
           <button
             type="button"
@@ -152,19 +154,19 @@ export default function PermissionCard({
               setRejectOpen((v) => !v);
             }}
           >
-            {compact ? "Deny ▾" : "Reject ▾"}
+            {compact ? t("Deny ▾") : t("Reject ▾")}
           </button>
         </div>
       )}
       {!decided && alwaysOpen ? (
-        <div className="flex flex-wrap gap-2" role="menu" aria-label="always allow scope">
+        <div className="flex flex-wrap gap-2" role="menu" aria-label={t("always allow scope")}>
           <button
             type="button"
             className={act}
             disabled={readOnly || busy}
             onClick={() => run(() => api.permissionAlways(card.id, "exact", []), "Always: this command")}
           >
-            This exact command
+            {t("This exact command")}
           </button>
           {card.prefix ? (
             <button
@@ -175,20 +177,20 @@ export default function PermissionCard({
                 run(() => api.permissionAlways(card.id, "prefix", card.prefix ?? []), "Always: prefix")
               }
             >
-              Prefix {card.prefix.join(" ")}
+              {t("Prefix")} {card.prefix.join(" ")}
             </button>
           ) : null}
         </div>
       ) : null}
       {!decided && rejectOpen ? (
-        <div className="flex flex-wrap gap-2" role="menu" aria-label="reject">
+        <div className="flex flex-wrap gap-2" role="menu" aria-label={t("reject")}>
           <button
             type="button"
             className={act}
             disabled={readOnly || busy}
             onClick={() => run(() => api.permissionReject(card.id, false), "Rejected")}
           >
-            Reject once
+            {t("Reject once")}
           </button>
           <button
             type="button"
@@ -196,7 +198,7 @@ export default function PermissionCard({
             disabled={readOnly || busy}
             onClick={() => run(() => api.permissionReject(card.id, true), "Rejected — won't ask again")}
           >
-            Don't ask again
+            {t("Don't ask again")}
           </button>
         </div>
       ) : null}

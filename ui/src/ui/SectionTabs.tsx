@@ -1,4 +1,5 @@
 import Link from "./Link";
+import { useTranslate } from "../lib/locale";
 
 /** Page navigation: real links with a visible current-page indicator. */
 export default function SectionTabs({
@@ -13,16 +14,19 @@ export default function SectionTabs({
    *  `section-nav` kit either way. */
   bare?: boolean;
 }) {
+  const t = useTranslate();
+  // `label` is the caller's name (an authored project slug or a UI word); only
+  // the "{label} sections" wording is translated, the name is inserted as given.
   return (
-    <nav className={`section-nav${bare ? "" : " px-4 lg:px-8"}`} aria-label={`${label} sections`}>
-      {tabs.map((t) => (
+    <nav className={`section-nav${bare ? "" : " px-4 lg:px-8"}`} aria-label={t("{label} sections").replace("{label}", () => label)}>
+      {tabs.map((tab) => (
         <Link
-          key={t.label}
-          href={t.href}
-          aria-current={t.on ? "page" : undefined}
+          key={tab.label}
+          href={tab.href}
+          aria-current={tab.on ? "page" : undefined}
           className="section-nav-link"
         >
-          {t.label}
+          {t(tab.label)}
         </Link>
       ))}
     </nav>

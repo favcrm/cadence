@@ -1063,6 +1063,23 @@ impl Shared {
 impl Shared {
     pub(super) fn take_app_aware(&self, alias: &str) -> Result<Take> {
         let head = self.store.queued_head(alias)?;
+        // CAD-1380 R1: a queued member turn re-proves its ORIGINAL credential
+        // before the generic take. A refused row is failed and retained, never
+        // dropped, with a bounded event naming the refusal.
+        if let Some(message) = head.as_ref().filter(|m| m.source != "app_run_dispatch") {
+            if let Err(error) = self.member_message_reprove(message) {
+                let reason = error.to_string();
+                let refused = json!({"status": "failed", "text": "", "error": reason});
+                self.store
+                    .finish(message, "failed", &refused, Some(&reason))?;
+                self.store.event_public(
+                    alias,
+                    "member_turn_refused",
+                    json!({"message": message.id, "reason": reason}),
+                )?;
+                return Ok(Take::Empty);
+            }
+        }
         if let Some(message) = head.filter(|m| m.source == "app_run_dispatch") {
             // CAD-1374: a queued app step is a new execution, so its sealed
             // approver is re-proven first, with no store or auth lock held. A
@@ -1122,7 +1139,12 @@ impl Shared {
     }
     pub(super) fn admit_app_submission(&self, message: &Message) -> Result<()> {
         if message.source != "app_run_dispatch" {
-            return Ok(());
+            // CAD-1380 R1: a member turn re-proves at the admission gate, so a
+            // revoke after claim cannot reach the adapter. A refusal is a
+            // pre-write rejection: the row fails and the endpoint stays live.
+            return self
+                .member_message_reprove(message)
+                .map_err(|e| Error::PreWrite(e.to_string()));
         }
         let (run_id, install) = self
             .store

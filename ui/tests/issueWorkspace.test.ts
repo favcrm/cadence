@@ -40,8 +40,11 @@ loader.prototype.require = function (this: unknown, id: string) {
 const React = require("react") as typeof import("react");
 const { createRoot } =
   require("react-dom/client") as typeof import("react-dom/client");
-const IssuePage = require("../src/features/issues/IssuePage")
+const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
+const IssuePageComponent = require("../src/features/issues/IssuePage")
   .default as typeof import("../src/features/issues/IssuePage").default;
+const IssuePage = (props: React.ComponentProps<typeof IssuePageComponent>) =>
+  React.createElement(LocaleProvider, null, React.createElement(IssuePageComponent, props));
 const { resources } =
   require("../src/lib/resources") as typeof import("../src/lib/resources");
 type Detail = import("../src/lib/types").IssueDetail;

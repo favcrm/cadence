@@ -77,7 +77,6 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             use_,
             token_stdin,
             no_open,
-            wiki,
             auth_dir,
         } => {
             // `--token-stdin` is the legacy AgenticOS token path, not org login.
@@ -95,11 +94,6 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                 .as_deref()
                 .unwrap_or(cadence_agent::remote_enrollment::HOSTED_LOGIN_ISSUER);
             let grant = if let Some(org) = org.as_deref() {
-                if *wiki {
-                    return Err(Error::rejected(
-                        "--wiki is for the hosted portal login; the legacy --org flow is CLI-only",
-                    ));
-                }
                 let slug = slug.as_deref().ok_or_else(|| {
                     Error::rejected("legacy login with --org needs --slug <org-slug>")
                 })?;
@@ -115,7 +109,6 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
                     issuer,
                     hint.as_deref().or(slug.as_deref()),
                     &dir,
-                    *wiki,
                     |url, code| show_login_code(url, code, *no_open),
                 )?
             };

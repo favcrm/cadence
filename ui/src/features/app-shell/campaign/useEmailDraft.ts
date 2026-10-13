@@ -19,6 +19,33 @@ export interface EditorBlock {
   url: string;
 }
 
+/** A product-owned notice/error the display translates in the active
+ *  locale: `key` is the English catalog key (which may carry `{name}`
+ *  slots), `slots` holds the values interpolated after translation, and
+ *  `detail` is raw daemon text glued on verbatim. A plain string stays
+ *  raw (server/friendly error text) so existing matching keeps working.
+ *  Never a pre-translated string — that would freeze the locale at
+ *  completion time. */
+export type UiNotice = { key: string; slots?: Record<string, string>; detail?: string } | string;
+
+/** Render-time expansion: translate the key, interpolate slots, then
+ *  append any raw detail exactly as stored. English expands to the key
+ *  byte-for-byte. */
+export function displayUiNotice(notice: UiNotice, t: (english: string) => string): string {
+  // A raw string still goes through the catalog lookup — known keys
+  // translate; daemon/friendly text misses the catalog and renders
+  // verbatim, exactly like a direct t() call.
+  if (typeof notice === "string") return t(notice);
+  let text = t(notice.key);
+  for (const [name, value] of Object.entries(notice.slots ?? {})) {
+    // Replacement callback inserts `value` literally — a replacement
+    // string would re-interpret $& $' $` $$ sequences inside raw
+    // daemon/friendly text as special patterns.
+    text = text.replace(`{${name}}`, () => value);
+  }
+  return notice.detail !== undefined ? `${text}${notice.detail}` : text;
+}
+
 /** What the operator is editing. `html === null` means the blocks are
  *  the body; a string means the pasted/edited HTML is (never both —
  *  the save sends exactly one). `ownText` is the "Write my own"
@@ -122,8 +149,8 @@ export function useEmailDraft(
   const [saving, setSaving] = useState(false);
   const [reloading, setReloading] = useState(false);
   const [needsLatestReload, setNeedsLatestReload] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [note, setNote] = useState<string | null>(null);
+  const [error, setError] = useState<UiNotice | null>(null);
+  const [note, setNote] = useState<UiNotice | null>(null);
   /** CAD-1146: undo history for structural block ops (add/move/delete).
    *  Keystroke text edits never push — they ride `patch` directly — so
    *  Undo restores the last block add/move/delete exactly. The history
@@ -213,7 +240,7 @@ export function useEmailDraft(
         }
         onDoc(latest);
         if (editEpoch.current !== editsAtStart) {
-          setError("The draft changed while the latest version was loading. Your edits are kept; discard again to reload.");
+          setError({ key: "The draft changed while the latest version was loading. Your edits are kept; discard again to reload." });
           return;
         }
         const next = draftFromDoc(latest);
@@ -223,12 +250,15 @@ export function useEmailDraft(
         setStale(false);
         setNeedsLatestReload(false);
         setError(null);
-        setNote(`Reloaded latest saved version v${latest.revision}.`);
+        setNote({ key: "Reloaded latest saved version v{v}.", slots: { v: String(latest.revision) } });
         blockHistory.current = [];
       })
       .catch((err: unknown) => {
         if (!mounted.current || live.current.sessionKey !== requestedSession || requestEpoch.current !== epoch) return;
-        setError(`Could not reload the latest saved email. Your edits are kept. ${friendlyCampaignError(err)}`);
+        setError({
+          key: "Could not reload the latest saved email. Your edits are kept. ",
+          detail: friendlyCampaignError(err),
+        });
       })
       .finally(() => {
         if (mounted.current && live.current.sessionKey === requestedSession && requestEpoch.current === epoch) {
@@ -286,7 +316,7 @@ export function useEmailDraft(
         requestEpoch.current += 1;
         blockHistory.current = [];
         onDoc(next);
-        setNote(`Saved v${next.revision} — approval reset. The preview below is the host render.`);
+        setNote({ key: "Saved v{v} — approval reset. The preview below is the host render.", slots: { v: String(next.revision) } });
       })
       .catch((err: unknown) => {
         if (!isConflict(err)) {
@@ -299,7 +329,10 @@ export function useEmailDraft(
         setStale(true);
         const epoch = ++requestEpoch.current;
         const requestedSession = sessionKey;
-        setError(`Not saved — the email changed after editing began (v${source}). Your edits are kept while the latest version loads.`);
+        setError({
+          key: "Not saved — the email changed after editing began (v{source}). Your edits are kept while the latest version loads.",
+          slots: { source: String(source) },
+        });
         void contentClient.show(scope, campaignId)
           .then((value) => {
             const latest = parseContentDoc(value);
@@ -310,11 +343,18 @@ export function useEmailDraft(
             onDoc(latest);
             setNeedsLatestReload(true);
             setStale(true);
-            setError(`Not saved — the saved email is now v${latest.revision}. Your edits are kept; choose Discard to reload the latest, or copy them out first.`);
+            setError({
+              key: "Not saved — the saved email is now v{v}. Your edits are kept; choose Discard to reload the latest, or copy them out first.",
+              slots: { v: String(latest.revision) },
+            });
           })
           .catch((refreshError: unknown) => {
             if (!mounted.current || live.current.sessionKey !== requestedSession || requestEpoch.current !== epoch) return;
-            setError(`Not saved — the email changed after editing began (v${source}), but the latest version could not be loaded. Your edits are kept; retry Discard to reload. ${friendlyCampaignError(refreshError)}`);
+            setError({
+              key: "Not saved — the email changed after editing began (v{source}), but the latest version could not be loaded. Your edits are kept; retry Discard to reload. ",
+              slots: { source: String(source) },
+              detail: friendlyCampaignError(refreshError),
+            });
           });
       })
       .finally(() => setSaving(false));

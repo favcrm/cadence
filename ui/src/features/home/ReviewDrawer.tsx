@@ -5,6 +5,7 @@ import { resources } from "../../lib/resources";
 import { useMaybeResource } from "../../lib/useResource";
 import Button from "../../ui/Button";
 import { READ_ONLY_COPY } from "./AnswerForm";
+import { useTranslate } from "../../lib/locale";
 import { useApproveHead } from "./ApproveHead";
 import { useIdeaDecision } from "./IdeaCard";
 import { useMergeDecision } from "./MergeForm";
@@ -48,11 +49,12 @@ function useIssue(id: string) {
 }
 
 function Details({ text }: { text: string }) {
+  const t = useTranslate();
   const [shown, setShown] = useState(false);
   return (
     <>
       <button type="button" className="rv-dlnk" aria-expanded={shown} onClick={() => setShown((s) => !s)}>
-        Details
+        {t("Details")}
       </button>
       {shown && <pre className="rv-tech">{text}</pre>}
     </>
@@ -60,10 +62,11 @@ function Details({ text }: { text: string }) {
 }
 
 function Ticks({ items }: { items: string[] }) {
+  const t = useTranslate();
   if (items.length === 0) return null;
   return (
     <>
-      <h4 className="rv-h">Checked</h4>
+      <h4 className="rv-h">{t("Checked")}</h4>
       <ul className="rv-ticks">
         {items.map((t) => (
           <li key={t}>{t}</li>
@@ -85,6 +88,7 @@ function SendBack({
   busy: boolean;
   onSend: (reason: string) => void;
 }) {
+  const t = useTranslate();
   const [reason, setReason] = useState("");
   return (
     <div className="rv-sendback">
@@ -93,11 +97,11 @@ function SendBack({
         onChange={(e) => setReason(e.target.value)}
         onFocus={(e) => e.currentTarget.scrollIntoView?.({ block: "center" })}
         rows={3}
-        placeholder={placeholder}
-        aria-label={placeholder}
+        placeholder={t(placeholder)}
+        aria-label={t(placeholder)}
       />
       <Button size="sm" loading={busy} disabled={busy} onClick={() => onSend(reason)}>
-        {label}
+        {t(label)}
       </Button>
     </div>
   );
@@ -119,17 +123,18 @@ function Foot({
   total: number;
   onClose: () => void;
 }) {
+  const t = useTranslate();
   return (
     <div className="rv-foot">
-      {block && <p className="rv-readonly">{READ_ONLY_COPY}</p>}
+      {block && <p className="rv-readonly">{t(READ_ONLY_COPY)}</p>}
       <div className="rv-actions">
         <span className="rv-primary">{primary}</span>
         {secondary}
         <Button variant="ghost" onClick={onClose}>
-          Not now
+          {t("Not now")}
         </Button>
         <span className="rv-count">
-          {index} of {total}
+          {index} {t("of")} {total}
         </span>
       </div>
     </div>
@@ -153,26 +158,28 @@ function Shell({
   foot: ReactNode;
   onClose: () => void;
 }) {
+  const t = useTranslate();
   return (
     <DrawerShell
       kind="review"
       scrim="board"
-      label={verb}
-      kicker={kicker(verb, need)}
+      label={t(verb)}
+      kicker={kicker(t(verb), need)}
       title={title}
       subtitle={subtitle}
-      tabs={[{ id: "review", label: verb, panel: <div className="rv-body">{body}</div> }]}
+      tabs={[{ id: "review", label: t(verb), panel: <div className="rv-body">{body}</div> }]}
       foot={foot}
       onClose={onClose}
     />
   );
 }
 
-const waiting = (need: HomeNeed) => `${ageWords(need.age)}${need.age < 60 ? "" : " ago"}`;
+const waiting = (need: HomeNeed, t: (s: string) => string) => `${t(ageWords(need.age))}${need.age < 60 ? "" : ` ${t("ago")}`}`;
 
 function PlanReview({ need, readOnly, index, total, onDone, onClose, onAsk }: ReviewProps) {
   const epic = need.action.type === "plan" ? need.action.epic : "";
   const block = useWriteBlock(readOnly);
+  const t = useTranslate();
   const [sendBack, setSendBack] = useState(false);
   const p = usePlanDecision(epic, block, (_, state) => onDone(need.key, state === "rejected" ? "Sent back" : "Plan approved"));
   const view = p.view;
@@ -180,14 +187,14 @@ function PlanReview({ need, readOnly, index, total, onDone, onClose, onAsk }: Re
   const title = view?.title ?? need.shortTitle ?? "Plan";
   const lead = firstSentence(view?.goal);
   const body = !p.detail ? (
-    <p className="rv-note">{p.state.status === "failed" ? "This plan could not be read." : "Reading the plan…"}</p>
+    <p className="rv-note">{p.state.status === "failed" ? t("This plan could not be read.") : t("Reading the plan…")}</p>
   ) : !view ? (
-    <p className="rv-note">This isn't a plan any more.</p>
+    <p className="rv-note">{t("This isn't a plan any more.")}</p>
   ) : (
     <>
       {lead && <p className="rv-lead">{lead}</p>}
-      {!open && <p className="rv-note">This plan is already {view.state}.</p>}
-      <h4 className="rv-h">The steps</h4>
+      {!open && <p className="rv-note">{t("This plan is already")} {view.state}.</p>}
+      <h4 className="rv-h">{t("The steps")}</h4>
       <ol className="rv-steps">
         {view.tickets.map((t, i) => (
           <li key={t.id}>
@@ -206,7 +213,7 @@ function PlanReview({ need, readOnly, index, total, onDone, onClose, onAsk }: Re
             </div>
           </li>
         ))}
-        {view.tickets.length === 0 && <li className="rv-note">No steps are listed.</li>}
+        {view.tickets.length === 0 && <li className="rv-note">{t("No steps are listed.")}</li>}
       </ol>
       {sendBack && open && (
         <SendBack
@@ -230,7 +237,7 @@ function PlanReview({ need, readOnly, index, total, onDone, onClose, onAsk }: Re
       need={need}
       verb="Approve plan"
       title={title}
-      subtitle={`Proposed by ${view?.proposedBy === "master" ? "Master" : "your team"} · ${waiting(need)}`}
+      subtitle={`${t("Proposed by")} ${view?.proposedBy === "master" ? t("Master") : t("your team")} · ${waiting(need, t)}`}
       body={body}
       onClose={onClose}
       foot={
@@ -241,23 +248,23 @@ function PlanReview({ need, readOnly, index, total, onDone, onClose, onAsk }: Re
           onClose={onClose}
           primary={
             <Button variant="primary" size="md" loading={p.busy === "approve"} disabled={off || p.busy !== null} onClick={() => p.decide("approve")}>
-              Approve plan
+              {t("Approve plan")}
             </Button>
           }
           secondary={
             <>
               <Button
                 disabled={!!block}
-                title={block ? READ_ONLY_COPY : undefined}
+                title={block ? t(READ_ONLY_COPY) : undefined}
                 onClick={() => {
                   onAsk(need, `I'd like to change something in the plan "${title}": `);
                   onClose();
                 }}
               >
-                Change something…
+                {t("Change something…")}
               </Button>
               <Button disabled={off || p.busy !== null} onClick={() => setSendBack((s) => !s)}>
-                Send back…
+                {t("Send back…")}
               </Button>
             </>
           }
@@ -270,6 +277,7 @@ function PlanReview({ need, readOnly, index, total, onDone, onClose, onAsk }: Re
 function IdeaReview({ need, readOnly, index, total, onDone, onClose }: ReviewProps) {
   const issue = need.action.type === "idea" ? need.action.issue : "";
   const block = useWriteBlock(readOnly);
+  const t = useTranslate();
   const [mode, setMode] = useState<"reject" | "park" | null>(null);
   const [parkUntil, setParkUntil] = useState("");
   const d = useIdeaDecision(issue, (_, action) =>
@@ -283,11 +291,11 @@ function IdeaReview({ need, readOnly, index, total, onDone, onClose }: ReviewPro
       need={need}
       verb="Approve idea"
       title={detail?.title ?? "Idea"}
-      subtitle={`Waiting ${ageWords(need.age)}`}
+      subtitle={`${t("Waiting")} ${t(ageWords(need.age))}`}
       onClose={onClose}
       body={
         !detail ? (
-          <p className="rv-note">{d.state.status === "failed" ? "This idea could not be read." : "Reading the idea…"}</p>
+          <p className="rv-note">{d.state.status === "failed" ? t("This idea could not be read.") : t("Reading the idea…")}</p>
         ) : (
           <>
             {lead && <p className="rv-lead">{lead}</p>}
@@ -302,11 +310,11 @@ function IdeaReview({ need, readOnly, index, total, onDone, onClose }: ReviewPro
             {mode === "park" && (
               <div className="rv-sendback">
                 <label className="rv-note" htmlFor="rv-park">
-                  Look at it again after
+                  {t("Look at it again after")}
                 </label>
                 <input id="rv-park" type="date" className="field" value={parkUntil} onChange={(e) => setParkUntil(e.target.value)} />
                 <Button size="sm" loading={d.busy === "park"} disabled={d.busy !== null} onClick={() => d.decide("park", "", parkUntil)}>
-                  Park it
+                  {t("Park it")}
                 </Button>
               </div>
             )}
@@ -316,7 +324,7 @@ function IdeaReview({ need, readOnly, index, total, onDone, onClose }: ReviewPro
               </p>
             )}
             <button type="button" className="rv-dlnk" disabled={off} onClick={() => setMode(mode === "park" ? null : "park")}>
-              Not ready? Park it for later
+              {t("Not ready? Park it for later")}
             </button>
             <Details text={`${issue} · project ${need.project ?? "—"}`} />
           </>
@@ -330,12 +338,12 @@ function IdeaReview({ need, readOnly, index, total, onDone, onClose }: ReviewPro
           onClose={onClose}
           primary={
             <Button variant="primary" loading={d.busy === "approve"} disabled={off || d.busy !== null} onClick={() => d.decide("approve", "", "")}>
-              Approve idea
+              {t("Approve idea")}
             </Button>
           }
           secondary={
             <Button disabled={off || d.busy !== null} onClick={() => setMode(mode === "reject" ? null : "reject")}>
-              Send back…
+              {t("Send back…")}
             </Button>
           }
         />
@@ -347,6 +355,7 @@ function IdeaReview({ need, readOnly, index, total, onDone, onClose }: ReviewPro
 function MergeReview({ need, readOnly, index, total, onDone, onClose }: ReviewProps) {
   const action = need.action as HomeNeed["action"] & { type: "merge" };
   const block = useWriteBlock(readOnly);
+  const t = useTranslate();
   const [sendBack, setSendBack] = useState(false);
   const [takeBack, setTakeBack] = useState(false);
   const issue = useIssue(action.issue);
@@ -369,19 +378,19 @@ function MergeReview({ need, readOnly, index, total, onDone, onClose }: ReviewPr
       need={need}
       verb="Approve change"
       title={issue?.title ?? need.shortTitle ?? "Publish a change"}
-      subtitle={`Ready ${waiting(need)}`}
+      subtitle={`${t("Ready")} ${waiting(need, t)}`}
       onClose={onClose}
       body={
         <>
           {lead && <p className="rv-lead">{lead}</p>}
           {size && (
             <>
-              <h4 className="rv-h">What changes</h4>
+              <h4 className="rv-h">{t("What changes")}</h4>
               <p className="rv-note">{size}</p>
             </>
           )}
           <Ticks items={ticks} />
-          {!m.head && <p className="rv-error">This has no checked version to approve. It needs a fresh review.</p>}
+          {!m.head && <p className="rv-error">{t("This has no checked version to approve. It needs a fresh review.")}</p>}
           {sendBack && (
             <SendBack
               label="Send back"
@@ -392,10 +401,10 @@ function MergeReview({ need, readOnly, index, total, onDone, onClose }: ReviewPr
           )}
           {a.approved && (
             <>
-              <p className="rv-note">{a.revocable ? "Approved." : "Approved from your terminal."}</p>
+              <p className="rv-note">{a.revocable ? t("Approved.") : t("Approved from your terminal.")}</p>
               {a.revocable && !block && (
                 <button type="button" className="rv-dlnk" disabled={a.busy !== null} onClick={() => setTakeBack((t) => !t)}>
-                  Take my approval back
+                  {t("Take my approval back")}
                 </button>
               )}
               {a.revocable && !block && takeBack && (
@@ -408,8 +417,8 @@ function MergeReview({ need, readOnly, index, total, onDone, onClose }: ReviewPr
               )}
             </>
           )}
-          {a.revoked && <p className="rv-note">Your approval was taken back. A new version needs a fresh approval.</p>}
-          {a.member && <p className="rv-note">Only the board's owner can approve or publish.</p>}
+          {a.revoked && <p className="rv-note">{t("Your approval was taken back. A new version needs a fresh approval.")}</p>}
+          {a.member && <p className="rv-note">{t("Only the board's owner can approve or publish.")}</p>}
           {errors.map((text) => (
             <p key={text} className="rv-error" role="alert">
               {text}
@@ -435,7 +444,7 @@ function MergeReview({ need, readOnly, index, total, onDone, onClose }: ReviewPr
           onClose={onClose}
           primary={
             <Button variant="primary" loading={m.busy === "merge"} disabled={off || m.busy !== null} onClick={() => { a.clearError(); m.merge(); }}>
-              {m.busy === "merge" ? "Publishing…" : "Publish"}
+              {m.busy === "merge" ? t("Publishing…") : t("Publish")}
             </Button>
           }
           secondary={
@@ -444,10 +453,10 @@ function MergeReview({ need, readOnly, index, total, onDone, onClose }: ReviewPr
                 <Button
                   disabled={!!block || a.member || a.busy !== null || m.busy !== null}
                   loading={a.busy === "approve"}
-                  title={block ? READ_ONLY_COPY : undefined}
+                  title={block ? t(READ_ONLY_COPY) : undefined}
                   onClick={() => { m.clearError(); a.approve(); }}
                 >
-                  Approve this version
+                  {t("Approve this version")}
                 </Button>
               )}
               <Button disabled={!!block || m.busy !== null} onClick={() => { setSendBack((s) => !s); m.clearError(); }}>

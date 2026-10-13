@@ -21,12 +21,16 @@ export function effectivePrompt(value: string, fallback: { value: string; origin
     : fallback;
 }
 
-export function promptError(value: string, label: string): string | null {
+export function promptError(
+  value: string,
+  label: string,
+  t: (english: string) => string = (english) => english,
+): string | null {
   if (!value) return null;
   if (value !== value.trim() || /[\x00-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/u.test(value)
     || /\s/u.test(value.replaceAll(" ", "")))
-    return `${label} must be one trimmed line with ordinary spaces only.`;
+    return t(`${label} must be one trimmed line with ordinary spaces only.`);
   if ([...value].length > 512 || new TextEncoder().encode(value).length > 2048)
-    return `${label} must fit 512 characters and 2,048 UTF-8 bytes.`;
+    return t(`${label} must fit 512 characters and 2,048 UTF-8 bytes.`);
   return null;
 }

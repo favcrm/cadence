@@ -1,4 +1,5 @@
 import { PILOT_DESTINATION, dueLabel } from "./socialPublish";
+import { useTranslate } from "../../lib/locale";
 
 /** The exact post an operator approves: reviewed caption text, image,
  *  due time, timezone, destination, grant and approval. */
@@ -19,9 +20,10 @@ export interface PublishConfirmationFacts {
 /** CAD-1027 confirmation facts, shared by schedule and CAD-1041 send-now
  *  so both decisions show the same post the same way. */
 export default function PublishConfirmation({ facts }: { facts: PublishConfirmationFacts }) {
+  const t = useTranslate();
   return (
     <dl className="wa-stack">
-      <dt className="wa-kicker">Caption (reviewed text that will post)</dt>
+      <dt className="wa-kicker">{t("Caption (reviewed text that will post)")}</dt>
       <dd>
         {facts.caption ? (
           <>
@@ -31,29 +33,29 @@ export default function PublishConfirmation({ facts }: { facts: PublishConfirmat
             <code>{facts.caption.digest}</code>
           </>
         ) : (
-          "Loading the reviewed caption…"
+          t("Loading the reviewed caption…")
         )}
       </dd>
-      <dt className="wa-kicker">Image digest</dt>
+      <dt className="wa-kicker">{t("Image digest")}</dt>
       <dd>
         {facts.image ? (
           <>
             <code>{facts.image.digest}</code> · {facts.image.label} <code>{facts.image.ref}</code>
           </>
         ) : (
-          "text-only"
+          t("text-only")
         )}
       </dd>
-      <dt className="wa-kicker">Due</dt>
+      <dt className="wa-kicker">{t("Due")}</dt>
       <dd>{dueLabel(facts.dueEpoch, facts.timezone)}</dd>
-      <dt className="wa-kicker">Timezone</dt>
+      <dt className="wa-kicker">{t("Timezone")}</dt>
       <dd>{facts.timezone}</dd>
-      <dt className="wa-kicker">Destination</dt>
+      <dt className="wa-kicker">{t("Destination")}</dt>
       <dd>
         {facts.toolkit} · {PILOT_DESTINATION.handle} ·{" "}
         <code>{facts.destinationId}</code>
       </dd>
-      <dt className="wa-kicker">Grant · approval</dt>
+      <dt className="wa-kicker">{t("Grant")} · {t("approval")}</dt>
       <dd>
         <code>{facts.grantId}</code> · <code>{facts.approvalId}</code>
       </dd>

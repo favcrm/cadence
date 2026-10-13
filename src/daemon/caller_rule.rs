@@ -304,6 +304,20 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ),
     ("job_list", Rule::Read),
     ("job_show", Rule::Read),
+    // CAD-1380/AOS-216 member plane: every member_* method re-binds
+    // `member_as` to a stored assistant row on a proven operator/board
+    // connection only (members_rpc::member_caller); a request field, an
+    // agent connection or an unproven one never mints a member identity.
+    ("member_assist_state", Rule::Handler("member_caller: member_as on a proven board relay only")),
+    ("member_assist_history", Rule::Handler("member_caller: member_as on a proven board relay only")),
+    ("member_assist_send", Rule::Handler("member_caller: member_as on a proven board relay only")),
+    ("member_job_request", Rule::Handler("member_caller: member_as on a proven board relay only")),
+    ("member_job_list", Rule::Handler("member_caller: member_as on a proven board relay only")),
+    ("member_job_evidence", Rule::Handler("member_caller: member_as on a proven board relay only")),
+    ("member_job_events", Rule::Handler("member_caller: member_as on a proven board relay only")),
+    ("member_job_subscribe", Rule::Handler("member_caller: member_as on a proven board relay only")),
+    ("member_job_share", Rule::Handler("member_caller: member_as on a proven board relay only")),
+    ("member_job_reconcile", Rule::Handler("member_caller: member_as on a proven board relay only")),
     ("job_events", Rule::Read),
     ("job_cancel", Rule::OnJob(Target::Job)),
     ("job_close", Rule::OnJob(Target::Job)),

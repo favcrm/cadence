@@ -4,6 +4,7 @@ import { resources } from "../../lib/resources";
 import { useQuery, useResource } from "../../lib/useResource";
 import type { Agent } from "../../lib/types";
 import { activityTimeMs } from "../../lib/fmt";
+import { useTranslate } from "../../lib/locale";
 import { recentAgentUpdates, recentWorkingAgents, reportedAgentUpdates, type AgentUpdate } from "./agentUpdateModel";
 import { ageLabel } from "./needs";
 
@@ -83,6 +84,7 @@ function UpdatedAt({ at }: { at: string | number | null }) {
 function AgentCard({ agent, reports, onAsk, onOpenIssue }: {
   agent: Agent; reports: AgentUpdate[]; onAsk: (agent: Agent, update?: AgentUpdate) => void; onOpenIssue: (id: string) => void;
 }) {
+  const t = useTranslate();
   const [detail, setDetail] = useState<Source>(reading);
   const [thread, setThread] = useState<Source>(reading);
   const [attempt, setAttempt] = useState(0);
@@ -130,16 +132,17 @@ function AgentCard({ agent, reports, onAsk, onOpenIssue }: {
       </li>)}
     </ul>}
     {line && <p className={`${line.warn ? "text-micro text-warn" : "text-label text-ink-500"} ${recent.length > 0 ? "mt-2" : "mt-3"}`}>
-      {line.text}
-      {line.retry && <button type="button" className="lnk text-micro ml-2" onClick={() => setAttempt((n) => n + 1)}>Retry</button>}
+      {t(line.text)}
+      {line.retry && <button type="button" className="lnk text-micro ml-2" onClick={() => setAttempt((n) => n + 1)}>{t("Retry")}</button>}
     </p>}
-    <button className="lnk text-label mt-3" onClick={() => onAsk(agent, recent[0])}>Ask the Assistant about this <span aria-hidden>↗</span></button>
+    <button className="lnk text-label mt-3" onClick={() => onAsk(agent, recent[0])}>{t("Ask the Assistant about this")} <span aria-hidden>↗</span></button>
   </li>;
 }
 
 export default function AgentUpdates({ onAsk, onOpenIssue }: {
   onAsk: (agent: Agent, update?: AgentUpdate) => void; onOpenIssue: (id: string) => void;
 }) {
+  const t = useTranslate();
   const state = useResource(resources.agents);
   const thread = useQuery(resources.masterThread);
   const reports = reportedAgentUpdates(thread.data?.entries ?? []);
@@ -149,11 +152,11 @@ export default function AgentUpdates({ onAsk, onOpenIssue }: {
     return { ...agent, last_activity: latest > 0 ? new Date(latest).toISOString() : agent.last_activity };
   }));
   return <div>
-    <p className="px-4 py-3 text-label text-ink-500 border-b border-ink-700">Recent work across all projects. Ask the Assistant to check in or explain an update.</p>
-    {!state.data && <p className="px-4 py-4 text-label text-ink-500">{state.status === "failed" ? `Agent updates unavailable — ${state.error}` : "Reading agent activity…"}</p>}
-    {state.data && state.data.daemon === "unreachable" && <p className="px-4 py-3 text-label text-warn">Daemon unreachable. Showing the last available activity.</p>}
-    {state.data && agents.length === 0 && <p className="px-4 py-6 text-label text-ink-400">No agent activity yet. Ask the Assistant to plan the next job.</p>}
+    <p className="px-4 py-3 text-label text-ink-500 border-b border-ink-700">{t("Recent work across all projects. Ask the Assistant to check in or explain an update.")}</p>
+    {!state.data && <p className="px-4 py-4 text-label text-ink-500">{state.status === "failed" ? `${t("Agent updates unavailable")} — ${state.error}` : t("Reading agent activity…")}</p>}
+    {state.data && state.data.daemon === "unreachable" && <p className="px-4 py-3 text-label text-warn">{t("Daemon unreachable. Showing the last available activity.")}</p>}
+    {state.data && agents.length === 0 && <p className="px-4 py-6 text-label text-ink-400">{t("No agent activity yet. Ask the Assistant to plan the next job.")}</p>}
     <ul>{agents.map((agent) => <AgentCard key={agent.alias} agent={agent} reports={reports.get(agent.alias) ?? []} onAsk={onAsk} onOpenIssue={onOpenIssue} />)}</ul>
-    {agents.length === 12 && <p className="px-4 py-3 text-micro text-ink-500">Showing the 12 most recently active agents. See Team overview for everyone.</p>}
+    {agents.length === 12 && <p className="px-4 py-3 text-micro text-ink-500">{t("Showing the 12 most recently active agents. See Team overview for everyone.")}</p>}
   </div>;
 }

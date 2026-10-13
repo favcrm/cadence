@@ -69,14 +69,16 @@ export function conversationLabel(
   c: Conversation,
   index: number,
   subjects: readonly { kind: string; label: string }[] = [],
+  t: (english: string) => string = (english) => english,
 ): string {
-  if (c.isGeneral) return "General";
+  if (c.isGeneral) return t("General");
   if (c.title) return c.title;
   if (c.subject !== null) {
     const kind = c.subject.split(":")[0];
-    return subjects.find((s) => s.kind === kind)?.label ?? "Other";
+    const label = subjects.find((s) => s.kind === kind)?.label;
+    return label === undefined ? t("Other") : t(label);
   }
-  return `Conversation ${index}`;
+  return t("Conversation {index}").replace("{index}", String(index));
 }
 
 /** Composer commands that mean "start a fresh conversation" and are never sent. */
