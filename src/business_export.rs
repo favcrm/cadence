@@ -15,6 +15,9 @@ use std::time::Duration;
 use crate::error::{Error, Result};
 use crate::proc::{self, BoundedError};
 
+/// CAD-1416: hosted intake and export, selected by the daemon's real lease.
+pub(crate) mod hosted;
+
 /// Wall-clock bound for one export, above the runner's own 105 s limit.
 const EXPORT_TIMEOUT: Duration = Duration::from_secs(120);
 /// Output cap for runner stdout/stderr that is kept for the error message.

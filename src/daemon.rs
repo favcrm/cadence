@@ -638,6 +638,12 @@ pub struct Shared {
     /// is configured. The heartbeat renews it; its fence is shared with
     /// `store` (every `write_conn`) and with each [`Self::pm`] handle.
     lease: Option<Arc<crate::lease::LeaseCtl>>,
+    /// CAD-1416: the image-owned business-documents admission. `Some` only
+    /// when the trusted metadata carries the exact tuple; it selects the
+    /// hosted template document door, independent of [`Self::lease`]. Never
+    /// set by RPC, PM, env or a caller flag.
+    hosted_business_documents:
+        Option<crate::platform::deployments::HostedBusinessDocumentsAdmission>,
     /// CAD-482: the test-only caller seam's armed credential — `Some`
     /// only when a fixture asked for it ([`ServeOptions::test_seam`])
     /// on a `test-seam` build. Request frames carrying `test_caller`
@@ -775,6 +781,13 @@ impl Shared {
         // `Arc` so `lease` can move into the struct.
         let wiki_pm_dir = pm_dir_of(&opts.provider_env)?;
         let wiki_pm_lease = lease.as_ref().map(|l| l.pm_lease());
+        // CAD-1416: the document door is selected by the image-owned tuple
+        // alone, never by the lifecycle lease. Trusted in-memory metadata wins
+        // over the root-owned file, as for the other image-owned assertions.
+        let hosted_business_documents = opts
+            .provider_deployments
+            .as_ref()
+            .and_then(|metadata| metadata.hosted_business_documents());
         // Actors consume Store candidates at open; retain an independent
         // copy until adoption succeeds, refuses, or is skipped entirely.
         let adoptions_pending = store
@@ -909,6 +922,7 @@ impl Shared {
             outbox_dir: opts.outbox_dir.clone(),
             smtp_test_ca: opts.smtp_test_ca_pem.clone(),
             lease,
+            hosted_business_documents,
             seam,
             #[cfg(feature = "test-seam")]
             after_done_write_failure: opts.after_done_write_failure.clone(),
