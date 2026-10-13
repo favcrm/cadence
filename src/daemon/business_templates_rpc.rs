@@ -68,7 +68,11 @@ impl Shared {
                 self.business_template_caller("template intake", params, peer_pid)?;
                 let file = required_str(params, "file")?;
                 let source = source_param(params)?;
-                let out = crate::business_export::intake(file, &source)?;
+                let out = if self.lease.is_some() {
+                    crate::business_export::hosted::intake(file, &source)?
+                } else {
+                    crate::business_export::intake(file, &source)?
+                };
                 use base64::Engine;
                 let engine = base64::engine::general_purpose::STANDARD;
                 Ok(json!({
@@ -101,7 +105,11 @@ impl Shared {
                     &row.spec,
                     &crate::business_templates::sample_data(&row.spec),
                 )?;
-                let out = crate::business_export::export_sample(&source, &draft.context())?;
+                let out = if self.lease.is_some() {
+                    crate::business_export::hosted::export_sample(&source, &draft.context())?
+                } else {
+                    crate::business_export::export_sample(&source, &draft.context())?
+                };
                 use base64::Engine;
                 let engine = base64::engine::general_purpose::STANDARD;
                 Ok(json!({
@@ -176,7 +184,11 @@ impl Shared {
                     .store
                     .business_template_source(&doc.template_name, doc.template_version)?
                     .ok_or_else(|| Error::rejected("the template version is not approved"))?;
-                let out = crate::business_export::export(&source, &doc.context)?;
+                let out = if self.lease.is_some() {
+                    crate::business_export::hosted::export(&source, &doc.context)?
+                } else {
+                    crate::business_export::export(&source, &doc.context)?
+                };
                 use base64::Engine;
                 Ok(json!({
                     "id": doc.id,
