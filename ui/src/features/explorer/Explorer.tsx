@@ -9,75 +9,42 @@ import { appErrorCopy, appLoadErrorCopy } from "./appErrors";
 import { displayUiNotice, type UiNotice } from "../app-shell/campaign/useEmailDraft";
 import InstallCheckPanel from "./InstallCheckPanel";
 import { Loading, Notice } from "../app-shell/shared/States";
-import { navigate } from "../../lib/useLocation";
 import { useBackoffLoad } from "../workspace-apps/useBackoffLoad";
+import { navigate } from "../../lib/useLocation";
 import "./explorer.css";
 
-/** A card opens its detail page through the router. */
-const openDetail = (id: string) => navigate(`/apps/catalog/${encodeURIComponent(id)}`);
+/** The AgenticOS marketplace's Apps page — discovery and installs of
+ * canonical app releases moved here (CAD-1422); the host's embedded
+ * catalog is retired. Public origin proven by the provider's deploy
+ * config (`agenticos-v2-web` custom domain `app-v2.agenticos.hk`). */
+const MARKETPLACE_URL = "https://app-v2.agenticos.hk/apps";
 
 /**
- * The Apps Explorer (CAD-1129, `/apps/explore`): the catalog the host
- * ships — every built-in as a card saying what it can see before the
- * install. An operator's card carries an Install button and a request
- * count; a member's shows Request and "Installing is up to your
- * admin". A Git URL is the operator's "More" — checked live, it opens
- * as an "unverified app" card, never a catalog row.
+ * The Apps Explorer (CAD-1422, `/apps/explore`). The host no longer
+ * ships a built-in catalog: browsing and marketplace installs happen in
+ * AgenticOS, so this page hands discovery off there and keeps the
+ * operator's local sources — a checked Git URL — plus tombstone rows
+ * for catalog ids a historical install or an open request still names.
  */
 export default function Explorer({ viewer }: { viewer: Viewer }) {
   const t = useTranslate();
   const [revision, setRevision] = useState(0);
-  const [q, setQ] = useState("");
-  const [cat, setCat] = useState("All");
   const [gitOpen, setGitOpen] = useState(false);
   const [busy, setBusy] = useState<Record<string, boolean>>({});
   const [notice, setNotice] = useState<UiNotice | null>(null);
-  const [reviewing, setReviewing] = useState<{ id: string; title: string } | null>(null);
 
   const isOp = viewer.operator === true && !viewer.readOnly;
-  // Split around the bold "Ask an admin" so the sentence keeps one key.
-  const askNote = t("You can browse and open installed apps. Installing is up to your admin — tap {ask} on any app.").split("{ask}");
 
-  // CAD-1189: the catalog and the request list load with the shared busy
-  // backoff, keep their last good answer on a failed refresh and never
-  // read an error as "no apps".
+  // The retired catalog still answers: tombstones for ids history names,
+  // never a fake "no apps" or up-to-date state. A failed read is shown.
   const catalogLoad = useBackoffLoad((signal) => appExplorer.catalog(signal).then((r) => r.catalog), revision, viewer.operator !== null);
   const requestsLoad = useBackoffLoad((signal) => appExplorer.requests(signal).then((r) => r.requests), revision, isOp);
   const catalog = catalogLoad.data;
   const requests = requestsLoad.data;
   const error = catalogLoad.error === null ? null : appLoadErrorCopy(catalogLoad.error, "The catalog didn't load.");
 
-  const cats = useMemo(() => {
-    const set = new Set<string>();
-    (catalog ?? []).forEach((c) => { if (c.listing?.category) set.add(c.listing.category); });
-    return ["All", ...Array.from(set).sort()];
-  }, [catalog]);
+  const tombstones = useMemo(() => catalog ?? [], [catalog]);
 
-  const items = useMemo(() => {
-    const needle = q.trim().toLowerCase();
-    return (catalog ?? []).filter((c) => {
-      if (cat !== "All" && c.listing?.category !== cat) return false;
-      if (!needle) return true;
-      return [c.name, c.title, c.listing?.tagline, c.listing?.category, ...(c.can ?? c.listing?.can ?? [])]
-        .filter(Boolean).join(" ").toLowerCase().includes(needle);
-    });
-  }, [catalog, q, cat]);
-
-  const featured = useMemo(() => catalog?.filter((c) => c.featured) ?? [], [catalog]);
-
-  // Every install starts with a check (CAD-1194): the panel shows what
-  // the built-in would install and installs the checked digest.
-  const install = (id: string) => {
-    setNotice(null);
-    setReviewing({ id, title: catalog?.find((c) => c.id === id)?.title ?? id });
-  };
-  const requestInstall = (id: string) => {
-    setBusy((b) => ({ ...b, [id]: true }));
-    void appExplorer.requestInstall(id)
-      .then(() => { setNotice("Asked — your admin will see the request."); setRevision((r) => r + 1); })
-      .catch((e: unknown) => setNotice(appErrorCopy(e, "Could not send the request. Try again in a moment.")))
-      .finally(() => setBusy((b) => ({ ...b, [id]: false })));
-  };
   // A removed app comes back with Restore, never a second Install.
   const restore = (card: CatalogCard) => {
     if (!card.install_id) return;
@@ -128,24 +95,26 @@ export default function Explorer({ viewer }: { viewer: Viewer }) {
         </div>
       </div>
       <p className="text-secondary text-ink-400 mb-4">
-        {t("Apps add new skills to your workspace. Each one says what it can see before you install.")}
+        {t("Apps add new skills to your workspace. Browse and install them from the AgenticOS marketplace.")}
       </p>
+
+      <div className="card p-4 mb-5" role="group" aria-label={t("AgenticOS marketplace")}>
+        <h2 className="text-cardtitle font-medium text-ink-100 mb-1">{t("The app marketplace moved")}</h2>
+        <p className="text-label text-ink-400 mb-3">
+          {t("The built-in catalog is retired. Discover reviewed releases on your company's Apps page in AgenticOS. Marketplace installs belong to your AgenticOS workspace; use a checked package or Git source to install on this Cadence host.")}
+        </p>
+        <a className="btn btn-primary btn-sm" href={MARKETPLACE_URL} target="_blank" rel="noopener noreferrer">
+          {t("Open the AgenticOS marketplace")}
+        </a>
+        <p className="text-micro text-ink-500 mt-2">
+          {t("Sign in with your company account; the marketplace handles install approval.")}
+        </p>
+      </div>
 
       {isOp && gitOpen && (
         <GitAdd
           onDone={() => { setGitOpen(false); setNotice("Installed — it's in your apps now."); setRevision((r) => r + 1); notifyAppsChanged(); }}
           onClose={() => setGitOpen(false)}
-        />
-      )}
-
-      {isOp && reviewing && (
-        <InstallCheckPanel
-          key={reviewing.id}
-          source={`builtin:${reviewing.id}`}
-          label={reviewing.title}
-          install={(digest) => appExplorer.installEntry(reviewing.id, digest)}
-          onInstalled={() => { setReviewing(null); setNotice("Installed — it's in your apps now."); setRevision((r) => r + 1); notifyAppsChanged(); }}
-          onClose={() => setReviewing(null)}
         />
       )}
 
@@ -163,101 +132,59 @@ export default function Explorer({ viewer }: { viewer: Viewer }) {
         </div>
       )}
       {catalogLoad.retrying && <p className="text-label text-ink-400 mb-2" role="status">{t("The workspace is busy. Retrying…")}</p>}
-      {catalog === null ? (
-        error === null && !catalogLoad.retrying && <p className="text-label text-ink-400" role="status">{t("Loading the catalog…")}</p>
-      ) : (
-        <>
-          <div className="flex flex-wrap items-center gap-3 mb-5">
-            <input
-              className="field flex-1 min-w-[220px]"
-              placeholder={t("Search apps, e.g. “email”, “bookings”")}
-              value={q}
-              onChange={(e) => setQ(e.target.value)}
-              aria-label={t("Search apps")}
-            />
-            <div className="cats flex flex-wrap gap-1.5" role="group" aria-label={t("Categories")}>
-              {cats.map((c) => (
-                <button key={c} className={`cat ${cat === c ? "on" : ""}`} onClick={() => setCat(c)} aria-pressed={cat === c}>{c}</button>
-              ))}
-            </div>
+
+      {tombstones.length > 0 && (
+        <section className="sec" aria-label={t("Earlier catalog apps")}>
+          <h2 className="text-cardtitle font-medium text-ink-100 mb-3">{t("From the retired catalog")}</h2>
+          <div className="cgrid grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+            {tombstones.map((c) => (
+              <TombstoneCard key={c.id} card={c} isOp={isOp} busy={busy[c.id]} onRestore={() => restore(c)} />
+            ))}
           </div>
-
-          {!isOp && (
-            <div className="alert info mb-4">
-              {askNote[0]}<b>{t("Ask an admin")}</b>{askNote[1]}
-            </div>
-          )}
-
-          {!q && cat === "All" && featured.length > 0 && (
-            <section className="sec mb-6" aria-label={t("Featured")}>
-              <h2 className="text-cardtitle font-medium text-ink-100 mb-2">{t("Made for your business")}</h2>
-              <div className="feat grid gap-3 md:grid-cols-2">
-                {featured.map((c) => (
-                  <div key={c.id} className="card fcard p-4 cursor-pointer" role="button" tabIndex={0}
-                    onClick={() => openDetail(c.id)}
-                    onKeyDown={(e) => e.key === "Enter" && openDetail(c.id)}>
-                    <span className="why text-micro text-ink-500">{t("Popular with shops like yours")}</span>
-                    <div className="flex items-center gap-3 mt-1">
-                      <AppGlyph name={c.name} icon={c.listing?.icon} size="sm" />
-                      <h3 className="text-cardtitle font-medium text-ink-100">{c.title}</h3>
-                    </div>
-                    <p className="text-label text-ink-400 mt-2">{c.listing?.tagline}</p>
-                    <div className="flex items-center justify-end mt-3">
-                      <CardAction card={c} isOp={isOp} busy={busy[c.id]} onInstall={() => install(c.id)} onRequest={() => requestInstall(c.id)} onRestore={() => restore(c)} />
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </section>
-          )}
-
-          <section className="sec" aria-label={t("All apps")}>
-            <div className="sechead flex items-center gap-2 mb-3">
-              <h2 className="text-cardtitle font-medium text-ink-100">
-                {q ? t("Results for “{q}”").replace("{q}", () => q) : cat === "All" ? t("All apps") : cat}
-              </h2>
-              <span className="chip">{items.length}</span>
-            </div>
-            {items.length === 0 ? (
-              <div className="card px-4 py-5 text-secondary text-ink-400">
-                <h3 className="font-medium text-ink-100 mb-1">{t("No apps match “{q}”").replace("{q}", () => q)}</h3>
-                <p>{t("Try a simpler word like “email” or “posts”.")}</p>
-                {isOp && <Button className="mt-3" onClick={() => setGitOpen(true)}>{t("Add from Git URL")}</Button>}
-              </div>
-            ) : (
-              <div className="cgrid grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-                {items.map((c) => (
-                  <CatalogCardView key={c.id} card={c} isOp={isOp} busy={busy[c.id]} onInstall={() => install(c.id)} onRequest={() => requestInstall(c.id)} onRestore={() => restore(c)} />
-                ))}
-              </div>
-            )}
-          </section>
-        </>
+        </section>
       )}
     </main>
   );
 }
 
-function CatalogCardView({ card, isOp, busy, onInstall, onRequest, onRestore }: {
-  card: CatalogCard; isOp: boolean; busy?: boolean; onInstall: () => void; onRequest: () => void; onRestore: () => void;
+/** A retired catalog entry: why the source is gone, plus the install's
+ * real state — Open when live, Restore inside the window, never an
+ * Install action. */
+function TombstoneCard({ card, isOp, busy, onRestore }: {
+  card: CatalogCard; isOp: boolean; busy?: boolean; onRestore: () => void;
 }) {
+  const t = useTranslate();
   return (
     <div className="card ccard p-4 flex flex-col gap-2" role="button" tabIndex={0}
-      onClick={() => openDetail(card.id)}
-      onKeyDown={(e) => e.key === "Enter" && openDetail(card.id)}>
+      onClick={() => navigate(`/apps/catalog/${encodeURIComponent(card.id)}`)}
+      onKeyDown={(event) => {
+        if (event.target === event.currentTarget && event.key === "Enter") navigate(`/apps/catalog/${encodeURIComponent(card.id)}`);
+      }}>
       <div className="flex items-start gap-3">
         <AppGlyph name={card.name} icon={card.listing?.icon} />
         <div className="min-w-0">
           <div className="nm text-cardtitle font-medium text-ink-100 truncate">{card.title}</div>
           <div className="pub text-micro text-ink-500">
-            <TrustChip trust={card.trust} /> · {card.listing?.category ?? "App"}
+            <TrustChip trust={card.trust} /> · {t("Retired source")}
           </div>
         </div>
       </div>
-      <p className="text-label text-ink-400 flex-1">{card.listing?.tagline}</p>
+      <p className="text-label text-ink-400 flex-1">
+        {card.retired_reason ?? t("Its built-in catalog entry was retired. Update or reinstall it from the app's own repository.")}
+      </p>
       <div className="flex items-center justify-between mt-1">
         <InstallStateChip state={card.removed ? "removed" : card.state} />
-        <CardAction card={card} isOp={isOp} busy={busy} onInstall={onInstall} onRequest={onRequest} onRestore={onRestore} />
+        {busy ? (
+          <Button className="btn-sm btn-primary" disabled>{t("Working…")}</Button>
+        ) : card.removed ? (
+          isOp && card.restorable
+            ? <Button className="btn-sm" onClick={(event) => { event.stopPropagation(); onRestore(); }}>{t("Restore")}</Button>
+            : <span className="text-micro text-ink-500">{isOp ? t("Restore window closed") : t("Removed")}</span>
+        ) : card.state === "installed" || card.state === "off" ? (
+          <Link className="btn btn-sm" href={`/app-installations/${card.install_id}`} onClick={(event) => event.stopPropagation()}>{t("Open")}</Link>
+        ) : (
+          <span className="text-micro text-ink-500">{t("Retired")}</span>
+        )}
       </div>
       {isOp && (card.request_count ?? 0) > 0 && (
         <div className="text-micro text-ink-500">{card.request_count} teammate{card.request_count === 1 ? "" : "s"} asked for this</div>
@@ -266,36 +193,11 @@ function CatalogCardView({ card, isOp, busy, onInstall, onRequest, onRestore }: 
   );
 }
 
-/** The one action a card's corner offers: Install (operator), Ask an
- * admin (member, then "Asked"), or Open when installed. */
-function CardAction({ card, isOp, busy, onInstall, onRequest, onRestore }: {
-  card: CatalogCard; isOp: boolean; busy?: boolean; onInstall: () => void; onRequest: () => void; onRestore: () => void;
-}) {
-  const t = useTranslate();
-  if (busy) return <Button className="btn-sm btn-primary" disabled>{t("Working…")}</Button>;
-  if (card.removed) {
-    if (!isOp) return <span className="text-micro text-ink-500">Removed</span>;
-    return card.restorable
-      ? <Button className="btn-sm" onClick={(e) => { e.stopPropagation(); onRestore(); }}>Restore</Button>
-      : <span className="text-micro text-ink-500">Restore window closed</span>;
-  }
-  if (card.state === "installed" || card.state === "off") {
-    return <Link className="btn btn-sm" href={`/app-installations/${card.install_id}`} onClick={(e) => e.stopPropagation()}>Open</Link>;
-  }
-  if (card.state === "requested" || card.requested_by_me) {
-    return <Button className="btn-sm" disabled>{t("Asked")}</Button>;
-  }
-  if (!isOp) {
-    return <Button className="btn-sm" onClick={(e) => { e.stopPropagation(); onRequest(); }}>{t("Ask an admin")}</Button>;
-  }
-  return <Button className="btn-sm btn-primary" onClick={(e) => { e.stopPropagation(); onInstall(); }}>Install</Button>;
-}
-
 /** The operator's "Add from Git URL" — a live check against the repo
  * (HTTPS, public host), then the install review: the daemon's
  * install-check shows exactly what would be installed and the install
  * sends that digest. Never a catalog row: it ships nothing to the
- * built-in list. */
+ * catalog list. */
 function GitAdd({ onDone, onClose }: { onDone: () => void; onClose: () => void }) {
   const t = useTranslate();
   const [url, setUrl] = useState("");

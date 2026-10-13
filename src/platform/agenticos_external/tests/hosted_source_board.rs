@@ -104,7 +104,10 @@ fn boot_daemon_pinned(
 fn board_quote(answer: fn(&str, &str, &Value) -> Reply, slot: &str) -> (u16, Value, Value) {
     let (mut stop, root, state) = boot_daemon(answer);
     let pm = root.path().join("pm");
-    let source = concat!(env!("CARGO_MANIFEST_DIR"), "/workspace-apps/social-content");
+    let source = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/apps/social-content"
+    );
     let install = operator(&state, "app_workspace_install", json!({"source":source}));
     let approve = json!({"install_id":install["install_id"],"digest":install["digest"]});
     operator(&state, "app_local_install_approve", approve);
@@ -248,7 +251,7 @@ fn cad1294_screen_fetch_of_a_saved_handle_reaches_the_provider_door() {
     let fixture = root.path().join("app");
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     copy_dir(
-        &std::path::Path::new(manifest_dir).join("workspace-apps/social-content"),
+        &std::path::Path::new(manifest_dir).join("tests/fixtures/apps/social-content"),
         &fixture,
     );
     let screen =
@@ -367,7 +370,7 @@ fn cad1302_caption_through_a_slot_named_writer_reaches_the_lease_door() {
     // The host's Social Content workflows satisfy the local-workflow
     // check; the manifest is the real app's declarations, `writer` included.
     copy_dir(
-        &manifest_dir.join("workspace-apps/social-content"),
+        &manifest_dir.join("tests/fixtures/apps/social-content"),
         &fixture,
     );
     std::fs::copy(
@@ -566,7 +569,7 @@ fn invoke_1302(
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let fixture = root.join(format!("app-{tag}"));
     copy_dir(
-        &manifest_dir.join("workspace-apps/social-content"),
+        &manifest_dir.join("tests/fixtures/apps/social-content"),
         &fixture,
     );
     std::fs::write(fixture.join("app.md"), manifest).unwrap();
@@ -875,7 +878,7 @@ fn social_fixture(root: &std::path::Path) -> PathBuf {
     let fixture = root.join("app");
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     copy_dir(
-        &manifest_dir.join("workspace-apps/social-content"),
+        &manifest_dir.join("tests/fixtures/apps/social-content"),
         &fixture,
     );
     let screens = manifest_dir.join("tests/fixtures/apps/ig-tools-fixture/screens");

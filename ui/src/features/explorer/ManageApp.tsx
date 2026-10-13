@@ -70,9 +70,9 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
 
   useEffect(() => {
     if (!inst) return;
-    const source = inst.source?.kind === "builtin" && inst.source.id
-      ? `builtin:${inst.source.id}`
-      : inst.source?.kind === "git" ? inst.source.url ?? "" : "";
+    // CAD-1422: a `builtin:` source is retired — there is no embedded
+    // upstream to prefill. Git installs keep their recorded URL.
+    const source = inst.source?.kind === "git" ? inst.source.url ?? "" : "";
     setUpgradeSource(source);
     setUpgradeProposal(null);
   }, [inst]);
@@ -229,11 +229,14 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
           <h3>{t("App package")}</h3>
           <p>{updateReady ? t("An update is ready to review.") : t("No update is currently flagged.")}</p>
           <p className="mt-1">{t("Installed version {version}.").replace("{version}", () => inst.version)}</p>
+          {inst.source?.kind === "builtin" && (
+            <p className="hint mt-2">{t("This install came from the retired built-in catalog — name the app's detached repository (a path or Git URL) to update it.")}</p>
+          )}
           <label className="block mt-3 text-label text-ink-400">
             <span className="block mb-1">{t("App package path or Git URL")}</span>
             <input className="update-source" type="text" value={upgradeSource}
               onChange={(event) => { setUpgradeSource(event.target.value); setUpgradeProposal(null); }}
-              placeholder="builtin:catalog-id, /absolute/path, or Git URL" autoComplete="off" />
+              placeholder="/absolute/path or Git URL" autoComplete="off" />
           </label>
           <div className="mt-3">
             <Button className="btn-sm" disabled={checking || applying || !upgradeSource.trim()} onClick={checkPackageUpdate}>{checking ? t("Checking…") : t("Check update")}</Button>

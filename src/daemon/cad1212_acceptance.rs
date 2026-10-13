@@ -18,7 +18,7 @@ fn cad1212_switched_read_rpcs_write_nothing_to_the_store() {
         .set("CADENCE_PM_DIR", pm.to_str().unwrap());
     let shared = Shared::new(dir.path(), &opts).unwrap();
     let pid = std::process::id();
-    let source = format!("{}/workspace-apps/crm", env!("CARGO_MANIFEST_DIR"));
+    let source = format!("{}/tests/fixtures/apps/crm", env!("CARGO_MANIFEST_DIR"));
     let installed = scoped(Asserted::Operator, || {
         shared.dispatch("app_workspace_install", &json!({ "source": source }), pid)
     })

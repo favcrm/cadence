@@ -308,7 +308,7 @@ impl Fx {
         let app = self.root.path().join("app");
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         copy_dir(
-            &std::path::Path::new(manifest_dir).join("workspace-apps/social-content"),
+            &std::path::Path::new(manifest_dir).join("tests/fixtures/apps/social-content"),
             &app,
         );
         copy_dir(

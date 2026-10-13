@@ -1,6 +1,10 @@
 # CRM package setup
 
-`workspace-apps/crm` is the installable CRM metadata bundle. Installing it
+The canonical CRM package lives in the independent
+[`favcrm/cadence-app-crm`](https://github.com/favcrm/cadence-app-crm)
+repository, under `app/`. Use a trusted, pinned checkout of that repository,
+not the historical embedded `workspace-apps/crm` snapshot or
+`tests/fixtures/apps/crm` (host-contract test data only). Installing it
 creates a workspace installation whose app is named `crm` — the name the
 host-compiled CRM screens (Customers, Segments, Campaigns, content review,
 bounded send controls) key on. The package is metadata plus one local-only
@@ -11,13 +15,14 @@ it makes the already host-compiled UI discoverable to an authorized operator
 under the name `crm`; it does not itself confer UI access, records, SMTP
 custody, send authority, or a sandbox over what workers may do.
 
-Use a trusted Cadence source checkout and an owned, disposable test daemon
+Use a trusted CRM package checkout and an owned, disposable test daemon
 and workspace. These are operator commands, not a production rollout.
 
 ## Install (consent)
 
 ```sh
-cadence app catalog install workspace-apps/crm
+cadence app check /absolute/path/to/cadence-app-crm/app
+cadence app catalog install /absolute/path/to/cadence-app-crm/app
 cadence app catalog show <install-id>
 ```
 
@@ -30,7 +35,7 @@ binding, customer record, SMTP connection or send authority.
 
 ## Generic app assistant declaration
 
-`workspace-apps/crm/app-assistant.json` declares the CRM action IDs and their
+The CRM repository's `app/app-assistant.json` declares the CRM action IDs and their
 input schemas as data in `app-assistant/v1`. It is not executable code and
 cannot add host handlers, commands, URLs, identity or scope. The host serves
 actions only for the selected installation and context, and its reviewed
@@ -162,9 +167,9 @@ A package-only upgrade (changed `version`/content bytes) goes through the
 supported check/commit pair:
 
 ```sh
-cadence app catalog upgrade-check <install-id> --source <dir> \
+cadence app catalog upgrade-check <install-id> <dir> \
   --expected-digest <current-digest> --expected-generation <generation>
-cadence app catalog upgrade <install-id> --source <dir> \
+cadence app catalog upgrade <install-id> <dir> \
   --expected-digest <current-digest> --expected-generation <generation> \
   --expected-new-digest <proposed-digest> --request-id <unique-id>
 ```

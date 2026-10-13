@@ -6,7 +6,7 @@ The read-only check returns the exact proposed `digest` and a file-level
 structural diff:
 
 ```sh
-cadence app catalog upgrade-check <install-id> <absolute-source-path-or-git-url-or-builtin:id> \
+cadence app catalog upgrade-check <install-id> <absolute-source-path-or-git-url> \
   --expected-digest 'sha256:…' \
   --expected-generation '<catalog-generation>'
 ```
@@ -17,13 +17,16 @@ session can check and apply updates for any installed app at
 `/apps/manage/<id>`: enter a source, select **Check update**, inspect the
 proposed version, digest, changed files and compatibility/notes, then select
 **Apply checked update**. The page pins the installed digest, catalog
-generation, and checked new digest, and refuses stale proposals. Built-in
-installs are prefilled with `builtin:<catalog_id>`, Git installs with their
-recorded URL, and path installs start empty for an absolute path or Git URL.
+generation, and checked new digest, and refuses stale proposals. Git installs
+are prefilled with their recorded URL, and other installs start empty for an
+absolute path or Git URL. A historical built-in install (CAD-1422 retired
+the embedded catalog) updates from the app's detached repository — name its
+trusted path or Git URL.
 The Social Content **Settings → App package** panel remains available.
 
 `cadence app catalog upgrade-check` and `cadence app catalog upgrade` accept
-absolute source paths, Git URLs, and `builtin:<catalog_id>`. In a hosted
+absolute source paths and Git URLs. The `builtin:<catalog_id>` source form is
+retired (CAD-1422) and refused. In a hosted
 AgenticOS container the remote CLI still has no app-management verbs, so the
 Manage page is the board path for operators updating any app there.
 
@@ -57,7 +60,7 @@ project approvals. Either command refuses a stale digest. Approval of an app
 bundle does not approve an individual run or authorize outward effects.
 
 ```sh
-cadence app catalog upgrade <install-id> <absolute-source-path-or-git-url-or-builtin:id> \
+cadence app catalog upgrade <install-id> <absolute-source-path-or-git-url> \
   --expected-digest 'sha256:…' \
   --expected-generation '<catalog-generation>' \
   --expected-new-digest '<digest-from-upgrade-check>' \
@@ -122,14 +125,16 @@ There is no in-place rollback after a committed upgrade. To return to earlier
 bytes, submit a new upgrade from those bytes with the current digest and
 generation, then review and approve that digest again.
 
-Built-in app bundles and their catalog index are embedded in the Cadence
-binary. A new version of a built-in app arrives with a new Cadence build. The
-Explorer's operator-only `update_available` flag means a check for the installed
+The built-in catalog is retired (CAD-1422): the Cadence binary embeds no app
+bundles or catalog index. Canonical apps live in their own repositories and
+release artifacts; discovery and marketplace installs happen on the AgenticOS
+Apps page (`https://app-v2.agenticos.hk/apps`). A new app version arrives as a
+detached release — update an installation from its trusted path or Git URL.
+The Explorer's operator-only `update_available` flag means a check for the installed
 app found a different bundle digest and cached that result; members do not see
 the flag. The remote CLI (`cadence --org …`) has no app-management verbs. In a hosted
 AgenticOS container, operators can update any installed app from its
-`/apps/manage/<id>` page; the same CLI commands accept `builtin:<catalog_id>`
-for embedded bundles.
+`/apps/manage/<id>` page.
 
 This transport currently handles the package bundle and Cadence-owned app
 metadata. Host-managed per-install SQLite storage and staged schema/data

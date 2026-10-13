@@ -273,8 +273,10 @@ fn params(method: &str, source: &str) -> Value {
 
 /// CAD-1209 item 2, RPC: install, install-check, upgrade and upgrade-check
 /// refuse every URL the check route refuses, by the vet itself, and write
-/// nothing. Positive controls: a local absolute path and `builtin:` pass
-/// the vet.
+/// nothing. Positive controls: a local absolute path passes the vet, and a
+/// `builtin:` source passes the vet but is refused downstream — the
+/// built-in catalog is retired (CAD-1422), so the refusal is the retired
+/// source refusal, not the vet's.
 #[test]
 fn rpc_routes_refuse_what_the_check_route_refuses() {
     let fx = Fx::start();
@@ -323,11 +325,18 @@ fn rpc_routes_refuse_what_the_check_route_refuses() {
     }
     let chk = fx.op("app_workspace_install_check", json!({"source": src}));
     assert!(chk["digest"].is_string());
-    let b = fx.op(
+    // CAD-1422: `builtin:` still passes the vet (it is not a network
+    // source); the refusal comes from the retired catalog, downstream.
+    let b = fx.rpc(
+        Asserted::Operator,
         "app_workspace_install_check",
         json!({"source": "builtin:crm"}),
     );
-    assert!(b["digest"].is_string());
+    let e = b
+        .err()
+        .unwrap_or_else(|| panic!("builtin: accepted"))
+        .to_string();
+    assert!(e.contains("built-in catalog"), "{e}");
     let inst = fx.op("app_workspace_install", json!({"source": src}));
     assert!(inst["install_id"].is_string(), "{inst}");
 }
@@ -380,9 +389,6 @@ fn board_routes_refuse_what_the_check_route_refuses() {
     for src in SMUGGLE {
         for route in ["/api/app-installations", "/api/app-installations/check"] {
             let (status, text) = fx.http("operator", route, &json!({"source": src}).to_string());
-            if route.ends_with("check") && *src == "builtin:crm" {
-                continue;
-            }
             assert!(status >= 400, "{route} accepted {src}: {status} {text}");
         }
     }
@@ -397,12 +403,15 @@ fn board_routes_refuse_what_the_check_route_refuses() {
         &json!({"source": src}).to_string(),
     );
     assert_eq!(status, 200, "{text}");
+    // CAD-1422: a retired `builtin:` source is refused — and the refusal
+    // is the retired catalog's, not the transport vet's.
     let (status, text) = fx.http(
         "operator",
         "/api/app-installations/check",
         &json!({"source": "builtin:crm"}).to_string(),
     );
-    assert_eq!(status, 200, "{text}");
+    assert!(status >= 400, "retired builtin check accepted: {text}");
+    assert!(!text.contains(VET), "{text}");
     let (status, text) = fx.http(
         "operator",
         "/api/app-installations",

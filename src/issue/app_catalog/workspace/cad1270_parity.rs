@@ -1,11 +1,14 @@
 //! CAD-1270 parity test: `check_offline` (the daemon-free `app check`)
 //! and `install_check` (the daemon's `app catalog install-check`) agree
 //! on the same bundle bytes — the ticket's required agreement over the
-//! built-in CRM and Social Content packages plus malformed fixtures.
+//! historical `tests/fixtures/apps/` packages plus malformed fixtures.
 //! Parity is the pass/refusal verdict and, on a pass, the bundle digest;
 //! stateful catalog admission (same-name installs, pending journals, the
 //! tracker-self guard, the PM agent registry) stays install-check-only
 //! by design and is excluded.
+//!
+//! CAD-1422: the built-in catalog is retired, so `builtin:<id>` is a
+//! refused source form — the retired refusal is checked at the end.
 
 use super::*;
 
@@ -45,14 +48,13 @@ fn cad1270_check_and_install_check_agree_on_the_same_bytes() {
     let pm = Pm::init(pm_dir.path()).unwrap();
     let sources = tempfile::tempdir().unwrap();
 
-    // --- valid packages: both embedded built-ins, their on-disk
-    // workspace-apps/ copies, and a local fixture bundle.
+    // --- valid packages: the on-disk tests/fixtures/apps/ copies
+    // (byte-identical snapshots of the retired built-ins) and a local
+    // fixture bundle.
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut sources_ok: Vec<String> = vec![
-        "builtin:crm".into(),
-        "builtin:social-content".into(),
-        repo.join("workspace-apps/crm").display().to_string(),
-        repo.join("workspace-apps/social-content")
+        repo.join("tests/fixtures/apps/crm").display().to_string(),
+        repo.join("tests/fixtures/apps/social-content")
             .display()
             .to_string(),
     ];
@@ -161,6 +163,28 @@ fn cad1270_check_and_install_check_agree_on_the_same_bytes() {
     // --- a remote source is refused as a transport, never fetched.
     let check = check_offline("https://example.invalid/repo.git").unwrap();
     check_is_refusal(&check, CHECK_TRANSPORT);
+
+    // --- CAD-1422: the retired `builtin:` source form refuses at the
+    // source stage — every historical id, not just unknown ones.
+    for source in [
+        "builtin:crm",
+        "builtin:social-content",
+        "builtin:nope",
+        "builtin:",
+    ] {
+        let check = check_offline(source).unwrap();
+        check_is_refusal(&check, CHECK_SOURCE);
+        assert!(
+            check["refusal"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("built-in catalog")),
+            "{source}: {check}"
+        );
+        assert!(
+            install_check(&pm, source).is_err(),
+            "install-check accepted retired source {source}"
+        );
+    }
 }
 
 /// Relative pm-dir paths below `root`, sorted, for the no-write compare.

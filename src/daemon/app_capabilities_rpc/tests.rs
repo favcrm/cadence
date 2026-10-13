@@ -39,7 +39,7 @@ fn fixture() -> (
     let bundle = json!({"digest":"sha256:fixture-bundle"});
     let files = BTreeMap::from([(
         "app.md".into(),
-        include_str!("../../../workspace-apps/social-content/app.md").into(),
+        include_str!("../../../tests/fixtures/apps/social-content/app.md").into(),
     )]);
     let config = shared
         .app_binding_config(

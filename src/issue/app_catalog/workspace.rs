@@ -568,8 +568,8 @@ fn check_expected_digest(expected: &str, actual: &str) -> Result<()> {
 /// `install` does and returns the digest `--expected-digest` must carry. It
 /// writes nothing: no catalog, journal or lock file is created.
 ///
-/// CAD-1194: `builtin:<catalog_id>` names a host built-in, so the board's
-/// built-in install pins a digest through this same check.
+/// CAD-1422: `builtin:<catalog_id>` was the host built-in source form; the
+/// catalog is retired, so a `builtin:` source is refused here.
 pub(crate) fn install_check(pm: &Pm, source: &str) -> Result<Value> {
     let (files, validated, provenance) = match source.strip_prefix(BUILTIN_SOURCE_PREFIX) {
         Some(catalog_id) => builtin_bundle(pm, catalog_id)?,
@@ -624,7 +624,7 @@ fn check_host_block() -> Result<Value> {
     }))
 }
 
-/// CAD-1270 `cadence app check <dir|builtin:<id>>`: the bundle's offline
+/// CAD-1270 `cadence app check <dir>`: the bundle's offline
 /// byte-validation report — the identical `snapshot` + `validate_texts`
 /// pipeline `install_check` runs (entry grammar, per-file and aggregate
 /// caps, manifest, descriptors, workflow checks, `requires` against this
@@ -632,10 +632,11 @@ fn check_host_block() -> Result<Value> {
 /// computed with no daemon, no store, no PM read or write and no
 /// transport.
 ///
-/// Sources: a local directory (relative paths are canonicalized) or
-/// `builtin:<catalog id>` — the host's embedded bundles, checked as the
-/// same bytes the daemon would embed. A git/URL source is refused: it is
-/// a transport, not bytes in hand, and the daemon vets remote sources.
+/// Sources: a local directory (relative paths are canonicalized).
+/// `builtin:<catalog id>` is the retired catalog form (CAD-1422) — the
+/// host ships no embedded bundles, so it is refused at the source stage
+/// like an unknown source. A git/URL source is refused: it is a
+/// transport, not bytes in hand, and the daemon vets remote sources.
 ///
 /// Stateful admission is deliberately not reproduced — the report's
 /// `stateful_admission` field says so. `install_check`'s catalog read
@@ -666,25 +667,24 @@ pub fn check_offline(source: &str) -> Result<Value> {
             CHECK_TRANSPORT,
             &Error::rejected(
                 "a git or URL source needs the daemon's checked transport — \
-                 `app check` accepts a local directory or `builtin:<catalog id>`",
+                 `app check` accepts a local directory; `builtin:` sources are \
+                 retired (CAD-1422)",
             ),
         ));
     }
 
-    // ---- source → a canonical directory, or an embedded builtin bundle.
+    // ---- source → a canonical directory. `builtin:<id>` is retired
+    // (CAD-1422): `builtin::get` returns the retired source refusal, so
+    // it never reaches the inventory stage.
     enum Resolved {
-        Builtin(BTreeMap<String, String>),
         Dir(PathBuf),
     }
     let resolved = (|| -> Result<(Resolved, app::Source)> {
         if let Some(id) = source.strip_prefix(BUILTIN_SOURCE_PREFIX) {
-            let entry = super::builtin::get(id)?
-                .ok_or_else(|| Error::rejected(format!("unknown built-in catalog id '{id}'")))?;
-            let provenance = app::Source::Builtin {
-                id: entry.id.to_string(),
-                digest: bundle_digest(&entry.files),
-            };
-            return Ok((Resolved::Builtin(entry.files), provenance));
+            // `get` is the retired refusal; `?` propagates it as this
+            // source's refusal.
+            super::builtin::get(id)?;
+            unreachable!("builtin::get always returns the retired refusal");
         }
         let path = Path::new(source);
         if path.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
@@ -721,7 +721,6 @@ pub fn check_offline(source: &str) -> Result<Value> {
     // ---- inventory: the install snapshot — descriptor-relative,
     // grammar-, cap- and UTF-8-checked member reads.
     let files = match resolved {
-        Resolved::Builtin(files) => files,
         Resolved::Dir(dir) => {
             let files = Root::open(&dir).and_then(|root| snapshot(&root, Path::new(""), true));
             match files {
@@ -2007,40 +2006,31 @@ pub(crate) fn with_completed_bundle_snapshot<T>(
     callback(&json!({"digest":digest}), &files)
 }
 
-/// CAD-1129: the host's embedded built-in bundle `catalog_id`, resolved
-/// and validated like a source bundle. The bytes come from
-/// `include_str!`, never a checkout or a caller path.
+/// CAD-1422: `builtin:<catalog_id>` is the retired embedded-catalog
+/// source form. It is never resolved as a bundle: `builtin::get` is the
+/// explicit retired refusal, so an install or upgrade naming it fails
+/// closed before the lock, the catalog read or any write.
 fn builtin_bundle(
     pm: &Pm,
     catalog_id: &str,
 ) -> Result<(BTreeMap<String, String>, app::Validated, app::Source)> {
-    let entry =
-        super::builtin::get(catalog_id)?.ok_or_else(|| Error::rejected("unknown catalog entry"))?;
-    let files = entry.files;
-    let (agents, agent_sources) = workflow::known_agents(&pm.dir, None, &[]);
-    let validated = app::validate_texts(
-        files
-            .iter()
-            .map(|(name, text)| (name.clone(), text.clone()))
-            .collect(),
-        &agents,
-        &agent_sources,
-    )?;
-    let provenance = app::Source::Builtin {
-        id: entry.id.to_string(),
-        digest: bundle_digest(&files),
-    };
-    Ok((files, validated, provenance))
+    let _ = pm;
+    super::builtin::get(catalog_id)?;
+    unreachable!("builtin::get always returns the retired refusal")
 }
 
 /// [`install_builtin`] with a guard re-run under the PM lock before the first
-/// write (CAD-1374). The guard refuses a stale human; it never grants access.
+/// write (CAD-1374). Retired (CAD-1422): the catalog no longer ships
+/// distributions, so this always resolves to the retired refusal before
+/// any lock or write — the guard never runs on a source that cannot
+/// install.
 pub(crate) fn install_builtin_guarded(
     pm: &Pm,
     catalog_id: &str,
     expected_digest: &str,
     guard: &dyn Fn() -> Result<()>,
 ) -> Result<Value> {
+    let _ = guard;
     let (files, validated, provenance) = builtin_bundle(pm, catalog_id)?;
     install_resolved(
         pm,
@@ -2078,20 +2068,13 @@ pub(crate) fn update_check(pm: &Pm, install_id: &str) -> Result<Value> {
     let source = record.source;
     match source {
         app::Source::Builtin { id: cat_id, digest } => {
-            let builtin = crate::issue::app_catalog::builtin::get(&cat_id)?
-                .ok_or_else(|| Error::rejected("the built-in catalog no longer ships this app"))?;
-            let files = builtin.files;
-            let new_digest = bundle_digest(&files);
-            let validated = app::validate_texts(
-                files.iter().map(|(n, t)| (n.clone(), t.clone())).collect(),
-                &Default::default(),
-                &[],
-            )?;
-            let has_update = new_digest != digest;
+            // CAD-1422: the built-in catalog is retired — there is no
+            // embedded upstream to check against. Report the retired
+            // source honestly, never a fake up-to-date answer.
             Ok(json!({"schema":1,"install_id":&*id,"source":"builtin",
-                "catalog_id":cat_id,"has_update":has_update,
-                "current_digest":digest,"digest":new_digest,
-                "version":validated.manifest.version}))
+                "catalog_id":cat_id,"has_update":false,"retired":true,
+                "current_digest":digest,
+                "note":"the built-in catalog was retired — update from the app's detached repository (a trusted path or Git source)"}))
         }
         app::Source::Git { url, sha, dir } => {
             let dir = dir.unwrap_or_default();
