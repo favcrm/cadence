@@ -1062,9 +1062,11 @@ pub fn rpc_app_media_original(state_dir: &Path, params: Value) -> Result<(Value,
         ));
     }
     let declared = result["bytes"].as_u64().unwrap_or_default() as usize;
+    if body_leftover.len() > declared {
+        return Err(Error::internal("daemon original reply carried extra bytes"));
+    }
     let mut body = Vec::with_capacity(declared);
-    body.extend_from_slice(&body_leftover[..body_leftover.len().min(declared)]);
-    let mut extra: Vec<u8> = body_leftover[body_leftover.len().min(declared)..].to_vec();
+    body.extend_from_slice(&body_leftover);
     // Body: exact `declared` bytes under the same absolute deadline,
     // then a clean EOF — a truncated, extra or corrupt body refuses
     // before the board can serve it.
@@ -1090,14 +1092,15 @@ pub fn rpc_app_media_original(state_dir: &Path, params: Value) -> Result<(Value,
             return Err(e.into());
         }
     }
+    // EOF proof: the first byte past `declared` refuses at once, never
+    // accumulated; EINTR/EAGAIN keep waiting under the same deadline.
     loop {
         if !poll_deadline(fd, libc::POLLIN, deadline)? {
             return Err(Error::busy("daemon original reply deadline reached"));
         }
-        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), 1) };
         if n > 0 {
-            extra.extend_from_slice(&buf[..n as usize]);
-            continue;
+            return Err(Error::internal("daemon original reply carried extra bytes"));
         }
         if n == 0 {
             break;
@@ -1109,9 +1112,6 @@ pub fn rpc_app_media_original(state_dir: &Path, params: Value) -> Result<(Value,
         ) {
             return Err(e.into());
         }
-    }
-    if !extra.is_empty() {
-        return Err(Error::internal("daemon original reply carried extra bytes"));
     }
     if format!("sha256:{:x}", Sha256::digest(&body)) != result["sha256"] {
         return Err(Error::internal("daemon original body failed its digest"));
@@ -1402,3 +1402,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod cad1365_original_extra_acceptance;
