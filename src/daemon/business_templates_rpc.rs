@@ -68,7 +68,7 @@ impl Shared {
                 self.business_template_caller("template intake", params, peer_pid)?;
                 let file = required_str(params, "file")?;
                 let source = source_param(params)?;
-                let out = if self.lease.is_some() {
+                let out = if self.hosted_business_documents.is_some() {
                     crate::business_export::hosted::intake(file, &source)?
                 } else {
                     crate::business_export::intake(file, &source)?
@@ -105,7 +105,7 @@ impl Shared {
                     &row.spec,
                     &crate::business_templates::sample_data(&row.spec),
                 )?;
-                let out = if self.lease.is_some() {
+                let out = if self.hosted_business_documents.is_some() {
                     crate::business_export::hosted::export_sample(&source, &draft.context())?
                 } else {
                     crate::business_export::export_sample(&source, &draft.context())?
@@ -184,7 +184,7 @@ impl Shared {
                     .store
                     .business_template_source(&doc.template_name, doc.template_version)?
                     .ok_or_else(|| Error::rejected("the template version is not approved"))?;
-                let out = if self.lease.is_some() {
+                let out = if self.hosted_business_documents.is_some() {
                     crate::business_export::hosted::export(&source, &doc.context)?
                 } else {
                     crate::business_export::export(&source, &doc.context)?

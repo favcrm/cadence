@@ -38,11 +38,17 @@ struct ProviderDeployment {
 }
 
 #[derive(Clone, Debug)]
+// Variant names mirror the wire transports (`hosted-*`); the shared prefix is intentional.
+#[allow(clippy::enum_variant_names)]
 enum DeploymentTransport {
     HostedMediaLease,
     /// CAD-1158: dedicated bridge-owned SMTP admission. Binds the fixed
     /// `smtp.internal` relay contract only; never media or lease authority.
     HostedSmtpRelay,
+    /// CAD-1416: the image-owned hosted business-documents admission. Binds
+    /// the fixed `api.internal` document door only; never media, SMTP or a
+    /// lifecycle lease.
+    HostedBusinessDocuments,
 }
 
 /// CAD-1158: the exact image-owned SMTP admission tuple. Only this tuple
@@ -51,6 +57,13 @@ enum DeploymentTransport {
 pub(crate) const SMTP_PROVIDER: &str = "smtp";
 pub(crate) const SMTP_ORIGIN: &str = "http://smtp.internal";
 pub(crate) const SMTP_MANIFEST_PIN: &str = "smtp-internal-relay@2";
+
+/// CAD-1416: the exact image-owned business-documents tuple. Only this
+/// tuple admits the hosted template document door; no other provider,
+/// origin or pin does.
+pub(crate) const BUSINESS_DOCUMENTS_PROVIDER: &str = "business_documents";
+pub(crate) const BUSINESS_DOCUMENTS_ORIGIN: &str = "http://api.internal";
+pub(crate) const BUSINESS_DOCUMENTS_MANIFEST_PIN: &str = "business-documents@1";
 
 fn parse_transport<'de, D>(
     deserializer: D,
@@ -61,6 +74,7 @@ where
     match String::deserialize(deserializer)?.as_str() {
         "hosted-media-lease@1" => Ok(Some(DeploymentTransport::HostedMediaLease)),
         "hosted-smtp-relay@1" => Ok(Some(DeploymentTransport::HostedSmtpRelay)),
+        "hosted-business-documents@1" => Ok(Some(DeploymentTransport::HostedBusinessDocuments)),
         _ => Err(serde::de::Error::custom(
             "unknown provider transport assertion",
         )),
@@ -91,6 +105,14 @@ impl HostedMediaAdmission {
     pub(crate) fn pin(&self) -> &'static str {
         self.pin
     }
+}
+
+/// CAD-1416: only validated image metadata carrying the exact business-
+/// documents tuple can produce this proof. It selects the hosted document
+/// door and grants no lifecycle lease, media or SMTP authority.
+#[derive(Clone, Debug)]
+pub(crate) struct HostedBusinessDocumentsAdmission {
+    _private: (),
 }
 
 /// CAD-1158: only validated image metadata carrying the exact SMTP tuple
@@ -171,6 +193,11 @@ impl DeploymentMetadata {
                                 || entry.origin != SMTP_ORIGIN
                                 || entry.manifest_pin != SMTP_MANIFEST_PIN
                         }
+                        DeploymentTransport::HostedBusinessDocuments => {
+                            entry.provider != BUSINESS_DOCUMENTS_PROVIDER
+                                || entry.origin != BUSINESS_DOCUMENTS_ORIGIN
+                                || entry.manifest_pin != BUSINESS_DOCUMENTS_MANIFEST_PIN
+                        }
                     }
                 })
                 || entry.manifest_pin.is_empty()
@@ -211,6 +238,23 @@ impl DeploymentMetadata {
                     && matches!(entry.transport, Some(DeploymentTransport::HostedSmtpRelay))
             })
             .map(|_| HostedSmtpAdmission { _private: () })
+    }
+
+    /// CAD-1416: `Some` only for the exact business-documents tuple (all
+    /// four fields). An SMTP or media assertion never yields it.
+    pub(crate) fn hosted_business_documents(&self) -> Option<HostedBusinessDocumentsAdmission> {
+        self.providers
+            .iter()
+            .find(|entry| {
+                entry.provider == BUSINESS_DOCUMENTS_PROVIDER
+                    && entry.origin == BUSINESS_DOCUMENTS_ORIGIN
+                    && entry.manifest_pin == BUSINESS_DOCUMENTS_MANIFEST_PIN
+                    && matches!(
+                        entry.transport,
+                        Some(DeploymentTransport::HostedBusinessDocuments)
+                    )
+            })
+            .map(|_| HostedBusinessDocumentsAdmission { _private: () })
     }
 
     pub fn pin(&self, provider: &str, origin: &str) -> Option<&str> {
