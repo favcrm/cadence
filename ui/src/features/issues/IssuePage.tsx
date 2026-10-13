@@ -229,7 +229,7 @@ function PageBody({
           <Button
             variant={blocked ? "secondary" : "primary"}
             disabled={!!blocked}
-            title={blocked ?? undefined}
+            title={blocked == null ? undefined : t(blocked)}
             onClick={() => setKickoff(true)}
           >
             {t("Kick off")}
@@ -265,7 +265,7 @@ function PageBody({
           {items.length === 0 && (
             <div className="border border-ink-700 border-l-[3px] border-l-warn rounded-lg px-3.5 py-3 bg-warn/10">
               <strong className="text-ink-100">{t("Kick off blocked")}</strong>
-              <p className="text-secondary text-ink-300 mt-1 m-0">{blocked}</p>
+              <p className="text-secondary text-ink-300 mt-1 m-0">{blocked && t(blocked)}</p>
             </div>
           )}
         </div>

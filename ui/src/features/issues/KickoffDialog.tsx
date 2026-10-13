@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { api, ApiError, type WriteResp } from "../../lib/api";
+import { useTranslate } from "../../lib/locale";
 import Button from "../../ui/Button";
 import Link from "../../ui/Link";
 import Select from "../../ui/Select";
@@ -24,6 +25,7 @@ interface Props {
 }
 
 export default function KickoffDialog({ id, title, body, groups, blocked, onClose, onWrite, onDone, planHref }: Props) {
+  const t = useTranslate();
   const [step, setStep] = useState<"edit" | "confirm">("edit");
   const [provider, setProvider] = useState(KICKOFF_CHOICES[0].id);
   const [model, setModel] = useState(KICKOFF_CHOICES[0].models[0].id);
@@ -119,7 +121,7 @@ export default function KickoffDialog({ id, title, body, groups, blocked, onClos
           <span className="kicker">{step === "edit" ? id : "operator"}</span>
         </header>
         <div className="overflow-auto px-4 py-4 grid gap-3">
-          {blocked && <p className="text-secondary text-fail m-0" role="alert">{blocked}</p>}
+          {blocked && <p className="text-secondary text-fail m-0" role="alert">{t(blocked)}</p>}
           {step === "edit" ? (
             <>
               <p className="text-secondary text-ink-400 m-0">

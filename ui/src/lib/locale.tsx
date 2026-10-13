@@ -1019,6 +1019,8 @@ Object.assign(zhTW, {
 Object.assign(zhTW, {
   "Browser default": "瀏覽器預設",
   "Language saved in this browser.": "語言已儲存於此瀏覽器。",
+  "You're viewing read-only.": "您正在以唯讀模式檢視。",
+  "This issue has no acceptance checklist. Kick off stays blocked until at least one check exists.": "此議題尚無驗收清單。至少新增一個驗收項目後才能啟動。",
 });
 
 export function useLocale(): LocaleContextValue {
