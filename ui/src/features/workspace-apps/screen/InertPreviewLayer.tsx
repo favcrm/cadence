@@ -51,7 +51,7 @@ export default function InertPreviewLayer({ preview, remoteImages }: { preview: 
     const observer = new ResizeObserver(measure); observer.observe(node);
     return () => observer.disconnect();
   }, []);
-  const box = preview ? slotBox(preview.anchor, size.w, size.h) : null;
+  const box = preview ? (preview.anchor === "footer" ? slotBox(preview.anchor, size.w, size.h) : preview.anchor) : null;
   return <div ref={layer} style={{ position: "absolute", inset: 0, pointerEvents: "none", overflow: "hidden", zIndex: 2 }}>
     {preview && box && <iframe title="Inert app document preview" sandbox="" referrerPolicy="no-referrer" srcDoc={inertDocument(preview, remoteImages)}
       style={{ position: "absolute", left: box.x, top: box.y, width: box.w, height: box.h, border: 0, pointerEvents: "auto", background: "white" }} />}
