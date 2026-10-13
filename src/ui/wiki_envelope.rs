@@ -323,7 +323,7 @@ fn upload_path(path: Option<String>, grant: &WikiGrant) -> Result<String, HttpRe
     let path = path.ok_or_else(|| refuse(400, "invalid_request", "wiki upload needs ?path="))?;
     let norm = crate::wiki::upload::logical_upload_path(&path)
         .map_err(|e| refuse(400, "invalid_request", &e.to_string()))?;
-    if !grant.contains(WikiAction::Write, &norm) {
+    if !grant.contains_file(WikiAction::Write, &norm) {
         return Err(refuse(
             403,
             "insufficient_scope",
@@ -454,7 +454,13 @@ mod tests {
         ] {
             let grant = verified_upload_grant(actor, prefix);
             assert_eq!(relay_claim(&grant.actor).as_deref(), Some(claim));
-            for suffix in ["source.md", "source.pdf"] {
+            let directory = prefix.trim_end_matches('/');
+            let refusal = upload_path(Some(directory.into()), &grant)
+                .err()
+                .expect("the write prefix itself must not be an upload target");
+            assert_eq!(refusal.status_code(), StatusCode(403));
+            assert!(upload_path(Some(format!("{directory}.extracted.md")), &grant).is_err());
+            for suffix in ["source.md", "source.pdf", "nested/source.pdf"] {
                 let path = format!("{prefix}{suffix}");
                 assert_eq!(
                     upload_path(Some(path.clone()), &grant)

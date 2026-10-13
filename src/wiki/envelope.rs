@@ -122,6 +122,16 @@ impl WikiGrant {
             .is_some_and(|p| !p.is_empty())
     }
 
+    /// Is a normalized file path a strict descendant of any prefix granted
+    /// for `action`? Unlike directory reads, a file cannot be the prefix itself.
+    pub fn contains_file(&self, action: WikiAction, path: &str) -> bool {
+        self.prefixes_for(action.scope()).is_some_and(|prefixes| {
+            prefixes
+                .iter()
+                .any(|prefix| path.starts_with(prefix.as_str()))
+        })
+    }
+
     /// Is `path` (a normalized, root-relative wiki path with no trailing
     /// slash) inside the prefix ceiling for `action`'s scope? Every read
     /// result is checked here, listings and search hits included.
@@ -432,6 +442,27 @@ mod tests {
         let g = grant(&[WikiScope::Read], &[("wiki.read", &["global/"])]);
         assert!(!g.contains(WikiAction::Read, "global-evil/x.md"));
         assert!(g.contains(WikiAction::Read, "global"));
+    }
+
+    #[test]
+    fn file_authorization_requires_a_descendant_of_any_action_prefix() {
+        let g = grant(
+            &[WikiScope::Read, WikiScope::Write],
+            &[
+                ("wiki.read", &["global/"]),
+                ("wiki.write", &["global/scoped/", "global/scoped/narrow/"]),
+            ],
+        );
+        assert!(g.contains(WikiAction::Read, "global"));
+        assert!(!g.contains_file(WikiAction::Write, "global/scoped"));
+        assert!(!g.contains_file(WikiAction::Write, "global/scoped.extracted.md"));
+        assert!(!g.contains_file(WikiAction::Write, "global/scoped-evil/a.md"));
+        assert!(!g.contains_file(WikiAction::Write, "global/outside.md"));
+        assert!(g.contains_file(WikiAction::Write, "global/scoped/a.md"));
+        assert!(g.contains_file(WikiAction::Write, "global/scoped/narrow"));
+        assert!(g.contains_file(WikiAction::Write, "global/scoped/narrow/a.md"));
+        let read_only = grant(&[WikiScope::Read], &[("wiki.read", &["global/"])]);
+        assert!(!read_only.contains_file(WikiAction::Write, "global/a.md"));
     }
 
     #[test]

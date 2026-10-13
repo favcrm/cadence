@@ -509,6 +509,41 @@ fn wiki_envelope_upload_refuses_before_staging_and_commits_only_verified_targets
         "over-cap file staged or mutated data"
     );
 
+    // A write prefix grants descendants, not the directory itself. A PDF at
+    // the exact grant path could otherwise create its extracted Markdown
+    // sibling outside the signed prefix. Keep this check before any successful
+    // upload and prove the fixture directory does not already exist.
+    let vault = cadence_agent::wiki::vault_dir(&Pm::at(&rig.pm()).unwrap()).unwrap();
+    assert!(
+        !vault.join(PREFIX).exists(),
+        "directory-target fixture must start absent"
+    );
+    let directory_query = format!("/api/wiki/upload?path={}", PREFIX.trim_end_matches('/'));
+    let directory_token = rig.sign(&rig.claims("directory-prefix-upload"));
+    let before = rig.snapshot();
+    assert_eq!(
+        rig.refusal_before_body(&directory_query, &directory_token),
+        Some(403),
+        "exact granted-prefix directory target must refuse before body read"
+    );
+    assert_eq!(
+        rig.snapshot(),
+        before,
+        "pre-body directory-target refusal staged or mutated data"
+    );
+    let pdf_token = rig.sign(&rig.claims("directory-prefix-upload-pdf"));
+    let (status, body) = rig.multipart(
+        &directory_query,
+        Some(&pdf_token),
+        &multipart_file("directory.pdf", b"%PDF-1.7\nsynthetic fixture"),
+    );
+    assert_eq!(status, 403, "PDF upload to exact prefix directory: {body}");
+    assert_eq!(
+        rig.snapshot(),
+        before,
+        "directory-target PDF staged or mutated data"
+    );
+
     // Positive controls: text and binary go through the real existing daemon
     // mutation routes with owner and member attribution respectively.
     let (status, body) = rig.multipart(
