@@ -120,6 +120,110 @@ export interface ComposerProps {
   onResolveOriginal?: () => void;
 }
 
+/** Draft attachment chips (CAD-1419): one icon slot per chip that
+ *  becomes Remove on hover/focus and stays visible on touch. Up to three
+ *  show; the rest sit behind +N more, with any failed or uploading file
+ *  surfaced first so an unresolved file is never hidden silently. */
+const CHIP_LIMIT = 3;
+
+function AttachChips({
+  items,
+  t,
+  onRetry,
+  onRemove,
+}: {
+  items: AttachItem[];
+  /** The shared attach translator (`translateAttachText`), the same one
+   *  `attachMeta` and `displayAttachError` receive everywhere else. */
+  t: (english: string) => string;
+  onRetry: (item: AttachItem) => void;
+  onRemove: (item: AttachItem) => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  // Failed first, then uploading, then ready: the rows behind +N more
+  // are the ones that still need the operator.
+  const rank = (a: AttachItem) => (a.status === "failed" ? 0 : a.status === "uploading" ? 1 : 2);
+  const ordered = [...items].sort((a, b) => rank(a) - rank(b));
+  const visible = expanded || ordered.length <= CHIP_LIMIT ? ordered : ordered.slice(0, CHIP_LIMIT);
+  const hidden = ordered.slice(visible.length);
+  // Unresolved rows behind +N more must stay discoverable: the button says
+  // so, and the failure is named on it.
+  const hiddenFailed = hidden.some((a) => a.status === "failed");
+  const hiddenPending = hidden.some((a) => a.status === "uploading");
+  return (
+    <div className="app-chat-attachrow" data-composer-attachments>
+      {visible.map((a) => (
+        <div
+          key={a.key}
+          role="group"
+          className={`app-chat-filerow${a.status === "failed" ? " failed" : ""}`}
+          data-attach-status={a.status}
+          aria-label={`${a.name}: ${t(a.status)}${a.error ? ` — ${displayAttachError(a.error, t)}` : ""}`}
+          title={a.name}
+        >
+          <span className="app-chat-filename">
+            <span className="app-chat-chip-name">{a.name}</span>
+            <small>
+              {attachMeta(a.name, a.size, t)}
+              {a.status !== "ready" && (
+                <span className="app-chat-touch-status">{` · ${t(a.status === "uploading" ? "Uploading…" : "Failed")}`}</span>
+              )}
+            </small>
+          </span>
+          <span className="app-chat-chip-slot">
+            <span className="app-chat-chip-status" aria-hidden="true">
+              {a.status === "uploading" ? (
+                <span className="app-chat-spinner" />
+              ) : a.status === "failed" ? (
+                <svg viewBox="0 0 24 24"><path d="M12 4l9 16H3zM12 10v4M12 17h.01" /></svg>
+              ) : (
+                <svg viewBox="0 0 24 24"><path d="M5 3h9l5 5v13H5zM14 3v6h5" /></svg>
+              )}
+            </span>
+            <button
+              type="button"
+              className="app-chat-remove"
+              aria-label={`${t("Remove")} ${a.name}`}
+              title={`${t("Remove")} ${a.name}`}
+              onClick={() => onRemove(a)}
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M6 6l12 12M18 6L6 18" />
+              </svg>
+            </button>
+          </span>
+          {a.status === "failed" && a.error && (
+            <small className="app-chat-upload-error" role="alert" title={displayAttachError(a.error, t)}>
+              {displayAttachError(a.error, t)}
+            </small>
+          )}
+          {a.status === "failed" && !a.permanent && (
+            <button type="button" className="lnk app-chat-chip-retry" onClick={() => onRetry(a)}>
+              {t("Retry")}
+            </button>
+          )}
+        </div>
+      ))}
+      {hidden.length > 0 && (
+        <button
+          type="button"
+          className={`app-chat-more lnk${hiddenFailed ? " failed" : ""}`}
+          aria-expanded={expanded}
+          onClick={() => setExpanded(true)}
+        >
+          +{hidden.length} {t("more")}
+          {hiddenFailed ? ` · ${t("failed")}` : hiddenPending ? ` · ${t("Uploading…")}` : ""}
+        </button>
+      )}
+      {expanded && ordered.length > CHIP_LIMIT && (
+        <button type="button" className="app-chat-more lnk" aria-expanded={expanded} onClick={() => setExpanded(false)}>
+          {t("Show less")}
+        </button>
+      )}
+    </div>
+  );
+}
+
 /** The shared icon Send: one renderer for both densities (CAD-1168).
  *  Circular, monochrome, accessible; disabled while the send is held. */
 function IconSend({ disabled, title }: { disabled: boolean; title: string }) {
@@ -356,49 +460,12 @@ export default function Composer({
 
   const attachChips =
     attachItems.length > 0 ? (
-      <div className="app-chat-attachrow" data-composer-attachments>
-        {attachItems.map((a) => (
-          <div
-            key={a.key}
-            role="group"
-            className={`app-chat-filerow${a.status === "failed" ? " failed" : ""}`}
-            data-attach-status={a.status}
-            aria-label={`${a.name}: ${t(a.status)}${a.error ? ` — ${displayAttachError(a.error, translateAttachText)}` : ""}`}
-          >
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M5 3h9l5 5v13H5zM14 3v6h5M8 13h8M8 17h5" />
-            </svg>
-            <div className="app-chat-filename">
-              <span>{a.name}</span>
-              <small>
-                {attachMeta(a.name, a.size, translateAttachText)}
-                {a.status === "uploading" ? ` · ${t("Uploading…")}` : ""}
-              </small>
-              {a.status === "failed" && a.error && (
-                <small className="app-chat-upload-error" role="alert">
-                  {displayAttachError(a.error, translateAttachText)}
-                </small>
-              )}
-            </div>
-            {a.status === "failed" && !a.permanent && (
-              <button type="button" className="lnk" onClick={() => retryAttach(key, a.key)}>
-                {t("Retry")}
-              </button>
-            )}
-            <button
-              type="button"
-              className="app-chat-remove"
-              aria-label={`${t("Remove")} ${a.name}`}
-              title={`${t("Remove")} ${a.name}`}
-              onClick={() => removeAttach(key, a.key)}
-            >
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M6 6l12 12M18 6L6 18" />
-              </svg>
-            </button>
-          </div>
-        ))}
-      </div>
+      <AttachChips
+        items={attachItems}
+        t={translateAttachText}
+        onRetry={(item) => retryAttach(key, item.key)}
+        onRemove={(item) => removeAttach(key, item.key)}
+      />
     ) : null;
 
   const boxEl = (
