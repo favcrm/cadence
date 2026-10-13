@@ -51,6 +51,32 @@ build-provenance attestation verifies for the repository. A sha that is not
 on main, or has no attested build, is refused with a sentence naming the
 reason. Without `--to`, behavior is unchanged.
 
+## Client only: `cadence client-update` (CAD-1425)
+
+```
+cadence-client client-update --check            # selects the target and reports it; no download, no verify, no change
+cadence-client client-update                     # newest public release, forward only
+cadence-client client-update --version v0.2.0    # a newer pinned release
+```
+
+Runs only from a client-only installation (`install.sh --client-only`,
+receipt `<prefix>/client-install.json`). It resolves locally whatever the
+saved org default is, never uses or changes remote credentials, and never
+contacts a tenant. `--check` only reports the selected target; it does not
+download or verify the artifact. A real upgrade fetches only the fixed public
+GitHub release through the operator's own GitHub CLI (`gh`) session, and runs a
+candidate only after its build-provenance attestation verifies and its
+manifest matches this platform and version. It does not downgrade, delete old
+releases or touch the daemon.
+
+From a client-only installation, local daemon and state commands refuse with
+exit 3, including `update`. Remote org verbs route to their org, and bounded
+login, auth, org and offline management stays available.
+
+This mode needs a published release that contains client-only support. The
+current public v0.1.0 has none, so it cannot be installed or upgraded in this
+mode until a newer capable release is published.
+
 ## Development: `cadence dev`
 
 `cadence dev` (old name: `cadence sandbox`) is a disposable second Cadence

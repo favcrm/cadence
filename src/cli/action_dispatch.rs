@@ -58,6 +58,20 @@ pub(crate) fn run() -> Result<i32> {
 }
 
 pub(super) fn run_cli(cli: Cli) -> Result<i32> {
+    let client_only = client_update::client_only_mode()?;
+    // CAD-1425: client-update is its own local verb, resolved before any
+    // org selection, credential or tracker work.
+    if let Commands::ClientUpdate { check, version } = &cli.command {
+        return client_update::run(*check, version.as_deref());
+    }
+    // CAD-1425: the native daemon updater cannot prove its operator on
+    // macOS. Refuse before org resolution, sandbox adoption or any state.
+    if matches!(cli.command, Commands::Update { .. }) {
+        if client_only {
+            return Err(client_update::local_command_refusal());
+        }
+        client_update::native_platform_refusal()?;
+    }
     // Offline custody never resolves daemon, org defaults or issuer credentials.
     if let Commands::Remote { action } = &cli.command {
         if cli.state_dir.is_some() {
@@ -149,6 +163,14 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             }
         }
         _ => {}
+    }
+    // CAD-1425: a client-only installation runs local commands never; it
+    // routes only through an actual remote org, before any local action.
+    if client_only {
+        if let Commands::Org { action } = cli.command {
+            return client_update::client_org(action);
+        }
+        return client_update::route_client_only(cli);
     }
     // ADR 0007 T1: dispatch before any state-dir resolution or sandbox
     // adoption — under sudo those would resolve root's home and could
@@ -684,6 +706,7 @@ pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
         Commands::Topic { action } => topic::run(state_dir, action),
         Commands::Monitor { action } => monitor::run(state_dir, action),
         Commands::Org { action } => org::run(action),
+        Commands::ClientUpdate { .. } => unreachable!("client-update dispatched before state-dir"),
         Commands::Issue { action } => issue::run(state_dir, action),
         Commands::Connection { action } => connection::run(state_dir, action),
         Commands::Platform { action } => platform::run(state_dir, action),
