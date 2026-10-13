@@ -238,7 +238,9 @@ fn guarded_declaration<T>(
             .ok_or_else(|| Error::rejected("installation digest unavailable"))?
             .to_string();
         let text = files.get(crate::issue::app_action::FILE).ok_or_else(|| {
-            Error::rejected("action is not declared by this consented installation")
+            Error::rejected(
+                "unknown assistant action: action is not declared by this consented installation",
+            )
         })?;
         // Serialize against the release/consent writers that withdraw authority.
         let _release = shared
@@ -257,7 +259,9 @@ fn guarded_declaration<T>(
         let app = shared.install_app_slug(install)?;
         let descriptor = crate::issue::app_action::validate_customer_bundle(text, &app)?;
         let action = declared_action(&descriptor, action_id).ok_or_else(|| {
-            Error::rejected("action is not declared by this consented installation")
+            Error::rejected(
+                "unknown assistant action: action is not declared by this consented installation",
+            )
         })?;
         work(&digest, &action)
     })
