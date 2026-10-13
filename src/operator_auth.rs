@@ -987,7 +987,14 @@ impl Auth {
             issuer: realm.issuer.clone(),
             organization_id: realm.company.clone(),
         };
-        self.open_public_row(user, jti, user_agent, (Some(realm), Some(scope)), now, intent)
+        self.open_public_row(
+            user,
+            jti,
+            user_agent,
+            (Some(realm), Some(scope)),
+            now,
+            intent,
+        )
     }
 
     fn open_public_row(
