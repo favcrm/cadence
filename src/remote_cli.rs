@@ -870,6 +870,10 @@ fn upload_once(
 /// Without `overwrite`, the parent is listed first and an existing name is
 /// refused before any upload. The wake loop and verdicts match `call_verb`.
 /// The bearer and the envelope are never printed.
+///
+/// The overwrite check is advisory, not atomic: a file created between the
+/// listing and the upload is replaced. Closing that needs a server-side
+/// create-only precondition, which the upload route does not send yet.
 pub fn upload_file(
     target: &RemoteTarget,
     logical_path: &str,
