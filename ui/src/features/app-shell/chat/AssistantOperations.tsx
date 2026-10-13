@@ -18,11 +18,22 @@ interface TagPreview {
   after_tags: string[];
   expected_revision: number;
 }
+interface RecordPreview {
+  record_id: string;
+  operation: "record.create" | "record.update";
+  before: Record<string, unknown> | null;
+  after: Record<string, unknown>;
+  expected_revision: number;
+}
 interface PermissionRequest {
   reason: string;
   scope: { install_id: string; context_id: string; action_id: string; resource_id: string };
   allow_always: boolean;
   preview: TagPreview | null;
+  recordPreview: RecordPreview | null;
+  // Host-owned discriminator: "record" for a declared record change; absent
+  // or null is legacy. Any other value is rejected at parse time.
+  previewKind: "record" | "legacy";
 }
 interface Operation {
   id: string;
@@ -84,10 +95,55 @@ function parseTagPreview(value: unknown): TagPreview | null {
     expected_revision: preview.expected_revision as number,
   };
 }
+const RECORD_FIELDS = ["display_name", "email", "phone", "tags", "source"] as const;
+// The typed preview of a declared record change. Only the host's known
+// customer fields are kept; anything else in the payload is ignored, never
+// rendered. Returns null unless the shape is exact.
+function parseRecordProfile(value: unknown): Record<string, unknown> | null {
+  const profile = record(value);
+  if (!profile) return null;
+  const out: Record<string, unknown> = {};
+  for (const field of RECORD_FIELDS) {
+    const raw = profile[field];
+    if (raw === undefined || raw === null) continue;
+    if (field === "tags") {
+      if (!Array.isArray(raw) || raw.length > 16 || !raw.every((tag) => typeof tag === "string" && tag.length > 0 && [...tag].length <= 40)) return null;
+      out.tags = raw;
+    } else {
+      if (text(raw, 320) === null) return null;
+      out[field] = raw;
+    }
+  }
+  return out;
+}
+// Plain text only (React escapes it). An absent or empty field shows "None".
+function recordFieldText(profile: Record<string, unknown> | null, field: string): string {
+  const value = profile?.[field];
+  if (Array.isArray(value)) return value.length ? value.join(", ") : "None";
+  return typeof value === "string" && value.length > 0 ? value : "None";
+}
+function parseRecordPreview(value: unknown): RecordPreview | null {
+  const preview = record(value);
+  if (!preview || text(preview.record_id, 64) === null ||
+      (preview.operation !== "record.create" && preview.operation !== "record.update") ||
+      !Number.isSafeInteger(preview.expected_revision) || (preview.expected_revision as number) < 1) return null;
+  const after = parseRecordProfile(preview.after);
+  if (after === null) return null;
+  const before = preview.before === null ? null : parseRecordProfile(preview.before);
+  if (preview.before !== null && before === null) return null;
+  return {
+    record_id: preview.record_id as string,
+    operation: preview.operation,
+    before,
+    after,
+    expected_revision: preview.expected_revision as number,
+  };
+}
 function parsePermissionRequest(value: unknown): PermissionRequest | null {
   const v = record(value);
   const scope = record(v?.scope);
   if (!v || !scope || typeof v.allow_always !== "boolean") return null;
+  if (v.preview_kind !== undefined && v.preview_kind !== null && v.preview_kind !== "record") return null;
   const fields = [scope.install_id, scope.context_id, scope.action_id, scope.resource_id];
   if (!fields.every((field) => typeof field === "string" && field.length > 0 && field.length <= 128)) return null;
   const reason = text(v.reason, 300);
@@ -102,6 +158,8 @@ function parsePermissionRequest(value: unknown): PermissionRequest | null {
     },
     allow_always: v.allow_always,
     preview: parseTagPreview(v.preview),
+    recordPreview: parseRecordPreview(v.preview),
+    previewKind: v.preview_kind === "record" ? "record" : "legacy",
   };
 }
 function parseOperation(value: unknown): Operation | null {
@@ -179,7 +237,18 @@ function AssistantOperationCard({ operation, installId, contextId, busy, decide 
     request.scope.context_id === contextId && request.scope.action_id === operation.action_id &&
     (!request.allow_always || operation.action_id === "customer.tags.update");
   const requiresTagPreview = operation.action_id === "customer.tags.update";
-  const previewReady = !requiresTagPreview || request?.preview !== null && request?.preview !== undefined;
+  // A declared record change is decided only from its authoritative typed
+  // preview, which must name this request's record. Legacy tag preview and
+  // Social actions keep their existing gate.
+  const recordPreview = request?.recordPreview ?? null;
+  const recordPreviewReady = recordPreview !== null && request !== null && recordPreview.record_id === request.scope.resource_id;
+  // Only a host-declared record request needs a valid record preview. Any
+  // other request keeps its legacy gate (exact tag preview or none).
+  const recordKind = request?.previewKind === "record";
+  const recordPreviewMissing = recordKind && !recordPreviewReady;
+  const previewReady = requiresTagPreview
+    ? request?.preview !== null && request?.preview !== undefined
+    : !recordKind || recordPreviewReady;
   const title = operation.action_id.replaceAll(".", " · ");
   const resultRows = resultValues(operation.result);
   return (
@@ -196,6 +265,22 @@ function AssistantOperationCard({ operation, installId, contextId, busy, decide 
           {!requestMatches ? <p className="text-micro text-fail" role="alert">{t("The permission scope does not match this installation and action; no decision is available.")}</p> : <>
             <p className="text-micro text-ink-400">{t("Only this action on")} {request.scope.resource_id} {t("in this installation.")}</p>
             {requiresTagPreview && request.preview === null && <p className="text-micro text-fail" role="alert">{t("The required current tag-change preview is missing or invalid. No permission decision is available.")}</p>}
+            {recordPreviewMissing && recordPreview === null && <p className="text-micro text-fail" role="alert">{t("The required record change preview is missing or invalid. No permission decision is available.")}</p>}
+            {recordPreview !== null && (
+              <div className="app-assistant-tag-preview" aria-label={t("Customer record change preview")}>
+                <strong className="text-label text-ink-100">{recordPreview.record_id}</strong>
+                {!recordPreviewReady && <p className="text-micro text-fail" role="alert">{t("This preview does not match the requested record. No permission decision is available.")}</p>}
+                <dl>
+                  {RECORD_FIELDS.filter((field) => recordPreview.before !== null && recordPreview.before[field] !== undefined || recordPreview.after[field] !== undefined).map((field) => (
+                    <div key={field}>
+                      <dt>{field.replaceAll("_", " ")}</dt>
+                      <dd>{recordFieldText(recordPreview.before, field)} → {recordFieldText(recordPreview.after, field)}</dd>
+                    </div>
+                  ))}
+                  <div><dt>{t("Record revision")}</dt><dd>{recordPreview.expected_revision}</dd></div>
+                </dl>
+              </div>
+            )}
             {requiresTagPreview && request.preview !== null && (
               <div className="app-assistant-tag-preview" aria-label={t("Customer tag change preview")}>
                 <strong className="text-label text-ink-100">{request.preview.customer_label}</strong>

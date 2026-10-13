@@ -691,7 +691,11 @@ fn snapshot_dir(dir: &File) -> Result<BTreeMap<String, String>> {
                 add(dir, &name, text.to_string())?;
             }
             // CAD-1110: the data-only chat descriptor beside app.md.
-            libc::S_IFREG if text == crate::issue::app_chat::FILE => {
+            libc::S_IFREG
+                if text == crate::issue::app_chat::FILE
+                    || text == crate::issue::app_assistant::FILE
+                    || text == crate::issue::app_action::FILE =>
+            {
                 add(dir, &name, text.to_string())?;
             }
             libc::S_IFLNK => {
