@@ -1047,6 +1047,13 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: ThreadAction,
     },
+    /// CAD-1412: an agent reads and replies in a human room it is a member
+    /// of (`topic read <topic-id>`, `topic publish <topic-id> <text>`). The
+    /// daemon checks membership on each call; this adds no authority.
+    Topic {
+        #[command(subcommand)]
+        action: TopicAction,
+    },
     /// A retained chat attachment (CAD-1168): `attachment read <id>`
     /// returns its bounded text (txt/md/csv). The operator reads any
     /// retained id; the master reads only an id on its own running

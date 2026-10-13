@@ -54,6 +54,7 @@ pub use events::{
 // CAD-316: the rollup's read-only counts for `doctor --host`.
 pub(crate) use events::event_store_stats;
 pub mod conversations;
+pub mod human_threads;
 mod topics;
 pub use topics::{
     delivery_id as topic_delivery_id, post_id as topic_post_id, request_id as topic_request_id,

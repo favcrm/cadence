@@ -14,7 +14,7 @@ import { issuePath } from "../issues/model";
 import { IconClose, IconRefresh, IconSearch, IconThreads } from "../../ui/icons";
 import Composer from "../app-shell/chat/Composer";
 import { asEntry, newMessageId, type ThreadEntry } from "../home/thread";
-import { Bubble, USER_BUBBLE } from "../home/ThreadView";
+import { StageLabel, ThreadComposerFrame, Turn } from "./ThreadChatParts";
 import {
   changeSubscriber,
   createTopic,
@@ -37,7 +37,6 @@ import {
 } from "./threadsClient";
 import {
   conversationTitle,
-  deliveryLabel,
   kindFilterMatches,
   operatorDmAlias,
   participantLabel,
@@ -45,6 +44,18 @@ import {
   threadsUrlSearch,
   type ThreadsUrlState,
 } from "./threadsView";
+import {
+  HumanContextPanel,
+  HumanNewDm,
+  HumanNewGroup,
+  HumanRoomRows,
+  HumanRoomTimeline,
+  useHumanAgents,
+  useHumanMe,
+  useHumanPeople,
+  useHumanRooms,
+  type HumanRoomState,
+} from "./HumanThreads";
 import "./threads.css";
 
 /**
@@ -64,6 +75,7 @@ export default function ThreadsPage({ operator }: { operator: boolean }) {
   const search = href.includes("?") ? href.slice(href.indexOf("?")) : "";
   const url = useMemo(() => readThreadsUrl(search), [search]);
   const draftAlias = useMemo(() => readDmParam(search), [search]);
+  const humanId = useMemo(() => readHumanParam(search), [search]);
   const writeBlock = useWriteBlock(!operator);
   const t = useTranslate();
   const agentsState = useResource(resources.agents);
@@ -79,6 +91,36 @@ export default function ThreadsPage({ operator }: { operator: boolean }) {
   const [contextOpen, setContextOpen] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
   const threadsTick = useSyncExternalStore(subscribeThreadsChanged, threadsRevisionNow);
+  // Human discovery is the server's `me`, independent of the operator flag:
+  // a verified member sees human rooms; agent conversations stay operator-only.
+  const human = useHumanMe(true);
+  const humanRooms = useHumanRooms(human.me !== null);
+  const people = useHumanPeople(human.me !== null);
+  const agents = useHumanAgents(human.me !== null);
+  const [humanState, setHumanState] = useState<HumanRoomState | null>(null);
+  const [humanRefresh, setHumanRefresh] = useState(0);
+  const onHumanState = useCallback((s: HumanRoomState) => setHumanState(s), []);
+  const humanRoom = humanId ? humanRooms.rooms?.find((r) => r.id === humanId) ?? null : null;
+  const humanContext = human.me && humanRoom && humanState !== null && humanState.id === humanId ? (
+    <HumanContextPanel
+      room={humanRoom}
+      me={human.me}
+      members={humanState.members}
+      denied={humanState.denied}
+      people={people.people}
+      peopleError={people.error}
+      agents={agents.agents}
+      onChanged={() => {
+        setHumanRefresh((n) => n + 1);
+        void humanRooms.reload();
+      }}
+      onOpened={(id) => {
+        setContextOpen(false);
+        void humanRooms.reload();
+        navigate(humanHref(id), { replace: true });
+      }}
+    />
+  ) : null;
 
   // Only the newest list request for the current scope may publish. A slow
   // earlier request, or one started under a scope the page has since left,
@@ -150,7 +192,16 @@ export default function ThreadsPage({ operator }: { operator: boolean }) {
     else navigate(draftHref(url, alias), { replace: true });
   };
 
-  if (!operator) {
+  if (!operator && human.me === null && human.loading) {
+    return (
+      <section className="threads-page px-4 lg:px-8 py-5" aria-labelledby="threads-title">
+        <h1 id="threads-title" className="sr-only">Threads</h1>
+        <p className="threads-note" role="status">Checking your access…</p>
+      </section>
+    );
+  }
+
+  if (!operator && human.me === null) {
     return (
       <section className="threads-page px-4 lg:px-8 py-5" aria-labelledby="threads-title">
         <h1 id="threads-title" className="sr-only">{t("Threads")}</h1>
@@ -161,7 +212,7 @@ export default function ThreadsPage({ operator }: { operator: boolean }) {
     );
   }
 
-  const context = open ? (
+  const context = humanId ? humanContext : open ? (
     <ContextPanel row={open} writeBlock={writeBlock} onChanged={() => void loadList()} />
   ) : null;
 
@@ -193,7 +244,8 @@ export default function ThreadsPage({ operator }: { operator: boolean }) {
           ) : list.error ? (
             <p className="threads-note" role="status">{t("Conversations could not load:")} {list.error}</p>
           ) : list.rows === null ? (
-            <p className="threads-note">{t("Loading conversations…")}</p>
+            // A non-operator never fetches agent conversations: no loading state for them.
+            operator ? <p className="threads-note">{t("Loading conversations…")}</p> : null
           ) : visible.length === 0 ? (
             <p className="threads-note">{t("No conversations match these filters.")}</p>
           ) : (
@@ -215,10 +267,37 @@ export default function ThreadsPage({ operator }: { operator: boolean }) {
               ))}
             </ul>
           )}
+          {human.error !== null && <p className="threads-note">Human rooms are unavailable for this sign-in.</p>}
+          {human.me && url.kind === "all" && humanRooms.rooms !== null && humanRooms.rooms.length > 0 && (
+            <ul className="threads-rows" aria-label="Human rooms">
+              <HumanRoomRows
+                rooms={humanRooms.rooms.filter((r) => query.trim() === "" || r.title.toLowerCase().includes(query.trim().toLowerCase()))}
+                openId={humanId}
+                hrefFor={humanHref}
+              />
+            </ul>
+          )}
         </aside>
 
         <main className="threads-main" aria-label={t("Conversation")}>
-          {open ? (
+          {humanId ? (
+            human.me ? (
+              <HumanRoomTimeline
+                key={humanId}
+                id={humanId}
+                me={human.me}
+                refresh={humanRefresh}
+                onState={onHumanState}
+                onOpenContext={() => setContextOpen(true)}
+                onChanged={humanRooms.reload}
+                isDm={humanRoom?.kind === "dm"}
+              />
+            ) : (
+              <div className="threads-empty">
+                <p>Human rooms are unavailable for this sign-in.</p>
+              </div>
+            )
+          ) : open ? (
             <Timeline
               key={open.id}
               row={open}
@@ -263,12 +342,37 @@ export default function ThreadsPage({ operator }: { operator: boolean }) {
           {context}
         </aside>
       </div>
-      {open && (
+      {(open || humanId) && (
         <SheetDialog open={contextOpen} title="Context" className="threads-context-sheet" onClose={() => setContextOpen(false)}>
           {context}
         </SheetDialog>
       )}
       <SheetDialog open={createOpen} title="New thread or group" className="threads-create-sheet" onClose={() => setCreateOpen(false)}>
+        {human.me && (
+          <HumanNewGroup
+            me={human.me}
+            people={people.people}
+            peopleError={people.error}
+            agents={agents.agents}
+            onCreated={(id) => {
+              setCreateOpen(false);
+              void humanRooms.reload();
+              navigate(humanHref(id), { replace: true });
+            }}
+          />
+        )}
+        {human.me && (
+          <HumanNewDm
+            me={human.me}
+            people={people.people}
+            peopleError={people.error}
+            onOpened={(id) => {
+              setCreateOpen(false);
+              void humanRooms.reload();
+              navigate(humanHref(id), { replace: true });
+            }}
+          />
+        )}
         <NewGroup
           writeBlock={writeBlock}
           onCreated={(id) => {
@@ -289,6 +393,16 @@ export default function ThreadsPage({ operator }: { operator: boolean }) {
       </SheetDialog>
     </section>
   );
+}
+
+/** `?h=<room>`: an open human room (CAD-1412). */
+function readHumanParam(search: string): string | null {
+  const v = new URLSearchParams(search).get("h");
+  return v === null || v.trim() === "" ? null : v;
+}
+
+function humanHref(id: string): string {
+  return `/threads?h=${encodeURIComponent(id)}`;
 }
 
 /** `?dm=<alias>`: a local draft You ↔ agent conversation (no server row yet). */
@@ -358,46 +472,6 @@ function issueProjectMap(issues: { id: string; project: string }[]): IssueProjec
   return new Map(issues.map((i) => [i.id, i.project]));
 }
 
-/** A delivery stage for display, as quiet metadata text (not a chip). Queued is never shown as delivered or seen. */
-function StageLabel({ state }: { state: DeliveryState | string }) {
-  const t = useTranslate();
-  return <span className="threads-stage" data-state={state}>{deliveryLabel(state, t)}</span>;
-}
-
-/** One transcript turn: the Home message bubble (Bubble, with the real sender
- *  and time). Operator turns take the Home outgoing tint and shape; agent and
- *  system turns stay plain. Compact density drops Home's 92% cap, so the body
- *  uses the full column. */
-function Turn({
-  who,
-  at,
-  me,
-  state,
-  children,
-}: {
-  who: string;
-  at?: string;
-  me?: boolean;
-  state?: DeliveryState | string | null;
-  children: ReactNode;
-}) {
-  return (
-    <Bubble who={who} at={at} me={me} density="compact">
-      <div
-        className={`inline-block text-left px-3 py-2 text-body text-ink-100 whitespace-pre-wrap [overflow-wrap:anywhere] ${
-          me ? `bg-accent/10 border border-accent/20 ${USER_BUBBLE}` : "text-ink-200"
-        }`}
-      >
-        {children}
-      </div>
-      {state ? (
-        <div className="mt-1">
-          <StageLabel state={state} />
-        </div>
-      ) : null}
-    </Bubble>
-  );
-}
 
 /** A row's second line from real data only: the last preview; else a group's
  *  post and member counts; else a direct thread's label. */
@@ -943,27 +1017,21 @@ function GroupComposer({
   const askBlocked = mode === "ask" && (noMembers || !members.some((m) => m.alias === target));
 
   return (
-    <div className="threads-composer threads-group">
-      <div className="threads-mode" role="group" aria-label={t("Group message type")}>
-        <button type="button" aria-pressed={mode === "post"} onClick={() => setMode("post")}>{t("Post")}</button>
-        <button type="button" aria-pressed={mode === "ask"} onClick={() => setMode("ask")}>{t("Ask agent")}</button>
-        {mode === "ask" && (
-          <label className="threads-target">
-            <span className="sr-only">{t("Member to ask")}</span>
-            <select value={target} onChange={(e) => setTarget(e.target.value)} aria-label={t("Member to ask")}>
-              <option value="">{noMembers ? t("No current members") : t("Choose a member")}</option>
-              {members.map((m) => (
-                <option key={m.uid ?? m.alias} value={m.alias as string}>{m.alias}</option>
-              ))}
-            </select>
-          </label>
-        )}
-      </div>
-      <p className="threads-note">
-        {mode === "post"
-          ? "A post notifies members. It does not start agents."
-          : "One request, to the member you choose. Nothing else is sent."}
-      </p>
+    <ThreadComposerFrame
+      modeLabel={t("Group message type")}
+      allowAsk
+      mode={mode}
+      onMode={setMode}
+      targetLabel={t("Member to ask")}
+      target={target}
+      onTarget={setTarget}
+      targetOptions={members.map((m) => ({ id: m.alias as string, label: m.alias as string }))}
+      targetPlaceholder={noMembers ? t("No current members") : t("Choose a member")}
+      helper={mode === "post"
+        ? "A post notifies members. It does not start agents."
+        : "One request, to the member you choose. Nothing else is sent."}
+      notice={notice ? displayUiNotice(notice, t) : null}
+    >
       <Composer
         density="full"
         block={writeBlock !== null ? writeBlock : askBlocked ? "Choose a current member to ask" : null}
@@ -987,8 +1055,7 @@ function GroupComposer({
         placeholder={mode === "post" ? t("Post to the group…") : t("Ask one member…")}
         className="card p-2.5 relative"
       />
-      {notice && <p className="threads-note" role="status">{displayUiNotice(notice, t)}</p>}
-    </div>
+    </ThreadComposerFrame>
   );
 }
 
@@ -1017,7 +1084,10 @@ function ContextPanel({
   };
   return (
     <div className="threads-context-body">
-      <h3 className="threads-context-title">{t("Participants")}</h3>
+      <div className="threads-context-heading">
+        <h3 className="threads-context-title">{t("Participants")}</h3>
+        <span className="threads-context-count">{row.participants.filter((p) => !p.removed).length}</span>
+      </div>
       <ul className="threads-roster">
         {row.participants.map((p) => (
           <li key={p.uid ?? p.alias ?? p.kind} data-kind={p.kind} data-removed={p.removed || undefined}>
@@ -1052,7 +1122,7 @@ function ContextPanel({
           }}
         >
           <label>
-            <span className="sr-only">{t("Add member by alias")}</span>
+            <span className="threads-field-label">{t("Add an agent by alias")}</span>
             <input value={alias} onChange={(e) => setAlias(e.target.value)} placeholder={t("Add agent alias")} />
           </label>
           <Button variant="secondary" size="sm" type="submit" disabled={writeBlock !== null || alias.trim() === ""}>{t("Add")}</Button>

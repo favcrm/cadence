@@ -446,6 +446,10 @@ impl Shared {
         // Group rows: a topic whose source is the project (`project:<key>`)
         // or that has an in-scope subscriber. Read-only.
         for (topic, members, posts, last_at) in self.store.topic_listing()? {
+            // CAD-1412: private human rooms never appear in the legacy list.
+            if topic.kind == crate::store::human_threads::ROOM_TOPIC_TYPE {
+                continue;
+            }
             let subscribers = self.store.topic_subscribers(&topic.id)?;
             if let Some(key) = project {
                 let by_source = topic.kind == "project" && topic.source == key;

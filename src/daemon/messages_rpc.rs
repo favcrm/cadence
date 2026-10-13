@@ -75,6 +75,20 @@ impl Shared {
         sender_of: &dyn Fn(&str) -> Result<store::Sender>,
         steer_caller: &dyn Fn(&str) -> Result<AgentCaller>,
     ) -> Result<Value> {
+        self.send_with_expected(params, sender_of, steer_caller, None)
+    }
+
+    /// CAD-1412: `send_with` with an optional expected recipient uid. The
+    /// same guards run for every caller (confinement, PTY, control
+    /// characters, delivery, steering); the uid is checked only by the
+    /// enqueue transaction. `None` is the ordinary path, unchanged.
+    pub(super) fn send_with_expected(
+        self: &Arc<Self>,
+        params: &Value,
+        sender_of: &dyn Fn(&str) -> Result<store::Sender>,
+        steer_caller: &dyn Fn(&str) -> Result<AgentCaller>,
+        expected_uid: Option<&str>,
+    ) -> Result<Value> {
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
         let text = required_str(params, "text")?;
         let target = self.store.agent_opt(&alias)?;
@@ -432,8 +446,9 @@ impl Shared {
                 "turn_id": stored.turn_id, "delivery": "native_turn_steering", "disposition": stored.result}),
             );
         }
-        let (duplicate, state) = self.store.enqueue_steered(
+        let (duplicate, state) = self.store.enqueue_steered_for(
             &alias,
+            expected_uid,
             text,
             reply_to.as_deref(),
             &message,

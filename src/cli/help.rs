@@ -123,6 +123,7 @@ const ADVANCED: &[&str] = &[
     "template",
     "test",
     "thread",
+    "topic",
     "workflow",
 ];
 

@@ -441,8 +441,55 @@ impl Store {
         app: Option<&Value>,
         attachments: Option<&Value>,
     ) -> Result<(bool, String)> {
+        self.enqueue_steered_for(
+            alias,
+            None,
+            body,
+            reply_to,
+            id,
+            source,
+            task_id,
+            issue,
+            worktree,
+            sender,
+            steer,
+            refs,
+            app,
+            attachments,
+        )
+    }
+
+    /// CAD-1412: `enqueue_steered` with an optional expected recipient uid.
+    /// When set, the alias must still resolve to that uid inside the same
+    /// write transaction as the insert, so an alias reassigned after the
+    /// caller's check is refused, never queued to the new occupant.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn enqueue_steered_for(
+        &self,
+        alias: &str,
+        expected_uid: Option<&str>,
+        body: &str,
+        reply_to: Option<&str>,
+        id: &str,
+        source: &str,
+        task_id: Option<&str>,
+        issue: Option<&str>,
+        worktree: Option<&str>,
+        sender: &Sender,
+        steer: &Steer,
+        refs: Option<&Value>,
+        app: Option<&Value>,
+        attachments: Option<&Value>,
+    ) -> Result<(bool, String)> {
         self.write_tx(|conn| {
             let tx = &mut *conn;
+            if let Some(uid) = expected_uid {
+                if self.agent_in(&tx, alias)?.uid != uid {
+                    return Err(Error::rejected(
+                        "Recipient changed before the request was queued; nothing was sent",
+                    ));
+                }
+            }
             let mut named: Vec<&str> = Vec::new();
             for m in steer.supersedes {
                 if !named.contains(&m.as_str()) {
