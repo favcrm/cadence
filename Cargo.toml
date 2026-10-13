@@ -96,6 +96,7 @@ webpki-roots = { version = "1" }
 # Decode retained CDN bytes before issuing an image asset receipt.
 image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
 ammonia = "4"
+chrono-tz = { version = "0.10", default-features = false, features = ["std"] }
 
 # CAD-1073: the legacy e2e target was retired with the suite; the
 # safety-floor binary in tests/ is autodiscovered and needs no entry.

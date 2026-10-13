@@ -275,6 +275,7 @@ fn member_path_ok(name: &str) -> bool {
     if name == "app.md"
         || name == crate::issue::app_chat::FILE
         || name == crate::issue::app_assistant::FILE
+        || name == crate::issue::app_action::FILE
     {
         return true;
     }
@@ -489,7 +490,8 @@ fn snapshot(root: &Root, base: &Path, source: bool) -> Result<BTreeMap<String, S
             Some(libc::S_IFREG)
                 if name == "app.md"
                     || name == crate::issue::app_chat::FILE
-                    || name == crate::issue::app_assistant::FILE =>
+                    || name == crate::issue::app_assistant::FILE
+                    || name == crate::issue::app_action::FILE =>
             {
                 add(name, path)?
             }

@@ -261,6 +261,9 @@ impl Shared {
             let deadline = Instant::now() + Duration::from_secs(TICK_DEADLINE_SECS);
             self.reconcile_processing(&mut reconcile_after, &mut backoff, deadline);
             self.claim_due(&mut backoff, deadline);
+            if let Err(error) = self.drive_scheduled_social_drafts((driver.clock)(), PER_TICK_CAP) {
+                driver.fail(&error.to_string());
+            }
             driver.set_status("ok", Some(epoch_secs() + driver.interval.as_secs_f64()));
             sleep_until(&self.closing, Instant::now() + driver.interval);
         }

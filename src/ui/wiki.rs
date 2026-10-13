@@ -381,8 +381,53 @@ fn upload(
     let Some(bytes) = file else {
         return err_response(400, "wiki upload needs a 'file' part");
     };
+    match store_upload_with_proof(
+        state_dir,
+        &path,
+        bytes,
+        query("if_rev").or_else(|| fields.get("if_rev").cloned()),
+        wiki_as,
+        proof.as_deref(),
+    ) {
+        Ok(v) => json_response(v),
+        Err(resp) => resp,
+    }
+}
+
+/// Shared landing path. Callers own authentication, target validation and
+/// multipart policy; neither a filename nor a body field supplies authority.
+pub(super) fn store_upload(
+    state_dir: &Path,
+    path: &str,
+    bytes: Vec<u8>,
+    if_rev: Option<String>,
+    wiki_as: &str,
+) -> Result<Value, HttpResp> {
+    store_upload_with_proof(state_dir, path, bytes, if_rev, wiki_as, None)
+}
+
+/// `store_upload` with the browser's trusted public-session relay token.
+/// `proof` only ever comes from the server's own `PublicRelay` decision
+/// upstream — never from the request — so a `None` caller cannot name a
+/// session. Both RPC branches forward it as `public_session` so the daemon
+/// re-checks membership and audits the verified actor before any effect.
+fn store_upload_with_proof(
+    state_dir: &Path,
+    path: &str,
+    bytes: Vec<u8>,
+    if_rev: Option<String>,
+    wiki_as: &str,
+    proof: Option<&str>,
+) -> Result<Value, HttpResp> {
+    // Fold the server-held bearer into RPC params only when one was proven.
+    let with_proof = |mut params: Value| {
+        if let Some(token) = proof {
+            params["public_session"] = Value::String(token.to_string());
+        }
+        params
+    };
     if bytes.is_empty() {
-        return err_response(400, "wiki upload: the file part is empty");
+        return Err(err_response(400, "wiki upload: the file part is empty"));
     }
     // Text sources are first-class Git pages. Sending them through the blob
     // route would make an uploaded Markdown or TXT file invisible to search.
@@ -392,33 +437,214 @@ fn upload(
     if is_text {
         let text = match String::from_utf8(bytes) {
             Ok(text) => text,
-            Err(_) => return err_response(400, "text upload is not UTF-8"),
+            Err(_) => return Err(err_response(400, "text upload is not UTF-8")),
         };
-        let mut params = json!({"path":path,"text":text,
-                   "if_rev":query("if_rev").or_else(|| fields.get("if_rev").cloned())});
-        if let Some(token) = &proof {
-            params["public_session"] = Value::String(token.clone());
-        }
-        return relay(state_dir, "wiki_write", params, wiki_as);
+        return client::rpc(
+            state_dir,
+            "wiki_write",
+            with_proof(json!({"path":path,"text":text,"if_rev":if_rev,"wiki_as":wiki_as})),
+        )
+        .map_err(|e| write_err(&e));
     }
     let uploads = state_dir.join(crate::wiki::UPLOAD_DIR);
-    if let Err(e) = std::fs::create_dir_all(&uploads) {
-        return err_response(500, &format!("upload staging failed: {e}"));
+    std::fs::create_dir_all(&uploads)
+        .map_err(|e| err_response(500, &format!("upload staging failed: {e}")))?;
+    // RAII removes our private staging file on every outcome, including a
+    // conflict or a failed write. The daemon may already have consumed it.
+    let mut tmp = tempfile::Builder::new()
+        .prefix("upload-")
+        .tempfile_in(&uploads)
+        .map_err(|e| err_response(500, &format!("upload staging failed: {e}")))?;
+    std::io::Write::write_all(&mut tmp, &bytes)
+        .map_err(|e| err_response(500, &format!("upload staging failed: {e}")))?;
+    client::rpc(
+        state_dir,
+        "wiki_put_blob",
+        with_proof(json!({"path": path, "tmp": tmp.path(), "wiki_as": wiki_as,"if_rev": if_rev})),
+    )
+    .map_err(|e| write_err(&e))
+}
+
+/// The envelope proxy contract is one file with its target in the query.
+/// Keep the browser's field-capable parser above unchanged.
+pub(super) fn read_envelope_upload(
+    request: &mut Request,
+    pm_dir: &Path,
+) -> Result<Vec<u8>, HttpResp> {
+    let ct = header_value(request, "Content-Type").unwrap_or_default();
+    let boundary = ct
+        .trim()
+        .strip_prefix("multipart/form-data; boundary=")
+        .map(str::trim)
+        .and_then(|b| {
+            if b.starts_with('"') {
+                b.strip_prefix('"')?.strip_suffix('"')
+            } else {
+                Some(b)
+            }
+        })
+        .filter(|b| {
+            !b.is_empty()
+                && b.len() <= 100
+                && b.bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"'()+_,-./:=?".contains(&c))
+        })
+        .ok_or_else(|| err_response(400, "upload needs a valid multipart/form-data boundary"))?;
+    let file_cap = Pm::at(pm_dir)
+        .map(|pm| pm.config.wiki.max_upload_bytes)
+        .map_err(|e| err_response(500, &format!("upload configuration unavailable: {e}")))?
+        .min(crate::wiki::upload::UPLOAD_CAP_BYTES);
+    // Same 64 KiB envelope allowance as the browser, below the proxy's
+    // 16 MiB body ceiling. Check the actual file cap separately as well.
+    let body = read_body(request, file_cap.saturating_add(64 * 1024))?;
+    let bytes = single_file_part(&body, boundary).map_err(|why| err_response(400, why))?;
+    if bytes.len() as u64 > file_cap {
+        return Err(err_response(413, "wiki upload file is over the upload cap"));
     }
-    let tmp = uploads.join(format!("upload-{}", uuid::Uuid::new_v4().simple()));
-    if let Err(e) = std::fs::write(&tmp, &bytes) {
-        return err_response(500, &format!("upload staging failed: {e}"));
+    Ok(bytes)
+}
+
+/// Byte-safe and closed: exactly one `file` part, no fields, duplicate
+/// headers/parameters, second part, missing terminator or trailing body.
+fn single_file_part(body: &[u8], boundary: &str) -> Result<Vec<u8>, &'static str> {
+    let start = format!("--{boundary}\r\n");
+    let rest = body
+        .strip_prefix(start.as_bytes())
+        .ok_or("bad multipart start")?;
+    let header_end = rest
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or("multipart part has no header/body split")?;
+    if header_end > 64 * 1024 {
+        return Err("multipart headers are too large");
     }
-    let mut params = json!({"path": path, "tmp": tmp, "wiki_as": wiki_as,
-               "if_rev": query("if_rev").or_else(|| fields.get("if_rev").cloned())});
-    if let Some(token) = &proof {
-        params["public_session"] = Value::String(token.clone());
+    let headers = std::str::from_utf8(&rest[..header_end]).map_err(|_| "bad multipart headers")?;
+    let mut disposition = None;
+    let mut content_type = false;
+    for line in headers.split("\r\n") {
+        let (name, value) = line.split_once(':').ok_or("bad multipart header")?;
+        if value.chars().any(|c| c.is_control()) {
+            return Err("bad multipart header value");
+        }
+        match name.to_ascii_lowercase().as_str() {
+            "content-disposition" if disposition.is_none() => disposition = Some(value.trim()),
+            "content-type" if !content_type && !value.trim().is_empty() => content_type = true,
+            _ => return Err("unknown or duplicate multipart header"),
+        }
     }
-    match client::rpc(state_dir, "wiki_put_blob", params) {
-        Ok(v) => json_response(v),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            write_err(&e)
+    let mut parts = disposition
+        .ok_or("missing multipart disposition")?
+        .split(';');
+    if parts.next().map(str::trim) != Some("form-data") {
+        return Err("bad multipart disposition");
+    }
+    let mut name = None;
+    let mut filename = false;
+    for parameter in parts {
+        let (key, value) = parameter
+            .trim()
+            .split_once('=')
+            .ok_or("bad multipart parameter")?;
+        let value = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .filter(|v| !v.contains('"'))
+            .ok_or("bad multipart parameter value")?;
+        match key {
+            "name" if name.is_none() => name = Some(value),
+            "filename" if !filename => filename = true,
+            _ => return Err("unknown or duplicate multipart parameter"),
+        }
+    }
+    if name != Some("file") {
+        return Err("upload accepts only a single 'file' part");
+    }
+    let payload = &rest[header_end + 4..];
+    let marker = format!("\r\n--{boundary}");
+    let end = payload
+        .windows(marker.len())
+        .position(|w| w == marker.as_bytes())
+        .ok_or("multipart file never terminates")?;
+    let trailer = &payload[end + marker.len()..];
+    if trailer != b"--" && trailer != b"--\r\n" {
+        return Err("upload accepts exactly one file and no trailing body");
+    }
+    if end == 0 {
+        return Err("wiki upload: the file part is empty");
+    }
+    Ok(payload[..end].to_vec())
+}
+
+#[cfg(test)]
+mod upload_tests {
+    use super::*;
+    use crate::wiki::upload::build_multipart;
+
+    #[test]
+    fn single_file_preserves_text_and_binary_bytes() {
+        for bytes in [
+            b"# Notes\n\nUploaded text\n".as_slice(),
+            b"\x00\xff\x80binary\r\n".as_slice(),
+        ] {
+            let body = build_multipart("fixture", &[], "source", bytes);
+            assert_eq!(single_file_part(&body, "fixture").unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn fields_extra_files_and_malformed_parts_fail_closed() {
+        let good = build_multipart("fixture", &[], "source", b"one");
+        let mut multiple = good[..good.len() - b"--fixture--\r\n".len()].to_vec();
+        multiple.extend_from_slice(&good);
+        let mut trailing = good.clone();
+        trailing.extend_from_slice(b"ignored");
+        let duplicate = String::from_utf8(good.clone())
+            .unwrap()
+            .replace("name=\"file\"", "name=\"file\"; name=\"other\"")
+            .into_bytes();
+        let unknown_file = String::from_utf8(good.clone())
+            .unwrap()
+            .replace("name=\"file\"", "name=\"other\"")
+            .into_bytes();
+        for body in [
+            build_multipart(
+                "fixture",
+                &[("path", "global/elsewhere.pdf")],
+                "source",
+                b"one",
+            ),
+            build_multipart("fixture", &[("wiki_as", "operator")], "source", b"one"),
+            build_multipart("fixture", &[], "source", b""),
+            good[..good.len() - 5].to_vec(),
+            multiple,
+            trailing,
+            duplicate,
+            unknown_file,
+        ] {
+            assert!(single_file_part(&body, "fixture").is_err());
+        }
+    }
+
+    #[test]
+    fn browser_field_parser_is_still_field_capable() {
+        let body = build_multipart(
+            "fixture",
+            &[("path", "users/u/file.txt"), ("if_rev", "none")],
+            "source",
+            b"text",
+        );
+        let (fields, file) = super::super::parse_multipart(&body, "fixture").unwrap();
+        assert_eq!(fields["path"], "users/u/file.txt");
+        assert_eq!(fields["if_rev"], "none");
+        assert_eq!(file.unwrap(), b"text");
+    }
+
+    #[test]
+    fn invalid_text_and_empty_uploads_never_stage() {
+        let root = tempfile::tempdir().unwrap();
+        for bytes in [Vec::new(), vec![0xff]] {
+            assert!(store_upload(root.path(), "users/u/source.md", bytes, None, "user:u").is_err());
+            assert!(!root.path().join(crate::wiki::UPLOAD_DIR).exists());
         }
     }
 }

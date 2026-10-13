@@ -32,6 +32,7 @@ mod app_contexts_rpc;
 pub(crate) mod app_effects_rpc;
 mod app_explorer_rpc;
 mod app_image_jobs;
+mod app_record_actions_rpc;
 #[cfg(feature = "test-seam")]
 pub use app_image_jobs::test_probe as image_job_probe;
 mod app_records_rpc;
@@ -59,6 +60,8 @@ mod cad1300_acceptance;
 mod cad1314_approval_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1327_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad1415_app_actions_acceptance;
 mod caller_rule;
 #[cfg(all(test, feature = "test-seam"))]
 mod campaign_clone_acceptance;
@@ -2684,6 +2687,9 @@ impl Shared {
             "app_effect_decide" => self.rpc_app_effect(method, params, peer_pid),
             "app_effect_publish_now" => self.rpc_app_effect(method, params, peer_pid),
             "app_effect_confirm_publish" => self.rpc_app_effect(method, params, peer_pid),
+            "app_effect_schedule" => self.rpc_app_effect(method, params, peer_pid),
+            "app_effect_reschedule" => self.rpc_app_effect(method, params, peer_pid),
+            "app_effect_cancel" => self.rpc_app_effect(method, params, peer_pid),
             "app_effect_resolve" => self.rpc_app_effect(method, params, peer_pid),
             "social_publish_media_import" => self.rpc_social_publish(method, params, peer_pid),
             "social_publish_schedule" => self.rpc_social_publish(method, params, peer_pid),

@@ -21,7 +21,7 @@ export const SLOT_GUARD_MS = 500;
 export const SLOT_TTL_MS = 120_000;
 
 /** CAD-1328: what a confirm card shows, from the daemon's frozen effect material (never from the frame). */
-export interface SlotCard { target: string; caption: string; image: string | null }
+export interface SlotCard { target: string; caption: string; image: string | null; title?: string; detail?: string }
 export interface SlotPlan { label: string; run: () => Promise<ActionResult>; card?: SlotCard }
 export type Planner = (verb: SlotVerb, args: Record<string, unknown>, ui?: { actionToken?: string }) => Promise<SlotPlan | ActionRefusal>;
 export interface SlotView { token: string; label: string; anchor: SlotAnchor; pending: boolean; card?: SlotCard }

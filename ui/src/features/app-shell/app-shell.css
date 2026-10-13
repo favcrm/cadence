@@ -300,7 +300,9 @@
    `.file-row`: icon, name with size · kind, an inline reason when the
    file was refused, and a Remove icon (CAD-1168 slice 2). */
 .app-chat-attachrow {
-  display: grid;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
   gap: 0.375rem;
   margin-bottom: 0.375rem;
 }
@@ -355,6 +357,82 @@
   font-size: var(--text-micro);
   color: var(--color-fail);
 }
+
+/* CAD-1419: one icon slot per draft chip. Rest shows the status glyph
+   (file, spinner while uploading, warning on failure); hover or focus
+   swaps in Remove, and a coarse pointer keeps Remove visible. */
+.app-chat-filerow { flex-wrap: wrap; max-width: 100%; }
+.app-chat-filerow > .app-chat-filename { flex: 1 1 8rem; }
+/* A refusal reason stays one line inside the chip (full text in title,
+   the accessible name carries it too), so a failed chip never grows into
+   a full-width error block. */
+.app-chat-filerow .app-chat-upload-error {
+  flex: 1 1 100%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.app-chat-filerow .app-chat-chip-retry { flex-shrink: 0; }
+.app-chat-chip-name {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.app-chat-chip-slot {
+  position: relative;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  width: 1.5rem;
+  height: 1.5rem;
+}
+.app-chat-chip-status,
+.app-chat-chip-slot > .app-chat-remove {
+  grid-area: 1 / 1;
+}
+.app-chat-chip-status svg {
+  width: 1rem;
+  height: 1rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  color: var(--color-accent);
+}
+.app-chat-filerow.failed .app-chat-chip-status svg { color: var(--color-fail); }
+.app-chat-chip-slot > .app-chat-remove { opacity: 0; pointer-events: none; }
+.app-chat-filerow:hover .app-chat-chip-status,
+.app-chat-filerow:focus-within .app-chat-chip-status { visibility: hidden; }
+.app-chat-filerow:hover .app-chat-remove,
+.app-chat-filerow:focus-within .app-chat-remove { opacity: 1; pointer-events: auto; }
+/* Touch has no hover: Remove holds the one icon slot, and the state
+   that the glyph would show is written out in the chip's meta line. */
+.app-chat-touch-status { display: none; }
+@media (hover: none) {
+  .app-chat-chip-slot > .app-chat-remove { opacity: 1; pointer-events: auto; }
+  .app-chat-filerow .app-chat-chip-status { display: none; }
+  .app-chat-touch-status { display: inline; }
+}
+.app-chat-spinner {
+  width: 0.9rem;
+  height: 0.9rem;
+  border: 1.5px solid color-mix(in srgb, var(--color-accent) 30%, transparent);
+  border-top-color: var(--color-accent);
+  border-radius: 50%;
+  animation: app-chat-spin 0.9s linear infinite;
+}
+@keyframes app-chat-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .app-chat-spinner { animation: none; }
+}
+.app-chat-more {
+  align-self: center;
+  font-size: var(--text-micro);
+}
+.app-chat-more.failed { color: var(--color-fail); }
 
 .app-chat-filerow .lnk {
   flex-shrink: 0;
@@ -445,7 +523,8 @@
      focus zoom). */
   .app-chat-send,
   .app-chat-attach,
-  .app-chat-remove {
+  .app-chat-remove,
+  .app-chat-chip-slot {
     width: 2.5rem;
     height: 2.5rem;
   }

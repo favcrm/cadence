@@ -5,6 +5,7 @@
 //! - enumerate → `GET /api/wiki/ls?path=` or `GET /api/wiki/search?q=&path=`
 //! - read      → `GET /api/wiki/file?path=`
 //! - write     → `PUT /api/wiki/file` JSON `{path,text,if_rev?}`
+//! - upload    → `POST /api/wiki/upload?path=` single-file multipart
 //!
 //! Only a request bearing a `wikienv_` bearer enters here. A browser
 //! request never does, so browser routes and their CSRF/session gates are
@@ -62,7 +63,7 @@ fn action_of(method: &Method, tail: &str) -> Option<WikiAction> {
     match (method, tail) {
         (Method::Get, "ls") | (Method::Get, "search") => Some(WikiAction::Enumerate),
         (Method::Get, "file") => Some(WikiAction::Read),
-        (Method::Put, "file") => Some(WikiAction::Write),
+        (Method::Put, "file") | (Method::Post, "upload") => Some(WikiAction::Write),
         _ => None,
     }
 }
@@ -130,6 +131,7 @@ pub(crate) fn handle(
     tail: &str,
     query: &dyn Fn(&str) -> Option<String>,
     state_dir: &std::path::Path,
+    pm_dir: &std::path::Path,
     opts: &ServeOpts,
 ) -> HttpResp {
     let Some(public) = opts.public.as_ref() else {
@@ -181,6 +183,9 @@ pub(crate) fn handle(
     match action {
         WikiAction::Enumerate => enumerate(query, state_dir, &grant, &attribution),
         WikiAction::Read => read(query, state_dir, &grant, &attribution),
+        WikiAction::Write if tail == "upload" => {
+            upload(request, query, state_dir, pm_dir, &grant, &attribution)
+        }
         WikiAction::Write => write(request, state_dir, &grant, &attribution),
     }
 }
@@ -312,6 +317,46 @@ fn write(
     }
 }
 
+/// Validate the logical target before buffering any multipart bytes. The
+/// daemon receives this normalized spelling, not another request field.
+fn upload_path(path: Option<String>, grant: &WikiGrant) -> Result<String, HttpResp> {
+    let path = path.ok_or_else(|| refuse(400, "invalid_request", "wiki upload needs ?path="))?;
+    let norm = crate::wiki::upload::logical_upload_path(&path)
+        .map_err(|e| refuse(400, "invalid_request", &e.to_string()))?;
+    if !grant.contains_file(WikiAction::Write, &norm) {
+        return Err(refuse(
+            403,
+            "insufficient_scope",
+            "the path is outside this envelope's wiki write prefix",
+        ));
+    }
+    Ok(norm)
+}
+
+/// Verified-envelope uploads accept exactly one file part; multipart fields
+/// cannot replace the query target or supply a relay identity.
+fn upload(
+    request: &mut Request,
+    query: &dyn Fn(&str) -> Option<String>,
+    state_dir: &std::path::Path,
+    pm_dir: &std::path::Path,
+    grant: &WikiGrant,
+    attribution: &str,
+) -> HttpResp {
+    let path = match upload_path(query("path"), grant) {
+        Ok(path) => path,
+        Err(resp) => return resp,
+    };
+    let bytes = match super::wiki::read_envelope_upload(request, pm_dir) {
+        Ok(bytes) => bytes,
+        Err(resp) => return resp,
+    };
+    match super::wiki::store_upload(state_dir, &path, bytes, query("if_rev"), attribution) {
+        Ok(v) => write_answer(v),
+        Err(resp) => resp,
+    }
+}
+
 /// A daemon `{conflict: …}` answer (stale `if_rev`) is a refusal, never a
 /// success: HTTP 409 with the body, so the remote CLI exits nonzero and
 /// never reports a write that did not happen. Anything else is 200.
@@ -362,6 +407,86 @@ fn consume_jti(state_dir: &std::path::Path, grant: &WikiGrant) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn verified_upload_grant(actor: &str, prefix: &str) -> WikiGrant {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+        let key = Ed25519KeyPair::from_seed_unchecked(&[91; 32]).unwrap();
+        let config = board_identity::Config {
+            host: "upload.cadencecloud.test".into(),
+            issuer: "https://issuer.test".into(),
+            company: "fixture".into(),
+        };
+        let claims = json!({
+            "iss":config.issuer,"aud":"https://upload.cadencecloud.test","sub":"fixture",
+            "actor":actor,"principal_kind":"user",
+            "role_at_issue":if actor == "operator" {"owner"} else {"member"},
+            "organization_id":config.company,"scope":["wiki.read","wiki.write"],
+            "wiki_prefixes":["global/",prefix],
+            "prefix_grants":[{"scope":"wiki.read","prefixes":["global/"]},
+                {"scope":"wiki.write","prefixes":[prefix]}],
+            "credential_id":"fixture","iat":100,"exp":200,"jti":"fixture"
+        });
+        let header = json!({"alg":"EdDSA","typ":"agenticos-wiki-actor/1","kid":"fixture"});
+        let signed = format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(header.to_string()),
+            URL_SAFE_NO_PAD.encode(claims.to_string())
+        );
+        let env = format!(
+            "{signed}.{}",
+            URL_SAFE_NO_PAD.encode(key.sign(signed.as_bytes()).as_ref())
+        );
+        let public_key = board_identity::PublicKey {
+            kid: "fixture".into(),
+            x: key.public_key().as_ref().try_into().unwrap(),
+        };
+        envelope::verify(&env, &config, &public_key, 120).unwrap()
+    }
+
+    #[test]
+    fn uploads_use_verified_owner_and_member_write_ceilings_and_attribution() {
+        assert_eq!(action_of(&Method::Post, "upload"), Some(WikiAction::Write));
+        assert_eq!(action_of(&Method::Post, "rm"), None);
+        for (actor, prefix, claim) in [
+            ("operator", "global/covered/", "operator"),
+            ("users/u", "users/u/", "user:u"),
+        ] {
+            let grant = verified_upload_grant(actor, prefix);
+            assert_eq!(relay_claim(&grant.actor).as_deref(), Some(claim));
+            let directory = prefix.trim_end_matches('/');
+            let refusal = match upload_path(Some(directory.into()), &grant) {
+                Ok(_) => panic!("the write prefix itself must not be an upload target"),
+                Err(refusal) => refusal,
+            };
+            assert_eq!(refusal.status_code(), StatusCode(403));
+            assert!(upload_path(Some(format!("{directory}.extracted.md")), &grant).is_err());
+            for suffix in ["source.md", "source.pdf", "nested/source.pdf"] {
+                let path = format!("{prefix}{suffix}");
+                assert_eq!(
+                    upload_path(Some(path.clone()), &grant)
+                        .unwrap_or_else(|_| panic!("verified upload target refused")),
+                    path
+                );
+            }
+            let nfd = format!("{prefix}cafe\u{301}.md");
+            assert_eq!(
+                upload_path(Some(nfd), &grant)
+                    .unwrap_or_else(|_| panic!("normalized upload target refused")),
+                format!("{prefix}caf\u{e9}.md")
+            );
+            for bad in [
+                "global/outside.pdf",
+                "global/covered/../outside.pdf",
+                "/global/covered/a.pdf",
+                "",
+                "global/covered/a.blob",
+            ] {
+                assert!(upload_path(Some(bad.into()), &grant).is_err());
+            }
+            assert!(upload_path(None, &grant).is_err());
+        }
+    }
 
     /// The daemon's checked-conflict answer for a stale `if_rev`.
     fn conflict() -> Value {
