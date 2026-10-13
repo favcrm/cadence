@@ -33,6 +33,9 @@ const ORG: &str = "ws_cad913_fixture";
 const KID: &str = "cad913-independent-fixture";
 const PREFIX: &str = "global/cad913/";
 
+type SnapshotFiles = Vec<(String, Vec<u8>)>;
+type Snapshot = (String, SnapshotFiles, SnapshotFiles);
+
 fn port() -> u16 {
     (3110..=3199)
         .find(|p| TcpListener::bind(("127.0.0.1", *p)).is_ok())
@@ -81,7 +84,7 @@ impl Rig {
         let mut pm = Pm::init(&pm_dir).unwrap();
         pm.config.wiki.max_upload_bytes = 128;
         std::fs::write(
-            &pm_dir.join("pm.yaml"),
+            pm_dir.join("pm.yaml"),
             serde_yaml::to_string(&pm.config).unwrap(),
         )
         .unwrap();
@@ -286,8 +289,8 @@ impl Rig {
 
     // Compare tracker HEAD, wiki bytes, and every staged upload byte. This
     // catches both a daemon mutation and pre-auth/pre-cap staging side effects.
-    fn snapshot(&self) -> (String, Vec<(String, Vec<u8>)>, Vec<(String, Vec<u8>)>) {
-        fn walk(dir: &std::path::Path, out: &mut Vec<(String, Vec<u8>)>) {
+    fn snapshot(&self) -> Snapshot {
+        fn walk(dir: &std::path::Path, out: &mut SnapshotFiles) {
             if !dir.exists() {
                 return;
             }
