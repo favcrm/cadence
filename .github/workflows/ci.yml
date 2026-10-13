@@ -295,7 +295,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: agenticos-stack/agenticos-v2
-          ref: 517edbc0dfd357f3e31a96878070ceab1b66faf6
+          ref: b8ea9c1d2b4cc2e26fb066da2d68f684bb834f0a
           path: .cad1374-aos
           token: ${{ secrets.CAD1374_AOS_READ_TOKEN }}
           persist-credentials: false

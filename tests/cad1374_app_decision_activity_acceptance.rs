@@ -74,6 +74,8 @@ impl Platform {
         command
             .args([
                 "run",
+                "--config",
+                "vitest.cad1374-paired.config.ts",
                 DRIVER_TEST,
                 "--pool=threads",
                 "--maxWorkers=1",
