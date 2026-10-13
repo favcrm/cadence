@@ -26,6 +26,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Total budget for one hosted intake or export, polling included.
 const DEADLINE: Duration = Duration::from_secs(120);
 const POLL_EVERY: Duration = Duration::from_secs(1);
+/// Refusal when the whole-operation budget is spent.
+const EXPIRED: &str =
+    "hosted document operation exceeded its 120 s deadline and was not treated as success";
 /// One admitted original, and the aggregate of template + context inputs
 /// and of downloaded artifacts (AOS staged-input and artifact bounds).
 const BYTES_CAP: usize = 8 * 1024 * 1024;
@@ -166,28 +169,42 @@ impl Client {
         Ok(source.reference)
     }
 
+    /// Time left in the whole operation. An expired budget refuses, so no
+    /// request starts after the deadline.
+    fn remaining(&self) -> Result<Duration> {
+        self.deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| Error::rejected(EXPIRED))
+    }
+
+    /// Per-request bound: the smaller of the request timeout and what is left.
+    fn timeout(&self) -> Result<Duration> {
+        Ok(self.remaining()?.min(REQUEST_TIMEOUT))
+    }
+
     fn post<T: DeserializeOwned>(&self, path: &str, body: &Value, key: &str) -> Result<T> {
         let request = self
             .http
             .post(format!("{ORIGIN}{path}"))
             .header("idempotency-key", key);
-        let mut response = request.send_json(body).map_err(unavailable)?;
+        let mut response = bounded(request, self.timeout()?)
+            .send_json(body)
+            .map_err(unavailable)?;
         read(&mut response)
     }
 
     fn post_unkeyed<T: DeserializeOwned>(&self, path: &str, body: &Value) -> Result<T> {
-        let mut response = self
-            .http
-            .post(format!("{ORIGIN}{path}"))
+        let request = self.http.post(format!("{ORIGIN}{path}"));
+        let mut response = bounded(request, self.timeout()?)
             .send_json(body)
             .map_err(unavailable)?;
         read(&mut response)
     }
 
     fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        let mut response = self
-            .http
-            .get(format!("{ORIGIN}{path}"))
+        let request = self.http.get(format!("{ORIGIN}{path}"));
+        let mut response = bounded(request, self.timeout()?)
             .call()
             .map_err(unavailable)?;
         read(&mut response)
@@ -210,12 +227,9 @@ impl Client {
                 "admitted" | "running" => {}
                 _ => return Err(malformed()),
             }
-            if Instant::now() >= self.deadline {
-                return Err(Error::rejected(
-                    "hosted document job did not finish within the deadline and was not treated as success",
-                ));
-            }
-            std::thread::sleep(POLL_EVERY);
+            // Sleep no longer than the budget left. The next `get` re-checks
+            // the deadline before it sends, and refuses once it has passed.
+            std::thread::sleep(POLL_EVERY.min(self.remaining()?));
             let id = job.id.clone();
             job = self.get::<JobData>(&format!("/jobs/{id}"))?.job;
             verify_job(&job, Some(&id), kind, sources)?;
@@ -250,9 +264,10 @@ impl Client {
         }
         *budget -= declared;
 
-        let mut response = self
+        let request = self
             .http
-            .get(format!("{ORIGIN}/artifacts/{}", record.reference))
+            .get(format!("{ORIGIN}/artifacts/{}", record.reference));
+        let mut response = bounded(request, self.timeout()?)
             .call()
             .map_err(unavailable)?;
         if response.status().as_u16() != 200 {
@@ -286,6 +301,13 @@ impl Client {
         }
         Ok(Some(bytes))
     }
+}
+
+/// Apply the per-request timeout. ureq's global timeout covers DNS, connect,
+/// send and the body read, so the request ends within its budget. Other
+/// config (no redirects, no proxy, status handling) is inherited from the agent.
+fn bounded<B>(request: ureq::RequestBuilder<B>, timeout: Duration) -> ureq::RequestBuilder<B> {
+    request.config().timeout_global(Some(timeout)).build()
 }
 
 /// Parse one response. Only `200`/`201` with `{ok:true,data}` succeed. A
