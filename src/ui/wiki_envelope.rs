@@ -455,9 +455,10 @@ mod tests {
             let grant = verified_upload_grant(actor, prefix);
             assert_eq!(relay_claim(&grant.actor).as_deref(), Some(claim));
             let directory = prefix.trim_end_matches('/');
-            let refusal = upload_path(Some(directory.into()), &grant)
-                .err()
-                .expect("the write prefix itself must not be an upload target");
+            let refusal = match upload_path(Some(directory.into()), &grant) {
+                Ok(_) => panic!("the write prefix itself must not be an upload target"),
+                Err(refusal) => refusal,
+            };
             assert_eq!(refusal.status_code(), StatusCode(403));
             assert!(upload_path(Some(format!("{directory}.extracted.md")), &grant).is_err());
             for suffix in ["source.md", "source.pdf", "nested/source.pdf"] {
