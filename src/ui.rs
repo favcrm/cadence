@@ -49,6 +49,7 @@ mod crm_send;
 mod crm_smtp;
 pub mod delivery_sync;
 mod home;
+mod human_threads;
 mod lane;
 mod lifecycle;
 mod locale;
@@ -74,6 +75,7 @@ mod work_conversations;
 mod workflows;
 mod write_path;
 
+pub(crate) use operator::{public_scheme, PUBLIC_COOKIE};
 pub use operator::{route_class, RouteClass, WriteRoute, WRITE_ROUTES};
 pub use serve::serve;
 pub use setup::{read_model_stats, setup_runs};

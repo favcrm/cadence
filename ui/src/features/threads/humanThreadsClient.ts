@@ -1,0 +1,203 @@
+import { ApiError } from "../../lib/api";
+import { sessionHeaders } from "../../lib/sessionKey";
+
+/**
+ * CAD-1412 human rooms wire client (`/api/human-threads/*`, same origin).
+ * Every call carries the Threads headers, DELETE included. The daemon derives
+ * the actor from the board sign-in and checks the live roster itself; this
+ * client never sends an identity, and a role is presentation only.
+ */
+
+export interface HumanMe {
+  id: string;
+  name: string;
+}
+
+export type HumanRoomKind = "dm" | "human_group" | "mixed_group";
+
+export interface HumanRoomSummary {
+  id: string;
+  kind: HumanRoomKind;
+  title: string;
+  creator: string;
+  created: number;
+  unread: number;
+}
+
+export interface HumanMember {
+  kind: "human" | "agent";
+  id: string;
+  label: string;
+}
+
+export interface HumanPost {
+  id: string;
+  seq: number;
+  sender: { id: string | null; label: string };
+  /** Already sanitized by the daemon (`conversations::body`). Plain text. */
+  body: string;
+  created: number;
+}
+
+export interface HumanRoomPage {
+  room: string;
+  members: HumanMember[];
+  posts: HumanPost[];
+  /** Fresh permission hint for an explicit Ask. Missing or false offers no Ask. */
+  can_ask?: boolean;
+}
+
+/** A current agent on the trusted catalog (`uid` is the durable id, never an alias hash). */
+export interface HumanAgent {
+  uid: string;
+  alias: string;
+}
+
+export interface HumanAskReceipt {
+  request: string;
+  post: HumanPost;
+  target: HumanAgent;
+  /** True when the same client id was already queued: nothing new was sent. */
+  duplicate: boolean;
+}
+
+async function call<T>(method: "GET" | "POST" | "DELETE", path: string, body?: object): Promise<T> {
+  const resp = await fetch(path, {
+    method,
+    credentials: "same-origin",
+    cache: "no-store",
+    headers: {
+      ...(method === "GET" ? {} : { "Content-Type": "application/json" }),
+      "X-Cadence-Board": "1",
+      ...sessionHeaders(),
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const parsed = (await resp.json().catch(() => null)) as Record<string, unknown> | null;
+  if (!resp.ok) {
+    const error = parsed?.error;
+    throw new ApiError(
+      typeof error === "string" && error !== "" ? error : `${resp.status} ${resp.statusText}`.trim(),
+      resp.status,
+      parsed ?? undefined,
+    );
+  }
+  if (parsed === null || typeof parsed !== "object") {
+    throw new ApiError("The server returned an invalid human rooms response", 502);
+  }
+  return parsed as T;
+}
+
+const ROOMS = "/api/human-threads/rooms";
+const roomPath = (id: string) => `${ROOMS}/${encodeURIComponent(id)}`;
+
+/** `GET /api/human-threads/me` — the signed-in person (`{human:{id,name}}`). */
+export function humanMe(): Promise<HumanMe> {
+  return call<{ human: HumanMe }>("GET", "/api/human-threads/me").then((r) => r.human);
+}
+
+/** `GET /api/human-threads/rooms` — the rooms this person belongs to. */
+export function listHumanRooms(): Promise<HumanRoomSummary[]> {
+  return call<{ rooms: HumanRoomSummary[] }>("GET", ROOMS).then((r) => r.rooms);
+}
+
+/** `POST /api/human-threads/dm` — the same pair reopens its room. Returns the room id. */
+export function openHumanDm(peerSubject: string): Promise<string> {
+  return call<{ room: string }>("POST", "/api/human-threads/dm", { peer_subject: peerSubject }).then((r) => r.room);
+}
+
+export interface HumanGroupInput {
+  kind: "human_group" | "mixed_group";
+  title?: string;
+  /** One id per logical envelope (`crypto.randomUUID()`), reused on retry. */
+  client_id: string;
+  humans: string[];
+  agents: string[];
+}
+
+/** `POST /api/human-threads/groups` — a new group, never a copy of a DM. */
+export function createHumanGroup(input: HumanGroupInput): Promise<string> {
+  return call<{ room: string }>("POST", "/api/human-threads/groups", input).then((r) => r.room);
+}
+
+/** `GET /api/human-threads/rooms/<id>` — members and one page of posts. */
+export function readHumanRoom(id: string, at: { before?: number; limit?: number } = {}): Promise<HumanRoomPage> {
+  const q = new URLSearchParams();
+  if (at.before !== undefined) q.set("before", String(at.before));
+  if (at.limit !== undefined) q.set("limit", String(at.limit));
+  const query = q.toString();
+  return call<HumanRoomPage>("GET", `${roomPath(id)}${query ? `?${query}` : ""}`).then((p) => ({
+    ...p,
+    can_ask: p.can_ask === true,
+  }));
+}
+
+/** `POST /api/human-threads/rooms/<id>/posts` — a turnless post. */
+export function postHumanRoom(id: string, clientId: string, body: string): Promise<{ post: HumanPost; created: boolean }> {
+  return call("POST", `${roomPath(id)}/posts`, { client_id: clientId, body });
+}
+
+/** `GET /api/human-threads/agents` — the current agents this person may ask (`{agents:[{uid,alias}]}`). */
+export function humanAgents(): Promise<HumanAgent[]> {
+  return call<{ agents: HumanAgent[] }>("GET", "/api/human-threads/agents").then((r) => r.agents);
+}
+
+/** `POST /api/human-threads/rooms/<id>/ask` — one explicit Ask to one current agent. Queued, not done. */
+export function humanAskRoom(
+  id: string,
+  input: { agent_uid: string; client_id: string; body: string },
+): Promise<HumanAskReceipt> {
+  return call<HumanAskReceipt>("POST", `${roomPath(id)}/ask`, input);
+}
+
+/** `POST /api/human-threads/rooms/<id>/read` — the newest seq actually shown. */
+export function markHumanRead(id: string, seq: number): Promise<{ unread: number }> {
+  return call("POST", `${roomPath(id)}/read`, { seq });
+}
+
+export interface HumanPerson {
+  /** Presentation only: `human-` + first 12 bytes of SHA256 over the verified tuple. */
+  id: string;
+  subject: string;
+  name: string;
+}
+
+interface RosterResponse {
+  issuer: string;
+  organization_id: string;
+  members: { subject_id: string; name: string; role: string }[];
+}
+
+/**
+ * The human id the daemon derives for a verified tuple (store `VerifiedHuman`):
+ * SHA256 over UTF-8 `issuer\norg\nsubject`, first 12 bytes as hex. Used only to
+ * match a roster person to a room member; the id is never sent as authority.
+ */
+export async function humanIdFor(issuer: string, org: string, subject: string): Promise<string> {
+  const subtle = globalThis.crypto?.subtle;
+  if (!subtle) throw new Error("This origin has no secure crypto, so people cannot be matched here");
+  const digest = new Uint8Array(await subtle.digest("SHA-256", new TextEncoder().encode(`${issuer}\n${org}\n${subject}`)));
+  return `human-${Array.from(digest.slice(0, 12), (b) => b.toString(16).padStart(2, "0")).join("")}`;
+}
+
+/** `GET /__platform/threads/roster` — the current people, same origin. */
+export async function humanPeople(): Promise<HumanPerson[]> {
+  const roster = await call<RosterResponse>("GET", "/__platform/threads/roster");
+  return Promise.all(
+    roster.members.map(async (m) => ({
+      id: await humanIdFor(roster.issuer, roster.organization_id, m.subject_id),
+      subject: m.subject_id,
+      name: m.name,
+    })),
+  );
+}
+
+/** `POST /api/human-threads/rooms/<id>/members` — creator only, groups only. */
+export function addHumanMember(id: string, target: { human_subject: string } | { agent_uid: string }): Promise<unknown> {
+  return call("POST", `${roomPath(id)}/members`, target);
+}
+
+/** `DELETE /api/human-threads/rooms/<id>/members/<kind>/<member>` — creator only. */
+export function removeHumanMember(id: string, kind: "human" | "agent", member: string): Promise<unknown> {
+  return call("DELETE", `${roomPath(id)}/members/${kind}/${encodeURIComponent(member)}`);
+}

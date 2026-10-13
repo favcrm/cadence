@@ -96,6 +96,68 @@ impl Shared {
     /// CAD-810: may `caller` change the membership of `topic`? Operator
     /// for fleet/project; the job's PM for its own job's members. A worker
     /// may not change membership.
+    /// CAD-1412: a human room is reached only through the human-threads
+    /// RPCs and their verified ACL. The legacy topic verbs serve every
+    /// topic to the operator, so a human room is refused here before any
+    /// caller check (its transcript and membership never leak this way).
+    fn refuse_human_room(topic: &Topic, verb: &str) -> Result<()> {
+        if topic.kind == crate::store::human_threads::ROOM_TOPIC_TYPE {
+            return Err(Error::rejected(format!(
+                "{verb} refused: this topic is a private human room — use the human-threads API"
+            )));
+        }
+        Ok(())
+    }
+
+    /// CAD-1412: the durable uid of an agent caller of a human room. The
+    /// operator's generic topic verbs never reach a human room's transcript.
+    fn human_room_agent(&self, caller: &crate::peer::AgentCaller, verb: &str) -> Result<String> {
+        match caller {
+            crate::peer::AgentCaller::Agent(alias) => Ok(self.store.agent(alias)?.uid),
+            crate::peer::AgentCaller::Operator => Err(Error::rejected(format!(
+                "{verb} refused: this topic is a private human room — use the human-threads API"
+            ))),
+        }
+    }
+
+    /// CAD-1412: an agent member reads a human room's transcript page. The
+    /// store rechecks the active membership and the join cutoff.
+    fn human_room_agent_read(
+        &self,
+        caller: &crate::peer::AgentCaller,
+        topic: &Topic,
+        params: &Value,
+        limit: i64,
+    ) -> Result<Value> {
+        let uid = self.human_room_agent(caller, "topic_read")?;
+        if params.get("after").is_some() {
+            return Err(Error::rejected(
+                "topic_read: a human room pages by before only",
+            ));
+        }
+        let before = optional_i64(params, "before");
+        let org = crate::board_identity::read_config(&self.state_dir)?.company;
+        let (posts, more_before) = self
+            .store
+            .human_agent_read(&org, &uid, &topic.id, before, limit)?;
+        let out: Vec<Value> = posts
+            .iter()
+            .map(|post| {
+                let mut row = post.to_json();
+                row["body"] = json!(store::conversations::body(&post.body));
+                row["request"] = Value::Null;
+                row["deliveries"] = json!([]);
+                row
+            })
+            .collect();
+        Ok(json!({
+            "topic": topic.to_json(),
+            "posts": out,
+            "cursor": posts.last().map(|p| p.seq).unwrap_or(0),
+            "more_before": more_before,
+        }))
+    }
+
     fn may_manage_members(
         &self,
         caller: &crate::peer::AgentCaller,
@@ -198,6 +260,7 @@ impl Shared {
             .ok_or_else(|| Error::rejected("Unknown topic"))?;
         let member = self.resolve_alias(required_str(params, "alias")?)?;
         let agent = self.store.agent(&member)?;
+        Self::refuse_human_room(&topic, verb)?;
         self.may_manage_members(&caller, &topic, &member)?;
         if subscribe {
             self.store.topic_subscribe(&topic.id, &agent.uid)?;
@@ -228,6 +291,19 @@ impl Shared {
         let text = required_str(params, "text")?;
         let client_id = required_str(params, "id")?;
         identifier(client_id, "post ID")?;
+        if topic.kind == crate::store::human_threads::ROOM_TOPIC_TYPE {
+            let uid = self.human_room_agent(&caller, "topic_publish")?;
+            let org = crate::board_identity::read_config(&self.state_dir)?.company;
+            let (post, fresh) = self
+                .store
+                .human_agent_post(&org, &uid, &topic.id, client_id, text)?;
+            return Ok(json!({
+                "topic": topic.id,
+                "message": post.id,
+                "duplicate": !fresh,
+                "deliveries": [],
+            }));
+        }
         self.may_use_topic(&caller, &topic, "topic_publish")?;
         let (sender_uid, sender_label) = match &caller {
             crate::peer::AgentCaller::Operator => (None, "operator".to_string()),
@@ -305,6 +381,7 @@ impl Shared {
             .store
             .topic(topic_key)?
             .ok_or_else(|| Error::rejected("Unknown topic"))?;
+        Self::refuse_human_room(&topic, "topic_request")?;
         let text = required_str(params, "text")?;
         let client_id = required_str(params, "id")?;
         identifier(client_id, "request ID")?;
@@ -393,7 +470,6 @@ impl Shared {
             .store
             .topic(topic_key)?
             .ok_or_else(|| Error::rejected("Unknown topic"))?;
-        self.may_use_topic(&caller, &topic, "topic_read")?;
         let limit = optional_i64(params, "limit").unwrap_or(50);
         if !(1..=crate::store::THREAD_PAGE_MAX).contains(&limit) {
             return Err(Error::rejected(format!(
@@ -401,6 +477,10 @@ impl Shared {
                 crate::store::THREAD_PAGE_MAX
             )));
         }
+        if topic.kind == crate::store::human_threads::ROOM_TOPIC_TYPE {
+            return self.human_room_agent_read(&caller, &topic, params, limit);
+        }
+        self.may_use_topic(&caller, &topic, "topic_read")?;
         let before = optional_i64(params, "before");
         let after = optional_i64(params, "after");
         let posts = self.store.topic_posts(&topic.id, before, after, limit)?;

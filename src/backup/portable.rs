@@ -722,6 +722,21 @@ const CATALOG: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "human_principals",
+        &["id", "org", "issuer", "subject", "name", "seen"],
+    ),
+    ("human_read_markers", &["room", "human", "seq"]),
+    (
+        "human_room_members",
+        &["room", "kind", "member", "cutoff", "added", "removed"],
+    ),
+    (
+        "human_rooms",
+        &[
+            "id", "topic_id", "org", "kind", "pair", "title", "creator", "created",
+        ],
+    ),
+    (
         "tasks",
         &[
             "id",
@@ -1124,7 +1139,41 @@ fn project(db: &Path) -> Result<Vec<(String, i64)>> {
         )?);
         tx.execute(&format!("DROP TRIGGER {}", quote_ident(name)), [])?;
     }
+    // CAD-1412: human-room transcripts reuse the coordination topic tables.
+    // Scrub those rows before the room metadata is dropped, so no private
+    // human post, delivery or membership leaks through the coordination
+    // profile.
+    if tx.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='human_rooms'",
+        [],
+        |r| r.get::<_, i64>(0),
+    )? > 0
+    {
+        tx.execute(
+            "DELETE FROM topic_deliveries WHERE post_id IN (SELECT p.id FROM topic_posts p JOIN topics t ON t.id=p.topic_id WHERE t.type='human_room')",
+            [],
+        )?;
+        tx.execute(
+            "DELETE FROM topic_posts WHERE topic_id IN (SELECT id FROM topics WHERE type='human_room')",
+            [],
+        )?;
+        tx.execute(
+            "DELETE FROM topic_subscriptions WHERE topic_id IN (SELECT id FROM topics WHERE type='human_room')",
+            [],
+        )?;
+        tx.execute("DELETE FROM topics WHERE type='human_room'", [])?;
+    }
     for table in omitted_names() {
+        let present: i64 = tx.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?",
+            [table],
+            |r| r.get(0),
+        )?;
+        if present == 0 {
+            // A catalog table this store predates: nothing to remove.
+            omitted.push((table.to_string(), 0));
+            continue;
+        }
         let rows: i64 = tx.query_row(
             &format!("SELECT count(*) FROM {}", quote_ident(table)),
             [],
@@ -2001,6 +2050,14 @@ fn validate_staged_store(db: &Path, manifest: &PortableManifest) -> Result<()> {
         )));
     }
     for table in omitted_names() {
+        let present: i64 = conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?",
+            [table],
+            |r| r.get(0),
+        )?;
+        if present == 0 {
+            continue;
+        }
         let rows: i64 = conn.query_row(
             &format!("SELECT count(*) FROM {}", quote_ident(table)),
             [],

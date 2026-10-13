@@ -503,6 +503,18 @@ impl BoardUser {
 /// store's 200-character source limit.
 const ACTOR_MAX: usize = 190;
 
+/// The verified platform tenancy a public session was opened under
+/// (CAD-1412): the assertion's `iss` and `company`, which the daemon
+/// checked against the configured board identity before this value
+/// existed. Absent on every legacy or non-public session, so a session
+/// without it can never authorize a human-threads actor.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HumanScope {
+    pub issuer: String,
+    pub organization_id: String,
+}
+
 /// One stored session: the token's hash and what `ui sessions` shows.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Row {
@@ -530,6 +542,10 @@ struct Row {
     /// operator's loopback/tailnet sessions.
     #[serde(default)]
     user: Option<BoardUser>,
+    /// The verified issuer and organization a public session was opened
+    /// under (CAD-1412). Legacy rows deserialize to `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scope: Option<HumanScope>,
 }
 
 impl Row {
@@ -553,6 +569,7 @@ impl Row {
             expires_at: self.expires_at,
             user_agent: self.user_agent.clone(),
             user: self.user.clone(),
+            scope: self.scope.clone(),
         }
     }
 }
@@ -569,6 +586,9 @@ pub struct SessionView {
     pub user_agent: String,
     /// The platform-asserted user a `public` session names (CAD-526).
     pub user: Option<BoardUser>,
+    /// The verified tenancy of a scoped public session (CAD-1412).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<HumanScope>,
 }
 
 /// A freshly opened session: the token goes to the board once, for its
@@ -754,6 +774,7 @@ impl Auth {
             user_agent: clean_user_agent(user_agent),
             max_idle_secs: default_idle_secs(),
             user: None,
+            scope: None,
         };
         let session = row.view();
         self.sessions.push(row);
@@ -811,6 +832,7 @@ impl Auth {
             user_agent: clean_user_agent(user_agent),
             max_idle_secs: crate::device_login::REMOTE_IDLE_SECS,
             user: Some(user),
+            scope: None,
         };
         let session = row.view();
         self.sessions.push(row);
@@ -828,6 +850,34 @@ impl Auth {
     pub fn open_public(
         &mut self,
         user: BoardUser,
+        jti: &str,
+        jti_exp: i64,
+        user_agent: &str,
+        now: i64,
+    ) -> Result<Option<Opened>> {
+        self.open_public_inner(user, None, jti, jti_exp, user_agent, now)
+    }
+
+    /// [`Auth::open_public`] for a verified assertion, persisting the
+    /// verified `scope` with the row (CAD-1412). Call only after the
+    /// daemon has verified the assertion against the configured board
+    /// identity; `scope` is never read from request params.
+    pub fn open_public_scoped(
+        &mut self,
+        user: BoardUser,
+        scope: HumanScope,
+        jti: &str,
+        jti_exp: i64,
+        user_agent: &str,
+        now: i64,
+    ) -> Result<Option<Opened>> {
+        self.open_public_inner(user, Some(scope), jti, jti_exp, user_agent, now)
+    }
+
+    fn open_public_inner(
+        &mut self,
+        user: BoardUser,
+        scope: Option<HumanScope>,
         jti: &str,
         jti_exp: i64,
         user_agent: &str,
@@ -859,6 +909,7 @@ impl Auth {
             user_agent: clean_user_agent(user_agent),
             max_idle_secs: default_idle_secs(),
             user: Some(user),
+            scope,
         };
         let session = row.view();
         self.sessions.push(row);
@@ -869,6 +920,32 @@ impl Auth {
             key: String::new(),
             session,
         }))
+    }
+
+    /// The verified human scope of the live public session `token` names
+    /// (CAD-1412), and its named user. `None` for a missing, expired, legacy
+    /// unscoped or non-public session: the human-threads proof fails
+    /// closed on `None`. Cookie-only, like [`Auth::check_public`].
+    pub(crate) fn verified_human_scope(
+        &mut self,
+        token: &str,
+        now: i64,
+    ) -> Result<Option<(HumanScope, BoardUser)>> {
+        if self.prune(now) {
+            self.persist()?;
+        }
+        if !well_formed(token) {
+            return Ok(None);
+        }
+        let hash = digest(token);
+        Ok(self
+            .sessions
+            .iter()
+            .find(|r| r.origin == Origin::Public && same_credential(&r.hash, &hash) && r.live(now))
+            .and_then(|r| match (&r.scope, &r.user) {
+                (Some(scope), Some(user)) => Some((scope.clone(), user.clone())),
+                _ => None,
+            }))
     }
 
     /// The live public session `token` names, touching its idle clock.
@@ -1114,6 +1191,7 @@ mod tests {
             user_agent: String::new(),
             max_idle_secs: IDLE_SECS,
             user: None,
+            scope: None,
         };
         let orig = mk(&"1".repeat(56));
         let collider = mk(&"2".repeat(56));

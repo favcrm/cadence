@@ -681,6 +681,7 @@ pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
         } => events::run(state_dir, alias, job, after, wait, follow),
         Commands::Job { action } => job::run(state_dir, action),
         Commands::Thread { action } => thread::run(state_dir, action),
+        Commands::Topic { action } => topic::run(state_dir, action),
         Commands::Monitor { action } => monitor::run(state_dir, action),
         Commands::Org { action } => org::run(action),
         Commands::Issue { action } => issue::run(state_dir, action),
