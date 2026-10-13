@@ -5,6 +5,7 @@ import {
   useState,
   useSyncExternalStore,
   type KeyboardEvent,
+  type MouseEvent,
 } from "react";
 import type { ThreadRef } from "../../../lib/types";
 import { useLocale } from "../../../lib/locale";
@@ -126,6 +127,14 @@ export interface ComposerProps {
  *  surfaced first so an unresolved file is never hidden silently. */
 const CHIP_LIMIT = 3;
 
+/** Where keyboard focus goes after a keyboard-initiated removal: the row
+ *  that took the removed row's place, else the one before it. */
+interface RemoveFocusTarget {
+  removed: string;
+  next: string | null;
+  prev: string | null;
+}
+
 function AttachChips({
   items,
   t,
@@ -137,7 +146,7 @@ function AttachChips({
    *  `attachMeta` and `displayAttachError` receive everywhere else. */
   t: (english: string) => string;
   onRetry: (item: AttachItem) => void;
-  onRemove: (item: AttachItem) => void;
+  onRemove: (item: AttachItem, focus: RemoveFocusTarget | null) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   // Failed first, then uploading, then ready: the rows behind +N more
@@ -152,13 +161,14 @@ function AttachChips({
   const hiddenPending = hidden.some((a) => a.status === "uploading");
   return (
     <div className="app-chat-attachrow" data-composer-attachments>
-      {visible.map((a) => (
+      {visible.map((a, i) => (
         <div
           key={a.key}
           role="group"
           className={`app-chat-filerow${a.status === "failed" ? " failed" : ""}`}
           data-attach-status={a.status}
-          aria-label={`${a.name}: ${t(a.status)}${a.error ? ` — ${displayAttachError(a.error, t)}` : ""}`}
+          data-attach-key={a.key}
+          aria-label={`${a.name}: ${t(a.status === "uploading" ? "Uploading…" : a.status === "failed" ? "Failed" : "Ready")}${a.error ? ` — ${displayAttachError(a.error, t)}` : ""}`}
           title={a.name}
         >
           <span className="app-chat-filename">
@@ -185,7 +195,14 @@ function AttachChips({
               className="app-chat-remove"
               aria-label={`${t("Remove")} ${a.name}`}
               title={`${t("Remove")} ${a.name}`}
-              onClick={() => onRemove(a)}
+              onClick={(e: MouseEvent<HTMLButtonElement>) => {
+                // Only keyboard or assistive activation (detail 0) on the
+                // button that holds focus moves focus; a pointer click never does.
+                const keyboard = e.detail === 0 && document.activeElement === e.currentTarget;
+                onRemove(a, keyboard
+                  ? { removed: a.key, next: ordered[i + 1]?.key ?? null, prev: ordered[i - 1]?.key ?? null }
+                  : null);
+              }}
             >
               <svg viewBox="0 0 24 24" aria-hidden="true">
                 <path d="M6 6l12 12M18 6L6 18" />
@@ -283,6 +300,23 @@ export default function Composer({
   const attachItems = useSyncExternalStore(subscribeQueue, readQueue);
   const [dropping, setDropping] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
+  // A keyboard removal waits here until its commit paints, so focus lands
+  // on the surviving row's own Remove button (or the composer when none).
+  const pendingFocus = useRef<RemoveFocusTarget | null>(null);
+  useEffect(() => {
+    const pending = pendingFocus.current;
+    if (!pending) return;
+    pendingFocus.current = null;
+    // A no-op removal (the row was already gone) moves nothing.
+    if (attachItems.some((a) => a.key === pending.removed)) return;
+    const form = box.current?.form;
+    const rowRemove = (k: string | null) => {
+      if (k === null || !form) return null;
+      const row = Array.from(form.querySelectorAll<HTMLElement>("[data-attach-key]")).find((el) => el.dataset.attachKey === k);
+      return row?.querySelector<HTMLButtonElement>(".app-chat-remove") ?? null;
+    };
+    (rowRemove(pending.next) ?? rowRemove(pending.prev) ?? box.current)?.focus({ preventScroll: true });
+  });
   const [hi, setHi] = useState(0);
   // Esc dismisses the menu for THIS verb text — the next keystroke
   // reopens it (or a cleared draft does).
@@ -464,7 +498,10 @@ export default function Composer({
         items={attachItems}
         t={translateAttachText}
         onRetry={(item) => retryAttach(key, item.key)}
-        onRemove={(item) => removeAttach(key, item.key)}
+        onRemove={(item, focus) => {
+          pendingFocus.current = focus;
+          removeAttach(key, item.key);
+        }}
       />
     ) : null;
 
