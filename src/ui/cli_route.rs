@@ -54,7 +54,7 @@ static CLI_JWKS: Mutex<board_identity::JwksCache> = Mutex::new(board_identity::J
 /// Serializes `Spent::load`+`consume` — the single-use check-and-record
 /// races on the on-disk set otherwise (two in-flight replays of one
 /// jti could both pass). Held for the file read+write only.
-static SPENT_LOCK: Mutex<()> = Mutex::new(());
+pub(super) static SPENT_LOCK: Mutex<()> = Mutex::new(());
 
 /// A refusal in the contract's `error.code` shape — `{ok:false,
 /// error:{code,message}}` plus `no-store`; never a redirect, never a

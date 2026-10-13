@@ -65,6 +65,7 @@ mod threads;
 mod topics;
 mod updates;
 mod wiki;
+mod wiki_envelope;
 mod work_conversations;
 mod workflows;
 mod write_path;

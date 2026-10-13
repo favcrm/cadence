@@ -49,8 +49,10 @@ use crate::error::{Error, Result};
 use crate::issue::Pm;
 
 pub mod cli;
+pub mod envelope;
 pub mod index;
 pub mod ingest;
+pub mod upload;
 
 /// `if_rev` value meaning "the page does not exist yet" — a
 /// create-only write. Any real content rev is `fnv1a:<16 hex>`.

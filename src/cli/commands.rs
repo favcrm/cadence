@@ -46,6 +46,10 @@ pub(crate) enum Commands {
         /// Print the authorization URL/code without opening a browser.
         #[arg(long, conflicts_with = "token_stdin")]
         no_open: bool,
+        /// Also request wiki access (`wiki.read` and `wiki.write`) for the
+        /// remote wiki verbs. Off by default: a plain login is CLI-only.
+        #[arg(long, conflicts_with = "token_stdin")]
+        wiki: bool,
         /// Isolated credential directory; defaults to XDG_CONFIG_HOME/cadence/remote-auth.
         #[arg(long)]
         auth_dir: Option<PathBuf>,
