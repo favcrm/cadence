@@ -1859,6 +1859,34 @@ Start an isolated sandbox board and use the Rust restart loop in
 [CONTRIBUTING.md](../CONTRIBUTING.md#isolated-board-development) before running
 the Vite server. The configured dev port must match that sandbox board.
 
+### App routing QA handovers
+
+Use `/apps/<app-key>` (for example `/apps/social-content`) for installed-app
+navigation. Installation IDs remain internal scope identifiers and API path
+parameters; `/app-installations/<id>` is a compatibility bookmark, not a second
+app entry point. A legacy bookmark may redirect only when its exact active
+installation maps unambiguously to the canonical route. Missing, removed,
+ambiguous or inaccessible mappings must fail safely, never select another
+installation. Preserve context, conversation, record and app-view selection.
+
+Every setup or Browser QA handover states these separately:
+
+- The actually served backend build and board address, with the existing
+  build/version evidence used to identify them.
+- The actually served UI revision: the embedded build, or the Vite checkout
+  revision and any uncommitted changes when testing a development UI.
+- The reviewed candidate's exact head, whether or not it is served.
+- The installed app package version and digest, when relevant, using existing
+  installation metadata.
+
+Mark unknown provenance as unverified. A requested restart, successful build,
+fixture harness or canonical-looking URL is not evidence that the candidate is
+installed or served. Identify fixture/component evidence as such rather than
+claiming a real board acceptance run. At desktop and narrow widths, exercise
+canonical navigation and a representative old contextual deep link; verify
+that the installation/context is retained and missing access fails safely.
+This procedure grants no permission to refresh staging or production.
+
 The original mock is `ui/design/board-mock-v4.html`. In I2 cards drag
 between columns (derived/container cards don't — the reason shows on
 hover), the issue page edits fields/body/links/refs, comments and attaches

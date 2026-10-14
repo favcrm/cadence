@@ -11,6 +11,8 @@ import {
   notifyAppsChanged,
 } from "../workspace-apps/workspaceApps";
 import type { Viewer } from "../projects/work";
+import { useInstallations } from "../workspace-apps/useInstallations";
+import { installationAppHref } from "../apps/appViewModel";
 import { AppGlyph, useModal } from "./shared";
 import { appErrorCopy, appLoadErrorCopy, isUnchangedUpgradeError } from "./appErrors";
 import { Loading, Notice } from "../app-shell/shared/States";
@@ -50,8 +52,11 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
   const [error, setError] = useState<string | null>(null);
 
   const isOp = viewer.operator === true && !viewer.readOnly;
-
   const [reread, setReread] = useState(0);
+  // CAD-1438: "Open its page" spells the canonical `/apps/<key>` route,
+  // resolved against the verified install list; ambiguous or unsafe
+  // keys get no link instead of the retired ID route.
+  const installs = useInstallations(viewer.operator === true, reread).list;
   useEffect(() => {
     if (!isOp) return;
     const controller = new AbortController();
@@ -265,7 +270,14 @@ export default function ManageApp({ installId, viewer }: { installId: string; vi
             </ul>
           )}
           <div className="mt-3">
-            <Link className="btn btn-sm" href={`/app-installations/${inst.install_id}`}>{t("Open its page")}</Link>
+            {(() => {
+              const href = installationAppHref(installs, inst.install_id);
+              return href === null ? (
+                <span className="text-micro text-ink-500">{t("No unique app page — the app key names more than one installation.")}</span>
+              ) : (
+                <Link className="btn btn-sm" href={href}>{t("Open its page")}</Link>
+              );
+            })()}
           </div>
         </div>
 

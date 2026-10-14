@@ -18,6 +18,7 @@ import { assertRecordId, type HostScope } from "./hostActions";
 import { isDev } from "../../env";
 import AppViewContractPreview, { contractPreviewHref, contractPreviewKey } from "./app-views/AppViewContractPreview";
 import { useChatCollapsed, type ConversationLinkRequest } from "./conversationClient";
+import { installedAppHref } from "../apps/appViewModel";
 import { useLocale } from "../../lib/locale";
 import "./app-shell.css";
 
@@ -584,10 +585,15 @@ export default function AppShell({
         {
           // Preserve a stale ctx selector alongside a conversation link so
           // its target can fail visibly instead of becoming contextless.
+          // CAD-1438: when the ctx selector survives for that reason, the
+          // record/appview selectors it arrived with ride along verbatim —
+          // the outlet renders a record id only as the unverifiable stub
+          // and a stale scope keeps the link's failure visible rather than
+          // silently opening under no scope.
           ctx: soleContext ? activeIds[0] : staleCtx && !hasConversationLink ? null : undefined,
           crm: badCrm ? null : undefined,
-          record: badRecord || staleCtx || scopelessRecord ? null : undefined,
-          appview: staleCtx ? null : undefined,
+          record: badRecord || scopelessRecord || (staleCtx && !hasConversationLink) ? null : undefined,
+          appview: staleCtx && !hasConversationLink ? null : undefined,
         },
         { replace: true },
       );
@@ -791,6 +797,10 @@ export default function AppShell({
               descriptor: chatDescriptor,
               conversationRequest,
               contextProof: conversationContextProof,
+              // CAD-1438: shareable links spell the canonical key route. The
+              // shell only mounts after the route proved the key unique for
+              // this install, so the verified receipt's name is its path.
+              appPath: verified && installation ? installedAppHref(installation.name) : null,
               fileUpload: chatProjection.projection?.fileUpload ?? { declared: false, available: false },
               fileUploadLoading: chatProjection.loading || !verified || loading || loadError !== null,
             }}

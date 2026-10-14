@@ -117,6 +117,9 @@ export type ConversationMode =
       conversationRequest: ConversationLinkRequest | null;
       /** The current host context receipt, compared with a URL scope selector. */
       contextProof?: ConversationContextProof;
+      /** The verified installation's canonical `/apps/<key>` path — shareable
+       *  links emit it. Null (ambiguous/unresolved) means no link renders. */
+      appPath?: string | null;
       /** Separate live native capability projection, not app-chat schema data. */
       fileUpload: FileUploadProjection;
       fileUploadLoading: boolean;
@@ -1114,9 +1117,10 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           binding.scope.install_id === installId &&
           binding.scope.context_id !== "" &&
           mode.contextProof?.status === "ready" &&
-          mode.contextProof.contextId === binding.scope.context_id && (
+          mode.contextProof.contextId === binding.scope.context_id &&
+          mode.appPath != null && (
             <Link
-              href={`/app-installations/${encodeURIComponent(installId)}?ctx=${encodeURIComponent(binding.scope.context_id)}&conversation=${encodeURIComponent(active.selected.id)}`}
+              href={`${mode.appPath}?install=${encodeURIComponent(installId)}&ctx=${encodeURIComponent(binding.scope.context_id)}&conversation=${encodeURIComponent(active.selected.id)}`}
               className="lnk app-chat-scope-link"
               aria-label={t("Link to this conversation")}
               title={t("Shareable link to this conversation")}
@@ -1247,7 +1251,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           </li>
         ))}
       </ol>
-      <AssistantOperations key={`${installId}\u0000${mode.contextId}`} installId={installId} contextId={mode.contextId} canDecide={viewer.operator === true && !viewer.readOnly} />
+      <AssistantOperations key={`${installId}\u0000${mode.contextId}`} installId={installId} contextId={mode.contextId} appPath={mode.appPath ?? null} canDecide={viewer.operator === true && !viewer.readOnly} />
       {jump && (
         <button type="button" className="lnk text-label app-chat-jump" onClick={jumpToLatest} data-jump-to-latest>
           ↓ {t("New messages")}

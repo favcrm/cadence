@@ -43,12 +43,39 @@ export function installedAppHref(name: string): string | null {
   return `/apps/${encodeURIComponent(name)}`;
 }
 
+/** The active (not removed) installs sharing one package key. */
+type KeyedInstall = Pick<Installation, "install_id" | "name" | "removed">;
+function activeInstallsForKey(
+  installs: readonly KeyedInstall[] | null | undefined,
+  name: string,
+): KeyedInstall[] {
+  return (installs ?? []).filter((i) => i.removed == null && i.name === name);
+}
+
 /**
- * The v3 app screen (`/app-installations/<id>`) of the installation a
- * project app card stands for, or null: the card keeps its legacy link
- * unless exactly one installation of that project and name declares a
- * supported screen (CAD-1253). Whether the screen mounts stays the
- * host's own approval check.
+ * CAD-1438: one installation's canonical `/apps/<key>` route, or null when
+ * the key cannot name it uniquely — no active install with that id, the
+ * install is removed, its key resolves to more than one active install, or
+ * the key itself is not a safe route segment. A `null` answer is the
+ * retired/unavailable outcome: never substitute another install's key.
+ */
+export function installationAppHref(
+  installs: readonly KeyedInstall[] | null | undefined,
+  installId: string,
+): string | null {
+  const install = (installs ?? []).find((i) => i.install_id === installId && i.removed == null);
+  if (!install) return null;
+  if (activeInstallsForKey(installs, install.name).length !== 1) return null;
+  return installedAppHref(install.name);
+}
+
+/**
+ * The v3 app screen of the installation a project app card stands for, or
+ * null: the card keeps its legacy link unless exactly one installation of
+ * that project and name declares a supported screen (CAD-1253) — and the
+ * package key names no other ACTIVE install anywhere (CAD-1438: counting
+ * only this project's installs could mint an ambiguous `/apps/<key>`).
+ * Whether the screen mounts stays the host's own approval check.
  */
 export function screenInstallHref(
   installs: Pick<Installation, "install_id" | "name" | "project_link" | "files" | "removed">[] | null,
@@ -60,7 +87,8 @@ export function screenInstallHref(
       i.removed == null && i.name === name && i.project_link === project &&
       i.files.some((f) => /^screens\/[a-z0-9][a-z0-9-]{0,31}\/screens\.json$/.test(f)),
   );
-  return hits.length === 1 ? installedAppHref(hits[0].name) : null;
+  if (hits.length !== 1) return null;
+  return installationAppHref(installs, hits[0].install_id);
 }
 
 /**

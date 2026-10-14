@@ -23,7 +23,7 @@ globalThis.fetch = async (input, init) => {
   return new Response(JSON.stringify(hit.body), { status: hit.status ?? 200, headers: { "Content-Type": "application/json" } });
 };
 
-const installation = { install_id: "inst1", digest: "sha256:d1", capabilities: {
+const installation = { install_id: "inst1", name: "social-content", digest: "sha256:d1", capabilities: {
   publication: { schema: 1, capability: "text.publish", version: 1, action: "publish", resource_kind: "connection_account", effect: "send" },
   source: { schema: 1, capability: "social.read", version: 1, action: "list_posts", resource_kind: "connection_account", effect: "read" } } } as unknown as Installation;
 const ctx = (changed: () => void = () => {}): ActionContext => ({ installation, installId: "inst1", contextId: "ctx1", runs: [], onChanged: changed });
@@ -47,7 +47,8 @@ async function main() {
   equal(connectToast("connected", publishAllowed("?aos_connect=connected&toolkit=instagram&aos_publish=skipped")).text, "Instagram connected", "skipped keeps the connected copy");
   equal(withoutConnectParams("?aos_connect=connected&aos_publish=allowed&toolkit=instagram&screen=native"), "?screen=native", "aos_publish leaves the URL");
   equal(connectToast("cancelled"), connectToast("failed"), "cancelled reads as not connected");
-  equal(connectReturnTo("https://ef.cadencecloud.app", "inst 1"), "https://ef.cadencecloud.app/app-installations/inst%201?screen=native", "return_to is this board's host Settings page");
+  // CAD-1438: return_to spells the canonical `/apps/<key>` route.
+  equal(connectReturnTo("https://ef.cadencecloud.app", "social content"), "https://ef.cadencecloud.app/apps/social%20content?screen=native", "return_to is this board's host Settings page");
   equal([accountLabel("harbour"), accountLabel("@harbour"), accountLabel("Harbour Cafe")], ["@harbour", "@harbour", "Harbour Cafe"], "handles get an @");
   equal(sendSlot(installation), "publication", "one send slot");
   equal(sendSlot({ ...installation, capabilities: {} } as Installation), null, "no send slot");
@@ -64,7 +65,7 @@ async function main() {
   const ui = { showLink: (url: string) => { shown = url; }, navigate: (path: string) => { navigated = path; }, assign: (url: string) => { assigned = url; } };
   let result = await runCall(ctx(), "open-link", { url: "/settings/connections" }, ui);
   assert(result.ok && assigned === "https://api.example/account/ws/connections/connect?toolkit=instagram&return_to=x" && shown === null, "hosted opens the AgenticOS link top-level");
-  equal(calls[0], { path: "/api/app-installations/inst1/publishing/connect-link", body: { return_to: "https://ef.cadencecloud.app/app-installations/inst1?screen=native" } }, "the host asks with its own return_to");
+  equal(calls[0], { path: "/api/app-installations/inst1/publishing/connect-link", body: { return_to: "https://ef.cadencecloud.app/apps/social-content?screen=native" } }, "the host asks with its own canonical return_to");
   // The frame never supplies the URL: another url is not routed through the connect link.
   assigned = null; calls.length = 0;
   result = await runCall(ctx(), "open-link", { url: "https://evil.example/x" }, ui);

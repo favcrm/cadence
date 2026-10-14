@@ -53,20 +53,22 @@ const App = () => React.createElement(LocaleProvider, null, React.createElement(
 const outlet = require("../src/features/app-shell/CrmOutlet") as typeof import("../src/features/app-shell/CrmOutlet");
 // Pure menu derivation: titles, hrefs and current flags from the
 // route href alone.
-const menu = outlet.crmAppMenu("/app-installations/install-crm?ctx=ctx-a", "CRM", "segments");
+// CAD-1438: menu hrefs spell whatever base path they are handed —
+// canonical `/apps/<key>` in the live board.
+const menu = outlet.crmAppMenu("/apps/crm?ctx=ctx-a", "CRM", "segments");
 equal(menu.title, "CRM", "menu carries the verified installation title");
 equal(
   menu.sections.map((s) => [s.label, s.href, s.current]),
   [
-    ["Customers", "/app-installations/install-crm?ctx=ctx-a", false],
-    ["Segments", "/app-installations/install-crm?ctx=ctx-a&crm=segments", true],
-    ["Campaigns", "/app-installations/install-crm?ctx=ctx-a&crm=campaigns", false],
+    ["Customers", "/apps/crm?ctx=ctx-a", false],
+    ["Segments", "/apps/crm?ctx=ctx-a&crm=segments", true],
+    ["Campaigns", "/apps/crm?ctx=ctx-a&crm=campaigns", false],
   ],
   "menu sections link with context and mark current",
 );
 equal(
-  outlet.crmAppMenu("/app-installations/install-crm?ctx=ctx-a&crm=campaigns&record=r1", "CRM", "campaigns").sections[2],
-  { label: "Campaigns", href: "/app-installations/install-crm?ctx=ctx-a&crm=campaigns", current: true },
+  outlet.crmAppMenu("/apps/crm?ctx=ctx-a&crm=campaigns&record=r1", "CRM", "campaigns").sections[2],
+  { label: "Campaigns", href: "/apps/crm?ctx=ctx-a&crm=campaigns", current: true },
   "menu links drop the record view",
 );
 
@@ -144,7 +146,7 @@ const sidebarMenu = () => host.querySelector('aside nav[aria-label="CRM sections
 const sidebarLinks = () => Array.from(sidebarMenu()?.querySelectorAll("a") ?? []);
 
 win.sessionStorage.clear();
-history.pushState(null, "", "/app-installations/install-crm?ctx=ctx-a");
+history.pushState(null, "", "/apps/crm?ctx=ctx-a");
 await React.act(async () => {
   root.render(React.createElement(App));
 });
@@ -156,8 +158,8 @@ assert(sidebarLinks().length === 3, "sidebar submenu lists three sections");
 assert(!host.querySelector(".app-outlet .section-nav"), "CRM pages have no duplicate outlet tabs");
 assert(!host.querySelector(".crm-crumb"), "CRM pages have no redundant breadcrumb row");
 assert(
-  (sidebarLinks()[1] as HTMLAnchorElement).getAttribute("href") === "/app-installations/install-crm?ctx=ctx-a&crm=segments",
-  "sidebar segment link keeps the selected context",
+  (sidebarLinks()[1] as HTMLAnchorElement).getAttribute("href") === "/apps/crm?ctx=ctx-a&crm=segments",
+  "sidebar segment link keeps the selected context on the canonical route",
 );
 assert(
   sidebarMenu()!.querySelector('a[aria-current="page"]')?.textContent?.trim() === "Customers",
@@ -240,7 +242,7 @@ assert(!host.querySelector("#mobile-navigation"), "phone link closes the menu");
 // Absence: a non-CRM installation shows no CRM submenu anywhere.
 const { navigate } = require("../src/lib/useLocation") as typeof import("../src/lib/useLocation");
 await React.act(async () => {
-  navigate("/app-installations/install-notes");
+  navigate("/apps/notes");
 });
 await settle(() => assert(text().includes("No records yet"), "generic outlet renders"));
 assert(!host.querySelector('aside nav[aria-label="CRM sections"]'), "no sidebar submenu for a non-CRM app");
@@ -253,10 +255,11 @@ assert(
   "no phone submenu for a non-CRM app",
 );
 // Absence: an unverified installation (failed receipt) shows none either.
+// CAD-1438: an unknown id on the retired route renders the retired page.
 await React.act(async () => {
   navigate("/app-installations/install-nope?ctx=ctx-a");
 });
-await settle(() => assert(text().includes("unknown installation"), "unknown installation refuses"));
+await settle(() => assert(text().includes("App link retired"), "unknown installation refuses"));
 assert(!host.querySelector('aside nav[aria-label="CRM sections"]'), "no sidebar submenu without a verified receipt");
 await React.act(async () => { root.unmount(); });
 

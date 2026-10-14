@@ -3,7 +3,7 @@ import { api, ApiError, type WriteResp } from "./lib/api";
 import { useLocale } from "./lib/locale";
 import Agents from "./features/agents/Agents";
 import Apps from "./features/apps/Apps";
-import { installedAppHref } from "./features/apps/appViewModel";
+import { installationAppHref } from "./features/apps/appViewModel";
 import AppDetail from "./features/apps/AppDetail";
 import Explorer from "./features/explorer/Explorer";
 import CatalogDetail from "./features/explorer/CatalogDetail";
@@ -799,6 +799,13 @@ export default function App() {
   else if (route.screen === "workspaceAppKey" && installations.error === null && keyInstallations.length === 1) {
     routeInstallId = keyInstallations[0].install_id;
   }
+  // CAD-1438: resolve an install id to its canonical `/apps/<key>` path
+  // against the operator-verified list only — a removed install, an
+  // unknown id or a shared key answers null (retired), never a guess.
+  const resolveAppPath = useCallback(
+    (installId: string) => installationAppHref(installations.list, installId),
+    [installations.list],
+  );
   const onAppScreen = route.screen === "workspaceApp" || route.screen === "workspaceAppKey";
   const receipt = onAppScreen && activeApp !== null && activeApp.installId === routeInstallId ? activeApp : null;
   const menuApps =
@@ -839,16 +846,18 @@ export default function App() {
       activeHref: href,
       last,
       installHref: (installId) => {
-        const app = menuApps.find((value) => value.installId === installId);
-        const sameKey = app ? installed.filter((value) => value.kind === app.kind) : [];
-        const readableHref = app ? installedAppHref(app.kind) : null;
-        let next: Route = { screen: "workspaceApp", installId };
-        if (app && installed.some((value) => value.installId === installId) && sameKey.length === 1 && readableHref) {
-          next = { screen: "workspaceAppKey", appKey: app.kind };
-        }
+        // CAD-1438: app menu entries emit only the canonical key route.
+        // A receipt-only app (in the menu but not the list) or a shared
+        // key cannot spell one — the entry falls back to the inert
+        // current href rather than the retired installation-ID route.
+        const href2 = resolveAppPath(installId);
+        if (href2 === null) return href;
+        // `installationAppHref` returns the encoded path; the route stores
+        // the decoded key, and valid keys carry no encodable characters.
+        const next: Route = { screen: "workspaceAppKey", appKey: decodeURIComponent(href2.slice("/apps/".length)) };
         const targetSearch = new URLSearchParams(search);
         if (installId !== activeId) {
-          for (const key of ["crm", "record", "ctx", "appview", "segment", "conversation"]) targetSearch.delete(key);
+          for (const key of ["crm", "record", "ctx", "appview", "segment", "conversation", "install"]) targetSearch.delete(key);
         }
         const nextSearch = targetSearch.toString();
         return locationHref(goTo(loc, next), contextNavigationSearch(route, next, nextSearch));
@@ -1020,6 +1029,7 @@ export default function App() {
             onOpenIssue={openIssue}
             overviewHref={hrefFor({ screen: "overview" })}
             permissionsHref={hrefFor({ screen: "settings", section: "permissions" })}
+            resolveAppPath={resolveAppPath}
             setupNotice={<SetupNudge readOnly={meta ? boardReadOnly : null} />}
           />
         )}
@@ -1191,13 +1201,22 @@ export default function App() {
           <ManageApp key={route.installId} installId={route.installId} viewer={viewer} />
         )}
         {route.screen === "workspaceApp" && (
-          <AppShell installId={route.installId} viewer={viewer} onInstallation={reportInstallation}>
-            <WorkspaceApp installId={route.installId} viewer={viewer} onBack={() => goRoute({ screen: "apps", project: null, name: null })} />
-          </AppShell>
+          // CAD-1438: the installation-ID route is compatibility-only —
+          // it resolves the id against the verified install list and
+          // replaces itself with the canonical `/apps/<key>` URL, or
+          // says the link is retired when no unique mapping exists.
+          <LegacyAppInstall
+            installId={route.installId}
+            installations={installations}
+            viewer={viewer}
+            recheckFinished={recheckFinished}
+            onRetryWorkspace={reload}
+          />
         )}
         {route.screen === "workspaceAppKey" && (
           <WorkspaceAppEntry
             appKey={route.appKey}
+            search={search}
             installations={installations}
             viewer={viewer}
             recheckFinished={recheckFinished}
@@ -1323,6 +1342,7 @@ export default function App() {
 
 function WorkspaceAppEntry({
   appKey,
+  search,
   installations,
   viewer,
   recheckFinished,
@@ -1331,6 +1351,8 @@ function WorkspaceAppEntry({
   onBack,
 }: {
   appKey: string;
+  /** The current query — the `install` pin is read from it. */
+  search: string;
   installations: InstallationsState;
   viewer: Viewer;
   recheckFinished: boolean;
@@ -1392,26 +1414,47 @@ function WorkspaceAppEntry({
     );
   }
   if (matches.length > 1) {
+    // CAD-1438: an ambiguous key cannot spell a canonical URL and the
+    // retired ID route must not resolve it either — say so, with the
+    // installations named for the operator, but no dead-end links.
     return (
       <main className="px-4 lg:px-8 pt-10 pb-9">
-        <h1 className="text-section font-semibold text-ink-100">{t("Choose an installation")}</h1>
+        <h1 className="text-section font-semibold text-ink-100">{t("App key is ambiguous")}</h1>
         <p className="text-body text-ink-400 mt-2">
-          {t("More than one active installation uses app key “{appKey}”. Choose which installation to open.").replace("{appKey}", () => appKey)}
+          {t("More than one active installation uses app key “{appKey}”, so this route cannot pick one. Remove or rename the duplicates and the link works again.").replace("{appKey}", () => appKey)}
         </p>
-        <ul className="mt-4 space-y-2">
+        <ul className="mt-4 space-y-1 text-body text-ink-400">
           {matches.map((installation) => (
             <li key={installation.install_id}>
-              <Link className="lnk" href={`/app-installations/${encodeURIComponent(installation.install_id)}`}>
-                {installation.title || installation.name} · {installation.project_link || "workspace"} · {installation.install_id}
-              </Link>
+              {installation.title || installation.name} · {installation.project_link || "workspace"}
             </li>
           ))}
         </ul>
+        <p className="mt-3"><Link href="/apps" className="lnk">{t("All apps")}</Link></p>
       </main>
     );
   }
 
   const installation = matches[0];
+  // CAD-1438: a generated contextual link carries `install=<id>` — the
+  // immutable id it was minted for. A pin that names a different install
+  // than the one this key now resolves means the app was removed and
+  // reinstalled (or the key moved): the pinned context/conversation/record
+  // belongs to the old install, so the link is retired rather than
+  // silently opening the replacement. The pin is a refusal check only —
+  // it never grants access or overrides the receipt.
+  const pinnedInstall = new URLSearchParams(search).get("install");
+  if (pinnedInstall !== null && pinnedInstall !== installation.install_id) {
+    return (
+      <main className="px-4 lg:px-8 pt-10 pb-9">
+        <h1 className="text-section font-semibold text-ink-100">{t("App link retired")}</h1>
+        <p className="text-body text-ink-400 mt-2">
+          {t("This link was made for a different installation of “{appKey}” — its context cannot be carried to the current one.").replace("{appKey}", () => appKey)}
+        </p>
+        <Link href="/apps" className="lnk">{t("All apps")}</Link>
+      </main>
+    );
+  }
   return (
     <AppShell
       key={installation.install_id}
@@ -1421,5 +1464,94 @@ function WorkspaceAppEntry({
     >
       <WorkspaceApp installId={installation.install_id} appKey={appKey} viewer={viewer} onBack={onBack} />
     </AppShell>
+  );
+}
+
+/**
+ * CAD-1438: the retired `/app-installations/<id>` route. It no longer
+ * renders an app — it resolves the id against the operator-verified
+ * installation list and, when exactly one ACTIVE installation owns it and
+ * that install's key is unique, replaces the history entry with the
+ * canonical `/apps/<key>` URL (query — ctx, conversation, record, view —
+ * carried verbatim). Any other outcome is a retired/unavailable page:
+ * an unknown id, a removed install, an ambiguous key, or a key that does
+ * not map back to this exact install never silently opens another app.
+ * The list itself is operator-only, so the resolution never broadens
+ * who may read it; every guard below the route stays untouched.
+ */
+function LegacyAppInstall({
+  installId,
+  installations,
+  viewer,
+  recheckFinished,
+  onRetryWorkspace,
+}: {
+  installId: string;
+  installations: InstallationsState;
+  viewer: Viewer;
+  recheckFinished: boolean;
+  onRetryWorkspace: () => void;
+}) {
+  const { t } = useLocale();
+  const target = viewer.operator === true && installations.error === null
+    ? installationAppHref(installations.list, installId)
+    : null;
+  useEffect(() => {
+    if (target === null) return;
+    // History replacement, never a push: back/forward never lands here
+    // twice, and query (ctx, conversation, record, view) plus fragment
+    // carry verbatim onto the canonical route.
+    navigate(target + location.search + location.hash, { replace: true });
+  }, [target]);
+  if (viewer.operator === null) {
+    return (
+      <main className="px-4 lg:px-8 pt-10 pb-9">
+        {viewer.access === "unavailable" ? (
+          <Notice state="access-unavailable">
+            <span role="status">{t("Workspace waking or unreachable.")} {recheckFinished ? t("Retry when ready.") : t("Checking again for up to 60 seconds…")}</span>
+            {recheckFinished && <button type="button" className="lnk ml-2" onClick={onRetryWorkspace}>{t("Retry workspace")}</button>}
+          </Notice>
+        ) : <Loading>{t("Checking access…")}</Loading>}
+      </main>
+    );
+  }
+  if (viewer.operator !== true) {
+    return (
+      <main className="px-4 lg:px-8 pt-10 pb-9">
+        <h1 className="text-section font-semibold text-ink-100">{t("App link unavailable")}</h1>
+        <p className="text-body text-ink-400 mt-2">{t("Sign in as the operator to resolve an installed app.")}</p>
+        <Link href="/apps" className="lnk">{t("All apps")}</Link>
+      </main>
+    );
+  }
+  if (installations.error !== null) {
+    return (
+      <main className="px-4 lg:px-8 pt-10 pb-9">
+        <h1 className="text-section font-semibold text-ink-100">{t("Couldn’t load installed apps")}</h1>
+        <p className="text-body text-ink-400 mt-2" role="alert">
+          {t(appLoadErrorCopy(installations.error, "The installed-app list is unavailable."))}
+        </p>
+        <button type="button" className="lnk mt-3" onClick={installations.retry}>{t("Retry")}</button>
+      </main>
+    );
+  }
+  if (installations.list === null || target !== null) {
+    return (
+      <main className="px-4 lg:px-8 pt-10 pb-9">
+        <p className="text-body text-ink-400" role="status">{t("Opening the app…")}</p>
+      </main>
+    );
+  }
+  const known = installations.list.some((i) => i.install_id === installId);
+  return (
+    <main className="px-4 lg:px-8 pt-10 pb-9">
+      <h1 className="text-section font-semibold text-ink-100">{t("App link retired")}</h1>
+      <p className="text-body text-ink-400 mt-2">
+        {known
+          ? t("This installation’s old link cannot name it anymore — open it from your apps.")
+          : t("This link does not name an installed app anymore — it may have been removed.")}
+      </p>
+      <Link href="/apps" className="lnk">{t("All apps")}</Link>
+    </main>
   );
 }
