@@ -23,7 +23,7 @@ import {
 } from "./pushOptIn";
 import { useNotificationToast } from "./NotificationToast";
 
-/** The newest message seq already announced per room, so each new message alerts once. */
+/** The newest eligible unread alert intent already observed per room. */
 const announced = new Map<string, number>();
 
 /** Private inbox poll: authorized, private state only. Never shared SSE. */
@@ -394,18 +394,35 @@ function browserZone(): string {
 }
 
 /**
- * Surface only genuinely new interruptions: a DM or mention, in a room that is
- * not the visible thread and not muted, announced once per newer unread count.
- * Ordinary group posts update the bell count only and never toast.
+ * Surface only newly observed, eligible unread DM/mention intents. Advance the
+ * cursor before interruption preferences so quiet/muted/visible alerts do not
+ * reappear later; ordinary group posts never inherit an old mention.
  */
 function surfaceNew(next: Inbox, toast: { show: (title: string, room: string) => void }): void {
   const active = activeRoom();
   for (const g of next.groups) {
-    if (g.room === active || g.muted) continue;
-    if (g.kind !== "dm" && !g.mention) continue;
     const seen = announced.get(g.room) ?? 0;
-    if (g.unread <= seen) continue;
-    announced.set(g.room, g.unread);
-    toast.show(`New ${g.kind === "dm" ? "direct message" : "mention"} in ${g.title}`, g.room);
+    if (g.alert_seq <= seen) continue;
+    announced.set(g.room, g.alert_seq);
+    const isDm = g.kind === "dm";
+    if (g.room === active || g.muted || (!isDm && !g.mention)) continue;
+    if (isQuietNow(next.preferences)) continue;
+    if (isDm ? !next.preferences.dm : !next.preferences.mention) continue;
+    toast.show(`New ${isDm ? "direct message" : "mention"} in ${g.title}`, g.room);
+  }
+}
+
+/** Invalid IANA zones fail closed, matching push delivery's quiet-hours policy. */
+function isQuietNow(prefs: NotificationPreferences): boolean {
+  if (prefs.quiet !== "22-08") return false;
+  try {
+    const hour = Number(new Intl.DateTimeFormat("en", {
+      timeZone: prefs.zone,
+      hour: "numeric",
+      hourCycle: "h23",
+    }).format(new Date()));
+    return !Number.isInteger(hour) || hour < 8 || hour >= 22;
+  } catch {
+    return true;
   }
 }

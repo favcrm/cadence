@@ -223,6 +223,7 @@ export interface NotificationGroup {
   unread: number;
   muted: boolean;
   mention: boolean;
+  alert_seq: number;
 }
 
 export interface NotificationPreferences {

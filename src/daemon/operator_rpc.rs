@@ -610,6 +610,7 @@ impl Shared {
         }
         let assertion = required_str(params, "assertion")?;
         let user_agent = optional_str(params, "user_agent").unwrap_or_default();
+        let prior_session = optional_str(params, "prior_session");
         let config = match crate::board_identity::read_config(&self.state_dir) {
             Ok(config) => config,
             Err(e) => {
@@ -674,6 +675,20 @@ impl Shared {
         // CAD-1412: the bound open also persists the verified `HumanScope`
         // (issuer + company), derived from this typed realm inside
         // `open_public_bound_with_intent` — never a request field.
+        // Resolve a prior cookie only through the same live, scoped public
+        // session proof used by human-thread routes. Claims are never trusted.
+        let prior_consent_session = if let Some(token) = prior_session {
+            self.operator_auth()
+                .verified_human_scope(token, now)?
+                .filter(|(scope, user)| {
+                    scope.issuer != realm.issuer
+                        || scope.organization_id != realm.company
+                        || user.sub != identity.user().sub
+                })
+                .map(|_| crate::operator_auth::digest(token))
+        } else {
+            None
+        };
         let request = uuid::Uuid::new_v4().to_string();
         let company = config.company.clone();
         let mut audit = None;
@@ -689,6 +704,9 @@ impl Shared {
                 self.prepare_mutation(&a, std::slice::from_ref(row))?;
                 audit = Some(a);
                 opened_row = Some(row.clone());
+                if let Some(session) = prior_consent_session.as_deref() {
+                    self.store.push_consents_revoke_session(session)?;
+                }
                 Ok(())
             },
         );

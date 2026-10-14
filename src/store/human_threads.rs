@@ -1168,12 +1168,20 @@ impl Store {
         limit: i64,
     ) -> Result<Vec<NotificationGroup>> {
         self.read_tx(|conn| {
-            let rows: Vec<(String, String, String, i64, i64, i64)> = conn.query_vec(
-                "SELECT r.id, r.kind, r.title, m.cutoff, COALESCE(k.seq,0),
+            let rows: Vec<(String, String, String, i64, i64, bool)> = conn.query_vec(
+                "SELECT r.id, r.kind, r.title,
                         (SELECT COUNT(*) FROM topic_posts t
                           WHERE t.topic_id=r.topic_id AND t.seq>m.cutoff
                             AND t.seq>COALESCE(n.seq,0)
-                            AND (t.sender_uid IS NULL OR t.sender_uid<>?))
+                            AND (t.sender_uid IS NULL OR t.sender_uid<>?)),
+                        COALESCE((SELECT MAX(i.seq) FROM human_notification_intents i
+                          WHERE i.room=r.id AND i.recipient=m.member
+                            AND i.reason IN ('dm','mention') AND i.seq>m.cutoff
+                            AND i.seq>COALESCE(n.seq,0) AND i.seq>COALESCE(k.seq,0)),0),
+                        EXISTS(SELECT 1 FROM human_notification_intents i
+                          WHERE i.room=r.id AND i.recipient=m.member AND i.reason='mention'
+                            AND i.seq>m.cutoff AND i.seq>COALESCE(n.seq,0)
+                            AND i.seq>COALESCE(k.seq,0))
                    FROM human_rooms r
                    JOIN human_room_members m
                      ON m.room=r.id AND m.kind='human' AND m.member=? AND m.removed IS NULL
@@ -1193,7 +1201,7 @@ impl Store {
                 },
             )?;
             let mut groups: Vec<NotificationGroup> = Vec::new();
-            for (room, kind, title, _cutoff, _marker, unread) in rows {
+            for (room, kind, title, unread, alert_seq, mention) in rows {
                 if unread <= 0 {
                     continue;
                 }
@@ -1209,15 +1217,6 @@ impl Store {
                 } else {
                     title
                 };
-                // A mention is an unread interruption intent for this viewer.
-                let mention: bool = conn
-                    .query_opt(
-                        "SELECT 1 FROM human_notification_intents
-                          WHERE room=? AND recipient=? AND reason='mention' LIMIT 1",
-                        params![room, actor.id],
-                        |r| r.get::<_, i64>(0),
-                    )?
-                    .is_some();
                 groups.push(NotificationGroup {
                     room,
                     kind,
@@ -1225,6 +1224,7 @@ impl Store {
                     unread,
                     muted,
                     mention,
+                    alert_seq,
                 });
             }
             groups.sort_by(|a, b| b.unread.cmp(&a.unread).then(a.room.cmp(&b.room)));
@@ -1757,8 +1757,10 @@ pub struct NotificationGroup {
     pub title: String,
     pub unread: i64,
     pub muted: bool,
-    /// True when a pending interruption for this viewer names them.
+    /// True when an unread mention intent remains for this viewer.
     pub mention: bool,
+    /// Latest unread DM/mention intent sequence, or zero when none is eligible.
+    pub alert_seq: i64,
 }
 
 /// One pending private push intent for a recipient. Opaque ids and a reason.
