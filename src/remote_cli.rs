@@ -204,7 +204,15 @@ fn now() -> Result<u64> {
 /// credential recorded for another org is never sent to this host (contract
 /// I1). Expired means "run `cadence login` again", not retry.
 fn private_directory(dir: &Path) -> Result<()> {
-    let meta = fs::symlink_metadata(dir)?;
+    let meta = match fs::symlink_metadata(dir) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(reject(
+                "no remote credential directory — run `cadence login` first; nothing was sent",
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    };
     if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
         return Err(reject(
             "remote credential directory must be owned by you, mode 0700, and not a symlink",
@@ -631,21 +639,6 @@ fn validate_renewal_response(
         return Err(reject("remote renewal returned invalid session expiry"));
     }
     Ok(())
-}
-
-/// CAD-1429: the scopes a stored org credential holds, read locally without
-/// sending or renewing anything. Missing or unreadable credentials report
-/// `None`; the caller then tells the user to log in again.
-pub fn stored_capabilities(dir: &Path, org: &str) -> Option<Vec<String>> {
-    private_directory(dir).ok()?;
-    let path = dir.join(format!("cli-{org}.json"));
-    let raw = fs::read(&path).ok()?;
-    let body: Value = serde_json::from_slice(&raw).ok()?;
-    body.get("capabilities")?
-        .as_array()?
-        .iter()
-        .map(|v| v.as_str().map(str::to_owned))
-        .collect()
 }
 
 /// Known, unique capabilities that include the CLI pair. Wiki scopes are
@@ -1351,6 +1344,12 @@ pub fn web_envelope(response: WebResponse) -> Result<Value> {
         return Ok(body["data"].clone());
     }
     let code = body["error"]["code"].as_str().unwrap_or("unavailable");
+    if response.status == 409 && body["ok"] == Value::Bool(false) && code == "revision_conflict" {
+        return Err(Error::invalid(
+            "revision_conflict",
+            format!("remote web request refused ({} {code})", response.status),
+        ));
+    }
     let message = match response.status {
         401 | 403 if code == "unauthorized" || code == "forbidden" => {
             "the remote refused the credential — run `cadence login` again"

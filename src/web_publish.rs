@@ -112,7 +112,10 @@ pub fn freeze(input: &Path) -> Result<FrozenSite> {
                 "a single file must be an .html page; it is published as index.html",
             ));
         }
-        found.push((ENTRY.to_string(), read_bounded(input, meta.len())?));
+        // Read once; the single file's total is its real frozen byte count.
+        let bytes = read_bounded(input, meta.len())?;
+        total = bytes.len() as u64;
+        found.push((ENTRY.to_string(), bytes));
     } else if meta.is_dir() {
         if input.join("package.json").exists() && !input.join(ENTRY).exists() {
             return Err(reject(
@@ -470,6 +473,27 @@ mod tests {
         assert!(!is_safe_web_site_path(&long), "129-char segment");
         let too_many_bytes = format!("{}/x", "a".repeat(510));
         assert!(!is_safe_web_site_path(&too_many_bytes), "over 512 bytes");
+    }
+
+    /// CAD-1429: a single `.html` input reports its real frozen byte count
+    /// in `total_bytes`, matching the frozen file and the manifest entry.
+    #[test]
+    fn single_html_file_reports_its_real_total_bytes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let input = dir.path().join("page.html");
+        let html = b"<!doctype html><title>cad-1429</title><p>hello</p>";
+        std::fs::write(&input, html).unwrap();
+        let site = freeze(&input).unwrap();
+        assert_eq!(site.files.len(), 1);
+        let frozen = &site.files[0];
+        assert_eq!(frozen.path, ENTRY);
+        assert!(site.total_bytes > 0);
+        assert_eq!(site.total_bytes, frozen.bytes.len() as u64);
+        assert_eq!(site.total_bytes, html.len() as u64);
+        assert_eq!(
+            site.manifest["files"][0]["bytes"].as_u64(),
+            Some(site.total_bytes)
+        );
     }
 
     /// Hosted-refused file classes stay refused before any read.

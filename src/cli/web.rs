@@ -456,13 +456,24 @@ fn request_action(
             .ok_or_else(|| reject("the pending action has no recorded body"))?,
     )
     .map_err(|e| Error::internal(e.to_string()))?;
-    let action = create_action_reconciled(
+    let action = match create_action_reconciled(
         target,
         &site_id,
         &payload,
         &intent.request_key,
         wake_timeout,
-    )?;
+    ) {
+        Ok(action) => action,
+        Err(error) if error.code() == Some("revision_conflict") => {
+            // Authoritative refusal: no action exists for this key. Close the
+            // intent so the next explicit run reads the revision and makes a
+            // fresh key. Nothing is re-sent here.
+            record.intents[index].state = "failed".into();
+            save_pending(target, &identity, &mut record)?;
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
     let action_id = action["actionId"].as_str().unwrap_or_default().to_string();
     if is_id(&action_id, "act_") {
         record.intents[index].action_id = Some(action_id.clone());

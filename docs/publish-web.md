@@ -60,13 +60,22 @@ later run with the same intent reuses the same request key and body. It never
 rebuilds the request from fresh state. A failed or unknown outcome is shown as
 such and is not reported as success.
 
+A typed 409 with `ok: false` and `revision_conflict` closes the old intent as
+failed. The same key and body are returned, and the next explicit invocation
+creates a new key and revision. Unknown, lost, 5xx and malformed-success
+outcomes keep the intent open with its key and body. A missing auth directory
+is refused with exit 3 before anything is sent, unless create is requested.
+
 ## Known limits
 
 - Live public serving, public DNS and wildcard routes are not deployed. The
   commands can be exercised against a local rig; a public URL is not claimed.
 - Proven by tests: local HTTPS positive lifecycle cases for plain HTML and a
   locally built React static site against a real API with a separate cookie
-  owner; library client and TLS tests; strict clippy. Not proven: a
+  owner; library client tests (19 passed, 2 ignored); single-HTML byte total
+  unit test; TLS tests (7 passed); routing (3) and refusal (1) acceptance with
+  the test seam. Strict clippy was run before the final correction batch and is
+  not repeated for it. Not proven: a
   production-built CLI over TLS end to end, or a cold process restart mid-flow.
 - Owner browser approval was checked in mock states and at 390px only. Native
   keyboard, reduced-motion and a full browser end-to-end run are not proven.

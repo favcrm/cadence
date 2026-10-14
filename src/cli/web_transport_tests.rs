@@ -18,7 +18,7 @@
 //! so the production `web.rs` functions run unchanged.
 
 use super::web::{run, WebAction};
-use cadence_agent::remote_cli::RemoteTarget;
+use cadence_agent::remote_cli::{web_envelope, RemoteTarget, WebResponse};
 use cadence_agent::web_publish;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -1080,4 +1080,259 @@ fn status_reads_back_only_known_action_ids_and_never_invents_one() {
         seen.iter().all(|s| !s.path.contains("unknown")),
         "an action id was invented for the lost intent"
     );
+}
+
+/// CAD-1429 regression: the host refuses the first explicit publish with a typed
+/// `revision_conflict` 409. That refusal is authoritative: exactly one create
+/// is sent, the intent is closed as `failed` with its key and body kept
+/// verbatim, nothing is re-sent in the same invocation, and the next explicit
+/// invocation re-reads the revision and makes a new key and a new intent.
+#[test]
+fn a_typed_revision_conflict_closes_the_intent_and_the_next_explicit_run_makes_a_new_one() {
+    let revision = Arc::new(AtomicI64::new(4));
+    let refuse = Arc::new(AtomicBool::new(true));
+    let (rev, refusing) = (Arc::clone(&revision), Arc::clone(&refuse));
+    let (addr, log) = serve(Arc::new(move |seen: &Seen| {
+        match (seen.method.as_str(), seen.path.as_str()) {
+            ("GET", p) if p == format!("/v1/web-sites/sites/{SITE}") => (
+                200,
+                json!({"ok": true, "data": {"siteId": SITE, "slug": "my-site",
+                    "revision": rev.load(Ordering::SeqCst)}}),
+            ),
+            ("POST", p) if p == format!("/v1/web-sites/sites/{SITE}/actions") => {
+                if refusing.load(Ordering::SeqCst) {
+                    return (
+                        409,
+                        json!({"ok": false, "error": {"code": "revision_conflict", "message": "moved"}}),
+                    );
+                }
+                (
+                    201,
+                    json!({"ok": true, "data": {
+                    "actionId": "act_44444444", "siteId": SITE, "operation": "publish",
+                    "state": "awaiting_approval", "releaseId": RELEASE,
+                    "expectedRevision": 5, "resultRevision": null,
+                    "manifestDigest": "a".repeat(64), "liveUrl": null,
+                    "approvalUrl": null, "approvalExpiresAt": null,
+                    "updatedAt": "2030-01-01T00:00:00.000Z"}}),
+                )
+            }
+            _ => (
+                404,
+                json!({"ok": false, "error": {"code": "not_found", "message": "no"}}),
+            ),
+        }
+    }));
+    let creds = credential_dir(&addr);
+    seed_ready_release(creds.path());
+    let action = WebAction::Publish {
+        release: RELEASE.into(),
+    };
+
+    // First explicit run: the typed refusal surfaces and nothing is re-sent.
+    let first = with_config(creds.path(), || run(&action, &target(&addr), 5));
+    let err = first.expect_err("a typed revision conflict must not report success");
+    assert_eq!(err.code(), Some("revision_conflict"), "{err}");
+    let refused = read_record(creds.path())["intents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["kind"] == "publish")
+        .cloned()
+        .expect("the publish intent was not kept");
+    assert_eq!(refused["state"], "failed");
+    assert_eq!(refused["expected_revision"], 4);
+    let first_key = refused["request_key"].as_str().unwrap().to_string();
+    let first_body = refused["body"].clone();
+    assert_eq!(first_body["requestKey"], first_key.as_str());
+    assert_eq!(first_body["expectedRevision"], 4);
+    let sent_after_first: Vec<Value> = log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|s| s.method == "POST" && s.path.ends_with("/actions"))
+        .map(|s| serde_json::from_slice(&s.body).unwrap())
+        .collect();
+    assert_eq!(
+        sent_after_first,
+        vec![first_body.clone()],
+        "the refusal must not trigger a resend"
+    );
+
+    // The host moved on; the next explicit invocation starts over.
+    revision.store(5, Ordering::SeqCst);
+    refuse.store(false, Ordering::SeqCst);
+    let second = with_config(creds.path(), || run(&action, &target(&addr), 5));
+    assert_eq!(second.expect("the next explicit run failed"), 0);
+
+    let seen = log.lock().unwrap().clone();
+    let actions: Vec<Value> = seen
+        .iter()
+        .filter(|s| s.method == "POST" && s.path.ends_with("/actions"))
+        .map(|s| serde_json::from_slice(&s.body).unwrap())
+        .collect();
+    assert_eq!(actions.len(), 2, "expected exactly one create per run");
+    let fresh = &actions[1];
+    assert_ne!(
+        fresh["requestKey"],
+        first_key.as_str(),
+        "the key was reused"
+    );
+    assert!(fresh["requestKey"]
+        .as_str()
+        .unwrap()
+        .starts_with("web-publish-"));
+    assert_eq!(fresh["expectedRevision"], 5);
+    assert_eq!(fresh["operation"], "publish");
+    assert_eq!(fresh["releaseId"], RELEASE);
+    let reads = seen
+        .iter()
+        .filter(|s| s.method == "GET" && s.path == format!("/v1/web-sites/sites/{SITE}"))
+        .count();
+    assert_eq!(reads, 2, "each explicit run reads the revision once");
+
+    let record = read_record(creds.path());
+    let publishes: Vec<&Value> = record["intents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["kind"] == "publish")
+        .collect();
+    assert_eq!(publishes.len(), 2, "the old failed record must be retained");
+    assert_eq!(publishes[0]["state"], "failed");
+    assert_eq!(publishes[0]["request_key"], first_key.as_str());
+    assert_eq!(publishes[0]["body"], first_body);
+    assert_eq!(publishes[1]["state"], "open");
+    assert_eq!(publishes[1]["expected_revision"], 5);
+    assert_eq!(publishes[1]["request_key"], fresh["requestKey"]);
+    assert_eq!(publishes[1]["action_id"], "act_44444444");
+}
+
+/// A 201 whose data carries no action id or state is neither a success nor a
+/// refusal. The intent stays open with its key and body verbatim, and the next
+/// explicit invocation resends exactly that body.
+#[test]
+fn a_malformed_success_leaves_the_intent_open_with_the_same_key_and_body() {
+    let count = Arc::new(AtomicUsize::new(0));
+    let (addr, log) = serve(Arc::new(move |seen: &Seen| {
+        match (seen.method.as_str(), seen.path.as_str()) {
+            ("GET", p) if p == format!("/v1/web-sites/sites/{SITE}") => (
+                200,
+                json!({"ok": true, "data": {"siteId": SITE, "slug": "my-site", "revision": 4}}),
+            ),
+            ("POST", p) if p == format!("/v1/web-sites/sites/{SITE}/actions") => {
+                if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return (201, json!({"ok": true}));
+                }
+                (
+                    201,
+                    json!({"ok": true, "data": {
+                    "actionId": "act_44444444", "siteId": SITE, "operation": "publish",
+                    "state": "awaiting_approval", "releaseId": RELEASE,
+                    "expectedRevision": 4, "resultRevision": null,
+                    "manifestDigest": "a".repeat(64), "liveUrl": null,
+                    "approvalUrl": null, "approvalExpiresAt": null,
+                    "updatedAt": "2030-01-01T00:00:00.000Z"}}),
+                )
+            }
+            _ => (
+                404,
+                json!({"ok": false, "error": {"code": "not_found", "message": "no"}}),
+            ),
+        }
+    }));
+    let creds = credential_dir(&addr);
+    seed_ready_release(creds.path());
+    let action = WebAction::Publish {
+        release: RELEASE.into(),
+    };
+
+    let first = with_config(creds.path(), || run(&action, &target(&addr), 5));
+    assert!(
+        first.is_err(),
+        "a malformed success must not report success"
+    );
+    let open = read_record(creds.path())["intents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["kind"] == "publish")
+        .cloned()
+        .expect("the publish intent was not kept");
+    assert_eq!(open["state"], "open");
+    assert!(open["action_id"].is_null(), "an id was invented: {open}");
+
+    let second = with_config(creds.path(), || run(&action, &target(&addr), 5));
+    assert_eq!(second.expect("the resumed publish failed"), 0);
+
+    let seen = log.lock().unwrap().clone();
+    let bodies: Vec<Value> = seen
+        .iter()
+        .filter(|s| s.method == "POST" && s.path.ends_with("/actions"))
+        .map(|s| serde_json::from_slice(&s.body).unwrap())
+        .collect();
+    assert_eq!(bodies.len(), 2, "expected exactly one resend");
+    assert_eq!(
+        bodies[0], open["body"],
+        "the first send was not the stored body"
+    );
+    assert_eq!(bodies[0], bodies[1], "the resend changed the key or body");
+    assert_eq!(bodies[1]["requestKey"], open["request_key"]);
+}
+
+/// Negative unit for the typed-refusal mapping. Only a 409 whose body is
+/// exactly `ok:false` with `error.code == "revision_conflict"` yields the typed
+/// code. Any other status, any other or malformed shape, and any message text
+/// that merely contains the words must not.
+#[test]
+fn web_envelope_types_only_a_409_with_the_exact_revision_conflict_shape() {
+    fn refusal(status: u16, body: Option<Value>) -> cadence_agent::Error {
+        web_envelope(WebResponse { status, body }).expect_err("a refusal was expected")
+    }
+
+    let typed = refusal(
+        409,
+        Some(json!({"ok": false, "error": {"code": "revision_conflict", "message": "moved"}})),
+    );
+    assert_eq!(typed.code(), Some("revision_conflict"), "{typed}");
+
+    for status in [200u16, 400, 403, 412, 422, 500, 503] {
+        let e = refusal(
+            status,
+            Some(json!({"ok": false, "error": {"code": "revision_conflict"}})),
+        );
+        assert_ne!(
+            e.code(),
+            Some("revision_conflict"),
+            "status {status} was typed"
+        );
+    }
+
+    let shapes = [
+        json!({"ok": false, "error": {"code": "conflict"}}),
+        json!({"ok": false, "error": {"code": "Revision_Conflict"}}),
+        json!({"ok": false, "error": {"code": "revision_conflict "}}),
+        json!({"ok": "false", "error": {"code": "revision_conflict"}}),
+        json!({"error": {"code": "revision_conflict"}}),
+        json!({"ok": false, "error": {"message": "revision_conflict"}}),
+        json!({"ok": false, "message": "revision_conflict"}),
+        json!({"ok": false, "error": {"code": ["revision_conflict"]}}),
+        json!({"ok": false, "error": "revision_conflict"}),
+        json!({"ok": false, "error": {"code": "conflict", "message": "revision_conflict"}}),
+    ];
+    for body in shapes {
+        let e = refusal(409, Some(body.clone()));
+        assert_ne!(e.code(), Some("revision_conflict"), "{body} was typed");
+    }
+
+    let not_json = refusal(409, None);
+    assert_ne!(not_json.code(), Some("revision_conflict"));
+
+    // A success envelope unwraps to its data.
+    let data = web_envelope(WebResponse {
+        status: 200,
+        body: Some(json!({"ok": true, "data": {"revision": 7}})),
+    })
+    .expect("a success envelope must unwrap");
+    assert_eq!(data["revision"], 7);
 }
