@@ -265,6 +265,131 @@ pub(super) fn all_help_text() -> String {
     out
 }
 
+/// CAD-1432: the master's `cadence help`. The Pi guard already admits
+/// only a literal admitted command path; this renders it — the profile's
+/// admitted paths only, never the whole clap tree — so a Claude master
+/// (no JS guard) and every operator tool sees the same bounded text. A
+/// scoped app turn is refused: its per-turn reference is complete, and
+/// help admission must never imply a mutation.
+pub(super) fn master_help(args: &[String]) -> Option<String> {
+    if !cadence_agent::master::caller_is_master() || cadence_agent::master::in_app_conversation() {
+        return None;
+    }
+    let rest: Vec<&str> = args.iter().skip(1).map(String::as_str).collect();
+    if rest.first() != Some(&"help") {
+        return None;
+    }
+    let paths = cadence_agent::master::help_paths(cadence_agent::master::Profile::Home);
+    let target: Vec<&str> = rest[1..]
+        .iter()
+        .copied()
+        .filter(|t| !t.is_empty())
+        .collect();
+    let cmd = Cli::command();
+    let mut out = String::from("Commands you may run (exact forms; anything else is refused):\n");
+    if target.is_empty() {
+        for stem in cadence_agent::master::CLAUDE_ALLOWED_TOOLS {
+            let Some(inner) = stem
+                .strip_prefix("Bash(cadence ")
+                .and_then(|t| t.strip_suffix(')'))
+            else {
+                continue;
+            };
+            let (head, args_ok) = match inner.strip_suffix(" *") {
+                Some(h) => (h, true),
+                None => (inner, false),
+            };
+            if head == "help" {
+                continue;
+            }
+            out.push_str(&format!(
+                "  cadence {head}{}\n",
+                if args_ok { " …" } else { "" }
+            ));
+        }
+        out.push_str("\nUsage of one path: cadence help <command-path>\n");
+        return Some(out);
+    }
+    let path = target.join(" ");
+    if !target.iter().all(|t| is_token(t)) || !paths.iter().any(|p| p == &path) {
+        out.push_str(&format!(
+            "`{path}` is not a command path you may run (flags and argument values are refused).\n"
+        ));
+        for stem in &paths {
+            out.push_str(&format!("  cadence {stem}\n"));
+        }
+        return Some(out);
+    }
+    // Parent (other admitted paths sit under it) or leaf.
+    let children: Vec<&String> = paths
+        .iter()
+        .filter(|p| p.starts_with(&format!("{path} ")))
+        .collect();
+    if !children.is_empty() {
+        out.push_str(&format!("`{path}` paths you may run:\n"));
+        for c in &children {
+            out.push_str(&format!("  cadence {c}\n"));
+        }
+        return Some(out);
+    }
+    // Leaf: clap's own usage line for that command plus the guard's
+    // limits, so the syntax printed is exactly what the guard admits.
+    let mut node = cmd.clone();
+    let mut found = true;
+    for tok in &target {
+        match node.find_subcommand(*tok) {
+            Some(sub) => node = sub.clone(),
+            None => {
+                found = false;
+                break;
+            }
+        }
+    }
+    if found {
+        let mut help = node.render_help().to_string();
+        // Drop clap's trailing "subcommands" list — only the admitted
+        // children exist for this caller, and they were listed above
+        // when the path is a parent.
+        if let Some(i) = help.find("\nCommands:") {
+            help.truncate(i + 1);
+        }
+        out.push_str(help.trim_end());
+        out.push('\n');
+        if let Some(limits) = master_leaf_limits(&path) {
+            out.push_str(&format!("\nLimits for you: {limits}\n"));
+        }
+    } else {
+        out.push_str(&format!("`{path}` — run: cadence {path} …\n"));
+    }
+    Some(out)
+}
+
+fn is_token(t: &str) -> bool {
+    !t.is_empty()
+        && t.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// The guard rules a leaf's usage line cannot show — stated so a fresh
+/// master reads the bounds it actually runs under, not clap's full flag
+/// grammar.
+fn master_leaf_limits(path: &str) -> Option<&'static str> {
+    Some(match path {
+        "issue new" => {
+            "backlog tickets only: never --owner or --id; --status only as `--status backlog`; \
+             --file names a file under master/tmp"
+        }
+        "wiki put" => {
+            "path must be under agents/master/knowledge/; body via --file <file under master/tmp>; \
+             -m/--text refused"
+        }
+        "plan propose" | "report file" | "master escalate" => {
+            "--file names a file under master/tmp (stage it with the write tool first)"
+        }
+        _ => return None,
+    })
+}
+
 /// `cadence help operator|advanced|all` as typed (with an optional
 /// `--state-dir <dir>` anywhere): the text to print, else `None` and
 /// clap handles the line — `cadence help <verb>` stays clap's own.
@@ -278,6 +403,9 @@ pub(super) fn help_section(args: &[String]) -> Option<String> {
         } else if !a.starts_with("--state-dir=") {
             rest.push(a);
         }
+    }
+    if let Some(text) = master_help(args) {
+        return Some(text);
     }
     match rest.as_slice() {
         ["help", "operator" | "advanced"] => Some(operator_help_text()),

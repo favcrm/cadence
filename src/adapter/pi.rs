@@ -1404,6 +1404,10 @@ export default function (pi) {
   // `Bash(cadence <verb…> *)` forms — they need at least one arg.
   const RULES = __RULES__;
   const AGENTICOS_READ_TOOLS = __AGENTICOS_READ_TOOLS__;
+  // CAD-1432: the command paths `cadence help <path>` may describe
+  // for this profile — its own allowlisted stems plus their parents.
+  // Empty for an app session: scoped turns have no help at all.
+  const HELP_PATHS = __HELP_PATHS__;
   // The master's own tmp dir — Pi's bash spills long output here
   // (CAD-552) and the write tool stages `--file` input here (CAD-614).
   // Lexical normalization refuses `..` and prefix siblings; a second
@@ -1437,11 +1441,16 @@ export default function (pi) {
       return (
         "not an allowlisted verb — allowed: " +
         RULES.map((r) => "cadence " + r.argv.join(" ") + (r.args ? " …" : "")).join("; ") +
-        ". request approval with: cadence master ask-permission --reason refused -- " +
-        cmd
+        ". " + piNeverHint(rest) +
+        "for the exact usage of a verb you may run: cadence help <verb>"
       );
     }
-    return piIssueNewLimits(rest) || piWikiPutLimits(rest) || piFileArgLimits(rest);
+    return (
+      piHelpLimits(rest) ||
+      piIssueNewLimits(rest) ||
+      piWikiPutLimits(rest) ||
+      piFileArgLimits(rest)
+    );
   }
   function piGuardAllows(cmd) {
     return piGuardRefusal(cmd) === null;
@@ -1533,6 +1542,59 @@ export default function (pi) {
       }
     }
     return n;
+  }
+  // CAD-1432: `cadence help` and `cadence help <path>` only — every
+  // token after `help` is a literal subcommand word of an admitted
+  // path for THIS profile (no `help` target itself, no argument
+  // values, no `--flags`, no unknown or disallowed paths, no
+  // `--help`-style alternatives). Scoped app turns emit no `help`
+  // rule at all, so this runs only under the Home profile.
+  function piHelpLimits(rest) {
+    if (rest[0] !== "help") {
+      return null;
+    }
+    const target = rest.slice(1);
+    if (!target.length) {
+      return null; // bare `cadence help` — the exact-match rule admits it
+    }
+    if (
+      !target.every((t) => /^[a-z][a-z0-9-]*$/.test(t)) ||
+      !HELP_PATHS.includes(target.join(" "))
+    ) {
+      return (
+        "help takes no arguments — usage: cadence help, or cadence help <command-path> " +
+        "where <command-path> is a command you may run (" +
+        HELP_PATHS.join(", ") +
+        "); flags and argument values are refused"
+      );
+    }
+    return null;
+  }
+  // CAD-1432: matches master_perm's never-list for the cadence verb
+  // heads — merge, rollout, secrets, daemon restart, permission
+  // decisions, audit approve/designate and the master's own files.
+  // Those are not requestable, so the refusal never suggests
+  // ask-permission for them; anything else the operator may approve.
+  function piNeverHint(rest) {
+    const never =
+      rest.includes("merge") ||
+      rest.includes("rollout") ||
+      rest.some((t) => t.startsWith("secret")) ||
+      (rest.includes("daemon") && rest.some((t) => t === "restart" || t === "stop")) ||
+      (rest.includes("master") &&
+        rest.some(
+          (t) =>
+            t === "allow-once" ||
+            t === "always-allow" ||
+            t === "reject" ||
+            t === "revoke-permission" ||
+            t === "edit",
+        )) ||
+      (rest.includes("audit") && rest.some((t) => t === "approve" || t === "designate"));
+    if (never) {
+      return "that command is never requestable — tell the operator it needs an operator step; ";
+    }
+    return "request approval with: cadence master ask-permission --reason refused -- <the exact command>; ";
   }
   // Backlog creation only. `--status backlog` is the one accepted
   // override; `--owner` and `--id` are operator overrides.
@@ -1636,6 +1698,12 @@ export default function (pi) {
     if (tool !== "cadence" && tool !== "ls" && tool !== "cat" && tool !== "grep" && tool !== "find") {
       return;
     }
+    // A never-list command cannot be approved (master_perm classify
+    // refuses the request), so filing one only produces the same
+    // refusal again — the blocked reason already carries the hint.
+    if (tool === "cadence" && piNeverHint(argv.slice(1)).startsWith("that command")) {
+      return;
+    }
     try {
       spawnSync(
         "cadence",
@@ -1720,6 +1788,10 @@ fn write_pi_guard(
     // escaping of its own.
     let source = PI_GUARD_HEAD
         .replace("__RULES__", &json!(pi_guard_rules(profile)).to_string())
+        .replace(
+            "__HELP_PATHS__",
+            &json!(crate::master::help_paths(profile)).to_string(),
+        )
         .replace(
             "__AGENTICOS_READ_TOOLS__",
             &json!(if agenticos_reads {
