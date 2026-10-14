@@ -1437,6 +1437,19 @@ pub(crate) enum Commands {
         #[arg(long)]
         releases_dir: Option<PathBuf>,
     },
+    /// Upgrade a client-only installation (`install.sh --client-only`) to
+    /// the newest public release (CAD-1425). Resolves locally whatever the
+    /// saved org default, fetches only the fixed public release source,
+    /// and refuses any other installation. `--check` changes nothing.
+    #[command(name = "client-update")]
+    ClientUpdate {
+        /// Report the installed and available releases; change nothing.
+        #[arg(long)]
+        check: bool,
+        /// Install this release tag instead of the newest one (forward only).
+        #[arg(long, value_name = "TAG")]
+        version: Option<String>,
+    },
     /// Update to the newest attested green main build in one command
     /// (CAD-561): check → verify attestation + hash → backup → install
     /// side by side → bounded drain → switch → health check → done.

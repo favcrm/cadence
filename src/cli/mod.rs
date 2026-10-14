@@ -20,6 +20,7 @@ mod briefing;
 mod build_slot;
 mod business_templates;
 mod claude;
+mod client_update;
 mod codex;
 mod commands;
 mod confine;
