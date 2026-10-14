@@ -63,11 +63,18 @@ The current day-to-day loop (AGENTS.md "Delivery workflow" is the rule text):
    routine `--admin` merges or duplicate local integration trains. Disable
    auto-merge before editing an enqueued PR; a new head voids old verdicts.
 9. Follow the [artifact-specific rollout checklist](guides/rollout-checklist.md)
-   for staging, production order, pinned artifacts, verification and rollback.
+   and [host release cycle](RELEASING.md). For a native host:
+   merged → attested main CI artifact → staged → manually promoted with GitHub
+   `production` approval → operator-installed → operationally verified.
+   **Automatic staging is not production promotion.** Check the successful
+   manual `staging.yml` run and its `production-candidate` receipt before
+   handing over the default update commands; a green CI/staging run alone
+   cannot advance the updater's candidate. Public version tags use the
+   separate numbered-release path, not a tag on every merge.
    Production deployment is operator-owned; agents never restart the live
-   daemon. Merged, installed and operationally verified are separate outcomes.
-   After merge, reconcile the ticket, leave the worktree to the sweep, and
-   clean up only your own scratch and processes.
+   daemon. After merge, reconcile the ticket, leave the worktree to the sweep,
+   and clean up only your own scratch and processes. Record installation and
+   verification separately; reconciliation is merge evidence, not deployment.
 
 ## Pragmatic design and cycle time
 
