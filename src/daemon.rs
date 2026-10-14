@@ -61,6 +61,10 @@ mod cad1300_acceptance;
 mod cad1314_approval_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1327_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad1337_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad1337_migration_acceptance;
 mod cad1365_generation_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1365_media_publish_acceptance;
@@ -74,10 +78,6 @@ mod cad1365_original_fence_acceptance;
 mod cad1365_original_transfer_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1365_run_creator_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1337_acceptance;
-#[cfg(all(test, feature = "test-seam"))]
-mod cad1337_migration_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1415_app_actions_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
