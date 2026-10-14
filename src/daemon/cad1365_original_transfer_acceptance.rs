@@ -1583,3 +1583,185 @@ fn cad1365_original_transfer_install_revoke_closes_a_paused_stream() {
         body.len()
     );
 }
+
+/// CROSS-INSTALL READ UNDER A CRASHED LEGACY MARKER (CAD-1365 c63
+/// spec/security Finding A). A second, permitted generic media consumer
+/// (distinct app id, its own mount and context) reads the producer's
+/// original while the legacy seqlock is left ODD in the real coordination
+/// file `<pm>/.git/cadence-legacy-generation`, as a crashed legacy writer
+/// would. Positive first: the held snapshot must still serve the
+/// byte-exact original with exactly one provider GET and must not repair
+/// the marker. Bad case under the same odd marker: after the producer's
+/// approval is revoked through the real `app_local_install_revoke`, the
+/// cross-install read refuses with no header, no body and no provider GET.
+/// Baseline: RED at the positive — the odd marker surfaces as busy, not a
+/// setup failure.
+#[test]
+fn cad1365_original_transfer_cross_install_reads_under_a_crashed_legacy_marker() {
+    let fx = Fx::boot(noisy_square_png(), None, true);
+    let app = fx._dir.path().join("consumer");
+    std::fs::create_dir_all(app.join("workflows")).unwrap();
+    std::fs::write(
+        app.join("app.md"),
+        APP_MD
+            .replace("designer-fixture", "designer-consumer")
+            .replace("# Designer fixture", "# Designer consumer"),
+    )
+    .unwrap();
+    std::fs::write(app.join("workflows/create-image.md"), WORKFLOW_MD).unwrap();
+    media_screen(&app);
+    let screens = app.join("screens/media/screens.json");
+    let mut decl: Value =
+        serde_json::from_str(&std::fs::read_to_string(&screens).unwrap()).unwrap();
+    decl["app"] = json!("designer-consumer");
+    std::fs::write(&screens, serde_json::to_string_pretty(&decl).unwrap()).unwrap();
+    let installed = fx
+        .op(
+            "app_workspace_install",
+            json!({"source": app.to_str().unwrap()}),
+        )
+        .expect("consumer install");
+    let consumer = installed["install_id"].as_str().unwrap().to_string();
+    fx.op(
+        "app_local_install_approve",
+        json!({"install_id": consumer, "digest": installed["digest"]}),
+    )
+    .expect("consumer approve");
+    fx.op(
+        "app_binding_create",
+        json!({"install_id": consumer, "slot": "image",
+            "connection_id": "gen1365", "request_id": "bind-1365-consumer"}),
+    )
+    .expect("consumer bind");
+    let ctx = fx
+        .op(
+            "app_context_create",
+            json!({"install_id": consumer, "label": "media",
+                "input_defaults": {}, "request_id": "ctx-1365-consumer"}),
+        )
+        .expect("consumer context");
+    let context = ctx["context"]["id"]
+        .as_str()
+        .or_else(|| ctx["id"].as_str())
+        .unwrap()
+        .to_string();
+    let (token, key) = fx.session();
+    let mint = fx
+        .op(
+            "app_screen_mint",
+            json!({"install_id": consumer, "context_id": context,
+                "tag": "media", "token": token, "key": key,
+                "origin": "loopback", "generation": 1}),
+        )
+        .expect("consumer mint");
+    let nonce = mint["mount"]
+        .as_str()
+        .unwrap()
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_string();
+    fx.op("app_screen_consume", json!({"nonce": nonce}))
+        .expect("consumer consume");
+    let action = mint["action_token"].as_str().unwrap().to_string();
+
+    let marker = fx
+        .state
+        .parent()
+        .unwrap()
+        .join("pm/.git/cadence-legacy-generation");
+    std::fs::write(&marker, "7").unwrap();
+    let before = fx.artifact_gets();
+    let (reader, line) = socket_call(
+        &fx,
+        Asserted::Operator,
+        "app_media_original",
+        params(&action, &token, &key, &fx.asset_id),
+    )
+    .expect("socket");
+    let (frame, body) = read_transfer(reader, line, ORIGINAL_LIMIT);
+    assert_eq!(
+        frame["result"]["transfer"], "app-media-original/1",
+        "a permitted cross-install consumer must read the producer's original under a crashed legacy marker: {frame}"
+    );
+    assert_eq!(
+        body, fx.original,
+        "the cross-install original is byte-exact under the held snapshot"
+    );
+    assert_eq!(
+        fx.artifact_gets(),
+        before + 1,
+        "the positive read ran exactly one provider artifact GET"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap().trim(),
+        "7",
+        "the read must not repair the crashed legacy marker"
+    );
+
+    let install = fx
+        .op("app_workspace_show", json!({"install_id": fx.install}))
+        .expect("producer show");
+    let digest = install["digest"]
+        .as_str()
+        .or_else(|| install["install"]["digest"].as_str())
+        .expect("producer digest")
+        .to_string();
+    assert_eq!(
+        fx.shared
+            .store
+            .app_capability_status(&fx.install, &digest)
+            .unwrap()["state"],
+        "approved",
+        "the producer is approved before the revoke"
+    );
+    let reply = fx
+        .op(
+            "app_local_install_revoke",
+            json!({"install_id": fx.install, "digest": digest}),
+        )
+        .expect("producer revoke");
+    assert_eq!(
+        reply["approved"], false,
+        "the reply reports the revoke: {reply}"
+    );
+    assert_eq!(
+        reply["digest"], digest,
+        "the reply names the revoked digest"
+    );
+    assert_eq!(
+        fx.shared
+            .store
+            .app_capability_status(&fx.install, &digest)
+            .unwrap()["state"],
+        "revoked",
+        "the store records the producer as revoked"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap().trim(),
+        "7",
+        "the revoke must leave the crashed marker unchanged"
+    );
+    let before = fx.artifact_gets();
+    let (reader, line) = socket_call(
+        &fx,
+        Asserted::Operator,
+        "app_media_original",
+        params(&action, &token, &key, &fx.asset_id),
+    )
+    .expect("socket");
+    let (frame, body) = read_transfer(reader, line, ORIGINAL_LIMIT);
+    assert!(
+        body.is_empty(),
+        "a revoked producer carried bytes under the crashed marker: {frame}"
+    );
+    assert!(
+        frame.get("error").is_some() || frame["result"].is_null(),
+        "a revoked producer must be an error frame under the crashed marker: {frame}"
+    );
+    assert_eq!(
+        fx.artifact_gets(),
+        before,
+        "no refused cross-install request reached the provider artifact GET"
+    );
+}

@@ -1844,10 +1844,42 @@ pub(crate) fn with_runtime_snapshot<T>(
 ) -> Result<T> {
     let id = InstallationId::parse(id)?;
     let _lock = pm.lock()?;
+    let (description, files) = snapshot_under_lock(pm, &id)?;
+    callback(&description, &files)
+}
+
+/// CAD-1365: the caller's runtime snapshot AND a second install's, read
+/// under ONE held PM lock. The callback receives `(caller, producer)`.
+/// Both reads run the same checks as `with_runtime_snapshot`; the second
+/// read never re-enters `read_catalog`, so an odd legacy generation cannot
+/// refuse it while the caller already holds the lock.
+pub(crate) fn with_runtime_snapshot_pair<T>(
+    pm: &Pm,
+    caller: &str,
+    producer: &str,
+    callback: impl FnOnce(
+        (&Value, &BTreeMap<String, String>),
+        (&Value, &BTreeMap<String, String>),
+    ) -> Result<T>,
+) -> Result<T> {
+    let caller = InstallationId::parse(caller)?;
+    let producer = InstallationId::parse(producer)?;
+    let _lock = pm.lock()?;
+    let (cd, cf) = snapshot_under_lock(pm, &caller)?;
+    if producer == caller {
+        return callback((&cd, &cf), (&cd, &cf));
+    }
+    let (pd, pf) = snapshot_under_lock(pm, &producer)?;
+    callback((&cd, &cf), (&pd, &pf))
+}
+
+/// The checks of `with_runtime_snapshot`, run by the caller that already
+/// holds the PM lock. Returns the install's description and bundle files.
+fn snapshot_under_lock(pm: &Pm, id: &InstallationId) -> Result<(Value, BTreeMap<String, String>)> {
     let root = Root::open(&pm.dir)?;
     let catalog = Catalog::load(&pm.dir)?;
     no_pending(&root)?;
-    let description = describe(&root, &catalog, &id)?;
+    let description = describe(&root, &catalog, id)?;
     // CAD-1129 H5: a soft-removed install admits no runtime snapshot —
     // run creation, dispatch and consent checks all stop here.
     if description["removed"].as_i64().is_some() {
@@ -1855,7 +1887,7 @@ pub(crate) fn with_runtime_snapshot<T>(
             "installation is removed — restore it before any app action",
         ));
     }
-    let (bundle, _) = catalog.installations[&id].paths(&id);
+    let (bundle, _) = catalog.installations[id].paths(id);
     let files = snapshot(&root, &bundle, false)?;
     if bundle_digest(&files) != description["digest"].as_str().unwrap_or("") {
         return Err(Error::invalid(
@@ -1863,7 +1895,7 @@ pub(crate) fn with_runtime_snapshot<T>(
             "installation changed during runtime admission",
         ));
     }
-    callback(&description, &files)
+    Ok((description, files))
 }
 
 /// CAD-1212: test seam for `with_runtime_read`. A check installs a hook that

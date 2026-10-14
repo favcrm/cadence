@@ -267,8 +267,11 @@ impl Shared {
         let proven = self.store.app_media_original(asset_id)?;
         let pm_dir = self.pm_dir()?;
         let pm = self.pm_at(&pm_dir)?;
-        let (header, bytes) =
-            workspace::with_runtime_snapshot(&pm, &ctx.install_id, |bundle, files| {
+        let (header, bytes) = workspace::with_runtime_snapshot_pair(
+            &pm,
+            &ctx.install_id,
+            &proven.install_id,
+            |(bundle, files), producer| {
                 let _custody = self
                     .platform_custody_lock
                     .lock()
@@ -277,7 +280,7 @@ impl Shared {
                     .app_release_lock
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                self.original_runtime_current(&pm, &ctx, &proven, bundle, files)?;
+                self.original_runtime_current(&ctx, &proven, (bundle, files), producer)?;
                 let config = &proven.proof.config;
                 let provider = required_str(config, "provider")?;
                 let adapter = self
@@ -312,7 +315,8 @@ impl Shared {
                     "sha256": format!("sha256:{:x}", Sha256::digest(&bytes)),
                 });
                 Ok((header, bytes))
-            })?;
+            },
+        )?;
         let delivery = OriginalDelivery {
             shared: self,
             pm: &pm,
@@ -335,33 +339,16 @@ impl Shared {
     /// every socket send.
     fn original_runtime_current(
         &self,
-        pm: &crate::issue::Pm,
         ctx: &ToolContext,
         proven: &crate::store::app_media::MediaOriginalProof,
-        bundle: &Value,
-        files: &BTreeMap<String, String>,
+        (bundle, files): (&Value, &BTreeMap<String, String>),
+        (pbundle, pfiles): (&Value, &BTreeMap<String, String>),
     ) -> Result<()> {
         let verb = "media original";
         let context_id = ctx
             .context_id
             .as_deref()
             .ok_or_else(|| Error::rejected(format!("{verb} needs a mounted active context")))?;
-        // A different producing install's CURRENT bundle is read lock-free
-        // under the held guards, so a bundle mutation cannot slip between
-        // this read and the binding check.
-        let producing = if proven.install_id != ctx.install_id {
-            Some(workspace::with_runtime_read(
-                pm,
-                &proven.install_id,
-                |pb, pf| Ok((pb.clone(), pf.clone())),
-            )?)
-        } else {
-            None
-        };
-        let (pbundle, pfiles) = match &producing {
-            None => (bundle, files),
-            Some((pb, pf)) => (pb, pf),
-        };
         // The CURRENT binding/connection/revision at the PRODUCING install
         // must still match the run-frozen proof — drift, replacement,
         // rotation or revocation refuses before any provider access.
@@ -681,55 +668,59 @@ pub(super) struct OriginalDelivery<'a> {
 impl OriginalDelivery<'_> {
     pub(super) fn with_current<T>(&self, send: impl FnOnce() -> T) -> Result<T> {
         let refused = || Error::rejected("media original authority ended — delivery refused");
-        workspace::with_runtime_snapshot(self.pm, &self.expected.install_id, |bundle, files| {
-            let _custody = self
-                .shared
-                .platform_custody_lock
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let _release = self
-                .shared
-                .app_release_lock
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            self.shared.original_runtime_current(
-                self.pm,
-                &self.expected,
-                self.proven,
-                bundle,
-                files,
-            )?;
-            self.shared.original_mount_current(
-                self.token,
-                self.key,
-                self.origin,
-                self.action_token,
-                &self.expected,
-            )?;
-            let mut auth = self.shared.operator_auth();
-            if !auth.live_hash(&self.expected.session, self.shared.operator_now())? {
-                return Err(refused());
-            }
-            let map = self
-                .shared
-                .tool_contexts
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let ctx = map.get(self.action_token).ok_or_else(refused)?;
-            let e = &self.expected;
-            let same_mount = ctx.session == e.session
-                && ctx.install_id == e.install_id
-                && ctx.context_id == e.context_id
-                && ctx.digest == e.digest
-                && ctx.tag == e.tag
-                && ctx.generation == e.generation
-                && ctx.mount.is_some()
-                && ctx.mount == e.mount;
-            if !same_mount || Instant::now().duration_since(ctx.issued) >= TOOL_CTX_TTL {
-                return Err(refused());
-            }
-            Ok(send())
-        })
+        workspace::with_runtime_snapshot_pair(
+            self.pm,
+            &self.expected.install_id,
+            &self.proven.install_id,
+            |caller, producer| {
+                let _custody = self
+                    .shared
+                    .platform_custody_lock
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let _release = self
+                    .shared
+                    .app_release_lock
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                self.shared.original_runtime_current(
+                    &self.expected,
+                    self.proven,
+                    caller,
+                    producer,
+                )?;
+                self.shared.original_mount_current(
+                    self.token,
+                    self.key,
+                    self.origin,
+                    self.action_token,
+                    &self.expected,
+                )?;
+                let mut auth = self.shared.operator_auth();
+                if !auth.live_hash(&self.expected.session, self.shared.operator_now())? {
+                    return Err(refused());
+                }
+                let map = self
+                    .shared
+                    .tool_contexts
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let ctx = map.get(self.action_token).ok_or_else(refused)?;
+                let e = &self.expected;
+                let same_mount = ctx.session == e.session
+                    && ctx.install_id == e.install_id
+                    && ctx.context_id == e.context_id
+                    && ctx.digest == e.digest
+                    && ctx.tag == e.tag
+                    && ctx.generation == e.generation
+                    && ctx.mount.is_some()
+                    && ctx.mount == e.mount;
+                if !same_mount || Instant::now().duration_since(ctx.issued) >= TOOL_CTX_TTL {
+                    return Err(refused());
+                }
+                Ok(send())
+            },
+        )
     }
 }
 
