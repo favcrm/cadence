@@ -242,6 +242,9 @@ daemon/cad1337_acceptance.rs	independent-daemon-acceptance-fixtures	open	2
 daemon/cad1337_acceptance.rs	independent-daemon-acceptance-fixtures	prepare	1
 daemon/cad1337_migration_acceptance.rs	independent-daemon-acceptance-fixtures	execute	1
 daemon/cad1337_migration_acceptance.rs	independent-daemon-acceptance-fixtures	open	4
+daemon/cad1337_repair_acceptance.rs	test-fixtures	execute	2
+daemon/cad1337_repair_acceptance.rs	test-fixtures	open	6
+daemon/cad1337_repair_acceptance.rs	test-fixtures	prepare	1
 daemon/conversations_acceptance.rs	independent-daemon-acceptance-fixtures	execute	5
 daemon/conversations_acceptance.rs	independent-daemon-acceptance-fixtures	open	4
 daemon/campaign_clone_acceptance.rs	independent-daemon-acceptance-fixtures	open	1
