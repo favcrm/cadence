@@ -123,6 +123,63 @@ var MEDIA_VERBS = ["media.read", "media.publish"];
 *  deliberately absent; the channel appends a mount's declared media
 *  rights itself. */
 var ACTION_VERBS = [...CALL_VERBS.filter((v) => !MEDIA_VERBS.includes(v)), ...SLOT_VERBS.filter((v) => v !== ORIGINAL_DOWNLOAD_VERB)];
+var RECORD_CALL_VERBS = [
+	"records.list",
+	"records.show",
+	"records.create",
+	"records.update",
+	"records.csv.preview",
+	"segments.list",
+	"segments.show",
+	"segments.save",
+	"exclusions.list",
+	"exclusions.show",
+	"exclusions.save",
+	"suppressions.list",
+	"suppressions.add",
+	"audience.preview",
+	"audience.prepare",
+	"audience.show",
+	"content.list",
+	"content.show",
+	"content.save",
+	"content.clone",
+	"content.render",
+	"proposals.list",
+	"proposals.show",
+	"proposals.render",
+	"proposals.apply",
+	"proposals.discard",
+	"sender-bindings.list",
+	"sender-bindings.show",
+	"sender-bindings.save",
+	"content.test-prepare",
+	"content.send-prepare",
+	"sends.prepare",
+	"sends.show",
+	"sends.list",
+	"smtp.show",
+	"origin.show",
+	"screen.preview.show",
+	"screen.preview.clear",
+	"screen.route.patch"
+];
+var RECORD_SLOT_VERBS = [
+	"records.csv.import",
+	"records.csv.confirm",
+	"content.approve",
+	"smtp.manage",
+	"smtp.bind",
+	"smtp.rebind",
+	"smtp.revoke",
+	"smtp.test-send",
+	"sends.approve",
+	"sends.resolve",
+	"origin.manage",
+	"chat.campaign.open",
+	"chat.campaign.brief"
+];
+[...RECORD_CALL_VERBS, ...RECORD_SLOT_VERBS];
 var LINK_ID_MAX = 128;
 var V2_TOP = [
 	"sources",
@@ -130,7 +187,9 @@ var V2_TOP = [
 	"readiness",
 	"actions",
 	"run_receipts",
-	"original_downloads"
+	"original_downloads",
+	"route",
+	"read_observations"
 ];
 var V2_RUN = [
 	"created",
