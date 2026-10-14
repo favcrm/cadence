@@ -748,13 +748,12 @@ fn post(
     body: &Value,
     timeout: Duration,
 ) -> Result<(u16, Option<u64>, Option<Value>)> {
-    let config = ureq::Agent::config_builder()
+    let builder = ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
         .http_status_as_error(false)
         .max_redirects(0)
-        .proxy(None)
-        .build();
-    let response = ureq::Agent::new_with_config(config)
+        .proxy(None);
+    let response = crate::issuer_transport::agent(builder)
         .post(format!("{endpoint}{path}"))
         .header("Authorization", format!("Bearer {bearer}"))
         .send_json(body)
@@ -887,13 +886,12 @@ fn upload_once(
         ("path", logical_path),
     ];
     let body = crate::wiki::upload::build_multipart(&boundary, &fields, file_name, bytes);
-    let config = ureq::Agent::config_builder()
+    let builder = ureq::Agent::config_builder()
         .timeout_global(Some(CALL_TIMEOUT))
         .http_status_as_error(false)
         .max_redirects(0)
-        .proxy(None)
-        .build();
-    let response = ureq::Agent::new_with_config(config)
+        .proxy(None);
+    let response = crate::issuer_transport::agent(builder)
         .post(format!("{}/__platform/wiki/upload", target.endpoint))
         .header("Authorization", format!("Bearer {}", cred.access_token))
         .header("X-Cadence-Wiki-Envelope", envelope.as_str())
@@ -1530,6 +1528,11 @@ fn call_verb_in(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "test-seam")]
+    mod native_chain_acceptance {
+        include!("remote_cli_native_chain_acceptance.rs");
+    }
+
     use super::*;
     use serde_json::json;
     use std::io::{BufRead, BufReader, Write};

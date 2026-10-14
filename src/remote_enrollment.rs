@@ -847,13 +847,12 @@ fn send_issuer_request(
     body: &Value,
     timeout: Duration,
 ) -> Result<(u16, Vec<u8>, Option<IssuerCorrelation>)> {
-    let config = ureq::Agent::config_builder()
+    let builder = ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
         .http_status_as_error(false)
         .max_redirects(0)
-        .proxy(None)
-        .build();
-    let mut request = ureq::Agent::new_with_config(config)
+        .proxy(None);
+    let mut request = crate::issuer_transport::agent(builder)
         .post(url)
         .header("Authorization", &format!("Bearer {bearer}"));
     if let Some(access) = access {
@@ -1293,13 +1292,12 @@ fn post_public_with_access(
     if access.is_some() {
         origin(issuer, cfg!(test))?;
     }
-    let config = ureq::Agent::config_builder()
+    let builder = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(20)))
         .http_status_as_error(false)
         .max_redirects(0)
-        .proxy(None)
-        .build();
-    let mut request = ureq::Agent::new_with_config(config).post(format!("{issuer}{path}"));
+        .proxy(None);
+    let mut request = crate::issuer_transport::agent(builder).post(format!("{issuer}{path}"));
     if let Some(access) = access {
         if access.issuer != issuer {
             return Err(reject("Hosted Access ingress issuer changed"));
@@ -1716,6 +1714,18 @@ fn login_grant(
         cli_session,
         token: field(credential, "access_token")?.to_string(),
     })
+}
+
+/// Test controller access to the unchanged strict owner login parser.
+#[cfg(all(test, feature = "test-seam"))]
+pub(crate) fn login_grant_for_test(value: &Value, issuer: &str) -> Result<LoginGrant> {
+    login_grant(
+        value,
+        None,
+        Some("lc"),
+        issuer,
+        &["cli.read", "cli.write", "wiki.read", "wiki.write"],
+    )
 }
 
 impl LoginGrant {
@@ -4869,3 +4879,7 @@ mod tests {
 #[cfg(test)]
 #[path = "remote_enrollment_cli_lock_acceptance.rs"]
 mod cli_lock_acceptance;
+
+#[cfg(test)]
+#[path = "remote_enrollment_tls_acceptance.rs"]
+mod tls_acceptance;
