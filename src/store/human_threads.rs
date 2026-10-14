@@ -1340,7 +1340,7 @@ impl Store {
     ) -> Result<Option<PushDevice>> {
         self.write_tx(|conn| {
             let at = now();
-            conn.execute(
+            let changed = conn.execute(
                 "INSERT INTO human_push_deliveries(intent,device,state,attempts,next_at,lease,lease_until)
                  SELECT ?,d.id,'pending',0,0,?,?
                    FROM human_push_devices d
@@ -1362,12 +1362,10 @@ impl Store {
                     at
                 ],
             )?;
-            let claimed: Option<String> = conn.query_opt(
-                "SELECT lease FROM human_push_deliveries WHERE intent=? AND device=? AND lease=?",
-                params![intent, device, lease],
-                |r| r.get(0),
-            )?;
-            if claimed.is_none() {
+            // A refused claim (live lease, settled or backing-off device, or
+            // an ineligible device) changes no row. A replay of the same jti
+            // therefore cannot re-read the device it already claimed.
+            if changed == 0 {
                 return Ok(None);
             }
             Ok(conn.query_opt(

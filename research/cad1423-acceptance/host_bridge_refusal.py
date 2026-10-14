@@ -503,6 +503,9 @@ def build_cases(lease_holder, iid, did, co, inst, key, kid):
         {"name": "prepare positive control", "op": "prepare", "expect": "accept",
          "need": "lease_id", "body": prep_body, "token": lambda: tok(), "codes": set(),
          "capture": "lease"},
+        {"name": "prepare refuses exact proof replay while lease live", "op": "prepare",
+         "expect": "refuse", "body": prep_body, "token": lambda: lease_holder["token"],
+         "codes": {"lease_active"}},
     ]
     for name, token in [
         ("forged signature", lambda: zero_sig(tok())),
@@ -580,6 +583,7 @@ def run_transport(name, cases, send, lease_holder):
                 doc = res["doc"]
                 body = doc["result"] if "result" in doc else doc
                 lease_holder["lease"] = body["lease_id"]
+                lease_holder["token"] = token
     return out, False
 
 
@@ -652,6 +656,7 @@ def self_check() -> int:
     """Classifier logic only, on synthetic responses. Not acceptance evidence."""
     refuse_proof = {"expect": "refuse", "codes": set(PROOF_CODES) | {"expired"}}
     refuse_stale = {"expect": "refuse", "codes": {"stale_lease"}}
+    refuse_replay = {"expect": "refuse", "codes": {"lease_active"}}
     accept_lease = {"expect": "accept", "need": "lease_id", "codes": set()}
     cases = [
         (refuse_proof, {"status": 400, "doc": {"error": "bad", "code": "invalid_proof"}}, PASS_REFUSAL),
@@ -665,6 +670,8 @@ def self_check() -> int:
         (refuse_stale, {"status": 400, "doc": {"code": "invalid_proof"}}, AMBIGUOUS),
         (refuse_stale, {"status": 409, "doc": {"code": "stale_lease"}}, PASS_REFUSAL),
         (refuse_stale, {"status": 400, "doc": {"code": "stale_lease", "lease_id": "x"}}, AMBIGUOUS),
+        (refuse_replay, {"status": 409, "doc": {"code": "lease_active"}}, PASS_REFUSAL),
+        (refuse_replay, {"status": 409, "doc": {"code": "stale_lease"}}, AMBIGUOUS),
         (refuse_proof, {"status": None, "doc": {"ok": False, "error": {"code": "invalid_proof"}}, "ok": False}, PASS_REFUSAL),
         (accept_lease, {"status": 200, "doc": {"lease_id": "abc"}}, PASS_ACCEPT),
         (accept_lease, {"status": 200, "doc": {}}, INVALID),

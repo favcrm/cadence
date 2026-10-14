@@ -267,5 +267,5 @@ daemon/cad1365_original_transfer_acceptance.rs	test-fixtures	open	1
 daemon/cad1365_run_creator_acceptance.rs	test-fixtures	open	1
 store/app_media.rs	guarded-store-and-read-queries	execute	4
 store/app_media.rs	guarded-store-and-read-queries	guarded_write	1
-store/cad1365_schema41_acceptance.rs	test-fixtures	execute	5
-store/cad1365_schema41_acceptance.rs	test-fixtures	open	5
+store/cad1365_schema41_acceptance.rs	test-fixtures	execute	6
+store/cad1365_schema41_acceptance.rs	test-fixtures	open	6

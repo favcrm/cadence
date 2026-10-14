@@ -131,8 +131,8 @@ fn cad1365_s41_witness(db: &std::path::Path, store: &Store) -> Result<u64> {
 
 #[test]
 fn cad1365_schema45_owner_witness_acceptance() {
-    // 1. Actual current schema 47 (all three media tables present, the
-    //    is accepted and records db_schema 47.
+    // 1. Actual current schema 47 with all three media tables is accepted
+    //    and records db_schema 47.
     {
         let dir = TempDir::new().unwrap();
         let (db, store) = open_legacy(&dir);
