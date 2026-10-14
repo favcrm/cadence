@@ -1598,7 +1598,7 @@ export default function (pi) {
       i += rest[i].includes("=") || rest[i] === "--json" ? 1 : 2;
     }
     const tail = rest.slice(i);
-    if (tail[0] === "help") {
+    if (tail.length === 0 || tail[0] === "help") {
       return true;
     }
     const path = tail.join(" ");
