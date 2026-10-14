@@ -335,7 +335,9 @@ impl Shared {
         // never enters the frame bootstrap or a child message. It only
         // becomes invocable when `app_screen_consume` activates it — a
         // mint that is never consumed, or is superseded, stays refused.
-        // Empty tools → no token (read-only screen).
+        // No tools and no media contract → no token (read-only screen).
+        // A media-only screen (screen-media.v1 with media.read/publish)
+        // still mints a context with empty tools, so media actions work.
         let action_token = self.mint_tool_context(
             &session,
             &ToolContextBinding {
@@ -487,8 +489,9 @@ impl Shared {
     /// generation), `mount: None`. It becomes invocable only when
     /// `app_screen_consume` activates it against the real consumed
     /// mount. Returns the opaque token the trusted host holds (never the
-    /// frame); `Value::Null` when the screen declared no tools — the
-    /// token then carries no invocable aliases anyway.
+    /// frame); `Value::Null` when the screen declared no tools and no
+    /// media contract (no tools and no media yields null). A media-only
+    /// screen mints with empty tools.
     fn mint_tool_context(
         &self,
         session: &str,
@@ -503,7 +506,13 @@ impl Shared {
             generation,
             approval_epoch,
         } = *binding;
-        if pkg.tools.is_empty() {
+        let media_only = pkg.host_contract.as_deref()
+            == Some(crate::issue::app_screen_decl::HOST_CONTRACT_MEDIA)
+            && pkg.may.iter().any(|m| {
+                m.as_str() == crate::issue::app_screen_decl::MAY_MEDIA_READ
+                    || m.as_str() == crate::issue::app_screen_decl::MAY_MEDIA_PUBLISH
+            });
+        if pkg.tools.is_empty() && !media_only {
             return Value::Null;
         }
         let token = mint_nonce();

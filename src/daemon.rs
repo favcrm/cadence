@@ -76,6 +76,8 @@ mod cad1365_original_transfer_acceptance;
 mod cad1365_run_creator_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1415_app_actions_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad1440_media_only_context_acceptance;
 mod caller_rule;
 #[cfg(all(test, feature = "test-seam"))]
 mod campaign_clone_acceptance;
