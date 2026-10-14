@@ -28,7 +28,6 @@ import {
   settlePending,
   stepSummary,
   threadItems,
-  toolSteps,
   visibleWindow,
   type ThreadItem,
 } from "../../home/thread";
@@ -199,6 +198,8 @@ function hidden(item: ThreadItem): ThreadItem {
       return { ...item, entry: { ...item.entry, text: hideIds(item.entry.text) } };
     case "pending":
       return { ...item, pending: { ...item.pending, text: hideIds(item.pending.text) } };
+    case "tools":
+      return { ...item, entries: item.entries.map((e) => ({ ...e, text: hideIds(e.text) })) };
     default:
       return item;
   }
@@ -262,7 +263,7 @@ function AppRow({
   ) => void;
   onDiscard: (message: string) => void;
 }) {
-  const { t, formatNumber } = useLocale();
+  const { t } = useLocale();
   if (directive?.kind === "card") return <DirectiveCard card={directive.card} fields={directive.fields} actions={actions} />;
   if (directive?.kind === "confirmation") return <ConfirmationCard />;
   if (directive?.kind === "frame" && frame) {
@@ -279,16 +280,6 @@ function AppRow({
     );
   }
   // Plain text: a failed or refused directive reads as its message.
-  if (item.type === "tools") {
-    const steps = toolSteps(item.entries);
-    const open = steps.some((s) => !s.done);
-    const failed = steps.some((s) => s.error);
-    return (
-      <p className="text-micro text-ink-500" data-chat-steps>
-        {open ? t("Working") : failed ? t("Finished with an issue") : `✓ ${t("Done")}`} · {formatNumber(steps.length)} {t(steps.length === 1 ? "step" : "steps")}
-      </p>
-    );
-  }
   if (item.type === "system" && item.entry.payload?.source !== "permission") {
     return <p className="text-micro text-ink-500">· {hideIds(stepSummary(item.entry.text))}</p>;
   }
