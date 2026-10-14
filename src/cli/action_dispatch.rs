@@ -56,11 +56,15 @@ pub(crate) fn run() -> Result<i32> {
             let e = email_flag_error(&e).unwrap_or(e);
             // CAD-1432: any Clap help outcome for a master caller refuses
             // before printing. Clap's short-option clusters (`-hh`,
-            // `-vh`) reach here as DisplayHelp, which the exact-string
-            // guard cannot see. Scoped turns get report-and-stop; the master
-            // gets the one bounded help route.
-            if e.kind() == clap::error::ErrorKind::DisplayHelp
-                && cadence_agent::master::caller_is_master()
+            // `-vh`) reach here as DisplayHelp, and a bare parent
+            // (`cadence issue`) as DisplayHelpOnMissingArgumentOrSubcommand;
+            // the exact-string guard sees neither. Scoped turns get
+            // report-and-stop; the master gets the one bounded help route.
+            if matches!(
+                e.kind(),
+                clap::error::ErrorKind::DisplayHelp
+                    | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            ) && cadence_agent::master::caller_is_master()
             {
                 let scoped = cadence_agent::master::in_app_conversation();
                 return Err(if scoped {
