@@ -164,8 +164,10 @@ own shape (see the renewal rows below). The two are intentionally not merged.
 The gateway's real refusal shapes (AOS-243):
 
 - A policy outcome is `401` with `error.code: "unauthorized"` and a proven
-  `error.reason`: `scope_not_granted`, `grant_narrowed`, `path_not_granted` or
-  `binding_mismatch`.
+  `error.reason`: `scope_not_granted`, `grant_narrowed` or `binding_mismatch`.
+- The Cadence container's own envelope gate answers `403` with
+  `error.code: "insufficient_scope"` when the signed grant does not cover the
+  action or the target path. This is the path denial. See the layers below.
 - `envelope_invalid` is a structural, expired or legacy envelope. It is not a
   proven session loss.
 - A `401 unauthorized` with no reason means the bearer did not resolve, but the
@@ -174,11 +176,35 @@ The gateway's real refusal shapes (AOS-243):
 
 | Category | When | Next action |
 | --- | --- | --- |
-| `authorization` | `401` with an allowlisted policy reason (`scope_not_granted`, `grant_narrowed`, `path_not_granted`, `binding_mismatch`), or `403 forbidden` | Not a login problem. Read-only diagnosis (below): check the workspace role and target path. Not retried |
+| `authorization` | `401` with an allowlisted policy reason (`scope_not_granted`, `grant_narrowed`, `binding_mismatch`); `403` with `insufficient_scope` (container path or scope denial); or any `403` with `forbidden` or no safe code | Not a login problem. Read-only diagnosis (below): check the workspace role and target path. Not retried |
 | `authentication` | A terminal session code: `invalid_token`, `invalid_grant`, `session_expired`, `session_revoked`, `lineage_terminal` | `cadence login` again, once. The only case that names login as the known remedy |
 | `uncertain` | `401` with no reason, `envelope_invalid`, or a non-JSON `401` | Not confirmed expiry or revocation. Run the read-only diagnosis before any login. Not retried |
 | `availability` | any `5xx`, or a renewal that fails transiently | Retry later. Saved credentials and any pending renewal are kept |
 | `unknown` | Any other answer. A `400`/`409`/`413`/`422` keeps its safe code, such as `payload_too_large` | Report the status and code. Not retried |
+
+### Where a write or upload is refused (AOS-243)
+
+A wiki write or blob upload is refused at one of two layers. Neither needs a
+new login, and neither is retried.
+
+1. **Gateway admission** (AOS, before any byte is forwarded). It verifies the
+   envelope signature, issuer, audience and organization; that the action's
+   scope is granted; that the bearer still resolves to the same live
+   credential; and that the signed grant is still inside the live ceiling. A
+   refusal is `401` with a proven `reason` (for example `scope_not_granted`), or
+   a generic `401 unauthorized` when the bearer does not resolve. The gateway
+   does not check the requested target path against the signed prefixes.
+2. **Container enforcement** (the Cadence container, before any daemon
+   mutation). `src/ui/wiki_envelope.rs` checks the requested path against the
+   signed grant (`contains` for reads and writes, `contains_file` for uploads,
+   checked before the body is buffered). A path outside the grant, or an action
+   the grant does not cover, is `403 insufficient_scope`. The container then
+   relays only a verified `users/` or `operator` identity to the daemon. The
+   daemon's own `wiki::allowed` ACL runs last, under that attribution.
+
+So a path denial appears as `403 insufficient_scope`, not as a gateway `401`.
+Authorization is the category; the action is to check the target path and the
+workspace role, then ask the owner. It is never a login.
 
 Renewal (`/v1/hosted-cadence/cli-session/renew`) has its own reader. Only the
 issuer's `invalid_token` (401) and `invalid_grant` (400) ask for a fresh login.

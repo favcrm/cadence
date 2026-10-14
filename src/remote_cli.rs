@@ -1079,12 +1079,13 @@ impl Refusal {
 /// Policy outcomes the gateway names on a 401 (`error.reason`). Each is proven
 /// at its own gate, so a fresh login would not change it. Allowlisted: an
 /// unknown reason is never trusted as policy.
-const POLICY_REASONS: &[&str] = &[
-    "scope_not_granted",
-    "grant_narrowed",
-    "path_not_granted",
-    "binding_mismatch",
-];
+const POLICY_REASONS: &[&str] = &["scope_not_granted", "grant_narrowed", "binding_mismatch"];
+
+/// The Cadence container's own envelope gate (`src/ui/wiki_envelope.rs`) answers
+/// a 403 `insufficient_scope` when the signed grant does not cover the action or
+/// the target path. It runs before any daemon mutation. It is authorization, not
+/// a login problem, and only on 403: the same code on another status is unknown.
+const CONTAINER_SCOPE_CODE: &str = "insufficient_scope";
 
 /// `envelope_invalid` is a structural, expired or legacy-shape envelope. The
 /// bearer may be fine, so it is neither terminal session loss nor policy.
@@ -1134,6 +1135,11 @@ fn decode_refusal(status: u16, body: Option<&Value>) -> (Refusal, Option<String>
             (_, Some(_)) => Refusal::Uncertain, // envelope_invalid: not terminal, not policy
             (Some(c), None) if TERMINAL_CODES.contains(&c) => Refusal::Authentication,
             (Some("forbidden"), None) => Refusal::Authorization,
+            // The container's path/scope refusal: authorization on 403 only.
+            (Some(CONTAINER_SCOPE_CODE), None) if status == 403 => Refusal::Authorization,
+            // A generic 403 with no safe code is still an access denial, never a
+            // login or expiry claim.
+            (None, None) if status == 403 => Refusal::Authorization,
             (Some("unauthorized"), None) | (None, None) => Refusal::Uncertain,
             _ => Refusal::Unknown,
         },
@@ -1144,6 +1150,7 @@ fn decode_refusal(status: u16, body: Option<&Value>) -> (Refusal, Option<String>
     // Auth-class codes are never shown as a free reason.
     let shown = match status {
         400 | 409 | 413 | 422 => code.map(str::to_owned),
+        403 if code == Some(CONTAINER_SCOPE_CODE) => Some(CONTAINER_SCOPE_CODE.to_owned()),
         _ => known_reason.map(str::to_owned),
     };
     (category, shown)
@@ -2059,6 +2066,88 @@ mod tests {
         );
     }
 
+    /// The exact Cadence container refusal (`src/ui/wiki_envelope.rs`): a path
+    /// outside the signed grant is a 403 `insufficient_scope` with a message.
+    /// On the call path it is authorization, shows its safe code, asks for no
+    /// login, is sent once, and never echoes the body.
+    #[test]
+    fn a_container_403_insufficient_scope_is_authorization_on_the_call_path() {
+        let body = json!({"ok": false, "error": {"code": "insufficient_scope",
+            "message": "the path is outside this envelope's wiki write prefix do-not-print"}});
+        let (out, requests) = run(vec![(403, "", body)], "issue_set", Map::new(), 10);
+        let shown = out.unwrap_err().to_string();
+        assert!(shown.contains("authorization"), "{shown}");
+        assert!(shown.contains("insufficient_scope"), "{shown}");
+        assert!(!shown.contains("cadence login"), "{shown}");
+        assert!(!shown.contains("do-not-print"), "{shown}");
+        assert_eq!(
+            hits(&requests, "/__platform/cli/call"),
+            1,
+            "a container 403 was retried"
+        );
+    }
+
+    /// A generic 403 (no safe code) is still an access denial: conservative
+    /// authorization guidance, never a login claim or an unknown-shape answer.
+    #[test]
+    fn a_generic_403_is_conservative_access_denial_not_login() {
+        let (refusal, reason) = decode_refusal(403, Some(&json!({"error": {"code": "forbidden"}})));
+        assert_eq!(refusal, Refusal::Authorization);
+        assert_eq!(reason, None);
+        let text = refusal_message(refusal, reason.as_deref(), 403);
+        assert!(text.contains("not permitted"), "{text}");
+        assert!(!text.contains("cadence login"), "{text}");
+        let bare = decode_refusal(403, None);
+        assert_eq!(bare.0, Refusal::Authorization);
+        assert!(!refusal_message(bare.0, bare.1.as_deref(), 403).contains("cadence login"));
+    }
+
+    /// The container's `insufficient_scope` is authorization only on 403. The same
+    /// code on a 401 is not trusted as a policy proof, so it stays uncertain.
+    #[test]
+    fn insufficient_scope_is_authorization_only_on_403() {
+        let body = json!({"error": {"code": "insufficient_scope"}});
+        assert_eq!(decode_refusal(403, Some(&body)).0, Refusal::Authorization);
+        assert_eq!(decode_refusal(401, Some(&body)).0, Refusal::Unknown);
+    }
+
+    /// The same container refusal on the blob upload path: one upload request,
+    /// safe code shown, no login advice, the raw body never printed.
+    #[test]
+    fn a_container_403_insufficient_scope_is_authorization_on_the_upload_path() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        let (listener, handle) = upload_fake(
+            403,
+            r#"{"ok":false,"error":{"code":"insufficient_scope","message":"outside prefix do-not-print"}}"#,
+        );
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        store_credential(dir, &endpoint);
+        let target = RemoteTarget {
+            org: ORG.into(),
+            endpoint,
+            org_id: ORG_ID.into(),
+        };
+        let err = upload_file_in(
+            dir,
+            &target,
+            "projects/x/a.pdf",
+            "a.pdf",
+            b"%PDF-bytes",
+            true,
+            5,
+            |_| {},
+        )
+        .unwrap_err();
+        let _ = handle.join().unwrap();
+        let shown = err.to_string();
+        assert!(shown.contains("authorization"), "{shown}");
+        assert!(shown.contains("insufficient_scope"), "{shown}");
+        assert!(!shown.contains("cadence login"), "{shown}");
+        assert!(!shown.contains("do-not-print"), "{shown}");
+    }
+
     #[test]
     fn a_400_shows_its_safe_code_and_is_not_retried() {
         // A payload/validation refusal keeps its safe code so the caller sees
@@ -2116,7 +2205,7 @@ mod tests {
 
     #[test]
     fn every_allowlisted_policy_reason_is_authorization_on_the_real_path() {
-        for reason in ["grant_narrowed", "path_not_granted", "binding_mismatch"] {
+        for reason in ["scope_not_granted", "grant_narrowed", "binding_mismatch"] {
             let (out, requests) = run(
                 vec![(401, "", aos_refusal(reason))],
                 "issue_set",

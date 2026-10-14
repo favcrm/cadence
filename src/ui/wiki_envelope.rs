@@ -407,6 +407,7 @@ fn consume_jti(state_dir: &std::path::Path, grant: &WikiGrant) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
     fn verified_upload_grant(actor: &str, prefix: &str) -> WikiGrant {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -486,6 +487,24 @@ mod tests {
             }
             assert!(upload_path(None, &grant).is_err());
         }
+    }
+
+    /// The container's path denial is a real 403 `insufficient_scope` body on a
+    /// verified member grant. This is the exact shape the client decoder reads.
+    #[test]
+    fn a_member_upload_outside_its_signed_prefix_is_403_insufficient_scope() {
+        let grant = verified_upload_grant("users/u", "users/u/");
+        let refusal = match upload_path(Some("projects/x/a.pdf".into()), &grant) {
+            Ok(_) => panic!("a path outside the signed member prefix was accepted"),
+            Err(refusal) => refusal,
+        };
+        assert_eq!(refusal.status_code(), StatusCode(403));
+        let mut body = String::new();
+        refusal.into_reader().read_to_string(&mut body).unwrap();
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["ok"], json!(false));
+        assert_eq!(parsed["error"]["code"], json!("insufficient_scope"));
+        assert!(parsed["error"]["message"].is_string());
     }
 
     /// The daemon's checked-conflict answer for a stale `if_rev`.
