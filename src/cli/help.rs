@@ -426,6 +426,9 @@ fn master_leaf_limits(path: &str) -> Option<&'static str> {
             "path must be under agents/master/knowledge/; body via --file <file under master/tmp>; \
              -m/--text refused"
         }
+        "project new" => {
+            "--goal and each --agent take one plain token (letters, digits and . _ / = : -; no spaces, quotes or commas); repeat --agent for each agent"
+        }
         "plan propose" | "report file" | "master escalate" => {
             "--file names a file under master/tmp (stage it with the write tool first)"
         }

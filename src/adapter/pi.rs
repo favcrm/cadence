@@ -1575,6 +1575,39 @@ export default function (pi) {
     }
     return false;
   }
+  // CAD-1432: a help-shaped `cadence` command — a help probe, `help` after
+  // any leading global options or after an admitted path (`issue help`), or
+  // a bare command path that is not itself admitted. The tool call refuses
+  // these before any grant peek or permission request.
+  function piHelpRefused(cmd) {
+    if (typeof cmd !== "string" || !/^[A-Za-z0-9 ._\/=:-]+$/.test(cmd)) {
+      return false;
+    }
+    const argv = cmd.split(" ").filter((t) => t.length > 0);
+    if (argv[0] !== "cadence") {
+      return false;
+    }
+    const rest = argv.slice(1);
+    if (piHelpProbe(rest)) {
+      return true;
+    }
+    // Leading options before the verb: the globals, plus `--json`, which the
+    // acceptance corpus also puts before `help`.
+    let i = 0;
+    while (/^--(state-dir|org|wake-timeout|json)(=|$)/.test(rest[i] ?? "")) {
+      i += rest[i].includes("=") || rest[i] === "--json" ? 1 : 2;
+    }
+    const tail = rest.slice(i);
+    if (tail[0] === "help") {
+      return true;
+    }
+    const path = tail.join(" ");
+    if (tail.indexOf("help") > 0 && HELP_PATHS.includes(tail.slice(0, tail.indexOf("help")).join(" "))) {
+      return true;
+    }
+    // A bare parent (`issue`, `app`) makes clap print help; a leaf does not.
+    return HELP_PATHS.includes(path) && HELP_PATHS.some((p) => p.startsWith(path + " "));
+  }
   function piHelpLimits(rest) {
     if (rest[0] !== "help") {
       return null;
@@ -1689,22 +1722,37 @@ export default function (pi) {
       return false;
     }
   }
+  // The daemon's answer is the only evidence: a filed request is reported
+  // as pending, a canonical refusal as its own reason, and anything else as
+  // unconfirmed. Nothing here claims an approval.
   function piMaybeAsk(cmd) {
     if (typeof cmd !== "string" || !/^[A-Za-z0-9 ._\/=:-]+$/.test(cmd)) {
-      return;
+      return null;
     }
     const argv = cmd.split(" ").filter((t) => t.length > 0);
     const tool = argv[0];
     if (tool !== "cadence" && tool !== "ls" && tool !== "cat" && tool !== "grep" && tool !== "find") {
-      return;
+      return null;
     }
     try {
-      spawnSync(
+      const r = spawnSync(
         "cadence",
         ["master", "ask-permission", "--reason", "guard refused a requestable command", "--"].concat(argv),
         { encoding: "utf8", timeout: 8000, cwd: process.cwd() },
       );
+      if (r.status === 0) {
+        const body = JSON.parse(r.stdout);
+        if (body && typeof body.id === "string") {
+          return "Permission request " + body.id + " is pending with the operator; do not retry this command until it is allowed.";
+        }
+      } else {
+        const err = JSON.parse(r.stderr);
+        if (err && typeof err.error === "string") {
+          return "Permission request not filed: " + err.error + ".";
+        }
+      }
     } catch (e) {}
+    return "The permission status could not be confirmed; report and stop, and do not retry.";
   }
   pi.on("tool_call", async (event) => {
     if (AGENTICOS_READ_TOOLS.includes(event.toolName)) {
@@ -1738,11 +1786,17 @@ export default function (pi) {
     const cmd = String(event.input?.command ?? "");
     const refusal = piGuardRefusal(cmd);
     if (refusal !== null) {
+      // CAD-1432: help-shaped refusals, and every refusal in a scoped turn,
+      // stop here: no grant peek and no permission request, so an older
+      // grant cannot route around a closed help surface.
+      if (!HELP_ALLOWED || piHelpRefused(cmd)) {
+        return { block: true, reason: `cadence master refused bash '${cmd}': ${refusal}` };
+      }
       if (piGrantAllows(cmd)) {
         return;
       }
-      piMaybeAsk(cmd);
-      return { block: true, reason: `cadence master refused bash '${cmd}': ${refusal}` };
+      const note = piMaybeAsk(cmd);
+      return { block: true, reason: `cadence master refused bash '${cmd}': ${refusal}` + (note ? " " + note : "") };
     }
   });
 }
