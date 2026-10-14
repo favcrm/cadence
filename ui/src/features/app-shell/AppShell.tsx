@@ -585,15 +585,10 @@ export default function AppShell({
         {
           // Preserve a stale ctx selector alongside a conversation link so
           // its target can fail visibly instead of becoming contextless.
-          // CAD-1438: when the ctx selector survives for that reason, the
-          // record/appview selectors it arrived with ride along verbatim —
-          // the outlet renders a record id only as the unverifiable stub
-          // and a stale scope keeps the link's failure visible rather than
-          // silently opening under no scope.
           ctx: soleContext ? activeIds[0] : staleCtx && !hasConversationLink ? null : undefined,
           crm: badCrm ? null : undefined,
-          record: badRecord || scopelessRecord || (staleCtx && !hasConversationLink) ? null : undefined,
-          appview: staleCtx && !hasConversationLink ? null : undefined,
+          record: badRecord || staleCtx || scopelessRecord ? null : undefined,
+          appview: staleCtx ? null : undefined,
         },
         { replace: true },
       );

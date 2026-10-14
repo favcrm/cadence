@@ -18,11 +18,19 @@ export {};
  *                              requesting the protected
  *                              `/api/app-installations` list, and no app
  *                              data read is attempted for the id
+ *   6. a canonical `/apps/<key>?screen=native&install=<removed-id>` —
+ *      exactly what the real `connectReturnTo` emitter mints — must
+ *      refuse when the pin names the REMOVED install and only the
+ *      replacement owns the key: retired page, and no per-installation
+ *      read runs for either the removed id or the replacement
+ *   7. the same pin minted for a context/conversation link
+ *      (`?install=<old>&ctx=…&conversation=…`) mismatched against the
+ *      install the key resolves to now refuses the same way
  *
- * It mounts the real `App` component so the actual route guard
- * (`LegacyAppInstall` in src/App.tsx) and the real
- * `/api/meta?operator=1` access proof run — no re-implementation of the
- * helper logic on this side.
+ * It mounts the real `App` component so the actual route guards
+ * (`LegacyAppInstall` and `WorkspaceAppEntry`'s install-pin check in
+ * src/App.tsx) and the real `/api/meta?operator=1` access proof run —
+ * no re-implementation of the helper logic on this side.
  */
 declare function require(name: string): any;
 
@@ -68,6 +76,10 @@ const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
 const App = (require("../src/App") as typeof import("../src/App")).default;
 const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
+// The real emitter: the OAuth return URL a connect flow mints. Using the
+// production helper (not a hand-spelled string) means the fixture breaks
+// if the emitter's shape ever drifts from what the route refuses.
+const { connectReturnTo } = require("../src/features/workspace-apps/socialConnect") as typeof import("../src/features/workspace-apps/socialConnect");
 
 type Install = Record<string, unknown>;
 const mk = (id: string, name: string, title: string, removed: number | null = null): Install => ({
@@ -217,6 +229,40 @@ equal(landed.get("keep"), "1", "redirect preserved the unrelated query param");
 equal(history.state, null, "redirect replaced the history entry (no push)");
 await settle(() => assert(host.textContent?.includes("CRM"), "canonical route opens the same installation"));
 assert(location.pathname !== "/app-installations/install-ok", "the legacy URL did not remain an entry point");
+
+// (6) The connect-flow return URL the REAL emitter mints —
+// `/apps/<key>?screen=native&install=<id>` — pinned to the REMOVED
+// install while only the replacement owns the key. The route must
+// refuse the mismatched pin: retired page, no mount, and no read of
+// either install's data. (Generated through `connectReturnTo` so the
+// check exercises the emitter+route contract, not a hand-written URL.)
+const staleReturn = connectReturnTo("http://localhost", "social-content", "install-old");
+assert(staleReturn === "http://localhost/apps/social-content?screen=native&install=install-old", "emitter minted the expected pinned return");
+const readsBeforePin = appReads.length;
+await go(staleReturn.slice("http://localhost".length));
+await settle(() => assert(retired(), "canonical route with a removed-install pin answers the retired page"));
+equal(location.pathname, "/apps/social-content", "pinned canonical route keeps its path (no rewrite to the retired id route)");
+assert(!workspaceMounted(), "mismatched pin mounts no workspace app");
+equal(
+  appReads.slice(readsBeforePin).filter((id) => id === "install-old" || id === "install-new").length,
+  0,
+  "removed-pin refusal reads neither the removed install nor the replacement",
+);
+
+// (7) The same pin carried on a contextual deep link
+// (`?install=<old>&ctx=…&conversation=…`): the pinned install's context
+// cannot silently move to the replacement that owns the key now.
+const contextualReturn =
+  "/apps/social-content?install=install-old&ctx=ctx-old&conversation=conv-old&record=rec-old";
+const readsBeforeCtx = appReads.length;
+await go(contextualReturn);
+await settle(() => assert(retired(), "contextual link pinned to the removed install refuses"));
+assert(!workspaceMounted(), "mismatched contextual pin mounts no workspace app");
+equal(
+  appReads.slice(readsBeforeCtx).filter((id) => id === "install-old" || id === "install-new").length,
+  0,
+  "contextual refusal reads neither the removed install nor the replacement",
+);
 
 await React.act(async () => { root.unmount(); });
 

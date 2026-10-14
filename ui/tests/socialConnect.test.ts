@@ -48,7 +48,7 @@ async function main() {
   equal(withoutConnectParams("?aos_connect=connected&aos_publish=allowed&toolkit=instagram&screen=native"), "?screen=native", "aos_publish leaves the URL");
   equal(connectToast("cancelled"), connectToast("failed"), "cancelled reads as not connected");
   // CAD-1438: return_to spells the canonical `/apps/<key>` route.
-  equal(connectReturnTo("https://ef.cadencecloud.app", "social content"), "https://ef.cadencecloud.app/apps/social%20content?screen=native", "return_to is this board's host Settings page");
+  equal(connectReturnTo("https://ef.cadencecloud.app", "social content", "install-1"), "https://ef.cadencecloud.app/apps/social%20content?screen=native&install=install-1", "return_to pins this installation on the board Settings page");
   equal([accountLabel("harbour"), accountLabel("@harbour"), accountLabel("Harbour Cafe")], ["@harbour", "@harbour", "Harbour Cafe"], "handles get an @");
   equal(sendSlot(installation), "publication", "one send slot");
   equal(sendSlot({ ...installation, capabilities: {} } as Installation), null, "no send slot");
@@ -65,7 +65,7 @@ async function main() {
   const ui = { showLink: (url: string) => { shown = url; }, navigate: (path: string) => { navigated = path; }, assign: (url: string) => { assigned = url; } };
   let result = await runCall(ctx(), "open-link", { url: "/settings/connections" }, ui);
   assert(result.ok && assigned === "https://api.example/account/ws/connections/connect?toolkit=instagram&return_to=x" && shown === null, "hosted opens the AgenticOS link top-level");
-  equal(calls[0], { path: "/api/app-installations/inst1/publishing/connect-link", body: { return_to: "https://ef.cadencecloud.app/apps/social-content?screen=native" } }, "the host asks with its own canonical return_to");
+  equal(calls[0], { path: "/api/app-installations/inst1/publishing/connect-link", body: { return_to: "https://ef.cadencecloud.app/apps/social-content?screen=native&install=inst1" } }, "the host asks with its own canonical return_to");
   // The frame never supplies the URL: another url is not routed through the connect link.
   assigned = null; calls.length = 0;
   result = await runCall(ctx(), "open-link", { url: "https://evil.example/x" }, ui);

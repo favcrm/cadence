@@ -230,7 +230,7 @@ async function connectOrOpen(ctx: ActionContext, args: Record<string, unknown>, 
     try {
       // CAD-1438: the screen only runs under `/apps/<key>` (uniqueness proven
       // at route level), so the installation's own key is its return path.
-      const reply = await workspaceApps.connectLink(ctx.installId, connectReturnTo(window.location.origin, ctx.installation.name));
+      const reply = await workspaceApps.connectLink(ctx.installId, connectReturnTo(window.location.origin, ctx.installation.name, ctx.installId));
       if (reply.hosted && reply.url) { (ui.assign ?? (url => window.location.assign(url)))(reply.url); return { ok: true, data: {} }; }
       // Hosted but no public AgenticOS address: say so, never send the owner to the local page.
       if (reply.hosted) return refuse("unavailable", "Instagram connect isn't available for this workspace yet.");
