@@ -123,6 +123,7 @@ mod models_rpc;
 mod monitors_rpc;
 mod needs_rpc;
 mod next_action;
+mod notify_driver;
 mod operator_rpc;
 mod plans_rpc;
 mod platform_rpc;
@@ -2933,6 +2934,21 @@ impl Shared {
             "human_room_read" => self.rpc_human_room_read(params, peer_pid),
             "human_room_post" => self.rpc_human_room_post(params, peer_pid),
             "human_room_mark_read" => self.rpc_human_room_mark_read(params, peer_pid),
+            "human_notification_delivery_prepare" => {
+                self.rpc_human_notification_delivery_prepare(params, peer_pid)
+            }
+            "human_notification_delivery_finish" => {
+                self.rpc_human_notification_delivery_finish(params, peer_pid)
+            }
+            "human_push_presence" => self.rpc_human_push_presence(params, peer_pid),
+            "human_notifications" => self.rpc_human_notifications(params, peer_pid),
+            "human_notifications_read" => self.rpc_human_notifications_read(params, peer_pid),
+            "human_notification_prefs_set" => {
+                self.rpc_human_notification_prefs_set(params, peer_pid)
+            }
+            "human_room_mute" => self.rpc_human_room_mute(params, peer_pid),
+            "human_push_subscribe" => self.rpc_human_push_subscribe(params, peer_pid),
+            "human_push_unsubscribe" => self.rpc_human_push_unsubscribe(params, peer_pid),
             "human_room_add" => self.rpc_human_room_add(params, peer_pid),
             "human_room_remove" => self.rpc_human_room_remove(params, peer_pid),
             "human_agents_list" => self.rpc_human_agents_list(params, peer_pid),
@@ -4756,6 +4772,12 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
         let shared = Arc::clone(&shared);
         thread::spawn(move || shared.run_social_publish_driver())
     });
+    // CAD-1423: the Web Push initiator. Native placement only; joined with
+    // the publish driver before `Shared::shutdown`.
+    let notify_driver = (!fenced && shared.notify_driver_enabled()).then(|| {
+        let shared = Arc::clone(&shared);
+        thread::spawn(move || shared.run_notify_driver())
+    });
 
     // CAD-719: the wiki index refresh worker — a committed wiki
     // mutation kicks one coalesced rebuild; the query-time tree check
@@ -4875,6 +4897,9 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     // 150s worst case (the reconcile sweep's 16 status reads are
     // interruptible between items via the fence/`closing` checks).
     if let Some(handle) = publish_driver {
+        let _ = handle.join();
+    }
+    if let Some(handle) = notify_driver {
         let _ = handle.join();
     }
     // CAD-702: the heartbeat is NOT joined here — it stays the single

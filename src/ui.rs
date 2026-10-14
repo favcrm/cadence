@@ -57,6 +57,7 @@ mod lane;
 mod lifecycle;
 mod locale;
 mod login;
+mod notify_service;
 mod operator;
 mod platform_account;
 mod read_model;

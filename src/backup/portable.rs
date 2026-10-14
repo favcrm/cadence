@@ -759,6 +759,47 @@ const CATALOG: &[(&str, &[&str])] = &[
     ),
     ("human_read_markers", &["room", "human", "seq"]),
     (
+        "human_notification_prefs",
+        &[
+            "human", "dm", "mention", "sound", "preview", "quiet", "zone", "updated",
+        ],
+    ),
+    ("human_notification_reads", &["room", "human", "seq"]),
+    ("human_room_mutes", &["room", "human", "muted"]),
+    (
+        "human_push_devices",
+        &[
+            "id", "org", "issuer", "subject", "human", "endpoint", "p256dh", "auth", "session",
+            "enrolled", "expires", "revoked",
+        ],
+    ),
+    (
+        "human_push_deliveries",
+        &[
+            "intent",
+            "device",
+            "state",
+            "attempts",
+            "next_at",
+            "lease",
+            "lease_until",
+        ],
+    ),
+    ("human_push_presence", &["device", "room", "expires"]),
+    (
+        "human_notification_intents",
+        &[
+            "id",
+            "room",
+            "post",
+            "seq",
+            "recipient",
+            "reason",
+            "attempts",
+            "created",
+        ],
+    ),
+    (
         "human_room_members",
         &["room", "kind", "member", "cutoff", "added", "removed"],
     ),

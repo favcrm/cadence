@@ -1042,6 +1042,44 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         "human_room_remove",
         Rule::Handler("operator_connection + verified human session (CAD-1412)"),
     ),
+    // CAD-1423: notification inbox, preferences, mute and push enrollment. Each
+    // runs the same human guard; none grants room access, Ask or agent power.
+    (
+        "human_notification_delivery_prepare",
+        Rule::Handler("platform service proof, verified before any business check (CAD-1423)"),
+    ),
+    (
+        "human_notification_delivery_finish",
+        Rule::Handler("platform service proof, verified before any business check (CAD-1423)"),
+    ),
+    (
+        "human_push_presence",
+        Rule::Handler("operator_connection + verified human session (CAD-1423)"),
+    ),
+    (
+        "human_notifications",
+        Rule::Handler("operator_connection + verified human session (CAD-1423)"),
+    ),
+    (
+        "human_notifications_read",
+        Rule::Handler("operator_connection + verified human session (CAD-1423)"),
+    ),
+    (
+        "human_notification_prefs_set",
+        Rule::Handler("operator_connection + verified human session (CAD-1423)"),
+    ),
+    (
+        "human_room_mute",
+        Rule::Handler("operator_connection + verified human session (CAD-1423)"),
+    ),
+    (
+        "human_push_subscribe",
+        Rule::Handler("operator_connection + verified human session (CAD-1423)"),
+    ),
+    (
+        "human_push_unsubscribe",
+        Rule::Handler("operator_connection + verified human session (CAD-1423)"),
+    ),
     (
         "human_agents_list",
         Rule::Handler("operator_connection + verified human session (CAD-1412)"),

@@ -1,5 +1,6 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
+import { NotificationToastProvider } from "./features/threads/NotificationToast";
 import "@fontsource/ibm-plex-sans/latin-400.css";
 import "@fontsource/ibm-plex-sans/latin-500.css";
 import "@fontsource/ibm-plex-sans/latin-600.css";
@@ -30,6 +31,6 @@ captureLoginNonce();
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <LocaleProvider><App /></LocaleProvider>
+    <LocaleProvider><NotificationToastProvider><App /></NotificationToastProvider></LocaleProvider>
   </StrictMode>,
 );

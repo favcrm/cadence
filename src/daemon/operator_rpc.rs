@@ -1052,6 +1052,10 @@ impl Shared {
             .slot_identity(peer_pid)?
             .map(|who| who.lane().to_string());
         let request = uuid::Uuid::new_v4().to_string();
+        // CAD-1423: logout revokes this session's push consents first, keyed by
+        // the same digest the session row carries, so no consent outlives it.
+        self.store
+            .push_consents_revoke_session(&crate::operator_auth::digest(token))?;
         let mut frames = Frames::new();
         let result = self
             .operator_auth()

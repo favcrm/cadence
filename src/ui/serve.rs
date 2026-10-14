@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 use super::human_threads;
+use super::notify_service;
 use super::setup::{board_boot_agent_uid, setup_get, setup_refusal, WRITE_LOCK};
 use super::stream::stream_events;
 use super::write_path::{
@@ -197,6 +198,9 @@ pub(crate) fn static_file(dist: Option<&Path>, path: &str) -> Option<(String, Ve
             "/favicon.svg" => Some(embedded::FAVICON),
             "/icon.svg" => Some(embedded::ICON),
             "/apple-touch-icon.png" => Some(embedded::APPLE_TOUCH_ICON),
+            // CAD-1423: the push/click service worker, served from the root so
+            // its scope covers the whole board. Push and click only.
+            "/notifications-sw.js" => Some(embedded::NOTIFICATIONS_SW),
             _ => path
                 .strip_prefix("/assets/")
                 .and_then(|name| embedded::ASSETS.get(name).copied()),
@@ -321,6 +325,7 @@ mod embedded {
     pub const FAVICON: &[u8] = include_bytes!("../../ui/dist/favicon.svg");
     pub const ICON: &[u8] = include_bytes!("../../ui/dist/icon.svg");
     pub const APPLE_TOUCH_ICON: &[u8] = include_bytes!("../../ui/dist/apple-touch-icon.png");
+    pub const NOTIFICATIONS_SW: &[u8] = include_bytes!("../../ui/dist/notifications-sw.js");
 
     /// The latin woff2 files the CSS references (woff fallbacks are not
     /// embedded — every supported browser takes woff2 first).
@@ -1031,6 +1036,14 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
         // `assist_route::post` before any handler.
         if let Some(tail) = path.strip_prefix("/api/assist/") {
             let resp = assist_route::post(&mut request, &method, tail, state_dir, pm_dir, opts);
+            send(request, resp);
+            return;
+        }
+        // CAD-1423: the platform delivery service. Diverted ahead of the cookie
+        // gates; the daemon RPC verifies the platform proof before any business
+        // check. A browser session never satisfies it.
+        if let Some(tail) = path.strip_prefix("/api/internal/notifications/") {
+            let resp = notify_service::post(&mut request, &method, tail, state_dir, opts);
             send(request, resp);
             return;
         }
