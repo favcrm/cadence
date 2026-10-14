@@ -139,28 +139,57 @@ mod matrix {
     use super::*;
     use std::cell::RefCell;
 
-    /// The synthetic wire send: the same argument list as the real send.
+    /// The synthetic wire send: the same argument list as the real send. It
+    /// returns the same triple as production: status, body bytes, and the
+    /// correlation the production header validator derives from header values.
     type WireSend<'a> = Box<
-        dyn FnOnce(&str, &str, Option<&AccessIngress>, &Value, Duration) -> Result<(u16, Vec<u8>)>
-            + 'a,
+        dyn FnOnce(
+                &str,
+                &str,
+                Option<&AccessIngress>,
+                &Value,
+                Duration,
+            ) -> Result<(
+                u16,
+                Vec<u8>,
+                Option<crate::remote_enrollment::IssuerCorrelation>,
+            )> + 'a,
     >;
+
+    /// One scripted issuer reply. `hop` and `request_id` are the raw header
+    /// values the fake issuer sends (`None` = header absent). They are passed
+    /// through the production validator, not a copy of it.
+    #[derive(Clone)]
+    struct Reply {
+        status: u16,
+        body: Vec<u8>,
+        hop: Option<String>,
+        request_id: Option<String>,
+    }
+
+    fn reply(status: u16, body: Value) -> Reply {
+        Reply {
+            status,
+            body: serde_json::to_vec(&body).unwrap(),
+            hop: None,
+            request_id: None,
+        }
+    }
 
     /// One scripted issuer answer and the recorded requests. `RefCell` keeps the
     /// fake single-threaded and local to one test, so no test races another.
     struct Wire {
-        answers: RefCell<Vec<(u16, Vec<u8>)>>,
+        answers: RefCell<Vec<Reply>>,
         hits: RefCell<Vec<(String, Value)>>,
     }
 
     impl Wire {
         fn new(answers: Vec<(u16, Value)>) -> Self {
+            Self::with(answers.into_iter().map(|(s, b)| reply(s, b)).collect())
+        }
+        fn with(answers: Vec<Reply>) -> Self {
             Self {
-                answers: RefCell::new(
-                    answers
-                        .into_iter()
-                        .map(|(s, b)| (s, serde_json::to_vec(&b).unwrap()))
-                        .collect(),
-                ),
+                answers: RefCell::new(answers),
                 hits: RefCell::new(Vec::new()),
             }
         }
@@ -169,9 +198,15 @@ mod matrix {
                 self.hits.borrow_mut().push((url.to_owned(), body.clone()));
                 let mut answers = self.answers.borrow_mut();
                 if answers.is_empty() {
-                    return Ok((500, br#"{"error":"unexpected_renewal"}"#.to_vec()));
+                    let unexpected = reply(500, json!({"error": "unexpected_renewal"}));
+                    return Ok((unexpected.status, unexpected.body, None));
                 }
-                Ok(answers.remove(0))
+                let next = answers.remove(0);
+                let correlation = crate::remote_enrollment::correlation_from_header_values(
+                    next.hop.as_deref(),
+                    next.request_id.as_deref(),
+                );
+                Ok((next.status, next.body, correlation))
             })
         }
         fn posts(&self) -> usize {
@@ -370,7 +405,7 @@ mod matrix {
                                     posts.lock().unwrap().push(body.clone());
                                     // Hold the wire briefly so the threads overlap.
                                     std::thread::sleep(Duration::from_millis(60));
-                                    Ok((200, serde_json::to_vec(&*answer).unwrap()))
+                                    Ok((200, serde_json::to_vec(&*answer).unwrap(), None))
                                 },
                             )
                         },
@@ -400,6 +435,110 @@ mod matrix {
         let op = sent[0]["operation_id"].as_str().unwrap();
         assert!(op.starts_with("op_") && op.len() >= 35, "{op}");
         assert_eq!(sent[0]["expected_generation"], json!(1));
+    }
+
+    /// The AOS renewal emitter's id shape (`crypto.randomUUID()`): 36 chars.
+    const ISSUER_ID: &str = "0b2e1f4a-7c3d-4e5f-8a9b-1c2d3e4f5a6b";
+
+    #[test]
+    fn a_valid_issuer_hop_and_id_are_shown_on_a_flat_terminal_refusal() {
+        // The real issuer answers the flat {error} contract with the emitter's
+        // two headers. The terminal remediation is unchanged, and the id is shown
+        // so an operator can match it to the issuer's single log line.
+        let (root, target, before) = store(None);
+        let wire = Wire::with(vec![Reply {
+            status: 400,
+            body: serde_json::to_vec(&json!({"error": "invalid_grant"})).unwrap(),
+            hop: Some("issuer".into()),
+            request_id: Some(ISSUER_ID.into()),
+        }]);
+        let err = renew(root.path(), &target, &wire)
+            .err()
+            .expect("must refuse")
+            .to_string();
+        assert!(err.contains("cadence login"), "{err}");
+        assert!(
+            err.contains(ISSUER_ID),
+            "the valid issuer id was not shown: {err}"
+        );
+        // Authority unchanged; the header is never an authorization.
+        let after = load_credential(root.path(), &target).unwrap();
+        assert_eq!(after.access_token, before.access_token);
+        assert_eq!(wire.posts(), 1);
+    }
+
+    #[test]
+    fn a_valid_issuer_id_on_a_transient_503_keeps_the_saved_login_unchanged() {
+        let (root, target, before) = store(None);
+        let wire = Wire::with(vec![Reply {
+            status: 503,
+            body: serde_json::to_vec(&json!({"error": "authority_unavailable"})).unwrap(),
+            hop: Some("issuer".into()),
+            request_id: Some(ISSUER_ID.into()),
+        }]);
+        let err = renew(root.path(), &target, &wire)
+            .err()
+            .expect("503 must refuse")
+            .to_string();
+        assert!(err.contains("saved login is kept"), "{err}");
+        assert!(!err.contains("cadence login"), "{err}");
+        assert!(err.contains(ISSUER_ID), "{err}");
+        let kept = load_credential(root.path(), &target).unwrap();
+        assert_eq!(kept.access_token, before.access_token);
+    }
+
+    #[test]
+    fn hostile_overlong_unknown_hop_and_non_uuid_values_are_never_shown() {
+        // Each of these must be dropped by the single production validator, so the
+        // message carries no id at all. The flat terminal remediation still applies.
+        let hostile_hop = "issuer\u{7}ATTACKER-ECHO-do-not-show";
+        let overlong = "a".repeat(400);
+        let cases: Vec<(Option<&str>, Option<&str>, &str)> = vec![
+            (Some("board"), Some(ISSUER_ID), "unknown hop"),
+            (Some(hostile_hop), Some(ISSUER_ID), "hostile hop text"),
+            (
+                Some("issuer"),
+                Some("not-a-uuid <script>do-not-show</script>"),
+                "non-UUID id",
+            ),
+            (Some("issuer"), Some(overlong.as_str()), "overlong id"),
+            (Some("issuer"), None, "hop without an id"),
+            (None, Some(ISSUER_ID), "id without a hop"),
+        ];
+        for (hop, id, label) in cases {
+            let (root, target, _) = store(None);
+            let wire = Wire::with(vec![Reply {
+                status: 401,
+                body: serde_json::to_vec(&json!({"error": "invalid_token"})).unwrap(),
+                hop: hop.map(str::to_owned),
+                request_id: id.map(str::to_owned),
+            }]);
+            let err = renew(root.path(), &target, &wire)
+                .err()
+                .expect("must refuse")
+                .to_string();
+            assert!(err.contains("cadence login"), "{label}: {err}");
+            assert!(
+                !err.contains("issuer request"),
+                "{label} showed an id: {err}"
+            );
+            assert!(
+                !err.contains("do-not-show"),
+                "{label} echoed hostile text: {err}"
+            );
+            assert!(
+                !err.contains("ATTACKER"),
+                "{label} echoed hostile text: {err}"
+            );
+            assert!(
+                !err.contains(&overlong),
+                "{label} echoed an overlong value: {err}"
+            );
+            assert!(
+                err.len() < 400,
+                "{label} message grew with a hostile value: {err}"
+            );
+        }
     }
 
     #[test]

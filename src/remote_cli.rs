@@ -419,7 +419,7 @@ fn renewed_credential(dir: &Path, target: &RemoteTarget, deadline: Instant) -> R
         dir,
         target,
         deadline,
-        crate::remote_enrollment::cli_session_post,
+        crate::remote_enrollment::cli_session_post_detailed,
     )
 }
 
@@ -431,7 +431,14 @@ fn renewed_credential_with(
     dir: &Path,
     target: &RemoteTarget,
     deadline: Instant,
-    post: impl FnOnce(&Path, &str, &str, &str, Value, Instant) -> Result<(u16, Value)>,
+    post: impl FnOnce(
+        &Path,
+        &str,
+        &str,
+        &str,
+        Value,
+        Instant,
+    ) -> Result<crate::remote_enrollment::IssuerAnswer>,
 ) -> Result<Credential> {
     let _lock = private_lock(dir, &target.org, deadline)?;
     if Instant::now() >= deadline {
@@ -505,7 +512,7 @@ fn renewed_credential_with(
         "organization_id":cred.organization_id,"organization_slug":target.org,"audience":cred.audience,
         "subject_id":cred.subject_id,"device_label":session.device_label,"capabilities":cred.capabilities});
     let request_deadline = deadline.min(Instant::now() + RENEWAL_WAIT);
-    let (status, body) = post(
+    let answer = post(
         dir,
         issuer,
         "/v1/hosted-cadence/cli-session/renew",
@@ -513,9 +520,14 @@ fn renewed_credential_with(
         request,
         request_deadline,
     )?;
-    if status != 200 {
-        return Err(renewal_refusal(status, &body));
+    if answer.status != 200 {
+        return Err(renewal_refusal(
+            answer.status,
+            &answer.body,
+            answer.correlation.as_ref(),
+        ));
     }
+    let body = answer.body;
     validate_renewal_response(&body, &cred, target, &pending)?;
     let next = serde_json::from_value::<CliSession>(body["cli_session"].clone())
         .map_err(|_| reject("remote renewal returned invalid session metadata"))?;
@@ -535,18 +547,27 @@ fn renewed_credential_with(
 /// has its own reader. Only the issuer's terminal refresh-grant refusals ask
 /// for a fresh login. Anything else (a transient 503, a malformed answer) keeps
 /// the saved login and pending operation for a later retry, with no consent.
-fn renewal_refusal(status: u16, body: &Value) -> Error {
+fn renewal_refusal(
+    status: u16,
+    body: &Value,
+    correlation: Option<&crate::remote_enrollment::IssuerCorrelation>,
+) -> Error {
     let code = body
         .get("error")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    // The issuer's id is shown only when the header was valid (see
+    // `issuer_correlation`). It is a support reference, never an authority.
+    let request = correlation
+        .map(|c| format!(" (issuer request {})", c.request_id))
+        .unwrap_or_default();
     match (status, code) {
-        (401, "invalid_token") | (400, "invalid_grant") => reject(
-            "the renewable CLI session was rejected by the issuer — run `cadence login` again",
-        ),
+        (401, "invalid_token") | (400, "invalid_grant") => reject(format!(
+            "the renewable CLI session was rejected by the issuer — run `cadence login` again{request}"
+        )),
         _ => reject(format!(
             "remote CLI session renewal is not complete (HTTP {status}); your saved login \
-             is kept, retry the command later"
+             is kept, retry the command later{request}"
         )),
     }
 }
@@ -2381,9 +2402,9 @@ mod tests {
     fn a_renewal_refusal_uses_the_issuer_shape_not_the_gateway_envelope() {
         // Renewal reads the issuer's {error:"<code>"}. Only its terminal
         // refresh-grant refusals ask for login; a transient 503 keeps the login.
-        let terminal = renewal_refusal(401, &json!({"error": "invalid_token"}));
+        let terminal = renewal_refusal(401, &json!({"error": "invalid_token"}), None);
         assert!(terminal.to_string().contains("cadence login"), "{terminal}");
-        let transient = renewal_refusal(503, &json!({"error": "authority_unavailable"}));
+        let transient = renewal_refusal(503, &json!({"error": "authority_unavailable"}), None);
         assert!(
             !transient.to_string().contains("cadence login"),
             "{transient}"
