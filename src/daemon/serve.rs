@@ -4,6 +4,7 @@ pub(super) mod accept_wait;
 
 use super::*;
 
+use super::app_media_rpc::OriginalDelivery;
 use std::cell::Cell;
 use std::fs::{File, OpenOptions};
 use std::io::BufReader;
@@ -273,6 +274,85 @@ pub(super) fn handle_conn(shared: Arc<Shared>, stream: UnixStream) {
     for line in reader.lines() {
         let Ok(line) = line else { break };
         let _peer_scope = PeerUidScope::enter(peer.uid);
+        // CAD-1365: `app_media_original` is the one binary reply — the
+        // usual result line (a CLOSED transfer header) followed by
+        // exactly `bytes` raw octets and connection close. The method
+        // still passes the peer check, the test-seam scope and
+        // `Shared::master_policy` before any work; a refusal before the
+        // header is an ordinary `proto::err` line with no binary tail,
+        // and once the header has started a write failure closes the
+        // connection — a JSON error is never appended to partial bytes.
+        let is_original = serde_json::from_str::<Value>(&line)
+            .ok()
+            .as_ref()
+            .and_then(|frame| frame.get("method"))
+            .and_then(Value::as_str)
+            == Some("app_media_original");
+        if is_original {
+            let mut header_started = false;
+            // This connection ends with the reply and no further request
+            // is read, so the flag shared with the reader is safe. Every
+            // later write is one guarded nonblocking send.
+            if writer.set_nonblocking(true).is_err() {
+                break;
+            }
+            let outcome = serde_json::from_str::<Value>(&line)
+                .map_err(|_| Error::rejected("Request must be one JSON object per line"))
+                .and_then(|frame| {
+                    let params = frame.get("params").cloned().unwrap_or(json!({}));
+                    let _scope = crate::test_seam::scope_frame(shared.seam.as_ref(), &frame)?;
+                    shared.master_policy("app_media_original", &params, peer.pid)?;
+                    // Same portable-execution fence `Shared::dispatch` applies;
+                    // this binary branch does not go through `dispatch`.
+                    if shared.execution_mode.fenced()
+                        && !crate::backup::portable_fence::allows("app_media_original")
+                    {
+                        return Err(crate::backup::portable_fence::fence_refusal(
+                            "app_media_original",
+                        ));
+                    }
+                    // The byte delivery runs against ONE absolute
+                    // deadline in the existing artifact bound.
+                    let deadline = Instant::now() + Duration::from_secs(60);
+                    shared.rpc_app_media_original_stream(
+                        &params,
+                        peer.pid,
+                        |header, bytes, delivery| {
+                            let mut line = proto::ok(header.clone()).to_string();
+                            line.push('\n');
+                            write_original_guarded(
+                                delivery,
+                                &mut writer,
+                                line.as_bytes(),
+                                deadline,
+                                &mut header_started,
+                            )?;
+                            write_original_guarded(
+                                delivery,
+                                &mut writer,
+                                bytes,
+                                deadline,
+                                &mut header_started,
+                            )
+                        },
+                    )
+                });
+            match outcome {
+                Ok(()) => break,
+                Err(_error) if header_started => break,
+                Err(error) => {
+                    // A refusal before the header is one ordinary
+                    // `proto::err` line under the same absolute bound —
+                    // never a second frame and never binary — then the
+                    // connection closes like the success path.
+                    let deadline = Instant::now() + Duration::from_secs(60);
+                    let mut frame = proto::err(&error).to_string();
+                    frame.push('\n');
+                    let _ = client::write_bounded(writer.as_raw_fd(), frame.as_bytes(), deadline);
+                    break;
+                }
+            }
+        }
         let response = serde_json::from_str::<Value>(&line)
             .map_err(|_| Error::rejected("Request must be one JSON object per line"))
             .and_then(|frame| {
@@ -296,6 +376,45 @@ pub(super) fn handle_conn(shared: Arc<Shared>, stream: UnixStream) {
             break;
         }
     }
+}
+
+/// CAD-1365: one original reply segment on a nonblocking socket. Each
+/// chunk is a single `delivery.with_current` send, so authority is
+/// re-proven before every write. `WouldBlock` waits outside every guard
+/// for at most 100ms (a cancellation point) under the absolute deadline,
+/// then the authority is checked again. `sent` is set on the first byte.
+fn write_original_guarded(
+    delivery: &OriginalDelivery<'_>,
+    writer: &mut UnixStream,
+    mut bytes: &[u8],
+    deadline: Instant,
+    sent: &mut bool,
+) -> Result<()> {
+    const CHUNK: usize = 64 * 1024;
+    const WAIT: Duration = Duration::from_millis(100);
+    while !bytes.is_empty() {
+        if Instant::now() >= deadline {
+            return Err(Error::internal("media original delivery deadline reached"));
+        }
+        let chunk = &bytes[..bytes.len().min(CHUNK)];
+        match delivery.with_current(|| writer.write(chunk))? {
+            Ok(0) => return Err(Error::internal("media original socket closed mid-write")),
+            Ok(n) => {
+                *sent = true;
+                bytes = &bytes[n..];
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                client::poll_deadline(
+                    writer.as_raw_fd(),
+                    libc::POLLOUT,
+                    (Instant::now() + WAIT).min(deadline),
+                )?;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
 }
 
 /// The second socket lives outside the private state directory, so

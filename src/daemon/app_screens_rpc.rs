@@ -369,14 +369,41 @@ impl Shared {
         } else {
             pkg.tools.keys().collect()
         };
-        Ok(json!({
+        // CAD-1365: host-held media metadata for a package that pins
+        // `screen-media.v1` and minted a live action context. It is the
+        // package's own DECLARED media permission subset (never wider),
+        // emitted only when nonempty — a non-media package carries no
+        // `media` field at all. This is declaration metadata, not a new
+        // authority secret, and never enters the frame bootstrap.
+        let media_may: Vec<&String> = pkg
+            .may
+            .iter()
+            .filter(|m| {
+                m.as_str() == crate::issue::app_screen_decl::MAY_MEDIA_READ
+                    || m.as_str() == crate::issue::app_screen_decl::MAY_MEDIA_PUBLISH
+            })
+            .collect();
+        let media = if pkg.host_contract.as_deref()
+            == Some(crate::issue::app_screen_decl::HOST_CONTRACT_MEDIA)
+            && !action_token.is_null()
+            && !media_may.is_empty()
+        {
+            json!({"contract": crate::issue::app_screen_decl::HOST_CONTRACT_MEDIA, "may": media_may})
+        } else {
+            Value::Null
+        };
+        let mut receipt = json!({
             "mount": format!("/api/app-screen/{nonce}"),
             "bridge_nonce": bridge_nonce,
             "generation": generation,
             "tag": tag,
             "action_token": action_token,
             "tools": tools,
-        }))
+        });
+        if !media.is_null() {
+            receipt["media"] = media;
+        }
+        Ok(receipt)
     }
 
     /// `app_screen_consume {nonce}` — a CLOSED param set: exactly

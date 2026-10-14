@@ -51,6 +51,55 @@ build-provenance attestation verifies for the repository. A sha that is not
 on main, or has no attested build, is refused with a sentence naming the
 reason. Without `--to`, behavior is unchanged.
 
+## Client only: `cadence update` (CAD-1425, CAD-1437)
+
+One command serves both installations. A client-only installation
+(`install.sh --client-only`, receipt `<prefix>/client-install.json`) selects
+the public updater from its receipt, before any org or state work:
+
+```
+cadence update --check                    # selects the target and reports it; no download, no verify, no change
+cadence update                            # newest public release, forward only
+cadence update --version v0.2.0           # a newer pinned release
+```
+
+On a client-only installation `update` accepts only `--check` and
+`--version TAG`. A native option (`--rollback`, `--to`, `--now`, `--drain`,
+`--keep`, `--json`, `--progress`, `--backup-dir`, `--repo`, `--link`,
+`--releases-dir`, `--as`, even at its default value), `update status`, and a
+global `--org`, `--state-dir` or `--wake-timeout` refuse with exit 3 before
+any network, state or native work. A saved default org is ignored.
+
+On an ordinary daemon installation `update` keeps the native behaviour above,
+and `--version` refuses there with exit 3. A client-only installation is
+identified only by its receipt; a receipt that is present but malformed
+refuses and never falls back to a public update.
+
+The same updater runs only from a client-only installation. It resolves locally whatever the
+saved org default is, never uses or changes remote credentials, and never
+contacts a tenant. `--check` only reports the selected target; it does not
+download or verify the artifact. A real upgrade fetches only the fixed public
+GitHub release through the operator's own GitHub CLI (`gh`) session, and runs a
+candidate only after its build-provenance attestation verifies and its
+manifest matches this platform and version. It does not downgrade, delete old
+releases or touch the daemon.
+
+From a client-only installation, local daemon and state commands refuse with
+exit 3. Remote org verbs route to their org, and bounded
+login, auth, org and offline management stays available.
+
+This mode needs a published release whose `cadence update --help` carries the
+client-only marker (`Upgrade a client-only installation`). The published
+v0.1.1 predates the unified command and still has only `client-update`; it
+cannot be upgraded to `update` in place. The one-time migration is a reinstall
+with the `install.sh --client-only` shipped with the next signed
+unified-command release. Two rejections follow from the marker:
+- A new candidate run through the old v0.1.1 updater is refused: that updater
+  has no `update` client support and no `client-update` probe matches it.
+- v0.1.1's native-only `update --help` lacks the marker, so the new installer
+  and the new updater refuse v0.1.1 as a client.
+The old `client-update` command is removed with no alias.
+
 ## Development: `cadence dev`
 
 `cadence dev` (old name: `cadence sandbox`) is a disposable second Cadence

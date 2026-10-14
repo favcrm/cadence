@@ -1222,7 +1222,9 @@ fn validate_contents(
 /// screen — an integrity-checked `app-screens/v2` package whose
 /// declared `tools` map is non-empty AND resolves every alias to a
 /// `needs.capabilities` slot with a `read`/`draft` effect (the only
-/// effects a standalone, approval-free invoke may run). This is the
+/// effects a standalone, approval-free invoke may run). Its `may` is
+/// `tools.invoke`, optionally plus the exact `media.read` permission a
+/// `screen-media.v1` screen declares (CAD-1365). This is the
 /// install-time proof that lets a workflow-free plugin install; it is
 /// deliberately strict so an empty or malformed bundle cannot borrow
 /// the exception. Returns false on any integrity/parse failure — a
@@ -1242,7 +1244,17 @@ fn has_tools_only_screen(files: &[(String, String)], manifest: &Manifest) -> boo
             // different app can never satisfy this bundle's exception.
             && pkg.app == manifest.app
             && !pkg.tools.is_empty()
-            && pkg.may.iter().all(|m| m == "tools.invoke")
+            // `tools.invoke` alone, plus — only under the media host
+            // contract — the exact `media.read`/`media.publish`
+            // declarations. No other `may` member and no media right on
+            // an actions-contract screen qualifies.
+            && pkg.may.iter().all(|m| {
+                m == crate::issue::app_screen_decl::MAY_TOOLS_INVOKE
+                    || ((m == crate::issue::app_screen_decl::MAY_MEDIA_READ
+                        || m == crate::issue::app_screen_decl::MAY_MEDIA_PUBLISH)
+                        && pkg.host_contract.as_deref()
+                            == Some(crate::issue::app_screen_decl::HOST_CONTRACT_MEDIA))
+            })
             && pkg.tools.values().all(|slot| {
                 manifest
                     .capabilities

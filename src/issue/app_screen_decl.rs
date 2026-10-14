@@ -72,10 +72,24 @@ const CONTRACT_V1: &str = "app-screens/v1";
 /// allowlist of bridge methods and a bounded `tools` alias→slot map.
 /// A screen that does not declare them stays as read-only as v1.
 const CONTRACT_V2: &str = "app-screens/v2";
-/// The only host contract a v2 screen may pin to call tools.
+/// The host contract a v2 screen may pin to call tools.
 pub const HOST_CONTRACT_ACTIONS: &str = "screen-actions.v1";
-/// The only bridge method a v2 `may` may list today.
+/// CAD-1365: the media contract. Identical action mechanics to
+/// `screen-actions.v1`, plus the separate `media.read` catalog
+/// permission a media screen declares next to `tools.invoke`.
+/// A screen pinning it keeps the same closed alias→slot `tools` map —
+/// media rights never ride the provider-alias map.
+pub const HOST_CONTRACT_MEDIA: &str = "screen-media.v1";
+/// The tool bridge method a v2 `may` may list.
 pub const MAY_TOOLS_INVOKE: &str = "tools.invoke";
+/// CAD-1365: the workspace media-catalog read permission a
+/// `screen-media.v1` screen may declare.
+pub const MAY_MEDIA_READ: &str = "media.read";
+/// CAD-1365: the workspace media-catalog publish permission a
+/// `screen-media.v1` screen may declare — the draft→published
+/// metadata mutation `app_media_publish` serves. Read rights alone
+/// never carry it, and no tools alias can hold it.
+pub const MAY_MEDIA_PUBLISH: &str = "media.publish";
 /// The one entry point — pinned, and it must be a declared, supplied
 /// asset.
 const ENTRY: &str = "client.js";
@@ -116,9 +130,11 @@ pub struct IntegrityCheckedScreen {
     sdk_digest: String,
     toolchain_digest: String,
     remote_images: Vec<String>,
-    /// v2 only: the declared `may` methods (each currently only
-    /// `tools.invoke`). Empty on v1 and on a v2 that declares none.
+    /// v2 only: the declared `may` methods (the closed `tools.invoke`/
+    /// `media.*` set). Empty on v1 and on a v2 that declares none.
     may: Vec<String>,
+    /// v2 only: the declared `host_contract` pin.
+    host_contract: Option<String>,
     /// v2 only: declared logical tool alias → declared capability slot.
     /// The alias is app-owned vocabulary the frame calls; the slot is
     /// the `needs.capabilities` key it resolves through. Empty on v1.
@@ -139,6 +155,11 @@ impl IntegrityCheckedScreen {
     /// The declared `may` bridge methods (v2 only; empty on v1).
     pub fn may(&self) -> &[String] {
         &self.may
+    }
+    /// The declared `host_contract` pin (v2 only; `None` unless the
+    /// declaration named one of the host-served contracts).
+    pub fn host_contract(&self) -> Option<&str> {
+        self.host_contract.as_deref()
     }
     /// The declared tool alias→capability-slot map (v2 only; empty on v1).
     pub fn tools(&self) -> &BTreeMap<String, String> {
@@ -192,8 +213,8 @@ struct RawDecl {
     #[serde(default)]
     remote_images: Vec<String>,
     /// v2 only: the host contract this screen was built against. Must be
-    /// exactly `screen-actions.v1` when present (v2 with `may`/`tools`)
-    /// — an unknown or missing contract keeps the screen read-only.
+    /// a host-served contract when present (v2 with `may`/`tools`) — an
+    /// unknown or missing contract keeps the screen read-only.
     #[serde(default)]
     host_contract: Option<String>,
     /// v2 only: logical alias → capability-slot declaration. Each alias
@@ -310,6 +331,7 @@ pub fn validate_map(
             .iter()
             .filter_map(|v| v.as_str().map(str::to_string))
             .collect(),
+        host_contract: decl.host_contract,
         tools,
     })
 }
@@ -436,12 +458,20 @@ fn check_declaration(decl: &RawDecl) -> Result<()> {
     // `may` is a string allowlist of bridge methods. v1 admits none;
     // v2 admits only the closed set, each a string, no repeats. A
     // non-string member or a method outside the set refuses (fail closed).
+    // The `media.*` permissions exist only under `screen-media.v1` — an
+    // actions-contract screen cannot smuggle catalog rights in `may`.
+    // `media.read` and `media.publish` are the granted media members;
+    // publish is a separate declaration — read never implies mutation.
+    let media_contract = decl.host_contract.as_deref() == Some(HOST_CONTRACT_MEDIA);
     let mut may_seen = HashSet::new();
     for member in &decl.may {
         let Some(name) = member.as_str() else {
             return Err(Error::rejected("`may` members are strings"));
         };
-        if !is_v2 || name != MAY_TOOLS_INVOKE {
+        let granted = is_v2
+            && (name == MAY_TOOLS_INVOKE
+                || (media_contract && (name == MAY_MEDIA_READ || name == MAY_MEDIA_PUBLISH)));
+        if !granted {
             return Err(Error::rejected(format!(
                 "`may` method {name:?} is not a method this contract grants"
             )));
@@ -461,9 +491,10 @@ fn check_declaration(decl: &RawDecl) -> Result<()> {
         ));
     }
     if let Some(host) = &decl.host_contract {
-        if host != HOST_CONTRACT_ACTIONS {
+        if host != HOST_CONTRACT_ACTIONS && host != HOST_CONTRACT_MEDIA {
             return Err(Error::rejected(format!(
-                "host_contract {host:?} — the only served contract is {HOST_CONTRACT_ACTIONS:?}",
+                "host_contract {host:?} — the only served contracts are \
+                 {HOST_CONTRACT_ACTIONS:?} and {HOST_CONTRACT_MEDIA:?}",
             )));
         }
     }

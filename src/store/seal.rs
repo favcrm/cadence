@@ -66,9 +66,9 @@ fn raw_lease_refusal(reason: String) -> rusqlite::Error {
 /// provenance columns + the `assist_stall_checks` table, and v43 adds the
 /// standalone `assist_job_shares` table, and v44 (CAD-1412) adds only the
 /// human room tables. None touch a sealed/witnessed surface, so the bound
-/// extends to 44.
+/// extends to 45 (v45 CAD-1365 adds only app_media_* tables).
 #[allow(dead_code)]
-const PROTECTED_SCHEMA_MAX: i64 = 44;
+const PROTECTED_SCHEMA_MAX: i64 = 45;
 
 /// Arm level + transaction-control phase, shared between the `Store` and
 /// the connection's authorizer. Atomic because the authorizer callback must
@@ -1445,6 +1445,16 @@ impl Store {
             if !(1..=PROTECTED_SCHEMA_MAX).contains(db_schema) {
                 return Err(Error::rejected("owner witness database schema is unsupported"));
             }
+            if *db_schema >= 45 {
+                let media_tables: i64 = wtx.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('app_media_assets','app_media_publish_requests','app_media_asset_origins')",
+                    [],
+                    |r| r.get(0),
+                )?;
+                if media_tables != 3 {
+                    return Err(Error::rejected("owner witness database schema is unsupported"));
+                }
+            }
             wtx.execute(
                 "INSERT INTO owner_witness(challenge,attempt,artifact_identity,epoch,db_schema,committed_at)
                  VALUES(?,?,?,?,?,?)",
@@ -2499,7 +2509,7 @@ mod tests {
         // This is malformed metadata, not evidence of native owner authority.
         let fixture = Connection::open(&db).unwrap();
         fixture
-            .execute("UPDATE schema_version SET version=45", [])
+            .execute("UPDATE schema_version SET version=46", [])
             .unwrap();
         drop(fixture);
         store
@@ -2567,8 +2577,8 @@ mod tests {
     }
 
     #[test]
-    fn current_schema44_owner_witness_refuses_future45() {
-        // Positive control: a real current (44) database is accepted by the real guard.
+    fn current_schema45_owner_witness_refuses_future46() {
+        // Positive control: a real current (45) database is accepted by the real guard.
         {
             let dir = TempDir::new().unwrap();
             let (db, store) = open_legacy(&dir);
@@ -2576,7 +2586,7 @@ mod tests {
                 .conn()
                 .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(actual, 44, "current contract schema must be 44");
+            assert_eq!(actual, 45, "current contract schema must be 45");
             store
                 .propose_close(
                     &permit(&db, OwnerOp::Close, b"c44", "a44", "art", 1),
@@ -2590,16 +2600,16 @@ mod tests {
                 .conn()
                 .query_row("SELECT db_schema FROM owner_witness", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(witnessed, 44, "positive control must record db_schema 44");
+            assert_eq!(witnessed, 45, "positive control must record db_schema 45");
         }
-        // Bad case: a separate store, forged schema_version 45 (above
+        // Bad case: a separate store, forged schema_version 46 (above
         // PROTECTED_SCHEMA_MAX) via raw SQLite.
         let dir = TempDir::new().unwrap();
         let (db, store) = open_legacy(&dir);
         // Raw connection bypasses Store's authorizer, as the existing fixture does.
         let fixture = Connection::open(&db).unwrap();
         fixture
-            .execute("UPDATE schema_version SET version=45", [])
+            .execute("UPDATE schema_version SET version=46", [])
             .unwrap();
         drop(fixture);
         store
@@ -2627,7 +2637,7 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(&err, Error::Rejected(message) if message == "owner witness database schema is unsupported"),
-            "forged schema 45 must fail at the actual schema guard, got: {err}"
+            "forged schema 46 must fail at the actual schema guard, got: {err}"
         );
         let latch_after: (i64, i64, Vec<u8>, String, Option<String>, i64) = store
             .conn()
@@ -3042,4 +3052,6 @@ mod tests {
             *GATE.lock().unwrap() = None;
         }
     }
+
+    include!("cad1365_schema41_acceptance.rs");
 }

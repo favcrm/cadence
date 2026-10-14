@@ -20,6 +20,7 @@ mod briefing;
 mod build_slot;
 mod business_templates;
 mod claude;
+mod client_update;
 mod codex;
 mod commands;
 mod confine;
@@ -189,6 +190,11 @@ pub(crate) struct Cli {
     /// (CAD-1019 slice 2). Only used when the selected org is remote.
     #[arg(long, global = true, default_value_t = cadence_agent::remote_cli::WAKE_TIMEOUT_DEFAULT)]
     wake_timeout: u64,
+    /// The argument ids the command line itself typed, read at the CLI
+    /// entry (`action_dispatch::run`). `None` when no entry read them, so
+    /// the client-only updater refuses instead of assuming none were typed.
+    #[arg(skip)]
+    command_line: Option<Vec<String>>,
     #[command(subcommand)]
     command: Commands,
 }

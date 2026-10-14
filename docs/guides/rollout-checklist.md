@@ -46,17 +46,26 @@ publish to a live account to prove a release.
 
 - **Runner:** operator, using the supported `cadence update` flow.
 - **Blast radius:** one production host (board and daemon).
-- **Order:** verify the approved candidate and its checks, then follow
-  [the production update procedure](../../AGENTS.md#production-safety). Batch
-  host changes that need the same image cycle with that cycle, not a separate
-  restart.
+- **Order:** use the [host release cycle](../RELEASING.md): select the
+  exact attested main CI artifact and installed baseline; dispatch `staging.yml`
+  manually with their CI run IDs; require successful staging, GitHub
+  `production` approval and the matching `production-candidate` receipt.
+  Automatic `workflow_run`/scheduled staging deliberately skips promotion.
+  Only then hand over [the production update procedure](../../AGENTS.md#production-safety)
+  to the operator. Verify `--check` reports the intended available SHA; stop on
+  a refusal or stale candidate. Batch host changes that need the same image
+  cycle with that cycle, not a separate restart.
 - **Rollback trigger / decision:** update refusal, failed read-only health
   probe, or regression; operator decides whether to restore the previous
   release.
 - **Rollback:** restore the previous release symlink through the supported
   operator recovery procedure; do not improvise a state rollback.
-- **Verify:** read-only status/health probe on the updated host before any
-  canary; never publish to a live account to prove a release.
+- **Verify:** confirm the installed/running build matches the selected SHA,
+  then a read-only status/health probe and the ticket's actual affected UI or
+  CLI behavior. A release artifact, promotion receipt or running/listed state
+  alone is not proof of installation or acceptance. Keep installed and
+  operationally verified separate in the ticket. Never publish to a live
+  account to prove a release.
 
 ## App bundle
 

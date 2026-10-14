@@ -1692,7 +1692,7 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     send(request, response);
                     return;
                 }
-                let response = app_runs::handle(&mut request, state_dir, route, false);
+                let response = app_runs::handle(&mut request, state_dir, route, false, opts);
                 send(request, response);
                 return;
             }

@@ -518,7 +518,7 @@ fn rpc_deadline_frame_on(
 /// `Ok(false)` is the spent deadline — the caller reports it; a real
 /// readiness (data, hangup, error) is `Ok(true)` and the next syscall
 /// surfaces which. EINTR recomputes the remaining time and waits on.
-fn poll_deadline(fd: RawFd, events: libc::c_short, deadline: Instant) -> Result<bool> {
+pub(crate) fn poll_deadline(fd: RawFd, events: libc::c_short, deadline: Instant) -> Result<bool> {
     loop {
         let Some(left) = deadline.checked_duration_since(Instant::now()) else {
             return Ok(false);
@@ -552,7 +552,7 @@ fn poll_deadline(fd: RawFd, events: libc::c_short, deadline: Instant) -> Result<
 /// abandoned by `deadline`. Unlike `UnixStream::connect` — which can
 /// block far past a read bound on a full listen backlog — this waits
 /// on POLLOUT and reads the verdict from SO_ERROR.
-fn connect_bounded(socket: &Path, deadline: Instant) -> Result<UnixStream> {
+pub(crate) fn connect_bounded(socket: &Path, deadline: Instant) -> Result<UnixStream> {
     // Linux/Android: SOCK_NONBLOCK | SOCK_CLOEXEC create the
     // descriptor already nonblocking and close-on-exec — atomic, so a
     // multithreaded board has no window where an exec'ing child could
@@ -764,7 +764,7 @@ fn connect_on(fd: RawFd, socket: &Path, deadline: Instant) -> Result<()> {
 /// matching what std's UnixStream does on every unix target that has
 /// the flag; the BSD targets without it get SO_NOSIGPIPE at socket
 /// setup instead ([`no_sigpipe`]).
-fn write_bounded(fd: RawFd, mut bytes: &[u8], deadline: Instant) -> Result<()> {
+pub(crate) fn write_bounded(fd: RawFd, mut bytes: &[u8], deadline: Instant) -> Result<()> {
     // MSG_NOSIGNAL where send(2) supports it (every unix target here
     // except Apple); 0 on Apple where SO_NOSIGPIPE on the socket
     // already did the work.
@@ -816,7 +816,7 @@ fn write_bounded(fd: RawFd, mut bytes: &[u8], deadline: Instant) -> Result<()> {
 /// trickled reply cannot out-wait the budget the way it out-waits the
 /// general path's per-read inactivity timeout. Peer EOF before the
 /// newline is a closed connection, not an answer.
-fn read_line_bounded(fd: RawFd, deadline: Instant) -> Result<String> {
+pub(crate) fn read_line_bounded(fd: RawFd, deadline: Instant) -> Result<String> {
     let mut line = Vec::new();
     let mut buf = [0u8; 2048];
     loop {
@@ -958,6 +958,165 @@ fn rpc_frame_on(
 ) -> Result<Value> {
     let stream = UnixStream::connect(socket).map_err(|_| daemon_unreachable(socket))?;
     rpc_exchange(stream, state_dir, method, params, timeout)
+}
+
+/// CAD-1365: `app_media_original` — the daemon's one binary reply:
+/// the usual result line carrying the CLOSED header
+/// `{transfer:"app-media-original/1", asset_id, media_type, bytes,
+/// sha256}` followed by exactly `bytes` raw octets and connection
+/// close. This reader validates the header's closed field set, bounds,
+/// asset match, MIME allowlist and SHA grammar, then reads exactly
+/// `bytes`, requires clean EOF and verifies the digest BEFORE
+/// reporting success — a truncated, extra or corrupt body, or any
+/// bytes inside a JSON value, is refused. No other method uses this
+/// path; ordinary JSON framing is unchanged.
+pub fn rpc_app_media_original(state_dir: &Path, params: Value) -> Result<(Value, Vec<u8>)> {
+    use sha2::{Digest, Sha256};
+    const ORIGINAL_LIMIT: u64 = 10 * 1024 * 1024;
+    const HEADER_CAP: u64 = 64 * 1024;
+    let socket = rpc_socket_path(state_dir)?;
+    let mut request = proto::request("app_media_original", params.clone());
+    if let Some(test_caller) = crate::test_seam::caller_frame(state_dir)? {
+        request[crate::test_seam::FRAME_FIELD] = test_caller;
+    }
+    let mut body = request.to_string();
+    body.push('\n');
+    // ONE absolute deadline for connect, request write, header, body and
+    // the EOF proof — the existing artifact bound, never a per-read
+    // timeout a trickling daemon can reset.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let stream = connect_bounded(&socket, deadline).map_err(|e| match e {
+        e @ Error::Structured(_) => e,
+        _ => daemon_unreachable(&socket),
+    })?;
+    let fd = stream.as_raw_fd();
+    write_bounded(fd, body.as_bytes(), deadline)?;
+    // Half-close: the transfer is a single request/response — the
+    // daemon closes after its reply and a second request never rides
+    // this connection.
+    stream.shutdown(std::net::Shutdown::Write)?;
+    // Header: bounded bytes AND the absolute deadline. `poll_deadline`
+    // bounds each wait; the accumulated line is capped at HEADER_CAP so
+    // a newline-less daemon cannot fill the 10 MiB take first.
+    let mut line = Vec::new();
+    let mut chunk = [0u8; 2048];
+    let mut body_leftover = Vec::new();
+    loop {
+        if !poll_deadline(fd, libc::POLLIN, deadline)? {
+            return Err(Error::busy("daemon original header deadline reached"));
+        }
+        let n = unsafe { libc::read(fd, chunk.as_mut_ptr().cast::<libc::c_void>(), chunk.len()) };
+        if n > 0 {
+            let got = &chunk[..n as usize];
+            match got.iter().position(|b| *b == b'\n') {
+                Some(end) => {
+                    line.extend_from_slice(&got[..end]);
+                    body_leftover.extend_from_slice(&got[end + 1..]);
+                    break;
+                }
+                None => line.extend_from_slice(got),
+            }
+            if line.len() as u64 > HEADER_CAP {
+                return Err(Error::internal("daemon original header exceeds its bound"));
+            }
+            continue;
+        }
+        if n == 0 {
+            return Err(Error::internal("daemon closed the connection mid-reply"));
+        }
+        let e = std::io::Error::last_os_error();
+        if !matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+        ) {
+            return Err(e.into());
+        }
+    }
+    let frame: Value = serde_json::from_slice(&line)
+        .map_err(|_| Error::internal("Daemon returned a malformed response"))?;
+    let result = proto::unwrap(frame)?;
+    let object = result
+        .as_object()
+        .ok_or_else(|| Error::internal("daemon original header is not an object"))?;
+    if object.len() != 5
+        || result["transfer"] != "app-media-original/1"
+        || result["asset_id"].as_str() != params["asset_id"].as_str()
+        || !matches!(
+            result["media_type"].as_str(),
+            Some("image/png" | "image/jpeg" | "image/webp")
+        )
+        || !result["bytes"]
+            .as_u64()
+            .is_some_and(|n| (1..=ORIGINAL_LIMIT).contains(&n))
+        || !result["sha256"].as_str().is_some_and(|s| {
+            s.strip_prefix("sha256:").is_some_and(|hex| {
+                hex.len() == 64
+                    && hex
+                        .bytes()
+                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            })
+        })
+    {
+        return Err(Error::internal(
+            "daemon original header failed its closed checks",
+        ));
+    }
+    let declared = result["bytes"].as_u64().unwrap_or_default() as usize;
+    if body_leftover.len() > declared {
+        return Err(Error::internal("daemon original reply carried extra bytes"));
+    }
+    let mut body = Vec::with_capacity(declared);
+    body.extend_from_slice(&body_leftover);
+    // Body: exact `declared` bytes under the same absolute deadline,
+    // then a clean EOF — a truncated, extra or corrupt body refuses
+    // before the board can serve it.
+    let mut buf = [0u8; 65536];
+    while body.len() < declared {
+        if !poll_deadline(fd, libc::POLLIN, deadline)? {
+            return Err(Error::busy("daemon original body deadline reached"));
+        }
+        let want = (declared - body.len()).min(buf.len());
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), want) };
+        if n > 0 {
+            body.extend_from_slice(&buf[..n as usize]);
+            continue;
+        }
+        if n == 0 {
+            return Err(Error::internal("daemon original body was truncated"));
+        }
+        let e = std::io::Error::last_os_error();
+        if !matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+        ) {
+            return Err(e.into());
+        }
+    }
+    // EOF proof: the first byte past `declared` refuses at once, never
+    // accumulated; EINTR/EAGAIN keep waiting under the same deadline.
+    loop {
+        if !poll_deadline(fd, libc::POLLIN, deadline)? {
+            return Err(Error::busy("daemon original reply deadline reached"));
+        }
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), 1) };
+        if n > 0 {
+            return Err(Error::internal("daemon original reply carried extra bytes"));
+        }
+        if n == 0 {
+            break;
+        }
+        let e = std::io::Error::last_os_error();
+        if !matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+        ) {
+            return Err(e.into());
+        }
+    }
+    if format!("sha256:{:x}", Sha256::digest(&body)) != result["sha256"] {
+        return Err(Error::internal("daemon original body failed its digest"));
+    }
+    Ok((result, body))
 }
 
 fn daemon_unreachable(socket: &Path) -> Error {
@@ -1243,3 +1402,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod cad1365_original_extra_acceptance;

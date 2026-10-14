@@ -135,10 +135,29 @@ fn refuse_managed_runtime() -> Result<()> {
     Ok(())
 }
 
+/// The native updater proves its operator with Linux procfs, which macOS
+/// does not provide. Refuse before any proof, config, layout, network or
+/// state work; this is not a fallback proof and grants no bypass.
+#[cfg(target_os = "macos")]
+fn native_update_platform_guard() -> Result<()> {
+    Err(Error::rejected(
+        "native daemon updates are unsupported on macOS — the native updater \
+         cannot prove the operator on this platform. Upgrade a public client \
+         with the documented installer-based release flow (docs/INSTALL-AGENT.md); \
+         `--as` and environment variables do not bypass this",
+    ))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn native_update_platform_guard() -> Result<()> {
+    Ok(())
+}
+
 /// `cadence update`: the everyday path (CAD-561). `status`, `--check`
 /// and `--rollback` are the other faces of the same pipeline.
 pub(super) fn run_update(state_dir: &Path, args: UpdateArgs) -> Result<i32> {
     use cadence_agent::update;
+    native_update_platform_guard()?;
     let caller = update_caller(state_dir, args.as_identity.as_deref())?;
     // An established image-managed runtime refuses the native updater
     // outright — no install, restart, drain or marker work.

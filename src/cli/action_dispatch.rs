@@ -33,7 +33,13 @@ pub(crate) fn run() -> Result<i32> {
     }
     let parsed = help::root_command(help::in_pane())
         .try_get_matches()
-        .and_then(|m| <Cli as clap::FromArgMatches>::from_arg_matches(&m));
+        .and_then(|m| {
+            let typed = command_line_ids(&m);
+            <Cli as clap::FromArgMatches>::from_arg_matches(&m).map(|mut cli| {
+                cli.command_line = Some(typed);
+                cli
+            })
+        });
     let cli = match parsed {
         Ok(cli) => cli,
         Err(e) => {
@@ -57,7 +63,39 @@ pub(crate) fn run() -> Result<i32> {
     run_cli(cli)
 }
 
+/// Every argument id the command line typed, at the root and in each
+/// subcommand (clap `value_source`), so a client-only `update` can refuse
+/// native options even when they equal their defaults. Clap's own defaults
+/// never count as typed.
+fn command_line_ids(m: &clap::ArgMatches) -> Vec<String> {
+    let typed = m
+        .ids()
+        .filter(|id| m.value_source(id.as_str()) == Some(clap::parser::ValueSource::CommandLine))
+        .map(|id| id.as_str().to_string());
+    let nested = m
+        .subcommand()
+        .map(|(_, sub)| command_line_ids(sub))
+        .unwrap_or_default();
+    typed.chain(nested).collect()
+}
+
 pub(super) fn run_cli(cli: Cli) -> Result<i32> {
+    let client_only = client_update::client_only_mode()?;
+    // CAD-1437: a valid client-only receipt selects the public updater before
+    // any org, credential, tracker or state work. Native-only options refuse.
+    if let Commands::Update { check, version, .. } = &cli.command {
+        if client_only {
+            return client_update::run(&cli, *check, version.as_deref());
+        }
+        if version.is_some() {
+            return Err(client_update::client_only_required());
+        }
+    }
+    // CAD-1425: the native daemon updater cannot prove its operator on
+    // macOS. Refuse before org resolution, sandbox adoption or any state.
+    if matches!(cli.command, Commands::Update { .. }) {
+        client_update::native_platform_refusal()?;
+    }
     // Offline custody never resolves daemon, org defaults or issuer credentials.
     if let Commands::Remote { action } = &cli.command {
         if cli.state_dir.is_some() {
@@ -159,6 +197,30 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
         }
         _ => {}
     }
+    // CAD-1429: every `web` action is a hosted operation against one pinned
+    // remote workspace. Resolve it once here; a local or unselected org
+    // refuses before any request is built. It runs before the client-only
+    // router too, so a client-only install reaches the web module rather than
+    // the remote allowlist (which refuses web).
+    if let Commands::Web { action } = &cli.command {
+        let target = match org::resolve(cli.org.as_deref(), None, None)? {
+            org::Resolved::Remote(target) => target,
+            org::Resolved::Local(_) => {
+                return Err(Error::rejected(
+                    "cadence web needs a remote workspace: pass --org <org> for a logged-in workspace; nothing was sent",
+                ))
+            }
+        };
+        return web::run(action, &target, cli.wake_timeout);
+    }
+    // CAD-1425: a client-only installation runs local commands never; it
+    // routes only through an actual remote org, before any local action.
+    if client_only {
+        if let Commands::Org { action } = cli.command {
+            return client_update::client_org(action);
+        }
+        return client_update::route_client_only(cli);
+    }
     // ADR 0007 T1: dispatch before any state-dir resolution or sandbox
     // adoption — under sudo those would resolve root's home and could
     // write beneath it. The agent-uid lane is its own host surface.
@@ -210,20 +272,6 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
     } = &cli.command
     {
         return app::run_dev(name, source, *port, host, allow_host);
-    }
-    // CAD-1429: every `web` action is a hosted operation against one pinned
-    // remote workspace. Resolve it once here; a local or unselected org
-    // refuses before any request is built.
-    if let Commands::Web { action } = &cli.command {
-        let target = match org::resolve(cli.org.as_deref(), None, None)? {
-            org::Resolved::Remote(target) => target,
-            org::Resolved::Local(_) => {
-                return Err(Error::rejected(
-                    "cadence web needs a remote workspace: pass --org <org> for a logged-in workspace; nothing was sent",
-                ))
-            }
-        };
-        return web::run(action, &target, cli.wake_timeout);
     }
     // CAD-1270: `app check` is the offline byte validator — it resolves
     // no org or state dir, adopts no sandbox profile and never reaches
@@ -826,6 +874,7 @@ pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
         ),
         Commands::Update {
             action,
+            version: _,
             check,
             rollback,
             drain,
