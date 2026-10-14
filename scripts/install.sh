@@ -110,7 +110,7 @@ cleanup() {
 # --- client-only (CAD-1425) -----------------------------------------------
 
 # release_key <tag>: "MAJOR MINOR PATCH" for vMAJOR.MINOR.PATCH with plain
-# digits; fails for anything else (the same rule as `cadence client-update`).
+# digits; fails for anything else (the same rule as `cadence update`).
 release_key() {
     case "$1" in
         v*.*.*) ;;
@@ -215,7 +215,7 @@ client_seen_state() {
         "$(cat "$PREFIX/client-install.json" 2>/dev/null || echo none)"
 }
 
-# client_lock: the commit lock shared with `cadence client-update`, a
+# client_lock: the commit lock shared with `cadence update`, a
 # directory beside the prefix so the prefix holds nothing extra.
 client_lock() {
     mkdir -p "$(dirname "$PREFIX")" || die "could not create $(dirname "$PREFIX")"
@@ -299,14 +299,14 @@ client_only_install() {
         "cadence ${CO_TAG#v}+$source") ;;
         *) die "downloaded cadence --version reports '$version_out', expected cadence ${CO_TAG#v}+$source — refusing to install" ;;
     esac
-    # A release that predates client-only installs has no client-update and
-    # no local-command exclusion, so it is never linked as a client.
-    help_out=$("$TMP/x/cadence" client-update --help </dev/null 2>&1) \
+    # A release without the unified client-only update is never linked as a
+    # client. Its native-only `update --help` lacks the marker, so it refuses.
+    help_out=$("$TMP/x/cadence" update --help </dev/null 2>&1) \
         && case "$help_out" in
             *"Upgrade a client-only installation"*) ;;
             *) false ;;
         esac \
-        || die "$CO_TAG is not capable of client-only installs (its cadence has no client-update) — choose a newer public release"
+        || die "$CO_TAG is not capable of client-only installs (its cadence has no client-only update) — choose a newer public release"
 
     # Commit under the lock: the link and receipt must still be the state the
     # checks saw before the download, or nothing is written.

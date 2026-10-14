@@ -156,16 +156,24 @@ the GitHub CLI (`gh`) to verify the archive's build-provenance attestation
 (repository `favcrm/cadence`, signer `ci.yml`, tag ref, manifest source
 commit) before the candidate runs, and refuses without an insecure fallback.
 
-A client-only installation upgrades itself with `cadence-client client-update`
+A client-only installation upgrades itself with `cadence-client update`
 (`--check` selects and reports the target only, with no download or
 verification; `--version <tag>` pins a newer release, and the real upgrade
-verifies it before any change). It never downgrades, changes `$HOME/.local/bin/cadence`, or touches
-the remote credentials, registry or daemon. A client-only executable refuses
-local daemon and state commands, including `update`, with exit 3; bounded
+verifies it before any change). The old `client-update` command is removed.
+The published v0.1.1 already has legacy client-only support, through
+`client-update`; it cannot be upgraded to this unified `update` in place. The
+unified update needs the next capable signed release and its `install.sh`:
+reinstall once with that installer. It re-validates the existing receipt and
+link against the same prefix and moves the link only under its guards; it
+never adopts an ordinary installation. It never downgrades, changes
+`$HOME/.local/bin/cadence`, or touches the remote credentials, registry or
+daemon. A client-only executable refuses
+local daemon and state commands with exit 3; bounded
 login, auth, org and offline management stays available.
 
-This mode is not operational until a published release contains client-only
-support. The current public v0.1.0 has none, and the installer refuses it. The
+Client-only mode works on any published release whose `cadence update --help`
+carries the client-only marker. The published v0.1.1 has the legacy
+`client-update`; the unified `update` needs the next capable release. The
 GitHub CLI used for the attestation check is the operator's own `gh` session,
 not Cadence remote credentials.
 
@@ -176,7 +184,7 @@ for a host that runs the local daemon. `cadence upgrade` is recovery only.
 Both use the authenticated, attested internal CI channel. On macOS the native
 daemon updater is unsupported and refuses (it cannot prove the operator there
 without procfs); upgrade a macOS client with `install.sh --client-only` and
-`cadence-client client-update`. Do not present the native updater as an
+`cadence-client update`. Do not present the native updater as an
 anonymous public-release upgrade (CAD-661/CAD-561).
 
 The installer can select another published version explicitly, but replacing

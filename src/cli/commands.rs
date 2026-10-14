@@ -1438,18 +1438,13 @@ pub(crate) enum Commands {
         releases_dir: Option<PathBuf>,
     },
     /// Upgrade a client-only installation (`install.sh --client-only`) to
-    /// the newest public release (CAD-1425). Resolves locally whatever the
-    /// saved org default, fetches only the fixed public release source,
-    /// and refuses any other installation. `--check` changes nothing.
-    #[command(name = "client-update")]
-    ClientUpdate {
-        /// Report the installed and available releases; change nothing.
-        #[arg(long)]
-        check: bool,
-        /// Install this release tag instead of the newest one (forward only).
-        #[arg(long, value_name = "TAG")]
-        version: Option<String>,
-    },
+    /// the newest public release (CAD-1425, CAD-1437). Its receipt alone
+    /// selects this path, before any org or state work: a saved org default
+    /// never diverts it, it fetches only the fixed public release source,
+    /// and it accepts only `--check` and `--version TAG` (forward only).
+    /// Any other installation refuses `--version`; its native options and
+    /// subcommands are untouched.
+    ///
     /// Update to the newest attested green main build in one command
     /// (CAD-561): check → verify attestation + hash → backup → install
     /// side by side → bounded drain → switch → health check → done.
@@ -1469,6 +1464,10 @@ pub(crate) enum Commands {
     Update {
         #[command(subcommand)]
         action: Option<UpdateAction>,
+        /// Client-only installation: install this release tag instead of
+        /// the newest one (forward only). Refused on a daemon installation.
+        #[arg(long, value_name = "TAG")]
+        version: Option<String>,
         /// Show current vs available version, the merged PR titles
         /// between them, whether a schema migration is involved and
         /// what would block — changing nothing.

@@ -1,4 +1,4 @@
-//! CAD-1425: the client-only installation and `cadence client-update`.
+//! CAD-1425: the client-only installation, upgraded by `cadence update` (CAD-1437).
 //!
 //! `install.sh --client-only` puts a public release in its own prefix
 //! (`<prefix>/releases/<tag>/`, the layout `install.sh` already uses), behind
@@ -29,8 +29,12 @@ const GH_TIMEOUT: Duration = Duration::from_secs(60);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 const TOOL_TIMEOUT: Duration = Duration::from_secs(60);
 const CANDIDATE_TIMEOUT: Duration = Duration::from_secs(30);
-/// The client-update help text `install.sh --client-only` also requires.
-const CLIENT_UPDATE_HELP: &str = "Upgrade a client-only installation";
+/// The unified `update --help` marker `install.sh --client-only` also requires.
+/// Only a client-capable release prints it; the native-only update help does not.
+const CLIENT_UPDATE_MARKER: &str = "Upgrade a client-only installation";
+/// The only `update` arguments a client-only installation accepts from the
+/// command line (clap ids). Everything else refuses, even at its default.
+const CLIENT_ARGS: [&str; 2] = ["check", "version"];
 
 /// (asset target, CI runner) this build can install, as `ci.yml` names them.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -77,9 +81,9 @@ fn ambiguous(reason: impl std::fmt::Display) -> Error {
 }
 
 /// The refusal for a process that is not a client-only installation.
-fn not_client_only() -> Error {
+pub(crate) fn client_only_required() -> Error {
     Error::rejected(
-        "client-only installation required — `cadence client-update` upgrades only an \
+        "client-only installation required — `cadence update --version` upgrades only an \
          installation made by `install.sh --client-only` (its receipt is \
          <prefix>/client-install.json). This executable is not one, so nothing was \
          checked, fetched or changed",
@@ -217,37 +221,70 @@ pub(crate) fn client_org(action: org::OrgAction) -> Result<i32> {
     org::run(action)
 }
 
-/// Route a non-client-update command from a client-only installation. Only an
+/// Route a non-update command from a client-only installation. Only an
 /// actual remote org may proceed (over the org's own transport); a local
 /// result, saved default or pin refuses before sandbox adoption or any RPC.
 pub(crate) fn route_client_only(cli: Cli) -> Result<i32> {
     let tracker = std::env::var_os("CADENCE_PM_DIR")
         .map(|d| cadence_agent::home::guard_tracker(PathBuf::from(d)))
         .transpose()?;
-    let resolved = match cli.command {
-        // Updater-only selection never routes a saved default; `update` is local.
-        Commands::Update { .. } => {
-            return Err(local_command_refusal());
-        }
-        _ => org::resolve(cli.org.as_deref(), cli.state_dir.clone(), tracker)?,
-    };
-    match resolved {
+    match org::resolve(cli.org.as_deref(), cli.state_dir.clone(), tracker)? {
         org::Resolved::Remote(target) => remote::run(target, cli.command, cli.wake_timeout),
         org::Resolved::Local(_) => Err(local_command_refusal()),
     }
 }
 
-fn require_install() -> Result<ClientInstall> {
-    let exe = current_binary().ok_or_else(not_client_only)?;
-    identify(&exe)?.ok_or_else(not_client_only)
+/// Refuse any command-line argument a client-only `update` does not accept.
+/// The typed set comes from clap's value source, so an explicit default such
+/// as `--drain 10m` or `--keep 3` refuses too, and global selectors refuse as
+/// well. A missing record (no entry read the command line) refuses too.
+fn refuse_native_options(cli: &Cli) -> Result<()> {
+    let Some(typed) = &cli.command_line else {
+        return Err(Error::rejected(
+            "client-only update could not read its command line — refusing; nothing was changed",
+        ));
+    };
+    if matches!(
+        cli.command,
+        Commands::Update {
+            action: Some(_),
+            ..
+        }
+    ) {
+        return Err(Error::rejected(
+            "client-only update has no subcommands — refusing `update status`; nothing was changed",
+        ));
+    }
+    let refused: Vec<&str> = typed
+        .iter()
+        .map(String::as_str)
+        .filter(|id| !CLIENT_ARGS.contains(id))
+        .collect();
+    if !refused.is_empty() {
+        return Err(Error::rejected(format!(
+            "client-only update accepts only --check and --version TAG; refusing the native \
+             option(s) {} — nothing was checked, fetched or changed",
+            refused.join(", ")
+        )));
+    }
+    Ok(())
 }
 
-/// `cadence client-update`: the public release, client only.
-pub(crate) fn run(check: bool, version: Option<&str>) -> Result<i32> {
+fn require_install() -> Result<ClientInstall> {
+    let exe = current_binary().ok_or_else(client_only_required)?;
+    identify(&exe)?.ok_or_else(client_only_required)
+}
+
+/// A client-only installation's `update`: the public release, client only.
+/// Refuses every command-line option outside `CLIENT_ARGS` (native flags,
+/// global `--org`/`--state-dir`, explicit defaults, `update status`) before
+/// any identity, network or state work.
+pub(crate) fn run(cli: &Cli, check: bool, version: Option<&str>) -> Result<i32> {
+    refuse_native_options(cli)?;
     let install = require_install()?;
     let (target, runner) = PLATFORM.ok_or_else(|| {
         Error::rejected(
-            "client-update supports Ubuntu x86_64/aarch64 and Apple silicon macOS only — \
+            "update supports Ubuntu x86_64/aarch64 and Apple silicon macOS only — \
              this platform has no published client release",
         )
     })?;
@@ -264,23 +301,23 @@ pub(crate) fn run(check: bool, version: Option<&str>) -> Result<i32> {
     };
     let (Some(have), Some(want)) = (version_key(&current), version_key(&wanted)) else {
         return Err(Error::rejected(format!(
-            "cannot order {current} and {wanted}: client-update accepts only vMAJOR.MINOR.PATCH \
+            "cannot order {current} and {wanted}: update accepts only vMAJOR.MINOR.PATCH \
              release tags"
         )));
     };
     if want == have {
-        println!("client-update: {current} is the current release");
+        println!("update: {current} is the current release");
         return Ok(0);
     }
     if want < have {
         return Err(Error::rejected(format!(
-            "client-update refuses to downgrade {current} to {wanted} — it installs only newer \
+            "update refuses to downgrade {current} to {wanted} — it installs only newer \
              releases"
         )));
     }
     if check {
         println!(
-            "client-update: {current} installed; selected target {wanted}; artifact not downloaded or verified"
+            "update: {current} installed; selected target {wanted}; artifact not downloaded or verified"
         );
         return Ok(0);
     }
@@ -293,7 +330,7 @@ pub(crate) fn run(check: bool, version: Option<&str>) -> Result<i32> {
     }
     let dest = stage_release(&install.receipt_prefix, &wanted, &verified)?;
     switch_link(&install.link, &install.link_target, &dest.join(BINARY))?;
-    println!("client-update: installed {wanted} at {}", dest.display());
+    println!("update: installed {wanted} at {}", dest.display());
     println!(
         "linked {} -> {}",
         install.link.display(),
@@ -399,7 +436,7 @@ fn verify_release_dir(dir: &Path, tag: &str, target: &str, runner: &str) -> Resu
 fn run_ok(cmd: &mut Command, timeout: Duration, what: &str) -> Result<Vec<u8>> {
     let out = cadence_agent::proc::run_bounded(cmd, timeout).map_err(|e| match e {
         BoundedError::Spawn(err) if err.kind() == ErrorKind::NotFound => Error::rejected(format!(
-            "{what} is not on PATH — client-update needs the GitHub CLI (gh) to fetch and \
+            "{what} is not on PATH — update needs the GitHub CLI (gh) to fetch and \
              verify the release"
         )),
         other => Error::internal(format!("{what}: {other}")),
@@ -556,25 +593,25 @@ fn fetch_verified(tag: &str, target: &str, runner: &str) -> Result<Verified> {
             "the candidate reports a different version than {expected} — refusing to install"
         )));
     }
-    // Side-effect-free: `client-update --help` only prints clap's help and
-    // never reaches identify() or any state. Without this text the release
-    // has no client-only mode and must never become a client installation.
+    // Side-effect-free: `update --help` only prints clap's help and never
+    // reaches identify() or any state. Without this marker the release has no
+    // unified client-only mode and must never become a client installation.
     let help = run_ok(
         Command::new(&candidate)
-            .args(["client-update", "--help"])
+            .args(["update", "--help"])
             .current_dir(scratch.path()),
         CANDIDATE_TIMEOUT,
-        "the candidate cadence client-update --help",
+        "the candidate cadence update --help",
     )
     .map_err(|_| {
         Error::rejected(format!(
-            "{tag} release lacks client-only support (its cadence has no client-update) — \
+            "{tag} release lacks client-only support (its cadence has no client-only update) — \
              refusing to install it as a client; choose a newer public release"
         ))
     })?;
-    if !String::from_utf8_lossy(&help).contains(CLIENT_UPDATE_HELP) {
+    if !String::from_utf8_lossy(&help).contains(CLIENT_UPDATE_MARKER) {
         return Err(Error::rejected(format!(
-            "{tag} release lacks client-only support (its cadence has no client-update) — \
+            "{tag} release lacks client-only support (its cadence has no client-only update) — \
              refusing to install it as a client; choose a newer public release"
         )));
     }
