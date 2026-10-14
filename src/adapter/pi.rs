@@ -1408,6 +1408,9 @@ export default function (pi) {
   // for this profile — its own allowlisted stems plus their parents.
   // Empty for an app session: scoped turns have no help at all.
   const HELP_PATHS = __HELP_PATHS__;
+  // CAD-1432: only the Home profile has help at all; a scoped turn is
+  // refused with report-and-stop and no help or permission suggestion.
+  const HELP_ALLOWED = __HELP_ALLOWED__;
   // The master's own tmp dir — Pi's bash spills long output here
   // (CAD-552) and the write tool stages `--file` input here (CAD-614).
   // Lexical normalization refuses `..` and prefix siblings; a second
@@ -1432,18 +1435,24 @@ export default function (pi) {
       return "every command starts `cadence` — no env prefixes (`FOO=bar cadence …`), wrappers (`bash -c …`) or other programs";
     }
     const rest = argv.slice(1);
+    // CAD-1432: every --help/-h probe refuses, on any verb and at the root.
+    if (rest.includes("--help") || rest.includes("-h")) {
+      return HELP_ALLOWED
+        ? "--help and -h are not available — run cadence help <command-path> for the exact usage of a command you may run"
+        : "help probes are not available in a scoped chat turn — report the exact refusal and stop";
+    }
     const allowed = RULES.some(
       (r) =>
         r.argv.every((tok, i) => rest[i] === tok) &&
         (r.args ? rest.length > r.argv.length : rest.length === r.argv.length),
     );
     if (!allowed) {
-      return (
-        "not an allowlisted verb — allowed: " +
-        RULES.map((r) => "cadence " + r.argv.join(" ") + (r.args ? " …" : "")).join("; ") +
-        ". " + piNeverHint(rest) +
-        "for the exact usage of a verb you may run: cadence help <verb>"
-      );
+      const verbs = RULES.map((r) => "cadence " + r.argv.join(" ") + (r.args ? " …" : "")).join("; ");
+      return HELP_ALLOWED
+        ? "outside the admitted command surface — allowed: " + verbs +
+          ". For the exact usage of an admitted verb: cadence help <verb>"
+        : "outside this scoped turn's admitted verbs — allowed: " + verbs +
+          ". Report the exact refusal and stop";
     }
     return (
       piHelpLimits(rest) ||
@@ -1570,32 +1579,6 @@ export default function (pi) {
     }
     return null;
   }
-  // CAD-1432: matches master_perm's never-list for the cadence verb
-  // heads — merge, rollout, secrets, daemon restart, permission
-  // decisions, audit approve/designate and the master's own files.
-  // Those are not requestable, so the refusal never suggests
-  // ask-permission for them; anything else the operator may approve.
-  function piNeverHint(rest) {
-    const never =
-      rest.includes("merge") ||
-      rest.includes("rollout") ||
-      rest.some((t) => t.startsWith("secret")) ||
-      (rest.includes("daemon") && rest.some((t) => t === "restart" || t === "stop")) ||
-      (rest.includes("master") &&
-        rest.some(
-          (t) =>
-            t === "allow-once" ||
-            t === "always-allow" ||
-            t === "reject" ||
-            t === "revoke-permission" ||
-            t === "edit",
-        )) ||
-      (rest.includes("audit") && rest.some((t) => t === "approve" || t === "designate"));
-    if (never) {
-      return "that command is never requestable — tell the operator it needs an operator step; ";
-    }
-    return "request approval with: cadence master ask-permission --reason refused -- <the exact command>; ";
-  }
   // Backlog creation only. `--status backlog` is the one accepted
   // override; `--owner` and `--id` are operator overrides.
   function piIssueNewLimits(rest) {
@@ -1698,12 +1681,6 @@ export default function (pi) {
     if (tool !== "cadence" && tool !== "ls" && tool !== "cat" && tool !== "grep" && tool !== "find") {
       return;
     }
-    // A never-list command cannot be approved (master_perm classify
-    // refuses the request), so filing one only produces the same
-    // refusal again — the blocked reason already carries the hint.
-    if (tool === "cadence" && piNeverHint(argv.slice(1)).startsWith("that command")) {
-      return;
-    }
     try {
       spawnSync(
         "cadence",
@@ -1791,6 +1768,14 @@ fn write_pi_guard(
         .replace(
             "__HELP_PATHS__",
             &json!(crate::master::help_paths(profile)).to_string(),
+        )
+        .replace(
+            "__HELP_ALLOWED__",
+            if matches!(profile, crate::master::Profile::Home) {
+                "true"
+            } else {
+                "false"
+            },
         )
         .replace(
             "__AGENTICOS_READ_TOOLS__",

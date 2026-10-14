@@ -27,6 +27,12 @@ pub(crate) fn run() -> Result<i32> {
         .collect();
     // CAD-888: `help operator|advanced|all` print the sections the
     // default root help leaves out; `help <verb>` stays clap's own.
+    // CAD-1432: the master's help is bounded and refuses malformed or
+    // disallowed forms with a usage error, so it runs before the others.
+    if let Some(text) = help::master_help(&argv) {
+        print!("{}", text?);
+        return Ok(0);
+    }
     if let Some(text) = help::help_section(&argv) {
         print!("{text}");
         return Ok(0);

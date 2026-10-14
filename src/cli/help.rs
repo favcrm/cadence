@@ -268,100 +268,114 @@ pub(super) fn all_help_text() -> String {
 /// CAD-1432: the master's `cadence help`. The Pi guard already admits
 /// only a literal admitted command path; this renders it — the profile's
 /// admitted paths only, never the whole clap tree — so a Claude master
-/// (no JS guard) and every operator tool sees the same bounded text. A
-/// scoped app turn is refused: its per-turn reference is complete, and
-/// help admission must never imply a mutation.
-pub(super) fn master_help(args: &[String]) -> Option<String> {
-    if !cadence_agent::master::caller_is_master() || cadence_agent::master::in_app_conversation() {
+/// (no JS guard) and every operator tool sees the same bounded text.
+/// `None` for every caller but the master's own argv, so operator help is
+/// untouched. A malformed or disallowed master help form is a usage error
+/// (nonzero), never help text: refusal text must not exit 0.
+pub(super) fn master_help(args: &[String]) -> Option<cadence_agent::error::Result<String>> {
+    use cadence_agent::error::Error;
+    if !cadence_agent::master::caller_is_master() {
         return None;
     }
     let rest: Vec<&str> = args.iter().skip(1).map(String::as_str).collect();
-    if rest.first() != Some(&"help") {
+    let help_verb = rest.first() == Some(&"help");
+    let probe = rest.iter().any(|t| *t == "--help" || *t == "-h");
+    if !help_verb && !probe {
         return None;
     }
+    // A scoped turn has no help route at all (CAD-1432).
+    if cadence_agent::master::in_app_conversation() {
+        return Some(Err(Error::rejected(
+            "help and --help are not available in a scoped chat turn — report the exact refusal and stop",
+        )));
+    }
+    if !help_verb {
+        // Every master --help/-h probe refuses, the root one included:
+        // the exact ticket contract admits only `help` and `help <path>`.
+        return Some(Err(Error::usage(
+            "--help and -h are not available — run cadence help <command-path> for the exact usage of a command you may run",
+        )));
+    }
     let paths = cadence_agent::master::help_paths(cadence_agent::master::Profile::Home);
-    let target: Vec<&str> = rest[1..]
-        .iter()
-        .copied()
-        .filter(|t| !t.is_empty())
-        .collect();
-    let cmd = Cli::command();
-    let mut out = String::from("Commands you may run (exact forms; anything else is refused):\n");
+    let target = &rest[1..];
     if target.is_empty() {
-        for stem in cadence_agent::master::CLAUDE_ALLOWED_TOOLS {
-            let Some(inner) = stem
-                .strip_prefix("Bash(cadence ")
-                .and_then(|t| t.strip_suffix(')'))
-            else {
-                continue;
-            };
-            let (head, args_ok) = match inner.strip_suffix(" *") {
-                Some(h) => (h, true),
-                None => (inner, false),
-            };
-            if head == "help" {
-                continue;
-            }
-            out.push_str(&format!(
-                "  cadence {head}{}\n",
-                if args_ok { " …" } else { "" }
-            ));
-        }
-        out.push_str("\nUsage of one path: cadence help <command-path>\n");
-        return Some(out);
+        return Some(Ok(master_listing()));
     }
     let path = target.join(" ");
     if !target.iter().all(|t| is_token(t)) || !paths.iter().any(|p| p == &path) {
-        out.push_str(&format!(
-            "`{path}` is not a command path you may run (flags and argument values are refused).\n"
-        ));
-        for stem in &paths {
-            out.push_str(&format!("  cadence {stem}\n"));
-        }
-        return Some(out);
+        return Some(Err(Error::usage(format!(
+            "`{path}` is not a command path you may run — use cadence help, or cadence help <command-path> for one of: {}; flags, argument values and --help are refused",
+            paths.join(", ")
+        ))));
     }
-    // Parent (other admitted paths sit under it) or leaf.
+    // Parent (other admitted paths sit under it): list only those.
     let children: Vec<&String> = paths
         .iter()
         .filter(|p| p.starts_with(&format!("{path} ")))
         .collect();
     if !children.is_empty() {
-        out.push_str(&format!("`{path}` paths you may run:\n"));
+        let mut out = format!("`{path}` paths you may run:\n");
         for c in &children {
             out.push_str(&format!("  cadence {c}\n"));
         }
-        return Some(out);
+        return Some(Ok(out));
     }
-    // Leaf: clap's own usage line for that command plus the guard's
-    // limits, so the syntax printed is exactly what the guard admits.
-    let mut node = cmd.clone();
-    let mut found = true;
-    for tok in &target {
-        match node.find_subcommand(*tok) {
-            Some(sub) => node = sub.clone(),
+    // Leaf: clap's usage for the command, built from the top tree so it
+    // keeps the full `cadence <path>` prefix. The global options and
+    // -h/--help are hidden: the guard admits none of them.
+    let mut cmd = Cli::command();
+    cmd.build();
+    let mut node = &cmd;
+    for tok in target {
+        match node.find_subcommand(tok) {
+            Some(sub) => node = sub,
             None => {
-                found = false;
-                break;
+                return Some(Err(Error::usage(format!(
+                    "`{path}` is not a command path you may run"
+                ))))
             }
         }
     }
-    if found {
-        let mut help = node.render_help().to_string();
-        // Drop clap's trailing "subcommands" list — only the admitted
-        // children exist for this caller, and they were listed above
-        // when the path is a parent.
-        if let Some(i) = help.find("\nCommands:") {
-            help.truncate(i + 1);
-        }
-        out.push_str(help.trim_end());
-        out.push('\n');
-        if let Some(limits) = master_leaf_limits(&path) {
-            out.push_str(&format!("\nLimits for you: {limits}\n"));
-        }
-    } else {
-        out.push_str(&format!("`{path}` — run: cadence {path} …\n"));
+    let mut leaf = node.clone().mut_args(|a| {
+        let hide = matches!(
+            a.get_id().as_str(),
+            "help" | "state_dir" | "org" | "wake_timeout"
+        );
+        a.hide(hide)
+    });
+    let mut out = leaf.render_help().to_string().trim_end().to_string();
+    out.push('\n');
+    if let Some(limits) = master_leaf_limits(&path) {
+        out.push_str(&format!("\nLimits for you: {limits}\n"));
     }
-    Some(out)
+    Some(Ok(out))
+}
+
+/// The master's bounded command listing: exactly the Home profile's
+/// admitted commands, never the whole clap tree.
+fn master_listing() -> String {
+    let mut out = String::from("Commands you may run (exact forms; anything else is refused):\n");
+    for stem in cadence_agent::master::allowed_tools(cadence_agent::master::Profile::Home) {
+        let Some(inner) = stem
+            .strip_prefix("Bash(cadence ")
+            .and_then(|t| t.strip_suffix(')'))
+        else {
+            continue;
+        };
+        let (head, args_ok) = match inner.strip_suffix(" *") {
+            Some(h) => (h, true),
+            None => (inner, false),
+        };
+        if head == "help" {
+            continue;
+        }
+        out.push_str(&format!(
+            "  cadence {head}{}\n",
+            if args_ok { " …" } else { "" }
+        ));
+    }
+    out.push_str("\nUsage of one path: cadence help <command-path>\n");
+    out
 }
 
 fn is_token(t: &str) -> bool {
@@ -403,9 +417,6 @@ pub(super) fn help_section(args: &[String]) -> Option<String> {
         } else if !a.starts_with("--state-dir=") {
             rest.push(a);
         }
-    }
-    if let Some(text) = master_help(args) {
-        return Some(text);
     }
     match rest.as_slice() {
         ["help", "operator" | "advanced"] => Some(operator_help_text()),

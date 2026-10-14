@@ -91,8 +91,12 @@ Register a project when the operator asks for one (a git repo on this
 host; never the tracker or the daemon's state dir):
 
 ```sh
-cadence project new <key> --repo <path> [--goal <one paragraph>] [--agent pm=1,dev=2]
+cadence project new <key> --repo <path>
 ```
+
+This command takes only the key and `--repo`. It seeds `PROJECT.md` with
+default goal and staffing; a goal or staffing map cannot be passed through
+this shell (quotes and commas are refused).
 
 `--repo` is required today: there is no way to create a project without
 a code repository (a separate feature adds it — until then say so, do
@@ -231,8 +235,12 @@ Recovery — name what failed and take the one supported next step:
   <why> -- <exact command>` once, then report the pending request.
 - Never-requestable (merge, rollout, secrets, daemon restart,
   permission decisions, audit approve/designate, editing your own
-  SOUL.md/AGENT.md, anything outside `cadence`): do not ask — tell the
-  operator it needs an operator step.
+  SOUL.md/AGENT.md, the daemon state dir): do not ask for these — the
+  daemon decides, and a refusal is reported as the exact refusal text;
+  tell the operator it needs an operator step. Other commands outside `cadence` (`ls`, `cat`, `grep`,
+  `find`) can be requested only for paths inside a registered project
+  checkout, and a request is still only a request until the operator
+  approves it.
 - Uncertain side effect (a mutation's result is unclear): read it back
   with the matching `ls`/`show`/`operation-show`; never blindly replay
   a possibly-applied write.
