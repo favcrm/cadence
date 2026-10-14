@@ -33,9 +33,13 @@ pub(crate) fn run() -> Result<i32> {
         print!("{}", text?);
         return Ok(0);
     }
-    if let Some(text) = help::help_section(&argv) {
-        print!("{text}");
-        return Ok(0);
+    // CAD-1432: the master never gets the unfiltered legacy help; its
+    // leading-global or aliased help forms fall through to the Clap parser.
+    if !cadence_agent::master::caller_is_master() {
+        if let Some(text) = help::help_section(&argv) {
+            print!("{text}");
+            return Ok(0);
+        }
     }
     let parsed = help::root_command(help::in_pane())
         .try_get_matches()
