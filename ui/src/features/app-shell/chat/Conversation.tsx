@@ -59,18 +59,20 @@ import {
 } from "../conversationClient";
 import {
   carryEarlyDraft,
+  composerHasIntent,
   composerScope,
   moveComposerScope,
   restoreSavedIntent,
   savedIntentsFor,
   setComposerDraft,
   setComposerScope,
+  subscribeDraft,
   subscribeSavedIntents,
   type ComposerScope,
 } from "./composerStore";
 import type { ActionContext } from "./actions";
 import { renderCapability } from "./capabilities";
-import Composer from "./Composer";
+import Composer, { type ComposerAction } from "./Composer";
 import type { AppChat } from "./contract";
 import ChatFrame from "./ChatFrame";
 import DirectiveCard, { ConfirmationCard } from "./DirectiveCard";
@@ -112,9 +114,6 @@ export type ConversationMode =
       scopeLabel: string;
       /** The validated descriptor for this install, or null (plain chat). */
       descriptor: AppChat | null;
-      /** `list` lays the screen's static prompts out as suggestion rows and
-       *  drops the context chip; default is the compact chip row. */
-      promptLayout?: "chips" | "list";
       /** A one-shot host URL selector; native list membership proves it. */
       conversationRequest: ConversationLinkRequest | null;
       /** The current host context receipt, compared with a URL scope selector. */
@@ -128,6 +127,8 @@ type AppMode = Extract<ConversationMode, { kind: "app" }>;
 /** Items rendered at most in a pane before "Load earlier" pages more —
  *  a compact window under Home's 300-item one. */
 const APP_WINDOW = 120;
+/** The composer's textarea id: the starters fill and focus it. */
+const COMPOSER_ID = "app-shell-chat-box";
 
 export interface HomeListProps {
   mode: { kind: "home" };
@@ -330,6 +331,12 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const [composerNotice, setComposerNotice] = useState<UiNotice | null>(null);
   const [creating, setCreating] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
+  // CAD-1431: the CSV importer mounts only when the operator first opens it
+  // from the composer's More actions menu. Once mounted it is hidden, not
+  // unmounted, on Close, so a confirm already in flight still hands its
+  // receipt to the assistant instead of stranding the plan.
+  const [csvMounted, setCsvMounted] = useState(false);
+  const [csvOpen, setCsvOpen] = useState(false);
   // CAD-1168: like Home's WINDOW — the pane renders a bounded window of
   // the newest items and pages older entries of the SAME conversation
   // via `before`, instead of silently clipping to the newest eight.
@@ -413,6 +420,11 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   // park.
   const readSaved = useCallback(() => savedIntentsFor(composerKey), [composerKey]);
   const savedIntents = useSyncExternalStore(subscribeSavedIntents, readSaved);
+  // Whether the composer holds any unsent text, refs or files, read live so
+  // the empty-state starters hide the moment the operator starts typing.
+  const subscribeIntent = useCallback((listener: () => void) => subscribeDraft(composerKey, listener), [composerKey]);
+  const readIntent = useCallback(() => composerHasIntent(composerKey), [composerKey]);
+  const drafting = useSyncExternalStore(subscribeIntent, readIntent);
   const outboxRef = useRef<HTMLDivElement>(null);
   // With no context selected the send still carries the installation, so it
   // lands in the app's conversation (the context is only a per-turn hint).
@@ -440,6 +452,13 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const subjects = descriptor?.subjects ?? [];
 
   useEffect(() => setFailedFrames(new Set()), [installId, convId]);
+  // A context or installation change drops the importer (its scope key
+  // also remounts it). A conversation switch keeps it, as before, so a
+  // confirm in flight still hands its receipt to the assistant.
+  useEffect(() => {
+    setCsvOpen(false);
+    setCsvMounted(false);
+  }, [installId, frameToken]);
   // Switching conversations resets the render window and paging state —
   // the new conversation starts at its own tail.
   useLayoutEffect(() => {
@@ -966,6 +985,32 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const plan = planFrames(directives, failedFrames);
   const onFrameFail = useCallback((tag: string) => setFailedFrames((s) => new Set(s).add(tag)), []);
   const readOnly = !viewer.operator || viewer.readOnly;
+  // The CSV importer exists only when the descriptor declares it and the
+  // viewer can send through this route's scope.
+  const csvAvailable = canSend && binding.scope !== null && descriptor?.attachments.some((a) => a.id === "csv-import") === true;
+  const csvActions: ComposerAction[] = csvAvailable
+    ? [
+        {
+          label: t("Import customer CSV…"),
+          onSelect: () => {
+            setCsvMounted(true);
+            setCsvOpen(true);
+          },
+        },
+      ]
+    : [];
+  // Starters: a loaded, truly empty conversation with nothing unsent, no
+  // unresolved or saved submission, and a sendable composer. Loading,
+  // failed, stale and read-only states advertise no executable action.
+  const starters =
+    canSend &&
+    binding.error === null &&
+    thread.status === "ok" &&
+    thread.data?.missing !== true &&
+    items.length === 0 &&
+    outbox === null &&
+    savedIntents.length === 0 &&
+    !drafting;
 
   const subjectOf = (subject: string | null) => subject?.split(":")[0] ?? null;
   const draftKind = subjectOf(draftSubject);
@@ -1273,50 +1318,64 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           </p>
         </div>
       )}
-      {canSend &&
-        binding.scope !== null &&
-        descriptor?.attachments.map((a) => (
-          <div key={a.id}>
-            {renderCapability(a.id, a.label, {
-              scope: { installId: binding.scope!.install_id, contextId: binding.scope!.context_id },
-              canWrite: canSend,
-              sendIntent: async (intent) => {
-                const message = newMessageId();
-                try {
-                  await api.threadSend(
-                    MASTER,
-                    JSON.stringify(intent),
-                    message,
-                    undefined,
-                    sendApp,
-                    convId ?? undefined,
-                  );
-                  void store.refresh();
-                  void resources.masterState.refresh();
-                  return null;
-                } catch (e: unknown) {
-                  return e instanceof ApiError ? e.message : String(e);
-                }
-              },
-            }, t)}
+      {/* CAD-1431: the CSV import is an explicit composer action, not a
+          standing panel. It stays scoped to this install and context (the
+          key remounts it on a change) and is independent of the generic
+          file-upload grant. */}
+      {csvAvailable && csvMounted && (
+        <div className="app-chat-import" data-chat-attachment="csv-import" hidden={!csvOpen}>
+          <div className="app-chat-import-head">
+            <span className="text-label text-ink-300">{t("Import customer CSV…")}</span>
+            <button type="button" className="lnk text-label" onClick={() => setCsvOpen(false)}>
+              {t("Close")}
+            </button>
           </div>
-        ))}
+          {renderCapability("csv-import", {
+            scope: { installId: binding.scope!.install_id, contextId: binding.scope!.context_id },
+            canWrite: canSend,
+            sendIntent: async (intent) => {
+              const message = newMessageId();
+              try {
+                await api.threadSend(
+                  MASTER,
+                  JSON.stringify(intent),
+                  message,
+                  undefined,
+                  sendApp,
+                  convId ?? undefined,
+                );
+                void store.refresh();
+                void resources.masterState.refresh();
+                return null;
+              } catch (e: unknown) {
+                return e instanceof ApiError ? e.message : String(e);
+              }
+            },
+          })}
+        </div>
+      )}
       {/* CAD-1168: the shared composer at compact density. The key
           remounts it per conversation, so each conversation's draft and
           its citation refs (persisted with the same key) are restored and
           no other's leaks in. CAD-1174 keeps the context concept off the
-          surface: no default chip or prompt row, and a record chip waits
-          for a server-proven reference rather than the route's
-          `recordOpen` flag. */}
-      {ctx !== null && mode.promptLayout === "list" && usable && loaded && items.length === 0 && outbox === null && (
+          surface: no default chip, and a record chip waits for a
+          server-proven reference rather than the route's `recordOpen`
+          flag. CAD-1431: the starters show only in a loaded, empty
+          conversation with a clear composer; a click fills and focuses it. */}
+      {ctx !== null && ctx.prompts.length > 0 && starters && (
         <div className="app-chat-sugg" data-chat-context data-chat-prompts>
           {ctx.prompts.map((p) => (
             <button
               key={p}
               type="button"
               className="app-chat-sugg-row"
-              disabled={!canSend}
-              onClick={() => setComposerDraft(composerKey, p)}
+              onClick={() => {
+                // Fill and focus only. Never sends, and never replaces an
+                // intent that appeared since the list was painted.
+                if (composerHasIntent(composerKey)) return;
+                setComposerDraft(composerKey, p);
+                document.getElementById(COMPOSER_ID)?.focus();
+              }}
             >
               <span>{p}</span>
               <span aria-hidden="true">→</span>
@@ -1339,7 +1398,8 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         attach={{ enabled: canAttach, reason: attachReason, destination: attachDestination }}
         originalUnresolved={originalUnresolved !== null}
         onResolveOriginal={() => outboxRef.current?.scrollIntoView?.({ block: "nearest" })}
-        textareaId="app-shell-chat-box"
+        textareaId={COMPOSER_ID}
+        actions={csvActions}
         ariaLabel={t("Message to Assistant")}
         placeholder={t("Message Assistant…")}
         className="app-chat-form"

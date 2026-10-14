@@ -119,6 +119,14 @@ export interface ComposerProps {
   /** The operator asked to settle the unresolved original: the pane
    *  reveals its recovery control. */
   onResolveOriginal?: () => void;
+  /** Compact only: host actions (CAD-1431) listed in a More actions menu. */
+  actions?: ComposerAction[];
+}
+
+/** One host action behind the compact composer's More actions menu. */
+export interface ComposerAction {
+  label: string;
+  onSelect: () => void;
 }
 
 /** Draft attachment chips (CAD-1419): one icon slot per chip that
@@ -241,6 +249,56 @@ function AttachChips({
   );
 }
 
+/** The More actions menu: an on-demand list of host actions, closed by a
+ *  pick, Escape or a pointer press outside it. */
+function ComposerActions({ actions, disabled }: { actions: ComposerAction[]; disabled: boolean }) {
+  const { t } = useLocale();
+  const [open, setOpen] = useState(false);
+  const wrap = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const close = (e: Event) => {
+      if (!wrap.current?.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("pointerdown", close);
+    return () => document.removeEventListener("pointerdown", close);
+  }, [open]);
+  return (
+    <div className="app-chat-actions" ref={wrap} onKeyDown={(e) => { if (e.key === "Escape") setOpen(false); }}>
+      <button
+        type="button"
+        className="app-chat-attach"
+        aria-label={t("More actions")}
+        aria-expanded={open}
+        title={t("More actions")}
+        disabled={disabled}
+        onClick={() => setOpen((o) => !o)}
+      >
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M5 12h.01M12 12h.01M19 12h.01" />
+        </svg>
+      </button>
+      {open && (
+        <div className="app-chat-actions-menu" aria-label={t("More actions")}>
+          {actions.map((a) => (
+            <button
+              key={a.label}
+              type="button"
+              className="app-chat-actions-item"
+              onClick={() => {
+                setOpen(false);
+                a.onSelect();
+              }}
+            >
+              {a.label}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /** The shared icon Send: one renderer for both densities (CAD-1168).
  *  Circular, monochrome, accessible; disabled while the send is held. */
 function IconSend({ disabled, title }: { disabled: boolean; title: string }) {
@@ -277,6 +335,7 @@ export default function Composer({
   onNotice,
   originalUnresolved = false,
   onResolveOriginal,
+  actions,
 }: ComposerProps) {
   const { t } = useLocale();
   const compact = density === "compact";
@@ -615,6 +674,7 @@ export default function Composer({
           <div className="app-chat-composer-tools">
             {attachInput}
             {attachButton}
+            {actions && actions.length > 0 && <ComposerActions actions={actions} disabled={!!block} />}
             <IconSend disabled={sendBlocked} title={t(sendTitle ?? "Send")} />
           </div>
         </div>
