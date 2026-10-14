@@ -673,6 +673,144 @@ fn native_chain_automatic_renewal_and_real_wiki_mutation() {
         assert_eq!(control(port, &nonce, "assert_owner_renewed"), 200);
     }
 
+    // Actual issuer commit followed by a lost wire reply, NOT a client
+    // process crash. The next normal command must resume the saved operation,
+    // never replay the uncertain original user write.
+    let before_drop = load_credential(&owner_dir, &target).unwrap();
+    let before_drop_session = before_drop.cli_session.as_ref().unwrap();
+    assert_eq!(before_drop_session.generation, 4);
+    assert!(before_drop.pending.is_none());
+    assert_eq!(control(port, &nonce, "arm_owner_commit_drop"), 200);
+    expire_client(&owner_dir, &target);
+    let failed_path = "projects/lc/pages/drop-must-not-land.md";
+    assert!(!vault.join(failed_path).exists());
+    assert!(!vault.join(format!("{failed_path}.blob")).exists());
+    let before = rig.snapshot();
+    let error = call(
+        &target,
+        &owner_dir,
+        "write",
+        json!({"path":failed_path,"text":"lost reply must not land"}),
+    )
+    .expect_err("dropped renewal reply unexpectedly completed the write");
+    assert!(
+        error
+            .to_string()
+            .contains("Hosted CLI session request failed"),
+        "drop did not surface the actual issuer wire failure"
+    );
+    assert!(
+        !error.to_string().contains("cadence login"),
+        "wire failure recommended a new login"
+    );
+    assert_eq!(
+        rig.snapshot(),
+        before,
+        "failed renewal mutated native state"
+    );
+    assert!(!vault.join(failed_path).exists());
+    assert!(!vault.join(format!("{failed_path}.blob")).exists());
+    let failed = load_credential(&owner_dir, &target).unwrap();
+    let failed_session = failed.cli_session.as_ref().unwrap();
+    assert!(failed.access_token == before_drop.access_token);
+    assert!(
+        serde_json::to_vec(failed_session).unwrap()
+            == serde_json::to_vec(before_drop_session).unwrap()
+    );
+    assert_eq!(failed_session.generation, 4);
+    let pending = failed
+        .pending
+        .as_ref()
+        .expect("wire failure lost pending renewal");
+    assert_eq!(pending.expected_generation, 4);
+    assert!(valid_operation_id(&pending.operation_id));
+    assert_eq!(control(port, &nonce, "assert_owner_commit_dropped"), 200);
+
+    // No explicit/manual renewer: the normal read retries the SAME pending
+    // operation with the old refresh bearer and receives the real saved reply.
+    assert_eq!(
+        call(&target, &owner_dir, "read", json!({"path":page})).unwrap()["text"],
+        "automatic renewal generation 4"
+    );
+    let recovered = load_credential(&owner_dir, &target).unwrap();
+    let recovered_session = recovered.cli_session.as_ref().unwrap();
+    assert_eq!(recovered_session.generation, 5);
+    assert!(recovered.access_token != before_drop.access_token);
+    assert!(recovered_session.refresh_token != before_drop_session.refresh_token);
+    assert!(
+        recovered.organization_id == before_drop.organization_id
+            && recovered.organization_slug == before_drop.organization_slug
+            && recovered.subject_id == before_drop.subject_id
+            && recovered.audience == before_drop.audience
+            && recovered.issuer == before_drop.issuer
+            && recovered.capabilities == before_drop.capabilities
+            && recovered_session.session_id == before_drop_session.session_id
+            && recovered_session.device_label == before_drop_session.device_label
+            && recovered_session.absolute_expires_at == before_drop_session.absolute_expires_at
+    );
+    assert!(recovered.pending.is_none());
+    assert_eq!(control(port, &nonce, "assert_owner_recovered"), 200);
+    assert_eq!(
+        rig.snapshot(),
+        before,
+        "recovery replayed the failed user write"
+    );
+    assert!(!vault.join(failed_path).exists());
+    assert!(!vault.join(format!("{failed_path}.blob")).exists());
+
+    // Fresh post-recovery operations, on different paths/content. Leave the
+    // shared gen4 page intact for the original member read/refusal coverage.
+    let recovered_page = "projects/lc/pages/recovered-5.md";
+    let recovered_text = "fresh write after pending recovery generation 5";
+    assert!(!vault.join(recovered_page).exists());
+    call(
+        &target,
+        &owner_dir,
+        "write",
+        json!({"path":recovered_page,"text":recovered_text}),
+    )
+    .unwrap();
+    assert_eq!(
+        call(&target, &owner_dir, "read", json!({"path":recovered_page})).unwrap()["text"],
+        recovered_text
+    );
+    assert_eq!(
+        rig.rpc("wiki_read", json!({"path":recovered_page}))["text"],
+        recovered_text
+    );
+    let recovered_blob_path = "projects/lc/blobs/recovered-5.bin";
+    let recovered_bytes = b"\x00fresh pending recovery binary\x05\xff";
+    assert!(!vault.join(recovered_blob_path).exists());
+    assert!(!vault.join(format!("{recovered_blob_path}.blob")).exists());
+    upload_file_in(
+        &owner_dir,
+        &target,
+        recovered_blob_path,
+        "recovered-5.bin",
+        recovered_bytes,
+        false,
+        60,
+        |_| {},
+    )
+    .unwrap();
+    let recovered_blob = rig.rpc("wiki_read", json!({"path":recovered_blob_path}));
+    assert_eq!(recovered_blob["kind"], "blob");
+    assert_eq!(
+        fs::read(crate::wiki::blobs_dir(&vault).join(recovered_blob["sha256"].as_str().unwrap()))
+            .unwrap(),
+        recovered_bytes
+    );
+    assert_eq!(
+        call(
+            &target,
+            &owner_dir,
+            "read",
+            json!({"path":recovered_blob_path})
+        )
+        .unwrap()["size"],
+        recovered_bytes.len()
+    );
+
     assert_eq!(
         call(&target, &member_dir, "read", json!({"path":page})).unwrap()["text"],
         "automatic renewal generation 4"
