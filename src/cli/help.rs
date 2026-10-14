@@ -48,7 +48,7 @@ const CORE: &[(&str, &[(&str, &str)])] = &[
         &[
             (
                 "update",
-                "Ship a build to production: one command (--to <sha> pins)",
+                "Update this installation (client or native host); --to <sha> pins",
             ),
             (
                 "dev",
@@ -98,7 +98,6 @@ const ADVANCED: &[&str] = &[
     "attachment",
     "auth",
     "claude",
-    "client-update",
     "codex",
     "cursor",
     "delivery",

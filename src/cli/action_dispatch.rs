@@ -33,7 +33,13 @@ pub(crate) fn run() -> Result<i32> {
     }
     let parsed = help::root_command(help::in_pane())
         .try_get_matches()
-        .and_then(|m| <Cli as clap::FromArgMatches>::from_arg_matches(&m));
+        .and_then(|m| {
+            let typed = command_line_ids(&m);
+            <Cli as clap::FromArgMatches>::from_arg_matches(&m).map(|mut cli| {
+                cli.command_line = Some(typed);
+                cli
+            })
+        });
     let cli = match parsed {
         Ok(cli) => cli,
         Err(e) => {
@@ -57,19 +63,37 @@ pub(crate) fn run() -> Result<i32> {
     run_cli(cli)
 }
 
+/// Every argument id the command line typed, at the root and in each
+/// subcommand (clap `value_source`), so a client-only `update` can refuse
+/// native options even when they equal their defaults. Clap's own defaults
+/// never count as typed.
+fn command_line_ids(m: &clap::ArgMatches) -> Vec<String> {
+    let typed = m
+        .ids()
+        .filter(|id| m.value_source(id.as_str()) == Some(clap::parser::ValueSource::CommandLine))
+        .map(|id| id.as_str().to_string());
+    let nested = m
+        .subcommand()
+        .map(|(_, sub)| command_line_ids(sub))
+        .unwrap_or_default();
+    typed.chain(nested).collect()
+}
+
 pub(super) fn run_cli(cli: Cli) -> Result<i32> {
     let client_only = client_update::client_only_mode()?;
-    // CAD-1425: client-update is its own local verb, resolved before any
-    // org selection, credential or tracker work.
-    if let Commands::ClientUpdate { check, version } = &cli.command {
-        return client_update::run(*check, version.as_deref());
+    // CAD-1437: a valid client-only receipt selects the public updater before
+    // any org, credential, tracker or state work. Native-only options refuse.
+    if let Commands::Update { check, version, .. } = &cli.command {
+        if client_only {
+            return client_update::run(&cli, *check, version.as_deref());
+        }
+        if version.is_some() {
+            return Err(client_update::client_only_required());
+        }
     }
     // CAD-1425: the native daemon updater cannot prove its operator on
     // macOS. Refuse before org resolution, sandbox adoption or any state.
     if matches!(cli.command, Commands::Update { .. }) {
-        if client_only {
-            return Err(client_update::local_command_refusal());
-        }
         client_update::native_platform_refusal()?;
     }
     // Offline custody never resolves daemon, org defaults or issuer credentials.
@@ -706,7 +730,6 @@ pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
         Commands::Topic { action } => topic::run(state_dir, action),
         Commands::Monitor { action } => monitor::run(state_dir, action),
         Commands::Org { action } => org::run(action),
-        Commands::ClientUpdate { .. } => unreachable!("client-update dispatched before state-dir"),
         Commands::Issue { action } => issue::run(state_dir, action),
         Commands::Connection { action } => connection::run(state_dir, action),
         Commands::Platform { action } => platform::run(state_dir, action),
@@ -823,6 +846,7 @@ pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
         ),
         Commands::Update {
             action,
+            version: _,
             check,
             rollback,
             drain,

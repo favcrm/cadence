@@ -12,7 +12,7 @@
 //! Row 1, ordinary receipt-less installation: `$HOME/.local/bin/cadence` links
 //! to a real release at `$XDG_DATA_HOME/cadence/releases/<tag>/cadence` with
 //! CI-shaped `cadence.sha256` and `manifest.json`, and NO `client-install.json`.
-//! `cadence client-update --check` must refuse with the stable text
+//! `cadence update --version TAG` (receipt-less, CAD-1437) must refuse with the stable text
 //! "client-only installation required" and exit 3 (`rejected`), before any
 //! network or sentinel call. The saved remote registry
 //! (`$XDG_CONFIG_HOME/cadence/orgs.json`) and remote credential
@@ -23,12 +23,12 @@
 //! `<prefix>/client-install.json` receipt (schema 1, kind "client-only",
 //! absolute prefix, absolute link, release-asset target) and a separate link
 //! `$HOME/.local/bin/cadence-client`. Running that copy through its link with
-//! a local daemon command (`update --check`) must refuse with
+//! a local daemon command (`daemon status`) must refuse with
 //! "client-only installation cannot run local daemon commands" and exit 3,
 //! before any state is created (`$XDG_STATE_HOME/cadence` must not exist).
 //!
 //! Row 3, invalid provenance: a real client-only installation of v0.0.9 asks
-//! `client-update --version v0.1.0`. The owned fixture archive, checksum and
+//! `update --version v0.1.0`. The owned fixture archive, checksum and
 //! manifest are valid; the owned `gh` stand-in fails `attestation verify`.
 //! Must refuse with exit 3 at the attestation guard, after `ATTEST_CALLED`,
 //! before the candidate (which writes EXECUTED if run) is executed or staged.
@@ -44,7 +44,8 @@
 //! (including sentinel logs).
 //!
 //! Interface needs (from the approved CAD-1425 interface, not source): the
-//! subcommand `client-update` with `--check`; the receipt keys above; the two
+//! subcommand `update` with `--version` and `--check` (CAD-1437 unified
+//! interface); the retired `client-update` must be an unknown subcommand; the receipt keys above; the two
 //! stable refusal texts; exit code 3. Nothing else is required: no
 //! `--link`/`--releases-dir`/state knobs, and no test-seam or operator
 //! authority is used.
@@ -339,7 +340,7 @@ fn full_manifest(tag: &str, runner: &str, digest: &str) -> serde_json::Value {
 }
 
 /// A client-only release dir for `tag` with the full manifest, so the
-/// installed-release check passes and `client-update` reaches the download.
+/// installed-release check passes and `update --version` reaches the download.
 fn install_full_release(prefix: &Path, tag: &str, runner: &str) -> PathBuf {
     let dir = prefix.join("releases").join(tag);
     fs::create_dir_all(&dir).unwrap();
@@ -377,14 +378,20 @@ fn write_receipt(prefix: &Path, link: &Path) {
 /// bytes that record EXECUTED if ever run. Returns the archive and the sha256
 /// line naming it.
 fn write_candidate_archive(root: &Path, tag: &str, runner: &str) -> (PathBuf, PathBuf) {
-    let fixtures = root.join("fixtures");
-    let stage = fixtures.join("stage");
-    fs::create_dir_all(&stage).unwrap();
     let candidate = format!(
         "#!/bin/sh\necho executed >> '{}'\n",
         root.join(EXECUTED).display()
     );
-    fs::write(stage.join("cadence"), &candidate).unwrap();
+    write_archive_with(root, tag, runner, &candidate)
+}
+
+/// Owned archive for `tag` around the given candidate script bytes, with a
+/// full manifest and checksums. Returns the archive and its sha256 line.
+fn write_archive_with(root: &Path, tag: &str, runner: &str, candidate: &str) -> (PathBuf, PathBuf) {
+    let fixtures = root.join("fixtures");
+    let stage = fixtures.join("stage");
+    fs::create_dir_all(&stage).unwrap();
+    fs::write(stage.join("cadence"), candidate).unwrap();
     let digest = sha256_hex(candidate.as_bytes());
     fs::write(stage.join("cadence.sha256"), format!("{digest}  cadence\n")).unwrap();
     fs::write(
@@ -448,7 +455,7 @@ esac
 
 #[test]
 fn client_update_refuses_receipt_less_and_local_daemon_commands_before_effect() {
-    // ---- Row 1: ordinary receipt-less installation, client-update refused.
+    // ---- Row 1: ordinary receipt-less installation, public update refused.
     {
         let sb = Sandbox::new();
         sb.write_remote_state();
@@ -462,7 +469,7 @@ fn client_update_refuses_receipt_less_and_local_daemon_commands_before_effect() 
         );
 
         let before = snapshot(&sb.root);
-        let out = sb.run(&link, &["client-update", "--check"]);
+        let out = sb.run(&link, &["update", "--version", TAG]);
 
         assert_refused(&out, CLIENT_REFUSAL);
         assert_no_external_call(&sb);
@@ -476,10 +483,12 @@ fn client_update_refuses_receipt_less_and_local_daemon_commands_before_effect() 
     }
 
     // ---- Row 2: positive client-only installation, local daemon command
-    //      refused from the copied real binary.
+    //      refused from the copied real binary (`daemon status`; plain
+    //      `update` is now the public path, CAD-1437).
     {
         let sb = Sandbox::new();
-        sb.write_remote_state();
+        // No saved remote default: `daemon status` from a client routes to a
+        // saved remote org by design, so the local refusal needs a local default.
         let prefix = sb.xdg_data.join("cadence-client");
         let bin = sb.install_release(&prefix);
         let link = sb.home.join(".local/bin/cadence-client");
@@ -498,7 +507,7 @@ fn client_update_refuses_receipt_less_and_local_daemon_commands_before_effect() 
         .unwrap();
 
         let before = snapshot(&sb.root);
-        let out = sb.run(&link, &["update", "--check"]);
+        let out = sb.run(&link, &["daemon", "status"]);
 
         assert_refused(&out, LOCAL_REFUSAL);
         assert_no_external_call(&sb);
@@ -530,7 +539,7 @@ fn client_update_refuses_receipt_less_and_local_daemon_commands_before_effect() 
         let path = format!("{}:/usr/bin:/bin", bin_dir.display());
 
         let before = snapshot(&sb.root);
-        let out = sb.run_with_path(&link, &["client-update", "--version", TAG], &path);
+        let out = sb.run_with_path(&link, &["update", "--version", TAG], &path);
 
         assert_refused(&out, "did not verify — refusing to execute or install it");
         let calls = fs::read_to_string(sb.root.join(GH_CALLS)).unwrap_or_default();
@@ -637,17 +646,23 @@ fn snapshot_without_sentinel_log(sb: &Sandbox) -> BTreeMap<PathBuf, Entry> {
 /// `scripts/install.sh` with the sentinel PATH (curl, wget and gh only log and
 /// exit 97, so nothing is downloaded).
 fn run_installer(sb: &Sandbox, args: &[&str]) -> Output {
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/install.sh");
     let path = format!("{}:/usr/bin:/bin", sb.sentinel_bin.display());
+    run_installer_with_path(sb, args, &path)
+}
+
+/// `scripts/install.sh` with an explicit PATH (stand-ins that serve only the
+/// fixed release URLs).
+fn run_installer_with_path(sb: &Sandbox, args: &[&str], path: &str) -> Output {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/install.sh");
     let mut argv = vec![script.to_str().unwrap()];
     argv.extend_from_slice(args);
-    sb.run_with_path(Path::new("/bin/sh"), &argv, &path)
+    sb.run_with_path(Path::new("/bin/sh"), &argv, path)
 }
 
 /// Owned archive for `tag` whose binary is the REAL built `cadence`, with a
 /// correct outer and inner checksum and a full manifest whose source commit is
-/// the one that binary reports for `--version`. client-update then runs the
-/// real candidate `--version` and `client-update --help`.
+/// the one that binary reports for `--version`. The updater then runs the
+/// real candidate `--version` and `update --help`.
 fn write_real_candidate_archive(root: &Path, tag: &str) -> (PathBuf, PathBuf) {
     let version = cadence_agent::reaper::output(Command::new(BIN).arg("--version"))
         .expect("cadence --version must run");
@@ -849,17 +864,13 @@ fn client_update_round_trip_keeps_receipt_prefix_through_symlinked_ancestor() {
     let path = format!("{}:/usr/bin:/bin", bin_dir.display());
 
     // Updater: the real built CLI, identified through the symlinked prefix.
-    let out = sb.run_with_path(
-        &inst.link,
-        &["client-update", "--version", CANDIDATE_TAG],
-        &path,
-    );
+    let out = sb.run_with_path(&inst.link, &["update", "--version", CANDIDATE_TAG], &path);
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     assert_eq!(
         out.status.code(),
         Some(0),
-        "client-update must install {CANDIDATE_TAG}, got {:?}\n{stderr}",
+        "update --version must install {CANDIDATE_TAG}, got {:?}\n{stderr}",
         out.status
     );
     let new_dir = inst.raw_prefix.join("releases").join(CANDIDATE_TAG);
@@ -969,7 +980,7 @@ fn client_update_refuses_malformed_symlinked_receipts_before_effect() {
             link.to_str().unwrap(),
         );
         let before = snapshot(&sb.root);
-        let out = sb.run(&inst.link, &["client-update", "--check"]);
+        let out = sb.run(&inst.link, &["update", "--version", CANDIDATE_TAG]);
         assert_refused(&out, CLIENT_REFUSAL);
         assert_no_external_call(&sb);
         assert_eq!(
@@ -1060,11 +1071,7 @@ fn client_update_refuses_alias_retarget_before_staging_into_other_root() {
     // Expected end state: everything as before, except the owned alias now
     // points at the other root (the fixture's own retarget).
     let mut expected = snapshot(&sb.root);
-    let out = sb.run_with_path(
-        &inst.link,
-        &["client-update", "--version", CANDIDATE_TAG],
-        &path,
-    );
+    let out = sb.run_with_path(&inst.link, &["update", "--version", CANDIDATE_TAG], &path);
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
 
     let calls = fs::read_to_string(sb.root.join(GH_CALLS)).unwrap_or_default();
@@ -1100,6 +1107,328 @@ fn client_update_refuses_alias_retarget_before_staging_into_other_root() {
         fs::read_to_string(other_prefix.join("releases").join("witness.txt")).unwrap(),
         "witness\n",
         "the other root's witness must be untouched"
+    );
+}
+
+// ---- CAD-1437 unified-update rows (independent acceptance author; the
+// implementer may not edit these). They run the actual built binary against
+// owned fixtures. A `gh` stand-in here is NOT provenance evidence.
+
+const CLIENT_HELP_MARKER: &str = "Upgrade a client-only installation";
+/// The native-only `update --help` text from before CAD-1437. It names no
+/// client mode and must never qualify a candidate as client-capable.
+const NATIVE_UPDATE_HELP: &str =
+    "Update to the newest attested green main build in one command (CAD-561)";
+
+/// A `curl` stand-in that serves ONLY the fixed public GitHub release URLs for
+/// `tag` from the owned archive and checksum. The installer's client-only path
+/// has no mirror seam, so this stands in for the network, not for provenance.
+fn write_fake_curl_github(bin_dir: &Path, tag: &str, archive: &Path, sha_file: &Path) {
+    let prefix = format!("https://github.com/favcrm/cadence/releases/download/{tag}/");
+    let script = format!(
+        r#"#!/bin/sh
+out=
+prev=
+for a in "$@"; do
+  if [ "$prev" = -o ]; then out=$a; fi
+  prev=$a
+  url=$a
+done
+case "$url" in
+'{prefix}'*.tar.gz.sha256) cp '{sha}' "$out" || exit 1 ;;
+'{prefix}'*.tar.gz) cp '{archive}' "$out" || exit 1 ;;
+*) echo "$url" >> '{log}'; exit 97 ;;
+esac
+"#,
+        sha = sha_file.display(),
+        archive = archive.display(),
+        log = bin_dir.join("curl-refused.log").display(),
+    );
+    let curl = bin_dir.join("curl");
+    fs::write(&curl, script).unwrap();
+    fs::set_permissions(&curl, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A validated client-only installation at INSTALLED_TAG, linked at
+/// `~/.local/bin/cadence-client`, with a saved remote default org that must
+/// not divert a public update.
+fn validated_client(sb: &Sandbox) -> PathBuf {
+    sb.write_remote_state();
+    let prefix = sb.xdg_data.join("cadence-client");
+    let bin = install_full_release(&prefix, INSTALLED_TAG, RUNNER);
+    let link = sb.home.join(".local/bin/cadence-client");
+    sb.link(&link, &bin);
+    write_receipt(&prefix, &link);
+    link
+}
+
+/// Primary check path: `update --check --version TAG` on a validated client
+/// selects the tag from the local receipt, even under a saved remote default,
+/// and reports that the artifact is neither downloaded nor verified.
+#[test]
+fn unified_update_check_selects_public_path_from_local_receipt() {
+    let sb = Sandbox::new();
+    let link = validated_client(&sb);
+    let before = snapshot(&sb.root);
+    let out = sb.run(&link, &["update", "--check", "--version", TAG]);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "update --check must succeed, got {:?}\n{stderr}",
+        out.status
+    );
+    assert!(
+        stdout.contains(TAG),
+        "the check must select {TAG}, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("not downloaded or verified"),
+        "the check must not claim verification, got:\n{stdout}"
+    );
+    assert_no_external_call(&sb);
+    assert!(!sb.xdg_state.exists(), "the check must create no state");
+    assert_eq!(snapshot(&sb.root), before, "the check must change nothing");
+}
+
+/// The one CAD-1437 bad-case guard entry. Each row runs the actual binary and
+/// must refuse before any fetch, state or native action: native-only flags and
+/// subcommands on a validated client (including explicitly supplied defaults),
+/// the retired `client-update` invocations (unknown, not retained), a receipt-
+/// less or malformed identity, and an old native-only help candidate.
+#[test]
+fn unified_update_refuses_native_flags_and_retired_command_before_effect() {
+    let native: &[&[&str]] = &[
+        &["update", "--version", TAG, "--keep", "3"],
+        &["update", "--version", TAG, "--drain", "10m"],
+        &["update", "--version", TAG, "--repo", "favcrm/cadence"],
+        &["update", "--version", TAG, "--as", "operator:ada"],
+        &["update", "--version", TAG, "--to", FIXTURE_SOURCE_SHA],
+        &["update", "--version", TAG, "--now"],
+        &["update", "--version", TAG, "--rollback"],
+        &["update", "status"],
+    ];
+    for &args in native {
+        let sb = Sandbox::new();
+        let link = validated_client(&sb);
+        let before = snapshot(&sb.root);
+        let out = sb.run(&link, args);
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(
+            !out.status.success(),
+            "{args:?} on a client must refuse, got {:?}\n{stderr}",
+            out.status
+        );
+        assert!(
+            !stderr.trim().is_empty(),
+            "{args:?} must carry a refusal, got empty stderr"
+        );
+        assert_no_external_call(&sb);
+        assert!(!sb.xdg_state.exists(), "{args:?} must create no state");
+        assert_eq!(snapshot(&sb.root), before, "{args:?} must change nothing");
+    }
+
+    // The retired command is an unknown subcommand (clap usage error, exit 2),
+    // not an alias, hidden entry or help-only hook.
+    let retired: &[&[&str]] = &[
+        &["client-update", "--check"],
+        &["client-update", "--version", TAG],
+        &["client-update", "--help"],
+    ];
+    for &args in retired {
+        let sb = Sandbox::new();
+        let link = validated_client(&sb);
+        let before = snapshot(&sb.root);
+        let out = sb.run(&link, args);
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(
+            !out.status.success(),
+            "{args:?} must not run, got {:?}\n{stderr}",
+            out.status
+        );
+        assert!(
+            stderr.contains("unrecognized subcommand") && stderr.contains("client-update"),
+            "{args:?} must be refused as unrecognized, got:\n{stderr}"
+        );
+        assert!(
+            !stdout.contains(CLIENT_HELP_MARKER),
+            "{args:?} must not print a retained client help, got:\n{stdout}"
+        );
+        assert_no_external_call(&sb);
+        assert!(!sb.xdg_state.exists(), "{args:?} must create no state");
+        assert_eq!(snapshot(&sb.root), before, "{args:?} must change nothing");
+    }
+
+    // Receipt-less ordinary install: a native flag on the public selector.
+    {
+        let sb = Sandbox::new();
+        sb.write_remote_state();
+        let prefix = sb.xdg_data.join("cadence");
+        let bin = sb.install_release(&prefix);
+        let link = sb.home.join(".local/bin/cadence");
+        sb.link(&link, &bin);
+        let before = snapshot(&sb.root);
+        let out = sb.run(&link, &["update", "--version", TAG, "--keep", "3"]);
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(
+            !out.status.success(),
+            "receipt-less update with a native flag must refuse, got {:?}\n{stderr}",
+            out.status
+        );
+        assert_no_external_call(&sb);
+        assert!(!sb.xdg_state.exists(), "the refusal must create no state");
+        assert_eq!(
+            snapshot(&sb.root),
+            before,
+            "the refusal must change nothing"
+        );
+    }
+
+    // Malformed receipt (ambiguous identity) cannot opt into a public update.
+    {
+        let sb = Sandbox::new();
+        sb.write_remote_state();
+        let inst = symlinked_client_install(&sb);
+        let other = sb.root.join("linkdir/other-prefix");
+        write_shell_receipt(
+            &inst.physical_prefix,
+            other.to_str().unwrap(),
+            inst.link.to_str().unwrap(),
+        );
+        let before = snapshot(&sb.root);
+        let out = sb.run(
+            &inst.link,
+            &["update", "--version", CANDIDATE_TAG, "--keep", "3"],
+        );
+        assert_refused(&out, CLIENT_REFUSAL);
+        assert_no_external_call(&sb);
+        assert!(!sb.xdg_state.exists(), "the refusal must create no state");
+        assert_eq!(
+            snapshot(&sb.root),
+            before,
+            "the refusal must change nothing"
+        );
+    }
+
+    // A candidate whose `update --help` is only the old native help must be
+    // refused by the client capability probe, before any install. The shell
+    // stand-in runs only as the candidate; any other call records EXECUTED.
+    {
+        let sb = Sandbox::new();
+        let link = validated_client(&sb);
+        let candidate = format!(
+            "#!/bin/sh\ncase \"$1\" in\n--version) echo 'cadence {}+{}' ;;\nupdate) echo '{}' ;;\n*) echo executed >> '{}' ;;\nesac\n",
+            &CANDIDATE_TAG[1..],
+            FIXTURE_SOURCE_SHA,
+            NATIVE_UPDATE_HELP,
+            sb.root.join(EXECUTED).display()
+        );
+        let (archive, sha_file) = write_archive_with(&sb.root, CANDIDATE_TAG, RUNNER, &candidate);
+        let bin_dir = write_fake_gh_attest_ok(&sb.root, &archive, &sha_file);
+        let path = format!("{}:/usr/bin:/bin", bin_dir.display());
+        let before = snapshot(&sb.root);
+        let out = sb.run_with_path(&link, &["update", "--version", CANDIDATE_TAG], &path);
+        assert_refused(&out, "lacks client-only support");
+        assert!(
+            !sb.root.join(EXECUTED).exists(),
+            "a candidate without the client marker must not execute beyond its probe"
+        );
+        let mut after = snapshot(&sb.root);
+        after.remove(Path::new(GH_CALLS));
+        assert_eq!(
+            after, before,
+            "the old-help candidate must install nothing and change no link"
+        );
+    }
+
+    // The installer's own probe refuses the same old-help candidate, before
+    // any receipt, link or prefix write.
+    {
+        let sb = Sandbox::new();
+        let candidate = format!(
+            "#!/bin/sh\ncase \"$1\" in\n--version) echo 'cadence {}+{}' ;;\nupdate) echo '{}' ;;\n*) echo executed >> '{}' ;;\nesac\n",
+            &CANDIDATE_TAG[1..],
+            FIXTURE_SOURCE_SHA,
+            NATIVE_UPDATE_HELP,
+            sb.root.join(EXECUTED).display()
+        );
+        let (archive, sha_file) = write_archive_with(&sb.root, CANDIDATE_TAG, RUNNER, &candidate);
+        let bin_dir = write_fake_gh_attest_ok(&sb.root, &archive, &sha_file);
+        write_fake_curl_github(&bin_dir, CANDIDATE_TAG, &archive, &sha_file);
+        let path = format!("{}:/usr/bin:/bin", bin_dir.display());
+        let prefix = sb.xdg_data.join("cadence-client");
+        let before = snapshot(&sb.root);
+        let out = run_installer_with_path(
+            &sb,
+            &[
+                "--client-only",
+                "--version",
+                CANDIDATE_TAG,
+                "--prefix",
+                prefix.to_str().unwrap(),
+            ],
+            &path,
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(out.status.code(), Some(1), "got {:?}\n{stderr}", out.status);
+        assert!(
+            stderr.contains("is not capable of client-only installs"),
+            "the installer must refuse the native-only help, got:\n{stderr}"
+        );
+        assert!(
+            !sb.root.join(EXECUTED).exists(),
+            "the installer probe must not execute the candidate beyond its probe"
+        );
+        let mut after = snapshot(&sb.root);
+        after.remove(Path::new(GH_CALLS));
+        assert_eq!(
+            after, before,
+            "the installer refusal must write no prefix, receipt or link"
+        );
+    }
+}
+
+/// Primary installer path: `install.sh --client-only` with the real unified
+/// candidate writes the receipt and the `cadence-client` link after its probe.
+/// The `gh` and `curl` stand-ins are NOT provenance: they only answer the
+/// fixed download URLs and a passing attestation call.
+#[test]
+fn unified_installer_probe_accepts_real_candidate_and_links_client() {
+    let sb = Sandbox::new();
+    let (archive, sha_file) = write_real_candidate_archive(&sb.root, CANDIDATE_TAG);
+    let bin_dir = write_fake_gh_attest_ok(&sb.root, &archive, &sha_file);
+    write_fake_curl_github(&bin_dir, CANDIDATE_TAG, &archive, &sha_file);
+    let path = format!("{}:/usr/bin:/bin", bin_dir.display());
+    let prefix = sb.xdg_data.join("cadence-client");
+    let out = run_installer_with_path(
+        &sb,
+        &[
+            "--client-only",
+            "--version",
+            CANDIDATE_TAG,
+            "--prefix",
+            prefix.to_str().unwrap(),
+        ],
+        &path,
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "installer must accept the unified candidate, got {:?}\n{stderr}",
+        out.status
+    );
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&fs::read(prefix.join(RECEIPT_FILE)).unwrap()).unwrap();
+    assert_eq!(receipt["kind"], "client-only");
+    let dest = prefix.join("releases").join(CANDIDATE_TAG).join(BINARY);
+    assert!(dest.is_file(), "the release must be installed at {dest:?}");
+    assert_eq!(
+        fs::read_link(sb.home.join(".local/bin/cadence-client")).unwrap(),
+        dest,
+        "the cadence-client link must point at the installed release"
     );
 }
 
