@@ -458,6 +458,8 @@ main() {
         case "$TAG" in
             v | *[!0-9A-Za-z.+_-]* | *..*) die "not a release tag: $VERSION" ;;
         esac
+        release_key "$TAG" >/dev/null \
+            || die "$TAG is not a stable vMAJOR.MINOR.PATCH release tag — client-only installs refuse prerelease and build-metadata tags"
         client_only_install "$TAG" "$target"
         say "ok: $CLIENT_LINK --version"
         exit 0

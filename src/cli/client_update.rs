@@ -60,6 +60,9 @@ struct Receipt {
 /// A positively identified client-only installation.
 pub(crate) struct ClientInstall {
     prefix: PathBuf,
+    /// The validated absolute prefix as the receipt spells it (it canonicalizes
+    /// to `prefix`); used for the staged release path and switch target.
+    receipt_prefix: PathBuf,
     link: PathBuf,
     /// The link's raw target when the installation was identified.
     link_target: PathBuf,
@@ -182,6 +185,7 @@ fn identify(exe: &Path) -> Result<Option<ClientInstall>> {
         .map_err(|e| ambiguous(format!("cannot read the receipt link: {e}")))?;
     Ok(Some(ClientInstall {
         prefix: prefix.to_path_buf(),
+        receipt_prefix: real_prefix,
         link,
         link_target,
         tag: tag.to_string(),
@@ -282,7 +286,12 @@ pub(crate) fn run(check: bool, version: Option<&str>) -> Result<i32> {
     }
     let verified = fetch_verified(&wanted, target, runner)?;
     let _lock = CommitLock::take(&install.prefix)?;
-    let dest = stage_release(&install.prefix, &wanted, &verified)?;
+    if fs::canonicalize(&install.receipt_prefix).ok().as_deref() != Some(install.prefix.as_path()) {
+        return Err(ambiguous(
+            "the prefix changed while the release was verified",
+        ));
+    }
+    let dest = stage_release(&install.receipt_prefix, &wanted, &verified)?;
     switch_link(&install.link, &install.link_target, &dest.join(BINARY))?;
     println!("client-update: installed {wanted} at {}", dest.display());
     println!(

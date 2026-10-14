@@ -75,6 +75,9 @@ const REMOTE_ORG_ID: &str = "ws_fixture";
 const FIXTURE_SOURCE_SHA: &str = "1425142514251425142514251425142514251425";
 /// The installed client release in the provenance row (the target is TAG).
 const INSTALLED_TAG: &str = "v0.0.9";
+/// The release tag the two actual-built-binary rows install. The built `cadence`
+/// reports this package version, so the fixture follows the Cargo version bump.
+const CANDIDATE_TAG: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 const GH_CALLS: &str = "gh-calls.log";
 const EXECUTED: &str = "EXECUTED";
 
@@ -597,6 +600,507 @@ fn client_update_refuses_receipt_less_and_local_daemon_commands_before_effect() 
             "installer refusal on a client prefix must write nothing"
         );
     }
+}
+
+// ---- CAD-1430 rows (independent acceptance author; the implementer may not
+// edit these). Fixtures are owned and local. The `gh` stand-ins answer only
+// the download and attestation calls; a stand-in attestation is NOT
+// provenance evidence, and public release provenance is not checked here.
+
+const RECEIPT_FILE: &str = "client-install.json";
+const EXTERNAL_LOG: &str = "external-calls.log";
+const BINARY: &str = "cadence";
+const SHA_FILE: &str = "cadence.sha256";
+const MANIFEST: &str = "manifest.json";
+
+fn is_full_sha(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The receipt bytes `install.sh` writes (`client_receipt`), so the shell's
+/// exact-match check sees what the installer itself would have written.
+fn write_shell_receipt(dir: &Path, prefix: &str, link: &str) {
+    let text = format!(
+        "{{\n  \"schema\": 1,\n  \"kind\": \"client-only\",\n  \"prefix\": \"{prefix}\",\n  \"link\": \"{link}\",\n  \"target\": \"{TARGET}\"\n}}\n"
+    );
+    fs::write(dir.join(RECEIPT_FILE), text).unwrap();
+}
+
+/// The snapshot without the owned sentinel call log, the only file a refused
+/// installer run may add.
+fn snapshot_without_sentinel_log(sb: &Sandbox) -> BTreeMap<PathBuf, Entry> {
+    let mut snap = snapshot(&sb.root);
+    snap.remove(Path::new(EXTERNAL_LOG));
+    snap
+}
+
+/// `scripts/install.sh` with the sentinel PATH (curl, wget and gh only log and
+/// exit 97, so nothing is downloaded).
+fn run_installer(sb: &Sandbox, args: &[&str]) -> Output {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/install.sh");
+    let path = format!("{}:/usr/bin:/bin", sb.sentinel_bin.display());
+    let mut argv = vec![script.to_str().unwrap()];
+    argv.extend_from_slice(args);
+    sb.run_with_path(Path::new("/bin/sh"), &argv, &path)
+}
+
+/// Owned archive for `tag` whose binary is the REAL built `cadence`, with a
+/// correct outer and inner checksum and a full manifest whose source commit is
+/// the one that binary reports for `--version`. client-update then runs the
+/// real candidate `--version` and `client-update --help`.
+fn write_real_candidate_archive(root: &Path, tag: &str) -> (PathBuf, PathBuf) {
+    let version = cadence_agent::reaper::output(Command::new(BIN).arg("--version"))
+        .expect("cadence --version must run");
+    let version = String::from_utf8_lossy(&version.stdout).trim().to_string();
+    let source = version.rsplit('+').next().unwrap_or_default().to_string();
+    assert!(
+        is_full_sha(&source),
+        "built cadence must report a full commit, got {version:?}"
+    );
+    assert_eq!(
+        version,
+        format!("cadence {}+{source}", &tag[1..]),
+        "the built binary must be a candidate for {tag}"
+    );
+
+    let fixtures = root.join("fixtures-real");
+    let stage = fixtures.join("stage");
+    fs::create_dir_all(&stage).unwrap();
+    fs::copy(BIN, stage.join(BINARY)).unwrap();
+    fs::set_permissions(stage.join(BINARY), fs::Permissions::from_mode(0o755)).unwrap();
+    let digest = sha256_hex(&fs::read(stage.join(BINARY)).unwrap());
+    fs::write(stage.join(SHA_FILE), format!("{digest}  cadence\n")).unwrap();
+    let mut manifest = full_manifest(tag, RUNNER, &digest);
+    manifest["source_sha"] = json!(source);
+    fs::write(
+        stage.join(MANIFEST),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    let asset = format!("cadence-{tag}-{TARGET}.tar.gz");
+    let archive = fixtures.join(&asset);
+    let tar = cadence_agent::reaper::output(
+        Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&stage)
+            .args([BINARY, SHA_FILE, MANIFEST]),
+    )
+    .expect("tar must run");
+    assert!(tar.status.success(), "fixture archive must build");
+    let sha_file = fixtures.join(format!("{asset}.sha256"));
+    let archive_digest = sha256_hex(&fs::read(&archive).unwrap());
+    fs::write(&sha_file, format!("{archive_digest}  {asset}\n")).unwrap();
+    (archive, sha_file)
+}
+
+/// A `gh` stand-in for the positive updater row: `release download` copies the
+/// owned archive and checksum into `--dir`; `attestation verify` succeeds.
+/// This stands in for the signed attestation only. It is not provenance.
+fn write_fake_gh_attest_ok(root: &Path, archive: &Path, sha_file: &Path) -> PathBuf {
+    let bin_dir = root.join("provenance-ok-bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let script = format!(
+        r#"#!/bin/sh
+echo "$*" >> '{calls}'
+case "$1 $2" in
+"release download")
+  dir=
+  prev=
+  for a in "$@"; do
+    if [ "$prev" = --dir ]; then dir=$a; fi
+    prev=$a
+  done
+  cp '{archive}' '{sha}' "$dir/" || exit 1
+  ;;
+"attestation verify")
+  echo ATTEST_CALLED >> '{calls}'
+  exit 0
+  ;;
+*) exit 97 ;;
+esac
+"#,
+        calls = root.join(GH_CALLS).display(),
+        archive = archive.display(),
+        sha = sha_file.display(),
+    );
+    let gh = bin_dir.join("gh");
+    fs::write(&gh, script).unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    bin_dir
+}
+
+/// A client-only installation whose prefix is spelled through a symlinked
+/// ancestor (`<root>/linkdir -> <root>/realdir`). The receipt prefix and the
+/// link keep the raw spelling, as `install.sh` writes them.
+struct SymlinkedInstall {
+    raw_prefix: PathBuf,
+    physical_prefix: PathBuf,
+    link: PathBuf,
+}
+
+fn symlinked_client_install(sb: &Sandbox) -> SymlinkedInstall {
+    let real = sb.root.join("realdir");
+    fs::create_dir_all(&real).unwrap();
+    symlink(&real, sb.root.join("linkdir")).unwrap();
+    let physical_prefix = real.join("cadence-client");
+    let raw_prefix = sb.root.join("linkdir/cadence-client");
+    install_full_release(&physical_prefix, INSTALLED_TAG, RUNNER);
+    let link = sb.home.join(".local/bin/cadence-client");
+    sb.link(
+        &link,
+        &raw_prefix.join("releases").join(INSTALLED_TAG).join(BINARY),
+    );
+    write_shell_receipt(
+        &physical_prefix,
+        raw_prefix.to_str().unwrap(),
+        link.to_str().unwrap(),
+    );
+    SymlinkedInstall {
+        raw_prefix,
+        physical_prefix,
+        link,
+    }
+}
+
+#[test]
+fn fresh_client_install_refuses_prerelease_and_build_tags_before_download() {
+    for tag in ["v0.1.0-rc.1", "v0.1.0+build.7", "v1.0"] {
+        let sb = Sandbox::new();
+        let prefix = sb.xdg_data.join("cadence-client");
+        let before = snapshot(&sb.root);
+        let out = run_installer(
+            &sb,
+            &[
+                "--client-only",
+                "--version",
+                tag,
+                "--prefix",
+                prefix.to_str().unwrap(),
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{tag}: fresh client install must exit 1, got {:?}\n{stderr}",
+            out.status
+        );
+        assert!(
+            stderr.contains("is not a stable vMAJOR.MINOR.PATCH release tag"),
+            "{tag}: refusal must name the stable tag rule, got:\n{stderr}"
+        );
+        assert_no_external_call(&sb);
+        assert_eq!(
+            snapshot(&sb.root),
+            before,
+            "{tag}: refusal must write nothing"
+        );
+    }
+}
+
+#[test]
+fn fresh_client_install_keeps_stable_tag_eligible() {
+    let sb = Sandbox::new();
+    let prefix = sb.xdg_data.join("cadence-client");
+    let before = snapshot(&sb.root);
+    let out = run_installer(
+        &sb,
+        &[
+            "--client-only",
+            "--version",
+            TAG,
+            "--prefix",
+            prefix.to_str().unwrap(),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "got {:?}\n{stderr}", out.status);
+    assert!(
+        !stderr.contains("stable vMAJOR.MINOR.PATCH"),
+        "a stable tag must not hit the tag refusal, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("download failed"),
+        "a stable tag must reach its download (the sentinel refuses it), got:\n{stderr}"
+    );
+    let calls = fs::read_to_string(&sb.external_log).unwrap_or_default();
+    assert!(
+        calls.lines().any(|l| l == "curl"),
+        "the stable tag must attempt the sentinel download, log: {calls:?}"
+    );
+    assert_eq!(
+        snapshot_without_sentinel_log(&sb),
+        before,
+        "a stable tag stopped at download must write nothing"
+    );
+}
+
+#[test]
+fn client_update_round_trip_keeps_receipt_prefix_through_symlinked_ancestor() {
+    let sb = Sandbox::new();
+    sb.write_remote_state();
+    let inst = symlinked_client_install(&sb);
+    let receipt = inst.physical_prefix.join(RECEIPT_FILE);
+    let receipt_before = fs::read(&receipt).unwrap();
+    let (archive, sha_file) = write_real_candidate_archive(&sb.root, CANDIDATE_TAG);
+    let bin_dir = write_fake_gh_attest_ok(&sb.root, &archive, &sha_file);
+    let path = format!("{}:/usr/bin:/bin", bin_dir.display());
+
+    // Updater: the real built CLI, identified through the symlinked prefix.
+    let out = sb.run_with_path(
+        &inst.link,
+        &["client-update", "--version", CANDIDATE_TAG],
+        &path,
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "client-update must install {CANDIDATE_TAG}, got {:?}\n{stderr}",
+        out.status
+    );
+    let new_dir = inst.raw_prefix.join("releases").join(CANDIDATE_TAG);
+    assert!(
+        stdout.contains(new_dir.to_str().unwrap()),
+        "the updater must report the raw receipt spelling, got:\n{stdout}"
+    );
+    assert_eq!(
+        fs::read_link(&inst.link).unwrap(),
+        new_dir.join(BINARY),
+        "the link must keep the raw receipt spelling"
+    );
+    assert!(new_dir.join(BINARY).is_file());
+    assert_eq!(
+        fs::read(&receipt).unwrap(),
+        receipt_before,
+        "the receipt must not change"
+    );
+    assert_no_external_call(&sb);
+    assert!(!sb.xdg_state.exists(), "the updater must create no state");
+
+    // Installer, same physical installation, raw spelling: it must pass the
+    // link and receipt checks and stop only at its own download.
+    let before = snapshot_without_sentinel_log(&sb);
+    let prefix = inst.raw_prefix.to_str().unwrap();
+    let out = run_installer(
+        &sb,
+        &[
+            "--client-only",
+            "--version",
+            CANDIDATE_TAG,
+            "--prefix",
+            prefix,
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(out.status.code(), Some(1), "got {:?}\n{stderr}", out.status);
+    assert!(
+        stderr.contains("download failed"),
+        "the installer must accept the round-tripped installation, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("does not point into")
+            && !stderr.contains("does not match this client-only installation"),
+        "the installer must not reject its own installation, got:\n{stderr}"
+    );
+    let calls = fs::read_to_string(&sb.external_log).unwrap_or_default();
+    assert!(calls.lines().any(|l| l == "curl"), "log: {calls:?}");
+    assert_eq!(
+        snapshot_without_sentinel_log(&sb),
+        before,
+        "the installer stop must write nothing"
+    );
+
+    // Ordinary installer, strict exclusion: never into a client-only prefix,
+    // and never over a link into one.
+    let before = snapshot_without_sentinel_log(&sb);
+    let out = run_installer(&sb, &["--version", CANDIDATE_TAG, "--prefix", prefix]);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(out.status.code(), Some(1), "got {:?}\n{stderr}", out.status);
+    assert!(
+        stderr.contains("client-only prefix"),
+        "ordinary install into a client prefix must refuse, got:\n{stderr}"
+    );
+    assert_eq!(snapshot_without_sentinel_log(&sb), before);
+
+    sb.link(&sb.home.join(".local/bin/cadence"), &new_dir.join(BINARY));
+    let fresh = sb.xdg_data.join("cadence");
+    let before = snapshot_without_sentinel_log(&sb);
+    let out = run_installer(
+        &sb,
+        &[
+            "--version",
+            CANDIDATE_TAG,
+            "--prefix",
+            fresh.to_str().unwrap(),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(out.status.code(), Some(1), "got {:?}\n{stderr}", out.status);
+    assert!(
+        stderr.contains("points into a client-only prefix"),
+        "an ordinary link into a client prefix must refuse, got:\n{stderr}"
+    );
+    assert_eq!(snapshot_without_sentinel_log(&sb), before);
+}
+
+#[test]
+fn client_update_refuses_malformed_symlinked_receipts_before_effect() {
+    // (a) receipt prefix names a directory that is not the installation.
+    // (b) receipt link names a path that is not this installation's link.
+    for case in ["prefix", "link"] {
+        let sb = Sandbox::new();
+        sb.write_remote_state();
+        let inst = symlinked_client_install(&sb);
+        let (prefix, link) = if case == "prefix" {
+            (sb.root.join("linkdir/other-prefix"), inst.link.clone())
+        } else {
+            (
+                inst.raw_prefix.clone(),
+                sb.home.join(".local/bin/cadence-missing"),
+            )
+        };
+        write_shell_receipt(
+            &inst.physical_prefix,
+            prefix.to_str().unwrap(),
+            link.to_str().unwrap(),
+        );
+        let before = snapshot(&sb.root);
+        let out = sb.run(&inst.link, &["client-update", "--check"]);
+        assert_refused(&out, CLIENT_REFUSAL);
+        assert_no_external_call(&sb);
+        assert_eq!(
+            snapshot(&sb.root),
+            before,
+            "{case}: a malformed receipt must leave every path unchanged"
+        );
+    }
+}
+
+/// A `gh` stand-in that retargets the owned ancestor alias ONCE, during the
+/// source-bound attestation callback (the call that carries `--source-digest`),
+/// after the candidate's manifest was read and before the commit lock. The
+/// attestation itself succeeds: this is a fixture, not provenance.
+fn write_fake_gh_retarget(
+    root: &Path,
+    archive: &Path,
+    sha_file: &Path,
+    alias: &Path,
+    other: &Path,
+) -> PathBuf {
+    let bin_dir = root.join("provenance-retarget-bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let calls = root.join(GH_CALLS);
+    let script = format!(
+        r#"#!/bin/sh
+echo "$*" >> '{calls}'
+case "$1 $2" in
+"release download")
+  dir=
+  prev=
+  for a in "$@"; do
+    if [ "$prev" = --dir ]; then dir=$a; fi
+    prev=$a
+  done
+  cp '{archive}' '{sha}' "$dir/" || exit 1
+  ;;
+"attestation verify")
+  case "$*" in
+  *--source-digest*)
+    if [ "$(grep -c '^RETARGET$' '{calls}' 2>/dev/null)" = 0 ]; then
+      echo RETARGET >> '{calls}'
+      rm -f '{alias}' && ln -s '{other}' '{alias}' || exit 1
+    fi
+    ;;
+  esac
+  exit 0
+  ;;
+*) exit 97 ;;
+esac
+"#,
+        calls = calls.display(),
+        archive = archive.display(),
+        sha = sha_file.display(),
+        alias = alias.display(),
+        other = other.display(),
+    );
+    let gh = bin_dir.join("gh");
+    fs::write(&gh, script).unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    bin_dir
+}
+
+/// CAD-1430 retarget badcase: the receipt prefix's ancestor alias is pointed at
+/// a DIFFERENT owned physical root during the source-bound attestation, after
+/// identify() and before the commit lock. The fixed updater must refuse at the
+/// canonical prefix recheck with no staging and no link switch in either root.
+#[test]
+fn client_update_refuses_alias_retarget_before_staging_into_other_root() {
+    let sb = Sandbox::new();
+    sb.write_remote_state();
+    let inst = symlinked_client_install(&sb);
+    // Another physical root with a releases dir and a witness file: staging
+    // through the raw spelling would mutate it if the recheck were missing.
+    let other = sb.root.join("otherdir");
+    let other_prefix = other.join("cadence-client");
+    fs::create_dir_all(other_prefix.join("releases")).unwrap();
+    fs::write(
+        other_prefix.join("releases").join("witness.txt"),
+        "witness\n",
+    )
+    .unwrap();
+    let alias = sb.root.join("linkdir");
+    let (archive, sha_file) = write_real_candidate_archive(&sb.root, CANDIDATE_TAG);
+    let bin_dir = write_fake_gh_retarget(&sb.root, &archive, &sha_file, &alias, &other);
+    let path = format!("{}:/usr/bin:/bin", bin_dir.display());
+
+    // Expected end state: everything as before, except the owned alias now
+    // points at the other root (the fixture's own retarget).
+    let mut expected = snapshot(&sb.root);
+    let out = sb.run_with_path(
+        &inst.link,
+        &["client-update", "--version", CANDIDATE_TAG],
+        &path,
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+
+    let calls = fs::read_to_string(sb.root.join(GH_CALLS)).unwrap_or_default();
+    assert!(
+        calls.lines().any(|l| l == "RETARGET"),
+        "the alias must be retargeted during the attestation callback, log: {calls:?}"
+    );
+    assert_eq!(
+        fs::read_link(&alias).unwrap(),
+        other,
+        "the fixture must have retargeted the ancestor alias"
+    );
+    assert_refused(&out, CLIENT_REFUSAL);
+    assert!(
+        stderr.contains("the prefix changed while the release was verified"),
+        "the refusal must come from the canonical prefix recheck, got:\n{stderr}"
+    );
+    assert_no_external_call(&sb);
+    assert!(!sb.xdg_state.exists(), "the refusal must create no state");
+
+    expected.insert(PathBuf::from("linkdir"), Entry::Link(other.clone()));
+    let mut after = snapshot(&sb.root);
+    after.remove(Path::new(GH_CALLS));
+    assert_eq!(
+        after, expected,
+        "the refused retarget must stage nothing and switch no link in either root"
+    );
+    assert!(
+        !other_prefix.join("releases").join(CANDIDATE_TAG).exists(),
+        "nothing may be staged into the other root"
+    );
+    assert_eq!(
+        fs::read_to_string(other_prefix.join("releases").join("witness.txt")).unwrap(),
+        "witness\n",
+        "the other root's witness must be untouched"
+    );
 }
 
 /// Native macOS daemon-update refusal (CAD-1425), moved here from the former
