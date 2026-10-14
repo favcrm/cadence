@@ -279,16 +279,9 @@ pub(super) fn master_help(args: &[String]) -> Option<cadence_agent::error::Resul
     }
     let rest: Vec<&str> = args.iter().skip(1).map(String::as_str).collect();
     let help_verb = rest.first() == Some(&"help");
-    // Same probe shape as the Pi guard: `--help` or a single-dash short
-    // cluster containing `h` (Clap reads `-hh`/`-vh` as help too).
-    let probe = rest.iter().any(|t| {
-        *t == "--help"
-            || (t.len() > 1
-                && t.starts_with('-')
-                && !t.starts_with("--")
-                && t[1..].chars().all(|c| c.is_ascii_alphabetic())
-                && t.contains('h'))
-    });
+    // Same probe as the Pi guard: `--help`, or a single-dash cluster with
+    // an `h` before any standalone `--` (everything after `--` is payload).
+    let probe = help_probe(&rest);
     if !help_verb && !probe {
         return None;
     }
@@ -385,6 +378,33 @@ fn master_listing() -> String {
     }
     out.push_str("\nUsage of one path: cadence help <command-path>\n");
     out
+}
+
+/// CAD-1432: a help probe is `--help`, or a single-dash option cluster
+/// whose leading letters include `h` (`-h`, `-hh`, `-vh`, `-h=x`, `-h1`),
+/// before any standalone `--`. Everything after `--` is payload.
+fn help_probe(rest: &[&str]) -> bool {
+    for t in rest {
+        if *t == "--" {
+            return false;
+        }
+        if *t == "--help" {
+            return true;
+        }
+        if let Some(cluster) = t.strip_prefix('-') {
+            if cluster.starts_with("-") {
+                continue;
+            }
+            let letters: String = cluster
+                .chars()
+                .take_while(|c| c.is_ascii_alphabetic())
+                .collect();
+            if !letters.is_empty() && letters.contains('h') {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn is_token(t: &str) -> bool {
