@@ -584,82 +584,98 @@ fn native_chain_automatic_renewal_and_real_wiki_mutation() {
     // generation 1 and zero renewals; later count/rotation assertions bind it.
     assert_eq!(control(port, "wrong-nonce", "expire_owner_access"), 403);
     assert_eq!(control(port, &nonce, "unknown-op"), 400);
-    assert_eq!(control(port, &nonce, "expire_owner_access"), 200);
-    expire_client(&owner_dir, &target);
-    let before = rig.snapshot();
-    let (stale_status, _, _) = post(
-        BOARD,
-        "/__platform/wiki/authorize",
-        &initial.access_token,
-        &json!({"version":WIKI_VERSION,"organization_id":WORKSPACE,"audience":BOARD,
-            "requested_scopes":["wiki.read"],"ttl_seconds":MAX_TTL}),
-        AUTH_TIMEOUT,
-    )
-    .unwrap();
-    assert_eq!(stale_status, 401);
-    assert_eq!(rig.snapshot(), before);
-    // This is the normal CLI shared path, NOT an explicit renewal request.
-    call(
-        &target,
-        &owner_dir,
-        "write",
-        json!({"path":page,"text":"automatic renewal"}),
-    )
-    .unwrap();
-    let renewed = load_credential(&owner_dir, &target).unwrap();
-    assert_eq!(renewed.cli_session.as_ref().unwrap().generation, 2);
-    assert!(renewed.access_token != initial.access_token);
-    assert!(
-        renewed.cli_session.as_ref().unwrap().refresh_token
-            != initial.cli_session.as_ref().unwrap().refresh_token
-    );
-    assert!(
-        renewed.subject_id == initial.subject_id
-            && renewed.audience == initial.audience
-            && renewed.issuer == initial.issuer
-    );
-    assert!(renewed.pending.is_none());
-    assert_eq!(
-        call(&target, &owner_dir, "read", json!({"path":page})).unwrap()["text"],
-        "automatic renewal"
-    );
-    assert_eq!(
-        rig.rpc("wiki_read", json!({"path":page}))["text"],
-        "automatic renewal"
-    );
-    let renewed_blob_path = "projects/lc/blobs/renewed.bin";
-    upload_file_in(
-        &owner_dir,
-        &target,
-        renewed_blob_path,
-        "renewed.bin",
-        bytes,
-        false,
-        60,
-        |_| {},
-    )
-    .unwrap();
-    let renewed_blob = rig.rpc("wiki_read", json!({"path":renewed_blob_path}));
-    assert_eq!(
-        fs::read(crate::wiki::blobs_dir(&vault).join(renewed_blob["sha256"].as_str().unwrap()))
-            .unwrap(),
-        bytes
-    );
-    assert_eq!(
+    for generation in 2..=4 {
+        let previous = load_credential(&owner_dir, &target).unwrap();
+        assert_eq!(
+            previous.cli_session.as_ref().unwrap().generation,
+            generation - 1
+        );
+        assert_eq!(control(port, &nonce, "expire_owner_access"), 200);
+        expire_client(&owner_dir, &target);
+        let before = rig.snapshot();
+        let (stale_status, _, _) = post(
+            BOARD,
+            "/__platform/wiki/authorize",
+            &previous.access_token,
+            &json!({"version":WIKI_VERSION,"organization_id":WORKSPACE,"audience":BOARD,
+                "requested_scopes":["wiki.read"],"ttl_seconds":MAX_TTL}),
+            AUTH_TIMEOUT,
+        )
+        .unwrap();
+        assert_eq!(stale_status, 401);
+        assert_eq!(rig.snapshot(), before);
+        // Normal CLI shared path, NOT an explicit renewal request. Distinct
+        // text and binary content prove each generation made a new mutation.
+        let text = format!("automatic renewal generation {generation}");
         call(
             &target,
             &owner_dir,
-            "read",
-            json!({"path":renewed_blob_path})
+            "write",
+            json!({"path":page,"text":text}),
         )
-        .unwrap()["size"],
-        bytes.len()
-    );
-    assert_eq!(control(port, &nonce, "assert_owner_renewed"), 200);
+        .unwrap();
+        let renewed = load_credential(&owner_dir, &target).unwrap();
+        let renewed_session = renewed.cli_session.as_ref().unwrap();
+        let initial_session = initial.cli_session.as_ref().unwrap();
+        assert_eq!(renewed_session.generation, generation);
+        assert!(renewed.access_token != previous.access_token);
+        assert!(
+            renewed_session.refresh_token != previous.cli_session.as_ref().unwrap().refresh_token
+        );
+        assert!(
+            renewed.organization_id == initial.organization_id
+                && renewed.organization_slug == initial.organization_slug
+                && renewed.subject_id == initial.subject_id
+                && renewed.audience == initial.audience
+                && renewed.issuer == initial.issuer
+                && renewed.capabilities == initial.capabilities
+                && renewed_session.session_id == initial_session.session_id
+                && renewed_session.device_label == initial_session.device_label
+                && renewed_session.absolute_expires_at == initial_session.absolute_expires_at
+        );
+        assert!(renewed.pending.is_none());
+        assert_eq!(
+            call(&target, &owner_dir, "read", json!({"path":page})).unwrap()["text"],
+            text
+        );
+        assert_eq!(rig.rpc("wiki_read", json!({"path":page}))["text"], text);
+        let filename = format!("renewed-{generation}.bin");
+        let renewed_blob_path = format!("projects/lc/blobs/{filename}");
+        let renewed_bytes = [0, generation as u8, 0xff];
+        upload_file_in(
+            &owner_dir,
+            &target,
+            &renewed_blob_path,
+            &filename,
+            &renewed_bytes,
+            false,
+            60,
+            |_| {},
+        )
+        .unwrap();
+        let renewed_blob = rig.rpc("wiki_read", json!({"path":renewed_blob_path}));
+        assert_eq!(renewed_blob["kind"], "blob");
+        assert_eq!(
+            fs::read(crate::wiki::blobs_dir(&vault).join(renewed_blob["sha256"].as_str().unwrap()))
+                .unwrap(),
+            renewed_bytes
+        );
+        assert_eq!(
+            call(
+                &target,
+                &owner_dir,
+                "read",
+                json!({"path":renewed_blob_path})
+            )
+            .unwrap()["size"],
+            renewed_bytes.len()
+        );
+        assert_eq!(control(port, &nonce, "assert_owner_renewed"), 200);
+    }
 
     assert_eq!(
         call(&target, &member_dir, "read", json!({"path":page})).unwrap()["text"],
-        "automatic renewal"
+        "automatic renewal generation 4"
     );
     let own = format!("users/{}/notes.md", ready.member_id);
     call(
@@ -699,6 +715,45 @@ fn native_chain_automatic_renewal_and_real_wiki_mutation() {
             "policy denial did not explain that re-login cannot grant authorization"
         );
         assert_eq!(rig.snapshot(), before, "denied write mutated native state");
+    }
+    for (dir, path) in [
+        (&member_dir, "projects/lc/blobs/denied-project.bin"),
+        (&member_dir, "pms/denied-member.bin"),
+        (&owner_dir, "pms/denied-owner.bin"),
+    ] {
+        // These fresh private-fixture destinations do not exist. Overwrite is
+        // used ONLY for denial so advisory parent listing cannot short-circuit
+        // the actual HTTPS -> multipart -> native upload authorization gate.
+        assert!(!vault.join(path).exists());
+        assert!(!vault.join(format!("{path}.blob")).exists());
+        let before = rig.snapshot();
+        let error = upload_file_in(
+            dir,
+            &target,
+            path,
+            "denied.bin",
+            b"\x00must not land\xff",
+            true,
+            60,
+            |_| {},
+        )
+        .expect_err("native forbidden upload accepted");
+        assert!(
+            error.to_string().contains("authorization")
+                && error.to_string().contains("insufficient_scope"),
+            "upload denial did not come from the actual native grant gate"
+        );
+        assert!(
+            !error.to_string().contains("cadence login"),
+            "upload policy denial suggested re-login"
+        );
+        assert!(
+            error.to_string().contains("a new login does not grant it"),
+            "upload policy denial did not explain that re-login cannot grant authorization"
+        );
+        assert_eq!(rig.snapshot(), before, "denied upload mutated native state");
+        assert!(!vault.join(path).exists());
+        assert!(!vault.join(format!("{path}.blob")).exists());
     }
     // An allowed read root is not a write grant: member failed project write
     // above, and owner pms remains forbidden despite its operator actor.
