@@ -1449,3 +1449,137 @@ fn cad1365_original_transfer_authority_lifetime() {
         );
     }
 }
+
+/// SLOW INSTALL REVOKE (bot finding on ac18, Major): the original
+/// stream's authority is the install approval, not only session/mount.
+/// POSITIVE first: a REAL >2 MiB original header succeeds while its
+/// body stays UNDRAINED, so the daemon's writer is paused on the
+/// kernel socket buffer. The REAL `app_local_install_revoke` then runs
+/// concurrently and must complete within a generous 2 s bound. The
+/// original stream must then truncate: the daemon must not finish the
+/// declared bytes after the install authority is revoked. A stalled
+/// revoke closes the client first, so the blocked writer releases its
+/// locks, joins its own thread, and only then fails.
+#[test]
+fn cad1365_original_transfer_install_revoke_closes_a_paused_stream() {
+    let fx = Fx::boot(noisy_square_png(), None, true);
+    let (token, key) = fx.session();
+    let (_nonce, action) = fx.mount(&token, &key, 1);
+    let before = fx.artifact_gets();
+
+    let (reader, line) = socket_call(
+        &fx,
+        Asserted::Operator,
+        "app_media_original",
+        params(&action, &token, &key, &fx.asset_id),
+    )
+    .expect("original request reaches the daemon");
+    let frame: Value =
+        serde_json::from_str(&line).unwrap_or_else(|_| panic!("reply line is not JSON: {line}"));
+    let result = frame.get("result").cloned().unwrap_or(Value::Null);
+    assert_ne!(
+        result,
+        Value::Null,
+        "install revoke needs a real success header first — an up-front refusal tests nothing: {frame}"
+    );
+    assert_eq!(
+        result["transfer"], "app-media-original/1",
+        "initial authority must pass: {frame}"
+    );
+    let declared = result["bytes"].as_u64().expect("header bytes") as usize;
+    assert_eq!(
+        declared,
+        fx.original.len(),
+        "declared bytes are the fetched original: {frame}"
+    );
+    assert!(declared > 2 * 1024 * 1024, ">2 MiB original");
+    assert_eq!(
+        fx.artifact_gets(),
+        before + 1,
+        "the header proves the real provider artifact GET ran"
+    );
+
+    let install = fx
+        .op("app_workspace_show", json!({"install_id": fx.install}))
+        .expect("install show");
+    let digest = install["digest"]
+        .as_str()
+        .or_else(|| install["install"]["digest"].as_str())
+        .expect("install digest")
+        .to_string();
+    assert_eq!(
+        fx.shared
+            .store
+            .app_capability_status(&fx.install, &digest)
+            .unwrap()["state"],
+        "approved",
+        "the install is approved before the revoke"
+    );
+
+    // The REAL revoke, on its own thread and its own assertion scope,
+    // while the client body is still undrained.
+    let (done, revoke_reply) = std::sync::mpsc::channel();
+    let (state, install_id) = (fx.state.clone(), fx.install.clone());
+    let revoke_digest = digest.clone();
+    let revoker = std::thread::spawn(move || {
+        let reply = scoped(Asserted::Operator, || {
+            crate::client::rpc(
+                &state,
+                "app_local_install_revoke",
+                json!({"install_id": install_id, "digest": revoke_digest}),
+            )
+        });
+        let _ = done.send(reply);
+    });
+
+    match revoke_reply.recv_timeout(Duration::from_secs(2)) {
+        Ok(reply) => {
+            revoker.join().expect("revoke thread");
+            let reply = reply.expect("operator local-install revoke must succeed");
+            assert_eq!(
+                reply["approved"], false,
+                "the reply reports the revoke: {reply}"
+            );
+            assert_eq!(
+                reply["digest"], digest,
+                "the reply names the revoked digest"
+            );
+            assert_eq!(
+                fx.shared
+                    .store
+                    .app_capability_status(&fx.install, &digest)
+                    .unwrap()["state"],
+                "revoked",
+                "the store records the install as revoked, not approved"
+            );
+        }
+        Err(_) => {
+            // Close the client side so the paused writer fails and
+            // releases the locks; then join our own thread and fail.
+            drop(reader);
+            revoker.join().expect("revoke thread");
+            panic!(
+                "app_local_install_revoke did not complete within 2 s while the \
+                 original body was undrained — it waited on the paused writer"
+            );
+        }
+    }
+
+    // Drain what the daemon delivers after the install revoke, bounded
+    // at the contract cap; a truncated stream must stop short of the
+    // declared length.
+    reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("fixture read bound");
+    let mut body = Vec::new();
+    reader
+        .take(ORIGINAL_LIMIT as u64 + 1)
+        .read_to_end(&mut body)
+        .expect("revocation must close the original stream, not stall or time out");
+    assert!(
+        body.len() < declared,
+        "the daemon completed a {declared}-byte original AFTER the install was revoked — {} bytes arrived",
+        body.len()
+    );
+}

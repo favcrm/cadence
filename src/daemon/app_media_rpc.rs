@@ -51,6 +51,7 @@ use crate::error::{Error, Result};
 use crate::issue::app_catalog::workspace;
 use crate::issue::{app_screen_decl, app_screen_pkg};
 use crate::operator_auth::Origin;
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 /// Largest catalog page the contract admits.
@@ -187,14 +188,15 @@ impl Shared {
     /// binding/connection/revision/credential at the PRODUCING install
     /// (store-wide catalog — never the caller's mount install, never
     /// creator), and only then the adapter's bounded read-only artifact
-    /// GET. `deliver` is invoked INSIDE the proven critical section —
-    /// runtime snapshot + `app_release_lock` + `platform_custody_lock`
-    /// all still held — so verification, fetch and byte delivery are one
-    /// authority fence; a success reply is the closed header plus exact
-    /// octets the caller writes, errors are ordinary refusals.
+    /// GET. `deliver` runs only AFTER the runtime snapshot, custody and
+    /// release guards are dropped. Each socket send re-proves the whole
+    /// original authority under those guards before its nonblocking
+    /// write (`OriginalDelivery::with_current`), so a revoke, rotation or
+    /// approval change landing mid-stream refuses the next chunk. No
+    /// guard is held across a socket wait.
     /// `platform_custody_lock` is taken inside the runtime snapshot
     /// before `app_release_lock` — the funded capability path's own
-    /// pm → custody → release ordering — and is never re-taken inside.
+    /// pm → custody → release ordering — and is never nested.
     pub(super) fn rpc_app_media_original_stream(
         &self,
         params: &Value,
@@ -253,10 +255,11 @@ impl Shared {
             }
         }
         let ctx = self.tool_context_proven(action_token, &session)?;
-        let context_id = ctx
-            .context_id
-            .as_deref()
-            .ok_or_else(|| Error::rejected(format!("{verb} needs a mounted active context")))?;
+        if ctx.context_id.is_none() {
+            return Err(Error::rejected(format!(
+                "{verb} needs a mounted active context"
+            )));
+        }
         // The asset's private provenance — a pure store read, resolved
         // before the runtime snapshot so the producing install is known.
         // Store-wide catalog: the producing install is provenance, never
@@ -264,181 +267,209 @@ impl Shared {
         let proven = self.store.app_media_original(asset_id)?;
         let pm_dir = self.pm_dir()?;
         let pm = self.pm_at(&pm_dir)?;
-        workspace::with_runtime_snapshot(&pm, &ctx.install_id, |bundle, files| {
-            // A different producing install's CURRENT bundle is read
-            // INSIDE the held tracker lock — the pm→custody→release
-            // order the broker keeps — never outside it where a bundle
-            // mutation could slip between the read and the binding
-            // check. The lock-free funnel serves one pm dir at a time
-            // without nesting the kernel flock.
-            let producing = if proven.install_id != ctx.install_id {
-                Some(workspace::with_runtime_read(
-                    &pm,
-                    &proven.install_id,
-                    |pb, pf| Ok((pb.clone(), pf.clone())),
-                )?)
-            } else {
-                None
-            };
-            let _custody = self
-                .platform_custody_lock
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let _release = self
-                .app_release_lock
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            // The CURRENT binding/connection/revision at the PRODUCING
-            // install must still match the run-frozen proof — drift,
-            // replacement, rotation or revocation refuses before any
-            // provider access. `app_binding_receipt_current` re-proves
-            // against the producing install's live bundle, not this
-            // mount's; a cross-install producing bundle arrives as the
-            // clone read above under the same held tracker lock.
-            match &producing {
-                None => self.app_binding_receipt_current(
-                    &proven.install_id,
-                    proven.context_id.as_deref(),
-                    &proven.slot,
-                    &proven.proof,
-                    bundle,
-                    files,
-                )?,
-                Some((pbundle, pfiles)) => self.app_binding_receipt_current(
-                    &proven.install_id,
-                    proven.context_id.as_deref(),
-                    &proven.slot,
-                    &proven.proof,
-                    pbundle,
-                    pfiles,
-                )?,
-            }
-            let live_digest = required_str(bundle, "digest")?;
-            if live_digest != ctx.digest {
-                return Err(Error::rejected(format!(
-                    "installation digest changed since mount — {verb} refused",
-                )));
-            }
-            let status = self
-                .store
-                .app_capability_status(&ctx.install_id, live_digest)?;
-            if status["state"].as_str() != Some("approved") {
-                return Err(Error::rejected(
-                    "installation is not approved at its current digest",
-                ));
-            }
-            let pkg = app_screen_pkg::extract(files, &ctx.tag)?;
-            if !pkg.may.iter().any(|m| m == app_screen_decl::MAY_MEDIA_READ) {
-                return Err(Error::rejected(
-                    "screen does not declare media.read — the media surface \
-                     is refused to this mount",
-                ));
-            }
-            if pkg.host_contract.as_deref() != Some(app_screen_decl::HOST_CONTRACT_MEDIA) {
-                return Err(Error::rejected(format!(
-                    "{verb} requires the screen-media.v1 host contract",
-                )));
-            }
-            // The producing run's approval must still be current: a
-            // revoked or expired install approval at the producing
-            // install refuses the original read, exactly as a mount's
-            // own approval proof does.
-            let producing_digest = match &producing {
-                None => required_str(bundle, "digest")?,
-                Some((pbundle, _)) => required_str(pbundle, "digest")?,
-            };
-            if self
-                .store
-                .app_capability_status(&proven.install_id, producing_digest)?["state"]
-                .as_str()
-                != Some("approved")
-            {
-                return Err(Error::rejected(
-                    "producing installation is not approved at its current digest",
-                ));
-            }
-            let (_, proof) = self.store.app_context_proof(&ctx.install_id, context_id)?;
-            if proof.install_id != ctx.install_id {
-                return Err(Error::rejected(format!(
-                    "{verb} context belongs to another installation",
-                )));
-            }
-            let config = &proven.proof.config;
-            let provider = required_str(config, "provider")?;
-            let adapter = self
-                .platforms
-                .get(provider)
-                .ok_or_else(|| Error::rejected("media origin adapter unavailable"))?;
-            let credential = self.app_capability_credential(config)?;
-            let descriptor = json!({
-                "ref": proven.reference,
-                "sha256": proven.sha256,
-                "bytes": proven.bytes,
-                "media_type": proven.media_type,
-            });
-            let (media_type, bytes) = adapter
-                .read_app_media_original(&credential, config, &descriptor)
-                .map_err(Error::rejected)?;
-            // The session+mount proven above is re-proven AFTER the
-            // provider fetch and BEFORE any success header: an expiry
-            // or revoke that landed during the bounded GET refuses the
-            // delivery instead of riding the earlier proof. These are
-            // pure store/Auth reads — no custody, release or runtime
-            // lock is re-taken.
-            let (session2, view2) = self.tool_session(token, key, origin).ok_or_else(|| {
-                Error::rejected(format!(
-                    "{verb} session ended during retrieval — sign in again"
-                ))
+        let (header, bytes) =
+            workspace::with_runtime_snapshot(&pm, &ctx.install_id, |bundle, files| {
+                let _custody = self
+                    .platform_custody_lock
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let _release = self
+                    .app_release_lock
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                self.original_runtime_current(&pm, &ctx, &proven, bundle, files)?;
+                let config = &proven.proof.config;
+                let provider = required_str(config, "provider")?;
+                let adapter = self
+                    .platforms
+                    .get(provider)
+                    .ok_or_else(|| Error::rejected("media origin adapter unavailable"))?;
+                let credential = self.app_capability_credential(config)?;
+                let descriptor = json!({
+                    "ref": proven.reference,
+                    "sha256": proven.sha256,
+                    "bytes": proven.bytes,
+                    "media_type": proven.media_type,
+                });
+                let (media_type, bytes) = adapter
+                    .read_app_media_original(&credential, config, &descriptor)
+                    .map_err(Error::rejected)?;
+                // The session+mount proven above is re-proven AFTER the
+                // provider fetch and BEFORE any success header: an expiry
+                // or revoke that landed during the bounded GET refuses the
+                // delivery instead of riding the earlier proof.
+                self.original_mount_current(token, key, origin, action_token, &ctx)?;
+                crate::platform::refuse_leak(
+                    "media original",
+                    &descriptor.to_string(),
+                    &credential,
+                )?;
+                let header = json!({
+                    "transfer": "app-media-original/1",
+                    "asset_id": asset_id,
+                    "media_type": media_type,
+                    "bytes": bytes.len() as u64,
+                    "sha256": format!("sha256:{:x}", Sha256::digest(&bytes)),
+                });
+                Ok((header, bytes))
             })?;
-            if origin == Origin::Public {
-                let operator = view2
-                    .user
-                    .as_ref()
-                    .is_some_and(crate::operator_auth::BoardUser::is_operator);
-                if !operator {
-                    return Err(Error::rejected(format!(
-                        "{verb} needs an operator-role public session",
-                    )));
-                }
-            }
-            let ctx2 = self.tool_context_proven(action_token, &session2)?;
-            let context_id2 = ctx2
-                .context_id
-                .as_deref()
-                .ok_or_else(|| Error::rejected(format!("{verb} needs a mounted active context")))?;
-            if ctx2.install_id != ctx.install_id
-                || ctx2.digest != ctx.digest
-                || ctx2.tag != ctx.tag
-                || context_id2 != context_id
-            {
-                return Err(Error::rejected(format!(
-                    "{verb} mount moved during retrieval — refused",
-                )));
-            }
-            let (_, proof2) = self
-                .store
-                .app_context_proof(&ctx2.install_id, context_id2)?;
-            if proof2.install_id != ctx2.install_id {
-                return Err(Error::rejected(format!(
-                    "{verb} context belongs to another installation",
-                )));
-            }
-            crate::platform::refuse_leak("media original", &descriptor.to_string(), &credential)?;
-            let header = json!({
-                "transfer": "app-media-original/1",
-                "asset_id": asset_id,
-                "media_type": media_type,
-                "bytes": bytes.len() as u64,
-                "sha256": format!("sha256:{:x}", Sha256::digest(&bytes)),
-            });
-            let delivery = OriginalDelivery {
-                shared: self,
-                action_token,
-                expected: ctx2,
-            };
-            deliver(&header, &bytes, &delivery)?;
-            Ok(Value::Null)
+        let delivery = OriginalDelivery {
+            shared: self,
+            pm: &pm,
+            action_token,
+            token,
+            key,
+            origin,
+            proven: &proven,
+            expected: ctx,
+        };
+        deliver(&header, &bytes, &delivery)
+    }
+
+    /// The runtime half of the original authority, run under the held
+    /// runtime snapshot, `platform_custody_lock` and `app_release_lock`:
+    /// the producing install's CURRENT binding/connection/revision against
+    /// the run-frozen proof, the mount's live digest, approval at the
+    /// mounting and producing installs, the re-extracted media package and
+    /// the active context. Runs before the provider GET and again before
+    /// every socket send.
+    fn original_runtime_current(
+        &self,
+        pm: &crate::issue::Pm,
+        ctx: &ToolContext,
+        proven: &crate::store::app_media::MediaOriginalProof,
+        bundle: &Value,
+        files: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        let verb = "media original";
+        let context_id = ctx
+            .context_id
+            .as_deref()
+            .ok_or_else(|| Error::rejected(format!("{verb} needs a mounted active context")))?;
+        // A different producing install's CURRENT bundle is read lock-free
+        // under the held guards, so a bundle mutation cannot slip between
+        // this read and the binding check.
+        let producing = if proven.install_id != ctx.install_id {
+            Some(workspace::with_runtime_read(
+                pm,
+                &proven.install_id,
+                |pb, pf| Ok((pb.clone(), pf.clone())),
+            )?)
+        } else {
+            None
+        };
+        let (pbundle, pfiles) = match &producing {
+            None => (bundle, files),
+            Some((pb, pf)) => (pb, pf),
+        };
+        // The CURRENT binding/connection/revision at the PRODUCING install
+        // must still match the run-frozen proof — drift, replacement,
+        // rotation or revocation refuses before any provider access.
+        self.app_binding_receipt_current(
+            &proven.install_id,
+            proven.context_id.as_deref(),
+            &proven.slot,
+            &proven.proof,
+            pbundle,
+            pfiles,
+        )?;
+        let live_digest = required_str(bundle, "digest")?;
+        if live_digest != ctx.digest {
+            return Err(Error::rejected(format!(
+                "installation digest changed since mount — {verb} refused",
+            )));
+        }
+        let status = self
+            .store
+            .app_capability_status(&ctx.install_id, live_digest)?;
+        if status["state"].as_str() != Some("approved") {
+            return Err(Error::rejected(
+                "installation is not approved at its current digest",
+            ));
+        }
+        let pkg = app_screen_pkg::extract(files, &ctx.tag)?;
+        if !pkg.may.iter().any(|m| m == app_screen_decl::MAY_MEDIA_READ) {
+            return Err(Error::rejected(
+                "screen does not declare media.read — the media surface \
+                 is refused to this mount",
+            ));
+        }
+        if pkg.host_contract.as_deref() != Some(app_screen_decl::HOST_CONTRACT_MEDIA) {
+            return Err(Error::rejected(format!(
+                "{verb} requires the screen-media.v1 host contract",
+            )));
+        }
+        // The producing run's approval must still be current: a revoked or
+        // expired install approval at the producing install refuses the
+        // original read, exactly as a mount's own approval proof does.
+        if self
+            .store
+            .app_capability_status(&proven.install_id, required_str(pbundle, "digest")?)?["state"]
+            .as_str()
+            != Some("approved")
+        {
+            return Err(Error::rejected(
+                "producing installation is not approved at its current digest",
+            ));
+        }
+        let (_, proof) = self.store.app_context_proof(&ctx.install_id, context_id)?;
+        if proof.install_id != ctx.install_id {
+            return Err(Error::rejected(format!(
+                "{verb} context belongs to another installation",
+            )));
+        }
+        Ok(())
+    }
+
+    /// The caller side of the original authority: the verified session is
+    /// still live, the public operator-role floor holds, and the consumed
+    /// mount is still the one `expected` proved. Pure store/Auth reads; no
+    /// custody, release or runtime lock is taken here.
+    fn original_mount_current(
+        &self,
+        token: &str,
+        key: &str,
+        origin: Origin,
+        action_token: &str,
+        expected: &ToolContext,
+    ) -> Result<()> {
+        let verb = "media original";
+        let (session, view) = self.tool_session(token, key, origin).ok_or_else(|| {
+            Error::rejected(format!(
+                "{verb} session ended during retrieval — sign in again"
+            ))
         })?;
+        if origin == Origin::Public {
+            let operator = view
+                .user
+                .as_ref()
+                .is_some_and(crate::operator_auth::BoardUser::is_operator);
+            if !operator {
+                return Err(Error::rejected(format!(
+                    "{verb} needs an operator-role public session",
+                )));
+            }
+        }
+        let ctx = self.tool_context_proven(action_token, &session)?;
+        let context_id = ctx
+            .context_id
+            .as_deref()
+            .ok_or_else(|| Error::rejected(format!("{verb} needs a mounted active context")))?;
+        if ctx.install_id != expected.install_id
+            || ctx.digest != expected.digest
+            || ctx.tag != expected.tag
+            || ctx.context_id != expected.context_id
+        {
+            return Err(Error::rejected(format!(
+                "{verb} mount moved during retrieval — refused",
+            )));
+        }
+        let (_, proof) = self.store.app_context_proof(&ctx.install_id, context_id)?;
+        if proof.install_id != ctx.install_id {
+            return Err(Error::rejected(format!(
+                "{verb} context belongs to another installation",
+            )));
+        }
         Ok(())
     }
 
@@ -629,42 +660,76 @@ impl Shared {
 }
 
 /// The original transfer's write-time authority. Each nonblocking send
-/// runs under `with_current`, which re-proves the verified session is
-/// still live and the consumed mount is still the proven one, taking
-/// `operator_auth` then `tool_contexts` and releasing both before any
-/// socket wait. Revocation therefore serializes with a single send.
+/// runs under `with_current`, which re-proves the WHOLE original authority
+/// under the held guards before the write: the runtime snapshot,
+/// `platform_custody_lock` and `app_release_lock` (pm → custody → release),
+/// the producing binding, approvals and active context, then the caller's
+/// live session and consumed mount (Auth → tool_context). The write itself
+/// is one nonblocking send inside those guards. No guard is held across a
+/// `WouldBlock` wait, so a revoke serializes with a single send.
 pub(super) struct OriginalDelivery<'a> {
     shared: &'a Shared,
+    pm: &'a crate::issue::Pm,
     action_token: &'a str,
+    token: &'a str,
+    key: &'a str,
+    origin: Origin,
+    proven: &'a crate::store::app_media::MediaOriginalProof,
     expected: ToolContext,
 }
 
 impl OriginalDelivery<'_> {
     pub(super) fn with_current<T>(&self, send: impl FnOnce() -> T) -> Result<T> {
         let refused = || Error::rejected("media original authority ended — delivery refused");
-        let mut auth = self.shared.operator_auth();
-        if !auth.live_hash(&self.expected.session, self.shared.operator_now())? {
-            return Err(refused());
-        }
-        let map = self
-            .shared
-            .tool_contexts
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let ctx = map.get(self.action_token).ok_or_else(refused)?;
-        let e = &self.expected;
-        let same_mount = ctx.session == e.session
-            && ctx.install_id == e.install_id
-            && ctx.context_id == e.context_id
-            && ctx.digest == e.digest
-            && ctx.tag == e.tag
-            && ctx.generation == e.generation
-            && ctx.mount.is_some()
-            && ctx.mount == e.mount;
-        if !same_mount || Instant::now().duration_since(ctx.issued) >= TOOL_CTX_TTL {
-            return Err(refused());
-        }
-        Ok(send())
+        workspace::with_runtime_snapshot(self.pm, &self.expected.install_id, |bundle, files| {
+            let _custody = self
+                .shared
+                .platform_custody_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let _release = self
+                .shared
+                .app_release_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            self.shared.original_runtime_current(
+                self.pm,
+                &self.expected,
+                self.proven,
+                bundle,
+                files,
+            )?;
+            self.shared.original_mount_current(
+                self.token,
+                self.key,
+                self.origin,
+                self.action_token,
+                &self.expected,
+            )?;
+            let mut auth = self.shared.operator_auth();
+            if !auth.live_hash(&self.expected.session, self.shared.operator_now())? {
+                return Err(refused());
+            }
+            let map = self
+                .shared
+                .tool_contexts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let ctx = map.get(self.action_token).ok_or_else(refused)?;
+            let e = &self.expected;
+            let same_mount = ctx.session == e.session
+                && ctx.install_id == e.install_id
+                && ctx.context_id == e.context_id
+                && ctx.digest == e.digest
+                && ctx.tag == e.tag
+                && ctx.generation == e.generation
+                && ctx.mount.is_some()
+                && ctx.mount == e.mount;
+            if !same_mount || Instant::now().duration_since(ctx.issued) >= TOOL_CTX_TTL {
+                return Err(refused());
+            }
+            Ok(send())
+        })
     }
 }
 
