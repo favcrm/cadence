@@ -2,6 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import type { Meta } from "./types";
 import type { PrivateOperation } from "./privateSession";
 import { beginPrivateOperation, privateFetch, privateReadsAllowed, withPrivateOperation } from "./privateSession";
+import { LocaleTextProvider } from "./localeText";
 
 export type Locale = "en" | "zh-TW";
 type Scope = "user" | "organization";
@@ -315,7 +316,11 @@ export function LocaleProvider({ children }: { children: ReactNode }) {
     },
   }), [identity, locale, localLocale, meta?.session?.user?.role, preferences, setPreference, setSession]);
 
-  return <LocaleContext.Provider value={context}>{children}</LocaleContext.Provider>;
+  return (
+    <LocaleContext.Provider value={context}>
+      <LocaleTextProvider value={context.t}>{children}</LocaleTextProvider>
+    </LocaleContext.Provider>
+  );
 }
 
 Object.assign(zhTW, {
@@ -1094,7 +1099,4 @@ export function useLocale(): LocaleContextValue {
   return value;
 }
 
-export function useTranslate(): (english: string) => string {
-  const value = useContext(LocaleContext);
-  return value?.t ?? ((english) => english);
-}
+export { useTranslate } from "./localeText";

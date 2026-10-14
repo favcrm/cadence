@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import Button from "../../../ui/Button";
-import { useTranslate } from "../../../lib/locale";
+import { useTranslate } from "../../../lib/localeText";
 import { useDrawerClose } from "./useDrawerClose";
 
 /**

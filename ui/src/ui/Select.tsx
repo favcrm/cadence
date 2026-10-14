@@ -8,7 +8,7 @@ import {
   type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
-import { useTranslate } from "../lib/locale";
+import { useTranslate } from "../lib/localeText";
 import { IconCheck, IconChevron } from "./icons";
 import {
   closedSelect,

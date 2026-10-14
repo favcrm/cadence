@@ -55,6 +55,7 @@ const allowed = new Set([
   ...["Button", "Link", "Select", "icons"].map((name) => `src/ui/${name}.tsx`),
   "src/ui/buttonActivate.ts", "src/ui/selectLogic.ts",
   "src/lib/apiError.ts", "src/lib/types.ts", "src/lib/cache.ts", "src/lib/useResource.ts",
+  "src/lib/localeText.tsx",
 ]);
 const external = (id) => /^(react(?:\/.*)?|react-dom(?:\/.*)?|@hugeicons\/react|@hugeicons\/core-free-icons)$/.test(id);
 const options = {
