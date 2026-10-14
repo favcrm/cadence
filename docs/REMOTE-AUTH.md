@@ -172,7 +172,9 @@ The gateway's real refusal shapes (AOS-243):
   proven session loss.
 - A `401 unauthorized` with no reason means the bearer did not resolve, but the
   server cannot say whether it expired or was revoked.
-- `503` means waking or unavailable. A non-JSON answer is treated as unknown.
+- `503` means waking or unavailable. Without JSON, the HTTP status still
+  classifies the refusal: `401` is uncertain, `403` is authorization, and any
+  `5xx` is availability. No server reason or correlation is inferred.
 
 | Category | When | Next action |
 | --- | --- | --- |
@@ -464,15 +466,27 @@ requires another login:
    `reauthentication_required` means login is a real option. `renewable` only
    says a renewal can be attempted; it does not prove the server accepts the
    session, so it is not a health check.
-2. Re-run the failing command once and read its `category` and `reason`:
-   `authorization` means check the workspace role and target path (a login does
-   not change it); `authentication` means log in again once; `uncertain` means
-   the server did not say why, so do not assume expiry; `availability` means
-   retry later; `unknown` means report the status and code.
-3. Record the client revision (`cadence --version`), the org endpoint and the
-   HTTP status, `reason` and category on the ticket. Do not paste a token, the
-   credential file or a raw response body.
-4. Wiki writes and uploads: confirm the target path is inside a root your role
-   may write (`users/<you>/` or a shared root you hold write for). Then make one
-   small write before any bulk transfer. A refused path is not a reason to try
-   another shared root.
+2. Read the **already captured** safe error's HTTP status, `category`, `reason`
+   and hop/request ID, if present. Do not re-run a write or upload to obtain
+   diagnostics. `authorization` means check the workspace role and target path
+   (a login does not change it); `authentication` names one fresh login as a
+   remedy outside this read-only diagnosis; `uncertain` does not prove expiry;
+   `availability` means wait, not replay an uncertain mutation; `unknown` means
+   report the safe status and code. Do not blindly repeat login.
+3. Record the captured safe error, org endpoint and client revision
+   (`cadence --version`) on the ticket. Keep any already known issuer, gateway
+   and daemon revisions separate; unknown versions remain unknown. Do not paste
+   a token, the credential file or a raw response body.
+4. Wiki writes and uploads: inspect the workspace role and intended target path
+   using existing read-only evidence. A refused path is not a reason to try
+   another shared root. If outcome reconciliation needs a new inspection, use
+   only an explicitly read-only command such as `issue show` or `wiki ls`,
+   within your existing permissions. A dropped connection or missing
+   acknowledgment does not prove that the write did not land. Stop if these
+   reads cannot reconcile the outcome; do not retry the write or upload.
+
+Any fresh small **test write** is outside this read-only production diagnosis.
+It requires an authorized isolated workspace and explicit operator authorization,
+only after any prior uncertain outcome has been reconciled. It is not a
+production retry, an authority change or a prerequisite for collecting diagnosis
+evidence.

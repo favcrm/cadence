@@ -206,7 +206,19 @@ fn private_directory(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Command use retains the legacy access-only expiry refusal. Offline status
+/// reads the same validated metadata without treating expiry as corrupt storage.
 fn load_credential(dir: &Path, target: &RemoteTarget) -> Result<Credential> {
+    let cred = read_credential_metadata(dir, target)?;
+    if cred.cli_session.is_none() && cred.expires_at <= now()? {
+        return Err(reject(
+            "the remote credential has expired — run `cadence login` again",
+        ));
+    }
+    Ok(cred)
+}
+
+fn read_credential_metadata(dir: &Path, target: &RemoteTarget) -> Result<Credential> {
     private_directory(dir)?;
     let path = dir.join(format!("cli-{}.json", target.org));
     let file = OpenOptions::new()
@@ -325,11 +337,6 @@ fn load_credential(dir: &Path, target: &RemoteTarget) -> Result<Credential> {
     }
     if !valid_token(&cred.access_token, "hct_") {
         return Err(reject("invalid remote credential"));
-    }
-    if cred.cli_session.is_none() && cred.expires_at <= now()? {
-        return Err(reject(
-            "the remote credential has expired — run `cadence login` again",
-        ));
     }
     Ok(cred)
 }
@@ -801,9 +808,9 @@ fn authorize(
         }),
         AUTH_TIMEOUT,
     )?;
-    let body = body.ok_or_else(|| reject("remote authorize answered non-JSON"))?;
     match status {
         200 => {
+            let body = body.ok_or_else(|| reject("remote authorize answered non-JSON"))?;
             let envelope = body["envelope"].as_str().unwrap_or_default();
             let compact_jws = envelope.split('.').all(|p| {
                 !p.is_empty()
@@ -815,12 +822,8 @@ fn authorize(
             }
             Ok(envelope.to_string())
         }
-        401 | 403 => Err(refusal_error(status, Some(&body))),
         s if (300..400).contains(&s) => Err(reject("remote redirect refused")),
-        _ => Err(reject(format!(
-            "remote authorize failed ({})",
-            body["code"].as_str().unwrap_or("unavailable")
-        ))),
+        _ => Err(refusal_error(status, body.as_ref())),
     }
 }
 
@@ -1341,7 +1344,7 @@ fn local_status_at(dir: &Path, target: &RemoteTarget) -> Value {
                 "note": "the local credential store cannot be inspected; check its permissions"});
         }
     };
-    let cred = match load_credential(dir, target) {
+    let cred = match read_credential_metadata(dir, target) {
         Ok(cred) => cred,
         // Malformed, foreign or unreadable storage is a local problem, never
         // proof of absence or of server-side revocation.
@@ -1537,6 +1540,7 @@ mod tests {
     use serde_json::json;
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
+    use std::os::unix::fs::PermissionsExt;
     use std::thread;
 
     const ORG: &str = "acme";
@@ -1825,6 +1829,158 @@ mod tests {
     /// for that route ever left the client.
     fn hits(requests: &[Value], path: &str) -> usize {
         requests.iter().filter(|r| r["path"] == json!(path)).count()
+    }
+
+    #[test]
+    fn cad1434_blocker_authorize_refusals_never_forward_or_retry_user_writes() {
+        let request_id = "12345678-1234-4234-8234-123456789abc";
+        let unavailable = json!({"ok": false, "error": {
+            "code": "runtime_unavailable", "hop": "board", "request_id": request_id,
+            "message": "do-not-print-server-text"}})
+        .to_string();
+        let unsafe_code = json!({"code": "do-not-print-server-text /private/token",
+            "message": "do-not-print-server-text"})
+        .to_string();
+        for (status, body, expected) in [
+            (
+                401,
+                "<html>do-not-print-server-text</html>",
+                "uncertain, HTTP 401",
+            ),
+            (
+                403,
+                "<html>do-not-print-server-text</html>",
+                "authorization, HTTP 403",
+            ),
+            (503, unavailable.as_str(), "availability, HTTP 503"),
+            (400, unsafe_code.as_str(), "unknown, HTTP 400"),
+            (
+                302,
+                "<html>do-not-print-server-text</html>",
+                "remote redirect refused",
+            ),
+            (
+                200,
+                "<html>do-not-print-server-text</html>",
+                "remote authorize answered non-JSON",
+            ),
+        ] {
+            for operation in ["issue_new", "write", "upload"] {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let target = target(&listener);
+                let server = listener.try_clone().unwrap();
+                let response = body.to_owned();
+                let (stop, stopped) = std::sync::mpsc::channel();
+                let worker = thread::spawn(move || {
+                    let mut paths = Vec::new();
+                    let mut stopping = false;
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while Instant::now() < deadline {
+                        stopping |= stopped.try_recv().is_ok();
+                        let (mut socket, _) = match server.accept() {
+                            Ok(connection) => connection,
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                if stopping {
+                                    break;
+                                }
+                                thread::sleep(Duration::from_millis(2));
+                                continue;
+                            }
+                            Err(e) => panic!("refusal worker accept: {e}"),
+                        };
+                        socket.set_nonblocking(false).unwrap();
+                        socket
+                            .set_read_timeout(Some(Duration::from_secs(10)))
+                            .unwrap();
+                        let mut reader = BufReader::new(socket.try_clone().unwrap());
+                        let mut line = String::new();
+                        reader.read_line(&mut line).unwrap();
+                        paths.push(line.split(' ').nth(1).unwrap().to_owned());
+                        let mut length = 0;
+                        loop {
+                            line.clear();
+                            reader.read_line(&mut line).unwrap();
+                            if line == "\r\n" {
+                                break;
+                            }
+                            if let Some((key, value)) = line.split_once(':') {
+                                if key.eq_ignore_ascii_case("content-length") {
+                                    length = value.trim().parse::<usize>().unwrap();
+                                }
+                            }
+                        }
+                        // Read bytes, not JSON: an incorrectly forwarded multipart
+                        // upload must also be recorded and fail the path assertion.
+                        let mut raw = vec![0; length];
+                        reader.read_exact(&mut raw).unwrap();
+                        write!(socket, "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}", response.len()).unwrap();
+                    }
+                    paths
+                });
+                let root = tempfile::tempdir().unwrap();
+                let dir = root.path();
+                fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
+                store_credential(dir, &target.endpoint);
+                let saved = fs::read(dir.join(format!("cli-{ORG}.json"))).unwrap();
+                let result = if operation == "upload" {
+                    upload_file_in(
+                        dir,
+                        &target,
+                        "global/test.txt",
+                        "test.txt",
+                        b"test",
+                        true,
+                        5,
+                        |_| panic!("authorize refusal retried"),
+                    )
+                } else {
+                    let arguments = if operation == "write" {
+                        json!({"path": "global/test", "text": "test"})
+                    } else {
+                        json!({"project": "test", "title": "test"})
+                    };
+                    call_verb_in(
+                        &target,
+                        operation,
+                        arguments.as_object().unwrap().clone(),
+                        5,
+                        dir,
+                        |_| panic!("authorize refusal retried"),
+                        |_| panic!("authorize refusal slept"),
+                    )
+                    .map(|_| json!(null))
+                };
+                stop.send(()).unwrap();
+                let paths = worker.join().unwrap();
+                let relay = if operation == "issue_new" {
+                    "cli"
+                } else {
+                    "wiki"
+                };
+                assert_eq!(
+                    paths,
+                    [format!("/__platform/{relay}/authorize")],
+                    "{operation}, HTTP {status}"
+                );
+                let text = result.unwrap_err().to_string();
+                assert!(text.contains(expected), "{operation}: {text}");
+                assert!(!text.contains("do-not-print-server-text"), "{text}");
+                assert!(!text.contains("/private/token"), "{text}");
+                assert!(!text.contains("cadence login"), "{text}");
+                assert!(!text.contains(BRIDGE), "{text}");
+                if status == 503 {
+                    assert!(
+                        text.contains(&format!("hop board, request {request_id}")),
+                        "{text}"
+                    );
+                }
+                assert_eq!(
+                    fs::read(dir.join(format!("cli-{ORG}.json"))).unwrap(),
+                    saved
+                );
+            }
+        }
     }
 
     #[test]
@@ -2464,6 +2620,88 @@ mod tests {
         assert!(status["observed_at"].as_u64().is_some());
         assert!(status["stored_at"].as_u64().is_some());
         assert!(status.get("renewal_health").is_none(), "{text}");
+    }
+
+    #[test]
+    fn cad1434_blocker_local_status_legacy_expiry_keeps_command_refusal() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let target = target(&listener);
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.join(format!("cli-{ORG}.json"));
+        let at = now().unwrap();
+        store_credential_at(dir, ORG, ORG_ID, &target.endpoint, at + 300);
+        assert_eq!(
+            local_status_at(dir, &target)["state"],
+            "access_valid_until_expiry"
+        );
+        assert!(load_credential(dir, &target).is_ok());
+
+        store_credential_at(dir, ORG, ORG_ID, &target.endpoint, at - 1);
+        let mut body: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        body["capabilities"] = json!(["cli.read", "cli.write"]);
+        fs::write(&path, body.to_string()).unwrap();
+        let status = local_status_at(dir, &target);
+        assert_eq!(status["state"], "reauthentication_required");
+        assert_eq!(status["access_expires_at"], at - 1);
+        assert_eq!(status["scopes"], json!(["cli.read", "cli.write"]));
+        assert_eq!(status["live_verified"], false);
+        assert!(status["observed_at"].as_u64().is_some());
+        let text = status.to_string();
+        assert!(!text.contains("hct_"), "{text}");
+        assert!(!text.contains("hcr_"), "{text}");
+        assert!(!text.contains(dir.to_string_lossy().as_ref()), "{text}");
+        assert_eq!(
+            load_credential(dir, &target).err().unwrap().to_string(),
+            "the remote credential has expired — run `cadence login` again"
+        );
+
+        for (key, value) in [
+            ("version", json!("invalid")),
+            ("organization_id", json!("ws_other")),
+            ("audience", json!("https://other.cadencecloud.app")),
+            ("access_token", json!("invalid")),
+            ("unexpected", json!(true)),
+        ] {
+            let mut invalid = body.clone();
+            invalid[key] = value;
+            fs::write(&path, invalid.to_string()).unwrap();
+            assert_eq!(
+                local_status_at(dir, &target)["state"],
+                "invalid_local_credential",
+                "{key}"
+            );
+            assert!(load_credential(dir, &target).is_err());
+        }
+        fs::write(&path, "not JSON").unwrap();
+        assert_eq!(
+            local_status_at(dir, &target)["state"],
+            "invalid_local_credential"
+        );
+        fs::write(&path, body.to_string()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            local_status_at(dir, &target)["state"],
+            "invalid_local_credential"
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            local_status_at(dir, &target)["state"],
+            "invalid_local_credential"
+        );
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let original = dir.join("saved.json");
+        fs::rename(&path, &original).unwrap();
+        std::os::unix::fs::symlink(&original, &path).unwrap();
+        assert_eq!(
+            local_status_at(dir, &target)["state"],
+            "invalid_local_credential"
+        );
+        assert!(load_credential(dir, &target).is_err());
+        assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
     }
 
     #[test]
