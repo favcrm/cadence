@@ -2508,7 +2508,7 @@ mod tests {
         // This is malformed metadata, not evidence of native owner authority.
         let fixture = Connection::open(&db).unwrap();
         fixture
-            .execute("UPDATE schema_version SET version=46", [])
+            .execute("UPDATE schema_version SET version=47", [])
             .unwrap();
         drop(fixture);
         store
