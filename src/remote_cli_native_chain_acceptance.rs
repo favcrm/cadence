@@ -14,7 +14,7 @@ use crate::{client, daemon, issue::Pm, ui};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{
@@ -453,6 +453,265 @@ fn expire_client(dir: &Path, target: &RemoteTarget) {
     save_credential(dir, SLUG, &credential).unwrap();
 }
 
+// This is the existing cfg(test, feature="test-seam") harness, not the
+// installed CLI binary. Private piped stdin is its only fixture input.
+const CLIENT_HELPER: &str =
+    "remote_cli::tests::native_chain_acceptance::native_chain_private_client";
+const CRASH_PATH: &str = "projects/lc/pages/crash-must-not-land.md";
+const CLIENT_INPUT_LIMIT: usize = 4096;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ClientOperation {
+    Read,
+    Write,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClientInput {
+    owner_dir: PathBuf,
+    ca_der: Vec<u8>,
+    port: u16,
+    operation: ClientOperation,
+}
+
+fn private_client_input() -> ClientInput {
+    // Never block on an interactive terminal or an unattended inherited pipe.
+    let mut meta: libc::stat = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::fstat(0, &mut meta) }, 0);
+    assert_eq!(
+        meta.st_mode & libc::S_IFMT,
+        libc::S_IFIFO,
+        "private pipe required"
+    );
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut bytes = Vec::new();
+    loop {
+        assert!(Instant::now() < deadline, "private client input timed out");
+        let mut fd = libc::pollfd {
+            fd: 0,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let polled = unsafe { libc::poll(&mut fd, 1, 100) };
+        assert!(polled >= 0, "private client input poll failed");
+        if polled == 0 {
+            continue;
+        }
+        assert!(
+            fd.revents & (libc::POLLIN | libc::POLLHUP) != 0,
+            "invalid private input pipe"
+        );
+        let mut chunk = [0u8; 512];
+        let count = unsafe { libc::read(0, chunk.as_mut_ptr().cast(), chunk.len()) };
+        assert!(count >= 0, "private input read failed");
+        if count == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..count as usize]);
+        assert!(
+            bytes.len() <= CLIENT_INPUT_LIMIT,
+            "private input exceeds limit"
+        );
+    }
+    // Avoid printing serde errors or the private payload on failure.
+    serde_json::from_slice(&bytes).unwrap_or_else(|_| panic!("invalid private client input"))
+}
+
+#[test]
+#[ignore = "private stdin-only client helper; invoked only by the controlled parent harness"]
+fn native_chain_private_client() {
+    let input = private_client_input();
+    assert!((3110..=3199).contains(&input.port));
+    assert!(!input.ca_der.is_empty() && input.ca_der.len() <= 2048);
+    let owner = &input.owner_dir;
+    assert!(owner.is_absolute() && owner.file_name().unwrap() == "owner");
+    assert!(
+        fs::canonicalize(owner).unwrap() == *owner,
+        "noncanonical private owner directory"
+    );
+    let root = owner.parent().unwrap();
+    assert!(root.parent() == Some(Path::new("/tmp")));
+    assert!(root
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with("c1434-"));
+    for path in [root, owner.as_path()] {
+        let meta = fs::symlink_metadata(path).unwrap();
+        assert!(meta.is_dir() && meta.mode() & 0o077 == 0);
+        assert_eq!(meta.uid(), unsafe { libc::geteuid() });
+    }
+    let issuer = format!("https://issuer.board.localhost:{}", input.port);
+    assert!(fs::read(owner.join("trusted-issuer")).unwrap() == issuer.as_bytes());
+    let target = RemoteTarget {
+        org: SLUG.into(),
+        org_id: WORKSPACE.into(),
+        endpoint: BOARD.into(),
+    };
+    let stored = load_credential(owner, &target).unwrap();
+    assert!(stored.issuer.as_deref() == Some(issuer.as_str()));
+    let _trust = test_fixture::install(Fixture {
+        ca_der: input.ca_der,
+        loopback: format!("127.0.0.1:{}", input.port).parse().unwrap(),
+    });
+    let result = match input.operation {
+        ClientOperation::Read => call(
+            &target,
+            owner,
+            "read",
+            json!({"path":"projects/lc/pages/new.md"}),
+        ),
+        ClientOperation::Write => call(
+            &target,
+            owner,
+            "write",
+            json!({"path":CRASH_PATH,"text":"crashed write must not land"}),
+        ),
+    };
+    // Do not emit credential bodies or request errors to the test log/stdout.
+    assert!(result.is_ok(), "private normal client command failed");
+    if let ClientOperation::Read = input.operation {
+        assert!(result.unwrap()["text"] == "automatic renewal generation 4");
+    }
+}
+
+struct OwnedClient {
+    child: Option<Child>,
+}
+impl OwnedClient {
+    fn spawn(root: &Path, name: &str) -> Self {
+        let log = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(root.join(name))
+            .unwrap();
+        Self {
+            child: Some(
+                Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        CLIENT_HELPER,
+                        "--ignored",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .stdin(Stdio::piped())
+                    .stdout(log.try_clone().unwrap())
+                    .stderr(log)
+                    .spawn()
+                    .expect("spawn owned private test client"),
+            ),
+        }
+    }
+    fn send(&mut self, input: &ClientInput) {
+        let bytes = serde_json::to_vec(input).unwrap();
+        assert!(bytes.len() <= CLIENT_INPUT_LIMIT);
+        // Taking/dropping stdin closes the pipe; the child requires EOF.
+        self.child
+            .as_mut()
+            .unwrap()
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+    }
+    fn status(&mut self) -> Option<std::process::ExitStatus> {
+        let status = self.child.as_mut().unwrap().try_wait().unwrap();
+        if status.is_some() {
+            // try_wait reaped the child. Never signal this PID again.
+            self.child = None;
+        }
+        status
+    }
+    fn kill_and_reap(&mut self) -> std::process::ExitStatus {
+        let child = self.child.as_mut().unwrap();
+        child
+            .kill()
+            .expect("kill only the owned unreaped test client");
+        let status = child.wait().expect("reap killed test client");
+        self.child = None;
+        status
+    }
+}
+impl Drop for OwnedClient {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CrashMarker {
+    committed: bool,
+    generation: u64,
+}
+fn wait_crash_commit(driver: &Driver, child: &mut OwnedClient, path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(
+            driver.status().is_none(),
+            "AOS peer exited during client crash phase"
+        );
+        assert!(
+            child.status().is_none(),
+            "client exited before parent could crash it"
+        );
+        assert!(Instant::now() < deadline, "crash commit marker timed out");
+        if let Ok(file) = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+        {
+            let meta = file.metadata().unwrap();
+            assert!(meta.is_file() && meta.mode() & 0o077 == 0 && meta.len() <= 128);
+            let mut bytes = Vec::new();
+            file.take(129).read_to_end(&mut bytes).unwrap();
+            let marker: CrashMarker = serde_json::from_slice(&bytes).unwrap();
+            assert!(marker.committed && marker.generation == 6);
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+fn assert_owner_rotated(previous: &Credential, current: &Credential, generation: u64) {
+    let old = previous.cli_session.as_ref().unwrap();
+    let new = current.cli_session.as_ref().unwrap();
+    assert_eq!(new.generation, generation);
+    assert_eq!(old.generation + 1, generation);
+    assert!(
+        current.access_token != previous.access_token && new.refresh_token != old.refresh_token
+    );
+    assert!(
+        current.organization_id == previous.organization_id
+            && current.organization_slug == previous.organization_slug
+            && current.subject_id == previous.subject_id
+            && current.audience == previous.audience
+            && current.issuer == previous.issuer
+            && current.capabilities == previous.capabilities
+            && new.session_id == old.session_id
+            && new.device_label == old.device_label
+            && new.absolute_expires_at == old.absolute_expires_at
+    );
+    assert!(
+        new.idle_expires_at >= old.idle_expires_at
+            && new.idle_expires_at > now().unwrap()
+            && new.idle_expires_at <= new.absolute_expires_at
+    );
+    assert!(
+        current.expires_at > now().unwrap()
+            && current.expires_at <= now().unwrap() + 300
+            && current.expires_at <= new.absolute_expires_at
+    );
+    assert!(current.pending.is_none());
+}
+
 #[test]
 #[ignore = "controlled cross-repo runtime; supply CAD1434_AOS_API_DIR and run --ignored under admission"]
 fn native_chain_automatic_renewal_and_real_wiki_mutation() {
@@ -477,7 +736,7 @@ fn native_chain_automatic_renewal_and_real_wiki_mutation() {
     private_write(&root.path().join("native-seam"), rig.seam.as_bytes());
     let (ca_der, cert, key) = pki(root.path());
     let _trust = test_fixture::install(Fixture {
-        ca_der,
+        ca_der: ca_der.clone(),
         loopback: format!("127.0.0.1:{port}").parse().unwrap(),
     });
     let mut random = [0u8; 32];
@@ -811,6 +1070,133 @@ fn native_chain_automatic_renewal_and_real_wiki_mutation() {
         recovered_bytes.len()
     );
 
+    // Actual test CLIENT PROCESS death: hold the real committed issuer reply
+    // before any headers, kill/reap only our child, then resume its saved file.
+    // This is not evidence about an installed CLI binary or a wire-only error.
+    let before_crash = load_credential(&owner_dir, &target).unwrap();
+    assert_eq!(before_crash.cli_session.as_ref().unwrap().generation, 5);
+    assert!(before_crash.pending.is_none());
+    assert_eq!(control(port, &nonce, "arm_owner_commit_crash"), 200);
+    expire_client(&owner_dir, &target);
+    let before_crash_expired = load_credential(&owner_dir, &target).unwrap();
+    let before = rig.snapshot();
+    assert!(!vault.join(CRASH_PATH).exists());
+    assert!(!vault.join(format!("{CRASH_PATH}.blob")).exists());
+    let mut crashed_client = OwnedClient::spawn(root.path(), "crash-client.log");
+    crashed_client.send(&ClientInput {
+        owner_dir: owner_dir.clone(),
+        ca_der: ca_der.clone(),
+        port,
+        operation: ClientOperation::Write,
+    });
+    wait_crash_commit(
+        &driver,
+        &mut crashed_client,
+        &root.path().join("tokens.json.crash-committed"),
+    );
+    assert_eq!(control(port, &nonce, "assert_owner_crash_committed"), 200);
+    assert!(
+        crashed_client.status().is_none(),
+        "held client already exited"
+    );
+    let killed = crashed_client.kill_and_reap();
+    assert!(!killed.success());
+    assert_eq!(killed.signal(), Some(libc::SIGKILL));
+    let crashed = load_credential(&owner_dir, &target).unwrap();
+    assert!(crashed.access_token == before_crash_expired.access_token);
+    assert_eq!(crashed.expires_at, before_crash_expired.expires_at);
+    assert!(
+        serde_json::to_vec(&crashed.cli_session).unwrap()
+            == serde_json::to_vec(&before_crash_expired.cli_session).unwrap()
+    );
+    let pending = crashed
+        .pending
+        .as_ref()
+        .expect("actual process death lost pending renewal");
+    assert_eq!(pending.expected_generation, 5);
+    assert!(valid_operation_id(&pending.operation_id));
+    assert_eq!(
+        rig.snapshot(),
+        before,
+        "crashed client mutated native state"
+    );
+    assert_eq!(control(port, &nonce, "release_owner_crash_reply"), 200);
+    assert_eq!(
+        call(&target, &owner_dir, "read", json!({"path":page})).unwrap()["text"],
+        "automatic renewal generation 4"
+    );
+    let crash_recovered = load_credential(&owner_dir, &target).unwrap();
+    assert_owner_rotated(&before_crash, &crash_recovered, 6);
+    assert_eq!(control(port, &nonce, "assert_owner_crash_recovered"), 200);
+    assert_eq!(
+        rig.snapshot(),
+        before,
+        "crash recovery replayed the original write"
+    );
+    assert!(!vault.join(CRASH_PATH).exists());
+    assert!(!vault.join(format!("{CRASH_PATH}.blob")).exists());
+
+    // Both real test clients run the normal READ against the same owner file.
+    // Only the real production renewal lock/recheck coordinates them.
+    assert_eq!(control(port, &nonce, "expire_owner_concurrent_access"), 200);
+    expire_client(&owner_dir, &target);
+    let before = rig.snapshot();
+    let mut clients = [
+        OwnedClient::spawn(root.path(), "concurrent-1.log"),
+        OwnedClient::spawn(root.path(), "concurrent-2.log"),
+    ];
+    let read_input = ClientInput {
+        owner_dir: owner_dir.clone(),
+        ca_der: ca_der.clone(),
+        port,
+        operation: ClientOperation::Read,
+    };
+    for child in &mut clients {
+        assert!(child.status().is_none());
+    }
+    for child in &mut clients {
+        child.send(&read_input);
+    }
+    let deadline = Instant::now() + Duration::from_secs(40);
+    let mut reaped = [false; 2];
+    while !reaped.iter().all(|done| *done) {
+        assert!(
+            driver.status().is_none(),
+            "AOS peer exited during concurrent clients"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "concurrent normal clients timed out"
+        );
+        for (index, child) in clients.iter_mut().enumerate() {
+            if !reaped[index] {
+                if let Some(status) = child.status() {
+                    assert!(
+                        status.success(),
+                        "concurrent normal client failed (private log)"
+                    );
+                    reaped[index] = true;
+                }
+            }
+        }
+        if !reaped.iter().all(|done| *done) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    let concurrent = load_credential(&owner_dir, &target).unwrap();
+    assert_owner_rotated(&crash_recovered, &concurrent, 7);
+    assert_eq!(
+        rig.snapshot(),
+        before,
+        "concurrent reads mutated native state"
+    );
+    assert_eq!(
+        control(port, &nonce, "assert_owner_concurrent_renewed"),
+        200
+    );
+
+    // Finish legacy member operations/denials before its nonrenewable access
+    // naturally expires during the owner idle gap.
     assert_eq!(
         call(&target, &member_dir, "read", json!({"path":page})).unwrap()["text"],
         "automatic renewal generation 4"
@@ -893,6 +1279,106 @@ fn native_chain_automatic_renewal_and_real_wiki_mutation() {
         assert!(!vault.join(path).exists());
         assert!(!vault.join(format!("{path}.blob")).exists());
     }
+    // Natural idle gap, not SQL/manual expiry and not a fake clock. No call
+    // touches the owner session until its actual 300s access lifetime elapses.
+    let idle = load_credential(&owner_dir, &target).unwrap();
+    assert!(idle.pending.is_none());
+    assert_eq!(idle.cli_session.as_ref().unwrap().generation, 7);
+    let sleep_seconds = idle
+        .expires_at
+        .checked_add(1)
+        .unwrap()
+        .saturating_sub(now().unwrap());
+    assert!(sleep_seconds > 0 && sleep_seconds <= 310);
+    let before = rig.snapshot();
+    std::thread::sleep(Duration::from_secs(sleep_seconds));
+    assert!(
+        driver.status().is_none(),
+        "AOS peer exited during natural idle gap"
+    );
+    assert!(now().unwrap() > idle.expires_at);
+    assert!(idle.cli_session.as_ref().unwrap().idle_expires_at > now().unwrap());
+    assert!(idle.cli_session.as_ref().unwrap().absolute_expires_at > now().unwrap());
+    // Re-prime ONLY the existing controller-owned JWKS cache over verified TLS.
+    // Native handlers still do not prove a fresh handler-owned TLS JWKS fetch.
+    ui::prime_jwks_for_test(&issuer, KID, crate::issue::time::now_epoch()).unwrap();
+    assert_eq!(control(port, &nonce, "assert_owner_idle_gap"), 200);
+    let (stale_status, _, _) = post(
+        BOARD,
+        "/__platform/wiki/authorize",
+        &idle.access_token,
+        &json!({"version":WIKI_VERSION,"organization_id":WORKSPACE,"audience":BOARD,
+            "requested_scopes":["wiki.read"],"ttl_seconds":MAX_TTL}),
+        AUTH_TIMEOUT,
+    )
+    .unwrap();
+    assert_eq!(stale_status, 401);
+    assert_eq!(
+        rig.snapshot(),
+        before,
+        "expired idle bearer mutated native state"
+    );
+    assert_eq!(
+        call(&target, &owner_dir, "read", json!({"path":page})).unwrap()["text"],
+        "automatic renewal generation 4"
+    );
+    let idle_renewed = load_credential(&owner_dir, &target).unwrap();
+    assert_owner_rotated(&idle, &idle_renewed, 8);
+    assert_eq!(
+        rig.snapshot(),
+        before,
+        "idle renewal/read mutated native state"
+    );
+    let idle_page = "projects/lc/pages/idle-8.md";
+    let idle_text = "fresh owner write after natural idle expiry generation 8";
+    assert!(!vault.join(idle_page).exists());
+    call(
+        &target,
+        &owner_dir,
+        "write",
+        json!({"path":idle_page,"text":idle_text}),
+    )
+    .unwrap();
+    assert_eq!(
+        call(&target, &owner_dir, "read", json!({"path":idle_page})).unwrap()["text"],
+        idle_text
+    );
+    assert_eq!(
+        rig.rpc("wiki_read", json!({"path":idle_page}))["text"],
+        idle_text
+    );
+    let idle_blob_path = "projects/lc/blobs/idle-8.bin";
+    let idle_bytes = b"\x00fresh natural idle binary\x08\xff";
+    assert!(!vault.join(idle_blob_path).exists());
+    assert!(!vault.join(format!("{idle_blob_path}.blob")).exists());
+    upload_file_in(
+        &owner_dir,
+        &target,
+        idle_blob_path,
+        "idle-8.bin",
+        idle_bytes,
+        false,
+        60,
+        |_| {},
+    )
+    .unwrap();
+    let idle_blob = rig.rpc("wiki_read", json!({"path":idle_blob_path}));
+    assert_eq!(idle_blob["kind"], "blob");
+    assert_eq!(
+        fs::read(crate::wiki::blobs_dir(&vault).join(idle_blob["sha256"].as_str().unwrap()))
+            .unwrap(),
+        idle_bytes
+    );
+    assert_eq!(
+        call(&target, &owner_dir, "read", json!({"path":idle_blob_path})).unwrap()["size"],
+        idle_bytes.len()
+    );
+    assert!(load_credential(&owner_dir, &target)
+        .unwrap()
+        .pending
+        .is_none());
+    assert_eq!(control(port, &nonce, "assert_owner_idle_renewed"), 200);
+
     // An allowed read root is not a write grant: member failed project write
     // above, and owner pms remains forbidden despite its operator actor.
     assert_eq!(control(port, &nonce, "revoke_owner_session"), 200);
