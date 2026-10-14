@@ -496,9 +496,23 @@ fn renewed_credential(dir: &Path, target: &RemoteTarget, deadline: Instant) -> R
         request_deadline,
     )?;
     if status != 200 {
-        return Err(reject(
-            "remote CLI session renewal refused — run `cadence login` again",
-        ));
+        // CAD-1434: only the issuer's terminal session refusals (no longer a
+        // valid refresh grant) need a fresh login. Any other answer, including
+        // a transient 503, keeps the saved pending operation so a later
+        // command can retry the same renewal without asking for consent again.
+        let code = body
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        return Err(match (status, code) {
+            (401, "invalid_token") | (400, "invalid_grant") => reject(
+                "the renewable CLI session was rejected by the issuer — run `cadence login` again",
+            ),
+            _ => reject(format!(
+                "remote CLI session renewal is not complete (HTTP {status}); your saved login \
+                 is kept, retry the command later"
+            )),
+        });
     }
     validate_renewal_response(&body, &cred, target, &pending)?;
     let next = serde_json::from_value::<CliSession>(body["cli_session"].clone())
@@ -758,9 +772,10 @@ fn authorize(
             }
             Ok(envelope.to_string())
         }
-        401 | 403 => Err(reject(
-            "the remote refused the credential — run `cadence login` again",
-        )),
+        401 | 403 => {
+            let (refusal, reason) = decode_refusal(status, Some(&body));
+            Err(reject(refusal_message(refusal, reason.as_deref(), status)))
+        }
         s if (300..400).contains(&s) => Err(reject("remote redirect refused")),
         _ => Err(reject(format!(
             "remote authorize failed ({})",
@@ -979,17 +994,10 @@ fn upload_file_in(
         // raw body could carry anything, so it is never echoed.
         let conflict = status == 409 && body.as_ref().is_some_and(|b| b.get("conflict").is_some());
         if !(200..300).contains(&status) && status != 503 && !conflict {
-            let code = body
-                .as_ref()
-                .and_then(|b| b["code"].as_str())
-                .unwrap_or("unavailable")
-                .to_string();
-            if matches!(status, 401 | 403) {
-                return Err(reject(
-                    "the remote refused the credential — run `cadence login` again",
-                ));
-            }
-            return Err(reject(format!("remote upload refused ({status}, {code})")));
+            // CAD-1434: the gateway envelope is `{ok:false,error:{code}}`; the
+            // decoder reads it (the old top-level read always fell through).
+            let (refusal, reason) = decode_refusal(status, body.as_ref());
+            return Err(reject(refusal_message(refusal, reason.as_deref(), status)));
         }
         match classify(status, retry_after, body) {
             Verdict::Done(result) => return result,
@@ -1022,6 +1030,107 @@ enum Verdict {
     Waking(Duration),
 }
 
+/// CAD-1434: the one safe decoding of a hosted refusal, shared by authorize,
+/// cli/wiki call, blob upload and renewal. It reads the gateway envelope
+/// `{ok:false,error:{code}}` (or a legacy top-level `code`) and turns it into
+/// a stable category plus one next action. The raw body is never echoed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    /// 401 with a terminal or unspecified authentication code: the bearer
+    /// no longer resolves. Login again is the right action.
+    Authentication,
+    /// 403, or 401 with an explicit authorization code: the caller is
+    /// authenticated but not permitted. Login advice would be wrong.
+    Authorization,
+    /// 503 / transport / unknown server answer: retry later; no login advice.
+    Availability,
+    /// An answer whose shape we do not recognise. Conservative fallback.
+    Unknown,
+}
+
+impl Refusal {
+    fn category(self) -> &'static str {
+        match self {
+            Self::Authentication => "authentication",
+            Self::Authorization => "authorization",
+            Self::Availability => "availability",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Gateway error codes that prove an authenticated caller was refused for
+/// policy/scope reasons, so a fresh login would not change the outcome.
+const AUTHORIZATION_CODES: &[&str] = &[
+    "forbidden",
+    "scope_denied",
+    "capability_denied",
+    "prefix_denied",
+    "wiki_prefix_denied",
+    "action_not_allowed",
+];
+
+/// Gateway codes that prove the bearer itself is no longer valid, so a
+/// fresh login is the precise remedy.
+const AUTHENTICATION_CODES: &[&str] = &[
+    "unauthorized",
+    "invalid_token",
+    "invalid_grant",
+    "token_expired",
+    "session_expired",
+    "session_revoked",
+    "lineage_terminal",
+];
+
+/// Decode one refusal. Returns the category and the stable reason code (when
+/// the gateway supplied a safe one). The reason is one of the known codes
+/// above, never free text from the server.
+fn decode_refusal(status: u16, body: Option<&Value>) -> (Refusal, Option<String>) {
+    let code = body
+        .and_then(|b| {
+            b.get("error")
+                .and_then(|e| e.get("code"))
+                .or_else(|| b.get("code"))
+        })
+        .and_then(Value::as_str)
+        .filter(|c| c.len() <= 64 && c.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'));
+    let reason = code.map(str::to_owned);
+    let category = match (status, code) {
+        (503, _) | (502 | 504, _) => Refusal::Availability,
+        (403, _) => Refusal::Authorization,
+        (401, Some(c)) if AUTHORIZATION_CODES.contains(&c) => Refusal::Authorization,
+        (401, Some(c)) if AUTHENTICATION_CODES.contains(&c) => Refusal::Authentication,
+        (401, None) => Refusal::Authentication,
+        _ => Refusal::Unknown,
+    };
+    (category, reason)
+}
+
+/// The next action for a decoded refusal. A permission denial never tells the
+/// user to log in again; only a terminal authentication loss does.
+fn refusal_message(refusal: Refusal, reason: Option<&str>, status: u16) -> String {
+    let code = reason.map_or(String::new(), |r| format!(", reason {r}"));
+    let category = refusal.category();
+    match refusal {
+        Refusal::Authentication => format!(
+            "the remote refused the credential ({category}, HTTP {status}{code}) — run `cadence login` again"
+        ),
+        Refusal::Authorization => format!(
+            "the remote refused this action ({category}, HTTP {status}{code}); \
+             a new login will not grant it — check the workspace role and target path, \
+             or ask the workspace owner"
+        ),
+        Refusal::Availability => format!(
+            "the remote is unavailable ({category}, HTTP {status}{code}) — retry later; \
+             saved credentials are kept"
+        ),
+        Refusal::Unknown => format!(
+            "the remote refused the request ({category}, HTTP {status}{code}); it did not match a known \
+             refusal, so nothing was retried"
+        ),
+    }
+}
+
 fn classify(status: u16, retry_after: Option<u64>, body: Option<Value>) -> Verdict {
     match status {
         200..=299 => Verdict::Done(body.ok_or_else(|| reject("remote answer was not JSON"))),
@@ -1048,9 +1157,14 @@ fn classify(status: u16, retry_after: Option<u64>, body: Option<Value>) -> Verdi
                 _ => Verdict::Done(Err(reject("remote org is unavailable"))),
             }
         }
-        401 | 403 => Verdict::Done(Err(reject(
-            "the remote refused the credential — run `cadence login` again",
-        ))),
+        401 | 403 => {
+            let (refusal, reason) = decode_refusal(status, body.as_ref());
+            Verdict::Done(Err(reject(refusal_message(
+                refusal,
+                reason.as_deref(),
+                status,
+            ))))
+        }
         s if (300..400).contains(&s) => Verdict::Done(Err(reject("remote redirect refused"))),
         409 => {
             // A checked conflict (`{conflict, current_rev, card, error}`
@@ -1084,6 +1198,56 @@ fn classify(status: u16, retry_after: Option<u64>, body: Option<Value>) -> Verdi
 pub enum RemoteAnswer {
     Ok(Value),
     Conflict(Value),
+}
+
+/// CAD-1434: local-only credential state for `org list`/`org inspect`. It reads
+/// the stored credential with no network call and never returns a token. The
+/// result is a claim about what this machine holds, not about live connectivity
+/// or permission: `renewable` means the saved refresh session can be used on
+/// the next command; the server still decides each operation.
+pub fn local_status(target: &RemoteTarget) -> Value {
+    match auth_dir(None) {
+        Ok(dir) => local_status_at(&dir, target),
+        Err(_) => json!({"state": "unavailable", "live_verified": false}),
+    }
+}
+
+/// `local_status` with the credential dir injectable, so tests never touch the
+/// real config directory.
+fn local_status_at(dir: &Path, target: &RemoteTarget) -> Value {
+    let path = dir.join(format!("cli-{}.json", target.org));
+    if fs::symlink_metadata(&path).is_err() {
+        return json!({"state": "no_credential", "live_verified": false});
+    }
+    let cred = match load_credential(dir, target) {
+        Ok(cred) => cred,
+        // Malformed, foreign or unreadable storage is a local problem, never
+        // proof of absence or of server-side revocation.
+        Err(_) => {
+            return json!({"state": "invalid_local_credential", "live_verified": false,
+                "note": "the saved credential cannot be read; run `cadence login` again"})
+        }
+    };
+    let at = now().unwrap_or(0);
+    let scopes: Vec<&str> = cred.capabilities.iter().map(String::as_str).collect();
+    let mut out = json!({
+        "scopes": scopes,
+        "access_expires_at": cred.expires_at,
+        "live_verified": false,
+    });
+    let state = match cred.cli_session.as_ref() {
+        Some(session) if session.idle_expires_at > at && session.absolute_expires_at > at => {
+            out["session_idle_expires_at"] = json!(session.idle_expires_at);
+            out["session_absolute_expires_at"] = json!(session.absolute_expires_at);
+            out["pending_renewal"] = json!(cred.pending.is_some());
+            "renewable"
+        }
+        Some(_) => "reauthentication_required",
+        None if cred.expires_at > at => "access_valid_until_expiry",
+        None => "reauthentication_required",
+    };
+    out["state"] = json!(state);
+    out
 }
 
 /// Revoke one remote device/workspace session before removing its protected
@@ -1794,6 +1958,114 @@ mod tests {
         );
         assert!(out.unwrap_err().to_string().contains("remote call refused"));
         assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+    }
+
+    #[test]
+    fn a_403_policy_denial_never_recommends_login_and_keeps_the_reason() {
+        // CAD-1434 bad case: an authenticated caller refused for policy must not
+        // be told to log in again, and the safe gateway reason is preserved.
+        let (out, requests) = run(
+            vec![(
+                403,
+                "",
+                json!({"ok": false, "error": {"code": "prefix_denied"}}),
+            )],
+            "issue_set",
+            Map::new(),
+            10,
+        );
+        let shown = out.unwrap_err().to_string();
+        assert!(!shown.contains("cadence login"), "{shown}");
+        assert!(shown.contains("authorization"), "{shown}");
+        assert!(shown.contains("prefix_denied"), "{shown}");
+        assert_eq!(
+            hits(&requests, "/__platform/cli/call"),
+            1,
+            "a 403 was retried"
+        );
+    }
+
+    #[test]
+    fn a_terminal_401_asks_for_login_and_a_bare_401_is_still_authentication() {
+        let (out, _) = run(
+            vec![(
+                401,
+                "",
+                json!({"ok": false, "error": {"code": "session_expired"}}),
+            )],
+            "status",
+            Map::new(),
+            10,
+        );
+        let shown = out.unwrap_err().to_string();
+        assert!(shown.contains("cadence login"), "{shown}");
+        assert!(shown.contains("authentication"), "{shown}");
+        assert_eq!(
+            decode_refusal(401, Some(&json!({"error": {"code": "unauthorized"}}))).0,
+            Refusal::Authentication
+        );
+        assert_eq!(decode_refusal(401, None).0, Refusal::Authentication);
+    }
+
+    #[test]
+    fn unknown_or_html_answers_fall_back_conservatively_and_never_echo_the_body() {
+        assert_eq!(decode_refusal(401, None).0, Refusal::Authentication);
+        assert_eq!(decode_refusal(400, None).0, Refusal::Unknown);
+        let (refusal, reason) = decode_refusal(
+            418,
+            Some(&json!({"error": {"code": "Bad Code With Spaces"}})),
+        );
+        assert_eq!(refusal, Refusal::Unknown);
+        assert_eq!(reason, None, "an unsafe server code must not be surfaced");
+        let text = refusal_message(refusal, reason.as_deref(), 418);
+        assert!(!text.contains("Bad Code"), "{text}");
+    }
+
+    #[test]
+    fn a_transient_503_is_availability_and_keeps_saved_login() {
+        let (refusal, _) = decode_refusal(503, Some(&json!({"state": "wake_failed"})));
+        assert_eq!(refusal, Refusal::Availability);
+        let text = refusal_message(refusal, None, 503);
+        assert!(text.contains("retry later"), "{text}");
+        assert!(text.contains("kept"), "{text}");
+        assert!(!text.contains("cadence login"), "{text}");
+    }
+
+    #[test]
+    fn local_status_is_offline_redacted_and_never_claims_live_verification() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("a");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        let endpoint = "https://acme.cadencecloud.app";
+        let target = RemoteTarget {
+            org: ORG.into(),
+            endpoint: endpoint.into(),
+            org_id: ORG_ID.into(),
+        };
+        let at = now().unwrap();
+        let body = json!({"version": "hosted-cadence-auth.v1", "organization_id": ORG_ID,
+            "audience": endpoint, "access_token": BRIDGE, "expires_at": at + 300,
+            "capabilities": ["cli.read", "cli.write"],
+            "cli_session": {"session_id": "hcs_12345678-1234-4234-8234-123456789abc",
+                "refresh_token": "hcr_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "generation": 1, "device_label": "cadence CLI",
+                "idle_expires_at": at + 1000, "absolute_expires_at": at + 10_000}});
+        std::fs::write(dir.join(format!("cli-{ORG}.json")), body.to_string()).unwrap();
+        std::fs::set_permissions(
+            dir.join(format!("cli-{ORG}.json")),
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .unwrap();
+        let status = local_status_at(&dir, &target);
+        assert_eq!(status["state"], "renewable");
+        assert_eq!(status["live_verified"], false);
+        assert_eq!(status["scopes"], json!(["cli.read", "cli.write"]));
+        let text = status.to_string();
+        assert!(!text.contains(BRIDGE), "{text}");
+        assert!(!text.contains("hcr_AAAA"), "{text}");
+        assert!(!text.contains("hct_"), "{text}");
     }
 
     #[test]

@@ -147,13 +147,62 @@ other command is refused locally and never sent.
 A sleeping company answers `503 {"state":"waking","retry_after_s":N}`
 plus `Retry-After`; the CLI waits and retries inside `--wake-timeout`
 (default 120 s), printing `waking <org>… (Ns)` on stderr while stdout
-stays JSON. The budget lapses into exit 75 (`busy`). `wake_failed`, an
-unavailable remote, a redirect, or a refused credential (`401`/`403`)
-end the command with a `cadence login` hint — there is never a fallback
-to local or another org, and no token is ever printed. Operator-only
+stays JSON. The budget lapses into exit 75 (`busy`). There is never a
+fallback to local or another org, and no token is ever printed. Operator-only
 and every unlisted verb stay refused remotely; the remote path carries
 no operator proof, and the hosted `issue_set` verb accepts no `force`
 field — the `status=done` evidence gate has no remote override.
+
+### Refusal categories and next action (CAD-1434)
+
+Every hosted refusal (authorize, cli/wiki call, blob upload and renewal)
+is decoded by one shared classifier from the gateway's
+`{ok:false,error:{code}}` envelope. The message names a category, the HTTP
+status and, only when the gateway supplied a safe lowercase code, that
+reason. No raw body, token or private path is ever printed.
+
+| Category | When | Next action |
+| --- | --- | --- |
+| `authentication` | 401 whose code (or none) says the bearer no longer resolves, and a renewal the issuer rejects as `invalid_token`/`invalid_grant` | `cadence login` again, once |
+| `authorization` | 403, or 401 with an explicit policy code such as `prefix_denied` | Check the workspace role and target path, or ask the owner. A new login does not grant it; the command is not retried |
+| `availability` | 503, 502, 504, or a renewal that fails transiently | Retry later. Saved credentials and any pending renewal are kept |
+| `unknown` | Any other answer, including non-JSON or an unsafe code | The request is not retried; the status is reported |
+
+A mutation whose outcome is unknown (a dropped connection after dispatch,
+a 5xx after forward) is never replayed automatically. Reconcile with a read
+(`issue show`, `wiki ls`) before repeating the write.
+
+### Hosted credential status (CAD-1434)
+
+`cadence org list` and `cadence org inspect` are local-only: they make no
+network call. For a remote org the `credential` object reports what this
+machine holds, and `live_verified` is always `false`:
+
+- `no_credential`: nothing stored; run `cadence login`.
+- `renewable`: a renewable CLI session is stored and not yet past its idle or
+  absolute expiry. The next command renews the short access token automatically.
+- `access_valid_until_expiry`: a legacy login with a valid access token and no
+  renewable session; it expires without renewal.
+- `reauthentication_required`: the stored session is past its idle or absolute
+  expiry, or the access token expired with no renewable session.
+- `invalid_local_credential`: the file cannot be read or validated. This is a
+  local problem, not proof that the server revoked it.
+
+The `credential` object carries scope names, access expiry, session idle and
+absolute expiry, and whether a renewal is pending. It never carries a bearer or
+refresh token. `login_status` keeps its legacy values (`local_peer_authority`,
+`not_connected`) for compatibility; it reads `credential_saved` when a credential
+exists, instead of always `not_connected`.
+
+### Access token lifetime and renewal model (CAD-1434)
+
+Access tokens are deliberately short-lived (about 5 minutes). A command renews
+the token through the saved renewable CLI session when it is within 60 seconds
+of expiry, under a per-org lock with a persisted pending operation. A valid
+session therefore survives many access expirations and idle gaps while its idle
+and absolute expiry have not passed. Terminal session loss asks for one login;
+a transient renewal failure keeps the saved login for a later retry. The access
+token TTL is not extended to work around refusals.
 
 ### Remote ticket writes (CAD-1179)
 
@@ -347,3 +396,24 @@ durable sleep-safe application witness, and actual hosted Cadence command
 transport remain dependencies. Current device `read/draft/send` scopes belong
 to the issuer contract; they do not grant Cadence operator privileges. No board
 cookie authentication or assertion guard is weakened by this increment.
+
+### Read-only diagnosis before repeated login (CAD-1434)
+
+Diagnose a hosted refusal in this order. Each step is read-only and none
+requires another login:
+
+1. `cadence org inspect <org>`: check `credential.state`, the scopes, the
+   access expiry and the session idle/absolute expiry. `reauthentication_required`
+   or `no_credential` means login is the next action. `renewable` means keep
+   going: the failure is probably not a lost login.
+2. Re-run the failing command once and read its `category` and `reason`:
+   `authentication` means log in again once; `authorization` means check the
+   workspace role and target path (a login does not change it); `availability`
+   means retry later; `unknown` means report the HTTP status and the command.
+3. Record the client revision (`cadence --version`), the org endpoint and the
+   HTTP status and reason on the ticket. Do not paste a token, the credential
+   file or a raw response body.
+4. Wiki writes and uploads: confirm the target path is inside a root your role
+   may write (`users/<you>/` or a shared root you hold write for). Then make one
+   small write before any bulk transfer. A refused path is not a reason to try
+   another shared root.

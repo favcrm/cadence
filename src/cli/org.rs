@@ -257,16 +257,39 @@ fn select(registry: &Registry, org: Option<&str>) -> Result<Option<Connection>> 
         .ok_or_else(|| Error::rejected("unknown org"))
 }
 
+/// `login_status` keeps its legacy values for existing consumers: `Local`
+/// stays `local_peer_authority`; `Remote` is no longer always `not_connected`.
+/// The honest, local-only detail is `credential` (see `remote_cli::local_status`):
+/// its `state` says what this machine holds, and `live_verified` is always
+/// `false` because `org list` makes no network call.
 fn view(c: &Connection, selected: bool) -> Value {
-    json!({
+    let (login_status, credential) = match &c.destination {
+        Destination::Local { .. } => ("local_peer_authority", None),
+        Destination::Remote { endpoint, org_id } => {
+            let target = cadence_agent::remote_cli::RemoteTarget {
+                org: c.selection.org.clone(),
+                endpoint: endpoint.clone(),
+                org_id: org_id.clone(),
+            };
+            let status = cadence_agent::remote_cli::local_status(&target);
+            let legacy = if status["state"] == "no_credential" {
+                "not_connected"
+            } else {
+                "credential_saved"
+            };
+            (legacy, Some(status))
+        }
+    };
+    let mut out = json!({
         "org": c.selection.org,
         "selected": selected,
         "destination": c.destination,
-        "login_status": match c.destination {
-            Destination::Local { .. } => "local_peer_authority",
-            Destination::Remote { .. } => "not_connected",
-        }
-    })
+        "login_status": login_status,
+    });
+    if let Some(credential) = credential {
+        out["credential"] = credential;
+    }
+    out
 }
 
 /// `cadence org …` — no operator proof: a preference, never authority.
