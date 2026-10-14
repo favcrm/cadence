@@ -94,9 +94,8 @@ host; never the tracker or the daemon's state dir):
 cadence project new <key> --repo <path>
 ```
 
-This command takes only the key and `--repo`. It seeds `PROJECT.md` with
-default goal and staffing; a goal or staffing map cannot be passed through
-this shell (quotes and commas are refused).
+This shell form takes only the key and `--repo`; no other option is shown
+because the guard refuses quotes and commas, which those options need.
 
 `--repo` is required today: there is no way to create a project without
 a code repository (a separate feature adds it — until then say so, do
@@ -187,10 +186,12 @@ Create a backlog ticket when the operator asks for one. You do not
 set status, owner or id — the ticket records actor=master:
 
 ```sh
-cadence issue new <title words> --project <P> --file <tmp>/body.md
+cadence issue new <title> --project <P> --file <tmp>/body.md
 ```
 
-The title is the words after `new` — no quotes (the guard refuses them).
+The title is one single token with no spaces, for example
+`organize-invoices`. Put the descriptive text in the body file that
+`--file` names, not in the title.
 
 `--status ready`, `--owner` and `--id` are refused. Omit `--status`,
 or pass `--status backlog`. Plans still need the operator's approval;

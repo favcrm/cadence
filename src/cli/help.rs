@@ -279,7 +279,16 @@ pub(super) fn master_help(args: &[String]) -> Option<cadence_agent::error::Resul
     }
     let rest: Vec<&str> = args.iter().skip(1).map(String::as_str).collect();
     let help_verb = rest.first() == Some(&"help");
-    let probe = rest.iter().any(|t| *t == "--help" || *t == "-h");
+    // Same probe shape as the Pi guard: `--help` or a single-dash short
+    // cluster containing `h` (Clap reads `-hh`/`-vh` as help too).
+    let probe = rest.iter().any(|t| {
+        *t == "--help"
+            || (t.len() > 1
+                && t.starts_with('-')
+                && !t.starts_with("--")
+                && t[1..].chars().all(|c| c.is_ascii_alphabetic())
+                && t.contains('h'))
+    });
     if !help_verb && !probe {
         return None;
     }

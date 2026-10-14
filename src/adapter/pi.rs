@@ -1435,8 +1435,11 @@ export default function (pi) {
       return "every command starts `cadence` — no env prefixes (`FOO=bar cadence …`), wrappers (`bash -c …`) or other programs";
     }
     const rest = argv.slice(1);
-    // CAD-1432: every --help/-h probe refuses, on any verb and at the root.
-    if (rest.includes("--help") || rest.includes("-h")) {
+    // CAD-1432: every help probe refuses, on any verb and at the root:
+    // `--help`, and any single-dash short cluster that contains `h` (`-h`,
+    // `-hh`, `-vh`), which Clap reads as help. The charset admits no quotes,
+    // so such a token is always a bare flag cluster, never an argument value.
+    if (rest.some((t) => t === "--help" || /^-[A-Za-z]*h[A-Za-z]*$/.test(t))) {
       return HELP_ALLOWED
         ? "--help and -h are not available — run cadence help <command-path> for the exact usage of a command you may run"
         : "help probes are not available in a scoped chat turn — report the exact refusal and stop";

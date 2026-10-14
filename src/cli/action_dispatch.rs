@@ -50,6 +50,25 @@ pub(crate) fn run() -> Result<i32> {
         Ok(cli) => cli,
         Err(e) => {
             let e = email_flag_error(&e).unwrap_or(e);
+            // CAD-1432: any Clap help outcome for a master caller refuses
+            // before printing. Clap's short-option clusters (`-hh`,
+            // `-vh`) reach here as DisplayHelp, which the exact-string
+            // guard cannot see. Scoped turns get report-and-stop; the master
+            // gets the one bounded help route.
+            if e.kind() == clap::error::ErrorKind::DisplayHelp
+                && cadence_agent::master::caller_is_master()
+            {
+                let scoped = cadence_agent::master::in_app_conversation();
+                return Err(if scoped {
+                    Error::rejected(
+                        "help is not available in a scoped chat turn — report the exact refusal and stop",
+                    )
+                } else {
+                    Error::usage(
+                        "--help and -h are not available — run cadence help <command-path> for the exact usage of a command you may run",
+                    )
+                });
+            }
             // `--help` and `--version` print to stdout and exit 0 as before.
             // A bare parent command (`cadence issue`) prints its help as
             // plain text on stderr, exit 2, as before CAD-876: help stays
