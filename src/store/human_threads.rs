@@ -1069,6 +1069,53 @@ impl Store {
         })
     }
 
+    /// Rebind one existing, live browser consent to the actor's current
+    /// session. Endpoint is only a locator; the verified identity tuple must
+    /// still own the exact unexpired, unrevoked row. No consent fields change.
+    pub fn push_device_rebind(
+        &self,
+        actor: &VerifiedHuman,
+        endpoint: &str,
+        session: &str,
+    ) -> Result<Option<String>> {
+        self.write_tx(|conn| {
+            let at = now();
+            let device: Option<String> = conn.query_opt(
+                "SELECT id FROM human_push_devices
+                 WHERE endpoint=? AND human=? AND org=? AND issuer=? AND subject=?
+                   AND revoked IS NULL AND expires>?",
+                params![
+                    endpoint,
+                    actor.id,
+                    actor.org,
+                    actor.issuer,
+                    actor.subject,
+                    at
+                ],
+                |r| r.get(0),
+            )?;
+            let Some(device) = device else {
+                return Ok(None);
+            };
+            let changed = conn.execute(
+                "UPDATE human_push_devices SET session=?
+                 WHERE id=? AND endpoint=? AND human=? AND org=? AND issuer=? AND subject=?
+                   AND revoked IS NULL AND expires>?",
+                params![
+                    session,
+                    device,
+                    endpoint,
+                    actor.id,
+                    actor.org,
+                    actor.issuer,
+                    actor.subject,
+                    at
+                ],
+            )?;
+            Ok((changed == 1).then_some(device))
+        })
+    }
+
     /// Revoke one of the actor's own push devices. Returns whether a live
     /// device was removed. Another human's device is concealed the same as a
     /// missing one: `false`, nothing changed.

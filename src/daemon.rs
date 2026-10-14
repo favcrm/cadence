@@ -2948,6 +2948,7 @@ impl Shared {
             }
             "human_room_mute" => self.rpc_human_room_mute(params, peer_pid),
             "human_push_subscribe" => self.rpc_human_push_subscribe(params, peer_pid),
+            "human_push_rebind" => self.rpc_human_push_rebind(params, peer_pid),
             "human_push_unsubscribe" => self.rpc_human_push_unsubscribe(params, peer_pid),
             "human_room_add" => self.rpc_human_room_add(params, peer_pid),
             "human_room_remove" => self.rpc_human_room_remove(params, peer_pid),

@@ -479,6 +479,20 @@ impl Shared {
         Ok(json!({"device_id": device}))
     }
 
+    /// `human_push_rebind {token, endpoint}` — rebind only an existing,
+    /// unexpired consent for this exact verified human and browser endpoint.
+    pub(super) fn rpc_human_push_rebind(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        let token = required_str(params, "token")?;
+        let current = self.human_current_actor(token, params, peer_pid)?;
+        let endpoint = required_str(params, "endpoint")?;
+        crate::web_push::check_endpoint(endpoint)?;
+        let session = crate::operator_auth::digest(token);
+        let device = self
+            .store
+            .push_device_rebind(&current.actor, endpoint, &session)?;
+        Ok(json!({"device_id": device}))
+    }
+
     /// `human_push_unsubscribe {token, device_id}` — returns `removed`. Another
     /// human's device reports `removed: false` and nothing changes.
     pub(super) fn rpc_human_push_unsubscribe(

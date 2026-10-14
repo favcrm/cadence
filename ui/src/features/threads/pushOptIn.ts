@@ -1,4 +1,4 @@
-import { enrollPush, unenrollPush } from "./humanThreadsClient";
+import { enrollPush, rebindPush, unenrollPush } from "./humanThreadsClient";
 
 /**
  * CAD-1423: explicit browser opt-in for Web Push. Runs only from a user gesture
@@ -52,12 +52,40 @@ function serialized<T>(task: () => Promise<T>): Promise<T> {
 }
 
 /**
- * Enroll this browser. `isCurrent` says whether the same verified identity is
- * still signed in; it is checked after every async stage and before
- * `enrollPush`, so a switched account is never enrolled under the old click.
- * A stale run removes the subscription it created and throws StaleEnableError.
- * Returns the outcome text; the server-minted device id is kept only to offer
- * an explicit unsubscribe. Never throws to the caller except StaleEnableError.
+ * Link this epoch to the browser's existing subscription without prompting,
+ * registering a worker, or creating consent. A concealed server no-match
+ * closes the local subscription; transport failures leave it untouched.
+ */
+export function rebindExistingBrowserAlerts(isCurrent: () => boolean): Promise<string | null> {
+  return serialized(async () => {
+    if (!pushSupported()) return null;
+    const reg = await navigator.serviceWorker.getRegistration(SW_PATH);
+    if (!isCurrent()) throw new StaleEnableError();
+    const sub = await reg?.pushManager.getSubscription();
+    if (!isCurrent()) throw new StaleEnableError();
+    if (!reg || !sub) {
+      localStorage.removeItem(DEVICE_KEY);
+      return null;
+    }
+    const { device_id } = await rebindPush(sub.endpoint);
+    if (!isCurrent()) throw new StaleEnableError();
+    if (device_id === null) {
+      const notifications = await reg.getNotifications();
+      if (!isCurrent()) throw new StaleEnableError();
+      notifications.forEach((notification) => notification.close());
+      await sub.unsubscribe();
+      if (!isCurrent()) throw new StaleEnableError();
+      localStorage.removeItem(DEVICE_KEY);
+      return null;
+    }
+    localStorage.setItem(DEVICE_KEY, device_id);
+    return device_id;
+  });
+}
+
+/**
+ * Enroll this browser after an explicit user gesture. Stale completions release
+ * only the subscription and consent this operation just created.
  */
 export function enableBrowserAlerts(publicKey: string, isCurrent: () => boolean): Promise<string> {
   return serialized(async () => {

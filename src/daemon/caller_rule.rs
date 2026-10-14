@@ -1077,6 +1077,10 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         Rule::Handler("operator_connection + verified human session (CAD-1423)"),
     ),
     (
+        "human_push_rebind",
+        Rule::Handler("operator_connection + verified human session (CAD-1423)"),
+    ),
+    (
         "human_push_unsubscribe",
         Rule::Handler("operator_connection + verified human session (CAD-1423)"),
     ),

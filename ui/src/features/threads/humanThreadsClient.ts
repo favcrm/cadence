@@ -270,6 +270,11 @@ export function enrollPush(sub: { endpoint: string; keys: { p256dh: string; auth
   return call("POST", "/api/human-threads/push/subscriptions", sub);
 }
 
+/** Rebind only an existing consent for this verified human and endpoint. */
+export function rebindPush(endpoint: string): Promise<{ device_id: string | null }> {
+  return call("POST", "/api/human-threads/push/subscriptions/rebind", { endpoint });
+}
+
 /** `DELETE /api/human-threads/push/subscriptions/<device_id>` — `removed` is the explicit result. */
 export function unenrollPush(deviceId: string): Promise<{ removed: boolean }> {
   return call("DELETE", `/api/human-threads/push/subscriptions/${encodeURIComponent(deviceId)}`);

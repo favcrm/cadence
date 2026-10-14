@@ -229,6 +229,15 @@ fn route(method: &Method, rest: &str) -> Result<(Route, bool), HttpResp> {
             },
             false,
         )),
+        (Method::Post, "/push/subscriptions/rebind") => Ok((
+            Route {
+                rpc: "human_push_rebind",
+                server: Map::new(),
+                body_fields: &["endpoint"],
+            },
+            false,
+        )),
+
         (Method::Delete, p) if p.starts_with("/push/subscriptions/") => {
             let device = &p["/push/subscriptions/".len()..];
             if device.is_empty() || device.contains('/') {

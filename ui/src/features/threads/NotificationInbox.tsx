@@ -17,6 +17,7 @@ import {
   StaleEnableError,
   disableBrowserAlerts,
   enableBrowserAlerts,
+  rebindExistingBrowserAlerts,
   pushSupported,
   releaseBrowserAlerts,
 } from "./pushOptIn";
@@ -57,6 +58,8 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [deviceId, setDeviceId] = useState<string | null>(() => localStorage.getItem(DEVICE_KEY));
   const generation = useRef(0);
+  // Last verified human. Kept across auth epochs so a switch to another account is caught on its first valid feed.
+  const known = useRef<string | null>(null);
   const popover = useRef<HTMLDialogElement | null>(null);
   const settings = useRef<HTMLDialogElement | null>(null);
   const bell = useRef<HTMLButtonElement | null>(null);
@@ -91,10 +94,39 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
     setSettingsOpen(false);
     popover.current?.close();
 
-    let who: string | null = null;
     let latest = 0;
     let active = true;
     let timer = 0;
+    let linked = false;
+    let linking: Promise<void> | null = null;
+    const linkBeforeFeed = () => {
+      if (linked) return Promise.resolve();
+      if (linking === null) {
+        const epoch = generation.current;
+        linking = rebindExistingBrowserAlerts(() => active && generation.current === epoch)
+          .then(() => {
+            if (active && generation.current === epoch) {
+              linked = true;
+              setDeviceId(localStorage.getItem(DEVICE_KEY));
+            }
+          })
+          .catch((e: unknown) => {
+            if (
+              e instanceof StaleEnableError ||
+              (e instanceof ApiError && (e.status === 401 || e.status === 403))
+            ) {
+              throw e;
+            }
+            if (active && generation.current === epoch) {
+              setNotice("Could not sync browser alerts. Your threads still load.");
+            }
+          })
+          .finally(() => {
+            linking = null;
+          });
+      }
+      return linking;
+    };
     const stop = () => window.clearInterval(timer);
     const releaseDevice = () => {
       // Serialized before any new enable, so clearing the id here cannot erase a newer one.
@@ -110,9 +142,9 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
       const sent = ++latest;
       const started = generation.current;
       humanNotifications()
-        .then((next) => {
+        .then(async (next) => {
           if (!active || sent !== latest || generation.current !== started) return;
-          if (who !== null && next.human.id !== who) {
+          if (known.current !== null && next.human.id !== known.current) {
             // A verified identity change inside one epoch starts a new generation:
             // in-flight actions from the old identity are dropped, not applied.
             generation.current++;
@@ -120,20 +152,22 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
             toast.clear();
             setInbox(null);
             releaseDevice();
-            who = null;
+            known.current = null;
             return;
           }
-          who = next.human.id;
+          await linkBeforeFeed();
+          if (!active || sent !== latest || generation.current !== started) return;
+          known.current = next.human.id;
           setInbox(next);
           surfaceNew(next, toast);
         })
         .catch((e: unknown) => {
-          if (!active || sent !== latest || generation.current !== started) return;
+          if (!active || sent !== latest || generation.current !== started || e instanceof StaleEnableError) return;
           if (e instanceof ApiError && (e.status === 401 || e.status === 403)) {
             // Signed out or tenancy lost: clear everything and stop. The next auth epoch retries.
             stop();
-            if (who !== null) releaseDevice();
-            who = null;
+            if (known.current !== null) releaseDevice();
+            known.current = null;
             setInbox(null);
             return;
           }
