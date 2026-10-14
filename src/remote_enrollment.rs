@@ -679,7 +679,7 @@ fn require_login_issuer(dir: &Path, issuer: &str) -> Result<()> {
 /// pinned issuer only, never an AgenticOS identity or a board credential.
 #[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct AccessIngress {
+pub(crate) struct AccessIngress {
     issuer: String,
     client_id: String,
     client_secret: String,
@@ -759,6 +759,66 @@ pub fn cli_session_post(
     body: Value,
     deadline: Instant,
 ) -> Result<(u16, Value)> {
+    cli_session_post_with(
+        dir,
+        issuer,
+        path,
+        bearer,
+        body,
+        deadline,
+        send_issuer_request,
+    )
+}
+
+/// The production wire call: strict TLS, no redirects, no proxy, bounded
+/// timeout. It is the only transport a real renewal can use.
+fn send_issuer_request(
+    url: &str,
+    bearer: &str,
+    access: Option<&AccessIngress>,
+    body: &Value,
+    timeout: Duration,
+) -> Result<(u16, Vec<u8>)> {
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .proxy(None)
+        .build();
+    let mut request = ureq::Agent::new_with_config(config)
+        .post(url)
+        .header("Authorization", &format!("Bearer {bearer}"));
+    if let Some(access) = access {
+        request = request
+            .header("CF-Access-Client-Id", &access.client_id)
+            .header("CF-Access-Client-Secret", &access.client_secret);
+    }
+    let response = request
+        .send_json(body)
+        .map_err(|_| reject("Hosted CLI session request failed"))?;
+    let status = response.status().as_u16();
+    let mut bytes = Vec::new();
+    response
+        .into_body()
+        .as_reader()
+        .take(MAX_RESPONSE + 1)
+        .read_to_end(&mut bytes)?;
+    Ok((status, bytes))
+}
+
+/// `cli_session_post` with the wire call injected. Every check before the send
+/// and every response guard after it are the production code; only the bytes
+/// on the wire come from `send`. Production passes `send_issuer_request`.
+/// Tests pass a closure, which is never reachable from config or environment.
+fn cli_session_post_with(
+    dir: &Path,
+    issuer: &str,
+    path: &str,
+    bearer: &str,
+    body: Value,
+    deadline: Instant,
+    send: impl FnOnce(&str, &str, Option<&AccessIngress>, &Value, Duration) -> Result<(u16, Vec<u8>)>,
+) -> Result<(u16, Value)> {
     if !matches!(
         path,
         "/v1/hosted-cadence/cli-session/renew" | "/v1/hosted-cadence/cli-session/revoke"
@@ -777,41 +837,18 @@ pub fn cli_session_post(
             "remote command deadline elapsed before session request",
         ));
     }
-    let config = ureq::Agent::config_builder()
-        .timeout_global(Some(
-            request_deadline.saturating_duration_since(Instant::now()),
-        ))
-        .http_status_as_error(false)
-        .max_redirects(0)
-        .proxy(None)
-        .build();
-    let mut request = ureq::Agent::new_with_config(config)
-        .post(format!("{issuer}{path}"))
-        .header("Authorization", &format!("Bearer {bearer}"));
-    if let Some(access) = access.as_ref() {
-        request = request
-            .header("CF-Access-Client-Id", &access.client_id)
-            .header("CF-Access-Client-Secret", &access.client_secret);
-    }
     if Instant::now() >= request_deadline {
         return Err(Error::busy_coded(
             "timeout",
             "remote command deadline elapsed before session request",
         ));
     }
-    let response = request
-        .send_json(body)
-        .map_err(|_| reject("Hosted CLI session request failed"))?;
-    let status = response.status().as_u16();
+    let timeout = request_deadline.saturating_duration_since(Instant::now());
+    let url = format!("{issuer}{path}");
+    let (status, bytes) = send(&url, bearer, access.as_ref(), &body, timeout)?;
     if (300..400).contains(&status) {
         return Err(reject("Hosted issuer redirect refused"));
     }
-    let mut bytes = Vec::new();
-    response
-        .into_body()
-        .as_reader()
-        .take(MAX_RESPONSE + 1)
-        .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_RESPONSE {
         return Err(reject("Hosted issuer response too large"));
     }
@@ -819,6 +856,19 @@ pub fn cli_session_post(
         .map_err(|_| reject("Invalid hosted CLI session response"))?;
     confirm_login_access_ingress(dir, &issuer, &access)?;
     Ok((status, value))
+}
+
+#[cfg(test)]
+pub(crate) fn cli_session_post_for_test(
+    dir: &Path,
+    issuer: &str,
+    path: &str,
+    bearer: &str,
+    body: Value,
+    deadline: Instant,
+    send: impl FnOnce(&str, &str, Option<&AccessIngress>, &Value, Duration) -> Result<(u16, Vec<u8>)>,
+) -> Result<(u16, Value)> {
+    cli_session_post_with(dir, issuer, path, bearer, body, deadline, send)
 }
 
 fn confirm_access_ingress_config(

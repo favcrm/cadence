@@ -415,6 +415,24 @@ fn save_credential(dir: &Path, slug: &str, cred: &Credential) -> Result<()> {
 }
 
 fn renewed_credential(dir: &Path, target: &RemoteTarget, deadline: Instant) -> Result<Credential> {
+    renewed_credential_with(
+        dir,
+        target,
+        deadline,
+        crate::remote_enrollment::cli_session_post,
+    )
+}
+
+/// The renewal state machine (lock, load, due check, pending persist, POST,
+/// validate, save) with the issuer POST injected. Production passes the real
+/// `cli_session_post`; tests pass a closure that answers in place of the wire
+/// call, after the real pre-send checks, which live inside `cli_session_post`.
+fn renewed_credential_with(
+    dir: &Path,
+    target: &RemoteTarget,
+    deadline: Instant,
+    post: impl FnOnce(&Path, &str, &str, &str, Value, Instant) -> Result<(u16, Value)>,
+) -> Result<Credential> {
     let _lock = private_lock(dir, &target.org, deadline)?;
     if Instant::now() >= deadline {
         return Err(Error::busy_coded(
@@ -487,7 +505,7 @@ fn renewed_credential(dir: &Path, target: &RemoteTarget, deadline: Instant) -> R
         "organization_id":cred.organization_id,"organization_slug":target.org,"audience":cred.audience,
         "subject_id":cred.subject_id,"device_label":session.device_label,"capabilities":cred.capabilities});
     let request_deadline = deadline.min(Instant::now() + RENEWAL_WAIT);
-    let (status, body) = crate::remote_enrollment::cli_session_post(
+    let (status, body) = post(
         dir,
         issuer,
         "/v1/hosted-cadence/cli-session/renew",
