@@ -52,6 +52,9 @@ pub struct ScreenPackage {
     /// The `may` bridge methods the validated declaration opted into
     /// (empty on v1 / a v2 with none).
     pub may: Vec<String>,
+    /// The `host_contract` the validated declaration pinned (`None` when
+    /// the screen declared none — a read-only mount).
+    pub host_contract: Option<String>,
     /// Declared logical tool alias → declared capability slot (v2 only).
     pub tools: BTreeMap<String, String>,
 }
@@ -159,6 +162,7 @@ pub fn extract(files: &BTreeMap<String, String>, tag: &str) -> Result<ScreenPack
         remote_images: checked.remote_images().to_vec(),
         contract: checked.contract().to_string(),
         may: checked.may().to_vec(),
+        host_contract: checked.host_contract().map(str::to_string),
         tools: checked.tools().clone(),
     })
 }

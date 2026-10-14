@@ -90,7 +90,9 @@ var CALL_VERBS = [
 	"social.drafts.publish.stage",
 	"social.sources.show",
 	"social.sources.save",
-	"social.destinations.list"
+	"social.destinations.list",
+	"media.read",
+	"media.publish"
 ];
 var SLOT_VERBS = [
 	"run.start",
@@ -99,16 +101,29 @@ var SLOT_VERBS = [
 	"publish.draft.schedule",
 	"publish.draft.reschedule",
 	"publish.draft.cancel",
-	"publish.settings.save"
+	"publish.settings.save",
+	"media.original.download"
 ];
-/** The verbs a screen.v2 PUSH advertises in `actions`. */
-var ACTION_VERBS = [...CALL_VERBS, ...SLOT_VERBS];
+/** CAD-1365 — the protected original download slot. Qualified per mount
+*  (screen-media.v1 + media.read + live token); never a generic action verb. */
+var ORIGINAL_DOWNLOAD_VERB = "media.original.download";
+/** CAD-1365 — the media contract's verbs parse on the closed call
+*  envelope but are NEVER in the generic advertised set: they are
+*  appended per-mount, only to a media-opted-in child whose minted
+*  receipt declares them. */
+var MEDIA_VERBS = ["media.read", "media.publish"];
+/** The verbs a screen.v2 PUSH advertises in `actions` — media verbs are
+*  deliberately absent; the channel appends a mount's declared media
+*  rights itself. */
+var ACTION_VERBS = [...CALL_VERBS.filter((v) => !MEDIA_VERBS.includes(v)), ...SLOT_VERBS.filter((v) => v !== ORIGINAL_DOWNLOAD_VERB)];
 var LINK_ID_MAX = 128;
 var V2_TOP = [
 	"sources",
 	"defaults",
 	"readiness",
-	"actions"
+	"actions",
+	"run_receipts",
+	"original_downloads"
 ];
 var V2_RUN = [
 	"created",

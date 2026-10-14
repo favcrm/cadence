@@ -3,6 +3,8 @@
 //! External tokens stay in custody; the upstream door derives their company.
 //! Trusted hosted media and source reads (CAD-868, CAD-1060) instead use the
 //! fixed lease-owned door with no bearer; the Worker derives the company.
+#[cfg(test)]
+mod cad1365_original_artifact_acceptance;
 pub(crate) mod image;
 pub mod media_import;
 pub mod publish;
@@ -795,6 +797,79 @@ impl AgenticosExternalAdapter {
                 "AgenticOS media artifact descriptor is malformed",
             ));
         }
+        // The verified original is fetched by the same bounded,
+        // integrity-checked artifact GET the read-only retrieval uses.
+        let (original_mime, asset_bytes) =
+            self.fetch_media_artifact(token, artifact_ref, artifact_digest, artifact_bytes)?;
+        let fault = |(fault, detail): (ImageFault, &str)| {
+            ImageFailure::uncertain(
+                match fault {
+                    ImageFault::Unsupported => R::UnsupportedImage,
+                    ImageFault::NotSquare => R::NotSquare,
+                    ImageFault::Decode => R::DecodeFailed,
+                    ImageFault::TooLarge => R::ArtifactTooLarge,
+                },
+                detail,
+            )
+        };
+        // The verified original rides the result as a provenance receipt;
+        // every field comes from the descriptor and bytes proven above,
+        // captured before the custody re-encode shadows them.
+        let original_artifact = json!({
+            "schema":1,
+            "ref":artifact_ref,
+            "sha256":format!("sha256:{artifact_digest}"),
+            "bytes":artifact_bytes.unwrap_or_default(),
+            "media_type":original_mime,
+        });
+        // The original is proven against the AgenticOS descriptor above; what
+        // is retained must fit custody, so a larger one is re-encoded.
+        // The fetch already byte-sniffed the original; the retained
+        // derivative is re-checked only after a custody re-encode.
+        let (media_type, asset_bytes) = if asset_bytes.len() > ASSET_LIMIT {
+            let jpeg = fit_to_custody(&asset_bytes).map_err(fault)?;
+            (image_checked(&jpeg, "image/jpeg").map_err(fault)?, jpeg)
+        } else {
+            (original_mime, asset_bytes)
+        };
+        let digest = format!("sha256:{:x}", Sha256::digest(&asset_bytes));
+        let charge_minor = job["price"]["chargeMinor"].as_u64().unwrap_or_default();
+        let result = json!({
+            "schema":1,"kind":"media.generated.image","provider":PLATFORM,
+            "source_receipt_id":authority["source"]["receipt_id"],
+            "source_post_id":authority["source"]["post"]["id"],
+            "model":IMAGE_MODEL,"aspect_ratio":"1:1","n":1,
+            "job_id":id,
+            "charge":{"currency":"USD","scale":6,"amount":format!("{}.{:06}", charge_minor / 1_000_000, charge_minor % 1_000_000)},
+            "price_version":job["price"]["version"],
+            "quoted_micros":quoted,
+            "repeated":job["repeated"],
+            "asset_sha256":digest,"asset_media_type":media_type,
+            "original_artifact":original_artifact,
+        });
+        Ok(AppCapabilityOutput {
+            result,
+            asset: Some(AppCapabilityAsset {
+                media_type: media_type.into(),
+                bytes: asset_bytes,
+            }),
+        })
+    }
+
+    /// CAD-1365: the authenticated artifact GET half of `call_image_coded`,
+    /// shared with the read-only original retrieval. Fetches exactly
+    /// `artifact_ref` — no submit, poll, billing, claim or enrollment — and
+    /// proves the bytes against the descriptor: status, size cap, byte
+    /// count, digest and image safety/MIME. Returns the verified
+    /// `(media_type, bytes)`; every failure is a typed [`ImageFailure`].
+    fn fetch_media_artifact(
+        &self,
+        token: Option<&str>,
+        artifact_ref: &str,
+        artifact_digest: &str,
+        artifact_bytes: Option<u64>,
+    ) -> std::result::Result<(&'static str, Vec<u8>), ImageFailure> {
+        use ImageReason as R;
         let unconfirmed = || {
             ImageFailure::uncertain(
                 R::ArtifactUnavailable,
@@ -848,7 +923,7 @@ impl AgenticosExternalAdapter {
                 "AgenticOS media artifact digest differs from its receipt",
             ));
         }
-        let fault = |(fault, detail): (ImageFault, &str)| {
+        let media_type = image_checked(&asset_bytes, &header).map_err(|(fault, detail)| {
             ImageFailure::uncertain(
                 match fault {
                     ImageFault::Unsupported => R::UnsupportedImage,
@@ -858,38 +933,53 @@ impl AgenticosExternalAdapter {
                 },
                 detail,
             )
-        };
-        let mut media_type = image_checked(&asset_bytes, &header).map_err(fault)?;
-        // The original is proven against the AgenticOS descriptor above; what
-        // is retained must fit custody, so a larger one is re-encoded.
-        let asset_bytes = if asset_bytes.len() > ASSET_LIMIT {
-            let jpeg = fit_to_custody(&asset_bytes).map_err(fault)?;
-            media_type = image_checked(&jpeg, "image/jpeg").map_err(fault)?;
-            jpeg
-        } else {
-            asset_bytes
-        };
-        let digest = format!("sha256:{:x}", Sha256::digest(&asset_bytes));
-        let charge_minor = job["price"]["chargeMinor"].as_u64().unwrap_or_default();
-        let result = json!({
-            "schema":1,"kind":"media.generated.image","provider":PLATFORM,
-            "source_receipt_id":authority["source"]["receipt_id"],
-            "source_post_id":authority["source"]["post"]["id"],
-            "model":IMAGE_MODEL,"aspect_ratio":"1:1","n":1,
-            "job_id":id,
-            "charge":{"currency":"USD","scale":6,"amount":format!("{}.{:06}", charge_minor / 1_000_000, charge_minor % 1_000_000)},
-            "price_version":job["price"]["version"],
-            "quoted_micros":quoted,
-            "repeated":job["repeated"],
-            "asset_sha256":digest,"asset_media_type":media_type,
-        });
-        Ok(AppCapabilityOutput {
-            result,
-            asset: Some(AppCapabilityAsset {
-                media_type: media_type.into(),
-                bytes: asset_bytes,
-            }),
-        })
+        })?;
+        Ok((media_type, asset_bytes))
+    }
+
+    /// CAD-1365: the descriptor a stored `original_artifact` receipt
+    /// carries, re-checked before any fetch — canonical ref grammar, the
+    /// digest agreeing with `sha256`, a bounded positive size and an
+    /// allowlisted image MIME. A malformed stored receipt refuses
+    /// without provider traffic.
+    fn checked_original_descriptor(
+        descriptor: &Value,
+    ) -> std::result::Result<(String, String, u64, String), String> {
+        let reference = descriptor["ref"]
+            .as_str()
+            .filter(|r| valid_media_ref(r))
+            .ok_or("stored original artifact ref is malformed")?;
+        let sha256 = descriptor["sha256"]
+            .as_str()
+            .and_then(|s| s.strip_prefix("sha256:"))
+            .filter(|hex| {
+                hex.len() == 64
+                    && hex
+                        .bytes()
+                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            })
+            .ok_or("stored original artifact digest is malformed")?;
+        if reference
+            .split_once('.')
+            .map(|(_, digest)| digest != sha256)
+            .unwrap_or(true)
+        {
+            return Err("stored original artifact ref does not carry its digest".into());
+        }
+        let bytes = descriptor["bytes"]
+            .as_u64()
+            .filter(|n| *n > 0 && *n <= FETCH_LIMIT as u64)
+            .ok_or("stored original artifact size is outside the fetch bound")?;
+        let media_type = descriptor["media_type"]
+            .as_str()
+            .filter(|m| matches!(*m, "image/png" | "image/jpeg" | "image/webp"))
+            .ok_or("stored original artifact media type is not a retained image")?;
+        Ok((
+            reference.to_string(),
+            sha256.to_string(),
+            bytes,
+            media_type.to_string(),
+        ))
     }
 }
 
@@ -1402,6 +1492,54 @@ impl PlatformAdapter for AgenticosExternalAdapter {
         self.call_image_coded(credential, authority, input, idempotency_key)
     }
 
+    /// CAD-1365: read-only retrieval of the verified retained original
+    /// behind a stored `original_artifact` receipt. The frozen binding
+    /// config must still authorize the reviewed image action on the
+    /// recorded account; the fetch is the shared bounded artifact GET —
+    /// never a submit, poll, billing, claim, enrollment or signed URL —
+    /// and the returned bytes are re-proven byte-for-byte, digest and
+    /// image safety against the stored descriptor.
+    fn read_app_media_original(
+        &self,
+        credential: &[u8],
+        config: &Value,
+        descriptor: &Value,
+    ) -> std::result::Result<(String, Vec<u8>), String> {
+        if !matches!(
+            self.deployment_pin.as_deref(),
+            Some(MANIFEST_PIN | TEXT_MANIFEST_PIN)
+        ) {
+            return Err("original media retrieval has not been approved by this deployment".into());
+        }
+        let mapping = &config["mapping"];
+        if config["provider"] != PLATFORM
+            || config["account"].as_str().is_none_or(str::is_empty)
+            || config["connection_id"].as_str().is_none_or(str::is_empty)
+            || mapping["capability"] != "media.generate"
+            || mapping["version"] != 1
+            || mapping["action"] != "generate_image"
+            || mapping["resource_kind"] != "connection_account"
+            || mapping["effect"] != "draft"
+            || mapping["tool"] != IMAGE_TOOL
+        {
+            return Err("frozen binding does not authorize original media retrieval".into());
+        }
+        let (reference, sha256, bytes, media_type) = Self::checked_original_descriptor(descriptor)?;
+        let token = self.lease_token(credential, config)?;
+        let (served_type, original) = self
+            .fetch_media_artifact(token, &reference, &sha256, Some(bytes))
+            .map_err(|failure| {
+                format!(
+                    "AgenticOS original artifact retrieval failed ({})",
+                    failure.reason.code()
+                )
+            })?;
+        if served_type != media_type {
+            return Err("AgenticOS original artifact media type differs from its receipt".into());
+        }
+        Ok((served_type.to_string(), original))
+    }
+
     fn table(&self) -> &ToolTable {
         &self.table
     }
@@ -1833,7 +1971,9 @@ mod tests {
         bytes
     }
 
-    fn image_proof(quote: Value) -> Value {
+    // CAD-1365: shared with the dedicated original-artifact acceptance
+    // module; test-only visibility, no production surface.
+    pub(super) fn image_proof(quote: Value) -> Value {
         let mut proof = authority();
         proof["slot"] = json!("image");
         proof["binding"]["config"]["mapping"] = json!({"capability":"media.generate","version":1,"action":"generate_image","resource_kind":"connection_account","tool":IMAGE_TOOL,"effect":"draft"});
@@ -1843,27 +1983,30 @@ mod tests {
         proof
     }
 
-    fn media_quote() -> Value {
+    pub(super) fn media_quote() -> Value {
         json!({"schema":1,"currency":"USD","unit_price_micros":31500,"units":1,"total_price_micros":31500,"price_revision":"media:sha256:test-quote"})
     }
 
     #[derive(Clone, Debug)]
-    struct DoorRequest {
-        method: String,
-        url: String,
-        auth: Option<String>,
-        idem: Option<String>,
-        body: Value,
+    pub(super) struct DoorRequest {
+        pub(super) method: String,
+        pub(super) url: String,
+        pub(super) auth: Option<String>,
+        pub(super) idem: Option<String>,
+        pub(super) body: Value,
     }
 
-    fn json_response(status: u16, payload: Value) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
+    pub(super) fn json_response(
+        status: u16,
+        payload: Value,
+    ) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
         tiny_http::Response::from_string(payload.to_string()).with_status_code(status)
     }
 
     /// Loopback AgenticOS media door. It answers exactly `expected` requests
     /// and the test joins the worker, so a call that issues one extra
     /// request (a forbidden re-POST) fails instead of passing silently.
-    fn media_door(
+    pub(super) fn media_door(
         answer: impl Fn(&DoorRequest) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> + Send + 'static,
     ) -> (
         String,
@@ -2040,7 +2183,13 @@ mod tests {
         json!({"ok":true,"data":{"kind":"image","model":IMAGE_MODEL,"price":{"slug":IMAGE_TOOL,"chargeMinor":charge_minor,"currency":"USD","version":version}}})
     }
 
-    fn job_view(id: &str, status: &str, artifacts: Value, repeated: bool, charge: u64) -> Value {
+    pub(super) fn job_view(
+        id: &str,
+        status: &str,
+        artifacts: Value,
+        repeated: bool,
+        charge: u64,
+    ) -> Value {
         json!({"id":id,"kind":"image","status":status,"model":IMAGE_MODEL,"provider":"upstream-fixture",
             "providerTaskId":null,"artifacts":artifacts,"artifactError":null,
             "usage":{"providerCredits":null},
@@ -2048,17 +2197,17 @@ mod tests {
             "repeated":repeated,"cached":false,"stale":false})
     }
 
-    fn artifact_entry(job_id: &str, bytes: &[u8]) -> Value {
+    pub(super) fn artifact_entry(job_id: &str, bytes: &[u8]) -> Value {
         let digest = format!("{:x}", Sha256::digest(bytes));
         json!({"ref":format!("{job_id}.{digest}"),"digest":digest,"bytes":bytes.len(),"mime":"image/png"})
     }
 
-    fn artifact_response(bytes: &[u8]) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
+    pub(super) fn artifact_response(bytes: &[u8]) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
         tiny_http::Response::from_data(bytes.to_vec())
             .with_header(tiny_http::Header::from_bytes("Content-Type", "image/png").unwrap())
     }
 
-    fn image_adapter(base: &str) -> AgenticosExternalAdapter {
+    pub(super) fn image_adapter(base: &str) -> AgenticosExternalAdapter {
         AgenticosExternalAdapter::with_deployment_pin(base, Some(MANIFEST_PIN)).unwrap()
     }
 

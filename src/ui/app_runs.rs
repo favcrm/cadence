@@ -1,5 +1,8 @@
 //! Operator-only HTTP for stable-ID local runs. Worker artifact access is RPC-only.
-use super::{err_response, home, json_response, operator, parse_json, read_body, HttpResp};
+use super::{
+    app_screens, err_response, home, json_response, operator, parse_json, read_body, HttpResp,
+    ServeOpts,
+};
 use crate::client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -200,6 +203,7 @@ pub(super) fn handle(
     state: &Path,
     route: Route<'_>,
     write: bool,
+    opts: &ServeOpts,
 ) -> HttpResp {
     if write {
         return err_response(405, "method not allowed");
@@ -210,6 +214,7 @@ pub(super) fn handle(
         route,
         false,
         operator::PublicRelay::NotPublic,
+        opts,
     )
 }
 
@@ -222,6 +227,7 @@ pub(super) fn handle_with_relay(
     route: Route<'_>,
     write: bool,
     relay: operator::PublicRelay,
+    opts: &ServeOpts,
 ) -> HttpResp {
     let route = if write && matches!(route, Route::List) {
         Route::Create
@@ -249,10 +255,19 @@ pub(super) fn handle_with_relay(
                 Ok(value) => value,
                 Err(response) => return response,
             };
-            (
-                "app_run_create",
-                serde_json::to_value(value).expect("typed create serializes"),
-            )
+            let mut params = serde_json::to_value(value).expect("typed create serializes");
+            // CAD-1365: the trusted host adds the request's own proven
+            // session credential for native creator resolution — the
+            // typed body can never carry one, and a request without a
+            // live session fails closed, never a credential-less
+            // operator relay.
+            let Some((token, key, origin)) = app_screens::request_credentials(request, opts) else {
+                return err_response(403, "run create needs a live operator session");
+            };
+            params["token"] = json!(token);
+            params["key"] = json!(key);
+            params["origin"] = json!(origin);
+            ("app_run_create", params)
         }
         Route::Start => {
             let bytes = match read_body(request, BODY_CAP) {
@@ -263,10 +278,14 @@ pub(super) fn handle_with_relay(
                 Ok(value) => value,
                 Err(response) => return response,
             };
-            (
-                "app_run_start",
-                serde_json::to_value(value).expect("typed start serializes"),
-            )
+            let mut params = serde_json::to_value(value).expect("typed start serializes");
+            let Some((token, key, origin)) = app_screens::request_credentials(request, opts) else {
+                return err_response(403, "run start needs a live operator session");
+            };
+            params["token"] = json!(token);
+            params["key"] = json!(key);
+            params["origin"] = json!(origin);
+            ("app_run_start", params)
         }
         Route::Team(id) if !write => ("app_install_team_show", json!({"install_id":id})),
         Route::Team(id) => {

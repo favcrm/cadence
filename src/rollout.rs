@@ -58,7 +58,8 @@ use crate::store::{self, Store};
 /// `assist_requests` and the `assist_stall_checks` table.
 /// v43 (CAD-1380/AOS-216): the owner-granted `assist_job_shares` table.
 /// v44 (CAD-1412): human principals, rooms, membership and read markers.
-pub const SCHEMA_VERSION: i64 = 44;
+/// v45 (CAD-1365): the metadata-only `app_media_*` tables.
+pub const SCHEMA_VERSION: i64 = 45;
 
 /// Last schema that has no lease table. The bootstrap opt-in covers
 /// only this version.
@@ -3350,8 +3351,8 @@ mod tests {
         // tables; v42 adds the member-request provenance columns and
         // `assist_stall_checks`; v43 adds the owner-granted
         // `assist_job_shares` entitlement; CAD-1412: v44 adds the human
-        // room tables.
-        assert_eq!(SCHEMA_VERSION, 44);
+        // room tables, and v45 (CAD-1365) adds the app_media_* tables.
+        assert_eq!(SCHEMA_VERSION, 45);
     }
 
     struct MigrationHolder;

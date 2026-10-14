@@ -309,6 +309,26 @@ pub trait PlatformAdapter: Send + Sync {
             })
     }
 
+    /// CAD-1365: retrieve the verified retained ORIGINAL bytes behind a
+    /// stored `original_artifact` provenance descriptor. `credential` is
+    /// the enrolled custody bytes (or the proven builtin lease's empty
+    /// bytes) and `config` the frozen binding config — the same authority
+    /// `execute_app_capability` runs under; `descriptor` is the trusted
+    /// stored `{ref, sha256, bytes, media_type}` receipt, never a raw
+    /// frame locator. Implementations fetch ONLY the recorded ref under
+    /// the recorded account — no submit, poll, billing, claim, enroll or
+    /// signed public URL — verify byte count, digest and image safety,
+    /// and return the exact verified `(media_type, bytes)`.
+    /// The default refuses every provider.
+    fn read_app_media_original(
+        &self,
+        _credential: &[u8],
+        _config: &Value,
+        _descriptor: &Value,
+    ) -> std::result::Result<(String, Vec<u8>), String> {
+        Err("provider does not support original media retrieval".into())
+    }
+
     /// Quote the exact reviewed mapping and credential account in a frozen
     /// binding. Providers without live price discovery remain unavailable.
     fn quote_app_capability(

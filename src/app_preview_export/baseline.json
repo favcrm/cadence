@@ -1,6 +1,6 @@
 {
   "contract": "app-screen-projection-fixtures/2",
-  "artifact_sha256": "43719b2899cd7de16d59a45f8b4b745d27fa529966ed0f00b08de190040a3d33",
+  "artifact_sha256": "acb2e96ad2feeb6428dacde322ec6b48de29a4a6eea85174e730918fa658c3fe",
   "golden_sha256": "371c6a2e832809c78af679556896fd2195dc0694e1fefe178d5b6fcecf72cb35",
   "scenarios": [
     "empty",
@@ -21,7 +21,7 @@
     },
     {
       "path": "ui/src/features/workspace-apps/screen/screenProtocol.ts",
-      "sha256": "ffefa1ffc04f584d56ba494e336c8f8222d6c381692a1cbd2f453003e00e52b1"
+      "sha256": "b1c34140c35efd45c1333ab5c2057d0af12623a4254a86e561c9bead1202486e"
     },
     {
       "path": "ui/src/lib/api.ts",

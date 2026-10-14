@@ -1,6 +1,6 @@
-import { ASSET_BYTES_MAX, ASSET_DATA_URL, parseChild, parseInit, pushedAssetRefs, shapeFor, shapeOf,
-  wantsActions, TOOL_ALIAS, ASSET_REF,
-  type ActionResult, type AssetReply, type CallRequest, type CallVerb, type ChildToHost, type ReplyMessage, type ScreenPush,
+import { ASSET_BYTES_MAX, ASSET_DATA_URL, ORIGINAL_DOWNLOAD_VERB, parseChild, parseInit, pushedAssetRefs, shapeFor, shapeOf,
+  wantsActions, wantsMedia, isMediaVerb, SCREEN_MEDIA_V1, TOOL_ALIAS, ASSET_REF,
+  type ActionResult, type AssetReply, type CallRequest, type CallVerb, type ChildToHost, type MediaVerb, type ReplyMessage, type ScreenPush,
   type Shape, type SlotRequest, type ToolRequest } from "./screenProtocol";
 import { SlotController, type Planner, type SlotView } from "./screenSlot";
 
@@ -40,20 +40,38 @@ export type MountReceipt = { mount: string; bridge_nonce: string; generation: nu
   /** CAD-1177: the tool aliases the screen declared, named by the daemon
    *  only when a tool context was minted. Advertising an alias grants
    *  nothing: every invoke still re-proves binding, approval and operator. */
-  tools?: string[] };
+  tools?: string[];
+  /** CAD-1365: host-held media metadata for a `screen-media.v1` package
+   *  — the daemon-minted record of the media permissions the screen
+   *  DECLARED (`media.read` / `media.publish`, either or both, never
+   *  wider). Declaration metadata only: dispatch still requires the
+   *  mount's action token and the child's `screen-media.v1` opt-in, and
+   *  the daemon re-proves the declaration natively on every call. */
+  media?: { contract: "screen-media.v1"; may: MediaVerb[] } };
 export function parseMount(value: unknown, tag: string): MountReceipt | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const v = value as Record<string, unknown>;
   const keySet = Object.keys(v);
   const keysOk = ["bridge_nonce", "generation", "mount", "tag"].every(k => keySet.includes(k)) &&
-    keySet.every(k => ["bridge_nonce", "generation", "mount", "tag", "action_token", "tools"].includes(k));
+    keySet.every(k => ["bridge_nonce", "generation", "mount", "tag", "action_token", "tools", "media"].includes(k));
   const tools = v.tools;
   const toolsOk = tools === undefined || (Array.isArray(tools) && tools.length <= 32 &&
     new Set(tools).size === tools.length && tools.every(a => typeof a === "string" && TOOL_ALIAS.test(a)));
+  // `media` is a closed object when present: exactly
+  // {contract:"screen-media.v1", may:[1..2 distinct declared verbs]}.
+  const media = v.media;
+  const mediaOk = media === undefined || (typeof media === "object" && media !== null && !Array.isArray(media) &&
+    Object.keys(media as Record<string, unknown>).sort().join() === "contract,may" &&
+    (media as Record<string, unknown>).contract === SCREEN_MEDIA_V1 &&
+    Array.isArray((media as Record<string, unknown>).may) &&
+    ((media as Record<string, unknown>).may as unknown[]).length >= 1 &&
+    ((media as Record<string, unknown>).may as unknown[]).length <= 2 &&
+    new Set((media as Record<string, unknown>).may as unknown[]).size === ((media as Record<string, unknown>).may as unknown[]).length &&
+    ((media as Record<string, unknown>).may as unknown[]).every(m => isMediaVerb(m as string)));
   const action = v.action_token;
   const actionOk = action === null || action === undefined ||
     (typeof action === "string" && /^[a-f0-9]{64}$/.test(action) && !v.mount?.toString().endsWith(action));
-  if (!keysOk || !toolsOk ||
+  if (!keysOk || !toolsOk || !mediaOk ||
       typeof v.mount !== "string" || !/^\/api\/app-screen\/[a-f0-9]{64}$/.test(v.mount) ||
       typeof v.bridge_nonce !== "string" || !/^[a-f0-9]{64}$/.test(v.bridge_nonce) ||
       v.mount.endsWith(v.bridge_nonce) || v.tag !== tag || !actionOk ||
@@ -156,10 +174,28 @@ export class ScreenChannel extends FrameChannel {
   }
   private calls = 0;
   private slots: SlotController | null = null;
+  /** CAD-1365: a media verb dispatches only for a v2 child that opted
+   *  into `screen-media.v1`, on an operator-scoped mount (nonempty
+   *  projected actions) holding a live action token, whose minted
+   *  receipt declares this exact verb in `media.may`. Every check is
+   *  host-held metadata — the frame's own fields never widen it, and a
+   *  denied verb closes before any dispatch. */
+  private mediaAdmits(verb: MediaVerb): boolean {
+    return this.shape === "v2" && this.wantsMedia && !!this.actions &&
+      !!this.projection.actions?.length && !!this.receipt.action_token &&
+      this.receipt.media?.contract === SCREEN_MEDIA_V1 &&
+      this.receipt.media.may.includes(verb);
+  }
+  /** CAD-1365: the original download is qualified only on the same media
+   *  gates as `media.read`, plus the real planner. Support is never permission. */
+  private originalDownloadAdmits(): boolean {
+    return this.mediaAdmits("media.read") && !!this.actions?.planner;
+  }
   /** Only a v2 child with an action host; the verb set was closed by the parser. */
   protected call(request: CallRequest): void {
     const actions = this.actions;
     if (this.shape !== "v2" || !actions || this.calls >= CALL_QUEUE_MAX) { this.close(true); return; }
+    if (isMediaVerb(request.verb) && !this.mediaAdmits(request.verb)) { this.close(true); return; }
     this.calls++;
     const reply = (message: ReplyMessage) => { if (!this.closed) this.port?.postMessage(message); };
     void actions.call(request.verb, request.args, { showLink: url => actions.onLink(url), actionToken: this.receipt.action_token ?? undefined })
@@ -179,8 +215,13 @@ export class ScreenChannel extends FrameChannel {
   protected slot(request: SlotRequest): void {
     const actions = this.actions;
     if (this.shape !== "v2" || !actions) { this.close(true); return; }
+    if (request.verb === ORIGINAL_DOWNLOAD_VERB && !this.originalDownloadAdmits()) { this.close(true); return; }
+    // The download token comes only from the consumed receipt, never from the frame's args.
+    const token = this.receipt.action_token ?? undefined;
+    const planner: Planner = (verb, args) => actions.planner(verb, args, verb === ORIGINAL_DOWNLOAD_VERB
+      ? { actionToken: token, isCurrent: () => !this.closed && this.receipt.action_token === token } : undefined);
     this.slots ??= new SlotController(message => { if (!this.closed) this.port?.postMessage(message); },
-      view => actions.onSlot(view), actions.planner, this.clock);
+      view => actions.onSlot(view), planner, this.clock);
     void this.slots.request(request);
   }
   /** Only a v2 child that opted into `screen-actions.v1` AND whose host
@@ -188,6 +229,7 @@ export class ScreenChannel extends FrameChannel {
    *  daemon against the closed declared set — the host never trusts the
    *  frame's choice. One outstanding tool call at a time. */
   private wantsTools = false;
+  private wantsMedia = false;
   private toolBusy = false;
   protected tool(request: ToolRequest): void {
     const actions = this.actions;
@@ -226,6 +268,11 @@ export class ScreenChannel extends FrameChannel {
     // Record the tool/action opt-in: the child may then send `tool` ops,
     // which only run when the host holds a live mount action context.
     this.wantsTools = wantsActions(ready.accepts);
+    // Record the media opt-in: the child may then send media call verbs,
+    // which still dispatch only on the receipt's declared `may` (a
+   //  tool-less media mount's receipt carries no action token and its
+    // calls refuse in `call`).
+    this.wantsMedia = wantsMedia(ready.accepts);
     return true;
   }
   /** Only a v2 child, for a ref the last PUSH carried; anything else closes. */
@@ -253,9 +300,37 @@ export class ScreenChannel extends FrameChannel {
         !aliases?.length || !projection.actions?.length) return projection;
     return { ...projection, actions: [...projection.actions, ...aliases.filter(a => !projection.actions!.includes(a))] };
   }
+  /** Advertise the media verbs this mount was minted with — only to a
+   *  media-opted-in v2 child on an eligible mount (the same gates
+   *  `mediaAdmits` enforces at dispatch). Media verbs are never in the
+   *  generic `ACTION_VERBS` set, so a legacy or non-media frame never
+   *  sees them. */
+  private withMediaVerbs(projection: ScreenPush): ScreenPush {
+    const may = this.receipt.media?.may ?? [];
+    const advertised: string[] = may.filter(verb => this.mediaAdmits(verb) && !projection.actions?.includes(verb));
+    if (this.originalDownloadAdmits() && projection.actions?.length && !projection.actions.includes(ORIGINAL_DOWNLOAD_VERB))
+      advertised.push(ORIGINAL_DOWNLOAD_VERB);
+    if (!advertised.length || !projection.actions?.length) return projection;
+    return { ...projection, actions: [...projection.actions, ...advertised] };
+  }
   /** Send the negotiated shape, or close when it cannot be sent within bounds. */
   protected send(): void {
-    const push = shapeFor(this.withToolAliases(this.projection), this.shape);
+    // DSN-1: `run_receipts` is a host-derived marker, never forwarded. Any
+    // value on the incoming projection is discarded first; it is set only
+    // for a v2 child whose mount holds a real planner AND whose projected
+    // action list already carries `run.start` (a no-action host or a
+    // frame that merely forges the marker gets none). Granting nothing:
+    // the slot path still validates, plans and confirms natively.
+    const projection: ScreenPush = { ...this.projection };
+    delete projection.run_receipts;
+    if (this.shape === "v2" && this.actions?.planner && projection.actions?.includes("run.start")) {
+      projection.run_receipts = 1;
+    }
+    // CAD-1365: `original_downloads` is host-derived the same way, and only for
+    // a v2 child whose mount may read media. It grants nothing by itself.
+    delete projection.original_downloads;
+    if (this.shape === "v2" && this.originalDownloadAdmits() && projection.actions?.length) projection.original_downloads = 1;
+    const push = shapeFor(this.withMediaVerbs(this.withToolAliases(projection)), this.shape);
     if (!push) { this.close(true); return; }
     this.refs = this.shape === "v2" ? pushedAssetRefs(push) : new Set();
     if(this.shape==="v2") for(const ref of this.dynamicDraftRefs) this.refs.add(ref);
