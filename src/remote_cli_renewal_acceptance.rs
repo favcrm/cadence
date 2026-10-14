@@ -126,3 +126,63 @@ fn current_issuer_response_passes_identity_and_rotation_guard() {
     assert_ne!(next.refresh_token, OLD_REFRESH);
     assert!(response["credential"]["expires_at"].as_u64().unwrap() > now().unwrap());
 }
+
+/// CAD-1434 renewal persistence matrix. A renewal POST is HTTPS-only by a
+/// deliberate production guard (`remote_enrollment::cli_session_post` refuses
+/// any non-HTTPS issuer, even under `cargo test`), so a loopback fake issuer
+/// cannot reach the real renewal request. These cases therefore test what the
+/// real credential store guarantees around that request, with no network:
+/// a pending operation survives a crash and reload unchanged, so a retry reuses
+/// the same operation id. The POST-driven cases (503, invalid_grant, replay)
+/// are NOT covered here; they are an acknowledged gap, see the batch report.
+mod matrix {
+    use super::*;
+
+    #[test]
+    fn a_pending_renewal_survives_a_crash_and_reload_with_the_same_operation_id() {
+        // The pending operation is persisted before any POST. A crash after that
+        // point must leave the same operation id and generation on disk, so the
+        // retry can resend it and the issuer can replay the committed result.
+        let (root, target, mut cred, _) = fixture();
+        let op = format!("op_{}", "g".repeat(43));
+        cred.pending = Some(PendingRenewal {
+            operation_id: op.clone(),
+            expected_generation: 1,
+        });
+        save_credential(root.path(), ORG, &cred).unwrap();
+        let reloaded = load_credential(root.path(), &target).unwrap();
+        let pending = reloaded
+            .pending
+            .expect("pending operation dropped across reload");
+        assert_eq!(pending.operation_id, op);
+        assert_eq!(pending.expected_generation, 1);
+        // The authority is not rotated by persisting the pending record alone.
+        assert_eq!(reloaded.access_token, cred.access_token);
+    }
+
+    #[test]
+    fn a_pending_renewal_with_a_mismatched_generation_is_refused_before_any_post() {
+        // A stale pending operation (generation no longer matches the session)
+        // is refused by the REAL renewal path before any request is sent. The
+        // file is left byte-identical, so the stale operation can never replay.
+        let (root, target, mut cred, _) = fixture();
+        cred.pending = Some(PendingRenewal {
+            operation_id: format!("op_{}", "h".repeat(43)),
+            expected_generation: 99,
+        });
+        save_credential(root.path(), ORG, &cred).unwrap();
+        let path = root.path().join(format!("cli-{ORG}.json"));
+        let before = std::fs::read(&path).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let err = renewed_credential(root.path(), &target, deadline)
+            .err()
+            .expect("a mismatched pending generation must be refused")
+            .to_string();
+        assert!(err.contains("pending CLI renewal is inconsistent"), "{err}");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "stale pending rewrote the file"
+        );
+    }
+}

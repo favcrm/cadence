@@ -206,6 +206,12 @@ So a path denial appears as `403 insufficient_scope`, not as a gateway `401`.
 Authorization is the category; the action is to check the target path and the
 workspace role, then ask the owner. It is never a login.
 
+A board refusal also names its hop and a request id, for example
+`(hop board, request 0b2e1f4a-…)`. The id is a fresh UUID per refusal, used to
+correlate a report with the board's log. It is not a token or an identity. Only
+the board hop is named; a refusal from the container or the daemon is shown
+without a hop, never attributed to one.
+
 Renewal (`/v1/hosted-cadence/cli-session/renew`) has its own reader. Only the
 issuer's `invalid_token` (401) and `invalid_grant` (400) ask for a fresh login.
 Any other answer keeps the saved login and the pending operation for a later

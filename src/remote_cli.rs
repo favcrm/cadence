@@ -777,10 +777,7 @@ fn authorize(
             }
             Ok(envelope.to_string())
         }
-        401 | 403 => {
-            let (refusal, reason) = decode_refusal(status, Some(&body));
-            Err(reject(refusal_message(refusal, reason.as_deref(), status)))
-        }
+        401 | 403 => Err(refusal_error(status, Some(&body))),
         s if (300..400).contains(&s) => Err(reject("remote redirect refused")),
         _ => Err(reject(format!(
             "remote authorize failed ({})",
@@ -1001,8 +998,7 @@ fn upload_file_in(
         if !(200..300).contains(&status) && status != 503 && !conflict {
             // CAD-1434: the gateway envelope is `{ok:false,error:{code}}`; the
             // decoder reads it (the old top-level read always fell through).
-            let (refusal, reason) = decode_refusal(status, body.as_ref());
-            return Err(reject(refusal_message(refusal, reason.as_deref(), status)));
+            return Err(refusal_error(status, body.as_ref()));
         }
         match classify(status, retry_after, body) {
             Verdict::Done(result) => return result,
@@ -1114,6 +1110,23 @@ fn refusal_fields(body: Option<&Value>) -> (Option<&str>, Option<&str>) {
         .and_then(Value::as_str);
     let reason = error.and_then(|e| e.get("reason")).and_then(Value::as_str);
     (safe(code), safe(reason))
+}
+
+/// CAD-1434 / AOS-243: the correlation a refusal carries, read only when it is
+/// safe to show. `hop` is an allowlisted name (today only the board names a
+/// hop) and `request_id` must be a bounded UUID. Anything else is dropped, so
+/// no arbitrary server text reaches the message or a log.
+fn refusal_correlation(body: Option<&Value>) -> Option<String> {
+    let error = body.and_then(|b| b.get("error"))?;
+    let hop = error
+        .get("hop")
+        .and_then(Value::as_str)
+        .filter(|h| *h == "board")?;
+    let id = error
+        .get("request_id")
+        .and_then(Value::as_str)
+        .filter(|id| id.len() == 36 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'))?;
+    Some(format!(" (hop {hop}, request {id})"))
 }
 
 /// Decode one refusal to its category plus the safe reason to show. The reason
@@ -1240,7 +1253,11 @@ fn classify(status: u16, retry_after: Option<u64>, body: Option<Value>) -> Verdi
 /// decodes the safe category and reason, then names the next action.
 fn refusal_error(status: u16, body: Option<&Value>) -> Error {
     let (refusal, reason) = decode_refusal(status, body);
-    reject(refusal_message(refusal, reason.as_deref(), status))
+    let mut text = refusal_message(refusal, reason.as_deref(), status);
+    if let Some(correlation) = refusal_correlation(body) {
+        text.push_str(&correlation);
+    }
+    reject(text)
 }
 
 /// Run one allowlisted remote verb: a [`REMOTE_VERBS`] cli verb or a
@@ -2307,6 +2324,39 @@ mod tests {
         );
         assert_eq!(reason, None);
         assert_eq!(refusal, Refusal::Uncertain);
+    }
+
+    #[test]
+    fn a_board_refusal_shows_its_hop_and_request_id_and_never_the_raw_body() {
+        // The AOS board names its hop and a fresh UUID. Both reach the message;
+        // the raw body and any extra server text never do.
+        let id = "0b2e1f4a-7c3d-4e5f-8a9b-1c2d3e4f5a6b";
+        let body = json!({"ok": false, "error": {"code": "unauthorized",
+            "reason": "scope_not_granted", "hop": "board", "request_id": id,
+            "message": "raw server text do-not-print"}});
+        let (out, requests) = run(vec![(401, "", body)], "issue_set", Map::new(), 10);
+        let shown = out.unwrap_err().to_string();
+        assert!(shown.contains("hop board"), "{shown}");
+        assert!(shown.contains(id), "{shown}");
+        assert!(!shown.contains("do-not-print"), "{shown}");
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+    }
+
+    #[test]
+    fn an_unlisted_hop_or_a_non_uuid_request_id_is_dropped() {
+        for body in [
+            json!({"error": {"code": "unauthorized", "hop": "evil.example",
+                "request_id": "0b2e1f4a-7c3d-4e5f-8a9b-1c2d3e4f5a6b"}}),
+            json!({"error": {"code": "unauthorized", "hop": "board",
+                "request_id": "not a uuid <script>"}}),
+        ] {
+            assert_eq!(refusal_correlation(Some(&body)), None, "{body}");
+        }
+        // A legacy envelope with no correlation still decodes exactly as before.
+        assert_eq!(
+            refusal_correlation(Some(&json!({"error": {"code": "unauthorized"}}))),
+            None
+        );
     }
 
     #[test]
