@@ -155,21 +155,38 @@ field — the `status=done` evidence gate has no remote override.
 
 ### Refusal categories and next action (CAD-1434)
 
-Every hosted refusal (authorize, cli/wiki call, blob upload and renewal)
-is decoded by one shared classifier from the gateway's
-`{ok:false,error:{code}}` envelope. The message names a category, the HTTP
-status and, only when the gateway supplied a safe lowercase code, that
-reason. No raw body, token or private path is ever printed.
+Authorize, cli/wiki call and blob upload share one decoder. It reads the AOS
+gateway envelope `{ok:false,error:{code,reason?}}` and shows only allowlisted
+values, never raw server text, a token or a private path. Renewal is a
+separate adapter: the issuer answers `{error:"<code>"}`, so renewal reads its
+own shape (see the renewal rows below). The two are intentionally not merged.
+
+The gateway's real refusal shapes (AOS-243):
+
+- A policy outcome is `401` with `error.code: "unauthorized"` and a proven
+  `error.reason`: `scope_not_granted`, `grant_narrowed`, `path_not_granted` or
+  `binding_mismatch`.
+- `envelope_invalid` is a structural, expired or legacy envelope. It is not a
+  proven session loss.
+- A `401 unauthorized` with no reason means the bearer did not resolve, but the
+  server cannot say whether it expired or was revoked.
+- `503` means waking or unavailable. A non-JSON answer is treated as unknown.
 
 | Category | When | Next action |
 | --- | --- | --- |
-| `authentication` | 401 whose code (or none) says the bearer no longer resolves, and a renewal the issuer rejects as `invalid_token`/`invalid_grant` | `cadence login` again, once |
-| `authorization` | 403, or 401 with an explicit policy code such as `prefix_denied` | Check the workspace role and target path, or ask the owner. A new login does not grant it; the command is not retried |
-| `availability` | 503, 502, 504, or a renewal that fails transiently | Retry later. Saved credentials and any pending renewal are kept |
-| `unknown` | Any other answer, including non-JSON or an unsafe code | The request is not retried; the status is reported |
+| `authorization` | `401` with an allowlisted policy reason (`scope_not_granted`, `grant_narrowed`, `path_not_granted`, `binding_mismatch`), or `403 forbidden` | Not a login problem. Read-only diagnosis (below): check the workspace role and target path. Not retried |
+| `authentication` | A terminal session code: `invalid_token`, `invalid_grant`, `session_expired`, `session_revoked`, `lineage_terminal` | `cadence login` again, once. The only case that names login as the known remedy |
+| `uncertain` | `401` with no reason, `envelope_invalid`, or a non-JSON `401` | Not confirmed expiry or revocation. Run the read-only diagnosis before any login. Not retried |
+| `availability` | `502`, `503`, `504`, or a renewal that fails transiently | Retry later. Saved credentials and any pending renewal are kept |
+| `unknown` | Any other answer. A `400`/`409`/`413`/`422` keeps its safe code, such as `payload_too_large` | Report the status and code. Not retried |
 
-A mutation whose outcome is unknown (a dropped connection after dispatch,
-a 5xx after forward) is never replayed automatically. Reconcile with a read
+Renewal (`/v1/hosted-cadence/cli-session/renew`) has its own reader. Only the
+issuer's `invalid_token` (401) and `invalid_grant` (400) ask for a fresh login.
+Any other answer keeps the saved login and the pending operation for a later
+retry, with no consent prompt.
+
+A mutation whose outcome is unknown (a dropped connection after dispatch, or a
+5xx after forward) is never replayed automatically. Reconcile with a read
 (`issue show`, `wiki ls`) before repeating the write.
 
 ### Hosted credential status (CAD-1434)
@@ -187,10 +204,16 @@ machine holds, and `live_verified` is always `false`:
   expiry, or the access token expired with no renewable session.
 - `invalid_local_credential`: the file cannot be read or validated. This is a
   local problem, not proof that the server revoked it.
+- `unavailable`: the local store cannot be inspected (for example a permission
+  error). Only a missing file is `no_credential`; a stat failure is never
+  reported as absence.
 
 The `credential` object carries scope names, access expiry, session idle and
-absolute expiry, and whether a renewal is pending. It never carries a bearer or
-refresh token. `login_status` keeps its legacy values (`local_peer_authority`,
+absolute expiry (kept even when the session has expired), whether a renewal is
+pending, and two local observations: `stored_at` (when this machine last wrote
+the credential file) and `observed_at` (when the status was read). These are
+local facts only. They are not a server renewal result and prove no renewal
+health; `live_verified` stays `false`. It never carries a bearer or refresh token. `login_status` keeps its legacy values (`local_peer_authority`,
 `not_connected`) for compatibility; it reads `credential_saved` when a credential
 exists, instead of always `not_connected`.
 
@@ -402,17 +425,19 @@ cookie authentication or assertion guard is weakened by this increment.
 Diagnose a hosted refusal in this order. Each step is read-only and none
 requires another login:
 
-1. `cadence org inspect <org>`: check `credential.state`, the scopes, the
-   access expiry and the session idle/absolute expiry. `reauthentication_required`
-   or `no_credential` means login is the next action. `renewable` means keep
-   going: the failure is probably not a lost login.
+1. `cadence org inspect <org>`: read `credential.state`, the scopes, the access
+   expiry and the session idle/absolute expiry. `no_credential` or
+   `reauthentication_required` means login is a real option. `renewable` only
+   says a renewal can be attempted; it does not prove the server accepts the
+   session, so it is not a health check.
 2. Re-run the failing command once and read its `category` and `reason`:
-   `authentication` means log in again once; `authorization` means check the
-   workspace role and target path (a login does not change it); `availability`
-   means retry later; `unknown` means report the HTTP status and the command.
+   `authorization` means check the workspace role and target path (a login does
+   not change it); `authentication` means log in again once; `uncertain` means
+   the server did not say why, so do not assume expiry; `availability` means
+   retry later; `unknown` means report the status and code.
 3. Record the client revision (`cadence --version`), the org endpoint and the
-   HTTP status and reason on the ticket. Do not paste a token, the credential
-   file or a raw response body.
+   HTTP status, `reason` and category on the ticket. Do not paste a token, the
+   credential file or a raw response body.
 4. Wiki writes and uploads: confirm the target path is inside a root your role
    may write (`users/<you>/` or a shared root you hold write for). Then make one
    small write before any bulk transfer. A refused path is not a reason to try

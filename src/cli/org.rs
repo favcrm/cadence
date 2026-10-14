@@ -272,6 +272,8 @@ fn view(c: &Connection, selected: bool) -> Value {
                 org_id: org_id.clone(),
             };
             let status = cadence_agent::remote_cli::local_status(&target);
+            // Only a proven absence keeps the legacy `not_connected`. An
+            // unavailable or invalid local store is not "not connected".
             let legacy = if status["state"] == "no_credential" {
                 "not_connected"
             } else {

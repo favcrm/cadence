@@ -496,23 +496,7 @@ fn renewed_credential(dir: &Path, target: &RemoteTarget, deadline: Instant) -> R
         request_deadline,
     )?;
     if status != 200 {
-        // CAD-1434: only the issuer's terminal session refusals (no longer a
-        // valid refresh grant) need a fresh login. Any other answer, including
-        // a transient 503, keeps the saved pending operation so a later
-        // command can retry the same renewal without asking for consent again.
-        let code = body
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        return Err(match (status, code) {
-            (401, "invalid_token") | (400, "invalid_grant") => reject(
-                "the renewable CLI session was rejected by the issuer — run `cadence login` again",
-            ),
-            _ => reject(format!(
-                "remote CLI session renewal is not complete (HTTP {status}); your saved login \
-                 is kept, retry the command later"
-            )),
-        });
+        return Err(renewal_refusal(status, &body));
     }
     validate_renewal_response(&body, &cred, target, &pending)?;
     let next = serde_json::from_value::<CliSession>(body["cli_session"].clone())
@@ -526,6 +510,27 @@ fn renewed_credential(dir: &Path, target: &RemoteTarget, deadline: Instant) -> R
     cred.pending = None;
     save_credential(dir, &target.org, &cred)?;
     Ok(cred)
+}
+
+/// CAD-1434: renewal's separate adapter. The issuer's renewal route answers
+/// `{error:"<code>"}` (AOS `cli-session.ts`), not the gateway envelope, so it
+/// has its own reader. Only the issuer's terminal refresh-grant refusals ask
+/// for a fresh login. Anything else (a transient 503, a malformed answer) keeps
+/// the saved login and pending operation for a later retry, with no consent.
+fn renewal_refusal(status: u16, body: &Value) -> Error {
+    let code = body
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match (status, code) {
+        (401, "invalid_token") | (400, "invalid_grant") => reject(
+            "the renewable CLI session was rejected by the issuer — run `cadence login` again",
+        ),
+        _ => reject(format!(
+            "remote CLI session renewal is not complete (HTTP {status}); your saved login \
+             is kept, retry the command later"
+        )),
+    }
 }
 
 fn validate_renewal_response(
@@ -1030,19 +1035,30 @@ enum Verdict {
     Waking(Duration),
 }
 
-/// CAD-1434: the one safe decoding of a hosted refusal, shared by authorize,
-/// cli/wiki call, blob upload and renewal. It reads the gateway envelope
-/// `{ok:false,error:{code}}` (or a legacy top-level `code`) and turns it into
-/// a stable category plus one next action. The raw body is never echoed.
+/// CAD-1434: the safe decoding of a gateway refusal, shared by authorize,
+/// cli/wiki call and blob upload. It reads the AOS gateway envelope
+/// `{ok:false,error:{code,reason?}}` (or a legacy top-level `code`). The raw
+/// body is never echoed. Renewal is a separate adapter; see `renewal_refusal`.
+///
+/// The gateway's real refusal shapes (AOS-243, `apps/api/src/board/routes.ts`):
+/// - authorize/call/upload refusals are `401` with `error.code: "unauthorized"`
+///   and, when proven at that layer, `error.reason` naming a policy outcome;
+/// - a bare `401 unauthorized` without a reason means the bearer did not
+///   resolve, but the server cannot say whether it expired or was revoked;
+/// - `503` is availability (waking, unavailable, runtime).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Refusal {
-    /// 401 with a terminal or unspecified authentication code: the bearer
-    /// no longer resolves. Login again is the right action.
-    Authentication,
-    /// 403, or 401 with an explicit authorization code: the caller is
-    /// authenticated but not permitted. Login advice would be wrong.
+    /// The caller was authenticated and a policy outcome refused the action.
+    /// A fresh login does not change it, so it never advises login.
     Authorization,
-    /// 503 / transport / unknown server answer: retry later; no login advice.
+    /// The gateway proved the bearer's session is gone (a terminal code). The
+    /// one precise case where a fresh login is the known remedy.
+    Authentication,
+    /// A 401 the server did not explain. It is not confirmed expiry or
+    /// revocation: diagnose read-only before any login.
+    Uncertain,
+    /// 503 / 502 / 504: retry later; saved credentials and any pending
+    /// renewal are kept.
     Availability,
     /// An answer whose shape we do not recognise. Conservative fallback.
     Unknown,
@@ -1051,82 +1067,113 @@ enum Refusal {
 impl Refusal {
     fn category(self) -> &'static str {
         match self {
-            Self::Authentication => "authentication",
             Self::Authorization => "authorization",
+            Self::Authentication => "authentication",
+            Self::Uncertain => "uncertain",
             Self::Availability => "availability",
             Self::Unknown => "unknown",
         }
     }
 }
 
-/// Gateway error codes that prove an authenticated caller was refused for
-/// policy/scope reasons, so a fresh login would not change the outcome.
-const AUTHORIZATION_CODES: &[&str] = &[
-    "forbidden",
-    "scope_denied",
-    "capability_denied",
-    "prefix_denied",
-    "wiki_prefix_denied",
-    "action_not_allowed",
+/// Policy outcomes the gateway names on a 401 (`error.reason`). Each is proven
+/// at its own gate, so a fresh login would not change it. Allowlisted: an
+/// unknown reason is never trusted as policy.
+const POLICY_REASONS: &[&str] = &[
+    "scope_not_granted",
+    "grant_narrowed",
+    "path_not_granted",
+    "binding_mismatch",
 ];
 
-/// Gateway codes that prove the bearer itself is no longer valid, so a
-/// fresh login is the precise remedy.
-const AUTHENTICATION_CODES: &[&str] = &[
-    "unauthorized",
+/// `envelope_invalid` is a structural, expired or legacy-shape envelope. The
+/// bearer may be fine, so it is neither terminal session loss nor policy.
+const ENVELOPE_REASONS: &[&str] = &["envelope_invalid"];
+
+/// Gateway codes that the issuer or gateway states outright: the session is
+/// gone. Only these may ask for a fresh login as the known remedy.
+const TERMINAL_CODES: &[&str] = &[
     "invalid_token",
     "invalid_grant",
-    "token_expired",
     "session_expired",
     "session_revoked",
     "lineage_terminal",
 ];
 
-/// Decode one refusal. Returns the category and the stable reason code (when
-/// the gateway supplied a safe one). The reason is one of the known codes
-/// above, never free text from the server.
-fn decode_refusal(status: u16, body: Option<&Value>) -> (Refusal, Option<String>) {
-    let code = body
-        .and_then(|b| {
-            b.get("error")
-                .and_then(|e| e.get("code"))
-                .or_else(|| b.get("code"))
-        })
-        .and_then(Value::as_str)
-        .filter(|c| c.len() <= 64 && c.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'));
-    let reason = code.map(str::to_owned);
-    let category = match (status, code) {
-        (503, _) | (502 | 504, _) => Refusal::Availability,
-        (403, _) => Refusal::Authorization,
-        (401, Some(c)) if AUTHORIZATION_CODES.contains(&c) => Refusal::Authorization,
-        (401, Some(c)) if AUTHENTICATION_CODES.contains(&c) => Refusal::Authentication,
-        (401, None) => Refusal::Authentication,
-        _ => Refusal::Unknown,
-    };
-    (category, reason)
+/// Read the safe `error.code` and `error.reason` (or legacy top-level `code`).
+/// Only lowercase, bounded tokens survive; anything else is dropped.
+fn refusal_fields(body: Option<&Value>) -> (Option<&str>, Option<&str>) {
+    fn safe(v: Option<&str>) -> Option<&str> {
+        v.filter(|c| c.len() <= 64 && c.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'))
+    }
+    let error = body.and_then(|b| b.get("error"));
+    let code = error
+        .and_then(|e| e.get("code"))
+        .or_else(|| body.and_then(|b| b.get("code")))
+        .and_then(Value::as_str);
+    let reason = error.and_then(|e| e.get("reason")).and_then(Value::as_str);
+    (safe(code), safe(reason))
 }
 
-/// The next action for a decoded refusal. A permission denial never tells the
-/// user to log in again; only a terminal authentication loss does.
+/// Decode one refusal to its category plus the safe reason to show. The reason
+/// is returned only when it is a known allowlisted value, never raw server text.
+fn decode_refusal(status: u16, body: Option<&Value>) -> (Refusal, Option<String>) {
+    let (code, reason) = refusal_fields(body);
+    let known_reason =
+        reason.filter(|r| POLICY_REASONS.contains(r) || ENVELOPE_REASONS.contains(r));
+    let category = match status {
+        502..=504 => Refusal::Availability,
+        // A non-auth refusal keeps its safe code (for example `payload_too_large`
+        // or a legacy `too_large`) so the caller sees what was refused. It is not
+        // a login or availability claim.
+        400 | 409 | 413 | 422 => Refusal::Unknown,
+        401 | 403 => match (code, known_reason) {
+            // A policy outcome proven at a gate is authorization, whatever the code.
+            (_, Some(r)) if POLICY_REASONS.contains(&r) => Refusal::Authorization,
+            (_, Some(_)) => Refusal::Uncertain, // envelope_invalid: not terminal, not policy
+            (Some(c), None) if TERMINAL_CODES.contains(&c) => Refusal::Authentication,
+            (Some("forbidden"), None) => Refusal::Authorization,
+            (Some("unauthorized"), None) | (None, None) => Refusal::Uncertain,
+            _ => Refusal::Unknown,
+        },
+        _ => Refusal::Unknown,
+    };
+    // The shown reason: an allowlisted policy/envelope reason on 401/403, or the
+    // safe `error.code` on a non-auth refusal (a payload-size or validation code).
+    // Auth-class codes are never shown as a free reason.
+    let shown = match status {
+        400 | 409 | 413 | 422 => code.map(str::to_owned),
+        _ => known_reason.map(str::to_owned),
+    };
+    (category, shown)
+}
+
+/// The next action for a decoded refusal. Login is named only for a terminal
+/// session loss. Everything else is diagnosed read-only and never retried.
 fn refusal_message(refusal: Refusal, reason: Option<&str>, status: u16) -> String {
     let code = reason.map_or(String::new(), |r| format!(", reason {r}"));
     let category = refusal.category();
     match refusal {
         Refusal::Authentication => format!(
-            "the remote refused the credential ({category}, HTTP {status}{code}) — run `cadence login` again"
+            "the remote session ended ({category}, HTTP {status}{code}) — run `cadence login` again once"
         ),
         Refusal::Authorization => format!(
-            "the remote refused this action ({category}, HTTP {status}{code}); \
-             a new login will not grant it — check the workspace role and target path, \
-             or ask the workspace owner"
+            "the remote refused this action as not permitted ({category}, HTTP {status}{code}); \
+             a new login does not grant it — check the workspace role and target path (see \
+             docs/REMOTE-AUTH.md, read-only diagnosis), then ask the owner. Nothing was retried"
+        ),
+        Refusal::Uncertain => format!(
+            "the remote did not confirm why it refused the credential ({category}, HTTP {status}{code}); \
+             it may or may not be expired — run the read-only diagnosis in docs/REMOTE-AUTH.md \
+             before any login. Nothing was retried"
         ),
         Refusal::Availability => format!(
             "the remote is unavailable ({category}, HTTP {status}{code}) — retry later; \
              saved credentials are kept"
         ),
         Refusal::Unknown => format!(
-            "the remote refused the request ({category}, HTTP {status}{code}); it did not match a known \
-             refusal, so nothing was retried"
+            "the remote refused the request ({category}, HTTP {status}{code}); it did not match \
+             a known refusal, so nothing was retried"
         ),
     }
 }
@@ -1213,12 +1260,20 @@ pub fn local_status(target: &RemoteTarget) -> Value {
 }
 
 /// `local_status` with the credential dir injectable, so tests never touch the
-/// real config directory.
+/// real config directory. Only a missing file is absence. A permission or I/O
+/// error is `unavailable`, never a claim that no credential exists.
 fn local_status_at(dir: &Path, target: &RemoteTarget) -> Value {
     let path = dir.join(format!("cli-{}.json", target.org));
-    if fs::symlink_metadata(&path).is_err() {
-        return json!({"state": "no_credential", "live_verified": false});
-    }
+    let meta = match fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return json!({"state": "no_credential", "live_verified": false});
+        }
+        Err(_) => {
+            return json!({"state": "unavailable", "live_verified": false,
+                "note": "the local credential store cannot be inspected; check its permissions"});
+        }
+    };
     let cred = match load_credential(dir, target) {
         Ok(cred) => cred,
         // Malformed, foreign or unreadable storage is a local problem, never
@@ -1234,12 +1289,24 @@ fn local_status_at(dir: &Path, target: &RemoteTarget) -> Value {
         "scopes": scopes,
         "access_expires_at": cred.expires_at,
         "live_verified": false,
+        // Local observation only: when this machine last wrote the credential
+        // file. It is not a server renewal result and proves no health.
+        "stored_at": meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs()),
+        "observed_at": at,
     });
+    // Session expiry is reported whether or not the session is still live, so
+    // the reader sees exactly why a renewal is no longer possible.
+    if let Some(session) = cred.cli_session.as_ref() {
+        out["session_idle_expires_at"] = json!(session.idle_expires_at);
+        out["session_absolute_expires_at"] = json!(session.absolute_expires_at);
+        out["pending_renewal"] = json!(cred.pending.is_some());
+    }
     let state = match cred.cli_session.as_ref() {
         Some(session) if session.idle_expires_at > at && session.absolute_expires_at > at => {
-            out["session_idle_expires_at"] = json!(session.idle_expires_at);
-            out["session_absolute_expires_at"] = json!(session.absolute_expires_at);
-            out["pending_renewal"] = json!(cred.pending.is_some());
             "renewable"
         }
         Some(_) => "reauthentication_required",
@@ -1960,16 +2027,22 @@ mod tests {
         assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
     }
 
+    /// The exact AOS gateway refusal (`routes.ts` `gateRefusal`): 401, code
+    /// `unauthorized`, plus the proven policy reason. Each is driven through the
+    /// real call path (`call_verb_in` -> `call_once` -> fake relay), not only the
+    /// decoder.
+    fn aos_refusal(reason: &str) -> Value {
+        json!({"ok": false, "error": {"code": "unauthorized",
+            "message": "Wiki call refused.", "reason": reason}})
+    }
+
     #[test]
-    fn a_403_policy_denial_never_recommends_login_and_keeps_the_reason() {
-        // CAD-1434 bad case: an authenticated caller refused for policy must not
-        // be told to log in again, and the safe gateway reason is preserved.
+    fn a_policy_401_scope_not_granted_never_recommends_login_and_is_not_retried() {
+        // Paired AOS shape: 401 unauthorized + reason scope_not_granted is a
+        // policy outcome. It must not say "cadence login", and exactly one
+        // attempt is sent (no retry, no mutation replay).
         let (out, requests) = run(
-            vec![(
-                403,
-                "",
-                json!({"ok": false, "error": {"code": "prefix_denied"}}),
-            )],
+            vec![(401, "", aos_refusal("scope_not_granted"))],
             "issue_set",
             Map::new(),
             10,
@@ -1977,48 +2050,132 @@ mod tests {
         let shown = out.unwrap_err().to_string();
         assert!(!shown.contains("cadence login"), "{shown}");
         assert!(shown.contains("authorization"), "{shown}");
-        assert!(shown.contains("prefix_denied"), "{shown}");
+        assert!(shown.contains("scope_not_granted"), "{shown}");
         assert_eq!(
             hits(&requests, "/__platform/cli/call"),
             1,
-            "a 403 was retried"
+            "a policy 401 was retried"
         );
     }
 
     #[test]
-    fn a_terminal_401_asks_for_login_and_a_bare_401_is_still_authentication() {
-        let (out, _) = run(
+    fn every_allowlisted_policy_reason_is_authorization_on_the_real_path() {
+        for reason in ["grant_narrowed", "path_not_granted", "binding_mismatch"] {
+            let (out, requests) = run(
+                vec![(401, "", aos_refusal(reason))],
+                "issue_set",
+                Map::new(),
+                10,
+            );
+            let shown = out.unwrap_err().to_string();
+            assert!(!shown.contains("cadence login"), "{reason}: {shown}");
+            assert!(shown.contains(reason), "{reason}: {shown}");
+            assert_eq!(
+                hits(&requests, "/__platform/cli/call"),
+                1,
+                "{reason} retried"
+            );
+        }
+    }
+
+    #[test]
+    fn envelope_invalid_is_not_terminal_session_loss_and_is_not_retried() {
+        // envelope_invalid (expired/legacy envelope) is neither policy nor a
+        // proven session loss. It must not claim expiry or tell the user to log in.
+        let (out, requests) = run(
+            vec![(401, "", aos_refusal("envelope_invalid"))],
+            "status",
+            Map::new(),
+            10,
+        );
+        let shown = out.unwrap_err().to_string();
+        assert!(!shown.contains("cadence login"), "{shown}");
+        assert!(shown.contains("did not confirm"), "{shown}");
+        assert_eq!(
+            hits(&requests, "/__platform/cli/call"),
+            1,
+            "an envelope refusal was retried"
+        );
+    }
+
+    #[test]
+    fn a_generic_unauthorized_without_reason_is_uncertain_not_confirmed_expiry() {
+        // A 401 unauthorized with no reason means the bearer did not resolve, but
+        // the server cannot tell expiry from revocation. It is uncertain: no
+        // confirmed-expiry claim, one attempt, read-only diagnosis advised.
+        let (out, requests) = run(
             vec![(
                 401,
                 "",
-                json!({"ok": false, "error": {"code": "session_expired"}}),
+                json!({"ok": false, "error": {"code": "unauthorized"}}),
             )],
             "status",
             Map::new(),
             10,
         );
         let shown = out.unwrap_err().to_string();
-        assert!(shown.contains("cadence login"), "{shown}");
-        assert!(shown.contains("authentication"), "{shown}");
+        assert!(shown.contains("did not confirm"), "{shown}");
+        assert!(shown.contains("read-only diagnosis"), "{shown}");
+        assert!(!shown.contains("has expired"), "{shown}");
         assert_eq!(
-            decode_refusal(401, Some(&json!({"error": {"code": "unauthorized"}}))).0,
-            Refusal::Authentication
+            hits(&requests, "/__platform/cli/call"),
+            1,
+            "a generic 401 was retried"
         );
-        assert_eq!(decode_refusal(401, None).0, Refusal::Authentication);
     }
 
     #[test]
-    fn unknown_or_html_answers_fall_back_conservatively_and_never_echo_the_body() {
-        assert_eq!(decode_refusal(401, None).0, Refusal::Authentication);
-        assert_eq!(decode_refusal(400, None).0, Refusal::Unknown);
+    fn a_non_json_401_is_uncertain_and_never_echoes_the_body() {
+        // A gateway or ingress 401 that is not the envelope (HTML, empty) must not
+        // be read as confirmed expiry, and its body must not be echoed.
+        let (refusal, reason) = decode_refusal(401, None);
+        assert_eq!(refusal, Refusal::Uncertain);
+        assert_eq!(reason, None);
+        let text = refusal_message(refusal, reason.as_deref(), 401);
+        assert!(text.contains("did not confirm"), "{text}");
+        assert!(!text.contains("<html"), "{text}");
+    }
+
+    #[test]
+    fn only_terminal_issuer_and_session_codes_ask_for_login() {
+        for code in [
+            "invalid_token",
+            "invalid_grant",
+            "session_expired",
+            "session_revoked",
+            "lineage_terminal",
+        ] {
+            let (refusal, _) = decode_refusal(401, Some(&json!({"error": {"code": code}})));
+            assert_eq!(refusal, Refusal::Authentication, "{code}");
+            let text = refusal_message(refusal, None, 401);
+            assert!(text.contains("cadence login"), "{code}: {text}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_policy_looking_reason_is_not_trusted() {
+        // Only the allowlisted reasons count. A free-form or unknown reason is
+        // dropped, so it can neither assert policy nor leak into the message.
         let (refusal, reason) = decode_refusal(
-            418,
-            Some(&json!({"error": {"code": "Bad Code With Spaces"}})),
+            401,
+            Some(&json!({"error": {"code": "unauthorized", "reason": "some raw server text"}})),
         );
-        assert_eq!(refusal, Refusal::Unknown);
-        assert_eq!(reason, None, "an unsafe server code must not be surfaced");
-        let text = refusal_message(refusal, reason.as_deref(), 418);
-        assert!(!text.contains("Bad Code"), "{text}");
+        assert_eq!(reason, None);
+        assert_eq!(refusal, Refusal::Uncertain);
+    }
+
+    #[test]
+    fn a_renewal_refusal_uses_the_issuer_shape_not_the_gateway_envelope() {
+        // Renewal reads the issuer's {error:"<code>"}. Only its terminal
+        // refresh-grant refusals ask for login; a transient 503 keeps the login.
+        let terminal = renewal_refusal(401, &json!({"error": "invalid_token"}));
+        assert!(terminal.to_string().contains("cadence login"), "{terminal}");
+        let transient = renewal_refusal(503, &json!({"error": "authority_unavailable"}));
+        assert!(
+            !transient.to_string().contains("cadence login"),
+            "{transient}"
+        );
+        assert!(transient.to_string().contains("kept"), "{transient}");
     }
 
     #[test]
@@ -2066,6 +2223,85 @@ mod tests {
         assert!(!text.contains(BRIDGE), "{text}");
         assert!(!text.contains("hcr_AAAA"), "{text}");
         assert!(!text.contains("hct_"), "{text}");
+        // Freshness is a local observation, not renewal health.
+        assert!(status["observed_at"].as_u64().is_some());
+        assert!(status["stored_at"].as_u64().is_some());
+        assert!(status.get("renewal_health").is_none(), "{text}");
+    }
+
+    #[test]
+    fn a_permission_error_is_unavailable_never_no_credential() {
+        // Only a missing file is absence. A stat failure (here: the credential
+        // directory is unreadable) is unavailable, not proof that nothing is stored.
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("a");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+            .unwrap();
+        let target = RemoteTarget {
+            org: ORG.into(),
+            endpoint: "https://acme.cadencecloud.app".into(),
+            org_id: ORG_ID.into(),
+        };
+        let status = local_status_at(&dir, &target);
+        // Restore before asserting so the tempdir can be removed either way.
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        assert_ne!(status["state"], "no_credential", "{status}");
+        assert!(
+            matches!(
+                status["state"].as_str(),
+                Some("unavailable" | "invalid_local_credential")
+            ),
+            "{status}"
+        );
+    }
+
+    #[test]
+    fn an_expired_session_keeps_its_expiry_fields() {
+        // The expired branch must still report the session's idle/absolute
+        // expiry, so a reader sees why renewal is no longer possible.
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("a");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        let endpoint = "https://acme.cadencecloud.app";
+        let target = RemoteTarget {
+            org: ORG.into(),
+            endpoint: endpoint.into(),
+            org_id: ORG_ID.into(),
+        };
+        let at = now().unwrap();
+        let body = json!({"version": "hosted-cadence-auth.v1", "organization_id": ORG_ID,
+            "audience": endpoint, "access_token": BRIDGE, "expires_at": at - 10,
+            "capabilities": ["cli.read", "cli.write"],
+            "cli_session": {"session_id": "hcs_12345678-1234-4234-8234-123456789abc",
+                "refresh_token": "hcr_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "generation": 1, "device_label": "cadence CLI",
+                "idle_expires_at": at - 5, "absolute_expires_at": at - 1}});
+        let path = dir.join(format!("cli-{ORG}.json"));
+        std::fs::write(&path, body.to_string()).unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
+        let status = local_status_at(&dir, &target);
+        assert_eq!(status["state"], "reauthentication_required");
+        assert_eq!(status["session_idle_expires_at"], json!(at - 5));
+        assert_eq!(status["session_absolute_expires_at"], json!(at - 1));
+        assert_eq!(status["live_verified"], false);
+    }
+
+    #[test]
+    fn an_unsafe_server_code_is_dropped_from_the_decoded_reason() {
+        // Free text or wrong case from a server never becomes the shown reason.
+        let (refusal, reason) = decode_refusal(
+            418,
+            Some(&json!({"error": {"code": "Bad Code With Spaces"}})),
+        );
+        assert_eq!(refusal, Refusal::Unknown);
+        assert_eq!(reason, None);
+        let text = refusal_message(refusal, reason.as_deref(), 418);
+        assert!(!text.contains("Bad Code"), "{text}");
     }
 
     #[test]
