@@ -177,7 +177,7 @@ The gateway's real refusal shapes (AOS-243):
 | `authorization` | `401` with an allowlisted policy reason (`scope_not_granted`, `grant_narrowed`, `path_not_granted`, `binding_mismatch`), or `403 forbidden` | Not a login problem. Read-only diagnosis (below): check the workspace role and target path. Not retried |
 | `authentication` | A terminal session code: `invalid_token`, `invalid_grant`, `session_expired`, `session_revoked`, `lineage_terminal` | `cadence login` again, once. The only case that names login as the known remedy |
 | `uncertain` | `401` with no reason, `envelope_invalid`, or a non-JSON `401` | Not confirmed expiry or revocation. Run the read-only diagnosis before any login. Not retried |
-| `availability` | `502`, `503`, `504`, or a renewal that fails transiently | Retry later. Saved credentials and any pending renewal are kept |
+| `availability` | any `5xx`, or a renewal that fails transiently | Retry later. Saved credentials and any pending renewal are kept |
 | `unknown` | Any other answer. A `400`/`409`/`413`/`422` keeps its safe code, such as `payload_too_large` | Report the status and code. Not retried |
 
 Renewal (`/v1/hosted-cadence/cli-session/renew`) has its own reader. Only the
@@ -213,9 +213,11 @@ absolute expiry (kept even when the session has expired), whether a renewal is
 pending, and two local observations: `stored_at` (when this machine last wrote
 the credential file) and `observed_at` (when the status was read). These are
 local facts only. They are not a server renewal result and prove no renewal
-health; `live_verified` stays `false`. It never carries a bearer or refresh token. `login_status` keeps its legacy values (`local_peer_authority`,
-`not_connected`) for compatibility; it reads `credential_saved` when a credential
-exists, instead of always `not_connected`.
+health; `live_verified` stays `false`. Renewal health is `unknown` until a command
+observes a renewal result, and it is never inferred from a file timestamp. It
+never carries a bearer or refresh token. `login_status` keeps its legacy values
+(`local_peer_authority`, `not_connected`) for compatibility; it reads
+`credential_saved` when a credential exists, instead of always `not_connected`.
 
 ### Access token lifetime and renewal model (CAD-1434)
 

@@ -1045,7 +1045,7 @@ enum Verdict {
 ///   and, when proven at that layer, `error.reason` naming a policy outcome;
 /// - a bare `401 unauthorized` without a reason means the bearer did not
 ///   resolve, but the server cannot say whether it expired or was revoked;
-/// - `503` is availability (waking, unavailable, runtime).
+/// - any `5xx` is availability (waking, unavailable, runtime).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Refusal {
     /// The caller was authenticated and a policy outcome refused the action.
@@ -1057,7 +1057,7 @@ enum Refusal {
     /// A 401 the server did not explain. It is not confirmed expiry or
     /// revocation: diagnose read-only before any login.
     Uncertain,
-    /// 503 / 502 / 504: retry later; saved credentials and any pending
+    /// Any 5xx: retry later; saved credentials and any pending
     /// renewal are kept.
     Availability,
     /// An answer whose shape we do not recognise. Conservative fallback.
@@ -1122,7 +1122,8 @@ fn decode_refusal(status: u16, body: Option<&Value>) -> (Refusal, Option<String>
     let known_reason =
         reason.filter(|r| POLICY_REASONS.contains(r) || ENVELOPE_REASONS.contains(r));
     let category = match status {
-        502..=504 => Refusal::Availability,
+        // Every 5xx is the gateway or runtime being unavailable: retry later.
+        500..=599 => Refusal::Availability,
         // A non-auth refusal keeps its safe code (for example `payload_too_large`
         // or a legacy `too_large`) so the caller sees what was refused. It is not
         // a login or availability claim.
@@ -1201,17 +1202,12 @@ fn classify(status: u16, retry_after: Option<u64>, body: Option<Value>) -> Verdi
                     body.and_then(|b| b["code"].as_str().map(str::to_string))
                         .unwrap_or_else(|| "wake_failed".into())
                 )))),
-                _ => Verdict::Done(Err(reject("remote org is unavailable"))),
+                // CAD-1434: a bare 503 is availability, decoded the same as
+                // every other refusal (no retry, saved login kept).
+                _ => Verdict::Done(Err(refusal_error(status, body.as_ref()))),
             }
         }
-        401 | 403 => {
-            let (refusal, reason) = decode_refusal(status, body.as_ref());
-            Verdict::Done(Err(reject(refusal_message(
-                refusal,
-                reason.as_deref(),
-                status,
-            ))))
-        }
+        401 | 403 => Verdict::Done(Err(refusal_error(status, body.as_ref()))),
         s if (300..400).contains(&s) => Verdict::Done(Err(reject("remote redirect refused"))),
         409 => {
             // A checked conflict (`{conflict, current_rev, card, error}`
@@ -1223,11 +1219,21 @@ fn classify(status: u16, retry_after: Option<u64>, body: Option<Value>) -> Verdi
             // generic refusal as any other unhandled status.
             match body {
                 Some(b) if b.get("conflict").is_some() => Verdict::Conflict(b),
-                _ => Verdict::Done(Err(reject("remote call refused"))),
+                _ => Verdict::Done(Err(refusal_error(status, body.as_ref()))),
             }
         }
-        _ => Verdict::Done(Err(reject("remote call refused"))),
+        // CAD-1434: 400/413/422/5xx and any other status use the same decoder,
+        // so the safe code or availability category is shown, never a bare
+        // generic message. None of these retries.
+        _ => Verdict::Done(Err(refusal_error(status, body.as_ref()))),
     }
+}
+
+/// CAD-1434: the one place a non-success gateway answer becomes an error. It
+/// decodes the safe category and reason, then names the next action.
+fn refusal_error(status: u16, body: Option<&Value>) -> Error {
+    let (refusal, reason) = decode_refusal(status, body);
+    reject(refusal_message(refusal, reason.as_deref(), status))
 }
 
 /// Run one allowlisted remote verb: a [`REMOTE_VERBS`] cli verb or a
@@ -2023,8 +2029,58 @@ mod tests {
             Map::new(),
             10,
         );
-        assert!(out.unwrap_err().to_string().contains("remote call refused"));
+        // CAD-1434: decoded, not a bare generic message. It shows the safe
+        // category, never the raw body, and is never retried.
+        let shown = out.unwrap_err().to_string();
+        assert!(shown.contains("unknown"), "{shown}");
+        assert!(!shown.contains("midway collision"), "{shown}");
+        assert!(!shown.contains("cadence login"), "{shown}");
         assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+    }
+
+    #[test]
+    fn a_bare_503_is_availability_and_is_not_retried_or_login() {
+        // A 503 without a waking state is terminal for this command: retry
+        // later, keep the saved login, never ask for a fresh one.
+        let (out, requests) = run(
+            vec![(503, "", json!({"state": "board_unreachable"}))],
+            "issue_set",
+            Map::new(),
+            10,
+        );
+        let shown = out.unwrap_err().to_string();
+        assert!(shown.contains("unavailable"), "{shown}");
+        assert!(shown.contains("retry later"), "{shown}");
+        assert!(!shown.contains("cadence login"), "{shown}");
+        assert_eq!(
+            hits(&requests, "/__platform/cli/call"),
+            1,
+            "a bare 503 was retried"
+        );
+    }
+
+    #[test]
+    fn a_400_shows_its_safe_code_and_is_not_retried() {
+        // A payload/validation refusal keeps its safe code so the caller sees
+        // what was refused. It is not a login or availability claim.
+        let (out, requests) = run(
+            vec![(
+                400,
+                "",
+                json!({"ok": false, "error": {"code": "payload_too_large"}}),
+            )],
+            "issue_set",
+            Map::new(),
+            10,
+        );
+        let shown = out.unwrap_err().to_string();
+        assert!(shown.contains("payload_too_large"), "{shown}");
+        assert!(!shown.contains("cadence login"), "{shown}");
+        assert_eq!(
+            hits(&requests, "/__platform/cli/call"),
+            1,
+            "a 400 was retried"
+        );
     }
 
     /// The exact AOS gateway refusal (`routes.ts` `gateRefusal`): 401, code
