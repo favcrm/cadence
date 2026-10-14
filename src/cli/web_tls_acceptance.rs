@@ -305,8 +305,8 @@ fn action_intents(auth_dir: &Path, org: &str, slug: &str) -> Vec<(String, Option
         .filter(|i| i["slug"] == slug && i["kind"] != "prepare")
         .map(|i| {
             assert_eq!(
-                i["state"], "open",
-                "action intents stay open until a receipt"
+                i["state"], "done",
+                "completed known action intents are durably closed"
             );
             (
                 i["kind"].as_str().expect("kind").to_owned(),

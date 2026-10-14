@@ -11,6 +11,9 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::Path;
 
+#[path = "web_publish_fs.rs"]
+mod anchored_fs;
+
 pub const MAX_FILES: usize = 2_000;
 pub const MAX_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
 pub const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
@@ -113,7 +116,9 @@ pub fn freeze(input: &Path) -> Result<FrozenSite> {
             ));
         }
         // Read once; the single file's total is its real frozen byte count.
-        let bytes = read_bounded(input, meta.len())?;
+        let (file, size) = anchored_fs::open_regular(input)
+            .map_err(|_| reject("cannot read the selected regular HTML file"))?;
+        let bytes = read_bounded(file, "selected HTML file", size)?;
         total = bytes.len() as u64;
         found.push((ENTRY.to_string(), bytes));
     } else if meta.is_dir() {
@@ -123,7 +128,9 @@ pub fn freeze(input: &Path) -> Result<FrozenSite> {
                  (for example `npm run build`) and upload its dist/ folder; cadence never runs it",
             ));
         }
-        walk(input, "", &mut found, &mut total)?;
+        let root = anchored_fs::open_root(input)
+            .map_err(|_| reject("cannot open the selected site folder safely"))?;
+        walk(&root, "", &mut found, &mut total)?;
     } else {
         return Err(reject(
             "only a regular .html file or a folder can be published",
@@ -184,45 +191,36 @@ pub fn freeze(input: &Path) -> Result<FrozenSite> {
     })
 }
 
-fn walk(root: &Path, rel: &str, out: &mut Vec<(String, Vec<u8>)>, total: &mut u64) -> Result<()> {
-    let dir = if rel.is_empty() {
-        root.to_path_buf()
-    } else {
-        root.join(rel)
-    };
-    let mut entries = fs::read_dir(&dir)?.collect::<std::io::Result<Vec<_>>>()?;
-    entries.sort_by_key(|e| e.file_name());
-    for entry in entries {
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| reject("non-UTF-8 file names are refused"))?;
+fn walk(dir: &File, rel: &str, out: &mut Vec<(String, Vec<u8>)>, total: &mut u64) -> Result<()> {
+    let entries = anchored_fs::entries(dir)
+        .map_err(|_| reject("cannot enumerate the selected site folder safely"))?;
+    for name in entries {
         let path = if rel.is_empty() {
             name.clone()
         } else {
             format!("{rel}/{name}")
         };
         check_path(&path)?;
-        let kind = entry.file_type()?;
-        if kind.is_symlink() {
-            return Err(reject(format!("symlink '{path}' is refused")));
-        }
-        if kind.is_dir() {
-            walk(root, &path, out, total)?;
-        } else if kind.is_file() {
-            if out.len() >= MAX_FILES {
-                return Err(reject(format!(
-                    "more than {MAX_FILES} files; the release is too large"
-                )));
+        let child = anchored_fs::open_child(dir, &name)
+            .map_err(|_| reject(format!("cannot safely open '{path}'")))?;
+        match child {
+            anchored_fs::Child::Directory(child_dir) => walk(&child_dir, &path, out, total)?,
+            anchored_fs::Child::Regular(file, size) => {
+                if out.len() >= MAX_FILES {
+                    return Err(reject(format!(
+                        "more than {MAX_FILES} files; the release is too large"
+                    )));
+                }
+                let bytes = read_bounded(file, &path, size)?;
+                *total = total.saturating_add(bytes.len() as u64);
+                if *total > MAX_TOTAL_BYTES {
+                    return Err(reject("the site exceeds the 100 MiB total limit"));
+                }
+                out.push((path.clone(), bytes));
             }
-            let size = entry.metadata()?.len();
-            *total = total.saturating_add(size);
-            if *total > MAX_TOTAL_BYTES {
-                return Err(reject("the site exceeds the 100 MiB total limit"));
+            anchored_fs::Child::Other => {
+                return Err(reject(format!("'{path}' is not a regular file")));
             }
-            out.push((path.clone(), read_bounded(&root.join(&path), size)?));
-        } else {
-            return Err(reject(format!("'{path}' is not a regular file")));
         }
     }
     Ok(())
@@ -368,17 +366,14 @@ fn is_refused_web_site_file(path: &str) -> bool {
 
 /// Read at most the per-file limit. `declared` is the size from metadata;
 /// the read cap is independent of it, so a file that grows is still refused.
-fn read_bounded(path: &Path, declared: u64) -> Result<Vec<u8>> {
-    let name = path.display().to_string();
+fn read_bounded(file: File, name: &str, declared: u64) -> Result<Vec<u8>> {
     if declared > MAX_FILE_BYTES {
         return Err(reject(format!(
             "'{name}' exceeds the 10 MiB per-file limit"
         )));
     }
     let mut bytes = Vec::new();
-    File::open(path)?
-        .take(MAX_FILE_BYTES + 1)
-        .read_to_end(&mut bytes)?;
+    file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_FILE_BYTES {
         return Err(reject(format!(
             "'{name}' exceeds the 10 MiB per-file limit"
@@ -494,6 +489,90 @@ mod tests {
             site.manifest["files"][0]["bytes"].as_u64(),
             Some(site.total_bytes)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_file_symlink_is_rejected_before_read() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let outside = dir.path().join("outside.html");
+        let selected = dir.path().join("selected.html");
+        std::fs::write(&outside, b"secret").unwrap();
+        std::os::unix::fs::symlink(&outside, &selected).unwrap();
+        assert!(freeze(&selected).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn held_root_descriptor_stays_inside_original_tree_after_rename() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let selected = temp.path().join("site");
+        let moved = temp.path().join("site-original");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&selected).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(selected.join(ENTRY), b"original safe content").unwrap();
+        std::fs::write(outside.join(ENTRY), b"secret outsider content").unwrap();
+        let root = anchored_fs::open_root(&selected).unwrap();
+        std::fs::rename(&selected, &moved).unwrap();
+        std::os::unix::fs::symlink(&outside, &selected).unwrap();
+
+        let mut found = Vec::new();
+        let mut total = 0;
+        walk(&root, "", &mut found, &mut total).unwrap();
+        assert_eq!(
+            found,
+            vec![(ENTRY.to_string(), b"original safe content".to_vec())]
+        );
+        assert_eq!(total, b"original safe content".len() as u64);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn held_nested_directory_stays_anchored_and_counts_frozen_bytes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let selected = temp.path().join("site");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(selected.join("assets")).unwrap();
+        std::fs::create_dir_all(outside.join("assets")).unwrap();
+        let safe = b"safe bundle";
+        std::fs::write(selected.join("assets/app.js"), safe).unwrap();
+        std::fs::write(outside.join("assets/app.js"), b"secret bundle").unwrap();
+        let root = anchored_fs::open_root(&selected).unwrap();
+        let held_child = match anchored_fs::open_child(&root, "assets").unwrap() {
+            anchored_fs::Child::Directory(dir) => dir,
+            _ => panic!("assets directory was not opened as a directory"),
+        };
+        std::fs::rename(selected.join("assets"), selected.join("assets-original")).unwrap();
+        std::os::unix::fs::symlink(outside.join("assets"), selected.join("assets")).unwrap();
+
+        let mut found = Vec::new();
+        let mut total = 0;
+        walk(&held_child, "assets", &mut found, &mut total).unwrap();
+        assert_eq!(found, vec![("assets/app.js".to_string(), safe.to_vec())]);
+        assert_eq!(
+            total,
+            found
+                .iter()
+                .map(|(_, bytes)| bytes.len() as u64)
+                .sum::<u64>()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_is_rejected_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+        let temp = tempfile::TempDir::new().unwrap();
+        let fifo = temp.path().join("pipe.txt");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: mkfifo reads a NUL-terminated path and creates only this test fixture.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let root = anchored_fs::open_root(temp.path()).unwrap();
+        assert!(matches!(
+            anchored_fs::open_child(&root, "pipe.txt").unwrap(),
+            anchored_fs::Child::Other
+        ));
     }
 
     /// Hosted-refused file classes stay refused before any read.

@@ -859,7 +859,7 @@ pub fn web_issuer_request(
     require_login_issuer(dir, &issuer)?;
     let access = read_access_ingress(dir, &issuer)?;
     confirm_login_access_ingress(dir, &issuer, &access)?;
-    let request_deadline = deadline.min(Instant::now() + Duration::from_secs(20));
+    let request_deadline = web_request_deadline(method, path, Instant::now(), deadline);
     if Instant::now() >= request_deadline {
         return Err(Error::busy_coded(
             "timeout",
@@ -972,6 +972,31 @@ fn web_management_path(path: &str) -> bool {
     // Every other route: no percent-encoded separators, traversal or double encoding.
     let lower = path.to_ascii_lowercase();
     !path.contains("..") && !lower.contains("%2f") && !lower.contains("%5c") && !lower.contains('%')
+}
+
+/// A file upload gets the caller's bounded deadline; JSON and other routes
+/// retain the normal 20-second request cap.
+fn web_request_deadline(
+    method: &str,
+    path: &str,
+    now: Instant,
+    caller_deadline: Instant,
+) -> Instant {
+    if method == "PUT" && web_upload_file_path(path) {
+        caller_deadline
+    } else {
+        caller_deadline.min(now + Duration::from_secs(20))
+    }
+}
+
+fn web_upload_file_path(path: &str) -> bool {
+    path.strip_prefix("/v1/web-sites/uploads/")
+        .and_then(|rest| rest.split_once("/files/"))
+        .is_some_and(|(upload, segment)| {
+            is_upload_id(upload)
+                && !segment.contains('/')
+                && crate::web_publish::decode_artifact_segment(segment).is_ok()
+        })
 }
 
 /// `upl_` plus the contract's id body: 8 to 80 of `[A-Za-z0-9_-]`.
@@ -2239,6 +2264,45 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(dir.join(ACCESS_INGRESS), fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[test]
+    fn web_request_deadline_uses_caller_budget_only_for_valid_upload_file_puts() {
+        let now = Instant::now();
+        let caller = now + Duration::from_secs(60);
+        let file_path = "/v1/web-sites/uploads/upl_12345678/files/assets%2Fjs%2Fapp.js";
+        assert_eq!(web_request_deadline("PUT", file_path, now, caller), caller);
+        assert_eq!(
+            web_request_deadline(
+                "POST",
+                "/v1/web-sites/uploads/upl_12345678/files/assets%2Fapp.js",
+                now,
+                caller
+            ),
+            now + Duration::from_secs(20)
+        );
+        assert_eq!(
+            web_request_deadline(
+                "PUT",
+                "/v1/web-sites/uploads/upl_12345678/finalize",
+                now,
+                caller
+            ),
+            now + Duration::from_secs(20)
+        );
+        assert_eq!(
+            web_request_deadline("PUT", file_path, now, now + Duration::from_secs(5)),
+            now + Duration::from_secs(5)
+        );
+        for invalid in [
+            "/v1/web-sites/uploads/upl_short/files/assets%2Fapp.js",
+            "/v1/web-sites/uploads/upl_12345678/files/assets/js/app.js",
+        ] {
+            assert_eq!(
+                web_request_deadline("PUT", invalid, now, caller),
+                now + Duration::from_secs(20)
+            );
+        }
     }
 
     #[test]

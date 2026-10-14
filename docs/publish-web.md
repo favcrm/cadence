@@ -16,8 +16,8 @@ cadence login --web
 ```
 
 Without `--web` the login is unchanged and grants no web authority. The
-scopes requested are `web.read` and `web.prepare`. They do not imply
-`cli.*` or `wiki.*`. A `web.prepare` credential can prepare releases and
+scopes requested are `cli.read`, `cli.write`, `web.read` and
+`web.prepare`. No `wiki.*` scopes are requested. A `web.prepare` credential can prepare releases and
 request publication, rollback or unpublish, but it cannot promote a release or
 change the public pointer. Only browser-owner approval does so.
 
@@ -60,11 +60,16 @@ later run with the same intent reuses the same request key and body. It never
 rebuilds the request from fresh state. A failed or unknown outcome is shown as
 such and is not reported as success.
 
-A typed 409 with `ok: false` and `revision_conflict` closes the old intent as
-failed. The same key and body are returned, and the next explicit invocation
-creates a new key and revision. Unknown, lost, 5xx and malformed-success
-outcomes keep the intent open with its key and body. A missing auth directory
-is refused with exit 3 before anything is sent, unless create is requested.
+A typed 409 with `ok: false` and `revision_conflict`, or another validated
+4xx refusal (except 401/403), closes the old intent as failed. The refused
+request is not resent with a fresh key during that invocation; the next explicit
+invocation reads the current revision and creates a new key and body. Unknown,
+lost, 5xx, authentication refusals and malformed-success outcomes keep the
+intent open with its original key and body. When an action id is known, an
+explicit action command reads that action first: an active action resumes the
+same intent, while a terminal receipt is saved before that invocation creates a
+fresh intent. `status` also saves known terminal receipts. A missing auth
+directory is refused; only the separate login grant flow creates it.
 
 ## Known limits
 

@@ -469,6 +469,21 @@ fn read_record(creds: &Path) -> Value {
     serde_json::from_slice(&raw).unwrap()
 }
 
+fn action_dto(
+    action_id: &str,
+    state: &str,
+    site_id: &str,
+    operation: &str,
+    release_id: Option<&str>,
+    expected_revision: i64,
+) -> Value {
+    json!({"actionId": action_id, "siteId": site_id, "operation": operation,
+        "state": state, "releaseId": release_id, "expectedRevision": expected_revision,
+        "resultRevision": null, "manifestDigest": "a".repeat(64), "liveUrl": null,
+        "approvalUrl": null, "approvalExpiresAt": null,
+        "updatedAt": "2030-01-01T00:00:00.000Z"})
+}
+
 fn action_handler(state: &'static str, approval: Value) -> Handler {
     Arc::new(
         move |seen: &Seen| match (seen.method.as_str(), seen.path.as_str()) {
@@ -1031,8 +1046,9 @@ fn status_reads_back_only_known_action_ids_and_never_invents_one() {
             ),
             ("GET", "/v1/web-sites/actions/act_44444444") => (
                 200,
-                json!({"ok": true, "data": {"actionId": "act_44444444",
-                    "state": "awaiting_approval"}}),
+                json!({"ok": true, "data": action_dto(
+                    "act_44444444", "awaiting_approval", SITE, "publish", Some(RELEASE), 4
+                )}),
             ),
             _ => (
                 404,
@@ -1335,4 +1351,403 @@ fn web_envelope_types_only_a_409_with_the_exact_revision_conflict_shape() {
     })
     .expect("a success envelope must unwrap");
     assert_eq!(data["revision"], 7);
+}
+
+#[test]
+fn a_terminal_known_action_is_saved_before_a_fresh_explicit_action() {
+    for (operation, old_key, release_id) in [
+        ("rollback", "web-rollback-original01", Some(RELEASE)),
+        ("unpublish", "web-unpublish-original1", None),
+    ] {
+        let op = operation.to_string();
+        let release = release_id.map(str::to_string);
+        let (addr, log) = serve(Arc::new(move |seen: &Seen| {
+            match (seen.method.as_str(), seen.path.as_str()) {
+                ("GET", "/v1/web-sites/actions/act_44444444") => (
+                    200,
+                    json!({"ok": true, "data": action_dto(
+                        "act_44444444", "completed", SITE, &op, release.as_deref(), 4
+                    )}),
+                ),
+                ("GET", p) if p == format!("/v1/web-sites/sites/{SITE}") => (
+                    200,
+                    json!({"ok": true, "data": {"siteId": SITE, "slug": "my-site", "revision": 9}}),
+                ),
+                ("POST", p) if p == format!("/v1/web-sites/sites/{SITE}/actions") => (
+                    201,
+                    json!({"ok": true, "data": action_dto(
+                        "act_55555555", "awaiting_approval", SITE, &op, release.as_deref(), 9
+                    )}),
+                ),
+                _ => (
+                    404,
+                    json!({"ok": false, "error": {"code": "not_found", "message": "no"}}),
+                ),
+            }
+        }));
+        let creds = credential_dir(&addr);
+        let issuer = fixture_issuer(creds.path());
+        let old_body = if let Some(release_id) = release_id {
+            json!({"version":"1","workspaceId":ORG_ID,"operation":operation,
+                "releaseId":release_id,"expectedRevision":4,"requestKey":old_key})
+        } else {
+            json!({"version":"1","workspaceId":ORG_ID,"operation":operation,
+                "expectedRevision":4,"requestKey":old_key})
+        };
+        write_record(
+            creds.path(),
+            fixture_identity(&issuer),
+            vec![json!({
+                "kind": operation, "slug": "my-site", "release_id": release_id,
+                "expected_revision": 4, "request_key": old_key, "body": old_body,
+                "site_id": SITE, "action_id": "act_44444444", "state": "open"
+            })],
+        );
+        let action = match operation {
+            "rollback" => WebAction::Rollback {
+                slug: "my-site".into(),
+                release: RELEASE.into(),
+            },
+            _ => WebAction::Unpublish {
+                slug: "my-site".into(),
+            },
+        };
+        assert_eq!(
+            with_config(creds.path(), || run(&action, &target(&addr), 5)).unwrap(),
+            0
+        );
+        let seen = log.lock().unwrap().clone();
+        assert_eq!(
+            seen.iter().map(|s| s.method.as_str()).collect::<Vec<_>>(),
+            ["GET", "GET", "POST"]
+        );
+        assert_eq!(seen[0].path, "/v1/web-sites/actions/act_44444444");
+        assert_eq!(seen[1].path, format!("/v1/web-sites/sites/{SITE}"));
+        let created: Value = serde_json::from_slice(&seen[2].body).unwrap();
+        assert_eq!(created["expectedRevision"], 9);
+        assert_ne!(created["requestKey"], old_key);
+        assert_eq!(created.get("releaseId").and_then(Value::as_str), release_id);
+        let intents = read_record(creds.path())["intents"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(intents[0]["state"], "done");
+        assert_eq!(intents[0]["body"]["requestKey"], old_key);
+        assert_eq!(intents[1]["state"], "open");
+    }
+}
+
+#[test]
+fn an_awaiting_known_action_reuses_exact_key_and_body_without_revision_read() {
+    let old_body = json!({"version":"1","workspaceId":ORG_ID,"operation":"publish",
+        "releaseId":RELEASE,"expectedRevision":4,"requestKey":"web-publish-awaiting01"});
+    let (addr, log) = serve(Arc::new(|seen: &Seen| {
+        match (seen.method.as_str(), seen.path.as_str()) {
+            ("GET", "/v1/web-sites/actions/act_44444444") => (
+                200,
+                json!({"ok":true,"data":action_dto(
+                    "act_44444444","awaiting_approval",SITE,"publish",Some(RELEASE),4
+                )}),
+            ),
+            ("POST", p) if p == format!("/v1/web-sites/sites/{SITE}/actions") => (
+                201,
+                json!({"ok":true,"data":action_dto(
+                    "act_44444444","awaiting_approval",SITE,"publish",Some(RELEASE),4
+                )}),
+            ),
+            _ => (
+                404,
+                json!({"ok":false,"error":{"code":"not_found","message":"no"}}),
+            ),
+        }
+    }));
+    let creds = credential_dir(&addr);
+    let issuer = fixture_issuer(creds.path());
+    write_record(
+        creds.path(),
+        fixture_identity(&issuer),
+        vec![json!({
+            "kind":"publish","slug":"my-site","release_id":RELEASE,"expected_revision":4,
+            "request_key":"web-publish-awaiting01","body":old_body,"site_id":SITE,
+            "action_id":"act_44444444","state":"open"
+        })],
+    );
+    let action = WebAction::Publish {
+        release: RELEASE.into(),
+    };
+    assert_eq!(
+        with_config(creds.path(), || run(&action, &target(&addr), 5)).unwrap(),
+        0
+    );
+    let seen = log.lock().unwrap().clone();
+    assert_eq!(
+        seen.iter().map(|s| s.method.as_str()).collect::<Vec<_>>(),
+        ["GET", "POST"]
+    );
+    assert_eq!(seen[0].path, "/v1/web-sites/actions/act_44444444");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&seen[1].body).unwrap(),
+        old_body
+    );
+    assert_eq!(read_record(creds.path())["intents"][0]["state"], "open");
+}
+
+#[test]
+fn a_known_action_with_any_binding_or_state_mismatch_fails_closed() {
+    let base = action_dto(
+        "act_44444444",
+        "completed",
+        SITE,
+        "publish",
+        Some(RELEASE),
+        4,
+    );
+    let mut variants = Vec::new();
+    for (field, value) in [
+        ("actionId", json!("act_99999999")),
+        ("siteId", json!("site_99999999")),
+        ("operation", json!("rollback")),
+        ("releaseId", json!("rel_99999999")),
+        ("expectedRevision", json!(5)),
+        ("state", json!("future_state")),
+    ] {
+        let mut action = base.clone();
+        action[field] = value;
+        variants.push((200, action));
+    }
+    let mut missing_state = base.clone();
+    missing_state.as_object_mut().unwrap().remove("state");
+    variants.push((200, missing_state));
+    let mut missing_operation = base.clone();
+    missing_operation
+        .as_object_mut()
+        .unwrap()
+        .remove("operation");
+    variants.push((200, missing_operation));
+    variants.push((500, base.clone()));
+    for (status, bad) in variants {
+        let response = bad.clone();
+        let (addr, log) = serve(Arc::new(move |seen: &Seen| {
+            if seen.method == "GET" && seen.path == "/v1/web-sites/actions/act_44444444" {
+                return (status, json!({"ok": true, "data": response}));
+            }
+            (
+                404,
+                json!({"ok": false, "error": {"code": "not_found", "message": "no"}}),
+            )
+        }));
+        let creds = credential_dir(&addr);
+        let issuer = fixture_issuer(creds.path());
+        write_record(
+            creds.path(),
+            fixture_identity(&issuer),
+            vec![json!({
+                "kind": "publish", "slug": "my-site", "release_id": RELEASE,
+                "expected_revision": 4, "request_key": "web-publish-known0001",
+                "site_id": SITE, "action_id": "act_44444444", "state": "open"
+            })],
+        );
+        let action = WebAction::Publish {
+            release: RELEASE.into(),
+        };
+        assert!(
+            with_config(creds.path(), || run(&action, &target(&addr), 5)).is_err(),
+            "accepted {bad}"
+        );
+        assert!(
+            log.lock().unwrap().iter().all(|s| s.method != "POST"),
+            "sent for {bad}"
+        );
+        let saved = read_record(creds.path());
+        assert_eq!(
+            saved["intents"].as_array().unwrap().len(),
+            1,
+            "created a replacement intent for {bad}"
+        );
+        assert_eq!(saved["intents"][0]["state"], "open");
+    }
+}
+
+#[test]
+fn status_persists_first_terminal_receipt_when_a_later_read_fails_and_never_posts() {
+    let (addr, log) = serve(Arc::new(|seen: &Seen| {
+        match (seen.method.as_str(), seen.path.as_str()) {
+            ("GET", "/v1/web-sites/sites/by-slug/my-site") => (
+                200,
+                json!({"ok": true, "data": {
+            "siteId": SITE, "slug": "my-site", "revision": 4,
+            "liveReleaseId": null, "liveUrl": null, "suspended": false}}),
+            ),
+            ("GET", "/v1/web-sites/actions/act_44444444") => (
+                200,
+                json!({"ok": true, "data": action_dto(
+                    "act_44444444", "completed", SITE, "publish", Some(RELEASE), 4
+                )}),
+            ),
+            ("GET", "/v1/web-sites/actions/act_55555555") => (
+                503,
+                json!({"ok": false, "error": {"code": "offline", "message": "no"}}),
+            ),
+            _ => (
+                404,
+                json!({"ok": false, "error": {"code": "not_found", "message": "no"}}),
+            ),
+        }
+    }));
+    let creds = credential_dir(&addr);
+    let issuer = fixture_issuer(creds.path());
+    write_record(
+        creds.path(),
+        fixture_identity(&issuer),
+        vec![
+            json!({"kind":"publish","slug":"my-site","release_id":RELEASE,"expected_revision":4,"request_key":"web-publish-first0001","site_id":SITE,"action_id":"act_44444444","state":"open"}),
+            json!({"kind":"rollback","slug":"my-site","release_id":RELEASE,"expected_revision":4,"request_key":"web-rollback-second01","site_id":SITE,"action_id":"act_55555555","state":"open"}),
+        ],
+    );
+    let action = WebAction::Status {
+        slug: "my-site".into(),
+    };
+    assert!(with_config(creds.path(), || run(&action, &target(&addr), 5)).is_err());
+    let intents = read_record(creds.path())["intents"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(intents[0]["state"], "done");
+    assert_eq!(intents[1]["state"], "open");
+    assert!(log.lock().unwrap().iter().all(|s| s.method != "POST"));
+}
+
+#[test]
+fn typed_non_auth_4xx_refusal_retires_once_and_next_run_uses_fresh_intent() {
+    for status in [400u16, 404, 410] {
+        let refusals = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&refusals);
+        let revision = Arc::new(AtomicI64::new(4));
+        let rev = Arc::clone(&revision);
+        let (addr, log) = serve(Arc::new(move |seen: &Seen| {
+            match (seen.method.as_str(), seen.path.as_str()) {
+                ("GET", p) if p == format!("/v1/web-sites/sites/{SITE}") => (
+                    200,
+                    json!({"ok":true,"data":{"siteId":SITE,"slug":"my-site","revision":rev.load(Ordering::SeqCst)}}),
+                ),
+                ("POST", p) if p == format!("/v1/web-sites/sites/{SITE}/actions") => {
+                    if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (
+                            status,
+                            json!({"ok":false,"error":{"code":"invalid_action","message":"refused"}}),
+                        )
+                    } else {
+                        (
+                            201,
+                            json!({"ok":true,"data":action_dto("act_55555555","awaiting_approval",SITE,"publish",Some(RELEASE),5)}),
+                        )
+                    }
+                }
+                _ => (
+                    404,
+                    json!({"ok":false,"error":{"code":"not_found","message":"no"}}),
+                ),
+            }
+        }));
+        let creds = credential_dir(&addr);
+        seed_ready_release(creds.path());
+        let action = WebAction::Publish {
+            release: RELEASE.into(),
+        };
+        assert!(with_config(creds.path(), || run(&action, &target(&addr), 5)).is_err());
+        let old = read_record(creds.path())["intents"][1].clone();
+        assert_eq!(old["state"], "failed");
+        let once = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.method == "POST")
+            .count();
+        assert_eq!(once, 1, "status={status}");
+        revision.store(5, Ordering::SeqCst);
+        assert_eq!(
+            with_config(creds.path(), || run(&action, &target(&addr), 5)).unwrap(),
+            0
+        );
+        let posts: Vec<Value> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.method == "POST")
+            .map(|s| serde_json::from_slice(&s.body).unwrap())
+            .collect();
+        assert_eq!(posts.len(), 2, "status={status}");
+        assert_eq!(posts[0], old["body"]);
+        assert_ne!(posts[1]["requestKey"], posts[0]["requestKey"]);
+        assert_eq!(posts[1]["expectedRevision"], 5);
+    }
+}
+
+#[test]
+fn auth_and_server_errors_remain_unknown_and_retry_the_same_body() {
+    for status in [401u16, 403, 500] {
+        let count = Arc::new(AtomicUsize::new(0));
+        let attempts = Arc::clone(&count);
+        let (addr, log) = serve(Arc::new(move |seen: &Seen| {
+            match (seen.method.as_str(), seen.path.as_str()) {
+                ("GET", p) if p == format!("/v1/web-sites/sites/{SITE}") => (
+                    200,
+                    json!({"ok":true,"data":{"siteId":SITE,"slug":"my-site","revision":4}}),
+                ),
+                ("POST", p) if p == format!("/v1/web-sites/sites/{SITE}/actions") => {
+                    if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
+                        (
+                            status,
+                            json!({"ok":false,"error":{"code":"unknown","message":"retry"}}),
+                        )
+                    } else {
+                        (
+                            201,
+                            json!({"ok":true,"data":action_dto("act_55555555","awaiting_approval",SITE,"publish",Some(RELEASE),4)}),
+                        )
+                    }
+                }
+                _ => (
+                    404,
+                    json!({"ok":false,"error":{"code":"not_found","message":"no"}}),
+                ),
+            }
+        }));
+        let creds = credential_dir(&addr);
+        seed_ready_release(creds.path());
+        let action = WebAction::Publish {
+            release: RELEASE.into(),
+        };
+        assert!(
+            with_config(creds.path(), || run(&action, &target(&addr), 5)).is_err(),
+            "status={status}"
+        );
+        let open = read_record(creds.path())["intents"][1].clone();
+        assert_eq!(open["state"], "open");
+        assert_eq!(open["body"]["requestKey"], open["request_key"]);
+        assert_eq!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|s| s.method == "POST")
+                .count(),
+            2
+        );
+        assert_eq!(
+            with_config(creds.path(), || run(&action, &target(&addr), 5)).unwrap(),
+            0
+        );
+        let posts: Vec<Value> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.method == "POST")
+            .map(|s| serde_json::from_slice(&s.body).unwrap())
+            .collect();
+        assert_eq!(posts.len(), 3, "status={status}");
+        assert!(
+            posts.iter().all(|body| body == &open["body"]),
+            "status={status}: {posts:?}"
+        );
+    }
 }

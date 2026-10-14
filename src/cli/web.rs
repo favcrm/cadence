@@ -416,6 +416,23 @@ fn request_action(
             && i.release_id == release_id
             && i.state == "open"
     });
+    let existing = if let Some(index) = existing {
+        if let Some(action_id) = record.intents[index].action_id.as_deref() {
+            let action =
+                read_known_action(target, &record.intents[index], action_id, wake_timeout)?;
+            if let Some(state) = terminal_action_state(action["state"].as_str()) {
+                record.intents[index].state = state.into();
+                save_pending(target, &identity, &mut record)?;
+                None
+            } else {
+                Some(index)
+            }
+        } else {
+            Some(index)
+        }
+    } else {
+        None
+    };
     let index = match existing {
         Some(index) => index,
         None => {
@@ -464,15 +481,12 @@ fn request_action(
         wake_timeout,
     ) {
         Ok(action) => action,
-        Err(error) if error.code() == Some("revision_conflict") => {
-            // Authoritative refusal: no action exists for this key. Close the
-            // intent so the next explicit run reads the revision and makes a
-            // fresh key. Nothing is re-sent here.
+        Err(ActionCreateFailure::DefiniteRefusal(error)) => {
             record.intents[index].state = "failed".into();
             save_pending(target, &identity, &mut record)?;
             return Err(error);
         }
-        Err(error) => return Err(error),
+        Err(ActionCreateFailure::Unknown(error)) => return Err(error),
     };
     let action_id = action["actionId"].as_str().unwrap_or_default().to_string();
     if is_id(&action_id, "act_") {
@@ -578,13 +592,29 @@ fn fetch_revision(target: &RemoteTarget, site_id: &str, wake_timeout: u64) -> Re
 /// a server error after the request may have landed) is reconciled by sending
 /// the SAME body and key again, never a new key. If it is still unknown, the
 /// intent stays open and is reported by its key.
+enum ActionCreateFailure {
+    DefiniteRefusal(Error),
+    Unknown(Error),
+}
+
+fn definite_action_refusal(response: &remote_cli::WebResponse) -> bool {
+    (400..500).contains(&response.status)
+        && !matches!(response.status, 401 | 403)
+        && response.body.as_ref().is_some_and(|body| {
+            body["ok"] == Value::Bool(false)
+                && body["error"]["code"]
+                    .as_str()
+                    .is_some_and(|code| !code.is_empty())
+        })
+}
+
 fn create_action_reconciled(
     target: &RemoteTarget,
     site_id: &str,
     payload: &[u8],
     request_key: &str,
     wake_timeout: u64,
-) -> Result<Value> {
+) -> std::result::Result<Value, ActionCreateFailure> {
     let path = format!("/v1/web-sites/sites/{site_id}/actions");
     let send = || {
         remote_cli::web_request(
@@ -597,25 +627,99 @@ fn create_action_reconciled(
             wake_timeout,
         )
     };
-    if let Ok(response) = send() {
-        if response.status < 500 {
-            return remote_cli::web_envelope(response);
+    let mut failure = None;
+    for _ in 0..2 {
+        match send() {
+            Ok(response) if definite_action_refusal(&response) => {
+                return Err(ActionCreateFailure::DefiniteRefusal(
+                    remote_cli::web_envelope(response)
+                        .expect_err("validated refusal envelope must be an error"),
+                ));
+            }
+            Ok(response) if response.status < 500 => match remote_cli::web_envelope(response) {
+                Ok(action) => return Ok(action),
+                Err(error) => failure = Some(error),
+            },
+            Ok(_) | Err(_) => {}
         }
     }
-    match send() {
-        Ok(response) if response.status < 500 => remote_cli::web_envelope(response),
-        _ => Err(Error::busy_coded(
+    Err(ActionCreateFailure::Unknown(failure.unwrap_or_else(|| {
+        Error::busy_coded(
             "unknown",
             format!(
                 "the action outcome is unknown; `cadence web status` will show it for request key {request_key}. No new key was sent"
             ),
-        )),
-    }
+        )
+    })))
 }
 
 /// Print an action without implying success. `approvalUrl` is null on the host
 /// until the owner confirmation page exists, so the result is reported as
 /// pending; `liveUrl` appears only on a confirmed `completed` state.
+fn terminal_action_state(state: Option<&str>) -> Option<&'static str> {
+    match state {
+        Some("completed") => Some("done"),
+        Some("declined" | "failed" | "expired") => Some("failed"),
+        _ => None,
+    }
+}
+
+/// Read back an action only through its known id and require the complete
+/// immutable intent binding to match before trusting its state.
+fn read_known_action(
+    target: &RemoteTarget,
+    intent: &Intent,
+    action_id: &str,
+    wake_timeout: u64,
+) -> Result<Value> {
+    if !is_id(action_id, "act_") {
+        return Err(reject("the pending action id is invalid; nothing was sent"));
+    }
+    let site_id = intent
+        .site_id
+        .as_deref()
+        .ok_or_else(|| reject("the pending action has no site binding; nothing was sent"))?;
+    let response = remote_cli::web_request(
+        target,
+        "web.read",
+        "GET",
+        &format!("/v1/web-sites/actions/{action_id}"),
+        &[("x-workspace-id", target.org_id.clone())],
+        None,
+        wake_timeout,
+    )?;
+    if response.status != 200 {
+        return Err(Error::busy_coded(
+            "unknown",
+            "the known action could not be safely reconciled; its intent remains open",
+        ));
+    }
+    let action = remote_cli::web_envelope(response)?;
+    if action["actionId"].as_str() != Some(action_id)
+        || action["siteId"].as_str() != Some(site_id)
+        || action["operation"].as_str() != Some(intent.kind.as_str())
+        || action["releaseId"].as_str().map(str::to_owned) != intent.release_id
+        || action["expectedRevision"].as_i64() != intent.expected_revision
+        || !matches!(
+            action["state"].as_str(),
+            Some(
+                "awaiting_approval"
+                    | "approved"
+                    | "promoting"
+                    | "completed"
+                    | "declined"
+                    | "failed"
+                    | "expired"
+            )
+        )
+    {
+        return Err(reject(
+            "the host action does not match its saved intent; nothing was sent",
+        ));
+    }
+    Ok(action)
+}
+
 fn report_action(target: &RemoteTarget, request_key: &str, action: &Value) -> Result<i32> {
     let state = action["state"].as_str().unwrap_or("unknown");
     let live = if state == "completed" {
@@ -650,7 +754,7 @@ fn report_action(target: &RemoteTarget, request_key: &str, action: &Value) -> Re
 /// shown as unknown, never given an invented status.
 fn status(target: &RemoteTarget, slug: &str, wake_timeout: u64) -> Result<i32> {
     let identity = remote_cli::web_identity(target)?;
-    let record = load_pending(target, &identity)?;
+    let mut record = load_pending(target, &identity)?;
     let response = remote_cli::web_request(
         target,
         "web.read",
@@ -662,25 +766,21 @@ fn status(target: &RemoteTarget, slug: &str, wake_timeout: u64) -> Result<i32> {
     )?;
     let site = remote_cli::web_envelope(response)?;
     let mut pending = Vec::new();
-    for intent in record
-        .intents
-        .iter()
-        .filter(|i| i.slug == slug && i.state == "open" && i.kind != "prepare")
-    {
-        let read_back = match &intent.action_id {
-            Some(action_id) if is_id(action_id, "act_") => {
-                let response = remote_cli::web_request(
-                    target,
-                    "web.read",
-                    "GET",
-                    &format!("/v1/web-sites/actions/{action_id}"),
-                    &[("x-workspace-id", target.org_id.clone())],
-                    None,
-                    wake_timeout,
-                )?;
-                json!({"actionId": action_id, "status": remote_cli::web_envelope(response)?})
+    for index in 0..record.intents.len() {
+        let intent = record.intents[index].clone();
+        if intent.slug != slug || intent.state != "open" || intent.kind == "prepare" {
+            continue;
+        }
+        let read_back = match intent.action_id.as_deref() {
+            Some(action_id) => {
+                let action = read_known_action(target, &intent, action_id, wake_timeout)?;
+                if let Some(state) = terminal_action_state(action["state"].as_str()) {
+                    record.intents[index].state = state.into();
+                    save_pending(target, &identity, &mut record)?;
+                }
+                json!({"actionId": action_id, "status": action})
             }
-            _ => json!({"actionId": Value::Null, "status": "unknown",
+            None => json!({"actionId": Value::Null, "status": "unknown",
                 "reason": "the create reply was lost; the action id is not known"}),
         };
         pending.push(json!({
