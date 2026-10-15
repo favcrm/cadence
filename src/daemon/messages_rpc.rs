@@ -1383,13 +1383,6 @@ impl Shared {
                             // now, not on the idle poll.
                             self.notify_agent(&finished.alias);
                             self.wake();
-                            crate::local_assignment::report_actor_completion(
-                                &self.state_dir,
-                                &finished.id,
-                                "completed",
-                                text,
-                                sha.as_deref(),
-                            )?;
                             return Ok(json!({"state": "reported", "kind": kind}));
                         }
                         Err(current) => {
@@ -1412,18 +1405,6 @@ impl Shared {
                             "Message already completed with a different result",
                         ));
                     }
-                    let sha = message
-                        .result
-                        .as_ref()
-                        .and_then(|result| result.get("sha"))
-                        .and_then(Value::as_str);
-                    crate::local_assignment::report_actor_completion(
-                        &self.state_dir,
-                        &message.id,
-                        "completed",
-                        text,
-                        sha,
-                    )?;
                     return Ok(json!({"state": "completed", "duplicate": true}));
                 } else {
                     return Err(Error::rejected(format!(
@@ -1667,13 +1648,6 @@ impl Shared {
         record("delivered", None)?;
         if let Some(done) = finished.into_inner() {
             self.notify_routed_target(&done, &stored);
-            let _ = crate::local_assignment::report_actor_completion(
-                &self.state_dir,
-                &done.id,
-                "interrupted",
-                "local actor interrupted",
-                None,
-            );
             self.wake();
         }
         let deadline = Instant::now() + Duration::from_secs(wait);

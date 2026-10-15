@@ -103,8 +103,17 @@ login. Two consequences:
   org. A `503` waking reply with `Retry-After` is waited on per AOS-128's
   rule — bounded, counted, and still fails closed after the bound.
 - I4: Destination resolution is pinned once per command; `org switch` during
-  a running command cannot move it; `CADENCE_ALIAS`-bound callers keep
-  CAD-657's rule (inherited pins win; `--org` conflicts, never overrides).
+  a running command cannot move it. A `CADENCE_ALIAS` caller keeps its
+  inherited local daemon when `--org` is omitted and never consults the
+  registry default. An explicit `--org` is accepted only when the live local
+  daemon shows exactly one running message whose immutable kickoff binding
+  names that org and records an original member and issuer; the endpoint
+  and organization id come from the binding, and the saved login must still
+  name that same member and issuer. Audience, scope, and renewal checks
+  then run unchanged. A binding without those pins is not eligible. A
+  different org, no binding, queued, terminal, or unresolved
+  work, more than one running message, and an explicit `--state-dir` or
+  tracker pin stay refused. `org switch` stays refused.
 - I5: Login never changes an existing default org without `--use`; a second
   workspace login adds an org and leaves the default untouched; concurrent
   logins for different orgs cannot clobber each other's records (existing
@@ -140,7 +149,7 @@ Refused remotely (default-deny): every operator-only daemon verb
 `issue start`/`dispatch` are not container verbs. On a selected remote org
 they coordinate this user's local agent through
 `/__platform/hosted-cadence/:organizationId/local-assignments`
-(`hosted-cadence-local-assignment.v1`). When the local actor finishes, `cadence message result` reports the claim stored with that message, not a newer reclaim, and a managed `CADENCE_ALIAS` worker is not instructed to pass `--org` or `org switch`. A worktree alone is not execution.
+(`hosted-cadence-local-assignment.v1`). When the local actor finishes, `cadence message result` reports the claim stored with that message, not a newer reclaim, and does not take `--org`. While that message is the alias's single running assignment, hosted ticket, wiki, and tool commands pass the binding's `--org` only when the saved login is still the member and issuer captured at claim time. A later login is not adopted. A managed worker is not instructed to `org switch` or to unset `CADENCE_ALIAS`. A worktree alone is not execution.
 Operator-only verbs need the remote operator proof tied to CAD-657's
 source-authority decision — out of scope for v1.
 

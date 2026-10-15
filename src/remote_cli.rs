@@ -127,10 +127,13 @@ impl Surface {
     }
 }
 
-/// A resolved remote org destination — pinned once per invocation from the
-/// registry (`cli::org::resolve`). `org` is the registry name (the
-/// issuer-verified slug); `endpoint`/`org_id` came only from the verified
-/// grant at login. Nothing here is caller-mutable mid-command.
+/// A resolved remote org destination, pinned once per invocation.
+/// Ordinary selection reads the registry (`cli::org::resolve`): `org` is
+/// the issuer-verified slug, and `endpoint`/`org_id` come from the grant
+/// recorded at login. A managed caller with one live kickoff copies those
+/// three fields from that binding instead, then still requires the saved
+/// credential for this destination to name the original member and issuer.
+/// Nothing here is caller-mutable mid-command.
 #[derive(Clone, Debug)]
 pub struct RemoteTarget {
     pub org: String,
@@ -1512,10 +1515,31 @@ pub struct CliMaterial {
     pub issuer: Option<String>,
 }
 
+/// Whether this saved login is the original member. Both pins must be
+/// present and equal. Capabilities are not consulted: an account image
+/// does not need a legacy `provider.draft` grant to match.
+pub fn login_names_member(material: &CliMaterial, subject_id: &str, issuer: &str) -> bool {
+    !subject_id.is_empty()
+        && !issuer.is_empty()
+        && material.subject_id.as_deref() == Some(subject_id)
+        && material.issuer.as_deref() == Some(issuer)
+}
+
 /// The live hosted CLI bearer for `target`, renewed when it is due.
 /// The subject and issuer come from the stored login, not from the caller.
 pub fn cli_material(dir: &Path, target: &RemoteTarget) -> Result<CliMaterial> {
-    let cred = renewed_credential(dir, target, Instant::now() + Duration::from_secs(20))?;
+    cli_material_until(dir, target, Instant::now() + Duration::from_secs(20))
+}
+
+/// Same saved-login renewal as [`cli_material`], bounded by the caller's
+/// total deadline. The deadline covers lock, refresh, and return; it does
+/// not start a second clock.
+pub fn cli_material_until(
+    dir: &Path,
+    target: &RemoteTarget,
+    deadline: Instant,
+) -> Result<CliMaterial> {
+    let cred = renewed_credential(dir, target, deadline)?;
     if !valid_token(&cred.access_token, "hct_") {
         return Err(reject("invalid remote credential"));
     }

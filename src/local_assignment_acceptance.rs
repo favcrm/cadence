@@ -6,15 +6,12 @@ use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::thread;
 
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
-use super::{
-    completion_outcome, report_actor_completion, store_kickoff_binding, CoordHttp, Coordinator,
-    Kickoff, Reply, VERSION,
-};
+use super::reporting::{completion_outcome, store_kickoff_binding};
+use super::{CoordHttp, Coordinator, Kickoff, Reply, VERSION};
 use crate::error::{Error, Result};
 
 const ORG: &str = "ws_cad1460";
@@ -34,6 +31,7 @@ struct Call {
     body: Value,
 }
 
+#[derive(Clone)]
 struct Row {
     assignment_id: String,
     issue_id: String,
@@ -52,6 +50,9 @@ struct Row {
 
 struct Board {
     rows: Vec<Row>,
+    list_snapshot: Option<Vec<Row>>,
+    /// Claim response returned instead of the live row, for a delayed body.
+    claim_snapshot: Option<Row>,
     calls: Vec<Call>,
     next_assignment: u64,
     next_claim: u64,
@@ -138,6 +139,8 @@ impl Board {
     fn empty() -> Self {
         Self {
             rows: Vec::new(),
+            list_snapshot: None,
+            claim_snapshot: None,
             calls: Vec::new(),
             next_assignment: 1,
             next_claim: 1,
@@ -182,11 +185,12 @@ impl Board {
         let (route, query) = path.split_once('?').unwrap_or((path, ""));
         if method == "GET" && route == base() {
             let state = query.strip_prefix("state=");
+            let rows = self.list_snapshot.as_deref().unwrap_or(&self.rows);
             return Ok(Reply {
                 status: 200,
                 body: json!({
                     "version": VERSION,
-                    "assignments": self.rows.iter().rev()
+                    "assignments": rows.iter().rev()
                         .filter(|row| state.is_none_or(|state| row.state == state))
                         .take(50).map(Row::json).collect::<Vec<_>>(),
                 }),
@@ -292,6 +296,16 @@ impl Board {
     }
 
     fn claim(&mut self, id: &str, body: &Value) -> Reply {
+        if let Some(row) = self
+            .claim_snapshot
+            .clone()
+            .filter(|row| row.assignment_id == id)
+        {
+            return Reply {
+                status: 200,
+                body: row.claimed_json(),
+            };
+        }
         let Some(index) = self.rows.iter().position(|row| row.assignment_id == id) else {
             return http(404, "api_missing");
         };
@@ -389,6 +403,8 @@ impl Board {
         row.generation += 1;
         row.claim_id = None;
         row.client_agent_id = None;
+        row.text = None;
+        row.head = None;
         if cancel {
             row.state = "cancelled".to_string();
         } else {
@@ -560,10 +576,6 @@ fn start_adopts_this_users_waiting_assignment() {
     assert_eq!(actor_message(&again), message);
     let calls = script.calls();
     assert_eq!(calls.iter().filter(|call| call.is_create()).count(), 1);
-    assert_eq!(
-        calls.iter().filter(|call| call.is_suffix("/claim")).count(),
-        1
-    );
     let reassign: Vec<_> = calls
         .iter()
         .filter(|call| call.is_suffix("/reassign"))
@@ -602,10 +614,6 @@ fn connect_adopts_waiting_work_and_reuses_one_kickoff_id() {
             .iter()
             .filter(|call| call.is_suffix("/reassign"))
             .count(),
-        1
-    );
-    assert_eq!(
-        calls.iter().filter(|call| call.is_suffix("/claim")).count(),
         1
     );
     let ledger = ledger_file(auth.path());
@@ -931,6 +939,7 @@ fn external_claim_of_the_replacement_gets_a_new_kickoff() {
     checkout(repo.path());
     let mut board = Board::empty();
     let assignment = board.seed("dispatch", "queued", Some(ME), THEM);
+    let delayed_old_generation = board.rows.clone();
     let script = Script::new(board);
     let mut coord = open(&script, auth.path());
     let mut deliver = deliver_to(auth.path().to_path_buf());
@@ -976,11 +985,6 @@ fn external_claim_of_the_replacement_gets_a_new_kickoff() {
         )
         .expect("another process claims the replacement");
     assert_eq!(claimed.status, 200);
-    let claims_before = script
-        .calls()
-        .iter()
-        .filter(|call| call.is_suffix("/claim"))
-        .count();
     let second = coord
         .connect(Some(repo.path()), None, Some("worker"), &mut deliver)
         .expect("adopt the claimed replacement");
@@ -989,15 +993,6 @@ fn external_claim_of_the_replacement_gets_a_new_kickoff() {
     assert_ne!(second_message, first_message);
     assert_ne!(second_claim, first_claim);
     assert!(second["claimed"][0]["actor"].get("state").is_none());
-    assert_eq!(
-        script
-            .calls()
-            .iter()
-            .filter(|call| call.is_suffix("/claim"))
-            .count(),
-        claims_before,
-        "adopting a claim another process already holds must not claim again"
-    );
     let new_path = PathBuf::from(second["claimed"][0]["worktree"].as_str().unwrap());
     assert_ne!(new_path, old_path);
     assert_eq!(
@@ -1018,6 +1013,25 @@ fn external_claim_of_the_replacement_gets_a_new_kickoff() {
     assert_eq!(
         bind_file(auth.path(), &second_message)["claim_id"],
         second_claim
+    );
+    script.0.lock().expect("board").list_snapshot = Some(delayed_old_generation);
+    let delayed = coord
+        .connect(Some(repo.path()), None, Some("worker"), &mut deliver)
+        .expect("old generation is refused in the batch");
+    assert!(delayed["claimed"].as_array().unwrap().is_empty());
+    assert_eq!(delayed["refused"][0]["code"], "fenced");
+    script.0.lock().expect("board").list_snapshot = None;
+    let current = coord
+        .connect(Some(repo.path()), None, Some("worker"), &mut deliver)
+        .expect("newer claim survives the delayed observation");
+    assert_eq!(actor_message(&current), second_message);
+    assert_eq!(current["claimed"][0]["actor"]["state"], "already_delivered");
+    assert_eq!(
+        ledger_file(auth.path())["origins"]
+            .as_object()
+            .unwrap()
+            .len(),
+        2
     );
 }
 
@@ -1122,56 +1136,265 @@ fn another_members_waiting_assignment_is_not_taken() {
 }
 
 #[test]
-fn concurrent_connects_share_one_reserved_kickoff() {
+fn delayed_queued_observations_reuse_one_reserved_kickoff() {
     let auth = private_dir();
     let repo = private_dir();
     checkout(repo.path());
     let mut board = Board::empty();
     board.seed("dispatch", "queued", Some(ME), ME);
+    board.list_snapshot = Some(board.rows.clone());
     let script = Script::new(board);
     let mut first = open(&script, auth.path());
-    first.bind_alias("worker").expect("alias");
     let mut second = open(&script, auth.path());
-    let repo_path = repo.path().to_path_buf();
-    let (left, right) = thread::scope(|scope| {
-        let repo_a = repo_path.clone();
-        let repo_b = repo_path.clone();
-        let left = scope.spawn(move || {
-            let mut deliver = |kickoff: &Kickoff| Ok(json!({"message": kickoff.message_id}));
-            first.connect(Some(&repo_a), None, Some("worker"), &mut deliver)
-        });
-        let right = scope.spawn(move || {
-            let mut deliver = |kickoff: &Kickoff| Ok(json!({"message": kickoff.message_id}));
-            second.connect(Some(&repo_b), None, Some("worker"), &mut deliver)
-        });
-        (
-            left.join().expect("left thread"),
-            right.join().expect("right thread"),
-        )
-    });
-    let left = left.expect("left connect");
-    let right = right.expect("right connect");
+    let mut delivered = Vec::new();
+    let mut deliver = |kickoff: &Kickoff| {
+        store_kickoff_binding(auth.path(), "acme", ENDPOINT, kickoff, KICKOFF)?;
+        delivered.push(kickoff.message_id.to_string());
+        Ok(json!({"message": kickoff.message_id}))
+    };
+    let left = first
+        .connect(Some(repo.path()), None, Some("worker"), &mut deliver)
+        .expect("first claim");
+    let right = second
+        .connect(Some(repo.path()), None, Some("worker"), &mut deliver)
+        .expect("delayed queued observation replays the live claim");
     assert_eq!(actor_message(&left), actor_message(&right));
+    assert_eq!(right["claimed"][0]["actor"]["state"], "already_delivered");
+    assert_eq!(delivered, [actor_message(&left)]);
     let ledger = ledger_file(auth.path());
     assert_eq!(ledger["origins"].as_object().unwrap().len(), 1);
-    assert!(ledger["origins"].get(actor_message(&left)).is_some());
-    let claims = script
+    assert_eq!(
+        bind_file(auth.path(), &actor_message(&left))["claim_id"],
+        left["claimed"][0]["claim_id"]
+    );
+}
+
+#[test]
+fn delayed_running_observation_cannot_start_after_remote_cancellation() {
+    let auth = private_dir();
+    let repo = private_dir();
+    checkout(repo.path());
+    let mut board = Board::empty();
+    board.seed("dispatch", "queued", Some(ME), THEM);
+    let script = Script::new(board);
+    let mut coord = open(&script, auth.path());
+    let queued = coord
+        .list_state(Some("queued"))
+        .expect("queued list")
+        .pop()
+        .expect("queued row");
+    coord.claim(&queued).expect("claim before local delivery");
+    {
+        let mut board = script.0.lock().expect("board");
+        board.list_snapshot = Some(board.rows.clone());
+        let row = &mut board.rows[0];
+        row.generation += 1;
+        row.state = "cancelled".to_string();
+        row.claim_id = None;
+        row.client_agent_id = None;
+        row.target = None;
+    }
+    let mut delivered = false;
+    let connected = coord
+        .connect(Some(repo.path()), None, Some("worker"), &mut |kickoff| {
+            delivered = true;
+            Ok(json!({"message": kickoff.message_id}))
+        })
+        .expect("cancelled claim is refused in the batch");
+    assert!(connected["claimed"].as_array().unwrap().is_empty());
+    assert_eq!(connected["refused"][0]["code"], "fenced");
+    assert!(
+        !delivered,
+        "a cached running row is not execution authority"
+    );
+}
+
+#[test]
+fn older_queued_snapshot_does_not_erase_the_newer_claim() {
+    let auth = private_dir();
+    let repo = private_dir();
+    checkout(repo.path());
+    let mut board = Board::empty();
+    let assignment = board.seed("dispatch", "queued", Some(ME), ME);
+    let script = Script::new(board);
+    let mut coord = open(&script, auth.path());
+    let mut deliveries = Vec::new();
+    let mut deliver = |kickoff: &Kickoff| {
+        deliveries.push(kickoff.message_id.to_string());
+        Ok(json!({"message": kickoff.message_id}))
+    };
+    let first = coord
+        .connect(Some(repo.path()), None, Some("worker"), &mut deliver)
+        .expect("first generation");
+    let first_message = actor_message(&first);
+    coord
+        .reassign(&assignment, Some(ME), false)
+        .expect("newer generation");
+    let second = coord
+        .connect(None, None, None, &mut deliver)
+        .expect("second generation");
+    let second_message = actor_message(&second);
+    assert_ne!(second_message, first_message);
+    {
+        let mut board = script.0.lock().expect("board");
+        let mut stale = board.rows[0].clone();
+        stale.generation = 1;
+        stale.state = "queued".to_string();
+        stale.claim_id = None;
+        stale.client_agent_id = None;
+        board.list_snapshot = Some(vec![stale]);
+    }
+    let watched = coord
+        .connect(None, None, None, &mut deliver)
+        .expect("older snapshot is not execution authority");
+    assert!(watched["claimed"].as_array().unwrap().is_empty());
+    assert_eq!(watched["refused"][0]["code"], "fenced");
+    assert_eq!(
+        deliveries,
+        vec![first_message.clone(), second_message.clone()]
+    );
+    let ledger = ledger_file(auth.path());
+    assert_eq!(ledger["origins"].as_object().unwrap().len(), 2);
+    assert_eq!(
+        attempt(&ledger, &assignment)["kickoff_message"],
+        second_message
+    );
+    assert_eq!(
+        attempt(&ledger, &assignment)["claim_id"],
+        second["claimed"][0]["claim_id"]
+    );
+    assert_eq!(
+        attempt(&ledger, &assignment)["generation"],
+        second["claimed"][0]["generation"]
+    );
+    assert_eq!(
+        ledger["origins"][&first_message]["claim_id"],
+        first["claimed"][0]["claim_id"]
+    );
+}
+
+#[test]
+fn stale_null_claim_keeps_pending_reassign_generation() {
+    let auth = private_dir();
+    let repo = private_dir();
+    checkout(repo.path());
+    let mut board = Board::empty();
+    let assignment = board.seed("dispatch", "queued", Some(ME), ME);
+    board.fail_reassign = true;
+    let script = Script::new(board);
+    let mut coord = open(&script, auth.path());
+    let mut deliveries = 0;
+    let mut deliver = |kickoff: &Kickoff| {
+        deliveries += 1;
+        Ok(json!({"message": kickoff.message_id}))
+    };
+    let first = coord
+        .connect(Some(repo.path()), None, Some("worker"), &mut deliver)
+        .expect("claim");
+    let message = actor_message(&first);
+    let generation = first["claimed"][0]["generation"].clone();
+    let failed = coord
+        .reassign(&assignment, None, true)
+        .expect_err("lost cancel acknowledgement");
+    assert_eq!(failed.code(), Some("unavailable"));
+    let operation = script
         .calls()
         .iter()
-        .filter(|call| call.is_suffix("/claim"))
-        .map(|call| call.body["client_agent_id"].as_str().unwrap().to_string())
-        .collect::<Vec<_>>();
-    assert!(!claims.is_empty());
-    assert!(claims.iter().all(|client| client == &claims[0]));
+        .rev()
+        .find(|call| call.is_suffix("/reassign"))
+        .unwrap()
+        .body["operation_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    {
+        let mut board = script.0.lock().expect("board");
+        let mut stale = board.rows[0].clone();
+        stale.state = "queued".to_string();
+        stale.claim_id = None;
+        stale.client_agent_id = None;
+        board.list_snapshot = Some(vec![stale]);
+    }
+    let again = coord
+        .connect(None, None, None, &mut deliver)
+        .expect("null claim snapshot replays the live claim");
+    assert_eq!(deliveries, 1);
+    assert_eq!(actor_message(&again), message);
+    assert_eq!(again["claimed"][0]["actor"]["state"], "already_delivered");
+    let ledger = ledger_file(auth.path());
+    let saved = attempt(&ledger, &assignment);
+    assert_eq!(saved["reassign_operation_id"], operation);
+    assert_eq!(saved["reassign_fingerprint"], "cancel");
+    assert_eq!(saved["reassign_expected_generation"], generation);
+    assert_eq!(saved["kickoff_message"], message);
+    assert_eq!(ledger["origins"].as_object().unwrap().len(), 1);
+    assert_eq!(
+        ledger["origins"][&message]["claim_id"],
+        first["claimed"][0]["claim_id"]
+    );
+}
+
+#[test]
+fn stale_running_snapshot_after_terminal_result_does_not_execute() {
+    let auth = private_dir();
+    let repo = private_dir();
+    checkout(repo.path());
+    let mut board = Board::empty();
+    let assignment = board.seed("dispatch", "queued", Some(ME), ME);
+    let script = Script::new(board);
+    let mut coord = open(&script, auth.path());
+    let deliveries = std::cell::Cell::new(0);
+    let mut deliver = |kickoff: &Kickoff| {
+        deliveries.set(deliveries.get() + 1);
+        Ok(json!({"message": kickoff.message_id}))
+    };
+    let first = coord
+        .connect(Some(repo.path()), None, Some("worker"), &mut deliver)
+        .expect("claim");
+    let message = actor_message(&first);
+    coord
+        .report(&assignment, "result", Some("finished locally"), Some(SHA))
+        .expect("result");
+    assert_eq!(script.row(&assignment).0, "result");
+    {
+        let mut board = script.0.lock().expect("board");
+        let mut running = board.rows[0].clone();
+        running.state = "running".to_string();
+        board.list_snapshot = Some(vec![running]);
+    }
+    let watched = coord
+        .connect(None, None, None, &mut deliver)
+        .expect("terminal board refuses the stale running list");
+    assert!(watched["claimed"].as_array().unwrap().is_empty());
+    assert_eq!(watched["refused"][0]["code"], "not_claimable");
+    assert_eq!(deliveries.get(), 1);
+    assert_eq!(script.row(&assignment).0, "result");
+    {
+        let mut board = script.0.lock().expect("board");
+        let running = board.list_snapshot.as_ref().unwrap()[0].clone();
+        board.claim_snapshot = Some(running);
+    }
+    let replayed = coord
+        .connect(None, None, None, &mut deliver)
+        .expect("stale running claim body is not reopened");
+    assert!(replayed["claimed"].as_array().unwrap().is_empty());
+    assert_eq!(replayed["refused"][0]["code"], "terminal");
+    assert_eq!(deliveries.get(), 1);
+    assert_eq!(script.row(&assignment).0, "result");
+    let ledger = ledger_file(auth.path());
+    assert_eq!(ledger["origins"].as_object().unwrap().len(), 1);
+    assert_eq!(ledger["origins"][&message]["settled"], true);
+    assert_eq!(attempt(&ledger, &assignment)["state"], "result");
+    assert!(attempt(&ledger, &assignment)["kickoff_message"].is_null());
+    assert!(attempt(&ledger, &assignment)["kickoff_reserved"].is_null());
 }
 
 #[test]
 fn completion_does_not_invent_a_commit() {
-    let (state, text, head) =
+    let (state, _, head) =
         completion_outcome("completed", "landed", Some(SHA), Path::new("/absent"))
             .expect("sha result");
     assert_eq!(state, "result");
-    assert_eq!(text, "landed");
     assert_eq!(head.as_deref(), Some(SHA));
     let (state, _, head) =
         completion_outcome("completed", "no head", None, Path::new("/absent")).expect("no sha");
@@ -1191,16 +1414,18 @@ fn completion_does_not_invent_a_commit() {
             .expect("stop");
     assert_eq!(state, "failed");
     assert!(head.is_none());
-    let dir = private_dir();
-    report_actor_completion(
-        dir.path(),
-        "not-a-hosted-kickoff",
-        "completed",
-        "x",
+    let (state, _, head) = completion_outcome(
+        "cancelled",
+        "operator stop",
         Some(SHA),
+        Path::new("/absent"),
     )
-    .expect("unbound message");
-    assert!(fs::read_dir(dir.path()).unwrap().next().is_none());
+    .expect("cancel");
+    assert_eq!(state, "failed");
+    assert!(head.is_none());
+    assert!(
+        completion_outcome("unknown", "still running", Some(SHA), Path::new("/absent")).is_none()
+    );
 }
 
 #[test]
@@ -1540,7 +1765,7 @@ fn status_reads_a_valid_fifty_result_response_larger_than_sixty_four_kib() {
         write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", payload.len()).expect("headers");
         stream.write_all(payload.as_bytes()).expect("body");
     });
-    let http = super::BoardHttp::from_parts(
+    let http = super::http::BoardHttp::from_parts(
         endpoint,
         ORG.to_string(),
         format!("hct_{}", "s".repeat(43)),

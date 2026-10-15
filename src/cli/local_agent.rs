@@ -11,7 +11,8 @@ use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use cadence_agent::local_assignment::{BoardHttp, Coordinator, Kickoff};
+use cadence_agent::local_assignment::http::BoardHttp;
+use cadence_agent::local_assignment::{Coordinator, Kickoff};
 use cadence_agent::remote_cli::{self, RemoteAnswer, RemoteTarget};
 use clap::Subcommand;
 use serde_json::{json, Map, Value};
@@ -93,7 +94,7 @@ pub(super) fn run(
                 .clone()
                 .or_else(|| cadence_agent::client::state_dir().ok())
             {
-                let _ = cadence_agent::local_assignment::retry_pending_reports(&dir, Some(target));
+                ensure_report_driver(&dir);
             }
             value
         }
@@ -104,13 +105,13 @@ pub(super) fn run(
             let report_state = local_state
                 .clone()
                 .or_else(|| cadence_agent::client::state_dir().ok());
+            if let Some(dir) = &report_state {
+                ensure_report_driver(dir);
+            }
             // The coordinator stays open for the watch. Each later poll
             // reloads the saved login in place; it does not resolve another org.
             let mut previous = None;
             loop {
-                if let Some(dir) = &report_state {
-                    cadence_agent::local_assignment::retry_pending_reports(dir, Some(target))?;
-                }
                 let value = match coord.pickup(None, false, &mut deliver) {
                     Ok(value) => value,
                     Err(error) => {
@@ -174,9 +175,23 @@ pub(super) fn start(
         |kickoff: &Kickoff| deliver_kickoff(target, local_state.clone(), kickoff, wake_timeout);
     let value = coordinator(target)?.start_here(id, repo, name, &mut deliver)?;
     if let Some(dir) = local_state.or_else(|| cadence_agent::client::state_dir().ok()) {
-        let _ = cadence_agent::local_assignment::retry_pending_reports(&dir, Some(target));
+        ensure_report_driver(&dir);
     }
     finish(&value)
+}
+
+fn ensure_report_driver(state: &Path) {
+    if cadence_agent::client::rpc_timeout(
+        state,
+        "health",
+        json!({}),
+        std::time::Duration::from_millis(200),
+    )
+    .is_ok()
+    {
+        return;
+    }
+    let _ = cadence_agent::client::daemon_start(state);
 }
 
 fn finish(value: &Value) -> Result<i32> {
@@ -202,14 +217,14 @@ fn deliver_kickoff(
         None => cadence_agent::client::state_dir()?,
     };
     let (text, note) = if let Some(text) =
-        cadence_agent::local_assignment::stored_kickoff_text(&state, kickoff)?
+        cadence_agent::local_assignment::reporting::stored_kickoff_text(&state, kickoff)?
     {
         (text, context_note_path(&state, kickoff))
     } else {
         let context = require_context(target, kickoff, wake_timeout)?;
         let note = write_note(&state, kickoff, &context)?;
         let text = kickoff_line(kickoff, &note, &context)?;
-        cadence_agent::local_assignment::store_kickoff_binding(
+        cadence_agent::local_assignment::reporting::store_kickoff_binding(
             &state,
             &target.org,
             &target.endpoint,
@@ -421,6 +436,8 @@ mod context_snapshots {
             generation: 1,
             organization_id: "ws_cad1460",
             audience: "https://board.test",
+            subject_id: None,
+            issuer: None,
         };
         let first = write_note(dir.path(), &kickoff, &json!({"issue": "original work"}))
             .expect("first context");

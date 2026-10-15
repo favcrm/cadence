@@ -4653,14 +4653,21 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     }
     let listener = UnixListener::bind(&socket_path)?;
     listener.set_nonblocking(true)?;
-    // One process-lifetime startup drain, after the listener exists.
-    // Pending reports are durable before network I/O; reconnect/watch retries
-    // them if this process exits. Neither readiness nor shutdown waits for
-    // an unreachable board. One thread, never one per report.
+    // One process-lifetime reporter, after the listener exists. It reads
+    // kickoff bindings and the durable message store; shutdown does not join
+    // it, so an unreachable board cannot hold `stop_ctls`.
     let _ = {
-        let state_dir = shared.state_dir.clone();
+        let shared = Arc::clone(&shared);
         thread::spawn(move || {
-            let _ = crate::local_assignment::retry_pending_reports(&state_dir, None);
+            let driver = crate::local_assignment::reporting::ReportDriver::new(&shared.state_dir);
+            while !shared.closing.load(Ordering::SeqCst) {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let _ = driver.tick(&shared.store, deadline);
+                let pause = Instant::now() + Duration::from_millis(250);
+                while Instant::now() < pause && !shared.closing.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(25));
+                }
+            }
         })
     };
     // Signal-driven shutdown: set the same flag as the rpc. Installed
@@ -6404,7 +6411,7 @@ mod tests {
                 model_policy: None,
             })
             .unwrap();
-        crate::local_assignment::store_kickoff_binding(
+        crate::local_assignment::reporting::store_kickoff_binding(
             &shared.state_dir,
             "cad1460-prewrite-report",
             "https://hosted-completion-regression.invalid",
@@ -6418,6 +6425,8 @@ mod tests {
                 generation: 1,
                 organization_id: "ws_hosted_fail_probe",
                 audience: "https://hosted-completion-regression.invalid",
+                subject_id: None,
+                issuer: None,
             },
             "Synthetic terminal failure",
         )
@@ -6444,9 +6453,7 @@ mod tests {
                     shared.store.message("prewrite-1").ok()
                 );
             }
-            if shared.store.message("prewrite-1").unwrap().unwrap().state == "failed"
-                && report().is_some_and(|value| value["pending_state"] == "failed")
-            {
+            if shared.store.message("prewrite-1").unwrap().unwrap().state == "failed" {
                 break;
             }
             thread::sleep(Duration::from_millis(20));

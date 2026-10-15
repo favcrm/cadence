@@ -203,8 +203,12 @@ new login, and neither is retried.
    scope is granted; that the bearer still resolves to the same live
    credential; and that the signed grant is still inside the live ceiling. A
    refusal is `401` with a proven `reason` (for example `scope_not_granted`), or
-   a generic `401 unauthorized` when the bearer does not resolve. The gateway
-   does not check the requested target path against the signed prefixes.
+   a generic `401 unauthorized` when the bearer does not resolve. After argument
+   validation, it also checks every normalized target against the action's
+   signed prefixes **before any runtime wake**: both move legs and the combined
+   upload directory/filename. An out-of-prefix target is `403 insufficient_scope`;
+   a malformed path is `400`. Root enumeration remains available under a narrow
+   grant, with entries filtered by the container.
 2. **Container enforcement** (the Cadence container, before any daemon
    mutation). `src/ui/wiki_envelope.rs` checks the requested path against the
    signed grant (`contains` for reads and writes, `contains_file` for uploads,

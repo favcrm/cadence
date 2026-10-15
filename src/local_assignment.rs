@@ -25,6 +25,10 @@ use crate::error::{Error, Result};
 use crate::remote_cli::{self, CliMaterial, RemoteTarget};
 use crate::worktree::{self, layout};
 
+pub mod http;
+pub mod reporting;
+mod wire;
+
 pub const VERSION: &str = "hosted-cadence-local-assignment.v1";
 const MAX_BODY: u64 = 1024 * 1024;
 
@@ -50,6 +54,10 @@ pub struct Kickoff<'a> {
     pub generation: u64,
     pub organization_id: &'a str,
     pub audience: &'a str,
+    /// Directory member and issuer captured when this coordinator opened.
+    /// Both are required together. A missing half is not inferred.
+    pub subject_id: Option<&'a str>,
+    pub issuer: Option<&'a str>,
 }
 
 #[derive(Clone)]
@@ -153,18 +161,6 @@ pub struct Coordinator<H> {
     /// Board audience recorded at login. Reports go here, not to whatever
     /// org a later process has selected.
     audience: String,
-}
-
-pub struct BoardHttp {
-    endpoint: String,
-    org_id: String,
-    /// Saved-login authority captured at open; absent for an explicit bearer.
-    saved_target: Option<RemoteTarget>,
-    agent: ureq::Agent,
-    bearer: String,
-    ledger: PathBuf,
-    subject_id: Option<String>,
-    issuer: Option<String>,
 }
 
 fn hosted_id(value: &str) -> bool {
@@ -546,19 +542,6 @@ impl Ledger {
     }
 }
 
-/// True when the recorded generation differs, or a recorded claim id
-/// differs. The first claim on a generation is not a move, so a lost
-/// actor acknowledgement reuses that kickoff.
-fn current_claim_moved(attempt: &Attempt, assignment: &Assignment) -> bool {
-    match attempt.generation {
-        None => false,
-        Some(generation) => {
-            generation != assignment.generation
-                || (attempt.claim_id.is_some() && attempt.claim_id != assignment.claim_id)
-        }
-    }
-}
-
 /// Drop delivery, lane, and worktree pointers for the claim we were on.
 /// Origins, binding files, old checkouts, and pending reassign operations stay.
 fn retire_current_claim(attempt: &mut Attempt) {
@@ -572,12 +555,29 @@ fn retire_current_claim(attempt: &mut Attempt) {
     attempt.lane_generation = None;
 }
 
-/// Record the board row as this attempt's current claim. A moved claim
-/// retires only current delivery metadata. Reassign operation id, fingerprint,
-/// and expected generation are not touched.
+fn attempt_ended(state: &str) -> bool {
+    matches!(state, "result" | "failed" | "cancelled")
+}
+
+/// Observe the board without letting delayed rows retire newer custody.
+/// An older generation, a same-generation null or different claim, or a
+/// non-terminal row for a claim that already ended is ignored. Only a higher
+/// generation retires the current delivery. Pending reassignment receipts
+/// retain their original expected generation.
 fn stamp(attempt: &mut Attempt, assignment: &Assignment) {
-    if current_claim_moved(attempt, assignment) {
-        retire_current_claim(attempt);
+    if let Some(generation) = attempt.generation {
+        let same_generation = assignment.generation == generation;
+        let claim_regressed = same_generation
+            && attempt.claim_id.is_some()
+            && assignment.claim_id != attempt.claim_id;
+        let reopened =
+            same_generation && attempt_ended(&attempt.state) && !attempt_ended(&assignment.state);
+        if assignment.generation < generation || claim_regressed || reopened {
+            return;
+        }
+        if assignment.generation > generation {
+            retire_current_claim(attempt);
+        }
     }
     attempt.assignment_id = Some(assignment.assignment_id.clone());
     attempt.generation = Some(assignment.generation);
@@ -843,6 +843,7 @@ impl<H: CoordHttp> Coordinator<H> {
         )?;
         let claimed = self.parse_owned(&value)?;
         if claimed.assignment_id != assignment.assignment_id
+            || claimed.generation != assignment.generation
             || claimed.issue_id != assignment.issue_id
             || claimed.client_agent_id.as_deref() != Some(client_agent_id.as_str())
             || claimed.state != "running"
@@ -1125,13 +1126,25 @@ impl<H: CoordHttp> Coordinator<H> {
     }
 
     fn block_claim(&mut self, claimed: &Assignment, text: &str) {
-        let Some(claim_id) = claimed.claim_id.clone() else {
+        let Some(claim_id) = claimed.claim_id.as_deref() else {
             return;
         };
-        let text: String = text.chars().take(2000).collect();
+        let Ok(text) = wire::bounded_report_text(
+            &wire::ReportIdentity {
+                organization_id: &claimed.organization_id,
+                claim_id,
+                generation: claimed.generation,
+            },
+            "blocked",
+            None,
+            &claimed.assignment_id,
+            text,
+        ) else {
+            return;
+        };
         let _ = self.report_claimed(
             &claimed.assignment_id,
-            &claim_id,
+            claim_id,
             claimed.generation,
             "blocked",
             Some(&text),
@@ -1185,6 +1198,29 @@ impl<H: CoordHttp> Coordinator<H> {
         })
     }
 
+    /// True when this claim generation was already reported terminal.
+    /// A later running or queued snapshot must not reserve another message.
+    fn claim_already_ended(&self, claimed: &Assignment) -> Result<bool> {
+        let Some(claim_id) = claimed.claim_id.as_deref() else {
+            return Ok(false);
+        };
+        self.with_ledger(|ledger| {
+            let settled = ledger.origins.values().any(|origin| {
+                origin.assignment_id == claimed.assignment_id
+                    && origin.claim_id == claim_id
+                    && origin.generation == claimed.generation
+                    && origin.settled
+            });
+            let ended = ledger.attempts.values().any(|attempt| {
+                attempt.assignment_id.as_deref() == Some(claimed.assignment_id.as_str())
+                    && attempt.claim_id.as_deref() == Some(claim_id)
+                    && attempt.generation == Some(claimed.generation)
+                    && attempt_ended(&attempt.state)
+            });
+            Ok(settled || ended)
+        })
+    }
+
     fn activate<F>(
         &mut self,
         assignment: &Assignment,
@@ -1196,9 +1232,9 @@ impl<H: CoordHttp> Coordinator<H> {
     where
         F: FnMut(&Kickoff) -> Result<Value>,
     {
-        self.remember_discovered(assignment)?;
         let client_agent_id = self.client_agent_id()?;
         let claimed = if assignment.state == "blocked" {
+            self.remember_discovered(assignment)?;
             if assignment.claim_id.is_none()
                 || assignment.client_agent_id.as_deref() != Some(client_agent_id.as_str())
             {
@@ -1209,17 +1245,23 @@ impl<H: CoordHttp> Coordinator<H> {
             }
             assignment.clone()
         } else if assignment.state == "running"
-            && assignment.client_agent_id.as_deref() == Some(client_agent_id.as_str())
+            && assignment.client_agent_id.as_deref() != Some(client_agent_id.as_str())
         {
-            assignment.clone()
-        } else if assignment.state == "running" {
             return Err(Error::invalid(
                 "fenced",
                 "another local worker of this member already holds the claim; this machine did not start a second one",
             ));
         } else {
+            // Lists are observations, not execution authority. Replay the
+            // live claim even for this machine before any local handoff.
             self.claim(assignment)?
         };
+        if self.claim_already_ended(&claimed)? {
+            return Err(Error::invalid(
+                "terminal",
+                "that assignment already ended; it was not reopened",
+            ));
+        }
         // A blocked row is already this claim. Mark it running before the
         // actor is messaged so a fast completion cannot land first and
         // then be downgraded. A fresh claim is already running.
@@ -1291,6 +1333,8 @@ impl<H: CoordHttp> Coordinator<H> {
                 generation: origin_generation,
                 organization_id: &current.organization_id,
                 audience: self.audience.as_str(),
+                subject_id: self.subject_id.as_deref(),
+                issuer: self.issuer.as_deref(),
             };
             match deliver(&kickoff) {
                 Ok(value) => {
@@ -1374,19 +1418,16 @@ impl<H: CoordHttp> Coordinator<H> {
         if !prefixed_id(assignment, "hla_") || !prefixed_id(claim_id, "hlc_") {
             return Err(Error::rejected("report is missing its claim"));
         }
-        let mut body = json!({
-            "version": VERSION,
-            "organization_id": self.org_id,
-            "claim_id": claim_id,
-            "expected_generation": generation,
-            "state": state,
-        });
-        if let Some(text) = text {
-            body["text"] = json!(text);
-        }
-        if let Some(head) = head {
-            body["reported_head_sha"] = json!(head);
-        }
+        let body = wire::report_body(
+            &wire::ReportIdentity {
+                organization_id: &self.org_id,
+                claim_id,
+                generation,
+            },
+            state,
+            text,
+            head,
+        )?;
         match self.exchange(
             "POST",
             &format!("{}/{assignment}/report", self.base()),
@@ -1734,9 +1775,6 @@ impl<H: CoordHttp> Coordinator<H> {
         if matches!(state, "blocked" | "failed" | "result") && text.unwrap_or("").is_empty() {
             return Err(Error::rejected("this report requires --text"));
         }
-        if text.unwrap_or("").chars().count() > 4000 {
-            return Err(Error::rejected("report text exceeds 4000 characters"));
-        }
         let (claim_id, generation) = self.origin_for_assignment(assignment)?;
         Ok(self
             .report_claimed(assignment, &claim_id, generation, state, text, head)?
@@ -1960,484 +1998,6 @@ fn ensure_lane(root: &Path, lane: &str) -> Result<PathBuf> {
             }
             Err(error)
         }
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct KickoffFile {
-    version: u32,
-    message_id: String,
-    organization_id: String,
-    org: String,
-    endpoint: String,
-    assignment_id: String,
-    claim_id: String,
-    generation: u64,
-    worktree: String,
-    text: String,
-    #[serde(default)]
-    pending_state: Option<String>,
-    #[serde(default)]
-    pending_text: Option<String>,
-    #[serde(default)]
-    pending_head: Option<String>,
-    #[serde(default)]
-    reported_state: Option<String>,
-}
-
-fn binding_dir(state_dir: &Path) -> PathBuf {
-    state_dir.join("hosted-assignments")
-}
-
-fn binding_path(state_dir: &Path, message_id: &str) -> Result<PathBuf> {
-    crate::proto::identifier(message_id, "actor message")?;
-    Ok(binding_dir(state_dir).join(format!("{message_id}.bind")))
-}
-
-fn safe_slug(slug: &str) -> bool {
-    !slug.is_empty()
-        && slug.len() <= 64
-        && !slug.contains(['/', '\\', '\0'])
-        && slug != "."
-        && slug != ".."
-}
-
-fn read_kickoff_file(path: &Path) -> Result<Option<KickoffFile>> {
-    let meta = match fs::symlink_metadata(path) {
-        Ok(meta) => meta,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    if !meta.is_file() || meta.file_type().is_symlink() || meta.mode() & 0o077 != 0 {
-        return Err(Error::rejected(
-            "hosted kickoff binding must be a private regular file",
-        ));
-    }
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(|_| Error::rejected("hosted kickoff binding is unreadable"))
-}
-
-fn write_kickoff_file(path: &Path, binding: &KickoffFile) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
-    }
-    let tmp = path.with_extension("bind.tmp");
-    let bytes =
-        serde_json::to_vec_pretty(binding).map_err(|error| Error::internal(error.to_string()))?;
-    {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&tmp)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-    }
-    fs::rename(tmp, path)?;
-    Ok(())
-}
-
-fn kickoff_matches(file: &KickoffFile, kickoff: &Kickoff) -> bool {
-    file.version == 1
-        && file.message_id == kickoff.message_id
-        && file.assignment_id == kickoff.assignment_id
-        && file.claim_id == kickoff.claim_id
-        && file.generation == kickoff.generation
-        && file.organization_id == kickoff.organization_id
-}
-
-/// Text already bound to this kickoff id, if a previous attempt stored it.
-/// A changed claim does not reuse the body.
-pub fn stored_kickoff_text(state_dir: &Path, kickoff: &Kickoff) -> Result<Option<String>> {
-    let path = binding_path(state_dir, kickoff.message_id)?;
-    let Some(file) = read_kickoff_file(&path)? else {
-        return Ok(None);
-    };
-    if !kickoff_matches(&file, kickoff) {
-        return Err(Error::rejected(
-            "reserved kickoff identity does not match this claim; the actor was not messaged",
-        ));
-    }
-    Ok(Some(file.text))
-}
-
-/// Durably bind the reserved message to its originating claim before send.
-pub fn store_kickoff_binding(
-    state_dir: &Path,
-    org_slug: &str,
-    endpoint: &str,
-    kickoff: &Kickoff,
-    text: &str,
-) -> Result<()> {
-    if !safe_slug(org_slug)
-        || !(endpoint.starts_with("https://") || endpoint.starts_with("http://"))
-        || endpoint.chars().any(char::is_control)
-        || !prefixed_id(kickoff.assignment_id, "hla_")
-        || !prefixed_id(kickoff.claim_id, "hlc_")
-        || !hosted_id(kickoff.organization_id)
-    {
-        return Err(Error::rejected(
-            "hosted kickoff binding was refused; the actor was not messaged",
-        ));
-    }
-    let path = binding_path(state_dir, kickoff.message_id)?;
-    if let Some(existing) = read_kickoff_file(&path)? {
-        if !kickoff_matches(&existing, kickoff) || existing.text != text {
-            return Err(Error::rejected(
-                "reserved kickoff identity does not match this claim; the actor was not messaged",
-            ));
-        }
-        return Ok(());
-    }
-    write_kickoff_file(
-        &path,
-        &KickoffFile {
-            version: 1,
-            message_id: kickoff.message_id.to_string(),
-            organization_id: kickoff.organization_id.to_string(),
-            org: org_slug.to_string(),
-            endpoint: endpoint.to_string(),
-            assignment_id: kickoff.assignment_id.to_string(),
-            claim_id: kickoff.claim_id.to_string(),
-            generation: kickoff.generation,
-            worktree: kickoff.worktree.to_string(),
-            text: text.to_string(),
-            pending_state: None,
-            pending_text: None,
-            pending_head: None,
-            reported_state: None,
-        },
-    )
-}
-
-fn bounded_report_text(text: &str, fallback: &str) -> String {
-    let flat: String = text
-        .chars()
-        .map(|ch| if ch.is_control() { ' ' } else { ch })
-        .take(4000)
-        .collect();
-    let trimmed = flat.trim();
-    if trimmed.is_empty() {
-        fallback.to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
-fn worktree_head(path: &Path) -> Option<String> {
-    if !path.is_absolute() {
-        return None;
-    }
-    let mut command = Command::new("git");
-    command.arg("-C").arg(path).args(["rev-parse", "HEAD"]);
-    let output = crate::reaper::output(&mut command).ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let sha = String::from_utf8(output.stdout).ok()?;
-    let sha = sha.trim();
-    head_sha(sha).then(|| sha.to_string())
-}
-
-fn completion_outcome(
-    status: &str,
-    text: &str,
-    sha: Option<&str>,
-    worktree: &Path,
-) -> Option<(String, String, Option<String>)> {
-    match status {
-        "completed" | "result" => {
-            let head = sha
-                .filter(|value| head_sha(value))
-                .map(str::to_string)
-                .or_else(|| worktree_head(worktree));
-            let Some(head) = head else {
-                return Some((
-                    "failed".to_string(),
-                    bounded_report_text(text, "local actor completed without a commit"),
-                    None,
-                ));
-            };
-            Some((
-                "result".to_string(),
-                bounded_report_text(text, "local actor completed"),
-                Some(head),
-            ))
-        }
-        "failed" | "interrupted" => Some((
-            "failed".to_string(),
-            bounded_report_text(text, &format!("local actor {status}")),
-            None,
-        )),
-        _ => None,
-    }
-}
-
-fn post_kickoff_report(binding: &KickoffFile) -> Result<()> {
-    let state = binding
-        .pending_state
-        .as_deref()
-        .ok_or_else(|| Error::rejected("hosted completion has no pending report"))?;
-    let text = binding.pending_text.as_deref().unwrap_or("");
-    let target = RemoteTarget {
-        org: binding.org.clone(),
-        endpoint: binding.endpoint.clone(),
-        org_id: binding.organization_id.clone(),
-    };
-    let mut coord = BoardHttp::open(&target)?.into_coordinator()?;
-    match coord.report_claimed(
-        &binding.assignment_id,
-        &binding.claim_id,
-        binding.generation,
-        state,
-        Some(text),
-        binding.pending_head.as_deref(),
-    ) {
-        Ok(_) => Ok(()),
-        Err(error) if matches!(error.code(), Some("fenced" | "terminal")) => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-fn settle_binding(path: &Path, binding: &mut KickoffFile) -> Result<()> {
-    if binding.reported_state.is_some() {
-        return Ok(());
-    }
-    if binding.pending_state.is_none() {
-        return Ok(());
-    }
-    post_kickoff_report(binding)?;
-    binding.reported_state = binding.pending_state.clone();
-    write_kickoff_file(path, binding)
-}
-
-/// Report the hosted assignment for a finished local kickoff, using the
-/// claim stored with that message. No binding means this message is not one.
-pub fn report_actor_completion(
-    state_dir: &Path,
-    message_id: &str,
-    status: &str,
-    text: &str,
-    sha: Option<&str>,
-) -> Result<()> {
-    let Ok(path) = binding_path(state_dir, message_id) else {
-        return Ok(());
-    };
-    let Some(mut binding) = read_kickoff_file(&path)? else {
-        return Ok(());
-    };
-    if binding.reported_state.is_some() {
-        return Ok(());
-    }
-    if binding.pending_state.is_none() {
-        let Some((state, pending_text, head)) =
-            completion_outcome(status, text, sha, Path::new(&binding.worktree))
-        else {
-            return Ok(());
-        };
-        binding.pending_state = Some(state);
-        binding.pending_text = Some(pending_text);
-        binding.pending_head = head;
-        write_kickoff_file(&path, &binding)?;
-    }
-    settle_binding(&path, &mut binding)
-}
-
-/// Retry hosted reports whose local completion was saved and not accepted.
-/// `Some(target)` posts only that workspace id and audience, so another
-/// company's unreachable board cannot block this pickup. `None` drains every
-/// company and is the daemon-startup pass.
-pub fn retry_pending_reports(state_dir: &Path, target: Option<&RemoteTarget>) -> Result<()> {
-    let dir = binding_dir(state_dir);
-    let entries = match fs::read_dir(&dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        let Some(message_id) = name.strip_suffix(".bind") else {
-            continue;
-        };
-        if binding_path(state_dir, message_id).is_err() {
-            continue;
-        }
-        let Some(mut binding) = read_kickoff_file(&entry.path())? else {
-            continue;
-        };
-        if binding.pending_state.is_none() || binding.reported_state.is_some() {
-            continue;
-        }
-        if target.is_some_and(|target| {
-            binding.organization_id != target.org_id || binding.endpoint != target.endpoint
-        }) {
-            continue;
-        }
-        let _ = settle_binding(&entry.path(), &mut binding);
-    }
-    Ok(())
-}
-
-impl BoardHttp {
-    pub fn from_parts(
-        endpoint: String,
-        org_id: String,
-        bearer: String,
-        ledger: PathBuf,
-        subject_id: Option<String>,
-        issuer: Option<String>,
-    ) -> Self {
-        let builder = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(20)))
-            .http_status_as_error(false)
-            .max_redirects(0)
-            .proxy(None);
-        let agent = crate::issuer_transport::agent(builder);
-        Self {
-            endpoint,
-            org_id,
-            saved_target: None,
-            agent,
-            bearer,
-            ledger,
-            subject_id,
-            issuer,
-        }
-    }
-
-    pub fn open(target: &RemoteTarget) -> Result<Self> {
-        let ledger = crate::remote_auth::auth_dir(None).map_err(|_| {
-            Error::rejected(
-                "remote credential directory is unavailable — set HOME or XDG_CONFIG_HOME",
-            )
-        })?;
-        let CliMaterial {
-            access_token,
-            subject_id,
-            issuer,
-        } = remote_cli::cli_material(&ledger, target)?;
-        if !valid_hct(&access_token) || !hosted_id(&target.org_id) {
-            return Err(Error::rejected("invalid remote credential"));
-        }
-        let mut client = Self::from_parts(
-            target.endpoint.clone(),
-            target.org_id.clone(),
-            access_token,
-            ledger,
-            subject_id,
-            issuer,
-        );
-        client.saved_target = Some(target.clone());
-        Ok(client)
-    }
-
-    /// Reload the saved login for the org, audience, and member captured at
-    /// open. A rotated token is used. A different member or issuer is refused.
-    /// Renewal stays on `cli_material`, which keeps the stored scopes and does
-    /// not select another org.
-    fn reload_saved_login(&mut self) -> Result<()> {
-        let Some(target) = self.saved_target.as_ref() else {
-            return Ok(());
-        };
-        let material = remote_cli::cli_material(&self.ledger, target)?;
-        if material.subject_id != self.subject_id || material.issuer != self.issuer {
-            return Err(Error::rejected(
-                "saved login changed member or issuer; this session kept the original identity and sent nothing",
-            ));
-        }
-        if !valid_hct(&material.access_token) {
-            return Err(Error::rejected("invalid remote credential"));
-        }
-        self.bearer = material.access_token;
-        Ok(())
-    }
-
-    pub fn into_coordinator(self) -> Result<Coordinator<Self>> {
-        let org_id = self.org_id.clone();
-        let ledger = self.ledger.clone();
-        let subject_id = self.subject_id.clone();
-        let issuer = self.issuer.clone();
-        let audience = self.endpoint.clone();
-        Coordinator::open(self, org_id, ledger, subject_id, issuer, audience)
-    }
-}
-
-impl CoordHttp for BoardHttp {
-    fn send(&mut self, method: &str, path: &str, body: Option<&Value>) -> Result<Reply> {
-        self.reload_saved_login()?;
-        if !valid_hct(&self.bearer) {
-            return Err(Error::rejected("invalid remote credential"));
-        }
-        let prefix = assignment_prefix(&self.org_id);
-        let route = path.split_once('?').map_or(path, |(route, _)| route);
-        if !hosted_id(&self.org_id)
-            || !(route == prefix
-                || route
-                    .strip_prefix(prefix.as_str())
-                    .is_some_and(|tail| tail.starts_with('/')))
-            || path.contains("..")
-            || path.contains("local-agents")
-            || path.contains("tool-exchange")
-            || path.contains("/presence")
-        {
-            return Err(Error::invalid(
-                "cross_workspace",
-                "refusing to send an assignment request outside this workspace",
-            ));
-        }
-        let url = format!("{}{path}", self.endpoint.trim_end_matches('/'));
-        let authorization = format!("Bearer {}", self.bearer);
-        let response = match method {
-            "GET" => self
-                .agent
-                .get(url)
-                .header("Authorization", authorization)
-                .call(),
-            "POST" => self
-                .agent
-                .post(url)
-                .header("Authorization", authorization)
-                .send_json(body.unwrap_or(&json!({}))),
-            _ => return Err(Error::rejected("unsupported coordination method")),
-        }
-        .map_err(|_| Error::rejected("remote request failed"))?;
-        let status = response.status().as_u16();
-        let mut bytes = Vec::new();
-        response
-            .into_body()
-            .as_reader()
-            .take(MAX_BODY + 1)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > MAX_BODY {
-            return Err(Error::rejected("coordination response is too large"));
-        }
-        if (300..400).contains(&status) {
-            return Err(Error::invalid(
-                "redirect",
-                "remote redirect refused; nothing was followed and nothing ran locally",
-            ));
-        }
-        let body = if bytes.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(&bytes)
-                .map_err(|_| Error::rejected("coordination response was not JSON"))?
-        };
-        Ok(Reply { status, body })
     }
 }
 

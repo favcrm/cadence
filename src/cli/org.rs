@@ -12,8 +12,10 @@
 //!   state dir + tracker already are, no cloud identity asserted.
 //! - `--org` beats `CADENCE_ORG` beats the saved `selected`; absent all
 //!   three the resolved org is `local`.
-//! - A managed caller (`CADENCE_ALIAS`) keeps its inherited binding:
-//!   `--org`/registry defaults are refused, never silently merged.
+//! - A managed caller (`CADENCE_ALIAS`) keeps its inherited local daemon
+//!   and never consults the registry. `--org` is accepted only when it
+//!   matches the hosted org on that alias's single running kickoff
+//!   binding; any other selector stays refused. `org switch` stays refused.
 //! - A `switch` mid-command cannot move it: each invocation resolves its
 //!   destination once at startup.
 //! - `Remote` rows persist the issuer-verified endpoint and org id but are
@@ -483,32 +485,129 @@ pub(super) enum Resolved {
     Remote(cadence_agent::remote_cli::RemoteTarget),
 }
 
-/// Resolve this invocation's destination once. `org` is `--org`; a
-/// managed caller keeps its ambient binding and never consults the
-/// registry. `state`/`tracker` are explicit pins — either wins over the
-/// registry and refuses `--org`. Returns [`Resolved`]; a local-org
-/// selection also exports `CADENCE_PM_DIR` so the tracker lands on the
-/// org's root. Never resolves the tracker for a managed, pinned or
-/// ambient caller — those never needed it (the CAD-313 `ui login`
-/// residual runs with no `HOME`).
+fn managed_org_refused() -> Error {
+    Error::rejected("managed callers cannot override their destination with --org")
+}
+
+fn pin_conflict() -> Error {
+    Error::rejected(
+        "--org conflicts with an explicit or inherited local instance binding; \
+         use a clean operator shell",
+    )
+}
+
+/// `action_dispatch` forwards inherited `CADENCE_PM_DIR` as `tracker`.
+/// That is the local daemon's tracker, not a second explicit pin. A
+/// different path still conflicts with `--org`.
+fn tracker_pin_conflicts(tracker: Option<&Path>) -> bool {
+    let Some(tracker) = tracker else {
+        return false;
+    };
+    match std::env::var_os("CADENCE_PM_DIR") {
+        Some(inherited) if Path::new(&inherited) == tracker => false,
+        _ => true,
+    }
+}
+
+/// The one executing message, or `None` when there is not exactly one
+/// `running` row with an id. Queued, terminal, and unresolved rows do
+/// not qualify; a second running row is ambiguous.
+fn single_running_message(show: &Value) -> Option<String> {
+    let messages = show.get("messages")?.as_array()?;
+    let mut found = None;
+    for message in messages {
+        if message.get("state").and_then(Value::as_str) != Some("running") {
+            continue;
+        }
+        let id = message.get("id").and_then(Value::as_str)?;
+        if found.is_some() {
+            return None;
+        }
+        found = Some(id.to_string());
+    }
+    found
+}
+
+fn hosted_assignment_target(
+    state_dir: &Path,
+    alias: &str,
+    selector: &str,
+) -> Result<cadence_agent::remote_cli::RemoteTarget> {
+    let show = cadence_agent::client::rpc(state_dir, "agent_show", json!({"alias": alias}))?;
+    let Some(message_id) = single_running_message(&show) else {
+        return Err(managed_org_refused());
+    };
+    let bound =
+        cadence_agent::local_assignment::reporting::hosted_binding_target(state_dir, &message_id)?;
+    let Some(bound) = bound else {
+        return Err(managed_org_refused());
+    };
+    if bound.org != selector {
+        return Err(managed_org_refused());
+    }
+    let target = cadence_agent::remote_cli::RemoteTarget {
+        org: bound.org,
+        endpoint: bound.endpoint,
+        org_id: bound.organization_id,
+    };
+    let dir = cadence_agent::remote_auth::auth_dir(None).map_err(|_| {
+        Error::rejected("remote credential directory is unavailable — set HOME or XDG_CONFIG_HOME")
+    })?;
+    let material = cadence_agent::remote_cli::cli_material(&dir, &target)?;
+    if !cadence_agent::remote_cli::login_names_member(&material, &bound.subject_id, &bound.issuer) {
+        return Err(Error::rejected(
+            "saved login does not match the member who claimed this assignment; nothing was sent",
+        ));
+    }
+    Ok(target)
+}
+
+fn resolve_managed(
+    org: Option<&str>,
+    state: Option<PathBuf>,
+    tracker: Option<PathBuf>,
+) -> Result<Resolved> {
+    let Some(selector) = org else {
+        return state
+            .map(Resolved::Local)
+            .map(Ok)
+            .unwrap_or_else(|| cadence_agent::client::state_dir().map(Resolved::Local));
+    };
+    if state.is_some() || tracker_pin_conflicts(tracker.as_deref()) {
+        return Err(pin_conflict());
+    }
+    let alias = std::env::var("CADENCE_ALIAS").map_err(|_| managed_org_refused())?;
+    if alias.is_empty() {
+        return Err(managed_org_refused());
+    }
+    let state_dir = cadence_agent::client::state_dir()?;
+    let target = hosted_assignment_target(&state_dir, &alias, selector)?;
+    eprintln!("cadence org={} remote={}", target.org, target.endpoint);
+    Ok(Resolved::Remote(target))
+}
+
+/// Resolve this invocation's destination once. `org` is `--org`. A
+/// managed caller keeps its inherited local daemon and never consults
+/// the registry. `--org` is accepted only when the live daemon reports
+/// exactly one running message whose kickoff binding names that org and
+/// whose original member and issuer still match the saved login;
+/// endpoint and organization id come from that binding. A binding with
+/// no member pin stays unavailable. An explicit
+/// `--state-dir`, or a tracker path other than the inherited
+/// `CADENCE_PM_DIR`, still conflicts. For every other caller,
+/// `state`/`tracker` are pins — either wins over the registry and
+/// refuses `--org`. Returns [`Resolved`]; a local-org selection also
+/// exports `CADENCE_PM_DIR` so the tracker lands on the org's root.
+/// Never resolves the tracker for a managed, pinned or ambient caller —
+/// those never needed it (the CAD-313 `ui login` residual runs with no
+/// `HOME`).
 pub(super) fn resolve(
     org: Option<&str>,
     state: Option<PathBuf>,
     tracker: Option<PathBuf>,
 ) -> Result<Resolved> {
-    // A managed caller's inherited binding always wins over a saved
-    // preference — it cannot be retargeted by a default the operator
-    // changed mid-run, and it never reads the registry at all.
     if std::env::var_os("CADENCE_ALIAS").is_some() {
-        if org.is_some() {
-            return Err(Error::rejected(
-                "managed callers cannot override their destination with --org",
-            ));
-        }
-        return state
-            .map(Resolved::Local)
-            .map(Ok)
-            .unwrap_or_else(|| cadence_agent::client::state_dir().map(Resolved::Local));
+        return resolve_managed(org, state, tracker);
     }
     // An explicit flag or inherited binding is a pin; it conflicts with
     // `--org` rather than mixing roots.
@@ -524,10 +623,7 @@ pub(super) fn resolve(
         .any(|name| std::env::var_os(name).is_some());
     if pinned {
         if org.is_some() {
-            return Err(Error::rejected(
-                "--org conflicts with an explicit or inherited local instance binding; \
-                 use a clean operator shell",
-            ));
+            return Err(pin_conflict());
         }
         return state
             .map(Resolved::Local)
@@ -591,7 +687,8 @@ fn local_resolved(org: &str, state_dir: PathBuf, tracker_dir: PathBuf) -> Result
 
 /// CAD-1355: `cadence update` is local maintenance — a *saved* remote
 /// default must never route it. This resolves only for the updater:
-/// managed callers and pins behave exactly as [`resolve`], explicit
+/// a managed caller keeps the pre-assignment rule (no `--org`, inherited
+/// local state, no registry), pins behave exactly as [`resolve`], explicit
 /// `--org`/`CADENCE_ORG` selectors stay deliberate (a remote one refuses
 /// with local-only guidance before any transport, credential read or
 /// container wake; a local one keeps the normal local routing), and a
@@ -599,15 +696,24 @@ fn local_resolved(org: &str, state_dir: PathBuf, tracker_dir: PathBuf) -> Result
 /// binds the canonical `local` connection when one exists, else the
 /// ambient state dir. The registry is only ever read here: no row is
 /// created, selected or switched to make updating work, and the tracker
-/// pin precedence is unchanged.
+/// pin precedence is unchanged. A live hosted assignment does not route
+/// `update`.
 pub(super) fn resolve_update(
     org: Option<&str>,
     state: Option<PathBuf>,
     tracker: Option<PathBuf>,
 ) -> Result<Resolved> {
-    // Keep existing managed bindings and pin-conflict rules in one place.
-    if std::env::var_os("CADENCE_ALIAS").is_some()
-        || state.is_some()
+    // Local maintenance never follows a hosted assignment selector.
+    if std::env::var_os("CADENCE_ALIAS").is_some() {
+        if org.is_some() {
+            return Err(managed_org_refused());
+        }
+        return state
+            .map(Resolved::Local)
+            .map(Ok)
+            .unwrap_or_else(|| cadence_agent::client::state_dir().map(Resolved::Local));
+    }
+    if state.is_some()
         || tracker.is_some()
         || [
             "CADENCE_STATE_DIR",
@@ -721,6 +827,7 @@ mod tests {
                 "CADENCE_PM_DIR",
                 "CADENCE_HOME",
                 "CADENCE_PROFILE",
+                "CADENCE_SOCKET",
             ]
             .into_iter()
             .map(|name| {
@@ -928,5 +1035,276 @@ mod tests {
         .is_err());
         assert!(registry.connections.is_empty());
         assert!(registry.selected.is_none());
+    }
+
+    fn hosted_message(id: &str, state: &str) -> Value {
+        json!({"id": id, "alias": "worker-1", "state": state})
+    }
+
+    fn managed_state(env: &EnvGuard) -> PathBuf {
+        let dir = env.home.path().join("daemon-state");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("CADENCE_STATE_DIR", &dir);
+        std::env::set_var("CADENCE_ALIAS", "worker-1");
+        dir
+    }
+
+    fn write_login(env: &EnvGuard, subject: &str, issuer: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = env.home.path().join("config/cadence/remote-auth");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.join("cli-acme.json");
+        let body = json!({
+            "version": "hosted-cadence-auth.v1",
+            "organization_id": "ws_binding",
+            "organization_slug": "acme",
+            "audience": EP_A,
+            "issuer": issuer,
+            "subject_id": subject,
+            "capabilities": ["cli.read", "cli.write"],
+            "access_token": format!("hct_{}", "a".repeat(43)),
+            "expires_at": 4_000_000_000u64,
+        });
+        std::fs::write(&path, serde_json::to_vec(&body).unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    fn bind_hosted(dir: &Path, message: &str) {
+        let kickoff = cadence_agent::local_assignment::Kickoff {
+            alias: "worker-1",
+            issue_id: "CAD-1460",
+            assignment_id: "hla_00000000000000000000000000000001",
+            worktree: "/tmp/not-a-checkout",
+            message_id: message,
+            claim_id: "hlc_00000000000000000000000000000001",
+            generation: 4,
+            organization_id: "ws_binding",
+            audience: EP_A,
+            subject_id: Some("user_claimant"),
+            issuer: Some("https://issuer.example/original"),
+        };
+        cadence_agent::local_assignment::reporting::store_kickoff_binding(
+            dir,
+            "acme",
+            EP_A,
+            &kickoff,
+            "hosted kickoff",
+        )
+        .unwrap();
+    }
+
+    fn settle_hosted(dir: &Path, message: &str) {
+        let path = dir
+            .join("hosted-assignments")
+            .join(format!("{message}.bind"));
+        let mut value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value["settled"] = json!(true);
+        std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    }
+
+    fn serve_show(dir: &Path, messages: Value, wait_ms: i32) -> std::thread::JoinHandle<()> {
+        use std::io::{BufRead, Write};
+        use std::os::unix::io::AsRawFd;
+        use std::os::unix::net::UnixListener;
+        let socket = dir.join("cadence.sock");
+        let _ = std::fs::remove_file(&socket);
+        let listener = UnixListener::bind(&socket).unwrap();
+        std::thread::spawn(move || {
+            let fd = listener.as_raw_fd();
+            let mut pollfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            if unsafe { libc::poll(&mut pollfd, 1, wait_ms) } <= 0 {
+                return;
+            }
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut request = String::new();
+            let _ = std::io::BufReader::new(stream.try_clone().unwrap()).read_line(&mut request);
+            let accepted = serde_json::from_str::<Value>(&request)
+                .ok()
+                .is_some_and(|frame| {
+                    frame["method"] == "agent_show" && frame["params"]["alias"] == "worker-1"
+                });
+            let reply = if accepted {
+                cadence_agent::proto::ok(json!({
+                    "agent": {"alias": "worker-1"},
+                    "messages": messages,
+                }))
+            } else {
+                json!({"ok": false, "error": {"kind": "rejected", "message": "unexpected agent_show"}})
+            };
+            let _ = writeln!(stream, "{reply}");
+        })
+    }
+
+    fn assert_refused(dir: &Path, messages: Value, org: &str) {
+        let server = serve_show(dir, messages, 3_000);
+        let err = resolve(Some(org), None, None).unwrap_err();
+        server.join().unwrap();
+        let _ = std::fs::remove_file(dir.join("cadence.sock"));
+        assert_eq!(err.kind(), "rejected", "{err}");
+        let text = err.to_string();
+        assert!(!text.to_ascii_lowercase().contains("unset"), "{text}");
+        assert!(!text.contains("unexpected"), "{text}");
+        assert!(!text.contains("Daemon is not reachable"), "{text}");
+    }
+
+    #[test]
+    fn managed_running_binding_uses_that_hosted_org() {
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        let dir = managed_state(&env);
+        std::env::set_var("CADENCE_ORG", "other");
+        std::env::set_var("CADENCE_PM_DIR", "/inherited/pm");
+        env.write_registry(&remote_registry("acme", EP_B, "ws_registry", true));
+        write_login(&env, "user_claimant", "https://issuer.example/original");
+        bind_hosted(&dir, "msg-live");
+        let server = serve_show(
+            &dir,
+            json!([
+                hosted_message("msg-old", "completed"),
+                hosted_message("msg-wait", "queued"),
+                hosted_message("msg-live", "running"),
+            ]),
+            3_000,
+        );
+        let resolved = resolve(Some("acme"), None, Some(PathBuf::from("/inherited/pm"))).unwrap();
+        server.join().unwrap();
+        let _ = std::fs::remove_file(dir.join("cadence.sock"));
+        match resolved {
+            Resolved::Remote(target) => {
+                assert_eq!(target.org, "acme");
+                assert_eq!(target.endpoint, EP_A);
+                assert_eq!(target.org_id, "ws_binding");
+            }
+            Resolved::Local(path) => panic!("live binding resolved local {path:?}"),
+        }
+        match resolve(None, None, Some(PathBuf::from("/inherited/pm"))).unwrap() {
+            Resolved::Local(path) => assert_eq!(path, dir),
+            Resolved::Remote(target) => panic!("omitted --org resolved {}", target.endpoint),
+        }
+    }
+
+    #[test]
+    fn managed_wrong_unbound_ended_and_ambiguous_selectors_are_refused() {
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        let dir = managed_state(&env);
+        env.write_registry(&remote_registry("other", EP_B, "ws_other", true));
+        bind_hosted(&dir, "msg-live");
+        bind_hosted(&dir, "msg-done");
+        assert_refused(
+            &dir,
+            json!([hosted_message("msg-live", "running")]),
+            "other",
+        );
+        assert_refused(
+            &dir,
+            json!([
+                hosted_message("msg-gap", "running"),
+                hosted_message("msg-done", "completed"),
+            ]),
+            "acme",
+        );
+        assert_refused(
+            &dir,
+            json!([hosted_message("msg-done", "completed")]),
+            "acme",
+        );
+        assert_refused(&dir, json!([hosted_message("msg-live", "queued")]), "acme");
+        assert_refused(&dir, json!([hosted_message("msg-live", "unknown")]), "acme");
+        assert_refused(
+            &dir,
+            json!([
+                hosted_message("msg-live", "running"),
+                hosted_message("msg-other", "running"),
+            ]),
+            "acme",
+        );
+        assert_refused(&dir, json!([]), "acme");
+        settle_hosted(&dir, "msg-live");
+        assert_refused(&dir, json!([hosted_message("msg-live", "running")]), "acme");
+    }
+
+    #[test]
+    fn managed_explicit_state_and_foreign_tracker_still_conflict() {
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        let dir = managed_state(&env);
+        bind_hosted(&dir, "msg-live");
+        let err = resolve(Some("acme"), Some(dir.clone()), None).unwrap_err();
+        assert!(err.to_string().contains("conflicts"), "{err}");
+        std::env::set_var("CADENCE_PM_DIR", "/inherited/pm");
+        let err = resolve(Some("acme"), None, Some(PathBuf::from("/other/pm"))).unwrap_err();
+        assert!(err.to_string().contains("conflicts"), "{err}");
+    }
+
+    #[test]
+    fn managed_update_does_not_follow_the_live_hosted_org() {
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        let dir = managed_state(&env);
+        bind_hosted(&dir, "msg-live");
+        write_login(&env, "user_claimant", "https://issuer.example/original");
+        let err = resolve_update(Some("acme"), None, None).unwrap_err();
+        assert_eq!(err.kind(), "rejected", "{err}");
+        let server = serve_show(&dir, json!([hosted_message("msg-live", "running")]), 3_000);
+        let resolved = resolve(Some("acme"), None, None).unwrap();
+        server.join().unwrap();
+        assert!(
+            matches!(resolved, Resolved::Remote(target) if target.org == "acme"
+            && target.endpoint == EP_A
+            && target.org_id == "ws_binding")
+        );
+    }
+
+    #[test]
+    fn managed_caller_still_cannot_switch_org() {
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        env.write_registry(&remote_registry("acme", EP_A, "ws_alpha", false));
+        std::env::set_var("CADENCE_ALIAS", "worker-1");
+        let err = run(OrgAction::Switch {
+            name: "acme".into(),
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), "rejected", "{err}");
+        let registry: Value =
+            serde_json::from_slice(&std::fs::read(env.registry_path()).unwrap()).unwrap();
+        assert!(registry["selected"].is_null());
+    }
+
+    #[test]
+    fn managed_binding_without_member_or_another_login_cannot_retarget() {
+        let _lock = RESOLVE_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let env = EnvGuard::bare();
+        let dir = managed_state(&env);
+        bind_hosted(&dir, "msg-live");
+        let path = dir.join("hosted-assignments/msg-live.bind");
+        let mut value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value.as_object_mut().unwrap().remove("subject_id");
+        value.as_object_mut().unwrap().remove("issuer");
+        std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        write_login(&env, "user_claimant", "https://issuer.example/original");
+        assert_refused(&dir, json!([hosted_message("msg-live", "running")]), "acme");
+        let mut value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value["subject_id"] = json!("user_claimant");
+        value["issuer"] = json!("https://issuer.example/original");
+        std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        write_login(&env, "user_other", "https://issuer.example/later");
+        let server = serve_show(&dir, json!([hosted_message("msg-live", "running")]), 3_000);
+        let err = resolve(Some("acme"), None, None).unwrap_err();
+        server.join().unwrap();
+        assert_eq!(err.kind(), "rejected", "{err}");
+        assert!(err.to_string().contains("member who claimed"), "{err}");
+        assert!(
+            !err.to_string().to_ascii_lowercase().contains("unset"),
+            "{err}"
+        );
     }
 }
