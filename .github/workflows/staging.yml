@@ -304,6 +304,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     environment: production
+    # CAD-1455: id-token/attestations are needed to sign the promoted
+    # receipt offline-verifiably; contents stay read-only.
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -327,10 +334,75 @@ jobs:
           jq --argjson run "$GITHUB_RUN_ID" --argjson attempt "$GITHUB_RUN_ATTEMPT" \
             '. + {promotion_run_id: $run, promotion_run_attempt: $attempt}' "$RUNNER_TEMP/approved/candidate.json" > "$RUNNER_TEMP/production-candidate.json"
           cat "$RUNNER_TEMP/production-candidate.json" >> "$GITHUB_STEP_SUMMARY"
+      # CAD-1455: the promoted receipt is signed by staging.yml's own
+      # provenance so an offline consumer can prove the approved
+      # promotion without the GitHub API. The subject is the exact
+      # receipt bytes; the signer's own commit (this run's head) is
+      # recorded in the certificate, deliberately NOT pinned to the
+      # promoted source_sha — they legitimately differ.
+      - name: Attest the promoted receipt
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/production-candidate.json
+      # CAD-1455: retain the immutable evidence a consumer verifies
+      # offline: the exact receipt bytes, their staging.yml attestation
+      # bundle, the binary's ci.yml build-provenance bundle and the
+      # Sigstore/GitHub trusted root the verifier needs.
+      - name: Retain the offline promotion evidence package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          pkg="$RUNNER_TEMP/retained"
+          mkdir -p "$pkg"
+          cp "$RUNNER_TEMP/production-candidate.json" "$pkg/production-candidate.json"
+          # The promotion bundle covers the receipt's exact bytes; the
+          # build bundle covers the binary's. Digest-derived names are
+          # renamed to the fixed package names consumers expect.
+          (cd "$RUNNER_TEMP" && gh attestation download production-candidate.json \
+            --repo "$REPO" --digest-alg sha256)
+          mv "$RUNNER_TEMP"/sha256-*.jsonl "$pkg/promotion-attestation.jsonl"
+          cp "$RUNNER_TEMP/approved/cadence" "$pkg/cadence"
+          cp "$RUNNER_TEMP/approved/cadence.sha256" "$pkg/cadence.sha256"
+          cp "$RUNNER_TEMP/approved/manifest.json" "$pkg/manifest.json"
+          (cd "$pkg" && gh attestation download cadence \
+            --repo "$REPO" --digest-alg sha256)
+          mv "$pkg"/sha256-*.jsonl "$pkg/build-attestation.jsonl"
+          gh attestation trusted-root > "$pkg/trusted_root.jsonl"
+          ls -l "$pkg"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: production-candidate
           path: ${{ runner.temp }}/production-candidate.json
+          if-no-files-found: error
+          retention-days: 90
+          overwrite: true
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: production-evidence-${{ needs.stage.outputs.source_sha }}
+          path: |
+            ${{ runner.temp }}/retained/production-candidate.json
+            ${{ runner.temp }}/retained/promotion-attestation.jsonl
+            ${{ runner.temp }}/retained/build-attestation.jsonl
+            ${{ runner.temp }}/retained/trusted_root.jsonl
+            ${{ runner.temp }}/retained/cadence
+            ${{ runner.temp }}/retained/cadence.sha256
+            ${{ runner.temp }}/retained/manifest.json
+          if-no-files-found: error
+          retention-days: 90
+          overwrite: true
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: production-evidence-${{ needs.stage.outputs.source_sha }}
+          path: |
+            ${{ runner.temp }}/retained/production-candidate.json
+            ${{ runner.temp }}/retained/promotion-attestation.jsonl
+            ${{ runner.temp }}/retained/build-attestation.jsonl
+            ${{ runner.temp }}/retained/trusted_root.jsonl
+            ${{ runner.temp }}/retained/cadence
+            ${{ runner.temp }}/retained/cadence.sha256
+            ${{ runner.temp }}/retained/manifest.json
           if-no-files-found: error
           retention-days: 90
           overwrite: true

@@ -42,6 +42,16 @@
 //!
 //! Restarting the daemon is never automatic. GitHub access sits behind
 //! [`ReleaseSource`] so tests run against a fake and never call GitHub.
+//!
+//! CAD-1455: the staging promotion also emits a *retained* evidence package —
+//! the exact `production-candidate.json` bytes it attested with
+//! `staging.yml`, the binary's `ci.yml` build-provenance bundle and the
+//! Sigstore trusted root — so a consumer can prove the same promotion
+//! entirely offline (`gh attestation verify --bundle`, no `gh api`, no
+//! `gh run download`, no login). [`Gh::verify_retained`] is that offline
+//! proof. It never replaces the online path's guards and grants no
+//! execution authority by itself: a build signature alone is not a
+//! production approval, and unsigned metadata never is either.
 
 use std::cell::RefCell;
 use std::fs;
@@ -91,6 +101,26 @@ pub fn is_full_sha(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+/// Files of a retained evidence package (CAD-1455), next to [`BINARY`],
+/// [`SHA_FILE`] and [`MANIFEST`]: the exact promoted receipt bytes,
+/// their `staging.yml` attestation bundle, the binary's `ci.yml`
+/// build-provenance bundle and the Sigstore/GitHub trusted root the
+/// offline verifier needs.
+pub const RECEIPT_FILE: &str = "production-candidate.json";
+pub const PROMOTION_BUNDLE: &str = "promotion-attestation.jsonl";
+pub const BUILD_BUNDLE: &str = "build-attestation.jsonl";
+pub const TRUSTED_ROOT: &str = "trusted_root.jsonl";
+
+/// Bounds on the files a retained package is allowed to hold: a receipt
+/// is a few hundred bytes, a Sigstore bundle a few hundred KB at most,
+/// the combined trusted root a few MB. Anything larger is refused
+/// unread rather than streamed into memory.
+const RECEIPT_MAX: u64 = 64 * 1024;
+const BUNDLE_MAX: u64 = 32 * 1024 * 1024;
+const ROOT_MAX: u64 = 16 * 1024 * 1024;
+const SHA_FILE_MAX: u64 = 4096;
+const MANIFEST_MAX: u64 = 64 * 1024;
+
 /// The restart command printed when `--restart` was not given.
 pub fn restart_command(as_identity: Option<&str>) -> String {
     let mut cmd = format!("cadence {}", RESTART_ARGS.join(" "));
@@ -126,18 +156,47 @@ pub struct ProductionCandidate {
     pub promotion_run_attempt: u64,
 }
 
+/// A lowercase 64-hex sha256.
+fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+/// The receipt's own closed shape: every field the producer writes,
+/// well formed and nonzero. Who approved what is proven separately
+/// (online by the promotion run, offline by the receipt's attested
+/// bytes) — this only says the JSON is a candidate.
+fn candidate_fields(candidate: &ProductionCandidate) -> bool {
+    candidate.schema == 1
+        && is_full_sha(&candidate.source_sha)
+        && candidate.ci_run_id != 0
+        && candidate.ci_run_attempt != 0
+        && is_sha256_hex(&candidate.sha256)
+        && candidate.promotion_run_id != 0
+        && candidate.promotion_run_attempt != 0
+}
+
+/// CAD-1455: parse a retained `production-candidate.json` on its own
+/// merits — the closed schema and field bounds, without the live
+/// promotion-run cross-check [`parse_production_candidate`] adds.
+/// Offline the attested receipt bytes, not a fresh API answer, carry
+/// the promotion proof.
+fn parse_retained_candidate(text: &str) -> Result<ProductionCandidate> {
+    let candidate: ProductionCandidate = serde_json::from_str(text)
+        .map_err(|e| Error::rejected(format!("invalid production candidate receipt: {e}")))?;
+    if !candidate_fields(&candidate) {
+        return Err(Error::rejected(
+            "production candidate receipt fails its own schema",
+        ));
+    }
+    Ok(candidate)
+}
+
 pub fn parse_production_candidate(text: &str, promotion: &Run) -> Result<ProductionCandidate> {
     let candidate: ProductionCandidate = serde_json::from_str(text)
         .map_err(|e| Error::rejected(format!("invalid production candidate receipt: {e}")))?;
-    if candidate.schema != 1
-        || !is_full_sha(&candidate.source_sha)
-        || candidate.ci_run_id == 0
-        || candidate.ci_run_attempt == 0
-        || candidate.sha256.len() != 64
-        || !candidate
-            .sha256
-            .bytes()
-            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    if !candidate_fields(&candidate)
         || candidate.promotion_run_id != promotion.id
         || candidate.promotion_run_attempt != promotion.attempt
         || promotion.event != "workflow_dispatch"
@@ -208,6 +267,20 @@ pub trait ReleaseSource {
     /// [`Self::repo`], built from `sha` on `main`. Returns a short
     /// description of what was verified.
     fn verify_attestation(&self, binary: &Path, sha: &str) -> Result<String>;
+    /// CAD-1455: prove a retained evidence package offline. `dir` holds
+    /// [`BINARY`], [`SHA_FILE`], [`MANIFEST`], [`RECEIPT_FILE`],
+    /// [`PROMOTION_BUNDLE`], [`BUILD_BUNDLE`] and [`TRUSTED_ROOT`]; the
+    /// verification must not contact GitHub and must bind the receipt's
+    /// exact bytes and the binary's exact bytes to the recorded
+    /// `source_sha`. Sources that cannot prove that (including this
+    /// online `gh` path, which keeps its live-API proof) refuse.
+    fn verify_retained(&self, dir: &Path) -> Result<String> {
+        let _ = dir;
+        Err(Error::rejected(
+            "this release source cannot verify a retained offline package; \
+             the online GitHub path proves promotion live",
+        ))
+    }
     /// CAD-561: the PR titles merged between `base` and `head` — what
     /// `cadence update --check` shows as the change summary. A squash
     /// merge's subject is the PR title with its number, which is what
@@ -629,6 +702,383 @@ pub fn parse_schema_version(source: &str) -> Option<i64> {
             .strip_prefix("pub const SCHEMA_VERSION: i64 = ")?;
         rest.trim().trim_end_matches(';').trim().parse().ok()
     })
+}
+
+// ---------------------------------------------------------------------------
+// retained offline evidence (CAD-1455)
+// ---------------------------------------------------------------------------
+
+/// The certificate SAN an in-repo GitHub Actions signer gets:
+/// `https://github.com/<owner>/<repo>/.github/workflows/<workflow>@refs/heads/<ref>`.
+/// It is exact (`--cert-identity`, no regex), which is stricter than the
+/// historical prefix `--signer-workflow` matching.
+fn cert_identity(repo: &str, workflow: &str, source_ref: &str) -> String {
+    format!("https://github.com/{repo}/.github/workflows/{workflow}@{source_ref}")
+}
+
+/// Read `path` only when it is a regular file no larger than `max`;
+/// anything else (a directory, a symlink chain resolved to a directory,
+/// a bigger file) is refused before its bytes are trusted. Bounds the
+/// inputs an offline package can feed the verifier.
+fn read_bounded(path: &Path, max: u64, what: &str) -> Result<Vec<u8>> {
+    let meta = fs::metadata(path).map_err(|e| {
+        Error::rejected(format!(
+            "retained package is missing {what} ({}): {e}",
+            path.display()
+        ))
+    })?;
+    if !meta.is_file() {
+        return Err(Error::rejected(format!(
+            "{} ({what}) is not a regular file — refusing the retained package",
+            path.display()
+        )));
+    }
+    if meta.len() == 0 || meta.len() > max {
+        return Err(Error::rejected(format!(
+            "{} ({what}) is {} bytes, outside the allowed 1..={max} — refusing \
+             the retained package",
+            path.display(),
+            meta.len()
+        )));
+    }
+    Ok(fs::read(path)?)
+}
+
+/// A [`ReleaseSource`] that proves a retained evidence package without
+/// GitHub. Its [`ReleaseSource::verify_retained`] is the offline proof;
+/// every online query the trait also names (compare, run lists,
+/// downloads) stays unimplemented — a retained package carries no live
+/// answers, and this source never invents them. Consumers combine this
+/// with the existing on-main/ancestry/lease/operator guards; it is a
+/// verifier, not a full transport, until the catalogue contract lands.
+pub struct OfflineGh {
+    pub program: PathBuf,
+    pub repo: String,
+}
+
+impl OfflineGh {
+    pub fn new(repo: &str) -> Self {
+        Self {
+            program: PathBuf::from("gh"),
+            repo: repo.to_string(),
+        }
+    }
+
+    /// `gh attestation verify <subject> --bundle <bundle> --custom-trusted-root
+    /// <root>` under the pinned policy. The bundle makes the verification
+    /// local; the trusted root replaces the online root lookup, so no
+    /// `gh api`, `gh run download` or login happens. Returns
+    /// [`BundleFacts`] read back out of the verified result so the caller
+    /// pins and reports real certificate facts, never caller metadata.
+    ///
+    /// `expect_signer_sha`, when `Some`, is passed to `--signer-digest`:
+    /// the commit the signer *workflow* ran at. It is `None` on the
+    /// promotion pass (staging.yml may sign at a different main commit
+    /// than the promoted binary's `source_sha`); the certificate's
+    /// reported signer SHA is then the authoritative record.
+    /// `source_digest`, when `Some`, pins `--source-digest` — the commit
+    /// the attestation claims as its source.
+    ///
+    /// Subject binding is double-checked: `gh` proves the signature
+    /// covers the subject's bytes, and [`check_subjects`] re-reads the
+    /// statement's recorded subject name and digest so a bundle minted
+    /// for a different artifact is never accepted.
+    #[allow(clippy::too_many_arguments)]
+    fn verify_bundle(
+        &self,
+        subject: &Path,
+        bundle: &Path,
+        root: &Path,
+        workflow: &str,
+        source_ref: &str,
+        source_digest: Option<&str>,
+        expect_signer_sha: Option<&str>,
+        expect_subject: &str,
+        expect_digest: &str,
+        what: &str,
+    ) -> Result<BundleFacts> {
+        let subject = subject.to_string_lossy();
+        let bundle = bundle.to_string_lossy();
+        let root = root.to_string_lossy();
+        let identity = cert_identity(&self.repo, workflow, source_ref);
+        let mut args = vec![
+            "attestation",
+            "verify",
+            &subject,
+            "--bundle",
+            &bundle,
+            "--custom-trusted-root",
+            &root,
+            "--repo",
+            &self.repo,
+            "--cert-identity",
+            &identity,
+            "--signer-repo",
+            &self.repo,
+            "--deny-self-hosted-runners",
+            "--format",
+            "json",
+        ];
+        if let Some(sha) = expect_signer_sha {
+            args.extend(["--signer-digest", sha]);
+        }
+        if let Some(sha) = source_digest {
+            args.extend(["--source-digest", sha]);
+        }
+        let mut cmd = Command::new(&self.program);
+        cmd.args(&args).env("GH_PROMPT_DISABLED", "1");
+        let out = crate::proc::run_bounded(&mut cmd, GH_TIMEOUT).map_err(|e| match e {
+            crate::proc::BoundedError::Spawn(err) if err.kind() == ErrorKind::NotFound => {
+                Error::rejected(
+                    "gh (GitHub CLI) is not on PATH — the offline bundle verifier needs it",
+                )
+            }
+            other => Error::internal(format!("gh attestation verify: {other}")),
+        })?;
+        if !out.status.success() {
+            return Err(Error::rejected(format!(
+                "{what} attestation did not verify offline for {} — refusing: {}",
+                self.repo,
+                tail(&out.stderr)
+            )));
+        }
+        check_subjects(&out.stdout, expect_subject, expect_digest)
+            .map_err(|e| Error::rejected(format!("{what} {e}")))
+    }
+}
+
+/// The authenticated facts an offline verification reports back: the
+/// signer workflow's commit (certificate source-repository digest) and
+/// the subject digest the statement was verified over. Both come from
+/// `gh`'s `--format json` `verificationResult`, never from the caller.
+pub struct BundleFacts {
+    pub signer_sha: String,
+    pub subject_digest: String,
+}
+
+/// Read `gh attestation verify --format json` output: a list of verified
+/// entries, each carrying `verificationResult.statement.subject` (the
+/// attested artifacts) and `verificationResult.signature.certificate`
+/// (the signer identity, populated from the OIDC token — not forgeable
+/// by the workflow). Every subject entry must name `expect_subject`
+/// with digest `expect_digest`, and all certificates must agree on one
+/// signer SHA. Returns [`BundleFacts`] for the caller's report.
+fn check_subjects(out: &[u8], expect_subject: &str, expect_digest: &str) -> Result<BundleFacts> {
+    let value: Value = serde_json::from_slice(out)
+        .map_err(|e| Error::internal(format!("unreadable attestation verification output: {e}")))?;
+    let entries = value
+        .as_array()
+        .ok_or_else(|| Error::rejected("attestation verification returned no attestation list"))?;
+    if entries.is_empty() {
+        return Err(Error::rejected(
+            "attestation verification accepted no bundle entry — refusing",
+        ));
+    }
+    let mut signer: Option<String> = None;
+    for entry in entries {
+        let result = &entry["verificationResult"];
+        let subjects = result["statement"]["subject"]
+            .as_array()
+            .ok_or_else(|| Error::rejected("attestation statement carries no subject list"))?;
+        for subject in subjects {
+            let name = subject["name"].as_str().unwrap_or_default();
+            let digest = subject["digest"]["sha256"].as_str().unwrap_or_default();
+            if name != expect_subject || digest != expect_digest {
+                return Err(Error::rejected(format!(
+                    "attestation subject {name} sha256 {digest} is not the expected \
+                     {expect_subject} sha256 {expect_digest} — refusing"
+                )));
+            }
+        }
+        let cert = &result["signature"]["certificate"];
+        let sha = cert["sourceRepositoryDigest"]
+            .as_str()
+            .filter(|s| is_full_sha(s))
+            .ok_or_else(|| {
+                Error::rejected(
+                    "attestation certificate reports no full signer source-repository digest",
+                )
+            })?;
+        match &signer {
+            Some(previous) if previous != sha => {
+                return Err(Error::rejected(
+                    "attestation entries disagree on the signer commit — refusing",
+                ));
+            }
+            _ => signer = Some(sha.to_string()),
+        }
+    }
+    Ok(BundleFacts {
+        signer_sha: signer.expect("nonempty entries"),
+        subject_digest: expect_digest.to_string(),
+    })
+}
+
+impl ReleaseSource for OfflineGh {
+    fn repo(&self) -> &str {
+        &self.repo
+    }
+
+    fn check_auth(&self) -> Result<()> {
+        // Offline verification needs no GitHub login; `gh attestation
+        // verify --bundle` runs unauthenticated.
+        Ok(())
+    }
+
+    fn latest_green_main(&self) -> Result<Option<Run>> {
+        Err(Error::rejected(
+            "a retained package carries no live promotion view; offline selection \
+             goes through the published catalogue (not yet wired)",
+        ))
+    }
+
+    fn on_main(&self, _sha: &str) -> Result<OnMain> {
+        Err(Error::rejected(OFFLINE_NO_LIVE))
+    }
+
+    fn compare(&self, _base: &str, _head: &str) -> Result<Option<String>> {
+        Err(Error::rejected(OFFLINE_NO_LIVE))
+    }
+
+    fn main_runs(&self, _sha: &str) -> Result<Vec<Run>> {
+        Err(Error::rejected(OFFLINE_NO_LIVE))
+    }
+
+    fn merge_group_runs(&self, _sha: &str) -> Result<Vec<Run>> {
+        Err(Error::rejected(OFFLINE_NO_LIVE))
+    }
+
+    fn jobs(&self, _run_id: u64) -> Result<Vec<Job>> {
+        Err(Error::rejected(OFFLINE_NO_LIVE))
+    }
+
+    fn artifact(&self, _run_id: u64, _name: &str) -> Result<ArtifactState> {
+        Err(Error::rejected(OFFLINE_NO_LIVE))
+    }
+
+    fn download(&self, _run_id: u64, _name: &str, _dest: &Path) -> Result<()> {
+        Err(Error::rejected(OFFLINE_NO_LIVE))
+    }
+
+    fn verify_attestation(&self, _binary: &Path, _sha: &str) -> Result<String> {
+        Err(Error::rejected(OFFLINE_NO_LIVE))
+    }
+
+    fn merged_titles(&self, _base: &str, _head: &str) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    fn schema_version(&self, _sha: &str) -> Result<Option<i64>> {
+        Ok(None)
+    }
+
+    /// Prove a retained package's bytes offline, in order:
+    ///
+    /// 1. every package entry is a bounded regular file;
+    /// 2. the receipt parses as the closed [`ProductionCandidate`] and
+    ///    its `sha256` names the package binary's bytes;
+    /// 3. a first promotion pass verifies the `staging.yml` bundle over
+    ///    the receipt's exact bytes and reads the signer commit out of
+    ///    the certificate; staging.yml may run at a different main SHA
+    ///    than the promoted `source_sha`, so `--source-digest` is not
+    ///    pinned here;
+    /// 4. the binary's `cadence.sha256` and `manifest.json` agree with
+    ///    the receipt's `sha256`/`source_sha` (the existing artifact
+    ///    checks, unchanged);
+    /// 5. the build bundle, produced by `ci.yml` at `refs/heads/main`
+    ///    on `source_sha` as both source and signer digest, attests the
+    ///    binary's exact bytes — the build-provenance proof.
+    ///
+    /// Only then is the binary verified to the CI build *and* to an
+    /// approved production candidate. A build signature alone, or a
+    /// valid signature over tampered/unsigned receipt metadata, refuses.
+    /// The verified `source_sha` is reported for the caller's own
+    /// ancestry/no-backward and manifest checks; install/execute still
+    /// sits behind every existing guard.
+    fn verify_retained(&self, dir: &Path) -> Result<String> {
+        let binary = dir.join(BINARY);
+        let receipt_path = dir.join(RECEIPT_FILE);
+        let receipt_bytes = read_bounded(&receipt_path, RECEIPT_MAX, RECEIPT_FILE)?;
+        let receipt_sha = sha256_bytes(&receipt_bytes);
+        let candidate = parse_retained_candidate(&String::from_utf8_lossy(&receipt_bytes))?;
+        let digest = sha256_file(&binary)?;
+        if candidate.sha256 != digest {
+            return Err(Error::rejected(format!(
+                "retained receipt binds sha256 {} but the package binary hashes to {digest} — \
+                 refusing; the package does not hold the promoted bytes",
+                candidate.sha256
+            )));
+        }
+        let root = dir.join(TRUSTED_ROOT);
+        read_bounded(&root, ROOT_MAX, TRUSTED_ROOT)?;
+        let promotion_bundle = dir.join(PROMOTION_BUNDLE);
+        read_bounded(&promotion_bundle, BUNDLE_MAX, PROMOTION_BUNDLE)?;
+        let main_ref = format!("refs/heads/{MAIN}");
+        // Pass one: crypto + exact staging.yml/main cert identity. The
+        // signer commit is unknown until the certificate answers it.
+        let promotion = self.verify_bundle(
+            &receipt_path,
+            &promotion_bundle,
+            &root,
+            STAGING_WORKFLOW,
+            &main_ref,
+            None,
+            None,
+            RECEIPT_FILE,
+            &receipt_sha,
+            "promotion",
+        )?;
+        // Pass two: re-pin that commit as --signer-digest so a bundle
+        // whose certificate drifted between passes cannot slide through.
+        let promotion = self.verify_bundle(
+            &receipt_path,
+            &promotion_bundle,
+            &root,
+            STAGING_WORKFLOW,
+            &main_ref,
+            None,
+            Some(&promotion.signer_sha),
+            RECEIPT_FILE,
+            &receipt_sha,
+            "promotion",
+        )?;
+        let build_bundle = dir.join(BUILD_BUNDLE);
+        read_bounded(&build_bundle, BUNDLE_MAX, BUILD_BUNDLE)?;
+        let build = self.verify_bundle(
+            &binary,
+            &build_bundle,
+            &root,
+            WORKFLOW,
+            &main_ref,
+            Some(&candidate.source_sha),
+            Some(&candidate.source_sha),
+            BINARY,
+            &candidate.sha256,
+            "build",
+        )?;
+        let recorded = check_sha256(&binary, &dir.join(SHA_FILE))?;
+        if recorded != candidate.sha256 {
+            return Err(Error::rejected(format!(
+                "{SHA_FILE} records {recorded}, the attested receipt binds {} — refusing",
+                candidate.sha256
+            )));
+        }
+        check_manifest(&dir.join(MANIFEST), &candidate.source_sha, &recorded)?;
+        Ok(format!(
+            "retained package verified offline: promotion (staging.yml signer {}, \
+             receipt sha256 {receipt_sha}) + build (ci.yml signer {}, subject sha256 {}) \
+             — source_sha {}",
+            promotion.signer_sha, build.signer_sha, build.subject_digest, candidate.source_sha
+        ))
+    }
+}
+
+const OFFLINE_NO_LIVE: &str =
+    "a retained offline source answers no live GitHub queries — refusing; \
+     online checks (on-main, run history, downloads) need the GitHub source";
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::new().chain_update(bytes).finalize())
 }
 
 // ---------------------------------------------------------------------------
@@ -1385,7 +1835,8 @@ pub fn sha256_file(path: &Path) -> Result<String> {
 
 /// Compare the binary's digest with the first field of a `sha256sum` line.
 fn check_sha256(binary: &Path, sha_file: &Path) -> Result<String> {
-    let recorded = fs::read_to_string(sha_file)?;
+    let recorded =
+        String::from_utf8_lossy(&read_bounded(sha_file, SHA_FILE_MAX, SHA_FILE)?).into_owned();
     let expected = recorded
         .split_whitespace()
         .next()
@@ -1404,7 +1855,7 @@ fn check_sha256(binary: &Path, sha_file: &Path) -> Result<String> {
 }
 
 fn check_manifest(path: &Path, sha: &str, digest: &str) -> Result<Value> {
-    let text = fs::read_to_string(path)?;
+    let text = String::from_utf8_lossy(&read_bounded(path, MANIFEST_MAX, MANIFEST)?).into_owned();
     let manifest: Value = serde_json::from_str(&text).map_err(|e| {
         Error::rejected(format!(
             "{} is not valid JSON ({e}) — refusing to install",
@@ -1551,5 +2002,103 @@ mod backup_pair_tests {
         assert!(err.contains("no longer verifies"), "{err}");
         // No store yet: nothing to check.
         verify_backup_pair(&json!({"skipped": "no database"})).unwrap();
+    }
+
+    /// CAD-1455 policy checks, not crypto evidence: `read_bounded` and
+    /// `check_subjects` enforce the file and statement rules the
+    /// verifier relies on; the actual signature check belongs to the
+    /// real `gh attestation verify` on production bytes.
+    #[test]
+    fn cad1455_retained_policy_checks_refuse_bad_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        // Missing file is refused, not read.
+        let err = read_bounded(&dir.path().join("missing"), 1024, "file")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("missing"), "{err}");
+        // A directory is not a regular file.
+        let err = read_bounded(dir.path(), 1024, "file")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a regular file"), "{err}");
+        // Empty and oversized files are refused.
+        let empty = dir.path().join("empty");
+        fs::write(&empty, b"").unwrap();
+        assert!(read_bounded(&empty, 4, "file").is_err());
+        let big = dir.path().join("big");
+        fs::write(&big, b"0123456789").unwrap();
+        assert!(read_bounded(&big, 4, "file").is_err());
+        // A bounded read succeeds.
+        assert_eq!(read_bounded(&big, 16, "file").unwrap(), b"0123456789");
+
+        // check_subjects: wrong subject name or digest refuses; the
+        // certificate's signer digest must be a full sha and identical
+        // across entries.
+        let entry = |name: &str, digest: &str, signer: &str| {
+            json!({"verificationResult": {
+                "statement": {"subject": [{"name": name, "digest": {"sha256": digest}}]},
+                "signature": {"certificate": {"sourceRepositoryDigest": signer}}
+            }})
+        };
+        let sha = "a".repeat(64);
+        let signer = "b".repeat(40);
+        let good = serde_json::to_vec(&json!([entry("cadence", &sha, &signer)])).unwrap();
+        let facts = check_subjects(&good, "cadence", &sha).unwrap();
+        assert_eq!(facts.signer_sha, signer);
+        assert_eq!(facts.subject_digest, sha);
+        // Wrong subject digest is refused.
+        let bad = serde_json::to_vec(&json!([entry("cadence", &"c".repeat(64), &signer)])).unwrap();
+        assert!(check_subjects(&bad, "cadence", &sha).is_err());
+        // Missing signer digest is refused.
+        let no_signer = serde_json::to_vec(&json!([entry("cadence", &sha, "")])).unwrap();
+        assert!(check_subjects(&no_signer, "cadence", &sha).is_err());
+        // Empty list is refused.
+        assert!(check_subjects(b"[]", "cadence", &sha).is_err());
+    }
+
+    /// The retained candidate parser accepts the closed schema only and
+    /// does not need a live run; the online parser still requires the
+    /// promotion run to match.
+    #[test]
+    fn cad1455_retained_candidate_needs_no_run_but_is_closed() {
+        let receipt = json!({
+            "schema": 1,
+            "source_sha": "a".repeat(40),
+            "ci_run_id": 11,
+            "ci_run_attempt": 2,
+            "sha256": "b".repeat(64),
+            "promotion_run_id": 99,
+            "promotion_run_attempt": 1
+        })
+        .to_string();
+        let candidate = parse_retained_candidate(&receipt).unwrap();
+        assert_eq!(candidate.source_sha, "a".repeat(40));
+        assert_eq!(candidate.promotion_run_id, 99);
+        // An extra field is refused by deny_unknown_fields.
+        let forged = json!({
+            "schema": 1,
+            "source_sha": "a".repeat(40),
+            "ci_run_id": 11,
+            "ci_run_attempt": 2,
+            "sha256": "b".repeat(64),
+            "promotion_run_id": 99,
+            "promotion_run_attempt": 1,
+            "extra": true
+        })
+        .to_string();
+        assert!(parse_retained_candidate(&forged).is_err());
+        // The online parser still needs the matching promotion run.
+        let run = Run {
+            id: 99,
+            attempt: 1,
+            head_sha: "c".repeat(40),
+            head_branch: MAIN.into(),
+            event: "workflow_dispatch".into(),
+            status: "completed".into(),
+            conclusion: "success".into(),
+        };
+        assert!(parse_production_candidate(&receipt, &run).is_ok());
+        let wrong = Run { id: 1, ..run };
+        assert!(parse_production_candidate(&receipt, &wrong).is_err());
     }
 }
