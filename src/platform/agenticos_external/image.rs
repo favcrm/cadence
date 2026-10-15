@@ -76,13 +76,22 @@ pub(crate) fn image_plan_preflight(
 }
 
 pub(super) fn image_prompt(authority: &Value, input: &Value) -> Result<String, String> {
+    image_prompt_for(authority, input, PLATFORM)
+}
+
+/// Shared composition, with the calling adapter enforcing its exact provider.
+pub(super) fn image_prompt_for(
+    authority: &Value,
+    input: &Value,
+    provider: &str,
+) -> Result<String, String> {
     if input.as_object().is_none_or(|fields| !fields.is_empty()) {
         return Err("image input cannot override the frozen generation plan".into());
     }
     let config = &authority["binding"]["config"];
     let mapping = &config["mapping"];
     if authority["schema"] != 1
-        || config["provider"] != PLATFORM
+        || config["provider"] != provider
         || config["install_id"] != authority["install_id"]
         || config["connection_id"].as_str().is_none_or(str::is_empty)
         || config["account"].as_str().is_none_or(str::is_empty)

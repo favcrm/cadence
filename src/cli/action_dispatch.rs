@@ -116,9 +116,20 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
     let client_only = client_update::client_only_mode()?;
     // CAD-1437: a valid client-only receipt selects the public updater before
     // any org, credential, tracker or state work. Native-only options refuse.
-    if let Commands::Update { check, version, .. } = &cli.command {
+    if let Commands::Update {
+        check,
+        version,
+        target,
+        ..
+    } = &cli.command
+    {
         if client_only {
-            return client_update::run(&cli, *check, version.as_deref());
+            return client_update::run(
+                &cli,
+                *check,
+                version.as_deref(),
+                target.release_source.as_deref(),
+            );
         }
         if version.is_some() {
             return Err(client_update::client_only_required());
@@ -893,6 +904,7 @@ pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
             repo,
             link,
             releases_dir,
+            release_source,
         } => upgrade::run(
             state_dir,
             sha,
@@ -904,6 +916,7 @@ pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
             repo,
             link,
             releases_dir,
+            release_source,
         ),
         Commands::Update {
             action,

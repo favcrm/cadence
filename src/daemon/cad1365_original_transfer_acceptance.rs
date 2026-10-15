@@ -115,6 +115,38 @@ with an empty input object and retains the actual provider response.
 
 const JOB_ID: &str = "med_job1365orig";
 
+/// Agent execution with the same image slot. The host workflow stays the
+/// default package; this file is written only for the lineage entry check.
+const WORKER_WORKFLOW_MD: &str = r#"---
+title: "Worker image: {{subject}}"
+goal: "One assigned turn over the frozen image slot"
+label: Worker image
+capability_slots: [image]
+execution: agent
+inputs:
+  subject: { ask: "Image subject", example: "Harbour" }
+  source: { ask: "Source facts", example: "A red lighthouse marks the harbour" }
+  image_prompt: { ask: "Image guidance", example: "Use an editorial palette" }
+---
+
+## Prepare the frozen image: {{subject}}
+agent: image-worker
+size: S
+action: local.text.produce
+
+The assigned worker calls the frozen image slot. No second provider is named.
+
+### Acceptance
+- [ ] the assigned worker used only the frozen image slot
+"#;
+
+#[path = "cad1459_native_lineage_entry_acceptance.rs"]
+mod cad1459_native_lineage_entry_acceptance;
+#[path = "cad1459_original_account_acceptance.rs"]
+mod cad1459_original_account_acceptance;
+#[path = "cad1459_public_membership_original_acceptance.rs"]
+mod cad1459_public_membership_original_acceptance;
+
 /// The >2 MiB original the provider retains — the exact byte recipe
 /// `cad1365_original_artifact_acceptance` proves forces the custody
 /// derivative path: deterministic SplitMix64 noise over two thirds of a
@@ -295,6 +327,8 @@ struct Fx {
     door: Option<std::thread::JoinHandle<()>>,
     server: Option<std::thread::JoinHandle<()>>,
     stop: Arc<AtomicBool>,
+    account: bool,
+    worker_workflow: bool,
 }
 
 /// One raw JSON-RPC exchange on the fixture socket: the exact frame
@@ -343,6 +377,31 @@ impl Fx {
     /// `original`/`descriptor` drive the loopback provider; `None`
     /// serves the honest >2 MiB PNG with a truthful descriptor.
     fn boot(original: Vec<u8>, descriptor: Option<Value>, seed_asset: bool) -> Self {
+        Self::boot_with_account(original, descriptor, seed_asset, None)
+    }
+
+    // Bounded CAD-1459 extension: register the real account adapter before
+    // Shared escapes, and install synthetic TLS on each actual RPC thread.
+    fn boot_with_account(
+        original: Vec<u8>,
+        descriptor: Option<Value>,
+        seed_asset: bool,
+        trust: Option<crate::issuer_transport::test_fixture::Fixture>,
+    ) -> Self {
+        Self::boot_configured(original, descriptor, seed_asset, trust, false, false)
+    }
+
+    /// `native_membership` captures real Native mode from provider env.
+    /// `worker_workflow` adds one agent workflow beside the host image
+    /// workflow. Both default off for every existing caller.
+    fn boot_configured(
+        original: Vec<u8>,
+        descriptor: Option<Value>,
+        seed_asset: bool,
+        trust: Option<crate::issuer_transport::test_fixture::Fixture>,
+        native_membership: bool,
+        worker_workflow: bool,
+    ) -> Self {
         let dir = tempfile::Builder::new()
             .prefix("c1365orig")
             .tempdir()
@@ -375,7 +434,12 @@ impl Fx {
             })
             .unwrap();
         let get_override = Arc::new(Mutex::new(None));
-        let (base, seen, door) = media_door(original.clone(), descriptor, get_override.clone());
+        let (base, seen, door) = if trust.is_some() {
+            (String::new(), Arc::new(Mutex::new(Vec::new())), None)
+        } else {
+            let (base, seen, door) = media_door(original.clone(), descriptor, get_override.clone());
+            (base, seen, Some(door))
+        };
         let stop = Arc::new(AtomicBool::new(false));
         let mut opts = ServeOptions {
             test_seam: true,
@@ -387,16 +451,34 @@ impl Fx {
         opts.provider_env.set("CADENCE_TEST_MEDIA_POLL_MS", "20");
         opts.provider_env
             .set("CADENCE_TEST_MEDIA_DEADLINE_MS", "5000");
-        opts.platforms.insert(
-            agenticos_external::PLATFORM.into(),
-            Arc::new(
-                agenticos_external::AgenticosExternalAdapter::with_deployment_pin(
-                    &base,
-                    Some(agenticos_external::MANIFEST_PIN),
-                )
-                .unwrap(),
-            ),
-        );
+        if native_membership {
+            // Same board identity `write_config` already saved. Native mode
+            // re-proves public sessions against the platform; standalone
+            // callers leave these unset.
+            opts.provider_env
+                .set("AGENTICOS_COMPANY", "cad1365-test-company");
+            opts.provider_env.set("AGENTICOS_INSTANCE", "inst0001");
+            opts.provider_env
+                .set("AGENTICOS_BOARD_HOST", "cad1365.example.test");
+            opts.provider_env
+                .set("AGENTICOS_BOARD_ISSUER", "https://platform.example.test");
+            opts.provider_env
+                .set("AGENTICOS_BOARD_COMPANY", "cad1365-test-company");
+        }
+        if trust.is_some() {
+            crate::platform::account_media::attach(&mut opts).unwrap();
+        } else {
+            opts.platforms.insert(
+                agenticos_external::PLATFORM.into(),
+                Arc::new(
+                    agenticos_external::AgenticosExternalAdapter::with_deployment_pin(
+                        &base,
+                        Some(agenticos_external::MANIFEST_PIN),
+                    )
+                    .unwrap(),
+                ),
+            );
+        }
         let shared = Shared::new(&state, &opts).unwrap();
         // Custody and the enrollment row are set BEFORE the `Arc`
         // escapes — the same ordering `app_capabilities_rpc::tests`
@@ -404,31 +486,33 @@ impl Fx {
         let mut shared = shared;
         Arc::get_mut(&mut shared).unwrap().platform_custody =
             Custody::File(dir.path().join("fixture-custody"));
-        let token = b"synthetic-cad1365-orig-token";
-        let key = Key {
-            platform: agenticos_external::PLATFORM,
-            account: ACCOUNT,
-        };
-        let custody = shared.platform_custody.put(&key, token).unwrap();
-        shared
-            .store
-            .platform_enroll(
-                &crate::store::CredentialRecord {
-                    connection_id: "gen1365".into(),
-                    credential_revision: 1,
-                    platform: agenticos_external::PLATFORM.into(),
-                    account: ACCOUNT.into(),
-                    scopes: vec!["provider.draft".into()],
-                    fingerprint: crate::secret::fingerprint(token),
-                    custody: custody.into(),
-                    exchange: "token".into(),
-                    enrolled_at: 1.0,
-                    by: "operator".into(),
-                },
-                false,
-                None,
-            )
-            .unwrap();
+        if trust.is_none() {
+            let token = b"synthetic-cad1365-orig-token";
+            let key = Key {
+                platform: agenticos_external::PLATFORM,
+                account: ACCOUNT,
+            };
+            let custody = shared.platform_custody.put(&key, token).unwrap();
+            shared
+                .store
+                .platform_enroll(
+                    &crate::store::CredentialRecord {
+                        connection_id: "gen1365".into(),
+                        credential_revision: 1,
+                        platform: agenticos_external::PLATFORM.into(),
+                        account: ACCOUNT.into(),
+                        scopes: vec!["provider.draft".into()],
+                        fingerprint: crate::secret::fingerprint(token),
+                        custody: custody.into(),
+                        exchange: "token".into(),
+                        enrolled_at: 1.0,
+                        by: "operator".into(),
+                    },
+                    false,
+                    None,
+                )
+                .unwrap();
+        }
         // The listening side of the fixture socket: accept on the
         // tempdir socket and hand every connection to the REAL
         // `serve::handle_conn` — SO_PEERCRED check, `PeerUidScope`,
@@ -442,19 +526,31 @@ impl Fx {
             let shared_server = shared.clone();
             let stop_server = stop.clone();
             listener.set_nonblocking(true).unwrap();
-            let server = std::thread::spawn(move || loop {
-                if stop_server.load(Ordering::SeqCst) {
-                    break;
+            let request_trust = trust.clone();
+            let server = std::thread::spawn(move || {
+                let mut requests = Vec::new();
+                loop {
+                    if stop_server.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let shared = shared_server.clone();
+                            let trust = request_trust.clone();
+                            requests.push(std::thread::spawn(move || {
+                                let _tls =
+                                    trust.map(crate::issuer_transport::test_fixture::install);
+                                super::serve::handle_conn(shared, stream);
+                            }));
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
                 }
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        let shared = shared_server.clone();
-                        std::thread::spawn(move || super::serve::handle_conn(shared, stream));
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(_) => break,
+                for request in requests {
+                    request.join().expect("fixture RPC thread");
                 }
             });
             let mut fx = Self {
@@ -466,9 +562,11 @@ impl Fx {
                 original,
                 get_override,
                 seen,
-                door: Some(door),
+                door,
                 server: Some(server),
                 stop,
+                account: trust.is_some(),
+                worker_workflow,
                 shared,
                 _dir: dir,
             };
@@ -489,6 +587,9 @@ impl Fx {
         std::fs::write(app.join("app.md"), APP_MD).unwrap();
         std::fs::write(app.join("workflows/create-image.md"), WORKFLOW_MD).unwrap();
         media_screen(&app);
+        if self.worker_workflow {
+            std::fs::write(app.join("workflows/worker-image.md"), WORKER_WORKFLOW_MD).unwrap();
+        }
         let installed = self
             .op(
                 "app_workspace_install",
@@ -501,12 +602,14 @@ impl Fx {
             json!({"install_id": self.install, "digest": installed["digest"]}),
         )
         .expect("approve");
-        self.op(
-            "app_binding_create",
-            json!({"install_id": self.install, "slot": "image",
-                "connection_id": "gen1365", "request_id": "bind-1365-orig"}),
-        )
-        .expect("bind image slot");
+        if !self.account {
+            self.op(
+                "app_binding_create",
+                json!({"install_id": self.install, "slot": "image",
+                    "connection_id": "gen1365", "request_id": "bind-1365-orig"}),
+            )
+            .expect("bind image slot");
+        }
         let ctx = self
             .op(
                 "app_context_create",

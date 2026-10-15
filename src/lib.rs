@@ -66,6 +66,7 @@ pub mod proc;
 pub(crate) mod protected_pi_profile;
 pub mod proto;
 pub mod reaper;
+pub mod releases;
 pub mod remote_auth;
 pub mod remote_cli;
 pub mod remote_enrollment;

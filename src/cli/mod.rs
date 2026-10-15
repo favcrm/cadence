@@ -164,7 +164,7 @@ use topic::TopicAction;
 use update::UpdateAction;
 #[cfg(test)]
 use update_args::{daemon_build_or_absent, fd_is_path};
-use update_args::{RealUpdateHost, UpdateArgs, UpdateTargetArgs, UpgradeArgs};
+use update_args::{RealUpdateHost, UpdateArgs, UpdateSource, UpdateTargetArgs, UpgradeArgs};
 use util::{cli_verbs, create_worktree, git, parse_duration};
 use uuid::Uuid;
 use web::WebAction;

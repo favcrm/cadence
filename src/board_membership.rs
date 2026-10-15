@@ -350,11 +350,11 @@ pub fn lookup_current_membership_by_digest(
         return Err(refused_phase("request", None));
     }
 
-    let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(DEADLINE))
-        .http_status_as_error(false)
-        .build();
-    let agent = ureq::Agent::new_with_config(agent);
+    let agent = crate::issuer_transport::agent(
+        ureq::Agent::config_builder()
+            .timeout_global(Some(DEADLINE))
+            .http_status_as_error(false),
+    );
     let mut resp = agent
         .post(CHECK_URL)
         .send_json(&request)

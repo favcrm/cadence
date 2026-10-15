@@ -66,7 +66,13 @@ pub(crate) fn frozen_image_prompt(
     authority: &Value,
     input: &Value,
 ) -> std::result::Result<String, String> {
-    image_prompt(authority, input)
+    match authority["binding"]["config"]["provider"].as_str() {
+        Some(PLATFORM) => image_prompt(authority, input),
+        Some(super::account_media::PLATFORM) => {
+            image::image_prompt_for(authority, input, super::account_media::PLATFORM)
+        }
+        _ => Err("frozen image binding names an unreviewed provider".into()),
+    }
 }
 
 pub(crate) fn image_plan_preflight(
@@ -98,11 +104,13 @@ const TABLE_JSON_V4: &str = r#"{
 enum Transport {
     ExternalBearer,
     HostedMediaLease,
+    AccountImage,
 }
 
 pub struct AgenticosExternalAdapter {
     table: ToolTable,
     transport: Transport,
+    account_identity: Option<crate::remote_cli::AccountImageIdentity>,
     base: String,
     deployment_pin: Option<String>,
     http: ureq::Agent,
@@ -145,6 +153,7 @@ impl AgenticosExternalAdapter {
         let adapter = Self {
             table,
             transport,
+            account_identity: None,
             base,
             deployment_pin: deployment_pin.map(str::to_owned),
             http: ureq::Agent::new_with_config(config),
@@ -158,6 +167,85 @@ impl AgenticosExternalAdapter {
             .expect("descriptor")
             .validate(&adapter.table)?;
         Ok(adapter)
+    }
+
+    /// The normal-login adapter reuses only the reviewed image protocol.
+    pub(crate) fn account_image(identity: crate::remote_cli::AccountImageIdentity) -> Result<Self> {
+        let mut adapter = Self::new(identity.audience.clone(), None, Transport::ExternalBearer)?;
+        adapter.transport = Transport::AccountImage;
+        adapter.account_identity = Some(identity);
+        Ok(adapter)
+    }
+
+    fn image_provider(&self) -> &str {
+        if self.transport == Transport::AccountImage {
+            super::account_media::PLATFORM
+        } else {
+            PLATFORM
+        }
+    }
+
+    fn image_approved(&self) -> bool {
+        self.transport == Transport::AccountImage
+            || matches!(
+                self.deployment_pin.as_deref(),
+                Some(MANIFEST_PIN | TEXT_MANIFEST_PIN)
+            )
+    }
+
+    fn image_json(
+        &self,
+        token: Option<&str>,
+        operation: crate::remote_cli::AccountImageOperation,
+    ) -> std::result::Result<(u16, Value), String> {
+        use crate::remote_cli::AccountImageOperation as Op;
+        if let Some(identity) = &self.account_identity {
+            let response = crate::remote_cli::account_image_request(identity, operation, 20)
+                .map_err(|_| {
+                    "saved account image operation refused or could not be confirmed".to_owned()
+                })?;
+            return Ok((
+                response.status,
+                response.body.ok_or("account image response was not JSON")?,
+            ));
+        }
+        match operation {
+            Op::Quote => self.get_media(
+                &format!("{}{MEDIA_PRICE_PATH}", self.base),
+                token,
+                MEDIA_BODY_CAP,
+                "AgenticOS media price read could not reach the service",
+            ),
+            Op::Job { job_id } => self.get_media(
+                &format!("{}{MEDIA_JOBS_PATH}{job_id}", self.base),
+                token,
+                MEDIA_BODY_CAP,
+                "AgenticOS image job read failed",
+            ),
+            Op::Submit {
+                input,
+                idempotency_key,
+            } => {
+                let mut response = authorized(
+                    self.http.post(format!("{}{MEDIA_SUBMIT_PATH}", self.base)),
+                    token,
+                )
+                .header("idempotency-key", &idempotency_key)
+                .send_json(input)
+                .map_err(|_| MEDIA_UNCERTAIN_SUBMIT.to_owned())?;
+                let status = response.status().as_u16();
+                let bytes = response
+                    .body_mut()
+                    .with_config()
+                    .limit(RESPONSE_CAP)
+                    .read_to_vec()
+                    .map_err(|_| MEDIA_UNCERTAIN_SUBMIT.to_owned())?;
+                let envelope = serde_json::from_slice(&bytes)
+                    .map_err(|_| MEDIA_UNCERTAIN_SUBMIT.to_owned())?;
+                Ok((status, envelope))
+            }
+            _ => Err("not a JSON image operation".into()),
+        }
     }
 
     fn poll_interval(&self) -> Duration {
@@ -192,6 +280,23 @@ impl AgenticosExternalAdapter {
     ) -> std::result::Result<Option<&'a str>, String> {
         match self.transport {
             Transport::ExternalBearer => bearer_token(credential).map(Some),
+            Transport::AccountImage => {
+                let identity = self
+                    .account_identity
+                    .as_ref()
+                    .ok_or("account image identity unavailable")?;
+                if !credential.is_empty()
+                    || config["provider"] != super::account_media::PLATFORM
+                    || config["connection_kind"] != "builtin"
+                    || config["account"] != super::account_media::account_handle(identity)
+                {
+                    return Err(
+                        "account image requires its exact credentialless saved-login identity"
+                            .into(),
+                    );
+                }
+                Ok(None)
+            }
             Transport::HostedMediaLease => {
                 if !credential.is_empty()
                     || config["account"] != "hosted"
@@ -418,20 +523,17 @@ impl AgenticosExternalAdapter {
     /// provider-tool catalog. The quote carries the current rate; the
     /// daemon re-quotes at execution and refuses a changed rate, so a price
     /// move can never silently bill under an old approval.
-    fn quote_image(
+    pub(crate) fn quote_image(
         &self,
         credential: &[u8],
         binding: &Value,
     ) -> std::result::Result<AppCapabilityQuote, String> {
-        if !matches!(
-            self.deployment_pin.as_deref(),
-            Some(MANIFEST_PIN | TEXT_MANIFEST_PIN)
-        ) {
+        if !self.image_approved() {
             return Err("image generation has not been approved by this deployment".into());
         }
         let config = &binding["config"];
         let mapping = &config["mapping"];
-        if config["provider"] != PLATFORM
+        if config["provider"] != self.image_provider()
             || config["account"].as_str().is_none_or(str::is_empty)
             || config["connection_id"].as_str().is_none_or(str::is_empty)
             || mapping["capability"] != "media.generate"
@@ -444,12 +546,8 @@ impl AgenticosExternalAdapter {
             return Err("provider quote names an unreviewed action".into());
         }
         let token = self.lease_token(credential, config)?;
-        let (status, envelope) = self.get_media(
-            &format!("{}{MEDIA_PRICE_PATH}", self.base),
-            token,
-            MEDIA_BODY_CAP,
-            "AgenticOS media price read could not reach the service",
-        )?;
+        let (status, envelope) =
+            self.image_json(token, crate::remote_cli::AccountImageOperation::Quote)?;
         match status {
             200 if envelope["ok"] == true => {}
             404 => return Err("AgenticOS media serving is not enabled for this deployment".into()),
@@ -501,7 +599,14 @@ impl AgenticosExternalAdapter {
             unit_price_micros: charge,
             units: 1,
             total_price_micros: charge,
-            price_revision: format!("media:sha256:{:x}", Sha256::digest(&bytes)),
+            price_revision: match &self.account_identity {
+                Some(identity) => format!(
+                    "{}{:x}",
+                    super::account_media::source_digest(identity),
+                    Sha256::digest(&bytes)
+                ),
+                None => format!("media:sha256:{:x}", Sha256::digest(&bytes)),
+            },
         })
     }
 
@@ -591,7 +696,7 @@ impl AgenticosExternalAdapter {
     /// for the same key and body, never a second reserve), poll, fetch. Every
     /// failure carries an allow-listed [`ImageReason`], classified here by
     /// type and never from provider text.
-    fn call_image_coded(
+    pub(crate) fn call_image_coded(
         &self,
         credential: &[u8],
         authority: &Value,
@@ -600,20 +705,27 @@ impl AgenticosExternalAdapter {
     ) -> std::result::Result<AppCapabilityOutput, ImageFailure> {
         use ImageReason as R;
         let uncertain_submit = || ImageFailure::uncertain(R::SubmitError, MEDIA_UNCERTAIN_SUBMIT);
-        if !matches!(
-            self.deployment_pin.as_deref(),
-            Some(MANIFEST_PIN | TEXT_MANIFEST_PIN)
-        ) {
+        if !self.image_approved() {
             return Err(ImageFailure::refused(
                 R::NotApproved,
                 "image generation has not been approved by this deployment",
             ));
         }
+        if self.transport == Transport::AccountImage {
+            let identity = self.account_identity.as_ref().ok_or_else(|| {
+                ImageFailure::refused(R::NotAuthorized, "account image identity unavailable")
+            })?;
+            super::account_media::validate_quote_source(
+                identity,
+                authority["quote"]["price_revision"].as_str().unwrap_or(""),
+            )
+            .map_err(|detail| ImageFailure::refused(R::NotAuthorized, detail))?;
+        }
         // A job admitted by this daemon froze its exact prompt: a restart on a
         // newer build must replay the byte-identical body under the same key.
         let prompt = match authority["frozen_prompt"].as_str() {
             Some(frozen) => frozen.to_owned(),
-            None => image_prompt(authority, input)
+            None => image::image_prompt_for(authority, input, self.image_provider())
                 .map_err(|detail| ImageFailure::refused(R::PlanInvalid, detail))?,
         };
         // The frozen approval maximum uses the same micro-USD units as
@@ -629,24 +741,10 @@ impl AgenticosExternalAdapter {
                 "provider idempotency key is invalid",
             ));
         }
-        let request = self.http.post(format!("{}{MEDIA_SUBMIT_PATH}", self.base));
-        let mut response = authorized(request, token)
-            .header("idempotency-key", idempotency_key)
-            .send_json(json!({
-                "model": IMAGE_MODEL,
-                "prompt": prompt,
-                "aspectRatio": "1:1",
-                "max_charge_minor": quoted,
-            }))
-            .map_err(|_| uncertain_submit())?;
-        let status = response.status().as_u16();
-        let bytes = response
-            .body_mut()
-            .with_config()
-            .limit(RESPONSE_CAP)
-            .read_to_vec()
-            .map_err(|_| uncertain_submit())?;
-        let envelope: Value = serde_json::from_slice(&bytes).map_err(|_| uncertain_submit())?;
+        let (status, envelope) = self.image_json(token, crate::remote_cli::AccountImageOperation::Submit {
+            input: json!({"model":IMAGE_MODEL,"prompt":prompt,"aspectRatio":"1:1","max_charge_minor":quoted}),
+            idempotency_key: idempotency_key.to_owned(),
+        }).map_err(|_| uncertain_submit())?;
         match status {
             200 | 201 if envelope["ok"] == true => {}
             404 if envelope["ok"] == false => {
@@ -745,12 +843,9 @@ impl AgenticosExternalAdapter {
                 ));
             }
             std::thread::sleep(self.poll_interval());
-            let url = format!("{}{MEDIA_JOBS_PATH}{id}", self.base);
-            let (status, envelope) = match self.get_media(
-                &url,
+            let (status, envelope) = match self.image_json(
                 token,
-                MEDIA_BODY_CAP,
-                "AgenticOS image job read failed",
+                crate::remote_cli::AccountImageOperation::Job { job_id: id.clone() },
             ) {
                 Ok(pair) => pair,
                 // A transient read failure keeps polling until the deadline.
@@ -838,7 +933,7 @@ impl AgenticosExternalAdapter {
         let digest = format!("sha256:{:x}", Sha256::digest(&asset_bytes));
         let charge_minor = job["price"]["chargeMinor"].as_u64().unwrap_or_default();
         let result = json!({
-            "schema":1,"kind":"media.generated.image","provider":PLATFORM,
+            "schema":1,"kind":"media.generated.image","provider":self.image_provider(),
             "source_receipt_id":authority["source"]["receipt_id"],
             "source_post_id":authority["source"]["post"]["id"],
             "model":IMAGE_MODEL,"aspect_ratio":"1:1","n":1,
@@ -879,41 +974,66 @@ impl AgenticosExternalAdapter {
                 "AgenticOS media artifact could not be confirmed",
             )
         };
-        let request = self
-            .http
-            .get(format!("{}{MEDIA_ARTIFACTS_PATH}{artifact_ref}", self.base));
-        let mut response = authorized(request, token)
-            .config()
-            .timeout_global(Some(ARTIFACT_TIMEOUT))
-            .build()
-            .call()
-            .map_err(|_| unconfirmed())?;
-        if response.status().as_u16() != 200 {
-            return Err(unconfirmed());
-        }
-        let header = response
-            .headers()
-            .get("content-type")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("")
-            .to_owned();
-        let asset_bytes = response
-            .body_mut()
-            .with_config()
-            .limit(FETCH_LIMIT as u64 + 1)
-            .read_to_vec()
-            .map_err(|error| match error {
-                // Only the size cap is "too large"; a timeout, reset or
-                // truncated body is retried under the same key.
-                ureq::Error::BodyExceedsLimit(_) => ImageFailure::uncertain(
-                    R::ArtifactTooLarge,
-                    "AgenticOS media artifact exceeds the AgenticOS import bound",
-                ),
-                _ => ImageFailure::uncertain(
-                    R::ArtifactUnavailable,
-                    "AgenticOS media artifact download did not complete",
-                ),
+        let (header, asset_bytes) = if let Some(identity) = &self.account_identity {
+            let response = crate::remote_cli::account_image_request(
+                identity,
+                crate::remote_cli::AccountImageOperation::Artifact {
+                    reference: artifact_ref.to_owned(),
+                },
+                60,
+            )
+            .map_err(|error| {
+                if error.code() == Some("account_image_response_too_large") {
+                    ImageFailure::uncertain(
+                        R::ArtifactTooLarge,
+                        "account image artifact exceeds the import bound",
+                    )
+                } else {
+                    unconfirmed()
+                }
             })?;
+            if response.status != 200 {
+                return Err(unconfirmed());
+            }
+            (response.content_type.unwrap_or_default(), response.bytes)
+        } else {
+            let request = self
+                .http
+                .get(format!("{}{MEDIA_ARTIFACTS_PATH}{artifact_ref}", self.base));
+            let mut response = authorized(request, token)
+                .config()
+                .timeout_global(Some(ARTIFACT_TIMEOUT))
+                .build()
+                .call()
+                .map_err(|_| unconfirmed())?;
+            if response.status().as_u16() != 200 {
+                return Err(unconfirmed());
+            }
+            let header = response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+                .to_owned();
+            let asset_bytes = response
+                .body_mut()
+                .with_config()
+                .limit(FETCH_LIMIT as u64 + 1)
+                .read_to_vec()
+                .map_err(|error| match error {
+                    // Only the size cap is "too large"; a timeout, reset or
+                    // truncated body is retried under the same key.
+                    ureq::Error::BodyExceedsLimit(_) => ImageFailure::uncertain(
+                        R::ArtifactTooLarge,
+                        "AgenticOS media artifact exceeds the AgenticOS import bound",
+                    ),
+                    _ => ImageFailure::uncertain(
+                        R::ArtifactUnavailable,
+                        "AgenticOS media artifact download did not complete",
+                    ),
+                })?;
+            (header, asset_bytes)
+        };
         if asset_bytes.len() as u64 != artifact_bytes.unwrap_or_default() {
             return Err(ImageFailure::uncertain(
                 R::ArtifactMismatch,
@@ -1382,6 +1502,7 @@ fn register_with_deployment(
 /// Otherwise external access remains opt-in per daemon. Caller URL settings
 /// and conflicting pre-registration cannot replace a hosted transport.
 pub fn attach(opts: &mut crate::daemon::ServeOptions) -> Result<()> {
+    super::account_media::attach(opts)?;
     let metadata = match &opts.provider_deployments {
         Some(value) => Some(value.clone()),
         None => super::deployments::load()?,
@@ -1508,14 +1629,11 @@ impl PlatformAdapter for AgenticosExternalAdapter {
         config: &Value,
         descriptor: &Value,
     ) -> std::result::Result<(String, Vec<u8>), String> {
-        if !matches!(
-            self.deployment_pin.as_deref(),
-            Some(MANIFEST_PIN | TEXT_MANIFEST_PIN)
-        ) {
+        if !self.image_approved() {
             return Err("original media retrieval has not been approved by this deployment".into());
         }
         let mapping = &config["mapping"];
-        if config["provider"] != PLATFORM
+        if config["provider"] != self.image_provider()
             || config["account"].as_str().is_none_or(str::is_empty)
             || config["connection_id"].as_str().is_none_or(str::is_empty)
             || mapping["capability"] != "media.generate"

@@ -120,6 +120,105 @@ impl Shared {
     /// declared alias for each, the live digest and each slot's live quote.
     fn social_quotes(&self, install: &str, context: &str, need: Need) -> Result<Quoted> {
         let pm = self.pm_at(&self.pm_dir()?)?;
+        let (mut quoted, requests) =
+            workspace::with_runtime_snapshot(&pm, install, |bundle, files| {
+                let _custody = self
+                    .platform_custody_lock
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let _release = self
+                    .app_release_lock
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let digest = required_str(bundle, "digest")?.to_string();
+                let status = self.store.app_capability_status(install, &digest)?;
+                if status["state"].as_str() != Some("approved") {
+                    return Err(Error::rejected(
+                        "installation is not approved at its current digest",
+                    ));
+                }
+                let approval_epoch = status["epoch"]
+                    .as_i64()
+                    .ok_or_else(|| Error::rejected("installation approval epoch unavailable"))?;
+                let manifest = crate::issue::app::parse_manifest(
+                    files
+                        .get("app.md")
+                        .ok_or_else(|| Error::rejected("installation manifest unavailable"))?,
+                )?;
+                if manifest.app != crate::app_assistant::SOCIAL_APP {
+                    return Err(Error::rejected(
+                        "social actions run only for the Social Content app",
+                    ));
+                }
+                let mut tools: BTreeMap<String, String> = BTreeMap::new();
+                for tag in crate::issue::app_screen_pkg::tags_in(files)? {
+                    tools.extend(crate::issue::app_screen_pkg::extract(files, &tag)?.tools);
+                }
+                let mut requests = Vec::new();
+                let mut find = |capability: &str, effect: &str| -> Result<SlotRef> {
+                    let mut slots = manifest
+                        .capabilities
+                        .iter()
+                        .filter(|(_, need)| need.capability == capability && need.effect == effect)
+                        .map(|(name, _)| name.clone());
+                    let (Some(slot), None) = (slots.next(), slots.next()) else {
+                        return Err(Error::rejected(format!(
+                            "this app declares no single {capability} slot"
+                        )));
+                    };
+                    let mut aliases = tools
+                        .iter()
+                        .filter(|(_, value)| **value == slot)
+                        .map(|(alias, _)| alias.clone());
+                    let (Some(alias), None) = (aliases.next(), aliases.next()) else {
+                        return Err(Error::rejected(format!(
+                            "this app's screen declares no single tool for {capability}"
+                        )));
+                    };
+                    let proof = self
+                        .app_binding_live(install, Some(context), &slot, bundle, files)?
+                        .ok_or_else(|| {
+                            Error::rejected("capability binding is absent — finish setup")
+                        })?;
+                    let request = self.prepare_app_capability_quote(&proof)?;
+                    requests.push((slot.clone(), proof, request));
+                    Ok(SlotRef {
+                        slot,
+                        alias,
+                        micros: 0,
+                    })
+                };
+                let mut quoted = Quoted {
+                    digest,
+                    approval_epoch,
+                    source: None,
+                    writer: None,
+                    image: None,
+                };
+                match need {
+                    Need::Source => quoted.source = Some(find("social.read", "read")?),
+                    Need::WriterAndImage(image) => {
+                        quoted.writer = Some(find("text.generate", "draft")?);
+                        if image {
+                            quoted.image = Some(find("media.generate", "draft")?);
+                        }
+                    }
+                }
+                Ok((quoted, requests))
+            })?;
+        let mut proofs = Vec::new();
+        for (slot, proof, request) in requests {
+            let quote = request.fetch()?;
+            for selected in [&mut quoted.source, &mut quoted.writer, &mut quoted.image]
+                .into_iter()
+                .flatten()
+            {
+                if selected.slot == slot {
+                    selected.micros = quote.total_price_micros;
+                }
+            }
+            proofs.push((slot, proof, quote));
+        }
         workspace::with_runtime_snapshot(&pm, install, |bundle, files| {
             let _custody = self
                 .platform_custody_lock
@@ -129,77 +228,27 @@ impl Shared {
                 .app_release_lock
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            let digest = required_str(bundle, "digest")?.to_string();
-            let status = self.store.app_capability_status(install, &digest)?;
-            if status["state"].as_str() != Some("approved") {
+            let status = self
+                .store
+                .app_capability_status(install, required_str(bundle, "digest")?)?;
+            if bundle["digest"] != quoted.digest
+                || status["state"] != "approved"
+                || status["epoch"].as_i64() != Some(quoted.approval_epoch)
+            {
                 return Err(Error::rejected(
-                    "installation is not approved at its current digest",
+                    "installation approval changed during price discovery",
                 ));
             }
-            let approval_epoch = status["epoch"]
-                .as_i64()
-                .ok_or_else(|| Error::rejected("installation approval epoch unavailable"))?;
-            let manifest = crate::issue::app::parse_manifest(
-                files
-                    .get("app.md")
-                    .ok_or_else(|| Error::rejected("installation manifest unavailable"))?,
-            )?;
-            if manifest.app != crate::app_assistant::SOCIAL_APP {
-                return Err(Error::rejected(
-                    "social actions run only for the Social Content app",
-                ));
-            }
-            let mut tools: BTreeMap<String, String> = BTreeMap::new();
-            for tag in crate::issue::app_screen_pkg::tags_in(files)? {
-                tools.extend(crate::issue::app_screen_pkg::extract(files, &tag)?.tools);
-            }
-            let find = |capability: &str, effect: &str| -> Result<SlotRef> {
-                let mut slots = manifest
-                    .capabilities
-                    .iter()
-                    .filter(|(_, need)| need.capability == capability && need.effect == effect)
-                    .map(|(name, _)| name.clone());
-                let (Some(slot), None) = (slots.next(), slots.next()) else {
-                    return Err(Error::rejected(format!(
-                        "this app declares no single {capability} slot"
-                    )));
-                };
-                let mut aliases = tools
-                    .iter()
-                    .filter(|(_, value)| **value == slot)
-                    .map(|(alias, _)| alias.clone());
-                let (Some(alias), None) = (aliases.next(), aliases.next()) else {
-                    return Err(Error::rejected(format!(
-                        "this app's screen declares no single tool for {capability}"
-                    )));
-                };
-                let proof = self
-                    .app_binding_live(install, Some(context), &slot, bundle, files)?
-                    .ok_or_else(|| {
-                        Error::rejected("capability binding is absent — finish setup")
-                    })?;
-                let quote = self.app_capability_quote(&proof)?;
-                Ok(SlotRef {
+            for (slot, proof, quote) in &proofs {
+                self.app_binding_receipt_current(
+                    install,
+                    Some(context),
                     slot,
-                    alias,
-                    micros: quote.total_price_micros,
-                })
-            };
-            let mut quoted = Quoted {
-                digest,
-                approval_epoch,
-                source: None,
-                writer: None,
-                image: None,
-            };
-            match need {
-                Need::Source => quoted.source = Some(find("social.read", "read")?),
-                Need::WriterAndImage(image) => {
-                    quoted.writer = Some(find("text.generate", "draft")?);
-                    if image {
-                        quoted.image = Some(find("media.generate", "draft")?);
-                    }
-                }
+                    proof,
+                    bundle,
+                    files,
+                )?;
+                self.recheck_app_capability_quote(proof, quote)?;
             }
             Ok(quoted)
         })

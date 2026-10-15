@@ -258,6 +258,7 @@ impl Shared {
         // through `tool_session` — partial or invalid proofs refuse,
         // never an operator fallback.
         let creator = self.run_creator(params)?;
+        let account_actor = self.account_image_actor(params)?;
         // Owner resolution needs the installed template's declared
         // execution, so it happens inside the runtime snapshot below.
         if params.get("source_receipt_id").is_some() != params.get("selected_post_id").is_some() {
@@ -282,7 +283,17 @@ impl Shared {
             return Err(Error::rejected("inputs exceed encoded byte limit"));
         }
         let pm = self.pm_at(&self.pm_dir()?)?;
-        workspace::with_runtime_snapshot(&pm, id, |row, files| {
+        let (
+            bundle_digest,
+            workflow,
+            inputs,
+            input_origins,
+            owner_pm,
+            context,
+            binding,
+            capabilities,
+            requests,
+        ) = workspace::with_runtime_snapshot(&pm, id, |row, files| {
             let _custody = self
                 .platform_custody_lock
                 .lock()
@@ -435,7 +446,7 @@ impl Shared {
                 .transpose()?
                 .flatten();
             let mut capabilities = BTreeMap::new();
-            let mut quotes = BTreeMap::new();
+            let mut requests = BTreeMap::new();
             for slot in &workflow.capability_slots {
                 let manifest = crate::issue::app::parse_manifest(
                     files
@@ -449,19 +460,70 @@ impl Shared {
                     return Err(Error::rejected("run capability slot must be read or draft"));
                 }
                 let proof = self
-                    .app_binding_live(
+                    .app_binding_auto_image(
                         id,
                         context.as_ref().map(|(_, proof)| proof.id.as_str()),
                         slot,
+                        &account_actor,
                         row,
                         files,
                     )?
                     .ok_or_else(|| Error::rejected("run capability binding is absent"))?;
+                self.app_account_binding_owned(&account_actor, &proof)?;
+                requests.insert(slot.clone(), self.prepare_app_capability_quote(&proof)?);
                 capabilities.insert(slot.clone(), proof);
-                quotes.insert(
-                    slot.clone(),
-                    self.app_capability_quote(capabilities.get(slot).unwrap())?,
-                );
+            }
+            Ok((
+                required_str(row, "digest")?.to_owned(),
+                workflow,
+                inputs,
+                input_origins,
+                owner_pm,
+                context,
+                binding,
+                capabilities,
+                requests,
+            ))
+        })?;
+        let quotes = requests
+            .into_iter()
+            .map(|(slot, request)| Ok((slot, request.fetch()?)))
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        if self.run_creator(params)? != creator
+            || self.account_image_actor(params)? != account_actor
+        {
+            return Err(Error::rejected(
+                "native run creator changed during price discovery",
+            ));
+        }
+        workspace::with_runtime_snapshot(&pm, id, |row, files| {
+            let _custody = self
+                .platform_custody_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let _release = self
+                .app_release_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            self.account_image_actor_live(&account_actor)?;
+            if row["digest"] != bundle_digest {
+                return Err(Error::rejected(
+                    "installation changed during price discovery",
+                ));
+            }
+            let context_id = context.as_ref().map(|(_, proof)| proof.id.as_str());
+            if let (Some(slot), Some(proof)) =
+                (workflow.publication_slot.as_deref(), binding.as_ref())
+            {
+                self.app_binding_receipt_current(id, context_id, slot, proof, row, files)?;
+            }
+            for (slot, proof) in &capabilities {
+                self.app_binding_receipt_current(id, context_id, slot, proof, row, files)?;
+                self.app_account_binding_owned(&account_actor, proof)?;
+                let quote = quotes
+                    .get(slot)
+                    .ok_or_else(|| Error::rejected("run capability quote is absent"))?;
+                self.recheck_app_capability_quote(proof, quote)?;
             }
             if let Some(expected) = expected {
                 // The quote the host fetched when it drew the slot must
@@ -801,12 +863,62 @@ impl Shared {
             _ => Err(Error::rejected("unknown app lifecycle method")),
         }
     }
+    /// Capture only local receipts under the established lock order. The
+    /// caller performs price I/O unlocked, then rechecks these same receipts.
+    pub(super) fn prepare_app_run_quotes(
+        &self,
+        run: &Value,
+    ) -> Result<BTreeMap<String, Result<super::app_capabilities_rpc::CapabilityQuoteRequest>>> {
+        let install = required_str(run, "install_id")?;
+        let pm = self.pm_at(&self.pm_dir()?)?;
+        workspace::with_runtime_snapshot(&pm, install, |bundle, files| {
+            let _custody = self
+                .platform_custody_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let _release = self
+                .app_release_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            self.app_run_binding_current(run, bundle, files)?;
+            let mut requests = BTreeMap::new();
+            for (slot, binding) in run["snapshot"]["capabilities"]
+                .as_object()
+                .into_iter()
+                .flatten()
+            {
+                let proof = serde_json::from_value(binding.clone())
+                    .map_err(|_| Error::rejected("run capability binding receipt is invalid"))?;
+                requests.insert(slot.clone(), self.prepare_app_capability_quote(&proof));
+            }
+            Ok(requests)
+        })
+    }
+
+    pub(super) fn probe_app_run_prices(&self, run: &Value) -> Result<()> {
+        // As before, a failed PRICE probe is not proof of authority loss.
+        // The final locked receipt check remains authoritative.
+        if let Ok(requests) = self.prepare_app_run_quotes(run) {
+            for (slot, request) in requests {
+                if let Ok(quote) = request.and_then(|request| request.fetch()) {
+                    if run["snapshot"]["quotes"][&slot] != json!(quote) {
+                        return Err(Error::rejected(
+                            "capability price changed since run creation",
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn with_app_run_current<T>(
         &self,
         id: &str,
         callback: impl FnOnce(&str) -> Result<T>,
     ) -> Result<T> {
         let run = self.store.app_run_show(id)?;
+        self.probe_app_run_prices(&run)?;
         let pm = self.pm_at(&self.pm_dir()?)?;
         workspace::with_runtime_snapshot(&pm, run["install_id"].as_str().unwrap(), |row, files| {
             let _custody = self
@@ -857,24 +969,8 @@ impl Shared {
                     bundle,
                     files,
                 )?;
-                // CAD-1142: classify the live price probe. The frozen binding
-                // receipt above (local store/descriptor read) is the authority
-                // verdict; the quote below is only a price-liveness probe. A
-                // probe failure — unreachable provider, timeout, refusal — is
-                // NOT authority loss, so it must not reject the run: on Demo
-                // a ~15s quote read outage made `advance_app_runs` mistake it
-                // for stale authority and fail a running run before the
-                // worker's first turn. Skip the drift comparison and leave the
-                // run running; the capability call re-quotes at execution and
-                // enforces the frozen `max_charge_minor` ceiling where money
-                // moves, so a failed call still fails the step with a reason.
-                if let Ok(quote) = self.app_capability_quote(&proof) {
-                    if run["snapshot"]["quotes"][slot] != json!(quote) {
-                        return Err(Error::rejected(
-                            "capability price changed since run creation",
-                        ));
-                    }
-                }
+                // Price liveness is probed by the caller before taking these
+                // locks. This is the final, local authority recheck.
             }
         }
         Ok(())
@@ -895,16 +991,58 @@ impl Shared {
         if let Some(sealed) = &approved_by {
             self.fresh_run_human(sealed)?;
         }
-        let result = self.with_app_run_current(id, |digest| {
-            // CAD-1374: the bundle and capability quote I/O above can be slow,
-            // so the sealed approver is re-proven here, after it and right before
-            // the store transaction. No store or auth lock is held over network.
+        let account_run = run["snapshot"]["capabilities"]
+            .as_object()
+            .is_some_and(|slots| {
+                slots.values().any(|proof| {
+                    proof["config"]["provider"] == crate::platform::account_media::PLATFORM
+                })
+            });
+        let result = if account_run {
+            self.account_frozen_lineage(&run)?;
+            self.probe_app_run_prices(&run)?;
             if let Some(sealed) = &approved_by {
                 self.fresh_run_human(sealed)?;
             }
-            self.store
-                .app_run_dispatch_as(id, digest, approved_by.as_ref(), human)
-        })?;
+            let pm = self.pm_at(&self.pm_dir()?)?;
+            workspace::with_runtime_snapshot(
+                &pm,
+                required_str(&run, "install_id")?,
+                |bundle, files| {
+                    let _custody = self
+                        .platform_custody_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let _release = self
+                        .app_release_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let current = self.store.app_run_show(id)?;
+                    if current["snapshot"] != run["snapshot"]
+                        || current["approval"]["human"] != run["approval"]["human"]
+                    {
+                        return Err(Error::rejected(
+                            "account run authority changed before dispatch",
+                        ));
+                    }
+                    self.app_run_binding_current(&current, bundle, files)?;
+                    self.store.app_run_dispatch_as(
+                        id,
+                        required_str(bundle, "digest")?,
+                        approved_by.as_ref(),
+                        human,
+                    )
+                },
+            )?
+        } else {
+            self.with_app_run_current(id, |digest| {
+                if let Some(sealed) = &approved_by {
+                    self.fresh_run_human(sealed)?;
+                }
+                self.store
+                    .app_run_dispatch_as(id, digest, approved_by.as_ref(), human)
+            })?
+        };
         if result["snapshot"]["workflow"]["execution"].as_str() == Some("host") {
             // CAD-1171: the operator's own click executes the capability;
             // no worker is kicked and no message is created.
@@ -937,7 +1075,255 @@ impl Shared {
                     .collect()
             })
             .unwrap_or_default();
+        let quotes = self
+            .prepare_app_run_quotes(run)?
+            .into_iter()
+            .map(|(slot, request)| Ok((slot, request?.fetch()?)))
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let account_slots: Vec<_> = slots
+            .iter()
+            .filter(|slot| {
+                run["snapshot"]["capabilities"][*slot]["config"]["provider"]
+                    == crate::platform::account_media::PLATFORM
+            })
+            .collect();
         let pm = self.pm_at(&self.pm_dir()?)?;
+        // Preserve the entire legacy critical section for runs without account
+        // slots. Mixed runs release only at the necessary account boundaries.
+        let execute_legacy = |legacy_slots: &[String], finish: bool| {
+            workspace::with_runtime_snapshot(&pm, install, |bundle, files| {
+                let _custody = self
+                    .platform_custody_lock
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let _release = self
+                    .app_release_lock
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                self.app_run_binding_current(run, bundle, files)?;
+                for slot in legacy_slots {
+                    let proof = self
+                        .app_binding_live(install, run["context_id"].as_str(), slot, bundle, files)?
+                        .ok_or_else(|| Error::rejected("run capability binding is absent"))?;
+                    let quote = quotes
+                        .get(slot)
+                        .ok_or_else(|| Error::rejected("run capability quote is absent"))?;
+                    if run["snapshot"]["quotes"][slot] != json!(quote) {
+                        return Err(Error::rejected(
+                            "capability price changed since run approval",
+                        ));
+                    }
+                    self.recheck_app_capability_quote(&proof, quote)?;
+                    let config = &proof.config;
+                    let provider = required_str(config, "provider")?;
+                    let tool = required_str(&config["mapping"], "tool")?;
+                    let effect = required_str(&config["mapping"], "effect")?;
+                    let adapter = self
+                        .platforms
+                        .get(provider)
+                        .ok_or_else(|| Error::rejected("bound capability adapter unavailable"))?;
+                    if !matches!(effect, "read" | "draft")
+                        || classify_call(
+                            adapter.table(),
+                            adapter.reported_manifest_version().as_deref(),
+                            tool,
+                        ) != if effect == "read" {
+                            Effect::Read
+                        } else {
+                            Effect::Draft
+                        }
+                    {
+                        return Err(Error::rejected(
+                            "bound app capability is not a current read/draft action",
+                        ));
+                    }
+                    let input = json!({});
+                    let input_digest = app_runs::material_digest(&input);
+                    let request = format!("host-{run_id}-{slot}");
+                    let call_id = format!(
+                        "app-call-{}",
+                        uuid::Uuid::new_v5(
+                            &uuid::Uuid::NAMESPACE_OID,
+                            format!("{run_id}:{slot}").as_bytes(),
+                        )
+                        .simple()
+                    );
+                    let authority = json!({
+                        "schema":1,"run_id":run_id,"run_snapshot_digest":run["snapshot_digest"],
+                        "install_id":install,"context_id":run["context_id"],
+                        "step_id":step_id,"slot":slot,"binding":proof,
+                        "inputs":run["snapshot"]["inputs"],"source":run["snapshot"]["source"],
+                        "quote":run["snapshot"]["quotes"][slot],
+                        "call_id":call_id,
+                    });
+                    if self
+                        .store
+                        .app_capability_result_for_slot(run_id, slot)?
+                        .is_some()
+                    {
+                        continue;
+                    }
+                    let credential = self.app_capability_credential(config)?;
+                    let newly_claimed = self.store.app_capability_claim(
+                        crate::store::app_capabilities::AppCapabilityClaim {
+                            run: run_id,
+                            step: &step_id,
+                            message: "",
+                            turn: "",
+                            slot,
+                            request: &request,
+                            binding_digest: &proof.digest,
+                            input_digest: &input_digest,
+                            call_id: &call_id,
+                        },
+                    )?;
+                    if !newly_claimed {
+                        let reason = "A prior provider call has no retained receipt; its outcome is uncertain and no automatic retry was made.";
+                        self.store.app_run_host_step_failed(
+                            run_id,
+                            &step_id,
+                            "uncertain",
+                            reason,
+                        )?;
+                        return Err(Error::unknown(reason));
+                    }
+                    // CAD-1374: re-prove the sealed approver after the claim shows
+                    // a NEW call and before any provider bytes leave. A revoked or
+                    // demoted approver refuses this step; the claim stays for an
+                    // honest, non-retried outcome.
+                    if let Some(sealed) = run["approval"]["human"]
+                        .as_object()
+                        .map(|_| &run["approval"]["human"])
+                    {
+                        self.fresh_run_human(sealed)?;
+                    }
+                    let output = match adapter.execute_app_capability_outcome(
+                        &credential,
+                        &authority,
+                        &input,
+                        &call_id,
+                    ) {
+                        Ok(output) => output,
+                        Err(error) => {
+                            let message = if crate::platform::refuse_leak(
+                                "app capability failure",
+                                error.reason(),
+                                &credential,
+                            )
+                            .is_ok()
+                            {
+                                error.reason().chars().take(250).collect::<String>()
+                            } else {
+                                "Provider failure details were withheld because they matched credential custody.".into()
+                            };
+                            self.store.app_run_host_step_failed(
+                                run_id,
+                                &step_id,
+                                error.kind(),
+                                &message,
+                            )?;
+                            return Err(match error {
+                                crate::platform::AppCapabilityError::Refused(_) => {
+                                    Error::provider(message)
+                                }
+                                crate::platform::AppCapabilityError::Uncertain(_) => {
+                                    Error::unknown(message)
+                                }
+                            });
+                        }
+                    };
+                    if crate::platform::refuse_leak(
+                        "app capability result",
+                        &output.result.to_string(),
+                        &credential,
+                    )
+                    .is_err()
+                        || output.asset.as_ref().is_some_and(|asset| {
+                            crate::platform::refuse_leak(
+                                "app capability asset",
+                                &String::from_utf8_lossy(&asset.bytes),
+                                &credential,
+                            )
+                            .is_err()
+                        })
+                    {
+                        let reason = "Provider output could not be safely retained; the outcome is uncertain and no automatic retry was made.";
+                        self.store.app_run_host_step_failed(
+                            run_id,
+                            &step_id,
+                            "uncertain",
+                            reason,
+                        )?;
+                        return Err(Error::unknown(reason));
+                    }
+                    if let Err(_error) = self.store.app_capability_record(
+                        crate::store::app_capabilities::AppCapabilityRecord {
+                            id: &call_id,
+                            run: run_id,
+                            step: &step_id,
+                            message: "",
+                            turn: "",
+                            slot,
+                            request: &request,
+                            binding_digest: &proof.digest,
+                            input_digest: &input_digest,
+                            result: &output.result,
+                            asset: output
+                                .asset
+                                .as_ref()
+                                .map(|asset| (asset.media_type.as_str(), asset.bytes.as_slice())),
+                        },
+                    ) {
+                        let reason = "Provider returned a result that could not be durably retained; the outcome is uncertain and no automatic retry was made.";
+                        self.store.app_run_host_step_failed(
+                            run_id,
+                            &step_id,
+                            "uncertain",
+                            reason,
+                        )?;
+                        return Err(Error::unknown(reason));
+                    }
+                }
+                if finish {
+                    self.store.app_run_host_step_succeeded(run_id, &step_id)?;
+                }
+                Ok(())
+            })
+        };
+        if account_slots.is_empty() {
+            return execute_legacy(&slots, true);
+        }
+        for slot in &slots {
+            if !account_slots.contains(&slot) {
+                execute_legacy(std::slice::from_ref(slot), false)?;
+                continue;
+            }
+            let quote = quotes
+                .get(slot)
+                .ok_or_else(|| Error::rejected("run capability quote is absent"))?;
+            if let Err(error) = self.execute_account_run_capability(
+                run,
+                slot,
+                quote,
+                (&json!({}), &format!("host-{run_id}-{slot}")),
+                None,
+            ) {
+                let kind = if error.kind() == "unknown" {
+                    "uncertain"
+                } else {
+                    "refused"
+                };
+                // Revocation may already have ended the run. Preserve the
+                // actual call outcome even if marking the step now refuses.
+                let _ =
+                    self.store
+                        .app_run_host_step_failed(run_id, &step_id, kind, &error.to_string());
+                return Err(error);
+            }
+        }
+        if run["approval"]["human"].is_object() {
+            self.fresh_run_human(&run["approval"]["human"])?;
+        }
         workspace::with_runtime_snapshot(&pm, install, |bundle, files| {
             let _custody = self
                 .platform_custody_lock
@@ -948,173 +1334,24 @@ impl Shared {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             self.app_run_binding_current(run, bundle, files)?;
-            for slot in &slots {
-                let proof = self
-                    .app_binding_live(install, run["context_id"].as_str(), slot, bundle, files)?
-                    .ok_or_else(|| Error::rejected("run capability binding is absent"))?;
-                let quote = self.app_capability_quote(&proof)?;
-                if run["snapshot"]["quotes"][slot] != json!(quote) {
-                    return Err(Error::rejected(
-                        "capability price changed since run approval",
-                    ));
-                }
-                let config = &proof.config;
-                let provider = required_str(config, "provider")?;
-                let tool = required_str(&config["mapping"], "tool")?;
-                let effect = required_str(&config["mapping"], "effect")?;
-                let adapter = self
-                    .platforms
-                    .get(provider)
-                    .ok_or_else(|| Error::rejected("bound capability adapter unavailable"))?;
-                if !matches!(effect, "read" | "draft")
-                    || classify_call(
-                        adapter.table(),
-                        adapter.reported_manifest_version().as_deref(),
-                        tool,
-                    ) != if effect == "read" {
-                        Effect::Read
-                    } else {
-                        Effect::Draft
-                    }
-                {
-                    return Err(Error::rejected(
-                        "bound app capability is not a current read/draft action",
-                    ));
-                }
-                let input = json!({});
-                let input_digest = app_runs::material_digest(&input);
-                let request = format!("host-{run_id}-{slot}");
-                let call_id = format!(
-                    "app-call-{}",
-                    uuid::Uuid::new_v5(
-                        &uuid::Uuid::NAMESPACE_OID,
-                        format!("{run_id}:{slot}").as_bytes(),
-                    )
-                    .simple()
-                );
-                let authority = json!({
-                    "schema":1,"run_id":run_id,"run_snapshot_digest":run["snapshot_digest"],
-                    "install_id":install,"context_id":run["context_id"],
-                    "step_id":step_id,"slot":slot,"binding":proof,
-                    "inputs":run["snapshot"]["inputs"],"source":run["snapshot"]["source"],
-                    "quote":run["snapshot"]["quotes"][slot],
-                    "call_id":call_id,
-                });
-                if self
-                    .store
-                    .app_capability_result_for_slot(run_id, slot)?
-                    .is_some()
-                {
-                    continue;
-                }
-                let credential = self.app_capability_credential(config)?;
-                let newly_claimed = self.store.app_capability_claim(
-                    crate::store::app_capabilities::AppCapabilityClaim {
-                        run: run_id,
-                        step: &step_id,
-                        message: "",
-                        turn: "",
-                        slot,
-                        request: &request,
-                        binding_digest: &proof.digest,
-                        input_digest: &input_digest,
-                        call_id: &call_id,
-                    },
-                )?;
-                if !newly_claimed {
-                    let reason = "A prior provider call has no retained receipt; its outcome is uncertain and no automatic retry was made.";
-                    self.store
-                        .app_run_host_step_failed(run_id, &step_id, "uncertain", reason)?;
-                    return Err(Error::unknown(reason));
-                }
-                // CAD-1374: re-prove the sealed approver after the claim shows
-                // a NEW call and before any provider bytes leave. A revoked or
-                // demoted approver refuses this step; the claim stays for an
-                // honest, non-retried outcome.
-                if let Some(sealed) = run["approval"]["human"]
-                    .as_object()
-                    .map(|_| &run["approval"]["human"])
-                {
-                    self.fresh_run_human(sealed)?;
-                }
-                let output = match adapter.execute_app_capability_outcome(
-                    &credential,
-                    &authority,
-                    &input,
-                    &call_id,
-                ) {
-                    Ok(output) => output,
-                    Err(error) => {
-                        let message = if crate::platform::refuse_leak(
-                            "app capability failure",
-                            error.reason(),
-                            &credential,
-                        )
-                        .is_ok()
-                        {
-                            error.reason().chars().take(250).collect::<String>()
-                        } else {
-                            "Provider failure details were withheld because they matched credential custody.".into()
-                        };
-                        self.store.app_run_host_step_failed(
-                            run_id,
-                            &step_id,
-                            error.kind(),
-                            &message,
-                        )?;
-                        return Err(match error {
-                            crate::platform::AppCapabilityError::Refused(_) => {
-                                Error::provider(message)
-                            }
-                            crate::platform::AppCapabilityError::Uncertain(_) => {
-                                Error::unknown(message)
-                            }
-                        });
-                    }
-                };
-                if crate::platform::refuse_leak(
-                    "app capability result",
-                    &output.result.to_string(),
-                    &credential,
-                )
-                .is_err()
-                    || output.asset.as_ref().is_some_and(|asset| {
-                        crate::platform::refuse_leak(
-                            "app capability asset",
-                            &String::from_utf8_lossy(&asset.bytes),
-                            &credential,
-                        )
-                        .is_err()
-                    })
-                {
-                    let reason = "Provider output could not be safely retained; the outcome is uncertain and no automatic retry was made.";
-                    self.store
-                        .app_run_host_step_failed(run_id, &step_id, "uncertain", reason)?;
-                    return Err(Error::unknown(reason));
-                }
-                if let Err(_error) = self.store.app_capability_record(
-                    crate::store::app_capabilities::AppCapabilityRecord {
-                        id: &call_id,
-                        run: run_id,
-                        step: &step_id,
-                        message: "",
-                        turn: "",
-                        slot,
-                        request: &request,
-                        binding_digest: &proof.digest,
-                        input_digest: &input_digest,
-                        result: &output.result,
-                        asset: output
-                            .asset
-                            .as_ref()
-                            .map(|asset| (asset.media_type.as_str(), asset.bytes.as_slice())),
-                    },
-                ) {
-                    let reason = "Provider returned a result that could not be durably retained; the outcome is uncertain and no automatic retry was made.";
-                    self.store
-                        .app_run_host_step_failed(run_id, &step_id, "uncertain", reason)?;
-                    return Err(Error::unknown(reason));
-                }
+            let current = self.store.app_run_show(run_id)?;
+            let status = self
+                .store
+                .app_capability_status(install, required_str(bundle, "digest")?)?;
+            if current["snapshot"] != run["snapshot"]
+                || current["snapshot_digest"] != run["snapshot_digest"]
+                || current["approval"]["human"] != run["approval"]["human"]
+                || status["state"] != "approved"
+                || status["epoch"] != current["epoch"]
+            {
+                return Err(Error::rejected(
+                    "account host authority changed before step completion",
+                ));
+            }
+            for slot in &account_slots {
+                let proof = serde_json::from_value(run["snapshot"]["capabilities"][*slot].clone())
+                    .map_err(|_| Error::rejected("account host binding is absent"))?;
+                self.recheck_app_capability_quote(&proof, &quotes[*slot])?;
             }
             self.store.app_run_host_step_succeeded(run_id, &step_id)?;
             Ok(())
@@ -1141,6 +1378,7 @@ impl Shared {
     fn app_artifact_current(&self, id: &str, turn: Option<(&str, &str)>) -> Result<Value> {
         let install = self.store.app_artifact_installation(id)?;
         let run_id = self.store.app_artifact_run_id(id)?;
+        self.probe_app_run_prices(&self.store.app_run_show(&run_id)?)?;
         let pm = self.pm_at(&self.pm_dir()?)?;
         workspace::with_runtime_snapshot(&pm, &install, |row, files| {
             let _custody = self
@@ -1201,6 +1439,7 @@ impl Shared {
                     .store
                     .app_message_installation(&message.id)?
                     .ok_or_else(|| Error::rejected("app message association is absent"))?;
+                self.probe_app_run_prices(&checked)?;
                 let pm = self.pm_at(&self.pm_dir()?)?;
                 workspace::with_runtime_snapshot(&pm, &install, |row, files| {
                     let _custody = self
@@ -1248,6 +1487,7 @@ impl Shared {
             .store
             .app_message_installation(&message.id)?
             .ok_or_else(|| Error::rejected("app association is absent"))?;
+        self.probe_app_run_prices(&self.store.app_run_show(&run_id)?)?;
         let pm = self.pm_at(&self.pm_dir()?)?;
         workspace::with_runtime_snapshot(&pm, &install, |row, files| {
             let _custody = self

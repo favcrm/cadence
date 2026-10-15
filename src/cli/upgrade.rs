@@ -26,7 +26,13 @@ pub(super) fn run_upgrade(state_dir: &Path, args: UpgradeArgs) -> Result<i32> {
         }
     };
     let layout = upgrade::Layout::detect(args.link, args.releases_dir)?;
-    let source = upgrade::Gh::new(&args.repo);
+    // CAD-1455: an owned HTTPS source is opt-in; the default stays the
+    // GitHub route, and an explicit source failure refuses rather than
+    // silently falling back to the API.
+    let source = match &args.release_source {
+        Some(base) => UpdateSource::Http(Box::new(cadence_agent::releases::HttpGh::new(base)?)),
+        None => UpdateSource::Gh(upgrade::Gh::new(&args.repo)),
+    };
     let mut report = upgrade::run(
         &source,
         &layout,
@@ -101,6 +107,7 @@ pub(super) fn run(
     repo: String,
     link: Option<PathBuf>,
     releases_dir: Option<PathBuf>,
+    release_source: Option<String>,
 ) -> Result<i32> {
     run_upgrade(
         &state_dir,
@@ -114,6 +121,7 @@ pub(super) fn run(
             repo,
             link,
             releases_dir,
+            release_source,
         },
     )
 }

@@ -292,6 +292,51 @@ impl Shared {
         })
     }
 
+    /// Local residue of a native public decision whose central membership
+    /// lookup already finished outside PM, custody and release guards.
+    /// Re-reads the cookie row and current realm only: no membership POST
+    /// and no JWKS fetch. `fresh_operator` is that central decision; the
+    /// stored role can withhold operator authority and cannot grant it.
+    pub(super) fn public_session_still(
+        &self,
+        token: &str,
+        fresh_hash: &str,
+        fresh_sub: &str,
+        fresh_realm: &PublicRealm,
+        fresh_operator: bool,
+    ) -> Result<bool> {
+        if !fresh_operator {
+            return Ok(false);
+        }
+        let MembershipMode::Native(native) = &self.membership_mode else {
+            return Ok(false);
+        };
+        if native.realm != *fresh_realm {
+            return Ok(false);
+        }
+        let now = self.operator_now();
+        let snapshot = {
+            let mut auth = self.operator_auth();
+            if auth.check_public(token, now)?.is_none() {
+                return Ok(false);
+            }
+            auth.public_snapshot(token, now)
+        };
+        let Some(after) = snapshot else {
+            return Ok(false);
+        };
+        if after.hash != fresh_hash || after.revoked || after.realm.as_ref() != Some(fresh_realm) {
+            return Ok(false);
+        }
+        let Some(user) = after.view.user else {
+            return Ok(false);
+        };
+        if user.sub != fresh_sub || after.view.expires_at <= now || !user.is_operator() {
+            return Ok(false);
+        }
+        Ok(self.current_realm()? == *fresh_realm)
+    }
+
     /// CAD-1374: the fresh freshness fence for an approved run's human. The
     /// sealed binding (company, sub, session reference) must still name a live
     /// public row whose fresh central decision is the owner of that company.

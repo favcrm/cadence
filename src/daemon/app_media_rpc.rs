@@ -267,7 +267,10 @@ impl Shared {
         let proven = self.store.app_media_original(asset_id)?;
         let pm_dir = self.pm_dir()?;
         let pm = self.pm_at(&pm_dir)?;
-        let (header, bytes) = workspace::with_runtime_snapshot_pair(
+        let mut account_source = None;
+        let mut account_fetch = None;
+        let mut public_body = None;
+        let prepared = workspace::with_runtime_snapshot_pair(
             &pm,
             &ctx.install_id,
             &proven.install_id,
@@ -294,9 +297,25 @@ impl Shared {
                     "bytes": proven.bytes,
                     "media_type": proven.media_type,
                 });
+                if provider == crate::platform::account_media::PLATFORM {
+                    // Freeze the FULL source, not just the durable account handle.
+                    // The broker checks this exact lineage before renewal/GET.
+                    let identity = crate::platform::account_media::current_identity(config)
+                        .map_err(Error::rejected)?;
+                    let frozen = crate::platform::agenticos_external::AgenticosExternalAdapter::account_image(identity.clone())?;
+                    account_source = Some(identity);
+                    account_fetch = Some((frozen, credential, descriptor));
+                    return Ok(None);
+                }
                 let (media_type, bytes) = adapter
                     .read_app_media_original(&credential, config, &descriptor)
                     .map_err(Error::rejected)?;
+                // Native public membership cannot run under these guards.
+                // Refresh it after they drop, then pin the exact result.
+                if self.native_public_original(origin) {
+                    public_body = Some((media_type, bytes, credential, descriptor));
+                    return Ok(None);
+                }
                 // The session+mount proven above is re-proven AFTER the
                 // provider fetch and BEFORE any success header: an expiry
                 // or revoke that landed during the bounded GET refuses the
@@ -314,9 +333,66 @@ impl Shared {
                     "bytes": bytes.len() as u64,
                     "sha256": format!("sha256:{:x}", Sha256::digest(&bytes)),
                 });
-                Ok((header, bytes))
+                Ok(Some((header, bytes)))
             },
         )?;
+        let (header, bytes) = if let Some((adapter, credential, descriptor)) = account_fetch {
+            // No PM, custody or release guard survives the preparation callback.
+            let (media_type, bytes) = crate::platform::PlatformAdapter::read_app_media_original(
+                &adapter,
+                &credential,
+                &proven.proof.config,
+                &descriptor,
+            )
+            .map_err(Error::rejected)?;
+            // Central public membership, when this daemon is native, is
+            // refreshed after the GET and before the guards return.
+            let proof = self.original_public_proof(token, origin, action_token, &ctx)?;
+            self.original_bytes_current(
+                &pm,
+                &ctx,
+                &proven,
+                OriginalSession {
+                    token,
+                    key,
+                    origin,
+                    action_token,
+                    proof: proof.as_ref(),
+                },
+                OriginalFetched {
+                    asset_id,
+                    media_type,
+                    bytes,
+                    credential: &credential,
+                    descriptor: &descriptor,
+                    account_source: account_source.as_ref(),
+                },
+            )?
+        } else if let Some((media_type, bytes, credential, descriptor)) = public_body {
+            let proof = self.original_public_proof(token, origin, action_token, &ctx)?;
+            self.original_bytes_current(
+                &pm,
+                &ctx,
+                &proven,
+                OriginalSession {
+                    token,
+                    key,
+                    origin,
+                    action_token,
+                    proof: proof.as_ref(),
+                },
+                OriginalFetched {
+                    asset_id,
+                    media_type,
+                    bytes,
+                    credential: &credential,
+                    descriptor: &descriptor,
+                    account_source: None,
+                },
+            )?
+        } else {
+            prepared.ok_or_else(|| Error::internal("media original preparation is absent"))?
+        };
         let delivery = OriginalDelivery {
             shared: self,
             pm: &pm,
@@ -325,6 +401,7 @@ impl Shared {
             key,
             origin,
             proven: &proven,
+            account_source,
             expected: ctx,
         };
         deliver(&header, &bytes, &delivery)
@@ -408,10 +485,9 @@ impl Shared {
         Ok(())
     }
 
-    /// The caller side of the original authority: the verified session is
-    /// still live, the public operator-role floor holds, and the consumed
-    /// mount is still the one `expected` proved. Pure store/Auth reads; no
-    /// custody, release or runtime lock is taken here.
+    /// The caller side of the original authority for sessions whose proof is
+    /// local. Native public membership HTTP is refused here so it cannot run
+    /// under the caller's PM, custody or release guards.
     fn original_mount_current(
         &self,
         token: &str,
@@ -420,10 +496,15 @@ impl Shared {
         action_token: &str,
         expected: &ToolContext,
     ) -> Result<()> {
+        if self.native_public_original(origin) {
+            return Err(Error::internal(
+                "media original public membership must be refreshed outside native guards",
+            ));
+        }
         let verb = "media original";
         let (session, view) = self.tool_session(token, key, origin).ok_or_else(|| {
             Error::rejected(format!(
-                "{verb} session ended during retrieval — sign in again"
+                "{verb} session ended during retrieval \u{2014} sign in again"
             ))
         })?;
         if origin == Origin::Public {
@@ -438,6 +519,130 @@ impl Shared {
             }
         }
         let ctx = self.tool_context_proven(action_token, &session)?;
+        self.original_mount_matches(&ctx, expected)
+    }
+
+    fn native_public_original(&self, origin: Origin) -> bool {
+        origin == Origin::Public
+            && matches!(
+                self.membership_mode,
+                crate::daemon::public_membership::MembershipMode::Native(_)
+            )
+    }
+
+    /// `None` unless this is a native public session. The lookup, including
+    /// both central membership paths, finishes before the caller takes guards.
+    fn original_public_proof(
+        &self,
+        token: &str,
+        origin: Origin,
+        action_token: &str,
+        expected: &ToolContext,
+    ) -> Result<Option<OriginalPublicProof>> {
+        if !self.native_public_original(origin) {
+            return Ok(None);
+        }
+        self.original_public_fresh(token, action_token, expected)
+            .map(Some)
+    }
+
+    fn original_public_fresh(
+        &self,
+        token: &str,
+        action_token: &str,
+        expected: &ToolContext,
+    ) -> Result<OriginalPublicProof> {
+        let verb = "media original";
+        let crate::daemon::public_membership::Authority::Granted {
+            sub,
+            role,
+            hash,
+            realm,
+            view,
+            ..
+        } = self.current_public_session(token)?
+        else {
+            return Err(Error::rejected(format!(
+                "{verb} session ended during retrieval \u{2014} sign in again"
+            )));
+        };
+        if !role.is_operator()
+            || !view
+                .user
+                .as_ref()
+                .is_some_and(crate::operator_auth::BoardUser::is_operator)
+        {
+            return Err(Error::rejected(format!(
+                "{verb} needs an operator-role public session",
+            )));
+        }
+        let ctx = self.tool_context_proven(action_token, &hash)?;
+        self.original_mount_matches(&ctx, expected)?;
+        Ok(OriginalPublicProof {
+            hash,
+            sub,
+            realm,
+            operator: true,
+            ctx,
+        })
+    }
+
+    /// Re-check the exact fresh native decision under guards already held.
+    /// Local row, realm, mount and approval only. No second membership lookup.
+    fn original_public_pinned(
+        &self,
+        proof: &OriginalPublicProof,
+        token: &str,
+        action_token: &str,
+        expected: &ToolContext,
+    ) -> Result<()> {
+        let verb = "media original";
+        if !self.public_session_still(
+            token,
+            &proof.hash,
+            &proof.sub,
+            &proof.realm,
+            proof.operator,
+        )? {
+            return Err(Error::rejected(format!(
+                "{verb} session ended during retrieval \u{2014} sign in again"
+            )));
+        }
+        let ctx = self.original_context_local(action_token, &proof.hash)?;
+        if ctx.session != proof.ctx.session
+            || ctx.install_id != proof.ctx.install_id
+            || ctx.context_id != proof.ctx.context_id
+            || ctx.digest != proof.ctx.digest
+            || ctx.tag != proof.ctx.tag
+            || ctx.generation != proof.ctx.generation
+            || ctx.mount != proof.ctx.mount
+            || ctx.approval_epoch != proof.ctx.approval_epoch
+        {
+            return Err(Error::rejected(format!(
+                "{verb} mount moved during retrieval \u{2014} refused",
+            )));
+        }
+        self.original_mount_matches(&ctx, expected)
+    }
+
+    fn original_authority_under_guards(
+        &self,
+        token: &str,
+        key: &str,
+        origin: Origin,
+        action_token: &str,
+        expected: &ToolContext,
+        proof: Option<&OriginalPublicProof>,
+    ) -> Result<()> {
+        if let Some(proof) = proof {
+            self.original_public_pinned(proof, token, action_token, expected)
+        } else {
+            self.original_mount_current(token, key, origin, action_token, expected)
+        }
+    }
+
+    fn original_mount_matches(&self, ctx: &ToolContext, expected: &ToolContext) -> Result<()> {
+        let verb = "media original";
         let context_id = ctx
             .context_id
             .as_deref()
@@ -448,7 +653,7 @@ impl Shared {
             || ctx.context_id != expected.context_id
         {
             return Err(Error::rejected(format!(
-                "{verb} mount moved during retrieval — refused",
+                "{verb} mount moved during retrieval \u{2014} refused",
             )));
         }
         let (_, proof) = self.store.app_context_proof(&ctx.install_id, context_id)?;
@@ -458,6 +663,110 @@ impl Shared {
             )));
         }
         Ok(())
+    }
+
+    /// The local half of `tool_context_proven`. Central `public_row_hash`
+    /// membership stays in the unlocked fresh proof.
+    fn original_context_local(&self, token: &str, session_hash: &str) -> Result<ToolContext> {
+        if token.len() != 64
+            || !token
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(Error::rejected("invalid tool action context"));
+        }
+        let ctx = {
+            let map = self.tool_contexts.lock().unwrap_or_else(|e| e.into_inner());
+            map.get(token)
+                .cloned()
+                .ok_or_else(|| Error::rejected("tool action context is stale or unknown"))?
+        };
+        if Instant::now().duration_since(ctx.issued) >= TOOL_CTX_TTL {
+            let mut map = self.tool_contexts.lock().unwrap_or_else(|e| e.into_inner());
+            map.remove(token);
+            return Err(Error::rejected("tool action context expired"));
+        }
+        if ctx.session != session_hash {
+            return Err(Error::rejected(
+                "tool action context does not belong to this session",
+            ));
+        }
+        if ctx.mount.is_none() {
+            return Err(Error::rejected(
+                "tool action context has no live mount \u{2014} the screen is not consumed",
+            ));
+        }
+        let status = self
+            .store
+            .app_capability_status(&ctx.install_id, &ctx.digest)?;
+        if status["state"].as_str() != Some("approved") {
+            return Err(Error::rejected(
+                "installation is not approved at its current digest",
+            ));
+        }
+        if status["epoch"].as_i64() != Some(ctx.approval_epoch) {
+            return Err(Error::rejected(
+                "installation was re-approved or revoked since mount \u{2014} tool call refused",
+            ));
+        }
+        Ok(ctx)
+    }
+
+    fn original_bytes_current(
+        &self,
+        pm: &crate::issue::Pm,
+        ctx: &ToolContext,
+        proven: &crate::store::app_media::MediaOriginalProof,
+        session: OriginalSession<'_>,
+        fetched: OriginalFetched<'_>,
+    ) -> Result<(Value, Vec<u8>)> {
+        workspace::with_runtime_snapshot_pair(
+            pm,
+            &ctx.install_id,
+            &proven.install_id,
+            |caller, producer| {
+                let _custody = self
+                    .platform_custody_lock
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let _release = self
+                    .app_release_lock
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                self.original_runtime_current(ctx, proven, caller, producer)?;
+                self.original_authority_under_guards(
+                    session.token,
+                    session.key,
+                    session.origin,
+                    session.action_token,
+                    ctx,
+                    session.proof,
+                )?;
+                if let Some(expected) = fetched.account_source {
+                    let current =
+                        crate::platform::account_media::current_identity(&proven.proof.config)
+                            .map_err(Error::rejected)?;
+                    if expected != &current {
+                        return Err(Error::rejected(
+                            "media original account source changed during retrieval",
+                        ));
+                    }
+                }
+                crate::platform::refuse_leak(
+                    "media original",
+                    &fetched.descriptor.to_string(),
+                    fetched.credential,
+                )?;
+                Ok((
+                    json!({
+                        "transfer": "app-media-original/1", "asset_id": fetched.asset_id,
+                        "media_type": fetched.media_type, "bytes": fetched.bytes.len() as u64,
+                        "sha256": format!("sha256:{:x}", Sha256::digest(&fetched.bytes)),
+                    }),
+                    fetched.bytes,
+                ))
+            },
+        )
     }
 
     /// The shared fresh authority proof both media verbs run on EVERY
@@ -646,14 +955,40 @@ impl Shared {
     }
 }
 
+struct OriginalSession<'a> {
+    token: &'a str,
+    key: &'a str,
+    origin: Origin,
+    action_token: &'a str,
+    proof: Option<&'a OriginalPublicProof>,
+}
+
+struct OriginalFetched<'a> {
+    asset_id: &'a str,
+    media_type: String,
+    bytes: Vec<u8>,
+    credential: &'a [u8],
+    descriptor: &'a Value,
+    account_source: Option<&'a crate::remote_cli::AccountImageIdentity>,
+}
+
+struct OriginalPublicProof {
+    hash: String,
+    sub: String,
+    realm: crate::operator_auth::PublicRealm,
+    operator: bool,
+    ctx: ToolContext,
+}
+
 /// The original transfer's write-time authority. Each nonblocking send
-/// runs under `with_current`, which re-proves the WHOLE original authority
-/// under the held guards before the write: the runtime snapshot,
+/// runs under `with_current`, which re-proves the original authority
+/// under the held guards before the write: runtime snapshot,
 /// `platform_custody_lock` and `app_release_lock` (pm → custody → release),
 /// the producing binding, approvals and active context, then the caller's
-/// live session and consumed mount (Auth → tool_context). The write itself
-/// is one nonblocking send inside those guards. No guard is held across a
-/// `WouldBlock` wait, so a revoke serializes with a single send.
+/// live session and consumed mount. Native public membership HTTP is
+/// refreshed before those guards and pinned locally inside them. The write
+/// itself is one nonblocking send inside the guards. No guard is held
+/// across a `WouldBlock` wait, so a revoke serializes with a single send.
 pub(super) struct OriginalDelivery<'a> {
     shared: &'a Shared,
     pm: &'a crate::issue::Pm,
@@ -662,12 +997,19 @@ pub(super) struct OriginalDelivery<'a> {
     key: &'a str,
     origin: Origin,
     proven: &'a crate::store::app_media::MediaOriginalProof,
+    account_source: Option<crate::remote_cli::AccountImageIdentity>,
     expected: ToolContext,
 }
 
 impl OriginalDelivery<'_> {
     pub(super) fn with_current<T>(&self, send: impl FnOnce() -> T) -> Result<T> {
         let refused = || Error::rejected("media original authority ended — delivery refused");
+        let proof = self.shared.original_public_proof(
+            self.token,
+            self.origin,
+            self.action_token,
+            &self.expected,
+        )?;
         workspace::with_runtime_snapshot_pair(
             self.pm,
             &self.expected.install_id,
@@ -689,13 +1031,22 @@ impl OriginalDelivery<'_> {
                     caller,
                     producer,
                 )?;
-                self.shared.original_mount_current(
+                self.shared.original_authority_under_guards(
                     self.token,
                     self.key,
                     self.origin,
                     self.action_token,
                     &self.expected,
+                    proof.as_ref(),
                 )?;
+                if let Some(expected) = &self.account_source {
+                    let current =
+                        crate::platform::account_media::current_identity(&self.proven.proof.config)
+                            .map_err(Error::rejected)?;
+                    if &current != expected {
+                        return Err(refused());
+                    }
+                }
                 let mut auth = self.shared.operator_auth();
                 if !auth.live_hash(&self.expected.session, self.shared.operator_now())? {
                     return Err(refused());

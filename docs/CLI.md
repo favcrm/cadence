@@ -51,6 +51,15 @@ build-provenance attestation verifies for the repository. A sha that is not
 on main, or has no attested build, is refused with a sentence naming the
 reason. Without `--to`, behavior is unchanged.
 
+`--release-source https://<host>` (CAD-1455, opt-in) consumes the published
+release from an owned endpoint instead of live GitHub queries: the catalogue
+selects the subject (discovery only), the retained package's receipt,
+build/promotion/completion Sigstore bundles and signed source-facts verify
+offline, and the publication-time snapshot answers on-main, ancestry and
+schema. An explicit source failure refuses — there is no silent GitHub API
+fallback. Omit it to keep the default GitHub route; see
+docs/RELEASING.md "Owned release source".
+
 ## Client only: `cadence update` (CAD-1425, CAD-1437)
 
 One command serves both installations. A client-only installation
@@ -63,8 +72,11 @@ cadence update                            # newest public release, forward only
 cadence update --version v0.2.0           # a newer pinned release
 ```
 
-On a client-only installation `update` accepts only `--check` and
-`--version TAG`. A native option (`--rollback`, `--to`, `--now`, `--drain`,
+On a client-only installation `update` accepts only `--check`,
+`--version TAG` and `--release-source` (the owned `public-client`
+endpoint; CAD-1455 — same offline proof, forward-only rule and explicit
+failure refusal). Every other native option (`--rollback`, `--to`,
+`--now`, `--drain`,
 `--keep`, `--json`, `--progress`, `--backup-dir`, `--repo`, `--link`,
 `--releases-dir`, `--as`, even at its default value), `update status`, and a
 global `--org`, `--state-dir` or `--wake-timeout` refuse with exit 3 before

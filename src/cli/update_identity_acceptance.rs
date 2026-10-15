@@ -330,6 +330,7 @@ fn update_args() -> UpdateArgs {
         to: None,
         as_identity: None,
         repo: "unused/fixture".into(), // never reached: the layout refuses first
+        release_source: None,
         link: None,
         releases_dir: None,
     }
