@@ -115,8 +115,37 @@ with an empty input object and retains the actual provider response.
 
 const JOB_ID: &str = "med_job1365orig";
 
+/// Agent execution with the same image slot. The host workflow stays the
+/// default package; this file is written only for the lineage entry check.
+const WORKER_WORKFLOW_MD: &str = r#"---
+title: "Worker image: {{subject}}"
+goal: "One assigned turn over the frozen image slot"
+label: Worker image
+capability_slots: [image]
+execution: agent
+inputs:
+  subject: { ask: "Image subject", example: "Harbour" }
+  source: { ask: "Source facts", example: "A red lighthouse marks the harbour" }
+  image_prompt: { ask: "Image guidance", example: "Use an editorial palette" }
+---
+
+## Prepare the frozen image: {{subject}}
+agent: image-worker
+size: S
+action: local.text.produce
+
+The assigned worker calls the frozen image slot. No second provider is named.
+
+### Acceptance
+- [ ] the assigned worker used only the frozen image slot
+"#;
+
+#[path = "cad1459_native_lineage_entry_acceptance.rs"]
+mod cad1459_native_lineage_entry_acceptance;
 #[path = "cad1459_original_account_acceptance.rs"]
 mod cad1459_original_account_acceptance;
+#[path = "cad1459_public_membership_original_acceptance.rs"]
+mod cad1459_public_membership_original_acceptance;
 
 /// The >2 MiB original the provider retains — the exact byte recipe
 /// `cad1365_original_artifact_acceptance` proves forces the custody
@@ -299,6 +328,7 @@ struct Fx {
     server: Option<std::thread::JoinHandle<()>>,
     stop: Arc<AtomicBool>,
     account: bool,
+    worker_workflow: bool,
 }
 
 /// One raw JSON-RPC exchange on the fixture socket: the exact frame
@@ -358,6 +388,20 @@ impl Fx {
         seed_asset: bool,
         trust: Option<crate::issuer_transport::test_fixture::Fixture>,
     ) -> Self {
+        Self::boot_configured(original, descriptor, seed_asset, trust, false, false)
+    }
+
+    /// `native_membership` captures real Native mode from provider env.
+    /// `worker_workflow` adds one agent workflow beside the host image
+    /// workflow. Both default off for every existing caller.
+    fn boot_configured(
+        original: Vec<u8>,
+        descriptor: Option<Value>,
+        seed_asset: bool,
+        trust: Option<crate::issuer_transport::test_fixture::Fixture>,
+        native_membership: bool,
+        worker_workflow: bool,
+    ) -> Self {
         let dir = tempfile::Builder::new()
             .prefix("c1365orig")
             .tempdir()
@@ -407,6 +451,20 @@ impl Fx {
         opts.provider_env.set("CADENCE_TEST_MEDIA_POLL_MS", "20");
         opts.provider_env
             .set("CADENCE_TEST_MEDIA_DEADLINE_MS", "5000");
+        if native_membership {
+            // Same board identity `write_config` already saved. Native mode
+            // re-proves public sessions against the platform; standalone
+            // callers leave these unset.
+            opts.provider_env
+                .set("AGENTICOS_COMPANY", "cad1365-test-company");
+            opts.provider_env.set("AGENTICOS_INSTANCE", "inst0001");
+            opts.provider_env
+                .set("AGENTICOS_BOARD_HOST", "cad1365.example.test");
+            opts.provider_env
+                .set("AGENTICOS_BOARD_ISSUER", "https://platform.example.test");
+            opts.provider_env
+                .set("AGENTICOS_BOARD_COMPANY", "cad1365-test-company");
+        }
         if trust.is_some() {
             crate::platform::account_media::attach(&mut opts).unwrap();
         } else {
@@ -508,6 +566,7 @@ impl Fx {
                 server: Some(server),
                 stop,
                 account: trust.is_some(),
+                worker_workflow,
                 shared,
                 _dir: dir,
             };
@@ -528,6 +587,9 @@ impl Fx {
         std::fs::write(app.join("app.md"), APP_MD).unwrap();
         std::fs::write(app.join("workflows/create-image.md"), WORKFLOW_MD).unwrap();
         media_screen(&app);
+        if self.worker_workflow {
+            std::fs::write(app.join("workflows/worker-image.md"), WORKER_WORKFLOW_MD).unwrap();
+        }
         let installed = self
             .op(
                 "app_workspace_install",

@@ -140,6 +140,11 @@ impl Wire {
     }
 
     #[cfg(feature = "test-seam")]
+    pub(crate) fn connection_count(&self) -> usize {
+        self.connections.load(SeqCst)
+    }
+
+    #[cfg(feature = "test-seam")]
     pub(crate) fn trust(&self) -> Fixture {
         Fixture {
             ca_der: self.ca_der.clone(),

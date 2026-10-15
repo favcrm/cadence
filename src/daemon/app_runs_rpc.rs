@@ -999,6 +999,7 @@ impl Shared {
                 })
             });
         let result = if account_run {
+            self.account_frozen_lineage(&run)?;
             self.probe_app_run_prices(&run)?;
             if let Some(sealed) = &approved_by {
                 self.fresh_run_human(sealed)?;

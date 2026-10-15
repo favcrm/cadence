@@ -174,6 +174,31 @@ impl Shared {
         self.prepare_app_capability_quote(proof)?.fetch()
     }
 
+    /// Offline refusal for a frozen account quote. Custody is resolved
+    /// locally; renewal, price discovery and provider HTTP stay with the caller.
+    pub(super) fn account_frozen_lineage(&self, run: &Value) -> Result<()> {
+        let Some(slots) = run["snapshot"]["capabilities"].as_object() else {
+            return Ok(());
+        };
+        for (slot, proof) in slots {
+            if proof["config"]["provider"] != crate::platform::account_media::PLATFORM {
+                continue;
+            }
+            let revision = run["snapshot"]["quotes"][slot]["price_revision"]
+                .as_str()
+                .ok_or_else(|| {
+                    Error::rejected(
+                        "saved account SESSION QUOTE is stale; request a fresh quote and approve it again",
+                    )
+                })?;
+            let identity = crate::platform::account_media::current_identity(&proof["config"])
+                .map_err(Error::rejected)?;
+            crate::platform::account_media::validate_quote_source(&identity, revision)
+                .map_err(Error::rejected)?;
+        }
+        Ok(())
+    }
+
     /// Account-only run execution. Preparation and retention each take a FRESH
     /// PM/custody/release snapshot; neither provider nor human-authority I/O is
     /// inside either callback. A durable claim admits exactly one sender.
@@ -685,6 +710,11 @@ impl Shared {
                     .app_message_installation(&msg.id)?
                     .ok_or_else(|| Error::rejected("capability app association is absent"))?;
                 let checked_run = self.store.app_run_show(&run_id)?;
+                if checked_run["snapshot"]["capabilities"][&slot]["config"]["provider"]
+                    == crate::platform::account_media::PLATFORM
+                {
+                    self.account_frozen_lineage(&checked_run)?;
+                }
                 self.probe_app_run_prices(&checked_run)?;
                 let quote = self
                     .prepare_app_run_quotes(&checked_run)?
