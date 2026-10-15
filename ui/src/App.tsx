@@ -168,7 +168,7 @@ export default function App() {
   const issues = issuesState.data ?? [];
   const projects = projectsState.data ?? [];
   const agents = agentsState.data;
-  const [health, setHealth] = useState<Health | null>(null);
+  const [health, setHealth] = useState<Health | null | "unavailable">(null);
   const [meta, setMeta] = useState<Meta | null>(null);
   const [updateBanner, setUpdateBanner] = useState<UpdateBanner | null>(null);
   useEffect(() => setSession(meta), [meta, setSession]);
@@ -300,6 +300,7 @@ export default function App() {
   const threadsSession = useRef<string | null>(null);
   const metaKey = useRef<string | null>(null);
   const metaRequest = useRef(0);
+  const healthRequest = useRef(0);
   const metaInFlight = useRef<{ scope: string; promise: Promise<Meta | null> } | null>(null);
   const [credentialGeneration, setCredentialGeneration] = useState(0);
   // CAD-1193: the two unknowns stay distinct. `meta === null` alone is
@@ -357,7 +358,15 @@ export default function App() {
   }, []);
 
   const refresh = useCallback((forceProof = false) => {
-    api.health().then(setHealth).catch(() => setHealth(null));
+    const healthProbe = ++healthRequest.current;
+    api
+      .health()
+      .then((next) => {
+        if (healthProbe === healthRequest.current) setHealth(next);
+      })
+      .catch(() => {
+        if (healthProbe === healthRequest.current) setHealth("unavailable");
+      });
     const request = ++metaRequest.current;
     const sentKey = sessionKey();
     if (sentKey !== metaKey.current) {

@@ -799,15 +799,31 @@ fn post(
     Ok((status, retry_after, value))
 }
 
+fn request_timeout(deadline: Instant, cap: Duration) -> Result<Duration> {
+    let exhausted = || {
+        Error::busy_coded(
+            "waking",
+            "remote wake budget exhausted — retry or increase --wake-timeout",
+        )
+    };
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or_else(exhausted)?;
+    if remaining.is_zero() {
+        return Err(exhausted());
+    }
+    Ok(remaining.min(cap))
+}
+
 /// `POST /__platform/{cli,wiki}/authorize` — exchange the live `hct_` for one
-/// actor envelope scoped to `scopes`. The request is the strict AOS-128 /
-/// AOS-122 shape; the answer must echo the version and carry a compact-JWS
-/// envelope.
+/// actor envelope scoped to `scopes`. The request is the strict relay shape;
+/// the answer must echo the version and carry a compact-JWS envelope.
 fn authorize(
     target: &RemoteTarget,
     cred: &Credential,
     surface: Surface,
     scopes: &[&str],
+    timeout: Duration,
 ) -> Result<String> {
     let (relay, version) = surface.relay();
     let (status, _, body) = post(
@@ -821,7 +837,7 @@ fn authorize(
             "requested_scopes": scopes,
             "ttl_seconds": MAX_TTL,
         }),
-        AUTH_TIMEOUT,
+        timeout,
     )?;
     match status {
         200 => {
@@ -853,13 +869,20 @@ fn call_once(
     surface: Surface,
     verb: &str,
     arguments: &Map<String, Value>,
+    deadline: Instant,
 ) -> Result<(u16, Option<u64>, Option<Value>)> {
     let scopes: &[&str] = match surface {
         Surface::Cli => &["cli.read", "cli.write"],
         Surface::Wiki if verb == "write" => &["wiki.write"],
         Surface::Wiki => &["wiki.read"],
     };
-    let envelope = authorize(target, cred, surface, scopes)?;
+    let envelope = authorize(
+        target,
+        cred,
+        surface,
+        scopes,
+        request_timeout(deadline, AUTH_TIMEOUT)?,
+    )?;
     let (relay, version) = surface.relay();
     // A wiki body always carries `arguments` (`{}` when there are none).
     let mut body = match surface {
@@ -876,7 +899,7 @@ fn call_once(
         &format!("{relay}/call"),
         &cred.access_token,
         &body,
-        CALL_TIMEOUT,
+        request_timeout(deadline, CALL_TIMEOUT)?,
     )
 }
 
@@ -894,7 +917,7 @@ fn upload_once(
     file_name: &str,
     bytes: &[u8],
 ) -> Result<(u16, Option<u64>, Option<Value>)> {
-    let envelope = authorize(target, cred, Surface::Wiki, &["wiki.write"])?;
+    let envelope = authorize(target, cred, Surface::Wiki, &["wiki.write"], AUTH_TIMEOUT)?;
     let mut random = [0u8; 16];
     getrandom::fill(&mut random).map_err(|_| reject("unable to create upload boundary"))?;
     let boundary = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random);
@@ -1492,8 +1515,24 @@ fn call_verb_in(
             )));
         }
     }
-    let deadline = Instant::now() + Duration::from_secs(wake_timeout);
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(wake_timeout))
+        .ok_or_else(|| reject("invalid wake timeout"))?;
+    let budget_over = || -> Error {
+        Error::busy_coded(
+            "waking",
+            format!(
+                "org '{}' is still waking after {}s — retry, or pass a \
+                 larger --wake-timeout",
+                target.org, wake_timeout
+            ),
+        )
+    };
+    if wake_timeout == 0 {
+        return Err(budget_over());
+    }
     loop {
+        request_timeout(deadline, AUTH_TIMEOUT)?;
         let cred = renewed_credential(dir, target, deadline)?;
         // A login that records its capabilities must hold the wiki scope the
         // action needs; a legacy login with none is left to the server's check.
@@ -1518,26 +1557,23 @@ fn call_verb_in(
                 "remote command deadline elapsed during session renewal",
             ));
         }
-        let (status, retry_after, body) = call_once(target, &cred, surface, verb, &arguments)?;
+        let (status, retry_after, body) =
+            call_once(target, &cred, surface, verb, &arguments, deadline)?;
         match classify(status, retry_after, body) {
             Verdict::Done(result) => return result.map(RemoteAnswer::Ok),
             Verdict::Conflict(body) => return Ok(RemoteAnswer::Conflict(body)),
             Verdict::Waking(wait) => {
                 let now = Instant::now();
-                if now + wait > deadline {
-                    // The remote was still waking when the budget ran out —
-                    // retryable by the operator's own choice, so `busy` (75)
-                    // with the `waking` code the contract pins.
-                    return Err(Error::busy_coded(
-                        "waking",
-                        format!(
-                            "org '{}' is still waking after {}s — retry, or pass a \
-                             larger --wake-timeout",
-                            target.org, wake_timeout
-                        ),
-                    ));
+                let remaining = deadline
+                    .checked_duration_since(now)
+                    .ok_or_else(budget_over)?;
+                if wait >= remaining {
+                    return Err(budget_over());
                 }
-                note(&format!("waking {}… ({}s)", target.org, wait.as_secs()));
+                note(&format!(
+                    "Starting {}… waiting for it to become ready",
+                    target.org
+                ));
                 sleep(wait);
             }
         }
@@ -1675,6 +1711,7 @@ mod tests {
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
     use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
     use std::thread;
 
     const ORG: &str = "acme";
@@ -3246,6 +3283,358 @@ mod tests {
         stop.store(true, Ordering::SeqCst);
         let paths = fake.join().unwrap();
         (err.to_string(), paths)
+    }
+    fn credentialed(listener: &TcpListener) -> (RemoteTarget, tempfile::TempDir, PathBuf) {
+        let target = target(listener);
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("a");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        store_credential(&dir, &target.endpoint);
+        (target, root, dir)
+    }
+
+    fn write_answer(socket: &mut std::net::TcpStream, status: &str, extra: &str, body: &Value) {
+        let bytes = serde_json::to_vec(body).unwrap();
+        let _ = write!(
+            socket,
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n{extra}\r\n",
+            bytes.len()
+        );
+        let _ = socket.write_all(&bytes);
+        let _ = socket.flush();
+    }
+
+    fn finite_worker(
+        n: usize,
+        serve: impl Fn(usize, &mut std::net::TcpStream, &Request) + Send + 'static,
+    ) -> (
+        TcpListener,
+        std::sync::Arc<std::sync::Mutex<Vec<Request>>>,
+        thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server = listener.try_clone().unwrap();
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<Request>>> = Default::default();
+        let requests = seen.clone();
+        let handle = thread::spawn(move || {
+            for i in 0..n {
+                let Ok((socket, _)) = server.accept() else {
+                    return;
+                };
+                let (mut socket, req) = {
+                    let (s, r) = read_request(socket);
+                    (s, r)
+                };
+                requests.lock().unwrap().push(clone_request(&req));
+                serve(i, &mut socket, &req);
+            }
+        });
+        (listener, seen, handle)
+    }
+
+    fn clone_request(req: &Request) -> Request {
+        Request {
+            path: req.path.clone(),
+            bearer: req.bearer.clone(),
+            body: req.body.clone(),
+        }
+    }
+
+    /// Read an HTTP request without assuming its body is JSON; uploads are
+    /// multipart and the server fixture must observe the bytes as sent.
+    fn read_raw_request(socket: std::net::TcpStream) -> (std::net::TcpStream, String, Vec<u8>) {
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = BufReader::new(socket.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let path = line.split(' ').nth(1).unwrap().to_string();
+        let mut length = 0_usize;
+        loop {
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" {
+                break;
+            }
+            if let Some((key, value)) = line.split_once(':') {
+                if key.eq_ignore_ascii_case("content-length") {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+        }
+        let mut raw = vec![0; length];
+        reader.read_exact(&mut raw).unwrap();
+        (socket, path, raw)
+    }
+
+    /// Bounded loopback fixture for upload deadline tests. A quiet half-second
+    /// after the last request ends the fixture, including when the client
+    /// correctly refuses before sending a later phase.
+    fn upload_deadline_worker(
+        serve: impl Fn(&str, &mut std::net::TcpStream, &[u8]) + Send + 'static,
+    ) -> (
+        TcpListener,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server = listener.try_clone().unwrap();
+        server.set_nonblocking(true).unwrap();
+        let paths = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = paths.clone();
+        let handle = thread::spawn(move || {
+            let overall = Instant::now() + Duration::from_secs(8);
+            let mut last_request = Instant::now();
+            while Instant::now() < overall {
+                match server.accept() {
+                    Ok((socket, _)) => {
+                        let (mut socket, path, raw) = read_raw_request(socket);
+                        observed.lock().unwrap().push(path.clone());
+                        serve(&path, &mut socket, &raw);
+                        last_request = Instant::now();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if !observed.lock().unwrap().is_empty()
+                            && last_request.elapsed() >= Duration::from_millis(500)
+                        {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (listener, paths, handle)
+    }
+
+    fn upload_authorize_answer(socket: &mut std::net::TcpStream) {
+        write_answer(
+            socket,
+            "200 OK",
+            "",
+            &json!({"version": WIKI_VERSION, "envelope": "h.e.1"}),
+        );
+    }
+
+    #[test]
+    fn upload_total_deadline_covers_authorization() {
+        let (listener, paths, server) = upload_deadline_worker(|path, socket, _raw| {
+            if path == "/__platform/wiki/authorize" {
+                thread::sleep(Duration::from_secs(3));
+                upload_authorize_answer(socket);
+            } else {
+                write_answer(socket, "200 OK", "", &json!({"ok": true}));
+            }
+        });
+        let (target, _root, dir) = credentialed(&listener);
+        let start = Instant::now();
+        let out = upload_file_in(&dir, &target, "a.pdf", "a.pdf", b"pdf", true, 1, |_| {});
+        let elapsed = start.elapsed();
+        assert!(
+            out.is_err(),
+            "slow upload authorization unexpectedly succeeded"
+        );
+        assert!(
+            elapsed < Duration::from_millis(2300),
+            "1s upload budget took {elapsed:?}"
+        );
+        server.join().unwrap();
+        assert_eq!(*paths.lock().unwrap(), ["/__platform/wiki/authorize"]);
+    }
+
+    #[test]
+    fn upload_total_deadline_covers_response_body() {
+        let (listener, paths, server) = upload_deadline_worker(|path, socket, _raw| {
+            if path == "/__platform/wiki/authorize" {
+                upload_authorize_answer(socket);
+            } else {
+                let _ = write!(socket, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 11\r\nconnection: close\r\n\r\n{{");
+                let _ = socket.flush();
+                thread::sleep(Duration::from_secs(3));
+                let _ = socket.write_all(b"\"ok\":true}");
+            }
+        });
+        let (target, _root, dir) = credentialed(&listener);
+        let start = Instant::now();
+        let out = upload_file_in(&dir, &target, "a.pdf", "a.pdf", b"pdf", true, 1, |_| {});
+        let elapsed = start.elapsed();
+        assert!(
+            out.is_err(),
+            "slow upload response body unexpectedly succeeded"
+        );
+        assert!(
+            elapsed < Duration::from_millis(2300),
+            "1s upload budget took {elapsed:?}"
+        );
+        server.join().unwrap();
+        assert_eq!(
+            *paths.lock().unwrap(),
+            ["/__platform/wiki/authorize", "/__platform/wiki/upload"]
+        );
+    }
+
+    #[test]
+    fn upload_total_deadline_includes_overwrite_preflight() {
+        let wiki_authorizes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let authorizes = wiki_authorizes.clone();
+        let (listener, paths, server) =
+            upload_deadline_worker(move |path, socket, _raw| match path {
+                "/__platform/wiki/authorize"
+                    if authorizes.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 =>
+                {
+                    upload_authorize_answer(socket);
+                }
+                "/__platform/wiki/authorize" => {
+                    thread::sleep(Duration::from_secs(3));
+                    upload_authorize_answer(socket);
+                }
+                "/__platform/wiki/call" => {
+                    thread::sleep(Duration::from_millis(1200));
+                    write_answer(socket, "200 OK", "", &json!({"path":"a", "entries":[]}));
+                }
+                _ => write_answer(socket, "200 OK", "", &json!({"ok": true})),
+            });
+        let (target, _root, dir) = credentialed(&listener);
+        let start = Instant::now();
+        let out = upload_file_in(&dir, &target, "a/a.pdf", "a.pdf", b"pdf", false, 2, |_| {});
+        let elapsed = start.elapsed();
+        assert!(out.is_err(), "upload exceeded the shared preflight budget");
+        assert!(
+            elapsed < Duration::from_millis(2700),
+            "2s total upload budget took {elapsed:?}"
+        );
+        server.join().unwrap();
+        let paths = paths.lock().unwrap();
+        assert_eq!(paths[0], "/__platform/wiki/authorize");
+        assert_eq!(paths[1], "/__platform/wiki/call");
+        assert_eq!(paths[2], "/__platform/wiki/authorize");
+        assert_eq!(paths.len(), 3, "timeout must not send or replay an upload");
+    }
+
+    #[test]
+    fn a_slow_authorize_is_capped_by_the_wake_budget() {
+        let (listener, seen, server) = finite_worker(1, |_i, socket, _req| {
+            thread::sleep(Duration::from_secs(3));
+            write_answer(
+                socket,
+                "200 OK",
+                "",
+                &json!({"version": CLI_VERSION, "envelope": "h.e.1"}),
+            );
+        });
+        let (target, _root, dir) = credentialed(&listener);
+        let start = Instant::now();
+        let out = call_verb_in(&target, "status", Map::new(), 1, &dir, |_| {}, |_| {});
+        let elapsed = start.elapsed();
+        assert!(out.is_err());
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "a 1s budget let authorize run {elapsed:?}"
+        );
+        server.join().unwrap();
+        let reqs = seen.lock().unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].path, "/__platform/cli/authorize");
+    }
+
+    #[test]
+    fn authorize_and_call_share_one_deadline() {
+        let (listener, seen, server) = finite_worker(2, |i, socket, _req| {
+            if i == 0 {
+                thread::sleep(Duration::from_secs(1));
+                write_answer(
+                    socket,
+                    "200 OK",
+                    "",
+                    &json!({"version": CLI_VERSION, "envelope": "h.e.1"}),
+                );
+            } else {
+                thread::sleep(Duration::from_secs(3));
+                write_answer(socket, "200 OK", "", &json!({"ok": true}));
+            }
+        });
+        let (target, _root, dir) = credentialed(&listener);
+        let start = Instant::now();
+        let out = call_verb_in(&target, "status", Map::new(), 2, &dir, |_| {}, |_| {});
+        let elapsed = start.elapsed();
+        assert!(out.is_err());
+        assert!(
+            elapsed < Duration::from_millis(2750),
+            "authorize+call did not share the 2s deadline: {elapsed:?}"
+        );
+        server.join().unwrap();
+        let reqs = seen.lock().unwrap();
+        assert_eq!(reqs.len(), 2);
+        assert!(check_authorize(&reqs[0]), "authorize schema");
+        assert!(check_call(&reqs[1]), "call schema");
+    }
+
+    #[test]
+    fn call_response_body_is_bounded_by_remaining_deadline() {
+        let (listener, _seen, server) = finite_worker(2, |i, socket, _req| {
+            if i == 0 {
+                write_answer(
+                    socket,
+                    "200 OK",
+                    "",
+                    &json!({"version": CLI_VERSION, "envelope": "h.e.1"}),
+                );
+            } else {
+                let body = serde_json::to_vec(&json!({"ok": true})).unwrap();
+                let _ = write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(&body[..1]);
+                let _ = socket.flush();
+                thread::sleep(Duration::from_secs(3));
+                let _ = socket.write_all(&body[1..]);
+            }
+        });
+        let (target, _root, dir) = credentialed(&listener);
+        let start = Instant::now();
+        let out = call_verb_in(&target, "status", Map::new(), 1, &dir, |_| {}, |_| {});
+        let elapsed = start.elapsed();
+        assert!(out.is_err());
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "a 1s budget let the body read run {elapsed:?}"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_zero_budget_never_sends_a_byte() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (target, _root, dir) = credentialed(&listener);
+        let out = call_verb_in(&target, "status", Map::new(), 0, &dir, |_| {}, |_| {});
+        assert!(out.is_err());
+        assert!(
+            matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "a dead budget opened a socket"
+        );
+    }
+
+    #[test]
+    fn a_wake_sleep_that_would_pass_the_deadline_is_the_retryable_busy() {
+        let (out, _requests) = run(
+            vec![
+                (503, "", json!({"state": "waking", "retry_after_s": 5})),
+                (503, "", json!({"state": "waking", "retry_after_s": 5})),
+            ],
+            "status",
+            Map::new(),
+            2,
+        );
+        let err = out.unwrap_err();
+        assert_eq!(err.kind(), "busy");
+        assert_eq!(err.code(), Some("waking"));
     }
 }
 
