@@ -447,9 +447,6 @@
 .threads-context-sheet::backdrop {
   background: rgba(0, 0, 0, 0.5);
 }
-.threads-create-sheet > .threads-newgroup + .threads-newgroup {
-  margin-top: 0.75rem;
-}
 .threads-context-sheet-head {
   display: flex;
   justify-content: space-between;
@@ -546,22 +543,263 @@
     display: none;
   }
 }
-.threads-newgroup {
+/* Creation uses shared .field / Button / Select primitives at one compact scale. */
+.threads-create-sheet {
+  width: min(29rem, calc(100vw - 2rem));
+  max-height: calc(100dvh - 2rem);
+  padding: 0;
+  overflow: hidden;
+  background: var(--color-ink-850);
+  border-color: var(--color-edge);
+}
+.threads-create-sheet[open] {
+  display: flex;
+  flex-direction: column;
+}
+.threads-create-sheet > .threads-context-sheet-head {
+  flex: none;
+  padding: 1.15rem 1.25rem 1rem;
+  margin: 0;
+}
+.threads-create-sheet > .threads-context-sheet-head h2 {
+  font-size: var(--text-section);
+  font-weight: 500;
+}
+.threads-create-modes {
+  display: flex;
+  flex: none;
+  gap: 0.2rem;
+  margin: 0 1.25rem;
+  padding: 0.2rem;
+  background: var(--color-ink-900);
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.3rem;
+}
+.threads-create-modes .btn {
+  flex: 1;
+  min-width: 0;
+  padding-inline: 0.4rem;
+  color: var(--color-ink-400);
+}
+.threads-create-modes .btn[aria-pressed="true"] {
+  background: var(--color-ink-800);
+  color: var(--color-ink-100);
+}
+.threads-create-sheet .btn {
+  font-size: var(--text-label);
+}
+.threads-create-form {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.threads-create-body {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  padding: 1.1rem 1.25rem;
+  overflow-y: auto;
+  min-height: 0;
+}
+.threads-form-field {
+  display: grid;
+  gap: 0.375rem;
+  min-width: 0;
+}
+.threads-create-sheet .field {
+  width: 100%;
+  min-width: 0;
+  height: 2rem;
+  padding-inline: 0.625rem;
+  font-size: var(--text-secondary);
+}
+.threads-optional {
+  margin-left: 0.25rem;
+  color: var(--color-ink-500);
+  font-size: var(--text-micro);
+  font-weight: 400;
+}
+.threads-member-picker {
+  display: grid;
+  gap: 0.375rem;
+  min-width: 0;
+}
+.threads-member-search {
+  position: relative;
+  min-width: 0;
+}
+.threads-member-search > svg {
+  position: absolute;
+  top: 50%;
+  left: 0.625rem;
+  transform: translateY(-50%);
+  color: var(--color-ink-500);
+  pointer-events: none;
+}
+.threads-member-search .field {
+  padding-left: 2rem;
+  padding-right: 2.25rem;
+}
+.threads-member-search .field::-webkit-search-cancel-button {
+  appearance: none;
+}
+.threads-member-search > .btn {
+  position: absolute;
+  top: 50%;
+  right: 0.125rem;
+  transform: translateY(-50%);
+}
+.threads-member-caption {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.5rem 0 0.125rem;
+  color: var(--color-ink-500);
+  font-size: var(--text-micro);
+}
+.threads-member-results {
+  display: grid;
+  gap: 0.25rem;
+  max-height: min(14.75rem, 35dvh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+.threads-member-row {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  min-height: 2.75rem;
+  padding: 0.5rem 0.625rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.3rem;
+  background: var(--color-ink-875);
+  cursor: pointer;
+}
+.threads-member-row:hover {
+  border-color: var(--color-edge-hover);
+}
+.threads-member-row:has(:checked) {
+  border-color: color-mix(in srgb, var(--color-accent) 50%, var(--color-ink-700));
+  background: color-mix(in srgb, var(--color-accent) 5%, var(--color-ink-875));
+}
+.threads-member-row:focus-within {
+  outline: 2px solid var(--color-accent);
+  outline-offset: -2px;
+}
+.threads-member-row .threads-avatar {
+  width: 1.5rem;
+  height: 1.5rem;
+  border-radius: 50%;
+}
+.threads-member-name {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--color-ink-200);
+  font-size: var(--text-secondary);
+}
+.threads-member-row input {
+  flex: none;
+  width: 0.875rem;
+  height: 0.875rem;
+  margin: 0;
+  accent-color: var(--color-accent);
+}
+.threads-member-state {
+  display: grid;
+  justify-items: start;
+  gap: 0.75rem;
+  min-height: 5.5rem;
+  padding: 1rem 0.625rem;
+  color: var(--color-ink-400);
+  font-size: var(--text-label);
+  overflow-wrap: anywhere;
+}
+.threads-picked {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.35rem;
+  gap: 0.3rem;
+  max-height: 5rem;
+  overflow-y: auto;
+  padding: 0.125rem;
+}
+.threads-picked-person {
+  display: inline-flex;
   align-items: center;
+  max-width: 100%;
+  gap: 0.25rem;
+  padding-left: 0.5rem;
+  border: 1px solid var(--color-ink-600);
+  border-radius: 0.25rem;
+  background: var(--color-ink-800);
+  color: var(--color-ink-200);
+  font-size: var(--text-label);
 }
-.threads-newgroup input,
-.threads-newgroup select {
+.threads-picked-person > span {
   min-width: 0;
-  border: 1px solid var(--color-ink-700);
-  border-radius: 0.35rem;
-  padding: 0.2rem 0.45rem;
-  background: transparent;
-  color: inherit;
-  font: inherit;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.threads-newgroup input {
-  flex: 1 1 8rem;
+.threads-picked-person .btn {
+  flex: none;
+}
+.threads-create-error {
+  color: var(--color-fail);
+  font-size: var(--text-label);
+}
+.threads-create-footer {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.875rem 1.25rem;
+  border-top: 1px solid var(--color-ink-700);
+  background: var(--color-ink-875);
+}
+.threads-create-footer > .threads-note {
+  font-size: var(--text-micro);
+}
+.threads-create-footer > div {
+  display: flex;
+  flex: none;
+  gap: 0.4rem;
+}
+.threads-create-footer .btn {
+  height: 2rem;
+}
+@media (width < 640px), (pointer: coarse) {
+  .threads-create-sheet .field,
+  .threads-create-sheet .select-trigger,
+  .threads-create-sheet .select-search {
+    min-height: 2.25rem;
+    font-size: 1rem;
+  }
+  .threads-member-row {
+    min-height: 3rem;
+  }
+  .threads-member-row input {
+    width: 1rem;
+    height: 1rem;
+  }
+}
+@media (width < 480px) {
+  .threads-create-sheet > .threads-context-sheet-head,
+  .threads-create-body,
+  .threads-create-footer {
+    padding-inline: 1rem;
+  }
+  .threads-create-modes {
+    margin-inline: 1rem;
+  }
+  .threads-create-footer {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0.5rem;
+  }
+  .threads-create-footer > div {
+    justify-content: flex-end;
+  }
 }

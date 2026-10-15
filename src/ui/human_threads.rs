@@ -98,6 +98,26 @@ fn page_params(query: &str) -> Result<Map<String, Value>, HttpResp> {
     Ok(out)
 }
 
+/// The member picker accepts only a search string, never identity selectors.
+fn people_params(query: &str) -> Result<Map<String, Value>, HttpResp> {
+    let mut out = Map::new();
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let key = super::pct_decode(key)
+            .ok_or_else(|| bad_request("invalid_request", "invalid search query"))?;
+        let value = super::pct_decode(&value.replace('+', " "))
+            .ok_or_else(|| bad_request("invalid_request", "invalid search query"))?;
+        if key != "query" || out.contains_key(&key) {
+            return Err(bad_request(
+                "invalid_request",
+                "only one query parameter is accepted",
+            ));
+        }
+        out.insert(key, json!(value));
+    }
+    Ok(out)
+}
+
 /// The room id a `/rooms/<id>...` path names, and its tail.
 fn room_path(rest: &str) -> Option<(&str, &str)> {
     let tail = rest.strip_prefix("/rooms/")?;
@@ -148,6 +168,14 @@ fn route(method: &Method, rest: &str) -> Result<(Route, bool), HttpResp> {
         (Method::Get, "/me") => Ok((
             Route {
                 rpc: "human_actor_check",
+                server: Map::new(),
+                body_fields: &[],
+            },
+            false,
+        )),
+        (Method::Get, "/people") => Ok((
+            Route {
+                rpc: "human_people_search",
                 server: Map::new(),
                 body_fields: &[],
             },
@@ -264,6 +292,11 @@ pub(crate) fn dispatch(
             Ok(fields) => params.extend(fields),
             Err(resp) => return resp,
         }
+    } else if route.rpc == "human_people_search" {
+        match people_params(query) {
+            Ok(search) => params.extend(search),
+            Err(resp) => return resp,
+        }
     } else if history {
         match page_params(query) {
             Ok(page) => params.extend(page),
@@ -276,14 +309,15 @@ pub(crate) fn dispatch(
     params.insert("token".to_string(), json!(cookie));
     match client::rpc(state_dir, route.rpc, Value::Object(params)) {
         Ok(v) => json_response(v),
-        Err(e) => daemon_failure(&e.to_string()),
+        Err(e) => daemon_failure(&e),
     }
 }
 
 /// Map a daemon refusal to the HTTP contract. Codes come from the daemon's
 /// own `code` where it set one.
-fn daemon_failure(message: &str) -> HttpResp {
-    if message.contains("human_session_required") {
+fn daemon_failure(error: &crate::error::Error) -> HttpResp {
+    let message = error.to_string();
+    if error.code() == Some("human_session_required") {
         return coded_response(
             401,
             "signed_out",
@@ -291,7 +325,7 @@ fn daemon_failure(message: &str) -> HttpResp {
             None,
         );
     }
-    if message.contains("tenancy_mismatch") {
+    if error.code() == Some("tenancy_mismatch") {
         return coded_response(
             403,
             "tenancy_mismatch",
@@ -299,7 +333,7 @@ fn daemon_failure(message: &str) -> HttpResp {
             None,
         );
     }
-    if message.contains("not_a_member") {
+    if error.code() == Some("not_a_member") {
         return coded_response(
             403,
             "not_a_member",
@@ -307,7 +341,7 @@ fn daemon_failure(message: &str) -> HttpResp {
             None,
         );
     }
-    if message.contains("roster_unavailable") {
+    if error.code() == Some("roster_unavailable") {
         return coded_response(
             503,
             "roster_unavailable",
@@ -323,5 +357,5 @@ fn daemon_failure(message: &str) -> HttpResp {
             None,
         );
     }
-    coded_response(400, "rejected", message, None)
+    coded_response(400, "rejected", &message, None)
 }

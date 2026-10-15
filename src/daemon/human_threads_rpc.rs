@@ -123,6 +123,36 @@ impl Shared {
         }}))
     }
 
+    /// Search the complete live roster before bounding the browser's results.
+    /// The same current-actor guard as room writes owns identity and tenancy.
+    pub(super) fn rpc_human_people_search(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        let current = self.human_current_actor(required_str(params, "token")?, params, peer_pid)?;
+        let query = optional_str(params, "query")
+            .unwrap_or("")
+            .trim()
+            .to_lowercase();
+        let mut matches = current.roster.members.iter().filter(|member| {
+            member.subject_id != current.subject
+                && (query.is_empty() || member.name.to_lowercase().contains(&query))
+        });
+        let people = matches
+            .by_ref()
+            .take(20)
+            .map(|member| {
+                let human = VerifiedHuman::with_name(
+                    &current.scope.issuer,
+                    &current.scope.organization_id,
+                    &member.subject_id,
+                    &member.name,
+                )?;
+                Ok(json!({"id": human.id, "subject": member.subject_id, "name": human.name}))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(
+            json!({"actor": current.actor.id, "people": people, "has_more": matches.next().is_some()}),
+        )
+    }
+
     /// `human_agents_list {token}` — the current agents by durable uid. The
     /// read is identity-only: no grant, no roster beyond the guard's check.
     pub(super) fn rpc_human_agents_list(&self, params: &Value, peer_pid: u32) -> Result<Value> {

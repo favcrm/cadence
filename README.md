@@ -71,6 +71,20 @@ deliberately serving a board in the foreground without one already running.
 [project context](docs/START-HERE.md) for contracts and source ownership, or the
 [contribution guide](CONTRIBUTING.md) for development and validation.
 
+### Start a conversation
+
+On a signed-in hosted board, open **Threads → Add** and choose **Direct** or
+**Group**. Operators also have **Project** (project/fleet coordination) and
+**Agent** (a thread with a live agent). Each mode has one creation action.
+
+The member picker searches the complete current workspace by name, returning
+at most 20 matches in a compact scroll area. Type to refine the results;
+selected people remain above the list when the query changes. Use a selected
+person's remove button to unselect them. Loading, unavailable and empty results
+are distinct, and **Retry search** repeats a failed search without losing picks.
+The server rechecks sign-in and live workspace membership on every search and
+creation request; search results never grant access.
+
 ## What it gives you
 
 - **Durable messaging** — every assignment, acknowledgement and result is a

@@ -297,6 +297,7 @@ export default function App() {
   // sign-out and never a resolved non-operator.
   const operatorKnown = useRef(false);
   const metaIdentity = useRef<string | null>(null);
+  const threadsSession = useRef<string | null>(null);
   const metaKey = useRef<string | null>(null);
   const metaRequest = useRef(0);
   const metaInFlight = useRef<{ scope: string; promise: Promise<Meta | null> } | null>(null);
@@ -395,6 +396,8 @@ export default function App() {
       const identity = JSON.stringify([next.signed_in ?? null, next.session?.id ?? null, next.read_only]);
       const changed = metaIdentity.current !== null && identity !== metaIdentity.current;
       metaIdentity.current = identity;
+      if (next.signed_in === true && next.session) threadsSession.current = next.session.id;
+      else if (next.signed_in === false) threadsSession.current = null;
       // A key the server refused (expired, revoked) is dropped — only
       // the very key this request carried, and only on a proven
       // `signed_in: false`, never on a null or a failed probe.
@@ -414,6 +417,8 @@ export default function App() {
         metaProbe(true, sentKey).then((fresh) => {
           if (!current() || fresh === null) return;
           metaIdentity.current = JSON.stringify([fresh.signed_in ?? null, fresh.session?.id ?? null, fresh.read_only]);
+          if (fresh.signed_in === true && fresh.session) threadsSession.current = fresh.session.id;
+          else if (fresh.signed_in === false) threadsSession.current = null;
           operatorKnown.current = typeof fresh.operator === "boolean";
           setMeta(fresh);
           setMetaUnavailable(fresh.operator === null || fresh.operator === undefined);
@@ -1242,7 +1247,7 @@ export default function App() {
             onToast={say}
           />
         )}
-        {route.screen === "threads" && <ThreadsPage operator={meta?.operator === true} />}
+        {route.screen === "threads" && <ThreadsPage key={`${credentialGeneration}:${threadsSession.current ?? ""}`} operator={meta?.operator === true} />}
         {screen === "outbox" && <Outbox operator={meta?.operator === true} onOpenIssue={openIssue} />}
         {screen === "setup" && (
           <Setup settingsHref={hrefFor({ screen: "settings", section: "models" })} readOnly={meta ? boardReadOnly : null} />
