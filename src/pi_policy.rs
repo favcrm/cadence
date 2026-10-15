@@ -764,6 +764,10 @@ fn dependency_dirs(
             // not the ancestor. The first hit wins.
             let mut resolved = None;
             for dir in pkg_dir.ancestors() {
+                // Node skips a repeated node_modules/node_modules lookup.
+                if dir.file_name().is_some_and(|name| name == "node_modules") {
+                    continue;
+                }
                 let candidate = dir.join("node_modules").join(dep_name);
                 if !candidate.starts_with(root_canon) {
                     break;

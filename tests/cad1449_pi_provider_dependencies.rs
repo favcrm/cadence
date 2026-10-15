@@ -292,7 +292,7 @@ impl Host {
             .env("HOME", self.path("home"))
             .env("TMPDIR", self.path("state/master/tmp"));
         std::fs::create_dir_all(self.path("state/master/tmp")).unwrap();
-        cmd.output()
+        cadence_agent::reaper::output(&mut cmd)
     }
 }
 
