@@ -1869,6 +1869,13 @@ installation maps unambiguously to the canonical route. Missing, removed,
 ambiguous or inaccessible mappings must fail safely, never select another
 installation. Preserve context, conversation, record and app-view selection.
 
+Legacy and canonical links share the same access, list-error and identity
+checks. A compatibility redirect carries `install=<original-id>` so a stale
+list or a later reinstall cannot transfer the link to a replacement with the
+same app key. An existing conflicting pin refuses before redirect or app
+mount; it is never overwritten. The redirect replaces history and preserves
+the original query and fragment, adding only a missing installation pin.
+
 Every setup or Browser QA handover states these separately:
 
 - The actually served backend build and board address, with the existing
