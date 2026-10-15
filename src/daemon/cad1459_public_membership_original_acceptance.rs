@@ -525,16 +525,19 @@ fn cad1459_public_membership_original_refuses_without_holding_guards() {
     let gate = Gate::new();
     let membership = Membership::start(gate.clone());
 
-    // The first two membership POSTs are tool_session and the live-mount
-    // recheck, both before the artifact GET. pause_at 3 is the post-GET
-    // original_public_fresh call, which is outside the runtime guards.
-    // pause_at 4 is the with_current header recheck when that chunk still
-    // performs its own membership HTTP.
+    // Membership POSTs on one fresh public original, counted only for
+    // POST /v1/runtime/cadence/member/check and reset by each arm():
+    // 1 tool_session current_public_session, before the artifact GET.
+    // 2 tool_context_proven public_row_hash, before the artifact GET.
+    // 3 and 4 are both post-GET original_public_fresh: current_public_session,
+    //    then public_row_hash. Neither is the chunk path.
+    // 5 is the first OriginalDelivery::with_current current_public_session,
+    //    the header chunk. Later body chunks repeat that pair.
     for (case, (mode, pause_at)) in [
         ("callback", 3usize),
         ("native", 3usize),
-        ("http", 4usize),
-        ("native", 4usize),
+        ("http", 5usize),
+        ("native", 5usize),
     ]
     .into_iter()
     .enumerate()

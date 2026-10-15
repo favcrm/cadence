@@ -93,13 +93,14 @@ fn worker_call(
     message: &str,
     turn: &str,
     request: &str,
+    slot: &str,
 ) -> Value {
     let frame = crate::proto::request(
         "app_run_capability_call",
         json!({
             "message": message,
             "token": turn,
-            "slot": "image",
+            "slot": slot,
             "request_id": request,
             "input": {}
         }),
@@ -330,6 +331,7 @@ fn cad1459_native_host_and_worker_refuse_frozen_lineage_before_network() {
         &running.id,
         &current_turn,
         "cad1459-worker-ok",
+        "image",
     );
     assert!(
         positive.get("error").is_none() && positive.get("result").is_some(),
@@ -416,6 +418,7 @@ fn cad1459_native_host_and_worker_refuse_frozen_lineage_before_network() {
         &stale_turn.id,
         &stale_token,
         "cad1459-worker-stale",
+        "image",
     );
     assert!(
         worker_refusal.get("error").is_some(),
@@ -425,6 +428,23 @@ fn cad1459_native_host_and_worker_refuse_frozen_lineage_before_network() {
         worker_refusal["error"]["kind"].as_str(),
         Some("unknown"),
         "worker refusal must be definite: {worker_refusal}"
+    );
+    let undeclared = worker_call(
+        &mut stdin,
+        &mut stdout,
+        &stale_turn.id,
+        &stale_token,
+        "cad1459-worker-undeclared",
+        "notes",
+    );
+    assert!(
+        undeclared.get("error").is_some(),
+        "undeclared slot must refuse the frozen lineage: {undeclared}"
+    );
+    assert_ne!(
+        undeclared["error"]["kind"].as_str(),
+        Some("unknown"),
+        "undeclared slot refusal must be definite: {undeclared}"
     );
     assert_eq!(
         wire.connection_count(),

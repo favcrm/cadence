@@ -710,11 +710,10 @@ impl Shared {
                     .app_message_installation(&msg.id)?
                     .ok_or_else(|| Error::rejected("capability app association is absent"))?;
                 let checked_run = self.store.app_run_show(&run_id)?;
-                if checked_run["snapshot"]["capabilities"][&slot]["config"]["provider"]
-                    == crate::platform::account_media::PLATFORM
-                {
-                    self.account_frozen_lineage(&checked_run)?;
-                }
+                // The next probe prices every frozen slot, not only the one
+                // the worker named. Lineage is offline and ignores non-account
+                // slots, so an unknown or mixed slot cannot skip it.
+                self.account_frozen_lineage(&checked_run)?;
                 self.probe_app_run_prices(&checked_run)?;
                 let quote = self
                     .prepare_app_run_quotes(&checked_run)?
