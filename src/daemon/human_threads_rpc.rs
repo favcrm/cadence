@@ -71,6 +71,28 @@ fn summary_json(row: &HumanRoomSummary) -> Value {
     })
 }
 
+fn group_json(g: &crate::store::human_threads::NotificationGroup) -> Value {
+    json!({
+        "room": g.room,
+        "kind": g.kind,
+        "title": g.title,
+        "unread": g.unread,
+        "muted": g.muted,
+        "mention": g.mention,
+    })
+}
+
+fn prefs_json(p: &crate::store::human_threads::NotificationPrefs) -> Value {
+    json!({
+        "dm": p.dm,
+        "mention": p.mention,
+        "sound": p.sound,
+        "preview": p.preview,
+        "quiet": p.quiet.as_str(),
+        "zone": p.zone,
+    })
+}
+
 fn member_json(m: &HumanRoomMember) -> Value {
     json!({"kind": m.kind, "id": m.id, "label": m.label})
 }
@@ -339,6 +361,150 @@ impl Shared {
         Ok(json!({"post": post_json(&post), "created": created}))
     }
 
+    /// `human_notifications {token}` — all the actor's inbox groups, the
+    /// notification preferences, and push availability. The verified current
+    /// human rides in the same response so identity and feed change together.
+    /// Push availability comes from the platform broker; no key lives here.
+    pub(super) fn rpc_human_notifications(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        let current = self.human_current_actor(required_str(params, "token")?, params, peer_pid)?;
+        let groups = self.store.notification_groups(&current.actor)?;
+        let prefs = self.store.notification_prefs(&current.actor)?;
+        // The platform owns the VAPID key. Push is available only when the
+        // platform broker reports a configured public key; any failure to
+        // read that answer is unavailable, never an error for the inbox.
+        // Only a native membership reads the platform's push config. Any other
+        // mode is unavailable without a network call.
+        let push = match &self.membership_mode {
+            crate::daemon::public_membership::MembershipMode::Native(_) => {
+                match crate::notify_host::push_config() {
+                    Ok(cfg) => json!({"available": cfg.available, "public_key": cfg.public_key}),
+                    Err(_) => json!({"available": false, "public_key": null}),
+                }
+            }
+            _ => json!({"available": false, "public_key": null}),
+        };
+        let unread_total: i64 = groups.iter().map(|g| g.unread).sum();
+        Ok(json!({
+            "human": {"id": current.actor.id, "name": current.actor.name},
+            "unread_total": unread_total,
+            "groups": groups.iter().map(group_json).collect::<Vec<_>>(),
+            "preferences": prefs_json(&prefs),
+            "push": push,
+        }))
+    }
+
+    /// `human_notifications_read {token}` — dismiss the inbox. Never a thread
+    /// read: transcript unread state is untouched.
+    pub(super) fn rpc_human_notifications_read(
+        &self,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        let current = self.human_current_actor(required_str(params, "token")?, params, peer_pid)?;
+        self.store.notification_mark_all_read(&current.actor)?;
+        let groups = self.store.notification_groups(&current.actor)?;
+        let unread_total: i64 = groups.iter().map(|g| g.unread).sum();
+        Ok(json!({"unread_total": unread_total}))
+    }
+
+    /// `human_notification_prefs_set {token, dm, mention, sound, preview, quiet}`
+    pub(super) fn rpc_human_notification_prefs_set(
+        &self,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        let current = self.human_current_actor(required_str(params, "token")?, params, peer_pid)?;
+        let flag = |field: &str| -> Result<bool> {
+            params.get(field).and_then(Value::as_bool).ok_or_else(|| {
+                Error::invalid("invalid_request", format!("{field} must be a boolean"))
+            })
+        };
+        // The quiet preset and the zone are validated at the boundary: an
+        // unknown preset or an unparseable IANA zone is refused, never stored.
+        let quiet = params
+            .get("quiet")
+            .and_then(Value::as_str)
+            .and_then(crate::store::human_threads::QuietHours::parse)
+            .ok_or_else(|| Error::invalid("invalid_request", "quiet must be off or 22-08"))?;
+        let zone = params
+            .get("zone")
+            .and_then(Value::as_str)
+            .filter(|z| z.parse::<chrono_tz::Tz>().is_ok())
+            .ok_or_else(|| {
+                Error::invalid("invalid_request", "zone must be a valid IANA time zone")
+            })?
+            .to_string();
+        let prefs = crate::store::human_threads::NotificationPrefs {
+            dm: flag("dm")?,
+            mention: flag("mention")?,
+            sound: flag("sound")?,
+            preview: flag("preview")?,
+            quiet,
+            zone,
+        };
+        self.store.notification_prefs_set(&current.actor, &prefs)?;
+        Ok(json!({"preferences": prefs_json(&prefs)}))
+    }
+
+    /// `human_room_mute {token, room, muted}` — current membership required.
+    pub(super) fn rpc_human_room_mute(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        let current = self.human_current_actor(required_str(params, "token")?, params, peer_pid)?;
+        let room = room_param(params)?;
+        let muted = params
+            .get("muted")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| Error::invalid("invalid_request", "muted must be a boolean"))?;
+        self.store
+            .human_room_set_mute(&current.actor, room, muted)?;
+        Ok(json!({"muted": muted}))
+    }
+
+    /// `human_push_subscribe {token, endpoint, p256dh, auth}`. Validates the
+    /// provider endpoint and the browser keys before any write. Returns the
+    /// server-minted device id.
+    pub(super) fn rpc_human_push_subscribe(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        let current = self.human_current_actor(required_str(params, "token")?, params, peer_pid)?;
+        let endpoint = required_str(params, "endpoint")?;
+        let p256dh = required_str(params, "p256dh")?;
+        let auth = required_str(params, "auth")?;
+        crate::web_push::check_endpoint(endpoint)?;
+        crate::web_push::subscription_keys(p256dh, auth)?;
+        // Bind the device to this session by digest only. The raw cookie is
+        // never stored; the dispatcher later asks the fresh-proof seam by it.
+        let session = crate::operator_auth::digest(required_str(params, "token")?);
+        let device =
+            self.store
+                .push_device_enroll(&current.actor, endpoint, p256dh, auth, &session)?;
+        Ok(json!({"device_id": device}))
+    }
+
+    /// `human_push_rebind {token, endpoint}` — rebind only an existing,
+    /// unexpired consent for this exact verified human and browser endpoint.
+    pub(super) fn rpc_human_push_rebind(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        let token = required_str(params, "token")?;
+        let current = self.human_current_actor(token, params, peer_pid)?;
+        let endpoint = required_str(params, "endpoint")?;
+        crate::web_push::check_endpoint(endpoint)?;
+        let session = crate::operator_auth::digest(token);
+        let device = self
+            .store
+            .push_device_rebind(&current.actor, endpoint, &session)?;
+        Ok(json!({"device_id": device}))
+    }
+
+    /// `human_push_unsubscribe {token, device_id}` — returns `removed`. Another
+    /// human's device reports `removed: false` and nothing changes.
+    pub(super) fn rpc_human_push_unsubscribe(
+        &self,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        let current = self.human_current_actor(required_str(params, "token")?, params, peer_pid)?;
+        let device = required_str(params, "device_id")?;
+        let removed = self.store.push_device_revoke(&current.actor, device)?;
+        Ok(json!({"removed": removed}))
+    }
+
     /// `human_room_mark_read {token, room, seq}`
     pub(super) fn rpc_human_room_mark_read(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         let current = self.human_current_actor(required_str(params, "token")?, params, peer_pid)?;
@@ -383,5 +549,243 @@ impl Shared {
         self.store
             .human_group_remove(&current.actor, room, kind, member)?;
         Ok(json!({"ok": true}))
+    }
+}
+
+/// Refuse any field the delivery RPC does not name. A caller-chosen endpoint,
+/// recipient or key is never authority.
+fn strict_fields(params: &Value, allowed: &[&str]) -> Result<()> {
+    let obj = params.as_object().ok_or_else(|| {
+        Error::invalid("invalid_request", "the delivery request must be an object")
+    })?;
+    if obj.keys().all(|k| allowed.contains(&k.as_str())) {
+        Ok(())
+    } else {
+        Err(Error::invalid(
+            "invalid_request",
+            "a delivery request field is not allowed",
+        ))
+    }
+}
+
+/// A bounded opaque reference (device id or lease id).
+fn bounded_ref<'a>(params: &'a Value, field: &str) -> Result<&'a str> {
+    let v = required_str(params, field)
+        .map_err(|_| Error::invalid("invalid_request", format!("{field} is not valid")))?;
+    if v.is_empty() || v.len() > 128 {
+        return Err(Error::invalid(
+            "invalid_request",
+            format!("{field} is not valid"),
+        ));
+    }
+    Ok(v)
+}
+
+/// The intent reference: a positive safe integer.
+fn intent_ref(params: &Value) -> Result<i64> {
+    params
+        .get("intent_id")
+        .and_then(Value::as_i64)
+        .filter(|n| (1..=9_007_199_254_740_991).contains(n))
+        .ok_or_else(|| {
+            Error::invalid(
+                "invalid_request",
+                "intent_id must be a positive safe integer",
+            )
+        })
+}
+
+/// The platform-service proof for one delivery RPC. The trusted company and
+/// instance come from native membership config only; the method and path are
+/// fixed by the handler. Verified before any business check or store access.
+/// Returns the verified claims; the prepare lease is the proof's `jti`.
+fn verify_service_proof(
+    shared: &Shared,
+    params: &Value,
+    path: &str,
+    intent_id: i64,
+    device_id: &str,
+    lease_id: Option<&str>,
+    outcome: Option<&str>,
+) -> Result<crate::notify_bridge::Claims> {
+    let crate::daemon::public_membership::MembershipMode::Native(native) = &shared.membership_mode
+    else {
+        return Err(Error::invalid(
+            "capability_unavailable",
+            "notification delivery is unavailable on this daemon",
+        ));
+    };
+    let proof = required_str(params, "proof")?;
+    let now = crate::notify_bridge::now_unix()?;
+    let expected = crate::notify_bridge::Expected {
+        company: &native.company,
+        instance: &native.instance,
+        method: "POST",
+        path,
+        intent_id,
+        device_id,
+        lease_id,
+        outcome,
+    };
+    crate::notify_bridge::verify(proof, &expected, &shared.board_jwks, now)
+}
+
+impl Shared {
+    /// `human_notification_delivery_prepare {proof, intent_id, device_id}`.
+    /// Platform-only. The proof is verified first. Eligibility and the device's
+    /// own presence are checked before the claim, so an ineligible intent never
+    /// holds a lease. A live lease is `lease_active`. An ineligible, missing or
+    /// already-delivered device is `suppressed` with no private data.
+    pub(super) fn rpc_human_notification_delivery_prepare(
+        &self,
+        params: &Value,
+        _peer_pid: u32,
+    ) -> Result<Value> {
+        strict_fields(params, &["proof", "intent_id", "device_id"])?;
+        let intent_id = intent_ref(params)?;
+        let device_id = bounded_ref(params, "device_id")?;
+        let claims = verify_service_proof(
+            self,
+            params,
+            crate::notify_bridge::PREPARE_PATH,
+            intent_id,
+            device_id,
+            None,
+            None,
+        )?;
+        let suppressed = || json!({"state": "suppressed"});
+        let Some(intent) = self.store.push_intent_for_prepare(intent_id)? else {
+            return Ok(suppressed());
+        };
+        if self.store.push_device_owner(device_id)?.as_deref() != Some(intent.recipient.as_str()) {
+            return Ok(suppressed());
+        }
+        // The proof's audience is the verified company (checked against native
+        // config). A suppressed device gets a terminal row so the initiator
+        // stops re-selecting it and no later burst can send.
+        let settle_suppressed = || -> Result<Value> {
+            self.store
+                .push_suppress_device(intent_id, device_id, &claims.aud)?;
+            Ok(suppressed())
+        };
+        if !self.store.push_recipient_eligible(&intent)? {
+            return settle_suppressed();
+        }
+        if self
+            .store
+            .push_device_visible(device_id, &intent.recipient, &intent.room)?
+        {
+            return settle_suppressed();
+        }
+        let prefs = self.store.notification_prefs_for(&intent.recipient)?;
+        // Preview text is opt-in, bounded, and redacted by the existing cleaner.
+        let preview = match prefs.preview {
+            true => self
+                .store
+                .topic_post_by_id(&intent.post)?
+                .map(|p| crate::store::conversations::body(&p.body))
+                .map(|t| t.chars().take(140).collect::<String>()),
+            false => None,
+        };
+        let payload = json!({
+            "title": "New message",
+            "tag": format!("room-{}", intent.room),
+            "url": format!("/threads?h={}", intent.room),
+            "silent": !prefs.sound,
+            "body": preview,
+        })
+        .to_string();
+        if payload.len() > 2048 {
+            return Err(Error::invalid(
+                "invalid_request",
+                "the delivery payload is too large",
+            ));
+        }
+        // The lease is the prepare proof's jti: one proof, one lease.
+        let lease = claims.jti;
+        let Some(device) = self.store.push_delivery_claim(
+            intent_id,
+            device_id,
+            &lease,
+            crate::store::human_threads::LEASE_SECS_F64,
+        )?
+        else {
+            if self.store.push_delivery_lease_live(intent_id, device_id)? {
+                return Err(Error::gate_coded(
+                    "lease_active",
+                    "this delivery already has a live lease",
+                ));
+            }
+            return Ok(suppressed());
+        };
+        Ok(json!({
+            "lease_id": lease,
+            "issuer": device.issuer,
+            "organization_id": device.org,
+            "subject_id": device.subject,
+            "endpoint": device.endpoint,
+            "keys": {"p256dh": device.p256dh, "auth": device.auth},
+            "payload": payload,
+        }))
+    }
+
+    /// `human_notification_delivery_finish {proof, intent_id, device_id, lease_id, outcome}`.
+    /// Platform-only. The proof binds every field. Only the live lease can
+    /// finish; a stale or wrong lease is `stale_lease` and changes nothing.
+    pub(super) fn rpc_human_notification_delivery_finish(
+        &self,
+        params: &Value,
+        _peer_pid: u32,
+    ) -> Result<Value> {
+        strict_fields(
+            params,
+            &["proof", "intent_id", "device_id", "lease_id", "outcome"],
+        )?;
+        let intent_id = intent_ref(params)?;
+        let device_id = bounded_ref(params, "device_id")?;
+        let lease_id = bounded_ref(params, "lease_id")?;
+        let outcome = required_str(params, "outcome")?;
+        if !matches!(outcome, "accepted" | "gone" | "retry" | "suppressed") {
+            return Err(Error::invalid(
+                "invalid_request",
+                "outcome is not recognized",
+            ));
+        }
+        verify_service_proof(
+            self,
+            params,
+            crate::notify_bridge::FINISH_PATH,
+            intent_id,
+            device_id,
+            Some(lease_id),
+            Some(outcome),
+        )?;
+        if !self
+            .store
+            .push_delivery_finish(intent_id, device_id, lease_id, outcome)?
+        {
+            return Err(Error::gate_coded(
+                "stale_lease",
+                "the delivery lease is no longer live",
+            ));
+        }
+        Ok(json!({"ok": true}))
+    }
+
+    /// `human_push_presence {token, device_id, tab_id, room}`. Each owned
+    /// device tab reports independently; presence expires in 30 seconds.
+    pub(super) fn rpc_human_push_presence(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        let current = self.human_current_actor(required_str(params, "token")?, params, peer_pid)?;
+        let device = bounded_ref(params, "device_id")?;
+        let tab = bounded_ref(params, "tab_id")?;
+        let room = match params.get("room") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(r)) if !r.is_empty() && r.len() <= 96 => Some(r.as_str()),
+            Some(_) => return Err(Error::invalid("invalid_request", "room is not valid")),
+        };
+        let accepted = self
+            .store
+            .push_presence_set(&current.actor, device, tab, room)?;
+        Ok(json!({"accepted": accepted}))
     }
 }

@@ -23,6 +23,9 @@ pub mod cli_actor;
 pub mod client;
 pub mod confine;
 pub mod continuity;
+pub mod notify_bridge;
+pub mod notify_host;
+pub mod web_push;
 // Test support for the shared ADR 0006 fixture — a deterministic
 // platform double, not a live adapter. Hidden from the public API docs.
 #[doc(hidden)]

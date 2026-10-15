@@ -189,6 +189,68 @@ fn route(method: &Method, rest: &str) -> Result<(Route, bool), HttpResp> {
             },
             false,
         )),
+        (Method::Get, "/notifications") => Ok((
+            Route {
+                rpc: "human_notifications",
+                server: Map::new(),
+                body_fields: &[],
+            },
+            false,
+        )),
+        (Method::Post, "/notifications/read") => Ok((
+            Route {
+                rpc: "human_notifications_read",
+                server: Map::new(),
+                body_fields: &[],
+            },
+            false,
+        )),
+        (Method::Post, "/notifications/preferences") => Ok((
+            Route {
+                rpc: "human_notification_prefs_set",
+                server: Map::new(),
+                body_fields: &["dm", "mention", "sound", "preview", "quiet", "zone"],
+            },
+            false,
+        )),
+        (Method::Post, "/push/presence") => Ok((
+            Route {
+                rpc: "human_push_presence",
+                server: Map::new(),
+                body_fields: &["device_id", "tab_id", "room"],
+            },
+            false,
+        )),
+        (Method::Post, "/push/subscriptions") => Ok((
+            Route {
+                rpc: "human_push_subscribe",
+                server: Map::new(),
+                body_fields: &["endpoint", "keys"],
+            },
+            false,
+        )),
+        (Method::Post, "/push/subscriptions/rebind") => Ok((
+            Route {
+                rpc: "human_push_rebind",
+                server: Map::new(),
+                body_fields: &["endpoint"],
+            },
+            false,
+        )),
+
+        (Method::Delete, p) if p.starts_with("/push/subscriptions/") => {
+            let device = &p["/push/subscriptions/".len()..];
+            if device.is_empty() || device.contains('/') {
+                return Err(not_found());
+            }
+            let mut r = Route {
+                rpc: "human_push_unsubscribe",
+                server: Map::new(),
+                body_fields: &[],
+            };
+            r.server.insert("device_id".to_string(), json!(device));
+            Ok((r, false))
+        }
         (Method::Get, "/rooms") => Ok((
             Route {
                 rpc: "human_rooms_list",
@@ -229,6 +291,7 @@ fn route(method: &Method, rest: &str) -> Result<(Route, bool), HttpResp> {
             Some((room, "/read")) => {
                 Ok((room_route("human_room_mark_read", room, &["seq"]), false))
             }
+            Some((room, "/mute")) => Ok((room_route("human_room_mute", room, &["muted"]), false)),
             Some((room, "/members")) => Ok((
                 room_route("human_room_add", room, &["human_subject", "agent_uid"]),
                 false,
@@ -289,7 +352,20 @@ pub(crate) fn dispatch(
             Err(_) => return bad_request("invalid_request", "the body must be JSON"),
         };
         match whitelist(&body, route.body_fields) {
-            Ok(fields) => params.extend(fields),
+            Ok(mut fields) => {
+                // The public push contract nests the browser keys; the daemon
+                // reads them flat. Only the two named keys cross over.
+                if let Some(keys) = fields.remove("keys") {
+                    match push_keys(&keys) {
+                        Ok((p256dh, auth)) => {
+                            fields.insert("p256dh".to_string(), json!(p256dh));
+                            fields.insert("auth".to_string(), json!(auth));
+                        }
+                        Err(resp) => return resp,
+                    }
+                }
+                params.extend(fields)
+            }
             Err(resp) => return resp,
         }
     } else if route.rpc == "human_people_search" {
@@ -313,10 +389,27 @@ pub(crate) fn dispatch(
     }
 }
 
+/// The browser's push keys: exactly `{p256dh, auth}`, both strings.
+fn push_keys(keys: &Value) -> Result<(String, String), HttpResp> {
+    let invalid = || bad_request("invalid_request", "keys must be {p256dh, auth} strings");
+    let obj = keys.as_object().ok_or_else(invalid)?;
+    if obj.len() != 2 {
+        return Err(invalid());
+    }
+    let p256dh = obj
+        .get("p256dh")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid)?;
+    let auth = obj
+        .get("auth")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid)?;
+    Ok((p256dh.to_string(), auth.to_string()))
+}
+
 /// Map a daemon refusal to the HTTP contract. Codes come from the daemon's
 /// own `code` where it set one.
 fn daemon_failure(error: &crate::error::Error) -> HttpResp {
-    let message = error.to_string();
     if error.code() == Some("human_session_required") {
         return coded_response(
             401,
@@ -349,6 +442,7 @@ fn daemon_failure(error: &crate::error::Error) -> HttpResp {
             None,
         );
     }
+    let message = error.to_string();
     if message.contains("Unknown method") {
         return coded_response(
             501,

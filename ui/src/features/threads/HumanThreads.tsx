@@ -276,15 +276,36 @@ export function HumanRoomTimeline({
       .finally(() => setOlderBusy(false));
   };
 
-  // Mark read only the newest seq actually shown. Never a future one.
-  const newest = page ? page.posts.reduce((max, p) => (p.seq > max ? p.seq : max), 0) : 0;
+  // CAD-1423: a post is read only when it is actually visible. The timeline
+  // reports the newest visible seq; loading a page never marks it read.
+  const [visibleSeq, setVisibleSeq] = useState(0);
+  const messagesRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
-    if (newest <= shown) return;
-    setShown(newest);
-    void markHumanRead(id, newest)
+    const root = messagesRef.current;
+    if (!root || typeof IntersectionObserver === "undefined") return;
+    const seen = new Map<Element, boolean>();
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) seen.set(entry.target, entry.isIntersecting);
+        let newestVisible = 0;
+        for (const [el, visible] of seen) {
+          const seq = Number((el as HTMLElement).dataset.seq);
+          if (visible && seq > newestVisible) newestVisible = seq;
+        }
+        if (newestVisible > 0) setVisibleSeq((cur) => (newestVisible > cur ? newestVisible : cur));
+      },
+      { root, threshold: 0.5 },
+    );
+    root.querySelectorAll<HTMLElement>("[data-seq]").forEach((el) => observer.observe(el));
+    return () => observer.disconnect();
+  }, [page]);
+  useEffect(() => {
+    if (visibleSeq <= shown) return;
+    setShown(visibleSeq);
+    void markHumanRead(id, visibleSeq)
       .then(() => onChanged())
       .catch(() => undefined);
-  }, [newest, shown, id, onChanged]);
+  }, [visibleSeq, shown, id, onChanged]);
 
   return (
     <div className="threads-timeline">
@@ -304,7 +325,7 @@ export function HumanRoomTimeline({
       ) : page === null ? (
         <p className="threads-note">Loading…</p>
       ) : null}
-      <div className="threads-messages" aria-live="polite">
+      <div className="threads-messages" aria-live="polite" ref={messagesRef}>
         {page && hasOlder && page.posts.length > 0 && (
           <Button variant="ghost" size="sm" disabled={olderBusy} onClick={loadEarlier}>
             Earlier
@@ -313,7 +334,7 @@ export function HumanRoomTimeline({
         {page?.posts.map((p) => {
           const mine = p.sender.id === me.id;
           return (
-            <article key={p.id} className="threads-msg" data-role={mine ? "operator" : "member"}>
+            <article key={p.id} className="threads-msg" data-seq={p.seq} data-role={mine ? "operator" : "member"}>
               <Turn who={mine ? "You" : p.sender.label} at={fmtTime(p.created)} me={mine}>
                 {p.body}
               </Turn>
