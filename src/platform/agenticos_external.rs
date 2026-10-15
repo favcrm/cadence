@@ -5,6 +5,8 @@
 //! fixed lease-owned door with no bearer; the Worker derives the company.
 #[cfg(test)]
 mod cad1365_original_artifact_acceptance;
+#[cfg(test)]
+mod cad1446_image_max_acceptance;
 pub(crate) mod image;
 pub mod media_import;
 pub mod publish;
@@ -614,8 +616,8 @@ impl AgenticosExternalAdapter {
             None => image_prompt(authority, input)
                 .map_err(|detail| ImageFailure::refused(R::PlanInvalid, detail))?,
         };
-        // The frozen quote still proves shape (schema/currency/units); its
-        // amount is recorded, never enforced as a charge ceiling.
+        // The frozen approval maximum uses the same micro-USD units as
+        // AgenticOS chargeMinor; submit it for enforcement before reservation.
         let quoted = frozen_charge_ceiling(authority)
             .map_err(|detail| ImageFailure::refused(R::PlanInvalid, detail))?;
         let token = self
@@ -634,6 +636,7 @@ impl AgenticosExternalAdapter {
                 "model": IMAGE_MODEL,
                 "prompt": prompt,
                 "aspectRatio": "1:1",
+                "max_charge_minor": quoted,
             }))
             .map_err(|_| uncertain_submit())?;
         let status = response.status().as_u16();
@@ -2608,7 +2611,8 @@ mod tests {
                     assert_eq!(request.idem.as_deref(), Some("app-call-image-1"));
                     assert_eq!(request.body["model"], json!("openai/gpt-image-2.5"));
                     assert_eq!(request.body["aspectRatio"], json!("1:1"));
-                    assert_eq!(request.body.as_object().unwrap().len(), 3);
+                    assert_eq!(request.body.as_object().unwrap().len(), 4);
+                    assert_eq!(request.body["max_charge_minor"], json!(31_500));
                     assert!(request.body["prompt"]
                         .as_str()
                         .unwrap()
@@ -2944,7 +2948,8 @@ mod tests {
                         ("GET", MEDIA_PRICE_PATH) => json_response(200, price_view(31_500, "v1")),
                         ("POST", MEDIA_SUBMIT_PATH) => {
                             assert_eq!(request.idem.as_deref(), Some("app-call-868"));
-                            assert_eq!(request.body.as_object().unwrap().len(), 3);
+                            assert_eq!(request.body.as_object().unwrap().len(), 4);
+                            assert_eq!(request.body["max_charge_minor"], json!(31_500));
                             json_response(
                                 201,
                                 json!({"ok":true,"data":{"job":job_view("med_job868", "queued", json!([]), false, 40_000)}}),
@@ -3036,7 +3041,7 @@ mod tests {
                         assert_eq!(request.auth.as_deref(), Some("Bearer test-token"));
                         assert_eq!(
                             request.body,
-                            json!({"model":"openai/gpt-image-2.5","prompt":request.body["prompt"],"aspectRatio":"1:1"})
+                            json!({"model":"openai/gpt-image-2.5","prompt":request.body["prompt"],"aspectRatio":"1:1","max_charge_minor":31_500})
                         );
                         json_response(
                             201,
