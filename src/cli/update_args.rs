@@ -23,6 +23,14 @@ pub(crate) struct UpdateTargetArgs {
     /// Releases directory [default: read off the current link].
     #[arg(long)]
     pub(super) releases_dir: Option<PathBuf>,
+    /// Owned HTTPS release source (CAD-1455): the endpoint's https://
+    /// origin only. When set, updates consume the published release
+    /// through the AOS catalogue and its signed offline evidence instead
+    /// of live GitHub queries; an explicit source failure refuses —
+    /// there is no silent GitHub API fallback. Omit to keep the default
+    /// GitHub route.
+    #[arg(long, value_name = "https://host")]
+    pub(super) release_source: Option<String>,
 }
 
 impl UpdateTargetArgs {
@@ -37,6 +45,7 @@ impl UpdateTargetArgs {
             },
             link: self.link.or(parent.link),
             releases_dir: self.releases_dir.or(parent.releases_dir),
+            release_source: self.release_source.or(parent.release_source),
         }
     }
 }
@@ -51,6 +60,7 @@ pub(crate) struct UpgradeArgs {
     pub(super) repo: String,
     pub(super) link: Option<PathBuf>,
     pub(super) releases_dir: Option<PathBuf>,
+    pub(super) release_source: Option<String>,
 }
 
 pub(crate) struct UpdateArgs {
@@ -68,15 +78,123 @@ pub(crate) struct UpdateArgs {
     pub(super) repo: String,
     pub(super) link: Option<PathBuf>,
     pub(super) releases_dir: Option<PathBuf>,
+    pub(super) release_source: Option<String>,
 }
 
 /// The production [`cadence_agent::update::UpdateHost`]: the daemon for
 /// the drain, the waiters and the health answers; the filesystem for
 /// the releases and the marker.
+/// The update's release source: the default online GitHub route, or
+/// the configured owned HTTPS endpoint (CAD-1455). Both implement
+/// `ReleaseSource`; the field type dispatches between them.
+pub(crate) enum UpdateSource {
+    Gh(cadence_agent::upgrade::Gh),
+    Http(Box<cadence_agent::releases::HttpGh>),
+}
+
+impl cadence_agent::upgrade::ReleaseSource for UpdateSource {
+    fn repo(&self) -> &str {
+        match self {
+            Self::Gh(s) => s.repo(),
+            Self::Http(s) => s.repo(),
+        }
+    }
+    fn check_auth(&self) -> Result<()> {
+        match self {
+            Self::Gh(s) => s.check_auth(),
+            Self::Http(s) => s.check_auth(),
+        }
+    }
+    fn latest_green_main(&self) -> Result<Option<cadence_agent::upgrade::Run>> {
+        match self {
+            Self::Gh(s) => s.latest_green_main(),
+            Self::Http(s) => s.latest_green_main(),
+        }
+    }
+    fn on_main(&self, sha: &str) -> Result<cadence_agent::upgrade::OnMain> {
+        match self {
+            Self::Gh(s) => s.on_main(sha),
+            Self::Http(s) => s.on_main(sha),
+        }
+    }
+    fn compare(&self, base: &str, head: &str) -> Result<Option<String>> {
+        match self {
+            Self::Gh(s) => s.compare(base, head),
+            Self::Http(s) => s.compare(base, head),
+        }
+    }
+    fn main_runs(&self, sha: &str) -> Result<Vec<cadence_agent::upgrade::Run>> {
+        match self {
+            Self::Gh(s) => s.main_runs(sha),
+            Self::Http(s) => s.main_runs(sha),
+        }
+    }
+    fn merge_group_runs(&self, sha: &str) -> Result<Vec<cadence_agent::upgrade::Run>> {
+        match self {
+            Self::Gh(s) => s.merge_group_runs(sha),
+            Self::Http(s) => s.merge_group_runs(sha),
+        }
+    }
+    fn jobs(&self, run_id: u64) -> Result<Vec<cadence_agent::upgrade::Job>> {
+        match self {
+            Self::Gh(s) => s.jobs(run_id),
+            Self::Http(s) => s.jobs(run_id),
+        }
+    }
+    fn artifact(&self, run_id: u64, name: &str) -> Result<cadence_agent::upgrade::ArtifactState> {
+        match self {
+            Self::Gh(s) => s.artifact(run_id, name),
+            Self::Http(s) => s.artifact(run_id, name),
+        }
+    }
+    fn download(&self, run_id: u64, name: &str, dest: &Path) -> Result<()> {
+        match self {
+            Self::Gh(s) => s.download(run_id, name, dest),
+            Self::Http(s) => s.download(run_id, name, dest),
+        }
+    }
+    fn verify_attestation(&self, binary: &Path, sha: &str) -> Result<String> {
+        match self {
+            Self::Gh(s) => s.verify_attestation(binary, sha),
+            Self::Http(s) => s.verify_attestation(binary, sha),
+        }
+    }
+    fn verify_retained(&self, dir: &Path) -> Result<cadence_agent::upgrade::RetainedProof> {
+        match self {
+            Self::Gh(s) => s.verify_retained(dir),
+            Self::Http(s) => s.verify_retained(dir),
+        }
+    }
+    fn published(&self) -> bool {
+        match self {
+            Self::Gh(s) => s.published(),
+            Self::Http(s) => s.published(),
+        }
+    }
+    fn published_proof(&self, sha: &str) -> Result<cadence_agent::upgrade::RetainedProof> {
+        match self {
+            Self::Gh(s) => s.published_proof(sha),
+            Self::Http(s) => s.published_proof(sha),
+        }
+    }
+    fn merged_titles(&self, base: &str, head: &str) -> Result<Vec<String>> {
+        match self {
+            Self::Gh(s) => s.merged_titles(base, head),
+            Self::Http(s) => s.merged_titles(base, head),
+        }
+    }
+    fn schema_version(&self, sha: &str) -> Result<Option<i64>> {
+        match self {
+            Self::Gh(s) => s.schema_version(sha),
+            Self::Http(s) => s.schema_version(sha),
+        }
+    }
+}
+
 pub(crate) struct RealUpdateHost<'a> {
     pub(super) state_dir: &'a Path,
     pub(super) layout: cadence_agent::upgrade::Layout,
-    pub(super) source: cadence_agent::upgrade::Gh,
+    pub(super) source: UpdateSource,
     pub(super) label: String,
     /// Collect the plain lines for `--json`; `None` prints them as they
     /// happen (the plain form).

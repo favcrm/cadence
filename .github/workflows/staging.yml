@@ -376,7 +376,13 @@ jobs:
             --repo "$REPO" --digest-alg sha256)
           mv "$pkg"/sha256-*.jsonl "$pkg/build-attestation.jsonl"
           gh attestation trusted-root > "$pkg/trusted_root.jsonl"
-          ls -l "$pkg"
+          # The operator-host published package: the exact retained
+          # members as one flat tarball. The completion evidence
+          # (promotion-completion.yml) arrives separately; the R2
+          # publisher merges them into one immutable package before
+          # the catalogue record is written.
+          tar -czf "$RUNNER_TEMP/cadence-release.tar.gz" -C "$pkg" .
+          ls -l "$pkg" "$RUNNER_TEMP/cadence-release.tar.gz"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: production-candidate
@@ -395,6 +401,14 @@ jobs:
             ${{ runner.temp }}/retained/cadence
             ${{ runner.temp }}/retained/cadence.sha256
             ${{ runner.temp }}/retained/manifest.json
+          if-no-files-found: error
+          retention-days: 90
+          overwrite: true
+      # The flat package tarball the publisher uploads verbatim.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: release-package-${{ needs.stage.outputs.source_sha }}
+          path: ${{ runner.temp }}/cadence-release.tar.gz
           if-no-files-found: error
           retention-days: 90
           overwrite: true

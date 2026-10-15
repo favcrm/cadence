@@ -86,6 +86,48 @@ Report any remaining operator rollout work explicitly.
    intended target. Installation, drain, backup and health checks remain in
    the supported update flow, not a hand-built restart recipe.
 
+### Owned release source (CAD-1455, opt-in)
+
+`staging.yml` retains the promoted release's evidence package
+(`production-evidence-<sha>`) and packages the flat retained bundle as
+`release-package-<sha>`; `promotion-completion.yml` re-proves the completed
+promotion, signs the publication-time source facts (observed main head,
+bounded ancestor list including the candidate, `SCHEMA_VERSION` at the
+candidate) and attests a closed completion receipt binding them. When the
+operator provisions the release bucket (`vars.RELEASES_R2_ENDPOINT`,
+`vars.RELEASES_R2_BUCKET`, `vars.RELEASES_AWS_PROFILE`), the same workflow
+publishes the merged package into the owned R2 catalogue with a conditional,
+immutable write — the catalogue record last.
+
+`cadence update|upgrade --release-source https://<host>` then consumes the
+published release without any GitHub API call: the catalogue selects the
+subject (discovery only, never authority); the binary, receipt,
+build/promotion/completion Sigstore bundles and the signed source-facts are
+verified offline against the embedded trusted-root snapshot, and the
+snapshot — never a live main lookup — answers on-main, ancestry and schema
+checks. The existing operator identity, lease, backup, schema, no-backward,
+atomic install, drain, health and rollback rules are unchanged. An explicit
+source failure refuses; there is no silent fallback to the GitHub API. Omit
+`--release-source` to keep the default GitHub route until the endpoint is
+qualified. A pinned `--to`/`--sha` resolves the published release named by
+that exact source SHA; a sha the catalogue does not publish refuses.
+
+The publication-time snapshot is an authenticated record of eligibility
+*observed at promotion*; it cannot know a later main rewrite. Offline
+verification needs `gh` installed (for `attestation verify --bundle`) but
+no GitHub login and no API access. Operator-host catalogue visibility
+defaults `private`; public serving stays closed until an operator-owned
+endpoint/policy explicitly authorizes it. Public-client release authority
+is distinct (below) — a `public-client` record never stands in for an
+operator-host promotion, and the shared catalogue grants no install or
+rollout authority by itself.
+
+Publication and consumption are not yet operationally qualified: no genuine
+new producer run has published into a real bucket, and the trusted-root
+snapshot is a proposed capture pending independent review. Treat the code
+path as implemented-but-unqualified until the operator runs the two
+commands on the documented path and reports results.
+
 **Scheduled and `workflow_run` staging cannot promote.** Their successful
 runs may have `promote: skipped`; that means staged, not production-approved.
 The default updater selects the last successful approved manual promotion,
@@ -181,6 +223,19 @@ notes were `--generate-notes` output only and are immutable with the release;
 this file, not those notes, records corrections. The public stable updater is
 still not implemented; `cadence update`/`upgrade` continue to use the
 authenticated internal channel.
+
+For a client-only installation, `cadence update --release-source
+https://<host>` (CAD-1455) fetches the same tag's exact published archive,
+checksum file and retained `ci.yml` build-provenance bundle through the
+owned `public-client` catalogue profile and verifies the signature offline
+against the embedded trusted root — the same repo/workflow/tag/digest/runner
+policy as the live `gh` lookup. It does not use the operator-host promotion
+authority, never substitutes a daemon for the client archive, and preserves
+the tag/manifest/platform/version checks and the forward-only rule. A
+configured source failure refuses rather than falling back to the GitHub
+release API. Publication of the public-client record runs only after the
+existing `release-publish` job publishes the GitHub Release, and only when
+the operator provisioned the release bucket (`vars.RELEASES_R2_*`).
 
 The first publication exposed an x86 artifact/verifier gap fixed under
 CAD-1400: `release-build` zips the toolchain pair into the x86 artifact but

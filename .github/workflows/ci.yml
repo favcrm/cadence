@@ -1259,6 +1259,91 @@ jobs:
           gh release create "$TAG" --draft --verify-tag --title "cadence $TAG" \
             --generate-notes --prerelease="$prerelease" --latest="$latest" "${assets[@]}"
           gh release edit "$TAG" --draft=false --prerelease="$prerelease" --latest="$latest"
+      # CAD-1455: retain the published public-client attestation bundles
+      # offline-verifiably so the owned release source can carry the same
+      # `ci.yml` proof the live `gh attestation verify` checks. Each
+      # per-target tarball's bundle is downloaded after the release
+      # published — the signatures cover the exact published bytes.
+      - name: Retain the published build-provenance bundles
+        working-directory: dist
+        env:
+          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p bundles
+          for target in x86_64-linux aarch64-linux aarch64-macos; do
+            asset="cadence-$TAG-$target.tar.gz"
+            (cd "$RUNNER_TEMP" && gh attestation download "$OLDPWD/$asset" \
+              --repo "$GH_REPO" --digest-alg sha256)
+            mv "$RUNNER_TEMP"/sha256-*.jsonl "bundles/build-attestation-$target.jsonl"
+          done
+          ls -l bundles
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-bundles-${{ github.ref_name }}
+          path: dist/bundles/
+          if-no-files-found: error
+          retention-days: 90
+          overwrite: true
+
+  # CAD-1455: publish the public-client release into the owned R2
+  # release namespace after the GitHub Release above is published (the
+  # existing public release gate). Runs only when the operator
+  # provisioned endpoint/bucket/credentials as vars/secrets — an absent
+  # configuration is an honest skip. Objects are copied byte-exact and
+  # written conditionally; the catalogue record is written last.
+  release-publish-r2:
+    needs: [release-publish]
+    if: >
+      vars.RELEASES_R2_ENDPOINT != '' &&
+      vars.RELEASES_R2_BUCKET != '' &&
+      vars.RELEASES_AWS_PROFILE != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: release-${{ github.ref_name }}-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: release-bundles-${{ github.ref_name }}
+          path: dist/bundles
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          sparse-checkout: |
+            scripts/publish-release.py
+          sparse-checkout-cone-mode: false
+          path: src
+          persist-credentials: false
+      - name: Publish the public-client release
+        env:
+          TAG: ${{ github.ref_name }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          export AWS_PROFILE="${{ vars.RELEASES_AWS_PROFILE }}"
+          args=()
+          for target in x86_64-linux aarch64-linux aarch64-macos; do
+            asset="cadence-$TAG-$target.tar.gz"
+            args+=(--artifact "$asset=dist/$asset:$target:application/octet-stream")
+            args+=(--artifact "$asset.sha256=dist/$asset.sha256:$target:text/plain")
+            args+=(--artifact "build-attestation-$target.jsonl=dist/bundles/build-attestation-$target.jsonl:$target:application/json")
+          done
+          python3 src/scripts/publish-release.py \
+            --endpoint "${{ vars.RELEASES_R2_ENDPOINT }}" \
+            --bucket "${{ vars.RELEASES_R2_BUCKET }}" \
+            --product cadence --profile public-client \
+            --version "$TAG" --source-sha "$SOURCE_SHA" \
+            --visibility "${{ vars.RELEASES_R2_PUBLIC_VISIBILITY || 'private' }}" \
+            --published-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            "${args[@]}"
 
   # CAD-311: prove the non-x86_64 builds on every PR and queue entry, not
   # first at a tag. macOS also builds the UI to catch case-insensitive

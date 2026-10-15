@@ -37,6 +37,8 @@ jobs:
       github.event.workflow_run.path == '.github/workflows/staging.yml'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    outputs:
+      source_sha: ${{ steps.candidate.outputs.source_sha }}
     permissions:
       contents: read
       actions: read
@@ -132,21 +134,24 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           SOURCE_SHA: ${{ steps.candidate.outputs.source_sha }}
-          MAIN_HEAD: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
-          git clone --quiet --filter=blob:none --no-checkout \
-            "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "$RUNNER_TEMP/graph"
+          # Keep the token out of argv and the stored remote URL. The
+          # helper reads the existing job token from its environment.
+          git -c credential.helper='!gh auth git-credential' clone \
+            --quiet --filter=blob:none --no-checkout \
+            "https://github.com/${REPO}.git" "$RUNNER_TEMP/graph"
           cd "$RUNNER_TEMP/graph"
-          git fetch --quiet origin "$SOURCE_SHA" main
-          # The observed main head must contain the candidate; this is
-          # the publication-time ancestry fact, not a live claim.
+          git config --local credential.helper '!gh auth git-credential'
+          git fetch --quiet origin "$SOURCE_SHA" \
+            '+refs/heads/main:refs/remotes/origin/main'
+          # Main may advance after promotion. Prove ancestry against
+          # the main head actually observed for this publication.
           observed_main=$(git rev-parse origin/main)
-          test "$observed_main" = "$MAIN_HEAD"
           git merge-base --is-ancestor "$SOURCE_SHA" origin/main
-          # Bounded deduplicated ancestor list INCLUDING the candidate,
-          # oldest first. Refuse rather than truncate on overflow.
-          git rev-list --reverse "$SOURCE_SHA" > "$RUNNER_TEMP/ancestors.txt"
+          # Limit output before writing; the extra entry detects
+          # overflow, which refuses instead of accepting truncation.
+          git rev-list --max-count=20001 --reverse "$SOURCE_SHA" > "$RUNNER_TEMP/ancestors.txt"
           count=$(wc -l < "$RUNNER_TEMP/ancestors.txt")
           test "$count" -ge 1 -a "$count" -le 20000
           test "$(sort -u "$RUNNER_TEMP/ancestors.txt" | wc -l)" = "$count"
@@ -156,15 +161,15 @@ jobs:
           git show "$SOURCE_SHA:src/rollout.rs" > "$RUNNER_TEMP/rollout.rs"
           schema_version=$(sed -n 's/^ *pub const SCHEMA_VERSION: i64 = \([0-9][0-9]*\);/\1/p' "$RUNNER_TEMP/rollout.rs")
           test -n "$schema_version"
-          ancestors_json=$(jq -R . "$RUNNER_TEMP/ancestors.txt" | jq -s .)
+          jq -Rn '[inputs]' < "$RUNNER_TEMP/ancestors.txt" > "$RUNNER_TEMP/ancestors.json"
           jq -n \
             --argjson schema 1 \
             --arg source "$SOURCE_SHA" \
             --arg main "$observed_main" \
-            --argjson ancestors "$ancestors_json" \
+            --slurpfile ancestors "$RUNNER_TEMP/ancestors.json" \
             --argjson sv "$schema_version" \
             '{schema: $schema, source_sha: $source, observed_main_head: $main,
-              ancestors: $ancestors, schema_version: $sv}' \
+              ancestors: $ancestors[0], schema_version: $sv}' \
             > "$RUNNER_TEMP/source-facts.json"
           jq . "$RUNNER_TEMP/source-facts.json"
           echo "facts_sha256=$(sha256sum "$RUNNER_TEMP/source-facts.json" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
@@ -253,3 +258,74 @@ jobs:
           if-no-files-found: error
           retention-days: 90
           overwrite: true
+
+  # CAD-1455: publish the operator-host release into the owned R2
+  # release namespace. This runs only when the operator provisioned
+  # the endpoint/bucket/credentials as vars/secrets — an absent
+  # configuration is an honest skip, never a guessed bucket. The
+  # publisher copies the EXACT original CI bytes (never rebuilds),
+  # writes objects conditionally, and writes the catalogue record
+  # last; operator-host visibility defaults private.
+  publish-release:
+    needs: [complete]
+    if: >
+      vars.RELEASES_R2_ENDPOINT != '' &&
+      vars.RELEASES_R2_BUCKET != '' &&
+      vars.RELEASES_AWS_PROFILE != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    env:
+      RELEASES_AWS_PROFILE: ${{ vars.RELEASES_AWS_PROFILE }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      # The package tarball was uploaded by the upstream staging.yml
+      # run; the completion evidence by this workflow's `complete` job.
+      # Cross-run download needs the upstream run id and a token.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: release-package-${{ needs.complete.outputs.source_sha }}
+          path: ${{ runner.temp }}/pkg
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: promotion-completion-${{ needs.complete.outputs.source_sha }}
+          path: ${{ runner.temp }}/completion
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+      - name: Merge completion evidence into the package
+        env:
+          SOURCE_SHA: ${{ needs.complete.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/flat"
+          tar -xzf "$RUNNER_TEMP/pkg/cadence-release.tar.gz" -C "$RUNNER_TEMP/flat"
+          cp "$RUNNER_TEMP/completion/promotion-completion.json" "$RUNNER_TEMP/flat/"
+          cp "$RUNNER_TEMP/completion/completion-attestation.jsonl" "$RUNNER_TEMP/flat/"
+          cp "$RUNNER_TEMP/completion/source-facts.json" "$RUNNER_TEMP/flat/"
+          # The completion job's manifest/receipt are byte-identical to
+          # the promoted ones (the completion step already cmp-checked
+          # them); the package keeps its own originals.
+          tar -czf "$RUNNER_TEMP/cadence-release-final.tar.gz" -C "$RUNNER_TEMP/flat" .
+          ls -l "$RUNNER_TEMP/flat"
+      - name: Publish the operator-host release
+        env:
+          SOURCE_SHA: ${{ needs.complete.outputs.source_sha }}
+          UPSTREAM_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          export AWS_PROFILE="$RELEASES_AWS_PROFILE"
+          python3 scripts/publish-release.py \
+            --endpoint "${{ vars.RELEASES_R2_ENDPOINT }}" \
+            --bucket "${{ vars.RELEASES_R2_BUCKET }}" \
+            --product cadence --profile operator-host \
+            --version "$SOURCE_SHA" --source-sha "$SOURCE_SHA" \
+            --visibility "${{ vars.RELEASES_R2_VISIBILITY || 'private' }}" \
+            --production-candidate-id "$UPSTREAM_ID" \
+            --published-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --artifact "cadence-release.tar.gz=$RUNNER_TEMP/cadence-release-final.tar.gz:x86_64-linux:application/octet-stream"

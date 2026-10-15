@@ -295,6 +295,25 @@ pub trait ReleaseSource {
              the online GitHub path proves promotion live",
         ))
     }
+    /// CAD-1455: whether this source installs a *published* retained
+    /// package — the owned HTTPS route (`crate::releases::HttpGh`) —
+    /// instead of a live CI artifact run. `Gh` is not published; it
+    /// keeps the live proof.
+    fn published(&self) -> bool {
+        false
+    }
+    /// CAD-1455: fetch and prove the published release for `sha`,
+    /// returning its [`RetainedProof`] with the captured workspace
+    /// still owned so the install consumes the identical verified
+    /// bytes — never re-downloaded, never a caller path. Sources that
+    /// cannot prove a published package (the online `gh` path) refuse.
+    fn published_proof(&self, sha: &str) -> Result<RetainedProof> {
+        let _ = sha;
+        Err(Error::rejected(
+            "this release source has no published retained package; \
+             the online GitHub path downloads and proves a CI artifact",
+        ))
+    }
     /// CAD-561: the PR titles merged between `base` and `head` — what
     /// `cadence update --check` shows as the change summary. A squash
     /// merge's subject is the PR title with its number, which is what
@@ -755,17 +774,17 @@ pub const TRUSTED_ROOT_SNAPSHOT_SHA256: &str =
 /// hundred KB at most, a manifest a few hundred bytes. Anything larger
 /// is refused unread rather than streamed into memory. The binary is
 /// hashed, not loaded.
-const RECEIPT_MAX: u64 = 64 * 1024;
-const BUNDLE_MAX: u64 = 32 * 1024 * 1024;
-const MANIFEST_MAX: u64 = 64 * 1024;
-const SHA_FILE_MAX: u64 = 4096;
+pub(crate) const RECEIPT_MAX: u64 = 64 * 1024;
+pub(crate) const BUNDLE_MAX: u64 = 32 * 1024 * 1024;
+pub(crate) const MANIFEST_MAX: u64 = 64 * 1024;
+pub(crate) const SHA_FILE_MAX: u64 = 4096;
 /// `source-facts.json` holds the bounded ancestor list; the producer
 /// refuses rather than truncate beyond this many entries.
 const SOURCE_FACTS_ANCESTORS_MAX: usize = 20_000;
-const SOURCE_FACTS_MAX: u64 = 8 * 1024 * 1024;
+pub(crate) const SOURCE_FACTS_MAX: u64 = 8 * 1024 * 1024;
 /// The release binary is bounded too: a real build is a few hundred MB
 /// at most; an absurd package member is refused before it is copied.
-const BINARY_MAX: u64 = 512 * 1024 * 1024;
+pub(crate) const BINARY_MAX: u64 = 512 * 1024 * 1024;
 
 /// Copy `path` into `dest` only when it is a regular file no larger
 /// than `max`, opening it without following the final symlink so a
@@ -899,17 +918,31 @@ impl OfflineGh {
     /// the build bundle). The promotion pass leaves it unpinned:
     /// `staging.yml` signs at its own run head, which legitimately
     /// differs from the promoted `source_sha`, and the certificate is
-    /// the authoritative record of which one it was. `--signer-repo`
-    /// pins the signer's repository and `--cert-identity` the exact
-    /// SAN; the signer commit itself is reported from the verified
-    /// certificate, not asserted by the caller.
+    /// the authoritative record of which one it was.
+    ///
+    /// gh 2.83.2 makes `--cert-identity`/`--cert-identity-regex`/
+    /// `--signer-repo`/`--signer-workflow` mutually exclusive — this
+    /// verifier passes the exact `--cert-identity` SAN (which already
+    /// spells `https://github.com/<repo>/.github/workflows/<wf>@ref`,
+    /// pinning the signer's repository and workflow together) plus
+    /// `--repo`, so `--signer-repo` must NOT be added: both flags
+    /// abort before any crypto. Whether an explicit certificate
+    /// `sourceRepositoryURI` binding is still required on top is being
+    /// determined by an independent wrong-repo negative against the
+    /// same policy; the signer commit itself is always reported from
+    /// the verified certificate, never asserted by the caller.
     ///
     /// Subject binding is double-checked: `gh` proves the signature
     /// covers the subject's bytes, and [`check_subjects`] re-reads the
     /// statement's recorded subject name and digest so a bundle minted
     /// for a different artifact is never accepted.
+    ///
+    /// Also used by the public-client update path (`cli/client_update.rs`)
+    /// to verify a published release asset's retained build bundle
+    /// offline under the same pinned policy — that caller supplies its
+    /// own subject inside its owned scratch dir.
     #[allow(clippy::too_many_arguments)]
-    fn verify_bundle(
+    pub fn verify_bundle(
         &self,
         subject: &Path,
         bundle: &Path,
@@ -939,8 +972,6 @@ impl OfflineGh {
             &identity,
             "--cert-oidc-issuer",
             "https://token.actions.githubusercontent.com",
-            "--signer-repo",
-            &self.repo,
             "--source-ref",
             source_ref,
             "--deny-self-hosted-runners",
@@ -1674,10 +1705,18 @@ pub fn run(src: &dyn ReleaseSource, layout: &Layout, req: &Request) -> Result<Va
             }
             verified.insert(
                 "resolved".into(),
-                json!(format!(
-                    "--latest-main → approved production candidate from {MAIN} CI run {} ({})",
-                    run.id, run.head_sha
-                )),
+                json!(if src.published() {
+                    format!(
+                        "--latest-main → published release {MAIN} source {} ({})",
+                        src.repo(),
+                        run.head_sha
+                    )
+                } else {
+                    format!(
+                        "--latest-main → approved production candidate from {MAIN} CI run {} ({})",
+                        run.id, run.head_sha
+                    )
+                }),
             );
             refuse_backwards(src, from_sha.as_deref(), &run.head_sha)?;
             (run.head_sha, false, Ok(()))
@@ -1685,12 +1724,51 @@ pub fn run(src: &dyn ReleaseSource, layout: &Layout, req: &Request) -> Result<Va
     };
 
     check_release_entries(layout, &sha)?;
+    // CAD-1455: a published release source installs its captured,
+    // already-verified package — not a live CI artifact download. The
+    // proof's owned workspace hands the exact verified subjects to the
+    // install below; nothing is re-downloaded or re-read from caller
+    // paths. An explicit --sha the source cannot publish refuses
+    // inside `published_proof` (a live eligibility lookup is not
+    // invented for it).
+    let mut published_proof: Option<RetainedProof> = None;
+    if src.published() {
+        published_proof = Some(src.published_proof(&sha)?);
+    }
     let installed_path = layout.binary(&sha);
     let mut trust = TRUST_ATTESTED;
     let mut digest = None;
     // Why an on-disk release was not reused, when it was not.
     let mut local_rejected: Option<String> = None;
-    if installed_path.is_file() {
+    // A published release has no live local-record cross-check: reuse
+    // an on-disk copy only when its binary hashes to the verified
+    // published bytes AND its recorded checksum/manifest agree (the
+    // same bar a downloaded install leaves behind); the proof's
+    // captured package replaces anything else.
+    if let Some(proof) = &published_proof {
+        let verified_digest = sha256_file(&proof.captured.dir.join(BINARY))?;
+        let reusable = installed_path.is_file()
+            && check_sha256(&installed_path, &layout.release_dir(&sha).join(SHA_FILE))
+                .is_ok_and(|d| d == verified_digest)
+            && layout.release_dir(&sha).join(MANIFEST).is_file()
+            && check_manifest(
+                &layout.release_dir(&sha).join(MANIFEST),
+                &sha,
+                &verified_digest,
+            )
+            .is_ok();
+        if reusable {
+            verified.insert(
+                "download".into(),
+                json!("skipped — the verified published build is already installed"),
+            );
+        }
+        digest = Some(verified_digest);
+        verified.insert(
+            "attestation".into(),
+            json!("verified published release package (offline retained proof)"),
+        );
+    } else if installed_path.is_file() {
         match local_release(src, layout, &sha, explicit, &online, req, &mut verified)? {
             Local::Use {
                 digest: d,
@@ -1711,10 +1789,22 @@ pub fn run(src: &dyn ReleaseSource, layout: &Layout, req: &Request) -> Result<Va
         }
     }
 
-    let source = if digest.is_some() {
-        "installed-release"
-    } else {
-        "ci-artifact"
+    // `published_path`: the captured verified package to install when
+    // the published bytes are not already on disk. `source` records
+    // which route produced the install.
+    let mut published_path: Option<PathBuf> = None;
+    let source = match &published_proof {
+        Some(_) if installed_path.is_file() && digest.is_some() => {
+            // Reused the already-installed verified copy; the proof's
+            // workspace only verifies, it is not installed from.
+            "installed-release"
+        }
+        Some(proof) => {
+            published_path = Some(proof.captured.dir.clone());
+            "published-release"
+        }
+        None if digest.is_some() => "installed-release",
+        None => "ci-artifact",
     };
     let mut run_id = None;
     // Holds the downloaded files until they are installed or dropped.
@@ -1774,7 +1864,20 @@ pub fn run(src: &dyn ReleaseSource, layout: &Layout, req: &Request) -> Result<Va
         }
     }
     if !req.dry_run {
-        if let Some(tmp) = &staged {
+        if let Some(pkg) = &published_path {
+            // Install the published package's captured subjects — the
+            // identical verified bytes the offline proof captured.
+            install_files(pkg, &layout.release_dir(&sha))?;
+            installed = true;
+            let persisted = sha256_file(&installed_path)?;
+            if persisted != digest {
+                return Err(Error::rejected(format!(
+                    "installed copy {} hashes to {persisted}, not the verified {digest} — \
+                     the link was not moved; remove that file and rerun",
+                    installed_path.display()
+                )));
+            }
+        } else if let Some(tmp) = &staged {
             install_files(tmp.path(), &layout.release_dir(&sha))?;
             installed = true;
             // The persisted copy, not just the staged one, must be the

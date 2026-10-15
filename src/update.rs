@@ -909,6 +909,9 @@ pub fn check(host: &dyn UpdateHost) -> Result<CheckReport> {
 /// installable: [`upgrade::run`] as a dry run verifies main, the green CI
 /// `test` job on that sha, the sha256, the manifest and the attestation,
 /// and installs nothing. Its refusal sentence is the reason.
+/// CAD-1455: a published release source proves the pinned sha through
+/// its own verified package instead — the same dry-run, nothing
+/// installed.
 pub fn verify_pinned(host: &dyn UpdateHost, sha: &str) -> Result<Value> {
     upgrade::run(
         host.source(),

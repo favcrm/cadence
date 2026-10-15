@@ -1448,6 +1448,13 @@ pub(crate) enum Commands {
         /// found there are candidates for reuse.
         #[arg(long)]
         releases_dir: Option<PathBuf>,
+        /// Owned HTTPS release source (CAD-1455): the endpoint's
+        /// https:// origin only; consumes the published release through
+        /// the catalogue and signed offline evidence instead of live
+        /// GitHub queries. An explicit source failure refuses — no
+        /// silent GitHub API fallback. Omit for the default GitHub route.
+        #[arg(long, value_name = "https://host")]
+        release_source: Option<String>,
     },
     /// Upgrade a client-only installation (`install.sh --client-only`) to
     /// the newest public release (CAD-1425, CAD-1437). Its receipt alone
