@@ -183,8 +183,11 @@ claim stops retrying without being recorded as an accepted result.
 The complete provider result remains in the local message. Automatic hosted
 summaries fit both 4,000 Unicode codepoints and 8,192 bytes for the complete
 pretty-serialized JSON request, retaining the reported revision when present.
-An oversized manual report is refused before HTTP. Neither path invents a
-Git revision when the local result did not report one.
+An oversized manual report is refused before HTTP. A durable `result.sha`
+takes precedence; managed endpoints may instead report the final `SHA: <hex>`
+line in their durable result text. Missing or invalid reported revisions make
+the hosted completion fail, even when the checkout has a HEAD or advances
+before recovery. Neither path infers a revision from that mutable checkout.
 
 ## Auth chain
 

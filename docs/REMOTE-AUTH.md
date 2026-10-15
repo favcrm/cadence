@@ -13,21 +13,37 @@ chosen issuer must serve the matching contract.
 
 ## Provider-adapter and publishing consent
 
-After hosted-org login, legacy provider-adapter and publish lanes request
-separate financial consent:
+Normal image-enabled apps use the signed-in funded-account media flow; that
+path does not require `provider.draft`. The optional legacy external-adapter
+and publisher setup commands below request separate financial consent:
 
 ```sh
 cadence --org <slug> local-agent tool --lane provider.draft
 cadence --org <slug> local-agent tool --lane publish.send
 ```
 
-These use the existing device consent endpoints, not a new tool-token issuer.
-Draft execution binds the saved lane to the frozen workspace and actual
-adapter issuer. A publish grant writes a private credential file; it does not
-register a publisher automatically. Publishing still uses the explicit door URL
-and credential-file configuration. No selected-org credential is borrowed.
-The generic device lane remains owner-approved financial authorization. It is
-not an additional owner requirement for ordinary CLI or wiki collaboration.
+These use the existing device consent endpoints, not a new token issuer.
+Success means `credential_saved`, with activation `not_checked`: neither
+command claims that a tool, connection or sender is already usable. The raw
+token file and a separate issuer/workspace/expiry binding stay private.
+
+For legacy draft tools, the response supplies a `connection create`
+argument vector and `stdin_file` for the **local operator**. That existing
+scoped-token path accepts the `agenticos_external` provider and its canonical
+workspace account; ordinary `platform enroll` is not that path. An unsupported
+legacy account is reported as `config_required` before financial consent;
+ordinary CLI/wiki collaboration is unaffected. Configure the external provider
+door for the issuer, enroll or rotate the credential through native custody,
+then select the connection in the authorized app. Existing custody policy,
+descriptor checks, app authority and budgets remain; no worker grants are
+created and there is no missing-enrollment token fallback.
+
+A publish grant writes the private credential file without registering a
+sender. If not already configured, publishing needs its explicit door URL and
+credential-file configuration. The command does not restart the daemon, send,
+spend or replace the CLI login. Standing publishing authorization still applies.
+Generic device lanes remain owner-approved financial authorization, not an
+additional owner requirement for ordinary CLI/wiki collaboration.
 
 ## Existing token and unattended verification
 
