@@ -39,6 +39,12 @@ Three storage concerns stay distinct:
   artifacts. A tracker reference binds work to the real repo/branch/worktree;
   folder names alone are not ownership proof.
 
+Ordinary daemon RPC replies buffer JSON formatting writes per connection and
+flush after each newline-delimited response, including errors. This avoids a
+socket syscall for each formatting fragment without delaying a complete frame.
+Original-media transfers bypass that buffer: each binary send retains its
+existing authority recheck and absolute deadline.
+
 ## Code ownership map
 
 | Path | Responsibility / first read |
