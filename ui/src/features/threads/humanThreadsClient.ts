@@ -215,7 +215,7 @@ export function removeHumanMember(id: string, kind: "human" | "agent", member: s
   return call("DELETE", `${roomPath(id)}/members/${kind}/${encodeURIComponent(member)}`);
 }
 
-/** CAD-1423: one inbox group — a room with unread messages for the viewer. */
+/** CAD-1423: one authorized received-message history group for the viewer. */
 export interface NotificationGroup {
   room: string;
   kind: HumanRoomKind;

@@ -2007,6 +2007,8 @@ in the header inbox. Unread respects both actually viewed thread messages and th
 notification-dismissal cursor; All retains received conversation history after
 either cursor advances. Mark all read dismisses notifications without marking
 unviewed transcript messages read.
+All includes every eligible conversation, not a truncated first page. The bell's
+unread total covers that complete authorized history.
 
 Browser alerts require explicit device opt-in through the browser's native
 permission and subscription flow. Alerts are generic by default; opening one

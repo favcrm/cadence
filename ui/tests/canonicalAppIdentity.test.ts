@@ -98,6 +98,9 @@ async function main() {
     const path = String(input);
     const url = new URL(path, "http://localhost");
     if (url.pathname === "/api/meta") return json({ read_only: false, operator: true, signed_in: true, actor: "operator (ui)", session: null });
+    if (url.pathname === "/api/human-threads/notifications") return json({
+      error: "sign in to use human threads", code: "signed_out", revision: null,
+    }, 401);
     if (url.pathname === "/api/issues") return json({ issues: [] });
     if (path === "/api/projects") return json({ projects: [] });
     if (path === "/api/agents") return json({ daemon: "unreachable", agents: [], totals: null });

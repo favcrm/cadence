@@ -24,7 +24,7 @@ fn cad1423_tab_presence_and_reenrollment_are_owner_scoped() {
         .unwrap();
     assert!(posted);
     let group = store
-        .notification_groups(&owner, 100)
+        .notification_groups(&owner)
         .unwrap()
         .into_iter()
         .find(|group| group.room == room)
@@ -44,7 +44,7 @@ fn cad1423_tab_presence_and_reenrollment_are_owner_scoped() {
         .human_room_mark_read(&owner, &room, first_post.seq)
         .unwrap();
     let viewed = store
-        .notification_groups(&owner, 100)
+        .notification_groups(&owner)
         .unwrap()
         .into_iter()
         .find(|group| group.room == room)
@@ -67,7 +67,7 @@ fn cad1423_tab_presence_and_reenrollment_are_owner_scoped() {
     assert!(posted);
     assert_eq!(
         store
-            .notification_groups(&owner, 100)
+            .notification_groups(&owner)
             .unwrap()
             .into_iter()
             .find(|group| group.room == room)
@@ -77,7 +77,7 @@ fn cad1423_tab_presence_and_reenrollment_are_owner_scoped() {
     );
     store.notification_mark_all_read(&owner).unwrap();
     let dismissed = store
-        .notification_groups(&owner, 100)
+        .notification_groups(&owner)
         .unwrap()
         .into_iter()
         .find(|group| group.room == room)
@@ -233,4 +233,50 @@ fn cad1423_tab_presence_and_reenrollment_are_owner_scoped() {
     assert!(!store
         .push_device_visible(&replacement, &owner.id, &room)
         .unwrap());
+}
+
+#[test]
+fn cad1423_notification_history_is_complete_and_scope_limited() {
+    let (_dir, store) = store();
+    let owner = VerifiedHuman::with_name("issuer", "org", "owner", "Owner").unwrap();
+    let mut expected_rooms = Vec::new();
+
+    // More than the former 20-room cap, each with one real received post.
+    for n in 0..21 {
+        let peer =
+            VerifiedHuman::with_name("issuer", "org", &format!("peer-{n}"), &format!("Peer {n}"))
+                .unwrap();
+        store
+            .notification_prefs_set(&peer, &NotificationPrefs::default())
+            .unwrap();
+        let (room, created) = store.human_dm_open(&owner, &peer.id).unwrap();
+        assert!(created);
+        let (_, posted) = store
+            .human_room_post(&peer, &room, &format!("history-{n}"), "Received message")
+            .unwrap();
+        assert!(posted);
+        expected_rooms.push(room);
+    }
+
+    // A real conversation in another organization is outside this actor's history.
+    let other = VerifiedHuman::with_name("issuer", "other-org", "other", "Other").unwrap();
+    let other_peer = VerifiedHuman::with_name("issuer", "other-org", "peer", "Other peer").unwrap();
+    store
+        .notification_prefs_set(&other_peer, &NotificationPrefs::default())
+        .unwrap();
+    let (out_of_scope, created) = store.human_dm_open(&other, &other_peer.id).unwrap();
+    assert!(created);
+    let (_, posted) = store
+        .human_room_post(&other_peer, &out_of_scope, "other-history", "Out of scope")
+        .unwrap();
+    assert!(posted);
+
+    let groups = store.notification_groups(&owner).unwrap();
+    assert_eq!(groups.len(), 21);
+    let mut actual_rooms: Vec<String> = groups.iter().map(|group| group.room.clone()).collect();
+    actual_rooms.sort();
+    expected_rooms.sort();
+    assert_eq!(actual_rooms, expected_rooms);
+    assert!(!groups.iter().any(|group| group.room == out_of_scope));
+    assert_eq!(groups.iter().map(|group| group.unread).sum::<i64>(), 21);
 }

@@ -1177,15 +1177,11 @@ impl Store {
     }
 
     /// The actor's notification history: one group per room with received
-    /// messages, most unread first, bounded. A message counts as unread when it is after
+    /// messages, most unread first. A message counts as unread when it is after
     /// the actor's history cutoff and the notification cursor, and not sent by
     /// the actor. The notification cursor is separate from the thread read
     /// marker, so inbox dismissal never marks a transcript read.
-    pub fn notification_groups(
-        &self,
-        actor: &VerifiedHuman,
-        limit: i64,
-    ) -> Result<Vec<NotificationGroup>> {
+    pub fn notification_groups(&self, actor: &VerifiedHuman) -> Result<Vec<NotificationGroup>> {
         self.read_tx(|conn| {
             let rows: Vec<(String, String, String, i64, i64, bool)> = conn.query_vec(
                 "SELECT r.id, r.kind, r.title,
@@ -1222,7 +1218,7 @@ impl Store {
                     ))
                 },
             )?;
-            let mut groups: Vec<NotificationGroup> = Vec::new();
+            let mut groups = Vec::with_capacity(rows.len());
             for (room, kind, title, unread, alert_seq, mention) in rows {
                 let muted: bool = conn
                     .query_opt(
@@ -1247,7 +1243,6 @@ impl Store {
                 });
             }
             groups.sort_by(|a, b| b.unread.cmp(&a.unread).then(a.room.cmp(&b.room)));
-            groups.truncate(limit.clamp(1, 100) as usize);
             Ok(groups)
         })
     }

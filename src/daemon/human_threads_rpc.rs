@@ -361,14 +361,13 @@ impl Shared {
         Ok(json!({"post": post_json(&post), "created": created}))
     }
 
-    /// `human_notifications {token, limit?}` — the actor's inbox groups, the
+    /// `human_notifications {token}` — all the actor's inbox groups, the
     /// notification preferences, and push availability. The verified current
     /// human rides in the same response so identity and feed change together.
     /// Push availability comes from the platform broker; no key lives here.
     pub(super) fn rpc_human_notifications(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         let current = self.human_current_actor(required_str(params, "token")?, params, peer_pid)?;
-        let limit = optional_i64(params, "limit").unwrap_or(20);
-        let groups = self.store.notification_groups(&current.actor, limit)?;
+        let groups = self.store.notification_groups(&current.actor)?;
         let prefs = self.store.notification_prefs(&current.actor)?;
         // The platform owns the VAPID key. Push is available only when the
         // platform broker reports a configured public key; any failure to
@@ -403,7 +402,7 @@ impl Shared {
     ) -> Result<Value> {
         let current = self.human_current_actor(required_str(params, "token")?, params, peer_pid)?;
         self.store.notification_mark_all_read(&current.actor)?;
-        let groups = self.store.notification_groups(&current.actor, 100)?;
+        let groups = self.store.notification_groups(&current.actor)?;
         let unread_total: i64 = groups.iter().map(|g| g.unread).sum();
         Ok(json!({"unread_total": unread_total}))
     }
