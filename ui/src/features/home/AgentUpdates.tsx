@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../../lib/api";
 import { resources } from "../../lib/resources";
-import { onPrivateSessionReset, privateReadsAllowed, privateSessionGeneration } from "../../lib/privateSession";
+import { onPrivateReadsPaused, onPrivateSessionReset, privateReadsAllowed, privateSessionGeneration } from "../../lib/privateSession";
 import { useQuery, useResource } from "../../lib/useResource";
 import type { Agent } from "../../lib/types";
 import { activityTimeMs } from "../../lib/fmt";
@@ -12,15 +12,18 @@ import { ageLabel } from "./needs";
 // Cap concurrent history reads across the rail. Thread tails are small, so a
 // freed slot goes to a waiting thread before a waiting agent detail: notes
 // render while the slow detail is still pending.
+// Queued reads have no API operation yet; pause must retire their lease too.
+let historyEpoch = 0;
 let pendingReads = 0;
 const urgentWaiting: (() => void)[] = [];
 const waiting: (() => void)[] = [];
 async function historyRead<T>(read: () => Promise<T>, urgent: boolean): Promise<T> {
   const generation = privateSessionGeneration();
+  const epoch = historyEpoch;
   if (pendingReads >= 3) await new Promise<void>((resolve) => (urgent ? urgentWaiting : waiting).push(resolve));
   else pendingReads++;
   try {
-    if (generation !== privateSessionGeneration() || !privateReadsAllowed()) {
+    if (epoch !== historyEpoch || generation !== privateSessionGeneration() || !privateReadsAllowed()) {
       throw new DOMException("The private session changed", "AbortError");
     }
     return await read();
@@ -39,8 +42,12 @@ interface HistoryEntry { stamp: string; parts: Map<"detail" | "thread", Promise<
 const HISTORY_LIMIT = 24;
 const historyCache = new Map<string, HistoryEntry>();
 
-onPrivateSessionReset(() => {
+onPrivateReadsPaused(() => {
+  historyEpoch += 1;
   historyCache.clear();
+});
+
+onPrivateSessionReset(() => {
   pendingReads = 0;
   // Release queued jobs only so they can observe their expired generation;
   // they must not start a read under the next identity.
@@ -55,6 +62,7 @@ onPrivateSessionReset(() => {
  */
 function cachedPart<T>(alias: string, stamp: string, key: "detail" | "thread", read: () => Promise<T>): Promise<Part<T>> {
   const generation = privateSessionGeneration();
+  const epoch = historyEpoch;
   if (!privateReadsAllowed()) return Promise.resolve({ ok: false });
   let entry = historyCache.get(alias);
   if (!entry || entry.stamp !== stamp) {
@@ -68,7 +76,7 @@ function cachedPart<T>(alias: string, stamp: string, key: "detail" | "thread", r
   if (known) return known;
   const attempt: Promise<Part<T>> = historyRead(read, key === "thread").then(
     (value): Part<T> => {
-      if (generation === privateSessionGeneration() && privateReadsAllowed()) return { ok: true, value };
+      if (epoch === historyEpoch && generation === privateSessionGeneration() && privateReadsAllowed()) return { ok: true, value };
       if (owner.parts.get(key) === attempt) owner.parts.delete(key);
       return { ok: false };
     },

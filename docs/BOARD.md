@@ -1194,6 +1194,8 @@ retry restores the previous live control's keyboard focus or returns focus to
 the admitted workspace.
 Hosted language-preference reads and saves share the same operation lifetime
 and typed session-refusal boundary. Local language choices remain browser-only.
+Queued agent-history reads retire on pause before acquiring a read slot;
+re-verification creates fresh work rather than reviving old cached promises.
 
 Private SSE uses authenticated fetch streaming rather than URL-carried tab
 keys. The server revalidates the live session every five seconds with a
