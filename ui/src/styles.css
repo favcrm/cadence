@@ -626,22 +626,19 @@ pre {
  */
 
 /* The turn status line (CAD-1462: docked above the composer, outside
-   the message rows): truthful queued/submitting/compacting state, the
-   live step, and Stop. The working presentation itself is the subtle
-   name-row indicator (`.chat-live`), so no accent border or shimmer
-   paints a loading bar here. */
+   the message rows) — a quiet INLINE line, not a boxed card: truthful
+   queued/submitting/compacting state, the live step, and Stop, with no
+   border/background/radius/full-width box. The working presentation
+   itself is the subtle name-row indicator (`.chat-live`). */
 .workrow {
   position: relative;
-  overflow: hidden;
   display: flex;
   align-items: center;
   gap: .5rem;
   min-width: 0;
-  border: 1px solid var(--color-ink-700);
-  background: var(--color-ink-850);
-  border-radius: .5rem;
-  padding: .4rem .75rem;
+  padding: .15rem .1rem;
   font-size: var(--text-label);
+  color: var(--color-ink-400);
 }
 /* The name row's right-aligned live state (the mock's `.who .live`):
    pulse dot + Working + elapsed, accent, mono — beside the row's own
@@ -655,8 +652,7 @@ pre {
   white-space: nowrap;
 }
 .chatdock .workrow {
-  margin-bottom: .4rem;
-  background: color-mix(in srgb, var(--color-ink-850) 92%, transparent);
+  margin-bottom: .15rem;
 }
 .workdot {
   flex: none;

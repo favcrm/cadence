@@ -138,7 +138,8 @@ function AssistantNameRow({ at, live }: { at?: string; live: ReactNode }) {
     <div className="flex gap-2 items-center text-micro text-ink-400" data-kind="assistant-name">
       <span className="text-ink-100 font-medium">{t("Assistant")}</span>
       {at ? <span>{at}</span> : null}
-      {live}
+      {/* The same `.chat-live` wrapper Bubble uses: right-aligned accent. */}
+      <span className="chat-live num">{live}</span>
     </div>
   );
 }
