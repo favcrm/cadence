@@ -156,7 +156,7 @@ interface Props {
   onRetry: () => void;
   projects: Project[];
   agents: AgentsPayload | null;
-  health: Health | null;
+  health: Health | null | "unavailable";
   project: string;
   view: ProjectView;
   onView: (view: ProjectView) => void;
@@ -378,7 +378,7 @@ export default function Board({
 
   return (
     <main className="issues-board px-4 lg:px-8 pt-6 pb-9 w-full">
-      {health && !health.pm_present && (
+      {health !== null && health !== "unavailable" && !health.pm_present && (
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mb-5 reveal">
           <span className="chip bg-warn/10 text-warn">{t("no pm dir")}</span>
           <span className="text-secondary text-ink-400">
@@ -671,7 +671,7 @@ export default function Board({
       )}
 
       <footer className="mt-8 pt-4 border-t border-ink-700 text-label text-ink-500 num">
-        {t("source:")} {health?.pm_dir ?? "~/pm"} {t("issue folders")} ·{" "}
+        {t("source:")} {(health !== null && health !== "unavailable" ? health.pm_dir : null) ?? "~/pm"} {t("issue folders")} ·{" "}
         /var/www/agent-notes {t("chains")} · {t("cadence daemon socket")} ·{" "}
         {readOnly
           ? `${t("writes are disabled")} — ${block}`
