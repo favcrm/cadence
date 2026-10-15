@@ -11,6 +11,8 @@ description: >
 
 # Company-guided business documents
 
+For a request that needs a proposed solution/output plan, profile selection and scoped confirmation before authoring, start with [company-outputs](../company-outputs/SKILL.md). It reuses this skill's source, drafting and tool safeguards and adds the two-stage request workflow; it introduces no new rendering or issuance capability.
+
 Use this skill to prepare a draft for human review. It does not grant authority to send correspondence, submit a bid, make a purchase, record an approval, or make a legal, operational, or commercial commitment. Follow the instructions below for the document actually requested; conditional steps apply only when relevant.
 
 ## 1. Clarify the task
