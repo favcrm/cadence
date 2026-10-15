@@ -1,0 +1,990 @@
+{
+  "ticket": "CAD-1436",
+  "freeze": "original-read gold; every verified case has probes re-found in the named original file/page",
+  "targets": {
+    "answerable": 20,
+    "unsupported": 5,
+    "version": 5
+  },
+  "counts": {
+    "answerable": {
+      "total": 20,
+      "verified": 20,
+      "unresolved": 0
+    },
+    "unsupported": {
+      "total": 5,
+      "verified": 5,
+      "unresolved": 0
+    },
+    "version": {
+      "total": 5,
+      "verified": 5,
+      "unresolved": 0
+    }
+  },
+  "cases": [
+    {
+      "id": "A01-infor-checkout-path",
+      "bucket": "answerable",
+      "vendor": "infor",
+      "question": "What method and path check out an Infor folio?",
+      "scoped_queries": [
+        "Infor folios checkout"
+      ],
+      "expected_corpus_source": "global/pms/infor/endpoint-index.md",
+      "original": {
+        "kind": "swagger_yaml",
+        "path": "infor/infor_swagger.yaml",
+        "page": null
+      },
+      "version": "3.8.4.1",
+      "gold": {
+        "method": "POST",
+        "path": "/hotelOperation/{property}/folios/checkout",
+        "operation_id": "postCheckout"
+      },
+      "original_checks": [
+        {
+          "probe": "POST checkout path",
+          "found_in_original": true,
+          "page": null
+        },
+        {
+          "probe": "postCheckout",
+          "found_in_original": true,
+          "page": null
+        }
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "A02-infor-checkout-identifiers",
+      "bucket": "answerable",
+      "vendor": "infor",
+      "question": "Which identifiers does Infor checkout need and in what order are they validated?",
+      "scoped_queries": [
+        "Infor folios checkout identifiers"
+      ],
+      "expected_corpus_source": "global/pms/infor/endpoint-index.md",
+      "original": {
+        "kind": "swagger_yaml",
+        "path": "infor/infor_swagger.yaml",
+        "page": null
+      },
+      "version": "3.8.4.1",
+      "gold": {
+        "precedence": [
+          "confirmationNumber",
+          "account",
+          "roomNumber"
+        ]
+      },
+      "original_checks": [
+        {
+          "probe": "precedence text",
+          "found_in_original": true,
+          "page": null
+        },
+        {
+          "probe": "one of account/confirmationNumber/roomNumber",
+          "found_in_original": true,
+          "page": null
+        }
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "A03-infor-checkout-mode-flag",
+      "bucket": "answerable",
+      "vendor": "infor",
+      "question": "Which checkout mode flag must be true for Infor checkout?",
+      "scoped_queries": [
+        "Infor folios checkout isCheckOutFolio"
+      ],
+      "expected_corpus_source": "global/pms/infor/endpoint-index.md",
+      "original": {
+        "kind": "swagger_yaml",
+        "path": "infor/infor_swagger.yaml",
+        "page": null
+      },
+      "version": "3.8.4.1",
+      "gold": {
+        "flags_one_of_true": [
+          "isCheckOutFolio",
+          "isCheckOutWithSettlement",
+          "isCheckOutRoom"
+        ]
+      },
+      "original_checks": [
+        {
+          "probe": "mode flags",
+          "found_in_original": true,
+          "page": null
+        }
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "A04-infor-selfcheckout-distinct",
+      "bucket": "answerable",
+      "vendor": "infor",
+      "question": "Is Infor selfCheckout the same as folio checkout?",
+      "scoped_queries": [
+        "Infor selfCheckout"
+      ],
+      "expected_corpus_source": "global/pms/infor/endpoint-index.md",
+      "original": {
+        "kind": "swagger_yaml",
+        "path": "infor/infor_swagger.yaml",
+        "page": null
+      },
+      "version": "3.8.4.1",
+      "gold": {
+        "distinct_operation": "postSelfCheckout",
+        "not": "postCheckout"
+      },
+      "original_checks": [
+        {
+          "probe": "selfCheckout operation",
+          "found_in_original": true,
+          "page": null
+        },
+        {
+          "probe": "selfCheckout path",
+          "found_in_original": true,
+          "page": null
+        }
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "A05-infor-room-assignment-path",
+      "bucket": "answerable",
+      "vendor": "infor",
+      "question": "What method and path assign a room to an Infor reservation?",
+      "scoped_queries": [
+        "Infor folios roomAssignment"
+      ],
+      "expected_corpus_source": "global/pms/infor/endpoint-index.md",
+      "original": {
+        "kind": "swagger_yaml",
+        "path": "infor/infor_swagger.yaml",
+        "page": null
+      },
+      "version": "3.8.4.1",
+      "gold": {
+        "method": "POST",
+        "path": "/hotelOperation/{property}/folios/roomAssignment",
+        "operation_id": "postRoomAssignment"
+      },
+      "original_checks": [
+        {
+          "probe": "roomAssignment path",
+          "found_in_original": true,
+          "page": null
+        },
+        {
+          "probe": "operation",
+          "found_in_original": true,
+          "page": null
+        }
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "A06-infor-checkin-folio",
+      "bucket": "answerable",
+      "vendor": "infor",
+      "question": "What method and path check in an Infor folio?",
+      "scoped_queries": [
+        "Infor folios checkin"
+      ],
+      "expected_corpus_source": "global/pms/infor/endpoint-index.md",
+      "original": {
+        "kind": "swagger_yaml",
+        "path": "infor/infor_swagger.yaml",
+        "page": null
+      },
+      "version": "3.8.4.1",
+      "gold": {
+        "method": "POST",
+        "path": "/hotelOperation/{property}/folios/checkin",
+        "operation_id": "postCheckInFolio"
+      },
+      "original_checks": [
+        {
+          "probe": "checkin path",
+          "found_in_original": true,
+          "page": null
+        },
+        {
+          "probe": "operation",
+          "found_in_original": true,
+          "page": null
+        }
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "A07-infor-property-info",
+      "bucket": "answerable",
+      "vendor": "infor",
+      "question": "What endpoint returns Infor basic property info?",
+      "scoped_queries": [
+        "Infor propertyInfo"
+      ],
+      "expected_corpus_source": "global/pms/infor/endpoint-index.md",
+      "original": {
+        "kind": "swagger_yaml",
+        "path": "infor/infor_swagger.yaml",
+        "page": null
+      },
+      "version": "3.8.4.1",
+      "gold": {
+        "method": "GET",
+        "path": "/hotelOperation/{property}/propertyInfo",
+        "operation_id": "getPropertyInfo"
+      },
+      "original_checks": [
+        {
+          "probe": "path",
+          "found_in_original": true,
+          "page": null
+        },
+        {
+          "probe": "operation",
+          "found_in_original": true,
+          "page": null
+        }
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "A08-eva-v1-0-checkin-format",
+      "bucket": "answerable",
+      "vendor": "eva",
+      "question": "What format and type are EVA v1.0 check-in/check-out dates?",
+      "scoped_queries": [
+        "EVA v1.0 checkIn"
+      ],
+      "expected_corpus_source": "global/pms/eva/stb-eva-hotel-interface-v1-0.md",
+      "original": {
+        "kind": "pdf_page",
+        "path": "eva/STB_EVA_Hotel_Interface v1.0.pdf",
+        "page": 13
+      },
+      "version": "1.0",
+      "gold": {
+        "fields": [
+          "checkIn",
+          "checkOut"
+        ],
+        "type": "String",
+        "length": 8,
+        "required": true,
+        "format": "YYYYMMDD"
+      },
+      "original_checks": [
+        {
+          "probe": "checkIn row",
+          "found_in_original": true,
+          "page": 13
+        },
+        {
+          "probe": "checkOut row",
+          "found_in_original": true,
+          "page": 13
+        }
+      ],
+      "status": "verified",
+      "note": "PDF page 13 table; section 6.2.4 (heading on original PDF page 12). Locator corrected against the primary original; question and expected facts unchanged."
+    },
+    {
+      "id": "A09-eva-v1-0-dateofbirth-format",
+      "bucket": "answerable",
+      "vendor": "eva",
+      "question": "What date formats does EVA v1.0 accept for dateOfBirth?",
+      "scoped_queries": [
+        "EVA v1.0 dateOfBirth YYYYMMDD"
+      ],
+      "expected_corpus_source": "global/pms/eva/stb-eva-hotel-interface-v1-0.md",
+      "original": {
+        "kind": "pdf_page",
+        "path": "eva/STB_EVA_Hotel_Interface v1.0.pdf",
+        "page": 13
+      },
+      "version": "1.0",
+      "gold": {
+        "field": "dateOfBirth",
+        "accepted_formats": [
+          "YYYYMMDD",
+          "YYYYMM00",
+          "YYYY0000"
+        ]
+      },
+      "original_checks": [
+        {
+          "probe": "dateOfBirth row",
+          "found_in_original": true,
+          "page": 13
+        },
+        {
+          "probe": "alt formats",
+          "found_in_original": true,
+          "page": 13
+        }
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "A10-eva-v1-0-gender-optional",
+      "bucket": "answerable",
+      "vendor": "eva",
+      "question": "Is gender required in the EVA v1.0 visitor data?",
+      "scoped_queries": [
+        "EVA v1.0 gender"
+      ],
+      "expected_corpus_source": "global/pms/eva/stb-eva-hotel-interface-v1-0.md",
+      "original": {
+        "kind": "pdf_page",
+        "path": "eva/STB_EVA_Hotel_Interface v1.0.pdf",
+        "page": 13
+      },
+      "version": "1.0",
+      "gold": {
+        "field": "gender",
+        "required": false,
+        "type": "String",
+        "length": 1
+      },
+      "original_checks": [
+        {
+          "probe": "gender row",
+          "found_in_original": true,
+          "page": 13
+        }
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "A11-eva-factsheet-ica-response",
+      "bucket": "answerable",
+      "vendor": "eva",
+      "question": "Does an EVA hotel get a real-time response from ICA?",
+      "scoped_queries": [
+        "EVA factsheet real-time ICA"
+      ],
+      "expected_corpus_source": "eva/eva-factsheet-oct-2022.md",
+      "original": {
+        "kind": "pdf",
+        "path": "eva/EVA Factsheet_261022.pdf",
+        "page": null
+      },
+      "version": null,
+      "gold": {
+        "answer": "yes, real-time API acknowledgement that data is submitted accurately per specs"
+      },
+      "original_checks": [
+        {
+          "probe": "real-time",
+          "found_in_original": true,
+          "page": null
+        }
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "A12-eva-factsheet-flow",
+      "bucket": "answerable",
+      "vendor": "eva",
+      "question": "What is the EVA backend data path for guest stay validity?",
+      "scoped_queries": [
+        "EVA factsheet ICA"
+      ],
+      "expected_corpus_source": "eva/eva-factsheet-oct-2022.md",
+      "original": {
+        "kind": "pdf",
+        "path": "eva/EVA Factsheet_261022.pdf",
+        "page": null
+      },
+      "version": null,
+      "gold": {
+        "path": "hotel -> STB/EVA -> ICA",
+        "purpose": "backend check of stay validity in Singapore"
+      },
+      "original_checks": [
+        {
+          "probe": "STB/EVA to ICA",
+          "found_in_original": true,
+          "page": null
+        }
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "A13-eva-factsheet-manual-fallback",
+      "bucket": "answerable",
+      "vendor": "eva",
+      "question": "What must a hotel do if automated EVA check-in fails?",
+      "scoped_queries": [
+        "EVA factsheet manual check-in"
+      ],
+      "expected_corpus_source": "eva/eva-factsheet-oct-2022.md",
+      "original": {
+        "kind": "pdf",
+        "path": "eva/EVA Factsheet_261022.pdf",
+        "page": null
+      },
+      "version": null,
+      "gold": {
+        "answer": "check guests in manually"
+      },
+      "original_checks": [
+        {
+          "probe": "manual fallback",
+          "found_in_original": true,
+          "page": null
+        }
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "A14-opera-precheckin-definition",
+      "bucket": "answerable",
+      "vendor": "opera",
+      "question": "What does OPERA OWS PreCheckin do?",
+      "scoped_queries": [
+        "OPERA PreCheckin"
+      ],
+      "expected_corpus_source": "global/pms/opera/reservation-web-service-specifications.md",
+      "original": {
+        "kind": "pdf_page",
+        "path": "Opera/opera_doc/Reservation Web Service Specifications.pdf",
+        "page": 885
+      },
+      "version": null,
+      "gold": {
+        "section": "31",
+        "pdf_page": 885,
+        "description": "lightweight operation allowing modification of selected items needed for pre-check-in"
+      },
+      "original_checks": [
+        {
+          "probe": "section 31 title",
+          "found_in_original": true,
+          "page": 885
+        },
+        {
+          "probe": "definition",
+          "found_in_original": true,
+          "page": 885
+        }
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "A15-opera-precheckin-soapaction",
+      "bucket": "answerable",
+      "vendor": "opera",
+      "question": "What SOAP action is used for OPERA PreCheckin?",
+      "scoped_queries": [
+        "OPERA PreCheckin SoapAction"
+      ],
+      "expected_corpus_source": "global/pms/opera/reservation-web-service-specifications.md",
+      "original": {
+        "kind": "pdf_page",
+        "path": "Opera/opera_doc/Reservation Web Service Specifications.pdf",
+        "page": 885
+      },
+      "version": null,
+      "gold": {
+        "soap_action": "http://webservices.micros.com/ows/5.1/Reservation.wsdl#PreCheckin"
+      },
+      "original_checks": [
+        {
+          "probe": "soap action",
+          "found_in_original": true,
+          "page": 885
+        }
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "A16-opera-preregister-flag-scoped",
+      "bucket": "answerable",
+      "vendor": "opera",
+      "question": "In the OPERA Reservation Web Service spec, what does the preRegisterFlag example for Internet Pre-Check In show?",
+      "scoped_queries": [
+        "OPERA preRegisterFlag ModifyBooking",
+        "OPERA PreCheckin PreRegisterFlag"
+      ],
+      "expected_corpus_source": "global/pms/opera/reservation-web-service-specifications.md",
+      "original": {
+        "kind": "pdf_page",
+        "path": "Opera/opera_doc/Reservation Web Service Specifications.pdf",
+        "page": 885
+      },
+      "version": null,
+      "gold": {
+        "example_operation": "ModifyBookingRequest",
+        "example_location": "Reservation spec PDF page 713 (ModifyBookingRequest with preRegisterFlag for Internet Pre-Check In)",
+        "example_casing": "attribute preRegisterFlag=\"true\" on the HotelReservation element (lowercase p)",
+        "separate_element": "PreCheckinRequest (section 31, PDF page 885) has element PreRegisterFlag (capital P), type xs:boolean, minOccurs=1, maxOccurs=1",
+        "must_not": "treat the ModifyBooking attribute and the PreCheckinRequest element as the same field; do not claim preRegisterFlag is the only or exclusive way to flag pre-check-in; do not claim PreCheckin completes check-in"
+      },
+      "original_checks": [
+        {
+          "probe": "ModifyBooking example title on p.713",
+          "found_in_original": true,
+          "page": 713
+        },
+        {
+          "probe": "attribute on HotelReservation (p.713)",
+          "found_in_original": true,
+          "page": 713
+        },
+        {
+          "probe": "PreCheckinRequest element PreRegisterFlag, capital P, minOccurs=1 (p.885)",
+          "found_in_original": true,
+          "page": 885
+        }
+      ],
+      "status": "verified",
+      "note": "narrowed per coordinator review: scope is the ModifyBooking example plus PreCheckinRequest element as separately located in the original; casing preserved per context"
+    },
+    {
+      "id": "A17-ows-soap-header-auth",
+      "bucket": "answerable",
+      "vendor": "opera",
+      "question": "How are credentials carried in an OPERA OWS SOAP request header?",
+      "scoped_queries": [
+        "OPERA OWS Authentication UserCredentials"
+      ],
+      "expected_corpus_source": "opera/reservation-advanced-web-service-specifications.md",
+      "original": {
+        "kind": "pdf",
+        "path": "Opera/opera_doc/Reservation Advanced Web Service Specifications.pdf",
+        "page": null
+      },
+      "version": null,
+      "gold": {
+        "element": "OGHeader/Authentication/UserCredentials",
+        "fields": [
+          "UserName",
+          "UserPassword"
+        ],
+        "scope": "classic OWS SOAP messages in Reservation Advanced spec; not OPERA Cloud"
+      },
+      "original_checks": [
+        {
+          "probe": "UserCredentials",
+          "found_in_original": true,
+          "page": null
+        },
+        {
+          "probe": "UserName/UserPassword",
+          "found_in_original": true,
+          "page": null
+        }
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "A18-opera-housekeeping-domain",
+      "bucket": "answerable",
+      "vendor": "opera",
+      "question": "Does an OPERA housekeeping SOAP example include a Domain in UserCredentials?",
+      "scoped_queries": [
+        "OPERA housekeeping Domain"
+      ],
+      "expected_corpus_source": "opera/housekeeping-web-service-specifications.md",
+      "original": {
+        "kind": "pdf",
+        "path": "Opera/opera_doc/Housekeeping Web Service Specifications.pdf",
+        "page": null
+      },
+      "version": null,
+      "gold": {
+        "element": "UserCredentials/Domain",
+        "example_value": "CASINO",
+        "note": "example only, not required by all requests"
+      },
+      "original_checks": [
+        {
+          "probe": "Domain",
+          "found_in_original": true,
+          "page": null
+        }
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "A19-opera-error-kiosk-esignature",
+      "bucket": "answerable",
+      "vendor": "opera",
+      "question": "What is the solution for the Opera kiosk e-signature registration card error?",
+      "scoped_queries": [
+        "Opera error e-signature kiosk"
+      ],
+      "expected_corpus_source": "opera/opera-error-catalog.md",
+      "original": {
+        "kind": "docx",
+        "path": "Opera/Opera Error.docx",
+        "page": null
+      },
+      "version": null,
+      "gold": {
+        "solution": "Open opera > configuration > setup > application settings > kiosk Parameters; turn off USE KIOSK E-SIGNATURE REGISTRATION CARD"
+      },
+      "original_checks": [
+        {
+          "probe": "solution",
+          "found_in_original": true,
+          "page": null
+        }
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "A20-opera-error-room-unavailable",
+      "bucket": "answerable",
+      "vendor": "opera",
+      "question": "What reason is recorded when an Opera room is unavailable?",
+      "scoped_queries": [
+        "Opera error room unavailable"
+      ],
+      "expected_corpus_source": "opera/opera-error-catalog.md",
+      "original": {
+        "kind": "docx",
+        "path": "Opera/Opera Error.docx",
+        "page": null
+      },
+      "version": null,
+      "gold": {
+        "causes": [
+          "available room zero (room availability inventory <= 0)",
+          "rate code enabled \"daily rate\" with no rate for the date"
+        ],
+        "solution": "none for zero availability; rooms cannot be overbooked via API"
+      },
+      "original_checks": [
+        {
+          "probe": "room unavailable",
+          "found_in_original": true,
+          "page": null
+        },
+        {
+          "probe": "reason zero rooms",
+          "found_in_original": true,
+          "page": null
+        },
+        {
+          "probe": "no-solution clause",
+          "found_in_original": true,
+          "page": null
+        },
+        {
+          "probe": "rate code cause",
+          "found_in_original": true,
+          "page": null
+        }
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "U01-eva-room-assignment",
+      "bucket": "unsupported",
+      "vendor": "eva",
+      "question": "What EVA endpoint assigns a room to a reservation?",
+      "scoped_queries": [
+        "EVA room assignment",
+        "room assignment"
+      ],
+      "expected_corpus_source": "eva/stb-eva-hotel-interface-v1-0.md",
+      "original": {
+        "kind": "pdf",
+        "path": "eva/STB_EVA_Hotel_Interface v1.0.pdf",
+        "page": null
+      },
+      "version": "1.0",
+      "gold": {
+        "expected_behavior": "abstain: the supplied EVA v1.0 original does not establish a room-assignment endpoint; do not relabel Infor postRoomAssignment as EVA",
+        "must_not": "/folios/roomAssignment attributed to EVA"
+      },
+      "original_checks": [
+        {
+          "probe": "no room-assignment term in EVA v1.0 original",
+          "found_in_original": true,
+          "kind": "absent-in-document"
+        }
+      ],
+      "status": "verified",
+      "note": "probe inverted: passes when the term is ABSENT from the EVA v1.0 original (scoped to that document only, not global absence)"
+    },
+    {
+      "id": "U02-opera-cloud-auth-narrowed",
+      "bucket": "unsupported",
+      "vendor": "opera",
+      "question": "What authentication does the supplied OPERA Cloud Authentication OWS PDF describe?",
+      "scoped_queries": [
+        "OPERA Cloud Authentication OWS"
+      ],
+      "expected_corpus_source": "opera (no corpus text page for the empty original)",
+      "original": {
+        "kind": "pdf",
+        "path": "Opera/opera_doc/OPERA Cloud Authentication OWS.PDF",
+        "page": null
+      },
+      "version": null,
+      "gold": {
+        "expected_behavior": "abstain: the supplied OPERA Cloud Authentication OWS PDF is 0 bytes and establishes no content; the classic OWS SOAP Authentication/UserCredentials header is a different document and is not Cloud auth",
+        "must_not": "name a Cloud protocol, header, token type or endpoint"
+      },
+      "original_checks": [
+        {
+          "probe": "supplied PDF is empty (0 bytes)",
+          "found_in_original": true,
+          "kind": "empty-original"
+        }
+      ],
+      "status": "verified",
+      "note": "narrowed per coordinator: scope is the one empty original, not all OPERA Cloud"
+    },
+    {
+      "id": "U03-business-event-xml-narrowed",
+      "bucket": "unsupported",
+      "vendor": "opera",
+      "question": "What does the supplied HTTP Communication Specification for Business Event XML Retrieval PDF specify?",
+      "scoped_queries": [
+        "Business Event XML HTTP Communication"
+      ],
+      "expected_corpus_source": "opera (no corpus text page for the empty original)",
+      "original": {
+        "kind": "pdf",
+        "path": "Opera/opera_doc/HTTP Communication Specification for Business Event XML Retrieval.pdf",
+        "page": null
+      },
+      "version": null,
+      "gold": {
+        "expected_behavior": "abstain: the supplied Business Event XML HTTP spec PDF is 0 bytes; no protocol, endpoint or header is established by it; no other supplied source was found to cover Business Event retrieval",
+        "must_not": "invent an endpoint, header or auth method"
+      },
+      "original_checks": [
+        {
+          "probe": "supplied PDF is empty (0 bytes)",
+          "found_in_original": true,
+          "kind": "empty-original"
+        }
+      ],
+      "status": "verified",
+      "note": "narrowed per coordinator: scope is the one empty original; absence claim limited to the supplied corpus"
+    },
+    {
+      "id": "U04-infor-checkout-rest-fields-absent",
+      "bucket": "unsupported",
+      "vendor": "infor",
+      "question": "Does the Infor checkout API take a payment card number in the request?",
+      "scoped_queries": [
+        "Infor checkout credit card"
+      ],
+      "expected_corpus_source": "global/pms/infor/endpoint-index.md",
+      "original": {
+        "kind": "swagger_yaml",
+        "path": "infor/infor_swagger.yaml",
+        "page": null
+      },
+      "version": "3.8.4.1",
+      "gold": {
+        "expected_behavior": "answer from the source: checkout description says credit card information should not be provided when settlement uses an authorized card; do not claim a card field is absent from the schema without reading CheckOutRequest",
+        "must_not": "assert schema-level absence from the description alone"
+      },
+      "original_checks": [
+        {
+          "probe": "policy text: card info should not be provided",
+          "found_in_original": true,
+          "page": null
+        }
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "U05-eva-visitor-checkout-endpoint",
+      "bucket": "unsupported",
+      "vendor": "eva",
+      "question": "What EVA endpoint performs a guest checkout?",
+      "scoped_queries": [
+        "EVA checkout endpoint"
+      ],
+      "expected_corpus_source": "global/pms/eva/stb-eva-hotel-interface-v1-0.md",
+      "original": {
+        "kind": "pdf",
+        "path": "eva/STB_EVA_Hotel_Interface v1.0.pdf",
+        "page": null
+      },
+      "version": "1.0",
+      "gold": {
+        "expected_behavior": "abstain: the EVA v1.0 interface document establishes checkOut as a date field in visitor data, not a checkout endpoint; no EVA checkout endpoint is asserted",
+        "must_not": "relabel Infor postCheckout or selfCheckout as EVA"
+      },
+      "original_checks": [
+        {
+          "probe": "check-out only as date field",
+          "found_in_original": true,
+          "page": null
+        }
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "V01-eva-v0-14-vs-v1-0-dates",
+      "bucket": "version",
+      "vendor": "eva",
+      "question": "What are the EVA check-in and check-out date fields, and which interface version applies?",
+      "scoped_queries": [
+        "EVA checkIn",
+        "EVA v0.14 checkIn"
+      ],
+      "expected_corpus_source": "global/pms/eva/stb-eva-hotel-interface-v1-0.md",
+      "original": {
+        "kind": "pdf_page",
+        "path": "eva/STB_EVA_Hotel_Interface v1.0.pdf",
+        "page": 13
+      },
+      "version": "1.0 (v0.14 superseded per corpus metadata)",
+      "gold": {
+        "answer_version": "1.0",
+        "supersession": "v0.14 corpus frontmatter says superseded_by v1.0; that is metadata to corroborate, not authority",
+        "v0_14_same_rows": true
+      },
+      "original_checks": [
+        {
+          "probe": "v1.0 row",
+          "found_in_original": true,
+          "page": 13
+        }
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "V02-eva-v0-14-page-hit",
+      "bucket": "version",
+      "vendor": "eva",
+      "question": "Is the EVA v0.14 check-in field still current?",
+      "scoped_queries": [
+        "EVA v0.14 checkIn"
+      ],
+      "expected_corpus_source": "global/pms/eva/stb-eva-hotel-interface-v0-14.md",
+      "original": {
+        "kind": "pdf",
+        "path": "eva/STB_EVA_Hotel_Interface v0.14.pdf",
+        "page": null
+      },
+      "version": "0.14",
+      "gold": {
+        "answer": "v0.14 text exists but is a superseded revision; answer from v1.0 and say v0.14 is not the current version unless approval evidence shows otherwise"
+      },
+      "original_checks": [
+        {
+          "probe": "v0.14 original has checkIn row",
+          "found_in_original": true,
+          "page": null
+        }
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "V03-eva-version-label-unknown",
+      "bucket": "version",
+      "vendor": "eva",
+      "question": "Which EVA version does the factsheet describe?",
+      "scoped_queries": [
+        "EVA factsheet version"
+      ],
+      "expected_corpus_source": "eva/eva-factsheet-oct-2022.md",
+      "original": {
+        "kind": "pdf",
+        "path": "eva/EVA Factsheet_261022.pdf",
+        "page": null
+      },
+      "version": "unknown",
+      "gold": {
+        "expected_behavior": "report the interface version as not stated by the factsheet; do not assign v1.0 or v0.14 from the filename or a related spec"
+      },
+      "original_checks": [
+        {
+          "probe": "factsheet states no interface version (absent term)",
+          "found_in_original": true,
+          "kind": "absent-in-document"
+        },
+        {
+          "probe": "no v0.14 term",
+          "found_in_original": true,
+          "kind": "absent-in-document"
+        }
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "V04-opera-reservation-vs-advanced-spec",
+      "bucket": "version",
+      "vendor": "opera",
+      "question": "Which OPERA spec document describes PreCheckin, and does Reservation Advanced also define it?",
+      "scoped_queries": [
+        "OPERA PreCheckin",
+        "OPERA Reservation Advanced PreCheckin"
+      ],
+      "expected_corpus_source": "global/pms/opera/reservation-web-service-specifications.md",
+      "original": {
+        "kind": "pdf_page",
+        "path": "Opera/opera_doc/Reservation Web Service Specifications.pdf",
+        "page": 885
+      },
+      "version": "Reservation Web Service Specifications (version per document)",
+      "gold": {
+        "answer": "PreCheckin is section 31 of the Reservation Web Service Specifications (page 885); the Reservation Advanced spec is a separate document and its coverage is not asserted here"
+      },
+      "original_checks": [
+        {
+          "probe": "PreCheckin in Reservation spec",
+          "found_in_original": true,
+          "page": 885
+        }
+      ],
+      "status": "verified"
+    },
+    {
+      "id": "V05-infor-version-3-8-4-1",
+      "bucket": "version",
+      "vendor": "infor",
+      "question": "Which Infor HMS API version does the checkout operation belong to?",
+      "scoped_queries": [
+        "Infor checkout 3.8.4"
+      ],
+      "expected_corpus_source": "global/pms/infor/endpoint-index.md",
+      "original": {
+        "kind": "swagger_yaml",
+        "path": "infor/infor_swagger.yaml",
+        "page": null
+      },
+      "version": "3.8.4.1",
+      "gold": {
+        "version": "3.8.4.1",
+        "note": "description says Released in 3.8.2, Updated in 3.8.4"
+      },
+      "original_checks": [
+        {
+          "probe": "info version",
+          "found_in_original": true,
+          "page": null
+        },
+        {
+          "probe": "checkout released 3.8.2 updated 3.8.4",
+          "found_in_original": true,
+          "page": null
+        }
+      ],
+      "status": "verified"
+    }
+  ]
+}

@@ -76,11 +76,12 @@ fn tools() -> Value {
     json!([
         {"name":"self","description":"Show your Cadence identity and running work.",
          "inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
-        {"name":"wiki_search","description":"Search wiki pages visible to your Cadence identity.",
+        {"name":"wiki_search","description":"Lexical search of wiki pages visible to your Cadence identity. Not semantic: every token in q must appear (AND); punctuation splits tokens; only the first 12 tokens are used; q is at most 256 bytes. A full question usually matches nothing, so pass scoped keywords instead: the vendor, product or entity, the operation or field name, and the exact identifier, version or number from the question (e.g. '<vendor> <operation>', '<product> <field> <version>'). Drop filler words. Use path to limit to a collection you are authorized for (an organization/global folder, a project folder such as projects/<key>, or a private folder your identity may read); do not narrow by default. Results are candidates, not evidence: wiki_read each source before answering, and an empty result is not proof of absence.",
          "inputSchema":{"type":"object","properties":{
-             "q":{"type":"string"},"path":{"type":"string"}},
+             "q":{"type":"string","description":"Scoped keywords; all tokens must match; first 12 tokens only."},
+             "path":{"type":"string","description":"Optional authorized wiki folder prefix, e.g. global, projects/<key>, or global/pms/eva."}},
              "required":["q"],"additionalProperties":false}},
-        {"name":"wiki_read","description":"Read a visible wiki page with source metadata.",
+        {"name":"wiki_read","description":"Read a visible wiki page with source metadata (path, revision, status). Read every source you cite; cite the path and revision, plus the section or PDF page when known.",
          "inputSchema":{"type":"object","properties":{"path":{"type":"string"}},
              "required":["path"],"additionalProperties":false}},
         {"name":"issue_show","description":"Read one Cadence issue by ID.",
