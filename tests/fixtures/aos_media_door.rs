@@ -261,11 +261,18 @@ impl MediaDoor {
                         o.keys().all(|k| {
                             matches!(
                                 k.as_str(),
-                                "model" | "prompt" | "aspectRatio" | "resolution" | "references"
+                                "model"
+                                    | "prompt"
+                                    | "aspectRatio"
+                                    | "resolution"
+                                    | "references"
+                                    | "max_charge_minor"
                             )
                         }) && o
                             .get("prompt")
                             .is_some_and(|p| p.as_str().is_some_and(|p| !p.trim().is_empty()))
+                            && o.get("max_charge_minor")
+                                .is_none_or(|max| max.as_u64() == Some(31_500))
                     })
                 });
                 if !key_ok || !strict {

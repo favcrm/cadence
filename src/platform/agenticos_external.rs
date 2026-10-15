@@ -2611,7 +2611,8 @@ mod tests {
                     assert_eq!(request.idem.as_deref(), Some("app-call-image-1"));
                     assert_eq!(request.body["model"], json!("openai/gpt-image-2.5"));
                     assert_eq!(request.body["aspectRatio"], json!("1:1"));
-                    assert_eq!(request.body.as_object().unwrap().len(), 3);
+                    assert_eq!(request.body.as_object().unwrap().len(), 4);
+                    assert_eq!(request.body["max_charge_minor"], json!(31_500));
                     assert!(request.body["prompt"]
                         .as_str()
                         .unwrap()
@@ -2947,7 +2948,8 @@ mod tests {
                         ("GET", MEDIA_PRICE_PATH) => json_response(200, price_view(31_500, "v1")),
                         ("POST", MEDIA_SUBMIT_PATH) => {
                             assert_eq!(request.idem.as_deref(), Some("app-call-868"));
-                            assert_eq!(request.body.as_object().unwrap().len(), 3);
+                            assert_eq!(request.body.as_object().unwrap().len(), 4);
+                            assert_eq!(request.body["max_charge_minor"], json!(31_500));
                             json_response(
                                 201,
                                 json!({"ok":true,"data":{"job":job_view("med_job868", "queued", json!([]), false, 40_000)}}),
@@ -3039,7 +3041,7 @@ mod tests {
                         assert_eq!(request.auth.as_deref(), Some("Bearer test-token"));
                         assert_eq!(
                             request.body,
-                            json!({"model":"openai/gpt-image-2.5","prompt":request.body["prompt"],"aspectRatio":"1:1"})
+                            json!({"model":"openai/gpt-image-2.5","prompt":request.body["prompt"],"aspectRatio":"1:1","max_charge_minor":31_500})
                         );
                         json_response(
                             201,
