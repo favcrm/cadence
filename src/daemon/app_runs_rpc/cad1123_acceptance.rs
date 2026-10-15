@@ -502,6 +502,11 @@ fn accept_board_http_is_at_least_as_strict_as_the_rpc() {
             ("GET", team_path.clone(), None),
         ] {
             let (status, reply) = board.call(who, method, &path, body);
+            if method == "GET" {
+                assert_eq!(status, 401, "{who} {method} {path}: {reply}");
+                assert_eq!(reply["code"], "operator_session_required", "{reply}");
+                continue;
+            }
             assert_eq!(status, 403, "{who} {method} {path}: {reply}");
             // An agent's attributed write is refused as the operator's
             // own; an unattributable one cannot even name a caller —

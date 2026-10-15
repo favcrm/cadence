@@ -8,6 +8,7 @@ import {
   counts,
   pending,
   queued,
+  releaseUpload,
   serverErrorText,
   startUpload,
   uploadDone,
@@ -18,6 +19,7 @@ import {
 import Button from "../../ui/Button";
 import { KindIcon, Note, WikiToolbar } from "./shared";
 import { useTranslate } from "../../lib/locale";
+import { beginPrivateOperation, onPrivateReadsPaused, onPrivateSessionReset, type PrivateOperation } from "../../lib/privateSession";
 
 /**
  * The upload pane (CAD-581): a drag-and-drop overlay plus the multi-file
@@ -41,10 +43,34 @@ export default function UploadPane({
 }) {
   const [items, setItems] = useState<UploadItem[]>([]);
   const [drag, setDrag] = useState(0);
+  const [held, setHeld] = useState(false);
+  const itemsRef = useRef<UploadItem[]>([]);
   const files = useRef(new Map<string, File>());
   const nextId = useRef(0);
   const running = useRef(false);
+  const heldRef = useRef(false);
+  const attempt = useRef(0);
+  const operationRef = useRef<PrivateOperation | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
+
+  const abandon = () => {
+    attempt.current += 1;
+    running.current = false;
+    const operation = operationRef.current;
+    operationRef.current = null;
+    operation?.dispose();
+    const active = itemsRef.current.find((item) => item.state === "uploading");
+    const preview = active ? releaseUpload(itemsRef.current, active.id) : itemsRef.current;
+    setHeld(pending(preview).length > 0);
+    setItems((current) => {
+      const uploading = current.find((item) => item.state === "uploading");
+      const next = uploading ? releaseUpload(current, uploading.id) : current;
+      const waiting = pending(next).length > 0;
+      heldRef.current = waiting;
+      itemsRef.current = next;
+      return next;
+    });
+  };
 
   const add = (list: FileList | null) => {
     if (readOnly || !list || list.length === 0) return;
@@ -55,32 +81,115 @@ export default function UploadPane({
     );
     nextId.current += fresh.length;
     picked.forEach((file, i) => files.current.set(fresh[i].id, file));
-    setItems((current) => [...current, ...fresh]);
+    const hadPending = pending(itemsRef.current).length > 0;
+    const next = [...itemsRef.current, ...fresh];
+    itemsRef.current = next;
+    if (!hadPending) {
+      heldRef.current = false;
+      setHeld(false);
+    }
+    setItems(next);
   };
 
   useEffect(() => {
+    const stopPause = onPrivateReadsPaused(abandon);
+    const stopReset = onPrivateSessionReset(() => {
+      attempt.current += 1;
+      running.current = false;
+      heldRef.current = false;
+      const operation = operationRef.current;
+      operationRef.current = null;
+      operation?.dispose();
+      files.current.clear();
+      itemsRef.current = [];
+      setHeld(false);
+      setItems([]);
+    });
+    return () => {
+      stopPause();
+      stopReset();
+    };
+  }, []);
+
+  useEffect(() => () => {
+    attempt.current += 1;
+    running.current = false;
+    const operation = operationRef.current;
+    operationRef.current = null;
+    operation?.dispose();
+  }, []);
+
+  useEffect(() => {
+    if (readOnly || heldRef.current || running.current) return;
     const id = pending(items)[0];
-    if (readOnly || !id || running.current) return;
+    if (!id) return;
     const file = files.current.get(id);
     if (!file) {
-      setItems((current) => uploadFailed(current, id, "the file is no longer available — add it again"));
+      setItems((current) => {
+        const next = uploadFailed(current, id, "the file is no longer available — add it again");
+        itemsRef.current = next;
+        return next;
+      });
       return;
     }
+    let operation: PrivateOperation;
+    try {
+      operation = beginPrivateOperation();
+    } catch {
+      return;
+    }
+    const epoch = attempt.current;
+    operationRef.current = operation;
     running.current = true;
-    setItems((current) => startUpload(current, id));
-    uploadFile(dir, file, (percent) => setItems((current) => uploadProgress(current, id, percent)))
+    setItems((current) => {
+      const next = startUpload(current, id);
+      itemsRef.current = next;
+      return next;
+    });
+    const currentAttempt = () => epoch === attempt.current && operationRef.current === operation && !operation.signal.aborted;
+    const releaseTransport = () => {
+      if (operationRef.current === operation) operationRef.current = null;
+      running.current = false;
+    };
+    uploadFile(dir, file, (percent) => {
+      if (!currentAttempt()) return;
+      setItems((current) => {
+        const next = uploadProgress(current, id, percent);
+        itemsRef.current = next;
+        return next;
+      });
+    }, operation)
       .then((result) => {
-        setItems((current) => uploadDone(current, id));
+        if (!currentAttempt()) return;
+        const abandonedTransfer = operation.signal.aborted || heldRef.current;
+        releaseTransport();
+        setItems((current) => {
+          const next = uploadDone(current, id);
+          itemsRef.current = next;
+          return next;
+        });
+        if (abandonedTransfer) return;
         if (result?.extraction && result.extraction.status !== "indexed") {
           onToast("warn", `${file.name} was saved; text extraction ${result.extraction.status}: ${result.extraction.reason ?? "review the source"}`);
         }
-      })
-      .catch((error) => setItems((current) => uploadFailed(current, id, serverErrorText(error))))
-      .finally(() => {
-        running.current = false;
         onUploaded();
+      })
+      .catch((error: unknown) => {
+        if (!currentAttempt()) return;
+        if (error instanceof DOMException && error.name === "AbortError") return;
+        const abandonedTransfer = operation.signal.aborted || heldRef.current;
+        releaseTransport();
+        setItems((current) => {
+          const next = uploadFailed(current, id, serverErrorText(error));
+          itemsRef.current = next;
+          return next;
+        });
+        if (!abandonedTransfer) onUploaded();
+      })
+      .finally(() => {
+        operation.dispose();
       });
-  }, [items, dir, onUploaded, onToast, readOnly]);
+  }, [items, dir, onUploaded, onToast, readOnly, held]);
 
   const tally = counts(items);
   const active = items.some((item) => item.state === "queued" || item.state === "uploading");
@@ -180,10 +289,17 @@ export default function UploadPane({
             </div>
           ))}
           <div className="wk-tools">
+            {held && pending(items).length > 0 && (
+              <Button onClick={() => {
+                heldRef.current = false;
+                setHeld(false);
+              }}>{t("Retry uploads")}</Button>
+            )}
             <Button
               disabled={active}
               onClick={() => {
                 onToast("ok", `${tally.done} uploaded${tally.failed ? `, ${tally.failed} failed` : ""}`);
+                itemsRef.current = [];
                 setItems([]);
                 files.current.clear();
               }}

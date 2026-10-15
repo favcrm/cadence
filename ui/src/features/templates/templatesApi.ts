@@ -1,4 +1,5 @@
 import { sessionHeaders } from "../../lib/sessionKey";
+import { privateFetch, usingPrivateOperation, type PrivateOperation } from "../../lib/privateSession";
 
 /**
  * The company document-template HTTP surface (CAD-1393). Each call relays
@@ -125,18 +126,26 @@ export class TemplateError extends Error {
   }
 }
 
-async function read<T>(url: string): Promise<T> {
-  const resp = await fetch(url, { headers: sessionHeaders() });
-  return answer<T>(resp);
+async function read<T>(url: string, operation?: PrivateOperation): Promise<T> {
+  return usingPrivateOperation(operation, async (op) => {
+    const resp = await privateFetch(url, { headers: sessionHeaders() }, op);
+    const value = await answer<T>(resp);
+    op.assertCurrent();
+    return value;
+  });
 }
 
-async function write<T>(url: string, body: unknown): Promise<T> {
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
-    body: JSON.stringify(body),
+async function write<T>(url: string, body: unknown, operation?: PrivateOperation): Promise<T> {
+  return usingPrivateOperation(operation, async (op) => {
+    const resp = await privateFetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
+      body: JSON.stringify(body),
+    }, op);
+    const value = await answer<T>(resp);
+    op.assertCurrent();
+    return value;
   });
-  return answer<T>(resp);
 }
 
 async function answer<T>(resp: Response): Promise<T> {

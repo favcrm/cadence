@@ -9,8 +9,6 @@ import {
   blobPage,
   wiki,
   WikiError,
-  wikiFileUrl,
-  wikiRawUrl,
   type WikiEntry,
   type WikiListing,
   type WikiPage,
@@ -19,7 +17,7 @@ import { treeRows } from "./tree";
 import { scopedAncestors, withinScope, type WikiScope } from "./scope";
 import { baseName, joinPath, parentPath } from "./paths";
 import { relTime } from "./history";
-import { kindLabel, previewKind } from "./preview";
+import { kindLabel, previewKind, type PreviewKind } from "./preview";
 import {
   WikiToolbar,
   EmptyCard,
@@ -28,7 +26,7 @@ import {
   LockIcon,
   Note,
   WIKI_ROOT_LABEL,
-  WikiImage,
+  useWikiBlobSource,
   WikiScopeContext,
 } from "./shared";
 import FileExplorer from "./FileExplorer";
@@ -489,32 +487,33 @@ function BrowsePane({
 
   const page = open.page;
   if (page.kind === "page") return <PagePane page={page} navHref={navHref} readOnly={readOnly} />;
-  return (
-    <>
-      <WikiToolbar path={page.path} navHref={navHref} actions={<>
-          <Button href={navHref({ screen: "wiki", mode: "search", path: null, query: null })}>{t("Search")}</Button>
-          <a className="btn" href={wikiFileUrl(page.path)} download>{t("Download")}</a>
-      </>} />
-      <BlobPane page={page} blob={previewKind(baseName(page.path), page.mime)} />
-    </>
-  );
+  return <BlobPane page={page} blob={previewKind(baseName(page.path), page.mime)} navHref={navHref} />;
 }
 
-function BlobPane({ page, blob }: { page: WikiPage; blob: ReturnType<typeof previewKind> }) {
+function BlobPane({ page, blob, navHref }: {
+  page: WikiPage;
+  blob: PreviewKind;
+  navHref: (route: Route) => string;
+}) {
   const t = useTranslate();
-  const url = wikiFileUrl(page.path);
+  const { src, download, error, loading } = useWikiBlobSource(page.path, blob, true);
   const name = baseName(page.path);
   return (
     <>
+      <WikiToolbar path={page.path} navHref={navHref} actions={<>
+        <Button href={navHref({ screen: "wiki", mode: "search", path: null, query: null })}>{t("Search")}</Button>
+        {download ? <a className="btn" href={download} download={name}>{t("Download")}</a> : <Button disabled>{t("Download")}</Button>}
+      </>} />
+      {error && <Failure what="could not open this file" error={error} />}
       <div className="wk-pstage">
-        {blob === "image" ? (
-          <WikiImage className="wk-img" path={page.path} alt={name} />
-        ) : blob === "video" ? (
-          <video className="wk-video" src={url} controls preload="metadata">
+        {loading ? <Loading what="loading the file…" /> : blob === "image" && src ? (
+          <img className="wk-img" src={src} alt={name} />
+        ) : blob === "video" && src ? (
+          <video className="wk-video" src={src} controls preload="metadata">
             <track kind="captions" />
           </video>
-        ) : blob === "pdf" ? (
-          <iframe className="wk-pdf" src={url} sandbox="" title={name} />
+        ) : blob === "pdf" && src ? (
+          <iframe className="wk-pdf" src={src} sandbox="" title={name} />
         ) : (
           <div className="wk-download">
             <span className="chip bg-ink-800 text-ink-400">{kindLabel(name, page.mime)}</span>
@@ -522,9 +521,9 @@ function BlobPane({ page, blob }: { page: WikiPage; blob: ReturnType<typeof prev
             <div className="wk-ebody">
               {t("this type has no inline preview — download it, or open it with the tool it belongs to.")}
             </div>
-            <a className="btn btn-primary" href={wikiRawUrl(page.path)} download>
+            {download && <a className="btn btn-primary" href={download} download={name}>
               {t("Download")}
-            </a>
+            </a>}
           </div>
         )}
       </div>

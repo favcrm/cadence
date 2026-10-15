@@ -20,11 +20,15 @@ export function sessionKey(): string | null {
 }
 
 export function setSessionKey(key: string | null): void {
+  const previous = sessionKey();
   try {
     if (key) sessionStorage.setItem(STORE, key);
     else sessionStorage.removeItem(STORE);
   } catch {
     // Storage blocked: the tab simply stays signed out.
+  }
+  if (previous !== sessionKey() && typeof window !== "undefined") {
+    window.dispatchEvent(new Event("cadence:session-changed"));
   }
 }
 

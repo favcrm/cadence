@@ -3,6 +3,7 @@ import { api, ApiError } from "../../lib/api";
 import { cache, resources } from "../../lib/resources";
 import { useQuery } from "../../lib/useResource";
 import type { Resource } from "../../lib/cache";
+import { beginPrivateOperation, onPrivateReadsPaused, onPrivateSessionReset, withPrivateOperation, type PrivateOperation } from "../../lib/privateSession";
 import type { MasterState, ThreadRef } from "../../lib/types";
 import { EMPTY_THREAD, loadThread, type PageReader, type ThreadEntry, type ThreadState, type PendingMessage } from "../home/thread";
 
@@ -108,7 +109,12 @@ const listFamily = cache.family<string, ConversationList>("conversations", async
 });
 export const conversationList = (installId: string): Resource<ConversationList> => listFamily(installId);
 
-const inflight = new Map<string, Promise<Conversation>>();
+interface InflightCreate {
+  promise: Promise<Conversation>;
+  operation: PrivateOperation;
+}
+
+const inflight = new Map<string, InflightCreate>();
 
 /** Bumped by every explicit selection change (a picker choice, a new
  *  draft subject). A create that resolves after the operator chose
@@ -139,39 +145,64 @@ export function createConversation(
   installId: string,
   contextId: string,
   subject?: string,
-  options: { shouldSelect?: () => boolean } = {},
+  options: { shouldSelect?: () => boolean; operation?: PrivateOperation } = {},
 ): Promise<Conversation> {
+  const parent = options.operation;
+  let gate: PrivateOperation;
+  let release = () => {};
+  try {
+    if (parent) {
+      parent.assertCurrent();
+      gate = parent;
+    } else {
+      gate = beginPrivateOperation();
+      release = () => gate.dispose();
+    }
+  } catch (error) {
+    release();
+    return Promise.reject(error);
+  }
   // The full captured creation binding is the identity: install, context
   // and subject. Context is part of it — the daemon proves the scope on
   // create, so two requests for the same subject under different contexts
   // are different requests, not one shared idempotent open.
   const key = `${installId}|${contextId}|${subject ?? ""}`;
-  let request = subject ? inflight.get(key) : undefined;
+  let held = subject ? inflight.get(key) : undefined;
+  if (held !== undefined && held.operation.signal.aborted) {
+    inflight.delete(key);
+    held = undefined;
+  }
+  let request = held?.promise;
   if (request === undefined) {
+    const fetchOp = gate;
     const run = api
-      .conversationCreate(installId, contextId, subject)
+      .conversationCreate(installId, contextId, subject, fetchOp)
       .then((raw) => {
+        fetchOp.assertCurrent();
         const c = parseConversation(raw.conversation);
         if (!c) throw new Error("The assistant did not return a conversation.");
         return c;
       })
       .then(async (c) => {
+        fetchOp.assertCurrent();
         await conversationList(installId).refresh();
+        fetchOp.assertCurrent();
         return c;
       })
       .finally(() => {
-        if (subject && inflight.get(key) === run) inflight.delete(key);
+        if (subject && inflight.get(key)?.promise === run) inflight.delete(key);
       });
     request = run;
-    if (subject) inflight.set(key, run);
+    if (subject) inflight.set(key, { promise: run, operation: fetchOp });
   }
   const epoch = selectionEpoch;
   return request.then((conversation) => {
+    gate.assertCurrent();
     if (selectionEpoch === epoch && (options.shouldSelect?.() ?? true)) {
       selectConversation(installId, conversation.id);
     }
     return conversation;
-  });
+  }).finally(release);
 }
 
 /** The campaign's conversation id (created idempotently); null when the
@@ -180,9 +211,10 @@ export async function openCampaignConversation(
   installId: string,
   contextId: string,
   campaignId: string,
+  operation?: PrivateOperation,
 ): Promise<string | null> {
   try {
-    return (await createConversation(installId, contextId, campaignSubject(campaignId))).id;
+    return (await createConversation(installId, contextId, campaignSubject(campaignId), { operation })).id;
   } catch (e) {
     if (predatesConversations(e)) return null;
     throw e;
@@ -196,11 +228,17 @@ export async function autoSelectCampaignConversation(
   installId: string,
   campaignId: string,
 ): Promise<void> {
-  const res = conversationList(installId);
-  if (res.get().data === null) await res.refresh();
-  const existing = res.get().data?.conversations.find((c) => c.subject === campaignSubject(campaignId));
-  if (existing) return selectConversation(installId, existing.id);
-  if (res.get().data?.legacy === false) setDraftSubject(installId, campaignSubject(campaignId));
+  await withPrivateOperation(async (op) => {
+    const res = conversationList(installId);
+    if (res.get().data === null) await res.refresh();
+    op.assertCurrent();
+    const existing = res.get().data?.conversations.find((c) => c.subject === campaignSubject(campaignId));
+    if (existing) {
+      selectConversation(installId, existing.id);
+      return;
+    }
+    if (res.get().data?.legacy === false) setDraftSubject(installId, campaignSubject(campaignId));
+  });
 }
 
 // --- threads -------------------------------------------------------------
@@ -351,6 +389,30 @@ export function setCollapsed(installId: string, collapsed: boolean) {
   writeKey(`chat-collapsed:${installId}`, collapsed ? "1" : "0");
   notify();
 }
+
+onPrivateReadsPaused(() => {
+  inflight.clear();
+});
+
+onPrivateSessionReset(() => {
+  inflight.clear();
+  selectionEpoch += 1;
+  selectionActionEpochs.clear();
+  drafts.clear();
+  outbox.clear();
+  memory.clear();
+  try {
+    const storage = globalThis.localStorage;
+    for (let index = storage.length - 1; index >= 0; index -= 1) {
+      const key = storage.key(index);
+      if (key?.startsWith("chat-conv:") || key?.startsWith("chat-collapsed:")) storage.removeItem(key);
+    }
+  } catch {
+    // Storage may be blocked; the private in-memory selection is still gone.
+  }
+  notify();
+  outboxNotify();
+});
 
 /** The conversation to show: the stored pick if it still exists, else General. */
 export function resolveSelected(list: Conversation[], stored: string | null): Conversation | null {

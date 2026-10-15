@@ -1,4 +1,5 @@
 import { CRM_SECTIONS, crmSectionHref, type AppMenuSection } from "./CrmOutlet";
+import { onPrivateSessionReset } from "../../lib/privateSession";
 
 /** One installed app in the board's Apps menu (CAD-1116). */
 export interface AppNavEntry {
@@ -64,6 +65,11 @@ export interface LastApp {
 }
 
 const LAST_APP_KEY = "cadence.apps.last";
+
+onPrivateSessionReset(() => {
+  try { safeStorage()?.removeItem(LAST_APP_KEY); }
+  catch { /* Storage may be blocked; the next private shell starts without app state. */ }
+});
 
 /** Per-browser memory of the last-used app and its section. Storage that is
  *  missing or throws means no memory, never an error. */

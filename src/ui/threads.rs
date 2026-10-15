@@ -39,7 +39,6 @@
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -54,8 +53,9 @@ use crate::error::Error;
 
 /// A chat message body is at most the queue's 48 000 bytes plus JSON.
 const MESSAGE_CAP: u64 = 64 * 1024;
-/// Seconds one stream long-poll waits on the daemon before a keepalive.
-const STREAM_WAIT: u64 = 15;
+/// Keep each read within the two-second absolute daemon-read bound, so a
+/// stalled long-poll cannot indefinitely hold an authenticated stream.
+const STREAM_WAIT: u64 = 1;
 
 /// Maximum simultaneous multipart bodies held by this board process.
 /// This bounds this HTTP ingress only; it is not a host-wide job limit.
@@ -274,6 +274,7 @@ pub(super) fn stream(
     state_dir: &std::path::Path,
     alias: &str,
     query: &dyn Fn(&str) -> Option<String>,
+    mut admission: super::operator::ReadAdmission,
 ) {
     if !valid_alias(alias) {
         let _ = request.respond(err_response(400, "bad agent alias"));
@@ -297,12 +298,16 @@ pub(super) fn stream(
     };
     // Fail before the stream opens when the alias or daemon is wrong —
     // a 404/501/503 beats an event stream that only ever errors.
-    if let Err(e) = client::rpc(
+    let budget = client::MetaBudget::fresh(client::MetaBudget::READ_CAP);
+    if let Err(e) = budget.read(
         state_dir,
         "thread_read",
         with_conversation(json!({"alias": alias, "after": cursor, "limit": 1})),
     ) {
         let _ = request.respond(rpc_err(&e));
+        return;
+    }
+    if !admission.still_live(state_dir) {
         return;
     }
     let mut w = request.into_writer();
@@ -316,14 +321,18 @@ pub(super) fn stream(
         return;
     }
     loop {
-        let started = Instant::now();
-        match client::rpc(
+        let budget = client::MetaBudget::fresh(client::MetaBudget::READ_CAP);
+        let page = budget.read(
             state_dir,
             "thread_read",
             with_conversation(
                 json!({"alias": alias, "after": cursor, "limit": 100, "wait": STREAM_WAIT}),
             ),
-        ) {
+        );
+        if !admission.still_live(state_dir) {
+            return;
+        }
+        match page {
             Ok(page) => {
                 let entries = page["entries"].as_array().cloned().unwrap_or_default();
                 if entries.is_empty() && !frame(&mut w, b": ping\n\n") {
@@ -333,6 +342,9 @@ pub(super) fn stream(
                     let Some(seq) = entry["seq"].as_i64() else {
                         continue;
                     };
+                    if !admission.still_live(state_dir) {
+                        return;
+                    }
                     let bytes = format!("id: {seq}\nevent: entry\ndata: {entry}\n\n");
                     if !frame(&mut w, bytes.as_bytes()) {
                         return;
@@ -340,17 +352,7 @@ pub(super) fn stream(
                     cursor = cursor.max(seq);
                 }
             }
-            Err(e) => {
-                let data = json!({"error": e.to_string()});
-                if !frame(&mut w, format!("event: error\ndata: {data}\n\n").as_bytes()) {
-                    return;
-                }
-                // A down daemon answers at once — never spin on it.
-                let spent = started.elapsed();
-                if spent < Duration::from_secs(2) {
-                    std::thread::sleep(Duration::from_secs(2) - spent);
-                }
-            }
+            Err(_) => return,
         }
     }
 }

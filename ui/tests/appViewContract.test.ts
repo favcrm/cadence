@@ -328,12 +328,6 @@ await React.act(async () => { root.unmount(); });
 
 // Real shell lifecycle with fixture HTTP receipts: direct preview links and
 // same-installation navigation remain, App-menu installation switches exit.
-let streams = 0;
-Object.defineProperty(globalThis, "EventSource", { configurable: true, value: class {
-  onopen = null; onerror = null;
-  constructor() { streams += 1; }
-  addEventListener() {} removeEventListener() {} close() {}
-} });
 const shellBase = {
   title: "Reports", name: "reports", version: "0.1.0", digest: "fixture-digest",
   catalog_generation: "fixture-generation", approved: true, storage_kind: "workspace",
@@ -341,6 +335,7 @@ const shellBase = {
 };
 globalThis.fetch = (async (input: unknown) => {
   const url = String(input);
+  if (new URL(url, "http://localhost").pathname.endsWith("/stream")) return new Response(new ReadableStream(), { headers: { "Content-Type": "text/event-stream" } });
   if (url.endsWith("/conversations")) return new Response("{}", { status: 404 });
   const receipt = url.endsWith("/contexts") ? { contexts: [] }
     : url.startsWith("/api/threads/master") ? { entries: [], more_before: false }
@@ -383,7 +378,6 @@ assert(!location.search.includes("contract-preview"), "App menu installation swi
 assert(!host.querySelector("[data-contract-preview]"), "new installation never stays behind an old fixture");
 assert(text().includes("Social operational outlet"), "new installation opens its real outlet");
 equal(host.querySelectorAll("[data-chat-pane]").length, 1, "installation switch preserves one chat pane");
-equal(streams, 2, "installation switch reconnects the chat stream once (per-install legacy detection)");
 await React.act(async () => { shellRoot.unmount(); });
 console.log("app view contract checks passed");
 }

@@ -82,10 +82,6 @@ async function mounted(readOnly: boolean) {
   Object.defineProperty(globalThis, "crypto", { value: require("crypto").webcrypto, configurable: true });
   Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { value: true });
   Object.defineProperty(globalThis, "requestAnimationFrame", { value: (fn: () => void) => setTimeout(fn, 0), configurable: true });
-  Object.defineProperty(globalThis, "EventSource", {
-    configurable: true,
-    value: class { onopen: null = null; onerror: null = null; addEventListener() {} removeEventListener() {} close() {} },
-  });
   const loader = require("module"), originalRequire = loader.prototype.require;
   loader.prototype.require = function (this: unknown, id: string) {
     if (id.endsWith(".css")) return {};
@@ -139,6 +135,7 @@ async function mounted(readOnly: boolean) {
   globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
     const path = String(input);
     const url = new URL(path, "http://localhost");
+    if (url.pathname.endsWith("/stream")) return new Response(new ReadableStream(), { headers: { "Content-Type": "text/event-stream" } });
     const method = init?.method ?? "GET";
     const parts = url.pathname.split("/");
     if (method !== "GET") posts.push(`${method} ${url.pathname}`);

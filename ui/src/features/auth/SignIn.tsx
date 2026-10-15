@@ -6,8 +6,8 @@ import { useLocale } from "../../lib/locale";
 
 /**
  * The header's sign-in state: "Sign in with `cadence ui login`" when this
- * browser holds no operator session, else nothing. The signed-in identity lives in AccountMenu (CAD-1030).
- * Nothing on a read-only board (the read-only chip says it all).
+ * browser holds no session, else nothing. The signed-in identity lives in
+ * AccountMenu. Explicit anonymous read-only browsing still offers local login.
  */
 export default function SignIn({
   meta,
@@ -44,7 +44,7 @@ export default function SignIn({
       </span>
     );
   }
-  if (!meta || meta.read_only || meta.signed_in === undefined || meta.signed_in === null) return null;
+  if (!meta || meta.signed_in === undefined || meta.signed_in === null) return null;
   if (!meta.signed_in) {
     const cmd = meta.login_hint ?? SIGN_IN_COMMAND;
     const device = meta.device_login === true;
@@ -52,7 +52,7 @@ export default function SignIn({
       <details className="relative text-label">
         {/* CAD-1312: unsigned-in browsing is a neutral state, not a warning —
             the quiet pill carries the lock, "Read only" and the accent action. */}
-        <summary className="header-auth-target header-state" aria-label={t("Read-only. Sign in to make changes")}>
+        <summary className="header-auth-target header-state" aria-label={t(meta.read_only ? "Sign in to your local board." : "Read-only. Sign in to make changes")}>
           <IconLock size={11} />
           <span className="hidden sm:inline">{t("Read only")}<span className="text-ink-600" aria-hidden> · </span><span className="header-state-action">{t("Sign in")}</span></span>
           <span className="sm:hidden">{t("Sign in")}</span>
@@ -67,7 +67,7 @@ export default function SignIn({
               <p className="text-label text-ink-400 mb-2">{t("Or, on the host:")}</p>
             </>
           ) : (
-            <p className="text-label text-ink-200 mb-2">{t("Sign in to send messages and make decisions.")}</p>
+            <p className="text-label text-ink-200 mb-2">{t(meta.read_only ? "Sign in to your local board." : "Sign in to send messages and make decisions.")}</p>
           )}
           <p className="text-label text-ink-400 mb-2">{t("Run this command on the host, then open the link it prints in this tab.")}</p>
           <code className="num text-label text-accent break-words select-all">{cmd}</code>

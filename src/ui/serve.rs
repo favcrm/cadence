@@ -72,7 +72,7 @@ pub(crate) fn err_response(code: u16, message: &str) -> Response<std::io::Cursor
 /// Defence in depth on an unauthenticated loopback origin that renders
 /// agent-written Markdown. Social source previews use only these reviewed
 /// image CDNs; the client checks the same host families before rendering.
-pub(crate) const CSP: &str = "default-src 'self'; img-src 'self' data: https://cdninstagram.com https://*.cdninstagram.com https://fbcdn.net https://*.fbcdn.net; font-src 'self' data:; style-src 'self' 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'";
+pub(crate) const CSP: &str = "default-src 'self'; img-src 'self' data: https://cdninstagram.com https://*.cdninstagram.com https://fbcdn.net https://*.fbcdn.net; frame-src 'self' blob:; media-src 'self' blob:; font-src 'self' data:; style-src 'self' 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'";
 
 /// Every response gets nosniff + no-referrer; HTML additionally gets
 /// the CSP. Returns whether the response is HTML.
@@ -1082,25 +1082,6 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             );
             return;
         }
-        // A read on the public host needs a live board session —
-        // `/api/health` and `/api/version` stay open so a probe can see
-        // the board is up, and a signed-out tab can still learn the
-        // serving build, without holding a credential.
-        if path != "/api/health" && path != "/api/version" {
-            match operator::public_session(&request, state_dir, opts) {
-                Ok(Some(_)) => {}
-                Ok(None) => {
-                    let resp = operator::session_bounce(&request, &path, opts);
-                    send(request, resp);
-                    return;
-                }
-                Err(resp) => {
-                    send(request, resp);
-                    return;
-                }
-            }
-        }
-        // Signed-in reads fall through to the shared dispatch below.
     }
 
     if is_write {
@@ -1123,6 +1104,30 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
         return;
     }
 
+    // Every private API read is admitted before dispatch, including future
+    // routes and streams. Local bootstrap/static files are public. The
+    // screen document instead owns a one-use, live-session-bound capability.
+    let private_api = path.starts_with("/api/")
+        && !matches!(path.as_str(), "/api/meta" | "/api/health" | "/api/version")
+        && app_screens::frame_route(&path).is_none();
+    let public_read = public_host && !matches!(path.as_str(), "/api/health" | "/api/version");
+    let read_admission = if private_api || public_read {
+        match operator::admit_read(&request, state_dir, opts) {
+            Ok(admission) => Some(admission),
+            Err(resp) => {
+                let resp = if public_host && resp.status_code().0 == 401 {
+                    operator::session_bounce(&request, &path, opts)
+                } else {
+                    resp
+                };
+                send(request, resp);
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
     match path.as_str() {
         "/api/locale" => {
             let response = locale::get(&request, state_dir, opts);
@@ -1142,8 +1147,24 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             // sign-out. Writes are untouched: their guards keep the
             // full RPC bound.
             let budget = client::MetaBudget::fresh(client::MetaBudget::LIMIT);
-            let daemon = budget.read(state_dir, "daemon_info", json!({})).ok();
+            let session = operator::meta(&request, state_dir, opts, &budget);
+            let signed_in = session["signed_in"].as_bool() == Some(true);
+            let daemon = budget
+                .read(state_dir, "daemon_info", json!({}))
+                .ok()
+                .map(|info| {
+                    json!({
+                        "build_commit": info["build_commit"],
+                        "build_time": info["build_time"],
+                        "started_at": info["started_at"],
+                    })
+                });
             let (actor, tailnet_proof) = request_identity(&request, opts);
+            let actor = if signed_in {
+                actor
+            } else {
+                super::UI_ACTOR.to_string()
+            };
             // CAD-432: may this client make the operator's board
             // decisions — the same proof those writes run. It walks
             // /proc, so it is computed only when asked (`?operator=1`,
@@ -1152,10 +1173,10 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             // dependency could not answer in budget — serializes as
             // `operator: null`, which the UI shows as unavailable,
             // never as a resolved non-operator.
-            let operator = matches!(query("operator").as_deref(), Some("1" | "true"))
-                .then(|| home::operator_viewer(&request, state_dir, opts, &budget))
-                .flatten();
-            let session = operator::meta(&request, state_dir, opts, &budget);
+            let operator = (signed_in
+                && matches!(query("operator").as_deref(), Some("1" | "true")))
+            .then(|| home::operator_viewer(&request, state_dir, opts, &budget))
+            .flatten();
             // Display the same verified identity that attributes public
             // board writes, never a name supplied by request fields.
             // Public-origin sessions carry a verified user; every other
@@ -1174,6 +1195,7 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 request,
                 json_response(json!({
                     "read_only": opts.read_only,
+                    "anonymous_reads": operator::anonymous_reads(opts),
                     "signed_in": session["signed_in"],
                     "hosted": session["hosted"],
                     "session": session["session"],
@@ -1194,7 +1216,7 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     "daemon": daemon,
                     // CAD-446: the `gh` this board's sync runs, fixed at
                     // start; `null` when the board runs no sync.
-                    "delivery_sync": opts.delivery_sync.as_ref().map(|s| s.meta()),
+                    "delivery_sync": signed_in.then(|| opts.delivery_sync.as_ref().map(|s| s.meta())).flatten(),
                 })),
             );
         }
@@ -1264,35 +1286,46 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             );
         }
         "/api/health" => {
-            let pm = Pm::at(pm_dir).ok();
-            let (projects, issues) = match &pm {
-                Some(pm) => {
-                    let p = project::list(&pm.dir).map(|l| l.len()).unwrap_or(0);
-                    let i = board::load_all(&pm.dir, None).map(|l| l.len()).unwrap_or(0);
-                    (p, i)
+            // Health probes are public, but the workspace projection is
+            // not. Keep authenticated status chips truthful without
+            // leaking tracker paths/counts to an unsigned probe.
+            let admitted = match operator::admit_read(&request, state_dir, opts) {
+                Ok(_) => true,
+                Err(resp) if resp.status_code().0 == 401 => false,
+                Err(resp) => {
+                    send(request, resp);
+                    return;
                 }
-                None => (0, 0),
             };
-            let daemon = if client::rpc(state_dir, "health", json!({})).is_ok() {
-                "reachable"
-            } else {
-                "unreachable"
-            };
-            send(
-                request,
-                json_response(json!({
-                    "ok": true,
-                    "pm_dir": pm.as_ref().map(|p| p.dir.clone()),
-                    "pm_present": pm.is_some(),
-                    "projects": projects, "issues": issues,
-                    "daemon": daemon,
-                    "embedded": cfg!(feature = "ui"),
-                    // CAD-561: which build is answering, so
-                    // `cadence update`'s health check can require the
-                    // board to come back on the new release.
-                    "build": crate::overview::BUILD_COMMIT,
-                })),
-            );
+            let mut health = json!({
+                "ok": true,
+                "embedded": cfg!(feature = "ui"),
+                "build": crate::overview::BUILD_COMMIT,
+            });
+            if admitted {
+                let pm = Pm::at(pm_dir).ok();
+                let (projects, issues) = match &pm {
+                    Some(pm) => (
+                        project::list(&pm.dir).map(|list| list.len()).unwrap_or(0),
+                        board::load_all(&pm.dir, None)
+                            .map(|list| list.len())
+                            .unwrap_or(0),
+                    ),
+                    None => (0, 0),
+                };
+                let budget = client::MetaBudget::fresh(client::MetaBudget::READ_CAP);
+                let daemon = if budget.read(state_dir, "health", json!({})).is_ok() {
+                    "reachable"
+                } else {
+                    "unreachable"
+                };
+                health["pm_dir"] = json!(pm.as_ref().map(|pm| &pm.dir));
+                health["pm_present"] = json!(pm.is_some());
+                health["projects"] = json!(projects);
+                health["issues"] = json!(issues);
+                health["daemon"] = json!(daemon);
+            }
+            send(request, json_response(health));
         }
         "/api/setup" => {
             // Refused before anything runs: no probe for a viewer.
@@ -1481,7 +1514,12 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             if head_only {
                 send(request, err_response(405, "stream is GET only"));
             } else {
-                stream_events(request, state_dir, pm_dir);
+                stream_events(
+                    request,
+                    state_dir,
+                    pm_dir,
+                    read_admission.expect("private stream admission"),
+                );
             }
         }
         _ => {
@@ -1860,7 +1898,13 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     Some("stream") if head_only => {
                         send(request, err_response(405, "stream is GET only"))
                     }
-                    Some("stream") => threads::stream(request, state_dir, alias, &query),
+                    Some("stream") => threads::stream(
+                        request,
+                        state_dir,
+                        alias,
+                        &query,
+                        read_admission.expect("private stream admission"),
+                    ),
                     Some(_) => send(request, err_response(404, "no such thread route")),
                 }
                 return;

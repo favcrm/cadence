@@ -1068,8 +1068,14 @@ fn check_session(
         None => client::rpc(state_dir, method, params),
     };
     match answered {
-        Ok(v) if v["valid"] == true => Ok(Some(v["session"].clone())),
-        Ok(_) => Ok(None),
+        Ok(v) if v["valid"] == true && v["session"].is_object() => Ok(Some(v["session"].clone())),
+        Ok(v) if v["valid"] == false => Ok(None),
+        Ok(_) => Err(coded_response(
+            503,
+            "session_unavailable",
+            "the daemon did not answer whether this session is valid",
+            None,
+        )),
         Err(e) if e.to_string().contains("Unknown method") => Err(coded_response(
             501,
             "unsupported_daemon",
@@ -1096,11 +1102,100 @@ pub(super) fn public_session(
 ) -> Result<Option<Value>, HttpResp> {
     match request_origin(request, opts) {
         ReqOrigin::Known(Origin::Public) => match session_cookie(request, opts, Origin::Public) {
-            Some(token) => check_session(state_dir, &token, "", Origin::Public, None),
+            Some(token) => {
+                let budget = client::MetaBudget::fresh(client::MetaBudget::READ_CAP);
+                check_session(state_dir, &token, "", Origin::Public, Some(&budget))
+            }
             None => Ok(None),
         },
         _ => Ok(None),
     }
+}
+
+/// Read authority is deliberately weaker than write/operator authority:
+/// the daemon's live cookie + tab key (public sessions use only their
+/// cookie), with no inferred privilege from the peer's process.
+/// Credentials stay in this request/stream and are never serialized.
+pub(super) struct ReadAdmission {
+    proof: Option<(String, String, Origin)>,
+    checked_at: std::time::Instant,
+}
+
+impl ReadAdmission {
+    pub(super) const RECHECK: std::time::Duration = std::time::Duration::from_secs(5);
+
+    pub(super) fn wait_timeout(&self) -> std::time::Duration {
+        if self.proof.is_none() {
+            Self::RECHECK
+        } else {
+            Self::RECHECK.saturating_sub(self.checked_at.elapsed())
+        }
+    }
+
+    /// Revalidate before new frames once the five-second window ends.
+    /// Idle board streams wait only until that deadline; thread streams
+    /// can additionally spend at most two seconds in their bounded poll.
+    /// Validation itself has a two-second absolute deadline. Unknown or
+    /// invalid closes the stream without revoking or clearing credentials.
+    /// Bytes already handed to the blocking HTTP writer are not retractable.
+    pub(super) fn still_live(&mut self, state_dir: &std::path::Path) -> bool {
+        let Some((token, key, origin)) = &self.proof else {
+            return true;
+        };
+        if self.checked_at.elapsed() < Self::RECHECK {
+            return true;
+        }
+        let checked_at = std::time::Instant::now();
+        let budget = client::MetaBudget::fresh(client::MetaBudget::READ_CAP);
+        match check_session(state_dir, token, key, *origin, Some(&budget)) {
+            Ok(Some(_)) => {
+                self.checked_at = checked_at;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+pub(super) fn anonymous_reads(opts: &ServeOpts) -> bool {
+    opts.allow_anonymous_reads && !opts.board_public_only && opts.public.is_none()
+}
+
+pub(super) fn admit_read(
+    request: &Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+) -> Result<ReadAdmission, HttpResp> {
+    let checked_at = std::time::Instant::now();
+    let admission = |proof| ReadAdmission { proof, checked_at };
+    if anonymous_reads(opts) {
+        return Ok(admission(None));
+    }
+    let origin = match request_origin(request, opts) {
+        ReqOrigin::Known(origin) => Some(origin),
+        ReqOrigin::NoSession(_) => None,
+    };
+    if let Some(origin) = origin {
+        if let Some(token) = session_cookie(request, opts, origin) {
+            let key = session_key(request);
+            let budget = client::MetaBudget::fresh(client::MetaBudget::READ_CAP);
+            if check_session(state_dir, &token, &key, origin, Some(&budget))?.is_some() {
+                return Ok(admission(Some((token, key, origin))));
+            }
+        }
+    }
+    let (code, message) = if origin == Some(Origin::Public) {
+        (
+            "board_session_required",
+            "a board session is required — sign in through your company's workspace",
+        )
+    } else {
+        (
+            "operator_session_required",
+            "a local board session is required — sign in with cadence ui login",
+        )
+    };
+    Err(coded_response(401, code, message, None))
 }
 
 /// How the board's peer attribution came out.
@@ -1631,7 +1726,7 @@ fn cookie_attrs(origin: Origin, max_age: i64) -> String {
 
 /// `POST /api/session {"nonce"}` — exchange a login link for a session:
 /// the cookie (`Set-Cookie`) plus `{"session_key"}` for the page, both
-/// required on every later write. The write guards apply, the Host must be this board's own
+/// required on later private reads and writes. The write guards apply, and the Host must be this board's own
 /// name (or the proven tailnet), and `Origin` must be this request's
 /// own; the link must have been minted for this origin. The peer is
 /// attributed BEFORE the exchange, under the same rule as a
@@ -1643,9 +1738,6 @@ pub(super) fn open(
     state_dir: &std::path::Path,
     opts: &ServeOpts,
 ) -> HttpResp {
-    if opts.read_only {
-        return guard_fail("read_only", "board is read-only — sign-in is disabled");
-    }
     if let Err(resp) = write_guard(request, "application/json", opts) {
         return resp;
     }
@@ -1886,9 +1978,6 @@ pub(super) fn device_code(
     let Some(config) = device_config(state_dir, None) else {
         return device_off();
     };
-    if opts.read_only {
-        return guard_fail("read_only", "board is read-only — sign-in is disabled");
-    }
     if let Err(resp) = write_guard(request, "application/json", opts) {
         return resp;
     }
@@ -1980,9 +2069,6 @@ pub(super) fn device_poll(
     let Some(config) = device_config(state_dir, None) else {
         return device_off();
     };
-    if opts.read_only {
-        return guard_fail("read_only", "board is read-only — sign-in is disabled");
-    }
     if let Err(resp) = write_guard(request, "application/json", opts) {
         return resp;
     }

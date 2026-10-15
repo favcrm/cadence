@@ -1,4 +1,21 @@
+import { onPrivateSessionReset } from "../../lib/privateSession";
+
 const key = (installId: string) => `cadence.workspace-app.context.${installId}`;
+
+onPrivateSessionReset(() => {
+  const prefix = "cadence.workspace-app.context.";
+  try {
+    const storage = window.sessionStorage;
+    for (let index = storage.length - 1; index >= 0; index -= 1) {
+      const saved = storage.key(index);
+      if (!saved?.startsWith(prefix)) continue;
+      storage.removeItem(saved);
+      emitContext(saved.slice(prefix.length), null);
+    }
+  } catch {
+    // Storage is optional; the private tree also discards its current frame.
+  }
+});
 
 export function rememberedContext(installId: string): string | null {
   try { return window.sessionStorage.getItem(key(installId)); }

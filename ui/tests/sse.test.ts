@@ -1,5 +1,8 @@
 import { Resource } from "../src/lib/cache";
 import { isPermanent, streamInto, subscribeSse, withResume, type EventSourceLike, type SseErrorState } from "../src/lib/sse";
+import { allowPrivateReads } from "../src/lib/privateSession";
+import { SESSION_HEADER, setSessionKey } from "../src/lib/sessionKey";
+import type { SseSubscription } from "../src/lib/sse";
 
 function equal(actual: unknown, expected: unknown, what: string): void {
   const a = JSON.stringify(actual);
@@ -40,6 +43,7 @@ class FakeSource implements EventSourceLike {
 const flush = () => new Promise<void>((r) => setTimeout(r, 0));
 
 async function main() {
+  allowPrivateReads();
   equal(withResume("/api/threads/pm/stream", null), "/api/threads/pm/stream", "no cursor");
   equal(withResume("/api/threads/pm/stream", "7"), "/api/threads/pm/stream?after=7", "cursor added");
   equal(withResume("/x?after=3&y=1", "9"), "/x?after=9&y=1", "cursor replaced");
@@ -183,6 +187,96 @@ async function main() {
     await flush();
     equal(r.get().data, ["live"], "trailing answer agrees");
     sub.close();
+  }
+
+  // The default transport must carry the tab credential as a header while
+  // retaining browser same-origin cookie semantics, and parse real byte chunks.
+  {
+    const oldStorage = Object.getOwnPropertyDescriptor(globalThis, "sessionStorage");
+    const oldFetch = globalThis.fetch;
+    const storage = new Map<string, string>();
+    Object.defineProperty(globalThis, "sessionStorage", { configurable: true, value: {
+      getItem: (key: string) => storage.get(key) ?? null,
+      setItem: (key: string, value: string) => { storage.set(key, value); },
+      removeItem: (key: string) => { storage.delete(key); },
+    } });
+    const requests: { url: string; init: RequestInit | undefined }[] = [];
+    let stream!: ReadableStreamDefaultController<Uint8Array>;
+    const body = new ReadableStream<Uint8Array>({ start(controller) { stream = controller; } });
+    const seen: { type: string; data: string; id: string | null }[] = [];
+    // ES2023 is this harness's lib target; Promise.withResolvers is unavailable.
+    let delivered!: () => void;
+    const framesDelivered = new Promise<void>((resolve) => { delivered = resolve; });
+    let sub: SseSubscription | undefined;
+    try {
+      setSessionKey("private-stream-key");
+      globalThis.fetch = async (input, init) => {
+        requests.push({ url: String(input), init });
+        return new Response(body, { headers: { "Content-Type": "text/event-stream" } });
+      };
+      sub = subscribeSse({
+        url: "/api/threads/member/stream",
+        lastEventId: "4",
+        events: ["entry", "message"],
+        onEvent: (event) => { seen.push(event); if (seen.length === 3) delivered(); },
+        schedule: () => { throw new Error("Closed stream must not schedule a retry"); },
+      });
+      equal(requests.length, 1, "default transport performs one fetch");
+      equal(requests[0].url, "/api/threads/member/stream?after=4", "resume URL contains only the cursor, never the session key");
+      equal(new Headers(requests[0].init?.headers).get(SESSION_HEADER), "private-stream-key", "stream sends this tab's second credential");
+      equal(new Headers(requests[0].init?.headers).get("Accept"), "text/event-stream", "stream requests SSE");
+      equal(requests[0].init?.credentials ?? "same-origin", "same-origin", "stream retains same-origin cookies without cross-origin credentials");
+      equal(requests[0].init?.cache, "no-store", "stream response cannot enter the HTTP cache");
+      const bytes = new TextEncoder().encode(": keepalive\r\nid: 7\r\nevent: entry\r\ndata: café\r\ndata: second\r\n\r\ndata: plain\n\nid: 8\nevent: entry\ndata: final\n\n");
+      const cr = bytes.indexOf(13), utf8 = bytes.indexOf(0xc3);
+      // Deliberately split CRLF and one UTF-8 character across chunks.
+      for (const [from, to] of [[0, cr + 1], [cr + 1, utf8 + 1], [utf8 + 1, bytes.length]])
+        stream.enqueue(bytes.slice(from, to));
+      await framesDelivered;
+      equal(seen, [
+        { type: "entry", data: "café\nsecond", id: "7" },
+        { type: "message", data: "plain", id: "7" },
+        { type: "entry", data: "final", id: "8" },
+      ], "default transport parses chunks, multiline data, named/default events and inherited cursors");
+      equal(sub.lastEventId(), "8", "parsed stream cursor is available for resume");
+      sub.close();
+      equal(requests[0].init?.signal?.aborted, true, "close aborts the authenticated fetch");
+      stream.enqueue(new TextEncoder().encode("event: entry\ndata: late\n\n"));
+      stream.close();
+      await Promise.resolve();
+      await Promise.resolve();
+      equal(seen.length, 3, "closed subscription ignores late bytes");
+
+      // The default status probe must obey the same second-credential rule.
+      requests.length = 0;
+      const errors: SseErrorState[] = [];
+      let stopped!: () => void;
+      const refused = new Promise<void>((resolve) => { stopped = resolve; });
+      globalThis.fetch = async (input, init) => {
+        requests.push({ url: String(input), init });
+        return new Response(null, { status: requests.length === 1 ? 503 : 403 });
+      };
+      sub = subscribeSse({
+        url: "/api/threads/member/stream",
+        events: ["entry"],
+        onEvent: () => { throw new Error("Refused stream cannot deliver events"); },
+        onError: (state) => { errors.push(state); if (state === "stopped") stopped(); },
+        schedule: () => { throw new Error("Permanent refusal must not schedule a retry"); },
+      });
+      await refused;
+      equal(requests.length, 2, "failed default stream is status-probed once");
+      for (const request of requests) {
+        equal(new Headers(request.init?.headers).get(SESSION_HEADER), "private-stream-key", "both stream and status probe send the tab key");
+        equal(request.init?.credentials ?? "same-origin", "same-origin", "both requests retain same-origin cookie policy");
+        equal(request.init?.signal?.aborted, true, "retired stream and header-only probe are aborted");
+      }
+      equal(errors, ["stopped"], "permanent authenticated probe refusal stops reconnection");
+    } finally {
+      sub?.close();
+      globalThis.fetch = oldFetch;
+      if (oldStorage) Object.defineProperty(globalThis, "sessionStorage", oldStorage);
+      else Reflect.deleteProperty(globalThis, "sessionStorage");
+    }
   }
 
   console.log("sse checks passed");

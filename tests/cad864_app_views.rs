@@ -780,17 +780,25 @@ fn cad864_descriptor_read_stays_operator_only_and_installation_bound() {
     // agent assertion — the existing operator-read gate's proof), and so
     // does an agent with no session at all.
     for held in [true, false] {
-        let stolen = if held {
-            Some((cookie.as_str(), key.as_str()))
-        } else {
-            None
-        };
         for who in ["agent:desc-reader", "unproven"] {
+            // Fresh credentials keep each caller-proof refusal independent
+            // of the preceding agent's session revocation.
+            let held_session = held.then(|| sign_in(&w.state, port));
+            let stolen = held_session
+                .as_ref()
+                .map(|(cookie, key)| (cookie.as_str(), key.as_str()));
             let (code, _, body) = get_as(&w.state, port, Some(who), stolen, &path);
             assert_eq!(
-                code, 403,
+                code,
+                if held { 403 } else { 401 },
                 "agent-peered HTTP descriptor read ({who}, session={held}) reached {path}: {body}"
             );
+            if !held {
+                assert_eq!(
+                    serde_json::from_str::<Value>(&body).unwrap()["code"],
+                    "operator_session_required"
+                );
+            }
         }
     }
     // A cross-install/guessed read — an id that is not a live

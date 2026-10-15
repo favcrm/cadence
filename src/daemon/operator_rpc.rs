@@ -16,8 +16,8 @@
 //!   endpoint on its ancestry — an agent that skipped the board, or a
 //!   board an agent started) spends the nonce and gets no session.
 //! - `operator_session_check {token, key, origin}` — the board, on every
-//!   write and `/api/meta`: the cookie's token AND the page's
-//!   `X-Cadence-Session` key, both required.
+//!   private read and write, `/api/meta`, and live streams: the cookie's
+//!   token AND the tab's `X-Cadence-Session` key, both required.
 //! - `operator_session_logout {token}` — the board's
 //!   `POST /api/session/logout`: possession of the token ends it.
 //! - `operator_session_stolen {token, agent}` — the board saw a session

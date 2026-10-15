@@ -1,5 +1,6 @@
 import { useEffect, useSyncExternalStore } from "react";
 import type { NeedsMe } from "../../lib/types";
+import { onPrivateSessionReset } from "../../lib/privateSession";
 import { needFingerprint, todoCount, todoSplit, type HomeNeed } from "./needs";
 
 /**
@@ -95,8 +96,10 @@ export function reconcileTodo(current: readonly HomeNeed[]) {
   set(next);
 }
 
-/** Clears everything — for tests, which share one module. */
+/** Clears private To do decisions without reusing an earlier visit. */
 export const resetTodoLocal = () => set(empty(state.visit));
+
+onPrivateSessionReset(resetTodoLocal);
 
 export function useTodoLocal(): TodoLocal {
   return useSyncExternalStore(

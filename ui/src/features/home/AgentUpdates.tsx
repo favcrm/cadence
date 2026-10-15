@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../../lib/api";
 import { resources } from "../../lib/resources";
+import { onPrivateReadsPaused, onPrivateSessionReset, privateReadsAllowed, privateSessionGeneration } from "../../lib/privateSession";
 import { useQuery, useResource } from "../../lib/useResource";
 import type { Agent } from "../../lib/types";
 import { activityTimeMs } from "../../lib/fmt";
@@ -11,16 +12,26 @@ import { ageLabel } from "./needs";
 // Cap concurrent history reads across the rail. Thread tails are small, so a
 // freed slot goes to a waiting thread before a waiting agent detail: notes
 // render while the slow detail is still pending.
+// Queued reads have no API operation yet; pause must retire their lease too.
+let historyEpoch = 0;
 let pendingReads = 0;
 const urgentWaiting: (() => void)[] = [];
 const waiting: (() => void)[] = [];
 async function historyRead<T>(read: () => Promise<T>, urgent: boolean): Promise<T> {
+  const generation = privateSessionGeneration();
+  const epoch = historyEpoch;
   if (pendingReads >= 3) await new Promise<void>((resolve) => (urgent ? urgentWaiting : waiting).push(resolve));
   else pendingReads++;
-  try { return await read(); }
-  finally {
-    const next = urgentWaiting.shift() ?? waiting.shift();
-    if (next) next(); else pendingReads--;
+  try {
+    if (epoch !== historyEpoch || generation !== privateSessionGeneration() || !privateReadsAllowed()) {
+      throw new DOMException("The private session changed", "AbortError");
+    }
+    return await read();
+  } finally {
+    if (generation === privateSessionGeneration()) {
+      const next = urgentWaiting.shift() ?? waiting.shift();
+      if (next) next(); else pendingReads--;
+    }
   }
 }
 
@@ -31,12 +42,28 @@ interface HistoryEntry { stamp: string; parts: Map<"detail" | "thread", Promise<
 const HISTORY_LIMIT = 24;
 const historyCache = new Map<string, HistoryEntry>();
 
+onPrivateReadsPaused(() => {
+  historyEpoch += 1;
+  historyCache.clear();
+});
+
+onPrivateSessionReset(() => {
+  pendingReads = 0;
+  // Release queued jobs only so they can observe their expired generation;
+  // they must not start a read under the next identity.
+  for (const resume of urgentWaiting.splice(0)) resume();
+  for (const resume of waiting.splice(0)) resume();
+});
+
 /**
  * One read per agent part for an activity stamp. A success is reused until the
  * stamp changes. A failure is dropped as soon as it settles, so the next load
  * or Retry reads again instead of replaying the error.
  */
 function cachedPart<T>(alias: string, stamp: string, key: "detail" | "thread", read: () => Promise<T>): Promise<Part<T>> {
+  const generation = privateSessionGeneration();
+  const epoch = historyEpoch;
+  if (!privateReadsAllowed()) return Promise.resolve({ ok: false });
   let entry = historyCache.get(alias);
   if (!entry || entry.stamp !== stamp) {
     entry = { stamp, parts: new Map() };
@@ -48,7 +75,11 @@ function cachedPart<T>(alias: string, stamp: string, key: "detail" | "thread", r
   const known = owner.parts.get(key) as Promise<Part<T>> | undefined;
   if (known) return known;
   const attempt: Promise<Part<T>> = historyRead(read, key === "thread").then(
-    (value): Part<T> => ({ ok: true, value }),
+    (value): Part<T> => {
+      if (epoch === historyEpoch && generation === privateSessionGeneration() && privateReadsAllowed()) return { ok: true, value };
+      if (owner.parts.get(key) === attempt) owner.parts.delete(key);
+      return { ok: false };
+    },
     (): Part<T> => {
       if (owner.parts.get(key) === attempt) owner.parts.delete(key);
       return { ok: false };

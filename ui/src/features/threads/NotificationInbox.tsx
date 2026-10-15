@@ -237,8 +237,9 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
   const markAll = () => {
     const mine = generation.current;
     void markNotificationsRead()
-      .then(() => humanNotifications())
-      .then((next) => {
+      .then(async () => {
+        if (generation.current !== mine) return;
+        const next = await humanNotifications();
         if (generation.current === mine) setInbox(next);
       })
       .catch(() => {
@@ -262,8 +263,9 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
   const toggleMute = (group: NotificationGroup) => {
     const mine = generation.current;
     void setRoomMuted(group.room, !group.muted)
-      .then(() => humanNotifications())
-      .then((next) => {
+      .then(async () => {
+        if (generation.current !== mine) return;
+        const next = await humanNotifications();
         if (generation.current === mine) setInbox(next);
       })
       .catch(() => {

@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Button from "../../ui/Button";
+import { onPrivateReadsPaused, privateReadsAllowed, privateSessionGeneration } from "../../lib/privateSession";
 import { handOffProposal, proposalRequest } from "./proposal";
 import {
   base64Blob,
@@ -16,11 +17,36 @@ import {
 const DOCX_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
 import "./templates.css";
 
-/** A shown SAMPLE: the daemon's view plus the object URLs made for it. */
+/** Retain accepted bytes, not disposable handles, across same-session Activity pauses. */
 interface SampleState {
   view: SampleView;
-  docxUrl: string;
-  pdfUrl: string;
+  docx: Blob;
+  pdf: Blob;
+  generation: number;
+}
+
+/** Each admitted effect owns its handle; Activity resume creates a fresh one. */
+function useBlobUrl(blob: Blob | undefined, generation: number | undefined): string | undefined {
+  const [loaded, setLoaded] = useState<{ blob: Blob; url: string } | null>(null);
+  useEffect(() => {
+    if (!blob || !privateReadsAllowed() || generation !== privateSessionGeneration()) return;
+    const url = URL.createObjectURL(blob);
+    let live = true;
+    setLoaded({ blob, url });
+    const dispose = () => {
+      if (!live) return;
+      live = false;
+      URL.revokeObjectURL(url);
+      setLoaded(null);
+    };
+    const stop = onPrivateReadsPaused(dispose);
+    return () => {
+      stop();
+      dispose();
+    };
+  }, [blob, generation]);
+  return loaded?.blob === blob && privateReadsAllowed() && generation === privateSessionGeneration()
+    ? loaded?.url : undefined;
 }
 
 /**
@@ -98,36 +124,53 @@ export default function Templates() {
   const [draftVersion, setDraftVersion] = useState<number | null>(null);
   const [draftData, setDraftData] = useState("");
   const [approveSource, setApproveSource] = useState("");
-  const [exported, setExported] = useState<{ id: string; docx: Blob; pdf: Blob } | null>(null);
+  const [exported, setExported] = useState<{ id: string; docx: Blob; pdf: Blob; generation: number } | null>(null);
   const [reference, setReference] = useState<IntakeView | null>(null);
   const [sample, setSample] = useState<SampleState | null>(null);
+  const [reconstruction, setReconstruction] = useState<{ blob: Blob; generation: number } | null>(null);
+  const sampleDocxUrl = useBlobUrl(sample?.docx, sample?.generation);
+  const samplePdfUrl = useBlobUrl(sample?.pdf, sample?.generation);
+  const exportedDocxUrl = useBlobUrl(exported?.docx, exported?.generation);
+  const exportedPdfUrl = useBlobUrl(exported?.pdf, exported?.generation);
+  const reconstructionUrl = useBlobUrl(reconstruction?.blob, reconstruction?.generation);
+  const lifecycle = useRef(0);
 
-  // One object URL per sample, created when the sample is shown and revoked
-  // when it is replaced or the page unmounts. No URL is minted per render.
+  // Invalidating on both pause and cleanup also rejects an old decoded body
+  // that finishes only after the same session has already been readmitted.
   useEffect(() => {
-    if (!sample) return;
-    return () => {
-      URL.revokeObjectURL(sample.docxUrl);
-      URL.revokeObjectURL(sample.pdfUrl);
+    const pause = () => {
+      lifecycle.current += 1;
+      setBusy(false);
     };
-  }, [sample]);
+    const stop = onPrivateReadsPaused(pause);
+    return () => {
+      stop();
+      pause();
+    };
+  }, []);
 
-  async function run(action: () => Promise<void>) {
+  async function run(action: (current: () => boolean) => Promise<void>) {
+    if (!privateReadsAllowed()) return;
+    const started = lifecycle.current;
+    const generation = privateSessionGeneration();
+    const current = () => privateReadsAllowed() && started === lifecycle.current
+      && generation === privateSessionGeneration();
     setBusy(true);
     setError(null);
     setMessage(null);
     try {
-      await action();
+      await action(current);
     } catch (cause) {
-      setError(cause instanceof TemplateError || cause instanceof Error ? cause.message : "request failed");
+      if (current()) setError(cause instanceof TemplateError || cause instanceof Error ? cause.message : "request failed");
     } finally {
-      setBusy(false);
+      if (current()) setBusy(false);
     }
   }
 
-  async function refresh(target = name) {
+  async function refresh(target: string, current: () => boolean) {
     if (!target) return;
-    setList(await templatesApi.list(target));
+    const view = await templatesApi.list(target);
+    if (current()) setList(view);
   }
 
   function parseJson(text: string, what: string): unknown {
@@ -139,50 +182,61 @@ export default function Templates() {
   }
 
   function create() {
-    return run(async () => {
+    return run(async (current) => {
       if (!docx) throw new Error("choose the company DOCX template first");
       const spec = parseJson(specText, "the spec");
       const bytes = await docx.arrayBuffer();
+      if (!current()) return;
       const view = await templatesApi.create(name, docxBase64(bytes), spec);
+      if (!current()) return;
       setMessage(`Created ${view.template.name} version ${view.template.version} as a draft. It is not approved.`);
-      await refresh(name);
+      await refresh(name, current);
     });
   }
 
   function approve(version: TemplateSummary) {
-    return run(async () => {
+    return run(async (current) => {
       if (!approveSource.trim()) throw new Error("say who decided and where before approving");
       const view = await templatesApi.approve(name, version.version, version.content_sha256, approveSource.trim());
+      if (!current()) return;
       setMessage(`Approved ${view.template.name} version ${view.template.version}. Approved versions are immutable.`);
-      await refresh(name);
+      await refresh(name, current);
     });
   }
 
   function createDocument(version: TemplateSummary) {
-    return run(async () => {
+    return run(async (current) => {
       const data = parseJson(draftData, "the draft data");
       const created = await templatesApi.createDocument(name, version.version, data);
+      if (!current()) return;
       setDraft(created);
       setMessage(`Draft ${created.id} created from version ${version.version}. Nothing was issued or sent.`);
     });
   }
 
   function inspectReference() {
-    return run(async () => {
+    return run(async (current) => {
       if (!docx) throw new Error("choose the reference DOCX or PDF first");
       const bytes = await docx.arrayBuffer();
+      if (!current()) return;
       const view = await templatesApi.intake(docx.name, docxBase64(bytes));
+      if (!current()) return;
+      setReconstruction(view.reconstruction_base64 ? {
+        blob: base64Blob(view.reconstruction_base64, DOCX_TYPE),
+        generation: privateSessionGeneration(),
+      } : null);
       setReference(view);
       setMessage(`Read ${view.file}. Nothing was stored. Review the findings below before writing a spec.`);
     });
   }
 
   function previewSample(version: TemplateSummary) {
-    return run(async () => {
+    return run(async (current) => {
       const view = await templatesApi.sample(name, version.version);
+      if (!current()) return;
       const docx = base64Blob(view.docx_base64, DOCX_TYPE);
       const pdf = base64Blob(view.pdf_base64, "application/pdf");
-      setSample({ view, docxUrl: URL.createObjectURL(docx), pdfUrl: URL.createObjectURL(pdf) });
+      setSample({ view, docx, pdf, generation: privateSessionGeneration() });
       setMessage(
         `Rendered a SAMPLE preview of ${view.status} v${version.version} with placeholder values. It is not a document.`,
       );
@@ -190,12 +244,14 @@ export default function Templates() {
   }
 
   function exportDocument(id: string) {
-    return run(async () => {
+    return run(async (current) => {
       const view = await templatesApi.exportDocument(id);
+      if (!current()) return;
       setExported({
         id: view.id,
         docx: base64Blob(view.docx_base64, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
         pdf: base64Blob(view.pdf_base64, "application/pdf"),
+        generation: privateSessionGeneration(),
       });
       setMessage(`Rendered draft ${view.id} as DOCX and PDF. Nothing was issued or sent.`);
     });
@@ -242,7 +298,7 @@ export default function Templates() {
                 </ul>
                 <a
                   download={`${reference.file}.reconstruction.docx`}
-                  href={URL.createObjectURL(base64Blob(reference.reconstruction_base64, DOCX_TYPE))}
+                  href={reconstructionUrl}
                 >
                   Download reconstruction DOCX
                 </a>
@@ -284,7 +340,7 @@ export default function Templates() {
         <Button variant="primary" loading={busy} disabled={!name || !docx} onClick={create}>
           Create draft version
         </Button>
-        <Button variant="secondary" disabled={!name || busy} onClick={() => run(() => refresh())}>
+        <Button variant="secondary" disabled={!name || busy} onClick={() => run((current) => refresh(name, current))}>
           Show versions
         </Button>
       </section>
@@ -355,7 +411,7 @@ export default function Templates() {
         </section>
       )}
 
-      {sample && (
+      {sample && sampleDocxUrl && samplePdfUrl && (
         <section aria-labelledby="templates-sample" data-sample={`${sample.view.template}-v${sample.view.version}`}>
           <h2 id="templates-sample">
             SAMPLE preview of {sample.view.template} v{sample.view.version} ({sample.view.status})
@@ -366,15 +422,15 @@ export default function Templates() {
           </p>
           <iframe
             className="templates-pdf"
-            src={sample.pdfUrl}
+            src={samplePdfUrl}
             sandbox=""
             title={`SAMPLE PDF of ${sample.view.template} v${sample.view.version}`}
           />
           <p className="templates-actions">
-            <a download={`${sample.view.template}-v${sample.view.version}-sample.docx`} href={sample.docxUrl}>
+            <a download={`${sample.view.template}-v${sample.view.version}-sample.docx`} href={sampleDocxUrl}>
               Download SAMPLE DOCX
             </a>{" "}
-            <a download={`${sample.view.template}-v${sample.view.version}-sample.pdf`} href={sample.pdfUrl}>
+            <a download={`${sample.view.template}-v${sample.view.version}-sample.pdf`} href={samplePdfUrl}>
               Download SAMPLE PDF
             </a>
           </p>
@@ -400,11 +456,11 @@ export default function Templates() {
           <Button variant="secondary" disabled={busy} onClick={() => exportDocument(draft.id)}>
             Render DOCX and PDF preview
           </Button>
-          {exported && exported.id === draft.id && (
+          {exported && exported.id === draft.id && exportedDocxUrl && exportedPdfUrl && (
             <p className="templates-actions">
-              <a download={`${draft.id}.docx`} href={URL.createObjectURL(exported.docx)}>Download DOCX</a>
+              <a download={`${draft.id}.docx`} href={exportedDocxUrl}>Download DOCX</a>
               {" "}
-              <a download={`${draft.id}.pdf`} href={URL.createObjectURL(exported.pdf)}>Download PDF</a>
+              <a download={`${draft.id}.pdf`} href={exportedPdfUrl}>Download PDF</a>
             </p>
           )}
           <dl>

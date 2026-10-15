@@ -1,5 +1,6 @@
 import { ApiError } from "../../lib/api";
 import { sessionHeaders } from "../../lib/sessionKey";
+import { privateFetch, usingPrivateOperation, type PrivateOperation } from "../../lib/privateSession";
 
 /**
  * Typed host action client for versioned campaign email content (CAD-782).
@@ -151,45 +152,51 @@ export const contentPaths = {
 
 // `body` undefined sends no body at all: routes such as proposal discard
 // take only URL IDs and the host refuses any body, even `{}`.
-async function post<T>(path: string, body?: Record<string, unknown>): Promise<T> {
-  const resp = await fetch(path, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
-    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+async function post<T>(path: string, body?: Record<string, unknown>, operation?: PrivateOperation): Promise<T> {
+  return usingPrivateOperation(operation, async (op) => {
+    const resp = await privateFetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    }, op);
+    // Writes surface the host refusal verbatim: a stale revision or a
+    // refused draft must read as the server's reason, never a bare
+    // status. The receipt is validated below; a missing body 502s.
+    const value = await resp.json().catch(() => null);
+    op.assertCurrent();
+    if (!resp.ok) {
+      const serverError = (value as { error?: unknown } | null)?.error;
+      throw new ApiError(
+        typeof serverError === "string" && serverError !== ""
+          ? serverError
+          : `${resp.status} ${resp.statusText}`.trim(),
+        resp.status,
+      );
+    }
+    if (value === null) throw new ApiError("The server returned an invalid campaign receipt", 502);
+    return value as T;
   });
-  // Writes surface the host refusal verbatim: a stale revision or a
-  // refused draft must read as the server's reason, never a bare
-  // status. The receipt is validated below; a missing body 502s.
-  const value = await resp.json().catch(() => null);
-  if (!resp.ok) {
-    const serverError = (value as { error?: unknown } | null)?.error;
-    throw new ApiError(
-      typeof serverError === "string" && serverError !== ""
-        ? serverError
-        : `${resp.status} ${resp.statusText}`.trim(),
-      resp.status,
-    );
-  }
-  if (value === null) throw new ApiError("The server returned an invalid campaign receipt", 502);
-  return value as T;
 }
 
-async function get<T>(path: string): Promise<T> {
-  const resp = await fetch(path, { headers: { ...sessionHeaders() } });
-  // Reads surface the host refusal verbatim (an unknown, foreign or
-  // stale ID must read as the server's reason, never a bare status).
-  const value = await resp.json().catch(() => null);
-  if (!resp.ok) {
-    const serverError = (value as { error?: unknown } | null)?.error;
-    throw new ApiError(
-      typeof serverError === "string" && serverError !== ""
-        ? serverError
-        : `${resp.status} ${resp.statusText}`.trim(),
-      resp.status,
-    );
-  }
-  if (value === null) throw new ApiError("The server returned an invalid campaign receipt", 502);
-  return value as T;
+async function get<T>(path: string, operation?: PrivateOperation): Promise<T> {
+  return usingPrivateOperation(operation, async (op) => {
+    const resp = await privateFetch(path, { headers: { ...sessionHeaders() } }, op);
+    // Reads surface the host refusal verbatim (an unknown, foreign or
+    // stale ID must read as the server's reason, never a bare status).
+    const value = await resp.json().catch(() => null);
+    op.assertCurrent();
+    if (!resp.ok) {
+      const serverError = (value as { error?: unknown } | null)?.error;
+      throw new ApiError(
+        typeof serverError === "string" && serverError !== ""
+          ? serverError
+          : `${resp.status} ${resp.statusText}`.trim(),
+        resp.status,
+      );
+    }
+    if (value === null) throw new ApiError("The server returned an invalid campaign receipt", 502);
+    return value as T;
+  });
 }
 
 /**
@@ -265,7 +272,7 @@ export interface ProposalInput {
  *  campaign route; this client stays mount-agnostic. */
 export const contentClient = {
   paths: contentPaths,
-  save(scope: ContentScope, input: ContentDraftInput): Promise<unknown> {
+  save(scope: ContentScope, input: ContentDraftInput, operation?: PrivateOperation): Promise<unknown> {
     assertInputClean(input as unknown as Record<string, unknown>, ["campaignId", "name", "subject", "preheader", "blocks", "html", "text", "expectedRevision"], "save");
     if ((input.blocks === undefined) === (input.html === undefined)) {
       throw new ApiError("content save needs exactly one of blocks or html", 400, {
@@ -283,7 +290,7 @@ export const contentClient = {
     if (input.name !== undefined) body.name = input.name;
     if (input.expectedRevision !== undefined) body.expected_revision = input.expectedRevision;
     assertClean(body, SAVE_KEYS, "save");
-    return post(contentPaths.savePath(scope), body);
+    return post(contentPaths.savePath(scope), body, operation);
   },
   show(scope: ContentScope, campaignId: string): Promise<unknown> {
     return get(contentPaths.showPath(scope, campaignId));

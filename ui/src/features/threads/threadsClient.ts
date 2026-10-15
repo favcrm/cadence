@@ -1,5 +1,6 @@
 import { ApiError } from "../../lib/api";
 import { sessionHeaders } from "../../lib/sessionKey";
+import { privateFetch, usingPrivateOperation, type PrivateOperation } from "../../lib/privateSession";
 
 /**
  * CAD-818 Threads wire client. Shapes follow the IMPLEMENTED daemon
@@ -177,31 +178,34 @@ function invalid(message: string): never {
 
 const part = encodeURIComponent;
 
-async function send<T>(method: "GET" | "POST", path: string, body?: object): Promise<T> {
-  const resp = await fetch(path, {
-    method,
-    credentials: "same-origin",
-    cache: "no-store",
-    headers: {
-      ...(body === undefined ? {} : { "Content-Type": "application/json" }),
-      "X-Cadence-Board": "1",
-      ...sessionHeaders(),
-    },
-    body: body === undefined ? undefined : JSON.stringify(body),
+async function send<T>(method: "GET" | "POST", path: string, body?: object, operation?: PrivateOperation): Promise<T> {
+  return usingPrivateOperation(operation, async (op) => {
+    const resp = await privateFetch(path, {
+      method,
+      credentials: "same-origin",
+      cache: "no-store",
+      headers: {
+        ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+        "X-Cadence-Board": "1",
+        ...sessionHeaders(),
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    }, op);
+    const parsed = await resp.json().catch(() => null);
+    op.assertCurrent();
+    if (!resp.ok) {
+      const error = (parsed as { error?: unknown } | null)?.error;
+      throw new ApiError(
+        typeof error === "string" && error !== "" ? error : `${resp.status} ${resp.statusText}`.trim(),
+        resp.status,
+        (parsed as Record<string, unknown> | null) ?? undefined,
+      );
+    }
+    if (parsed === null || typeof parsed !== "object") {
+      throw new ApiError("The server returned an invalid Threads response", 502);
+    }
+    return parsed as T;
   });
-  const parsed = await resp.json().catch(() => null);
-  if (!resp.ok) {
-    const error = (parsed as { error?: unknown } | null)?.error;
-    throw new ApiError(
-      typeof error === "string" && error !== "" ? error : `${resp.status} ${resp.statusText}`.trim(),
-      resp.status,
-      (parsed as Record<string, unknown> | null) ?? undefined,
-    );
-  }
-  if (parsed === null || typeof parsed !== "object") {
-    throw new ApiError("The server returned an invalid Threads response", 502);
-  }
-  return parsed as T;
 }
 
 /** The daemon's cursor: `before` or `after` a seq, else the newest page. */

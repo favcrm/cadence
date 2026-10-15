@@ -1,6 +1,15 @@
 import type { LanePayload } from "../features/issues/lane";
 import { ConditionalGet } from "./conditionalGet";
 import { sessionKey, sessionHeaders } from "./sessionKey";
+import {
+  bindPrivateAbort,
+  notifyPrivateSessionRequired,
+  privateFetch,
+  privateReadsAllowed,
+  privateSessionGeneration,
+  usingPrivateOperation,
+  type PrivateOperation,
+} from "./privateSession";
 import type {
   AgentDetail,
   AgentsPayload,
@@ -134,19 +143,55 @@ export class ApiError extends Error {
   }
 }
 
-const conditional = new ConditionalGet((input, init) => fetch(input, init), sessionKey);
+const conditional = new ConditionalGet(
+  (input, init) => fetch(input, init),
+  () => `${sessionKey() ?? ""}:${privateSessionGeneration()}`,
+);
 
-async function get<T>(path: string, signal?: AbortSignal): Promise<T> {
-  const { response: resp, value } = await conditional.get<T>(path, sessionHeaders(), signal);
-  if (!resp.ok && !(resp.status === 304 && value !== undefined)) {
-    const body = await resp.json().catch(() => null);
-    throw new ApiError(
-      body?.error ?? `${resp.status} ${resp.statusText}`,
-      resp.status,
-      body ?? undefined,
-    );
+async function readConditional<T>(path: string, signal: AbortSignal | undefined, operation: PrivateOperation | null): Promise<T> {
+  const protectedRead = !path.startsWith("/api/meta");
+  const generation = operation?.generation ?? privateSessionGeneration();
+  if (protectedRead) operation?.assertCurrent();
+  const controller = new AbortController();
+  const stopCaller = signal ? bindPrivateAbort(controller, signal) : () => {};
+  const stopOperation = operation ? bindPrivateAbort(controller, operation.signal) : () => {};
+  const stop = () => {
+    stopCaller();
+    stopOperation();
+  };
+  try {
+    if (controller.signal.aborted) throw new DOMException("The private session changed", "AbortError");
+    const { response: resp, value } = await conditional.get<T>(path, sessionHeaders(), controller.signal);
+    if (operation) operation.assertCurrent();
+    else if (generation !== privateSessionGeneration() || (protectedRead && !privateReadsAllowed())) {
+      throw new Error("Session changed during request");
+    }
+    if (!resp.ok && !(resp.status === 304 && value !== undefined)) {
+      const body = await resp.json().catch(() => null);
+      if (operation) operation.assertCurrent();
+      else if (generation !== privateSessionGeneration()) throw new Error("Session changed during response");
+      const code = body?.code ?? body?.error?.code;
+      if (protectedRead && resp.status === 401 && (code === "board_session_required" || code === "operator_session_required") && typeof window !== "undefined") {
+        window.dispatchEvent(new Event("cadence:session-required"));
+      }
+      throw new ApiError(
+        typeof body?.error === "string" ? body.error : body?.error?.message ?? `${resp.status} ${resp.statusText}`,
+        resp.status,
+        body ? { ...body, code } : undefined,
+      );
+    }
+    if (operation) operation.assertCurrent();
+    return value as T;
+  } finally {
+    stop();
   }
-  return value as T;
+}
+
+async function get<T>(path: string, signal?: AbortSignal, operation?: PrivateOperation): Promise<T> {
+  const protectedRead = !path.startsWith("/api/meta");
+  if (!protectedRead) return readConditional<T>(path, signal, null);
+  if (!operation && !privateReadsAllowed()) throw new Error("Session verification required");
+  return usingPrivateOperation(operation, (op) => readConditional<T>(path, signal, op), signal);
 }
 
 export interface WriteResp {
@@ -175,47 +220,54 @@ async function write<T extends object | undefined>(
   method: "POST" | "PATCH" | "DELETE",
   path: string,
   body?: T,
+  operation?: PrivateOperation,
 ): Promise<WriteResp> {
-  const resp = await fetch(path, {
-    method,
-    headers: {
-      "Content-Type": "application/json",
-      "X-Cadence-Board": "1",
-      ...sessionHeaders(),
-    },
-    body: body === undefined ? undefined : JSON.stringify(body),
+  return usingPrivateOperation(operation, async (op) => {
+    const resp = await privateFetch(path, {
+      method,
+      headers: {
+        "Content-Type": "application/json",
+        "X-Cadence-Board": "1",
+        ...sessionHeaders(),
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    }, op);
+    const parsed = await resp.json().catch(() => null);
+    op.assertCurrent();
+    if (!resp.ok) {
+      throw new ApiError(
+        parsed?.error ?? `${resp.status} ${resp.statusText}`,
+        resp.status,
+        parsed ?? undefined,
+      );
+    }
+    return parsed as WriteResp;
   });
-  const parsed = await resp.json().catch(() => null);
-  if (!resp.ok) {
-    throw new ApiError(
-      parsed?.error ?? `${resp.status} ${resp.statusText}`,
-      resp.status,
-      parsed ?? undefined,
-    );
-  }
-  return parsed as WriteResp;
 }
 
 /** A board write that answers its own JSON (not an issue `WriteResp`). */
-async function post<T>(path: string, body: object): Promise<T> {
-  const resp = await fetch(path, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Cadence-Board": "1",
-      ...sessionHeaders(),
-    },
-    body: JSON.stringify(body),
+async function post<T>(path: string, body: object, operation?: PrivateOperation): Promise<T> {
+  return usingPrivateOperation(operation, async (op) => {
+    const resp = await privateFetch(path, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Cadence-Board": "1",
+        ...sessionHeaders(),
+      },
+      body: JSON.stringify(body),
+    }, op);
+    const parsed = await resp.json().catch(() => null);
+    op.assertCurrent();
+    if (!resp.ok) {
+      throw new ApiError(
+        parsed?.error ?? `${resp.status} ${resp.statusText}`,
+        resp.status,
+        parsed ?? undefined,
+      );
+    }
+    return parsed as T;
   });
-  const parsed = await resp.json().catch(() => null);
-  if (!resp.ok) {
-    throw new ApiError(
-      parsed?.error ?? `${resp.status} ${resp.statusText}`,
-      resp.status,
-      parsed ?? undefined,
-    );
-  }
-  return parsed as T;
 }
 
 /** A plan decision's request: approve takes nothing, reject a reason. */
@@ -254,6 +306,28 @@ export interface MasterPermissionRule {
   at: number;
 }
 
+function textField(record: object, key: string): string | undefined {
+  if (!Object.prototype.hasOwnProperty.call(record, key)) return undefined;
+  const value: unknown = Reflect.get(record, key);
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+/** Local `{error, code}` and hosted `{error:{code,message}}` upload refusals. */
+function refusedUpload(body: unknown, status: number, statusText: string): { message: string; code?: string } {
+  const fallback = `${status} ${statusText}`.trim();
+  if (body === null || typeof body !== "object" || Array.isArray(body)) return { message: fallback };
+  const topCode = textField(body, "code");
+  const error: unknown = Reflect.get(body, "error");
+  if (typeof error === "string" && error.length > 0) return { message: error, code: topCode };
+  if (error !== null && typeof error === "object" && !Array.isArray(error)) {
+    return {
+      message: textField(error, "message") ?? fallback,
+      code: topCode ?? textField(error, "code"),
+    };
+  }
+  return { message: fallback, code: topCode };
+}
+
 export const api = {
   health: () => get<Health>("/api/health"),
   /** `withOperator` asks the server to run the operator proof (CAD-432) — once per page load.
@@ -279,37 +353,20 @@ export const api = {
     get<{ id: string; history: IssueHistoryEntry[] }>(
       `/api/issues/${id}/history?limit=${limit}`,
     ),
-  file: async (id: string) => {
-    const resp = await fetch(`/api/issues/${id}/file`);
-    if (!resp.ok) throw new ApiError(`${resp.status} ${resp.statusText}`, resp.status);
-    return resp.text();
+  file: async (id: string, operation?: PrivateOperation) => {
+    return usingPrivateOperation(operation, async (op) => {
+      const resp = await privateFetch(`/api/issues/${id}/file`, { headers: sessionHeaders() }, op);
+      if (!resp.ok) throw new ApiError(`${resp.status} ${resp.statusText}`, resp.status);
+      const text = await resp.text();
+      op.assertCurrent();
+      return text;
+    });
   },
   agents: () => get<AgentsPayload>("/api/agents"),
   agent: (alias: string) =>
     get<AgentDetail>(`/api/agents/${encodeURIComponent(alias)}`),
   monitorAck: (monitor: string, alert: number) =>
-    fetch(
-      `/api/monitors/${encodeURIComponent(monitor)}/alerts/${alert}/ack`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Cadence-Board": "1",
-      ...sessionHeaders(),
-        },
-        body: "{}",
-      },
-    ).then(async (resp) => {
-      const parsed = await resp.json().catch(() => null);
-      if (!resp.ok) {
-        throw new ApiError(
-          parsed?.error ?? `${resp.status} ${resp.statusText}`,
-          resp.status,
-          parsed ?? undefined,
-        );
-      }
-      return parsed as { ok: boolean; alert: unknown };
-    }),
+    post<{ ok: boolean; alert: unknown }>(`/api/monitors/${encodeURIComponent(monitor)}/alerts/${alert}/ack`, {}),
   memories: (opts: { project?: string; status?: string; type?: string } = {}) => {
     const q = new URLSearchParams();
     if (opts.project) q.set("project", opts.project);
@@ -385,28 +442,32 @@ export const api = {
     },
   ) => write("POST", `/api/issues/${encodeURIComponent(id)}/kickoff`, body),
 
-  attach: async (id: string, name: string, data: Blob): Promise<WriteResp> => {
-    const resp = await fetch(
-      `/api/issues/${id}/artifacts?name=${encodeURIComponent(name)}`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/octet-stream",
-          "X-Cadence-Board": "1",
-      ...sessionHeaders(),
+  attach: async (id: string, name: string, data: Blob, operation?: PrivateOperation): Promise<WriteResp> => {
+    return usingPrivateOperation(operation, async (op) => {
+      const resp = await privateFetch(
+        `/api/issues/${id}/artifacts?name=${encodeURIComponent(name)}`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/octet-stream",
+            "X-Cadence-Board": "1",
+            ...sessionHeaders(),
+          },
+          body: data,
         },
-        body: data,
-      },
-    );
-    const parsed = await resp.json().catch(() => null);
-    if (!resp.ok) {
-      throw new ApiError(
-        parsed?.error ?? `${resp.status} ${resp.statusText}`,
-        resp.status,
-        parsed ?? undefined,
+        op,
       );
-    }
-    return parsed as WriteResp;
+      const parsed = await resp.json().catch(() => null);
+      op.assertCurrent();
+      if (!resp.ok) {
+        throw new ApiError(
+          parsed?.error ?? `${resp.status} ${resp.statusText}`,
+          resp.status,
+          parsed ?? undefined,
+        );
+      }
+      return parsed as WriteResp;
+    });
   },
 
   artifactUrl: (id: string, name: string) =>
@@ -439,6 +500,7 @@ export const api = {
     app?: { install_id: string; context_id?: string },
     conversation?: string,
     attachments?: { id: string }[],
+    operation?: PrivateOperation,
   ) =>
     post<Record<string, unknown>>(
       `/api/threads/${encodeURIComponent(alias)}/messages`,
@@ -453,6 +515,7 @@ export const api = {
         // grammar and existence, never the client's metadata.
         ...(attachments && attachments.length > 0 ? { attachments } : {}),
       },
+      operation,
     ),
   /** `POST /api/chat/upload` — one retained chat attachment (CAD-1168).
    *  Operator-only multipart; returns the daemon-minted row. `signal`
@@ -462,9 +525,10 @@ export const api = {
     file: File,
     signal?: AbortSignal,
     destination?: ChatFileDestination,
-  ): Promise<ChatFileRow> =>
-    new Promise((resolve, reject) => {
-      if (signal?.aborted) {
+  ): Promise<ChatFileRow> => {
+    if (signal?.aborted) return Promise.reject(new DOMException("upload canceled", "AbortError"));
+    return usingPrivateOperation(undefined, (operation) => new Promise((resolve, reject) => {
+      if (operation.signal.aborted) {
         reject(new DOMException("upload canceled", "AbortError"));
         return;
       }
@@ -479,42 +543,62 @@ export const api = {
       }
       form.append("file", file, file.name);
       const xhr = new XMLHttpRequest();
+      let settled = false;
       const onAbort = () => xhr.abort();
-      signal?.addEventListener("abort", onAbort, { once: true });
-      const cleanup = () => signal?.removeEventListener("abort", onAbort);
+      operation.signal.addEventListener("abort", onAbort, { once: true });
+      const detach = () => {
+        operation.signal.removeEventListener("abort", onAbort);
+        xhr.onload = null;
+        xhr.onerror = null;
+        xhr.onabort = null;
+      };
+      const settle = (done: () => void) => {
+        if (settled) return;
+        settled = true;
+        detach();
+        done();
+      };
       xhr.open("POST", "/api/chat/upload");
       xhr.setRequestHeader("X-Cadence-Board", "1");
       for (const [key, value] of Object.entries(sessionHeaders())) xhr.setRequestHeader(key, value);
       xhr.onload = () => {
-        cleanup();
+        const status = xhr.status;
+        const statusText = xhr.statusText;
+        const responseText = xhr.responseText;
+        const stillCurrent = !operation.signal.aborted;
         let body: unknown = null;
         try {
-          body = JSON.parse(xhr.responseText);
+          body = JSON.parse(responseText);
         } catch {
           body = null;
         }
-        if (xhr.status >= 200 && xhr.status < 300) {
-          try {
-            resolve(decodeChatFileRow(body));
-          } catch (error) {
-            reject(error);
+        settle(() => {
+          if (!stillCurrent) {
+            reject(new DOMException("upload canceled", "AbortError"));
+            return;
           }
-          return;
-        }
-        const msg =
-          (body as { error?: string } | null)?.error ?? `${xhr.status} ${xhr.statusText}`;
-        reject(new ApiError(msg, xhr.status, (body as object | null) ?? undefined));
+          if (status >= 200 && status < 300) {
+            try {
+              resolve(decodeChatFileRow(body));
+            } catch (error) {
+              reject(error);
+            }
+            return;
+          }
+          if (status === 401) notifyPrivateSessionRequired(status, body, operation);
+          const refusal = refusedUpload(body, status, statusText);
+          reject(new ApiError(refusal.message, status, refusal.code === undefined ? undefined : { code: refusal.code }));
+        });
       };
       xhr.onerror = () => {
-        cleanup();
-        reject(new ApiError("upload failed — connection lost", 0));
+        settle(() => reject(new ApiError("upload failed — connection lost", 0)));
       };
       xhr.onabort = () => {
-        cleanup();
-        reject(new DOMException("upload canceled", "AbortError"));
+        settle(() => reject(new DOMException("upload canceled", "AbortError")));
       };
       xhr.send(form);
-    }),
+    }), signal);
+  },
   /** `GET /api/app-installations/<id>/chat-descriptor` (CAD-1110): the installed
    *  package's `app-chat.json`, pinned to the digest its install consented to. A
    *  404 means no descriptor (plain shared chat). */
@@ -562,7 +646,7 @@ export const api = {
    * conversation is made under (the daemon proves install, context and
    * campaign); `subject` (`campaign:<id>`) is idempotent, none always makes a new one.
    */
-  conversationCreate: (installId: string, contextId: string, subject?: string) =>
+  conversationCreate: (installId: string, contextId: string, subject?: string, operation?: PrivateOperation) =>
     post<Record<string, unknown>>(
       `/api/app-installations/${encodeURIComponent(installId)}/conversations`,
       {
@@ -570,6 +654,7 @@ export const api = {
         ...(contextId !== "" ? { context_id: contextId } : {}),
         ...(subject ? { subject } : {}),
       },
+      operation,
     ),
   /**
    * `POST /api/needs/<verb>` — the rail's snooze/dismiss (CAD-574);
@@ -921,22 +1006,5 @@ async function writeSettings(body: {
   expected_revision: number;
   config: ModelDefaultsConfig;
 }): Promise<ModelDefaultsSnapshot> {
-  const resp = await fetch("/api/settings/model-defaults", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Cadence-Board": "1",
-      ...sessionHeaders(),
-    },
-    body: JSON.stringify(body),
-  });
-  const parsed = await resp.json().catch(() => null);
-  if (!resp.ok) {
-    throw new ApiError(
-      parsed?.error ?? `${resp.status} ${resp.statusText}`,
-      resp.status,
-      parsed ?? undefined,
-    );
-  }
-  return parsed as ModelDefaultsSnapshot;
+  return post<ModelDefaultsSnapshot>("/api/settings/model-defaults", body);
 }

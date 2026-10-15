@@ -1,4 +1,5 @@
 import { enrollPush, rebindPush, setPushPresence, unenrollPush } from "./humanThreadsClient";
+import { beginPrivateOperation, privateReadsAllowed, type PrivateOperation } from "../../lib/privateSession";
 
 /**
  * CAD-1423: explicit browser opt-in for Web Push. Runs only from a user gesture
@@ -38,12 +39,13 @@ export function pushSupported(): boolean {
 const DEVICE_KEY = "cadence.push.device";
 let presenceTab: string | undefined;
 
-/** Thrown when the auth epoch moved on while an enable was in flight. */
+/** Thrown when this attempt's private session or caller epoch is no longer current. */
 export class StaleEnableError extends Error {}
 
 /**
  * Serialize release, enable and disable so a stale enable can never finish
- * after a release for a different identity has started.
+ * after a release for a different identity has started. The private operation
+ * is taken before the queue wait, so a pause stays retired after readmission.
  */
 let pushQueue: Promise<unknown> = Promise.resolve();
 function serialized<T>(task: () => Promise<T>): Promise<T> {
@@ -52,13 +54,41 @@ function serialized<T>(task: () => Promise<T>): Promise<T> {
   return run;
 }
 
+/** False once this operation was paused or reset, including after the same identity is readmitted. */
+function sessionCurrent(operation: PrivateOperation | null): boolean {
+  if (operation === null) return false;
+  try {
+    operation.assertCurrent();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function dropCreated(created: boolean, sub: PushSubscription): Promise<void> {
+  if (!created) return;
+  await sub.unsubscribe().catch(() => undefined);
+}
+
+// Capture before the queue; denied entry permits local release but never a later server call.
+function runOwned<T>(task: (operation: PrivateOperation | null) => Promise<T>): Promise<T> {
+  const operation = privateReadsAllowed() ? beginPrivateOperation() : null;
+  return serialized(async () => {
+    try {
+      return await task(operation);
+    } finally {
+      operation?.dispose();
+    }
+  });
+}
+
 /** Order presence with enrollment/release so a stale view cannot suppress a newly bound device. */
 export function reportBrowserPresence(room: string | null, isCurrent: () => boolean): Promise<void> {
-  return serialized(async () => {
-    if (!pushSupported()) return;
-    if (!isCurrent()) return;
+  return runOwned(async (operation) => {
+    if (!sessionCurrent(operation) || !pushSupported() || !isCurrent()) return;
     const deviceId = localStorage.getItem(DEVICE_KEY);
-    if (deviceId !== null) await setPushPresence(deviceId, presenceTab ??= crypto.randomUUID(), room);
+    if (deviceId === null || !sessionCurrent(operation) || !isCurrent()) return;
+    await setPushPresence(deviceId, presenceTab ??= crypto.randomUUID(), room);
   });
 }
 
@@ -68,24 +98,25 @@ export function reportBrowserPresence(room: string | null, isCurrent: () => bool
  * closes the local subscription; transport failures leave it untouched.
  */
 export function rebindExistingBrowserAlerts(isCurrent: () => boolean): Promise<string | null> {
-  return serialized(async () => {
+  return runOwned(async (operation) => {
+    if (!sessionCurrent(operation) || !isCurrent()) throw new StaleEnableError();
     if (!pushSupported()) return null;
     const reg = await navigator.serviceWorker.getRegistration(SW_PATH);
-    if (!isCurrent()) throw new StaleEnableError();
+    if (!sessionCurrent(operation) || !isCurrent()) throw new StaleEnableError();
     const sub = await reg?.pushManager.getSubscription();
-    if (!isCurrent()) throw new StaleEnableError();
+    if (!sessionCurrent(operation) || !isCurrent()) throw new StaleEnableError();
     if (!reg || !sub) {
       localStorage.removeItem(DEVICE_KEY);
       return null;
     }
     const { device_id } = await rebindPush(sub.endpoint);
-    if (!isCurrent()) throw new StaleEnableError();
+    if (!sessionCurrent(operation) || !isCurrent()) throw new StaleEnableError();
     if (device_id === null) {
       const notifications = await reg.getNotifications();
-      if (!isCurrent()) throw new StaleEnableError();
+      if (!sessionCurrent(operation) || !isCurrent()) throw new StaleEnableError();
       notifications.forEach((notification) => notification.close());
       await sub.unsubscribe();
-      if (!isCurrent()) throw new StaleEnableError();
+      if (!sessionCurrent(operation) || !isCurrent()) throw new StaleEnableError();
       localStorage.removeItem(DEVICE_KEY);
       return null;
     }
@@ -99,24 +130,28 @@ export function rebindExistingBrowserAlerts(isCurrent: () => boolean): Promise<s
  * only the subscription and consent this operation just created.
  */
 export function enableBrowserAlerts(publicKey: string, isCurrent: () => boolean): Promise<string> {
-  return serialized(async () => {
+  return runOwned(async (operation) => {
+    if (!sessionCurrent(operation) || !isCurrent()) throw new StaleEnableError();
     if (!pushSupported()) return "Browser alerts are not available in this browser. In-app unread still works.";
     const permission = await Notification.requestPermission();
-    if (!isCurrent()) throw new StaleEnableError();
+    if (!sessionCurrent(operation) || !isCurrent()) throw new StaleEnableError();
     if (permission !== "granted") return "Browser alerts are off. In-app unread still works.";
     await navigator.serviceWorker.register(SW_PATH, { scope: "/" });
+    if (!sessionCurrent(operation) || !isCurrent()) throw new StaleEnableError();
     // register() resolves before activation; subscribe needs the active worker (InvalidStateError on a first visit).
     const reg = await navigator.serviceWorker.ready;
-    if (!isCurrent()) throw new StaleEnableError();
+    if (!sessionCurrent(operation) || !isCurrent()) throw new StaleEnableError();
     const existing = await reg.pushManager.getSubscription();
+    if (!sessionCurrent(operation) || !isCurrent()) throw new StaleEnableError();
     const sub =
       existing ??
       (await reg.pushManager.subscribe({
         userVisibleOnly: true,
         applicationServerKey: base64urlToBytes(publicKey),
       }));
-    if (!isCurrent()) {
-      if (!existing) await sub.unsubscribe().catch(() => undefined);
+    const created = existing === null;
+    if (!sessionCurrent(operation) || !isCurrent()) {
+      await dropCreated(created, sub);
       throw new StaleEnableError();
     }
     const keys = {
@@ -124,10 +159,11 @@ export function enableBrowserAlerts(publicKey: string, isCurrent: () => boolean)
       auth: bytesToBase64url(sub.getKey("auth")),
     };
     const { device_id } = await enrollPush({ endpoint: sub.endpoint, keys });
-    if (!isCurrent()) {
-      // The server enrolled this device for the old identity; take it back.
-      await unenrollPush(device_id).catch(() => undefined);
-      await sub.unsubscribe().catch(() => undefined);
+    const callerCurrent = isCurrent();
+    const originCurrent = sessionCurrent(operation);
+    if (!callerCurrent || !originCurrent) {
+      if (originCurrent) await unenrollPush(device_id).catch(() => undefined);
+      await dropCreated(created, sub);
       throw new StaleEnableError();
     }
     localStorage.setItem(DEVICE_KEY, device_id);
@@ -137,13 +173,15 @@ export function enableBrowserAlerts(publicKey: string, isCurrent: () => boolean)
 
 /**
  * Local release for an identity change, sign-out or a fresh enrollment: close
- * this browser's own alerts, drop its push subscription, and ask the server to
- * remove the device it enrolled. The server only removes a device the current
- * human owns, so another account's record is never touched. After sign-out the
- * server call is refused; the row then sends nothing because its session is gone.
+ * this browser's own alerts and drop its push subscription. When the private
+ * operation captured at entry is still current, also ask the server to remove
+ * the device it enrolled. The server only removes a device the current human
+ * owns, so another account's record is never touched. A release that starts
+ * after reads are already denied, or that was paused, still clears this browser
+ * and does not mint a delete after readmission.
  */
 export function releaseBrowserAlerts(): Promise<void> {
-  return serialized(async () => {
+  return runOwned(async (operation) => {
     const id = localStorage.getItem(DEVICE_KEY);
     if (pushSupported()) {
       const reg = await navigator.serviceWorker.getRegistration(SW_PATH);
@@ -153,20 +191,25 @@ export function releaseBrowserAlerts(): Promise<void> {
         await sub?.unsubscribe();
       }
     }
-    if (id !== null) await unenrollPush(id).catch(() => undefined);
+    if (id !== null && sessionCurrent(operation)) await unenrollPush(id).catch(() => undefined);
     localStorage.removeItem(DEVICE_KEY);
   });
 }
 
 /** Remove this browser's subscription and its server enrollment. */
 export function disableBrowserAlerts(deviceId: string): Promise<string> {
-  return serialized(async () => {
+  return runOwned(async (operation) => {
+    if (!sessionCurrent(operation)) throw new StaleEnableError();
     if (pushSupported()) {
       const reg = await navigator.serviceWorker.getRegistration(SW_PATH);
+      if (!sessionCurrent(operation)) throw new StaleEnableError();
       const sub = await reg?.pushManager.getSubscription();
+      if (!sessionCurrent(operation)) throw new StaleEnableError();
       await sub?.unsubscribe();
+      if (!sessionCurrent(operation)) throw new StaleEnableError();
     }
     const { removed } = await unenrollPush(deviceId);
+    if (!sessionCurrent(operation)) throw new StaleEnableError();
     localStorage.removeItem(DEVICE_KEY);
     return removed ? "Browser alerts are off for this device." : "This device was not enrolled.";
   });

@@ -1,4 +1,5 @@
 import { sessionHeaders } from "../../lib/sessionKey";
+import { notifyPrivateSessionRequired, privateFetch, privateReadsAllowed, privateSessionGeneration, usingPrivateOperation, withPrivateOperation, type PrivateOperation } from "../../lib/privateSession";
 import type { WikiVersion } from "./history";
 import type { SearchHit } from "./search";
 import { normalizeListing, normalizePage, normalizeSearch, normalizeHistory } from "./wire";
@@ -145,20 +146,30 @@ export function blobPage(entry: WikiEntry): WikiPage {
   };
 }
 
-function get<T>(url: string): Promise<T> {
-  return fetch(url, { headers: sessionHeaders() }).then(json<T>);
+function get<T>(url: string, operation?: PrivateOperation): Promise<T> {
+  return usingPrivateOperation(operation, async (op) => {
+    const resp = await privateFetch(url, { headers: sessionHeaders() }, op);
+    const value = await json<T>(resp);
+    op.assertCurrent();
+    return value;
+  });
 }
 
-function send<T>(method: "PUT" | "POST", url: string, body: object): Promise<T> {
-  return fetch(url, {
-    method,
-    headers: {
-      "Content-Type": "application/json",
-      "X-Cadence-Board": "1",
-      ...sessionHeaders(),
-    },
-    body: JSON.stringify(body),
-  }).then(json<T>);
+function send<T>(method: "PUT" | "POST", url: string, body: object, operation?: PrivateOperation): Promise<T> {
+  return usingPrivateOperation(operation, async (op) => {
+    const resp = await privateFetch(url, {
+      method,
+      headers: {
+        "Content-Type": "application/json",
+        "X-Cadence-Board": "1",
+        ...sessionHeaders(),
+      },
+      body: JSON.stringify(body),
+    }, op);
+    const value = await json<T>(resp);
+    op.assertCurrent();
+    return value;
+  });
 }
 
 export function lsQuery(path: string): string {
@@ -170,35 +181,22 @@ export function fileQuery(path: string): string {
 }
 
 /**
- * The file route's query URL for a blob page. It is a plain URL: it carries
- * no session header, so an element that requests it directly is refused by
- * the operator proof. Image previews use `wikiBlob`; video and PDF elements
- * still request this URL, unchanged by CAD-1388.
+ * Blob bytes are fetched with this tab's session header, never by element
+ * URLs. Callers render data: images or local blob: previews/downloads and
+ * must fence their own asynchronous encoding and revoke owned object URLs.
  */
-export function wikiFileUrl(path: string): string {
-  return fileQuery(path);
-}
-
-/**
- * The bytes of a blob page, fetched with the session header. An `<img>`
- * cannot send `X-Cadence-Session`, so image previews load through this and
- * render a data URL instead of `wikiFileUrl`.
- */
-export function wikiBlob(path: string, signal?: AbortSignal): Promise<Blob> {
-  return fetch(wikiFileUrl(path), { headers: sessionHeaders(), signal }).then(async (resp) => {
-    if (!resp.ok) throw wikiErrorFrom(resp.status, await resp.json().catch(() => null));
-    return resp.blob();
-  });
-}
-
-/**
- * The raw bytes of a text page for the Download action: the file route
- * answers JSON by default (CAD-580), and `raw=1` asks for the file
- * itself. A contract question is open on CAD-580; if it settles on
- * another flag this is the one place to change.
- */
-export function wikiRawUrl(path: string): string {
-  return `${fileQuery(path)}&raw=1`;
+export async function wikiBlob(path: string, signal?: AbortSignal, operation?: PrivateOperation): Promise<Blob> {
+  const generation = privateSessionGeneration();
+  return usingPrivateOperation(operation, async (op) => {
+    const resp = await privateFetch(fileQuery(path), { headers: sessionHeaders(), signal }, op);
+    const value = resp.ok ? await resp.blob() : await resp.json().catch(() => null);
+    op.assertCurrent();
+    if (signal?.aborted || generation !== privateSessionGeneration() || !privateReadsAllowed()) {
+      throw new DOMException("The private session changed", "AbortError");
+    }
+    if (!resp.ok) throw wikiErrorFrom(resp.status, value);
+    return value as Blob;
+  }, signal);
 }
 
 export function searchQuery(query: string, type?: string, path?: string): string {
@@ -252,48 +250,128 @@ export interface UploadResult {
   extraction?: { status: string; reason?: string; path?: string };
 }
 
-export function uploadFile(
+function recordField(body: object, key: string): unknown {
+  if (!Object.prototype.hasOwnProperty.call(body, key)) return undefined;
+  return Reflect.get(body, key);
+}
+
+function textField(body: object, key: string): string | undefined {
+  const value = recordField(body, key);
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+/** Local `{error, code}` and hosted `{error:{code,message}}` bodies, guarded. */
+function uploadRefusalBody(body: unknown): unknown {
+  if (body === null || typeof body !== "object" || Array.isArray(body)) return body;
+  const error = recordField(body, "error");
+  if (typeof error === "string" || error === undefined) return body;
+  if (error === null || typeof error !== "object" || Array.isArray(error)) return { error: undefined, code: textField(body, "code") };
+  return {
+    error: textField(error, "message"),
+    code: textField(body, "code") ?? textField(error, "code"),
+  };
+}
+
+function uploadResultFrom(body: unknown): UploadResult | { conflict: "if_rev" } {
+  if (body === null || typeof body !== "object" || Array.isArray(body)) return {};
+  if (textField(body, "conflict") === "if_rev") return { conflict: "if_rev" };
+  const extraction = recordField(body, "extraction");
+  if (extraction === null || typeof extraction !== "object" || Array.isArray(extraction)) return {};
+  const status = textField(extraction, "status");
+  if (status === undefined) return {};
+  return {
+    extraction: {
+      status,
+      reason: textField(extraction, "reason"),
+      path: textField(extraction, "path"),
+    },
+  };
+}
+
+function sendUpload(
   dir: string,
   file: File,
-  onProgress?: (percent: number) => void,
+  onProgress: ((percent: number) => void) | undefined,
+  operation: PrivateOperation,
 ): Promise<UploadResult> {
   return new Promise((resolve, reject) => {
+    if (operation.signal.aborted) {
+      reject(new DOMException("upload canceled", "AbortError"));
+      return;
+    }
     const path = uploadTargetPath(dir, file.name);
     const form = new FormData();
     form.append("path", path);
     form.append("file", file, file.name);
     const xhr = new XMLHttpRequest();
+    let settled = false;
+    const onAbort = () => xhr.abort();
+    operation.signal.addEventListener("abort", onAbort, { once: true });
+    const detach = () => {
+      operation.signal.removeEventListener("abort", onAbort);
+      xhr.onload = null;
+      xhr.onerror = null;
+      xhr.onabort = null;
+      xhr.upload.onprogress = null;
+    };
+    const settle = (done: () => void) => {
+      if (settled) return;
+      settled = true;
+      detach();
+      done();
+    };
     xhr.open("POST", uploadQuery(path));
     xhr.setRequestHeader("X-Cadence-Board", "1");
     for (const [key, value] of Object.entries(sessionHeaders())) xhr.setRequestHeader(key, value);
-    xhr.upload.onprogress = (e) => {
-      if (e.lengthComputable && onProgress) onProgress((e.loaded / e.total) * 100);
+    xhr.upload.onprogress = (event) => {
+      if (settled || operation.signal.aborted || !event.lengthComputable || !onProgress) return;
+      onProgress((event.loaded / event.total) * 100);
     };
     xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) {
-        let body: UploadResult = {};
-        try {
-          body = JSON.parse(xhr.responseText) as UploadResult;
-        } catch {
-          body = {};
-        }
-        if ((body as UploadResult & { conflict?: string }).conflict === "if_rev") {
-          reject(wikiErrorFrom(409, { ...body, error: "This file changed during upload", code: "conflict" }));
-          return;
-        }
-        onProgress?.(100);
-        resolve(body);
-        return;
-      }
+      const status = xhr.status;
+      const responseText = xhr.responseText;
+      const stillCurrent = !operation.signal.aborted;
       let body: unknown = null;
       try {
-        body = JSON.parse(xhr.responseText);
+        body = JSON.parse(responseText);
       } catch {
         body = null;
       }
-      reject(wikiErrorFrom(xhr.status, body));
+      settle(() => {
+        if (!stillCurrent) {
+          reject(new DOMException("upload canceled", "AbortError"));
+          return;
+        }
+        if (status >= 200 && status < 300) {
+          const result = uploadResultFrom(body);
+          if ("conflict" in result) {
+            reject(wikiErrorFrom(409, { error: "This file changed during upload", code: "conflict" }));
+            return;
+          }
+          onProgress?.(100);
+          resolve(result);
+          return;
+        }
+        if (status === 401) notifyPrivateSessionRequired(status, body, operation);
+        reject(wikiErrorFrom(status, uploadRefusalBody(body)));
+      });
     };
-    xhr.onerror = () => reject(new WikiError("upload failed — connection lost", 0));
+    xhr.onerror = () => {
+      settle(() => reject(new WikiError("upload failed — connection lost", 0)));
+    };
+    xhr.onabort = () => {
+      settle(() => reject(new DOMException("upload canceled", "AbortError")));
+    };
     xhr.send(form);
   });
+}
+
+export function uploadFile(
+  dir: string,
+  file: File,
+  onProgress?: (percent: number) => void,
+  operation?: PrivateOperation,
+): Promise<UploadResult> {
+  if (operation) return sendUpload(dir, file, onProgress, operation);
+  return withPrivateOperation((owned) => sendUpload(dir, file, onProgress, owned));
 }

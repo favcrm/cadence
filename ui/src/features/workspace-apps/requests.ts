@@ -1,4 +1,18 @@
+import { onPrivateSessionReset } from "../../lib/privateSession";
+
 const memory = new Map<string, string>();
+
+onPrivateSessionReset(() => {
+  memory.clear();
+  try {
+    for (let index = sessionStorage.length - 1; index >= 0; index -= 1) {
+      const key = sessionStorage.key(index);
+      if (key && /^cadence\.workspace-app\.[0-9a-f]{64}$/.test(key)) sessionStorage.removeItem(key);
+    }
+  } catch {
+    // Browser storage is optional; the in-memory request ids are already gone.
+  }
+});
 const constants = [
   0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
   0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,

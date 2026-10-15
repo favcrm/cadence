@@ -1,5 +1,6 @@
 import { ApiError } from "../../lib/api";
 import { sessionHeaders } from "../../lib/sessionKey";
+import { privateFetch, usingPrivateOperation, type PrivateOperation } from "../../lib/privateSession";
 
 /**
  * CAD-1412 human rooms wire client (`/api/human-threads/*`, same origin).
@@ -61,32 +62,34 @@ export interface HumanAskReceipt {
   duplicate: boolean;
 }
 
-async function call<T>(method: "GET" | "POST" | "DELETE", path: string, body?: object, signal?: AbortSignal): Promise<T> {
-  const resp = await fetch(path, {
-    method,
-    credentials: "same-origin",
-    cache: "no-store",
-    signal,
-    headers: {
-      ...(method === "GET" ? {} : { "Content-Type": "application/json" }),
-      "X-Cadence-Board": "1",
-      ...sessionHeaders(),
-    },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
-  const parsed = (await resp.json().catch(() => null)) as Record<string, unknown> | null;
-  if (!resp.ok) {
-    const error = parsed?.error;
-    throw new ApiError(
-      typeof error === "string" && error !== "" ? error : `${resp.status} ${resp.statusText}`.trim(),
-      resp.status,
-      parsed ?? undefined,
-    );
-  }
-  if (parsed === null || typeof parsed !== "object") {
-    throw new ApiError("The server returned an invalid human rooms response", 502);
-  }
-  return parsed as T;
+async function call<T>(method: "GET" | "POST" | "DELETE", path: string, body?: object, operation?: PrivateOperation, signal?: AbortSignal): Promise<T> {
+  return usingPrivateOperation(operation, async (op) => {
+    const resp = await privateFetch(path, {
+      method,
+      credentials: "same-origin",
+      cache: "no-store",
+      headers: {
+        ...(method === "GET" ? {} : { "Content-Type": "application/json" }),
+        "X-Cadence-Board": "1",
+        ...sessionHeaders(),
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    }, op);
+    const parsed = (await resp.json().catch(() => null)) as Record<string, unknown> | null;
+    op.assertCurrent();
+    if (!resp.ok) {
+      const error = parsed?.error;
+      throw new ApiError(
+        typeof error === "string" && error !== "" ? error : `${resp.status} ${resp.statusText}`.trim(),
+        resp.status,
+        parsed ?? undefined,
+      );
+    }
+    if (parsed === null || typeof parsed !== "object") {
+      throw new ApiError("The server returned an invalid human rooms response", 502);
+    }
+    return parsed as T;
+  }, signal);
 }
 
 const ROOMS = "/api/human-threads/rooms";
@@ -172,7 +175,7 @@ export interface HumanPeoplePage {
 /** The complete verified workspace is searched before the server's 20-result cap. */
 export function searchHumanPeople(query: string, signal: AbortSignal): Promise<HumanPeoplePage> {
   const params = new URLSearchParams({ query });
-  return call("GET", `/api/human-threads/people?${params}`, undefined, signal);
+  return call("GET", `/api/human-threads/people?${params}`, undefined, undefined, signal);
 }
 
 interface RosterResponse {

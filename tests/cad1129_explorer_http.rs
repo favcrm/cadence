@@ -577,10 +577,11 @@ fn board_refuses_agent_peers_on_the_explorer_routes_itself() {
         "/api/app-requests",
     ] {
         let (status, text) = fx.get("agent:writer", route);
-        assert_eq!(status, 403, "GET {route}: {text}");
-        assert!(
-            text.contains(board),
-            "GET {route} not refused by the board gate: {text}"
+        assert_eq!(status, 401, "GET {route}: {text}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&text).unwrap()["code"],
+            "operator_session_required",
+            "GET {route} not refused by the private read gate: {text}"
         );
     }
     for (route, body) in [

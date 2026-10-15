@@ -19,10 +19,6 @@ for (const name of ["addEventListener", "removeEventListener", "requestAnimation
   Object.defineProperty(globalThis, name, { value: win[name].bind(win), configurable: true, writable: true });
 Object.defineProperty(globalThis, "crypto", { value: require("crypto").webcrypto, configurable: true });
 Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { value: true });
-Object.defineProperty(globalThis, "EventSource", {
-  configurable: true,
-  value: class { onopen = null; onerror = null; addEventListener() {} removeEventListener() {} close() {} },
-});
 const loader = require("module"), originalRequire = loader.prototype.require;
 loader.prototype.require = function (this: unknown, id: string) {
   if (id.endsWith(".css")) return {};
@@ -74,12 +70,13 @@ let thread: any = {
 const json = (v: unknown) => new Response(JSON.stringify(v), { status: 200, headers: { "Content-Type": "application/json" } });
 globalThis.fetch = (async (input: unknown) => {
   const path = String(input);
+  const url = new URL(path, "http://localhost");
+  if (url.pathname.endsWith("/stream")) return new Response(new ReadableStream(), { headers: { "Content-Type": "text/event-stream" } });
   if (path === "/api/app-installations/install-crm") return json(crm);
   if (path === "/api/app-installations/install-crm/contexts") return json(ctxs);
   if (path.endsWith("/chat-descriptor")) return json({ descriptor: crmDescriptor, digest: crm.digest, app: "crm" });
   if (path.endsWith("/conversations")) return new Response("{}", { status: 404 });
   if (path.startsWith("/api/threads/master")) return json(thread);
-  const url = new URL(path, "http://localhost");
   if (url.pathname === "/api/crm-send/list") return json({ sends: [] });
   if (url.pathname === "/api/crm-send/origin") return json({ unsubscribe_origin: null, stored: false });
   if (url.pathname.endsWith("/records")) return json({ records: [], truncated: false, next_cursor: null });

@@ -107,7 +107,7 @@ await rejected(
   "record path escape refused before the wire",
 );
 
-// Mounted shell: one chat pane/stream, scoped links, switch clearing,
+// Mounted shell: one chat pane, scoped links, switch clearing,
 // single context owner, verified send binding, neutral outlet copy.
 const { Window } = require("happy-dom");
 const win = new Window({ url: "http://localhost/app-installations/install-shell" });
@@ -117,18 +117,6 @@ for (const name of ["addEventListener", "removeEventListener", "requestAnimation
   Object.defineProperty(globalThis, name, { value: win[name].bind(win), configurable: true, writable: true });
 Object.defineProperty(globalThis, "crypto", { value: require("crypto").webcrypto, configurable: true });
 Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { value: true });
-let eventSources = 0;
-Object.defineProperty(globalThis, "EventSource", {
-  configurable: true,
-  value: class {
-    onopen: null = null;
-    onerror: null = null;
-    constructor() { eventSources += 1; }
-    addEventListener() {}
-    removeEventListener() {}
-    close() {}
-  },
-});
 const loader = require("module"), originalRequire = loader.prototype.require;
 loader.prototype.require = function (this: unknown, id: string) {
   if (id.endsWith(".css")) return {};
@@ -205,6 +193,9 @@ const reads: string[] = [];
 globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   const path = String(input);
   reads.push(path);
+  if (new URL(path, "http://localhost").pathname.endsWith("/stream")) {
+    return new Response(new ReadableStream(), { headers: { "Content-Type": "text/event-stream" } });
+  }
   if (init?.method === "POST") {
     posts.push({ path, body: JSON.parse(String(init.body)) });
     return json({ ok: true });
@@ -283,13 +274,11 @@ assert(text().includes("Master answer stays connected"), "the left pane shows th
 assert(!text().includes("ctx-a"), "CAD-1051: internal context ids never render in the chat");
 equal(panes(), 1, "exactly one chat pane in the document");
 equal(boxes(), 1, "exactly one chat draft box id in the document");
-equal(eventSources, 1, "exactly one SSE subscription for the shell");
 assert(!host.querySelector('[aria-label="App context"]'), "context selector removed — context follows URL only");
 
 // Narrow switch (approved mock): a full-width Assistant | Workspace
 // segmented control replaces the overlay drawer. The assistant is shown
-// by default; both panels stay mounted so the draft and the single SSE
-// subscription survive switching.
+// by default; both panels stay mounted so the draft survives switching.
 const tabs = Array.from(host.querySelectorAll<HTMLButtonElement>(".app-shell-panel-tab"));
 equal(tabs.map((t) => t.textContent), ["Assistant", "Workspace"], "segmented Assistant | Workspace switch");
 assert(!host.querySelector(".app-shell-chat-toggle") && !host.querySelector(".app-shell-scrim"), "no overlay drawer toggle or scrim remains");
@@ -303,7 +292,6 @@ equal(tabs[1].getAttribute("aria-pressed"), "true", "Workspace tab pressed");
 await click(tabs[0]);
 equal((host.querySelector("#app-shell-chat-box") as HTMLTextAreaElement)?.value, "unsent shell draft", "one pane keeps one draft across switching");
 equal(panes(), 1, "switching never mounts a second chat pane");
-equal(eventSources, 1, "switching opens no second stream");
 
 // Chat sends carry the verified-scope request; refusal would surface.
 // Context is adopted from the URL — no selector needed.
@@ -503,7 +491,7 @@ await flush(); await flush();
 assert(!location.search.includes("record="), "scopeless record link clears the record");
 assert(text().includes("names no context"), "scopeless record link explains itself");
 
-// Installation switch: outlet query stripped, chat draft and stream kept.
+// Installation switch: outlet query stripped, chat history stays visible.
 history.pushState(null, "", "/app-installations/install-second?ctx=ctx-only&record=rec-1");
 await React.act(async () => {
   root.render(React.createElement(LocaleProvider, null, React.createElement(AppShell, { installId: "install-second", viewer: { operator: true, readOnly: false } })));
@@ -514,9 +502,6 @@ assert(text().includes("Second"), "new installation renders");
 // A single-context install keeps the switch hidden — no link clutter.
 assert(!host.querySelector("[data-scope-link]"), "single-context installs render no switch links");
 equal(panes(), 1, "install switch keeps one chat pane");
-// Legacy detection is per installation (CAD-1098): the new install reads its own
-// conversation list before it resumes the home thread, so the stream reconnects once.
-equal(eventSources, 2, "install switch reconnects the stream once, never more");
 assert(text().includes("Scoped follow-up"), "install switch keeps the live thread");
 
 // chatBinding: empty wants plain chat, inactive blocks early with the

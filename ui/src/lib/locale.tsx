@@ -1,5 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { Meta } from "./types";
+import type { PrivateOperation } from "./privateSession";
+import { beginPrivateOperation, privateFetch, privateReadsAllowed, withPrivateOperation } from "./privateSession";
 
 export type Locale = "en" | "zh-TW";
 type Scope = "user" | "organization";
@@ -9,6 +11,7 @@ const zhTW: Record<string, string> = {
   "Home": "首頁", "Overview": "總覽", "Projects": "專案", "Apps": "應用程式", "Agents": "代理程式", "Wiki": "知識庫", "Outbox": "寄件匣", "Settings": "設定", "Sign in": "登入", "Account": "帳戶", "Account menu": "帳戶選單", "Sign out": "登出", "Theme": "佈景主題", "System": "系統", "Light": "淺色", "Dark": "深色",
   "Language": "語言", "Follow organization": "依組織設定", "English": "English", "Traditional Chinese": "繁體中文", "Organization default": "組織預設語言", "Save": "儲存", "Saving…": "儲存中…", "Language preference saved.": "語言偏好已儲存。", "Could not save language preference.": "無法儲存語言偏好。",
   "Workspace waking or unreachable": "工作區正在啟動或無法連線", "Workspace waking or unreachable.": "工作區正在啟動或無法連線。", "Workspace waking": "工作區啟動中", "Retry when ready.": "準備就緒後重試。", "Checking again for up to 60 seconds…": "正在重新檢查，最長 60 秒…", "Retry workspace": "重試工作區",
+  "Retry uploads": "重試上傳",
   "All projects": "所有專案", "Search projects": "搜尋專案", "Search issues": "搜尋議題", "New issue": "新增議題", "Create issue": "建立議題", "Issue": "議題", "Issues": "議題", "Project": "專案", "Status": "狀態", "Priority": "優先級", "Owner": "負責人", "Title": "標題", "Description": "描述", "Tags": "標籤", "Save changes": "儲存變更", "Cancel": "取消", "Close": "關閉", "Open": "開啟", "Edit": "編輯", "Delete": "刪除", "Refresh": "重新整理", "Loading…": "載入中…", "Retry": "重試", "No projects yet": "尚無專案", "No issues found": "找不到議題", "No results": "沒有結果", "Try again": "再試一次", "Something went wrong": "發生錯誤",
   "To do": "待辦", "Doing": "進行中", "Review": "審查中", "Done": "已完成", "Blocked": "受阻", "Ready": "就緒", "Dropped": "已放棄", "Backlog": "待排程", "High": "高", "Medium": "中", "Low": "低", "Critical": "緊急",
   "Search": "搜尋", "Filter": "篩選", "Sort": "排序", "List": "清單", "Board": "看板", "Timeline": "時間軸", "Milestones": "里程碑", "Epics": "史詩議題", "New project": "新增專案", "Create project": "建立專案", "No issues": "尚無議題", "No description": "沒有描述", "Unassigned": "未指派", "Comments": "留言", "Activity": "活動", "Details": "詳細資料", "History": "歷程", "Links": "連結", "Blocked by": "受阻於", "Related": "相關", "Parent": "上層議題", "Add comment": "新增留言", "Write a comment…": "撰寫留言…", "Post comment": "發佈留言", "Update issue": "更新議題", "Move to": "移至", "Confirm": "確認", "Are you sure?": "確定要繼續嗎？",
@@ -103,6 +106,53 @@ Object.assign(zhTW, {
   "compacting": "壓縮中", "master thread": "主助理對話", "since you left": "你離開後",
 });
 
+Object.assign(zhTW, {
+  "Secure workspace": "安全工作區",
+  "Local Cadence UI": "本機 Cadence 介面",
+  "Checking your session": "正在檢查你的工作階段",
+  "Just a moment while we verify your access. Your workspace stays private until the check is complete.": "請稍候，我們正在驗證你的存取權限。檢查完成前，工作區內容會保持隱藏。",
+  "Verifying this tab’s session with the local Cadence daemon. Nothing from your workspace is shown before access is confirmed.": "正在透過本機 Cadence 常駐程式驗證此分頁的工作階段。確認存取權限前，不會顯示任何工作區內容。",
+  "Welcome to Cadence": "歡迎使用 Cadence",
+  "Your work, behind a sign-in.": "登入後，安心開啟你的工作。",
+  "Sign in to your local board.": "登入你的本機看板。",
+  "Sign in with AgenticOS to open your workspace. We’ll bring you back here once your access is verified.": "使用 AgenticOS 登入以開啟工作區。存取權限驗證完成後，會將你帶回這裡。",
+  "On the computer running Cadence, run the command below. Open the one-use sign-in link in this browser tab.": "請在執行 Cadence 的電腦上執行下列指令，並在此瀏覽器分頁開啟一次性登入連結。",
+  "Verification unavailable": "目前無法驗證",
+  "We couldn’t verify your session.": "無法驗證你的工作階段。",
+  "This doesn’t mean you’ve been signed out. The connection may be interrupted. Retry to confirm your access.": "這不代表你已登出，連線可能暫時中斷。請重試以確認你的存取權限。",
+  "Access required": "需要存取權限",
+  "Local session refused": "本機工作階段遭拒",
+  "This workspace isn’t available to you.": "你目前無法存取此工作區。",
+  "This link can’t sign you in.": "無法使用此連結登入。",
+  "Your account is signed in, but doesn’t have access to this workspace. Ask its owner for an invitation, or use another account.": "你的帳戶已登入，但沒有此工作區的存取權限。請向擁有者索取邀請，或改用其他帳戶。",
+  "The sign-in link may have expired or already been used. Generate a fresh link on the computer running Cadence.": "登入連結可能已過期或已使用。請在執行 Cadence 的電腦上產生新連結。",
+  "Session ended": "工作階段已結束",
+  "Sign in to continue.": "請登入以繼續。",
+  "Your session has expired. Workspace content has been cleared from this view. Sign in again to reopen your work.": "你的工作階段已過期，此檢視中的工作區內容已清除。請重新登入以繼續工作。",
+  "Hosted workspace": "託管工作區",
+  "Local board": "本機看板",
+  "Private board": "私人看板",
+  "Verifying session & workspace access": "正在驗證工作階段與工作區存取權限",
+  "Confirming this tab’s local session": "正在確認此分頁的本機工作階段",
+  "Retry verification": "重試驗證",
+  "Use another account": "使用其他帳戶",
+  "Continue with AgenticOS": "繼續使用 AgenticOS",
+  "No separate Cadence account needed.": "不需要另外建立 Cadence 帳戶。",
+  "A fresh link is required for each tab. No AgenticOS account is needed for local operator login.": "每個分頁都需要新的連結。本機操作員登入不需要 AgenticOS 帳戶。",
+  "Check again": "重新檢查",
+  "Workspace content only appears after access is confirmed.": "只有在確認存取權限後，才會顯示工作區內容。",
+  "Protected by AgenticOS": "由 AgenticOS 保護",
+  "Tab-bound Cadence session": "與此分頁綁定的 Cadence 工作階段",
+  "Start a new local sign-in": "開始新的本機登入",
+  "Could not load": "無法載入",
+  "could not open this file": "無法開啟此檔案",
+  "loading the file…": "正在載入檔案…",
+  "Could not decode this image": "無法解碼此圖片",
+  "Download file": "下載檔案",
+  "The one-use link is exchanged for this tab’s session. Your workspace opens only after access is verified.": "此一次性連結會交換為此分頁的工作階段。只有驗證存取權限後，才會開啟工作區。",
+  "Run a fresh sign-in command on the computer running Cadence. Each link works once and belongs to this tab.": "請在執行 Cadence 的電腦上重新執行登入指令。每個連結僅能使用一次，且僅供此分頁使用。",
+});
+
 function validLocale(value: unknown): value is Locale {
   return value === "en" || value === "zh-TW";
 }
@@ -138,28 +188,36 @@ function storeLocalLocale(value: Locale | null): void {
   }
 }
 
-async function readPreferences(): Promise<Preferences> {
-  const response = await fetch("/api/locale", { headers: { "X-Cadence-Board": "1" } });
-  if (!response.ok) throw new Error(`Locale preferences unavailable (${response.status})`);
-  const value = await response.json() as Partial<Preferences>;
+function decodePreferences(value: unknown): Preferences {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Invalid locale preferences response");
+  }
+  const organizationLocale = "organization_locale" in value ? value.organization_locale : null;
+  const userLocale = "user_locale" in value ? value.user_locale : null;
   return {
-    organization_locale: validLocale(value.organization_locale) ? value.organization_locale : null,
-    user_locale: validLocale(value.user_locale) ? value.user_locale : null,
+    organization_locale: validLocale(organizationLocale) ? organizationLocale : null,
+    user_locale: validLocale(userLocale) ? userLocale : null,
   };
 }
 
-async function writePreference(scope: Scope, locale: Locale | null): Promise<Preferences> {
-  const response = await fetch("/api/locale", {
+async function readPreferences(operation: PrivateOperation): Promise<Preferences> {
+  const response = await privateFetch("/api/locale", { headers: { "X-Cadence-Board": "1" } }, operation);
+  if (!response.ok) throw new Error(`Locale preferences unavailable (${response.status})`);
+  const value: unknown = await response.json();
+  operation.assertCurrent();
+  return decodePreferences(value);
+}
+
+async function writePreference(scope: Scope, locale: Locale | null, operation: PrivateOperation): Promise<Preferences> {
+  const response = await privateFetch("/api/locale", {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Cadence-Board": "1" },
     body: JSON.stringify({ scope, locale }),
-  });
+  }, operation);
   if (!response.ok) throw new Error(`Locale preference write refused (${response.status})`);
-  const value = await response.json() as Partial<Preferences>;
-  return {
-    organization_locale: validLocale(value.organization_locale) ? value.organization_locale : null,
-    user_locale: validLocale(value.user_locale) ? value.user_locale : null,
-  };
+  const value: unknown = await response.json();
+  operation.assertCurrent();
+  return decodePreferences(value);
 }
 
 interface LocaleContextValue {
@@ -195,13 +253,21 @@ export function LocaleProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     const request = ++requestId.current;
-    if (!identity) {
-      return;
-    }
-    readPreferences()
-      .then((next) => { if (request === requestId.current) setStoredPreferences({ identity, value: next }); })
-      .catch(() => { if (request === requestId.current) setStoredPreferences(null); });
-    return () => { requestId.current += 1; };
+    if (!identity || !privateReadsAllowed()) return;
+    const operation = beginPrivateOperation();
+    void readPreferences(operation)
+      .then((next) => {
+        operation.assertCurrent();
+        if (request === requestId.current) setStoredPreferences({ identity, value: next });
+      })
+      .catch(() => {
+        if (!operation.signal.aborted && request === requestId.current) setStoredPreferences(null);
+      })
+      .finally(() => operation.dispose());
+    return () => {
+      requestId.current += 1;
+      operation.dispose();
+    };
   }, [identity]);
 
   const preferences = storedPreferences?.identity === identity ? storedPreferences.value : null;
@@ -222,13 +288,12 @@ export function LocaleProvider({ children }: { children: ReactNode }) {
     }
     const generation = ++requestId.current;
     const writeIdentity = identity;
-    const next = await writePreference(scope, value);
-    // A write that settled after the session or request generation moved
-    // on belongs to the old identity — it must not evict the new one's
-    // already-loaded preferences.
-    if (writeIdentity !== null && generation === requestId.current) {
-      setStoredPreferences({ identity: writeIdentity, value: next });
-    }
+    await withPrivateOperation(async (operation) => {
+      const next = await writePreference(scope, value, operation);
+      operation.assertCurrent();
+      // A retired save must neither resolve successfully nor evict a later identity's preferences.
+      if (generation === requestId.current) setStoredPreferences({ identity: writeIdentity, value: next });
+    });
   }, [identity]);
 
   const context = useMemo<LocaleContextValue>(() => ({

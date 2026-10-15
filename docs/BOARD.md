@@ -1106,8 +1106,8 @@ over the persisted `ui.json` in the state dir and saves the result —
 a later plain `ui start` reuses it, `--reset` forgets it, and
 `ui status` prints the effective options. Extra flags:
 `--allow-host <name>` / `--allow-origin <origin>` (repeatable — extend
-the Host/Origin allowlists), `--read-only` (every write answers `403`,
-the SPA hides its edit controls; `--no-read-only` clears a persisted
+the Host/Origin allowlists), `--read-only` (workspace writes answer `403`,
+the SPA hides its edit controls; sign-in/sign-out remain available; `--no-read-only` clears a persisted
 one), `--device-login-issuer <origin> --device-login-org <ws-id>
 --device-login-subject <id>` (remote operator sign-in through the
 AgenticOS device grant, CAD-777/841 — issuer + org + at least one
@@ -1117,8 +1117,15 @@ they apply live to a running board and never persist in `ui.json`;
 `ui start --reset` does not touch the daemon store either — only
 `cadence ui device-login clear` turns the flow off; default off).
 
-**Signing in (CAD-313, ADR 0004).** Board writes need the operator's
-session. `cadence ui login`, run from your own shell, prints a link —
+Private local reads require a session by default (CAD-1452).
+`--allow-anonymous-reads` explicitly permits local unsigned reads;
+`--no-allow-anonymous-reads` clears a persisted allowance. This policy is
+independent of `--read-only`: disabling writes does not grant read access.
+Configuring it together with a hosted board identity is refused. Changing an
+already-running board's read policy requires restarting that board explicitly.
+
+**Signing in (CAD-313, ADR 0004; read boundary CAD-1452).** Private board
+reads and operator writes need a session. `cadence ui login`, run from your own shell, prints a link —
 `http://cadence-<port>.localhost:<port>/login#n=<nonce>` (`--tailnet`:
 the tailnet URL) — that works once, within 120 s, for one browser.
 `cadence-<port>.localhost` is this board's own name: every `*.localhost`
@@ -1127,8 +1134,8 @@ cookie on this name is never sent to another board, an agent's dev
 server or anything else on `127.0.0.1`, `localhost` or
 `cadence.localhost` (the gateway vhost), whatever the port. Loopback
 sessions are opened and honoured on this Host only; on any other Host
-the board is sign-in-less and refuses writes. Opening
-it sets an HttpOnly, `SameSite=Strict` session cookie (`Secure` and
+the board cannot accept a local sign-in and refuses private reads and writes.
+Opening the link sets an HttpOnly, `SameSite=Strict` session cookie (`Secure` and
 `__Host-` on the https tailnet origin) valid 24 h idle, 7 days at most,
 and hands the page a second key it keeps in that tab's `sessionStorage`
 and sends as `X-Cadence-Session` on every request. The cookie alone is
@@ -1152,6 +1159,59 @@ random bits, and a shared failure budget would let an agent lock the
 operator out with no credential at all. A second link opened in the same
 tab (only the fragment changes, so no page load) is picked up by the
 login view's `hashchange` listener.
+
+**Loading, recovery and persistence (CAD-1452).** Both local Cadence and
+hosted AgenticOS boards verify the existing session before mounting private
+navigation, records, polling or streams. The accepted design reference is
+[the authentication preview](https://preview.simplebuild.site/20261015-061045/cadence-auth-loading/?e=1792131045&t=er1MMIdOAYNzo0KDOke6vw)
+(owner accepted 2026-10-15; source `design-plans/cad1452-auth-boundary/`).
+Local sign-in remains the one-use link (or configured device flow); hosted
+sign-in remains the AgenticOS membership/assertion handoff.
+
+Navigation and same-tab reload reuse the cookie and local tab key; they do
+not mint a new session or extend its absolute expiry. A new local tab still
+needs its own link. Hosted cookies retain their existing host-only lifetime.
+An unanswered verification conceals the admitted workspace and stops its
+effects, preserving same-session drafts and credentials for Retry. A
+confirmed sign-out, expiry or identity change clears private observations
+and rejects stale in-flight responses. A session-required `401` supersedes
+older pending verification; a feature's ordinary role-based `403` does not
+sign the board session out. Signed-in members pass the read boundary without
+operator privileges. Authentication and write authority remain separate.
+
+Private async work owns one operation across response headers, body decoding
+and any follow-up request, state adoption or navigation. Pause, caller cancellation or
+session reset permanently abandons that operation; re-verification cannot
+revive it. A paused draft may be retried explicitly with a fresh operation.
+Cancellation uses baseline-compatible signal forwarding, not `AbortSignal.any`.
+Already-accepted server mutations are not rolled back by abandoning a client
+continuation.
+
+Chat and Wiki uploads abort the underlying transfer on pause. Wiki retains
+same-session queued files for explicit **Retry uploads**, never automatic
+replay after verification; an identity reset discards those files. Verification
+retry restores the previous live control's keyboard focus or returns focus to
+the admitted workspace.
+Hosted language-preference reads and saves share the same operation lifetime
+and typed session-refusal boundary. Local language choices remain browser-only.
+Queued agent-history reads retire on pause before acquiring a read slot;
+re-verification creates fresh work rather than reviving old cached promises.
+Private notification toasts share the admitted workspace's boundary; a pause
+clears their room titles/actions and dismissal timers, without discarding drafts.
+Notification actions check their originating generation before follow-up reads.
+Browser-alert work captures its private lifetime before queue/browser waits and
+checks it before consent or remote effects. Signed-out local subscription cleanup
+can still finish, but never starts an authenticated request after re-admission.
+
+Private SSE uses authenticated fetch streaming rather than URL-carried tab
+keys. The server revalidates the live session every five seconds with a
+two-second validation deadline; thread polls add at most two seconds.
+Buffered bytes cannot be retracted, and a blocked OS write is not a strict
+socket-close deadline. No later private frame is authorized after a failed
+recheck. File previews/downloads fetch with the same session proof; temporary
+preview URLs are revoked on pause, session reset or unmount, and untrusted
+document frames remain sandboxed. Template downloads recreate fresh URLs
+from retained results on same-session recovery.
 
 **Remote sign-in without SSH (CAD-777, daemon-owned since CAD-841).**
 Device login is configured on the *daemon*, never by the board:
@@ -1376,8 +1436,8 @@ quick-add, drag, edit, link/ref, attach and comment controls.
 
 | Route | Returns |
 |---|---|
-| `GET /api/health` | `ok`, `pm_dir`, `pm_present`, counts, `daemon`, `embedded` |
-| `GET /api/meta` | `read_only`, `actor` (the request's resolved write identity), `tailnet_proof` (`null`, or whether the tailnet proxy was proven and which check refused), `tailnet_url`, `signed_in` (CAD-313: this request holds a live operator session), `session` (`{id, origin, created, last_used, idle_expires_at, expires_at, user_agent}` or `null` — never the token), `login_hint` (`cadence ui login`, or `… --tailnet` on the tailnet), `operator` (CAD-432, only with `?operator=1` — the proof walks `/proc`, so the SPA asks once per page load; `null` otherwise: this client passes the operator decisions' checks — a writable board, a live operator session (CAD-313) from a caller tied to no agent, CAD-276's positive proof on the peer, and the same proof on the board process itself, whose daemon connection relays the decision; the UI offers operator decisions such as stage moves only then), the serving binary's `version`/`build_commit`/`build_time`, plus the daemon's `daemon_info` when reachable |
+| `GET /api/health` | unsigned: `ok`, `build`, `embedded` only; admitted readers also receive `pm_dir`, `pm_present`, project/issue counts and `daemon`. Unknown credential validation is unavailable, not unsigned success |
+| `GET /api/meta` | safe local bootstrap: `read_only`, explicit local `anonymous_reads`, tri-state `signed_in` (`null` means unavailable), `hosted`, `session` (display identity/timestamps or `null`, never credentials), `login_hint`, `device_login`, `tab_signed_out`, `actor`, `tailnet_proof`, `tailnet_url`, serving build/version and daemon build projection. `operator` is a separate tri-state proof requested with `?operator=1`; a signed-in member need not be an operator. Hosted metadata remains session-gated |
 | `GET /api/setup[?fresh=1]` | the `/setup` wizard's checks (CAD-327): `cadence setup`'s list run **detect only** — no `apply`, nothing created, started or written; the `ui` check is answered by the serving board. `{checks: [{check, status, detail, fix, group}], master: {providers: [{bin, ready, start, warning}]}, checked_at, detect_only: true}`, `group` one of `environment`/`provider`/`master`. `master.providers` (CAD-448) is the master step's provider choice — every CLI `master start` accepts, each ready one with its exact `master start --provider <bin>` command once the `master` check's own prerequisites are met (the offer then absorbs the check's bare `master start` fix: one command for the action); a host that cannot confine adds `--unconfined` and carries the `UNCONFINED_WARNING` risk text in `warning`, and `master_login` states the same risk. Provider probes follow setup's rules (a version token and an exit code or a file's presence — never their output), each bounded at 5 s. One run is reused for 60 s and concurrent requests share it; `fresh=1` (or `true`) re-runs unless the last run is under 5 s old, and each answer says `ran_now`, `age_ms` and `recheck_in_ms`. **Operator on the host only:** `403` before any probe runs on a read-only board (`check: "read_only"`), for a request through the tailnet (`"tailnet"`, proven or not) and for a non-loopback peer (`"loopback"`) — the payload shows HOME's layout, installed CLIs and their sign-in state, and the daemon's pid and socket. Write methods answer `405` |
 | `GET /api/projects` | folders, prefixes, components, declared tags, repos, issue counts |
 | `GET /api/issues?project=` | card views: derived status, readiness, `tags`, counts, `rev`, the CAD-405 `work` block (type, milestone, size/weight; stage, progress and health on epics). The `issue ls` filters, combinable (AND across keys): `tag=` (repeat or comma-join — all of), `status=`/`type=`/`milestone=`/`owner=`/`component=`/`priority=`/`epic=<ID>` (repeat or comma-join — any of), `plan=` (`any` or a plan state), `open=1`; `400` on a value that could never match (unknown status/priority, bad tag or id grammar) |
@@ -1394,8 +1454,8 @@ quick-add, drag, edit, link/ref, attach and comment controls.
 | `GET /api/memories/:project/:slug` | one memory: frontmatter + body; `404` on unknown slug, `400` on grammar |
 | `GET /api/overview` | the Overview screen payload: `needs_me`, `drift`, `projects`, `github`, `daemon`, `generated_at` — same shape as `cadence overview --json` |
 | `GET /api/stream` | server-sent events — `event: issues` on tracker change, `event: jobs`/`event: agents`/`event: monitoring` on daemon state change; each frame's data names the board resources it invalidates (`{"resources":["agents","issue","overview"]}`); `: ping` immediately and every 15 s of silence; `405` on HEAD; deltas only (baselines at connect) |
-| `GET /api/threads/<alias>?after=&limit=` | one page of the agent's durable chat (CAD-319) over the daemon's `thread_read`: `{thread, entries, cursor}`; `?tail=1` (the newest page) or `?before=<seq>` read backwards and add `more_before` (CAD-328; `400` combined with `after`); `404` unknown alias, `501` a daemon without threads. Unscoped in the MVP: any caller that reaches the board reads any agent's thread, as with `/api/agents/<alias>`. A live turn token quoted in thread prose is only redacted at `export` |
-| `GET /api/threads/<alias>/stream` | server-sent events — one `event: entry` frame per thread entry with `id: <seq>`; resumes after `Last-Event-ID` (else `?after=`); `: ping` on each 15 s idle poll; `event: error` while the daemon is unreachable; `405` on HEAD |
+| `GET /api/threads/<alias>?after=&limit=` | one page of the agent's durable chat (CAD-319) over the daemon's `thread_read`: `{thread, entries, cursor}`; `?tail=1` (the newest page) or `?before=<seq>` read backwards and add `more_before` (CAD-328; `400` combined with `after`); `404` unknown alias, `501` a daemon without threads. Any admitted board reader can read agent threads, as with `/api/agents/<alias>`; private local/hosted admission happens first. A live turn token quoted in thread prose is only redacted at `export` |
+| `GET /api/threads/<alias>/stream` | server-sent events — one `event: entry` frame per thread entry with `id: <seq>`; resumes after `Last-Event-ID` (else `?after=`); `: ping` on each idle poll; closes when a daemon poll fails or session admission is lost; the authenticated UI reconnects from the last event ID; `405` on HEAD |
 | `GET /api/master/summary?since=<epoch secs>` | "since you left" (CAD-328) over the daemon's `master_summary` (CAD-339), never posted to the thread: plans proposed and decided, tickets moved, reports, open questions, `routing_backlog`; `400` without a numeric `since`, `501 unsupported_daemon` on a daemon without the master, `503` daemon down |
 
 ### API — writes
@@ -1599,9 +1659,13 @@ that deliberately steals the secret and evades `operator_proof` — ADR
 
 ### Security posture
 
-Reads need no auth; operator authority needs the session above. The
-rest is containment, so the write path adds four cross-site guards, each checked in order before any body is read
-or any writer runs, and each refusal names its check in `403` JSON:
+Private reads require the session above; unsigned local browsing requires
+the explicit `--allow-anonymous-reads` policy and never applies to hosted
+boards. Safe bootstrap, liveness/build probes and existing one-use capability
+routes are exceptions, not blanket read access. Operator authority remains
+a separate proof. The write path also adds four cross-site guards, checked
+in order before any body is read or writer runs; refusals name the check in
+`403` JSON:
 
 1. **Route + method.** Writes are `POST`/`PATCH`/`DELETE` on known
    shapes only; a known shape with the wrong method is `405`, anything

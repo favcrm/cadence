@@ -2,7 +2,7 @@ import { useEffect, useId, useRef, useState } from "react";
 import type { Route } from "../../lib/router";
 import Link from "../../ui/Link";
 import { IconFolder, IconGrid, IconList, IconMore } from "../../ui/icons";
-import { wiki, wikiRawUrl, type WikiEntry } from "./api";
+import { wiki, wikiBlob, type WikiEntry } from "./api";
 import { baseName, joinPath, parentPath } from "./paths";
 import { withinScope } from "./scope";
 import { kindLabel, previewKind } from "./preview";
@@ -10,6 +10,8 @@ import { entryOrder } from "./tree";
 import Button from "../../ui/Button";
 import { KindIcon, Loading, WikiImage, useWikiScope } from "./shared";
 import { useTranslate } from "../../lib/locale";
+import { onPrivateReadsPaused, privateReadsAllowed, privateSessionGeneration } from "../../lib/privateSession";
+import { sessionKey } from "../../lib/sessionKey";
 
 /**
  * The folder view (CAD-581): grid or list, image thumbnails, a per-item
@@ -41,6 +43,22 @@ export default function FolderPane({
   const fieldId = useId();
   const menuId = useId();
   const menuTrigger = useRef<HTMLButtonElement | null>(null);
+  const downloads = useRef(new Set<AbortController>());
+  const downloadUrls = useRef(new Map<string, number>());
+
+  useEffect(() => {
+    const dispose = () => {
+      for (const controller of downloads.current) controller.abort();
+      downloads.current.clear();
+      for (const [url, timer] of downloadUrls.current) {
+        window.clearTimeout(timer);
+        URL.revokeObjectURL(url);
+      }
+      downloadUrls.current.clear();
+    };
+    const stop = onPrivateReadsPaused(dispose);
+    return () => { stop(); dispose(); };
+  }, [entries]);
 
   useEffect(() => {
     if (!menu) return;
@@ -96,19 +114,34 @@ export default function FolderPane({
     }
   };
 
-  const downloadPage = async (entry: WikiEntry) => {
+  const downloadEntry = async (entry: WikiEntry) => {
+    const generation = privateSessionGeneration();
+    const key = sessionKey();
+    const controller = new AbortController();
+    downloads.current.add(controller);
     try {
-      const page = await wiki.file(entry.path);
-      const url = URL.createObjectURL(new Blob([page.text ?? ""], { type: "text/markdown;charset=utf-8" }));
+      const blob = entry.kind === "page"
+        ? new Blob([(await wiki.file(entry.path)).text ?? ""], { type: "text/markdown;charset=utf-8" })
+        : await wikiBlob(entry.path, controller.signal);
+      if (controller.signal.aborted || !privateReadsAllowed() || generation !== privateSessionGeneration() || key !== sessionKey()) return;
+      const url = URL.createObjectURL(blob.slice(0, blob.size, "application/octet-stream"));
       const link = document.createElement("a");
       link.href = url;
       link.download = entry.name;
       document.body.appendChild(link);
       link.click();
       link.remove();
-      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      const timer = window.setTimeout(() => {
+        URL.revokeObjectURL(url);
+        downloadUrls.current.delete(url);
+      }, 1000);
+      downloadUrls.current.set(url, timer);
       setMenu(null);
-    } catch (error) { onFail(error, "Download page"); }
+    } catch (error) {
+      if (!controller.signal.aborted && privateReadsAllowed() && generation === privateSessionGeneration() && key === sessionKey()) onFail(error, "Download file");
+    } finally {
+      downloads.current.delete(controller);
+    }
   };
 
   if (rows.length === 0) {
@@ -152,9 +185,7 @@ export default function FolderPane({
                 </button>
               </>
             )}
-            {entry.kind === "page" ? <button type="button" onClick={() => void downloadPage(entry)}>{t("Download")}</button> : entry.kind === "file" && <a href={wikiRawUrl(entry.path)} download onClick={() => setMenu(null)}>
-              {t("Download")}
-            </a>}
+            {(entry.kind === "page" || entry.kind === "file") && <button type="button" onClick={() => void downloadEntry(entry)}>{t("Download")}</button>}
             <button
               type="button"
               className="danger"

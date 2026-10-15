@@ -25,17 +25,6 @@ for (const name of ["addEventListener", "removeEventListener"])
   Object.defineProperty(globalThis, name, { value: win[name].bind(win), configurable: true });
 Object.defineProperty(globalThis, "crypto", { value: require("crypto").webcrypto, configurable: true });
 Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { value: true });
-Object.defineProperty(globalThis, "EventSource", {
-  configurable: true,
-  value: class {
-    onopen: null = null;
-    onerror: null = null;
-    constructor() {}
-    addEventListener() {}
-    removeEventListener() {}
-    close() {}
-  },
-});
 const loader = require("module"), originalRequire = loader.prototype.require;
 loader.prototype.require = function (this: unknown, id: string) {
   if (id.endsWith(".css")) return {};
@@ -95,8 +84,9 @@ const json = (value: unknown, status = 200) => new Response(JSON.stringify(value
 globalThis.fetch = (async (input: unknown) => {
   const path = String(input);
   const url = new URL(path, "http://localhost");
+  if (url.pathname.endsWith("/stream")) return new Response(new ReadableStream(), { headers: { "Content-Type": "text/event-stream" } });
   if (path.startsWith("/api/meta")) {
-    return json({ read_only: false, operator: true, signed_in: true, actor: "operator (ui)", session: null });
+    return json({ read_only: false, operator: true, signed_in: true, actor: "operator (ui)", session: { id: "crm-session", origin: "loopback", created: 1700000000, last_used: 1700000000, idle_expires_at: 4102444800, expires_at: 4102444800, user_agent: "test" } });
   }
   if (path === "/api/issues" || path.startsWith("/api/issues?")) return json({ issues: [] });
   if (path === "/api/projects") return json({ projects: [{ key: "alpha", prefix: "ALP", components: [], repos: [], issues: 0 }] });

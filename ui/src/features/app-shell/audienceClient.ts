@@ -1,5 +1,6 @@
 import { ApiError } from "../../lib/api";
 import { sessionHeaders } from "../../lib/sessionKey";
+import { privateFetch, usingPrivateOperation, type PrivateOperation } from "../../lib/privateSession";
 import { assertRecordId, assertScope, type HostScope } from "./hostActions";
 
 /**
@@ -109,34 +110,40 @@ export const audiencePaths = {
   },
 };
 
-async function post<T>(path: string, body: Record<string, unknown>): Promise<T> {
-  const response = await fetch(path, {
-    method: "POST",
-    credentials: "same-origin",
-    cache: "no-store",
-    headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
-    body: JSON.stringify(body),
+async function post<T>(path: string, body: Record<string, unknown>, operation?: PrivateOperation): Promise<T> {
+  return usingPrivateOperation(operation, async (op) => {
+    const response = await privateFetch(path, {
+      method: "POST",
+      credentials: "same-origin",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
+      body: JSON.stringify(body),
+    }, op);
+    const value = await response.json().catch(() => null);
+    op.assertCurrent();
+    if (!response.ok) {
+      throw new ApiError(value?.error ?? `${response.status} ${response.statusText}`, response.status);
+    }
+    if (value === null) throw new ApiError("The server returned an invalid audience receipt", 502);
+    return value as T;
   });
-  const value = await response.json().catch(() => null);
-  if (!response.ok) {
-    throw new ApiError(value?.error ?? `${response.status} ${response.statusText}`, response.status);
-  }
-  if (value === null) throw new ApiError("The server returned an invalid audience receipt", 502);
-  return value as T;
 }
 
-async function get<T>(path: string): Promise<T> {
-  const response = await fetch(path, {
-    credentials: "same-origin",
-    cache: "no-store",
-    headers: { ...sessionHeaders() },
+async function get<T>(path: string, operation?: PrivateOperation): Promise<T> {
+  return usingPrivateOperation(operation, async (op) => {
+    const response = await privateFetch(path, {
+      credentials: "same-origin",
+      cache: "no-store",
+      headers: { ...sessionHeaders() },
+    }, op);
+    const value = await response.json().catch(() => null);
+    op.assertCurrent();
+    if (!response.ok) {
+      throw new ApiError(value?.error ?? `${response.status} ${response.statusText}`, response.status);
+    }
+    if (value === null) throw new ApiError("The server returned an invalid audience receipt", 502);
+    return value as T;
   });
-  const value = await response.json().catch(() => null);
-  if (!response.ok) {
-    throw new ApiError(value?.error ?? `${response.status} ${response.statusText}`, response.status);
-  }
-  if (value === null) throw new ApiError("The server returned an invalid audience receipt", 502);
-  return value as T;
 }
 
 export interface SegmentSaveInput {
@@ -192,8 +199,8 @@ export const audienceClient = {
     return post(audiencePaths.segmentSavePath(scope), body);
   },
   /** `GET …/segments/list` — every saved rule in this context. */
-  async segmentList(scope: AudienceScope): Promise<unknown> {
-    return get(audiencePaths.segmentListPath(scope));
+  async segmentList(scope: AudienceScope, operation?: PrivateOperation): Promise<unknown> {
+    return get(audiencePaths.segmentListPath(scope), operation);
   },
   /** `GET …/segments/:id` — one saved rule. */
   async segmentShow(scope: AudienceScope, segmentId: string): Promise<unknown> {

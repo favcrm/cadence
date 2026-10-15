@@ -1,4 +1,5 @@
 import { ApiError } from "../../../lib/api";
+import { withPrivateOperation } from "../../../lib/privateSession";
 import { navigate } from "../../../lib/useLocation";
 import { rememberContext } from "../contextSelection";
 import { workspaceApps, type AppContext, type CapabilityQuote, type Installation, type WorkspaceRun } from "../workspaceApps";
@@ -224,19 +225,27 @@ export const linkTarget = (href: string): string => { const url = new URL(href);
 
 /** CAD-1290: on a hosted workspace the app's "Manage connections" link opens the AgenticOS Instagram
  *  connect page top-level. The host composes that URL (the frame never builds it); a local board, or
- *  any failure, keeps the local connections page. */
-async function connectOrOpen(ctx: ActionContext, args: Record<string, unknown>, ui: { showLink(url: string): void; navigate?: (path: string) => void; assign?: (url: string) => void }): Promise<ActionResult> {
-  if (args.url === "/settings/connections") {
-    try {
-      // CAD-1438: the screen only runs under `/apps/<key>` (uniqueness proven
-      // at route level), so the installation's own key is its return path.
-      const reply = await workspaceApps.connectLink(ctx.installId, connectReturnTo(window.location.origin, ctx.installation.name, ctx.installId));
-      if (reply.hosted && reply.url) { (ui.assign ?? (url => window.location.assign(url)))(reply.url); return { ok: true, data: {} }; }
-      // Hosted but no public AgenticOS address: say so, never send the owner to the local page.
-      if (reply.hosted) return refuse("unavailable", "Instagram connect isn't available for this workspace yet.");
-    } catch { /* keep the local page */ }
-  }
-  return openLink(args, ui);
+ *  a failure while this continuation is still current, keeps the local connections page.
+ *  Pause, reset, and frame close abort the continuation for good. A later response cannot assign,
+ *  navigate, or show a link, and re-admission does not revive it. */
+async function connectOrOpen(ctx: ActionContext, args: Record<string, unknown>, ui: { showLink(url: string): void; navigate?: (path: string) => void; assign?: (url: string) => void; signal?: AbortSignal }): Promise<ActionResult> {
+  return withPrivateOperation(async (operation) => {
+    if (args.url === "/settings/connections") {
+      try {
+        // CAD-1438: the screen only runs under `/apps/<key>` (uniqueness proven
+        // at route level), so the installation's own key is its return path.
+        const reply = await workspaceApps.connectLink(ctx.installId, connectReturnTo(window.location.origin, ctx.installation.name, ctx.installId), operation.signal);
+        operation.assertCurrent();
+        if (reply.hosted && reply.url) { (ui.assign ?? (url => window.location.assign(url)))(reply.url); return { ok: true, data: {} }; }
+        // Hosted but no public AgenticOS address: say so, never send the owner to the local page.
+        if (reply.hosted) return refuse("unavailable", "Instagram connect isn't available for this workspace yet.");
+      } catch {
+        operation.assertCurrent();
+      }
+    }
+    operation.assertCurrent();
+    return openLink(args, ui);
+  }, ui.signal);
 }
 
 /** `social.destinations.list`: the company's connected Instagram accounts. Read only. */
@@ -359,7 +368,7 @@ function openLink(args: Record<string, unknown>, ui: { showLink(url: string): vo
 
 /** The direct (non-spending) verbs. The set is closed in `screenProtocol`. */
 export function runCall(ctx: ActionContext, verb: CallVerb, args: Record<string, unknown>,
-  ui: { showLink(url: string): void; navigate?: (path: string) => void; assign?: (url: string) => void; actionToken?: string }): Promise<ActionResult> {
+  ui: { showLink(url: string): void; navigate?: (path: string) => void; assign?: (url: string) => void; actionToken?: string; signal?: AbortSignal }): Promise<ActionResult> {
   const table: Record<CallVerb, () => Promise<ActionResult> | ActionResult> = {
     "read.run": () => readRun(ctx, args),
     "context.defaults.save": () => saveDefaults(ctx, args),

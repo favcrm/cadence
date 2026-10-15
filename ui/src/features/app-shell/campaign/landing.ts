@@ -1,5 +1,6 @@
 import type { AudienceBaseInput } from "../audienceClient";
 import type { CampaignTab } from "./readiness";
+import { onPrivateSessionReset } from "../../../lib/privateSession";
 
 /**
  * One-shot hand-off from the New campaign dialog (CAD-1058) to the
@@ -18,6 +19,8 @@ export interface CampaignLanding {
 }
 
 let pending: CampaignLanding | null = null;
+
+onPrivateSessionReset(() => { pending = null; });
 
 export function setLanding(landing: CampaignLanding): void {
   pending = landing;
