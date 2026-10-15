@@ -6,8 +6,30 @@ use crate::contract_fixture::{classify_call, Effect};
 use crate::issue::app_catalog::workspace;
 use crate::store::app_bindings::BindingProof;
 use crate::store::app_runs;
+use std::collections::BTreeMap;
 
 const PRICE_REFUSED: &str = "bound capability price discovery refused";
+
+/// Immutable local custody snapshot. `fetch` is called only after dropping
+/// the PM, custody and release guards; it owns no daemon/store lock.
+pub(super) struct CapabilityQuoteRequest {
+    adapter: Arc<dyn crate::platform::PlatformAdapter>,
+    credential: Vec<u8>,
+    binding: Value,
+}
+
+impl CapabilityQuoteRequest {
+    pub(super) fn fetch(self) -> Result<crate::platform::AppCapabilityQuote> {
+        let quote = self
+            .adapter
+            .quote_app_capability(&self.credential, &self.binding)
+            .map_err(|error| Error::rejected(price_refusal(&error)))?;
+        if !quote.valid() {
+            return Err(Error::rejected("bound capability price quote is invalid"));
+        }
+        Ok(quote)
+    }
+}
 
 /// CAD-1096: the operator sees why the door refused a quote. Only an
 /// `[A-Za-z0-9_]{1,64}` code after the adapter's "refused: " crosses here.
@@ -100,10 +122,10 @@ impl Shared {
         Ok(Vec::new())
     }
 
-    pub(super) fn app_capability_quote(
+    pub(super) fn prepare_app_capability_quote(
         &self,
         proof: &BindingProof,
-    ) -> Result<crate::platform::AppCapabilityQuote> {
+    ) -> Result<CapabilityQuoteRequest> {
         let config = &proof.config;
         let provider = required_str(config, "provider")?;
         let tool = required_str(&config["mapping"], "tool")?;
@@ -128,13 +150,398 @@ impl Shared {
             ));
         }
         let credential = self.app_capability_credential(config)?;
-        let quote = adapter
-            .quote_app_capability(&credential, &serde_json::to_value(proof)?)
-            .map_err(|error| Error::rejected(price_refusal(&error)))?;
-        if !quote.valid() {
-            return Err(Error::rejected("bound capability price quote is invalid"));
+        Ok(CapabilityQuoteRequest {
+            adapter: Arc::clone(adapter),
+            credential,
+            binding: serde_json::to_value(proof)?,
+        })
+    }
+
+    pub(super) fn recheck_app_capability_quote(
+        &self,
+        proof: &BindingProof,
+        quote: &crate::platform::AppCapabilityQuote,
+    ) -> Result<()> {
+        self.app_capability_credential(&proof.config)?;
+        crate::platform::account_media::recheck_quote(&proof.config, quote)
+    }
+
+    #[cfg(test)]
+    pub(super) fn app_capability_quote(
+        &self,
+        proof: &BindingProof,
+    ) -> Result<crate::platform::AppCapabilityQuote> {
+        self.prepare_app_capability_quote(proof)?.fetch()
+    }
+
+    /// Offline refusal for a frozen account quote. Custody is resolved
+    /// locally; renewal, price discovery and provider HTTP stay with the caller.
+    pub(super) fn account_frozen_lineage(&self, run: &Value) -> Result<()> {
+        let Some(slots) = run["snapshot"]["capabilities"].as_object() else {
+            return Ok(());
+        };
+        for (slot, proof) in slots {
+            if proof["config"]["provider"] != crate::platform::account_media::PLATFORM {
+                continue;
+            }
+            let revision = run["snapshot"]["quotes"][slot]["price_revision"]
+                .as_str()
+                .ok_or_else(|| {
+                    Error::rejected(
+                        "saved account SESSION QUOTE is stale; request a fresh quote and approve it again",
+                    )
+                })?;
+            let identity = crate::platform::account_media::current_identity(&proof["config"])
+                .map_err(Error::rejected)?;
+            crate::platform::account_media::validate_quote_source(&identity, revision)
+                .map_err(Error::rejected)?;
         }
-        Ok(quote)
+        Ok(())
+    }
+
+    /// Account-only run execution. Preparation and retention each take a FRESH
+    /// PM/custody/release snapshot; neither provider nor human-authority I/O is
+    /// inside either callback. A durable claim admits exactly one sender.
+    pub(super) fn execute_account_run_capability(
+        &self,
+        expected: &Value,
+        slot: &str,
+        quote: &crate::platform::AppCapabilityQuote,
+        invocation: (&Value, &str),
+        worker: Option<(&str, &str, &str)>,
+    ) -> Result<Value> {
+        let (input, request) = invocation;
+        let run_id = required_str(expected, "id")?;
+        let install = required_str(expected, "install_id")?;
+        let (message, turn) = worker
+            .map(|(_, message, turn)| (message, turn))
+            .unwrap_or(("", ""));
+        let input_digest = app_runs::material_digest(input);
+        let call_id = format!(
+            "app-call-{}",
+            uuid::Uuid::new_v5(
+                &uuid::Uuid::NAMESPACE_OID,
+                format!("{run_id}:{slot}").as_bytes(),
+            )
+            .simple()
+        );
+        let pm = self.pm_at(&self.pm_dir()?)?;
+        let current = |bundle: &Value,
+                       files: &BTreeMap<String, String>|
+         -> Result<(String, BindingProof)> {
+            let run = self.store.app_run_show(run_id)?;
+            if run["state"] != "running"
+                || run["approved_digest"] != run["snapshot_digest"]
+                || run["snapshot_digest"] != expected["snapshot_digest"]
+                || app_runs::material_digest(&run["snapshot"]) != run["snapshot_digest"]
+                || run["snapshot"] != expected["snapshot"]
+                || run["approval"]["human"] != expected["approval"]["human"]
+                || run["context_id"] != expected["context_id"]
+                || run["install_id"] != install
+                || run["snapshot"]["bundle_digest"] != bundle["digest"]
+                || run["snapshot"]["quotes"][slot] != json!(quote)
+            {
+                return Err(Error::rejected(
+                    "account capability run approval or snapshot changed",
+                ));
+            }
+            let status = self
+                .store
+                .app_capability_status(install, required_str(bundle, "digest")?)?;
+            if status["state"] != "approved" || status["epoch"] != run["epoch"] {
+                return Err(Error::rejected("account capability approval epoch changed"));
+            }
+            self.app_run_binding_current(&run, bundle, files)?;
+            let (step, proof) = if let Some((alias, message, turn)) = worker {
+                let (active, step, proof) = self.store.app_capability_turn(
+                    alias,
+                    message,
+                    turn,
+                    slot,
+                    required_str(bundle, "digest")?,
+                )?;
+                if active["id"] != run_id
+                    || active["snapshot_digest"] != run["snapshot_digest"]
+                    || active["approval"]["human"] != run["approval"]["human"]
+                {
+                    return Err(Error::rejected("account capability assigned turn changed"));
+                }
+                (step, proof)
+            } else {
+                let step = required_str(&run["snapshot"]["workflow"]["steps"][0], "id")?;
+                if run["snapshot"]["workflow"]["execution"] != "host"
+                    || !run["steps"].as_array().is_some_and(|steps| {
+                        steps
+                            .iter()
+                            .any(|row| row["step_id"] == step && row["state"] == "dispatched")
+                    })
+                {
+                    return Err(Error::rejected(
+                        "account capability host step is not dispatched",
+                    ));
+                }
+                let proof = serde_json::from_value(run["snapshot"]["capabilities"][slot].clone())
+                    .map_err(|_| Error::rejected("account capability binding is absent"))?;
+                (step.to_string(), proof)
+            };
+            if proof.config["provider"] != crate::platform::account_media::PLATFORM {
+                return Err(Error::rejected("account capability source changed"));
+            }
+            self.recheck_app_capability_quote(&proof, quote)?;
+            Ok((step, proof))
+        };
+        let prepared = workspace::with_runtime_snapshot(&pm, install, |bundle, files| {
+            let _custody = self
+                .platform_custody_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let _release = self
+                .app_release_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let (step, proof) = current(bundle, files)?;
+            if let Some(existing) = self.store.app_capability_result_for_slot(run_id, slot)? {
+                if existing["step_id"] != step
+                    || existing["request_id"] != request
+                    || existing["input_digest"] != input_digest
+                    || existing["binding_digest"] != proof.digest
+                {
+                    return Err(Error::rejected(
+                        "approved run capability slot already has its one result",
+                    ));
+                }
+                return Ok(std::ops::ControlFlow::Break(existing));
+            }
+            let prepared = self.prepare_app_capability_quote(&proof)?;
+            if !self.store.app_capability_claim(
+                crate::store::app_capabilities::AppCapabilityClaim {
+                    run: run_id,
+                    step: &step,
+                    message,
+                    turn,
+                    slot,
+                    request,
+                    binding_digest: &proof.digest,
+                    input_digest: &input_digest,
+                    call_id: &call_id,
+                },
+            )? {
+                return Err(Error::unknown("A prior provider call has no retained receipt; its outcome is uncertain and no automatic retry was made."));
+            }
+            Ok(std::ops::ControlFlow::Continue((step, proof, prepared)))
+        })?;
+        let (step, proof, prepared) = match prepared {
+            std::ops::ControlFlow::Continue(prepared) => prepared,
+            std::ops::ControlFlow::Break(existing) => return Ok(existing),
+        };
+        let human = &expected["approval"]["human"];
+        if human.is_object() {
+            self.fresh_run_human(human)?;
+        }
+        // Human checks may perform network I/O: re-prove the exact native
+        // authority after them and before sending, without carrying guards out.
+        workspace::with_runtime_snapshot(&pm, install, |bundle, files| {
+            let _custody = self
+                .platform_custody_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let _release = self
+                .app_release_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let (live_step, live_proof) = current(bundle, files)?;
+            if live_step != step || json!(live_proof) != prepared.binding {
+                return Err(Error::rejected(
+                    "account capability authority changed before dispatch",
+                ));
+            }
+            Ok(())
+        })?;
+        let authority = json!({
+            "schema":1, "run_id":run_id, "run_snapshot_digest":expected["snapshot_digest"],
+            "install_id":install, "context_id":expected["context_id"], "step_id":step,
+            "slot":slot, "binding":proof, "inputs":expected["snapshot"]["inputs"],
+            "source":expected["snapshot"]["source"], "quote":quote, "call_id":call_id,
+        });
+        let output = prepared.adapter.execute_app_capability_outcome(
+            &prepared.credential, &authority, input, &call_id,
+        ).map_err(|error| {
+            let reason = if crate::platform::refuse_leak("app capability failure", error.reason(), &prepared.credential).is_ok() {
+                error.reason().chars().take(250).collect::<String>()
+            } else { "Provider failure details were withheld because they matched credential custody.".into() };
+            match error {
+                crate::platform::AppCapabilityError::Refused(_) => Error::provider(reason),
+                crate::platform::AppCapabilityError::Uncertain(_) => Error::unknown(reason),
+            }
+        })?;
+        let retain = || -> Result<Value> {
+            if human.is_object() {
+                self.fresh_run_human(human)?;
+            }
+            workspace::with_runtime_snapshot(&pm, install, |bundle, files| {
+                let _custody = self
+                    .platform_custody_lock
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let _release = self
+                    .app_release_lock
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let (live_step, live_proof) = current(bundle, files)?;
+                if live_step != step || json!(live_proof) != prepared.binding {
+                    return Err(Error::rejected(
+                        "account capability authority changed during dispatch",
+                    ));
+                }
+                crate::platform::refuse_leak(
+                    "app capability result",
+                    &output.result.to_string(),
+                    &prepared.credential,
+                )?;
+                if let Some(asset) = &output.asset {
+                    crate::platform::refuse_leak(
+                        "app capability asset",
+                        &String::from_utf8_lossy(&asset.bytes),
+                        &prepared.credential,
+                    )?;
+                }
+                self.store.app_capability_record(
+                    crate::store::app_capabilities::AppCapabilityRecord {
+                        id: &call_id,
+                        run: run_id,
+                        step: &step,
+                        message,
+                        turn,
+                        slot,
+                        request,
+                        binding_digest: &proof.digest,
+                        input_digest: &input_digest,
+                        result: &output.result,
+                        asset: output
+                            .asset
+                            .as_ref()
+                            .map(|asset| (asset.media_type.as_str(), asset.bytes.as_slice())),
+                    },
+                )
+            })
+        };
+        // Provider work already happened: failed freshness/retention is never
+        // reported as known-not-executed, and the claim is never released.
+        retain().map_err(|_| Error::unknown("Provider returned a result that could not be safely retained under current authority; the outcome is uncertain and no automatic retry was made."))
+    }
+
+    /// Only the existing verified native session can name a browser actor.
+    /// Credential-less calls are reachable solely behind operator_connection.
+    pub(super) fn account_image_actor(&self, params: &Value) -> Result<Value> {
+        if !["token", "key", "origin", "public_session"]
+            .iter()
+            .any(|key| params.get(key).is_some())
+        {
+            return Ok(json!({"kind":"operator"}));
+        }
+        let token = required_str(params, "token")?;
+        let key = match params.get("key") {
+            None => "",
+            Some(Value::String(key)) => key,
+            Some(_) => return Err(Error::rejected("native session key must be a string")),
+        };
+        let origin = required_str(params, "origin")
+            .ok()
+            .and_then(crate::operator_auth::Origin::parse)
+            .ok_or_else(|| Error::rejected("account quote needs a classified native session"))?;
+        if let Some(public) = params.get("public_session") {
+            if origin != crate::operator_auth::Origin::Public || public.as_str() != Some(token) {
+                return Err(Error::rejected(
+                    "account quote public session proof differs",
+                ));
+            }
+        }
+        let (hash, view) = self
+            .tool_session(token, key, origin)
+            .ok_or_else(|| Error::rejected("account quote needs a live operator session"))?;
+        if origin == crate::operator_auth::Origin::Public
+            && !view
+                .user
+                .as_ref()
+                .is_some_and(crate::operator_auth::BoardUser::is_operator)
+        {
+            return Err(Error::rejected(
+                "account quote needs an operator-role public session",
+            ));
+        }
+        match view.user {
+            Some(user) => Ok(json!({"kind":"user","id":user.sub,
+                    "issuer":view.scope.as_ref().map(|scope| &scope.issuer),
+                    "workspace_id":view.scope.as_ref().map(|scope| &scope.organization_id),"session":hash})),
+            None => Ok(json!({"kind":"operator","session":hash})),
+        }
+    }
+
+    /// Existing mounted tools carry the verified credential hash, not a raw
+    /// browser credential. Public hashes still use the central authority gate.
+    pub(super) fn account_image_actor_for_session(&self, hash: &str) -> Result<Value> {
+        if hash.is_empty() {
+            // An assistant's synthetic context is not a native account actor.
+            // Existing non-account providers do not consume this identity.
+            return Ok(json!({"kind":"unattributed"}));
+        }
+        let public = self
+            .operator_auth()
+            .public_snapshot_by_hash(hash, self.operator_now())
+            .is_some();
+        if public {
+            match self.current_session_for_hash(hash)? {
+                super::public_membership::Authority::Granted {
+                    sub, role, realm, ..
+                } if role.is_operator() => Ok(
+                    json!({"kind":"user","id":sub,"issuer":realm.issuer,"workspace_id":realm.company,"session":hash}),
+                ),
+                _ => Err(Error::rejected(
+                    "account image mounting session is not a live operator",
+                )),
+            }
+        } else {
+            let actor = json!({"kind":"operator","session":hash});
+            self.account_image_actor_live(&actor)?;
+            Ok(actor)
+        }
+    }
+
+    pub(super) fn account_image_actor_live(&self, actor: &Value) -> Result<()> {
+        if let Some(hash) = actor["session"].as_str() {
+            if !self.operator_auth().live_hash(hash, self.operator_now())? {
+                return Err(Error::rejected("account quote native session changed"));
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn account_image_owned(
+        actor: &Value,
+        source: &crate::platform::account_media::AccountSource,
+    ) -> bool {
+        actor["kind"] == "operator"
+            || (actor["kind"] == "user"
+                && actor["id"] == source.subject_id
+                && actor["issuer"] == source.issuer
+                && actor["workspace_id"] == source.organization_id)
+    }
+
+    pub(super) fn app_account_binding_owned(
+        &self,
+        actor: &Value,
+        proof: &BindingProof,
+    ) -> Result<()> {
+        if proof.config["provider"] == crate::platform::account_media::PLATFORM {
+            let source = serde_json::from_value(proof.config["account_source"].clone())
+                .map_err(|_| Error::rejected("account binding source identity is invalid"))?;
+            if !Self::account_image_owned(actor, &source) {
+                return Err(Error::rejected(
+                    "saved account does not belong to the proven native actor",
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn app_capability_caller(&self, pid: u32, verb: &str) -> Result<String> {
@@ -210,12 +617,44 @@ impl Shared {
     ) -> Result<Value> {
         match method {
             "app_binding_quote" => {
-                strict_fields(params, &["install_id", "context_id", "slot"])?;
+                strict_fields(
+                    params,
+                    &[
+                        "install_id",
+                        "context_id",
+                        "slot",
+                        "token",
+                        "key",
+                        "origin",
+                        "public_session",
+                    ],
+                )?;
                 self.operator_connection("app capability quote", params, pid)?;
                 let install = required_str(params, "install_id")?;
                 let slot = required_str(params, "slot")?;
                 let context = optional_str(params, "context_id");
+                let actor = self.account_image_actor(params)?;
                 let pm = self.pm_at(&self.pm_dir()?)?;
+                let (proof, request) =
+                    workspace::with_runtime_snapshot(&pm, install, |bundle, files| {
+                        let _custody = self
+                            .platform_custody_lock
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        let _release = self
+                            .app_release_lock
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        let proof = self
+                            .app_binding_auto_image(install, context, slot, &actor, bundle, files)?
+                            .ok_or_else(|| Error::rejected("capability binding is absent"))?;
+                        let request = self.prepare_app_capability_quote(&proof)?;
+                        Ok((proof, request))
+                    })?;
+                let quote = request.fetch()?;
+                if self.account_image_actor(params)? != actor {
+                    return Err(Error::rejected("capability quote native actor changed"));
+                }
                 workspace::with_runtime_snapshot(&pm, install, |bundle, files| {
                     let _custody = self
                         .platform_custody_lock
@@ -225,10 +664,12 @@ impl Shared {
                         .app_release_lock
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
-                    let proof = self
-                        .app_binding_live(install, context, slot, bundle, files)?
-                        .ok_or_else(|| Error::rejected("capability binding is absent"))?;
-                    let quote = self.app_capability_quote(&proof)?;
+                    self.account_image_actor_live(&actor)?;
+                    self.app_account_binding_owned(&actor, &proof)?;
+                    self.app_binding_receipt_current(
+                        install, context, slot, &proof, bundle, files,
+                    )?;
+                    self.recheck_app_capability_quote(&proof, &quote)?;
                     Ok(json!({"slot":slot,"binding_digest":proof.digest,
                         "quote":quote,"quote_digest":app_runs::material_digest(&json!(quote))}))
                 })
@@ -268,6 +709,28 @@ impl Shared {
                     .store
                     .app_message_installation(&msg.id)?
                     .ok_or_else(|| Error::rejected("capability app association is absent"))?;
+                let checked_run = self.store.app_run_show(&run_id)?;
+                // The next probe prices every frozen slot, not only the one
+                // the worker named. Lineage is offline and ignores non-account
+                // slots, so an unknown or mixed slot cannot skip it.
+                self.account_frozen_lineage(&checked_run)?;
+                self.probe_app_run_prices(&checked_run)?;
+                let quote = self
+                    .prepare_app_run_quotes(&checked_run)?
+                    .remove(&slot)
+                    .ok_or_else(|| Error::rejected("run capability quote is absent"))??
+                    .fetch()?;
+                if checked_run["snapshot"]["capabilities"][&slot]["config"]["provider"]
+                    == crate::platform::account_media::PLATFORM
+                {
+                    return self.execute_account_run_capability(
+                        &checked_run,
+                        &slot,
+                        &quote,
+                        (input, &request),
+                        Some((&alias, message, turn)),
+                    );
+                }
                 let pm = self.pm_at(&self.pm_dir()?)?;
                 workspace::with_runtime_snapshot(&pm, &install, |bundle, files| {
                     let _custody = self
@@ -290,12 +753,14 @@ impl Shared {
                     // CAD-1374: the sealed approving human bound at approval
                     // time. Null for a legacy approval (no human recorded).
                     let sealed_human = run["approval"]["human"].clone();
-                    let quote = self.app_capability_quote(&proof)?;
-                    if run["snapshot"]["quotes"][&slot] != json!(quote) {
+                    if run["snapshot_digest"] != checked_run["snapshot_digest"]
+                        || run["snapshot"]["quotes"][&slot] != json!(quote)
+                    {
                         return Err(Error::rejected(
                             "capability price changed since run approval",
                         ));
                     }
+                    self.recheck_app_capability_quote(&proof, &quote)?;
                     let config = &proof.config;
                     let provider = required_str(config, "provider")?;
                     let tool = required_str(&config["mapping"], "tool")?;
@@ -444,6 +909,7 @@ impl Shared {
                     let receipt_id = required_str(params, "receipt_id")?;
                     let receipt = self.store.app_capability_result(receipt_id)?;
                     let run = self.store.app_run_show(required_str(&receipt, "run_id")?)?;
+                    self.probe_app_run_prices(&run)?;
                     let pm = self.pm_at(&self.pm_dir()?)?;
                     return workspace::with_runtime_snapshot(
                         &pm,
