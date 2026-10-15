@@ -43,11 +43,13 @@ const mk = (id: string, name: string, title: string) => ({
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { "Content-Type": "application/json" } });
 let mode: "ok" | "fail" | "busy-once" = "ok";
 let operator: boolean | null = true;
+let metaUnavailable = false;
 let listCalls = 0;
 globalThis.fetch = (async (input: unknown) => {
   const path = String(input);
   const url = new URL(path, "http://localhost");
   if (url.pathname.endsWith("/stream")) return new Response(new ReadableStream(), { headers: { "Content-Type": "text/event-stream" } });
+  if (path.startsWith("/api/meta") && metaUnavailable) return json({ error: "Verification unavailable" }, 503);
   if (path.startsWith("/api/meta")) return json({ read_only: false, operator, signed_in: true, actor: "operator (ui)", session: { id: "sidebar-session", origin: "loopback", created: 1700000000, last_used: 1700000000, idle_expires_at: 4102444800, expires_at: 4102444800, user_agent: "test" } });
   if (path === "/api/issues" || path.startsWith("/api/issues?")) return json({ issues: [] });
   if (path === "/api/projects") return json({ projects: [] });
@@ -71,6 +73,7 @@ globalThis.fetch = (async (input: unknown) => {
   if (url.pathname.endsWith("/suppressions/list")) return json({ suppressions: [] });
   if (url.pathname.endsWith("/content/campaigns/list")) return json({ contents: [] });
   if (url.pathname.endsWith("/content/proposals/list")) return json({ proposals: [] });
+  if (url.pathname === "/api/wiki/ls") return json({ path: url.searchParams.get("path") ?? "", kind: "dir", entries: [] });
   if (url.pathname.startsWith("/api/settings") || url.pathname.startsWith("/api/connections")) return json({});
   throw new Error(`Unexpected read ${path}`);
 }) as typeof fetch;
@@ -163,6 +166,35 @@ await React.act(async () => { workspaceRetry.click(); });
 assert(reloads === 1, "mobile workspace retry performs the recovery reload");
 await React.act(async () => { root3.unmount(); });
 win.setTimeout = nativeTimeout;
+
+// Recovering the real Wiki route returns keyboard focus to the workspace,
+// even when it has no page heading or main landmark to receive it.
+operator = true;
+mode = "ok";
+metaUnavailable = true;
+history.replaceState(null, "", "/wiki/upload/global/guides");
+const root4 = createRoot(host2);
+await React.act(async () => { root4.render(React.createElement(App)); });
+await settle(() => assert(host2.querySelector('[data-auth-state="unavailable"]'), "initial verification is unavailable"));
+const initialVerificationRetry = Array.from(host2.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent?.trim() === "Retry verification");
+assert(initialVerificationRetry, "verification can be retried");
+metaUnavailable = false;
+await React.act(async () => { initialVerificationRetry.click(); });
+await settle(() => assert(host2.querySelector('[data-auth-state="ready"]'), "Wiki is admitted after retry"));
+const workspace = host2.querySelector<HTMLElement>("[data-app-shell]");
+assert(workspace?.contains(document.activeElement), "verification recovery returns keyboard focus to the admitted workspace");
+const chooser = Array.from(host2.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent?.trim() === "Choose files");
+assert(chooser, "the admitted Wiki offers file selection");
+chooser.focus();
+metaUnavailable = true;
+await React.act(async () => { win.dispatchEvent(new Event("focus")); });
+await settle(() => assert(host2.querySelector('[data-auth-state="unavailable"]'), "a later verification failure conceals Wiki"));
+const subsequentVerificationRetry = Array.from(host2.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent?.trim() === "Retry verification");
+assert(subsequentVerificationRetry, "the same session can be retried");
+metaUnavailable = false;
+await React.act(async () => { subsequentVerificationRetry.click(); });
+await settle(() => assert(document.activeElement === chooser, "same-session recovery restores the previously focused Wiki control"));
+await React.act(async () => { root4.unmount(); });
 console.log("sidebar busy checks passed");
 }
 void main();

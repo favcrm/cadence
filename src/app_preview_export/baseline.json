@@ -25,7 +25,7 @@
     },
     {
       "path": "ui/src/lib/api.ts",
-      "sha256": "50ba6548ecc510b02907de6d90d835842d7398e9efc9c886fdc9a6d520d8c363"
+      "sha256": "37816a64aecb00da4800bfdba51efd326108124be9ae79e1d5d369778e68416e"
     },
     {
       "path": "ui/src/lib/conditionalGet.ts",
@@ -33,7 +33,7 @@
     },
     {
       "path": "ui/src/lib/privateSession.ts",
-      "sha256": "6416106872baebbee2c736b3c32fdfdffe029366b1660ff9c070c427d213559e"
+      "sha256": "3d9a38fc95e71b0dd4fa0bfdbddde2c4bf8f056bd3dc1cfcad96bc89d377ab5b"
     },
     {
       "path": "ui/src/lib/sessionKey.ts",

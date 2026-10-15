@@ -237,7 +237,10 @@ export default function AuthBoundary({ children }: {
     if (state.status !== "ready" && state.status !== "checking") title.current?.focus();
     if (state.status === "ready" && (retryFocus.current || privateFocus.current)) {
       retryFocus.current = false;
-      const target = privateFocus.current?.isConnected ? privateFocus.current : document.querySelector<HTMLElement>("[data-app-shell] h1, [data-app-shell] main");
+      const target = privateFocus.current?.isConnected
+        ? privateFocus.current
+        : document.querySelector<HTMLElement>("[data-app-shell] h1, [data-app-shell] main")
+          ?? document.querySelector<HTMLElement>("[data-app-shell]");
       privateFocus.current = null;
       if (target) {
         if (!target.hasAttribute("tabindex") && !target.matches("button, input, textarea, select, a[href]")) target.tabIndex = -1;

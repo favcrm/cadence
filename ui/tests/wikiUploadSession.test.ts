@@ -20,19 +20,34 @@ function sameCount(actual: number, expected: number): boolean {
   return actual === expected;
 }
 
+function currentTransfer(name: string, previous: FakeXHR | undefined): FakeXHR {
+  const xhr = FakeXHR.sent.at(-1);
+  if (!xhr || xhr === previous || xhr.aborted || xhr.sentName !== name) {
+    throw new Error(`missing current transfer for ${name}`);
+  }
+  return xhr;
+}
+
 class FakeXHR {
   static sent: FakeXHR[] = [];
   status = 0;
   statusText = "";
   responseText = "";
   aborted = false;
+  sentName = "";
   onload: (() => void) | null = null;
   onerror: (() => void) | null = null;
   onabort: (() => void) | null = null;
   upload: { onprogress: ((event: ProgressEvent) => void) | null } = { onprogress: null };
   open(_method: string, _url: string): void {}
   setRequestHeader(_name: string, _value: string): void {}
-  send(_body: unknown): void { FakeXHR.sent.push(this); }
+  send(body: unknown): void {
+    if (typeof FormData !== "undefined" && body instanceof FormData) {
+      const file = body.get("file");
+      if (file instanceof File) this.sentName = file.name;
+    }
+    FakeXHR.sent.push(this);
+  }
   abort(): void {
     if (this.aborted) return;
     this.aborted = true;
@@ -67,11 +82,26 @@ function rowStates(host: HTMLElement): string[] {
 }
 
 async function main(): Promise<void> {
-  const { Window } = require<{ Window: new (options: { url: string }) => Window }>("happy-dom");
+  type DomConstructors = Pick<typeof globalThis, "Node" | "HTMLElement" | "HTMLInputElement" | "HTMLButtonElement" | "Event">;
+  const { Window } = require<{ Window: new (options: { url: string }) => Window & DomConstructors }>("happy-dom");
   const win = new Window({ url: "http://localhost/wiki" });
-  for (const name of ["window", "document", "navigator", "Node", "HTMLElement", "HTMLInputElement", "Event", "location", "history", "sessionStorage", "localStorage"] as const) {
-    Object.defineProperty(globalThis, name, { value: name === "window" ? win : win[name], configurable: true });
+  const constructors: DomConstructors = {
+    Node: win.Node,
+    HTMLElement: win.HTMLElement,
+    HTMLInputElement: win.HTMLInputElement,
+    HTMLButtonElement: win.HTMLButtonElement,
+    Event: win.Event,
+  };
+  for (const name of ["Node", "HTMLElement", "HTMLInputElement", "HTMLButtonElement", "Event"] as const) {
+    Object.defineProperty(globalThis, name, { value: constructors[name], configurable: true });
   }
+  Object.defineProperty(globalThis, "window", { value: win, configurable: true });
+  Object.defineProperty(globalThis, "document", { value: win.document, configurable: true });
+  Object.defineProperty(globalThis, "navigator", { value: win.navigator, configurable: true });
+  Object.defineProperty(globalThis, "location", { value: win.location, configurable: true });
+  Object.defineProperty(globalThis, "history", { value: win.history, configurable: true });
+  Object.defineProperty(globalThis, "sessionStorage", { value: win.sessionStorage, configurable: true });
+  Object.defineProperty(globalThis, "localStorage", { value: win.localStorage, configurable: true });
   for (const name of ["addEventListener", "removeEventListener"] as const)
     Object.defineProperty(globalThis, name, { value: win[name].bind(win), configurable: true });
   Object.defineProperty(globalThis, "XMLHttpRequest", { value: FakeXHR, configurable: true });
@@ -124,10 +154,10 @@ async function main(): Promise<void> {
 
   const host = document.createElement("div");
   document.body.appendChild(host);
-  let root: ReturnType<typeof createRoot> | undefined;
-  let resetRoot: ReturnType<typeof createRoot> | undefined;
+  const roots: { unmount: () => void }[] = [];
   try {
-  root = createRoot(host);
+  const root = createRoot(host);
+  roots.push(root);
   const toasts: string[] = [];
   let uploaded = 0;
   setSessionKey("admitted-tab-key");
@@ -147,9 +177,13 @@ async function main(): Promise<void> {
   assert(host.querySelector("[data-private-workspace='wiki']"), "verified metadata mounts the private upload workspace");
   assert(sessionKey() === "admitted-tab-key", "admission keeps the tab credential");
 
-  const input = host.querySelector('input[type="file"]');
-  if (!(input instanceof HTMLInputElement)) throw new Error("file input missing");
+  const mountedInput = (): HTMLInputElement => {
+    const input = host.querySelector('input[type="file"]');
+    if (!(input instanceof HTMLInputElement) || !input.isConnected) throw new Error("file input missing");
+    return input;
+  };
   const add = async (names: string[]) => {
+    const input = mountedInput();
     Object.defineProperty(input, "files", {
       configurable: true,
       value: fileList(names.map((name) => new File([name], name))),
@@ -178,29 +212,25 @@ async function main(): Promise<void> {
   assert(retry, "the held queue offers retry");
   await React.act(async () => { retry.click(); });
   assert(rowStates(host)[0] === "one.txt:uploading" && rowStates(host)[1] === "two.txt:queued", "retry uploads the abandoned file and holds the next");
-  const retried = FakeXHR.sent.at(-1);
-  if (!retried || retried === first) throw new Error("retry did not open a transfer");
+  const retried = currentTransfer("one.txt", first);
   await React.act(async () => { retried.respond(200, { extraction: { status: "indexed" } }); });
   assert(rowStates(host)[0] === "one.txt:done" && rowStates(host)[1] === "two.txt:uploading", "a live success advances to the next file");
   assert(sameCount(uploaded, 1), "a live success reports the upload");
-  const second = FakeXHR.sent.at(-1);
-  if (!second || second === retried) throw new Error("the second file did not start after success");
+  const second = currentTransfer("two.txt", retried);
   await React.act(async () => { second.respond(200, { extraction: { status: "skipped", reason: "binary" } }); });
   assert(JSON.stringify(rowStates(host)) === JSON.stringify(["one.txt:done", "two.txt:done"]), "the following file completes");
   assert(toasts.includes("two.txt was saved; text extraction skipped: binary"), "a live extraction warning still toasts");
 
   await React.act(async () => { pausePrivateReads(); });
   await React.act(async () => { allowPrivateReads(); });
-  const beforeFresh = FakeXHR.sent.length;
   await add(["fresh.txt"]);
   assert(!Array.from(host.querySelectorAll("button")).some((button) => button.textContent === "Retry uploads"), "a new selection after an empty pause starts without retry");
   assert(rowStates(host).includes("fresh.txt:uploading"), "a new selection after an empty pause uploads");
-  const fresh = FakeXHR.sent.at(-1);
-  if (!fresh || FakeXHR.sent.length === beforeFresh) throw new Error("fresh selection did not open a transfer");
+  const fresh = currentTransfer("fresh.txt", second);
   await React.act(async () => { fresh.respond(200, { extraction: { status: "indexed" } }); });
 
-  const beforeGap = FakeXHR.sent.length;
   await React.act(async () => {
+    const input = mountedInput();
     Object.defineProperty(input, "files", {
       configurable: true,
       value: fileList([new File(["batch-a"], "batch-a.txt"), new File(["batch-b"], "batch-b.txt")]),
@@ -208,39 +238,36 @@ async function main(): Promise<void> {
     input.dispatchEvent(new Event("change", { bubbles: true }));
     pausePrivateReads();
   });
-  assert(FakeXHR.sent.length === beforeGap, "a queued batch paused before the next transfer does not start");
+  const openedBeforePause = FakeXHR.sent.filter((xhr) => xhr.sentName === "batch-a.txt" || xhr.sentName === "batch-b.txt");
+  assert(openedBeforePause.every((xhr) => xhr.aborted), "pause aborts a transfer the selection already opened");
   assert(JSON.stringify(rowStates(host).slice(-2)) === JSON.stringify(["batch-a.txt:queued", "batch-b.txt:queued"]), "the paused batch stays queued");
+  const heldTransfer = FakeXHR.sent.at(-1);
   await React.act(async () => { allowPrivateReads(); });
   await flush();
-  assert(FakeXHR.sent.length === beforeGap, "re-admission does not start a batch paused before its transfer");
+  assert(FakeXHR.sent.at(-1) === heldTransfer, "resume does not open a new transfer");
   const gapRetry = Array.from(host.querySelectorAll("button")).find((button) => button.textContent === "Retry uploads");
   assert(gapRetry, "the paused batch offers retry");
   await React.act(async () => { gapRetry.click(); });
-  const gap = FakeXHR.sent.at(-1);
-  if (!gap) throw new Error("gap retry did not open a transfer");
+  const gap = currentTransfer("batch-a.txt", heldTransfer);
   await React.act(async () => { gap.respond(200, { extraction: { status: "indexed" } }); });
-  const gapNext = FakeXHR.sent.at(-1);
-  if (!gapNext || gapNext === gap) throw new Error("the second paused file did not start after retry");
+  const gapNext = currentTransfer("batch-b.txt", gap);
   await React.act(async () => { gapNext.respond(200, { extraction: { status: "indexed" } }); });
 
   await add(["forbidden.txt"]);
-  const forbidden = FakeXHR.sent.at(-1);
-  if (!forbidden) throw new Error("missing role refusal");
+  const forbidden = currentTransfer("forbidden.txt", gapNext);
   await React.act(async () => { forbidden.respond(403, { error: "operator only", check: "operator_only" }); });
   assert(host.querySelector("[data-auth-state='ready']") && host.querySelector("[data-private-workspace='wiki']"), "a role 403 leaves the admitted workspace mounted");
   assert(sessionKey() === "admitted-tab-key", "a role 403 keeps the tab credential");
   assert(rowStates(host).includes("forbidden.txt:error"), "the role refusal stays on that file");
 
   await add(["unrelated.txt"]);
-  const unrelated = FakeXHR.sent.at(-1);
-  if (!unrelated) throw new Error("missing unrelated refusal");
+  const unrelated = currentTransfer("unrelated.txt", forbidden);
   await React.act(async () => { unrelated.respond(401, { error: "not a session", code: "caller_identity" }); });
   assert(host.querySelector("[data-auth-state='ready']") && sessionKey() === "admitted-tab-key", "an unrelated 401 keeps the admitted view and key");
   assert(rowStates(host).includes("unrelated.txt:error"), "an unrelated 401 stays a file error");
 
   await add(["late.txt"]);
-  const late = FakeXHR.sent.at(-1);
-  if (!late) throw new Error("missing late transfer");
+  const late = currentTransfer("late.txt", unrelated);
   await React.act(async () => { setSessionKey("replacement-tab-key"); });
   await flush();
   assert(host.querySelector("[data-private-workspace='wiki']"), "the replacement session verifies a new private view");
@@ -252,8 +279,7 @@ async function main(): Promise<void> {
   assert(sessionKey() === "replacement-tab-key", "a late 401 does not clear the replacement credential");
 
   await add(["local.txt"]);
-  const local = FakeXHR.sent.at(-1);
-  if (!local) throw new Error("missing local refusal");
+  const local = currentTransfer("local.txt", late);
   await React.act(async () => { local.respond(401, { error: "sign in", code: "operator_session_required" }); });
   await flush();
   assert(host.querySelector("[data-auth-state='expired']"), "a current local session 401 ends the admitted view");
@@ -263,7 +289,8 @@ async function main(): Promise<void> {
   allowPrivateReads();
   const resetHost = document.createElement("div");
   document.body.appendChild(resetHost);
-  resetRoot = createRoot(resetHost);
+  const resetRoot = createRoot(resetHost);
+  roots.push(resetRoot);
   await React.act(async () => {
     resetRoot.render(React.createElement(LocaleProvider, null, React.createElement(UploadPane, {
       dir: "global/guides",
@@ -289,8 +316,7 @@ async function main(): Promise<void> {
   await flush();
   assert(host.querySelector("[data-private-workspace='wiki']") && sessionKey() === "hosted-tab-key", "a new key verifies the workspace again");
   await add(["hosted.txt"]);
-  const hosted = FakeXHR.sent.at(-1);
-  if (!hosted) throw new Error("missing hosted refusal");
+  const hosted = currentTransfer("hosted.txt", local);
   await React.act(async () => {
     hosted.respond(401, { ok: false, error: { code: "board_session_required", message: "sign in through your workspace" } });
   });
@@ -300,8 +326,7 @@ async function main(): Promise<void> {
 
   console.log("wiki upload session checks passed");
   } finally {
-    root?.unmount();
-    resetRoot?.unmount();
+    for (const owned of roots) owned.unmount();
     win.close();
     loader.prototype.require = originalRequire;
   }

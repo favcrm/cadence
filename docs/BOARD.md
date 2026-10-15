@@ -1187,6 +1187,12 @@ Cancellation uses baseline-compatible signal forwarding, not `AbortSignal.any`.
 Already-accepted server mutations are not rolled back by abandoning a client
 continuation.
 
+Chat and Wiki uploads abort the underlying transfer on pause. Wiki retains
+same-session queued files for explicit **Retry uploads**, never automatic
+replay after verification; an identity reset discards those files. Verification
+retry restores the previous live control's keyboard focus or returns focus to
+the admitted workspace.
+
 Private SSE uses authenticated fetch streaming rather than URL-carried tab
 keys. The server revalidates the live session every five seconds with a
 two-second validation deadline; thread polls add at most two seconds.

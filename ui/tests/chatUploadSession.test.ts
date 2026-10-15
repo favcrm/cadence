@@ -56,11 +56,26 @@ const receipt = {
 };
 
 async function main(): Promise<void> {
-  const { Window } = require<{ Window: new (options: { url: string }) => Window }>("happy-dom");
+  type DomConstructors = Pick<typeof globalThis, "Node" | "HTMLElement" | "HTMLInputElement" | "HTMLButtonElement" | "Event">;
+  const { Window } = require<{ Window: new (options: { url: string }) => Window & DomConstructors }>("happy-dom");
   const win = new Window({ url: "http://localhost/" });
-  for (const name of ["window", "document", "navigator", "Node", "HTMLElement", "HTMLInputElement", "Event", "location", "history", "sessionStorage", "localStorage"] as const) {
-    Object.defineProperty(globalThis, name, { value: name === "window" ? win : win[name], configurable: true });
+  const constructors: DomConstructors = {
+    Node: win.Node,
+    HTMLElement: win.HTMLElement,
+    HTMLInputElement: win.HTMLInputElement,
+    HTMLButtonElement: win.HTMLButtonElement,
+    Event: win.Event,
+  };
+  for (const name of ["Node", "HTMLElement", "HTMLInputElement", "HTMLButtonElement", "Event"] as const) {
+    Object.defineProperty(globalThis, name, { value: constructors[name], configurable: true });
   }
+  Object.defineProperty(globalThis, "window", { value: win, configurable: true });
+  Object.defineProperty(globalThis, "document", { value: win.document, configurable: true });
+  Object.defineProperty(globalThis, "navigator", { value: win.navigator, configurable: true });
+  Object.defineProperty(globalThis, "location", { value: win.location, configurable: true });
+  Object.defineProperty(globalThis, "history", { value: win.history, configurable: true });
+  Object.defineProperty(globalThis, "sessionStorage", { value: win.sessionStorage, configurable: true });
+  Object.defineProperty(globalThis, "localStorage", { value: win.localStorage, configurable: true });
   for (const name of ["addEventListener", "removeEventListener"] as const)
     Object.defineProperty(globalThis, name, { value: win[name].bind(win), configurable: true });
   Object.defineProperty(globalThis, "XMLHttpRequest", { value: FakeXHR, configurable: true });
@@ -128,9 +143,10 @@ async function main(): Promise<void> {
 
   const host = document.createElement("div");
   document.body.appendChild(host);
-  let root: ReturnType<typeof createRoot> | undefined;
+  const roots: { unmount: () => void }[] = [];
   try {
-  root = createRoot(host);
+  const root = createRoot(host);
+  roots.push(root);
   setSessionKey("admitted-tab-key");
   const flush = async () => { await React.act(async () => { await Promise.resolve(); }); };
   await React.act(async () => {
@@ -141,7 +157,7 @@ async function main(): Promise<void> {
   await flush();
   const upload = () => {
     const button = Array.from(host.querySelectorAll("button")).find((item) => item.textContent === "Upload notes");
-    assert(button, "the admitted workspace offers chat upload");
+    if (!(button instanceof HTMLButtonElement) || !button.isConnected) throw new Error("the admitted workspace offers chat upload");
     return React.act(async () => { button.click(); });
   };
   const output = () => host.querySelector("output")?.textContent ?? "";
@@ -182,7 +198,7 @@ async function main(): Promise<void> {
 
   await upload();
   const local = FakeXHR.sent.at(-1);
-  if (!local) throw new Error("missing local refusal");
+  if (!local || local === late || local.aborted) throw new Error("missing local refusal");
   await React.act(async () => { local.respond(401, { error: "a local board session is required", code: "operator_session_required" }); });
   await flush();
   assert(host.querySelector("[data-auth-state='expired']") && !host.querySelector("[data-private-workspace='chat']"), "a current local 401 removes the private view");
@@ -193,7 +209,7 @@ async function main(): Promise<void> {
   assert(host.querySelector("[data-private-workspace='chat']"), "a replacement key admits the workspace again");
   await upload();
   const hosted = FakeXHR.sent.at(-1);
-  if (!hosted) throw new Error("missing hosted refusal");
+  if (!hosted || hosted === local || hosted.aborted) throw new Error("missing hosted refusal");
   await React.act(async () => {
     hosted.respond(401, { ok: false, error: { code: "board_session_required", message: "sign in through your workspace" } });
   });
@@ -203,7 +219,7 @@ async function main(): Promise<void> {
 
   console.log("chat upload session checks passed");
   } finally {
-    root?.unmount();
+    for (const owned of roots) owned.unmount();
     win.close();
     loader.prototype.require = originalRequire;
   }
