@@ -24,6 +24,7 @@ fn fixture() -> (tempfile::TempDir, RemoteTarget, Credential, PendingRenewal) {
     let root = tempfile::tempdir().unwrap();
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let target = RemoteTarget {
+        identity: None,
         org: ORG.into(),
         endpoint: "https://acme.cadencecloud.app".into(),
         org_id: ORG_ID.into(),

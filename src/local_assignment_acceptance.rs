@@ -488,10 +488,15 @@ fn checkout(root: &Path) {
 }
 
 fn open(script: &Script, ledger: &Path) -> Coordinator<Script> {
-    let mut coord = Coordinator::new(script.clone(), ORG.to_string(), ledger.to_path_buf())
-        .expect("coordinator");
-    coord.set_subject(ME);
-    coord
+    Coordinator::open(
+        script.clone(),
+        ORG.to_string(),
+        ledger.to_path_buf(),
+        Some(ME.to_string()),
+        Some(ENDPOINT.to_string()),
+        ENDPOINT.to_string(),
+    )
+    .expect("coordinator")
 }
 
 fn deliver_to(state: PathBuf) -> impl FnMut(&Kickoff) -> Result<Value> {

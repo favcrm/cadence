@@ -109,9 +109,10 @@ login. Two consequences:
   daemon shows exactly one running message whose immutable kickoff binding
   names that org and records an original member and issuer; the endpoint
   and organization id come from the binding, and the saved login must still
-  name that same member and issuer. Audience, scope, and renewal checks
-  then run unchanged. A binding without those pins is not eligible. A
-  different org, no binding, queued, terminal, or unresolved
+  name that same member and issuer on every credential load, including a
+  post-resolution reload or renewal. Audience, scope, and renewal checks
+  otherwise run unchanged. A binding without both original pins is not
+  eligible. A different org, no binding, queued, terminal, or unresolved
   work, more than one running message, and an explicit `--state-dir` or
   tracker pin stay refused. `org switch` stays refused.
 - I5: Login never changes an existing default org without `--use`; a second
@@ -149,7 +150,13 @@ Refused remotely (default-deny): every operator-only daemon verb
 `issue start`/`dispatch` are not container verbs. On a selected remote org
 they coordinate this user's local agent through
 `/__platform/hosted-cadence/:organizationId/local-assignments`
-(`hosted-cadence-local-assignment.v1`). When the local actor finishes, `cadence message result` reports the claim stored with that message, not a newer reclaim, and does not take `--org`. While that message is the alias's single running assignment, hosted ticket, wiki, and tool commands pass the binding's `--org` only when the saved login is still the member and issuer captured at claim time. A later login is not adopted. A managed worker is not instructed to `org switch` or to unset `CADENCE_ALIAS`. A worktree alone is not execution.
+(`hosted-cadence-local-assignment.v1`). Local completion, including
+`cadence message result`, keeps the claim stored with that message, not a
+newer reclaim, and does not take `--org`. While that message is the alias's
+single running assignment, hosted ticket, wiki, and tool commands pass the
+binding's `--org` under its original member and issuer. A later login is not
+adopted. A managed worker is not instructed to `org switch` or to unset
+`CADENCE_ALIAS`. A worktree alone is not execution.
 Operator-only verbs need the remote operator proof tied to CAD-657's
 source-authority decision — out of scope for v1.
 
@@ -164,6 +171,20 @@ actors nor cancels their claims. Each assignment generation has a separate
 worktree, and reconnect reuses its reserved actor message rather than starting
 the issue twice. A blocked claim resumes before handoff, so a fast result is
 never overwritten by a later `running` report.
+
+Completion is local-first: the durable message result is committed before
+the background reporter contacts the board. A held or unavailable report
+does not block actor completion, local pickup, daemon readiness or shutdown.
+The next daemon startup recovers a terminal result even if it finished before
+the pending-report record was written, and delivers its original claim.
+An unknown outcome is not converted into a success or failure. A fenced
+claim stops retrying without being recorded as an accepted result.
+
+The complete provider result remains in the local message. Automatic hosted
+summaries fit both 4,000 Unicode codepoints and 8,192 bytes for the complete
+pretty-serialized JSON request, retaining the reported revision when present.
+An oversized manual report is refused before HTTP. Neither path invents a
+Git revision when the local result did not report one.
 
 ## Auth chain
 

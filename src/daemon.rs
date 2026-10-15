@@ -6425,8 +6425,8 @@ mod tests {
                 generation: 1,
                 organization_id: "ws_hosted_fail_probe",
                 audience: "https://hosted-completion-regression.invalid",
-                subject_id: None,
-                issuer: None,
+                subject_id: Some("user_member"),
+                issuer: Some("https://hosted-completion-regression.invalid"),
             },
             "Synthetic terminal failure",
         )

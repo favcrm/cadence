@@ -382,6 +382,7 @@ fn cad1459_native_host_and_worker_refuse_frozen_lineage_before_network() {
     )
     .unwrap();
     let target = RemoteTarget {
+        identity: None,
         org: "lc".into(),
         endpoint: BOARD.into(),
         org_id: WORKSPACE.into(),

@@ -174,6 +174,7 @@ fn write_private(path: &Path, bytes: &[u8]) {
 
 fn target(_issuer: &str) -> RemoteTarget {
     RemoteTarget {
+        identity: None,
         org: ORG.into(),
         endpoint: BOARD_AUDIENCE.into(),
         org_id: ORG_ID.into(),

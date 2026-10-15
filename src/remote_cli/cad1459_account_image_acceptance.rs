@@ -411,6 +411,7 @@ fn selected_normal_login_freezes_image_authority() {
     save_login(&dir, &baseline);
     select(&root, ORG);
     let target = RemoteTarget {
+        identity: None,
         org: ORG.into(),
         endpoint: BOARD.into(),
         org_id: WORKSPACE.into(),

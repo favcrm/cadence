@@ -44,11 +44,11 @@ fn pinned_issuer(value: &str) -> bool {
         && !value.contains('\\')
 }
 
-/// Both pins, or neither. A single side is not stored and is not invented.
-fn pinned_member(kickoff: &Kickoff) -> Option<(String, String)> {
+/// Original identity only. Missing or malformed pins never become authority.
+fn pinned_member<'a>(kickoff: &Kickoff<'a>) -> Option<(&'a str, &'a str)> {
     match (kickoff.subject_id, kickoff.issuer) {
         (Some(subject), Some(issuer)) if hosted_id(subject) && pinned_issuer(issuer) => {
-            Some((subject.to_string(), issuer.to_string()))
+            Some((subject, issuer))
         }
         _ => None,
     }
@@ -159,15 +159,17 @@ fn create_kickoff_file(path: &Path, binding: &KickoffFile) -> Result<bool> {
 }
 
 fn kickoff_matches(file: &KickoffFile, kickoff: &Kickoff) -> bool {
-    let pinned = pinned_member(kickoff);
+    let Some((subject_id, issuer)) = pinned_member(kickoff) else {
+        return false;
+    };
     file.version == 1
         && file.message_id == kickoff.message_id
         && file.assignment_id == kickoff.assignment_id
         && file.claim_id == kickoff.claim_id
         && file.generation == kickoff.generation
         && file.organization_id == kickoff.organization_id
-        && file.subject_id.as_deref() == pinned.as_ref().map(|(subject, _)| subject.as_str())
-        && file.issuer.as_deref() == pinned.as_ref().map(|(_, issuer)| issuer.as_str())
+        && file.subject_id.as_deref() == Some(subject_id)
+        && file.issuer.as_deref() == Some(issuer)
 }
 
 /// Text already bound to this kickoff id, if a previous attempt stored it.
@@ -260,14 +262,13 @@ pub fn store_kickoff_binding(
             "hosted kickoff binding was refused; the actor was not messaged",
         ));
     }
+    let (subject_id, issuer) = pinned_member(kickoff).ok_or_else(|| {
+        Error::rejected("hosted kickoff has no original member and issuer; nothing was delivered")
+    })?;
     let path = binding_path(state_dir, kickoff.message_id)?;
     if let Some(existing) = read_kickoff_file(&path)? {
         return same_binding(&existing, kickoff, text);
     }
-    let (subject_id, issuer) = match pinned_member(kickoff) {
-        Some((subject_id, issuer)) => (Some(subject_id), Some(issuer)),
-        None => (None, None),
-    };
     let created = create_kickoff_file(
         &path,
         &KickoffFile {
@@ -286,8 +287,8 @@ pub fn store_kickoff_binding(
             pending_head: None,
             reported_state: None,
             settled: false,
-            subject_id,
-            issuer,
+            subject_id: Some(subject_id.to_string()),
+            issuer: Some(issuer.to_string()),
         },
     )?;
     if created {
@@ -598,32 +599,27 @@ fn prepare_pending(path: &Path, store: &crate::store::Store, message_id: &str) -
 }
 
 fn post_report(prepared: &Prepared, deadline: Instant) -> Result<ReportAck> {
+    let (Some(subject_id), Some(issuer)) =
+        (prepared.subject_id.as_deref(), prepared.issuer.as_deref())
+    else {
+        return Err(Error::rejected(
+            "hosted kickoff binding has no original member and issuer; nothing was sent",
+        ));
+    };
+    if !hosted_id(subject_id) || !pinned_issuer(issuer) {
+        return Err(Error::rejected(
+            "hosted kickoff identity is invalid; nothing was sent",
+        ));
+    }
     let target = RemoteTarget {
+        identity: Some(remote_cli::CliIdentityPin {
+            subject_id: subject_id.to_string(),
+            issuer: issuer.to_string(),
+        }),
         org: prepared.org.clone(),
         endpoint: prepared.endpoint.clone(),
         org_id: prepared.organization_id.clone(),
     };
-    match (prepared.subject_id.as_deref(), prepared.issuer.as_deref()) {
-        (None, None) => {}
-        (Some(subject), Some(issuer)) if hosted_id(subject) && pinned_issuer(issuer) => {
-            let dir = crate::remote_auth::auth_dir(None).map_err(|_| {
-                Error::rejected(
-                    "remote credential directory is unavailable — set HOME or XDG_CONFIG_HOME",
-                )
-            })?;
-            let material = remote_cli::cli_material_until(&dir, &target, deadline)?;
-            if !remote_cli::login_names_member(&material, subject, issuer) {
-                return Err(Error::rejected(
-                    "saved login changed member or issuer; this report kept the original identity and sent nothing",
-                ));
-            }
-        }
-        _ => {
-            return Err(Error::rejected(
-                "hosted kickoff binding has no original member; nothing was sent",
-            ));
-        }
-    }
     let mut http = BoardHttp::open_until(&target, deadline)?;
     let path = format!(
         "{}/{}/report",
@@ -748,8 +744,8 @@ mod tests {
             generation: 3,
             organization_id: "ws_report_driver",
             audience: "https://hosted-report.invalid",
-            subject_id: None,
-            issuer: None,
+            subject_id: Some("user_member"),
+            issuer: Some("https://hosted-report.invalid"),
         }
     }
 
@@ -788,6 +784,34 @@ mod tests {
     fn file(dir: &Path, message: &str) -> Value {
         let bytes = fs::read(binding_path(dir, message).unwrap()).unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[test]
+    fn kickoff_without_original_identity_is_not_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        for (subject, issuer) in [
+            (None, None),
+            (Some("user_member"), None),
+            (None, Some("https://hosted-report.invalid")),
+            (
+                Some("invalid/subject"),
+                Some("https://hosted-report.invalid"),
+            ),
+            (Some("user_member"), Some("invalid\nissuer")),
+        ] {
+            let mut binding = kickoff("missing-1", "hlc_00000000000000000000000000000001");
+            binding.subject_id = subject;
+            binding.issuer = issuer;
+            assert!(store_kickoff_binding(
+                dir.path(),
+                "acme",
+                "https://hosted-report.invalid",
+                &binding,
+                "do the work",
+            )
+            .is_err());
+            assert!(!binding_path(dir.path(), "missing-1").unwrap().exists());
+        }
     }
 
     #[test]
@@ -935,6 +959,8 @@ mod tests {
             pending_state: "result".to_string(),
             pending_head: Some(SHA.to_string()),
             body: json!({}),
+            subject_id: Some("user_member".to_string()),
+            issuer: Some("https://hosted-report.invalid".to_string()),
         };
         let receipt = |sha: Value, state: &str| {
             json!({

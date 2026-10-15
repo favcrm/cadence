@@ -545,11 +545,9 @@ fn native_chain_private_client() {
     }
     let issuer = format!("https://issuer.board.localhost:{}", input.port);
     assert!(fs::read(owner.join("trusted-issuer")).unwrap() == issuer.as_bytes());
-    let target = RemoteTarget {
-        org: SLUG.into(),
-        org_id: WORKSPACE.into(),
-        endpoint: BOARD.into(),
-    };
+    let target = RemoteTarget { identity: None, org: SLUG.into(),
+    org_id: WORKSPACE.into(),
+    endpoint: BOARD.into(), };
     let stored = load_credential(owner, &target).unwrap();
     assert!(stored.issuer.as_deref() == Some(issuer.as_str()));
     let _trust = test_fixture::install(Fixture {
@@ -747,11 +745,9 @@ fn native_chain_automatic_renewal_and_real_wiki_mutation() {
     assert!(ready.issuer == issuer && ready.audience == BOARD);
     assert!(ready.owner["principal"]["subject_id"] == ready.owner_id);
     assert!(ready.member["principal"]["subject_id"] == ready.member_id);
-    let target = RemoteTarget {
-        org: SLUG.into(),
-        org_id: WORKSPACE.into(),
-        endpoint: BOARD.into(),
-    };
+    let target = RemoteTarget { identity: None, org: SLUG.into(),
+    org_id: WORKSPACE.into(),
+    endpoint: BOARD.into(), };
     let owner_dir = root.path().join("owner");
     let member_dir = root.path().join("member");
     let grant = crate::remote_enrollment::login_grant_for_test(&ready.owner, &issuer).unwrap();

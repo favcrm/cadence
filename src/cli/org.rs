@@ -282,6 +282,7 @@ fn view(c: &Connection, selected: bool) -> Value {
         Destination::Local { .. } => ("local_peer_authority", None),
         Destination::Remote { endpoint, org_id } => {
             let target = cadence_agent::remote_cli::RemoteTarget {
+                identity: None,
                 org: c.selection.org.clone(),
                 endpoint: endpoint.clone(),
                 org_id: org_id.clone(),
@@ -546,6 +547,10 @@ fn hosted_assignment_target(
         return Err(managed_org_refused());
     }
     let target = cadence_agent::remote_cli::RemoteTarget {
+        identity: Some(cadence_agent::remote_cli::CliIdentityPin {
+            subject_id: bound.subject_id,
+            issuer: bound.issuer,
+        }),
         org: bound.org,
         endpoint: bound.endpoint,
         org_id: bound.organization_id,
@@ -553,12 +558,7 @@ fn hosted_assignment_target(
     let dir = cadence_agent::remote_auth::auth_dir(None).map_err(|_| {
         Error::rejected("remote credential directory is unavailable — set HOME or XDG_CONFIG_HOME")
     })?;
-    let material = cadence_agent::remote_cli::cli_material(&dir, &target)?;
-    if !cadence_agent::remote_cli::login_names_member(&material, &bound.subject_id, &bound.issuer) {
-        return Err(Error::rejected(
-            "saved login does not match the member who claimed this assignment; nothing was sent",
-        ));
-    }
+    cadence_agent::remote_cli::cli_material(&dir, &target)?;
     Ok(target)
 }
 
@@ -668,6 +668,7 @@ pub(super) fn resolve(
             // anywhere else, and there is no local fallback.
             eprintln!("cadence org={} remote={}", conn.selection.org, endpoint);
             Ok(Resolved::Remote(cadence_agent::remote_cli::RemoteTarget {
+                identity: None,
                 org: conn.selection.org,
                 endpoint,
                 org_id,
@@ -1301,10 +1302,5 @@ mod tests {
         let err = resolve(Some("acme"), None, None).unwrap_err();
         server.join().unwrap();
         assert_eq!(err.kind(), "rejected", "{err}");
-        assert!(err.to_string().contains("member who claimed"), "{err}");
-        assert!(
-            !err.to_string().to_ascii_lowercase().contains("unset"),
-            "{err}"
-        );
     }
 }

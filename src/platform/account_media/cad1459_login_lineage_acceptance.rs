@@ -184,6 +184,7 @@ fn ordinary_relogin_keeps_connection_but_refuses_old_quoted_session() {
     let login_path = dir.join(format!("cli-{ORG}.json"));
     private_write(&login_path, &serde_json::to_vec(&login).unwrap());
     let target = RemoteTarget {
+        identity: None,
         org: ORG.into(),
         endpoint: BOARD.into(),
         org_id: WORKSPACE.into(),

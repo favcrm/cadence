@@ -107,6 +107,7 @@ fn install_tls(
 /// issuer-echoed grant (`LoginGrant`), never from a caller literal.
 fn target_from_grant(grant: &LoginGrant, slug: &str) -> RemoteTarget {
     RemoteTarget {
+        identity: None,
         org: slug.to_string(),
         endpoint: grant.endpoint.clone(),
         org_id: grant.organization_id.clone(),
