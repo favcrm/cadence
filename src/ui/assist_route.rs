@@ -67,16 +67,6 @@ fn status_of(code: &str) -> u16 {
     }
 }
 
-/// The rollout gate (CON-002): `HOSTED_CADENCE_ASSISTANT_ENABLED` must be
-/// exactly `true` — the platform injects it into the container env only
-/// when the feature is enabled, so absent/false/unknown is OFF here too
-/// and a stale envelope or cached service bearer meets a refusal before
-/// any verification, mint-forward or daemon effect. Read fresh per call:
-/// the daemon env is the same config the platform set at wake.
-pub(super) fn assistant_enabled() -> bool {
-    std::env::var("HOSTED_CADENCE_ASSISTANT_ENABLED").as_deref() == Ok("true")
-}
-
 /// POST body → bounded JSON object; identity fields are refused outright —
 /// a request field can never name the member, the assistant or authority.
 fn read_args(request: &mut Request) -> std::result::Result<Value, HttpResp> {
@@ -175,15 +165,6 @@ pub(super) fn post(
 ) -> HttpResp {
     if *method != Method::Post {
         return assist_fail(405, "invalid_request", "assist calls are POST");
-    }
-    // The rollout gate is the FIRST refusal: disabled means no verify, no
-    // jti consume, no daemon relay — an old envelope can never bypass it.
-    if !assistant_enabled() {
-        return assist_fail(
-            503,
-            "capability_unavailable",
-            "member assistant integration is not enabled",
-        );
     }
     if tail.is_empty() || tail.contains('/') {
         return assist_fail(404, "not_found", "no such assist route");

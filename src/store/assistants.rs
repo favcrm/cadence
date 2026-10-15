@@ -45,6 +45,11 @@ pub struct AssistantBinding {
     pub authority_rev: Option<String>,
     pub created: f64,
     pub updated: f64,
+    /// `pending` | `complete` | `skipped` | `deferred` (CAD-1420).
+    pub bootstrap_state: String,
+    pub bootstrap_template_version: i64,
+    /// Compare-and-set counter: every accepted bootstrap write bumps it.
+    pub bootstrap_revision: i64,
 }
 
 /// The pin prefix of a stored `assist_requests.authority_rev` —
@@ -80,6 +85,9 @@ fn row_binding(row: &rusqlite::Row) -> rusqlite::Result<AssistantBinding> {
         authority_rev: row.get("authority_rev")?,
         created: row.get("created")?,
         updated: row.get("updated")?,
+        bootstrap_state: row.get("bootstrap_state")?,
+        bootstrap_template_version: row.get("bootstrap_template_version")?,
+        bootstrap_revision: row.get("bootstrap_revision")?,
     })
 }
 
@@ -116,6 +124,9 @@ impl AssistantBinding {
             "authority_rev": self.authority_rev,
             "created": self.created,
             "updated": self.updated,
+            "bootstrap_state": self.bootstrap_state,
+            "bootstrap_template_version": self.bootstrap_template_version,
+            "bootstrap_revision": self.bootstrap_revision,
         })
     }
 }
@@ -262,6 +273,148 @@ impl Store {
                 row_binding,
             )?;
             Ok(binding)
+        })
+    }
+
+    /// CAD-1420: apply one bootstrap lifecycle transition as a compare-and-set
+    /// inside one fenced write. Every guard reads the rows INSIDE the same
+    /// transaction: the message still `running` under `turn_token` for this
+    /// alias, its immutable member stamp equal to `expect` (org, sub,
+    /// assistant, original credential), the generation-current agent, the
+    /// binding active for the same tuple, and `bootstrap_revision` equal to
+    /// `expected_revision`. Only then does `apply_files` run (local profile
+    /// files, no network), and only after it succeeds is the state written.
+    /// Unknown actions or states refuse before any effect. Any refusal writes
+    /// nothing and returns the error unchanged.
+    pub fn assistant_bootstrap_apply(
+        &self,
+        expect: &AssistDispatchExpect,
+        message_id: &str,
+        turn_token: &str,
+        action: &str,
+        expected_revision: i64,
+        apply_files: impl FnOnce() -> Result<()>,
+    ) -> Result<AssistantBinding> {
+        let now = crate::issue::time::now_epoch() as f64;
+        self.write_tx(|tx| {
+            let refused = |why: &str| Error::rejected(format!("bootstrap refused: {why}"));
+            let (state, msg_alias, turn): (String, String, Option<String>) = tx
+                .query_row(
+                    "SELECT state, alias, turn_id FROM messages WHERE id=?",
+                    [message_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .map_err(|_| refused("the message is unknown"))?;
+            if state != "running"
+                || turn.as_deref() != Some(turn_token)
+                || msg_alias != expect.alias
+            {
+                return Err(refused("the message is no longer the running turn"));
+            }
+            let stamp: (String, String, String, String) = tx
+                .query_row(
+                    "SELECT e.payload FROM thread_entries e \
+                     JOIN threads t ON t.id=e.thread_id \
+                     JOIN messages m ON m.id=e.message_id AND m.alias=t.alias \
+                     WHERE e.message_id=? AND e.role='member' AND e.kind='message' \
+                     ORDER BY e.seq LIMIT 1",
+                    [message_id],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .ok()
+                .flatten()
+                .and_then(|p| serde_json::from_str::<Value>(&p).ok())
+                .and_then(|v| v.get("member_authority").cloned())
+                .and_then(|a| {
+                    let f = |k: &str| a.get(k).and_then(Value::as_str).map(str::to_string);
+                    Some((
+                        f("org")?,
+                        f("sub")?,
+                        f("assistant_id")?,
+                        f("credential_id")?,
+                    ))
+                })
+                .ok_or_else(|| refused("the message has no immutable member stamp"))?;
+            if stamp.0 != expect.org
+                || stamp.1 != expect.sub
+                || stamp.2 != expect.assistant_id
+                || Some(stamp.3.as_str()) != expect.credential_id.as_deref()
+            {
+                return Err(refused("the member stamp does not match this assistant"));
+            }
+            // The live runtime row, read in this same fenced transaction: the
+            // token must still be current for the endpoint's own provider,
+            // kind and generation, so a restarted or re-minted endpoint
+            // refuses before any profile effect.
+            let (provider, kind, generation): (String, String, Option<String>) = tx
+                .query_row(
+                    "SELECT provider, endpoint_kind, generation FROM agents WHERE alias=?",
+                    [&expect.alias],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .map_err(|_| refused("the assistant runtime is not registered"))?;
+            if !crate::adapter::registry::turn_token_current(
+                &provider,
+                &kind,
+                generation.as_deref(),
+                turn_token,
+            ) {
+                return Err(refused("the turn token is not current for this endpoint"));
+            }
+            let binding = tx
+                .query_opt(
+                    "SELECT * FROM assistants WHERE org=? AND sub=?",
+                    params![expect.org, expect.sub],
+                    row_binding,
+                )?
+                .ok_or_else(|| refused("no assistant binding"))?;
+            if !binding.is_active()
+                || binding.assistant_id != expect.assistant_id
+                || binding.alias != expect.alias
+            {
+                return Err(refused("the assistant binding changed or is not active"));
+            }
+            if binding.bootstrap_revision != expected_revision {
+                return Err(refused(&format!(
+                    "stale revision (stored {}, expected {expected_revision})",
+                    binding.bootstrap_revision
+                )));
+            }
+            if !matches!(
+                binding.bootstrap_state.as_str(),
+                "pending" | "complete" | "skipped" | "deferred"
+            ) || binding.bootstrap_template_version != 1
+            {
+                return Err(refused("the stored bootstrap state is unknown"));
+            }
+            let next_state = match (action, binding.bootstrap_state.as_str()) {
+                ("update", state) => state,
+                ("complete", "pending") => "complete",
+                ("skip", "pending") => "skipped",
+                ("defer", "pending") => "deferred",
+                ("resume", "deferred") => "pending",
+                _ => {
+                    return Err(refused(&format!(
+                        "'{action}' is not allowed from state '{}'",
+                        binding.bootstrap_state
+                    )))
+                }
+            }
+            .to_string();
+            // Local profile files only; a failure here leaves state untouched.
+            apply_files()?;
+            tx.execute(
+                "UPDATE assistants SET bootstrap_state=?, \
+                 bootstrap_revision=bootstrap_revision+1, updated=? \
+                 WHERE org=? AND sub=? AND bootstrap_revision=?",
+                params![next_state, now, expect.org, expect.sub, expected_revision],
+            )?;
+            tx.query_row(
+                "SELECT * FROM assistants WHERE org=? AND sub=?",
+                params![expect.org, expect.sub],
+                row_binding,
+            )
+            .map_err(Into::into)
         })
     }
 

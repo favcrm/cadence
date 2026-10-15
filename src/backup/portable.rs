@@ -396,6 +396,9 @@ const CATALOG: &[(&str, &[&str])] = &[
             "authority_rev",
             "created",
             "updated",
+            "bootstrap_state",
+            "bootstrap_template_version",
+            "bootstrap_revision",
         ],
     ),
     (

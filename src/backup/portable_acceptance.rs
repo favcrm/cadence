@@ -472,6 +472,41 @@ fn cad1163_acc_export_refuses_unknown_core_authority_column() {
     );
 }
 
+/// CAD-1420: the current 47-schema `assistants` table is in the known catalog
+/// (positive control, unmodified store exports), and one forged extra column
+/// on that table refuses with the exact catalog error and writes nothing.
+#[test]
+fn cad1420_acc_export_refuses_unknown_assistants_column() {
+    let root = root("unknown-assistants-column");
+    let tracker = make_tracker(&root);
+    let state = make_state(&root, false);
+    let out = root.join("package-control");
+    export_portable(&state, &out, &opts(&tracker))
+        .expect("current 47 assistants catalog is supported");
+    fs::remove_dir_all(&out).unwrap();
+    {
+        let conn = Connection::open(db_file(&state)).unwrap();
+        conn.execute("ALTER TABLE assistants ADD COLUMN forged_grant TEXT", [])
+            .unwrap();
+    }
+    let out = root.join("package");
+    let err = export_portable(&state, &out, &opts(&tracker))
+        .expect_err("unknown assistants column refuses");
+    assert_eq!(
+        err.to_string(),
+        "portable export refuses: table assistants columns do not match the known catalog"
+    );
+    assert!(
+        !out.exists() && no_partial(&out),
+        "no output or staging written"
+    );
+    assert_eq!(
+        git(&tracker, &["status", "--porcelain=v1"]),
+        "",
+        "tracker untouched"
+    );
+}
+
 #[test]
 fn cad1163_acc_export_refuses_unknown_app_table_with_rows() {
     let root = root("unknown-app");

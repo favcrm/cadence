@@ -1,5 +1,6 @@
 //! CAD-534: `cadence daemon` messages RPC handlers — moved verbatim from src/daemon.rs.
 
+use super::bootstrap_files;
 use super::*;
 
 use crate::adapter::InterruptOutcome;
@@ -1246,6 +1247,13 @@ impl Shared {
         reject_identity_fields(params, "message report")?;
         let kind = required_str(params, "kind")?;
         let text = optional_str(params, "text");
+        // CAD-1420: a bootstrap object is an ACK-only field; the caller is
+        // derived from the connection, never from the request.
+        if params.get("bootstrap").is_some() && kind != "ack" {
+            return Err(Error::rejected(
+                "bootstrap is accepted only on a message ack",
+            ));
+        }
         let (id, token) = self.report_target(params, peer_pid)?;
         let mut message = self
             .store
@@ -1335,6 +1343,25 @@ impl Shared {
             return Ok(json!({"state": message.state, "task": message.task_id,
                              "issue": issue, "result_text": result_text}));
         }
+        // CAD-1420: a bootstrap ACK validates and applies BEFORE any activity
+        // bump, so a refused profile mutation changes neither activity nor the
+        // ack. An ordinary ACK (no `bootstrap`) takes the unchanged path below.
+        if kind == "ack" {
+            if let Some(bootstrap) = params.get("bootstrap") {
+                let AgentCaller::Agent(alias) = self.agent_caller(peer_pid, "bootstrap ack")?
+                else {
+                    return Err(Error::rejected(
+                        "bootstrap ack refused: it needs the assistant's own connection",
+                    ));
+                };
+                if alias != message.alias {
+                    return Err(Error::rejected(
+                        "bootstrap ack refused: the connection is not the message's assistant",
+                    ));
+                }
+                self.bootstrap_ack(&message, &token, bootstrap)?;
+            }
+        }
         // A valid ack/result report is explicit agent activity — it
         // feeds the stall clock for every endpoint kind.
         self.bump_activity(&message.alias);
@@ -1421,6 +1448,88 @@ impl Shared {
         }
         self.wake();
         Ok(json!({"state": "reported", "kind": kind}))
+    }
+
+    /// CAD-1420: apply the closed bootstrap object on a stamped assistant ACK.
+    /// Validation and the HTTP-capable reprove run BEFORE any SQLite lock. The
+    /// store then re-checks message/turn/stamp/binding/revision in one fenced
+    /// transaction and only then runs the local profile-file effect. Any
+    /// refusal changes neither profile files nor lifecycle state.
+    fn bootstrap_ack(
+        self: &Arc<Self>,
+        message: &store::Message,
+        token: &str,
+        bootstrap: &Value,
+    ) -> Result<()> {
+        let object = bootstrap
+            .as_object()
+            .ok_or_else(|| Error::rejected("bootstrap must be a JSON object"))?;
+        const FIELDS: [&str; 3] = ["action", "expected_revision", "profile"];
+        if let Some(field) = object.keys().find(|k| !FIELDS.contains(&k.as_str())) {
+            return Err(Error::rejected(format!(
+                "bootstrap refused: field '{field}' is not accepted"
+            )));
+        }
+        let action = required_str(bootstrap, "action")?;
+        if !matches!(action, "update" | "complete" | "skip" | "defer" | "resume") {
+            return Err(Error::rejected("bootstrap action is not recognized"));
+        }
+        let expected_revision = bootstrap
+            .get("expected_revision")
+            .and_then(Value::as_i64)
+            .filter(|r| *r >= 0)
+            .ok_or_else(|| Error::rejected("bootstrap needs a nonnegative expected_revision"))?;
+        let profile = match bootstrap.get("profile") {
+            None => None,
+            Some(value) => Some(bootstrap_files::Profile::parse(
+                value
+                    .as_object()
+                    .ok_or_else(|| Error::rejected("bootstrap profile must be an object"))?,
+            )?),
+        };
+        let stamp = self
+            .store
+            .message_member_authority(&message.id)?
+            .ok_or_else(|| {
+                Error::rejected("bootstrap refused: the message has no member authority")
+            })?;
+        if message.source == "assist_job_event" {
+            return Err(Error::rejected(
+                "bootstrap refused: a job notice cannot update the assistant profile",
+            ));
+        }
+        // HTTP-capable revalidation of the ORIGINAL queued credential, outside
+        // every SQLite lock.
+        self.member_message_reprove(message)?;
+        let expect = store::AssistDispatchExpect {
+            org: stamp.org.clone(),
+            sub: stamp.sub.clone(),
+            assistant_id: stamp.assistant_id.clone(),
+            alias: message.alias.clone(),
+            credential_id: Some(stamp.credential_id.clone()),
+            job: String::new(),
+        };
+        let root = self.assistant_principal_cwd(&stamp.org, &stamp.sub);
+        self.store.assistant_bootstrap_apply(
+            &expect,
+            &message.id,
+            token,
+            action,
+            expected_revision,
+            || {
+                if let Some(p) = profile.as_ref() {
+                    bootstrap_files::write_profile(&root, p)?;
+                }
+                Ok(())
+            },
+        )?;
+        // Completion is committed; cleanup is best-effort and never reopens setup.
+        if action == "complete" {
+            if let Err(error) = bootstrap_files::remove_bootstrap(&root) {
+                eprintln!("bootstrap cleanup for {}: {error}", message.alias);
+            }
+        }
+        Ok(())
     }
 
     /// Operator reconcile of an `unknown` message — no turn token, the

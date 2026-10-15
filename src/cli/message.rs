@@ -113,6 +113,10 @@ pub(crate) enum MessageAction {
         /// Read the note from a file (`-` reads stdin, capped at 4 MiB).
         #[arg(long)]
         file: Option<PathBuf>,
+        /// CAD-1420: a bounded bootstrap JSON object read from a file
+        /// (`-` reads stdin). Never passed as an argv value.
+        #[arg(long = "bootstrap-file")]
+        bootstrap_file: Option<PathBuf>,
     },
     /// Report the result of a submitted PTY message; completes it and
     /// routes to `reply_to` when set. With no message id and no `--token`,
@@ -213,6 +217,7 @@ pub(super) fn run(state_dir: PathBuf, action: MessageAction) -> Result<i32> {
             token,
             text,
             file,
+            bootstrap_file,
         } => {
             if message.is_some() != token.is_some() {
                 return Err(Error::rejected(
@@ -222,6 +227,12 @@ pub(super) fn run(state_dir: PathBuf, action: MessageAction) -> Result<i32> {
             }
             let text = read_result_body(text, file, false)?;
             let mut params = json!({"kind": "ack", "text": text});
+            if let Some(path) = bootstrap_file {
+                let raw = read_body_capped(None, Some(path), 64 << 10)?;
+                let object: Value = serde_json::from_str(&raw)
+                    .map_err(|_| Error::rejected("bootstrap file must be a JSON object"))?;
+                params["bootstrap"] = object;
+            }
             if let Some(m) = message {
                 params["message"] = json!(m);
             }

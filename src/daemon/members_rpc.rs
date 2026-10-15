@@ -800,7 +800,7 @@ impl Shared {
     /// The digest covers the canonical `(org, sub)` pair, length-prefixed so
     /// `("a|b", "c")` and `("a", "b|c")` can never encode alike. Distinct
     /// principals therefore never share one confined read/write directory.
-    fn assistant_principal_cwd(&self, org: &str, sub: &str) -> std::path::PathBuf {
+    pub(super) fn assistant_principal_cwd(&self, org: &str, sub: &str) -> std::path::PathBuf {
         let canonical = format!("{}:{org}|{}:{sub}", org.len(), sub.len());
         self.state_dir
             .join("assistants")
@@ -874,6 +874,8 @@ impl Shared {
         let principal_cwd = self.assistant_principal_cwd(&binding.org, &binding.sub);
         if self.store.agent_opt(&binding.alias)?.is_some() {
             self.assistant_runtime_cwd_guard(binding)?;
+            // CAD-1420: seed missing files; BOOTSTRAP only while pending.
+            super::bootstrap_files::seed(&principal_cwd, binding.bootstrap_state == "pending")?;
         } else {
             // The registered alias is the STORED binding alias — derived
             // at mint from the member, never a caller field. The agent-
@@ -886,6 +888,7 @@ impl Shared {
                     "member assist refused: the assistant's principal cwd cannot be created: {e}"
                 ))
             })?;
+            super::bootstrap_files::seed(&cwd, binding.bootstrap_state == "pending")?;
             let params = json!({"confine": true, "assist": binding.sub});
             self.store.register_agent(&crate::store::NewAgent {
                 alias: &binding.alias,
@@ -1034,9 +1037,6 @@ impl Shared {
     /// `finish_assist_job_notification`; a store failure returns an error and
     /// the intent stays pending (never silently claimed).
     pub(super) fn route_assist_job_notifications(self: &Arc<Self>) -> Result<usize> {
-        if std::env::var("HOSTED_CADENCE_ASSISTANT_ENABLED").as_deref() != Ok("true") {
-            return Ok(0);
-        }
         let pending = self
             .store
             .pending_assist_job_notifications(ASSIST_NOTICE_BATCH)?;
@@ -1330,18 +1330,6 @@ impl Shared {
         need: crate::assistant_actor::AssistScope,
         job_id: Option<&str>,
     ) -> Result<MemberCaller> {
-        // The rollout gate (CON-002): the platform injects
-        // `HOSTED_CADENCE_ASSISTANT_ENABLED=true` into the container env
-        // only when the feature is enabled — absent/false/unknown is
-        // OFF. Checked BEFORE the envelope is read: a stale envelope, a
-        // cached service bearer or a replayed member op can never reach
-        // a member effect while the feature is off. The live platform
-        // pull below is the authoritative second check.
-        if std::env::var("HOSTED_CADENCE_ASSISTANT_ENABLED").as_deref() != Ok("true") {
-            return Err(Error::rejected(format!(
-                "{verb} refused: member assistant integration is not enabled"
-            )));
-        }
         // The connection itself must be the operator/board relay — the
         // only channel allowed to carry a relayed member envelope. An
         // agent or unproven connection is refused outright, before the
@@ -2287,5 +2275,73 @@ impl Shared {
             "note": "the member now follows this shared job — evidence and \
                      events bind to it; no private conversation is shared",
         }))
+    }
+
+    /// CAD-1420: the private profile context for a stamped, interactive member
+    /// turn. Returns `Ok(None)` for ordinary agents, Master, job notices, nudges,
+    /// unstamped work and inactive bindings. An unknown stored state or an
+    /// unreadable profile file is an error, never a silent empty profile. The
+    /// BOOTSTRAP body is included only while the stored state is `pending`. The
+    /// ACK contract is shown in every valid state, so a deferred or completed
+    /// member can still resume or update through the same closed object.
+    pub(super) fn member_profile_context(
+        &self,
+        message: &store::Message,
+    ) -> Result<Option<String>> {
+        if message.source == "assist_job_event" || message.is_nudge() {
+            return Ok(None);
+        }
+        let Some(stamp) = self.store.message_member_authority(&message.id)? else {
+            return Ok(None);
+        };
+        let Some(binding) = self.store.assistant_for_alias(&message.alias)? else {
+            return Ok(None);
+        };
+        if !binding.is_active()
+            || binding.org != stamp.org
+            || binding.sub != stamp.sub
+            || binding.assistant_id != stamp.assistant_id
+        {
+            return Ok(None);
+        }
+        let state = binding.bootstrap_state.as_str();
+        let allowed: &str = match state {
+            "pending" => "\"update\", \"complete\", \"skip\", \"defer\"",
+            "deferred" => "\"update\", \"resume\"",
+            "complete" | "skipped" => "\"update\"",
+            other => {
+                return Err(Error::rejected(format!(
+                "stored bootstrap state '{other}' is unknown; the assistant profile is not loaded"
+            )))
+            }
+        };
+        let root = self.assistant_principal_cwd(&binding.org, &binding.sub);
+        let mut out = String::from("## Your private assistant profile\n\n");
+        for name in [
+            super::bootstrap_files::IDENTITY,
+            super::bootstrap_files::SOUL,
+            super::bootstrap_files::USER,
+        ] {
+            out.push_str(&super::bootstrap_files::read_profile_file(&root, name)?);
+            out.push_str("\n\n");
+        }
+        out.push_str(&format!(
+            "## Profile state\n\nstate: {state}\nrevision: {rev}\n\n\
+             Your reply already answers the user's request above. Setup is optional.\n\n\
+             To record an agreed change on this turn, ACK with a JSON object on stdin, \
+             for example: `cadence message ack --bootstrap-file -` with \
+             {{\"action\":\"update\",\"expected_revision\":{rev},\"profile\":{{\"name\":\"Ana\"}}}}\n\
+             Allowed actions in this state: {allowed}. Profile keys: name, tone, preferences.\n\n",
+            rev = binding.bootstrap_revision,
+        ));
+        if state == "pending" {
+            out.push_str("## Bootstrap (pending)\n\n");
+            out.push_str(&super::bootstrap_files::read_profile_file(
+                &root,
+                super::bootstrap_files::BOOTSTRAP,
+            )?);
+            out.push_str("\n\n");
+        }
+        Ok(Some(out))
     }
 }
