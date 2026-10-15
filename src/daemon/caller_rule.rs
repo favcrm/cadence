@@ -1007,6 +1007,10 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         Rule::Handler("operator_connection + verified human session (CAD-1412)"),
     ),
     (
+        "human_people_search",
+        Rule::Handler("operator_connection + verified human session (CAD-1453)"),
+    ),
+    (
         "human_rooms_list",
         Rule::Handler("operator_connection + verified human session (CAD-1412)"),
     ),

@@ -31,6 +31,7 @@ export type ButtonProps = {
   children?: ReactNode;
   onClick?: (event: MouseEvent<HTMLButtonElement | HTMLAnchorElement>) => void;
   "aria-label"?: string;
+  "aria-pressed"?: boolean | "mixed";
 };
 
 function buttonClass(props: ButtonProps): string {
@@ -116,6 +117,7 @@ export function Button(props: ButtonProps) {
       className={className}
       title={tip}
       aria-label={ariaLabel}
+      aria-pressed={props["aria-pressed"]}
       aria-busy={loading || undefined}
       disabled={inactive || undefined}
       onClick={onClick}

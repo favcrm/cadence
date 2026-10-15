@@ -47,6 +47,8 @@ pub(crate) struct RosterMember {
 /// The verified, current caller: the store principal plus the live roster.
 pub(crate) struct CurrentActor {
     pub actor: VerifiedHuman,
+    /// Exact subject from the verified session, for excluding self from discovery.
+    pub subject: String,
     pub scope: HumanScope,
     pub roster: Roster,
     /// The caller's own role in the live roster (`owner` or `member`).
@@ -164,6 +166,7 @@ impl Shared {
             .unwrap_or_default();
         Ok(CurrentActor {
             actor,
+            subject: sub,
             scope,
             roster,
             self_role,

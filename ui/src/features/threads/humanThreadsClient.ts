@@ -61,11 +61,12 @@ export interface HumanAskReceipt {
   duplicate: boolean;
 }
 
-async function call<T>(method: "GET" | "POST" | "DELETE", path: string, body?: object): Promise<T> {
+async function call<T>(method: "GET" | "POST" | "DELETE", path: string, body?: object, signal?: AbortSignal): Promise<T> {
   const resp = await fetch(path, {
     method,
     credentials: "same-origin",
     cache: "no-store",
+    signal,
     headers: {
       ...(method === "GET" ? {} : { "Content-Type": "application/json" }),
       "X-Cadence-Board": "1",
@@ -160,6 +161,18 @@ export interface HumanPerson {
   id: string;
   subject: string;
   name: string;
+}
+
+export interface HumanPeoplePage {
+  actor: string;
+  people: HumanPerson[];
+  has_more: boolean;
+}
+
+/** The complete verified workspace is searched before the server's 20-result cap. */
+export function searchHumanPeople(query: string, signal: AbortSignal): Promise<HumanPeoplePage> {
+  const params = new URLSearchParams({ query });
+  return call("GET", `/api/human-threads/people?${params}`, undefined, signal);
 }
 
 interface RosterResponse {

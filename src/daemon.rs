@@ -2926,6 +2926,7 @@ impl Shared {
             "board_session_check" => self.rpc_board_session_check(params),
             "human_actor_check" => self.rpc_human_actor_check(params, peer_pid),
             "human_roster_scope" => self.rpc_human_roster_scope(params, peer_pid),
+            "human_people_search" => self.rpc_human_people_search(params, peer_pid),
             "human_rooms_list" => self.rpc_human_rooms_list(params, peer_pid),
             "human_dm_open" => self.rpc_human_dm_open(params, peer_pid),
             "human_group_create" => self.rpc_human_group_create(params, peer_pid),

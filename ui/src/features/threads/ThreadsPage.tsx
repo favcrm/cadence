@@ -8,6 +8,8 @@ import { useWriteBlock } from "../auth/WriteGate";
 import { useTranslate } from "../../lib/locale";
 import { displayUiNotice, type UiNotice } from "../app-shell/campaign/useEmailDraft";
 import Button from "../../ui/Button";
+import Select from "../../ui/Select";
+import NewHumanConversation from "./NewHumanConversation";
 import Link from "../../ui/Link";
 import PageState from "../../ui/PageState";
 import { issuePath } from "../issues/model";
@@ -46,8 +48,6 @@ import {
 } from "./threadsView";
 import {
   HumanContextPanel,
-  HumanNewDm,
-  HumanNewGroup,
   HumanRoomRows,
   HumanRoomTimeline,
   useHumanAgents,
@@ -90,12 +90,14 @@ export default function ThreadsPage({ operator }: { operator: boolean }) {
   const [query, setQuery] = useState("");
   const [contextOpen, setContextOpen] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
+  const [createMode, setCreateMode] = useState<"direct" | "group" | "project" | "agent">("direct");
+  const [createBusy, setCreateBusy] = useState(false);
   const threadsTick = useSyncExternalStore(subscribeThreadsChanged, threadsRevisionNow);
   // Human discovery is the server's `me`, independent of the operator flag:
   // a verified member sees human rooms; agent conversations stay operator-only.
   const human = useHumanMe(true);
   const humanRooms = useHumanRooms(human.me !== null);
-  const people = useHumanPeople(human.me !== null);
+  const people = useHumanPeople(human.me !== null && humanId !== null);
   const agents = useHumanAgents(human.me !== null);
   const [humanState, setHumanState] = useState<HumanRoomState | null>(null);
   const [humanRefresh, setHumanRefresh] = useState(0);
@@ -225,7 +227,10 @@ export default function ThreadsPage({ operator }: { operator: boolean }) {
             <Button variant="ghost" size="sm" onClick={() => void loadList()} aria-label={t("Refresh conversations")}>
               <IconRefresh size={12} />
             </Button>
-            <Button variant="secondary" size="sm" onClick={() => setCreateOpen(true)}>
+            <Button variant="secondary" size="sm" onClick={() => {
+              setCreateMode(human.me ? "direct" : "agent");
+              setCreateOpen(true);
+            }}>
               {t("Add")}
             </Button>
           </div>
@@ -347,49 +352,38 @@ export default function ThreadsPage({ operator }: { operator: boolean }) {
           {context}
         </SheetDialog>
       )}
-      <SheetDialog open={createOpen} title="New thread or group" className="threads-create-sheet" onClose={() => setCreateOpen(false)}>
-        {human.me && (
-          <HumanNewGroup
-            me={human.me}
-            people={people.people}
-            peopleError={people.error}
-            agents={agents.agents}
-            onCreated={(id) => {
+      <SheetDialog open={createOpen} title="New conversation" className="threads-create-sheet"
+        busy={createBusy} onClose={() => setCreateOpen(false)}>
+        {createOpen && <>
+          <div className="threads-create-modes" aria-label="Conversation type">
+            {([
+              ...(human.me ? [{ value: "direct" as const, label: "Direct" }, { value: "group" as const, label: "Group" }] : []),
+              ...(operator || createMode === "project" || createMode === "agent" ? [{ value: "project" as const, label: "Project" }, { value: "agent" as const, label: "Agent" }] : []),
+            ]).map((mode) => <Button key={mode.value} variant="ghost"
+              disabled={createBusy || (!operator && (mode.value === "project" || mode.value === "agent"))}
+              aria-pressed={createMode === mode.value} onClick={() => setCreateMode(mode.value)}>{t(mode.label)}</Button>)}
+          </div>
+          {human.me && (createMode === "direct" || createMode === "group") && (
+            <NewHumanConversation key={createMode} mode={createMode} me={human.me}
+              agents={agents.agents} agentsError={agents.error} onBusy={setCreateBusy}
+              onCancel={() => setCreateOpen(false)} onCreated={(id) => {
+                setCreateOpen(false);
+                void humanRooms.reload();
+                navigate(humanHref(id), { replace: true });
+              }} />
+          )}
+          {createMode === "project" && <NewGroup writeBlock={writeBlock}
+            onCancel={() => setCreateOpen(false)} onBusy={setCreateBusy} onCreated={(id) => {
               setCreateOpen(false);
-              void humanRooms.reload();
-              navigate(humanHref(id), { replace: true });
-            }}
-          />
-        )}
-        {human.me && (
-          <HumanNewDm
-            me={human.me}
-            people={people.people}
-            peopleError={people.error}
-            onOpened={(id) => {
+              void loadList();
+              setUrl({ conversation: id });
+            }} />}
+          {createMode === "agent" && <NewThread agents={agentNames} current={draft}
+            writeBlock={writeBlock} onCancel={() => setCreateOpen(false)} onOpen={(alias) => {
               setCreateOpen(false);
-              void humanRooms.reload();
-              navigate(humanHref(id), { replace: true });
-            }}
-          />
-        )}
-        <NewGroup
-          writeBlock={writeBlock}
-          onCreated={(id) => {
-            setCreateOpen(false);
-            void loadList();
-            setUrl({ conversation: id });
-          }}
-        />
-        <NewThread
-          agents={agentNames}
-          current={draft}
-          onOpen={(alias) => {
-            setCreateOpen(false);
-            openDm(alias);
-          }}
-          writeBlock={writeBlock}
-        />
+              openDm(alias);
+            }} />}
+        </>}
       </SheetDialog>
     </section>
   );
@@ -431,12 +425,14 @@ function SheetDialog({
   className,
   onClose,
   children,
+  busy = false,
 }: {
   open: boolean;
   title: string;
   className: string;
   onClose: () => void;
   children: ReactNode;
+  busy?: boolean;
 }) {
   const ref = useRef<HTMLDialogElement>(null);
   const titleId = useId();
@@ -454,12 +450,13 @@ function SheetDialog({
       aria-labelledby={titleId}
       onCancel={(event) => {
         event.preventDefault();
+        if (busy) return;
         onClose();
       }}
     >
       <div className="threads-context-sheet-head">
         <h2 id={titleId}>{t(title)}</h2>
-        <Button variant="ghost" size="sm" onClick={onClose} aria-label={t(`Close ${title.toLowerCase()}`)} icon={<IconClose />} />
+        <Button variant="ghost" size="sm" disabled={busy} onClick={onClose} aria-label={t(`Close ${title.toLowerCase()}`)} icon={<IconClose />} />
       </div>
       {children}
     </dialog>
@@ -886,41 +883,37 @@ function ReplyBar({ row, openDm }: { row: ConversationRow; openDm: (alias: strin
 }
 
 /** New thread: choose a live agent and open its You ↔ agent conversation. */
-function NewThread({
-  agents,
-  current,
-  onOpen,
-  writeBlock,
-}: {
+function NewThread({ agents, current, onOpen, onCancel, writeBlock }: {
   agents: string[];
   current: string | null;
   onOpen: (alias: string) => void;
+  onCancel: () => void;
   writeBlock: string | null;
 }) {
   const [alias, setAlias] = useState("");
+  const id = useId();
   const t = useTranslate();
   return (
-    <form
-      className="threads-newgroup"
-      aria-label={t("New thread")}
-      onSubmit={(e) => {
-        e.preventDefault();
-        if (alias !== "") onOpen(alias);
-      }}
-    >
-      <label>
-        <span className="sr-only">{t("Agent for new thread")}</span>
-        <select value={alias} onChange={(e) => setAlias(e.target.value)} aria-label={t("Agent for new thread")}>
-          <option value="">{agents.length === 0 ? t("No live agents") : t("Choose an agent")}</option>
-          {agents.map((a) => (
-            <option key={a} value={a}>{a}</option>
-          ))}
-        </select>
-      </label>
-      <Button variant="secondary" size="sm" type="submit" disabled={writeBlock !== null || alias === ""}>
-        {t("New thread")}
-      </Button>
-      {current && <span className="threads-note">{t("Draft with {alias}").replace("{alias}", () => current)}</span>}
+    <form className="threads-create-form" aria-label={t("New thread")} onSubmit={(event) => {
+      event.preventDefault();
+      if (writeBlock === null && agents.includes(alias)) onOpen(alias);
+    }}>
+      <div className="threads-create-body">
+        <p className="threads-note">{t("Start a focused thread with a current agent.")}</p>
+        <div className="threads-form-field">
+          <label className="threads-field-label" htmlFor={id}>{t("Agent for new thread")}</label>
+          <Select id={id} full searchable value={alias} onChange={setAlias}
+            options={agents.map((agent) => ({ value: agent, label: agent }))}
+            placeholder={agents.length === 0 ? t("No live agents") : t("Choose an agent")}
+            disabled={writeBlock !== null} />
+        </div>
+        {current && <p className="threads-note">{t("Draft with {alias}").replace("{alias}", () => current)}</p>}
+        {writeBlock && <p className="threads-note" role="status">{writeBlock}</p>}
+      </div>
+      <div className="threads-create-footer"><span className="threads-note">{t("No message is sent until you write one.")}</span>
+        <div><Button variant="secondary" onClick={onCancel}>{t("Cancel")}</Button>
+          <Button variant="primary" type="submit" disabled={writeBlock !== null || !agents.includes(alias)}>{t("Start thread")}</Button></div>
+      </div>
     </form>
   );
 }
@@ -1135,40 +1128,50 @@ function ContextPanel({
 }
 
 /** Operator creates a `fleet:` or `project:` topic (the CAD-810 allowlist). */
-function NewGroup({ writeBlock, onCreated }: { writeBlock: string | null; onCreated: (id: string) => void }) {
+function NewGroup({ writeBlock, onCreated, onCancel, onBusy }: {
+  writeBlock: string | null;
+  onCreated: (id: string) => void;
+  onCancel: () => void;
+  onBusy: (busy: boolean) => void;
+}) {
   const t = useTranslate();
+  const id = useId();
   const [type, setType] = useState<"fleet" | "project">("project");
   const [source, setSource] = useState("");
+  const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   return (
-    <form
-      className="threads-newgroup"
-      onSubmit={(e) => {
-        e.preventDefault();
-        setError(null);
-        createTopic({ type, source })
-          .then((out) => {
-            setSource("");
-            onCreated(out.topic);
-          })
-          .catch((err: unknown) => setError(err instanceof ApiError ? err.message : String(err)));
-      }}
-    >
-      <label>
-        <span className="sr-only">{t("Group type")}</span>
-        <select value={type} onChange={(e) => setType(e.target.value as "fleet" | "project")}>
-          <option value="project">project:</option>
-          <option value="fleet">fleet:</option>
-        </select>
-      </label>
-      <label>
-        <span className="sr-only">{t("Group source")}</span>
-        <input value={source} onChange={(e) => setSource(e.target.value)} placeholder={t("New group name")} />
-      </label>
-      <Button variant="secondary" size="sm" type="submit" disabled={writeBlock !== null || source.trim() === ""}>
-        {t("New group")}
-      </Button>
-      {error && <p className="threads-note" role="status">{error}</p>}
+    <form className="threads-create-form" onSubmit={(event) => {
+      event.preventDefault();
+      if (pending || writeBlock !== null || source.trim() === "") return;
+      setError(null);
+      setPending(true);
+      onBusy(true);
+      void createTopic({ type, source: source.trim() })
+        .then((out) => onCreated(out.topic))
+        .catch((failure: unknown) => setError(failure instanceof Error ? failure.message : String(failure)))
+        .finally(() => { setPending(false); onBusy(false); });
+    }}>
+      <div className="threads-create-body">
+        <p className="threads-note">{t("Keep agent coordination connected to an existing project or fleet.")}</p>
+        <div className="threads-form-field">
+          <label className="threads-field-label" htmlFor={`${id}-scope`}>{t("Group scope")}</label>
+          <Select id={`${id}-scope`} full value={type} disabled={pending || writeBlock !== null}
+            onChange={(value) => { if (value === "project" || value === "fleet") setType(value); }}
+            options={[{ value: "project", label: t("Project") }, { value: "fleet", label: t("Fleet") }]} />
+        </div>
+        <label className="threads-form-field" htmlFor={`${id}-source`}>
+          <span className="threads-field-label">{type === "project" ? t("Project key") : t("Fleet name")}</span>
+          <input className="field" id={`${id}-source`} value={source} disabled={pending || writeBlock !== null}
+            onChange={(event) => setSource(event.target.value)} placeholder={type === "project" ? t("e.g. cadence") : t("Enter an existing fleet name")} />
+        </label>
+        {writeBlock && <p className="threads-note" role="status">{writeBlock}</p>}
+        {error && <p className="threads-create-error" role="alert">{error}</p>}
+      </div>
+      <div className="threads-create-footer"><span className="threads-note">{t("Workspace access still applies.")}</span>
+        <div><Button variant="secondary" onClick={onCancel} disabled={pending}>{t("Cancel")}</Button>
+          <Button variant="primary" type="submit" disabled={pending || writeBlock !== null || source.trim() === ""}>{pending ? t("Creating…") : t("Create conversation")}</Button></div>
+      </div>
     </form>
   );
 }
