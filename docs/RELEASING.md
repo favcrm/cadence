@@ -8,6 +8,41 @@ Neither path authorizes an agent to approve or restart production. Follow
 [artifact checklist](guides/rollout-checklist.md); image-managed hosts use the runtime
 image path instead of self-update.
 
+## Stable v0.2.0 (published, immutable)
+
+[Cadence 0.2.0](https://github.com/favcrm/cadence/releases/tag/v0.2.0) was
+published as the stable GitHub Release on 2026-10-15 at 10:07:27 UTC
+(`prerelease=false`, `latest=true`, `draft=false`, immutable). Its annotated tag
+object is `fd4a5491775c3cc8f0ba9c4c542a540bbee885e1`, peeled to source
+`361c118f76449317ad8edcc71126ed6572e00366`. The producing
+[tag workflow run 38708389618, attempt 2](https://github.com/favcrm/cadence/actions/runs/38708389618)
+completed successfully: all five tag gates, `release-gate`, three native release
+builds and three exact-candidate native installation legs passed. Attempt 1
+timed out after 15 minutes and is not success evidence; the single full guarded
+retry made no source, tag, timeout or gate changes.
+
+All nine published HTTPS assets were anonymously downloaded and their bytes
+matched the exact candidate assets. GitHub attestation verification passed for
+the installer, three platform archives and app-toolchain archive, bound to
+repository `favcrm/cadence`,
+`refs/tags/v0.2.0`, source digest above, and
+`favcrm/cadence/.github/workflows/ci.yml`. The installer SHA-256 is
+`c335171994e89da9d8d86b3cece9a7de8899a52056b6c42904a5f63dfa33c7e5`.
+The public native clean-install workflow also passed on its first attempt in
+[consumer run 38718119770](https://github.com/favcrm/cadence/actions/runs/38718119770),
+from reviewed main source `d990f570d236b8b7643ae67c80b2cef83df0def7`. All three
+actual published-URL legs (`x86_64-linux`, `aarch64-linux`, `aarch64-macos`)
+validated the release tag, source, producing run/attempt, success receipt and
+binary digests. Default/custom prefixes and reruns passed through the existing
+harness. This proves anonymous public download and CLI installation only; it
+does not complete CAD-317 setup/wizard/backup acceptance, claim a macOS daemon
+or board, or establish production-host promotion or rollout.
+
+The public release and its notes/assets are immutable. This record documents
+the delivery without modifying those bytes or notes. Public release publication
+is separate from native-host candidate staging, approval, promotion, installation
+and operational verification; none follows implicitly from this release.
+
 ## Native host: checkpoints, not one “shipped” status
 
 | State | Evidence to check before reporting it |

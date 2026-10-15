@@ -1,24 +1,31 @@
 # Native installation
 
-[Cadence 0.1.0](https://github.com/favcrm/cadence/releases/tag/v0.1.0)
-is the published stable local CLI release (`latest=true`), built from source
-`4066ddab844a318a85c3bc286392ec927a600a5c` by tag run `38201476703` attempt 1
-with build-provenance attestations. Anonymous public downloads and native
-installation passed on Linux x86_64, Linux ARM64 and Apple Silicon macOS in
-[run 38213520059, attempt 1](https://github.com/favcrm/cadence/actions/runs/38213520059).
-The consumer workflow used reviewed main source
-`b27a8ead58d471db6a88efeea03bba8433b0f700`; the installed package remained
-pinned to the v0.1.0 source and producing run above. On every target, default
-and custom-prefix installation, exact version, archive/binary checksums,
-installed manifest equality and same-version rerun stability passed without
-Rust, Node or GitHub login in the installation environment.
+[Cadence 0.2.0](https://github.com/favcrm/cadence/releases/tag/v0.2.0) is the
+current published stable local CLI release (`latest=true`), published 2026-10-15
+from source `361c118f76449317ad8edcc71126ed6572e00366` by
+[tag workflow run 38708389618, attempt 2](https://github.com/favcrm/cadence/actions/runs/38708389618).
+Its immutable release is stable (`draft=false`, `prerelease=false`) and contains
+nine public assets. Anonymous download of all nine assets and attestation
+verification of the installer, three platform archives and app-toolchain archive
+passed; the installer
+SHA-256 is `c335171994e89da9d8d86b3cece9a7de8899a52056b6c42904a5f63dfa33c7e5`.
+The public native installation workflow passed on all three actual published
+URL legs in [consumer run 38718119770, attempt 1](https://github.com/favcrm/cadence/actions/runs/38718119770),
+using reviewed main source `d990f570d236b8b7643ae67c80b2cef83df0def7` and
+validating the v0.2.0 tag, source, producing run/attempt, success receipts and
+binary digests. Default/custom prefixes and reruns passed. The install
+environment needed no Rust, Node or GitHub login.
 
-CAD-1400 also added a three-target `release-install` gate before publication
-approval. That tag-only gate awaits its first future authorized release tag;
-it did not run retroactively on immutable v0.1.0.
-This install-only proof does not complete CAD-317's setup, headless wizard or
-backup/restore acceptance, or establish compatibility with existing production
-state; it is not a production rollout.
+The producing workflow's five tag gates, release-gate, three builds and three
+native candidate-install legs all passed on attempt 2. Attempt 1 timed out and
+is not a pass. The public consumer check was its first attempt. This install-only
+proof does not complete CAD-317's setup, headless wizard or backup/restore
+acceptance, establish compatibility with existing production state, or imply a
+native-host promotion/rollout. Full evidence and the preserved v0.1.0 record are
+in [the release record](RELEASING.md).
+
+Historical stable v0.1.0 publication and anonymous native installation remain
+in [the release record](RELEASING.md); it is no longer the current `latest` release.
 
 The immutable `v0.1.0-beta.1` tag failed its macOS UI build and has no
 published installation assets; `v0.1.0-beta.2` remains installable only by
@@ -160,22 +167,22 @@ A client-only installation upgrades itself with `cadence-client update`
 (`--check` selects and reports the target only, with no download or
 verification; `--version <tag>` pins a newer release, and the real upgrade
 verifies it before any change). The old `client-update` command is removed.
-The published v0.1.1 already has legacy client-only support, through
-`client-update`; it cannot be upgraded to this unified `update` in place. The
-unified update needs the next capable signed release and its `install.sh`:
-reinstall once with that installer. It re-validates the existing receipt and
-link against the same prefix and moves the link only under its guards; it
-never adopts an ordinary installation. It never downgrades, changes
+The published v0.1.1 has legacy client-only support through `client-update`;
+it cannot be upgraded to the unified `update` in place. v0.2.0 provides the
+unified client-only updater. Reinstall once with the v0.2.0 `install.sh` using
+`--client-only`, then use `cadence-client update`. The installer re-validates
+the existing receipt and link against the same prefix and moves the link only
+under its guards; it never adopts an ordinary installation. It never downgrades, changes
 `$HOME/.local/bin/cadence`, or touches the remote credentials, registry or
 daemon. A client-only executable refuses
 local daemon and state commands with exit 3; bounded
 login, auth, org and offline management stays available.
 
 Client-only mode works on any published release whose `cadence update --help`
-carries the client-only marker. The published v0.1.1 has the legacy
-`client-update`; the unified `update` needs the next capable release. The
-GitHub CLI used for the attestation check is the operator's own `gh` session,
-not Cadence remote credentials.
+carries the client-only marker. v0.2.0 is the available unified-updater release;
+v0.1.1 clients must first reinstall once with its installer in `--client-only`
+mode, then use `cadence-client update`. The GitHub CLI used for the attestation
+check is the operator's own `gh` session, not Cadence remote credentials.
 
 ## Updates and current limits
 
