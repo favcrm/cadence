@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 import Link from "../../ui/Link";
 import Button from "../../ui/Button";
 import { appExplorer, notifyAppsChanged, type CatalogCard } from "../workspace-apps/workspaceApps";
+import { useInstallations } from "../workspace-apps/useInstallations";
+import { installationAppHref, installedAppHref } from "../apps/appViewModel";
 import type { Viewer } from "../projects/work";
 import { AppGlyph, TrustChip } from "./shared";
 import { appErrorCopy, appLoadErrorCopy } from "./appErrors";
@@ -28,6 +30,10 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const isOp = viewer.operator === true && !viewer.readOnly;
+  // CAD-1438: Open spells the canonical `/apps/<key>` route — for the
+  // operator resolved against the verified install list, for a member
+  // the key route itself proves the mapping before rendering anything.
+  const installs = useInstallations(viewer.operator === true, id).list;
   const installed = card?.state === "installed" || card?.state === "off";
   const removed = card?.removed === true;
   const retired = card?.retired === true;
@@ -193,7 +199,16 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
         <aside className="card side-card p-4 flex flex-col gap-3">
           {installed && card.install_id ? (
             <>
-              <Link className="btn btn-primary btn-lg" href={`/app-installations/${card.install_id}`}>Open {card.title}</Link>
+              {(() => {
+                const href = isOp
+                  ? installationAppHref(installs, card.install_id)
+                  : installedAppHref(card.name);
+                return href === null ? (
+                  <span className="text-micro text-ink-500">{t("This install has no unique app page — see Manage.")}</span>
+                ) : (
+                  <Link className="btn btn-primary btn-lg" href={href}>Open {card.title}</Link>
+                );
+              })()}
               {isOp && <Link className="btn" href={`/apps/manage/${card.install_id}`}>Manage</Link>}
               {!isOp && <span className="text-micro text-ink-500">Ask an admin to manage access.</span>}
             </>

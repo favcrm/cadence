@@ -16,6 +16,9 @@ import { readAppUrlState, type AppTab, type ProjectView } from "./urlState";
  *   /projects/:slug/issues/:id one issue (CAD-607). `?tab=` picks a section.
  *   /apps[/<project>/<app>]    installed apps, optionally one app's detail (CAD-557)
  *   /apps/<app-key>            one installed app resolved by package key
+ *   /app-installations/<id>    retired (CAD-1438): compatibility redirect
+ *                              to the same install's `/apps/<key>`, or a
+ *                              clear retired page when no unique mapping
  *   /agents[/:alias]           agents, optionally one agent's drawer
  *   /threads                   Threads: agent, operator and group conversations (CAD-818); `?c=<id>` opens one
  *   /wiki[/<path>]             the wiki: folder tree + page (CAD-581)
@@ -290,6 +293,8 @@ export function matchRoute(pathname: string): Route {
 export function routePath(route: Route): string {
   switch (route.screen) {
     case "workspaceApp":
+      // CAD-1438: kept only so the compatibility route round-trips; no
+      // producer emits it anymore.
       return `/app-installations/${encodeURIComponent(route.installId)}`;
     case "workspaceAppKey":
       return `/apps/${encodeURIComponent(route.appKey)}`;
@@ -399,8 +404,10 @@ function scopedRoute(route: Route, project: string): Route {
   return { screen: "projects", slug, section: slug ? route.section : route.section === "overview" ? "overview" : "issues" };
 }
 
-/** Query parameters only the mounted CRM app route owns. */
-const CRM_APP_PARAMS = ["crm", "record", "ctx", "appview", "segment"] as const;
+/** Query parameters only the mounted app route owns. `install` is the
+ *  CAD-1438 pin of a generated contextual link — the immutable install id
+ *  the ctx/conversation/record selectors were minted for. */
+const CRM_APP_PARAMS = ["crm", "record", "ctx", "appview", "segment", "install"] as const;
 
 /** Path plus query for a location, keeping query parameters the app does not own. */
 export function locationHref(loc: AppLocation, search = ""): string {
@@ -414,8 +421,9 @@ export function locationHref(loc: AppLocation, search = ""): string {
   for (const key of ["tab", "view", "project", "issue", "run", "new", "screen"]) q.delete(key);
   writeFilters(q, NO_FILTERS);
   const route = scopedRoute(loc.route, loc.project);
-  // CAD-1068: the mounted CRM app (`workspaceApp`) owns these; they stay
-  // on its own route and never follow the user to /settings and the like.
+  // CAD-1068: the mounted app routes (`workspaceAppKey`, and the retired
+  // `workspaceApp` compat route) own these; they stay on the app's own
+  // route and never follow the user to /settings and the like.
   if (route.screen !== "workspaceApp" && route.screen !== "workspaceAppKey") for (const key of CRM_APP_PARAMS) q.delete(key);
   if (route.screen === "issue") {
     if (route.tab !== "overview") q.set("tab", route.tab);

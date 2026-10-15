@@ -132,9 +132,10 @@ const clicked = appLink("CRM")!;
 await React.act(async () => { clicked.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
 await settle(() => assert(location.search.includes("crm=segments"), "clicking returns to CRM at Segments"));
 
-// (b) A forged installation in the URL yields no entry and no sections.
+// (b) CAD-1438: a forged installation id on the retired route yields the
+// retired page — no entry, no sections, and no protected read is issued.
 await go("/app-installations/install-forged");
-await settle(() => assert(host.textContent?.includes("unknown installation"), "forged installation refuses"));
+await settle(() => assert(host.textContent?.includes("App link retired"), "forged installation refuses"));
 assert(!appLink("install-forged") && appLinks().length === 2, "forged id adds no app entry");
 assert(sections().length === 0, "forged id shows no sections");
 await React.act(async () => { root2.unmount(); });

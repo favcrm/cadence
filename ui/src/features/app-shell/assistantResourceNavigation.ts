@@ -8,10 +8,18 @@ const RESOURCE_SECTIONS = new Map<string, string>([
   ["campaign", "campaigns"], ["campaigns", "campaigns"],
 ]);
 
-export function resourceHref(installId: string, contextId: string, ref: ResourceRef): string | null {
+/**
+ * CAD-1438: deep links emit the canonical `/apps/<key>` route only. `appPath`
+ * is the verified installation's canonical path (`installationAppHref`),
+ * already proven unique by the caller — never a caller-built route. `null`
+ * (ambiguous, removed, unsafe) means no link. `install` pins the immutable
+ * installation id so a replacement install at the same key can never open
+ * this context and record silently.
+ */
+export function resourceHref(appPath: string | null, installId: string, contextId: string, ref: ResourceRef): string | null {
   const section = RESOURCE_SECTIONS.get(ref.kind);
-  if (!section || !/^[A-Za-z0-9_-]{1,128}$/.test(ref.id) ||
+  if (!section || appPath === null || !/^[A-Za-z0-9_-]{1,128}$/.test(ref.id) ||
       !/^[A-Za-z0-9_-]{1,128}$/.test(installId) || !/^[A-Za-z0-9_-]{1,128}$/.test(contextId)) return null;
-  const query = new URLSearchParams({ ctx: contextId, crm: section, record: ref.id });
-  return `/app-installations/${encodeURIComponent(installId)}?${query.toString()}`;
+  const query = new URLSearchParams({ install: installId, ctx: contextId, crm: section, record: ref.id });
+  return `${appPath}?${query.toString()}`;
 }

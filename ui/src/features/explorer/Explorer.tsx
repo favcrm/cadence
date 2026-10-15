@@ -3,6 +3,8 @@ import Link from "../../ui/Link";
 import Button from "../../ui/Button";
 import { useTranslate } from "../../lib/locale";
 import { appExplorer, notifyAppsChanged, type CatalogCard } from "../workspace-apps/workspaceApps";
+import { useInstallations } from "../workspace-apps/useInstallations";
+import { installationAppHref, installedAppHref } from "../apps/appViewModel";
 import type { Viewer } from "../projects/work";
 import { AppGlyph, TrustChip, InstallStateChip, useEscape } from "./shared";
 import { appErrorCopy, appLoadErrorCopy } from "./appErrors";
@@ -34,6 +36,10 @@ export default function Explorer({ viewer }: { viewer: Viewer }) {
   const [notice, setNotice] = useState<UiNotice | null>(null);
 
   const isOp = viewer.operator === true && !viewer.readOnly;
+  // CAD-1438: the operator's verified install list decides each Open
+  // link's canonical target; members keep the key route, which proves
+  // the resolution itself.
+  const installs = useInstallations(viewer.operator === true, revision).list;
 
   // The retired catalog still answers: tombstones for ids history names,
   // never a fake "no apps" or up-to-date state. A failed read is shown.
@@ -138,7 +144,7 @@ export default function Explorer({ viewer }: { viewer: Viewer }) {
           <h2 className="text-cardtitle font-medium text-ink-100 mb-3">{t("From the retired catalog")}</h2>
           <div className="cgrid grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
             {tombstones.map((c) => (
-              <TombstoneCard key={c.id} card={c} isOp={isOp} busy={busy[c.id]} onRestore={() => restore(c)} />
+              <TombstoneCard key={c.id} card={c} isOp={isOp} busy={busy[c.id]} onRestore={() => restore(c)} installs={installs} />
             ))}
           </div>
         </section>
@@ -150,8 +156,9 @@ export default function Explorer({ viewer }: { viewer: Viewer }) {
 /** A retired catalog entry: why the source is gone, plus the install's
  * real state — Open when live, Restore inside the window, never an
  * Install action. */
-function TombstoneCard({ card, isOp, busy, onRestore }: {
+function TombstoneCard({ card, isOp, busy, onRestore, installs }: {
   card: CatalogCard; isOp: boolean; busy?: boolean; onRestore: () => void;
+  installs: readonly { install_id: string; name: string; removed?: number | null }[] | null;
 }) {
   const t = useTranslate();
   return (
@@ -181,7 +188,19 @@ function TombstoneCard({ card, isOp, busy, onRestore }: {
             ? <Button className="btn-sm" onClick={(event) => { event.stopPropagation(); onRestore(); }}>{t("Restore")}</Button>
             : <span className="text-micro text-ink-500">{isOp ? t("Restore window closed") : t("Removed")}</span>
         ) : card.state === "installed" || card.state === "off" ? (
-          <Link className="btn btn-sm" href={`/app-installations/${card.install_id}`} onClick={(event) => event.stopPropagation()}>{t("Open")}</Link>
+          (() => {
+            // CAD-1438: the canonical key route, resolved against the
+            // operator's verified list; members emit the key route and
+            // let it prove the mapping. No resolvable key → no link.
+            const href = isOp && card.install_id
+              ? installationAppHref(installs, card.install_id)
+              : installedAppHref(card.name);
+            return href === null ? (
+              <span className="text-micro text-ink-500">{t("No unique app page")}</span>
+            ) : (
+              <Link className="btn btn-sm" href={href} onClick={(event) => event.stopPropagation()}>{t("Open")}</Link>
+            );
+          })()
         ) : (
           <span className="text-micro text-ink-500">{t("Retired")}</span>
         )}

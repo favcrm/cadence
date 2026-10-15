@@ -9,9 +9,11 @@ const OUTCOMES: readonly string[] = ["connected", "failed", "cancelled"];
 const RETURN_PARAMS = ["aos_connect", "aos_publish", "toolkit"];
 
 /** This board's host-drawn Settings page for the install (`?screen=native`), where the connected
- *  accounts and "Use for publishing" live. The host sends it as `return_to`; AgenticOS refuses any other origin. */
-export function connectReturnTo(origin: string, installId: string): string {
-  return `${origin}/app-installations/${encodeURIComponent(installId)}?screen=native`;
+ *  accounts and "Use for publishing" live. The host sends it as `return_to`; AgenticOS refuses any other origin.
+ *  Keep the immutable installation pin so a return after reinstall cannot
+ *  select the replacement merely because its package key is the same. */
+export function connectReturnTo(origin: string, appKey: string, installId: string): string {
+  return `${origin}/apps/${encodeURIComponent(appKey)}?screen=native&install=${encodeURIComponent(installId)}`;
 }
 
 /** The outcome AgenticOS reported on return, only for Instagram. Anything else is not ours. */

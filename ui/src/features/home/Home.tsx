@@ -81,7 +81,10 @@ const reducedMotion = () =>
  * badges, and Stop → `/stop`. `queued`/`submitting` give the operator
  * the honest "behind a turn"/"still sending" states instead of silence.
  */
-function appOriginHref(origin: MasterAppOrigin | null): string | null {
+function appOriginHref(
+  origin: MasterAppOrigin | null,
+  resolveAppPath: (installId: string) => string | null,
+): string | null {
   if (!origin || typeof origin !== "object") return null;
   const { install_id, context_id, conversation_id } = origin;
   // Strict, fail-closed ids: malformed or foreign shapes give no link. An
@@ -90,8 +93,15 @@ function appOriginHref(origin: MasterAppOrigin | null): string | null {
   const strict = (id: unknown): id is string => typeof id === "string" && id.length > 0 && id.trim() === id;
   if (!strict(install_id) || !strict(conversation_id)) return null;
   if (context_id !== "" && !strict(context_id)) return null;
+  // CAD-1438: the canonical `/apps/<key>` route, resolved against the
+  // authorized install list. An ambiguous, removed or unknown install has
+  // no link — never another key's route. `install` pins the immutable id
+  // so a reinstalled/renamed app at the same key can never open this
+  // context and conversation under the replacement.
+  const appPath = resolveAppPath(install_id);
+  if (appPath === null) return null;
   const ctx = context_id === "" ? "" : `ctx=${encodeURIComponent(context_id)}&`;
-  return `/app-installations/${encodeURIComponent(install_id)}?${ctx}conversation=${encodeURIComponent(conversation_id)}`;
+  return `${appPath}?install=${encodeURIComponent(install_id)}&${ctx}conversation=${encodeURIComponent(conversation_id)}`;
 }
 
 /** CAD-1419: the Assistant name row's live state while the turn works
@@ -121,6 +131,7 @@ function WorkingRow({
   step,
   onStop,
   nameRow,
+  resolveAppPath,
 }: {
   turn: TurnState;
   appOrigin: MasterAppOrigin | null;
@@ -128,9 +139,11 @@ function WorkingRow({
   onStop: () => void;
   /** The Assistant name row shows Working + elapsed for this turn. */
   nameRow: boolean;
+  /** CAD-1438: resolves an install id to its unique canonical path (or null). */
+  resolveAppPath: (installId: string) => string | null;
 }) {
   const t = useTranslate();
-  const appHref = appOriginHref(appOrigin);
+  const appHref = appOriginHref(appOrigin, resolveAppPath);
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     if (turn.kind !== "working") return;
@@ -450,6 +463,7 @@ export default function Home({
   onOpenIssue,
   overviewHref,
   permissionsHref,
+  resolveAppPath,
   setupNotice = null,
 }: {
   readOnly: boolean;
@@ -459,6 +473,8 @@ export default function Home({
   overviewHref: string;
   /** Settings → Master permissions (the standing "Always" rules). */
   permissionsHref: string;
+  /** CAD-1438: resolves an install id to its unique canonical `/apps/<key>` path, or null. */
+  resolveAppPath: (installId: string) => string | null;
   /** The first-run setup strip (CAD-1312): rendered inside the chat
    *  panel below the Assistant heading so the Needs-you rail beside it
    *  keeps the workspace's top edge. */
@@ -974,6 +990,7 @@ export default function Home({
               step={step}
               onStop={() => runCommand("stop", "")}
               nameRow={nameRowShown}
+              resolveAppPath={resolveAppPath}
             />
           </div>
 

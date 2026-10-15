@@ -6,7 +6,7 @@ import { prefetchWorkspaceApp, readInstallationsFresh, readInstallationsSnapshot
 import { useQuery, useResource } from "../../lib/useResource";
 import type { AppRow } from "../../lib/types";
 import { homeNeeds, type HomeNeed } from "../home/needs";
-import { appApprovalChip, appHref, appPurpose, installedAppHref, runsSummary, screenInstallHref } from "./appViewModel";
+import { appApprovalChip, appHref, appPurpose, installedAppHref, installationAppHref, runsSummary, screenInstallHref } from "./appViewModel";
 import { useBackoffLoad } from "../workspace-apps/useBackoffLoad";
 import { useInstallations } from "../workspace-apps/useInstallations";
 import { ResourceGate } from "../../ui/ResourceStatus";
@@ -23,8 +23,8 @@ import "../explorer/explorer.css";
 /**
  * The Apps home (CAD-1129, `/apps`): the OS-style landing — a Needs-
  * attention rail, the operator's/member's favorites row, the installed
- * grid and (operator) Recently removed. "Open" opens the app's own
- * page (`/app-installations/<id>`); "Manage" opens its operator tab.
+ * grid and (operator) Recently removed. "Open" opens the app's canonical
+ * page (`/apps/<key>` — CAD-1438); "Manage" opens its operator tab.
  *
  * The legacy project-scoped list and the per-project catalog live
  * behind `/apps/<project>/<name>` (unchanged); this screen is the
@@ -131,11 +131,13 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
       .finally(() => setBusy(null));
   };
 
-  const openHref = (installation: HomeInstallation) => {
-    const sameKey = live.filter((item) => item.name === installation.name);
-    const stableHref = `/app-installations/${encodeURIComponent(installation.install_id)}`;
-    if (sameKey.length !== 1) return stableHref;
-    return installedAppHref(installation.name) ?? stableHref;
+  // CAD-1438: tiles link the canonical `/apps/<key>` route. For the
+  // operator the verified install list decides uniqueness before the
+  // link is emitted; for members (no list read) the route itself proves
+  // uniqueness — an ambiguous or unsafe key renders no link.
+  const openHref = (installation: HomeInstallation): string | null => {
+    if (installs !== null) return installationAppHref(installs, installation.install_id);
+    return installedAppHref(installation.name);
   };
 
   const attentionRow = (h: HomeInstallation) => {
@@ -146,7 +148,7 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
         <AppGlyph name={h.name} icon={h.icon} size="sm" />
         <span className="txt"><b>{h.title}</b> · {h.attention.message ?? label}</span>
         {isOp ? (
-          <Button className="btn-sm" href={s === "off" || s === "update" ? `/apps/manage/${h.install_id}` : openHref(h)}>
+          <Button className="btn-sm" href={(s === "off" || s === "update" ? `/apps/manage/${h.install_id}` : openHref(h)) ?? `/apps/manage/${h.install_id}`}>
             {t(s === "off" ? "Manage access" : s === "update" ? "Review update" : "Finish setup")}
           </Button>
         ) : (
@@ -244,12 +246,23 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
               <div className="favs">
                 {favorites.map((h) => (
                   <div key={h.install_id} className="card fav">
-                    <Link href={openHref(h)} className="open"
-                      onClick={() => opened(h.install_id)} aria-label={`${t("Open")} ${h.title}`}>
-                      <AppGlyph name={h.name} icon={h.icon} />
-                      <span className="nm">{h.title}</span>
-                      <span className="ln">{h.tagline}</span>
-                    </Link>
+                    {(() => {
+                      const href = openHref(h);
+                      return href === null ? (
+                        <span className="open" aria-label={`${t("Open")} ${h.title}`}>
+                          <AppGlyph name={h.name} icon={h.icon} />
+                          <span className="nm">{h.title}</span>
+                          <span className="ln">{t("No unique app page — see Manage")}</span>
+                        </span>
+                      ) : (
+                        <Link href={href} className="open"
+                          onClick={() => opened(h.install_id)} aria-label={`${t("Open")} ${h.title}`}>
+                          <AppGlyph name={h.name} icon={h.icon} />
+                          <span className="nm">{h.title}</span>
+                          <span className="ln">{h.tagline}</span>
+                        </Link>
+                      );
+                    })()}
                     <button className="star pinned absolute top-2 right-2" aria-label={`${t("Unpin")} ${h.title}`}
                       onClick={() => pin(h.install_id)}>★</button>
                   </div>
@@ -287,22 +300,33 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
                 <div className="igrid">
                   {items.map((h) => {
                     const pinned = favs?.favorites.includes(h.install_id) ?? false;
+                    const href = openHref(h);
+                    const body = (
+                      <>
+                        <AppGlyph name={h.name} icon={h.icon} size="sm" />
+                        <div className="min-w-0 flex-1">
+                          <div className="nm">{h.title}</div>
+                          <div className="ln">{h.tagline}</div>
+                          {h.project && <div className="ln text-ink-500">{t("Project")}: {h.project}</div>}
+                          {h.attention.state !== "ok" && (
+                            <div className="mt-1"><span className={`chip ${h.attention.state === "update" ? "info" : h.attention.state === "off" ? "" : "warn"}`}>
+                              {t(h.attention.state === "update" ? "Update" : h.attention.state === "off" ? "Access off" : h.attention.state === "setup" ? "Finish setup" : "Needs attention")}
+                            </span></div>
+                          )}
+                          {href === null && <div className="ln text-ink-500">{t("No unique app page — see Manage")}</div>}
+                        </div>
+                      </>
+                    );
                     return (
                       <div key={h.install_id} className="card itile">
-                        <Link className="open" href={openHref(h)}
-                          onClick={() => opened(h.install_id)} aria-label={`${t("Open")} ${h.title}`}>
-                          <AppGlyph name={h.name} icon={h.icon} size="sm" />
-                          <div className="min-w-0 flex-1">
-                            <div className="nm">{h.title}</div>
-                            <div className="ln">{h.tagline}</div>
-                            {h.project && <div className="ln text-ink-500">{t("Project")}: {h.project}</div>}
-                            {h.attention.state !== "ok" && (
-                              <div className="mt-1"><span className={`chip ${h.attention.state === "update" ? "info" : h.attention.state === "off" ? "" : "warn"}`}>
-                                {t(h.attention.state === "update" ? "Update" : h.attention.state === "off" ? "Access off" : h.attention.state === "setup" ? "Finish setup" : "Needs attention")}
-                              </span></div>
-                            )}
-                          </div>
-                        </Link>
+                        {href === null ? (
+                          <span className="open" aria-label={`${t("Open")} ${h.title}`}>{body}</span>
+                        ) : (
+                          <Link className="open" href={href}
+                            onClick={() => opened(h.install_id)} aria-label={`${t("Open")} ${h.title}`}>
+                            {body}
+                          </Link>
+                        )}
                         <div className="acts">
                           <button className={`star ${pinned ? "pinned" : ""}`} aria-pressed={pinned}
                             aria-label={`${t(pinned ? "Unpin" : "Pin")} ${h.title}`}
@@ -408,18 +432,26 @@ function WorkspaceCatalog() {
     </div>}
     {rows === null ? error ? null : <p className="text-label text-ink-400" role="status">{t("Loading workspace apps…")}</p> : rows.length === 0 ? <div className="card px-4 py-3 text-label text-ink-400">
       {t("No workspace apps installed. Install a package with")} <code>cadence app catalog install &lt;path|git-url&gt;</code>.
-    </div> : <ul className="space-y-2.5">{rows.map(row => <li key={row.install_id} className="card px-3.5 py-3 min-w-0"
+    </div> : <ul className="space-y-2.5">{rows.map(row => {
+      // CAD-1438: canonical `/apps/<key>` only — a shared or unsafe key
+      // gets no link instead of a retired ID route.
+      const href = installationAppHref(rows, row.install_id);
+      return <li key={row.install_id} className="card px-3.5 py-3 min-w-0"
       onMouseEnter={() => prefetchWorkspaceApp(row.install_id)} onFocus={() => prefetchWorkspaceApp(row.install_id)}>
       <div className="app-card-layout">
         <AppIcon label={row.title || row.name} />
         <div className="min-w-0 flex-1">
-          <Link href={`/app-installations/${encodeURIComponent(row.install_id)}`} className="text-cardtitle font-medium text-ink-100 hover:text-accent">{row.title || row.name}</Link>
+          {href === null
+            ? <span className="text-cardtitle font-medium text-ink-100">{row.title || row.name}</span>
+            : <Link href={href} className="text-cardtitle font-medium text-ink-100 hover:text-accent">{row.title || row.name}</Link>}
           {row.approved !== true && <span className="chip ml-2">{t("Access off")}</span>}
           <p className="text-label text-ink-400 mt-0.5 break-words">{row.summary}</p>
+          {href === null && <p className="text-micro text-ink-500 mt-0.5">{t("No unique app page — see Manage")}</p>}
         </div>
-        <Button href={`/app-installations/${encodeURIComponent(row.install_id)}`} className="app-card-action">{t("Open app")}</Button>
+        {href !== null && <Button href={href} className="app-card-action">{t("Open app")}</Button>}
       </div>
-    </li>)}</ul>}
+    </li>;
+    })}</ul>}
   </section>;
 }
 /** A monogram tile — the app's first letter, on the board's accent. */

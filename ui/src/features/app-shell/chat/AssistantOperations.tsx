@@ -228,12 +228,14 @@ function resultValues(value: unknown, depth = 0): Array<[string, string]> {
   return rows;
 }
 
-function AssistantOperationCard({ operation, installId, contextId, busy, decide }: {
+function AssistantOperationCard({ operation, installId, contextId, busy, decide, appPath }: {
   operation: Operation;
   installId: string;
   contextId: string;
   busy: boolean;
   decide: (operation: Operation, decision: "allow_once" | "allow_always" | "deny") => void;
+  /** The verified canonical `/apps/<key>` path for resource links; null means no link. */
+  appPath: string | null;
 }) {
   const t = useTranslate();
   const request = operation.permission_request;
@@ -314,7 +316,7 @@ function AssistantOperationCard({ operation, installId, contextId, busy, decide 
       {operation.resource_refs.length > 0 && (
         <ul className="app-assistant-resources" aria-label={t("Result resources")}>
           {operation.resource_refs.map((ref, index) => {
-            const href = resourceHref(installId, contextId, ref);
+            const href = resourceHref(appPath, installId, contextId, ref);
             return <li key={`${ref.kind}:${ref.id}:${index}`}>{href ? <Link className="lnk text-label" href={href}>{ref.label}</Link> : <span className="text-label text-ink-300">{ref.label}</span>}</li>;
           })}
         </ul>
@@ -359,10 +361,12 @@ interface Poller {
   refresh: () => Promise<void>;
 }
 
-export default function AssistantOperations({ installId, contextId, canDecide }: {
+export default function AssistantOperations({ installId, contextId, canDecide, appPath }: {
   installId: string;
   contextId: string;
   canDecide: boolean;
+  /** The verified canonical `/apps/<key>` path; resource links emit it. Null means no links. */
+  appPath: string | null;
 }) {
   const t = useTranslate();
   const scopeKey = JSON.stringify([installId, contextId]);
@@ -536,12 +540,12 @@ export default function AssistantOperations({ installId, contextId, canDecide }:
       </div>
       {visible.consent && <p className="text-micro text-ink-400" role="status">{t("Approve the app to enable assistant actions.")}</p>}
       {visible.error && <p className="text-micro text-fail" role="alert">{visible.error} <button className="lnk" type="button" onClick={() => void poller.current?.refresh()}>{t("Retry")}</button></p>}
-      {activeOperations.map((operation) => <AssistantOperationCard key={operation.id} operation={operation} installId={installId} contextId={contextId} busy={busy === operation.id || !canDecide} decide={decide} />)}
+      {activeOperations.map((operation) => <AssistantOperationCard key={operation.id} operation={operation} installId={installId} contextId={contextId} appPath={appPath} busy={busy === operation.id || !canDecide} decide={decide} />)}
       {completedOperations.length > 0 && (
         <details className="app-assistant-history">
           <summary className="text-micro">{t("Completed activity")} ({completedOperations.length})</summary>
           <div className="app-assistant-history-list">
-            {completedOperations.map((operation) => <AssistantOperationCard key={operation.id} operation={operation} installId={installId} contextId={contextId} busy={busy === operation.id || !canDecide} decide={decide} />)}
+            {completedOperations.map((operation) => <AssistantOperationCard key={operation.id} operation={operation} installId={installId} contextId={contextId} appPath={appPath} busy={busy === operation.id || !canDecide} decide={decide} />)}
           </div>
         </details>
       )}
