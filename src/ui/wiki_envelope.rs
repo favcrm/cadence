@@ -337,7 +337,6 @@ fn bounded_range_json(v: Value) -> HttpResp {
     json_ok(v)
 }
 
-
 /// `PUT /api/wiki/file` JSON `{path,text,if_rev?}`. The write runs the
 /// daemon's `wiki_write` (the existing mutation path) under the
 /// envelope's write ceiling. A text write only: no blob fields.

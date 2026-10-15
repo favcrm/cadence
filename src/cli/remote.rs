@@ -651,6 +651,7 @@ fn remote_blob_cat(
     target: &cadence_agent::remote_cli::RemoteTarget,
     command: &Commands,
     discovered: &Value,
+    deadline: std::time::Instant,
     wake_timeout: u64,
 ) -> Result<bool> {
     let Commands::Wiki {
@@ -670,7 +671,7 @@ fn remote_blob_cat(
     {
         return Ok(false);
     }
-    stream_remote_blob(target, path, discovered, wake_timeout)?;
+    stream_remote_blob(target, path, discovered, deadline, wake_timeout)?;
     Ok(true)
 }
 
@@ -678,10 +679,11 @@ fn stream_remote_blob(
     target: &cadence_agent::remote_cli::RemoteTarget,
     path: &str,
     discovered: &Value,
+    deadline: std::time::Instant,
     wake_timeout: u64,
 ) -> Result<()> {
     let mut spool = collect_remote_blob(discovered, |offset, rev| {
-        remote_blob_range(target, path, offset, rev, wake_timeout)
+        remote_blob_range(target, path, offset, rev, deadline, wake_timeout)
     })?;
     std::io::copy(&mut spool, &mut std::io::stdout())
         .map_err(|e| Error::rejected(format!("remote wiki cat: cannot write stdout: {e}")))?;
@@ -692,9 +694,9 @@ fn collect_remote_blob(
     discovered: &Value,
     mut fetch: impl FnMut(u64, &str) -> Result<Value>,
 ) -> Result<tempfile::NamedTempFile> {
+    use sha2::Digest;
     use std::io::{Seek, SeekFrom, Write};
     use std::os::unix::fs::PermissionsExt;
-    use sha2::Digest;
 
     let sha = blob_meta_str(discovered, "sha256")?;
     if sha.len() != 64 || !sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
@@ -810,7 +812,11 @@ fn collect_remote_blob(
             break;
         }
     }
-    let got: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    let got: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     if got != sha || offset != size {
         return Err(Error::rejected(
             "remote wiki cat refused: spooled bytes do not match the pointer sha256; nothing was written",
@@ -823,7 +829,6 @@ fn collect_remote_blob(
     })?;
     Ok(spool)
 }
-
 
 fn blob_range_fits(page: &Value) -> bool {
     struct Count(usize);
@@ -843,11 +848,15 @@ fn blob_range_fits(page: &Value) -> bool {
 }
 
 fn blob_meta_str<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
-    value.get(key).and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or_else(|| {
-        Error::rejected(format!(
-            "remote wiki cat refused: blob metadata '{key}' is missing; nothing was written"
-        ))
-    })
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            Error::rejected(format!(
+                "remote wiki cat refused: blob metadata '{key}' is missing; nothing was written"
+            ))
+        })
 }
 
 fn remote_blob_range(
@@ -855,25 +864,27 @@ fn remote_blob_range(
     path: &str,
     offset: u64,
     rev: &str,
+    deadline: std::time::Instant,
     wake_timeout: u64,
 ) -> Result<Value> {
     let mut args = serde_json::Map::new();
     args.insert("path".into(), json!(path));
     args.insert("offset".into(), json!(offset));
     args.insert("rev".into(), json!(rev));
-    match cadence_agent::remote_cli::call_verb(target, "read", args, wake_timeout, |line| {
-        eprintln!("{line}")
-    }) {
-        Ok(cadence_agent::remote_cli::RemoteAnswer::Ok(body)) => Ok(body),
-        Ok(cadence_agent::remote_cli::RemoteAnswer::Conflict(_)) => Err(Error::rejected(
+    match cadence_agent::remote_cli::call_verb(
+        target,
+        "read",
+        args,
+        deadline,
+        wake_timeout,
+        |line| eprintln!("{line}"),
+    )? {
+        cadence_agent::remote_cli::RemoteAnswer::Ok(body) => Ok(body),
+        cadence_agent::remote_cli::RemoteAnswer::Conflict(_) => Err(Error::rejected(
             "remote wiki cat refused: blob range returned a conflict; nothing was written",
         )),
-        Err(error) => Err(Error::rejected(format!(
-            "remote wiki cat refused: blob range at offset {offset} failed: {error}; nothing was written"
-        ))),
     }
 }
-
 
 /// `wiki ls|cat|search` answers print as the host prints them. The `--json`,
 /// `--meta` and `put` forms keep the JSON body. Returns whether it printed.
@@ -995,33 +1006,29 @@ pub(super) fn run(
         return upload(&target, file, path, *overwrite, wake_timeout);
     }
     let (verb, args) = verb_for(&command)?;
-    let out =
-        match cadence_agent::remote_cli::call_verb(&target, verb, args, wake_timeout, |line| {
-            eprintln!("{line}")
-        }) {
-            Ok(out) => out,
-            Err(error) => {
-                // The wake budget lapsed: the contract's exact payload on
-                // stderr, exit 75 — a retryable `busy`, never a silent hang.
-                if error.kind() == "busy" && error.code() == Some("waking") {
-                    eprintln!(
-                        "{}",
-                        serde_json::to_string(&json!({"kind": "busy", "state": "waking"}))
-                            .unwrap_or_default()
-                    );
-                    return Ok(75);
-                }
-                return Err(error);
-            }
-        };
+    let deadline = std::time::Instant::now()
+        .checked_add(std::time::Duration::from_secs(wake_timeout))
+        .ok_or_else(|| Error::rejected("invalid wake timeout"))?;
+    let out = match cadence_agent::remote_cli::call_verb(
+        &target,
+        verb,
+        args,
+        deadline,
+        wake_timeout,
+        |line| eprintln!("{line}"),
+    ) {
+        Ok(out) => out,
+        Err(error) => return remote_failure(error),
+    };
     match out {
         cadence_agent::remote_cli::RemoteAnswer::Ok(body) => {
-            if remote_blob_cat(&target, &command, &body, wake_timeout)? {
-                return Ok(0);
+            match remote_blob_cat(&target, &command, &body, deadline, wake_timeout) {
+                Ok(true) => return Ok(0),
+                Ok(false) => {}
+                Err(error) => return remote_failure(error),
             }
             if wiki_text(&command, &body)? {
                 return Ok(0);
-            }
             }
             println!(
                 "{}",
@@ -1040,6 +1047,15 @@ pub(super) fn run(
             );
             Ok(5)
         }
+    }
+}
+
+fn remote_failure(error: Error) -> Result<i32> {
+    if error.kind() == "busy" && error.code() == Some("waking") {
+        eprintln!("{}", json!({"kind": "busy", "state": "waking"}));
+        Ok(75)
+    } else {
+        Err(error)
     }
 }
 
@@ -1495,8 +1511,16 @@ mod blob_download_tests {
         std::fs::create_dir_all(&uploads).unwrap();
         let tmp = uploads.join("blob");
         std::fs::write(&tmp, bytes).unwrap();
-        wiki::put_blob(pm, state, &wiki::Caller::Operator, "global/proof.bin", &tmp, None, None)
-            .unwrap()
+        wiki::put_blob(
+            pm,
+            state,
+            &wiki::Caller::Operator,
+            "global/proof.bin",
+            &tmp,
+            None,
+            None,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1513,10 +1537,17 @@ mod blob_download_tests {
             let mut spool = collect_remote_blob(&meta, |offset, rev| {
                 calls += 1;
                 wiki::read_range(
-                    &pm, &wiki::Caller::Operator, "global/proof.bin",
-                    wiki::BodyRange { offset, bytes: None, rev: Some(rev) },
+                    &pm,
+                    &wiki::Caller::Operator,
+                    "global/proof.bin",
+                    wiki::BodyRange {
+                        offset,
+                        bytes: None,
+                        rev: Some(rev),
+                    },
                 )
-            }).unwrap();
+            })
+            .unwrap();
             let mut actual = Vec::new();
             spool.read_to_end(&mut actual).unwrap();
             assert_eq!(actual, bytes);
@@ -1546,13 +1577,26 @@ mod blob_download_tests {
                 }
                 calls += 1;
                 wiki::read_range(
-                    &pm, &wiki::Caller::Operator, "global/proof.bin",
-                    wiki::BodyRange { offset, bytes: None, rev: Some(rev) },
+                    &pm,
+                    &wiki::Caller::Operator,
+                    "global/proof.bin",
+                    wiki::BodyRange {
+                        offset,
+                        bytes: None,
+                        rev: Some(rev),
+                    },
                 )
-            }).unwrap_err();
+            })
+            .unwrap_err();
             let message = error.to_string();
-            assert!(message.contains(if replace_pointer { "revision" } else { "sha256" }),
-                    "{message}");
+            assert!(
+                message.contains(if replace_pointer {
+                    "revision"
+                } else {
+                    "sha256"
+                }),
+                "{message}"
+            );
         }
     }
 
@@ -1565,14 +1609,21 @@ mod blob_download_tests {
         let meta = plant(&pm, &root.path().join("state"), &bytes);
         let error = collect_remote_blob(&meta, |offset, rev| {
             let mut page = wiki::read_range(
-                &pm, &wiki::Caller::Operator, "global/proof.bin",
-                wiki::BodyRange { offset, bytes: None, rev: Some(rev) },
+                &pm,
+                &wiki::Caller::Operator,
+                "global/proof.bin",
+                wiki::BodyRange {
+                    offset,
+                    bytes: None,
+                    rev: Some(rev),
+                },
             )?;
             // A peer ignores the native bound, but keeps the bytes and hash valid.
             page["data_base64"] = json!(base64::engine::general_purpose::STANDARD.encode(&bytes));
             page["range"]["end"] = json!(bytes.len());
             Ok(page)
-        }).unwrap_err();
+        })
+        .unwrap_err();
         assert!(error.to_string().contains("complete blob range"), "{error}");
     }
 }

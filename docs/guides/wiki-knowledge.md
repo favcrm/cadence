@@ -93,6 +93,8 @@ the native tool bound. An explicit range that would exceed the bound is
 refused. An omitted `--bytes` returns the longest fitting slice. Empty blobs
 return an empty slice. Text pages do not use `data_base64`.
 Remote `cat` refuses blobs larger than 100 MiB before fetching byte ranges.
+Discovery and continuation reads share one `--wake-timeout` deadline. Expiry
+keeps the existing retryable `busy`/`waking` exit 75 and releases no blob bytes.
 
 `--if-rev none` is create-only. For an update, read the current revision with
 `cat --meta`, then pass that value to `put --if-rev <rev>`; a conflict means

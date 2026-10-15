@@ -155,7 +155,6 @@ fn file_response(
         Some("blob") => {}
         _ => return err_response(404, "no such wiki page"),
     }
-    }
     let sha = page["sha256"].as_str().unwrap_or_default();
     let mime = page["mime"].as_str().unwrap_or("application/octet-stream");
     let name = page["name"].as_str().unwrap_or("attachment");
@@ -276,7 +275,6 @@ fn compact_wiki_json(page: Value) -> HttpResp {
     resp.add_header(Header::from_bytes("Cache-Control", "no-store").unwrap());
     resp
 }
-
 
 // ---------- PUT /api/wiki/file, POST /api/wiki/{upload,mkdir,mv,rm} ----------
 

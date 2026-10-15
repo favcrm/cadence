@@ -608,7 +608,7 @@ fn signed_blob_read_refuses_out_of_prefix_and_stale_rev_before_bytes() {
         "signed text range stays text and does not use data_base64",
         note_range.0 == 200
             && note_range_json["kind"] == "text"
-            && note_range_json["text"] == &NOTE_TEXT[..4]
+            && note_range_json["text"] == NOTE_TEXT[..4]
             && note_range_json["range"]["start"] == json!(0)
             && note_range_json["range"]["end"] == json!(4)
             && note_range_json["range"]["total"] == json!(NOTE_TEXT.len())

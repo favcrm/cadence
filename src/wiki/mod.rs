@@ -927,13 +927,13 @@ fn text_read_range(page: TextPage, range: BodyRange<'_>) -> Result<Value> {
     Ok(ranged_value(&page, start, end))
 }
 
-struct BlobView {
-    path: String,
-    sha256: String,
+struct BlobView<'a> {
+    path: &'a str,
+    sha256: &'a str,
     size: u64,
-    mime: String,
-    name: String,
-    rev: String,
+    mime: &'a str,
+    name: &'a str,
+    rev: &'a str,
 }
 
 fn blob_str<'a>(meta: &'a Value, key: &str, path: &str) -> Result<&'a str> {
@@ -944,9 +944,9 @@ fn blob_str<'a>(meta: &'a Value, key: &str, path: &str) -> Result<&'a str> {
     })
 }
 
-fn blob_view(meta: &Value) -> Result<BlobView> {
-    let path = blob_str(meta, "path", "")?.to_string();
-    let sha256 = blob_str(meta, "sha256", &path)?.to_string();
+fn blob_view(meta: &Value) -> Result<BlobView<'_>> {
+    let path = blob_str(meta, "path", "")?;
+    let sha256 = blob_str(meta, "sha256", path)?;
     if sha256.len() != 64
         || !sha256
             .bytes()
@@ -962,17 +962,17 @@ fn blob_view(meta: &Value) -> Result<BlobView> {
         ))
     })?;
     Ok(BlobView {
-        mime: blob_str(meta, "mime", &path)?.to_string(),
-        name: blob_str(meta, "name", &path)?.to_string(),
-        rev: blob_str(meta, "rev", &path)?.to_string(),
+        mime: blob_str(meta, "mime", path)?,
+        name: blob_str(meta, "name", path)?,
+        rev: blob_str(meta, "rev", path)?,
         path,
         sha256,
         size,
     })
 }
 
-fn blob_ranged_value(view: &BlobView, start: u64, end: u64, data_base64: &str) -> Value {
-    json!({
+fn blob_ranged_value(view: &BlobView<'_>, start: u64, end: u64, data_base64: String) -> Value {
+    let mut value = json!({
         "path": view.path,
         "kind": "blob",
         "sha256": view.sha256,
@@ -981,8 +981,9 @@ fn blob_ranged_value(view: &BlobView, start: u64, end: u64, data_base64: &str) -
         "name": view.name,
         "rev": view.rev,
         "range": {"start": start, "end": end, "total": view.size},
-        "data_base64": data_base64,
-    })
+    });
+    value["data_base64"] = Value::String(data_base64);
+    value
 }
 
 fn b64_len(n: usize) -> usize {
@@ -999,7 +1000,7 @@ fn decimal_len_u64(n: u64) -> usize {
 
 /// Compact length of [`blob_ranged_value`]. Base64 uses the standard
 /// alphabet, which needs no JSON escape. Key order matches `json!`.
-fn blob_line_len(view: &BlobView, start: u64, end: u64) -> usize {
+fn blob_line_len(view: &BlobView<'_>, start: u64, end: u64) -> usize {
     let Ok(n) = usize::try_from(end.saturating_sub(start)) else {
         return usize::MAX;
     };
@@ -1010,11 +1011,11 @@ fn blob_line_len(view: &BlobView, start: u64, end: u64) -> usize {
         + 2
         + b64_len(n)
         + ",\"kind\":\"blob\",\"mime\":".len()
-        + json_string_len(&view.mime)
+        + json_string_len(view.mime)
         + ",\"name\":".len()
-        + json_string_len(&view.name)
+        + json_string_len(view.name)
         + ",\"path\":".len()
-        + json_string_len(&view.path)
+        + json_string_len(view.path)
         + ",\"range\":{\"end\":".len()
         + decimal_len_u64(end)
         + ",\"start\":".len()
@@ -1022,15 +1023,15 @@ fn blob_line_len(view: &BlobView, start: u64, end: u64) -> usize {
         + ",\"total\":".len()
         + decimal_len_u64(view.size)
         + "},\"rev\":".len()
-        + json_string_len(&view.rev)
+        + json_string_len(view.rev)
         + ",\"sha256\":".len()
-        + json_string_len(&view.sha256)
+        + json_string_len(view.sha256)
         + ",\"size\":".len()
         + decimal_len_u64(view.size)
         + "}".len()
 }
 
-fn blob_fits(view: &BlobView, start: u64, end: u64) -> bool {
+fn blob_fits(view: &BlobView<'_>, start: u64, end: u64) -> bool {
     if end < start {
         return false;
     }
@@ -1039,7 +1040,7 @@ fn blob_fits(view: &BlobView, start: u64, end: u64) -> bool {
         .is_some_and(|n| n < NATIVE_TOOL_LINE_BOUND)
 }
 
-fn blob_end(view: &BlobView, start: u64, bytes: Option<u64>) -> Result<u64> {
+fn blob_end(view: &BlobView<'_>, start: u64, bytes: Option<u64>) -> Result<u64> {
     let total = view.size;
     let end = match bytes {
         Some(n) => start.saturating_add(n).min(total),
@@ -1061,11 +1062,11 @@ fn blob_end(view: &BlobView, start: u64, bytes: Option<u64>) -> Result<u64> {
                     hi = mid - 1;
                 }
             }
-            best.ok_or_else(|| oversize(&view.path))?
+            best.ok_or_else(|| oversize(view.path))?
         }
     };
     if !blob_fits(view, start, end) {
-        return Err(oversize(&view.path));
+        return Err(oversize(view.path));
     }
     Ok(end)
 }
@@ -1092,7 +1093,7 @@ fn blob_read_range(pm: &Pm, meta: &Value, range: BodyRange<'_>) -> Result<Value>
     let bytes = read_blob_slice(pm, &view, start, end)?;
     use base64::Engine;
     let data_base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    let value = blob_ranged_value(&view, start, end, &data_base64);
+    let value = blob_ranged_value(&view, start, end, data_base64);
     debug_assert_eq!(
         blob_line_len(&view, start, end),
         serde_json::to_string(&value)
@@ -1104,7 +1105,7 @@ fn blob_read_range(pm: &Pm, meta: &Value, range: BodyRange<'_>) -> Result<Value>
 
 /// Read only the requested slice of an immutable, content-addressed object.
 /// Upload verifies its digest; remote cat verifies the assembled bytes once.
-fn read_blob_slice(pm: &Pm, view: &BlobView, start: u64, end: u64) -> Result<Vec<u8>> {
+fn read_blob_slice(pm: &Pm, view: &BlobView<'_>, start: u64, end: u64) -> Result<Vec<u8>> {
     use std::os::unix::fs::OpenOptionsExt;
 
     let vault = vault_dir(pm)?;
@@ -1124,7 +1125,7 @@ fn read_blob_slice(pm: &Pm, view: &BlobView, start: u64, end: u64) -> Result<Vec
             )))
         }
     }
-    let object = blobs.join(&view.sha256);
+    let object = blobs.join(view.sha256);
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -2783,6 +2784,15 @@ mod tests {
         assert_eq!(meta_only["sha256"], blob["sha256"]);
         let object = blobs_dir(&vault_dir(&pm).unwrap()).join(blob["sha256"].as_str().unwrap());
         assert_eq!(std::fs::read(&object).unwrap(), b"not-text-blob");
+        std::fs::write(&object, b"short").unwrap();
+        let short = read_range(
+            &pm,
+            &Caller::Operator,
+            "global/a.bin",
+            body_range(0, Some(4), Some(&rev)),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(short.contains("pointer size"), "{short}");
         assert!(!short.contains("data_base64"), "{short}");
         std::fs::write(&object, b"not-text-blob").unwrap();
@@ -2847,7 +2857,10 @@ mod tests {
             - fitted["range"]["start"].as_u64().unwrap()) as usize;
         let line = serde_json::to_string(&fitted).unwrap();
         assert!(n < 40_000, "slice {n} did not reserve base64 and metadata");
-        assert!(line.len() > n, "compact JSON must count base64 and metadata");
+        assert!(
+            line.len() > n,
+            "compact JSON must count base64 and metadata"
+        );
         assert!(line.len() + 1 < NATIVE_TOOL_LINE_BOUND, "{}", line.len());
         let raw = base64::engine::general_purpose::STANDARD
             .decode(fitted["data_base64"].as_str().unwrap())
@@ -2861,10 +2874,7 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(
-            past.contains("50000-byte native tool line bound"),
-            "{past}"
-        );
+        assert!(past.contains("50000-byte native tool line bound"), "{past}");
     }
 
     #[test]
