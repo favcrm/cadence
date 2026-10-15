@@ -217,3 +217,74 @@ export function addHumanMember(id: string, target: { human_subject: string } | {
 export function removeHumanMember(id: string, kind: "human" | "agent", member: string): Promise<unknown> {
   return call("DELETE", `${roomPath(id)}/members/${kind}/${encodeURIComponent(member)}`);
 }
+
+/** CAD-1423: one authorized received-message history group for the viewer. */
+export interface NotificationGroup {
+  room: string;
+  kind: HumanRoomKind;
+  title: string;
+  unread: number;
+  muted: boolean;
+  mention: boolean;
+  alert_seq: number;
+}
+
+export interface NotificationPreferences {
+  dm: boolean;
+  mention: boolean;
+  sound: boolean;
+  preview: boolean;
+  /** `off` or `22-08`: quiet from 22:00 to 08:00 in `zone`. */
+  quiet: "off" | "22-08";
+  /** The user's IANA time zone. */
+  zone: string;
+}
+
+export interface NotificationInbox {
+  /** The verified current human, returned atomically with the feed. */
+  human: HumanMe;
+  unread_total: number;
+  groups: NotificationGroup[];
+  preferences: NotificationPreferences;
+  push: { available: boolean; public_key: string | null };
+}
+
+/** `GET /api/human-threads/notifications` — the caller's inbox. Private state only. */
+export function humanNotifications(): Promise<NotificationInbox> {
+  return call("GET", "/api/human-threads/notifications");
+}
+
+/** `POST /api/human-threads/notifications/read` — dismiss the inbox; never a thread read. */
+export function markNotificationsRead(): Promise<{ unread_total: number }> {
+  return call("POST", "/api/human-threads/notifications/read", {});
+}
+
+/** `POST /api/human-threads/notifications/preferences` — the verified caller's own preferences. */
+export function setNotificationPreferences(prefs: NotificationPreferences): Promise<{ preferences: NotificationPreferences }> {
+  return call("POST", "/api/human-threads/notifications/preferences", prefs);
+}
+
+/** `POST /api/human-threads/rooms/<id>/mute` — mute or unmute one room; unread is kept. */
+export function setRoomMuted(id: string, muted: boolean): Promise<{ muted: boolean }> {
+  return call("POST", `${roomPath(id)}/mute`, { muted });
+}
+
+/** Refresh this verified device's visible room; presence expires after 30 seconds. */
+export function setPushPresence(deviceId: string, tabId: string, room: string | null): Promise<{ accepted: boolean }> {
+  return call("POST", "/api/human-threads/push/presence", { device_id: deviceId, tab_id: tabId, room });
+}
+
+/** `POST /api/human-threads/push/subscriptions` — enroll this browser endpoint. */
+export function enrollPush(sub: { endpoint: string; keys: { p256dh: string; auth: string } }): Promise<{ device_id: string }> {
+  return call("POST", "/api/human-threads/push/subscriptions", sub);
+}
+
+/** Rebind only an existing consent for this verified human and endpoint. */
+export function rebindPush(endpoint: string): Promise<{ device_id: string | null }> {
+  return call("POST", "/api/human-threads/push/subscriptions/rebind", { endpoint });
+}
+
+/** `DELETE /api/human-threads/push/subscriptions/<device_id>` — `removed` is the explicit result. */
+export function unenrollPush(deviceId: string): Promise<{ removed: boolean }> {
+  return call("DELETE", `/api/human-threads/push/subscriptions/${encodeURIComponent(deviceId)}`);
+}

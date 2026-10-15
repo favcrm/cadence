@@ -2410,10 +2410,17 @@ pub(super) fn platform_session(
         return platform_fail(400, "assertion_invalid", "request body is not valid JSON");
     }
     let user_agent = header_value(request, "User-Agent").unwrap_or_default();
+    // Only relay a prior session the browser actually presented. The daemon
+    // verifies this opaque proof before allowing it to affect consent state.
+    let prior_session = session_cookie(request, opts, Origin::Public);
     match client::rpc(
         state_dir,
         "board_session_open",
-        json!({"assertion": req.assertion, "user_agent": user_agent}),
+        json!({
+            "assertion": req.assertion,
+            "user_agent": user_agent,
+            "prior_session": prior_session,
+        }),
     ) {
         Ok(opened) => {
             let token = opened["token"].as_str().unwrap_or_default();

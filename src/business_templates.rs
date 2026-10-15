@@ -239,10 +239,15 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex(&Sha256::digest(bytes))
 }
 
-/// The version digest a human approves: the retained DOCX source bytes
-/// and the canonical spec, both. Changing either changes the digest.
-pub fn content_digest(source_sha256: &str, spec: &TemplateSpec) -> Result<String> {
-    let spec_json = serde_json::to_string(spec).map_err(|e| Error::internal(e.to_string()))?;
+/// The version digest a human approves: the retained source bytes and
+/// the canonical definition, both. A financial definition serializes as
+/// the historical `TemplateSpec` JSON, so existing digests stay put.
+/// An authoring pack's guidelines and reference bytes live in that same
+/// JSON, so the digest covers the whole pack. Changing either input
+/// changes the digest.
+pub fn content_digest(source_sha256: &str, definition: &TemplateDefinition) -> Result<String> {
+    let spec_json =
+        serde_json::to_string(definition).map_err(|e| Error::internal(e.to_string()))?;
     Ok(sha256_hex(
         format!("cad1393-template-v1\n{source_sha256}\n{spec_json}").as_bytes(),
     ))
@@ -332,6 +337,347 @@ pub fn check_approvable(spec: &TemplateSpec) -> Result<()> {
         return refuse("calculation rules are not confirmed; confirm them before approval");
     }
     Ok(())
+}
+
+/// Output format an agent authors against. Descriptive only: there is no
+/// renderer per format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthoringFormat {
+    Docx,
+    Pptx,
+    Xlsx,
+    Html,
+    Text,
+}
+
+/// The only authoring kind. It is not a quotation, invoice, or proposal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthoringKind {
+    Authoring,
+}
+
+/// One immutable reference file. `content_base64` is the bytes themselves;
+/// the daemon never resolves a path or URL from this record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReferenceAsset {
+    pub name: String,
+    pub media_type: String,
+    pub description: String,
+    pub content_base64: String,
+}
+
+/// A reference pack: guidelines plus the visual/textual references an
+/// agent should learn from. Data only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoringSpec {
+    pub kind: AuthoringKind,
+    pub purpose: String,
+    pub format: AuthoringFormat,
+    pub guidelines: String,
+    #[serde(default)]
+    pub references: Vec<ReferenceAsset>,
+}
+
+/// One template body. Financial JSON is the historical spec object;
+/// authoring JSON is a separate shape discriminated by `kind`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum TemplateDefinition {
+    Financial(TemplateSpec),
+    Authoring(AuthoringSpec),
+}
+
+impl TemplateDefinition {
+    /// The financial spec, or a refusal when this version is an authoring pack.
+    pub fn financial(&self) -> Result<&TemplateSpec> {
+        match self {
+            Self::Financial(spec) => Ok(spec),
+            Self::Authoring(_) => {
+                refuse("this template is an authoring reference pack, not a financial document")
+            }
+        }
+    }
+
+    pub fn authoring(&self) -> Option<&AuthoringSpec> {
+        match self {
+            Self::Authoring(spec) => Some(spec),
+            Self::Financial(_) => None,
+        }
+    }
+
+    /// `quotation`, `invoice`, or `authoring`.
+    pub fn kind(&self) -> &str {
+        match self {
+            Self::Financial(spec) => match spec.kind {
+                DocumentKind::Quotation => "quotation",
+                DocumentKind::Invoice => "invoice",
+            },
+            Self::Authoring(_) => "authoring",
+        }
+    }
+}
+
+/// Reference basenames the show export owns. A pack must not reuse them.
+pub const RESERVED_REFERENCE_NAMES: &[&str] = &["guidelines.md", "template.json"];
+
+const PACK_MAX_REFERENCES: usize = 12;
+const PACK_MAX_GUIDELINES: usize = 64 * 1024;
+const PACK_MIN_GUIDELINES: usize = 16;
+const PACK_MAX_PURPOSE: usize = 2_000;
+const PACK_MIN_PURPOSE: usize = 8;
+const PACK_MAX_DESCRIPTION: usize = 2_000;
+const PACK_MIN_DESCRIPTION: usize = 8;
+const PACK_MAX_NAME: usize = 120;
+const PACK_MAX_ASSET_BYTES: usize = 2 * 1024 * 1024;
+const PACK_MAX_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+
+/// Parse and validate either a financial spec or an authoring pack.
+/// Reference payload size is bounded before any base64 decode.
+pub fn parse_definition(value: Value) -> Result<TemplateDefinition> {
+    bound_authoring_wire(&value)?;
+    let kind = value.get("kind").and_then(Value::as_str);
+    match kind {
+        Some("quotation") | Some("invoice") => {
+            Ok(TemplateDefinition::Financial(parse_spec(value)?))
+        }
+        Some("authoring") => {
+            let spec: AuthoringSpec = serde_json::from_value(value)
+                .map_err(|e| Error::rejected(format!("authoring pack is malformed: {e}")))?;
+            validate_authoring(&spec)?;
+            Ok(TemplateDefinition::Authoring(spec))
+        }
+        Some(other) => refuse(format!(
+            "template kind '{other}' is not quotation, invoice, or authoring"
+        )),
+        None => refuse("template spec is malformed: missing kind"),
+    }
+}
+
+/// Structural validation for whichever body this definition carries.
+pub fn validate_definition(definition: &TemplateDefinition) -> Result<()> {
+    match definition {
+        TemplateDefinition::Financial(spec) => validate_spec(spec),
+        TemplateDefinition::Authoring(spec) => validate_authoring(spec),
+    }
+}
+
+/// Financial versions still need confirmed calculation rules. A structurally
+/// valid authoring pack may be approved by the operator; it has no prices.
+pub fn check_definition_approvable(definition: &TemplateDefinition) -> Result<()> {
+    match definition {
+        TemplateDefinition::Financial(spec) => check_approvable(spec),
+        TemplateDefinition::Authoring(spec) => validate_authoring(spec),
+    }
+}
+
+/// The bytes retained for this definition. Financial versions keep the
+/// checked DOCX. Authoring versions keep an empty blob and refuse a DOCX.
+pub fn retained_source<'a>(definition: &TemplateDefinition, source: &'a [u8]) -> Result<&'a [u8]> {
+    match definition {
+        TemplateDefinition::Financial(_) => {
+            check_docx_package(source)?;
+            Ok(source)
+        }
+        TemplateDefinition::Authoring(_) => {
+            if !source.is_empty() {
+                return refuse("authoring reference packs do not accept a DOCX source");
+            }
+            Ok(source)
+        }
+    }
+}
+
+fn bound_authoring_wire(value: &Value) -> Result<()> {
+    if value.get("kind").and_then(Value::as_str) != Some("authoring") {
+        return Ok(());
+    }
+    if let Some(guidelines) = value.get("guidelines").and_then(Value::as_str) {
+        if guidelines.len() > PACK_MAX_GUIDELINES {
+            return refuse(format!("guidelines exceed {PACK_MAX_GUIDELINES} bytes"));
+        }
+    }
+    let Some(refs) = value.get("references") else {
+        return Ok(());
+    };
+    let Some(refs) = refs.as_array() else {
+        return Ok(());
+    };
+    if refs.len() > PACK_MAX_REFERENCES {
+        return refuse(format!("at most {PACK_MAX_REFERENCES} reference assets"));
+    }
+    let mut wire = 0usize;
+    for reference in refs {
+        let encoded = reference
+            .get("content_base64")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let asset_limit = PACK_MAX_ASSET_BYTES * 4 / 3 + 4;
+        if encoded.len() > asset_limit {
+            return refuse(format!(
+                "a reference exceeds {PACK_MAX_ASSET_BYTES} decoded bytes"
+            ));
+        }
+        wire = wire.saturating_add(encoded.len());
+    }
+    let total_limit = PACK_MAX_TOTAL_BYTES * 4 / 3 + refs.len() * 4;
+    if wire > total_limit {
+        return refuse(format!(
+            "reference assets exceed {PACK_MAX_TOTAL_BYTES} decoded bytes in total"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_authoring(spec: &AuthoringSpec) -> Result<()> {
+    let purpose = spec.purpose.trim();
+    if purpose.len() < PACK_MIN_PURPOSE || spec.purpose.len() > PACK_MAX_PURPOSE {
+        return refuse(format!(
+            "purpose must be {PACK_MIN_PURPOSE}..={PACK_MAX_PURPOSE} bytes of text"
+        ));
+    }
+    let guidelines = spec.guidelines.trim();
+    if guidelines.len() < PACK_MIN_GUIDELINES || spec.guidelines.len() > PACK_MAX_GUIDELINES {
+        return refuse(format!(
+            "guidelines must be {PACK_MIN_GUIDELINES}..={PACK_MAX_GUIDELINES} bytes"
+        ));
+    }
+    if spec.references.len() > PACK_MAX_REFERENCES {
+        return refuse(format!("at most {PACK_MAX_REFERENCES} reference assets"));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut total = 0usize;
+    for reference in &spec.references {
+        check_reference_name(&reference.name)?;
+        let key = reference.name.to_ascii_lowercase();
+        if !seen.insert(key) {
+            return refuse(format!("reference '{}' is declared twice", reference.name));
+        }
+        if !reference_extension_matches(&reference.name, &reference.media_type)? {
+            return refuse(format!(
+                "reference '{}' extension does not match media_type '{}'",
+                reference.name, reference.media_type
+            ));
+        }
+        let description = reference.description.trim();
+        if description.len() < PACK_MIN_DESCRIPTION
+            || reference.description.len() > PACK_MAX_DESCRIPTION
+        {
+            return refuse(format!(
+                "reference '{}' needs a description of {PACK_MIN_DESCRIPTION}..={PACK_MAX_DESCRIPTION} bytes",
+                reference.name
+            ));
+        }
+        let asset_limit = PACK_MAX_ASSET_BYTES * 4 / 3 + 4;
+        if reference.content_base64.len() > asset_limit {
+            return refuse(format!(
+                "reference '{}' exceeds {PACK_MAX_ASSET_BYTES} decoded bytes",
+                reference.name
+            ));
+        }
+        let bytes = decode_reference(&reference.content_base64).map_err(|_| {
+            Error::rejected(format!(
+                "reference '{}' content_base64 is not standard base64",
+                reference.name
+            ))
+        })?;
+        if bytes.len() > PACK_MAX_ASSET_BYTES {
+            return refuse(format!(
+                "reference '{}' exceeds {PACK_MAX_ASSET_BYTES} decoded bytes",
+                reference.name
+            ));
+        }
+        total = total.saturating_add(bytes.len());
+        if total > PACK_MAX_TOTAL_BYTES {
+            return refuse(format!(
+                "reference assets exceed {PACK_MAX_TOTAL_BYTES} decoded bytes in total"
+            ));
+        }
+        check_reference_bytes(&reference.name, &reference.media_type, &bytes)?;
+    }
+    Ok(())
+}
+
+fn check_reference_name(name: &str) -> Result<()> {
+    let ok = !name.is_empty()
+        && name.len() <= PACK_MAX_NAME
+        && !name.starts_with('.')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+        && !name.contains('/')
+        && !name.contains('\\');
+    if !ok {
+        return refuse(format!(
+            "reference name '{name}' must be a flat basename of letters, digits, '.', '_' or '-'"
+        ));
+    }
+    if RESERVED_REFERENCE_NAMES
+        .iter()
+        .any(|reserved| reserved.eq_ignore_ascii_case(name))
+    {
+        return refuse(format!("reference name '{name}' is reserved"));
+    }
+    Ok(())
+}
+
+fn decode_reference(text: &str) -> std::result::Result<Vec<u8>, base64::DecodeError> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.decode(text)
+}
+
+/// The basename extension must be one of the allowlisted suffixes for
+/// `media_type`. Comparison is ASCII case-insensitive. Returns an error
+/// when `media_type` itself is not an allowlisted type.
+fn reference_extension_matches(name: &str, media_type: &str) -> Result<bool> {
+    let ext = name.rsplit_once('.').map(|(_, ext)| ext).unwrap_or("");
+    let allowed: &[&str] = match media_type {
+        "image/png" => &["png"],
+        "image/jpeg" => &["jpg", "jpeg"],
+        "application/pdf" => &["pdf"],
+        "text/plain" => &["txt"],
+        "text/markdown" => &["md"],
+        other => {
+            return refuse(format!(
+                "reference '{name}' media_type '{other}' is not png, jpeg, pdf, plain text, or markdown"
+            ))
+        }
+    };
+    Ok(allowed
+        .iter()
+        .any(|suffix| suffix.eq_ignore_ascii_case(ext)))
+}
+
+fn check_reference_bytes(name: &str, media_type: &str, bytes: &[u8]) -> Result<()> {
+    if bytes.is_empty() {
+        return refuse(format!("reference '{name}' is empty"));
+    }
+    let ok = match media_type {
+        "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "image/jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+        "application/pdf" => bytes.starts_with(b"%PDF-"),
+        "text/plain" | "text/markdown" => text_bytes(bytes),
+        _ => false,
+    };
+    if !ok {
+        return refuse(format!(
+            "reference '{name}' does not match media_type '{media_type}'"
+        ));
+    }
+    Ok(())
+}
+
+/// UTF-8 text. The only refused controls are bytes below 0x20 other than
+/// tab, LF, and CR. Contents stay untrusted data; nothing here is executed.
+fn text_bytes(bytes: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    text.bytes()
+        .all(|b| b >= 0x20 || b == b'\t' || b == b'\n' || b == b'\r')
 }
 
 /// Placeholder data that exercises every declared field and one line
@@ -634,22 +980,135 @@ mod tests {
         assert!(parse_spec(reserved).is_err());
     }
 
+    fn financial(spec: &TemplateSpec) -> TemplateDefinition {
+        TemplateDefinition::Financial(spec.clone())
+    }
+
     #[test]
     fn digest_binds_source_and_spec() {
         let a = spec();
         let mut b = spec();
         assert_eq!(
-            content_digest("s1", &a).unwrap(),
-            content_digest("s1", &b).unwrap()
+            serde_json::to_string(&a).unwrap(),
+            serde_json::to_string(&financial(&a)).unwrap()
+        );
+        assert_eq!(
+            content_digest("s1", &financial(&a)).unwrap(),
+            content_digest("s1", &financial(&b)).unwrap()
         );
         assert_ne!(
-            content_digest("s1", &a).unwrap(),
-            content_digest("s2", &a).unwrap()
+            content_digest("s1", &financial(&a)).unwrap(),
+            content_digest("s2", &financial(&a)).unwrap()
         );
         b.fixed_text.insert("terms".into(), "Net 60".into());
         assert_ne!(
-            content_digest("s1", &a).unwrap(),
-            content_digest("s1", &b).unwrap()
+            content_digest("s1", &financial(&a)).unwrap(),
+            content_digest("s1", &financial(&b)).unwrap()
         );
+    }
+
+    fn pack(references: Value) -> Value {
+        json!({
+            "kind": "authoring",
+            "purpose": "Cover letters for fictional bids",
+            "format": "docx",
+            "guidelines": "Use a single left-aligned column and the sample heading scale.",
+            "references": references
+        })
+    }
+
+    fn png_ref() -> Value {
+        json!({
+            "name": "cover.png",
+            "media_type": "image/png",
+            "description": "Sample cover crop showing the heading scale.",
+            "content_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVQI12P4z8AAAAADAAEABf4C/gAAAABJRU5ErkJggg=="
+        })
+    }
+
+    #[test]
+    fn authoring_pack_digest_covers_guidelines_and_rejects_financial_use() {
+        let parsed = parse_definition(pack(json!([png_ref()]))).unwrap();
+        assert!(parsed.authoring().is_some());
+        assert_eq!(parsed.kind(), "authoring");
+        assert!(parsed.financial().is_err());
+        assert!(check_definition_approvable(&parsed).is_ok());
+        assert!(retained_source(&parsed, b"").is_ok());
+        assert!(retained_source(&parsed, b"PK").is_err());
+        let mut changed = parsed.authoring().unwrap().clone();
+        let original = content_digest(&sha256_hex(b""), &parsed).unwrap();
+        changed
+            .guidelines
+            .push_str(" Prefer the sample's left margin.");
+        let next = TemplateDefinition::Authoring(changed);
+        assert_ne!(original, content_digest(&sha256_hex(b""), &next).unwrap());
+        let round = serde_json::to_string(&parsed).unwrap();
+        let again = parse_definition(serde_json::from_str(&round).unwrap()).unwrap();
+        assert_eq!(original, content_digest(&sha256_hex(b""), &again).unwrap());
+    }
+
+    #[test]
+    fn authoring_pack_rejects_unsafe_or_oversized_references() {
+        assert!(parse_definition(json!({
+            "kind": "proposal",
+            "purpose": "not a real kind",
+            "format": "docx",
+            "guidelines": "This must not become a document kind."
+        }))
+        .unwrap_err()
+        .to_string()
+        .contains("not quotation, invoice, or authoring"));
+        let bad_name = png_ref();
+        for (name, needle) in [
+            ("guidelines.md", "reserved"),
+            ("template.json", "reserved"),
+            ("../cover.png", "flat basename"),
+            ("nested/cover.png", "flat basename"),
+        ] {
+            let mut asset = bad_name.clone();
+            asset["name"] = json!(name);
+            let err = parse_definition(pack(json!([asset])))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(needle), "{name}: {err}");
+        }
+        let mut html = png_ref();
+        html["name"] = json!("script.html");
+        html["media_type"] = json!("text/plain");
+        html["content_base64"] = json!(base64_std(b"not really html\n"));
+        assert!(parse_definition(pack(json!([html]))).is_err());
+        let notes = json!({
+            "name": "notes.md",
+            "media_type": "text/markdown",
+            "description": "Notes that may quote prohibited patterns.",
+            "content_base64": base64_std(b"Do not copy a <script> tag or javascript: URL.\n")
+        });
+        assert!(parse_definition(pack(json!([notes]))).is_ok());
+        let layout = json!({
+            "name": "layout.txt",
+            "media_type": "text/plain",
+            "description": "Column and heading measurements.",
+            "content_base64": base64_std(b"Left margin 18mm. Heading 18pt.\n")
+        });
+        assert!(parse_definition(pack(json!([layout]))).is_ok());
+        let mut lie = png_ref();
+        lie["media_type"] = json!("application/pdf");
+        assert!(parse_definition(pack(json!([lie]))).is_err());
+        let mut extra = pack(json!([png_ref()]));
+        extra["remote"] = json!("https://example.invalid/x.png");
+        assert!(parse_definition(extra)
+            .unwrap_err()
+            .to_string()
+            .contains("malformed"));
+        let mut huge = png_ref();
+        huge["content_base64"] = json!("A".repeat(PACK_MAX_ASSET_BYTES * 4 / 3 + 8));
+        assert!(parse_definition(pack(json!([huge]))).is_err());
+        let many: Vec<_> = (0..PACK_MAX_REFERENCES + 1).map(|_| png_ref()).collect();
+        assert!(parse_definition(pack(json!(many))).is_err());
+    }
+
+    fn base64_std(bytes: &[u8]) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(bytes)
     }
 }

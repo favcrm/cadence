@@ -692,7 +692,7 @@
         }
         assert_eq!(
             crate::rollout::SCHEMA_VERSION,
-            46,
+            47,
             "bump? pin the new version and add its migration test"
         );
         // Half-applied: one table present, version rolled back — the
@@ -1681,7 +1681,7 @@
         assert!(columns("app_media_assets").is_empty());
         {
             let s = Store::open_for_schema_tests(&db).unwrap();
-            assert_eq!(version(), 46);
+            assert_eq!(version(), 47);
             assert_eq!(
                 columns("app_media_assets"),
                 ["id", "install_id", "title", "kind", "lifecycle", "revision", "creator", "created", "updated"]
@@ -1697,7 +1697,7 @@
         {
             Store::open_for_schema_tests(&db).unwrap();
         }
-        assert_eq!(version(), 46);
+        assert_eq!(version(), 47);
     }
 
     #[test]

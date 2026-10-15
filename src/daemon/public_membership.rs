@@ -370,6 +370,8 @@ impl Shared {
                 "target_user": sub,
             }),
         )?;
+        // CAD-1423: a withdrawn membership also ends that session's push consents.
+        self.store.push_consents_revoke_session(hash)?;
         self.operator_auth()
             .revoke_public(hash, self.operator_now())?;
         Ok(())

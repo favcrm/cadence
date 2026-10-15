@@ -1293,6 +1293,14 @@ impl Store {
                 tx.execute("UPDATE schema_version SET version=46", [])?;
                 tx.commit()?;
             }
+            if version < 47 {
+                // CAD-1423: notification preferences, push device consents
+                // and private notification intents. New objects only.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(super::human_threads::SCHEMA_V45)?;
+                tx.execute("UPDATE schema_version SET version=47", [])?;
+                tx.commit()?;
+            }
             if let Some(crossing) = permit.crossing {
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 Self::event(

@@ -64,10 +64,11 @@ fn raw_lease_refusal(reason: String) -> rusqlite::Error {
 /// add member-assistant tables and provenance; v44 (CAD-1412) adds human room
 /// tables; v45 (CAD-1365) adds only the metadata-only app_media_* tables.
 /// v46 (CAD-1337) adds nullable upload ownership/location metadata,
-/// the account registry and upload indexes. None touch a sealed/witnessed
-/// surface, so the bound extends to 46.
+/// the account registry and upload indexes. v47 (CAD-1423) adds notification
+/// preferences, push devices and private intents. None touch a sealed/witnessed
+/// surface, so the bound extends to 47.
 #[allow(dead_code)]
-const PROTECTED_SCHEMA_MAX: i64 = 46;
+const PROTECTED_SCHEMA_MAX: i64 = 47;
 
 /// Arm level + transaction-control phase, shared between the `Store` and
 /// the connection's authorizer. Atomic because the authorizer callback must
@@ -2508,12 +2509,12 @@ mod tests {
         // This is malformed metadata, not evidence of native owner authority.
         let fixture = Connection::open(&db).unwrap();
         fixture
-            .execute("UPDATE schema_version SET version=47", [])
+            .execute("UPDATE schema_version SET version=48", [])
             .unwrap();
         drop(fixture);
         store
             .propose_close(
-                &permit(&db, OwnerOp::Close, b"schema-45", "attempt-45", "art", 44),
+                &permit(&db, OwnerOp::Close, b"schema-48", "attempt-48", "art", 44),
                 "test",
             )
             .unwrap();
@@ -2537,8 +2538,8 @@ mod tests {
             .witness_commit(&permit(
                 &db,
                 OwnerOp::Witness,
-                b"schema-45",
-                "attempt-45",
+                b"schema-48",
+                "attempt-48",
                 "art",
                 44,
             ))
@@ -2576,8 +2577,8 @@ mod tests {
     }
 
     #[test]
-    fn current_schema44_owner_witness_refuses_future45() {
-        // Positive control: a real current (46) database is accepted by the real guard.
+    fn current_schema47_owner_witness_refuses_future48() {
+        // Positive control: a real current (47) database is accepted by the real guard.
         {
             let dir = TempDir::new().unwrap();
             let (db, store) = open_legacy(&dir);
@@ -2585,35 +2586,35 @@ mod tests {
                 .conn()
                 .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(actual, 46, "current contract schema must be 46");
+            assert_eq!(actual, 47, "current contract schema must be 47");
             store
                 .propose_close(
-                    &permit(&db, OwnerOp::Close, b"c45", "a45", "art", 1),
+                    &permit(&db, OwnerOp::Close, b"c47", "a47", "art", 1),
                     "test",
                 )
                 .unwrap();
             store
-                .witness_commit(&permit(&db, OwnerOp::Witness, b"c45", "a45", "art", 1))
-                .expect("schema 46 must be accepted by the real guard");
+                .witness_commit(&permit(&db, OwnerOp::Witness, b"c47", "a47", "art", 1))
+                .expect("schema 47 must be accepted by the real guard");
             let witnessed: i64 = store
                 .conn()
                 .query_row("SELECT db_schema FROM owner_witness", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(witnessed, 46, "positive control must record db_schema 46");
+            assert_eq!(witnessed, 47, "positive control must record db_schema 47");
         }
-        // Bad case: a separate store, forged schema_version 47 (above
+        // Bad case: a separate store, forged schema_version 48 (above
         // PROTECTED_SCHEMA_MAX) via raw SQLite.
         let dir = TempDir::new().unwrap();
         let (db, store) = open_legacy(&dir);
         // Raw connection bypasses Store's authorizer, as the existing fixture does.
         let fixture = Connection::open(&db).unwrap();
         fixture
-            .execute("UPDATE schema_version SET version=47", [])
+            .execute("UPDATE schema_version SET version=48", [])
             .unwrap();
         drop(fixture);
         store
             .propose_close(
-                &permit(&db, OwnerOp::Close, b"c45", "a45", "art", 1),
+                &permit(&db, OwnerOp::Close, b"c47", "a47", "art", 1),
                 "test",
             )
             .unwrap();
@@ -2632,11 +2633,11 @@ mod tests {
             .query_row("SELECT count(*) FROM events", [], |r| r.get(0))
             .unwrap();
         let err = store
-            .witness_commit(&permit(&db, OwnerOp::Witness, b"c45", "a45", "art", 1))
+            .witness_commit(&permit(&db, OwnerOp::Witness, b"c47", "a47", "art", 1))
             .unwrap_err();
         assert!(
             matches!(&err, Error::Rejected(message) if message == "owner witness database schema is unsupported"),
-            "forged schema 47 must fail at the actual schema guard, got: {err}"
+            "forged schema 48 must fail at the actual schema guard, got: {err}"
         );
         let latch_after: (i64, i64, Vec<u8>, String, Option<String>, i64) = store
             .conn()

@@ -52,6 +52,7 @@ import ThemeToggle from "./ui/ThemeToggle";
 import LocalLanguage from "./ui/LocalLanguage";
 import BuildUpdateNotice from "./ui/BuildUpdateNotice";
 import HeaderSearch from "./ui/HeaderSearch";
+import NotificationInbox from "./features/threads/NotificationInbox";
 import Setup from "./features/setup/Setup";
 import SetupNudge from "./features/setup/SetupNudge";
 import AuthBoundary from "./features/auth/AuthBoundary";
@@ -193,6 +194,9 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const block = writeBlock(meta);
   const readOnly = block !== null;
   const actor = meta?.actor ?? "operator (ui)";
+  // CAD-1423: change signal for the notification inbox. The verified identity is
+  // still read from the daemon by the inbox itself; this only says when to re-check.
+  const authEpoch = JSON.stringify([meta?.signed_in ?? null, meta?.session?.id ?? null, meta?.session?.user?.sub ?? null, meta?.read_only ?? null]);
 
   // CAD-1312: the header's organisation label is the hosted board's
   // configured company display name (`GET /api/platform-account`, already
@@ -780,6 +784,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           <HeaderSearch issues={issuesState} route={route} navHref={hrefFor} />
 
           <div className="ml-auto flex items-center gap-1 shrink-0">
+            <NotificationInbox authEpoch={authEpoch} />
             <StatusChips
               variant="header"
               readOnly={boardReadOnly}

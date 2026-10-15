@@ -2060,6 +2060,31 @@ The SPA has real routes (CAD-326, `ui/src/lib/router.ts`): `/` Home,
 `/settings[/memory]`; the nav shows Home, Projects, Agents and Settings,
 and Home's rail links to the overview.
 
+Threads notifications (CAD-1423) group received messages by authorized conversation
+in the header inbox. Unread respects both actually viewed thread messages and the
+notification-dismissal cursor; All retains received conversation history after
+either cursor advances. Mark all read dismisses notifications without marking
+unviewed transcript messages read.
+All includes every eligible conversation, not a truncated first page. The bell's
+unread total covers that complete authorized history.
+
+Browser alerts require explicit device opt-in through the browser's native
+permission and subscription flow. Alerts are generic by default; opening one
+still requires normal thread authorization. Muting a conversation or enabling
+the 22:00–08:00 quiet-hours preset suppresses interruptions, not unread messages.
+Sound and message previews are off by default. Posts and delivery remain turnless.
+
+An enrolled browser reports its visible thread through
+`POST /api/human-threads/push/presence` with `device_id`, a per-page `tab_id` and
+`room` (null clears that tab). The server verifies device ownership; these IDs
+never confer authority. Reports refresh every 15 seconds and expire after 30
+seconds of server time. Presence from any visible tab suppresses that device,
+without another tab's null report clearing it or suppressing other devices.
+Leaving the thread, hiding or closing a page releases only that page's report.
+Re-enrollment after revocation creates a fresh consent without transplanting old
+device presence or delivery metadata. A different human cannot take over a live
+endpoint. Private VAPID signing material remains in Host custody, not Native.
+
 Home is chat-first (CAD-328, `ui/src/features/home/`): the master's
 thread (`/api/threads/master`) rendered by kind — the operator's
 message, `assistant_text` as commentary, runs of `tool_call` /
@@ -2072,6 +2097,15 @@ its draft to itself, so typing never re-renders the thread. The composer posts
 with a client message id, shows the message at once and retires it when
 the stored `operator` entry with that id arrives; it is disabled, with
 the reason, on a read-only board or while the master is not running.
+While a turn works, its own rows carry a timestamped Assistant name row
+with a subtle Working indicator (CAD-1462) — anchored to the turn's own
+message id, never the list tail, so a newer queued or failed pending
+message cannot steal it; the truthful queued/submitting/compacting
+status line and Stop stay in the floating composer dock, outside the
+message rows. Attachments the operator picked show as compact wrapping
+chips above the composer (one status/remove icon slot each, +N more
+past three), and a sent message's files render as read-only chips under
+its bubble (CAD-1419/CAD-1462).
 A plan the thread mentions (or a `plan` row in Needs you) renders as a
 card — goal, tickets with size and acceptance, weighted progress, and
 Approve / Reject-with-reason through the plan endpoints above. The

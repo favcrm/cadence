@@ -89,6 +89,9 @@ async function main() {
     const url = new URL(path, "http://localhost");
     if (url.pathname.endsWith("/stream")) return new Response(new ReadableStream(), { headers: { "Content-Type": "text/event-stream" } });
     if (url.pathname === "/api/meta") return json({ read_only: false, operator: true, signed_in: true, actor: "operator (ui)", session: { id: "canonical-session", origin: "loopback", created: 1700000000, last_used: 1700000000, idle_expires_at: 4102444800, expires_at: 4102444800, user_agent: "test" } });
+    if (url.pathname === "/api/human-threads/notifications") return json({
+      error: "sign in to use human threads", code: "signed_out", revision: null,
+    }, 401);
     if (url.pathname === "/api/issues") return json({ issues: [] });
     if (path === "/api/projects") return json({ projects: [] });
     if (path === "/api/agents") return json({ daemon: "unreachable", agents: [], totals: null });

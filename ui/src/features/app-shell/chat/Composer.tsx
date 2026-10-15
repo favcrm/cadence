@@ -179,15 +179,6 @@ function AttachChips({
           aria-label={`${a.name}: ${t(a.status === "uploading" ? "Uploading…" : a.status === "failed" ? "Failed" : "Ready")}${a.error ? ` — ${displayAttachError(a.error, t)}` : ""}`}
           title={a.name}
         >
-          <span className="app-chat-filename">
-            <span className="app-chat-chip-name">{a.name}</span>
-            <small>
-              {attachMeta(a.name, a.size, t)}
-              {a.status !== "ready" && (
-                <span className="app-chat-touch-status">{` · ${t(a.status === "uploading" ? "Uploading…" : "Failed")}`}</span>
-              )}
-            </small>
-          </span>
           <span className="app-chat-chip-slot">
             <span className="app-chat-chip-status" aria-hidden="true">
               {a.status === "uploading" ? (
@@ -216,6 +207,15 @@ function AttachChips({
                 <path d="M6 6l12 12M18 6L6 18" />
               </svg>
             </button>
+          </span>
+          <span className="app-chat-filename">
+            <span className="app-chat-chip-name">{a.name}</span>
+            <small>
+              {attachMeta(a.name, a.size, t)}
+              {a.status !== "ready" && (
+                <span className="app-chat-touch-status">{` · ${t(a.status === "uploading" ? "Uploading…" : "Failed")}`}</span>
+              )}
+            </small>
           </span>
           {a.status === "failed" && a.error && (
             <small className="app-chat-upload-error" role="alert" title={displayAttachError(a.error, t)}>

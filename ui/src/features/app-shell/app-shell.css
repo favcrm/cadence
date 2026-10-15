@@ -345,9 +345,10 @@
   stroke-linejoin: round;
 }
 
-/* The queued-attachment rows above the composer — the mock's
-   `.file-row`: icon, name with size · kind, an inline reason when the
-   file was refused, and a Remove icon (CAD-1168 slice 2). */
+/* The queued-attachment chips above the composer (CAD-1462 finishes
+   CAD-1419's approved geometry): compact, bounded, wrapping pills —
+   the icon slot, name and `size · kind` on ONE line, the refusal
+   reason and Retry on a failed chip, Remove on the icon slot. */
 .app-chat-attachrow {
   display: flex;
   flex-wrap: wrap;
@@ -357,20 +358,31 @@
 }
 
 .app-chat-filerow {
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  gap: 0.6rem;
+  gap: 0.5rem;
   min-width: 0;
-  padding: 0.45rem 0.5rem 0.45rem 0.6rem;
+  max-width: min(17rem, 100%);
+  height: 1.75rem;
+  padding: 0 0.5rem 0 0.375rem;
   border: 1px solid color-mix(in srgb, var(--color-accent) 30%, var(--color-ink-700));
-  border-radius: 0.375rem;
+  border-radius: 999px;
   background: color-mix(in srgb, var(--color-accent) 7%, var(--color-ink-850));
-  font-size: var(--text-micro);
+  font-size: var(--text-label);
   color: var(--color-ink-200);
 }
 
+/* A failed chip keeps the refusal reachable but stays bounded: the
+   name/meta line holds its one-line height, and the reason wraps to a
+   second truncated line inside the pill rather than growing a card. */
 .app-chat-filerow.failed {
-  border-color: color-mix(in srgb, var(--color-fail) 50%, var(--color-ink-700));
+  height: auto;
+  min-height: 1.75rem;
+  flex-wrap: wrap;
+  row-gap: 0.125rem;
+  padding-block: 0.25rem;
+  max-width: 100%;
+  border-color: color-mix(in srgb, var(--color-fail) 55%, transparent);
   background: color-mix(in srgb, var(--color-fail) 6%, var(--color-ink-850));
 }
 
@@ -389,32 +401,35 @@
   color: var(--color-fail);
 }
 
+/* Name and meta share one line: the name truncates first, the meta
+   keeps its size · kind readable. */
 .app-chat-filename {
-  display: grid;
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
   min-width: 0;
-  flex: 1;
-  overflow-wrap: anywhere;
+  flex: 1 1 auto;
+  overflow: hidden;
 }
 
 .app-chat-filename small {
-  font-size: 0.5625rem;
+  font-size: var(--text-micro);
   color: var(--color-ink-400);
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
-/* Mock: .upload-error — the refusal reason is visible text. */
+/* Mock: .upload-error — the refusal reason is visible text, one
+   truncated line under the name (full text on the chip's title). */
 .app-chat-filename small.app-chat-upload-error {
   font-size: var(--text-micro);
   color: var(--color-fail);
 }
 
-/* CAD-1419: one icon slot per draft chip. Rest shows the status glyph
-   (file, spinner while uploading, warning on failure); hover or focus
-   swaps in Remove, and a coarse pointer keeps Remove visible. */
-.app-chat-filerow { flex-wrap: wrap; max-width: 100%; }
-.app-chat-filerow > .app-chat-filename { flex: 1 1 8rem; }
-/* A refusal reason stays one line inside the chip (full text in title,
-   the accessible name carries it too), so a failed chip never grows into
-   a full-width error block. */
+/* CAD-1419/CAD-1462: one icon slot per draft chip. Rest shows the
+   status glyph (file, spinner while uploading, warning on failure);
+   hover or focus swaps in Remove, and a coarse pointer keeps Remove
+   visible. */
 .app-chat-filerow .app-chat-upload-error {
   flex: 1 1 100%;
   min-width: 0;
@@ -482,6 +497,53 @@
   font-size: var(--text-micro);
 }
 .app-chat-more.failed { color: var(--color-fail); }
+
+/* The operator bubble's sent files (CAD-1462, the mock's `.sentchips`):
+   compact read-only chips wrapping beside the bubble — extension tag,
+   truncated name, `size · kind` — collapsing past three behind the
+   shared +N more. Never links, never remove/retry: they already sent. */
+.sentchips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.375rem;
+  margin-top: 0.375rem;
+  /* Contain inside the inline-block operator bubble at narrow widths:
+     a flex row's max-content is the single-line sum of its chips, so
+     bound it to the bubble's width and let the chips wrap (CAD-1462). */
+  min-width: 0;
+  max-width: 100%;
+}
+.sentchip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  min-width: 0;
+  max-width: min(15rem, 100%);
+  height: 1.5rem;
+  padding: 0 0.5rem;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 999px;
+  background: var(--color-ink-850);
+  font-size: var(--text-micro);
+  color: var(--color-ink-200);
+}
+.sentchip-ext {
+  flex-shrink: 0;
+  font-size: 0.5625rem;
+  letter-spacing: 0.04em;
+  color: var(--color-ink-400);
+}
+.sentchip-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sentchip-meta {
+  flex-shrink: 0;
+  color: var(--color-ink-500);
+}
 
 .app-chat-filerow .lnk {
   flex-shrink: 0;

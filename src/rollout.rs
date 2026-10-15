@@ -59,7 +59,9 @@ use crate::store::{self, Store};
 /// (CAD-1412) adds human principals, rooms, membership and read markers; v45
 /// (CAD-1365) adds the metadata-only `app_media_*` tables; v46 (CAD-1337)
 /// adds authenticated upload ownership and location metadata.
-pub const SCHEMA_VERSION: i64 = 46;
+/// v47 (CAD-1423) adds notification preferences, device push consents and
+/// private opaque notification intents.
+pub const SCHEMA_VERSION: i64 = 47;
 
 /// Last schema that has no lease table. The bootstrap opt-in covers
 /// only this version.
@@ -3351,9 +3353,10 @@ mod tests {
         // tables; v42 adds the member-request provenance columns and
         // `assist_stall_checks`; v43 adds the owner-granted
         // `assist_job_shares` entitlement; CAD-1412: v44 adds the human
-        // room tables, and v45 (CAD-1365) adds the app_media_* tables.
-        // CAD-1337: v46 adds authenticated upload ownership/location.
-        assert_eq!(SCHEMA_VERSION, 46);
+        // room tables, v45 (CAD-1365) adds the app_media_* tables;
+        // CAD-1337 v46 adds authenticated upload ownership/location; and
+        // CAD-1423 v47 adds notification preferences, devices and intents.
+        assert_eq!(SCHEMA_VERSION, 47);
     }
 
     struct MigrationHolder;
