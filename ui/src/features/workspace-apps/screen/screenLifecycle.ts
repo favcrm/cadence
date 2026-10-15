@@ -16,7 +16,7 @@ const ASSET_PARALLEL = 4;
  *  (a non-operator view, a chat frame) the `call` and `slot` ops close the port. */
 export interface ScreenActions {
   /** Run a non-spending verb as the board's operator session. */
-  call(verb: CallVerb, args: Record<string, unknown>, ui: { showLink(url: string): void; actionToken?: string }): Promise<ActionResult>;
+  call(verb: CallVerb, args: Record<string, unknown>, ui: { showLink(url: string): void; actionToken?: string; signal?: AbortSignal }): Promise<ActionResult>;
   /** Validate a spend verb, fetch what the host must check, and name the work. */
   planner: Planner;
   /** The host-drawn slot to show (or hide, `null`). */
@@ -173,6 +173,8 @@ export class ScreenChannel extends FrameChannel {
     super(source, receipt, removeFrame, failed, onReady);
   }
   private calls = 0;
+  /** In-flight call continuations. Close aborts them; resume does not restart them. */
+  private callRetire: AbortController[] = [];
   private slots: SlotController | null = null;
   /** CAD-1365: a media verb dispatches only for a v2 child that opted
    *  into `screen-media.v1`, on an operator-scoped mount (nonempty
@@ -197,8 +199,10 @@ export class ScreenChannel extends FrameChannel {
     if (this.shape !== "v2" || !actions || this.calls >= CALL_QUEUE_MAX) { this.close(true); return; }
     if (isMediaVerb(request.verb) && !this.mediaAdmits(request.verb)) { this.close(true); return; }
     this.calls++;
+    const retire = new AbortController();
+    this.callRetire.push(retire);
     const reply = (message: ReplyMessage) => { if (!this.closed) this.port?.postMessage(message); };
-    void actions.call(request.verb, request.args, { showLink: url => actions.onLink(url), actionToken: this.receipt.action_token ?? undefined })
+    void actions.call(request.verb, request.args, { showLink: url => actions.onLink(url), actionToken: this.receipt.action_token ?? undefined, signal: retire.signal })
       .catch((): ActionResult => ({ ok: false, refusal: { code: "failed", text: "That didn't work." } }))
       .then(result => {
         this.calls--;
@@ -209,6 +213,10 @@ export class ScreenChannel extends FrameChannel {
           this.rememberDraftAssetRefs(result.data,request.args);
           reply({ v: 2, op: "reply", id: request.id, ok: true, data: result.data ?? null });
         }
+      })
+      .finally(() => {
+        const index = this.callRetire.indexOf(retire);
+        if (index >= 0) this.callRetire.splice(index, 1);
       });
   }
   /** Only a v2 child with an action host. At most one live slot per frame. */
@@ -257,6 +265,8 @@ export class ScreenChannel extends FrameChannel {
     if (!this.closed) this.slots?.cancel(token);
   }
   close(report = false): void {
+    for (const retire of this.callRetire) retire.abort();
+    this.callRetire = [];
     this.slots?.close();
     super.close(report);
   }

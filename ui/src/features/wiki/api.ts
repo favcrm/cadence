@@ -1,5 +1,5 @@
 import { sessionHeaders } from "../../lib/sessionKey";
-import { privateFetch, privateReadsAllowed, privateSessionGeneration, usingPrivateOperation, type PrivateOperation } from "../../lib/privateSession";
+import { notifyPrivateSessionRequired, privateFetch, privateReadsAllowed, privateSessionGeneration, usingPrivateOperation, withPrivateOperation, type PrivateOperation } from "../../lib/privateSession";
 import type { WikiVersion } from "./history";
 import type { SearchHit } from "./search";
 import { normalizeListing, normalizePage, normalizeSearch, normalizeHistory } from "./wire";
@@ -250,48 +250,128 @@ export interface UploadResult {
   extraction?: { status: string; reason?: string; path?: string };
 }
 
-export function uploadFile(
+function recordField(body: object, key: string): unknown {
+  if (!Object.prototype.hasOwnProperty.call(body, key)) return undefined;
+  return Reflect.get(body, key);
+}
+
+function textField(body: object, key: string): string | undefined {
+  const value = recordField(body, key);
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+/** Local `{error, code}` and hosted `{error:{code,message}}` bodies, guarded. */
+function uploadRefusalBody(body: unknown): unknown {
+  if (body === null || typeof body !== "object" || Array.isArray(body)) return body;
+  const error = recordField(body, "error");
+  if (typeof error === "string" || error === undefined) return body;
+  if (error === null || typeof error !== "object" || Array.isArray(error)) return { error: undefined, code: textField(body, "code") };
+  return {
+    error: textField(error, "message"),
+    code: textField(body, "code") ?? textField(error, "code"),
+  };
+}
+
+function uploadResultFrom(body: unknown): UploadResult | { conflict: "if_rev" } {
+  if (body === null || typeof body !== "object" || Array.isArray(body)) return {};
+  if (textField(body, "conflict") === "if_rev") return { conflict: "if_rev" };
+  const extraction = recordField(body, "extraction");
+  if (extraction === null || typeof extraction !== "object" || Array.isArray(extraction)) return {};
+  const status = textField(extraction, "status");
+  if (status === undefined) return {};
+  return {
+    extraction: {
+      status,
+      reason: textField(extraction, "reason"),
+      path: textField(extraction, "path"),
+    },
+  };
+}
+
+function sendUpload(
   dir: string,
   file: File,
-  onProgress?: (percent: number) => void,
+  onProgress: ((percent: number) => void) | undefined,
+  operation: PrivateOperation,
 ): Promise<UploadResult> {
   return new Promise((resolve, reject) => {
+    if (operation.signal.aborted) {
+      reject(new DOMException("upload canceled", "AbortError"));
+      return;
+    }
     const path = uploadTargetPath(dir, file.name);
     const form = new FormData();
     form.append("path", path);
     form.append("file", file, file.name);
     const xhr = new XMLHttpRequest();
+    let settled = false;
+    const onAbort = () => xhr.abort();
+    operation.signal.addEventListener("abort", onAbort, { once: true });
+    const detach = () => {
+      operation.signal.removeEventListener("abort", onAbort);
+      xhr.onload = null;
+      xhr.onerror = null;
+      xhr.onabort = null;
+      xhr.upload.onprogress = null;
+    };
+    const settle = (done: () => void) => {
+      if (settled) return;
+      settled = true;
+      detach();
+      done();
+    };
     xhr.open("POST", uploadQuery(path));
     xhr.setRequestHeader("X-Cadence-Board", "1");
     for (const [key, value] of Object.entries(sessionHeaders())) xhr.setRequestHeader(key, value);
-    xhr.upload.onprogress = (e) => {
-      if (e.lengthComputable && onProgress) onProgress((e.loaded / e.total) * 100);
+    xhr.upload.onprogress = (event) => {
+      if (settled || operation.signal.aborted || !event.lengthComputable || !onProgress) return;
+      onProgress((event.loaded / event.total) * 100);
     };
     xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) {
-        let body: UploadResult = {};
-        try {
-          body = JSON.parse(xhr.responseText) as UploadResult;
-        } catch {
-          body = {};
-        }
-        if ((body as UploadResult & { conflict?: string }).conflict === "if_rev") {
-          reject(wikiErrorFrom(409, { ...body, error: "This file changed during upload", code: "conflict" }));
-          return;
-        }
-        onProgress?.(100);
-        resolve(body);
-        return;
-      }
+      const status = xhr.status;
+      const responseText = xhr.responseText;
+      const stillCurrent = !operation.signal.aborted;
       let body: unknown = null;
       try {
-        body = JSON.parse(xhr.responseText);
+        body = JSON.parse(responseText);
       } catch {
         body = null;
       }
-      reject(wikiErrorFrom(xhr.status, body));
+      settle(() => {
+        if (!stillCurrent) {
+          reject(new DOMException("upload canceled", "AbortError"));
+          return;
+        }
+        if (status >= 200 && status < 300) {
+          const result = uploadResultFrom(body);
+          if ("conflict" in result) {
+            reject(wikiErrorFrom(409, { error: "This file changed during upload", code: "conflict" }));
+            return;
+          }
+          onProgress?.(100);
+          resolve(result);
+          return;
+        }
+        if (status === 401) notifyPrivateSessionRequired(status, body, operation);
+        reject(wikiErrorFrom(status, uploadRefusalBody(body)));
+      });
     };
-    xhr.onerror = () => reject(new WikiError("upload failed — connection lost", 0));
+    xhr.onerror = () => {
+      settle(() => reject(new WikiError("upload failed — connection lost", 0)));
+    };
+    xhr.onabort = () => {
+      settle(() => reject(new DOMException("upload canceled", "AbortError")));
+    };
     xhr.send(form);
   });
+}
+
+export function uploadFile(
+  dir: string,
+  file: File,
+  onProgress?: (percent: number) => void,
+  operation?: PrivateOperation,
+): Promise<UploadResult> {
+  if (operation) return sendUpload(dir, file, onProgress, operation);
+  return withPrivateOperation((owned) => sendUpload(dir, file, onProgress, owned));
 }

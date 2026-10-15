@@ -606,7 +606,7 @@ function startUpload(
       operation.assertCurrent();
       const row: ChatFileRow | null = await oneAtATime(() =>
         stillOwned() && !operation.signal.aborted
-          ? api.chatFileUpload(file, controller.signal, uploadDestination(destination))
+          ? api.chatFileUpload(file, operation.signal, uploadDestination(destination))
           : Promise.resolve(null),
       );
       operation.assertCurrent();

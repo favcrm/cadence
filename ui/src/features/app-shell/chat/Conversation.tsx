@@ -924,18 +924,19 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     if (!canSend) return;
     const originKey = composerKey;
     setSendError(null);
-    if (!putOutbox(originKey, { ...envelope, state: "sending", error: undefined })) return;
+    const attempt: OutboxEnvelope = { ...envelope, state: "sending", error: undefined };
+    if (!putOutbox(originKey, attempt)) return;
     // The captured subject wins over the route's current one: a retry
     // opens the conversation this envelope was submitted for, never a
     // later selection.
     const create = envelope.subject ?? draftSubject;
     if (create === null) {
-      adopt(store, convId, envelope);
+      adopt(store, convId, attempt);
       removeOutbox(originKey, envelope.message);
       return;
     }
     const origin = { install: installId, visit: visitRef.current, frame: frameToken };
-    void createAndAdopt(originKey, create, envelope, origin).catch(() => undefined);
+    void createAndAdopt(originKey, create, attempt, origin).catch(() => undefined);
   };
   const discardOutbox = (envelope: OutboxEnvelope) => removeOutbox(composerKey, envelope.message);
 

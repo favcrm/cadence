@@ -173,14 +173,33 @@ function stringField(record: object, key: string): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
-/** Session-required code carried as `code` or `error.code`. Other codes are ignored. */
+/** Session-required code carried as top-level `code` (local) or nested `error.code` (hosted). */
 function privateSessionCode(body: unknown): string | undefined {
-  if (body === null || typeof body !== "object") return undefined;
+  if (body === null || typeof body !== "object" || Array.isArray(body)) return undefined;
   const direct = stringField(body, "code");
   if (direct !== undefined) return direct;
   const error: unknown = Reflect.get(body, "error");
-  if (error === null || typeof error !== "object") return undefined;
+  if (error === null || typeof error !== "object" || Array.isArray(error)) return undefined;
   return stringField(error, "code");
+}
+
+/**
+ * Dispatches `cadence:session-required` for an authoritative 401 whose body
+ * carries `operator_session_required` or `board_session_required`, and only
+ * while `operation` is still the admitted continuation. A paused, reset, or
+ * disposed operation cannot log out the session that replaced it.
+ */
+export function notifyPrivateSessionRequired(status: number, body: unknown, operation: PrivateOperation): void {
+  if (status !== 401 || typeof window === "undefined") return;
+  try {
+    operation.assertCurrent();
+  } catch {
+    return;
+  }
+  const code = privateSessionCode(body);
+  if (code === "operator_session_required" || code === "board_session_required") {
+    window.dispatchEvent(new Event("cadence:session-required"));
+  }
 }
 
 function requestInputSignal(input: RequestInfo | URL): AbortSignal | null {
@@ -245,10 +264,7 @@ export async function privateFetch(
         releaseRequest(state, request, stop);
         throw sessionChanged();
       }
-      const code = privateSessionCode(decoded);
-      if (code === "operator_session_required" || code === "board_session_required") {
-        window.dispatchEvent(new Event("cadence:session-required"));
-      }
+      notifyPrivateSessionRequired(response.status, decoded, operation);
     }
     if (abandoned(state, request)) {
       releaseRequest(state, request, stop);

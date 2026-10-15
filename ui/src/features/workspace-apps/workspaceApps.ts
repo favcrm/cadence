@@ -285,8 +285,8 @@ async function request<T>(path: string, signal?: AbortSignal, body?: object): Pr
 export interface PublishDestination { destination_id: string; label: string; toolkit: string }
 export const workspaceApps = {
   /** CAD-1290: the host-composed AgenticOS connect link; `hosted:false` on a local board. */
-  connectLink: (id: string, returnTo: string) =>
-    request<{ hosted: boolean; url?: string; unavailable?: boolean }>(`${installation(id)}/publishing/connect-link`, undefined, { return_to: returnTo }),
+  connectLink: (id: string, returnTo: string, signal?: AbortSignal) =>
+    request<{ hosted: boolean; url?: string; unavailable?: boolean }>(`${installation(id)}/publishing/connect-link`, signal, { return_to: returnTo }),
   destinations: (id: string, signal?: AbortSignal) =>
     request<{ unavailable: boolean; destinations: PublishDestination[] }>(`${installation(id)}/publishing/destinations`, signal),
   useDestination: (id: string, body: { destination_id: string; timezone?: string; request_id?: string; expected_revision?: number; context_id?: string }) =>

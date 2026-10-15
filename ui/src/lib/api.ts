@@ -3,6 +3,7 @@ import { ConditionalGet } from "./conditionalGet";
 import { sessionKey, sessionHeaders } from "./sessionKey";
 import {
   bindPrivateAbort,
+  notifyPrivateSessionRequired,
   privateFetch,
   privateReadsAllowed,
   privateSessionGeneration,
@@ -305,6 +306,28 @@ export interface MasterPermissionRule {
   at: number;
 }
 
+function textField(record: object, key: string): string | undefined {
+  if (!Object.prototype.hasOwnProperty.call(record, key)) return undefined;
+  const value: unknown = Reflect.get(record, key);
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+/** Local `{error, code}` and hosted `{error:{code,message}}` upload refusals. */
+function refusedUpload(body: unknown, status: number, statusText: string): { message: string; code?: string } {
+  const fallback = `${status} ${statusText}`.trim();
+  if (body === null || typeof body !== "object" || Array.isArray(body)) return { message: fallback };
+  const topCode = textField(body, "code");
+  const error: unknown = Reflect.get(body, "error");
+  if (typeof error === "string" && error.length > 0) return { message: error, code: topCode };
+  if (error !== null && typeof error === "object" && !Array.isArray(error)) {
+    return {
+      message: textField(error, "message") ?? fallback,
+      code: topCode ?? textField(error, "code"),
+    };
+  }
+  return { message: fallback, code: topCode };
+}
+
 export const api = {
   health: () => get<Health>("/api/health"),
   /** `withOperator` asks the server to run the operator proof (CAD-432) — once per page load.
@@ -502,9 +525,10 @@ export const api = {
     file: File,
     signal?: AbortSignal,
     destination?: ChatFileDestination,
-  ): Promise<ChatFileRow> =>
-    new Promise((resolve, reject) => {
-      if (signal?.aborted) {
+  ): Promise<ChatFileRow> => {
+    if (signal?.aborted) return Promise.reject(new DOMException("upload canceled", "AbortError"));
+    return usingPrivateOperation(undefined, (operation) => new Promise((resolve, reject) => {
+      if (operation.signal.aborted) {
         reject(new DOMException("upload canceled", "AbortError"));
         return;
       }
@@ -519,42 +543,62 @@ export const api = {
       }
       form.append("file", file, file.name);
       const xhr = new XMLHttpRequest();
+      let settled = false;
       const onAbort = () => xhr.abort();
-      signal?.addEventListener("abort", onAbort, { once: true });
-      const cleanup = () => signal?.removeEventListener("abort", onAbort);
+      operation.signal.addEventListener("abort", onAbort, { once: true });
+      const detach = () => {
+        operation.signal.removeEventListener("abort", onAbort);
+        xhr.onload = null;
+        xhr.onerror = null;
+        xhr.onabort = null;
+      };
+      const settle = (done: () => void) => {
+        if (settled) return;
+        settled = true;
+        detach();
+        done();
+      };
       xhr.open("POST", "/api/chat/upload");
       xhr.setRequestHeader("X-Cadence-Board", "1");
       for (const [key, value] of Object.entries(sessionHeaders())) xhr.setRequestHeader(key, value);
       xhr.onload = () => {
-        cleanup();
+        const status = xhr.status;
+        const statusText = xhr.statusText;
+        const responseText = xhr.responseText;
+        const stillCurrent = !operation.signal.aborted;
         let body: unknown = null;
         try {
-          body = JSON.parse(xhr.responseText);
+          body = JSON.parse(responseText);
         } catch {
           body = null;
         }
-        if (xhr.status >= 200 && xhr.status < 300) {
-          try {
-            resolve(decodeChatFileRow(body));
-          } catch (error) {
-            reject(error);
+        settle(() => {
+          if (!stillCurrent) {
+            reject(new DOMException("upload canceled", "AbortError"));
+            return;
           }
-          return;
-        }
-        const msg =
-          (body as { error?: string } | null)?.error ?? `${xhr.status} ${xhr.statusText}`;
-        reject(new ApiError(msg, xhr.status, (body as object | null) ?? undefined));
+          if (status >= 200 && status < 300) {
+            try {
+              resolve(decodeChatFileRow(body));
+            } catch (error) {
+              reject(error);
+            }
+            return;
+          }
+          if (status === 401) notifyPrivateSessionRequired(status, body, operation);
+          const refusal = refusedUpload(body, status, statusText);
+          reject(new ApiError(refusal.message, status, refusal.code === undefined ? undefined : { code: refusal.code }));
+        });
       };
       xhr.onerror = () => {
-        cleanup();
-        reject(new ApiError("upload failed — connection lost", 0));
+        settle(() => reject(new ApiError("upload failed — connection lost", 0)));
       };
       xhr.onabort = () => {
-        cleanup();
-        reject(new DOMException("upload canceled", "AbortError"));
+        settle(() => reject(new DOMException("upload canceled", "AbortError")));
       };
       xhr.send(form);
-    }),
+    }), signal);
+  },
   /** `GET /api/app-installations/<id>/chat-descriptor` (CAD-1110): the installed
    *  package's `app-chat.json`, pinned to the digest its install consented to. A
    *  404 means no descriptor (plain shared chat). */

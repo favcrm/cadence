@@ -63,6 +63,15 @@ export const uploadDone = (items: UploadItem[], id: string) =>
 export const uploadFailed = (items: UploadItem[], id: string, error: string) =>
   patch(items, id, { state: "error", error });
 
+/** Puts an abandoned in-flight row back in the queue without marking it failed. */
+export function releaseUpload(items: UploadItem[], id: string): UploadItem[] {
+  return items.map((item) => (
+    item.id === id && item.state === "uploading"
+      ? { ...item, state: "queued", progress: 0, error: undefined }
+      : item
+  ));
+}
+
 /** The files still waiting to start, in queue order. */
 export function pending(items: UploadItem[]): string[] {
   return items.filter((i) => i.state === "queued").map((i) => i.id);
