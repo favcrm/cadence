@@ -3,7 +3,7 @@
 //! actions onto these container routes and keeps the `wikienv_` bearer:
 //!
 //! - enumerate → `GET /api/wiki/ls?path=` or `GET /api/wiki/search?q=&path=`
-//! - read      → `GET /api/wiki/file?path=`
+//! - read      → `GET /api/wiki/file?path=` with optional `offset`, `bytes`, and `rev`
 //! - write     → `PUT /api/wiki/file` JSON `{path,text,if_rev?}`
 //! - upload    → `POST /api/wiki/upload?path=` single-file multipart
 //!
@@ -256,6 +256,11 @@ fn enumerate(
 }
 
 /// `GET /api/wiki/file`: a text page, only inside the read ceiling.
+/// Optional `offset`, `bytes`, and `rev` are the bounded original read.
+/// They are validated and forwarded only after the signed prefix check,
+/// so a path outside the envelope is still `insufficient_scope` and the
+/// daemon does not see the page. A bad integer or an empty revision is
+/// refused before that read. Omit all three to keep the whole-page reply.
 fn read(
     query: &dyn Fn(&str) -> Option<String>,
     state_dir: &std::path::Path,
@@ -272,11 +277,42 @@ fn read(
             "the path is outside this envelope's wiki prefix",
         );
     }
-    match client::rpc(
-        state_dir,
-        "wiki_read",
-        json!({"path": path, "wiki_as": attribution}),
-    ) {
+    let mut params = json!({"path": path, "wiki_as": attribution});
+    if let Some(raw) = query("offset") {
+        match raw.parse::<u64>() {
+            Ok(n) => params["offset"] = json!(n),
+            Err(_) => {
+                return refuse(
+                    400,
+                    "invalid_request",
+                    "wiki file offset must be a non-negative integer",
+                );
+            }
+        }
+    }
+    if let Some(raw) = query("bytes") {
+        match raw.parse::<u64>() {
+            Ok(n) => params["bytes"] = json!(n),
+            Err(_) => {
+                return refuse(
+                    400,
+                    "invalid_request",
+                    "wiki file bytes must be a non-negative integer",
+                );
+            }
+        }
+    }
+    if let Some(rev) = query("rev") {
+        if rev.is_empty() {
+            return refuse(
+                400,
+                "invalid_request",
+                "wiki file rev must be a non-empty string",
+            );
+        }
+        params["rev"] = json!(rev);
+    }
+    match client::rpc(state_dir, "wiki_read", params) {
         Ok(v) => json_ok(v),
         Err(e) => write_err(&e),
     }

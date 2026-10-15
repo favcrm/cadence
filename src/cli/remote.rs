@@ -444,8 +444,23 @@ fn wiki_for(action: &WikiAction) -> Result<(&'static str, serde_json::Map<String
             args.insert("path".into(), json!(path.clone().unwrap_or_default()));
             "enumerate"
         }
-        WikiAction::Cat { path, .. } => {
+        WikiAction::Cat {
+            path,
+            offset,
+            bytes,
+            rev,
+            ..
+        } => {
             args.insert("path".into(), json!(path));
+            if let Some(offset) = offset {
+                args.insert("offset".into(), json!(offset));
+            }
+            if let Some(bytes) = bytes {
+                args.insert("bytes".into(), json!(bytes));
+            }
+            if let Some(rev) = rev {
+                args.insert("rev".into(), json!(rev));
+            }
             "read"
         }
         WikiAction::Put {
@@ -550,6 +565,14 @@ fn wiki_text(command: &Commands, body: &Value) -> Result<bool> {
             return Err(Error::rejected(format!(
                 "wiki cat '{path}' refused: a directory — use `wiki ls`"
             )))
+        }
+        WikiAction::Cat {
+            offset, bytes, rev, ..
+        } if offset.is_some() || bytes.is_some() || rev.is_some() => {
+            // The daemon already bounded this compact line. Pretty-printing
+            // it could push one line over the native tool bound.
+            println!("{}", serde_json::to_string(body).unwrap_or_default());
+            true
         }
         WikiAction::Cat { meta: false, .. } if body["kind"] == "text" => {
             print!("{}", body["text"].as_str().unwrap_or(""));
@@ -703,6 +726,9 @@ mod tests {
                 action: WikiAction::Cat {
                     path: "global".into(),
                     meta,
+                    offset: None,
+                    bytes: None,
+                    rev: None,
                 },
             };
             let err = wiki_text(&cat, &dir).unwrap_err();
