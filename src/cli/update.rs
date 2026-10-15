@@ -164,10 +164,17 @@ pub(super) fn run_update(state_dir: &Path, args: UpdateArgs) -> Result<i32> {
     refuse_managed_runtime()?;
     let layout =
         cadence_agent::upgrade::Layout::detect(args.link.clone(), args.releases_dir.clone())?;
+    // CAD-1455: an owned HTTPS source is opt-in; the default stays the
+    // GitHub route, and an explicit source failure refuses rather than
+    // silently falling back to the API.
+    let source = match &args.release_source {
+        Some(base) => UpdateSource::Http(Box::new(cadence_agent::releases::HttpGh::new(base)?)),
+        None => UpdateSource::Gh(cadence_agent::upgrade::Gh::new(&args.repo)),
+    };
     let host = RealUpdateHost {
         state_dir,
         layout,
-        source: cadence_agent::upgrade::Gh::new(&args.repo),
+        source,
         label: caller.identity.clone(),
         collect: args.json.then(|| std::cell::RefCell::new(Vec::new())),
         pending: std::cell::RefCell::new(None),
@@ -304,6 +311,7 @@ pub(super) fn run(
             repo: target.repo,
             link: target.link,
             releases_dir: target.releases_dir,
+            release_source: target.release_source,
         },
     )
 }

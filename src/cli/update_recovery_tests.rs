@@ -51,7 +51,7 @@ exit 2
                 releases: self.dir.path().join("releases"),
                 link: self.dir.path().join("cadence"),
             },
-            source: cadence_agent::upgrade::Gh::new("unused/fixture"),
+            source: crate::cli::UpdateSource::Gh(cadence_agent::upgrade::Gh::new("unused/fixture")),
             label: "operator:cad628".into(),
             collect: Some(std::cell::RefCell::new(Vec::new())),
             pending: std::cell::RefCell::new(None),

@@ -24,6 +24,12 @@ const BINARY: &str = "cadence";
 const SHA_FILE: &str = "cadence.sha256";
 const MANIFEST: &str = "manifest.json";
 const ARCHIVE_MEMBERS: [&str; 3] = [BINARY, SHA_FILE, MANIFEST];
+/// The release archive's `tar -tvz` listing is three short lines; more
+/// is refused unread. The binary member's stdout bound matches the
+/// native package's (`upgrade::BINARY_MAX`); the small members a few KB.
+const LISTING_MAX: usize = 16 * 1024;
+const BINARY_MAX: usize = 512 * 1024 * 1024;
+const SMALL_MEMBER_MAX: usize = 64 * 1024;
 const CHECKS: [&str; 5] = ["fmt", "clippy", "test", "build", "ui"];
 const GH_TIMEOUT: Duration = Duration::from_secs(60);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
@@ -34,7 +40,10 @@ const CANDIDATE_TIMEOUT: Duration = Duration::from_secs(30);
 const CLIENT_UPDATE_MARKER: &str = "Upgrade a client-only installation";
 /// The only `update` arguments a client-only installation accepts from the
 /// command line (clap ids). Everything else refuses, even at its default.
-const CLIENT_ARGS: [&str; 2] = ["check", "version"];
+/// CAD-1455: `release_source` opts the client into an owned HTTPS
+/// endpoint for the public-client profile; all other native flags still
+/// refuse.
+const CLIENT_ARGS: [&str; 3] = ["check", "version", "release_source"];
 
 /// (asset target, CI runner) this build can install, as `ci.yml` names them.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -279,7 +288,12 @@ fn require_install() -> Result<ClientInstall> {
 /// Refuses every command-line option outside `CLIENT_ARGS` (native flags,
 /// global `--org`/`--state-dir`, explicit defaults, `update status`) before
 /// any identity, network or state work.
-pub(crate) fn run(cli: &Cli, check: bool, version: Option<&str>) -> Result<i32> {
+pub(crate) fn run(
+    cli: &Cli,
+    check: bool,
+    version: Option<&str>,
+    release_source: Option<&str>,
+) -> Result<i32> {
     refuse_native_options(cli)?;
     let install = require_install()?;
     let (target, runner) = PLATFORM.ok_or_else(|| {
@@ -297,7 +311,7 @@ pub(crate) fn run(cli: &Cli, check: bool, version: Option<&str>) -> Result<i32> 
     )?;
     let wanted = match version {
         Some(tag) => tag.to_string(),
-        None => latest_tag()?,
+        None => latest_tag(release_source)?,
     };
     let (Some(have), Some(want)) = (version_key(&current), version_key(&wanted)) else {
         return Err(Error::rejected(format!(
@@ -321,7 +335,7 @@ pub(crate) fn run(cli: &Cli, check: bool, version: Option<&str>) -> Result<i32> 
         );
         return Ok(0);
     }
-    let verified = fetch_verified(&wanted, target, runner)?;
+    let verified = fetch_verified(&wanted, target, runner, release_source)?;
     let _lock = CommitLock::take(&install.prefix)?;
     if fs::canonicalize(&install.receipt_prefix).ok().as_deref() != Some(install.prefix.as_path()) {
         return Err(ambiguous(
@@ -464,11 +478,56 @@ fn gh(args: &[&str], timeout: Duration) -> Result<Vec<u8>> {
     )
 }
 
-/// The newest published release tag (not a draft or prerelease).
-fn latest_tag() -> Result<String> {
-    let path = format!("repos/{DEFAULT_REPO}/releases/latest");
-    let out = gh(&["api", &path, "--jq", ".tag_name"], GH_TIMEOUT)?;
-    let tag = String::from_utf8_lossy(&out).trim().to_string();
+/// Run a tool bounded in time AND retained output; a non-zero exit is a
+/// refusal and output beyond `limit` refuses rather than trusting a
+/// truncated buffer. Used for the unauthenticated archive's listing and
+/// member reads — the bytes decide membership, never filesystem writes.
+fn run_limited(cmd: &mut Command, timeout: Duration, limit: usize, what: &str) -> Result<Vec<u8>> {
+    let (out, bounds) =
+        cadence_agent::proc::run_bounded_limited(cmd, timeout, limit).map_err(|e| match e {
+            BoundedError::Spawn(err) if err.kind() == ErrorKind::NotFound => {
+                Error::rejected(format!("{what} is not on PATH — refusing"))
+            }
+            other => Error::internal(format!("{what}: {other}")),
+        })?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(Error::rejected(format!("{what} failed: {}", stderr.trim())));
+    }
+    if bounds.stdout_exceeded || bounds.stderr_exceeded {
+        return Err(Error::rejected(format!(
+            "{what} produced output beyond its {limit}-byte bound — refusing"
+        )));
+    }
+    Ok(out.stdout)
+}
+
+/// The newest published release tag (not a draft or prerelease). With
+/// `--release-source` the owned catalogue's `public-client` latest answer
+/// supplies it — discovery only, no GitHub API.
+fn latest_tag(release_source: Option<&str>) -> Result<String> {
+    let tag = match release_source {
+        Some(base) => {
+            let source = cadence_agent::releases::HttpGh::for_profile(
+                base,
+                cadence_agent::releases::PROFILE_PUBLIC_CLIENT,
+            )?;
+            match source.latest()? {
+                Some(entry) => entry.version,
+                None => {
+                    return Err(Error::rejected(
+                        "the configured release source publishes no public-client release \
+                         yet — refusing",
+                    ))
+                }
+            }
+        }
+        None => {
+            let path = format!("repos/{DEFAULT_REPO}/releases/latest");
+            let out = gh(&["api", &path, "--jq", ".tag_name"], GH_TIMEOUT)?;
+            String::from_utf8_lossy(&out).trim().to_string()
+        }
+    };
     if version_key(&tag).is_none() {
         return Err(Error::rejected(format!(
             "the latest release tag '{tag}' is not a supported client version — refusing"
@@ -510,59 +569,181 @@ struct Verified {
 /// build-provenance attestation bound to this repository, the `ci.yml`
 /// signer, the tag ref and the manifest's source commit. Only after all of
 /// those does the candidate binary run.
-fn fetch_verified(tag: &str, target: &str, runner: &str) -> Result<Verified> {
+///
+/// CAD-1455: with `--release-source` the same bytes come from the owned
+/// catalogue under the `public-client` profile — the archive plus its
+/// checksum file and the retained `ci.yml` build bundle the publisher
+/// recorded — and the attestation verifies offline against the embedded
+/// trusted-root snapshot instead of a live `gh` lookup. The catalogue is
+/// discovery only; the exact published byte digests and the offline
+/// Sigstore proof authorize. An explicit source failure refuses — no
+/// silent GitHub fallback.
+fn fetch_verified(
+    tag: &str,
+    target: &str,
+    runner: &str,
+    release_source: Option<&str>,
+) -> Result<Verified> {
+    // The production constructor stays `https://`-only; the test-seam
+    // loopback constructor exists only in `test-seam` debug builds and
+    // supplies the identical `HttpGh` shape here.
+    let source = match release_source {
+        Some(base) => Some(cadence_agent::releases::HttpGh::for_profile(
+            base,
+            cadence_agent::releases::PROFILE_PUBLIC_CLIENT,
+        )?),
+        None => None,
+    };
+    fetch_verified_with(tag, target, runner, source)
+}
+
+/// `fetch_verified` with the owned source already constructed — the
+/// only difference the test-seam entry below needs. `source` is
+/// `Some(HttpGh)` exactly when the owned catalogue supplies the bytes
+/// (`--release-source`), `None` for the default GitHub release
+/// download.
+fn fetch_verified_with(
+    tag: &str,
+    target: &str,
+    runner: &str,
+    source: Option<cadence_agent::releases::HttpGh>,
+) -> Result<Verified> {
     let scratch = tempfile::tempdir()?;
     let asset = format!("cadence-{tag}-{target}.tar.gz");
     let sha_name = format!("{asset}.sha256");
-    let dir_arg = scratch.path().to_string_lossy().into_owned();
-    gh(
-        &[
-            "release",
-            "download",
-            tag,
-            "--repo",
-            DEFAULT_REPO,
-            "--pattern",
-            &asset,
-            "--pattern",
-            &sha_name,
-            "--dir",
-            &dir_arg,
-        ],
-        DOWNLOAD_TIMEOUT,
-    )?;
     let tarball = scratch.path().join(&asset);
+    let mut bundle_path: Option<PathBuf> = None;
+    let mut publication: Option<(PathBuf, PathBuf)> = None;
+    let mut archives_digests: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    match &source {
+        Some(source) => {
+            let entry = source.detail(tag)?;
+            if entry.status != "published" {
+                return Err(Error::rejected(format!(
+                    "release {tag} is {} in the configured source — refusing",
+                    entry.status
+                )));
+            }
+            let archive = source.release_artifact(&entry, &asset, target)?.clone();
+            let checksum = source.release_artifact(&entry, &sha_name, target)?.clone();
+            let bundle_name = cadence_agent::releases::client_bundle_name(target);
+            let bundle = source
+                .release_artifact(&entry, &bundle_name, target)?
+                .clone();
+            source.download_artifact(&entry, &archive, &tarball)?;
+            source.download_artifact(&entry, &checksum, &scratch.path().join(&sha_name))?;
+            let bundle_file = scratch.path().join(&bundle_name);
+            source.download_artifact(&entry, &bundle, &bundle_file)?;
+            bundle_path = Some(bundle_file);
+            // The digest of every published `cadence-<tag>-<target>
+            // .tar.gz` archive this entry records, for the receipt's
+            // exact asset binding.
+            for artifact in &entry.artifacts {
+                let is_archive = artifact.name.starts_with(&format!("cadence-{tag}-"))
+                    && artifact.name.ends_with(".tar.gz")
+                    && artifact.platform != "publication";
+                if is_archive {
+                    archives_digests.insert(artifact.name.clone(), artifact.sha256.clone());
+                }
+            }
+            // The post-publication receipt (CAD-1455): a build-time
+            // bundle attests the archive BEFORE `Publish the GitHub
+            // Release` ran — even a failed or unpublished release
+            // carries that proof. The owned route must also carry the
+            // receipt the publisher signed only after the real release
+            // was confirmed public: missing or unlisted, the release
+            // refuses here no matter how good the build bundle is.
+            let receipt = source
+                .release_artifact(
+                    &entry,
+                    cadence_agent::upgrade::PUBLICATION_RECEIPT,
+                    "publication",
+                )?
+                .clone();
+            let pub_bundle = source
+                .release_artifact(
+                    &entry,
+                    cadence_agent::upgrade::PUBLICATION_BUNDLE,
+                    "publication",
+                )?
+                .clone();
+            let receipt_file = scratch
+                .path()
+                .join(cadence_agent::upgrade::PUBLICATION_RECEIPT);
+            let pub_bundle_file = scratch
+                .path()
+                .join(cadence_agent::upgrade::PUBLICATION_BUNDLE);
+            source.download_artifact(&entry, &receipt, &receipt_file)?;
+            source.download_artifact(&entry, &pub_bundle, &pub_bundle_file)?;
+            publication = Some((receipt_file, pub_bundle_file));
+        }
+        None => {
+            let dir_arg = scratch.path().to_string_lossy().into_owned();
+            gh(
+                &[
+                    "release",
+                    "download",
+                    tag,
+                    "--repo",
+                    DEFAULT_REPO,
+                    "--pattern",
+                    &asset,
+                    "--pattern",
+                    &sha_name,
+                    "--dir",
+                    &dir_arg,
+                ],
+                DOWNLOAD_TIMEOUT,
+            )?;
+        }
+    }
     let outer = parse_sha_line(&fs::read_to_string(scratch.path().join(&sha_name))?, &asset)?;
     if sha256_file(&tarball)? != outer {
         return Err(Error::rejected(format!(
             "checksum mismatch for {asset} — refusing to install"
         )));
     }
-    attest(&tarball, &asset, tag, None)?;
-    let listing = run_ok(
+    attest(&tarball, &asset, tag, None, bundle_path.as_deref())?;
+    let listing = run_limited(
         Command::new("tar").arg("-tvzf").arg(&tarball),
         TOOL_TIMEOUT,
+        LISTING_MAX,
         "tar",
     )?;
     check_listing(&String::from_utf8_lossy(&listing))?;
+    // The archive is not yet authenticated against its manifest, so it
+    // is never extracted to the filesystem: each accepted member is
+    // read through bounded `tar -xOzf` stdout and only that accepted
+    // buffer is written create-new — an oversized or nonregular member
+    // can neither expand past its bound nor touch another path.
     let extract = scratch.path().join("x");
     fs::create_dir(&extract)?;
-    run_ok(
-        Command::new("tar")
-            .arg("-xzf")
-            .arg(&tarball)
-            .arg("-C")
-            .arg(&extract)
-            .args(ARCHIVE_MEMBERS),
-        TOOL_TIMEOUT,
-        "tar",
-    )?;
     for name in ARCHIVE_MEMBERS {
-        if !fs::symlink_metadata(extract.join(name)).is_ok_and(|m| m.is_file()) {
-            return Err(Error::rejected(format!(
-                "{asset} is missing a regular {name}"
-            )));
+        let bound = if name == BINARY {
+            BINARY_MAX
+        } else {
+            SMALL_MEMBER_MAX
+        };
+        let bytes = run_limited(
+            Command::new("tar").arg("-xOzf").arg(&tarball).arg(name),
+            TOOL_TIMEOUT,
+            bound,
+            "tar",
+        )?;
+        if bytes.is_empty() {
+            return Err(Error::rejected(format!("{asset} member {name} is empty")));
         }
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(extract.join(name))
+            .and_then(|mut file| {
+                use std::io::Write;
+                file.write_all(&bytes)?;
+                file.sync_all()
+            })
+            .map_err(|e| Error::rejected(format!("{asset} member {name}: {e}")))?;
     }
     let digest = parse_sha_line(&fs::read_to_string(extract.join(SHA_FILE))?, BINARY)?;
     if sha256_file(&extract.join(BINARY))? != digest {
@@ -577,7 +758,30 @@ fn fetch_verified(tag: &str, target: &str, runner: &str) -> Result<Verified> {
         runner,
         &digest,
     )?;
-    attest(&tarball, &asset, tag, Some(source.as_str()))?;
+    attest(
+        &tarball,
+        &asset,
+        tag,
+        Some(source.as_str()),
+        bundle_path.as_deref(),
+    )?;
+    // The owned route's last proof before the candidate may run: the
+    // post-publication receipt. Its closed JSON must bind this exact
+    // repository, tag, source commit and the digest of every published
+    // per-target archive this entry carries, and its retained
+    // `ci.yml`@tag bundle must verify offline over those exact bytes —
+    // the signature was minted only after the real GitHub Release was
+    // confirmed non-draft with those assets, so a build-only bundle or
+    // a `status:published` catalogue flag can never stand in for it.
+    if let Some((receipt_file, pub_bundle_file)) = &publication {
+        verify_publication_receipt(
+            receipt_file,
+            pub_bundle_file,
+            tag,
+            &source,
+            &archives_digests,
+        )?;
+    }
     let candidate = extract.join(BINARY);
     fs::set_permissions(&candidate, fs::Permissions::from_mode(0o755))?;
     let version = run_ok(
@@ -622,34 +826,217 @@ fn fetch_verified(tag: &str, target: &str, runner: &str) -> Result<Verified> {
     })
 }
 
+/// TEST SEAM ONLY (CAD-482): drive the REAL owned-source fetch path of
+/// `fetch_verified` against a loopback catalogue the fixture owns, and
+/// return only the verified binary's digest — the candidate is still
+/// downloaded, checksum/manifest-checked, attested and run for
+/// `--version` exactly as production does; the fixture supplies the
+/// archive bytes and the `gh` on PATH. Production callers cannot reach
+/// this (the feature compiles out of every release build via
+/// `compile_error!`, and the seam constructor accepts only
+/// `http://127.0.0.1:<port>`). This is not a separate validator: it is
+/// the identical code path with the source injected. Its only callers
+/// are the independently authored acceptance modules wired beside it
+/// (`cfg(all(test, feature = "test-seam"))`); until the check file
+/// lands, the entry is intentionally unused.
+#[allow(dead_code)]
+#[cfg(all(test, feature = "test-seam"))]
+pub(crate) fn fetch_verified_loopback(
+    tag: &str,
+    target: &str,
+    runner: &str,
+    loopback_base: &str,
+) -> Result<String> {
+    let source = cadence_agent::releases::HttpGh::for_profile_loopback(
+        loopback_base,
+        cadence_agent::releases::PROFILE_PUBLIC_CLIENT,
+    )?;
+    fetch_verified_with(tag, target, runner, Some(source)).map(|v| v.digest)
+}
+
 /// Verify the archive's build-provenance attestation: this repository, the
 /// `ci.yml` signer and the tag ref, plus the manifest's source commit once
-/// the manifest has been read.
-fn attest(tarball: &Path, asset: &str, tag: &str, source: Option<&str>) -> Result<()> {
+/// the manifest has been read. `bundle` is the publisher-retained local
+/// bundle (the owned-source path): `gh attestation verify --bundle` then
+/// proves the signature offline against the embedded trusted-root
+/// snapshot, with the same repo/workflow/ref/digest/runner policy — no
+/// GitHub API call. Without it, the live `gh` lookup verifies the same
+/// policy online.
+fn attest(
+    tarball: &Path,
+    asset: &str,
+    tag: &str,
+    source: Option<&str>,
+    bundle: Option<&Path>,
+) -> Result<()> {
     let signer = format!("{DEFAULT_REPO}/.github/workflows/{WORKFLOW}");
     let source_ref = format!("refs/tags/{tag}");
     let tarball_arg = tarball.to_string_lossy().into_owned();
-    let mut args: Vec<&str> = vec![
-        "attestation",
-        "verify",
-        &tarball_arg,
-        "--repo",
-        DEFAULT_REPO,
-        "--signer-workflow",
-        &signer,
-        "--source-ref",
-        &source_ref,
-    ];
-    if let Some(source) = source {
-        args.extend(["--source-digest", source]);
+    let mut args: Vec<String> = vec!["attestation".into(), "verify".into(), tarball_arg];
+    if let Some(bundle) = bundle {
+        // Offline bundle verification against the embedded snapshot —
+        // never a package-supplied trusted root. The shared verifier
+        // keeps the pinned policy (repo, exact ci.yml@tag cert identity,
+        // issuer, signer-repo, runner, --source-digest when the manifest
+        // named it) and re-binds the statement's recorded subject name
+        // and digest to this exact tarball.
+        let root = tempfile::NamedTempFile::new()?;
+        fs::write(root.path(), cadence_agent::upgrade::TRUSTED_ROOT_SNAPSHOT)?;
+        let digest = sha256_file(tarball)?;
+        return cadence_agent::upgrade::OfflineGh::new(DEFAULT_REPO)
+            .verify_bundle(
+                tarball,
+                bundle,
+                root.path(),
+                WORKFLOW,
+                &source_ref,
+                source,
+                asset,
+                &digest,
+                "build",
+            )
+            .map(|_| ())
+            .map_err(|_| {
+                Error::rejected(format!(
+                    "offline build-provenance attestation for {asset} did not verify — \
+                     refusing to execute or install it"
+                ))
+            });
     }
-    args.push("--deny-self-hosted-runners");
-    gh(&args, TOOL_TIMEOUT).map(|_| ()).map_err(|_| {
+    args.extend([
+        "--repo".into(),
+        DEFAULT_REPO.into(),
+        "--signer-workflow".into(),
+        signer,
+        "--source-ref".into(),
+        source_ref,
+    ]);
+    if let Some(source) = source {
+        args.extend(["--source-digest".into(), source.into()]);
+    }
+    args.push("--deny-self-hosted-runners".into());
+    let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
+    gh(&args_ref, TOOL_TIMEOUT).map(|_| ()).map_err(|_| {
         Error::rejected(format!(
             "build-provenance attestation for {asset} did not verify — refusing to execute or \
              install it"
         ))
     })
+}
+
+/// The closed publication receipt `ci.yml` emits and attests only
+/// AFTER `Publish the GitHub Release` has made the real release
+/// public (CAD-1455). `deny_unknown_fields` keeps a fattened or
+/// repurposed record unreadable.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicationReceipt {
+    schema: u64,
+    repo: String,
+    tag: String,
+    source_sha: String,
+    /// `sha256:<64 hex>` of each published `cadence-<tag>-<target>
+    /// .tar.gz` archive, keyed by its exact asset name.
+    archives: std::collections::BTreeMap<String, String>,
+    /// The release's genuine GitHub `publishedAt`, when the publisher
+    /// could read it back; null is truthful, an invented date is not.
+    published_at: Option<String>,
+}
+
+/// Verify the post-publication receipt: the closed document must bind
+/// this exact repository, tag and manifest source commit, carry the
+/// same `sha256:` digest the catalogue records for every published
+/// archive asset, and its retained bundle must verify offline under
+/// the fixed `ci.yml`@tag policy over the receipt's exact bytes. Only
+/// then has the release's post-publication identity been authenticated
+/// — a build-time bundle minted before `Publish the GitHub Release`
+/// (which even a failed or never-published release carries) can never
+/// stand in for it, and neither can the catalogue's unsigned
+/// `status:published`.
+fn verify_publication_receipt(
+    receipt_file: &Path,
+    bundle_file: &Path,
+    tag: &str,
+    source: &str,
+    archives: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    let bytes = fs::read(receipt_file).map_err(|e| {
+        Error::rejected(format!(
+            "the publication receipt cannot be read: {e} — refusing; the configured \
+             source's release is unproven"
+        ))
+    })?;
+    let receipt: PublicationReceipt = serde_json::from_slice(&bytes).map_err(|e| {
+        Error::rejected(format!(
+            "the publication receipt is malformed ({e}) — refusing"
+        ))
+    })?;
+    let well_formed = receipt.schema == 1
+        && receipt.repo == DEFAULT_REPO
+        && receipt.tag == tag
+        && receipt.source_sha == source
+        && !receipt.archives.is_empty()
+        && receipt.archives.iter().all(|(name, digest)| {
+            name.starts_with(&format!("cadence-{tag}-"))
+                && name.ends_with(".tar.gz")
+                && digest.len() == 71
+                && digest.starts_with("sha256:")
+                && digest[7..]
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        })
+        && receipt
+            .published_at
+            .as_deref()
+            .is_none_or(|d| !d.is_empty());
+    if !well_formed {
+        return Err(Error::rejected(
+            "the publication receipt does not bind this repository, tag, source commit \
+             and published archive digests — refusing; the configured source's release \
+             is unproven",
+        ));
+    }
+    // The receipt must name exactly the published archives the
+    // catalogue entry carries — not a superset, subset or renamed set.
+    if &receipt.archives != archives {
+        return Err(Error::rejected(
+            "the publication receipt's archive digests differ from the catalogue entry's \
+             — refusing; the receipt does not cover the actual published assets",
+        ));
+    }
+    let digest = cadence_agent::upgrade::sha256_file(receipt_file)?;
+    let root = tempfile::NamedTempFile::new()?;
+    fs::write(root.path(), cadence_agent::upgrade::TRUSTED_ROOT_SNAPSHOT)?;
+    let source_ref = format!("refs/tags/{tag}");
+    let facts = cadence_agent::upgrade::OfflineGh::new(DEFAULT_REPO)
+        .verify_bundle(
+            receipt_file,
+            bundle_file,
+            root.path(),
+            WORKFLOW,
+            &source_ref,
+            Some(source),
+            cadence_agent::upgrade::PUBLICATION_RECEIPT,
+            &digest,
+            "publication",
+        )
+        .map_err(|_| {
+            Error::rejected(format!(
+                "the post-publication receipt for {tag} did not verify offline — refusing; \
+                 a build-only proof cannot stand in for a published release"
+            ))
+        })?;
+    // The verified certificate's source-repository digest is the tag
+    // run's head — it must be the source commit the receipt (and the
+    // manifest) names, so a receipt signed at another commit refuses.
+    if facts.signer_sha != source {
+        return Err(Error::rejected(format!(
+            "the publication receipt was signed at {}, not the release's source {source} \
+             — refusing",
+            facts.signer_sha
+        )));
+    }
+    Ok(())
 }
 
 /// Exclusive commit lock shared with `install.sh --client-only`: the
@@ -729,3 +1116,7 @@ fn switch_link(link: &Path, expected: &Path, target: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(all(test, feature = "test-seam"))]
+#[path = "cad1455_public_client_acceptance.rs"]
+mod cad1455_public_client_acceptance;
