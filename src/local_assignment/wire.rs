@@ -294,7 +294,7 @@ fn org_for_unit(unit_bytes: usize) -> String {
             generation: 1,
         };
         let room = text_room(&identity, "result", None);
-        if room % unit_bytes == 0 {
+        if room.is_multiple_of(unit_bytes) {
             return org;
         }
         org.push('o');
@@ -313,12 +313,12 @@ fn assert_unit_boundary(unit: char, unit_bytes: usize) {
     let room = text_room(&identity, "result", None);
     let count = room / unit_bytes;
     assert!(count <= MAX_TEXT_CODEPOINTS);
-    let fit: String = std::iter::repeat(unit).take(count).collect();
+    let fit: String = std::iter::repeat_n(unit, count).collect();
     let body = report_body(&identity, "result", Some(&fit), None).expect("just fits");
     assert_eq!(posted(&body).len(), MAX_BODY_BYTES);
     assert_eq!(body["text"].as_str(), Some(fit.as_str()));
 
-    let over: String = std::iter::repeat(unit).take(count + 1).collect();
+    let over: String = std::iter::repeat_n(unit, count + 1).collect();
     let rejected = report_body(&identity, "result", Some(&over), None).expect_err("one over");
     assert_eq!(rejected.code(), Some("payload_too_large"));
 
@@ -406,7 +406,7 @@ fn manual_limits_hit_exact_byte_and_codepoint_boundaries() {
     };
     let overhead =
         posted(&report_body(&identity, "result", Some(""), None).expect("overhead")).len();
-    assert!(overhead + MAX_TEXT_CODEPOINTS + 1 <= MAX_BODY_BYTES);
+    assert!(overhead + MAX_TEXT_CODEPOINTS < MAX_BODY_BYTES);
     let fit = "a".repeat(MAX_TEXT_CODEPOINTS);
     let body = report_body(&identity, "result", Some(&fit), None).expect("4000");
     assert_eq!(posted(&body).len(), overhead + MAX_TEXT_CODEPOINTS);

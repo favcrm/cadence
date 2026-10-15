@@ -125,9 +125,8 @@ fn write_kickoff_file(path: &Path, binding: &KickoffFile) -> Result<()> {
         serde_json::to_vec_pretty(binding).map_err(|error| Error::internal(error.to_string()))?;
     let tmp = unique_temp(path);
     write_private(&tmp, &bytes)?;
-    fs::rename(&tmp, path).map_err(|error| {
+    fs::rename(&tmp, path).inspect_err(|_| {
         let _ = fs::remove_file(&tmp);
-        error
     })?;
     Ok(())
 }
@@ -476,10 +475,9 @@ impl ReportDriver {
         message_id: &str,
         deadline: Instant,
     ) -> Result<bool> {
-        let prepared = match prepare_pending(path, store, message_id)? {
-            Prep::Busy => return Ok(false),
-            Prep::Idle => return Ok(true),
-            Prep::Ready(prepared) => prepared,
+        let (visited, prepared) = prepare_pending(path, store, message_id)?;
+        let Some(prepared) = prepared else {
+            return Ok(visited);
         };
         let attempt = Instant::now() + ATTEMPT_BUDGET;
         let attempt = if attempt < deadline {
@@ -519,37 +517,35 @@ struct Prepared {
     issuer: Option<String>,
 }
 
-enum Prep {
-    Busy,
-    Idle,
-    Ready(Prepared),
-}
-
 /// Derive pending hosted state from the message row when the binding has
-/// none. Already reported or fenced rows are idle. The file lock does not
-/// span the later request.
-fn prepare_pending(path: &Path, store: &crate::store::Store, message_id: &str) -> Result<Prep> {
+/// none. Return whether the file was visited and its ready report, if any.
+/// Already reported or fenced rows are idle. The lock never spans a request.
+fn prepare_pending(
+    path: &Path,
+    store: &crate::store::Store,
+    message_id: &str,
+) -> Result<(bool, Option<Prepared>)> {
     let _lock = match try_lock(path)? {
         Some(lock) => lock,
-        None => return Ok(Prep::Busy),
+        None => return Ok((false, None)),
     };
     let Some(mut binding) = read_kickoff_file(path)? else {
-        return Ok(Prep::Idle);
+        return Ok((true, None));
     };
     if binding.reported_state.is_some() || binding.settled {
-        return Ok(Prep::Idle);
+        return Ok((true, None));
     }
     if binding.pending_state.is_none() {
         let Some(message) = store.message(message_id)? else {
-            return Ok(Prep::Idle);
+            return Ok((true, None));
         };
         let Some((state, text, head)) = completion_outcome(
             &message.state,
-            &message_text(&message),
+            message_text(&message),
             message_sha(&message),
             Path::new(&binding.worktree),
         ) else {
-            return Ok(Prep::Idle);
+            return Ok((true, None));
         };
         let identity = super::wire::ReportIdentity {
             organization_id: &binding.organization_id,
@@ -583,19 +579,22 @@ fn prepare_pending(path: &Path, store: &crate::store::Store, message_id: &str) -
         binding.pending_text.as_deref(),
         binding.pending_head.as_deref(),
     )?;
-    Ok(Prep::Ready(Prepared {
-        org: binding.org,
-        endpoint: binding.endpoint,
-        organization_id: binding.organization_id,
-        assignment_id: binding.assignment_id,
-        claim_id: binding.claim_id,
-        generation: binding.generation,
-        pending_state: state,
-        pending_head: binding.pending_head.clone(),
-        body,
-        subject_id: binding.subject_id,
-        issuer: binding.issuer,
-    }))
+    Ok((
+        true,
+        Some(Prepared {
+            org: binding.org,
+            endpoint: binding.endpoint,
+            organization_id: binding.organization_id,
+            assignment_id: binding.assignment_id,
+            claim_id: binding.claim_id,
+            generation: binding.generation,
+            pending_state: state,
+            pending_head: binding.pending_head.clone(),
+            body,
+            subject_id: binding.subject_id,
+            issuer: binding.issuer,
+        }),
+    ))
 }
 
 fn post_report(prepared: &Prepared, deadline: Instant) -> Result<ReportAck> {
