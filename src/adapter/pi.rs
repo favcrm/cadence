@@ -3552,6 +3552,9 @@ mod cad1457_tests {
         dir: Option<tempfile::TempDir>,
     }
 
+    type ObservedEvents = Arc<Mutex<Vec<(String, Value)>>>;
+    type Launch = (Stop, std::path::PathBuf, ObservedEvents);
+
     impl Drop for Stop {
         fn drop(&mut self) {
             if let Some(adapter) = self.adapter.take() {
@@ -3652,7 +3655,7 @@ for raw in sys.stdin:
         mode: &str,
         error: &str,
         master: bool,
-    ) -> (Stop, std::path::PathBuf, Arc<Mutex<Vec<(String, Value)>>>) {
+    ) -> Launch {
         let dir = tempfile::tempdir().unwrap();
         let script = script(dir.path());
         let log = dir.path().join("stderr.log");
