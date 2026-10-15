@@ -364,17 +364,17 @@ jobs:
           mkdir -p "$pkg"
           cp "$RUNNER_TEMP/production-candidate.json" "$pkg/production-candidate.json"
           # The promotion bundle covers the receipt's exact bytes; the
-          # build bundle covers the binary's. Digest-derived names are
-          # renamed to the fixed package names consumers expect.
+          # build bundle covers the binary's. gh names downloads
+          # sha256:<digest>.jsonl; retain them under the fixed consumer names.
           (cd "$RUNNER_TEMP" && gh attestation download production-candidate.json \
             --repo "$REPO" --digest-alg sha256)
-          mv "$RUNNER_TEMP"/sha256-*.jsonl "$pkg/promotion-attestation.jsonl"
+          mv "$RUNNER_TEMP"/sha256:*.jsonl "$pkg/promotion-attestation.jsonl"
           cp "$RUNNER_TEMP/approved/cadence" "$pkg/cadence"
           cp "$RUNNER_TEMP/approved/cadence.sha256" "$pkg/cadence.sha256"
           cp "$RUNNER_TEMP/approved/manifest.json" "$pkg/manifest.json"
           (cd "$pkg" && gh attestation download cadence \
             --repo "$REPO" --digest-alg sha256)
-          mv "$pkg"/sha256-*.jsonl "$pkg/build-attestation.jsonl"
+          mv "$pkg"/sha256:*.jsonl "$pkg/build-attestation.jsonl"
           gh attestation trusted-root > "$pkg/trusted_root.jsonl"
           # The operator-host published package: the exact retained
           # members as one flat tarball. The completion evidence

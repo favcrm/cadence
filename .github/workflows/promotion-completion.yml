@@ -244,7 +244,7 @@ jobs:
           cp "$RUNNER_TEMP/evidence/manifest.json" "$RUNNER_TEMP/completion/manifest.json"
           (cd "$RUNNER_TEMP" && gh attestation download promotion-completion.json \
             --repo "$REPO" --digest-alg sha256)
-          mv "$RUNNER_TEMP"/sha256-*.jsonl "$RUNNER_TEMP/completion/completion-attestation.jsonl"
+          mv "$RUNNER_TEMP"/sha256:*.jsonl "$RUNNER_TEMP/completion/completion-attestation.jsonl"
           ls -l "$RUNNER_TEMP/completion"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
