@@ -41,16 +41,6 @@ async function main() {
   const { webcrypto } = require("crypto") as { webcrypto: Crypto };
   Object.defineProperty(globalThis, "crypto", { value: webcrypto, configurable: true });
   Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { value: true });
-  Object.defineProperty(globalThis, "EventSource", {
-    configurable: true,
-    value: class {
-      onopen: null = null;
-      onerror: null = null;
-      addEventListener() {}
-      removeEventListener() {}
-      close() {}
-    },
-  });
   // Match neighboring real-App checks: only browser presentation dependencies
   // are substituted. AppShell, both route guards and useInstallations run.
   // Node's CommonJS loader is replaced only at its presentation-module seam.
@@ -97,7 +87,8 @@ async function main() {
   globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
     const path = String(input);
     const url = new URL(path, "http://localhost");
-    if (url.pathname === "/api/meta") return json({ read_only: false, operator: true, signed_in: true, actor: "operator (ui)", session: null });
+    if (url.pathname.endsWith("/stream")) return new Response(new ReadableStream(), { headers: { "Content-Type": "text/event-stream" } });
+    if (url.pathname === "/api/meta") return json({ read_only: false, operator: true, signed_in: true, actor: "operator (ui)", session: { id: "canonical-session", origin: "loopback", created: 1700000000, last_used: 1700000000, idle_expires_at: 4102444800, expires_at: 4102444800, user_agent: "test" } });
     if (url.pathname === "/api/issues") return json({ issues: [] });
     if (path === "/api/projects") return json({ projects: [] });
     if (path === "/api/agents") return json({ daemon: "unreachable", agents: [], totals: null });

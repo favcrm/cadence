@@ -52,17 +52,6 @@ for (const name of ["addEventListener", "removeEventListener"])
   Object.defineProperty(globalThis, name, { value: win[name].bind(win), configurable: true });
 Object.defineProperty(globalThis, "crypto", { value: require("crypto").webcrypto, configurable: true });
 Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { value: true });
-Object.defineProperty(globalThis, "EventSource", {
-  configurable: true,
-  value: class {
-    onopen: null = null;
-    onerror: null = null;
-    constructor() {}
-    addEventListener() {}
-    removeEventListener() {}
-    close() {}
-  },
-});
 const loader = require("module"), originalRequire = loader.prototype.require;
 loader.prototype.require = function (this: unknown, id: string) {
   if (id.endsWith(".css")) return {};
@@ -126,10 +115,11 @@ globalThis.fetch = (async (input: unknown) => {
   const path = String(input);
   const url = new URL(path, "http://localhost");
   requested.push(url.pathname);
+  if (url.pathname.endsWith("/stream")) return new Response(new ReadableStream(), { headers: { "Content-Type": "text/event-stream" } });
   if (path.startsWith("/api/meta")) {
-    return json(operatorSession
-      ? { read_only: false, operator: true, signed_in: true, actor: "operator (ui)", session: null }
-      : { read_only: false, operator: false, signed_in: true, actor: "member (ui)", session: null });
+    const role = operatorSession ? "operator" : "member";
+    return json({ read_only: false, operator: operatorSession, signed_in: true, actor: `${role} (ui)`,
+      session: { id: `refusal-session-${role}`, origin: "public", created: 1700000000, last_used: 1700000000, idle_expires_at: 4102444800, expires_at: 4102444800, user_agent: "test", user: { sub: role, role } } });
   }
   if (path === "/api/issues" || path.startsWith("/api/issues?")) return json({ issues: [] });
   if (path === "/api/projects") return json({ projects: [] });

@@ -1174,9 +1174,10 @@ needs its own link. Hosted cookies retain their existing host-only lifetime.
 An unanswered verification conceals the admitted workspace and stops its
 effects, preserving same-session drafts and credentials for Retry. A
 confirmed sign-out, expiry or identity change clears private observations
-and rejects stale in-flight responses. Signed-in members pass the read
-boundary without operator privileges. Authentication and write authority
-remain separate.
+and rejects stale in-flight responses. A session-required `401` supersedes
+older pending verification; a feature's ordinary role-based `403` does not
+sign the board session out. Signed-in members pass the read boundary without
+operator privileges. Authentication and write authority remain separate.
 
 Private SSE uses authenticated fetch streaming rather than URL-carried tab
 keys. The server revalidates the live session every five seconds with a
@@ -1185,7 +1186,8 @@ Buffered bytes cannot be retracted, and a blocked OS write is not a strict
 socket-close deadline. No later private frame is authorized after a failed
 recheck. File previews/downloads fetch with the same session proof; temporary
 preview URLs are revoked on pause, session reset or unmount, and untrusted
-document frames remain sandboxed.
+document frames remain sandboxed. Template downloads recreate fresh URLs
+from retained results on same-session recovery.
 
 **Remote sign-in without SSH (CAD-777, daemon-owned since CAD-841).**
 Device login is configured on the *daemon*, never by the board:
