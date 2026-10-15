@@ -63,7 +63,7 @@ impl Shared {
                 return Err(Error::rejected(format!(
                     "plan propose needs an attributable caller — a pane agent, an \
                      enrolled managed endpoint or the proven operator: {why}"
-                )))
+                )));
             }
         };
         let project = required_str(params, "project")?;
@@ -96,7 +96,7 @@ impl Shared {
                 return Err(Error::rejected(
                     "plan propose needs exactly one of 'text' or 'workflow' — \
                      `--file` or `--workflow`",
-                ))
+                ));
             }
         };
         let pm = self.pm()?;
@@ -145,7 +145,7 @@ impl Shared {
                         None => {
                             return Err(Error::rejected(format!(
                                 "input '{k}' must be a string — `--input {k}=<value>`"
-                            )))
+                            )));
                         }
                     }
                 }
@@ -154,7 +154,7 @@ impl Shared {
             Some(_) => {
                 return Err(Error::rejected(
                     "'inputs' must be an object of string values — `--input k=v`",
-                ))
+                ));
             }
         };
         let pm_dir = self.pm_dir()?;
@@ -704,7 +704,9 @@ impl Shared {
                     row["approval"] = status;
                     row["approved"] = json!(true);
                     row["executable"] = json!(true);
-                    row["execution_note"]=json!("local text workflow execution is available through app run; outward effects are not authorized");
+                    row["execution_note"] = json!(
+                        "local text workflow execution is available through app run; outward effects are not authorized"
+                    );
                 }
             }
             Ok(())
@@ -742,7 +744,7 @@ impl Shared {
             Some(_) => {
                 return Err(Error::rejected(
                     "'team' must be a list of '<input>=<agent>'",
-                ))
+                ));
             }
             None => return Err(Error::rejected("Missing or non-array 'team'")),
         };
@@ -1219,9 +1221,14 @@ impl Shared {
                 .collect::<Result<_>>()?,
             Some(_) => return Err(Error::rejected("'agents' must be a list of strings")),
         };
+        let repo = match params.get("repo") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(repo)) => Some(std::path::PathBuf::from(repo)),
+            Some(_) => return Err(Error::rejected("'repo' must be a path string or null")),
+        };
         let req = crate::issue::project_new::Request {
             key: required_str(params, "key")?.to_string(),
-            repo: std::path::PathBuf::from(required_str(params, "repo")?),
+            repo,
             prefix: text("prefix"),
             goal: text("goal"),
             agents,

@@ -335,7 +335,7 @@ pub(super) fn master_help(args: &[String]) -> Option<cadence_agent::error::Resul
             None => {
                 return Some(Err(Error::usage(format!(
                     "`{path}` is not a command path you may run"
-                ))))
+                ))));
             }
         }
     }
@@ -428,7 +428,7 @@ fn master_leaf_limits(path: &str) -> Option<&'static str> {
              -m/--text refused"
         }
         "project new" => {
-            "--goal and each --agent take one plain token (letters, digits and . _ / = : -; no spaces, quotes or commas); repeat --agent for each agent"
+            "--goal and each --agent require --repo and take one plain token (letters, digits and . _ / = : -; no spaces, quotes or commas); repeat --agent for each agent"
         }
         "plan propose" | "report file" | "master escalate" => {
             "--file names a file under master/tmp (stage it with the write tool first)"
