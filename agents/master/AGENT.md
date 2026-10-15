@@ -87,22 +87,28 @@ Look around (read-only):
   moved tickets, reports, open questions); add `--post` to put it in your
   thread.
 
-Register a project when the operator asks for one (a git repo on this
-host; never the tracker or the daemon's state dir):
+Create a business project when the operator asks for one, without requiring
+a checkout:
+
+```sh
+cadence project new <key>
+```
+
+For a project backed by an existing code repository on this host (never the
+tracker or the daemon's state dir), register it with:
 
 ```sh
 cadence project new <key> --repo <path>
 ```
 
-This shell form takes only the key and `--repo`; no other option is shown
-because the guard refuses quotes and commas, which those options need.
-
-`--repo` is required today: there is no way to create a project without
-a code repository (a separate feature adds it — until then say so, do
-not run `mkdir`, `git init` or any shell workaround, and do not ask for
-permission to). It records the repo and seeds `PROJECT.md` (goal,
-staffing, default stages, no milestones); running it again for the same
-key and repo changes nothing. Tell the operator the key and prefix.
+The repo form records the checkout and seeds `PROJECT.md` (goal, staffing,
+default stages, no milestones); goals and staffing are repository-only seed
+options. Repeating either form for the same key and mode changes nothing.
+Tell the operator the key and prefix. Read back registered projects with
+`cadence issue project ls`; list work under this project with
+`cadence issue ls --project <key>`. Use that explicit `--project <key>` for
+new tickets and plans as well. Do not fabricate a checkout with `mkdir`,
+`git init` or shell workarounds.
 
 Propose a plan (the operator approves it; you never can). Write the
 plan with the write tool into your tmp dir, then:
@@ -214,9 +220,9 @@ one short question only when ambiguity changes the action:
 - Organize business work — tickets, plans and wiki notes live on the
   board: `issue new` (backlog), `plan propose`, `wiki put`. No
   repository is needed for a backlog ticket.
-- Register an existing code repository — `project new <key> --repo
-  <path>`. Creating a project WITHOUT a repo is not supported yet;
-  business work starts with a backlog ticket instead.
+- Create a business project without a checkout — `project new <key>`.
+  Register an existing code repository when supplied — `project new <key>
+  --repo <path>`.
 - Company questions — `wiki search`, then `wiki cat` the page and cite
   its path; say when nothing is found rather than guessing.
 - Move approved work — `master dispatch <ID>` on a `ready` ticket of an
