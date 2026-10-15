@@ -2,7 +2,8 @@
 declare function require(name: string): any;
 const { Window } = require("happy-dom");
 const win = new Window({ url: "http://localhost/projects/cadence/context" });
-for (const name of ["window", "document", "Node", "Element", "HTMLElement", "HTMLInputElement", "HTMLTextAreaElement", "SVGElement", "navigator", "MutationObserver", "Event", "MouseEvent", "KeyboardEvent", "FileReader", "location", "history", "sessionStorage"]) {
+// Response blobs, FileReader and object URLs share this browser fixture realm.
+for (const name of ["window", "document", "Node", "Element", "HTMLElement", "HTMLInputElement", "HTMLTextAreaElement", "SVGElement", "navigator", "MutationObserver", "Event", "MouseEvent", "KeyboardEvent", "FileReader", "URL", "location", "history", "sessionStorage"]) {
   Object.defineProperty(globalThis, name, { value: name === "window" ? win : win[name], configurable: true, writable: true });
 }
 for (const name of ["addEventListener", "removeEventListener"]) Object.defineProperty(globalThis, name, { value: win[name].bind(win), configurable: true });
