@@ -98,7 +98,7 @@ function visit(file) {
   walk(parsed);
 }
 visit(entry);
-const cssNames = ["styles", "theme", "controls", "base", "primitives", "drawer-base", "drawer"].map((name) => `screen-ui/src/${name}.css`);
+const cssNames = ["styles", "theme", "controls", "base", "foundation", "primitives", "drawer-base", "drawer"].map((name) => `screen-ui/src/${name}.css`);
 const sourceNames = [...seen, ...cssNames, "screen-ui/package.json", "scripts/package-screen-ui.mjs", "package.json", "pnpm-lock.yaml"].sort();
 const sourceFiles = sourceNames.map((name) => ({ path: `ui/${name}`, sha256: sha256(readFileSync(join(ui, name))) }));
 if (!working) {

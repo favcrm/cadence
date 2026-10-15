@@ -1,25 +1,11 @@
+@import "./foundation.css";
+
 body {
   background: var(--color-ink-950);
   color: var(--color-ink-300);
-  font-family: "IBM Plex Sans", sans-serif;
-  font-size: .875rem;
+  font-family: var(--font-sans);
+  font-size: var(--text-body);
   line-height: 1.4;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
-}
-.num {
-  font-family: "IBM Plex Mono", monospace;
-  font-variant-numeric: tabular-nums lining-nums;
-}
-.card {
-  border: 1px solid var(--color-ink-700);
-  background: var(--color-ink-850);
-  border-radius: .5rem;
-  transition: border-color .15s ease, background-color .15s ease;
-}
-a.lnk, button.lnk {
-  color: var(--color-accent);
-}
-a.lnk:hover, button.lnk:hover {
-  text-decoration: underline;
 }
