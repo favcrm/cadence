@@ -95,6 +95,7 @@ mod update_recovery_tests;
 mod update_routing_acceptance;
 mod upgrade;
 mod util;
+mod web;
 mod wiki;
 mod workflow;
 
@@ -165,6 +166,7 @@ use update_args::{daemon_build_or_absent, fd_is_path};
 use update_args::{RealUpdateHost, UpdateArgs, UpdateTargetArgs, UpgradeArgs};
 use util::{cli_verbs, create_worktree, git, parse_duration};
 use uuid::Uuid;
+use web::WebAction;
 use workflow::WorkflowAction;
 
 #[derive(Parser)]

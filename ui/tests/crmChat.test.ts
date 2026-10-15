@@ -107,10 +107,15 @@ const text = () => pane().textContent ?? "";
 assert(host.querySelector('[data-kind="answer"] strong')?.textContent === "VIP customers", "markdown bold renders as <strong>");
 assert(!text().includes("**"), "no raw ** in the chat");
 // Tool steps fold to one line.
-const steps = host.querySelectorAll("[data-chat-steps]");
-equal(steps.length, 1, "tool run folds into one line");
-assert((steps[0].textContent ?? "").includes("2 steps"), "the line counts the steps");
-assert(!text().includes("list_segments") && !text().includes("create_segment"), "no per-step rows");
+// CAD-1431: app chat reuses Home's shared steps group (collapsed head,
+// expandable rows), not a plain one-line summary.
+const steps = host.querySelectorAll('[data-kind="tools"]');
+equal(steps.length, 1, "tool run folds into one shared steps group");
+assert((steps[0].textContent ?? "").includes("2 tool steps"), "the group counts the steps");
+equal(steps[0].getAttribute("data-open"), null, "steps stay collapsed until opened");
+// The step rows sit in the shared collapsed body (CSS grid 0fr); the head
+// carries only the count and the newest step, as on Home.
+assert(steps[0].querySelector(".steps-body") && steps[0].querySelector(".steps-head")?.getAttribute("aria-expanded") === "false", "steps body is the shared collapsed disclosure");
 // Directive card, never raw JSON, token, request id or ctx id.
 assert(host.querySelector('[data-chat-card="directive"]'), "CSV confirm renders as a card");
 for (const bad of [SECRET, "req-9", "confirm_token", "cadence_csv_import", "ctx-a", "{"]) assert(!text().includes(bad), `chat never shows ${bad}`);

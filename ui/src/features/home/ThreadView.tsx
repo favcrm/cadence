@@ -27,7 +27,7 @@ export function time(created: string | null | undefined): string {
  * a call still running shows the pulse instead of a result. Opening and
  * closing animate through the grid-rows height trick (styles.css).
  */
-function StepsGroup({ entries }: { entries: ThreadEntry[] }) {
+function StepsGroup({ entries, density = "full" }: { entries: ThreadEntry[]; density?: Density }) {
   const t = useTranslate();
   const [open, setOpen] = useState(false);
   const steps = useMemo(() => toolSteps(entries), [entries]);
@@ -36,7 +36,7 @@ function StepsGroup({ entries }: { entries: ThreadEntry[] }) {
   const running = steps.some((s) => !s.done);
   const last = steps[steps.length - 1];
   return (
-    <div className="steps min-w-0" data-kind="tools" data-open={open || undefined}>
+    <div className="steps min-w-0" data-kind="tools" data-density={density} data-open={open || undefined}>
       <button
         type="button"
         className="steps-head"
@@ -206,7 +206,7 @@ export function ThreadItemView({
         </div>
       );
     case "tools":
-      return <StepsGroup entries={item.entries} />;
+      return <StepsGroup entries={item.entries} density={density} />;
     case "answer": {
       // A failed turn carries its reason in payload.error and no text: say
       // why, instead of an empty bubble. No Retry here — the turn ran.

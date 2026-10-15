@@ -661,6 +661,9 @@ export function isQueuedBehindOther(
 ): boolean {
   if (!turn || turn.state !== "working") return false;
   if (entries.some((e) => e.message === turn.message)) return false;
+  // The running turn is this conversation's own message, not another's:
+  // the stored entry has not streamed in yet, so it is not queued behind.
+  if (pending.some((p) => p.message === turn.message && p.state !== "failed")) return false;
   const answered = new Set(entries.filter((e) => e.kind === "turn_result").map((e) => e.message));
   const waiting = entries.some((e) => e.role === "operator" && e.kind === "message" && !answered.has(e.message));
   return waiting || pending.some((p) => p.state !== "failed");

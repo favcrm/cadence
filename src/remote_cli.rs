@@ -142,7 +142,14 @@ const SESSION_VERSION: &str = "hosted-cadence-cli-session.v1";
 /// Every capability this client knows. A stored login holds a subset that
 /// includes `cli.read` and `cli.write` (the default login); a renewal keeps
 /// exactly the stored set, so a CLI-only login stays CLI-only.
-const CAPABILITIES: &[&str] = &["cli.read", "cli.write", "wiki.read", "wiki.write"];
+const CAPABILITIES: &[&str] = &[
+    "cli.read",
+    "cli.write",
+    "wiki.read",
+    "wiki.write",
+    "web.read",
+    "web.prepare",
+];
 const RENEW_BEFORE: u64 = 60;
 const SKEW: u64 = 5;
 const RENEWAL_WAIT: Duration = Duration::from_secs(20);
@@ -197,7 +204,15 @@ fn now() -> Result<u64> {
 /// credential recorded for another org is never sent to this host (contract
 /// I1). Expired means "run `cadence login` again", not retry.
 fn private_directory(dir: &Path) -> Result<()> {
-    let meta = fs::symlink_metadata(dir)?;
+    let meta = match fs::symlink_metadata(dir) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(reject(
+                "no remote credential directory — run `cadence login` first; nothing was sent",
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    };
     if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
         return Err(reject(
             "remote credential directory must be owned by you, mode 0700, and not a symlink",
@@ -206,7 +221,19 @@ fn private_directory(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Command use retains the legacy access-only expiry refusal. Offline status
+/// reads the same validated metadata without treating expiry as corrupt storage.
 fn load_credential(dir: &Path, target: &RemoteTarget) -> Result<Credential> {
+    let cred = read_credential_metadata(dir, target)?;
+    if cred.cli_session.is_none() && cred.expires_at <= now()? {
+        return Err(reject(
+            "the remote credential has expired — run `cadence login` again",
+        ));
+    }
+    Ok(cred)
+}
+
+fn read_credential_metadata(dir: &Path, target: &RemoteTarget) -> Result<Credential> {
     private_directory(dir)?;
     let path = dir.join(format!("cli-{}.json", target.org));
     let file = OpenOptions::new()
@@ -326,11 +353,6 @@ fn load_credential(dir: &Path, target: &RemoteTarget) -> Result<Credential> {
     if !valid_token(&cred.access_token, "hct_") {
         return Err(reject("invalid remote credential"));
     }
-    if cred.cli_session.is_none() && cred.expires_at <= now()? {
-        return Err(reject(
-            "the remote credential has expired — run `cadence login` again",
-        ));
-    }
     Ok(cred)
 }
 
@@ -415,6 +437,31 @@ fn save_credential(dir: &Path, slug: &str, cred: &Credential) -> Result<()> {
 }
 
 fn renewed_credential(dir: &Path, target: &RemoteTarget, deadline: Instant) -> Result<Credential> {
+    renewed_credential_with(
+        dir,
+        target,
+        deadline,
+        crate::remote_enrollment::cli_session_post_detailed,
+    )
+}
+
+/// The renewal state machine (lock, load, due check, pending persist, POST,
+/// validate, save) with the issuer POST injected. Production passes the real
+/// `cli_session_post`; tests pass a closure that answers in place of the wire
+/// call, after the real pre-send checks, which live inside `cli_session_post`.
+fn renewed_credential_with(
+    dir: &Path,
+    target: &RemoteTarget,
+    deadline: Instant,
+    post: impl FnOnce(
+        &Path,
+        &str,
+        &str,
+        &str,
+        Value,
+        Instant,
+    ) -> Result<crate::remote_enrollment::IssuerAnswer>,
+) -> Result<Credential> {
     let _lock = private_lock(dir, &target.org, deadline)?;
     if Instant::now() >= deadline {
         return Err(Error::busy_coded(
@@ -487,7 +534,7 @@ fn renewed_credential(dir: &Path, target: &RemoteTarget, deadline: Instant) -> R
         "organization_id":cred.organization_id,"organization_slug":target.org,"audience":cred.audience,
         "subject_id":cred.subject_id,"device_label":session.device_label,"capabilities":cred.capabilities});
     let request_deadline = deadline.min(Instant::now() + RENEWAL_WAIT);
-    let (status, body) = crate::remote_enrollment::cli_session_post(
+    let answer = post(
         dir,
         issuer,
         "/v1/hosted-cadence/cli-session/renew",
@@ -495,11 +542,14 @@ fn renewed_credential(dir: &Path, target: &RemoteTarget, deadline: Instant) -> R
         request,
         request_deadline,
     )?;
-    if status != 200 {
-        return Err(reject(
-            "remote CLI session renewal refused — run `cadence login` again",
+    if answer.status != 200 {
+        return Err(renewal_refusal(
+            answer.status,
+            &answer.body,
+            answer.correlation.as_ref(),
         ));
     }
+    let body = answer.body;
     validate_renewal_response(&body, &cred, target, &pending)?;
     let next = serde_json::from_value::<CliSession>(body["cli_session"].clone())
         .map_err(|_| reject("remote renewal returned invalid session metadata"))?;
@@ -512,6 +562,36 @@ fn renewed_credential(dir: &Path, target: &RemoteTarget, deadline: Instant) -> R
     cred.pending = None;
     save_credential(dir, &target.org, &cred)?;
     Ok(cred)
+}
+
+/// CAD-1434: renewal's separate adapter. The issuer's renewal route answers
+/// `{error:"<code>"}` (AOS `cli-session.ts`), not the gateway envelope, so it
+/// has its own reader. Only the issuer's terminal refresh-grant refusals ask
+/// for a fresh login. Anything else (a transient 503, a malformed answer) keeps
+/// the saved login and pending operation for a later retry, with no consent.
+fn renewal_refusal(
+    status: u16,
+    body: &Value,
+    correlation: Option<&crate::remote_enrollment::IssuerCorrelation>,
+) -> Error {
+    let code = body
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    // The issuer's id is shown only when the header was valid (see
+    // `issuer_correlation`). It is a support reference, never an authority.
+    let request = correlation
+        .map(|c| format!(" (issuer request {})", c.request_id))
+        .unwrap_or_default();
+    match (status, code) {
+        (401, "invalid_token") | (400, "invalid_grant") => reject(format!(
+            "the renewable CLI session was rejected by the issuer — run `cadence login` again{request}"
+        )),
+        _ => reject(format!(
+            "remote CLI session renewal is not complete (HTTP {status}); your saved login \
+             is kept, retry the command later{request}"
+        )),
+    }
 }
 
 fn validate_renewal_response(
@@ -690,13 +770,12 @@ fn post(
     body: &Value,
     timeout: Duration,
 ) -> Result<(u16, Option<u64>, Option<Value>)> {
-    let config = ureq::Agent::config_builder()
+    let builder = ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
         .http_status_as_error(false)
         .max_redirects(0)
-        .proxy(None)
-        .build();
-    let response = ureq::Agent::new_with_config(config)
+        .proxy(None);
+    let response = crate::issuer_transport::agent(builder)
         .post(format!("{endpoint}{path}"))
         .header("Authorization", format!("Bearer {bearer}"))
         .send_json(body)
@@ -744,9 +823,9 @@ fn authorize(
         }),
         AUTH_TIMEOUT,
     )?;
-    let body = body.ok_or_else(|| reject("remote authorize answered non-JSON"))?;
     match status {
         200 => {
+            let body = body.ok_or_else(|| reject("remote authorize answered non-JSON"))?;
             let envelope = body["envelope"].as_str().unwrap_or_default();
             let compact_jws = envelope.split('.').all(|p| {
                 !p.is_empty()
@@ -758,14 +837,8 @@ fn authorize(
             }
             Ok(envelope.to_string())
         }
-        401 | 403 => Err(reject(
-            "the remote refused the credential — run `cadence login` again",
-        )),
         s if (300..400).contains(&s) => Err(reject("remote redirect refused")),
-        _ => Err(reject(format!(
-            "remote authorize failed ({})",
-            body["code"].as_str().unwrap_or("unavailable")
-        ))),
+        _ => Err(refusal_error(status, body.as_ref())),
     }
 }
 
@@ -831,13 +904,12 @@ fn upload_once(
         ("path", logical_path),
     ];
     let body = crate::wiki::upload::build_multipart(&boundary, &fields, file_name, bytes);
-    let config = ureq::Agent::config_builder()
+    let builder = ureq::Agent::config_builder()
         .timeout_global(Some(CALL_TIMEOUT))
         .http_status_as_error(false)
         .max_redirects(0)
-        .proxy(None)
-        .build();
-    let response = ureq::Agent::new_with_config(config)
+        .proxy(None);
+    let response = crate::issuer_transport::agent(builder)
         .post(format!("{}/__platform/wiki/upload", target.endpoint))
         .header("Authorization", format!("Bearer {}", cred.access_token))
         .header("X-Cadence-Wiki-Envelope", envelope.as_str())
@@ -979,17 +1051,9 @@ fn upload_file_in(
         // raw body could carry anything, so it is never echoed.
         let conflict = status == 409 && body.as_ref().is_some_and(|b| b.get("conflict").is_some());
         if !(200..300).contains(&status) && status != 503 && !conflict {
-            let code = body
-                .as_ref()
-                .and_then(|b| b["code"].as_str())
-                .unwrap_or("unavailable")
-                .to_string();
-            if matches!(status, 401 | 403) {
-                return Err(reject(
-                    "the remote refused the credential — run `cadence login` again",
-                ));
-            }
-            return Err(reject(format!("remote upload refused ({status}, {code})")));
+            // CAD-1434: the gateway envelope is `{ok:false,error:{code}}`; the
+            // decoder reads it (the old top-level read always fell through).
+            return Err(refusal_error(status, body.as_ref()));
         }
         match classify(status, retry_after, body) {
             Verdict::Done(result) => return result,
@@ -1022,6 +1086,174 @@ enum Verdict {
     Waking(Duration),
 }
 
+/// CAD-1434: the safe decoding of a gateway refusal, shared by authorize,
+/// cli/wiki call and blob upload. It reads the AOS gateway envelope
+/// `{ok:false,error:{code,reason?}}` (or a legacy top-level `code`). The raw
+/// body is never echoed. Renewal is a separate adapter; see `renewal_refusal`.
+///
+/// The gateway's real refusal shapes (AOS-243, `apps/api/src/board/routes.ts`):
+/// - authorize/call/upload refusals are `401` with `error.code: "unauthorized"`
+///   and, when proven at that layer, `error.reason` naming a policy outcome;
+/// - a bare `401 unauthorized` without a reason means the bearer did not
+///   resolve, but the server cannot say whether it expired or was revoked;
+/// - any `5xx` is availability (waking, unavailable, runtime).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    /// The caller was authenticated and a policy outcome refused the action.
+    /// A fresh login does not change it, so it never advises login.
+    Authorization,
+    /// The gateway proved the bearer's session is gone (a terminal code). The
+    /// one precise case where a fresh login is the known remedy.
+    Authentication,
+    /// A 401 the server did not explain. It is not confirmed expiry or
+    /// revocation: diagnose read-only before any login.
+    Uncertain,
+    /// Any 5xx: retry later; saved credentials and any pending
+    /// renewal are kept.
+    Availability,
+    /// An answer whose shape we do not recognise. Conservative fallback.
+    Unknown,
+}
+
+impl Refusal {
+    fn category(self) -> &'static str {
+        match self {
+            Self::Authorization => "authorization",
+            Self::Authentication => "authentication",
+            Self::Uncertain => "uncertain",
+            Self::Availability => "availability",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Policy outcomes the gateway names on a 401 (`error.reason`). Each is proven
+/// at its own gate, so a fresh login would not change it. Allowlisted: an
+/// unknown reason is never trusted as policy.
+const POLICY_REASONS: &[&str] = &["scope_not_granted", "grant_narrowed", "binding_mismatch"];
+
+/// The Cadence container's own envelope gate (`src/ui/wiki_envelope.rs`) answers
+/// a 403 `insufficient_scope` when the signed grant does not cover the action or
+/// the target path. It runs before any daemon mutation. It is authorization, not
+/// a login problem, and only on 403: the same code on another status is unknown.
+const CONTAINER_SCOPE_CODE: &str = "insufficient_scope";
+
+/// `envelope_invalid` is a structural, expired or legacy-shape envelope. The
+/// bearer may be fine, so it is neither terminal session loss nor policy.
+const ENVELOPE_REASONS: &[&str] = &["envelope_invalid"];
+
+/// Gateway codes that the issuer or gateway states outright: the session is
+/// gone. Only these may ask for a fresh login as the known remedy.
+const TERMINAL_CODES: &[&str] = &[
+    "invalid_token",
+    "invalid_grant",
+    "session_expired",
+    "session_revoked",
+    "lineage_terminal",
+];
+
+/// Read the safe `error.code` and `error.reason` (or legacy top-level `code`).
+/// Only lowercase, bounded tokens survive; anything else is dropped.
+fn refusal_fields(body: Option<&Value>) -> (Option<&str>, Option<&str>) {
+    fn safe(v: Option<&str>) -> Option<&str> {
+        v.filter(|c| c.len() <= 64 && c.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'))
+    }
+    let error = body.and_then(|b| b.get("error"));
+    let code = error
+        .and_then(|e| e.get("code"))
+        .or_else(|| body.and_then(|b| b.get("code")))
+        .and_then(Value::as_str);
+    let reason = error.and_then(|e| e.get("reason")).and_then(Value::as_str);
+    (safe(code), safe(reason))
+}
+
+/// CAD-1434 / AOS-243: the correlation a refusal carries, read only when it is
+/// safe to show. `hop` is an allowlisted name (today only the board names a
+/// hop) and `request_id` must be a bounded UUID. Anything else is dropped, so
+/// no arbitrary server text reaches the message or a log.
+fn refusal_correlation(body: Option<&Value>) -> Option<String> {
+    let error = body.and_then(|b| b.get("error"))?;
+    let hop = error
+        .get("hop")
+        .and_then(Value::as_str)
+        .filter(|h| *h == "board")?;
+    let id = error
+        .get("request_id")
+        .and_then(Value::as_str)
+        .filter(|id| id.len() == 36 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'))?;
+    Some(format!(" (hop {hop}, request {id})"))
+}
+
+/// Decode one refusal to its category plus the safe reason to show. The reason
+/// is returned only when it is a known allowlisted value, never raw server text.
+fn decode_refusal(status: u16, body: Option<&Value>) -> (Refusal, Option<String>) {
+    let (code, reason) = refusal_fields(body);
+    let known_reason =
+        reason.filter(|r| POLICY_REASONS.contains(r) || ENVELOPE_REASONS.contains(r));
+    let category = match status {
+        // Every 5xx is the gateway or runtime being unavailable: retry later.
+        500..=599 => Refusal::Availability,
+        // A non-auth refusal keeps its safe code (for example `payload_too_large`
+        // or a legacy `too_large`) so the caller sees what was refused. It is not
+        // a login or availability claim.
+        400 | 409 | 413 | 422 => Refusal::Unknown,
+        401 | 403 => match (code, known_reason) {
+            // A policy outcome proven at a gate is authorization, whatever the code.
+            (_, Some(r)) if POLICY_REASONS.contains(&r) => Refusal::Authorization,
+            (_, Some(_)) => Refusal::Uncertain, // envelope_invalid: not terminal, not policy
+            (Some(c), None) if TERMINAL_CODES.contains(&c) => Refusal::Authentication,
+            (Some("forbidden"), None) => Refusal::Authorization,
+            // The container's path/scope refusal: authorization on 403 only.
+            (Some(CONTAINER_SCOPE_CODE), None) if status == 403 => Refusal::Authorization,
+            // A generic 403 with no safe code is still an access denial, never a
+            // login or expiry claim.
+            (None, None) if status == 403 => Refusal::Authorization,
+            (Some("unauthorized"), None) | (None, None) => Refusal::Uncertain,
+            _ => Refusal::Unknown,
+        },
+        _ => Refusal::Unknown,
+    };
+    // The shown reason: an allowlisted policy/envelope reason on 401/403, or the
+    // safe `error.code` on a non-auth refusal (a payload-size or validation code).
+    // Auth-class codes are never shown as a free reason.
+    let shown = match status {
+        400 | 409 | 413 | 422 => code.map(str::to_owned),
+        403 if code == Some(CONTAINER_SCOPE_CODE) => Some(CONTAINER_SCOPE_CODE.to_owned()),
+        _ => known_reason.map(str::to_owned),
+    };
+    (category, shown)
+}
+
+/// The next action for a decoded refusal. Login is named only for a terminal
+/// session loss. Everything else is diagnosed read-only and never retried.
+fn refusal_message(refusal: Refusal, reason: Option<&str>, status: u16) -> String {
+    let code = reason.map_or(String::new(), |r| format!(", reason {r}"));
+    let category = refusal.category();
+    match refusal {
+        Refusal::Authentication => format!(
+            "the remote session ended ({category}, HTTP {status}{code}) — run `cadence login` again once"
+        ),
+        Refusal::Authorization => format!(
+            "the remote refused this action as not permitted ({category}, HTTP {status}{code}); \
+             a new login does not grant it — check the workspace role and target path (see \
+             docs/REMOTE-AUTH.md, read-only diagnosis), then ask the owner. Nothing was retried"
+        ),
+        Refusal::Uncertain => format!(
+            "the remote did not confirm why it refused the credential ({category}, HTTP {status}{code}); \
+             it may or may not be expired — run the read-only diagnosis in docs/REMOTE-AUTH.md \
+             before any login. Nothing was retried"
+        ),
+        Refusal::Availability => format!(
+            "the remote is unavailable ({category}, HTTP {status}{code}) — retry later; \
+             saved credentials are kept"
+        ),
+        Refusal::Unknown => format!(
+            "the remote refused the request ({category}, HTTP {status}{code}); it did not match \
+             a known refusal, so nothing was retried"
+        ),
+    }
+}
+
 fn classify(status: u16, retry_after: Option<u64>, body: Option<Value>) -> Verdict {
     match status {
         200..=299 => Verdict::Done(body.ok_or_else(|| reject("remote answer was not JSON"))),
@@ -1045,12 +1277,12 @@ fn classify(status: u16, retry_after: Option<u64>, body: Option<Value>) -> Verdi
                     body.and_then(|b| b["code"].as_str().map(str::to_string))
                         .unwrap_or_else(|| "wake_failed".into())
                 )))),
-                _ => Verdict::Done(Err(reject("remote org is unavailable"))),
+                // CAD-1434: a bare 503 is availability, decoded the same as
+                // every other refusal (no retry, saved login kept).
+                _ => Verdict::Done(Err(refusal_error(status, body.as_ref()))),
             }
         }
-        401 | 403 => Verdict::Done(Err(reject(
-            "the remote refused the credential — run `cadence login` again",
-        ))),
+        401 | 403 => Verdict::Done(Err(refusal_error(status, body.as_ref()))),
         s if (300..400).contains(&s) => Verdict::Done(Err(reject("remote redirect refused"))),
         409 => {
             // A checked conflict (`{conflict, current_rev, card, error}`
@@ -1062,11 +1294,25 @@ fn classify(status: u16, retry_after: Option<u64>, body: Option<Value>) -> Verdi
             // generic refusal as any other unhandled status.
             match body {
                 Some(b) if b.get("conflict").is_some() => Verdict::Conflict(b),
-                _ => Verdict::Done(Err(reject("remote call refused"))),
+                _ => Verdict::Done(Err(refusal_error(status, body.as_ref()))),
             }
         }
-        _ => Verdict::Done(Err(reject("remote call refused"))),
+        // CAD-1434: 400/413/422/5xx and any other status use the same decoder,
+        // so the safe code or availability category is shown, never a bare
+        // generic message. None of these retries.
+        _ => Verdict::Done(Err(refusal_error(status, body.as_ref()))),
     }
+}
+
+/// CAD-1434: the one place a non-success gateway answer becomes an error. It
+/// decodes the safe category and reason, then names the next action.
+fn refusal_error(status: u16, body: Option<&Value>) -> Error {
+    let (refusal, reason) = decode_refusal(status, body);
+    let mut text = refusal_message(refusal, reason.as_deref(), status);
+    if let Some(correlation) = refusal_correlation(body) {
+        text.push_str(&correlation);
+    }
+    reject(text)
 }
 
 /// Run one allowlisted remote verb: a [`REMOTE_VERBS`] cli verb or a
@@ -1084,6 +1330,76 @@ fn classify(status: u16, retry_after: Option<u64>, body: Option<Value>) -> Verdi
 pub enum RemoteAnswer {
     Ok(Value),
     Conflict(Value),
+}
+
+/// CAD-1434: local-only credential state for `org list`/`org inspect`. It reads
+/// the stored credential with no network call and never returns a token. The
+/// result is a claim about what this machine holds, not about live connectivity
+/// or permission: `renewable` means the saved refresh session can be used on
+/// the next command; the server still decides each operation.
+pub fn local_status(target: &RemoteTarget) -> Value {
+    match auth_dir(None) {
+        Ok(dir) => local_status_at(&dir, target),
+        Err(_) => json!({"state": "unavailable", "live_verified": false}),
+    }
+}
+
+/// `local_status` with the credential dir injectable, so tests never touch the
+/// real config directory. Only a missing file is absence. A permission or I/O
+/// error is `unavailable`, never a claim that no credential exists.
+fn local_status_at(dir: &Path, target: &RemoteTarget) -> Value {
+    let path = dir.join(format!("cli-{}.json", target.org));
+    let meta = match fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return json!({"state": "no_credential", "live_verified": false});
+        }
+        Err(_) => {
+            return json!({"state": "unavailable", "live_verified": false,
+                "note": "the local credential store cannot be inspected; check its permissions"});
+        }
+    };
+    let cred = match read_credential_metadata(dir, target) {
+        Ok(cred) => cred,
+        // Malformed, foreign or unreadable storage is a local problem, never
+        // proof of absence or of server-side revocation.
+        Err(_) => {
+            return json!({"state": "invalid_local_credential", "live_verified": false,
+                "note": "the saved credential cannot be read; run `cadence login` again"})
+        }
+    };
+    let at = now().unwrap_or(0);
+    let scopes: Vec<&str> = cred.capabilities.iter().map(String::as_str).collect();
+    let mut out = json!({
+        "scopes": scopes,
+        "access_expires_at": cred.expires_at,
+        "live_verified": false,
+        // Local observation only: when this machine last wrote the credential
+        // file. It is not a server renewal result and proves no health.
+        "stored_at": meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs()),
+        "observed_at": at,
+    });
+    // Session expiry is reported whether or not the session is still live, so
+    // the reader sees exactly why a renewal is no longer possible.
+    if let Some(session) = cred.cli_session.as_ref() {
+        out["session_idle_expires_at"] = json!(session.idle_expires_at);
+        out["session_absolute_expires_at"] = json!(session.absolute_expires_at);
+        out["pending_renewal"] = json!(cred.pending.is_some());
+    }
+    let state = match cred.cli_session.as_ref() {
+        Some(session) if session.idle_expires_at > at && session.absolute_expires_at > at => {
+            "renewable"
+        }
+        Some(_) => "reauthentication_required",
+        None if cred.expires_at > at => "access_valid_until_expiry",
+        None => "reauthentication_required",
+    };
+    out["state"] = json!(state);
+    out
 }
 
 /// Revoke one remote device/workspace session before removing its protected
@@ -1228,12 +1544,137 @@ fn call_verb_in(
     }
 }
 
+/// CAD-1429: a Publish Web management request. Only a verified, live `hct_`
+/// credential for `target` is used; the bearer is never returned or printed.
+/// The required scope is checked against the credential's own stored grant
+/// (`web.read` or `web.prepare`); the server enforces it again per route.
+/// Redirects are refused and the body is bounded, as for every relay call.
+/// The answer is the server's `{ok,data|error}` envelope, unwrapped to `data`
+/// on success and to the stable server `code` on refusal.
+pub struct WebResponse {
+    pub status: u16,
+    pub body: Option<Value>,
+}
+
+/// CAD-1429: the verified identity a web record is bound to. It comes from the
+/// same live credential check as every web request (owner file, issuer pin,
+/// audience and org match, renewal). It never carries the token.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WebIdentity {
+    pub org: String,
+    pub organization_id: String,
+    pub audience: String,
+    pub issuer: String,
+}
+
+/// Verify the stored credential for `target` and return its identity. Fails
+/// closed when the credential has no issuer, expired, or was minted for
+/// another workspace or audience.
+pub fn web_identity(target: &RemoteTarget) -> Result<WebIdentity> {
+    let dir = auth_dir(None).map_err(|_| {
+        reject("remote credential directory is unavailable — set HOME or XDG_CONFIG_HOME")
+    })?;
+    let deadline = Instant::now() + Duration::from_secs(WAKE_TIMEOUT_DEFAULT);
+    let cred = renewed_credential(&dir, target, deadline)?;
+    let issuer = cred.issuer.clone().ok_or_else(|| {
+        reject("the stored login has no pinned issuer — run `cadence login --web` again")
+    })?;
+    Ok(WebIdentity {
+        org: target.org.clone(),
+        organization_id: cred.organization_id.clone(),
+        audience: cred.audience.clone(),
+        issuer,
+    })
+}
+
+/// One bounded web request. `headers` carry only the web contract's own
+/// headers (`X-Workspace-Id`, `X-Content-Sha256`, `Content-Type`); a bearer
+/// or envelope is never taken from the caller.
+pub fn web_request(
+    target: &RemoteTarget,
+    scope: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, String)],
+    body: Option<&[u8]>,
+    wake_timeout: u64,
+) -> Result<WebResponse> {
+    if !matches!(scope, "web.read" | "web.prepare") {
+        return Err(reject("web request scope is not allowed"));
+    }
+    let dir = auth_dir(None).map_err(|_| {
+        reject("remote credential directory is unavailable — set HOME or XDG_CONFIG_HOME")
+    })?;
+    let deadline = Instant::now() + Duration::from_secs(wake_timeout);
+    let cred = renewed_credential(&dir, target, deadline)?;
+    if !cred.capabilities.iter().any(|c| c == scope) {
+        return Err(reject(format!(
+            "this login for '{}' lacks {scope} — run `cadence login --web` for that workspace",
+            target.org
+        )));
+    }
+    // `/v1/web-sites` is a platform route on the public issuer. Board hosts are
+    // answered by the board catch-all before any `/v1` route, so the board
+    // audience is never sent a web request. The issuer is the one the saved,
+    // renewed credential was minted by; it is never taken from an argument.
+    let issuer = cred.issuer.clone().ok_or_else(|| {
+        reject("the stored login has no pinned issuer — run `cadence login --web` again")
+    })?;
+    let (status, body) = crate::remote_enrollment::web_issuer_request(
+        &dir,
+        &issuer,
+        crate::remote_enrollment::WebRequest {
+            method,
+            path,
+            bearer: &cred.access_token,
+            headers,
+            body,
+        },
+        deadline,
+    )?;
+    Ok(WebResponse { status, body })
+}
+
+/// Unwrap the server envelope: `data` on `ok:true`, else a stable refusal
+/// carrying the server's own `error.code` (never the raw body).
+pub fn web_envelope(response: WebResponse) -> Result<Value> {
+    let body = response
+        .body
+        .ok_or_else(|| reject("remote web answer was not JSON"))?;
+    if body["ok"] == Value::Bool(true) {
+        return Ok(body["data"].clone());
+    }
+    let code = body["error"]["code"].as_str().unwrap_or("unavailable");
+    if response.status == 409 && body["ok"] == Value::Bool(false) && code == "revision_conflict" {
+        return Err(Error::invalid(
+            "revision_conflict",
+            format!("remote web request refused ({} {code})", response.status),
+        ));
+    }
+    let message = match response.status {
+        401 | 403 if code == "unauthorized" || code == "forbidden" => {
+            "the remote refused the credential — run `cadence login` again"
+        }
+        _ => "remote web request refused",
+    };
+    Err(Error::rejected(format!(
+        "{message} ({} {code})",
+        response.status
+    )))
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "test-seam")]
+    mod native_chain_acceptance {
+        include!("remote_cli_native_chain_acceptance.rs");
+    }
+
     use super::*;
     use serde_json::json;
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
+    use std::os::unix::fs::PermissionsExt;
     use std::thread;
 
     const ORG: &str = "acme";
@@ -1525,6 +1966,158 @@ mod tests {
     }
 
     #[test]
+    fn cad1434_blocker_authorize_refusals_never_forward_or_retry_user_writes() {
+        let request_id = "12345678-1234-4234-8234-123456789abc";
+        let unavailable = json!({"ok": false, "error": {
+            "code": "runtime_unavailable", "hop": "board", "request_id": request_id,
+            "message": "do-not-print-server-text"}})
+        .to_string();
+        let unsafe_code = json!({"code": "do-not-print-server-text /private/token",
+            "message": "do-not-print-server-text"})
+        .to_string();
+        for (status, body, expected) in [
+            (
+                401,
+                "<html>do-not-print-server-text</html>",
+                "uncertain, HTTP 401",
+            ),
+            (
+                403,
+                "<html>do-not-print-server-text</html>",
+                "authorization, HTTP 403",
+            ),
+            (503, unavailable.as_str(), "availability, HTTP 503"),
+            (400, unsafe_code.as_str(), "unknown, HTTP 400"),
+            (
+                302,
+                "<html>do-not-print-server-text</html>",
+                "remote redirect refused",
+            ),
+            (
+                200,
+                "<html>do-not-print-server-text</html>",
+                "remote authorize answered non-JSON",
+            ),
+        ] {
+            for operation in ["issue_new", "write", "upload"] {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let target = target(&listener);
+                let server = listener.try_clone().unwrap();
+                let response = body.to_owned();
+                let (stop, stopped) = std::sync::mpsc::channel();
+                let worker = thread::spawn(move || {
+                    let mut paths = Vec::new();
+                    let mut stopping = false;
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while Instant::now() < deadline {
+                        stopping |= stopped.try_recv().is_ok();
+                        let (mut socket, _) = match server.accept() {
+                            Ok(connection) => connection,
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                if stopping {
+                                    break;
+                                }
+                                thread::sleep(Duration::from_millis(2));
+                                continue;
+                            }
+                            Err(e) => panic!("refusal worker accept: {e}"),
+                        };
+                        socket.set_nonblocking(false).unwrap();
+                        socket
+                            .set_read_timeout(Some(Duration::from_secs(10)))
+                            .unwrap();
+                        let mut reader = BufReader::new(socket.try_clone().unwrap());
+                        let mut line = String::new();
+                        reader.read_line(&mut line).unwrap();
+                        paths.push(line.split(' ').nth(1).unwrap().to_owned());
+                        let mut length = 0;
+                        loop {
+                            line.clear();
+                            reader.read_line(&mut line).unwrap();
+                            if line == "\r\n" {
+                                break;
+                            }
+                            if let Some((key, value)) = line.split_once(':') {
+                                if key.eq_ignore_ascii_case("content-length") {
+                                    length = value.trim().parse::<usize>().unwrap();
+                                }
+                            }
+                        }
+                        // Read bytes, not JSON: an incorrectly forwarded multipart
+                        // upload must also be recorded and fail the path assertion.
+                        let mut raw = vec![0; length];
+                        reader.read_exact(&mut raw).unwrap();
+                        write!(socket, "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}", response.len()).unwrap();
+                    }
+                    paths
+                });
+                let root = tempfile::tempdir().unwrap();
+                let dir = root.path();
+                fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
+                store_credential(dir, &target.endpoint);
+                let saved = fs::read(dir.join(format!("cli-{ORG}.json"))).unwrap();
+                let result = if operation == "upload" {
+                    upload_file_in(
+                        dir,
+                        &target,
+                        "global/test.txt",
+                        "test.txt",
+                        b"test",
+                        true,
+                        5,
+                        |_| panic!("authorize refusal retried"),
+                    )
+                } else {
+                    let arguments = if operation == "write" {
+                        json!({"path": "global/test", "text": "test"})
+                    } else {
+                        json!({"project": "test", "title": "test"})
+                    };
+                    call_verb_in(
+                        &target,
+                        operation,
+                        arguments.as_object().unwrap().clone(),
+                        5,
+                        dir,
+                        |_| panic!("authorize refusal retried"),
+                        |_| panic!("authorize refusal slept"),
+                    )
+                    .map(|_| json!(null))
+                };
+                stop.send(()).unwrap();
+                let paths = worker.join().unwrap();
+                let relay = if operation == "issue_new" {
+                    "cli"
+                } else {
+                    "wiki"
+                };
+                assert_eq!(
+                    paths,
+                    [format!("/__platform/{relay}/authorize")],
+                    "{operation}, HTTP {status}"
+                );
+                let text = result.unwrap_err().to_string();
+                assert!(text.contains(expected), "{operation}: {text}");
+                assert!(!text.contains("do-not-print-server-text"), "{text}");
+                assert!(!text.contains("/private/token"), "{text}");
+                assert!(!text.contains("cadence login"), "{text}");
+                assert!(!text.contains(BRIDGE), "{text}");
+                if status == 503 {
+                    assert!(
+                        text.contains(&format!("hop board, request {request_id}")),
+                        "{text}"
+                    );
+                }
+                assert_eq!(
+                    fs::read(dir.join(format!("cli-{ORG}.json"))).unwrap(),
+                    saved
+                );
+            }
+        }
+    }
+
+    #[test]
     fn wiki_refuses_forged_authority_before_mint_and_never_uses_cli_relay() {
         // CAD-1401 independent refusal acceptance. The worker deliberately
         // accepts every payload: only the real client guard can refuse it.
@@ -1792,8 +2385,532 @@ mod tests {
             Map::new(),
             10,
         );
-        assert!(out.unwrap_err().to_string().contains("remote call refused"));
+        // CAD-1434: decoded, not a bare generic message. It shows the safe
+        // category, never the raw body, and is never retried.
+        let shown = out.unwrap_err().to_string();
+        assert!(shown.contains("unknown"), "{shown}");
+        assert!(!shown.contains("midway collision"), "{shown}");
+        assert!(!shown.contains("cadence login"), "{shown}");
         assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+    }
+
+    #[test]
+    fn a_bare_503_is_availability_and_is_not_retried_or_login() {
+        // A 503 without a waking state is terminal for this command: retry
+        // later, keep the saved login, never ask for a fresh one.
+        let (out, requests) = run(
+            vec![(503, "", json!({"state": "board_unreachable"}))],
+            "issue_set",
+            Map::new(),
+            10,
+        );
+        let shown = out.unwrap_err().to_string();
+        assert!(shown.contains("unavailable"), "{shown}");
+        assert!(shown.contains("retry later"), "{shown}");
+        assert!(!shown.contains("cadence login"), "{shown}");
+        assert_eq!(
+            hits(&requests, "/__platform/cli/call"),
+            1,
+            "a bare 503 was retried"
+        );
+    }
+
+    /// The exact Cadence container refusal (`src/ui/wiki_envelope.rs`): a path
+    /// outside the signed grant is a 403 `insufficient_scope` with a message.
+    /// On the call path it is authorization, shows its safe code, asks for no
+    /// login, is sent once, and never echoes the body.
+    #[test]
+    fn a_container_403_insufficient_scope_is_authorization_on_the_call_path() {
+        let body = json!({"ok": false, "error": {"code": "insufficient_scope",
+            "message": "the path is outside this envelope's wiki write prefix do-not-print"}});
+        let (out, requests) = run(vec![(403, "", body)], "issue_set", Map::new(), 10);
+        let shown = out.unwrap_err().to_string();
+        assert!(shown.contains("authorization"), "{shown}");
+        assert!(shown.contains("insufficient_scope"), "{shown}");
+        assert!(!shown.contains("cadence login"), "{shown}");
+        assert!(!shown.contains("do-not-print"), "{shown}");
+        assert_eq!(
+            hits(&requests, "/__platform/cli/call"),
+            1,
+            "a container 403 was retried"
+        );
+    }
+
+    /// A generic 403 (no safe code) is still an access denial: conservative
+    /// authorization guidance, never a login claim or an unknown-shape answer.
+    #[test]
+    fn a_generic_403_is_conservative_access_denial_not_login() {
+        let (refusal, reason) = decode_refusal(403, Some(&json!({"error": {"code": "forbidden"}})));
+        assert_eq!(refusal, Refusal::Authorization);
+        assert_eq!(reason, None);
+        let text = refusal_message(refusal, reason.as_deref(), 403);
+        assert!(text.contains("not permitted"), "{text}");
+        assert!(!text.contains("cadence login"), "{text}");
+        let bare = decode_refusal(403, None);
+        assert_eq!(bare.0, Refusal::Authorization);
+        assert!(!refusal_message(bare.0, bare.1.as_deref(), 403).contains("cadence login"));
+    }
+
+    /// The container's `insufficient_scope` is authorization only on 403. The same
+    /// code on a 401 is not trusted as a policy proof, so it stays uncertain.
+    #[test]
+    fn insufficient_scope_is_authorization_only_on_403() {
+        let body = json!({"error": {"code": "insufficient_scope"}});
+        assert_eq!(decode_refusal(403, Some(&body)).0, Refusal::Authorization);
+        assert_eq!(decode_refusal(401, Some(&body)).0, Refusal::Unknown);
+    }
+
+    /// The same container refusal on the blob upload path: one upload request,
+    /// safe code shown, no login advice, the raw body never printed.
+    #[test]
+    fn a_container_403_insufficient_scope_is_authorization_on_the_upload_path() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        let (listener, handle) = upload_fake(
+            403,
+            r#"{"ok":false,"error":{"code":"insufficient_scope","message":"outside prefix do-not-print"}}"#,
+        );
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        store_credential(dir, &endpoint);
+        let target = RemoteTarget {
+            org: ORG.into(),
+            endpoint,
+            org_id: ORG_ID.into(),
+        };
+        let err = upload_file_in(
+            dir,
+            &target,
+            "projects/x/a.pdf",
+            "a.pdf",
+            b"%PDF-bytes",
+            true,
+            5,
+            |_| {},
+        )
+        .unwrap_err();
+        let _ = handle.join().unwrap();
+        let shown = err.to_string();
+        assert!(shown.contains("authorization"), "{shown}");
+        assert!(shown.contains("insufficient_scope"), "{shown}");
+        assert!(!shown.contains("cadence login"), "{shown}");
+        assert!(!shown.contains("do-not-print"), "{shown}");
+    }
+
+    #[test]
+    fn a_400_shows_its_safe_code_and_is_not_retried() {
+        // A payload/validation refusal keeps its safe code so the caller sees
+        // what was refused. It is not a login or availability claim.
+        let (out, requests) = run(
+            vec![(
+                400,
+                "",
+                json!({"ok": false, "error": {"code": "payload_too_large"}}),
+            )],
+            "issue_set",
+            Map::new(),
+            10,
+        );
+        let shown = out.unwrap_err().to_string();
+        assert!(shown.contains("payload_too_large"), "{shown}");
+        assert!(!shown.contains("cadence login"), "{shown}");
+        assert_eq!(
+            hits(&requests, "/__platform/cli/call"),
+            1,
+            "a 400 was retried"
+        );
+    }
+
+    /// The exact AOS gateway refusal (`routes.ts` `gateRefusal`): 401, code
+    /// `unauthorized`, plus the proven policy reason. Each is driven through the
+    /// real call path (`call_verb_in` -> `call_once` -> fake relay), not only the
+    /// decoder.
+    fn aos_refusal(reason: &str) -> Value {
+        json!({"ok": false, "error": {"code": "unauthorized",
+            "message": "Wiki call refused.", "reason": reason}})
+    }
+
+    #[test]
+    fn a_policy_401_scope_not_granted_never_recommends_login_and_is_not_retried() {
+        // Paired AOS shape: 401 unauthorized + reason scope_not_granted is a
+        // policy outcome. It must not say "cadence login", and exactly one
+        // attempt is sent (no retry, no mutation replay).
+        let (out, requests) = run(
+            vec![(401, "", aos_refusal("scope_not_granted"))],
+            "issue_set",
+            Map::new(),
+            10,
+        );
+        let shown = out.unwrap_err().to_string();
+        assert!(!shown.contains("cadence login"), "{shown}");
+        assert!(shown.contains("authorization"), "{shown}");
+        assert!(shown.contains("scope_not_granted"), "{shown}");
+        assert_eq!(
+            hits(&requests, "/__platform/cli/call"),
+            1,
+            "a policy 401 was retried"
+        );
+    }
+
+    #[test]
+    fn every_allowlisted_policy_reason_is_authorization_on_the_real_path() {
+        for reason in ["scope_not_granted", "grant_narrowed", "binding_mismatch"] {
+            let (out, requests) = run(
+                vec![(401, "", aos_refusal(reason))],
+                "issue_set",
+                Map::new(),
+                10,
+            );
+            let shown = out.unwrap_err().to_string();
+            assert!(!shown.contains("cadence login"), "{reason}: {shown}");
+            assert!(shown.contains(reason), "{reason}: {shown}");
+            assert_eq!(
+                hits(&requests, "/__platform/cli/call"),
+                1,
+                "{reason} retried"
+            );
+        }
+    }
+
+    #[test]
+    fn envelope_invalid_is_not_terminal_session_loss_and_is_not_retried() {
+        // envelope_invalid (expired/legacy envelope) is neither policy nor a
+        // proven session loss. It must not claim expiry or tell the user to log in.
+        let (out, requests) = run(
+            vec![(401, "", aos_refusal("envelope_invalid"))],
+            "status",
+            Map::new(),
+            10,
+        );
+        let shown = out.unwrap_err().to_string();
+        assert!(!shown.contains("cadence login"), "{shown}");
+        assert!(shown.contains("did not confirm"), "{shown}");
+        assert_eq!(
+            hits(&requests, "/__platform/cli/call"),
+            1,
+            "an envelope refusal was retried"
+        );
+    }
+
+    #[test]
+    fn a_generic_unauthorized_without_reason_is_uncertain_not_confirmed_expiry() {
+        // A 401 unauthorized with no reason means the bearer did not resolve, but
+        // the server cannot tell expiry from revocation. It is uncertain: no
+        // confirmed-expiry claim, one attempt, read-only diagnosis advised.
+        let (out, requests) = run(
+            vec![(
+                401,
+                "",
+                json!({"ok": false, "error": {"code": "unauthorized"}}),
+            )],
+            "status",
+            Map::new(),
+            10,
+        );
+        let shown = out.unwrap_err().to_string();
+        assert!(shown.contains("did not confirm"), "{shown}");
+        assert!(shown.contains("read-only diagnosis"), "{shown}");
+        assert!(!shown.contains("has expired"), "{shown}");
+        assert_eq!(
+            hits(&requests, "/__platform/cli/call"),
+            1,
+            "a generic 401 was retried"
+        );
+    }
+
+    #[test]
+    fn a_non_json_401_is_uncertain_and_never_echoes_the_body() {
+        // A gateway or ingress 401 that is not the envelope (HTML, empty) must not
+        // be read as confirmed expiry, and its body must not be echoed.
+        let (refusal, reason) = decode_refusal(401, None);
+        assert_eq!(refusal, Refusal::Uncertain);
+        assert_eq!(reason, None);
+        let text = refusal_message(refusal, reason.as_deref(), 401);
+        assert!(text.contains("did not confirm"), "{text}");
+        assert!(!text.contains("<html"), "{text}");
+    }
+
+    #[test]
+    fn only_terminal_issuer_and_session_codes_ask_for_login() {
+        for code in [
+            "invalid_token",
+            "invalid_grant",
+            "session_expired",
+            "session_revoked",
+            "lineage_terminal",
+        ] {
+            let (refusal, _) = decode_refusal(401, Some(&json!({"error": {"code": code}})));
+            assert_eq!(refusal, Refusal::Authentication, "{code}");
+            let text = refusal_message(refusal, None, 401);
+            assert!(text.contains("cadence login"), "{code}: {text}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_policy_looking_reason_is_not_trusted() {
+        // Only the allowlisted reasons count. A free-form or unknown reason is
+        // dropped, so it can neither assert policy nor leak into the message.
+        let (refusal, reason) = decode_refusal(
+            401,
+            Some(&json!({"error": {"code": "unauthorized", "reason": "some raw server text"}})),
+        );
+        assert_eq!(reason, None);
+        assert_eq!(refusal, Refusal::Uncertain);
+    }
+
+    #[test]
+    fn a_board_refusal_shows_its_hop_and_request_id_and_never_the_raw_body() {
+        // The AOS board names its hop and a fresh UUID. Both reach the message;
+        // the raw body and any extra server text never do.
+        let id = "0b2e1f4a-7c3d-4e5f-8a9b-1c2d3e4f5a6b";
+        let body = json!({"ok": false, "error": {"code": "unauthorized",
+            "reason": "scope_not_granted", "hop": "board", "request_id": id,
+            "message": "raw server text do-not-print"}});
+        let (out, requests) = run(vec![(401, "", body)], "issue_set", Map::new(), 10);
+        let shown = out.unwrap_err().to_string();
+        assert!(shown.contains("hop board"), "{shown}");
+        assert!(shown.contains(id), "{shown}");
+        assert!(!shown.contains("do-not-print"), "{shown}");
+        assert_eq!(hits(&requests, "/__platform/cli/call"), 1);
+    }
+
+    #[test]
+    fn an_unlisted_hop_or_a_non_uuid_request_id_is_dropped() {
+        for body in [
+            json!({"error": {"code": "unauthorized", "hop": "evil.example",
+                "request_id": "0b2e1f4a-7c3d-4e5f-8a9b-1c2d3e4f5a6b"}}),
+            json!({"error": {"code": "unauthorized", "hop": "board",
+                "request_id": "not a uuid <script>"}}),
+        ] {
+            assert_eq!(refusal_correlation(Some(&body)), None, "{body}");
+        }
+        // A legacy envelope with no correlation still decodes exactly as before.
+        assert_eq!(
+            refusal_correlation(Some(&json!({"error": {"code": "unauthorized"}}))),
+            None
+        );
+    }
+
+    #[test]
+    fn a_renewal_refusal_uses_the_issuer_shape_not_the_gateway_envelope() {
+        // Renewal reads the issuer's {error:"<code>"}. Only its terminal
+        // refresh-grant refusals ask for login; a transient 503 keeps the login.
+        let terminal = renewal_refusal(401, &json!({"error": "invalid_token"}), None);
+        assert!(terminal.to_string().contains("cadence login"), "{terminal}");
+        let transient = renewal_refusal(503, &json!({"error": "authority_unavailable"}), None);
+        assert!(
+            !transient.to_string().contains("cadence login"),
+            "{transient}"
+        );
+        assert!(transient.to_string().contains("kept"), "{transient}");
+    }
+
+    #[test]
+    fn a_transient_503_is_availability_and_keeps_saved_login() {
+        let (refusal, _) = decode_refusal(503, Some(&json!({"state": "wake_failed"})));
+        assert_eq!(refusal, Refusal::Availability);
+        let text = refusal_message(refusal, None, 503);
+        assert!(text.contains("retry later"), "{text}");
+        assert!(text.contains("kept"), "{text}");
+        assert!(!text.contains("cadence login"), "{text}");
+    }
+
+    #[test]
+    fn local_status_is_offline_redacted_and_never_claims_live_verification() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("a");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        let endpoint = "https://acme.cadencecloud.app";
+        let target = RemoteTarget {
+            org: ORG.into(),
+            endpoint: endpoint.into(),
+            org_id: ORG_ID.into(),
+        };
+        let at = now().unwrap();
+        let body = json!({"version": "hosted-cadence-auth.v1", "organization_id": ORG_ID,
+            "audience": endpoint, "access_token": BRIDGE, "expires_at": at + 300,
+            "capabilities": ["cli.read", "cli.write"],
+            "cli_session": {"session_id": "hcs_12345678-1234-4234-8234-123456789abc",
+                "refresh_token": "hcr_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "generation": 1, "device_label": "cadence CLI",
+                "idle_expires_at": at + 1000, "absolute_expires_at": at + 10_000}});
+        std::fs::write(dir.join(format!("cli-{ORG}.json")), body.to_string()).unwrap();
+        std::fs::set_permissions(
+            dir.join(format!("cli-{ORG}.json")),
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .unwrap();
+        let status = local_status_at(&dir, &target);
+        assert_eq!(status["state"], "renewable");
+        assert_eq!(status["live_verified"], false);
+        assert_eq!(status["scopes"], json!(["cli.read", "cli.write"]));
+        let text = status.to_string();
+        assert!(!text.contains(BRIDGE), "{text}");
+        assert!(!text.contains("hcr_AAAA"), "{text}");
+        assert!(!text.contains("hct_"), "{text}");
+        // Freshness is a local observation, not renewal health.
+        assert!(status["observed_at"].as_u64().is_some());
+        assert!(status["stored_at"].as_u64().is_some());
+        assert!(status.get("renewal_health").is_none(), "{text}");
+    }
+
+    #[test]
+    fn cad1434_blocker_local_status_legacy_expiry_keeps_command_refusal() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let target = target(&listener);
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.join(format!("cli-{ORG}.json"));
+        let at = now().unwrap();
+        store_credential_at(dir, ORG, ORG_ID, &target.endpoint, at + 300);
+        assert_eq!(
+            local_status_at(dir, &target)["state"],
+            "access_valid_until_expiry"
+        );
+        assert!(load_credential(dir, &target).is_ok());
+
+        store_credential_at(dir, ORG, ORG_ID, &target.endpoint, at - 1);
+        let mut body: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        body["capabilities"] = json!(["cli.read", "cli.write"]);
+        fs::write(&path, body.to_string()).unwrap();
+        let status = local_status_at(dir, &target);
+        assert_eq!(status["state"], "reauthentication_required");
+        assert_eq!(status["access_expires_at"], at - 1);
+        assert_eq!(status["scopes"], json!(["cli.read", "cli.write"]));
+        assert_eq!(status["live_verified"], false);
+        assert!(status["observed_at"].as_u64().is_some());
+        let text = status.to_string();
+        assert!(!text.contains("hct_"), "{text}");
+        assert!(!text.contains("hcr_"), "{text}");
+        assert!(!text.contains(dir.to_string_lossy().as_ref()), "{text}");
+        assert_eq!(
+            load_credential(dir, &target).err().unwrap().to_string(),
+            "the remote credential has expired — run `cadence login` again"
+        );
+
+        for (key, value) in [
+            ("version", json!("invalid")),
+            ("organization_id", json!("ws_other")),
+            ("audience", json!("https://other.cadencecloud.app")),
+            ("access_token", json!("invalid")),
+            ("unexpected", json!(true)),
+        ] {
+            let mut invalid = body.clone();
+            invalid[key] = value;
+            fs::write(&path, invalid.to_string()).unwrap();
+            assert_eq!(
+                local_status_at(dir, &target)["state"],
+                "invalid_local_credential",
+                "{key}"
+            );
+            assert!(load_credential(dir, &target).is_err());
+        }
+        fs::write(&path, "not JSON").unwrap();
+        assert_eq!(
+            local_status_at(dir, &target)["state"],
+            "invalid_local_credential"
+        );
+        fs::write(&path, body.to_string()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            local_status_at(dir, &target)["state"],
+            "invalid_local_credential"
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            local_status_at(dir, &target)["state"],
+            "invalid_local_credential"
+        );
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let original = dir.join("saved.json");
+        fs::rename(&path, &original).unwrap();
+        std::os::unix::fs::symlink(&original, &path).unwrap();
+        assert_eq!(
+            local_status_at(dir, &target)["state"],
+            "invalid_local_credential"
+        );
+        assert!(load_credential(dir, &target).is_err());
+        assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+    }
+
+    #[test]
+    fn a_permission_error_is_unavailable_never_no_credential() {
+        // Only a missing file is absence. A stat failure (here: the credential
+        // directory is unreadable) is unavailable, not proof that nothing is stored.
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("a");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+            .unwrap();
+        let target = RemoteTarget {
+            org: ORG.into(),
+            endpoint: "https://acme.cadencecloud.app".into(),
+            org_id: ORG_ID.into(),
+        };
+        let status = local_status_at(&dir, &target);
+        // Restore before asserting so the tempdir can be removed either way.
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        assert_ne!(status["state"], "no_credential", "{status}");
+        assert!(
+            matches!(
+                status["state"].as_str(),
+                Some("unavailable" | "invalid_local_credential")
+            ),
+            "{status}"
+        );
+    }
+
+    #[test]
+    fn an_expired_session_keeps_its_expiry_fields() {
+        // The expired branch must still report the session's idle/absolute
+        // expiry, so a reader sees why renewal is no longer possible.
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("a");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        let endpoint = "https://acme.cadencecloud.app";
+        let target = RemoteTarget {
+            org: ORG.into(),
+            endpoint: endpoint.into(),
+            org_id: ORG_ID.into(),
+        };
+        let at = now().unwrap();
+        let body = json!({"version": "hosted-cadence-auth.v1", "organization_id": ORG_ID,
+            "audience": endpoint, "access_token": BRIDGE, "expires_at": at - 10,
+            "capabilities": ["cli.read", "cli.write"],
+            "cli_session": {"session_id": "hcs_12345678-1234-4234-8234-123456789abc",
+                "refresh_token": "hcr_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "generation": 1, "device_label": "cadence CLI",
+                "idle_expires_at": at - 5, "absolute_expires_at": at - 1}});
+        let path = dir.join(format!("cli-{ORG}.json"));
+        std::fs::write(&path, body.to_string()).unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
+        let status = local_status_at(&dir, &target);
+        assert_eq!(status["state"], "reauthentication_required");
+        assert_eq!(status["session_idle_expires_at"], json!(at - 5));
+        assert_eq!(status["session_absolute_expires_at"], json!(at - 1));
+        assert_eq!(status["live_verified"], false);
+    }
+
+    #[test]
+    fn an_unsafe_server_code_is_dropped_from_the_decoded_reason() {
+        // Free text or wrong case from a server never becomes the shown reason.
+        let (refusal, reason) = decode_refusal(
+            418,
+            Some(&json!({"error": {"code": "Bad Code With Spaces"}})),
+        );
+        assert_eq!(refusal, Refusal::Unknown);
+        assert_eq!(reason, None);
+        let text = refusal_message(refusal, reason.as_deref(), 418);
+        assert!(!text.contains("Bad Code"), "{text}");
     }
 
     #[test]

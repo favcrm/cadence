@@ -679,7 +679,7 @@ fn require_login_issuer(dir: &Path, issuer: &str) -> Result<()> {
 /// pinned issuer only, never an AgenticOS identity or a board credential.
 #[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct AccessIngress {
+pub(crate) struct AccessIngress {
     issuer: String,
     client_id: String,
     client_secret: String,
@@ -759,6 +759,141 @@ pub fn cli_session_post(
     body: Value,
     deadline: Instant,
 ) -> Result<(u16, Value)> {
+    let answer = cli_session_post_detailed(dir, issuer, path, bearer, body, deadline)?;
+    Ok((answer.status, answer.body))
+}
+
+/// The issuer's correlation headers, read only when they are exactly the values
+/// the AOS renewal route emits (`x-cadence-hop: issuer` and a UUID id). They are
+/// diagnostic only: they never authorize anything and never change a status.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct IssuerCorrelation {
+    pub(crate) request_id: String,
+}
+
+/// Test-only: run the production header validator on values a fake issuer would
+/// send. The production send and the tests share this one validator.
+#[cfg(test)]
+pub(crate) fn correlation_from_header_values(
+    hop: Option<&str>,
+    request_id: Option<&str>,
+) -> Option<IssuerCorrelation> {
+    let mut headers = ureq::http::HeaderMap::new();
+    if let Some(hop) = hop {
+        headers.insert("x-cadence-hop", hop.parse().ok()?);
+    }
+    if let Some(id) = request_id {
+        headers.insert("x-cadence-request-id", id.parse().ok()?);
+    }
+    issuer_correlation(&headers)
+}
+
+/// One renewal or revoke answer: the status, the parsed body, and the safe
+/// correlation when the issuer sent a valid one. `correlation` is `None` for an
+/// old issuer, for a malformed header, or for a success answer that carries none.
+pub(crate) struct IssuerAnswer {
+    pub(crate) status: u16,
+    pub(crate) body: Value,
+    pub(crate) correlation: Option<IssuerCorrelation>,
+}
+
+/// Read the AOS issuer's correlation headers. Only `x-cadence-hop: issuer` and a
+/// bounded lowercase-or-uppercase UUID id are accepted; any other value is
+/// dropped, so no arbitrary header text reaches a message or a log.
+fn issuer_correlation(headers: &ureq::http::HeaderMap) -> Option<IssuerCorrelation> {
+    let hop = headers.get("x-cadence-hop")?.to_str().ok()?;
+    if hop != "issuer" {
+        return None;
+    }
+    let id = headers.get("x-cadence-request-id")?.to_str().ok()?;
+    let shaped = id.len() == 36
+        && id.bytes().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        });
+    shaped.then(|| IssuerCorrelation {
+        request_id: id.to_owned(),
+    })
+}
+
+/// The production renewal or revoke POST, returning the status, body and the
+/// validated issuer correlation. Only renewal reads the correlation; the legacy
+/// `cli_session_post` discards it.
+pub(crate) fn cli_session_post_detailed(
+    dir: &Path,
+    issuer: &str,
+    path: &str,
+    bearer: &str,
+    body: Value,
+    deadline: Instant,
+) -> Result<IssuerAnswer> {
+    cli_session_post_with(
+        dir,
+        issuer,
+        path,
+        bearer,
+        body,
+        deadline,
+        send_issuer_request,
+    )
+}
+
+/// The production wire call: strict TLS, no redirects, no proxy, bounded
+/// timeout. It is the only transport a real renewal can use.
+fn send_issuer_request(
+    url: &str,
+    bearer: &str,
+    access: Option<&AccessIngress>,
+    body: &Value,
+    timeout: Duration,
+) -> Result<(u16, Vec<u8>, Option<IssuerCorrelation>)> {
+    let builder = ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .proxy(None);
+    let mut request = crate::issuer_transport::agent(builder)
+        .post(url)
+        .header("Authorization", &format!("Bearer {bearer}"));
+    if let Some(access) = access {
+        request = request
+            .header("CF-Access-Client-Id", &access.client_id)
+            .header("CF-Access-Client-Secret", &access.client_secret);
+    }
+    let response = request
+        .send_json(body)
+        .map_err(|_| reject("Hosted CLI session request failed"))?;
+    let status = response.status().as_u16();
+    // Read the correlation headers before the body is consumed.
+    let correlation = issuer_correlation(response.headers());
+    let mut bytes = Vec::new();
+    response
+        .into_body()
+        .as_reader()
+        .take(MAX_RESPONSE + 1)
+        .read_to_end(&mut bytes)?;
+    Ok((status, bytes, correlation))
+}
+
+/// `cli_session_post` with the wire call injected. Every check before the send
+/// and every response guard after it are the production code; only the bytes
+/// on the wire come from `send`. Production passes `send_issuer_request`.
+/// Tests pass a closure, which is never reachable from config or environment.
+fn cli_session_post_with(
+    dir: &Path,
+    issuer: &str,
+    path: &str,
+    bearer: &str,
+    body: Value,
+    deadline: Instant,
+    send: impl FnOnce(
+        &str,
+        &str,
+        Option<&AccessIngress>,
+        &Value,
+        Duration,
+    ) -> Result<(u16, Vec<u8>, Option<IssuerCorrelation>)>,
+) -> Result<IssuerAnswer> {
     if !matches!(
         path,
         "/v1/hosted-cadence/cli-session/renew" | "/v1/hosted-cadence/cli-session/revoke"
@@ -777,31 +912,135 @@ pub fn cli_session_post(
             "remote command deadline elapsed before session request",
         ));
     }
+    let timeout = request_deadline.saturating_duration_since(Instant::now());
+    let url = format!("{issuer}{path}");
+    let (status, bytes, correlation) = send(&url, bearer, access.as_ref(), &body, timeout)?;
+    if (300..400).contains(&status) {
+        return Err(reject("Hosted issuer redirect refused"));
+    }
+    if bytes.len() as u64 > MAX_RESPONSE {
+        return Err(reject("Hosted issuer response too large"));
+    }
+    let value = serde_json::from_slice(&bytes)
+        .map_err(|_| reject("Invalid hosted CLI session response"))?;
+    confirm_login_access_ingress(dir, &issuer, &access)?;
+    Ok(IssuerAnswer {
+        status,
+        body: value,
+        correlation,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn cli_session_post_for_test(
+    dir: &Path,
+    issuer: &str,
+    path: &str,
+    bearer: &str,
+    body: Value,
+    deadline: Instant,
+    send: impl FnOnce(
+        &str,
+        &str,
+        Option<&AccessIngress>,
+        &Value,
+        Duration,
+    ) -> Result<(u16, Vec<u8>, Option<IssuerCorrelation>)>,
+) -> Result<IssuerAnswer> {
+    cli_session_post_with(dir, issuer, path, bearer, body, deadline, send)
+}
+
+/// CAD-1429: one Publish Web management request to the verified PUBLIC
+/// issuer, never to the board audience. Board hosts are answered by the board
+/// catch-all before any `/v1` route, so `/v1/web-sites` must go to the issuer
+/// origin the saved credential was minted by. The path namespace is exact, the
+/// issuer is the one the caller verified (never a request argument), the
+/// trusted-issuer pin and Access ingress are checked as for every issuer call,
+/// and redirects are refused. Returns `(status, parsed JSON body)`.
+/// One Publish Web management request: the verb, the namespace path, the
+/// bearer, the contract headers and an optional body.
+pub struct WebRequest<'a> {
+    pub method: &'a str,
+    pub path: &'a str,
+    pub bearer: &'a str,
+    pub headers: &'a [(&'a str, String)],
+    pub body: Option<&'a [u8]>,
+}
+
+pub fn web_issuer_request(
+    dir: &Path,
+    issuer: &str,
+    request: WebRequest<'_>,
+    deadline: Instant,
+) -> Result<(u16, Option<Value>)> {
+    let WebRequest {
+        method,
+        path,
+        bearer,
+        headers,
+        body,
+    } = request;
+    if !web_management_path(path) {
+        return Err(reject("Publish Web path refused"));
+    }
+    let issuer = origin(issuer, cfg!(test))?;
+    private_dir(dir, false)?;
+    require_login_issuer(dir, &issuer)?;
+    let access = read_access_ingress(dir, &issuer)?;
+    confirm_login_access_ingress(dir, &issuer, &access)?;
+    let request_deadline = web_request_deadline(method, path, Instant::now(), deadline);
+    if Instant::now() >= request_deadline {
+        return Err(Error::busy_coded(
+            "timeout",
+            "remote command deadline elapsed before the web request",
+        ));
+    }
     let config = ureq::Agent::config_builder()
         .timeout_global(Some(
             request_deadline.saturating_duration_since(Instant::now()),
         ))
         .http_status_as_error(false)
         .max_redirects(0)
-        .proxy(None)
-        .build();
-    let mut request = ureq::Agent::new_with_config(config)
-        .post(format!("{issuer}{path}"))
-        .header("Authorization", &format!("Bearer {bearer}"));
-    if let Some(access) = access.as_ref() {
-        request = request
-            .header("CF-Access-Client-Id", &access.client_id)
-            .header("CF-Access-Client-Secret", &access.client_secret);
+        .proxy(None);
+    let agent = issuer_agent(config);
+    let url = format!("{issuer}{path}");
+    let auth = format!("Bearer {bearer}");
+    let response = match (method, body) {
+        ("GET", _) => {
+            let mut request = agent.get(&url).header("Authorization", &auth);
+            if let Some(access) = access.as_ref() {
+                request = request
+                    .header("CF-Access-Client-Id", &access.client_id)
+                    .header("CF-Access-Client-Secret", &access.client_secret);
+            }
+            for (name, value) in headers {
+                request = request.header(*name, value.as_str());
+            }
+            request.call()
+        }
+        (verb @ ("POST" | "PUT"), bytes) => {
+            let builder = if verb == "PUT" {
+                agent.put(&url)
+            } else {
+                agent.post(&url)
+            };
+            let mut request = builder.header("Authorization", &auth);
+            if let Some(access) = access.as_ref() {
+                request = request
+                    .header("CF-Access-Client-Id", &access.client_id)
+                    .header("CF-Access-Client-Secret", &access.client_secret);
+            }
+            for (name, value) in headers {
+                request = request.header(*name, value.as_str());
+            }
+            match bytes {
+                Some(bytes) => request.send(bytes),
+                None => request.send_empty(),
+            }
+        }
+        _ => return Err(reject("Publish Web method refused")),
     }
-    if Instant::now() >= request_deadline {
-        return Err(Error::busy_coded(
-            "timeout",
-            "remote command deadline elapsed before session request",
-        ));
-    }
-    let response = request
-        .send_json(body)
-        .map_err(|_| reject("Hosted CLI session request failed"))?;
+    .map_err(|_| reject("Hosted Publish Web request failed"))?;
     let status = response.status().as_u16();
     if (300..400).contains(&status) {
         return Err(reject("Hosted issuer redirect refused"));
@@ -815,10 +1054,82 @@ pub fn cli_session_post(
     if bytes.len() as u64 > MAX_RESPONSE {
         return Err(reject("Hosted issuer response too large"));
     }
-    let value = serde_json::from_slice(&bytes)
-        .map_err(|_| reject("Invalid hosted CLI session response"))?;
     confirm_login_access_ingress(dir, &issuer, &access)?;
-    Ok((status, value))
+    Ok((status, serde_json::from_slice(&bytes).ok()))
+}
+
+/// The only paths a Publish Web management request may name. The namespace is
+/// `/v1/web-sites/`. Encoded separators are refused everywhere except one shape:
+/// the upload-file route `/v1/web-sites/uploads/upl_<id>/files/<segment>`, whose
+/// single segment must decode, once and canonically, to a safe artifact path
+/// (for example `assets/app-abc123.js` as `assets%2Fapp-abc123.js`). Every other
+/// route refuses `%2F` and `%5C`, traversal, a query or fragment, and any
+/// double-encoded or malformed escape.
+/// The one construction point for issuer agents. Production uses the caller's
+/// finished config; tests may additionally route through the installed issuer
+/// fixtures, with the canonical transport selecting their precedence.
+fn issuer_agent(builder: ureq::config::ConfigBuilder<ureq::typestate::AgentScope>) -> ureq::Agent {
+    crate::issuer_transport::agent(builder)
+}
+
+fn web_management_path(path: &str) -> bool {
+    if !path.starts_with("/v1/web-sites/")
+        || path.len() > 2048
+        || path.contains('?')
+        || path.contains('#')
+        || path.contains('\\')
+        || !path.bytes().all(|b| (0x21..0x7f).contains(&b))
+    {
+        return false;
+    }
+    if let Some(rest) = path.strip_prefix("/v1/web-sites/uploads/") {
+        if let Some((upload, segment)) = rest.split_once("/files/") {
+            if is_upload_id(upload) {
+                // Only this route may name an encoded artifact path, and only if
+                // the segment is the canonical encoding of a safe artifact path.
+                return !segment.contains('/')
+                    && crate::web_publish::decode_artifact_segment(segment).is_ok();
+            }
+        }
+    }
+    // Every other route: no percent-encoded separators, traversal or double encoding.
+    let lower = path.to_ascii_lowercase();
+    !path.contains("..") && !lower.contains("%2f") && !lower.contains("%5c") && !lower.contains('%')
+}
+
+/// A file upload gets the caller's bounded deadline; JSON and other routes
+/// retain the normal 20-second request cap.
+fn web_request_deadline(
+    method: &str,
+    path: &str,
+    now: Instant,
+    caller_deadline: Instant,
+) -> Instant {
+    if method == "PUT" && web_upload_file_path(path) {
+        caller_deadline
+    } else {
+        caller_deadline.min(now + Duration::from_secs(20))
+    }
+}
+
+fn web_upload_file_path(path: &str) -> bool {
+    path.strip_prefix("/v1/web-sites/uploads/")
+        .and_then(|rest| rest.split_once("/files/"))
+        .is_some_and(|(upload, segment)| {
+            is_upload_id(upload)
+                && !segment.contains('/')
+                && crate::web_publish::decode_artifact_segment(segment).is_ok()
+        })
+}
+
+/// `upl_` plus the contract's id body: 8 to 80 of `[A-Za-z0-9_-]`.
+fn is_upload_id(value: &str) -> bool {
+    value.strip_prefix("upl_").is_some_and(|rest| {
+        (8..=80).contains(&rest.len())
+            && rest
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    })
 }
 
 fn confirm_access_ingress_config(
@@ -1163,13 +1474,12 @@ fn post_public_with_access(
     if access.is_some() {
         origin(issuer, cfg!(test))?;
     }
-    let config = ureq::Agent::config_builder()
+    let builder = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(20)))
         .http_status_as_error(false)
         .max_redirects(0)
-        .proxy(None)
-        .build();
-    let mut request = ureq::Agent::new_with_config(config).post(format!("{issuer}{path}"));
+        .proxy(None);
+    let mut request = issuer_agent(builder).post(format!("{issuer}{path}"));
     if let Some(access) = access {
         if access.issuer != issuer {
             return Err(reject("Hosted Access ingress issuer changed"));
@@ -1468,6 +1778,8 @@ fn consented_caps(caps: &[Value], requested: &[&str]) -> bool {
         c.as_str()
             .is_some_and(|c| requested.contains(&c) && seen.insert(c))
     }) && ["cli.read", "cli.write"].iter().all(|c| seen.contains(c))
+        // A web scope must be granted exactly when it was requested.
+        && requested.iter().filter(|c| c.starts_with("web.")).all(|c| seen.contains(c))
 }
 
 /// Accept only an owner grant for the requested workspace and audience
@@ -1586,6 +1898,18 @@ fn login_grant(
         cli_session,
         token: field(credential, "access_token")?.to_string(),
     })
+}
+
+/// Test controller access to the unchanged strict owner login parser.
+#[cfg(all(test, feature = "test-seam"))]
+pub(crate) fn login_grant_for_test(value: &Value, issuer: &str) -> Result<LoginGrant> {
+    login_grant(
+        value,
+        None,
+        Some("lc"),
+        issuer,
+        &["cli.read", "cli.write", "wiki.read", "wiki.write"],
+    )
 }
 
 impl LoginGrant {
@@ -1710,12 +2034,16 @@ pub fn login_browser(
 
 /// The capabilities one login requests. `cli` is the default pair;
 /// `wiki` (the default portal login) adds `wiki.read` and `wiki.write` to it.
-/// The org-flag browser login stays CLI-only. The issuer's grant must equal
+/// The org-flag browser login stays CLI-only. `--web` adds the Publish Web
+/// pair only when the operator asks for it. The issuer's grant must equal
 /// the requested set, narrowed only by the issuer's own ceiling.
 #[derive(Clone, Copy)]
 enum LoginScope {
     Cli,
     CliAndWiki,
+    /// CAD-1429: `cadence login --web` asks for the Publish Web scopes on top
+    /// of the CLI pair, and only on this explicit request.
+    CliAndWeb,
 }
 
 impl LoginScope {
@@ -1723,6 +2051,7 @@ impl LoginScope {
         match self {
             LoginScope::Cli => vec!["cli.read", "cli.write"],
             LoginScope::CliAndWiki => vec!["cli.read", "cli.write", "wiki.read", "wiki.write"],
+            LoginScope::CliAndWeb => vec!["cli.read", "cli.write", "web.read", "web.prepare"],
         }
     }
 }
@@ -1733,6 +2062,18 @@ pub fn login_portal(
     dir: &Path,
     show_code: impl FnOnce(&str, &str) -> Result<()>,
 ) -> Result<LoginGrant> {
+    login_portal_scoped(issuer, hint, dir, show_code, false)
+}
+
+/// The portal login; `web` adds the Publish Web scopes (`cadence login --web`)
+/// and nothing else changes.
+pub fn login_portal_scoped(
+    issuer: &str,
+    hint: Option<&str>,
+    dir: &Path,
+    show_code: impl FnOnce(&str, &str) -> Result<()>,
+    web: bool,
+) -> Result<LoginGrant> {
     let issuer = origin(issuer, cfg!(test))?;
     login_device_flow(
         &issuer,
@@ -1741,7 +2082,11 @@ pub fn login_portal(
         dir,
         show_code,
         &mut RealLoginRuntime,
-        LoginScope::CliAndWiki,
+        if web {
+            LoginScope::CliAndWeb
+        } else {
+            LoginScope::CliAndWiki
+        },
     )
 }
 
@@ -2008,6 +2353,29 @@ fn enroll_child_locked(
 
 #[cfg(test)]
 mod tests {
+    /// The production header validator: exact `issuer` hop, bounded UUID id,
+    /// header names matched case-insensitively. Anything else yields no id.
+    #[test]
+    fn issuer_correlation_accepts_only_the_exact_issuer_hop_and_a_uuid() {
+        let id = "0b2e1f4a-7c3d-4e5f-8a9b-1c2d3e4f5a6b";
+        let good = super::correlation_from_header_values(Some("issuer"), Some(id)).unwrap();
+        assert_eq!(good.request_id, id);
+        assert!(super::correlation_from_header_values(Some("Issuer"), Some(id)).is_none());
+        assert!(super::correlation_from_header_values(Some("issuer "), Some(id)).is_none());
+        assert!(super::correlation_from_header_values(Some("board"), Some(id)).is_none());
+        assert!(super::correlation_from_header_values(Some("issuer"), Some("0b2e1f4a")).is_none());
+        assert!(super::correlation_from_header_values(
+            Some("issuer"),
+            Some("0b2e1f4a_7c3d-4e5f-8a9b-1c2d3e4f5a6b")
+        )
+        .is_none());
+        assert!(super::correlation_from_header_values(
+            Some("issuer"),
+            Some("0b2e1f4a-7c3d-4e5f-8a9b-1c2d3e4f5a6g")
+        )
+        .is_none());
+    }
+
     use super::*;
     use crate::remote_result_outbox::{deliver_with, ResultCommand, ResultOutbox};
     use std::io::{BufRead, BufReader};
@@ -2019,6 +2387,8 @@ mod tests {
     const BRIDGE: &str = "hct_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
     const CHILD: &str = "hct_CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
     const LINEAGE: &str = "hcl_00000000-0000-4000-8000-000000000001";
+    /// Shared log of `(method, path, Authorization)` a loopback issuer records.
+    type WebIssuerLog = std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>>;
     fn record(expires: u64) -> Enrollment {
         Enrollment {
             version: VERSION.into(),
@@ -2052,6 +2422,45 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(dir.join(ACCESS_INGRESS), fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[test]
+    fn web_request_deadline_uses_caller_budget_only_for_valid_upload_file_puts() {
+        let now = Instant::now();
+        let caller = now + Duration::from_secs(60);
+        let file_path = "/v1/web-sites/uploads/upl_12345678/files/assets%2Fjs%2Fapp.js";
+        assert_eq!(web_request_deadline("PUT", file_path, now, caller), caller);
+        assert_eq!(
+            web_request_deadline(
+                "POST",
+                "/v1/web-sites/uploads/upl_12345678/files/assets%2Fapp.js",
+                now,
+                caller
+            ),
+            now + Duration::from_secs(20)
+        );
+        assert_eq!(
+            web_request_deadline(
+                "PUT",
+                "/v1/web-sites/uploads/upl_12345678/finalize",
+                now,
+                caller
+            ),
+            now + Duration::from_secs(20)
+        );
+        assert_eq!(
+            web_request_deadline("PUT", file_path, now, now + Duration::from_secs(5)),
+            now + Duration::from_secs(5)
+        );
+        for invalid in [
+            "/v1/web-sites/uploads/upl_short/files/assets%2Fapp.js",
+            "/v1/web-sites/uploads/upl_12345678/files/assets/js/app.js",
+        ] {
+            assert_eq!(
+                web_request_deadline("PUT", invalid, now, caller),
+                now + Duration::from_secs(20)
+            );
+        }
     }
 
     #[test]
@@ -3874,6 +4283,348 @@ mod tests {
         }
     }
 
+    /// CAD-1429: `--web` consent. The request names exactly the CLI pair plus
+    /// the Publish Web pair; a grant that drops a requested web scope, adds an
+    /// unrequested one, or repeats one is refused and stores nothing.
+    /// A loopback issuer that records every request and answers with `reply`.
+    /// Returns its origin and the shared log of `(method, path, Authorization)`.
+    fn web_issuer_server(reply: &'static str) -> (String, WebIssuerLog) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::clone(&log);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let mut parts = line.split(' ');
+                let method = parts.next().unwrap_or_default().to_string();
+                let path = parts.next().unwrap_or_default().to_string();
+                let mut auth = String::new();
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).unwrap();
+                    if header == "\r\n" || header.is_empty() {
+                        break;
+                    }
+                    if let Some(v) = header.to_ascii_lowercase().strip_prefix("authorization:") {
+                        auth = v.trim().to_string();
+                    }
+                }
+                seen.lock().unwrap().push((method, path, auth));
+                let _ = stream.write_all(reply.as_bytes());
+            }
+        });
+        (origin, log)
+    }
+
+    /// CAD-1429: a board audience and a public issuer are different origins.
+    /// Web management must reach the saved issuer and never the board audience,
+    /// whose host answers `/v1` with the container catch-all.
+    #[test]
+    fn web_management_goes_to_the_saved_issuer_never_the_board_audience() {
+        let (issuer, issuer_log) = web_issuer_server(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+        );
+        let (board, board_log) = web_issuer_server(
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        );
+        assert_ne!(issuer, board, "the fixture must use distinct origins");
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("web/auth");
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(dir.join(TRUSTED_ISSUER), format!("{issuer}\n")).unwrap();
+        fs::set_permissions(dir.join(TRUSTED_ISSUER), fs::Permissions::from_mode(0o600)).unwrap();
+        // The board audience is only ever a stored field, never a web destination.
+        let _ = &board;
+        let (status, body) = web_issuer_request(
+            &dir,
+            &issuer,
+            WebRequest {
+                method: "GET",
+                path: "/v1/web-sites/sites/by-slug/my-site",
+                bearer: "hct_BEARERTOKENFORTESTONLYxxxxxxxxxxxxxxxxxxxxxxx",
+                headers: &[],
+                body: None,
+            },
+            Instant::now() + Duration::from_secs(10),
+        )
+        .expect("web request to the issuer failed");
+        assert_eq!(status, 200);
+        assert!(body.is_some());
+        let issuer_seen = issuer_log.lock().unwrap().clone();
+        assert_eq!(
+            issuer_seen.len(),
+            1,
+            "exactly one request reached the issuer"
+        );
+        assert_eq!(issuer_seen[0].1, "/v1/web-sites/sites/by-slug/my-site");
+        // The header name is case-insensitive and the scheme is too; the token is exact.
+        assert!(
+            issuer_seen[0]
+                .2
+                .to_ascii_lowercase()
+                .starts_with("bearer hct_"),
+            "auth header was {}",
+            issuer_seen[0].2
+        );
+        assert!(
+            board_log.lock().unwrap().is_empty(),
+            "a board/container audience received a web request"
+        );
+    }
+
+    /// Only the exact `/v1/web-sites` namespace is sent: no other `/v1` route,
+    /// no traversal, no query, no encoded separator. Each is refused before any
+    /// request reaches the issuer.
+    #[test]
+    fn web_paths_are_confined_to_the_web_namespace() {
+        let (issuer, log) = web_issuer_server(
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        );
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("ns/auth");
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(dir.join(TRUSTED_ISSUER), format!("{issuer}\n")).unwrap();
+        fs::set_permissions(dir.join(TRUSTED_ISSUER), fs::Permissions::from_mode(0o600)).unwrap();
+        for path in [
+            "/v1/hosted-cadence/cli-session/revoke",
+            "/v1/web-sites/../hosted-cadence/x",
+            "/v1/web-sites/a?x=1",
+            "/v1/web-sites/a%2Fb",
+            "/v1/web-sites/a%5Cb",
+            "/api/cli/status",
+        ] {
+            let out = web_issuer_request(
+                &dir,
+                &issuer,
+                WebRequest {
+                    method: "GET",
+                    path,
+                    bearer: "hct_BEARERTOKENFORTESTONLYxxxxxxxxxxxxxxxxxxxxxxx",
+                    headers: &[],
+                    body: None,
+                },
+                Instant::now() + Duration::from_secs(10),
+            );
+            assert!(out.is_err(), "path {path} was accepted");
+        }
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "a refused path reached the issuer"
+        );
+    }
+
+    /// CAD-1429: the upload-file route is the one place an encoded `/` is valid.
+    /// Built React/Vite assets are nested (`assets/app-abc123.js`, `assets/css/
+    /// site.css`), so their canonical `:encodedPath` must pass the transport
+    /// guard, and nothing else that looks like it may.
+    #[test]
+    fn upload_file_route_admits_canonical_nested_artifact_paths_only() {
+        let upload = "/v1/web-sites/uploads/upl_22222222/files/";
+        // Positive: the canonical encodings the client sends for built assets.
+        for ok in [
+            "index.html",
+            "assets%2Fapp-abc123.js",
+            "assets%2Fcss%2Fsite.css",
+        ] {
+            assert!(
+                web_management_path(&format!("{upload}{ok}")),
+                "{ok} refused"
+            );
+        }
+        // Negative: encoded traversal, double encoding, malformed or non-canonical
+        // escapes, raw separators, backslash, query and fragment.
+        for bad in [
+            "..%2Fsecret.js",
+            "assets%2F..%2Fsecret.js",
+            "assets%252Fapp.js",
+            "assets%2fapp.js",
+            "assets%2",
+            "assets%ZZapp.js",
+            "assets/app.js",
+            "assets%5Capp.js",
+            "app.js%3Fx%3D1",
+            "app.js?x=1",
+            "app.js#frag",
+            ".env",
+            "assets%2F.env",
+            "node_modules%2Fx.js",
+            "app.js.map",
+        ] {
+            assert!(
+                !web_management_path(&format!("{upload}{bad}")),
+                "{bad} accepted"
+            );
+        }
+        // Outside the upload-file shape, any encoded separator stays refused.
+        for bad in [
+            "/v1/web-sites/sites/by-slug/a%2Fb",
+            "/v1/web-sites/sites/site_11111111/releases%2F..",
+            "/v1/web-sites/uploads/upl_22222222/finalize%2F",
+            "/v1/web-sites/uploads/upl_bad/files/assets%2Fapp.js",
+        ] {
+            assert!(!web_management_path(bad), "{bad} accepted");
+        }
+    }
+
+    /// A redirect from the issuer is a refusal, never followed.
+    #[test]
+    fn web_issuer_redirects_are_refused() {
+        let (issuer, _log) = web_issuer_server(
+            "HTTP/1.1 302 Found\r\nLocation: https://evil.example.test/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("redir/auth");
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(dir.join(TRUSTED_ISSUER), format!("{issuer}\n")).unwrap();
+        fs::set_permissions(dir.join(TRUSTED_ISSUER), fs::Permissions::from_mode(0o600)).unwrap();
+        let err = web_issuer_request(
+            &dir,
+            &issuer,
+            WebRequest {
+                method: "GET",
+                path: "/v1/web-sites/sites/by-slug/my-site",
+                bearer: "hct_BEARERTOKENFORTESTONLYxxxxxxxxxxxxxxxxxxxxxxx",
+                headers: &[],
+                body: None,
+            },
+            Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("redirect refused"), "{err}");
+    }
+
+    /// No trusted-issuer pin: the bearer is never sent.
+    #[test]
+    fn web_issuer_without_a_pin_sends_no_bearer() {
+        let (issuer, log) = web_issuer_server(
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        );
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("nopin/auth");
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let out = web_issuer_request(
+            &dir,
+            &issuer,
+            WebRequest {
+                method: "GET",
+                path: "/v1/web-sites/sites/by-slug/my-site",
+                bearer: "hct_BEARERTOKENFORTESTONLYxxxxxxxxxxxxxxxxxxxxxxx",
+                headers: &[],
+                body: None,
+            },
+            Instant::now() + Duration::from_secs(10),
+        );
+        assert!(out.is_err());
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "a bearer reached an unpinned issuer"
+        );
+    }
+
+    #[test]
+    fn hosted_web_consent_requests_only_web_scopes_it_was_asked_for() {
+        let root = tempfile::tempdir().unwrap();
+        let mut runtime = PortalAcceptanceRuntime {
+            issuer: HOSTED_LOGIN_ISSUER.to_string(),
+            grant: None,
+            requests: Vec::new(),
+            baseline: Instant::now(),
+            elapsed: 0,
+            requested: vec!["cli.read", "cli.write", "web.read", "web.prepare"],
+        };
+        let mut grant = login_grant_body();
+        grant["organization_slug"] = json!("acme");
+        grant["capabilities"] = json!(["cli.read", "cli.write", "web.read", "web.prepare"]);
+        runtime.grant = Some(grant.clone());
+        let dir = root.path().join("web-ok/auth");
+        let out = login_device_flow(
+            HOSTED_LOGIN_ISSUER,
+            None,
+            Some("acme"),
+            &dir,
+            |_, _| Ok(()),
+            &mut runtime,
+            LoginScope::CliAndWeb,
+        );
+        let granted = out.expect("a full web consent was refused");
+        assert!(granted.capabilities.iter().any(|c| c == "web.prepare"));
+        assert_eq!(
+            runtime.requests[0].1["requested_capabilities"],
+            json!(["cli.read", "cli.write", "web.read", "web.prepare"])
+        );
+
+        for (case, capabilities) in [
+            (
+                "dropped-web-prepare",
+                json!(["cli.read", "cli.write", "web.read"]),
+            ),
+            (
+                "unrequested-wiki",
+                json!([
+                    "cli.read",
+                    "cli.write",
+                    "web.read",
+                    "web.prepare",
+                    "wiki.write"
+                ]),
+            ),
+            (
+                "duplicate-web-read",
+                json!([
+                    "cli.read",
+                    "cli.write",
+                    "web.read",
+                    "web.read",
+                    "web.prepare"
+                ]),
+            ),
+        ] {
+            let mut bad = grant.clone();
+            bad["capabilities"] = capabilities;
+            let mut runtime = PortalAcceptanceRuntime {
+                issuer: HOSTED_LOGIN_ISSUER.to_string(),
+                grant: Some(bad),
+                requests: Vec::new(),
+                baseline: Instant::now(),
+                elapsed: 0,
+                requested: vec!["cli.read", "cli.write", "web.read", "web.prepare"],
+            };
+            let dir = root.path().join(format!("{case}/auth"));
+            let out = login_device_flow(
+                HOSTED_LOGIN_ISSUER,
+                None,
+                Some("acme"),
+                &dir,
+                |_, _| Ok(()),
+                &mut runtime,
+                LoginScope::CliAndWeb,
+            );
+            assert!(out.is_err(), "web consent case {case} was accepted");
+            assert_nothing_stored(&dir);
+        }
+    }
+
+    /// A plain portal login (no `--web`) never asks for web scopes.
+    #[test]
+    fn plain_portal_login_never_requests_web_scopes() {
+        let root = tempfile::tempdir().unwrap();
+        let mut grant = login_grant_body();
+        grant["organization_slug"] = json!("acme");
+        let dir = root.path().join("plain/auth");
+        let (out, runtime) = run_wiki_portal_acceptance(grant, &dir);
+        out.expect("plain portal login was refused");
+        let requested = runtime.requests[0].1["requested_capabilities"].clone();
+        assert!(!requested.to_string().contains("web."));
+    }
+
     #[test]
     fn hosted_portal_rejects_conflicting_exact_issuer_pin_before_request() {
         let root = tempfile::tempdir().unwrap();
@@ -4716,3 +5467,7 @@ mod tests {
 #[cfg(test)]
 #[path = "remote_enrollment_cli_lock_acceptance.rs"]
 mod cli_lock_acceptance;
+
+#[cfg(test)]
+#[path = "remote_enrollment_tls_acceptance.rs"]
+mod tls_acceptance;

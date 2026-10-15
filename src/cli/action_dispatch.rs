@@ -27,9 +27,19 @@ pub(crate) fn run() -> Result<i32> {
         .collect();
     // CAD-888: `help operator|advanced|all` print the sections the
     // default root help leaves out; `help <verb>` stays clap's own.
-    if let Some(text) = help::help_section(&argv) {
-        print!("{text}");
+    // CAD-1432: the master's help is bounded and refuses malformed or
+    // disallowed forms with a usage error, so it runs before the others.
+    if let Some(text) = help::master_help(&argv) {
+        print!("{}", text?);
         return Ok(0);
+    }
+    // CAD-1432: the master never gets the unfiltered legacy help; its
+    // leading-global or aliased help forms fall through to the Clap parser.
+    if !cadence_agent::master::caller_is_master() {
+        if let Some(text) = help::help_section(&argv) {
+            print!("{text}");
+            return Ok(0);
+        }
     }
     let parsed = help::root_command(help::in_pane())
         .try_get_matches()
@@ -44,6 +54,29 @@ pub(crate) fn run() -> Result<i32> {
         Ok(cli) => cli,
         Err(e) => {
             let e = email_flag_error(&e).unwrap_or(e);
+            // CAD-1432: any Clap help outcome for a master caller refuses
+            // before printing. Clap's short-option clusters (`-hh`,
+            // `-vh`) reach here as DisplayHelp, and a bare parent
+            // (`cadence issue`) as DisplayHelpOnMissingArgumentOrSubcommand;
+            // the exact-string guard sees neither. Scoped turns get
+            // report-and-stop; the master gets the one bounded help route.
+            if matches!(
+                e.kind(),
+                clap::error::ErrorKind::DisplayHelp
+                    | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            ) && cadence_agent::master::caller_is_master()
+            {
+                let scoped = cadence_agent::master::in_app_conversation();
+                return Err(if scoped {
+                    Error::rejected(
+                        "help is not available in a scoped chat turn — report the exact refusal and stop",
+                    )
+                } else {
+                    Error::usage(
+                        "--help and -h are not available — run cadence help <command-path> for the exact usage of a command you may run",
+                    )
+                });
+            }
             // `--help` and `--version` print to stdout and exit 0 as before.
             // A bare parent command (`cadence issue`) prints its help as
             // plain text on stderr, exit 2, as before CAD-876: help stays
@@ -116,6 +149,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             token_stdin,
             no_open,
             auth_dir,
+            web,
         } => {
             // `--token-stdin` is the legacy AgenticOS token path, not org login.
             let dir = cadence_agent::remote_auth::auth_dir(auth_dir.as_deref())?;
@@ -131,7 +165,15 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             let issuer = issuer
                 .as_deref()
                 .unwrap_or(cadence_agent::remote_enrollment::HOSTED_LOGIN_ISSUER);
-            let grant = if let Some(org) = org.as_deref() {
+            let grant = if *web {
+                cadence_agent::remote_enrollment::login_portal_scoped(
+                    issuer,
+                    hint.as_deref().or(slug.as_deref()),
+                    &dir,
+                    |url, code| show_login_code(url, code, *no_open),
+                    true,
+                )?
+            } else if let Some(org) = org.as_deref() {
                 let slug = slug.as_deref().ok_or_else(|| {
                     Error::rejected("legacy login with --org needs --slug <org-slug>")
                 })?;
@@ -187,6 +229,22 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             }
         }
         _ => {}
+    }
+    // CAD-1429: every `web` action is a hosted operation against one pinned
+    // remote workspace. Resolve it once here; a local or unselected org
+    // refuses before any request is built. It runs before the client-only
+    // router too, so a client-only install reaches the web module rather than
+    // the remote allowlist (which refuses web).
+    if let Commands::Web { action } = &cli.command {
+        let target = match org::resolve(cli.org.as_deref(), None, None)? {
+            org::Resolved::Remote(target) => target,
+            org::Resolved::Local(_) => {
+                return Err(Error::rejected(
+                    "cadence web needs a remote workspace: pass --org <org> for a logged-in workspace; nothing was sent",
+                ))
+            }
+        };
+        return web::run(action, &target, cli.wake_timeout);
     }
     // CAD-1425: a client-only installation runs local commands never; it
     // routes only through an actual remote org, before any local action.
@@ -294,8 +352,11 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
 
 pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
     match command {
-        Commands::Remote { .. } | Commands::Login { .. } | Commands::Auth { .. } => {
-            unreachable!("auth dispatched before state-dir")
+        Commands::Remote { .. }
+        | Commands::Login { .. }
+        | Commands::Auth { .. }
+        | Commands::Web { .. } => {
+            unreachable!("auth or web dispatched before state-dir")
         }
         Commands::Doctor {
             host,

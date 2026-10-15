@@ -243,6 +243,14 @@ function removeSaved(family: Family, slot: number): void {
   family.saved = family.saved.filter((record) => record.slot !== slot);
 }
 
+/** Whether the visible slot holds any unsent intent (text, refs, a held
+ *  handoff or queued files). Read by the empty-conversation starters, which
+ *  must never fill over an intent the operator already started. */
+export function composerHasIntent(key: string): boolean {
+  const family = families.get(key);
+  return family !== undefined && hasIntent(activeOf(family));
+}
+
 /** The keyed draft snapshot — the Composer's `useSyncExternalStore`. */
 export function composerDraftState(key: string): ComposerDraft {
   const family = families.get(key);

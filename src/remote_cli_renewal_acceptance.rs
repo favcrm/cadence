@@ -6,6 +6,7 @@
 //! These tests exercise the real CLI validator and local credential writer;
 //! they do not claim to exercise issuer HTTP/D1 behavior.
 use super::*;
+use crate::remote_enrollment::AccessIngress;
 use serde_json::{json, Value};
 use std::os::unix::fs::PermissionsExt;
 
@@ -125,4 +126,512 @@ fn current_issuer_response_passes_identity_and_rotation_guard() {
     assert_eq!(next.generation, 2);
     assert_ne!(next.refresh_token, OLD_REFRESH);
     assert!(response["credential"]["expires_at"].as_u64().unwrap() > now().unwrap());
+}
+
+/// CAD-1434 renewal fault matrix, driven through the REAL `renewed_credential_with`
+/// state machine (lock, load, due check, pending persist, validate, save) and the
+/// REAL checked issuer POST (`cli_session_post_for_test`: HTTPS origin, private
+/// dir, pinned issuer, access ingress, route allowlist, deadline, redirect and
+/// size guards, JSON parse, access-ingress re-confirm). Only the bytes on the
+/// wire come from the synthetic `send` closure, which is a closure argument and
+/// is never reachable from config, the environment, or a global.
+mod matrix {
+    use super::*;
+    use std::cell::RefCell;
+
+    /// The synthetic wire send: the same argument list as the real send. It
+    /// returns the same triple as production: status, body bytes, and the
+    /// correlation the production header validator derives from header values.
+    type WireSend<'a> = Box<
+        dyn FnOnce(
+                &str,
+                &str,
+                Option<&AccessIngress>,
+                &Value,
+                Duration,
+            ) -> Result<(
+                u16,
+                Vec<u8>,
+                Option<crate::remote_enrollment::IssuerCorrelation>,
+            )> + 'a,
+    >;
+
+    /// One scripted issuer reply. `hop` and `request_id` are the raw header
+    /// values the fake issuer sends (`None` = header absent). They are passed
+    /// through the production validator, not a copy of it.
+    #[derive(Clone)]
+    struct Reply {
+        status: u16,
+        body: Vec<u8>,
+        hop: Option<String>,
+        request_id: Option<String>,
+    }
+
+    fn reply(status: u16, body: Value) -> Reply {
+        Reply {
+            status,
+            body: serde_json::to_vec(&body).unwrap(),
+            hop: None,
+            request_id: None,
+        }
+    }
+
+    /// One scripted issuer answer and the recorded requests. `RefCell` keeps the
+    /// fake single-threaded and local to one test, so no test races another.
+    struct Wire {
+        answers: RefCell<Vec<Reply>>,
+        hits: RefCell<Vec<(String, Value)>>,
+    }
+
+    impl Wire {
+        fn new(answers: Vec<(u16, Value)>) -> Self {
+            Self::with(answers.into_iter().map(|(s, b)| reply(s, b)).collect())
+        }
+        fn with(answers: Vec<Reply>) -> Self {
+            Self {
+                answers: RefCell::new(answers),
+                hits: RefCell::new(Vec::new()),
+            }
+        }
+        fn send(&self) -> WireSend<'_> {
+            Box::new(move |url, _bearer, _access, body, _timeout| {
+                self.hits.borrow_mut().push((url.to_owned(), body.clone()));
+                let mut answers = self.answers.borrow_mut();
+                if answers.is_empty() {
+                    let unexpected = reply(500, json!({"error": "unexpected_renewal"}));
+                    return Ok((unexpected.status, unexpected.body, None));
+                }
+                let next = answers.remove(0);
+                let correlation = crate::remote_enrollment::correlation_from_header_values(
+                    next.hop.as_deref(),
+                    next.request_id.as_deref(),
+                );
+                Ok((next.status, next.body, correlation))
+            })
+        }
+        fn posts(&self) -> usize {
+            self.hits.borrow().len()
+        }
+    }
+
+    /// A store whose issuer is the pinned synthetic `https` origin. The pin and
+    /// the access ingress are the real files the production checks read.
+    fn store(pending: Option<PendingRenewal>) -> (tempfile::TempDir, RemoteTarget, Credential) {
+        let (root, target, mut cred, _) = fixture();
+        cred.pending = pending;
+        std::fs::write(root.path().join("trusted-issuer"), format!("{ISSUER}\n")).unwrap();
+        std::fs::set_permissions(
+            root.path().join("trusted-issuer"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        save_credential(root.path(), ORG, &cred).unwrap();
+        (root, target, cred)
+    }
+
+    /// The real renewal path with the checked POST and a synthetic wire.
+    fn renew(dir: &Path, target: &RemoteTarget, wire: &Wire) -> Result<Credential> {
+        renewed_credential_with(
+            dir,
+            target,
+            Instant::now() + Duration::from_secs(30),
+            |dir, issuer, path, bearer, body, deadline| {
+                crate::remote_enrollment::cli_session_post_for_test(
+                    dir,
+                    issuer,
+                    path,
+                    bearer,
+                    body,
+                    deadline,
+                    wire.send(),
+                )
+            },
+        )
+    }
+
+    /// The issuer's validated renewal answer for `prior` at `pending`'s generation.
+    fn renewal_ok(prior: &Credential, pending: &PendingRenewal, target: &RemoteTarget) -> Value {
+        issuer_response(prior, pending, target)
+    }
+
+    #[test]
+    fn a_transient_503_keeps_the_saved_login_and_the_same_operation_for_a_later_retry() {
+        let (root, target, before) = store(None);
+        let wire = Wire::new(vec![
+            (503, json!({"error": "authority_unavailable"})),
+            (503, json!({"error": "authority_unavailable"})),
+        ]);
+        let first = renew(root.path(), &target, &wire)
+            .err()
+            .expect("503 must refuse")
+            .to_string();
+        assert!(first.contains("saved login is kept"), "{first}");
+        assert!(!first.contains("cadence login"), "{first}");
+        let kept = load_credential(root.path(), &target).unwrap();
+        assert_eq!(
+            kept.access_token, before.access_token,
+            "access replaced on 503"
+        );
+        let op = kept
+            .pending
+            .clone()
+            .expect("pending operation dropped on 503")
+            .operation_id;
+        // Later retry: the same pending operation is resent, not a new one.
+        let _ = renew(root.path(), &target, &wire);
+        let posts = wire.hits.borrow().clone();
+        assert_eq!(posts.len(), 2, "one POST per attempt");
+        assert_eq!(
+            posts[0].1["operation_id"], posts[1].1["operation_id"],
+            "retry changed operation id"
+        );
+        assert_eq!(posts[1].1["operation_id"], json!(op));
+    }
+
+    #[test]
+    fn a_terminal_flat_invalid_grant_asks_for_login_and_keeps_the_prior_authority() {
+        let (root, target, before) = store(None);
+        let wire = Wire::new(vec![(400, json!({"error": "invalid_grant"}))]);
+        let err = renew(root.path(), &target, &wire)
+            .err()
+            .expect("must refuse")
+            .to_string();
+        assert!(err.contains("cadence login"), "{err}");
+        let after = load_credential(root.path(), &target).unwrap();
+        assert_eq!(after.access_token, before.access_token);
+        assert_eq!(wire.posts(), 1);
+    }
+
+    #[test]
+    fn a_terminal_flat_invalid_token_asks_for_login_and_keeps_the_prior_authority() {
+        let (root, target, before) = store(None);
+        let wire = Wire::new(vec![(401, json!({"error": "invalid_token"}))]);
+        let err = renew(root.path(), &target, &wire)
+            .err()
+            .expect("must refuse")
+            .to_string();
+        assert!(err.contains("cadence login"), "{err}");
+        let after = load_credential(root.path(), &target).unwrap();
+        assert_eq!(after.access_token, before.access_token);
+        assert_eq!(wire.posts(), 1);
+    }
+
+    #[test]
+    fn a_committed_renewal_whose_response_is_lost_is_recovered_by_replaying_the_same_operation() {
+        // The issuer commits generation 1 -> 2 and rotates the refresh token, but
+        // the response is lost (crash or socket drop) before the CLI saves it. The
+        // CLI therefore still holds generation 1 with the pending operation.
+        // Recovery: the retry resends the SAME operation id, and the issuer replays
+        // its committed result. Build that exact committed answer for the replay.
+        let (root, target, before) = store(None);
+        let pending = PendingRenewal {
+            operation_id: format!("op_{}", "r".repeat(43)),
+            expected_generation: 1,
+        };
+        let committed = renewal_ok(&before, &pending, &target);
+        // First attempt: the wire drops (a transport-level loss surfaces as a
+        // refusal with no response body). Second attempt: the issuer replays.
+        let wire = Wire::new(vec![
+            (503, json!({"error": "authority_unavailable"})),
+            (200, committed.clone()),
+        ]);
+        let _ = renew(root.path(), &target, &wire);
+        let pend = load_credential(root.path(), &target).unwrap().pending;
+        assert!(pend.is_some(), "pending must survive the lost response");
+        let recovered = renew(root.path(), &target, &wire).expect("replayed result must recover");
+        let session = recovered.cli_session.expect("renewed session");
+        assert_eq!(session.generation, 2, "generation advanced exactly once");
+        assert_eq!(
+            session.refresh_token,
+            committed["cli_session"]["refresh_token"].as_str().unwrap()
+        );
+        assert!(
+            recovered.pending.is_none(),
+            "operation not cleared after recovery"
+        );
+        let posts = wire.hits.borrow().clone();
+        assert_eq!(posts.len(), 2);
+        assert_eq!(
+            posts[0].1["operation_id"], posts[1].1["operation_id"],
+            "replay used a new operation"
+        );
+        assert_eq!(posts[0].1["expected_generation"], json!(1));
+        assert_eq!(
+            posts[1].1["expected_generation"],
+            json!(1),
+            "replay sent a new generation"
+        );
+    }
+
+    #[test]
+    fn two_concurrent_renewals_of_one_org_are_serialized_into_one_effective_renewal() {
+        // Two real command threads renew the same org at once. The real per-org
+        // flock must serialize them: the first renews (generation 1 -> 2); the
+        // second, reloading under the lock, finds the session already current and
+        // does NOT post again. So exactly one renewal reaches the issuer and the
+        // generation advances once.
+        use std::sync::{Arc, Mutex};
+        let (root, target, _) = store(None);
+        let dir = Arc::new(root.path().to_path_buf());
+        let posts: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        // The issuer answer for the one allowed renewal, built from the saved
+        // prior credential (generation 1). The send is a closure per thread.
+        let prior = load_credential(root.path(), &target).unwrap();
+        let pending = PendingRenewal {
+            operation_id: format!("op_{}", "c".repeat(43)),
+            expected_generation: 1,
+        };
+        let answer = Arc::new(renewal_ok(&prior, &pending, &target));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let dir = dir.clone();
+                let target = target.clone();
+                let posts = posts.clone();
+                let answer = answer.clone();
+                std::thread::spawn(move || {
+                    renewed_credential_with(
+                        &dir,
+                        &target,
+                        Instant::now() + Duration::from_secs(30),
+                        |dir, issuer, path, bearer, body, deadline| {
+                            crate::remote_enrollment::cli_session_post_for_test(
+                                dir,
+                                issuer,
+                                path,
+                                bearer,
+                                body,
+                                deadline,
+                                |_url, _bearer, _access, body, _timeout| {
+                                    posts.lock().unwrap().push(body.clone());
+                                    // Hold the wire briefly so the threads overlap.
+                                    std::thread::sleep(Duration::from_millis(60));
+                                    Ok((200, serde_json::to_vec(&*answer).unwrap(), None))
+                                },
+                            )
+                        },
+                    )
+                    .map(|c| c.cli_session.map(|s| s.generation))
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let sent = posts.lock().unwrap().clone();
+        assert_eq!(
+            sent.len(),
+            1,
+            "two threads posted {} renewals, expected one",
+            sent.len()
+        );
+        let ok: Vec<_> = results.iter().filter(|r| r.is_ok()).collect();
+        assert!(!ok.is_empty(), "no thread completed a renewal: {results:?}");
+        let stored = load_credential(root.path(), &target).unwrap();
+        assert_eq!(
+            stored.cli_session.unwrap().generation,
+            2,
+            "generation advanced more than once"
+        );
+        // The single renewal used one fresh, well-formed operation id, and it is
+        // the id the POST carried (no reuse of a value the other thread invented).
+        let op = sent[0]["operation_id"].as_str().unwrap();
+        assert!(op.starts_with("op_") && op.len() >= 35, "{op}");
+        assert_eq!(sent[0]["expected_generation"], json!(1));
+    }
+
+    /// The AOS renewal emitter's id shape (`crypto.randomUUID()`): 36 chars.
+    const ISSUER_ID: &str = "0b2e1f4a-7c3d-4e5f-8a9b-1c2d3e4f5a6b";
+
+    #[test]
+    fn a_valid_issuer_hop_and_id_are_shown_on_a_flat_terminal_refusal() {
+        // The real issuer answers the flat {error} contract with the emitter's
+        // two headers. The terminal remediation is unchanged, and the id is shown
+        // so an operator can match it to the issuer's single log line.
+        let (root, target, before) = store(None);
+        let wire = Wire::with(vec![Reply {
+            status: 400,
+            body: serde_json::to_vec(&json!({"error": "invalid_grant"})).unwrap(),
+            hop: Some("issuer".into()),
+            request_id: Some(ISSUER_ID.into()),
+        }]);
+        let err = renew(root.path(), &target, &wire)
+            .err()
+            .expect("must refuse")
+            .to_string();
+        assert!(err.contains("cadence login"), "{err}");
+        assert!(
+            err.contains(ISSUER_ID),
+            "the valid issuer id was not shown: {err}"
+        );
+        // Authority unchanged; the header is never an authorization.
+        let after = load_credential(root.path(), &target).unwrap();
+        assert_eq!(after.access_token, before.access_token);
+        assert_eq!(wire.posts(), 1);
+    }
+
+    #[test]
+    fn a_valid_issuer_id_on_a_transient_503_keeps_the_saved_login_unchanged() {
+        let (root, target, before) = store(None);
+        let wire = Wire::with(vec![Reply {
+            status: 503,
+            body: serde_json::to_vec(&json!({"error": "authority_unavailable"})).unwrap(),
+            hop: Some("issuer".into()),
+            request_id: Some(ISSUER_ID.into()),
+        }]);
+        let err = renew(root.path(), &target, &wire)
+            .err()
+            .expect("503 must refuse")
+            .to_string();
+        assert!(err.contains("saved login is kept"), "{err}");
+        assert!(!err.contains("cadence login"), "{err}");
+        assert!(err.contains(ISSUER_ID), "{err}");
+        let kept = load_credential(root.path(), &target).unwrap();
+        assert_eq!(kept.access_token, before.access_token);
+    }
+
+    #[test]
+    fn hostile_overlong_unknown_hop_and_non_uuid_values_are_never_shown() {
+        // Each of these must be dropped by the single production validator, so the
+        // message carries no id at all. The flat terminal remediation still applies.
+        let hostile_hop = "issuer\u{7}ATTACKER-ECHO-do-not-show";
+        let overlong = "a".repeat(400);
+        let cases: Vec<(Option<&str>, Option<&str>, &str)> = vec![
+            (Some("board"), Some(ISSUER_ID), "unknown hop"),
+            (Some(hostile_hop), Some(ISSUER_ID), "hostile hop text"),
+            (
+                Some("issuer"),
+                Some("not-a-uuid <script>do-not-show</script>"),
+                "non-UUID id",
+            ),
+            (Some("issuer"), Some(overlong.as_str()), "overlong id"),
+            (Some("issuer"), None, "hop without an id"),
+            (None, Some(ISSUER_ID), "id without a hop"),
+        ];
+        for (hop, id, label) in cases {
+            let (root, target, _) = store(None);
+            let wire = Wire::with(vec![Reply {
+                status: 401,
+                body: serde_json::to_vec(&json!({"error": "invalid_token"})).unwrap(),
+                hop: hop.map(str::to_owned),
+                request_id: id.map(str::to_owned),
+            }]);
+            let err = renew(root.path(), &target, &wire)
+                .err()
+                .expect("must refuse")
+                .to_string();
+            assert!(err.contains("cadence login"), "{label}: {err}");
+            assert!(
+                !err.contains("issuer request"),
+                "{label} showed an id: {err}"
+            );
+            assert!(
+                !err.contains("do-not-show"),
+                "{label} echoed hostile text: {err}"
+            );
+            assert!(
+                !err.contains("ATTACKER"),
+                "{label} echoed hostile text: {err}"
+            );
+            assert!(
+                !err.contains(&overlong),
+                "{label} echoed an overlong value: {err}"
+            );
+            assert!(
+                err.len() < 400,
+                "{label} message grew with a hostile value: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_renewal_refused_before_the_wire_never_reaches_the_send_closure() {
+        // Pins are checked before the send. An unpinned issuer is refused with no
+        // request sent: the synthetic send must record zero hits.
+        let (root, target, _) = store(None);
+        std::fs::write(
+            root.path().join("trusted-issuer"),
+            "https://other.example.test\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            root.path().join("trusted-issuer"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let wire = Wire::new(vec![(200, json!({}))]);
+        let _ = renew(root.path(), &target, &wire);
+        assert_eq!(wire.posts(), 0, "an unpinned issuer reached the wire");
+    }
+
+    #[test]
+    fn a_plain_http_issuer_is_refused_before_the_wire() {
+        // The HTTPS-only production guard runs before the send closure.
+        let (root, target, _) = store(None);
+        let http = "http://api-v2.agenticos.hk";
+        std::fs::write(root.path().join("trusted-issuer"), format!("{http}\n")).unwrap();
+        std::fs::set_permissions(
+            root.path().join("trusted-issuer"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let mut cred = load_credential(root.path(), &target).unwrap();
+        cred.issuer = Some(http.into());
+        save_credential(root.path(), ORG, &cred).unwrap();
+        let wire = Wire::new(vec![(200, json!({}))]);
+        let err = renew(root.path(), &target, &wire)
+            .err()
+            .expect("http must refuse")
+            .to_string();
+        eprintln!("PLAINHTTP_ERR={err}");
+        assert!(err.contains("exact HTTPS origin"), "{err}");
+        assert_eq!(wire.posts(), 0, "a plain-http issuer reached the wire");
+    }
+
+    #[test]
+    fn a_pending_renewal_with_a_mismatched_generation_is_refused_before_any_post() {
+        let (root, target, mut cred, _) = fixture();
+        cred.pending = Some(PendingRenewal {
+            operation_id: format!("op_{}", "h".repeat(43)),
+            expected_generation: 99,
+        });
+        save_credential(root.path(), ORG, &cred).unwrap();
+        let path = root.path().join(format!("cli-{ORG}.json"));
+        let before = std::fs::read(&path).unwrap();
+        let wire = Wire::new(vec![(200, json!({}))]);
+        let err = renew(root.path(), &target, &wire)
+            .err()
+            .expect("must refuse")
+            .to_string();
+        assert!(err.contains("pending CLI renewal is inconsistent"), "{err}");
+        assert_eq!(wire.posts(), 0);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "stale pending rewrote the file"
+        );
+    }
+
+    #[test]
+    fn a_refused_renewal_changes_only_the_pending_record_never_the_authority() {
+        // Before the POST the pending operation is persisted (crash-safe). A
+        // refusal must leave every authority field byte-for-byte the same: the
+        // access token, refresh token, generation and expiry.
+        let (root, target, before) = store(None);
+        let wire = Wire::new(vec![(401, json!({"error": "invalid_token"}))]);
+        let _ = renew(root.path(), &target, &wire);
+        let after = load_credential(root.path(), &target).unwrap();
+        assert_eq!(
+            after.access_token, before.access_token,
+            "access token changed"
+        );
+        assert_eq!(after.expires_at, before.expires_at, "expiry changed");
+        let (b, a) = (before.cli_session.unwrap(), after.cli_session.unwrap());
+        assert_eq!(
+            a.refresh_token, b.refresh_token,
+            "refresh token rotated on refusal"
+        );
+        assert_eq!(a.generation, b.generation, "generation advanced on refusal");
+        assert!(
+            after.pending.is_some(),
+            "the pending operation must be kept for recovery"
+        );
+    }
 }

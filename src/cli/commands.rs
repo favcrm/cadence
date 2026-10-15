@@ -49,6 +49,11 @@ pub(crate) enum Commands {
         /// Isolated credential directory; defaults to XDG_CONFIG_HOME/cadence/remote-auth.
         #[arg(long)]
         auth_dir: Option<PathBuf>,
+        /// CAD-1429: also request the Publish Web scopes (`web.read`,
+        /// `web.prepare`) for this consent. Without it the login is unchanged
+        /// and grants no web authority.
+        #[arg(long, conflicts_with_all = ["token_stdin", "org"])]
+        web: bool,
     },
     /// Inspect or remove local AgenticOS credentials.
     Auth {
@@ -1221,6 +1226,13 @@ pub(crate) enum Commands {
     Memory {
         #[command(subcommand)]
         action: cadence_agent::memory::cli::MemoryAction,
+    },
+    /// CAD-1429: publish a plain HTML page or built static site. `prepare`
+    /// freezes the output locally; the hosted actions need a selected
+    /// AgenticOS workspace and never run project code.
+    Web {
+        #[command(subcommand)]
+        action: WebAction,
     },
     /// The wiki: shared, scoped knowledge under the tracker's vault —
     /// git-backed text pages and content-addressed blobs (CAD-580).

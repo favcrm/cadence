@@ -1,0 +1,139 @@
+//! CAD-1429 Publish Web: independent CLI refusal acceptance (driver skeleton).
+//!
+//! Independent acceptance author, not the source implementer.
+//!
+//! Status: SKELETON. The remote-scope cases are authored but are NOT executed
+//! here. They depend on the library-test TLS hook (`WebIssuerTls`, the exact
+//! virtual issuer plus loopback socket and explicit CA) and on the stable
+//! `cli/web.rs` / `web_cli_test_harness` module graph. Until the parent freezes
+//! those, this file records what it needs and proves only the local
+//! logged-out gate, which needs no network and no credential.
+//!
+//! Binding boundary (stated plainly): this file compiles only into the
+//! library unit-test path, where `cfg!(test)` admits the loopback issuer pin.
+//! It is NOT evidence about the production `cadence` binary, which rejects
+//! loopback http and trusts only webpki roots. Production binary TLS is not
+//! proved here.
+//!
+//! No credential is fabricated: no `cli-<org>.json`, no `web-<org>.json`, no
+//! hand-written `hct_`. The only remote grant a remote-scope case may use is one
+//! minted through the real device flow, which this skeleton does not perform.
+#![cfg(all(unix, feature = "test-seam"))]
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
+
+const BIN: &str = env!("CARGO_BIN_EXE_cadence");
+
+/// Fresh private temp root per case, so no real config directory is touched.
+fn private_root(label: &str) -> PathBuf {
+    let root = std::env::temp_dir().join(format!("cad1429-acc-{label}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    for sub in ["home", "xdg", "tmp", "state"] {
+        std::fs::create_dir_all(root.join(sub)).expect("create private root");
+    }
+    root
+}
+
+/// Run one `cadence web <args>` invocation with the environment fully
+/// isolated. Nothing is inherited from the operator's shell.
+fn web(root: &Path, args: &[&str]) -> Output {
+    // Global `--org` only; `--state-dir` conflicts with `--org` by design, so
+    // the org path resolves through the isolated XDG config instead.
+    let mut cmd = Command::new(BIN);
+    cmd.args(args)
+        .env("HOME", root.join("home"))
+        .env("XDG_CONFIG_HOME", root.join("xdg"))
+        .env("TMPDIR", root.join("tmp"))
+        .env_remove("CADENCE_STATE_DIR")
+        .env_remove("CADENCE_PM_DIR")
+        .env_remove("CADENCE_ALIAS")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cadence_agent::reaper::output(&mut cmd).expect("spawn cadence web")
+}
+
+/// No credential or pending record may exist after a refused call.
+fn no_auth_material(root: &Path) -> bool {
+    fn walk(dir: &Path, found: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, found);
+            } else {
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name.starts_with("cli-") || name.starts_with("web-") {
+                    found.push(p);
+                }
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(&root.join("xdg"), &mut found);
+    walk(&root.join("home"), &mut found);
+    found.is_empty()
+}
+
+/// Logged-out gate: all seven web actions refuse before any request is built.
+/// This is the one case that runs without the TLS hook or a device grant.
+#[test]
+fn logged_out_every_web_action_refuses_with_no_auth_material() {
+    let root = private_root("logged-out");
+    let cases: &[&[&str]] = &[
+        &["prepare", "--name", "acc-site", "index.html"],
+        &["publish", "rel_33333333"],
+        &["status", "acc-site"],
+        &["releases", "acc-site"],
+        &["rollback", "acc-site", "rel_33333333"],
+        &["unpublish", "acc-site"],
+    ];
+    for args in cases {
+        // Global flags come before the subcommand: `--org acme web <action>`.
+        let mut full: Vec<&str> = vec!["--org", "acme", "web"];
+        full.extend_from_slice(args);
+        let out = web(&root, &full);
+        let code = out.status.code().unwrap_or(-1);
+        assert_eq!(code, 3, "args {args:?} must refuse with exit 3");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("nothing was sent"),
+            "args {args:?} must state nothing was sent: {stderr}"
+        );
+    }
+    assert!(
+        no_auth_material(&root),
+        "a refused call wrote credential or pending material"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// --- Remote-scope cases: AUTHORED, NOT EXECUTED (blocked on dependencies) ---
+//
+// These require, in order:
+//   1. the library-test `WebIssuerTls` hook (exact virtual issuer, loopback
+//      socket, explicit CA; wrong name and wrong CA must fail; other hosts
+//      unmapped; production guards untouched) - source-owned, not yet landed;
+//   2. a real device grant against the NodeHTTPS bridge in
+//      `apps/api/src/web-sites/integration.acceptance.test.ts`, minted via
+//      device/code, owner device/approve and device/token - no row inserts;
+//   3. a pinned `trusted-issuer` file (mode 600) under the disposable
+//      `--auth-dir`, the legitimate bootstrap trust file.
+//
+// Cases to enable once those land (exit codes asserted, envelopes read from
+// packages/contracts/src/web-sites.ts, never copied):
+//   a. web.read-only login refuses prepare, publish, rollback, unpublish before
+//      any upload request, with the --web re-consent message;
+//   b. web.prepare login uploads and requests a publish action; publish does
+//      not reach the owner approval path (no live URL printed);
+//   c. missing selected workspace or issuer mismatch fails closed;
+//   d. cross-workspace release id refused; changed digest or revision refused
+//      with no fresh request key;
+//   e. interrupted send reconciles the same durable key; timeout is pending,
+//      not success;
+//   f. symlink, traversal, dotfile, source map, node_modules and over-limit
+//      artifacts refused locally with no upload request;
+//   g. a source-only React project is refused with build-first guidance.
