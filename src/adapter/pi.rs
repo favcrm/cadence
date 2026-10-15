@@ -3651,11 +3651,7 @@ for raw in sys.stdin:
         path
     }
 
-    fn launch(
-        mode: &str,
-        error: &str,
-        master: bool,
-    ) -> Launch {
+    fn launch(mode: &str, error: &str, master: bool) -> Launch {
         let dir = tempfile::tempdir().unwrap();
         let script = script(dir.path());
         let log = dir.path().join("stderr.log");
