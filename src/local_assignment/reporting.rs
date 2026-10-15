@@ -1,5 +1,6 @@
 use super::http::BoardHttp;
 use super::*;
+use std::borrow::Cow;
 use std::os::unix::io::AsRawFd;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -310,62 +311,45 @@ fn same_binding(existing: &KickoffFile, kickoff: &Kickoff, text: &str) -> Result
     Ok(())
 }
 
-fn worktree_head(path: &Path) -> Option<String> {
-    if !path.is_absolute() {
-        return None;
-    }
-    let mut command = Command::new("git");
-    command.arg("-C").arg(path).args(["rev-parse", "HEAD"]);
-    let output = crate::reaper::output(&mut command).ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let sha = String::from_utf8(output.stdout).ok()?;
-    let sha = sha.trim();
-    head_sha(sha).then(|| sha.to_string())
-}
-
 /// Hosted state owed by a local terminal row.
 /// `unknown` and anything still in flight return `None`: unresolved never
 /// becomes a result. An explicit accepted SHA is kept; a missing or illegal
 /// SHA on completion is a failure, not a guessed commit.
-pub fn completion_outcome(
+fn completion_outcome<'a>(
     status: &str,
-    text: &str,
-    sha: Option<&str>,
-    worktree: &Path,
-) -> Option<(String, String, Option<String>)> {
-    let explicit = sha.filter(|value| head_sha(value)).map(str::to_string);
+    text: &'a str,
+    sha: Option<String>,
+) -> Option<(&'static str, Cow<'a, str>, Option<String>)> {
+    let explicit = sha.filter(|value| head_sha(value));
     match status {
         "completed" | "result" => {
-            let head = explicit.or_else(|| worktree_head(worktree));
-            let Some(head) = head else {
+            let Some(head) = explicit else {
                 return Some((
-                    "failed".to_string(),
+                    "failed",
                     if text.trim().is_empty() {
-                        "local actor completed without a commit".to_string()
+                        Cow::Borrowed("local actor completed without a reported revision")
                     } else {
-                        text.to_string()
+                        Cow::Borrowed(text)
                     },
                     None,
                 ));
             };
             Some((
-                "result".to_string(),
+                "result",
                 if text.trim().is_empty() {
-                    "local actor completed".to_string()
+                    Cow::Borrowed("local actor completed")
                 } else {
-                    text.to_string()
+                    Cow::Borrowed(text)
                 },
                 Some(head),
             ))
         }
         "failed" | "interrupted" | "cancelled" => Some((
-            "failed".to_string(),
+            "failed",
             if text.trim().is_empty() {
-                format!("local actor {status}")
+                Cow::Owned(format!("local actor {status}"))
             } else {
-                text.to_string()
+                Cow::Borrowed(text)
             },
             None,
         )),
@@ -391,12 +375,17 @@ fn message_text(message: &crate::store::Message) -> &str {
     message.body.as_str()
 }
 
-fn message_sha(message: &crate::store::Message) -> Option<&str> {
-    message
-        .result
-        .as_ref()
-        .and_then(|result| result.get("sha").and_then(Value::as_str))
-        .filter(|sha| head_sha(sha))
+fn message_sha(message: &crate::store::Message) -> Option<String> {
+    let result = message.result.as_ref()?;
+    if let Some(sha) = result.get("sha").filter(|value| !value.is_null()) {
+        return sha.as_str().filter(|sha| head_sha(sha)).map(str::to_string);
+    }
+    ["text", "note"].iter().find_map(|key| {
+        result
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(crate::store::last_sha_line)
+    })
 }
 
 const ATTEMPT_BUDGET: Duration = Duration::from_secs(5);
@@ -543,7 +532,6 @@ fn prepare_pending(
             &message.state,
             message_text(&message),
             message_sha(&message),
-            Path::new(&binding.worktree),
         ) else {
             return Ok((true, None));
         };
@@ -554,12 +542,12 @@ fn prepare_pending(
         };
         let bounded = super::wire::bounded_report_text(
             &identity,
-            &state,
+            state,
             head.as_deref(),
             message_id,
-            &text,
+            text.as_ref(),
         )?;
-        binding.pending_state = Some(state);
+        binding.pending_state = Some(state.to_string());
         binding.pending_text = Some(bounded);
         binding.pending_head = head;
         write_kickoff_file(path, &binding)?;
@@ -847,6 +835,83 @@ mod tests {
         assert!(saved["reported_state"].is_null());
         assert_eq!(saved["text"], "do the work");
         assert_eq!(store.message("gap-1").unwrap().unwrap().state, "completed");
+    }
+
+    #[test]
+    fn recovery_uses_the_durable_reported_revision_not_checkout_head() {
+        for mode in ["missing", "invalid", "trailer", "explicit"] {
+            let dir = tempfile::tempdir().unwrap();
+            let repo = dir.path().join("checkout");
+            fs::create_dir(&repo).unwrap();
+            let git = |args: &[&str]| {
+                let output = Command::new("git")
+                    .arg("-C")
+                    .arg(&repo)
+                    .args([
+                        "-c",
+                        "user.name=Synthetic revision proof",
+                        "-c",
+                        "user.email=revision@example.test",
+                        "-c",
+                        "commit.gpgsign=false",
+                    ])
+                    .args(args)
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{:?}", output.stderr);
+                String::from_utf8(output.stdout).unwrap().trim().to_string()
+            };
+            git(&["init", "--initial-branch=revision-proof"]);
+            git(&["commit", "--allow-empty", "-m", "Original revision"]);
+            let original = git(&["rev-parse", "HEAD"]);
+            let mut binding = kickoff("revision-1", "hlc_00000000000000000000000000000001");
+            binding.worktree = repo.to_str().unwrap();
+            store_kickoff_binding(
+                dir.path(),
+                "acme",
+                "https://hosted-report.invalid",
+                &binding,
+                "do the work",
+            )
+            .unwrap();
+            let store = store_message(dir.path());
+            register(&store, &repo);
+            store
+                .enqueue("worker", "do the work", None, "revision-1", "user")
+                .unwrap();
+            let message = match store.take_queued("worker").unwrap() {
+                crate::store::Take::Message(message) => message,
+                _ => panic!("expected a claimed message"),
+            };
+            store.mark_running("revision-1", "turn-1").unwrap();
+            let result = match mode {
+                "missing" => json!({"text": "Completed without reporting a revision"}),
+                "invalid" => json!({"sha": "not-a-revision", "text": format!("SHA: {original}")}),
+                "trailer" => json!({"text": format!("Completed\nSHA: {original}")}),
+                "explicit" => json!({"sha": original, "text": format!("SHA: {}", "f".repeat(40))}),
+                _ => unreachable!(),
+            };
+            store.finish(&message, "completed", &result, None).unwrap();
+            git(&["commit", "--allow-empty", "-m", "Later unrelated revision"]);
+            assert_ne!(git(&["rev-parse", "HEAD"]), original);
+            ReportDriver::new(dir.path())
+                .tick(&store, Instant::now())
+                .unwrap();
+            let pending = file(dir.path(), "revision-1");
+            if matches!(mode, "missing" | "invalid") {
+                assert_eq!(pending["pending_state"], "failed", "{mode}");
+                assert!(pending["pending_head"].is_null(), "{mode}");
+            } else {
+                assert_eq!(pending["pending_state"], "result", "{mode}");
+                assert_eq!(pending["pending_head"], original, "{mode}");
+            }
+            assert_eq!(
+                store.message("revision-1").unwrap().unwrap().result,
+                Some(result)
+            );
+        }
     }
 
     #[test]

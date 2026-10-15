@@ -77,55 +77,12 @@ impl Shared {
                     "bound builtin is not credentialless in this registration",
                 ));
             }
-            return match crate::platform::load_credential(
+            return crate::platform::load_credential(
                 &self.store,
                 &self.platform_custody,
                 provider,
                 account,
-            ) {
-                Ok(bytes) => Ok(bytes),
-                Err(err) if crate::platform::credential_enrollment_missing(&err) => {
-                    let tool = config["mapping"]["tool"]
-                        .as_str()
-                        .or_else(|| config["mapping"]["action"].as_str())
-                        .unwrap_or("");
-                    let scopes = if let Some(items) = config["mapping"]["scopes"].as_array() {
-                        items
-                            .iter()
-                            .filter_map(|value| value.as_str().map(str::to_owned))
-                            .collect::<Vec<_>>()
-                    } else if matches!(tool, "generate_image" | "generate_text") {
-                        vec!["provider.draft".to_string()]
-                    } else {
-                        Vec::new()
-                    };
-                    let Ok(auth) = crate::remote_auth::auth_dir(None) else {
-                        return Err(err);
-                    };
-                    let Some(origin) = self
-                        .platforms
-                        .get(provider)
-                        .and_then(|adapter| adapter.credential_sink_origin().map(str::to_owned))
-                    else {
-                        return Err(err);
-                    };
-                    if let Some(workspace) = config.get("workspace_id").and_then(Value::as_str) {
-                        if crate::platform::connections::provider_account_identifier(
-                            provider, workspace,
-                        )
-                        .is_ok()
-                            && workspace != account
-                        {
-                            return Err(err);
-                        }
-                    }
-                    crate::remote_auth::provider_draft_lane(
-                        &auth, provider, account, tool, &scopes, &origin,
-                    )
-                    .ok_or(err)
-                }
-                Err(err) => Err(err),
-            };
+            );
         }
         let descriptor = self.connection_descriptor(provider)?;
         if config["schema"] != 1

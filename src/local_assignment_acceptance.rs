@@ -6,11 +6,13 @@ use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
-use super::reporting::{completion_outcome, store_kickoff_binding};
+use super::reporting::store_kickoff_binding;
 use super::{CoordHttp, Coordinator, Kickoff, Reply, VERSION};
 use crate::error::{Error, Result};
 
@@ -1395,42 +1397,106 @@ fn stale_running_snapshot_after_terminal_result_does_not_execute() {
 }
 
 #[test]
-fn completion_does_not_invent_a_commit() {
-    let (state, _, head) =
-        completion_outcome("completed", "landed", Some(SHA), Path::new("/absent"))
-            .expect("sha result");
-    assert_eq!(state, "result");
-    assert_eq!(head.as_deref(), Some(SHA));
-    let (state, _, head) =
-        completion_outcome("completed", "no head", None, Path::new("/absent")).expect("no sha");
-    assert_eq!(state, "failed");
-    assert!(head.is_none());
-    let (state, _, head) = completion_outcome(
-        "completed",
-        "bad",
-        Some("not-a-commit"),
-        Path::new("/absent"),
-    )
-    .expect("bad sha");
-    assert_eq!(state, "failed");
-    assert!(head.is_none());
-    let (state, _, head) =
-        completion_outcome("interrupted", "stopped", Some(SHA), Path::new("/absent"))
-            .expect("stop");
-    assert_eq!(state, "failed");
-    assert!(head.is_none());
-    let (state, _, head) = completion_outcome(
-        "cancelled",
-        "operator stop",
-        Some(SHA),
-        Path::new("/absent"),
-    )
-    .expect("cancel");
-    assert_eq!(state, "failed");
-    assert!(head.is_none());
+fn paused_generation_cannot_deliver_the_next_claims_kickoff() {
+    let auth = private_dir();
+    let repo = private_dir();
+    checkout(repo.path());
+    let mut board = Board::empty();
+    let assignment = board.seed("dispatch", "queued", Some(ME), ME);
+    let script = Script::new(board);
+    let mut first = open(&script, auth.path());
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let release_rx = Mutex::new(release_rx);
+    first.pause_after_delivery_check(Arc::new(move || {
+        entered_tx.send(()).expect("entered activation hook");
+        release_rx
+            .lock()
+            .expect("release receiver")
+            .recv_timeout(Duration::from_secs(10))
+            .expect("generation 2 must release the stale activation");
+    }));
+    let stale_deliveries = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+    let recorded = Arc::clone(&stale_deliveries);
+    let mut deliver_stale = move |kickoff: &Kickoff| {
+        recorded
+            .lock()
+            .expect("deliveries")
+            .push((kickoff.message_id.to_string(), kickoff.worktree.to_string()));
+        Ok(json!({"message": kickoff.message_id}))
+    };
+    let repo_for_stale = repo.path().to_path_buf();
+    let stale = thread::spawn(move || {
+        first.connect(
+            Some(&repo_for_stale),
+            Some("work"),
+            Some("worker"),
+            &mut deliver_stale,
+        )
+    });
+    entered_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("generation 1 reaches reservation boundary");
+    let paused = ledger_file(auth.path());
+    let old_checkout = attempt(&paused, &assignment)["worktree"]
+        .as_str()
+        .expect("gen1 checkout")
+        .to_string();
+    let old_claim = attempt(&paused, &assignment)["claim_id"].clone();
+    assert_eq!(attempt(&paused, &assignment)["generation"], 1);
+    assert!(paused["origins"].as_object().unwrap().is_empty());
+
+    let mut second = open(&script, auth.path());
+    let moved = second
+        .reassign(&assignment, Some(ME), false)
+        .expect("reassign to generation 2");
+    let mut deliver_current = deliver_to(auth.path().to_path_buf());
+    let current = second
+        .connect(
+            Some(repo.path()),
+            Some("work"),
+            Some("worker"),
+            &mut deliver_current,
+        )
+        .expect("generation 2 reserves its own kickoff");
+    let current_message = actor_message(&current);
+    let current_checkout = current["claimed"][0]["worktree"]
+        .as_str()
+        .expect("gen2 checkout")
+        .to_string();
+    assert_ne!(current_checkout, old_checkout);
+    let reserved = ledger_file(auth.path());
+    let origin = reserved["origins"][&current_message].clone();
+    assert_eq!(origin["generation"], moved["generation"]);
+    assert_eq!(origin["claim_id"], current["claimed"][0]["claim_id"]);
+    assert_ne!(origin["claim_id"], old_claim);
+    assert_eq!(reserved["origins"].as_object().unwrap().len(), 1);
+
+    release_tx.send(()).expect("release stale activation");
+    let stale = stale.join().expect("stale activation").expect("refusal");
+    assert!(stale["claimed"].as_array().expect("claimed").is_empty());
+    assert_eq!(stale["refused"][0]["assignment_id"], assignment);
     assert!(
-        completion_outcome("unknown", "still running", Some(SHA), Path::new("/absent")).is_none()
+        stale_deliveries.lock().expect("deliveries").is_empty(),
+        "generation 1 delivered a kickoff"
     );
+    assert!(Path::new(&old_checkout).is_dir());
+    let kept = ledger_file(auth.path());
+    assert_eq!(kept["origins"][&current_message], origin);
+    assert_eq!(kept["origins"].as_object().unwrap().len(), 1);
+    assert_eq!(
+        attempt(&kept, &assignment)["kickoff_reserved"].as_str(),
+        Some(current_message.as_str())
+    );
+
+    let again = second
+        .connect(None, None, None, &mut deliver_current)
+        .expect("generation 2 reconnect");
+    assert_eq!(actor_message(&again), current_message);
+    assert_eq!(again["claimed"][0]["actor"]["state"], "already_delivered");
+    assert_eq!(again["claimed"][0]["worktree"], current_checkout);
+    let reused = ledger_file(auth.path());
+    assert_eq!(reused["origins"][&current_message], origin);
 }
 
 #[test]

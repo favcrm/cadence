@@ -60,9 +60,9 @@ pub(crate) enum LocalAgentAction {
         #[arg(long)]
         cancel: bool,
     },
-    /// Run the existing device grant once for one lane and store that credential.
+    /// Save one optional legacy tool/publisher credential; does not activate tooling.
     Tool {
-        /// `provider.draft` or `publish.send`.
+        /// Legacy `provider.draft` or `publish.send`; normal account images need neither.
         #[arg(long)]
         lane: String,
     },
@@ -206,12 +206,54 @@ fn finish(value: &Value) -> Result<i32> {
     Ok(0)
 }
 
+/// Destination for this kickoff's context and handoff.
+/// Org, endpoint, and workspace stay the invocation's original selection.
+/// The member pin is the claimant captured when the coordinator opened.
+/// A missing or one-sided pin is unavailable: the current saved login is
+/// never substituted.
+fn claimant_target(target: &RemoteTarget, kickoff: &Kickoff) -> Result<RemoteTarget> {
+    let Some(subject_id) = kickoff.subject_id.filter(|value| !value.is_empty()) else {
+        return Err(Error::rejected(
+            "hosted assignment has no original member; context was not read and the local agent was not messaged",
+        ));
+    };
+    let Some(issuer) = kickoff.issuer.filter(|value| !value.is_empty()) else {
+        return Err(Error::rejected(
+            "hosted assignment has no original issuer; context was not read and the local agent was not messaged",
+        ));
+    };
+    Ok(RemoteTarget {
+        org: target.org.clone(),
+        endpoint: target.endpoint.clone(),
+        org_id: target.org_id.clone(),
+        identity: Some(remote_cli::CliIdentityPin {
+            subject_id: subject_id.to_string(),
+            issuer: issuer.to_string(),
+        }),
+    })
+}
+
+/// Reload the saved login against the claimant pin before a handoff that
+/// does not itself open a remote verb. Renewal of that same member is
+/// allowed; a different member or issuer fails inside credential load,
+/// before any request is given that login's authority.
+fn reload_claimant(target: &RemoteTarget) -> Result<()> {
+    let dir = cadence_agent::remote_auth::auth_dir(None).map_err(|_| {
+        Error::rejected(
+            "remote credential directory is unavailable; the local agent was not messaged",
+        )
+    })?;
+    remote_cli::cli_material(&dir, target)?;
+    Ok(())
+}
+
 fn deliver_kickoff(
     target: &RemoteTarget,
     local_state: Option<PathBuf>,
     kickoff: &Kickoff,
     wake_timeout: u64,
 ) -> Result<Value> {
+    let target = claimant_target(target, kickoff)?;
     let state = match local_state {
         Some(dir) => dir,
         None => cadence_agent::client::state_dir()?,
@@ -219,9 +261,10 @@ fn deliver_kickoff(
     let (text, note) = if let Some(text) =
         cadence_agent::local_assignment::reporting::stored_kickoff_text(&state, kickoff)?
     {
+        reload_claimant(&target)?;
         (text, context_note_path(&state, kickoff))
     } else {
-        let context = require_context(target, kickoff, wake_timeout)?;
+        let context = require_context(&target, kickoff, wake_timeout)?;
         let note = write_note(&state, kickoff, &context)?;
         let text = kickoff_line(kickoff, &note, &context)?;
         cadence_agent::local_assignment::reporting::store_kickoff_binding(
@@ -313,7 +356,7 @@ fn kickoff_line(kickoff: &Kickoff, note: &Path, context: &Value) -> Result<Strin
         .take(180)
         .collect();
     let line = format!(
-        "Hosted issue {} ({title}). Read {} for this assignment's issue, comments, and wiki index. Use its org selector explicitly for hosted ticket/wiki actions, verify organization_id and audience, and do not change global org selection. Worktree: {}. Report with cadence message result {} --token <turn_id> --text '<summary>' --sha <40-or-64-lowercase-hex>.",
+        "Hosted issue {} ({title}). Read {} for this assignment's issue, comments, and wiki index. Use its org selector explicitly for hosted ticket/wiki actions, verify organization_id and audience, and do not change global org selection. Worktree: {}. A managed endpoint ends its final answer with SHA:<40-or-64-lowercase-hex>. A PTY explicit reporter uses cadence message result {} --token <turn_id> --text '<summary>' --sha <40-or-64-lowercase-hex>.",
         kickoff.issue_id,
         note.display(),
         kickoff.worktree,
@@ -354,10 +397,13 @@ fn issue_context(target: &RemoteTarget, kickoff: &Kickoff, wake_timeout: u64) ->
         "comments": history,
         "wiki": wiki,
         "report": {
-            "command": "cadence message result",
-            "message": kickoff.message_id,
-            "token": "<turn_id>",
-            "sha": "<40-or-64-lowercase-hex>"
+            "managed_endpoint": "end the final answer with SHA:<40-or-64-lowercase-hex>",
+            "pty": {
+                "command": "cadence message result",
+                "message": kickoff.message_id,
+                "token": "<turn_id>",
+                "sha": "<40-or-64-lowercase-hex>"
+            }
         }
     });
     if !show_ok || !history_ok || !wiki_ok {
@@ -462,3 +508,7 @@ mod context_snapshots {
         assert!(!redacted.contains(&credential));
     }
 }
+
+#[cfg(test)]
+#[path = "local_agent_claimant_acceptance.rs"]
+mod claimant_acceptance;

@@ -161,6 +161,10 @@ pub struct Coordinator<H> {
     /// Board audience recorded at login. Reports go here, not to whatever
     /// org a later process has selected.
     audience: String,
+    /// Test seam: runs after the delivery check and before reservation,
+    /// while the ledger lock is not held.
+    #[cfg(test)]
+    before_reservation: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
 fn hosted_id(value: &str) -> bool {
@@ -559,6 +563,17 @@ fn attempt_ended(state: &str) -> bool {
     matches!(state, "result" | "failed" | "cancelled")
 }
 
+/// Ledger row still belongs to this claim generation and can message an actor.
+/// A newer generation, a fenced row, or a cancelled claim is not authority.
+fn claim_still_active(attempt: &Attempt, claimed: &Assignment) -> bool {
+    attempt.assignment_id.as_deref() == Some(claimed.assignment_id.as_str())
+        && attempt.claim_id.as_deref() == claimed.claim_id.as_deref()
+        && attempt.generation == Some(claimed.generation)
+        && attempt.state == claimed.state
+        && !attempt.fenced
+        && !attempt_ended(&attempt.state)
+}
+
 /// Observe the board without letting delayed rows retire newer custody.
 /// An older generation, a same-generation null or different claim, or a
 /// non-terminal row for a claim that already ended is ignored. Only a higher
@@ -624,7 +639,17 @@ impl<H: CoordHttp> Coordinator<H> {
             subject_id,
             issuer,
             audience,
+            #[cfg(test)]
+            before_reservation: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn pause_after_delivery_check(
+        &mut self,
+        wait: std::sync::Arc<dyn Fn() + Send + Sync>,
+    ) {
+        self.before_reservation = Some(wait);
     }
 
     #[cfg(test)]
@@ -957,17 +982,24 @@ impl<H: CoordHttp> Coordinator<H> {
         let audience = self.audience.clone();
         self.with_ledger(|ledger| {
             let (id, fresh) = {
-                let attempt = ledger
+                let recorded = ledger.attempts.values().any(|attempt| {
+                    attempt.assignment_id.as_deref() == Some(claimed.assignment_id.as_str())
+                });
+                let Some(attempt) = ledger
                     .attempts
                     .values_mut()
-                    .find(|attempt| {
-                        attempt.assignment_id.as_deref() == Some(claimed.assignment_id.as_str())
-                    })
-                    .ok_or_else(|| {
+                    .find(|attempt| claim_still_active(attempt, claimed))
+                else {
+                    return Err(if recorded {
+                        Error::rejected(
+                            "this claim is no longer active; a later generation was not messaged with its kickoff",
+                        )
+                    } else {
                         Error::rejected(
                             "the assignment was not recorded before the actor was messaged",
                         )
-                    })?;
+                    });
+                };
                 if let Some(id) = attempt
                     .kickoff_reserved
                     .clone()
@@ -982,18 +1014,24 @@ impl<H: CoordHttp> Coordinator<H> {
                     (id, true)
                 }
             };
-            if ledger.origins.contains_key(&id) {
+            if let Some(origin) = ledger.origins.get(&id) {
+                if origin.assignment_id != claimed.assignment_id
+                    || origin.claim_id != claim_id
+                    || origin.generation != claimed.generation
+                {
+                    return Err(Error::rejected(
+                        "this claim is no longer active; a later generation was not messaged with its kickoff",
+                    ));
+                }
                 return Ok(id);
             }
             let (origin_claim, origin_generation) = if fresh {
-                (claim_id, claimed.generation)
+                (claim_id.clone(), claimed.generation)
             } else {
                 ledger
                     .attempts
                     .values()
-                    .find(|attempt| {
-                        attempt.assignment_id.as_deref() == Some(claimed.assignment_id.as_str())
-                    })
+                    .find(|attempt| claim_still_active(attempt, claimed))
                     .and_then(|attempt| {
                         attempt.origin_claim_id.clone().zip(attempt.origin_generation)
                     })
@@ -1003,12 +1041,15 @@ impl<H: CoordHttp> Coordinator<H> {
                         )
                     })?
             };
+            if origin_claim != claim_id || origin_generation != claimed.generation {
+                return Err(Error::rejected(
+                    "this claim is no longer active; a later generation was not messaged with its kickoff",
+                ));
+            }
             let lane = ledger
                 .attempts
                 .values()
-                .find(|attempt| {
-                    attempt.assignment_id.as_deref() == Some(claimed.assignment_id.as_str())
-                })
+                .find(|attempt| claim_still_active(attempt, claimed))
                 .and_then(|attempt| attempt.lane.clone());
             ledger.origins.insert(
                 id.clone(),
@@ -1060,13 +1101,15 @@ impl<H: CoordHttp> Coordinator<H> {
         })
     }
 
-    fn kickoff_message(&self, assignment: &str) -> Result<Option<String>> {
+    /// Delivered kickoff for this claim only. A newer generation's message
+    /// is not already delivered for the checkout this activation opened.
+    fn delivered_kickoff(&self, claimed: &Assignment) -> Result<Option<String>> {
         self.with_ledger(|ledger| {
-            Ok(ledger
-                .attempts
-                .values()
-                .find(|attempt| attempt.assignment_id.as_deref() == Some(assignment))
-                .and_then(|attempt| attempt.kickoff_message.clone()))
+            Ok(ledger.attempts.values().find_map(|attempt| {
+                claim_still_active(attempt, claimed)
+                    .then(|| attempt.kickoff_message.clone())
+                    .flatten()
+            }))
         })
     }
 
@@ -1317,9 +1360,13 @@ impl<H: CoordHttp> Coordinator<H> {
             }
             Ok(())
         })?;
-        let actor = if let Some(message) = self.kickoff_message(&current.assignment_id)? {
+        let actor = if let Some(message) = self.delivered_kickoff(&current)? {
             json!({"message": message, "state": "already_delivered"})
         } else {
+            #[cfg(test)]
+            if let Some(wait) = self.before_reservation.clone() {
+                wait();
+            }
             let message_id = self.reserve_kickoff(&current)?;
             let (_origin_assignment, origin_claim, origin_generation) =
                 self.origin_for_message(&message_id)?;
@@ -1890,12 +1937,24 @@ impl<H: CoordHttp> Coordinator<H> {
             crate::remote_auth::authorize_lane(issuer, &self.org_id, lane, &self.ledger, false)?;
         Ok(json!({
             "lane": lane,
-            "status": "ready",
+            "status": "credential_saved",
+            "activation": "not_checked",
             "credential_file": path.display().to_string(),
-            "publish_registration": if lane == "publish.send" {
-                "The device grant wrote this private publish.send file and did not register a sender, set a door URL, restart the daemon, send, or spend. Point the existing publisher credential file at it to use it."
+            "enrollment": if lane == "provider.draft" {
+                Some(json!({
+                    "caller": "local_operator",
+                    "argv": ["cadence", "--org", "local", "platform", "enroll",
+                        "agenticos_external", "--account", self.org_id,
+                        "--scope", "provider.draft", "--token-stdin"],
+                    "stdin_file": path.display().to_string(),
+                }))
             } else {
-                "provider.draft is cached for a later image draft call that the existing grant or app broker already allowed. Hosted media stays credentialless."
+                None
+            },
+            "guidance": if lane == "publish.send" {
+                "Credential saved only. If not already configured, configure the existing publisher door URL and credential file; this did not register a sender, restart the daemon, send, or spend. Standing authorization and budgets still apply."
+            } else {
+                "Credential saved only. The local operator can enroll or rotate its raw token through the existing custody command, configure the external provider door for this issuer, and select that enrolled account in the authorized app connection. Existing custody policy, app authority and budgets still apply. Normal signed-in funded-account images do not require this legacy provider.draft lane."
             },
         }))
     }
