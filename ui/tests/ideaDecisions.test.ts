@@ -27,17 +27,6 @@ for (const name of ["addEventListener", "removeEventListener"])
   Object.defineProperty(globalThis, name, { value: win[name].bind(win), configurable: true });
 Object.defineProperty(globalThis, "crypto", { value: require("crypto").webcrypto, configurable: true });
 Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { value: true });
-Object.defineProperty(globalThis, "EventSource", {
-  configurable: true,
-  value: class {
-    onopen: null = null;
-    onerror: null = null;
-    constructor() {}
-    addEventListener() {}
-    removeEventListener() {}
-    close() {}
-  },
-});
 // The 390px pass: happy-dom has no layout engine (and its detached
 // window cannot resize), so the width is recorded, not measured — the
 // assertions below guard the wrapping/shrinking contracts that keep a

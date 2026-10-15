@@ -11,11 +11,6 @@ Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", { value: true });
 // Keep background timers and streams inert; explicit focus drives verification.
 Object.defineProperty(globalThis, "setInterval", { value: () => 1, configurable: true });
 Object.defineProperty(globalThis, "clearInterval", { value: () => undefined, configurable: true });
-Object.defineProperty(globalThis, "EventSource", { value: class {
-  readyState = 0;
-  addEventListener() {}
-  close() {}
-}, configurable: true });
 const loader = require("module"), originalRequire = loader.prototype.require;
 loader.prototype.require = function (this: unknown, id: string) {
   if (id.endsWith(".css")) return {};
