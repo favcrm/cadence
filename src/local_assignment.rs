@@ -1933,6 +1933,18 @@ impl<H: CoordHttp> Coordinator<H> {
                 "this workspace login has no issuer origin, so the existing device grant cannot run; no lane credential was saved",
             ));
         };
+        if lane == "provider.draft" {
+            crate::platform::connections::provider_account_identifier(
+                crate::platform::agenticos_external::PLATFORM,
+                &self.org_id,
+            )
+            .map_err(|_| {
+                Error::invalid(
+                    "config_required",
+                    "the legacy draft adapter requires a canonical workspace account; CLI/wiki collaboration is unaffected and no financial grant was requested",
+                )
+            })?;
+        }
         let path =
             crate::remote_auth::authorize_lane(issuer, &self.org_id, lane, &self.ledger, false)?;
         Ok(json!({
