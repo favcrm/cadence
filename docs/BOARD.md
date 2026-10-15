@@ -1180,7 +1180,7 @@ sign the board session out. Signed-in members pass the read boundary without
 operator privileges. Authentication and write authority remain separate.
 
 Private async work owns one operation across response headers, body decoding
-and any follow-up mutation or navigation. Pause, caller cancellation or
+and any follow-up request, state adoption or navigation. Pause, caller cancellation or
 session reset permanently abandons that operation; re-verification cannot
 revive it. A paused draft may be retried explicitly with a fresh operation.
 Cancellation uses baseline-compatible signal forwarding, not `AbortSignal.any`.
@@ -1196,6 +1196,12 @@ Hosted language-preference reads and saves share the same operation lifetime
 and typed session-refusal boundary. Local language choices remain browser-only.
 Queued agent-history reads retire on pause before acquiring a read slot;
 re-verification creates fresh work rather than reviving old cached promises.
+Private notification toasts share the admitted workspace's boundary; a pause
+clears their room titles/actions and dismissal timers, without discarding drafts.
+Notification actions check their originating generation before follow-up reads.
+Browser-alert work captures its private lifetime before queue/browser waits and
+checks it before consent or remote effects. Signed-out local subscription cleanup
+can still finish, but never starts an authenticated request after re-admission.
 
 Private SSE uses authenticated fetch streaming rather than URL-carried tab
 keys. The server revalidates the live session every five seconds with a

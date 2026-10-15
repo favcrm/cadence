@@ -1,7 +1,8 @@
-import { createContext, useCallback, useContext, useMemo, useRef, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import Button from "../../ui/Button";
 import { IconClose } from "../../ui/icons";
 import { navigate } from "../../lib/useLocation";
+import { onPrivateReadsPaused, privateReadsAllowed } from "../../lib/privateSession";
 
 /** One in-app alert. `href` is fixed when the alert is created: Open always goes to this thread. */
 interface Alert {
@@ -28,33 +29,60 @@ export function NotificationToastProvider({ children }: { children: ReactNode })
   // Per-room announce guard: one alert per room while it is pending, so a burst
   // of polls for one thread coalesces into the newest alert.
   const pending = useRef(new Map<string, number>());
+  const timers = useRef(new Map<number, number>());
+  const retired = useRef(false);
 
   const dismiss = useCallback((id: number) => {
     setAlerts((cur) => cur.filter((a) => a.id !== id));
   }, []);
 
+  const dropTimers = useCallback(() => {
+    for (const timer of timers.current.values()) window.clearTimeout(timer);
+    timers.current.clear();
+  }, []);
+
   const clear = useCallback(() => {
+    dropTimers();
     pending.current.clear();
     setAlerts([]);
-  }, []);
+  }, [dropTimers]);
 
   const show = useCallback(
     (title: string, room: string) => {
+      if (retired.current || !privateReadsAllowed()) return;
       const existing = pending.current.get(room);
       const id = ++seq.current;
       pending.current.set(room, id);
       const href = `/threads?h=${encodeURIComponent(room)}`;
       setAlerts((cur) => {
+        if (retired.current || !privateReadsAllowed()) return cur;
         const rest = cur.filter((a) => !(a.href === href && a.id === existing));
         return [...rest, { id, title, href }].slice(-3);
       });
-      window.setTimeout(() => {
+      const timer = window.setTimeout(() => {
+        timers.current.delete(id);
         if (pending.current.get(room) === id) pending.current.delete(room);
+        if (retired.current || !privateReadsAllowed()) return;
         dismiss(id);
       }, TOAST_MS);
+      timers.current.set(id, timer);
     },
     [dismiss],
   );
+
+  // Activity disconnects effects while retaining drafts; private alerts do not survive a pause.
+  useEffect(() => {
+    retired.current = !privateReadsAllowed();
+    const stop = onPrivateReadsPaused(() => {
+      retired.current = true;
+      clear();
+    });
+    return () => {
+      retired.current = true;
+      stop();
+      dropTimers();
+    };
+  }, [clear, dropTimers]);
 
   // Memoized so consumers' effects depend on a stable value, not on every alert change.
   const api = useMemo(() => ({ show, clear }), [show, clear]);

@@ -53,6 +53,7 @@ import LocalLanguage from "./ui/LocalLanguage";
 import BuildUpdateNotice from "./ui/BuildUpdateNotice";
 import HeaderSearch from "./ui/HeaderSearch";
 import NotificationInbox from "./features/threads/NotificationInbox";
+import { NotificationToastProvider } from "./features/threads/NotificationToast";
 import Setup from "./features/setup/Setup";
 import SetupNudge from "./features/setup/SetupNudge";
 import AuthBoundary from "./features/auth/AuthBoundary";
@@ -132,7 +133,8 @@ const SCREEN_LABEL: Record<Screen, string> = {
 const overviewOn = (s: Screen) => s === "home" || s === "overview";
 
 export default function App() {
-  return <AuthBoundary>{(meta, recheck) => <Workspace meta={meta} recheck={recheck} />}</AuthBoundary>;
+  // Private room alerts share the admitted workspace's concealment and reset lifecycle.
+  return <AuthBoundary>{(meta, recheck) => <NotificationToastProvider><Workspace meta={meta} recheck={recheck} /></NotificationToastProvider>}</AuthBoundary>;
 }
 
 /** All private routes, subscriptions and effects live below read admission. */
