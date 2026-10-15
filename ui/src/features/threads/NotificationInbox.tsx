@@ -69,6 +69,14 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
   const href = useHref();
   const humanId = inbox?.human.id;
 
+  useEffect(() => {
+    const onStorage = (event: StorageEvent) => {
+      if (event.storageArea === localStorage && event.key === DEVICE_KEY) setDeviceId(event.newValue);
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, []);
+
   // Click from the service worker: only our registered push worker, and only a
   // same-origin thread path, may route the board. Room authorization still applies.
   useEffect(() => {

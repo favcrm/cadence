@@ -36,6 +36,7 @@ export function pushSupported(): boolean {
 }
 
 const DEVICE_KEY = "cadence.push.device";
+let presenceTab: string | undefined;
 
 /** Thrown when the auth epoch moved on while an enable was in flight. */
 export class StaleEnableError extends Error {}
@@ -54,9 +55,10 @@ function serialized<T>(task: () => Promise<T>): Promise<T> {
 /** Order presence with enrollment/release so a stale view cannot suppress a newly bound device. */
 export function reportBrowserPresence(room: string | null, isCurrent: () => boolean): Promise<void> {
   return serialized(async () => {
+    if (!pushSupported()) return;
     if (!isCurrent()) return;
     const deviceId = localStorage.getItem(DEVICE_KEY);
-    if (deviceId !== null) await setPushPresence(deviceId, room);
+    if (deviceId !== null) await setPushPresence(deviceId, presenceTab ??= crypto.randomUUID(), room);
   });
 }
 

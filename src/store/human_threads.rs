@@ -62,7 +62,7 @@ pub const SCHEMA_V44: &str = "CREATE TABLE IF NOT EXISTS human_principals(
         seq INTEGER NOT NULL,
         PRIMARY KEY(room, human));";
 
-/// The DDL for schema v45 (CAD-1423): per-human notification preferences,
+/// The DDL for schema v47 (CAD-1423): per-human notification preferences,
 /// device push consents, and private opaque notification intents. Every
 /// object is `IF NOT EXISTS`. Intents carry opaque ids only, never message
 /// text, and are written in the same transaction as the post they describe.
@@ -108,9 +108,11 @@ pub const SCHEMA_V45: &str = "CREATE TABLE IF NOT EXISTS human_notification_pref
         lease_until REAL NOT NULL DEFAULT 0,
         PRIMARY KEY(intent, device));
      CREATE TABLE IF NOT EXISTS human_push_presence(
-        device TEXT PRIMARY KEY REFERENCES human_push_devices(id),
-        room TEXT,
-        expires REAL NOT NULL);
+        device TEXT NOT NULL REFERENCES human_push_devices(id),
+        tab TEXT NOT NULL,
+        room TEXT NOT NULL,
+        expires REAL NOT NULL,
+        PRIMARY KEY(device, tab));
      CREATE TABLE IF NOT EXISTS human_notification_intents(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         room TEXT NOT NULL REFERENCES human_rooms(id),
@@ -1041,6 +1043,23 @@ impl Store {
                 )?;
                 return Ok(id);
             }
+            // A fresh consent replaces only a revoked endpoint. Retire its
+            // device-local children before rotating the referenced device id.
+            let revoked: Option<String> = conn.query_opt(
+                "SELECT id FROM human_push_devices WHERE endpoint=? AND revoked IS NOT NULL",
+                [endpoint],
+                |r| r.get(0),
+            )?;
+            if let Some(revoked) = revoked {
+                conn.execute(
+                    "DELETE FROM human_push_presence WHERE device=?",
+                    [&revoked],
+                )?;
+                conn.execute(
+                    "DELETE FROM human_push_deliveries WHERE device=?",
+                    [&revoked],
+                )?;
+            }
             let id = format!("device-{}", uuid::Uuid::new_v4().simple());
             conn.execute(
                 "INSERT INTO human_push_devices(id,org,issuer,subject,human,endpoint,p256dh,auth,session,enrolled,expires)
@@ -1157,8 +1176,8 @@ impl Store {
         })
     }
 
-    /// The actor's notification inbox: one group per room with unread
-    /// messages, most unread first, bounded. A message counts when it is after
+    /// The actor's notification history: one group per room with received
+    /// messages, most unread first, bounded. A message counts as unread when it is after
     /// the actor's history cutoff and the notification cursor, and not sent by
     /// the actor. The notification cursor is separate from the thread read
     /// marker, so inbox dismissal never marks a transcript read.
@@ -1173,6 +1192,7 @@ impl Store {
                         (SELECT COUNT(*) FROM topic_posts t
                           WHERE t.topic_id=r.topic_id AND t.seq>m.cutoff
                             AND t.seq>COALESCE(n.seq,0)
+                            AND t.seq>COALESCE(k.seq,0)
                             AND (t.sender_uid IS NULL OR t.sender_uid<>?)),
                         COALESCE((SELECT MAX(i.seq) FROM human_notification_intents i
                           WHERE i.room=r.id AND i.recipient=m.member
@@ -1187,8 +1207,10 @@ impl Store {
                      ON m.room=r.id AND m.kind='human' AND m.member=? AND m.removed IS NULL
                    LEFT JOIN human_read_markers k ON k.room=r.id AND k.human=?
                    LEFT JOIN human_notification_reads n ON n.room=r.id AND n.human=?
-                  WHERE r.org=?",
-                params![actor.id, actor.id, actor.id, actor.id, actor.org],
+                  WHERE r.org=? AND EXISTS(SELECT 1 FROM topic_posts t
+                    WHERE t.topic_id=r.topic_id AND t.seq>m.cutoff
+                      AND (t.sender_uid IS NULL OR t.sender_uid<>?))",
+                params![actor.id, actor.id, actor.id, actor.id, actor.org, actor.id],
                 |r| {
                     Ok((
                         r.get(0)?,
@@ -1202,9 +1224,6 @@ impl Store {
             )?;
             let mut groups: Vec<NotificationGroup> = Vec::new();
             for (room, kind, title, unread, alert_seq, mention) in rows {
-                if unread <= 0 {
-                    continue;
-                }
                 let muted: bool = conn
                     .query_opt(
                         "SELECT 1 FROM human_room_mutes WHERE room=? AND human=?",
@@ -1520,13 +1539,14 @@ impl Store {
         })
     }
 
-    /// Report that one owned device is visibly showing `room` (or none). The
-    /// report expires after 30 seconds of server time and only suppresses that
-    /// device's interruption. It never marks anything read or grants access.
+    /// Report one owned device tab's visible room (or clear only that tab).
+    /// Reports expire after 30 seconds and only suppress that device's
+    /// interruption. Another tab cannot clear this tab's visible room.
     pub fn push_presence_set(
         &self,
         actor: &VerifiedHuman,
         device: &str,
+        tab: &str,
         room: Option<&str>,
     ) -> Result<bool> {
         self.write_tx(|conn| {
@@ -1539,10 +1559,15 @@ impl Store {
                 return Ok(false);
             }
             conn.execute(
-                "INSERT INTO human_push_presence(device,room,expires) VALUES(?,?,?)
-                 ON CONFLICT(device) DO UPDATE SET room=excluded.room, expires=excluded.expires",
-                params![device, room, now() + 30.0],
+                "DELETE FROM human_push_presence WHERE device=? AND (tab=? OR expires<=?)",
+                params![device, tab, now()],
             )?;
+            if let Some(room) = room {
+                conn.execute(
+                    "INSERT INTO human_push_presence(device,tab,room,expires) VALUES(?,?,?,?)",
+                    params![device, tab, room, now() + 30.0],
+                )?;
+            }
             Ok(true)
         })
     }
@@ -1578,7 +1603,7 @@ impl Store {
         self.read_tx(|conn| {
             let row: Option<i64> = conn.query_opt(
                 "SELECT 1 FROM human_push_presence p JOIN human_push_devices d ON d.id=p.device
-                  WHERE p.device=? AND d.human=? AND p.room=? AND p.expires>?",
+                  WHERE p.device=? AND d.human=? AND p.room=? AND p.expires>? LIMIT 1",
                 params![device, human, room, now()],
                 |r| r.get(0),
             )?;

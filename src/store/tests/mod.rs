@@ -619,5 +619,6 @@ mod app_records;
 mod app_social_drafts;
 mod app_tools;
 mod cad1365_media_producer_acceptance;
+mod human_push_presence_acceptance;
 mod social_generation_receipt_acceptance;
 mod social_publish;

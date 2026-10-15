@@ -217,7 +217,7 @@ fn route(method: &Method, rest: &str) -> Result<(Route, bool), HttpResp> {
             Route {
                 rpc: "human_push_presence",
                 server: Map::new(),
-                body_fields: &["device_id", "room"],
+                body_fields: &["device_id", "tab_id", "room"],
             },
             false,
         )),

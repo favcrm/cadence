@@ -785,7 +785,7 @@ const CATALOG: &[(&str, &[&str])] = &[
             "lease_until",
         ],
     ),
-    ("human_push_presence", &["device", "room", "expires"]),
+    ("human_push_presence", &["device", "tab", "room", "expires"]),
     (
         "human_notification_intents",
         &[

@@ -267,8 +267,8 @@ export function setRoomMuted(id: string, muted: boolean): Promise<{ muted: boole
 }
 
 /** Refresh this verified device's visible room; presence expires after 30 seconds. */
-export function setPushPresence(deviceId: string, room: string | null): Promise<{ accepted: boolean }> {
-  return call("POST", "/api/human-threads/push/presence", { device_id: deviceId, room });
+export function setPushPresence(deviceId: string, tabId: string, room: string | null): Promise<{ accepted: boolean }> {
+  return call("POST", "/api/human-threads/push/presence", { device_id: deviceId, tab_id: tabId, room });
 }
 
 /** `POST /api/human-threads/push/subscriptions` — enroll this browser endpoint. */

@@ -773,17 +773,20 @@ impl Shared {
         Ok(json!({"ok": true}))
     }
 
-    /// `human_push_presence {token, device_id, room}`. The owned device reports
-    /// its visible room (or null). Expires in 30s. Suppresses that device only.
+    /// `human_push_presence {token, device_id, tab_id, room}`. Each owned
+    /// device tab reports independently; presence expires in 30 seconds.
     pub(super) fn rpc_human_push_presence(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         let current = self.human_current_actor(required_str(params, "token")?, params, peer_pid)?;
         let device = bounded_ref(params, "device_id")?;
+        let tab = bounded_ref(params, "tab_id")?;
         let room = match params.get("room") {
             None | Some(Value::Null) => None,
             Some(Value::String(r)) if !r.is_empty() && r.len() <= 96 => Some(r.as_str()),
             Some(_) => return Err(Error::invalid("invalid_request", "room is not valid")),
         };
-        let accepted = self.store.push_presence_set(&current.actor, device, room)?;
+        let accepted = self
+            .store
+            .push_presence_set(&current.actor, device, tab, room)?;
         Ok(json!({"accepted": accepted}))
     }
 }
