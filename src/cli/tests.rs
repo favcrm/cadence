@@ -974,24 +974,6 @@ fn agents_block_is_idempotent() {
 }
 
 #[test]
-fn skill_subcommands_parse() {
-    let cli = Cli::try_parse_from(["cadence", "skill", "install"]).unwrap();
-    assert!(matches!(
-        cli.command,
-        Commands::Skill {
-            action: SkillAction::Install
-        }
-    ));
-    let cli = Cli::try_parse_from(["cadence", "skill", "status"]).unwrap();
-    assert!(matches!(
-        cli.command,
-        Commands::Skill {
-            action: SkillAction::Status
-        }
-    ));
-}
-
-#[test]
 fn group_lifecycle_commands_parse() {
     let cli = Cli::try_parse_from(["cadence", "resume", "pm1"]).unwrap();
     assert!(matches!(

@@ -60,7 +60,7 @@ impl Fixture {
                 command.env(key, value);
             }
         }
-        command.output().unwrap()
+        cadence_agent::reaper::output(&mut command).unwrap()
     }
 
     fn cli_json(&self, args: &[&str]) -> Value {
