@@ -1277,7 +1277,7 @@ jobs:
             asset="cadence-$TAG-$target.tar.gz"
             (cd "$RUNNER_TEMP" && gh attestation download "$OLDPWD/$asset" \
               --repo "$GH_REPO" --digest-alg sha256)
-            mv "$RUNNER_TEMP"/sha256-*.jsonl "bundles/build-attestation-$target.jsonl"
+            mv "$RUNNER_TEMP"/sha256:*.jsonl "bundles/build-attestation-$target.jsonl"
           done
           ls -l bundles
       # CAD-1455: the post-publication receipt. A build-provenance
@@ -1344,7 +1344,7 @@ jobs:
           set -euo pipefail
           (cd "$RUNNER_TEMP" && gh attestation download "$OLDPWD/publication-receipt.json" \
             --repo "$GH_REPO" --digest-alg sha256)
-          mv "$RUNNER_TEMP"/sha256-*.jsonl bundles/publication-attestation.jsonl
+          mv "$RUNNER_TEMP"/sha256:*.jsonl bundles/publication-attestation.jsonl
           ls -l publication-receipt.json bundles/publication-attestation.jsonl
       # Upload the receipt and its bundle inside the same
       # release-bundles artifact (byte-exact for the R2 publisher).
