@@ -140,11 +140,12 @@ fn project_new_refuses_an_agent_before_any_repo_less_write() {
     // existing Git repository. This prevents a blanket-failure false pass.
     let valid_repo = fx.root.path().join("operator-project");
     std::fs::create_dir(&valid_repo).unwrap();
-    let git = std::process::Command::new("git")
-        .args(["init", "-q"])
-        .current_dir(&valid_repo)
-        .status()
-        .unwrap();
+    let git = cadence_agent::reaper::status(
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&valid_repo),
+    )
+    .unwrap();
     assert!(
         git.success(),
         "could not initialize isolated control repository"
