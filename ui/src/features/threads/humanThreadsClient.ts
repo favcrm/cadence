@@ -266,6 +266,11 @@ export function setRoomMuted(id: string, muted: boolean): Promise<{ muted: boole
   return call("POST", `${roomPath(id)}/mute`, { muted });
 }
 
+/** Refresh this verified device's visible room; presence expires after 30 seconds. */
+export function setPushPresence(deviceId: string, room: string | null): Promise<{ accepted: boolean }> {
+  return call("POST", "/api/human-threads/push/presence", { device_id: deviceId, room });
+}
+
 /** `POST /api/human-threads/push/subscriptions` — enroll this browser endpoint. */
 export function enrollPush(sub: { endpoint: string; keys: { p256dh: string; auth: string } }): Promise<{ device_id: string }> {
   return call("POST", "/api/human-threads/push/subscriptions", sub);

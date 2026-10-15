@@ -1,4 +1,4 @@
-import { enrollPush, rebindPush, unenrollPush } from "./humanThreadsClient";
+import { enrollPush, rebindPush, setPushPresence, unenrollPush } from "./humanThreadsClient";
 
 /**
  * CAD-1423: explicit browser opt-in for Web Push. Runs only from a user gesture
@@ -49,6 +49,15 @@ function serialized<T>(task: () => Promise<T>): Promise<T> {
   const run = pushQueue.then(task, task);
   pushQueue = run.catch(() => undefined);
   return run;
+}
+
+/** Order presence with enrollment/release so a stale view cannot suppress a newly bound device. */
+export function reportBrowserPresence(room: string | null, isCurrent: () => boolean): Promise<void> {
+  return serialized(async () => {
+    if (!isCurrent()) return;
+    const deviceId = localStorage.getItem(DEVICE_KEY);
+    if (deviceId !== null) await setPushPresence(deviceId, room);
+  });
 }
 
 /**

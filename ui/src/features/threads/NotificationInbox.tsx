@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import "./notifications.css";
 import Button from "../../ui/Button";
 import { IconCheck, IconClose, IconSettings, IconThreads } from "../../ui/icons";
-import { navigate } from "../../lib/useLocation";
+import { navigate, useHref } from "../../lib/useLocation";
 import { ApiError } from "../../lib/api";
 import {
   humanNotifications,
@@ -20,6 +20,7 @@ import {
   enableBrowserAlerts,
   rebindExistingBrowserAlerts,
   pushSupported,
+  reportBrowserPresence,
   releaseBrowserAlerts,
 } from "./pushOptIn";
 import { useNotificationToast } from "./NotificationToast";
@@ -65,6 +66,8 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
   const settings = useRef<HTMLDialogElement | null>(null);
   const bell = useRef<HTMLButtonElement | null>(null);
   const toast = useNotificationToast();
+  const href = useHref();
+  const humanId = inbox?.human.id;
 
   // Click from the service worker: only our registered push worker, and only a
   // same-origin thread path, may route the board. Room authorization still applies.
@@ -183,6 +186,32 @@ export default function NotificationInbox({ authEpoch }: { authEpoch: string }) 
       stop();
     };
   }, [authEpoch, toast]);
+
+  // The delivery guard needs this device's view, not another tab's read marker.
+  useEffect(() => {
+    if (deviceId === null || humanId === undefined) return;
+    const epoch = generation.current;
+    let active = true;
+    const isCurrent = () => generation.current === epoch;
+    const publish = () => {
+      void reportBrowserPresence(activeRoom(), () => active && isCurrent()).catch(() => undefined);
+    };
+    const release = () => {
+      void reportBrowserPresence(null, isCurrent).catch(() => undefined);
+    };
+    publish();
+    // Half the server's 30-second presence lifetime; background tabs send null.
+    const timer = window.setInterval(publish, 15000);
+    document.addEventListener("visibilitychange", publish);
+    window.addEventListener("pagehide", release);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", publish);
+      window.removeEventListener("pagehide", release);
+      release();
+    };
+  }, [authEpoch, deviceId, humanId, href]);
 
   if (inbox === null) return null;
   const total = inbox.unread_total;
