@@ -677,3 +677,75 @@ fn cad811_screen_services_real_mount_refusals_preserve_scoped_records() {
     assert_eq!(approved["content"]["approval"]["valid"], true);
     eprintln!("CAD811 acceptance: named_checks=1 rpc_refusals={rpc_refusals} http_refusals={http_refusals} record_scopes=3 before_digest={before_digest}");
 }
+
+/// Independent sender recovery acceptance: real authorized empty read and
+/// real bad-caller/scope refusal on both peers. No sender enrollment or send.
+#[test]
+fn cad811_sender_empty_read_is_typed_and_access_refusals_stay_refused() {
+    let fx = Fixture::start();
+    let session = fx.session();
+    let scope = fx.install("sender-empty", &["smtp.show"]);
+    let action = fx.mount(&session, &scope, 1);
+    let body = call(&action, "smtp.show", json!({}));
+    let native_args = json!({"install_id": scope.install, "context_id": scope.context});
+    let empty_link = || {
+        crate::store::Store::open(&crate::rollout::db_file(fx.root.path()))
+            .unwrap()
+            .crm_smtp_link(&scope.install, &scope.context)
+            .unwrap()
+            .is_none()
+    };
+    assert!(empty_link(), "positive control must be genuinely unbound");
+    // Direct native read proves this code originates in the real SMTP handler,
+    // not in the screen relay synthesizing an empty response for any refusal.
+    for result in [
+        fx.rpc(Asserted::Operator, "crm_smtp_show", native_args.clone()),
+        fx.call(Asserted::Operator, &session, body.clone()),
+    ] {
+        let error = result.expect_err("unbound show must remain a typed refusal");
+        assert_eq!(error.kind(), "rejected");
+        assert_eq!(error.code(), Some("smtp_sender_unbound"));
+    }
+    let (status, reply) = fx.http("operator", &session, &body);
+    assert_eq!(status, 400, "unbound is not success or an access failure");
+    assert_eq!(reply["code"], "smtp_sender_unbound");
+    assert!(reply.get("binding").is_none() && reply.get("receipt").is_none());
+
+    let mut forged = body.clone();
+    forged["args"]["context_id"] = json!("wrong-context");
+    for (who, rejected_body) in [
+        (Asserted::Agent("synthetic-worker".into()), body),
+        (Asserted::Operator, forged),
+    ] {
+        let error = fx
+            .call(who.clone(), &session, rejected_body.clone())
+            .expect_err("sender access/context refusal must not become empty");
+        assert!(matches!(error.kind(), "rejected" | "gate"));
+        assert!(!matches!(
+            error.code(),
+            Some("smtp_sender_unbound" | "smtp_sender_revoked")
+        ));
+        let (status, reply) = fx.http(&who.as_str(), &session, &rejected_body);
+        assert!(matches!(status, 400 | 401 | 403));
+        assert_ne!(reply["code"], "smtp_sender_unbound");
+        assert_ne!(reply["code"], "smtp_sender_revoked");
+        assert!(reply.get("binding").is_none() && reply.get("receipt").is_none());
+    }
+    let error = fx
+        .rpc(
+            Asserted::Operator,
+            "crm_smtp_show",
+            json!({
+                "install_id": scope.install, "context_id": "wrong-context"
+            }),
+        )
+        .expect_err("native unknown context must refuse before empty read");
+    assert_eq!(error.kind(), "rejected");
+    assert_ne!(error.code(), Some("smtp_sender_unbound"));
+    assert_ne!(error.code(), Some("smtp_sender_revoked"));
+    assert!(
+        empty_link(),
+        "read/refusal paths must not create sender state"
+    );
+    eprintln!("CRM sender acceptance: genuine_unbound=1 native_rpc=1 screen_rpc=1 http_400_code=1 bad_caller=1 wrong_context=1 smtp_effects_requested=0");
+}

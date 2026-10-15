@@ -379,12 +379,14 @@ impl Shared {
                     .store
                     .crm_smtp_link(install, context)?
                     .ok_or_else(|| {
-                        Error::rejected(
+                        Error::invalid(
+                            "smtp_sender_unbound",
                             "no SMTP sender is bound to this installation and context",
                         )
                     })?;
                 if link.state != "live" {
-                    return Err(Error::rejected(
+                    return Err(Error::invalid(
+                        "smtp_sender_revoked",
                         "SMTP sender binding is revoked; bind it again instead",
                     ));
                 }

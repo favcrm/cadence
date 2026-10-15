@@ -16,10 +16,13 @@ function sanitized(value: unknown): unknown {
   if (!object(value)) return value;
   return Object.fromEntries(Object.entries(value).filter(([k]) => !SECRET_FIELDS.has(k)).map(([k, v]) => [k, sanitized(v)]));
 }
-function refusal(error: unknown): ActionRefusal {
+function refusal(error: unknown, operation?: RecordCallVerb): ActionRefusal {
   const status = error instanceof ApiError ? error.status : 0;
-  // The child protocol consumes canonical classes, not arbitrary native
-  // codes (a revision_conflict must still reach the editor as conflict).
+  if (operation === "smtp.show" && error instanceof ApiError && status === 400 && (error.code === "smtp_sender_unbound" || error.code === "smtp_sender_revoked")) {
+    return { code: error.code, text: "No live SMTP sender is bound. Configure a sender before sending." };
+  }
+  // Apart from explicit sender-state codes on smtp.show, the child consumes
+  // canonical classes (a revision_conflict must still reach the editor as conflict).
   const code = ({ 401: "unauthorized", 403: "forbidden", 404: "not_found", 409: "conflict", 503: "unavailable" } as Record<number, string>)[status] ?? "failed";
   return { code, text: status === 401 || status === 403 ? "This app's access is no longer available." : status === 409 ? "That changed. Refresh before trying again." : "Cadence refused this request. Inspect fresh status before retrying an effect." };
 }
@@ -50,10 +53,10 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
     if (!response.ok) throw new ApiError("Service refused", response.status, object(value) && typeof value.code === "string" ? { code: value.code } : undefined);
     return value;
   }
-  function failed(error: unknown): ActionRefusal {
+  function failed(error: unknown, operation?: RecordCallVerb): ActionRefusal {
     csv.clear();
     if (current() && error instanceof ApiError && [401, 403].includes(error.status)) { retired = true; purgeDisplayCache(); host.refused(); }
-    return refusal(error);
+    return refusal(error, operation);
   }
   function deliver(raw: unknown, executeCommand = true): unknown {
     if (!current()) throw new ApiError("Mount retired", 403);
@@ -83,7 +86,7 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
         else if (receipt.display_scope_key) observeRead(receipt.display_scope_key, receipt.display_session_key!, domain, operation, args, data, epoch);
         return { ok: true, data };
       } catch (error) {
-        const refusal = failed(error);
+        const refusal = failed(error, operation);
         if (current() && previewId && operation === "screen.preview.show" && latestShow?.id === previewId && latestShow.revision === revision) host.command({ operation: "screen.preview.clear", args: { preview_id: previewId } });
         return { ok: false, refusal };
       }
