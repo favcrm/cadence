@@ -789,7 +789,6 @@ export default function AppShell({
               contextName: singleScope ? null : contextLabel(activeContexts, contextId),
               scopeLabel: (singleScope ? null : contextLabel(activeContexts, contextId)) || title,
               descriptor: chatDescriptor,
-              promptLayout: screenOutlet ? "list" : "chips",
               conversationRequest,
               contextProof: conversationContextProof,
               fileUpload: chatProjection.projection?.fileUpload ?? { declared: false, available: false },
