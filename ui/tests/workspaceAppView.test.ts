@@ -19,6 +19,7 @@ loader.prototype.require = function(this: unknown, id: string) {
 const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
 const WorkspaceApp = (require("../src/features/workspace-apps/WorkspaceApp") as typeof import("../src/features/workspace-apps/WorkspaceApp")).default;
+const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
 const installation = { install_id: "install-a", title: "Social Content", name: "social-content", version: "0.2.0", digest: "bundle-digest", catalog_generation: "catalog-generation", approved: true, storage_kind: "workspace", files: ["workflows/instagram.md", "workflows/facebook.md"], capabilities: { publication: { schema: 1, capability: "text.publish", version: 1, action: "publish", resource_kind: "connection_account", effect: "send" } }, connection_slots: ["cms"] };
 let simulatedInstallation: typeof installation | null = null;
 let loseUpgradeReply = false;
@@ -130,7 +131,7 @@ async function click(element: Element | undefined | null) {
   await React.act(async () => { element.dispatchEvent(new MouseEvent("click", { bubbles: true })); }); await flush();
 }
 async function render(operator = true, readOnly = false) {
-  await React.act(async () => root.render(React.createElement(WorkspaceApp, { installId: "install-a", viewer: { operator, readOnly } }))); await flush();
+  await React.act(async () => root.render(React.createElement(LocaleProvider, null, React.createElement(WorkspaceApp, { installId: "install-a", viewer: { operator, readOnly } })))); await flush();
 }
 async function fresh(operator = true, readOnly = false) {
   await React.act(async () => root.unmount()); root = createRoot(host); reads.length = writes.length = 0; await render(operator, readOnly);

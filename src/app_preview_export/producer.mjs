@@ -189,7 +189,8 @@ var V2_TOP = [
 	"run_receipts",
 	"original_downloads",
 	"route",
-	"read_observations"
+	"read_observations",
+	"presentation_locale"
 ];
 var V2_RUN = [
 	"created",
