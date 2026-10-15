@@ -833,3 +833,6 @@ fn cad811_public_owner_attribution_survives_native_delegation_and_retirement_ref
         "PUBLIC_OWNER_ATTRIBUTION_MISSING: {missing:?}"
     );
 }
+
+#[path = "cad811_missing_state_acceptance.rs"]
+mod independent_missing_state;

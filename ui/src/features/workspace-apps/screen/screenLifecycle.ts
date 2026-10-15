@@ -248,6 +248,7 @@ export class ScreenChannel extends FrameChannel {
   /** Only a v2 child with an action host; the verb set was closed by the parser. */
   protected call(request: CallRequest): void {
     const actions = this.actions;
+    if (this.crmLocale && Object.hasOwn(request.args, "presentation_locale")) { this.close(true); return; }
     if (this.shape !== "v2" || !actions || this.calls >= CALL_QUEUE_MAX) { this.close(true); return; }
     const csv = this.records && request.verb === "records.csv.preview";
     if (csv && (this.csvBusy || this.csvSlot)) { this.close(true); return; }
@@ -285,6 +286,7 @@ export class ScreenChannel extends FrameChannel {
   /** Only a v2 child with an action host. At most one live slot per frame. */
   protected slot(request: SlotRequest): void {
     const actions = this.actions;
+    if (this.crmLocale && Object.hasOwn(request.args, "presentation_locale")) { this.close(true); return; }
     if (this.shape !== "v2" || !actions || (this.records ? !this.receipt.operations?.includes(request.verb) || !(RECORD_SLOT_VERBS as readonly string[]).includes(request.verb) : !(SLOT_VERBS as readonly string[]).includes(request.verb))) { this.close(true); return; }
     const csv = this.records && (request.verb === "records.csv.import" || request.verb === "records.csv.confirm");
     if (csv && (this.csvBusy || this.csvSlot !== null && this.csvSlot !== request.id)) { this.close(true); return; }
