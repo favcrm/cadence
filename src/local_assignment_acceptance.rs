@@ -481,9 +481,16 @@ fn checkout(root: &Path) {
     fs::write(root.join("README"), "checkout\n").expect("readme");
     git(root, &["add", "README"]);
     git(root, &["commit", "-m", "init"]);
-    let lane = root.join(".cadence").join("wt").join("cad1460-work");
+    let lane = crate::worktree::layout::worktree_dir(root, "cad1460-work");
     fs::create_dir_all(&lane).expect("lane");
-    git(&lane, &["init", "-b", "cadence/cad1460-work"]);
+    git(
+        &lane,
+        &[
+            "init",
+            "-b",
+            &crate::worktree::layout::branch("cad1460-work"),
+        ],
+    );
     fs::write(lane.join("note"), "lane\n").expect("note");
     git(&lane, &["add", "note"]);
     git(&lane, &["commit", "-m", "lane"]);
@@ -1134,12 +1141,7 @@ fn another_members_waiting_assignment_is_not_taken() {
         .expect_err("not ours");
     assert_eq!(error.code(), Some("assignment_live"));
     assert!(script.calls().iter().all(|call| call.method == "GET"));
-    assert!(!repo
-        .path()
-        .join(".cadence")
-        .join("wt")
-        .join("cad1460-work")
-        .exists());
+    assert!(!crate::worktree::layout::worktree_dir(repo.path(), "cad1460-work").exists());
 }
 
 #[test]

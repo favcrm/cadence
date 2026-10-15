@@ -594,8 +594,8 @@ fn issue_and_wiki_http_mutations_have_prepared_intent_and_same_commit_receipts()
         "existing member comment permission regressed: {member_response}"
     );
 
-    // A verified member may write only its own wiki prefix. The named claim
-    // must equal the live signed handle; no operator/agent may be substituted.
+    // A verified member may write shared wiki and its own private prefix.
+    // The named claim must still equal the live signed handle.
     let (status, response) = fx.http(
         "PUT",
         "/api/wiki/file",
@@ -624,12 +624,29 @@ fn issue_and_wiki_http_mutations_have_prepared_intent_and_same_commit_receipts()
         "member proof wrote as another live handle: {wrong_reply}"
     );
     let (shared_write, shared_reply) = fx.http("PUT", "/api/wiki/file", Some(&member), &json!({
-        "path":"global/member-must-not-write.md", "text":"must not land", "wiki_as":"user:user-member"
+        "path":"global/cad1374-member.md", "text":"shared-wiki-canary", "wiki_as":"user:user-member"
+    }).to_string());
+    assert_eq!(
+        shared_write, 200,
+        "signed member shared wiki write: {shared_reply}"
+    );
+    let shared_head = git(&fx.pm(), &["rev-parse", "HEAD"]);
+    assert_ne!(
+        shared_head, wiki_head,
+        "member shared wiki write did not commit"
+    );
+    let (private_denied, private_reply) = fx.http("PUT", "/api/wiki/file", Some(&member), &json!({
+        "path":"users/user-owner-a/cross-member.md", "text":"must not land", "wiki_as":"user:user-member"
     }).to_string());
     assert_ne!(
-        shared_write, 200,
-        "member bypassed existing global wiki ACL: {shared_reply}"
+        private_denied, 200,
+        "member wrote another user's private prefix: {private_reply}"
     );
+    assert_eq!(git(&fx.pm(), &["rev-parse", "HEAD"]), shared_head);
+    assert!(!fx
+        .pm()
+        .join("wiki/users/user-owner-a/cross-member.md")
+        .exists());
 
     // Verify durable prepared intents through the daemon store and their
     // fail-closed ordering at the real issue and wiki HTTP guards.
@@ -650,6 +667,12 @@ fn issue_and_wiki_http_mutations_have_prepared_intent_and_same_commit_receipts()
         .as_str()
         .unwrap_or_default()
         .contains("users/user-member/cad1374.md")));
+    assert!(events
+        .iter()
+        .any(|event| event["human"]["sub"] == "user-member"
+            && event["resource"]
+                .as_str()
+                .is_some_and(|path| path.contains("global/cad1374-member.md"))));
     for (action, sub) in [
         ("issue_updated", "user-owner-a"),
         ("issue_comment_added", "user-owner-b"),
@@ -678,6 +701,7 @@ fn issue_and_wiki_http_mutations_have_prepared_intent_and_same_commit_receipts()
         assert!(
             !event.to_string().contains("private-issue-canary")
                 && !event.to_string().contains("private-wiki-canary")
+                && !event.to_string().contains("shared-wiki-canary")
         );
     }
     assert_commit_receipt(
@@ -699,6 +723,13 @@ fn issue_and_wiki_http_mutations_have_prepared_intent_and_same_commit_receipts()
         &wiki_head,
         "user-member",
         "wiki/users/user-member/cad1374.md",
+        "wiki_",
+    );
+    assert_commit_receipt(
+        &fx,
+        &shared_head,
+        "user-member",
+        "wiki/global/cad1374-member.md",
         "wiki_",
     );
 

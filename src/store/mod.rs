@@ -121,8 +121,6 @@ pub use seal::WriteTxn;
 pub(crate) use seal::{preflight_writer_guard, require_legacy_writer_tx, StoreConn};
 #[cfg(test)]
 mod tests;
-#[cfg(test)]
-mod writer_census;
 
 /// How long a connection waits on another process's lock before
 /// SQLITE_BUSY (CAD-256). The daemon's writer and every out-of-process
