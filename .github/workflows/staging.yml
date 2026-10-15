@@ -346,8 +346,14 @@ jobs:
           subject-path: ${{ runner.temp }}/production-candidate.json
       # CAD-1455: retain the immutable evidence a consumer verifies
       # offline: the exact receipt bytes, their staging.yml attestation
-      # bundle, the binary's ci.yml build-provenance bundle and the
-      # Sigstore/GitHub trusted root the verifier needs.
+      # bundle, the binary's ci.yml build-provenance bundle, and (as
+      # transport data only, never a trust anchor) the trusted root the
+      # producer resolved — the consumer's own pinned root is what
+      # authorizes the signature. The receipt's promotion_run_id /
+      # promotion_run_attempt and the certificate's signer commit bind
+      # the exact promotion run; whether that run concluded
+      # successfully is proven by the completed-run record (online or
+      # catalogue), never by this in-flight signature alone.
       - name: Retain the offline promotion evidence package
         env:
           GH_TOKEN: ${{ github.token }}
@@ -375,20 +381,6 @@ jobs:
         with:
           name: production-candidate
           path: ${{ runner.temp }}/production-candidate.json
-          if-no-files-found: error
-          retention-days: 90
-          overwrite: true
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: production-evidence-${{ needs.stage.outputs.source_sha }}
-          path: |
-            ${{ runner.temp }}/retained/production-candidate.json
-            ${{ runner.temp }}/retained/promotion-attestation.jsonl
-            ${{ runner.temp }}/retained/build-attestation.jsonl
-            ${{ runner.temp }}/retained/trusted_root.jsonl
-            ${{ runner.temp }}/retained/cadence
-            ${{ runner.temp }}/retained/cadence.sha256
-            ${{ runner.temp }}/retained/manifest.json
           if-no-files-found: error
           retention-days: 90
           overwrite: true
