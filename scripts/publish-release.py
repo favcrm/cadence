@@ -168,10 +168,12 @@ def main():
     parser.add_argument("--version", required=True)
     parser.add_argument("--source-sha", required=True)
     parser.add_argument("--visibility", default="private", choices=["public", "private"])
-    parser.add_argument("--status", default="published", choices=["published", "withdrawn"])
     parser.add_argument("--production-candidate-id", default=None)
-    parser.add_argument("--published-at", default=None)
-    parser.add_argument("--withdrawn-at", default=None)
+    parser.add_argument("--published-at", default=None,
+                        help="The release's genuine publication instant (the GitHub Release's "
+                             "publishedAt read back after publish for public releases). Omit it "
+                             "when the fact is not recorded — publishedAt stays null; a mirror "
+                             "run never stamps its own clock time as a publication date.")
     parser.add_argument("--artifact", action="append", default=[],
                         metavar="NAME=PATH[:PLATFORM:CONTENT_TYPE]")
     parser.add_argument("--dry-run", action="store_true")
@@ -184,10 +186,6 @@ def main():
         fail(f"--source-sha {args.source_sha!r} is not a full lowercase 40-hex commit")
     if args.published_at is not None and not ISO.fullmatch(args.published_at):
         fail(f"--published-at {args.published_at!r} is not an ISO-8601 instant")
-    if args.withdrawn_at is not None and not ISO.fullmatch(args.withdrawn_at):
-        fail(f"--withdrawn-at {args.withdrawn_at!r} is not an ISO-8601 instant")
-    if args.status == "withdrawn" and args.withdrawn_at is None:
-        fail("a withdrawn record must carry --withdrawn-at")
     if args.production_candidate_id is not None and not (
         1 <= len(args.production_candidate_id) <= 200
     ):
@@ -297,11 +295,23 @@ def main():
             if not put_new(args.endpoint, args.bucket, ckey, entry_file, "application/json", env):
                 got = Path(td) / "existing.json"
                 download(args.endpoint, args.bucket, ckey, got, env)
-                if got.read_bytes() != entry_bytes:
-                    fail(
-                        f"conflict: catalogue entry {ckey} already exists with different metadata — "
-                        "refusing; an approved release record is never overwritten"
-                    )
+                existing = got.read_bytes()
+                if existing != entry_bytes:
+                    # An identical replay keeps the FIRST recorded
+                    # facts: recordedAt differs on every retry, so a
+                    # conflict means real divergence — unless the only
+                    # difference is this run's fresh recordedAt stamp.
+                    # Every other field (identity, visibility, status,
+                    # artifact digests) must already match exactly, and
+                    # the existing record's recordedAt must be a real
+                    # ISO instant; then the replay accepts the original
+                    # bytes untouched and never overwrites.
+                    if not _identical_replay(existing, entry):
+                        fail(
+                            f"conflict: catalogue entry {ckey} already exists with different metadata — "
+                            "refusing; an approved release record is never overwritten"
+                        )
+                    entry_bytes = existing
 
         # ---- reconcile: read back the catalogue and every object head ----
         with tempfile.TemporaryDirectory() as td:
@@ -325,11 +335,43 @@ def main():
                 "catalogue": keys["catalogue"],
                 "artifacts": [a["name"] for a in artifacts],
                 "visibility": args.visibility,
-                "status": args.status,
+                "status": "published",
             },
             indent=2,
         )
     )
+
+
+def _identical_replay(existing_bytes, candidate):
+    """True only when the stored entry differs from `candidate` solely
+    by its own earlier recordedAt — the same replay of the same
+    publication. Every other field must be identical, the stored
+    recordedAt must be a real ISO instant, and the stored record must
+    already carry status published. Anything else is a real conflict.
+    Returns the truthy original recordedAt on match, else False — the
+    caller keeps the stored bytes untouched either way (it never
+    rewrites the record)."""
+    try:
+        stored = json.loads(existing_bytes)
+    except (ValueError, UnicodeDecodeError):
+        return False
+    if not isinstance(stored, dict):
+        return False
+    original = stored.get("recordedAt")
+    candidate_stamp = candidate.get("recordedAt")
+    if (
+        not isinstance(original, str)
+        or not ISO.fullmatch(original)
+        or not isinstance(candidate_stamp, str)
+        or not ISO.fullmatch(candidate_stamp)
+    ):
+        return False
+    # Compare against a candidate stamped with the stored recordedAt:
+    # equal then means the replay's only divergence was its fresh
+    # write-time stamp.
+    stamped = dict(candidate)
+    stamped["recordedAt"] = original
+    return stored == stamped
 
 
 def _utcnow():

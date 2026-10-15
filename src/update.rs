@@ -770,21 +770,41 @@ pub fn check(host: &dyn UpdateHost) -> Result<CheckReport> {
     let target = match host.pin() {
         Some(pin) => pin.to_string(),
         None => {
-            let run = src.latest_green_main()?.ok_or_else(|| {
-                Error::rejected(format!(
-                    "no approved production candidate in {} — stage a successful main CI artifact \
-                     and approve the production job in `{}`",
-                    src.repo(),
-                    upgrade::STAGING_WORKFLOW
-                ))
-            })?;
-            if !upgrade::is_full_sha(&run.head_sha) {
-                return Err(Error::internal(format!(
-                    "run {} reports head sha `{}`, not a full commit id",
-                    run.id, run.head_sha
-                )));
+            // CAD-1455: a published release source selects the latest
+            // published subject explicitly — a catalogue fact, never a
+            // fabricated live run status.
+            if src.published() {
+                let sha = src.published_source()?.ok_or_else(|| {
+                    Error::rejected(format!(
+                        "the configured release source publishes no release in {} yet — \
+                         refusing",
+                        src.repo()
+                    ))
+                })?;
+                if !upgrade::is_full_sha(&sha) {
+                    return Err(Error::rejected(format!(
+                        "the published release names source `{sha}`, not a full commit id \
+                         — refusing the configured source"
+                    )));
+                }
+                sha
+            } else {
+                let run = src.latest_green_main()?.ok_or_else(|| {
+                    Error::rejected(format!(
+                        "no approved production candidate in {} — stage a successful main CI artifact \
+                         and approve the production job in `{}`",
+                        src.repo(),
+                        upgrade::STAGING_WORKFLOW
+                    ))
+                })?;
+                if !upgrade::is_full_sha(&run.head_sha) {
+                    return Err(Error::internal(format!(
+                        "run {} reports head sha `{}`, not a full commit id",
+                        run.id, run.head_sha
+                    )));
+                }
+                run.head_sha
             }
-            run.head_sha
         }
     };
     let up_to_date = current_sha.as_deref() == Some(target.as_str());

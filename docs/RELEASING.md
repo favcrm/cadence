@@ -94,10 +94,20 @@ Report any remaining operator rollout work explicitly.
 promotion, signs the publication-time source facts (observed main head,
 bounded ancestor list including the candidate, `SCHEMA_VERSION` at the
 candidate) and attests a closed completion receipt binding them. When the
-operator provisions the release bucket (`vars.RELEASES_R2_ENDPOINT`,
-`vars.RELEASES_R2_BUCKET`, `vars.RELEASES_AWS_PROFILE`), the same workflow
-publishes the merged package into the owned R2 catalogue with a conditional,
-immutable write — the catalogue record last.
+operator provisions the release bucket (endpoint/bucket as
+`vars.RELEASES_R2_ENDPOINT`/`vars.RELEASES_R2_BUCKET`, access keys as
+`secrets.RELEASES_R2_ACCESS_KEY_ID`/`secrets.RELEASES_R2_SECRET_ACCESS_KEY`
+— the hosted jobs export them as `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`
+environment fields; no AWS profile is created and no credential is an
+argument), the same workflow publishes the merged package into the owned R2
+catalogue with a conditional, immutable write — the catalogue record last.
+A configured job that lacks the secrets fails closed; absent endpoint/bucket
+configuration leaves the job inactive. The publisher is an automatic
+immutable writer: an identical replay (same identity, facts and artifact
+digests, differing only in its fresh write-time stamp) reuses the first
+recorded catalogue entry untouched; anything else conflicts. Withdrawal is
+not implemented by the publisher — a withdrawn record is an operator-owned
+lifecycle action through the data plane's own reviewed path.
 
 `cadence update|upgrade --release-source https://<host>` then consumes the
 published release without any GitHub API call: the catalogue selects the
@@ -105,12 +115,15 @@ subject (discovery only, never authority); the binary, receipt,
 build/promotion/completion Sigstore bundles and the signed source-facts are
 verified offline against the embedded trusted-root snapshot, and the
 snapshot — never a live main lookup — answers on-main, ancestry and schema
-checks. The existing operator identity, lease, backup, schema, no-backward,
-atomic install, drain, health and rollback rules are unchanged. An explicit
-source failure refuses; there is no silent fallback to the GitHub API. Omit
-`--release-source` to keep the default GitHub route until the endpoint is
-qualified. A pinned `--to`/`--sha` resolves the published release named by
-that exact source SHA; a sha the catalogue does not publish refuses.
+checks, and ancestry is proven only relative to the snapshot's own
+candidate (membership in its signed ancestor list), never between two
+sibling commits. The existing operator identity, lease, backup, schema,
+no-backward, atomic install, drain, health and rollback rules are
+unchanged. An explicit source failure refuses; there is no silent
+fallback to the GitHub API. Omit `--release-source` to keep the default
+GitHub route until the endpoint is qualified. A pinned `--to`/`--sha`
+resolves the published release named by that exact source SHA; a sha the
+catalogue does not publish refuses.
 
 The publication-time snapshot is an authenticated record of eligibility
 *observed at promotion*; it cannot know a later main rewrite. Offline
@@ -229,13 +242,26 @@ https://<host>` (CAD-1455) fetches the same tag's exact published archive,
 checksum file and retained `ci.yml` build-provenance bundle through the
 owned `public-client` catalogue profile and verifies the signature offline
 against the embedded trusted root — the same repo/workflow/tag/digest/runner
-policy as the live `gh` lookup. It does not use the operator-host promotion
-authority, never substitutes a daemon for the client archive, and preserves
-the tag/manifest/platform/version checks and the forward-only rule. A
-configured source failure refuses rather than falling back to the GitHub
-release API. Publication of the public-client record runs only after the
-existing `release-publish` job publishes the GitHub Release, and only when
-the operator provisioned the release bucket (`vars.RELEASES_R2_*`).
+policy as the live `gh` lookup. Because a build bundle attests the archive
+BEFORE `Publish the GitHub Release` ran, the publisher also retains a small
+closed post-publication receipt (`publication-receipt.json` +
+`publication-attestation.jsonl`, platform `publication`): minted and
+attested by `ci.yml`@tag only after the release is confirmed public, and
+binding the repository, tag, source commit and every published archive's
+sha256. The client verifies that receipt offline with the embedded root and
+binds it to the verified archive and manifest before the candidate binary
+runs; a missing, forged or unproven receipt refuses even when the build
+bundle and the catalogue's `status:published` are fine. It does not use the
+operator-host promotion authority, never substitutes a daemon for the client
+archive, and preserves the tag/manifest/platform/version checks and the
+forward-only rule. A configured source failure refuses rather than falling
+back to the GitHub release API. Publication of the public-client record runs
+only after the existing `release-publish` job publishes the GitHub Release,
+and only when the operator provisioned the release bucket
+(`vars.RELEASES_R2_ENDPOINT`/`vars.RELEASES_R2_BUCKET`, credentials
+`secrets.RELEASES_R2_ACCESS_KEY_ID`/`secrets.RELEASES_R2_SECRET_ACCESS_KEY`);
+its `publishedAt` is the release's genuine GitHub `publishedAt`, never a
+mirror run's clock.
 
 The first publication exposed an x86 artifact/verifier gap fixed under
 CAD-1400: `release-build` zips the toolchain pair into the x86 artifact but

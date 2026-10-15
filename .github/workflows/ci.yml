@@ -1280,10 +1280,80 @@ jobs:
             mv "$RUNNER_TEMP"/sha256-*.jsonl "bundles/build-attestation-$target.jsonl"
           done
           ls -l bundles
+      # CAD-1455: the post-publication receipt. A build-provenance
+      # bundle attests the archive BEFORE `Publish the GitHub Release`
+      # ran — even a failed or unpublished release carries that proof.
+      # This receipt is minted only after that step has made the real
+      # release public: it re-proves the release is non-draft with the
+      # exact tag, binds the repository, the genuine publishedAt (read
+      # back, never the run's clock), this run's source commit and the
+      # sha256 of every published per-target archive, and is attested
+      # by this job's ci.yml@tag identity. The owned release source's
+      # public-client path verifies it offline; without it the
+      # catalogue's build bundle alone cannot prove publication.
+      - name: Mint and attest the post-publication receipt
+        working-directory: dist
+        env:
+          TAG: ${{ github.ref_name }}
+          SOURCE_SHA: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          release=$(gh release view "$TAG" --repo "$GH_REPO" \
+            --json isDraft,tagName,publishedAt,assets)
+          echo "$release" | jq -e --arg tag "$TAG" '
+            .isDraft == false and .tagName == $tag' >/dev/null
+          published_at=$(echo "$release" | jq -r '.publishedAt // empty')
+          # The receipt binds the sha256 of every published
+          # per-target archive; the published asset list must name the
+          # exact same asset names, so a missing or extra published
+          # asset refuses here.
+          echo "$release" | jq -r '.assets[].name' | sort > /tmp/published-assets
+          archives=$(for target in x86_64-linux aarch64-linux aarch64-macos; do
+            asset="cadence-$TAG-$target.tar.gz"
+            jq -n --arg name "$asset" --arg digest "sha256:$(sha256sum "$asset" | cut -d' ' -f1)" \
+              '{key: $name, value: $digest}'
+          done | jq -s 'from_entries')
+          for asset in $(echo "$archives" | jq -r 'keys[]'); do
+            grep -qx "$asset" /tmp/published-assets
+            grep -qx "$asset.sha256" /tmp/published-assets
+          done
+          jq -n \
+            --argjson schema 1 \
+            --arg repo "$GH_REPO" \
+            --arg tag "$TAG" \
+            --arg source "$SOURCE_SHA" \
+            --argjson archives "$archives" \
+            --arg published_at "$published_at" '
+            {schema: $schema, repo: $repo, tag: $tag, source_sha: $source,
+             archives: $archives,
+             published_at: (if $published_at == "" then null else $published_at end)}' \
+            > publication-receipt.json
+          cat publication-receipt.json >> "$GITHUB_STEP_SUMMARY"
+      - name: Attest the post-publication receipt
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/publication-receipt.json
+      - name: Retain the post-publication bundle
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          (cd "$RUNNER_TEMP" && gh attestation download "$OLDPWD/publication-receipt.json" \
+            --repo "$GH_REPO" --digest-alg sha256)
+          mv "$RUNNER_TEMP"/sha256-*.jsonl bundles/publication-attestation.jsonl
+          ls -l publication-receipt.json bundles/publication-attestation.jsonl
+      # Upload the receipt and its bundle inside the same
+      # release-bundles artifact (byte-exact for the R2 publisher).
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-bundles-${{ github.ref_name }}
-          path: dist/bundles/
+          path: |
+            dist/bundles/
+            dist/publication-receipt.json
           if-no-files-found: error
           retention-days: 90
           overwrite: true
@@ -1298,8 +1368,7 @@ jobs:
     needs: [release-publish]
     if: >
       vars.RELEASES_R2_ENDPOINT != '' &&
-      vars.RELEASES_R2_BUCKET != '' &&
-      vars.RELEASES_AWS_PROFILE != ''
+      vars.RELEASES_R2_BUCKET != ''
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -1326,9 +1395,16 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
           SOURCE_SHA: ${{ github.sha }}
+          # Operator-provisioned R2 access keys, supplied as repository
+          # secrets — no local AWS profile is created (a hosted runner
+          # has none) and no credential value is ever an argument or
+          # printed. publish-release.py fails closed when the
+          # configured job lacks them.
+          AWS_ACCESS_KEY_ID: ${{ secrets.RELEASES_R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.RELEASES_R2_SECRET_ACCESS_KEY }}
         run: |
           set -euo pipefail
-          export AWS_PROFILE="${{ vars.RELEASES_AWS_PROFILE }}"
+          test -n "$AWS_ACCESS_KEY_ID" && test -n "$AWS_SECRET_ACCESS_KEY"
           args=()
           for target in x86_64-linux aarch64-linux aarch64-macos; do
             asset="cadence-$TAG-$target.tar.gz"
@@ -1336,13 +1412,23 @@ jobs:
             args+=(--artifact "$asset.sha256=dist/$asset.sha256:$target:text/plain")
             args+=(--artifact "build-attestation-$target.jsonl=dist/bundles/build-attestation-$target.jsonl:$target:application/json")
           done
+          args+=(--artifact "publication-receipt.json=dist/bundles/publication-receipt.json:publication:application/json")
+          args+=(--artifact "publication-attestation.jsonl=dist/bundles/publication-attestation.jsonl:publication:application/json")
+          # publishedAt is the release's genuine stamp, not this
+          # mirror run's clock; an idempotent retry passes the same
+          # first-recorded value.
+          published_at=$(GH_TOKEN="${{ github.token }}" gh release view "$TAG" \
+            --repo favcrm/cadence \
+            --json publishedAt --jq '.publishedAt // empty' 2>/dev/null || true)
+          extra=()
+          test -n "$published_at" && extra=(--published-at "$published_at")
           python3 src/scripts/publish-release.py \
             --endpoint "${{ vars.RELEASES_R2_ENDPOINT }}" \
             --bucket "${{ vars.RELEASES_R2_BUCKET }}" \
             --product cadence --profile public-client \
             --version "$TAG" --source-sha "$SOURCE_SHA" \
             --visibility "${{ vars.RELEASES_R2_PUBLIC_VISIBILITY || 'private' }}" \
-            --published-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            "${extra[@]}" \
             "${args[@]}"
 
   # CAD-311: prove the non-x86_64 builds on every PR and queue entry, not

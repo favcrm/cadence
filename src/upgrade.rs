@@ -125,6 +125,13 @@ pub const SOURCE_FACTS_FILE: &str = "source-facts.json";
 /// The trusted main workflow that attests the completed-promotion
 /// receipt after the upstream `staging.yml` run has already succeeded.
 pub const COMPLETION_WORKFLOW: &str = "promotion-completion.yml";
+/// The public-client publication receipt a `ci.yml` tag run emits and
+/// attests only AFTER `Publish the GitHub Release` has made the real
+/// release public — post-publication authority a build-time bundle
+/// cannot give (`cli/client_update.rs` verifies it through
+/// [`OfflineGh::verify_bundle`]).
+pub const PUBLICATION_RECEIPT: &str = "publication-receipt.json";
+pub const PUBLICATION_BUNDLE: &str = "publication-attestation.jsonl";
 
 /// The restart command printed when `--restart` was not given.
 pub fn restart_command(as_identity: Option<&str>) -> String {
@@ -272,6 +279,17 @@ pub trait ReleaseSource {
     /// [`Self::repo`], built from `sha` on `main`. Returns a short
     /// description of what was verified.
     fn verify_attestation(&self, binary: &Path, sha: &str) -> Result<String>;
+    /// CAD-1455: the published release's recorded source SHA, selected
+    /// explicitly — a *published-subject* fact, not a live run lookup.
+    /// The owned HTTPS source (`crate::releases::HttpGh`) answers from
+    /// the catalogue's latest published entry; a live source (`Gh`,
+    /// `OfflineGh`) refuses rather than fabricating a run status.
+    fn published_source(&self) -> Result<Option<String>> {
+        Err(Error::rejected(
+            "this release source answers no published-release selection; \
+             the online GitHub path selects the latest approved promotion run",
+        ))
+    }
     /// CAD-1455: prove a retained evidence package offline. `dir` holds
     /// [`BINARY`], [`SHA_FILE`], [`MANIFEST`], [`RECEIPT_FILE`],
     /// [`PROMOTION_BUNDLE`], [`BUILD_BUNDLE`], [`COMPLETION_FILE`],
@@ -1690,36 +1708,57 @@ pub fn run(src: &dyn ReleaseSource, layout: &Layout, req: &Request) -> Result<Va
         Target::Sha(sha) => (sha.clone(), true, src.check_auth()),
         Target::LatestMain => {
             src.check_auth()?;
-            let run = src.latest_green_main()?.ok_or_else(|| {
-                Error::rejected(format!(
-                    "no approved production candidate in {} — stage a successful main CI artifact \
-                     and approve the production job in `{STAGING_WORKFLOW}`",
-                    src.repo()
-                ))
-            })?;
-            if !is_full_sha(&run.head_sha) {
-                return Err(Error::internal(format!(
-                    "run {} reports head sha `{}`, not a full commit id",
-                    run.id, run.head_sha
-                )));
-            }
-            verified.insert(
-                "resolved".into(),
-                json!(if src.published() {
-                    format!(
+            // CAD-1455: a published release source selects the latest
+            // published subject explicitly — a catalogue fact, never a
+            // fabricated live run.
+            if src.published() {
+                let sha = src.published_source()?.ok_or_else(|| {
+                    Error::rejected(format!(
+                        "the configured release source publishes no {MAIN} release in {} \
+                         yet — refusing",
+                        src.repo()
+                    ))
+                })?;
+                if !is_full_sha(&sha) {
+                    return Err(Error::rejected(format!(
+                        "the published release names source `{sha}`, not a full commit id \
+                         — refusing the configured source"
+                    )));
+                }
+                verified.insert(
+                    "resolved".into(),
+                    json!(format!(
                         "--latest-main → published release {MAIN} source {} ({})",
                         src.repo(),
-                        run.head_sha
-                    )
-                } else {
-                    format!(
+                        sha
+                    )),
+                );
+                refuse_backwards(src, from_sha.as_deref(), &sha)?;
+                (sha, false, Ok(()))
+            } else {
+                let run = src.latest_green_main()?.ok_or_else(|| {
+                    Error::rejected(format!(
+                        "no approved production candidate in {} — stage a successful main CI artifact \
+                         and approve the production job in `{STAGING_WORKFLOW}`",
+                        src.repo()
+                    ))
+                })?;
+                if !is_full_sha(&run.head_sha) {
+                    return Err(Error::internal(format!(
+                        "run {} reports head sha `{}`, not a full commit id",
+                        run.id, run.head_sha
+                    )));
+                }
+                verified.insert(
+                    "resolved".into(),
+                    json!(format!(
                         "--latest-main → approved production candidate from {MAIN} CI run {} ({})",
                         run.id, run.head_sha
-                    )
-                }),
-            );
-            refuse_backwards(src, from_sha.as_deref(), &run.head_sha)?;
-            (run.head_sha, false, Ok(()))
+                    )),
+                );
+                refuse_backwards(src, from_sha.as_deref(), &run.head_sha)?;
+                (run.head_sha, false, Ok(()))
+            }
         }
     };
 

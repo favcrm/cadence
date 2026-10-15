@@ -111,6 +111,12 @@ impl cadence_agent::upgrade::ReleaseSource for UpdateSource {
             Self::Http(s) => s.latest_green_main(),
         }
     }
+    fn published_source(&self) -> Result<Option<String>> {
+        match self {
+            Self::Gh(s) => s.published_source(),
+            Self::Http(s) => s.published_source(),
+        }
+    }
     fn on_main(&self, sha: &str) -> Result<cadence_agent::upgrade::OnMain> {
         match self {
             Self::Gh(s) => s.on_main(sha),

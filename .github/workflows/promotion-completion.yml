@@ -270,15 +270,12 @@ jobs:
     needs: [complete]
     if: >
       vars.RELEASES_R2_ENDPOINT != '' &&
-      vars.RELEASES_R2_BUCKET != '' &&
-      vars.RELEASES_AWS_PROFILE != ''
+      vars.RELEASES_R2_BUCKET != ''
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: read
       actions: read
-    env:
-      RELEASES_AWS_PROFILE: ${{ vars.RELEASES_AWS_PROFILE }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -317,9 +314,19 @@ jobs:
         env:
           SOURCE_SHA: ${{ needs.complete.outputs.source_sha }}
           UPSTREAM_ID: ${{ github.event.workflow_run.id }}
+          # Operator-provisioned R2 access keys via repository secrets —
+          # a hosted runner has no local AWS profile, so none is
+          # created; credentials are never arguments or printed, and a
+          # configured job without them fails closed in the publisher.
+          AWS_ACCESS_KEY_ID: ${{ secrets.RELEASES_R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.RELEASES_R2_SECRET_ACCESS_KEY }}
         run: |
           set -euo pipefail
-          export AWS_PROFILE="$RELEASES_AWS_PROFILE"
+          test -n "$AWS_ACCESS_KEY_ID" && test -n "$AWS_SECRET_ACCESS_KEY"
+          # No --published-at: a native promotion has no GitHub Release
+          # publication instant to record, so publishedAt stays null —
+          # the catalogue's recordedAt (truthful write time) is its
+          # only date.
           python3 scripts/publish-release.py \
             --endpoint "${{ vars.RELEASES_R2_ENDPOINT }}" \
             --bucket "${{ vars.RELEASES_R2_BUCKET }}" \
@@ -327,5 +334,4 @@ jobs:
             --version "$SOURCE_SHA" --source-sha "$SOURCE_SHA" \
             --visibility "${{ vars.RELEASES_R2_VISIBILITY || 'private' }}" \
             --production-candidate-id "$UPSTREAM_ID" \
-            --published-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --artifact "cadence-release.tar.gz=$RUNNER_TEMP/cadence-release-final.tar.gz:x86_64-linux:application/octet-stream"

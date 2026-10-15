@@ -55,14 +55,17 @@ pub const PROFILE_PUBLIC_CLIENT: &str = "public-client";
 /// refused unread.
 const METADATA_MAX_BYTES: u64 = 256 * 1024;
 /// The release package tarball holds the retained evidence plus the
-/// bounded binary (the per-member bounds below are enforced again after
-/// extraction, and `capture_bounded` enforces them once more inside
-/// the verifier).
+/// bounded binary (per-member bounds cap every member's accepted
+/// bytes before it is written, and `capture_bounded` enforces them
+/// once more inside the verifier).
 const ARTIFACT_MAX_BYTES: u64 = 768 * 1024 * 1024;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(60);
 /// Members the operator-host release package may hold — exactly the
 /// retained evidence files the verifier captures.
 const PACKAGE_MAX_MEMBERS: usize = 16;
+/// The package's `tar -tvz` listing is a few dozen short lines; a
+/// listing beyond this refuses unread rather than trusting a flood.
+const LISTING_MAX: usize = 16 * 1024;
 
 /// The operator-host release package: one gzipped tar of the flat
 /// retained package (binary, checksum, manifest, receipt, the three
@@ -329,6 +332,65 @@ impl HttpGh {
         self.profile
     }
 
+    /// TEST SEAM ONLY (CAD-482): a loopback constructor for the
+    /// independent refusal-acceptance fixtures. `base` must be
+    /// `http://127.0.0.1:<port>` — an explicit numeric loopback port,
+    /// nothing else; every other origin refuses, so this can never
+    /// point the client at a remote host or a plain-`http` name. The
+    /// production constructors stay `https://`-only, and the
+    /// `test-seam` feature itself cannot compile into a release build
+    /// (`compile_error!` in `crate::test_seam`). The constructed source
+    /// is otherwise identical: same strict schema, same bounded reads,
+    /// same offline verification.
+    #[cfg(feature = "test-seam")]
+    pub fn for_profile_loopback(base: &str, profile: &'static str) -> Result<Self> {
+        if !matches!(profile, PROFILE_OPERATOR_HOST | PROFILE_PUBLIC_CLIENT) {
+            return Err(Error::rejected(format!(
+                "release profile `{profile}` is not a supported release profile"
+            )));
+        }
+        let uri: ureq::http::Uri = base.parse().map_err(|_| {
+            Error::rejected(format!(
+                "release source `{base}` is not a valid URL — the test seam accepts \
+                 only http://127.0.0.1:<port>"
+            ))
+        })?;
+        let scheme = uri.scheme_str().unwrap_or_default();
+        let authority = uri.authority().map(|a| a.as_str()).unwrap_or_default();
+        let path = uri.path();
+        let host = authority.split(':').next().unwrap_or_default();
+        let port = authority
+            .split_once(':')
+            .map(|(_, p)| p)
+            .unwrap_or_default();
+        if scheme != "http"
+            || host != "127.0.0.1"
+            || authority.contains('@')
+            || port.is_empty()
+            || !port.bytes().all(|b| b.is_ascii_digit())
+            || !matches!(path, "" | "/")
+            || uri.query().is_some()
+            || base.contains('#')
+        {
+            return Err(Error::rejected(format!(
+                "release source `{base}` is not a loopback origin — the test seam \
+                 accepts only http://127.0.0.1:<port> (no path, query or credentials)"
+            )));
+        }
+        let config = ureq::Agent::config_builder()
+            .timeout_global(Some(HTTP_TIMEOUT))
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .build();
+        Ok(Self {
+            base: format!("{scheme}://{authority}"),
+            profile,
+            http: ureq::Agent::new_with_config(config),
+            offline: OfflineGh::new(crate::upgrade::DEFAULT_REPO),
+            proof: RefCell::new(None),
+        })
+    }
+
     /// `GET` one metadata document: 2xx + `{ok:true,data}` or a
     /// refusal. A 4xx `{ok:false}` names the endpoint's own refusal;
     /// any other status, redirect or malformed body refuses the
@@ -560,9 +622,11 @@ impl HttpGh {
     }
 
     /// Fetch the published operator-host package into an owned staging
-    /// dir and prove it offline. The tarball holds the flat retained
-    /// members; each extracted member must be a known bounded regular
-    /// file before `verify_retained` recaptures the whole package.
+    /// dir and prove it offline. The tarball is never extracted to the
+    /// filesystem: its members are read through bounded `tar -xOzf`
+    /// stdout and written create-new into a private flat dir, and only
+    /// that accepted set reaches `verify_retained`. See the member
+    /// admission below for the exact rules.
     fn fetch_and_prove(&self, entry: &ReleaseEntry, expect_sha: Option<&str>) -> Result<()> {
         if let Some(expect) = expect_sha {
             if entry.source_sha != expect {
@@ -579,28 +643,53 @@ impl HttpGh {
             .tempdir()?;
         let archive = dir.path().join(PACKAGE_ARCHIVE);
         self.download_artifact(entry, package, &archive)?;
-        // List first: every member must be one of the known flat
-        // package names before anything is extracted.
-        let listing = run_tar(&["-tzf", &archive.to_string_lossy()])?;
-        let mut members = Vec::new();
+        // The archive is not authenticated yet, so it is never
+        // extracted to the filesystem: a verbose listing (bounded in
+        // time and retained bytes) must first show only the known flat
+        // regular-file member set — an unknown, duplicate or nonregular
+        // member (link, device, dir other than the lone container
+        // header) refuses before any byte is written. Each accepted
+        // member is then read through `tar -xOzf` into a bounded stdout
+        // buffer (truncation refuses) and only that accepted buffer is
+        // written, create-new, into the private flat directory.
+        let archive_arg = archive.to_string_lossy().into_owned();
+        let listing = run_tar_bounded(&["-tvzf", &archive_arg], LISTING_MAX)?;
+        let listing = String::from_utf8_lossy(&listing);
+        let mut members: Vec<(String, String)> = Vec::new();
         for line in listing.lines() {
-            let name = line.trim().trim_start_matches("./");
-            if name.is_empty() {
-                continue;
-            }
+            let stored = line.split_whitespace().last().unwrap_or_default();
+            let name = stored.trim_start_matches("./");
+            let kind = line.as_bytes().first().copied();
             // The producer's untrusted transport copy of the trusted
             // root rides along; it is never verified from (the
             // verifier's own embedded snapshot is the anchor) and is
             // simply not extracted into the package the verifier sees.
             if name == "trusted_root.jsonl" {
+                if kind != Some(b'-') {
+                    return Err(Error::rejected(
+                        "release package member trusted_root.jsonl is not a regular file \
+                         — refusing",
+                    ));
+                }
                 continue;
             }
-            if member_bound(name).is_none() {
+            if (name.is_empty() || name == ".") && kind == Some(b'd') {
+                // A single ordinary `.`/`./` container-directory
+                // header is the only non-file entry ignored; a link
+                // never is.
+                continue;
+            }
+            if kind != Some(b'-') || member_bound(name).is_none() {
                 return Err(Error::rejected(format!(
-                    "release package holds an unexpected member `{name}` — refusing"
+                    "release package holds an unexpected member `{stored}` — refusing"
                 )));
             }
-            members.push(name.to_string());
+            if members.iter().any(|(_, member)| member == name) {
+                return Err(Error::rejected(format!(
+                    "release package lists member `{name}` twice — refusing"
+                )));
+            }
+            members.push((stored.to_string(), name.to_string()));
         }
         if members.is_empty() || members.len() > PACKAGE_MAX_MEMBERS {
             return Err(Error::rejected(
@@ -609,22 +698,24 @@ impl HttpGh {
         }
         let flat = dir.path().join("package");
         fs::create_dir(&flat)?;
-        let archive_arg = archive.to_string_lossy().into_owned();
-        let flat_arg = flat.to_string_lossy().into_owned();
-        let mut args = vec!["-xzf", &archive_arg, "-C", &flat_arg];
-        args.extend(members.iter().map(String::as_str));
-        run_tar(&args)?;
-        for name in &members {
-            let path = flat.join(name);
-            let meta = fs::symlink_metadata(path)
-                .map_err(|e| Error::rejected(format!("release package member {name}: {e}")))?;
+        for (stored, name) in &members {
             let bound = member_bound(name).expect("listed members are bounded");
-            if !meta.file_type().is_file() || meta.len() == 0 || meta.len() > bound {
+            let bytes = run_tar_bounded(&["-xOzf", &archive_arg, stored], bound as usize)?;
+            if bytes.is_empty() {
                 return Err(Error::rejected(format!(
-                    "release package member {name} is not a regular file inside its \
-                     bound — refusing"
+                    "release package member {name} is empty — refusing"
                 )));
             }
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(flat.join(name))
+                .and_then(|mut file| {
+                    use std::io::Write;
+                    file.write_all(&bytes)?;
+                    file.sync_all()
+                })
+                .map_err(|e| Error::rejected(format!("release package member {name}: {e}")))?;
         }
         let proof = self.offline.verify_retained(&flat)?;
         if let Some(expect) = expect_sha {
@@ -709,11 +800,15 @@ fn member_bound(member: &str) -> Option<u64> {
     })
 }
 
-/// Run `tar` bounded; non-zero exit is a refusal.
-fn run_tar(args: &[&str]) -> Result<String> {
-    let out = crate::proc::run_bounded(
+/// Run `tar` bounded in time AND retained output; a non-zero exit or
+/// an output that exceeds `limit` is a refusal — the archive is not
+/// authenticated yet, so neither a runaway listing nor an oversized
+/// member may write or buffer beyond its bound.
+fn run_tar_bounded(args: &[&str], limit: usize) -> Result<Vec<u8>> {
+    let (out, bounds) = crate::proc::run_bounded_limited(
         std::process::Command::new("tar").args(args),
         Duration::from_secs(120),
+        limit,
     )
     .map_err(|e| Error::rejected(format!("tar on the release package failed: {e}")))?;
     if !out.status.success() {
@@ -722,7 +817,13 @@ fn run_tar(args: &[&str]) -> Result<String> {
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    if bounds.stdout_exceeded || bounds.stderr_exceeded {
+        return Err(Error::rejected(format!(
+            "tar on the release package produced output beyond its {limit}-byte bound \
+             — refusing"
+        )));
+    }
+    Ok(out.stdout)
 }
 
 /// `encodeURIComponent` for one path segment, matching how the worker
@@ -778,11 +879,20 @@ impl ReleaseSource for HttpGh {
         Ok(())
     }
 
-    /// Resolve the published release, fetch its package and prove it
-    /// offline. The returned run is a *published-subject* record — its
-    /// `head_sha` is the entry's recorded source SHA — never a live
-    /// run lookup.
+    /// A published source fabricates no live run record: the
+    /// catalogue's published-subject selection is answered by
+    /// [`ReleaseSource::published_source`], and the callers that want
+    /// a live run route to it through `published()`.
     fn latest_green_main(&self) -> Result<Option<Run>> {
+        Err(Error::rejected(OFFLINE_NO_LIVE))
+    }
+
+    /// The catalogue's latest published operator-host entry selects
+    /// the release's recorded source SHA — the explicit
+    /// published-subject selection this source makes. The package is
+    /// fetched and proven here so the snapshot's answers below bind
+    /// the same verified subject.
+    fn published_source(&self) -> Result<Option<String>> {
         if self.profile != PROFILE_OPERATOR_HOST {
             return Err(Error::rejected(
                 "the public-client profile is consumed by the client update path, \
@@ -800,15 +910,7 @@ impl ReleaseSource for HttpGh {
             )));
         }
         self.fetch_and_prove(&entry, Some(&entry.source_sha.clone()))?;
-        Ok(Some(Run {
-            id: 0,
-            attempt: 0,
-            head_sha: entry.source_sha.clone(),
-            head_branch: crate::upgrade::MAIN.into(),
-            event: "published".into(),
-            status: "completed".into(),
-            conclusion: "success".into(),
-        }))
+        Ok(Some(entry.source_sha.clone()))
     }
 
     /// The signed publication-time snapshot: the producer proved the
@@ -829,20 +931,30 @@ impl ReleaseSource for HttpGh {
         }
     }
 
-    /// `compare(base, head)`: `ahead` when `head` descends from `base`,
-    /// `behind` when `base` descends from `head` — judged against the
-    /// producer-signed ancestor list, never a live lookup. An ancestry
-    /// the snapshot cannot prove answers `None`, and the caller fails
-    /// closed exactly as it does when GitHub cannot answer.
+    /// `compare(base, head)`: the signed facts prove ancestry only
+    /// relative to their own candidate — `ancestors` is the
+    /// candidate's rev-list, so membership answers "ancestor of the
+    /// candidate", never an ordering between two sibling ancestors.
+    /// `ahead` only when `head` is the candidate and `base` one of its
+    /// ancestors, `behind` for the converse, `identical` when both are
+    /// the candidate; every other pair answers `None`, and the caller
+    /// fails closed exactly as it does when GitHub cannot answer.
     fn compare(&self, base: &str, head: &str) -> Result<Option<String>> {
-        let (_source, facts) = self.facts()?;
-        let ancestors = &facts.ancestors;
-        let base_at = ancestors.iter().position(|a| a == base);
-        let head_at = ancestors.iter().position(|a| a == head);
-        Ok(match (base_at, head_at) {
-            (Some(b), Some(h)) if b == h => Some("identical".to_string()),
-            (Some(b), Some(h)) if b < h => Some("ahead".to_string()),
-            (Some(_), Some(_)) => Some("behind".to_string()),
+        let (source, facts) = self.facts()?;
+        let base_is_candidate = base == source;
+        let head_is_candidate = head == source;
+        let base_ancestor = facts.ancestors.iter().any(|a| a == base);
+        let head_ancestor = facts.ancestors.iter().any(|a| a == head);
+        Ok(match (base_is_candidate, head_is_candidate) {
+            (true, true) => Some("identical".to_string()),
+            // head is the candidate: it descends from base exactly
+            // when base is one of its recorded ancestors.
+            (false, true) => base_ancestor.then(|| "ahead".to_string()),
+            // base is the candidate: head descends from it only if
+            // head is a recorded ancestor (impossible — the candidate
+            // is its own list's tip) or the same commit, so any other
+            // recorded ancestor of the candidate is behind it.
+            (true, false) => head_ancestor.then(|| "behind".to_string()),
             _ => None,
         })
     }
