@@ -149,6 +149,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             token_stdin,
             no_open,
             auth_dir,
+            web,
         } => {
             // `--token-stdin` is the legacy AgenticOS token path, not org login.
             let dir = cadence_agent::remote_auth::auth_dir(auth_dir.as_deref())?;
@@ -164,7 +165,15 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             let issuer = issuer
                 .as_deref()
                 .unwrap_or(cadence_agent::remote_enrollment::HOSTED_LOGIN_ISSUER);
-            let grant = if let Some(org) = org.as_deref() {
+            let grant = if *web {
+                cadence_agent::remote_enrollment::login_portal_scoped(
+                    issuer,
+                    hint.as_deref().or(slug.as_deref()),
+                    &dir,
+                    |url, code| show_login_code(url, code, *no_open),
+                    true,
+                )?
+            } else if let Some(org) = org.as_deref() {
                 let slug = slug.as_deref().ok_or_else(|| {
                     Error::rejected("legacy login with --org needs --slug <org-slug>")
                 })?;
@@ -220,6 +229,22 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             }
         }
         _ => {}
+    }
+    // CAD-1429: every `web` action is a hosted operation against one pinned
+    // remote workspace. Resolve it once here; a local or unselected org
+    // refuses before any request is built. It runs before the client-only
+    // router too, so a client-only install reaches the web module rather than
+    // the remote allowlist (which refuses web).
+    if let Commands::Web { action } = &cli.command {
+        let target = match org::resolve(cli.org.as_deref(), None, None)? {
+            org::Resolved::Remote(target) => target,
+            org::Resolved::Local(_) => {
+                return Err(Error::rejected(
+                    "cadence web needs a remote workspace: pass --org <org> for a logged-in workspace; nothing was sent",
+                ))
+            }
+        };
+        return web::run(action, &target, cli.wake_timeout);
     }
     // CAD-1425: a client-only installation runs local commands never; it
     // routes only through an actual remote org, before any local action.
@@ -327,8 +352,11 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
 
 pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
     match command {
-        Commands::Remote { .. } | Commands::Login { .. } | Commands::Auth { .. } => {
-            unreachable!("auth dispatched before state-dir")
+        Commands::Remote { .. }
+        | Commands::Login { .. }
+        | Commands::Auth { .. }
+        | Commands::Web { .. } => {
+            unreachable!("auth or web dispatched before state-dir")
         }
         Commands::Doctor {
             host,

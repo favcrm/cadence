@@ -142,7 +142,14 @@ const SESSION_VERSION: &str = "hosted-cadence-cli-session.v1";
 /// Every capability this client knows. A stored login holds a subset that
 /// includes `cli.read` and `cli.write` (the default login); a renewal keeps
 /// exactly the stored set, so a CLI-only login stays CLI-only.
-const CAPABILITIES: &[&str] = &["cli.read", "cli.write", "wiki.read", "wiki.write"];
+const CAPABILITIES: &[&str] = &[
+    "cli.read",
+    "cli.write",
+    "wiki.read",
+    "wiki.write",
+    "web.read",
+    "web.prepare",
+];
 const RENEW_BEFORE: u64 = 60;
 const SKEW: u64 = 5;
 const RENEWAL_WAIT: Duration = Duration::from_secs(20);
@@ -197,7 +204,15 @@ fn now() -> Result<u64> {
 /// credential recorded for another org is never sent to this host (contract
 /// I1). Expired means "run `cadence login` again", not retry.
 fn private_directory(dir: &Path) -> Result<()> {
-    let meta = fs::symlink_metadata(dir)?;
+    let meta = match fs::symlink_metadata(dir) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(reject(
+                "no remote credential directory — run `cadence login` first; nothing was sent",
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    };
     if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
         return Err(reject(
             "remote credential directory must be owned by you, mode 0700, and not a symlink",
@@ -1527,6 +1542,125 @@ fn call_verb_in(
             }
         }
     }
+}
+
+/// CAD-1429: a Publish Web management request. Only a verified, live `hct_`
+/// credential for `target` is used; the bearer is never returned or printed.
+/// The required scope is checked against the credential's own stored grant
+/// (`web.read` or `web.prepare`); the server enforces it again per route.
+/// Redirects are refused and the body is bounded, as for every relay call.
+/// The answer is the server's `{ok,data|error}` envelope, unwrapped to `data`
+/// on success and to the stable server `code` on refusal.
+pub struct WebResponse {
+    pub status: u16,
+    pub body: Option<Value>,
+}
+
+/// CAD-1429: the verified identity a web record is bound to. It comes from the
+/// same live credential check as every web request (owner file, issuer pin,
+/// audience and org match, renewal). It never carries the token.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WebIdentity {
+    pub org: String,
+    pub organization_id: String,
+    pub audience: String,
+    pub issuer: String,
+}
+
+/// Verify the stored credential for `target` and return its identity. Fails
+/// closed when the credential has no issuer, expired, or was minted for
+/// another workspace or audience.
+pub fn web_identity(target: &RemoteTarget) -> Result<WebIdentity> {
+    let dir = auth_dir(None).map_err(|_| {
+        reject("remote credential directory is unavailable — set HOME or XDG_CONFIG_HOME")
+    })?;
+    let deadline = Instant::now() + Duration::from_secs(WAKE_TIMEOUT_DEFAULT);
+    let cred = renewed_credential(&dir, target, deadline)?;
+    let issuer = cred.issuer.clone().ok_or_else(|| {
+        reject("the stored login has no pinned issuer — run `cadence login --web` again")
+    })?;
+    Ok(WebIdentity {
+        org: target.org.clone(),
+        organization_id: cred.organization_id.clone(),
+        audience: cred.audience.clone(),
+        issuer,
+    })
+}
+
+/// One bounded web request. `headers` carry only the web contract's own
+/// headers (`X-Workspace-Id`, `X-Content-Sha256`, `Content-Type`); a bearer
+/// or envelope is never taken from the caller.
+pub fn web_request(
+    target: &RemoteTarget,
+    scope: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, String)],
+    body: Option<&[u8]>,
+    wake_timeout: u64,
+) -> Result<WebResponse> {
+    if !matches!(scope, "web.read" | "web.prepare") {
+        return Err(reject("web request scope is not allowed"));
+    }
+    let dir = auth_dir(None).map_err(|_| {
+        reject("remote credential directory is unavailable — set HOME or XDG_CONFIG_HOME")
+    })?;
+    let deadline = Instant::now() + Duration::from_secs(wake_timeout);
+    let cred = renewed_credential(&dir, target, deadline)?;
+    if !cred.capabilities.iter().any(|c| c == scope) {
+        return Err(reject(format!(
+            "this login for '{}' lacks {scope} — run `cadence login --web` for that workspace",
+            target.org
+        )));
+    }
+    // `/v1/web-sites` is a platform route on the public issuer. Board hosts are
+    // answered by the board catch-all before any `/v1` route, so the board
+    // audience is never sent a web request. The issuer is the one the saved,
+    // renewed credential was minted by; it is never taken from an argument.
+    let issuer = cred.issuer.clone().ok_or_else(|| {
+        reject("the stored login has no pinned issuer — run `cadence login --web` again")
+    })?;
+    let (status, body) = crate::remote_enrollment::web_issuer_request(
+        &dir,
+        &issuer,
+        crate::remote_enrollment::WebRequest {
+            method,
+            path,
+            bearer: &cred.access_token,
+            headers,
+            body,
+        },
+        deadline,
+    )?;
+    Ok(WebResponse { status, body })
+}
+
+/// Unwrap the server envelope: `data` on `ok:true`, else a stable refusal
+/// carrying the server's own `error.code` (never the raw body).
+pub fn web_envelope(response: WebResponse) -> Result<Value> {
+    let body = response
+        .body
+        .ok_or_else(|| reject("remote web answer was not JSON"))?;
+    if body["ok"] == Value::Bool(true) {
+        return Ok(body["data"].clone());
+    }
+    let code = body["error"]["code"].as_str().unwrap_or("unavailable");
+    if response.status == 409 && body["ok"] == Value::Bool(false) && code == "revision_conflict" {
+        return Err(Error::invalid(
+            "revision_conflict",
+            format!("remote web request refused ({} {code})", response.status),
+        ));
+    }
+    let message = match response.status {
+        401 | 403 if code == "unauthorized" || code == "forbidden" => {
+            "the remote refused the credential — run `cadence login` again"
+        }
+        _ => "remote web request refused",
+    };
+    Err(Error::rejected(format!(
+        "{message} ({} {code})",
+        response.status
+    )))
 }
 
 #[cfg(test)]

@@ -112,7 +112,7 @@ pub(crate) mod test_fixture {
     pub(crate) fn agent(builder: ConfigBuilder<AgentScope>) -> ureq::Agent {
         let fixture = FIXTURE.with(|slot| slot.borrow().clone());
         let Some(fixture) = fixture else {
-            return ureq::Agent::new_with_config(builder.build());
+            return crate::test_web_issuer_tls::agent(builder);
         };
         let roots = RootCerts::new_with_certs(&[Certificate::from_der(&fixture.ca_der).to_owned()]);
         let tls = TlsConfig::builder().root_certs(roots).build();
