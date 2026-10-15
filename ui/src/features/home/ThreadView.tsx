@@ -101,12 +101,17 @@ export function Bubble({
   children,
   me,
   density = "full",
+  live,
 }: {
   who: string;
   at?: string;
   children: ReactNode;
   me?: boolean;
   density?: Density;
+  /** CAD-1462: subtle right-aligned live state on the name row (the
+   *  mock's `.who .live`) — the working indicator for the turn this
+   *  row belongs to. */
+  live?: ReactNode;
 }) {
   const compact = density === "compact";
   return (
@@ -114,6 +119,7 @@ export function Bubble({
       <div className={`flex gap-2 items-center text-micro text-ink-400 mb-1 ${me ? "justify-end" : ""}`}>
         <span className="text-ink-100 font-medium">{who}</span>
         {at ? <span>{at}</span> : null}
+        {live ? <span className="chat-live num">{live}</span> : null}
       </div>
       <div className={`min-w-0 ${compact ? "" : "max-w-[92%] inline-block"} ${me ? "text-left" : ""}`}>{children}</div>
     </div>
@@ -128,6 +134,7 @@ export function ThreadItemView({
   onOpenIssue,
   onRetry,
   onDiscard,
+  activity,
 }: {
   item: ThreadItem;
   density?: Density;
@@ -141,6 +148,10 @@ export function ThreadItemView({
     conversation?: string,
   ) => void;
   onDiscard: (message: string) => void;
+  /** CAD-1462: the item's own header activity — rendered right-aligned
+   *  on its bubble's name row. Only an `answer` bubble carries it (in-
+   *  flight tools/commentary get a standalone name row instead). */
+  activity?: ReactNode;
 }) {
   const t = useTranslate();
   const compact = density === "compact";
@@ -214,7 +225,7 @@ export function ThreadItemView({
       // why, instead of an empty bubble. No Retry here — the turn ran.
       const failure = turnFailure(item.entry, t);
       return (
-        <Bubble who={t("Assistant")} at={time(item.entry.created)} density={density}>
+        <Bubble who={t("Assistant")} at={time(item.entry.created)} density={density} live={activity}>
           {failure && (
             <div className={`mt-0.5 ${bodyText} text-fail break-words`} role="alert" data-kind="turn-failure">
               {failure}
@@ -350,27 +361,69 @@ export function entryAttachments(payload: unknown): EntryAttachment[] {
   );
 }
 
-/** The operator bubble's retained files as the mock's file card: icon,
- *  name, `size · kind`. Names, sizes and MIMEs only — a card is never a
- *  link and never carries a token or path. */
+/** CAD-1462: past this many sent files the extras sit behind a +N more
+ *  disclosure — the same collapse point the draft strip uses. */
+const SENT_CHIP_LIMIT = 3;
+
+/** The operator bubble's retained files as the mock's `.sentchips` row:
+ *  compact read-only chips — extension tag, name, `size · kind` — that
+ *  wrap beside the bubble and collapse past three behind a
+ *  keyboard-accessible +N more. Names, sizes and MIMEs only: a chip is
+ *  never a link and never carries a token or path; the full name, byte
+ *  size and MIME sit on the chip's `title`, so truncation hides nothing
+ *  the operator cannot reach. No remove or retry affordance — these
+ *  already sent. */
 function AttachmentRows({ files }: { files: EntryAttachment[] }) {
   const t = useTranslate();
+  const [expanded, setExpanded] = useState(false);
   if (files.length === 0) return null;
+  const collapsed = !expanded && files.length > SENT_CHIP_LIMIT;
+  const shown = collapsed ? files.slice(0, SENT_CHIP_LIMIT) : files;
   return (
-    <div className="grid gap-1.5 mt-2" data-entry-attachments>
-      {files.map((f) => (
-        <div key={f.id} className="app-chat-filerow" title={`${f.mime} · ${f.size} B`}>
-          <svg viewBox="0 0 24 24" aria-hidden="true">
-            <path d="M5 3h9l5 5v13H5zM14 3v6h5M8 13h8M8 17h5" />
-          </svg>
-          <div className="app-chat-filename">
-            <span>{f.name}</span>
-            <small>{attachMeta(f.name, f.size, t)}</small>
-          </div>
-        </div>
+    <div className="sentchips" data-entry-attachments>
+      {shown.map((f) => (
+        <span
+          key={f.id}
+          className="sentchip"
+          title={`${f.name} · ${f.size} B · ${f.mime}`}
+        >
+          <span className="sentchip-ext num" aria-hidden>
+            {sentExt(f.name)}
+          </span>
+          <span className="sentchip-name">{f.name}</span>
+          <span className="sentchip-meta num">{attachMeta(f.name, f.size, t)}</span>
+        </span>
       ))}
+      {collapsed && (
+        <button
+          type="button"
+          className="lnk app-chat-more"
+          aria-expanded="false"
+          onClick={() => setExpanded(true)}
+        >
+          +{files.length - shown.length} {t("more")}
+        </button>
+      )}
+      {expanded && files.length > SENT_CHIP_LIMIT && (
+        <button
+          type="button"
+          className="lnk app-chat-more"
+          aria-expanded="true"
+          onClick={() => setExpanded(false)}
+        >
+          {t("Show less")}
+        </button>
+      )}
     </div>
   );
+}
+
+/** The chip's type tag — the uppercased extension, `FILE` when a name
+ *  has none. */
+function sentExt(name: string): string {
+  const parts = name.split(".");
+  const ext = parts.length > 1 ? parts[parts.length - 1].trim() : "";
+  return ext ? ext.toUpperCase().slice(0, 5) : "FILE";
 }
 
 /** `payload.refs` as typed refs — a malformed value reads as none. */

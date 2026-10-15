@@ -2014,6 +2014,15 @@ its draft to itself, so typing never re-renders the thread. The composer posts
 with a client message id, shows the message at once and retires it when
 the stored `operator` entry with that id arrives; it is disabled, with
 the reason, on a read-only board or while the master is not running.
+While a turn works, its own rows carry a timestamped Assistant name row
+with a subtle Working indicator (CAD-1462) — anchored to the turn's own
+message id, never the list tail, so a newer queued or failed pending
+message cannot steal it; the truthful queued/submitting/compacting
+status line and Stop stay in the floating composer dock, outside the
+message rows. Attachments the operator picked show as compact wrapping
+chips above the composer (one status/remove icon slot each, +N more
+past three), and a sent message's files render as read-only chips under
+its bubble (CAD-1419/CAD-1462).
 A plan the thread mentions (or a `plan` row in Needs you) renders as a
 card — goal, tickets with size and acceptance, weighted progress, and
 Approve / Reject-with-reason through the plan endpoints above. The

@@ -147,7 +147,17 @@ export interface HomeListProps {
   onDiscard: (message: string) => void;
   /** Extra content under a row (Home's plan cards). */
   after?: (item: ThreadItem) => ReactNode;
+  /** CAD-1462: the running turn's activity for this item — a `header`
+   *  slot inside the item's own bubble name row, or a standalone
+   *  `row` name row placed before/after the item (the mock's `.who` row
+   *  for content that has no bubble of its own). */
+  activity?: (item: ThreadItem) => ItemActivity | null;
 }
+
+/** Where an item's live activity lands. */
+export type ItemActivity =
+  | { kind: "header"; node: ReactNode }
+  | { kind: "row"; node: ReactNode; position: "before" | "after" };
 export interface AppPaneProps {
   mode: AppMode;
   density: Density;
@@ -166,7 +176,7 @@ export default function Conversation(props: HomeListProps | AppPaneProps) {
 }
 
 /** Home's rows: the exact `<ol>` Home rendered before, one renderer. */
-function HomeList({ items, readOnly, liveAfter, onOpenIssue, onRetry, onDiscard, after }: HomeListProps) {
+function HomeList({ items, readOnly, liveAfter, onOpenIssue, onRetry, onDiscard, after, activity }: HomeListProps) {
   const { t } = useLocale();
   return (
     <ol className="space-y-3 min-w-0" aria-label={t("messages")} data-rendered={items.length}>
@@ -174,9 +184,12 @@ function HomeList({ items, readOnly, liveAfter, onOpenIssue, onRetry, onDiscard,
         // Live items (or the operator's pending ones) enter with the
         // rise animation; anything at or below the mount seq is history.
         const live = item.type === "pending" || Number(item.key.slice(1)) > liveAfter;
+        const act = activity?.(item) ?? null;
         return (
           <li key={item.key} className={`min-w-0 space-y-2${live ? " msg-in" : ""}`}>
-            <ThreadItemView item={item} readOnly={readOnly} onOpenIssue={onOpenIssue} onRetry={onRetry} onDiscard={onDiscard} />
+            {act?.kind === "row" && act.position === "before" ? act.node : null}
+            <ThreadItemView item={item} readOnly={readOnly} onOpenIssue={onOpenIssue} onRetry={onRetry} onDiscard={onDiscard} activity={act?.kind === "header" ? act.node : undefined} />
+            {act?.kind === "row" && act.position === "after" ? act.node : null}
             {after?.(item)}
           </li>
         );

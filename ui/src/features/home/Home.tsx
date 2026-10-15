@@ -29,6 +29,7 @@ import NeedsRail from "./NeedsRail";
 import { askDraft, readRailCollapsed, writeRailCollapsed, type HomeNeed } from "./needs";
 import PlanCard from "./PlanCard";
 import Conversation from "../app-shell/chat/Conversation";
+import { time } from "./ThreadView";
 import {
   initialFollow,
   motionBehavior,
@@ -104,9 +105,12 @@ function appOriginHref(
   return `${appPath}?install=${encodeURIComponent(install_id)}&${ctx}conversation=${encodeURIComponent(conversation_id)}`;
 }
 
-/** CAD-1419: the Assistant name row's live state while the turn works
- *  and has not produced its reply yet. Elapsed time from the same turn
- *  start as the dock row; no Stop here (Stop stays in the dock). */
+/** CAD-1462: the subtle live state on the running turn's own name row
+ *  (the approved mock's `.who .live`): pulse dot, "Working" and the
+ *  elapsed clock right-aligned beside the row's real name and
+ *  timestamp. The row itself supplies who/when; Stop and the truthful
+ *  queued/submitting/compacting information stay in the dock's status
+ *  line, outside the message rows. */
 function AssistantActivity({ since }: { since: number | null }) {
   const t = useTranslate();
   const [now, setNow] = useState(() => Date.now());
@@ -116,56 +120,85 @@ function AssistantActivity({ since }: { since: number | null }) {
   }, []);
   const elapsed = since !== null && Number.isFinite(since) ? fmtElapsed(Math.max(0, Math.floor(now / 1000 - since))) : null;
   return (
-    <div className="flex gap-2 items-center text-micro text-ink-400 min-w-0" data-assistant-activity>
-      <span className="text-ink-100 font-medium">{t("Assistant")}</span>
+    <span className="flex gap-1.5 items-center" data-assistant-activity role="status">
       <span className="workdot live" aria-hidden />
-      <span className="text-ink-300">{t("Working")}</span>
-      {elapsed !== null && <span className="num text-ink-500">{elapsed}</span>}
+      <span>{t("Working")}</span>
+      {elapsed !== null && <span className="text-ink-500">{elapsed}</span>}
+    </span>
+  );
+}
+
+/** A timestamped Assistant name row — the mock's `.who` — for in-flight
+ *  content that has no bubble of its own (tool steps, commentary), so
+ *  the running turn still shows its name, timestamp and live state on
+ *  one header. `at` is the anchored entry's own timestamp. */
+function AssistantNameRow({ at, live }: { at?: string; live: ReactNode }) {
+  const t = useTranslate();
+  return (
+    <div className="flex gap-2 items-center text-micro text-ink-400" data-kind="assistant-name">
+      <span className="text-ink-100 font-medium">{t("Assistant")}</span>
+      {at ? <span>{at}</span> : null}
+      {live}
     </div>
   );
 }
 
+/** The item the running turn's name-row activity belongs to: the last
+ *  thread item holding a stored entry stamped with the turn's own
+ *  `message` id. Stored entries are per-turn, so commentary, tool
+ *  groups and the answering row of THIS turn carry it; a newer queued
+ *  or failed pending message — or another conversation's turn —
+ *  carries a different id and can never steal the indicator. A pending
+ *  row holds no stored entry yet, so it never matches; an unidentified
+ *  turn anchors nothing here rather than guessing a row. */
+export function activityAnchor(items: ThreadItem[], message: string | undefined | null): string | null {
+  if (typeof message !== "string" || message === "") return null;
+  let found: string | null = null;
+  let answerKey: string | null = null;
+  for (const item of items) {
+    const entries =
+      item.type === "tools"
+        ? item.entries
+        : item.type === "pending"
+          ? []
+          : [item.entry];
+    if (entries.some((e) => e.message === message)) {
+      found = item.key;
+      if (item.type === "answer") answerKey = item.key;
+    }
+  }
+  // An answer bubble carries the indicator on its own timestamped name
+  // row — prefer it over in-progress steps/commentary of the same turn.
+  return answerKey ?? found;
+}
+
+/** The dock's one-line turn status (CAD-551, placed in `chatdock` by
+ *  CAD-1462): the truthful queued/submitting/compacting/queued-count
+ *  state, the live step while the turn works, the app-scope link, and
+ *  Stop — the supported interruption, always outside the message rows.
+ *  The working state's row presentation itself moved onto the turn's
+ *  own name row (`AssistantActivity`), so nothing here re-paints a
+ *  full-width loading bar inside the thread. */
 function WorkingRow({
   turn,
   appOrigin,
   step,
   onStop,
-  nameRow,
   resolveAppPath,
 }: {
   turn: TurnState;
   appOrigin: MasterAppOrigin | null;
   step: ThreadEntry | null;
   onStop: () => void;
-  /** The Assistant name row shows Working + elapsed for this turn. */
-  nameRow: boolean;
   /** CAD-1438: resolves an install id to its unique canonical path (or null). */
   resolveAppPath: (installId: string) => string | null;
 }) {
   const t = useTranslate();
   const appHref = appOriginHref(appOrigin, resolveAppPath);
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    if (turn.kind !== "working") return;
-    const timer = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(timer);
-  }, [turn.kind]);
   if (turn.kind === "idle") return null;
   const stepText = step ? stepSummary(step.text) : null;
-  const elapsed =
-    !nameRow &&
-    turn.kind === "working" &&
-    typeof turn.since === "number" &&
-    Number.isFinite(turn.since)
-      ? fmtElapsed(Math.max(0, Math.floor(now / 1000 - turn.since)))
-      : null;
   return (
     <div className="workrow" role="status" aria-live="polite" data-turn={turn.kind}>
-      {!nameRow && <span className={`workdot${turn.kind === "working" ? " live" : ""}`} aria-hidden />}
-      {turn.kind === "working" && !nameRow && (
-        <span className="text-ink-200 font-medium shrink-0">{t("Working")}</span>
-      )}
-      {elapsed !== null && <span className="num text-ink-500 shrink-0">{elapsed}</span>}
       {turn.kind === "queued" && (
         <span className="text-ink-400 min-w-0">
           {t("Queued")}{turn.summary ? ` — ${stepSummary(turn.summary)}` : ""}
@@ -174,8 +207,11 @@ function WorkingRow({
       {turn.kind === "submitting" && <span className="text-ink-400">{t("Sending…")}</span>}
       {turn.kind === "working" && stepText && (
         <span key={stepText} className="stepfade num text-ink-500 truncate min-w-0">
-          · {stepText}
+          {stepText}
         </span>
+      )}
+      {turn.kind === "working" && !stepText && (
+        <span className="text-ink-500 min-w-0">{t("Turn in progress")}</span>
       )}
       {turn.kind === "working" && turn.compacting === true && (
         <span className="chip bg-warn/10 text-warn shrink-0">{t("compacting")}</span>
@@ -405,13 +441,47 @@ const ThreadList = memo(function ThreadList({
     attachments?: { id: string }[],
     conversation?: string,
   ) => void;
-  /** The live turn's start (epoch s) while it works; null otherwise. */
-  working: { since: number | null } | null;
+  /** The live turn: its own `message` id picks the row the activity
+   *  belongs to; `since` drives the elapsed clock. Null otherwise. */
+  working: { message: string; since: number | null } | null;
 }) {
   const t = useTranslate();
   const { shown, hidden } = useMemo(() => visibleWindow(items, limit), [items, limit]);
   const anchors = useMemo(() => planAnchors(items), [items]);
-  const lastKey = items.length ? items[items.length - 1].key : "";
+  // The name-row activity's row: this turn's own last item only — a
+  // newer pending message or a plan card's anchor never steals it, and
+  // it renders independently of PlanCard (separate slots).
+  const anchorKey = working ? activityAnchor(shown, working.message) : null;
+  // The item the anchored key names: its entry's own timestamp drives
+  // the standalone name row (the turn's newest in-flight moment).
+  const anchorItem = anchorKey === null ? null : shown.find((i) => i.key === anchorKey) ?? null;
+  const anchorEntry: ThreadEntry | null =
+    anchorItem === null
+      ? null
+      : anchorItem.type === "tools"
+        ? anchorItem.entries[anchorItem.entries.length - 1] ?? null
+        : anchorItem.type === "pending"
+          ? null
+          : anchorItem.entry;
+  // A daemon that cannot name its running turn's message still owes an
+  // honest Working signal: bounded fallback on the tail item only while
+  // the tail is not an answer — once the reply lands, `turn.state`
+  // clears too. An answer tail keeps its own header slot instead.
+  const fallbackItem =
+    working && anchorItem === null && shown.length > 0 && shown[shown.length - 1].type !== "answer"
+      ? shown[shown.length - 1]
+      : null;
+  const activityItem = anchorItem ?? fallbackItem;
+  const activityEntry =
+    anchorItem !== null
+      ? anchorEntry
+      : fallbackItem === null
+        ? null
+        : fallbackItem.type === "tools"
+          ? fallbackItem.entries[fallbackItem.entries.length - 1] ?? null
+          : fallbackItem.type === "pending"
+            ? null
+            : fallbackItem.entry;
   if (items.length === 0) return null;
   return (
     <>
@@ -430,13 +500,21 @@ const ThreadList = memo(function ThreadList({
         onOpenIssue={onOpenIssue}
         onRetry={onRetry}
         onDiscard={discard}
+        activity={(item) => {
+          if (!working || activityItem === null || item.key !== activityItem.key) return null;
+          const live = <AssistantActivity since={working.since} />;
+          // The answer bubble carries the indicator on its own name row;
+          // a standalone row covers in-flight steps/commentary that have
+          // none of their own.
+          if (item.type === "answer") return { kind: "header", node: live };
+          if (item.type === "operator") return { kind: "row", node: <AssistantNameRow at={activityEntry ? time(activityEntry.created) : undefined} live={live} />, position: "after" };
+          return { kind: "row", node: <AssistantNameRow at={activityEntry ? time(activityEntry.created) : undefined} live={live} />, position: "before" };
+        }}
         after={(item) =>
           anchors.has(item.key) ? (
             <div className="ml-8">
               <PlanCard epic={anchors.get(item.key)!} readOnly={readOnly} onOpenIssue={onOpenIssue} />
             </div>
-          ) : working && item.key === lastKey && item.type !== "answer" ? (
-            <AssistantActivity since={working.since} />
           ) : null
         }
       />
@@ -551,10 +629,22 @@ export default function Home({
       ? serverTurn.app_origin
       : null;
   const step = useMemo(() => openStep(thread.data?.entries ?? []), [thread.data]);
-  // The Assistant name row carries Working for this turn when the turn is
-  // live and no reply row has landed after the operator's message (the
-  // ThreadList rule). The dock row then keeps only Stop and the step.
-  const nameRowShown = turn.kind === "working" && items.length > 0 && items[items.length - 1].type !== "answer";
+  // The running turn's name-row activity anchors to this turn's own
+  // message id — the item holding its newest stored entry (a pending
+  // row has no stored entry yet, so its row is the anchor while it
+  // waits). Once the terminal `turn_result` lands the daemon flips
+  // `turn.state` off working and the indicator clears with the reply.
+  const workingActivity =
+    turn.kind === "working"
+      ? { message: turn.message, since: typeof turn.since === "number" ? turn.since : null }
+      : null;
+  // Same-row growth the ResizeObserver follows re-subscribes when the
+  // name-row indicator appears or clears (its content lives inside the
+  // observed list).
+  const nameRowShown =
+    workingActivity !== null &&
+    (activityAnchor(items, workingActivity.message) !== null ||
+      (items.length > 0 && items[items.length - 1].type !== "answer"));
 
   // Live entries: the store opened on the newest page, so the stream
   // resumes after its last seq — never a replay of the history. On a
@@ -979,19 +1069,11 @@ export default function Home({
               onOpenIssue={onOpenIssue}
               liveAfter={liveAfter.current ?? 0}
               onRetry={onRetrySend}
-              working={nameRowShown ? { since: typeof turn.since === "number" ? turn.since : null } : null}
+              working={workingActivity}
             />
             {cmds.map((c) => (
               <CmdCard key={c.id} cmd={c} onOpenIssue={onOpenIssue} />
             ))}
-            <WorkingRow
-              turn={turn}
-              appOrigin={turnOrigin}
-              step={step}
-              onStop={() => runCommand("stop", "")}
-              nameRow={nameRowShown}
-              resolveAppPath={resolveAppPath}
-            />
           </div>
 
           {(unseen > 0 || activity) && (
@@ -1001,6 +1083,16 @@ export default function Home({
           )}
 
           <div className="chatdock" ref={dockRef} data-chat-dock>
+            {/* The turn's truthful status line and its Stop live in the
+                dock, outside the message rows (CAD-1462); the working
+                presentation itself is the subtle name-row indicator. */}
+            <WorkingRow
+              turn={turn}
+              appOrigin={turnOrigin}
+              step={step}
+              onStop={() => runCommand("stop", "")}
+              resolveAppPath={resolveAppPath}
+            />
             <Composer
               block={block}
               seed={seed}
