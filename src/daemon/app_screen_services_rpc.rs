@@ -35,6 +35,8 @@ fn screen_authority_error(error: Error, reason: &'static str) -> Error {
 #[derive(Clone)]
 pub(super) struct ScreenServiceProof {
     action_token: String,
+    // Server-private bearer; only native attribution consumers receive it.
+    public_session: Option<String>,
     context: ToolContext,
     operation: ScreenOperation,
     confirmed: Option<(Value, Value)>,
@@ -500,6 +502,7 @@ impl Shared {
         }
         Ok(ScreenServiceProof {
             action_token: action_token.to_owned(),
+            public_session: (origin == Origin::Public).then(|| token.to_owned()),
             context,
             operation,
             confirmed: None,
@@ -678,6 +681,16 @@ impl Shared {
         params["install_id"] = json!(proof.context.install_id);
         params["context_id"] = json!(proof.context.context_id);
         use ScreenOperation::*;
+        // Only native attribution consumers receive the verified public bearer;
+        // each re-derives the human from its live session, never child fields.
+        if matches!(
+            proof.operation,
+            RecordsCreate | RecordsUpdate | RecordsCsvImport | ContentSave
+        ) {
+            if let Some(public_session) = &proof.public_session {
+                params["public_session"] = json!(public_session);
+            }
+        }
         if matches!(
             proof.operation,
             ScreenRoutePatch | ScreenPreviewShow | ScreenPreviewClear | SmtpManage
@@ -716,9 +729,13 @@ impl Shared {
                 // current mount/runtime/release guard remains held. No frame
                 // alias, scope, message ID, receipt or turn token is accepted.
                 let message = format!("screen-{}", uuid::Uuid::new_v4().simple());
-                let receipt = self.rpc_thread_send(&json!({"alias": alias, "text": text,
+                let mut thread_params = json!({"alias": alias, "text": text,
                     "message": message, "app": {"install_id": proof.install(), "context_id": proof.context()?},
-                    "conversation": conversation.id}), peer_pid)?;
+                    "conversation": conversation.id});
+                if let Some(public_session) = &proof.public_session {
+                    thread_params["public_session"] = json!(public_session);
+                }
+                let receipt = self.rpc_thread_send(&thread_params, peer_pid)?;
                 Ok(json!({"host_command": {"operation": proof.operation, "args": {"campaign_id": campaign}, "conversation_id": conversation.id},
                     "receipt": {"message": receipt["message"], "queued": true}}))
             });

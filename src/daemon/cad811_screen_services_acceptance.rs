@@ -749,3 +749,6 @@ fn cad811_sender_empty_read_is_typed_and_access_refusals_stay_refused() {
     );
     eprintln!("CRM sender acceptance: genuine_unbound=1 native_rpc=1 screen_rpc=1 http_400_code=1 bad_caller=1 wrong_context=1 smtp_effects_requested=0");
 }
+
+#[path = "cad811_public_owner_attribution_acceptance.rs"]
+mod independent_public_owner_attribution;
