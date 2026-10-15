@@ -2002,6 +2002,29 @@ The SPA has real routes (CAD-326, `ui/src/lib/router.ts`): `/` Home,
 `/settings[/memory]`; the nav shows Home, Projects, Agents and Settings,
 and Home's rail links to the overview.
 
+Threads notifications (CAD-1423) group received messages by authorized conversation
+in the header inbox. Unread respects both actually viewed thread messages and the
+notification-dismissal cursor; All retains received conversation history after
+either cursor advances. Mark all read dismisses notifications without marking
+unviewed transcript messages read.
+
+Browser alerts require explicit device opt-in through the browser's native
+permission and subscription flow. Alerts are generic by default; opening one
+still requires normal thread authorization. Muting a conversation or enabling
+the 22:00–08:00 quiet-hours preset suppresses interruptions, not unread messages.
+Sound and message previews are off by default. Posts and delivery remain turnless.
+
+An enrolled browser reports its visible thread through
+`POST /api/human-threads/push/presence` with `device_id`, a per-page `tab_id` and
+`room` (null clears that tab). The server verifies device ownership; these IDs
+never confer authority. Reports refresh every 15 seconds and expire after 30
+seconds of server time. Presence from any visible tab suppresses that device,
+without another tab's null report clearing it or suppressing other devices.
+Leaving the thread, hiding or closing a page releases only that page's report.
+Re-enrollment after revocation creates a fresh consent without transplanting old
+device presence or delivery metadata. A different human cannot take over a live
+endpoint. Private VAPID signing material remains in Host custody, not Native.
+
 Home is chat-first (CAD-328, `ui/src/features/home/`): the master's
 thread (`/api/threads/master`) rendered by kind — the operator's
 message, `assistant_text` as commentary, runs of `tool_call` /

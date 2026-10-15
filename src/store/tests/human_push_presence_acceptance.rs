@@ -104,24 +104,18 @@ fn cad1423_tab_presence_and_reenrollment_are_owner_scoped() {
         )
         .unwrap();
 
-    assert!(
-        store
-            .push_presence_set(&owner, &device, "tab-a", Some(&room))
-            .unwrap()
-    );
-    assert!(
-        store
-            .push_device_visible(&device, &owner.id, &room)
-            .unwrap()
-    );
+    assert!(store
+        .push_presence_set(&owner, &device, "tab-a", Some(&room))
+        .unwrap());
+    assert!(store
+        .push_device_visible(&device, &owner.id, &room)
+        .unwrap());
 
     // Tab B is open elsewhere. Its explicit null must update only B's row,
     // leaving Tab A's current visible-room report effective for the device.
-    assert!(
-        store
-            .push_presence_set(&owner, &device, "tab-b", None)
-            .unwrap()
-    );
+    assert!(store
+        .push_presence_set(&owner, &device, "tab-b", None)
+        .unwrap());
     assert!(
         store
             .push_device_visible(&device, &owner.id, &room)
@@ -148,16 +142,12 @@ fn cad1423_tab_presence_and_reenrollment_are_owner_scoped() {
     assert_eq!(surviving_tab, ("tab-a".to_string(), room.clone()));
 
     // A different verified human cannot create or clear presence for this device.
-    assert!(
-        !store
-            .push_presence_set(&peer, &device, "tab-a", None)
-            .unwrap()
-    );
-    assert!(
-        store
-            .push_device_visible(&device, &owner.id, &room)
-            .unwrap()
-    );
+    assert!(!store
+        .push_presence_set(&peer, &device, "tab-a", None)
+        .unwrap());
+    assert!(store
+        .push_device_visible(&device, &owner.id, &room)
+        .unwrap());
 
     // Seed actual delivery-child metadata against one of the committed post
     // intents so the foreign-enrollment refusal and owner re-enrollment run
@@ -178,16 +168,12 @@ fn cad1423_tab_presence_and_reenrollment_are_owner_scoped() {
     // A different verified human cannot enroll the live endpoint or mutate
     // either child table; the original consent remains visible and deliverable.
     let endpoint = "https://fcm.googleapis.com/fcm/send/presence-acceptance";
-    assert!(
-        store
-            .push_device_enroll(&peer, endpoint, "p256dh-peer", "auth-peer", "peer-session")
-            .is_err()
-    );
-    assert!(
-        store
-            .push_device_visible(&device, &owner.id, &room)
-            .unwrap()
-    );
+    assert!(store
+        .push_device_enroll(&peer, endpoint, "p256dh-peer", "auth-peer", "peer-session")
+        .is_err());
+    assert!(store
+        .push_device_visible(&device, &owner.id, &room)
+        .unwrap());
     assert_eq!(
         store.push_device_owner(&device).unwrap().as_deref(),
         Some(owner.id.as_str())
@@ -244,9 +230,7 @@ fn cad1423_tab_presence_and_reenrollment_are_owner_scoped() {
             );
         }
     }
-    assert!(
-        !store
-            .push_device_visible(&replacement, &owner.id, &room)
-            .unwrap()
-    );
+    assert!(!store
+        .push_device_visible(&replacement, &owner.id, &room)
+        .unwrap());
 }
