@@ -321,9 +321,11 @@ export class ScreenChannel extends FrameChannel {
     // action list already carries `run.start` (a no-action host or a
     // frame that merely forges the marker gets none). Granting nothing:
     // the slot path still validates, plans and confirms natively.
+    // CAD-1447: the marker also requires the child's `screen-media.v1` opt-in —
+    // the released `screen-actions.v1` SDK rejects the unknown root field.
     const projection: ScreenPush = { ...this.projection };
     delete projection.run_receipts;
-    if (this.shape === "v2" && this.actions?.planner && projection.actions?.includes("run.start")) {
+    if (this.shape === "v2" && this.wantsMedia && this.actions?.planner && projection.actions?.includes("run.start")) {
       projection.run_receipts = 1;
     }
     // CAD-1365: `original_downloads` is host-derived the same way, and only for
