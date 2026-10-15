@@ -1782,10 +1782,16 @@ fn consented_caps(caps: &[Value], requested: &[&str]) -> bool {
         && requested.iter().filter(|c| c.starts_with("web.")).all(|c| seen.contains(c))
 }
 
-/// Accept only an owner grant for the requested workspace and audience
+/// Human workspace roles the hosted login exchange returns. Bridge
+/// enrollment stays owner-only; service identity stays `kind: service`.
+pub(crate) fn human_workspace_role(role: &str) -> bool {
+    matches!(role, "owner" | "member")
+}
+
+/// Accept an owner or member grant for the requested workspace and audience
 /// (`https://<slug>.cadencecloud.app`), with capabilities that
-/// [`consented_caps`] allows for `requested`. The issuer binds slug to
-/// workspace itself; the response carries no slug field.
+/// [`consented_caps`] allows for `requested`. The role does not add scopes.
+/// The issuer binds slug to workspace itself; the response carries no slug field.
 fn login_grant(
     value: &Value,
     org: Option<&str>,
@@ -1838,7 +1844,7 @@ fn login_grant(
         || !slug(slug_value)
         || field(value, "audience")? != endpoint
         || field(principal, "kind")? != "user"
-        || field(principal, "current_role")? != "owner"
+        || !human_workspace_role(field(principal, "current_role")?)
         || !id(field(principal, "subject_id")?)
         || !exact_caps
         || field(credential, "token_type")? != "Bearer"
@@ -1900,7 +1906,7 @@ fn login_grant(
     })
 }
 
-/// Test controller access to the unchanged strict owner login parser.
+/// Test controller access to the strict human login parser.
 #[cfg(all(test, feature = "test-seam"))]
 pub(crate) fn login_grant_for_test(value: &Value, issuer: &str) -> Result<LoginGrant> {
     login_grant(
@@ -2032,14 +2038,12 @@ pub fn login_browser(
     )
 }
 
-/// The capabilities one login requests. `cli` is the default pair;
-/// `wiki` (the default portal login) adds `wiki.read` and `wiki.write` to it.
-/// The org-flag browser login stays CLI-only. `--web` adds the Publish Web
-/// pair only when the operator asks for it. The issuer's grant must equal
-/// the requested set, narrowed only by the issuer's own ceiling.
+/// Ordinary portal and org-flag logins request CLI and wiki capabilities.
+/// `--web` deliberately requests CLI and Publish Web capabilities instead,
+/// without adding wiki consent. The issuer may narrow the requested set;
+/// accepting a member role never widens it.
 #[derive(Clone, Copy)]
 enum LoginScope {
-    Cli,
     CliAndWiki,
     /// CAD-1429: `cadence login --web` asks for the Publish Web scopes on top
     /// of the CLI pair, and only on this explicit request.
@@ -2049,7 +2053,6 @@ enum LoginScope {
 impl LoginScope {
     fn requested(self) -> Vec<&'static str> {
         match self {
-            LoginScope::Cli => vec!["cli.read", "cli.write"],
             LoginScope::CliAndWiki => vec!["cli.read", "cli.write", "wiki.read", "wiki.write"],
             LoginScope::CliAndWeb => vec!["cli.read", "cli.write", "web.read", "web.prepare"],
         }
@@ -2109,7 +2112,7 @@ fn login_browser_with(
         dir,
         show_code,
         runtime,
-        LoginScope::Cli,
+        LoginScope::CliAndWiki,
     )
 }
 
@@ -3976,7 +3979,8 @@ mod tests {
                 if !real_code_request_ok(&body)
                     || body["organization_id"] != "ws_real"
                     || body["audience"] != LOGIN_ENDPOINT
-                    || body["requested_capabilities"] != json!(["cli.read", "cli.write"])
+                    || body["requested_capabilities"]
+                        != json!(["cli.read", "cli.write", "wiki.read", "wiki.write"])
                 {
                     return Ok((400, json!({"error":"invalid_request"})));
                 }
@@ -4134,7 +4138,7 @@ mod tests {
             requests: Vec::new(),
             baseline: Instant::now(),
             elapsed: 0,
-            requested: vec!["cli.read", "cli.write"],
+            requested: vec!["cli.read", "cli.write", "wiki.read", "wiki.write"],
         };
         let out = login_device_flow(
             HOSTED_LOGIN_ISSUER,
@@ -4143,7 +4147,7 @@ mod tests {
             dir,
             |_, _| Ok(()),
             &mut runtime,
-            LoginScope::Cli,
+            LoginScope::CliAndWiki,
         );
         (out, runtime)
     }
@@ -4636,7 +4640,7 @@ mod tests {
             requests: Vec::new(),
             baseline: Instant::now(),
             elapsed: 0,
-            requested: vec!["cli.read", "cli.write"],
+            requested: vec!["cli.read", "cli.write", "wiki.read", "wiki.write"],
         };
         let out = login_device_flow(
             HOSTED_LOGIN_ISSUER,
@@ -4645,7 +4649,7 @@ mod tests {
             &dir,
             |_, _| Ok(()),
             &mut runtime,
-            LoginScope::Cli,
+            LoginScope::CliAndWiki,
         );
         assert!(out.is_err());
         assert!(runtime.requests.is_empty(), "pin conflict reached issuer");
@@ -4821,16 +4825,33 @@ mod tests {
     }
 
     #[test]
-    fn login_rejects_agent_capabilities_and_non_owner() {
+    fn login_rejects_agent_capabilities_and_unknown_role() {
         let mut agent = login_grant_body();
         agent["capabilities"] = json!(["bridge.enroll", "results.submit"]);
-        let mut member = login_grant_body();
-        member["principal"]["current_role"] = json!("member");
-        for grant in [agent, member] {
+        let mut unknown = login_grant_body();
+        unknown["principal"]["current_role"] = json!("admin");
+        for grant in [agent, unknown] {
             let (out, dir, _r, _s) = run_login(grant, vec![]);
             assert!(out.is_err());
             assert_nothing_stored(&dir);
         }
+    }
+
+    #[test]
+    fn login_accepts_member_without_adding_scopes() {
+        let mut member = login_grant_body();
+        member["principal"]["current_role"] = json!("member");
+        let (out, dir, _r, _s) = run_login(member, vec![]);
+        let grant = out.expect("member is a human workspace role");
+        assert_eq!(
+            grant.capabilities,
+            vec!["cli.read".to_string(), "cli.write".to_string(),]
+        );
+        grant.save_credential(&dir).unwrap();
+        let body: Value =
+            serde_json::from_slice(&fs::read(dir.join("cli-acme.json")).unwrap()).unwrap();
+        assert_eq!(body["capabilities"], json!(["cli.read", "cli.write"]));
+        assert_eq!(body["subject_id"], "user_1");
     }
 
     #[test]

@@ -333,7 +333,7 @@ pub(super) fn run_cli(cli: Cli) -> Result<i32> {
             // CAD-1019 slice 2: a remote org never opens local state or
             // adopts a sandbox profile — the allowlisted verb goes over
             // HTTPS; everything else refuses inside `remote::run`.
-            return remote::run(target, cli.command, cli.wake_timeout);
+            return remote::run(target, cli.command, cli.wake_timeout, cli.state_dir.clone());
         }
     };
     // CAD-310: a sandbox's state dir decides its profile and tracker,
@@ -931,5 +931,8 @@ pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
         Commands::McpPermission { timeout_secs } => mcp_permission::run(state_dir, timeout_secs),
         Commands::McpAgent => mcp_agent::run(state_dir),
         Commands::Attachment { action } => attachment::run(state_dir, action),
+        Commands::LocalAgent { .. } => Err(Error::usage(
+            "local-agent coordinates a hosted org with this machine. Select that org, or switch back from `--org local`. Nothing was claimed.",
+        )),
     }
 }

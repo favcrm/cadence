@@ -638,7 +638,9 @@ fn validate_renewal_response(
         || body["audience"] != target.endpoint
         || !exact_object(&body["principal"], &["kind", "current_role", "subject_id"])
         || body["principal"]["kind"] != "user"
-        || body["principal"]["current_role"] != "owner"
+        || body["principal"]["current_role"]
+            .as_str()
+            .is_none_or(|role| !crate::remote_enrollment::human_workspace_role(role))
         || body["principal"]["subject_id"].as_str() != prior.subject_id.as_deref()
         || !same_capabilities_json(&body["capabilities"], &prior.capabilities)
         || !exact_object(
@@ -1502,6 +1504,26 @@ pub fn logout(dir: &Path, target: &RemoteTarget) -> Result<i32> {
     File::open(dir)?.sync_all()?;
     println!("Remote CLI session revoked for {}", target.org);
     Ok(0)
+}
+
+pub struct CliMaterial {
+    pub access_token: String,
+    pub subject_id: Option<String>,
+    pub issuer: Option<String>,
+}
+
+/// The live hosted CLI bearer for `target`, renewed when it is due.
+/// The subject and issuer come from the stored login, not from the caller.
+pub fn cli_material(dir: &Path, target: &RemoteTarget) -> Result<CliMaterial> {
+    let cred = renewed_credential(dir, target, Instant::now() + Duration::from_secs(20))?;
+    if !valid_token(&cred.access_token, "hct_") {
+        return Err(reject("invalid remote credential"));
+    }
+    Ok(CliMaterial {
+        access_token: cred.access_token,
+        subject_id: cred.subject_id,
+        issuer: cred.issuer,
+    })
 }
 
 pub fn call_verb(

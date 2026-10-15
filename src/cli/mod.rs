@@ -42,6 +42,7 @@ mod issue;
 mod job;
 mod join;
 mod launch;
+mod local_agent;
 #[cfg(test)]
 #[path = "logout_auth_dir_acceptance.rs"]
 mod logout_auth_dir_acceptance;

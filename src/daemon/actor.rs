@@ -756,6 +756,7 @@ impl Shared {
                                         "error": reason});
                             self.store
                                 .finish(&message, "failed", &failed, Some(&reason))?;
+                            self.report_hosted_terminal(&message, "failed", &reason);
                             self.notify_routed_target(&message, &failed);
                             gate_notice = None;
                             self.wake();
@@ -771,6 +772,7 @@ impl Shared {
                                 &failed,
                                 Some(&error.to_string()),
                             )?;
+                            self.report_hosted_terminal(&message, "failed", &error.to_string());
                             self.notify_routed_target(&message, &failed);
                             // Other submitted PTY messages are now
                             // orphaned by the dead endpoint.
@@ -817,6 +819,18 @@ impl Shared {
         }
         self.wake();
         Ok(())
+    }
+
+    /// Hosted receipt for a turn that is already terminal locally.
+    /// No commit SHA is invented; unknown and requeued turns do not call this.
+    fn report_hosted_terminal(&self, message: &Message, status: &str, text: &str) {
+        let _ = crate::local_assignment::report_actor_completion(
+            &self.state_dir,
+            &message.id,
+            status,
+            text,
+            None,
+        );
     }
 
     pub(super) fn complete(&self, message: &Message, result: TurnResult) -> Result<()> {
@@ -882,6 +896,20 @@ impl Shared {
         } else {
             self.store
                 .finish(message, &status, &stored, result.error.as_deref())?;
+            let report_text = if result.text.is_empty() {
+                result.error.as_deref().unwrap_or("")
+            } else {
+                result.text.as_str()
+            };
+            // The local row is already terminal. A board miss stays pending
+            // on the kickoff binding for startup or reconnect/watch retries.
+            let _ = crate::local_assignment::report_actor_completion(
+                &self.state_dir,
+                &message.id,
+                &status,
+                report_text,
+                None,
+            );
         }
         self.notify_routed_target(message, &stored);
         self.wake();

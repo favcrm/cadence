@@ -762,10 +762,10 @@ fn native_chain_automatic_renewal_and_real_wiki_mutation() {
     assert!(initial.subject_id.as_deref() == Some(ready.owner_id.as_str()));
     assert_eq!(initial.cli_session.as_ref().unwrap().generation, 1);
 
-    // Do not weaken owner-only device/login consent for member coverage.
-    // The actual member exchange is mapped to the existing legacy credential
-    // store and then read by the strict production load_credential parser.
-    assert!(crate::remote_enrollment::login_grant_for_test(&ready.member, &issuer).is_err());
+    // A member exchange is a human CLI login. It does not widen scopes.
+    // The saved file below is still what load_credential reads for the calls.
+    crate::remote_enrollment::login_grant_for_test(&ready.member, &issuer)
+        .expect("member workspace role is accepted");
     assert!(ready.member["principal"]["current_role"] == "member");
     assert!(ready.member["organization_id"] == WORKSPACE && ready.member["audience"] == BOARD);
     let member = Credential {

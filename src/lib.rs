@@ -48,6 +48,7 @@ pub mod issue;
 mod issuer_tls_fixture;
 pub(crate) mod issuer_transport;
 pub mod lease;
+pub mod local_assignment;
 pub mod master;
 pub mod master_perm;
 pub mod mcp;

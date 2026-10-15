@@ -333,6 +333,347 @@ fn environment_credential(
     })
 }
 
+/// One existing device grant for a single tool lane. This is `/v1/device/code`
+/// and `/v1/device/token` with that lane as the only scope. It does not read
+/// or write the workspace `hct_` credential, and it does not call an
+/// assignment route.
+pub fn authorize_lane(
+    issuer: &str,
+    org: &str,
+    lane: &str,
+    dir: &Path,
+    no_open: bool,
+) -> Result<PathBuf> {
+    let issuer = issuer_origin(issuer)?;
+    validate_org(org)?;
+    if !matches!(lane, "provider.draft" | "publish.send") {
+        return Err(rejected("tool lane must be provider.draft or publish.send"));
+    }
+    let (status, value) = post(
+        &issuer,
+        "/v1/device/code",
+        json!({"client_label":"cadence-cli","scope":lane}),
+    )?;
+    if status == 404 {
+        return Err(Error::invalid(
+            "api_missing",
+            "this issuer has no /v1/device/code; no lane credential was saved",
+        ));
+    }
+    if status != 200 {
+        return Err(rejected("Device authorization unavailable at this issuer"));
+    }
+    let code: DeviceCode = serde_json::from_value(value)
+        .map_err(|_| rejected("Invalid device authorization response"))?;
+    validate_token(&code.device_code)?;
+    if code.expires_in == 0
+        || code.expires_in > 3600
+        || code.interval == 0
+        || code.interval > 60
+        || code.user_code.len() != 9
+        || !code
+            .user_code
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return Err(rejected("Invalid device authorization timing or code"));
+    }
+    let browser: ureq::http::Uri = code
+        .verification_uri_complete
+        .parse()
+        .map_err(|_| rejected("Invalid verification URL"))?;
+    if browser.scheme_str() != Some("https")
+        || browser.authority().is_none_or(|a| a.as_str().contains('@'))
+        || code.verification_uri.contains(['\n', '\r'])
+    {
+        return Err(rejected("Verification URL must use HTTPS"));
+    }
+    eprintln!(
+        "Authorize {lane} for organization {org}. Open {} and enter {}",
+        code.verification_uri_complete, code.user_code
+    );
+    if !no_open {
+        let program = if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
+        let mut command = std::process::Command::new(program);
+        command
+            .arg(&code.verification_uri_complete)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if !crate::reaper::status(&mut command).is_ok_and(|status| status.success()) {
+            eprintln!("Browser unavailable; use the URL above on another device.");
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(code.expires_in);
+    let mut interval = code.interval;
+    let token = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining <= Duration::from_secs(interval) {
+            return Err(rejected(
+                "Device authorization expired; start the lane grant again",
+            ));
+        }
+        std::thread::sleep(Duration::from_secs(interval));
+        let (status, value) = post(
+            &issuer,
+            "/v1/device/token",
+            json!({"grant_type":"urn:ietf:params:oauth:grant-type:device_code","device_code":code.device_code}),
+        )?;
+        if status == 404 {
+            return Err(Error::invalid(
+                "api_missing",
+                "this issuer has no /v1/device/token; no lane credential was saved",
+            ));
+        }
+        if status == 200 {
+            let token: DeviceToken = serde_json::from_value(value)
+                .map_err(|_| rejected("Invalid credential exchange response"))?;
+            validate_token(&token.access_token)?;
+            if token.access_token.starts_with("hct_")
+                || token.token_type != "Bearer"
+                || token.expires_in == 0
+            {
+                return Err(rejected(
+                    "Device grant did not return a bearer for one lane; nothing was saved",
+                ));
+            }
+            if token.scope != lane {
+                return Err(rejected(
+                    "Device grant scope is not that single lane; nothing was saved",
+                ));
+            }
+            if !safe_workspace_id(&token.workspace_id) {
+                return Err(rejected(
+                    "Device grant did not return a workspace id; nothing was saved",
+                ));
+            }
+            // Directory key is the server id. A different request is accepted
+            // only when a saved CLI login resolves that alias to this id.
+            if org != token.workspace_id
+                && trusted_login(dir, org, true)
+                    .is_none_or(|login| login.organization_id != token.workspace_id)
+            {
+                return Err(rejected(
+                    "Device grant workspace does not match the requested workspace id; nothing was saved",
+                ));
+            }
+            break token;
+        }
+        interval = next_poll_interval(status, &value, interval)?;
+    };
+    let expires_at = unix_now()?
+        .checked_add(token.expires_in)
+        .ok_or_else(|| rejected("Invalid credential expiry"))?;
+    save_lane_credential(
+        dir,
+        &issuer,
+        &token.workspace_id,
+        lane,
+        &token.access_token,
+        expires_at,
+    )
+}
+
+fn save_lane_credential(
+    dir: &Path,
+    issuer: &str,
+    org: &str,
+    lane: &str,
+    token: &str,
+    expires_at: u64,
+) -> Result<PathBuf> {
+    private_dir(dir, true)?;
+    if !safe_workspace_id(org) {
+        return Err(rejected(
+            "lane credential is stored only under the server workspace id",
+        ));
+    }
+    let folder = dir.join("lanes").join(org);
+    fs::create_dir_all(&folder)?;
+    fs::set_permissions(dir.join("lanes"), fs::Permissions::from_mode(0o700))?;
+    fs::set_permissions(&folder, fs::Permissions::from_mode(0o700))?;
+    let path = folder.join(if lane == "publish.send" {
+        "publish.send"
+    } else {
+        "provider.draft.json"
+    });
+    let binding = json!({
+        "issuer": issuer,
+        "organization_id": org,
+        "lane": lane,
+        "expires_at": expires_at,
+    });
+    let bytes = if lane == "publish.send" {
+        let meta = folder.join("publish.send.binding.json");
+        write_private(
+            &meta,
+            &serde_json::to_vec(&binding).map_err(|_| rejected("Cannot encode lane credential"))?,
+        )?;
+        token.as_bytes().to_vec()
+    } else {
+        let mut record = binding;
+        record["token"] = json!(token);
+        serde_json::to_vec(&record).map_err(|_| rejected("Cannot encode lane credential"))?
+    };
+    write_private(&path, &bytes)?;
+    Ok(path)
+}
+
+fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn private_bytes(path: &Path) -> Option<Vec<u8>> {
+    let meta = fs::symlink_metadata(path).ok()?;
+    if !meta.is_file()
+        || meta.file_type().is_symlink()
+        || meta.uid() != unsafe { libc::geteuid() }
+        || meta.mode() & 0o077 != 0
+        || meta.len() > MAX_BODY
+    {
+        return None;
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .ok()?;
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(MAX_BODY + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 <= MAX_BODY).then_some(bytes)
+}
+
+/// Hosted organization ids are opaque safe ids (`hostedIdSchema`): letters,
+/// digits, `_` and `-`, at most 200 characters. `ws_ops` and `ws_example`
+/// are valid. Shape is path safety, not a `ws_<uuid>` promise.
+fn safe_workspace_id(account: &str) -> bool {
+    validate_org(account).is_ok()
+}
+
+struct TrustedLogin {
+    organization_id: String,
+    issuer: String,
+}
+
+/// Saved CLI login for `account`. Execution passes `allow_slug: false` and
+/// matches `organization_id` only. Initial device consent may pass a slug;
+/// that alias is resolved once, before the grant is pinned to the server id.
+fn trusted_login(dir: &Path, account: &str, allow_slug: bool) -> Option<TrustedLogin> {
+    if !safe_workspace_id(account) || private_dir(dir, false).is_err() {
+        return None;
+    }
+    let mut found: Option<TrustedLogin> = None;
+    for entry in fs::read_dir(dir).ok()?.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with("cli-") || !name.ends_with(".json") {
+            continue;
+        }
+        let Some(bytes) = private_bytes(&entry.path()) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        let Some(organization_id) = value.get("organization_id").and_then(Value::as_str) else {
+            continue;
+        };
+        if !safe_workspace_id(organization_id) {
+            continue;
+        }
+        let slug = value.get("organization_slug").and_then(Value::as_str);
+        let slug_match = allow_slug && slug == Some(account);
+        if organization_id != account && !slug_match {
+            continue;
+        }
+        let Some(raw) = value.get("issuer").and_then(Value::as_str) else {
+            continue;
+        };
+        let Ok(issuer) = issuer_origin(raw) else {
+            continue;
+        };
+        match &found {
+            Some(current)
+                if current.organization_id == organization_id && current.issuer == issuer => {}
+            Some(_) => return None,
+            None => {
+                found = Some(TrustedLogin {
+                    organization_id: organization_id.to_owned(),
+                    issuer,
+                })
+            }
+        }
+    }
+    found
+}
+
+fn usable_token(token: &str) -> bool {
+    validate_token(token).is_ok() && !token.starts_with("hct_") && !token.starts_with('{')
+}
+
+fn provider_draft_grant(dir: &Path, account: &str, issuer: &str) -> Option<Vec<u8>> {
+    if !safe_workspace_id(account) || issuer_origin(issuer).ok().as_deref() != Some(issuer) {
+        return None;
+    }
+    let folder = dir.join("lanes").join(account);
+    let value: Value =
+        serde_json::from_slice(&private_bytes(&folder.join("provider.draft.json"))?).ok()?;
+    let token = value.get("token")?.as_str()?;
+    if !usable_token(token) {
+        return None;
+    }
+    let stored_issuer = issuer_origin(value.get("issuer")?.as_str()?).ok()?;
+    if stored_issuer != issuer
+        || value.get("organization_id")?.as_str()? != account
+        || value.get("lane")?.as_str()? != "provider.draft"
+        || value.get("expires_at")?.as_u64()? <= unix_now().ok()?
+    {
+        return None;
+    }
+    Some(token.as_bytes().to_vec())
+}
+
+/// `provider.draft` only when the frozen account is exactly the CLI login
+/// `organization_id` and `sink_origin` is that login's issuer. A slug is
+/// not an account. The platform id is `agenticos_external`.
+pub(crate) fn provider_draft_lane(
+    auth_dir: &Path,
+    platform: &str,
+    account: &str,
+    tool: &str,
+    scopes: &[String],
+    sink_origin: &str,
+) -> Option<Vec<u8>> {
+    if platform != crate::platform::agenticos_external::PLATFORM
+        || !matches!(tool, "generate_image" | "generate_text")
+        || scopes.len() != 1
+        || scopes.first().map(String::as_str) != Some("provider.draft")
+    {
+        return None;
+    }
+    let sink = issuer_origin(sink_origin).ok()?;
+    let login = trusted_login(auth_dir, account, false)?;
+    if login.issuer != sink {
+        return None;
+    }
+    provider_draft_grant(auth_dir, &login.organization_id, &login.issuer)
+}
+
 pub fn login(issuer: &str, org: &str, dir: &Path, token_stdin: bool, no_open: bool) -> Result<i32> {
     let issuer = issuer_origin(issuer)?;
     validate_org(org)?;
@@ -854,5 +1195,167 @@ mod tests {
             thread.join().unwrap();
             assert!(!dir.join("credential.json").exists());
         }
+    }
+
+    fn private_auth() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        root
+    }
+
+    fn write_cli(dir: &Path, slug: &str, issuer: &str, account: &str) {
+        let body = json!({
+            "version": 1,
+            "organization_id": account,
+            "organization_slug": slug,
+            "audience": issuer,
+            "issuer": issuer,
+            "subject_id": "user_fixture",
+            "capabilities": ["cli.read", "cli.write", "wiki.read", "wiki.write"],
+            "access_token": "hct_not_a_lane_token",
+            "expires_at": 4_000_000_000u64,
+        });
+        let path = dir.join(format!("cli-{slug}.json"));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        file.write_all(&serde_json::to_vec(&body).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn lane_token_follows_frozen_account_and_issuer_not_a_sibling_workspace() {
+        let root = private_auth();
+        let dir = root.path();
+        let issuer = "https://issuer.example.test";
+        let account_a = "ws_11111111-1111-4111-8111-111111111111";
+        let account_b = "ws_22222222-2222-4222-8222-222222222222";
+        write_cli(dir, "alpha", issuer, account_a);
+        write_cli(dir, "beta", issuer, account_b);
+        save_lane_credential(
+            dir,
+            issuer,
+            account_a,
+            "provider.draft",
+            "agc_workspace_a",
+            4_000_000_000,
+        )
+        .unwrap();
+        save_lane_credential(
+            dir,
+            issuer,
+            account_b,
+            "provider.draft",
+            "agc_workspace_b",
+            4_000_000_000,
+        )
+        .unwrap();
+        let draft = provider_draft_lane(
+            dir,
+            crate::platform::agenticos_external::PLATFORM,
+            account_b,
+            "generate_text",
+            &["provider.draft".into()],
+            issuer,
+        )
+        .unwrap();
+        assert_eq!(draft, b"agc_workspace_b");
+        assert!(provider_draft_lane(
+            dir,
+            crate::platform::agenticos_external::PLATFORM,
+            account_b,
+            "generate_text",
+            &["provider.draft".into()],
+            "https://other-door.example.test",
+        )
+        .is_none());
+        assert!(provider_draft_lane(
+            dir,
+            "agenticos",
+            account_b,
+            "generate_text",
+            &["provider.draft".into()],
+            issuer,
+        )
+        .is_none());
+        assert!(provider_draft_lane(
+            dir,
+            crate::platform::agenticos_external::PLATFORM,
+            account_a,
+            "generate_text",
+            &["provider.draft".into(), "publish.send".into()],
+            issuer,
+        )
+        .is_none());
+        assert!(provider_draft_lane(
+            dir,
+            "other",
+            account_b,
+            "generate_image",
+            &["provider.draft".into()],
+            issuer,
+        )
+        .is_none());
+        assert!(provider_draft_lane(
+            dir,
+            crate::platform::agenticos_external::PLATFORM,
+            "beta",
+            "generate_text",
+            &["provider.draft".into()],
+            issuer,
+        )
+        .is_none());
+        write_cli(dir, "ops", issuer, "ws_ops");
+        save_lane_credential(
+            dir,
+            issuer,
+            "ws_ops",
+            "provider.draft",
+            "agc_ops",
+            4_000_000_000,
+        )
+        .unwrap();
+        assert_eq!(
+            provider_draft_lane(
+                dir,
+                crate::platform::agenticos_external::PLATFORM,
+                "ws_ops",
+                "generate_image",
+                &["provider.draft".into()],
+                issuer,
+            )
+            .unwrap(),
+            b"agc_ops"
+        );
+        assert!(provider_draft_lane(
+            dir,
+            crate::platform::agenticos_external::PLATFORM,
+            "ops",
+            "generate_image",
+            &["provider.draft".into()],
+            issuer,
+        )
+        .is_none());
+        save_lane_credential(
+            dir,
+            "https://other.example.test",
+            account_b,
+            "provider.draft",
+            "agc_wrong_issuer",
+            4_000_000_000,
+        )
+        .unwrap();
+        assert!(provider_draft_lane(
+            dir,
+            crate::platform::agenticos_external::PLATFORM,
+            account_b,
+            "generate_text",
+            &["provider.draft".into()],
+            issuer,
+        )
+        .is_none());
     }
 }

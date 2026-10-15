@@ -137,15 +137,34 @@ Refused remotely (default-deny): every operator-only daemon verb
 (`agent join/stop/resume`, `daemon *`, `operator_*`, `rollout`, `master/*`,
 `approve`, `merge`, secrets), verbs naming local paths (`issue init`,
 `attach`, chunked wiki `put` — CAD-913's own envelope contract), and
-`issue start`/`dispatch` (worktree + ownership semantics are local).
+`issue start`/`dispatch` are not container verbs. On a selected remote org
+they coordinate this user's local agent through
+`/__platform/hosted-cadence/:organizationId/local-assignments`
+(`hosted-cadence-local-assignment.v1`). When the local actor finishes, `cadence message result` reports the claim stored with that message, not a newer reclaim, and a managed `CADENCE_ALIAS` worker is not instructed to pass `--org` or `org switch`. A worktree alone is not execution.
 Operator-only verbs need the remote operator proof tied to CAD-657's
 source-authority decision — out of scope for v1.
+
+`local-agent connect --alias <alias> --repo <checkout>` configures this
+machine and picks up current assignments once. Run `local-agent watch` for
+ongoing pickup, with a five-second poll and the org pinned for that process.
+Background pickup leaves blocked work alone; after resolving its blocker,
+explicitly reconnect or start that issue again. State-filtered reads prevent a
+recent terminal history page from hiding older queued work.
+Disconnect clears the saved alias and ends pickup; it neither stops existing
+actors nor cancels their claims. Each assignment generation has a separate
+worktree, and reconnect reuses its reserved actor message rather than starting
+the issue twice. A blocked claim resumes before handoff, so a fast result is
+never overwritten by a later `running` report.
 
 ## Auth chain
 
 `cadence login --issuer <api-origin> --org <workspace-id>` →
-`/v1/hosted-cadence/device/code` (PKCE, `requested_capabilities` = the CLI
-set) → owner approves on the app → `/v1/hosted-cadence/device/token` → `hct_`
+`/v1/hosted-cadence/device/code` (PKCE; ordinary portal login and
+`--org` login request `cli.read`, `cli.write`, `wiki.read`, and
+`wiki.write`; `cadence login --web` requests `cli.read`, `cli.write`,
+`web.read`, and `web.prepare` and no wiki scopes; renewal resends the
+stored set and does not widen it) → a current workspace member approves on the app →
+`/v1/hosted-cadence/device/token` → `hct_`
 bridge + minted cli-actor enrollment record (locally sealed) → each command:
 `POST https://<slug>.cadencecloud.app/__platform/cli/authorize` (bridge
 bearer → envelope, ≤300 s, `aud` = board host, `organization_id` = slug's

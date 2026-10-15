@@ -115,6 +115,19 @@ fn forged_renewal_response_is_refused_before_credential_replacement() {
 }
 
 #[test]
+fn member_renewal_keeps_the_saved_capabilities() {
+    let (_root, target, prior, pending) = fixture();
+    let mut response = issuer_response(&prior, &pending, &target);
+    response["principal"]["current_role"] = json!("member");
+    validate_renewal_response(&response, &prior, &target, &pending)
+        .expect("member renewal must not be treated as an identity change");
+    assert_eq!(response["capabilities"], json!(prior.capabilities));
+
+    response["principal"]["current_role"] = json!("admin");
+    assert!(validate_renewal_response(&response, &prior, &target, &pending).is_err());
+}
+
+#[test]
 fn current_issuer_response_passes_identity_and_rotation_guard() {
     let (_root, target, prior, pending) = fixture();
     let response = issuer_response(&prior, &pending, &target);

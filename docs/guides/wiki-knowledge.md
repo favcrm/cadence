@@ -26,10 +26,13 @@ Use three durable layers, following the LLM wiki pattern:
    and records `failed` or `empty` without keeping text from an older PDF.
    OCR is not provided. The index ignores a generated page when its source
    pointer is missing or names different bytes.
-3. **Curated wiki.** An authorized agent or operator writes concise Markdown
+3. **Curated wiki.** An authorized agent, board member or operator writes concise Markdown
    pages that summarize one durable topic, link to the source pages, name
    uncertainty, and update existing pages when evidence changes. For company
-   knowledge, the operator publishes under `global/`. The master may draft in
+   knowledge, board members and the operator may create, edit, move and delete
+   pages under `global/` and `projects/<key>/`. Members also control their own
+   `users/<handle>/`. Other users' private pages, agent-owned areas and the
+   namespace roots remain protected. The master may draft in
    `agents/master/knowledge/`; its current permission does not let it publish
    into `global/`.
 

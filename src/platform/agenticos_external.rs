@@ -1635,6 +1635,10 @@ impl PlatformAdapter for AgenticosExternalAdapter {
         self.transport == Transport::HostedMediaLease && account == "hosted"
     }
 
+    fn credential_sink_origin(&self) -> Option<&str> {
+        Some(self.base.as_str())
+    }
+
     fn connection_registration(&self) -> Option<String> {
         if self.transport == Transport::HostedMediaLease {
             return Some(super::connections::registration_digest(&format!(

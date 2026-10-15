@@ -237,8 +237,12 @@ impl Shared {
         draft: bool,
         adapter: &Arc<dyn PlatformAdapter>,
     ) -> Result<Value> {
-        let bytes =
-            platform::load_credential(&self.store, &self.platform_custody, platform_name, account)?;
+        let scopes = adapter
+            .table()
+            .declared(tool)
+            .map(|declared| declared.scopes.clone())
+            .unwrap_or_default();
+        let bytes = self.effect_credential(platform_name, account, tool, &scopes)?;
         let key = format!("call-{}", uuid::Uuid::new_v4().simple());
         let result = adapter
             .execute(&bytes, tool, input, &key, None)
@@ -316,8 +320,12 @@ impl Shared {
             })?),
             None => None,
         };
-        let bytes =
-            platform::load_credential(&self.store, &self.platform_custody, platform_name, account)?;
+        let scopes = adapter
+            .table()
+            .declared(tool)
+            .map(|declared| declared.scopes.clone())
+            .unwrap_or_default();
+        let bytes = self.effect_credential(platform_name, account, tool, &scopes)?;
         let decl = adapter.table().declared(tool);
         let summary = input_summary(tool, input);
         // An implied source joins the preview input so the press sees
@@ -662,14 +670,53 @@ impl Shared {
         }
     }
 
+    /// Custody first. A missing enrollment may use the `provider.draft`
+    /// lane bound to this frozen account and its login issuer. A
+    /// fingerprint or custody mismatch is returned as that failure.
+    fn effect_credential(
+        &self,
+        platform_name: &str,
+        account: &str,
+        tool: &str,
+        scopes: &[String],
+    ) -> Result<Vec<u8>> {
+        match platform::load_credential(&self.store, &self.platform_custody, platform_name, account)
+        {
+            Ok(bytes) => Ok(bytes),
+            Err(err) if platform::credential_enrollment_missing(&err) => {
+                let Ok(auth) = crate::remote_auth::auth_dir(None) else {
+                    return Err(err);
+                };
+                let Some(origin) = self
+                    .platforms
+                    .get(platform_name)
+                    .and_then(|adapter| adapter.credential_sink_origin().map(str::to_owned))
+                else {
+                    return Err(err);
+                };
+                crate::remote_auth::provider_draft_lane(
+                    &auth,
+                    platform_name,
+                    account,
+                    tool,
+                    scopes,
+                    &origin,
+                )
+                .ok_or(err)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     /// Execute the accepted send — §5.4 steps 3–6. The durable
     /// `decided` row exists already; this runs: source re-verify →
     /// grant re-check → custody load → `executing` → the platform call
     /// under the `effect_id` idempotency key and expected hash →
     /// adapter read-back → the recorded outcome → the delivered
-    /// message. A source change, a lost grant or a credential that no
-    /// longer loads closes the row instead of firing; a platform error
-    /// lands `failed`, never `closed`.
+    /// message. A source change, a lost grant or a missing enrollment
+    /// closes the row instead of firing. A custody fingerprint mismatch
+    /// stays that error and does not borrow another workspace. A
+    /// platform error lands `failed`, never `closed`.
     fn execute_effect(&self, row: &EffectRow) -> Result<EffectRow> {
         if self.store.app_effect_is_child(&row.effect_id)? {
             return Err(Error::rejected(
@@ -720,24 +767,21 @@ impl Shared {
         // not load means the call provably never ran — the still-
         // `decided` row closes `credential_revoked` and the requester
         // hears about it like every other execute-time close (N3).
-        let bytes = match platform::load_credential(
-            &self.store,
-            &self.platform_custody,
-            &row.platform,
-            &row.account,
-        ) {
-            Ok(b) => b,
-            Err(_) => {
-                let row = self
-                    .store
-                    .effect_close_decided(&row.effect_id, "credential_revoked")?
-                    .unwrap_or(row.clone());
-                self.emit_request_closed(&row.agent, &row.request, "credential_revoked");
-                self.deliver_effect_outcome(&row, "closed (credential_revoked)");
-                self.wake();
-                return Ok(row);
-            }
-        };
+        let bytes =
+            match self.effect_credential(&row.platform, &row.account, &row.tool, &row.scopes) {
+                Ok(bytes) => bytes,
+                Err(err) if platform::credential_enrollment_missing(&err) => {
+                    let row = self
+                        .store
+                        .effect_close_decided(&row.effect_id, "credential_revoked")?
+                        .unwrap_or(row.clone());
+                    self.emit_request_closed(&row.agent, &row.request, "credential_revoked");
+                    self.deliver_effect_outcome(&row, "closed (credential_revoked)");
+                    self.wake();
+                    return Ok(row);
+                }
+                Err(err) => return Err(err),
+            };
         self.store.effect_executing(&row.effect_id)?;
         let outcome = adapter.execute(
             &bytes,

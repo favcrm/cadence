@@ -240,6 +240,13 @@ pub trait PlatformAdapter: Send + Sync {
         false
     }
 
+    /// Origin this adapter posts credentials to. A device lane may be used
+    /// only when this origin is that lane's issuer. Adapters that do not
+    /// publish an origin never receive a lane token.
+    fn credential_sink_origin(&self) -> Option<&str> {
+        None
+    }
+
     /// Reviewed internal tools require persisted app-artifact authority,
     /// regardless of a legacy account grant held by a worker.
     fn app_artifact_tool(&self, tool: &str) -> bool {

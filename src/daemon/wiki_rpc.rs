@@ -149,13 +149,13 @@ impl Shared {
         caller: &Caller,
         human: Option<&Value>,
         action: &str,
-        paths: &[&str],
+        paths: &[(&str, wiki::Op)],
     ) -> Result<crate::issue::Pm> {
         let mut resource = String::new();
-        for path in paths {
+        for (path, op) in paths {
             let norm = wiki::normalize(path)?;
             let segs: Vec<&str> = norm.split('/').collect();
-            wiki::allowed(caller, wiki::Op::Write, &segs)?;
+            wiki::allowed(caller, *op, &segs)?;
             if !resource.is_empty() {
                 resource.push_str(" -> ");
             }
@@ -220,7 +220,13 @@ impl Shared {
         let text = required_str(params, "text")?;
         let if_rev = optional_str(params, "if_rev");
         let human = self.wiki_human(params, &caller, "wiki write")?;
-        let pm = self.wiki_receipt(self.pm()?, &caller, human.as_ref(), "wiki_written", &[path])?;
+        let pm = self.wiki_receipt(
+            self.pm()?,
+            &caller,
+            human.as_ref(),
+            "wiki_written",
+            &[(path, wiki::Op::Write)],
+        )?;
         let out = wiki::write(&pm, &caller, path, text, if_rev)?;
         // CAD-719: a committed write schedules the coalesced refresh —
         // an `if_rev` conflict (no commit) kicks nothing.
@@ -248,7 +254,7 @@ impl Shared {
             &caller,
             human.as_ref(),
             "wiki_blob_uploaded",
-            &[path],
+            &[(path, wiki::Op::Write)],
         )?;
         let mut out = wiki::put_blob(&pm, &self.state_dir, &caller, path, &tmp, sha256, if_rev)?;
         let committed = out["rev"].is_string();
@@ -275,7 +281,7 @@ impl Shared {
             &caller,
             human.as_ref(),
             "wiki_directory_created",
-            &[path],
+            &[(path, wiki::Op::Write)],
         )?;
         let out = wiki::mkdir(&pm, &caller, path)?;
         // CAD-719: a created dir commits a .gitkeep — the tree moved.
@@ -293,10 +299,10 @@ impl Shared {
         let human = self.wiki_human(params, &caller, "wiki mv")?;
         // A `.trash/` source is an operator-only restore that `wiki::mv`
         // gates itself; only a real source path needs the ACL check here.
-        let sources: Vec<&str> = if from.starts_with(".trash/") {
-            vec![to]
+        let sources: Vec<(&str, wiki::Op)> = if from.starts_with(".trash/") {
+            vec![(to, wiki::Op::Write)]
         } else {
-            vec![from, to]
+            vec![(from, wiki::Op::Remove), (to, wiki::Op::Write)]
         };
         let pm = self.wiki_receipt(self.pm()?, &caller, human.as_ref(), "wiki_moved", &sources)?;
         let mut out = wiki::mv(&pm, &caller, from, to)?;
@@ -346,7 +352,13 @@ impl Shared {
         let caller = self.wiki_caller(params, peer_pid, "wiki rm")?;
         let path = Self::wiki_path(params)?;
         let human = self.wiki_human(params, &caller, "wiki rm")?;
-        let pm = self.wiki_receipt(self.pm()?, &caller, human.as_ref(), "wiki_removed", &[path])?;
+        let pm = self.wiki_receipt(
+            self.pm()?,
+            &caller,
+            human.as_ref(),
+            "wiki_removed",
+            &[(path, wiki::Op::Remove)],
+        )?;
         let pdf = wiki::read(&pm, &caller, path)
             .ok()
             .is_some_and(|v| v["mime"] == "application/pdf");
