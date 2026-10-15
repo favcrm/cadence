@@ -120,10 +120,13 @@ function AssistantActivity({ since }: { since: number | null }) {
   }, []);
   const elapsed = since !== null && Number.isFinite(since) ? fmtElapsed(Math.max(0, Math.floor(now / 1000 - since))) : null;
   return (
-    <span className="flex gap-1.5 items-center" data-assistant-activity role="status">
+    <span className="flex gap-1.5 items-center" data-assistant-activity>
       <span className="workdot live" aria-hidden />
       <span>{t("Working")}</span>
-      {elapsed !== null && <span className="text-ink-500">{elapsed}</span>}
+      {/* The 1s-ticking counter is decorative — the dock `.workrow`
+         role=status already announces the truthful state, so this
+         stays silent (CAD-1419: no elapsed-second SR chatter). */}
+      {elapsed !== null && <span className="text-ink-500" aria-hidden>{elapsed}</span>}
     </span>
   );
 }
