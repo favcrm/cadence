@@ -62,7 +62,7 @@ export interface HumanAskReceipt {
   duplicate: boolean;
 }
 
-async function call<T>(method: "GET" | "POST" | "DELETE", path: string, body?: object, operation?: PrivateOperation): Promise<T> {
+async function call<T>(method: "GET" | "POST" | "DELETE", path: string, body?: object, operation?: PrivateOperation, signal?: AbortSignal): Promise<T> {
   return usingPrivateOperation(operation, async (op) => {
     const resp = await privateFetch(path, {
       method,
@@ -89,7 +89,7 @@ async function call<T>(method: "GET" | "POST" | "DELETE", path: string, body?: o
       throw new ApiError("The server returned an invalid human rooms response", 502);
     }
     return parsed as T;
-  });
+  }, signal);
 }
 
 const ROOMS = "/api/human-threads/rooms";
@@ -164,6 +164,18 @@ export interface HumanPerson {
   id: string;
   subject: string;
   name: string;
+}
+
+export interface HumanPeoplePage {
+  actor: string;
+  people: HumanPerson[];
+  has_more: boolean;
+}
+
+/** The complete verified workspace is searched before the server's 20-result cap. */
+export function searchHumanPeople(query: string, signal: AbortSignal): Promise<HumanPeoplePage> {
+  const params = new URLSearchParams({ query });
+  return call("GET", `/api/human-threads/people?${params}`, undefined, undefined, signal);
 }
 
 interface RosterResponse {

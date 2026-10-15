@@ -1075,7 +1075,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             onToast={say}
           />
         )}
-        {route.screen === "threads" && <ThreadsPage operator={meta?.operator === true} />}
+        {route.screen === "threads" && <ThreadsPage key={meta.session?.id ?? ""} operator={meta.operator === true} />}
         {screen === "outbox" && <Outbox operator={meta?.operator === true} onOpenIssue={openIssue} />}
         {screen === "setup" && (
           <Setup settingsHref={hrefFor({ screen: "settings", section: "models" })} readOnly={meta ? boardReadOnly : null} />

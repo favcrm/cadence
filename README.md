@@ -54,7 +54,9 @@ explicit pilot versions and provenance verification. The
 cadence setup                  # idempotent first run: state dir, tracker,
                                #  skill, daemon and board; reports provider CLIs
 cadence daemon start           # detached controller
-cadence skill install          # ship the `cadence` skill to your agent CLIs
+cadence skill install          # install the separate bundled guidance skills
+cadence skill install company-outputs # workflow + business-document guidance only
+cadence skill status           # per-skill files/content and provider-link status
 
 cadence claude --alias pm --role pm       # named headless PM
 cadence join pm devin --alias w1 --detach # named worker; keep this shell free
@@ -70,6 +72,20 @@ deliberately serving a board in the foreground without one already running.
 `cadence --help` is the installed CLI reference. Start with
 [project context](docs/START-HERE.md) for contracts and source ownership, or the
 [contribution guide](CONTRIBUTING.md) for development and validation.
+
+### Start a conversation
+
+On a signed-in hosted board, open **Threads → Add** and choose **Direct** or
+**Group**. Operators also have **Project** (project/fleet coordination) and
+**Agent** (a thread with a live agent). Each mode has one creation action.
+
+The member picker searches the complete current workspace by name, returning
+at most 20 matches in a compact scroll area. Type to refine the results;
+selected people remain above the list when the query changes. Use a selected
+person's remove button to unselect them. Loading, unavailable and empty results
+are distinct, and **Retry search** repeats a failed search without losing picks.
+The server rechecks sign-in and live workspace membership on every search and
+creation request; search results never grant access.
 
 ## What it gives you
 
@@ -95,8 +111,8 @@ Task worktrees live under `.cadence/wt/` inside the repo checkout.
 ```
 src/        CLI, daemon and provider adapters (Rust)
 ui/         the board (React + Vite; features/ + lib/ + ui/)
-skills/     agent skills — cadence (installed by `cadence skill install`),
-            agent-handover, business-documents, company-outputs, sop-workshop
+skills/     bundled cadence, business-documents and company-outputs guidance;
+            additional checked-out agent-handover and sop-workshop skills
 agents/     master-agent seed files
 contracts/  versioned platform schemas and worked vectors
 workflows/  reusable workflow templates
@@ -115,8 +131,24 @@ solution before authoring, and requires actual output checks. It reuses
 the existing business-document operations where their contracts fit.
 Native templates currently support quotation/invoice DOCX drafts, not
 arbitrary proposals or XLSX templates. `cadence skill install` installs
-the Cadence protocol only; providing this checked-out entry point is
-explicit skill consumption, not automatic hosted installation.
+the three public guidance skills in separate directories under
+`~/.agents/skills/`; the scoped `company-outputs` install also supplies
+business-document guidance without refreshing the core Cadence protocol.
+Company-private profiles, renderer scripts/images and trial data are not bundled.
+
+Codex discovers the canonical directory; Claude/Cursor/Copilot use provider
+symlinks. Existing real provider entries are preserved and reported as skipped,
+not proof of seeing the bundled version. Status reports each skill's files and
+links; a missing/stale reference is not a healthy install. Setup observes existing
+partial/stale installs without rewriting them; explicit install is the refresh.
+Daemon startup sync keeps the existing sandbox no-write guard.
+Canonical bundled-file symlinks are refused before reading or writing them,
+without rewriting their targets.
+
+Discovery is provider-specific, not a live-context reload or hosted rollout.
+Pi currently disables native skill loading, confined agents may lack access,
+and remote workers need an accessible approved path or supplied guidance.
+Do not change permissions or agent configuration to conceal those limits.
 
 ## Principles
 

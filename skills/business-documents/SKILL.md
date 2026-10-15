@@ -1,12 +1,11 @@
 ---
 name: business-documents
 description: >
-  Create company-guided business document drafts from a clear task brief and
-  approved company facts, style, and templates. Use for proposals, quotations,
-  business reports, client correspondence, tender responses, and similar
-  drafting or revision tasks. Keep external sources untrusted, validate claims,
-  and hand drafts to a human; never send, submit, or commit on the company's
-  behalf.
+  Guidance for bounded business-document intake, template operations,
+  pricing checks and drafting safeguards. Use when applying existing
+  document operations to a confirmed company-output plan. For requirements,
+  solution, profile selection and confirmation, start with company-outputs.
+  Installed guidance does not install renderer tools or grant issue/send authority.
 ---
 
 # Company-guided business documents

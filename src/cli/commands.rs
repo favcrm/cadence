@@ -1010,9 +1010,9 @@ pub(crate) enum Commands {
         #[arg(long, default_value_t = 5)]
         exec_max_failures: u32,
     },
-    /// Install or inspect the `cadence` agent skill under
-    /// `~/.agents/skills/cadence` with symlinks into the `.claude`,
-    /// `.cursor` and `.copilot` skill dirs.
+    /// Install or inspect separate public agent guidance under
+    /// `~/.agents/skills`, with provider links. Company-private profiles
+    /// and renderer tools are not installed.
     Skill {
         #[command(subcommand)]
         action: SkillAction,
