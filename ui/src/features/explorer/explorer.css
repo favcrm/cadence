@@ -106,3 +106,23 @@
 /* The Installed search stays usable at 390px: it wraps under the heading and grows, never shrinks to a stub. */
 .apps-home .sechead .search { flex: 1 1 160px; min-width: 140px; width: auto; }
 .apps-home .sechead .sort { flex: 0 1 auto; width: auto; max-width: 100%; }
+
+/* CAD-1471 public directory. Tokens stay the board's. */
+.pubdir-tools { display: flex; flex-wrap: wrap; gap: 12px; margin: 0 0 14px; }
+.pubdir-tools .field { width: min(240px, 100%); }
+.pubdir-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(290px, 100%), 1fr)); gap: 14px; }
+.pubdir-card { display: flex; flex-direction: column; gap: 10px; padding: 14px; text-align: left; }
+.pubdir-tile { width: 40px; height: 40px; border-radius: .4rem; display: grid; place-items: center; background: var(--color-ink-800, #24282f); color: var(--color-ink-100); font-weight: 600; }
+.pubdir-summary { color: var(--color-ink-300); font-size: var(--text-secondary); }
+.pubdir-meta { display: flex; gap: 6px; align-items: center; margin-top: auto; }
+.pubdir-ver { margin-left: auto; font-family: var(--font-mono); color: var(--color-ink-500); font-size: var(--text-label); }
+.pubdir-empty { padding: 28px; text-align: center; color: var(--color-ink-500); }
+.pubdir-split { display: grid; grid-template-columns: minmax(0, 1fr) 280px; gap: 22px; }
+.pubdir-side { padding: 18px; }
+.pubdir-kv { display: grid; grid-template-columns: 92px 1fr; gap: 8px 12px; }
+.pubdir-digest { overflow-wrap: anywhere; font-family: var(--font-mono); font-size: var(--text-label); }
+.pubdir-dialog { max-width: min(460px, calc(100% - 32px)); padding: 24px; }
+.pubdir-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 18px; }
+@media (max-width: 820px) { .pubdir-split { grid-template-columns: 1fr; } }
+@media (prefers-reduced-motion: reduce) { .pubdir-card { transition: none; } }
+

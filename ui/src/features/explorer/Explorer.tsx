@@ -14,19 +14,12 @@ import { Loading, Notice } from "../app-shell/shared/States";
 import { useBackoffLoad } from "../workspace-apps/useBackoffLoad";
 import { navigate } from "../../lib/useLocation";
 import "./explorer.css";
-
-/** The AgenticOS marketplace's Apps page — discovery and installs of
- * canonical app releases moved here (CAD-1422); the host's embedded
- * catalog is retired. Public origin proven by the provider's deploy
- * config (`agenticos-v2-web` custom domain `app-v2.agenticos.hk`). */
-const MARKETPLACE_URL = "https://app-v2.agenticos.hk/apps";
+import { PublicDirectory } from "./publicDirectory";
 
 /**
- * The Apps Explorer (CAD-1422, `/apps/explore`). The host no longer
- * ships a built-in catalog: browsing and marketplace installs happen in
- * AgenticOS, so this page hands discovery off there and keeps the
- * operator's local sources — a checked Git URL — plus tombstone rows
- * for catalog ids a historical install or an open request still names.
+ * The Apps Explorer (CAD-1471, `/apps/explore`). Published apps come from
+ * the public catalog. The retired built-in catalog stays as tombstones.
+ * A checked Git URL remains an operator-only local source.
  */
 export default function Explorer({ viewer }: { viewer: Viewer }) {
   const t = useTranslate();
@@ -62,15 +55,14 @@ export default function Explorer({ viewer }: { viewer: Viewer }) {
       .finally(() => setBusy((b) => ({ ...b, [id]: false })));
   };
 
-  if (viewer.operator === null) {
+  if (viewer.operator === null && viewer.access === "unavailable") {
     return (
       <main className="apps-explore px-4 lg:px-8 pt-4 pb-9 min-w-0" aria-label="explore apps">
         <h1 className="text-section font-semibold text-ink-100 mb-4">{t("Explore apps")}</h1>
-        {viewer.access === "unavailable" ? (
-          <Notice state="access-unavailable" onRetry={viewer.onRetryAccess} retryLabel="Retry access check">
-            Access could not be confirmed. Retry the access check before acting.
-          </Notice>
-        ) : <Loading>{t("Checking whether this session can act…")}</Loading>}
+        <PublicDirectory viewer={viewer} />
+        <Notice state="access-unavailable" onRetry={viewer.onRetryAccess} retryLabel="Retry access check">
+          Access could not be confirmed. Retry the access check before acting.
+        </Notice>
       </main>
     );
   }
@@ -100,22 +92,7 @@ export default function Explorer({ viewer }: { viewer: Viewer }) {
           )}
         </div>
       </div>
-      <p className="text-secondary text-ink-400 mb-4">
-        {t("Apps add new skills to your workspace. Browse and install them from the AgenticOS marketplace.")}
-      </p>
-
-      <div className="card p-4 mb-5" role="group" aria-label={t("AgenticOS marketplace")}>
-        <h2 className="text-cardtitle font-medium text-ink-100 mb-1">{t("The app marketplace moved")}</h2>
-        <p className="text-label text-ink-400 mb-3">
-          {t("The built-in catalog is retired. Discover reviewed releases on your company's Apps page in AgenticOS. Marketplace installs belong to your AgenticOS workspace; use a checked package or Git source to install on this Cadence host.")}
-        </p>
-        <a className="btn btn-primary btn-sm" href={MARKETPLACE_URL} target="_blank" rel="noopener noreferrer">
-          {t("Open the AgenticOS marketplace")}
-        </a>
-        <p className="text-micro text-ink-500 mt-2">
-          {t("Sign in with your company account; the marketplace handles install approval.")}
-        </p>
-      </div>
+      <PublicDirectory viewer={viewer} />
 
       {isOp && gitOpen && (
         <GitAdd
