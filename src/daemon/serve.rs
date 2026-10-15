@@ -7,8 +7,7 @@ use super::*;
 use super::app_media_rpc::OriginalDelivery;
 use std::cell::Cell;
 use std::fs::{File, OpenOptions};
-use std::io::BufReader;
-use std::io::Write;
+use std::io::{BufReader, BufWriter, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
@@ -267,7 +266,7 @@ pub(super) fn handle_conn(shared: Arc<Shared>, stream: UnixStream) {
         return;
     };
     let mut writer = match stream.try_clone() {
-        Ok(w) => w,
+        Ok(w) => BufWriter::new(w),
         Err(_) => return,
     };
     let reader = BufReader::new(stream);
@@ -293,7 +292,7 @@ pub(super) fn handle_conn(shared: Arc<Shared>, stream: UnixStream) {
             // This connection ends with the reply and no further request
             // is read, so the flag shared with the reader is safe. Every
             // later write is one guarded nonblocking send.
-            if writer.set_nonblocking(true).is_err() {
+            if writer.get_ref().set_nonblocking(true).is_err() {
                 break;
             }
             let outcome = serde_json::from_str::<Value>(&line)
@@ -322,14 +321,14 @@ pub(super) fn handle_conn(shared: Arc<Shared>, stream: UnixStream) {
                             line.push('\n');
                             write_original_guarded(
                                 delivery,
-                                &mut writer,
+                                writer.get_mut(),
                                 line.as_bytes(),
                                 deadline,
                                 &mut header_started,
                             )?;
                             write_original_guarded(
                                 delivery,
-                                &mut writer,
+                                writer.get_mut(),
                                 bytes,
                                 deadline,
                                 &mut header_started,
@@ -348,7 +347,11 @@ pub(super) fn handle_conn(shared: Arc<Shared>, stream: UnixStream) {
                     let deadline = Instant::now() + Duration::from_secs(60);
                     let mut frame = proto::err(&error).to_string();
                     frame.push('\n');
-                    let _ = client::write_bounded(writer.as_raw_fd(), frame.as_bytes(), deadline);
+                    let _ = client::write_bounded(
+                        writer.get_ref().as_raw_fd(),
+                        frame.as_bytes(),
+                        deadline,
+                    );
                     break;
                 }
             }
@@ -372,7 +375,12 @@ pub(super) fn handle_conn(shared: Arc<Shared>, stream: UnixStream) {
             Ok(result) => proto::ok(result),
             Err(error) => proto::err(&error),
         };
-        if writeln!(writer, "{frame}").is_err() {
+        // Value's formatter emits small fragments; coalesce socket writes,
+        // but flush each frame so a caller need not close or send again.
+        if writeln!(writer, "{frame}")
+            .and_then(|()| writer.flush())
+            .is_err()
+        {
             break;
         }
     }

@@ -73,6 +73,10 @@ const DEPTH_CAP: usize = 32;
 const TEXT_CAP: u64 = 64 * 1024 * 1024;
 /// Largest profile view file (matches master's cap order).
 const VIEW_CAP: u64 = 1_048_576;
+/// Existing native tool line bound. A bounded read's compact JSON plus
+/// its stdout newline stays strictly under this. It is not a new cap:
+/// an unbounded `read` still returns the whole page.
+pub const NATIVE_TOOL_LINE_BOUND: usize = 50_000;
 
 /// Who the daemon derived from the connection — never a request
 /// field. `wiki_as` on an operator connection produces the same
@@ -835,10 +839,107 @@ fn profile_file(pm: &Pm, alias: &str, name: &str) -> Result<PathBuf> {
     }
 }
 
+/// One bounded read of an original text page. `offset` is a UTF-8 byte
+/// index. `bytes` is the maximum length; `None` returns the longest
+/// slice from `offset` that fits [`NATIVE_TOOL_LINE_BOUND`]. `rev`,
+/// when set, must be the original page revision — a mismatch returns
+/// no body.
+pub struct BodyRange<'a> {
+    pub offset: u64,
+    pub bytes: Option<u64>,
+    pub rev: Option<&'a str>,
+}
+
+struct TextPage {
+    path: String,
+    text: String,
+    /// Revision of the whole original, not of the returned slice.
+    rev: String,
+}
+
+enum Opened {
+    Dir { path: String },
+    Blob(Value),
+    Text(TextPage),
+}
+
 /// `wiki read` — text as `{kind:"text",text,rev}`; a blob page as
 /// `{kind:"blob",sha256,size,mime,name,rev}` (rev = the pointer's);
 /// a directory as `{kind:"dir"}`. View paths read their source.
+/// The text `rev` is the original body's revision.
 pub fn read(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
+    match open_page(pm, caller, path)? {
+        Opened::Dir { path } => Ok(json!({"path": path, "kind": "dir"})),
+        Opened::Blob(value) => Ok(value),
+        Opened::Text(page) => Ok(json!({
+            "path": page.path,
+            "kind": "text",
+            "text": page.text,
+            "rev": page.rev,
+        })),
+    }
+}
+
+/// Bounded original-body read. Same authorization and sandbox path as
+/// [`read`]. The reply adds the exact byte range. It does not copy the
+/// page or raise [`TEXT_CAP`].
+pub fn read_range(pm: &Pm, caller: &Caller, path: &str, range: BodyRange<'_>) -> Result<Value> {
+    let Opened::Text(page) = open_page(pm, caller, path)? else {
+        return Err(Error::rejected(format!(
+            "wiki read '{path}' refused: a range read needs a text page — \
+             directories and blobs have no original text range"
+        )));
+    };
+    if let Some(want) = range.rev {
+        if want != page.rev {
+            return Err(Error::rejected(format!(
+                "wiki read '{}' refused: revision '{want}' is not the original \
+                 revision '{}' — ranges are not combined across revisions",
+                page.path, page.rev
+            )));
+        }
+    }
+    let total = page.text.len() as u64;
+    if range.offset > total {
+        return Err(Error::rejected(format!(
+            "wiki read '{}' refused: offset {} is past the original {total} bytes",
+            page.path, range.offset
+        )));
+    }
+    let start = range.offset as usize;
+    if !page.text.is_char_boundary(start) {
+        return Err(Error::rejected(format!(
+            "wiki read '{}' refused: offset {start} is inside a UTF-8 character",
+            page.path
+        )));
+    }
+    let end = match range.bytes {
+        Some(n) => explicit_end(&page, start, n)?,
+        None => fitting_end(&page, start)?,
+    };
+    Ok(ranged_value(&page, start, end))
+}
+
+/// Optional JSON integer field. Absent is `None`. A float, a negative,
+/// or a non-number is refused — never coerced.
+pub fn json_u64(params: &Value, key: &str) -> Result<Option<u64>> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .ok_or_else(|| {
+                Error::rejected(format!(
+                    "wiki read refused: '{key}' must be a non-negative integer"
+                ))
+            })
+            .map(Some),
+        Some(_) => Err(Error::rejected(format!(
+            "wiki read refused: '{key}' must be a non-negative integer"
+        ))),
+    }
+}
+
+fn open_page(pm: &Pm, caller: &Caller, path: &str) -> Result<Opened> {
     let norm = normalize(path)?;
     if norm.is_empty() {
         return Err(Error::rejected(
@@ -865,12 +966,7 @@ pub fn read(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
             }
             let text = std::fs::read_to_string(&file)
                 .map_err(|e| Error::rejected(format!("wiki read '{norm}': {e}")))?;
-            return Ok(json!({
-                "path": norm,
-                "kind": "text",
-                "text": text,
-                "rev": rev_of(&file)?,
-            }));
+            return Ok(text_page(norm, text));
         }
         View::Memory { alias } => {
             if segs.len() != 5 {
@@ -882,19 +978,14 @@ pub fn read(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
             let file = memory_file(pm, &alias, segs[3], segs[4])?;
             let text = std::fs::read_to_string(&file)
                 .map_err(|e| Error::rejected(format!("wiki read '{norm}': {e}")))?;
-            return Ok(json!({
-                "path": norm,
-                "kind": "text",
-                "text": text,
-                "rev": rev_of(&file)?,
-            }));
+            return Ok(text_page(norm, text));
         }
         View::Real => {}
     }
 
     let abs = resolve(&vault, &norm)?;
     match abs.symlink_metadata() {
-        Ok(m) if m.is_dir() => Ok(json!({"path": norm, "kind": "dir"})),
+        Ok(m) if m.is_dir() => Ok(Opened::Dir { path: norm }),
         Ok(m) if m.is_file() => {
             if m.len() > TEXT_CAP {
                 return Err(Error::rejected(format!(
@@ -906,12 +997,7 @@ pub fn read(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
                     "wiki read '{norm}' refused: not UTF-8 text (is it a blob?)"
                 ))
             })?;
-            Ok(json!({
-                "path": norm,
-                "kind": "text",
-                "text": text,
-                "rev": rev_of(&abs)?,
-            }))
+            Ok(text_page(norm, text))
         }
         Ok(_) => Err(Error::rejected(format!("wiki read '{norm}': not a file"))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -920,7 +1006,7 @@ pub fn read(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
             match pointer.symlink_metadata() {
                 Ok(m) if m.is_file() && !m.file_type().is_symlink() => {
                     let meta = blob_meta(&pointer)?;
-                    Ok(json!({
+                    Ok(Opened::Blob(json!({
                         "path": norm,
                         "kind": "blob",
                         "sha256": meta.get("sha256").cloned().unwrap_or(Value::Null),
@@ -928,13 +1014,150 @@ pub fn read(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
                         "mime": meta.get("mime").cloned().unwrap_or(Value::Null),
                         "name": meta.get("name").cloned().unwrap_or(Value::Null),
                         "rev": rev_of(&pointer)?,
-                    }))
+                    })))
                 }
                 _ => Err(Error::rejected(format!("wiki read '{norm}': no such file"))),
             }
         }
         Err(e) => Err(e.into()),
     }
+}
+
+fn text_page(path: String, text: String) -> Opened {
+    let rev = rev_bytes(text.as_bytes());
+    Opened::Text(TextPage { path, text, rev })
+}
+
+fn ranged_value(page: &TextPage, start: usize, end: usize) -> Value {
+    json!({
+        "path": page.path,
+        "kind": "text",
+        "rev": page.rev,
+        "text": &page.text[start..end],
+        "range": {
+            "start": start,
+            "end": end,
+            "total": page.text.len(),
+        }
+    })
+}
+
+fn oversize(path: &str) -> Error {
+    Error::rejected(format!(
+        "wiki read '{path}' refused: the range exceeds the \
+         {NATIVE_TOOL_LINE_BOUND}-byte native tool line bound"
+    ))
+}
+
+/// Bytes one UTF-8 byte contributes inside a `serde_json` string.
+/// Controls use the short escapes (`\n`, `\r`, `\t`, `\b`, `\f`); every
+/// other byte below 0x20 is `\u00XX`.
+fn json_byte_escape_len(b: u8) -> usize {
+    match b {
+        b'"' | b'\\' | 0x08 | b'\t' | b'\n' | 0x0c | b'\r' => 2,
+        0x00..=0x1F => 6,
+        _ => 1,
+    }
+}
+
+fn json_string_len(s: &str) -> usize {
+    let mut n = 2;
+    for &b in s.as_bytes() {
+        n += json_byte_escape_len(b);
+    }
+    n
+}
+
+fn decimal_len(n: usize) -> usize {
+    if n == 0 {
+        1
+    } else {
+        (n.ilog10() as usize) + 1
+    }
+}
+
+/// Compact length of [`ranged_value`], matching `serde_json::to_string`.
+/// `json!` maps sort keys, so the line is
+/// `{"kind":"text","path":…,"range":{"end":…,"start":…,"total":…},"rev":…,"text":…}`.
+fn compact_line_len(page: &TextPage, start: usize, end: usize) -> usize {
+    "{\"kind\":\"text\",\"path\":".len()
+        + json_string_len(&page.path)
+        + ",\"range\":{\"end\":".len()
+        + decimal_len(end)
+        + ",\"start\":".len()
+        + decimal_len(start)
+        + ",\"total\":".len()
+        + decimal_len(page.text.len())
+        + "},\"rev\":".len()
+        + json_string_len(&page.rev)
+        + ",\"text\":".len()
+        + json_string_len(&page.text[start..end])
+        + "}".len()
+}
+
+fn line_fits(len: usize) -> bool {
+    len + 1 < NATIVE_TOOL_LINE_BOUND
+}
+
+fn explicit_end(page: &TextPage, start: usize, bytes: u64) -> Result<usize> {
+    let mut end = start.saturating_add(usize::try_from(bytes).unwrap_or(usize::MAX));
+    if end > page.text.len() {
+        end = page.text.len();
+    }
+    if !page.text.is_char_boundary(end) {
+        return Err(Error::rejected(format!(
+            "wiki read '{}' refused: range end {end} is inside a UTF-8 character",
+            page.path
+        )));
+    }
+    // The JSON line is longer than the raw slice, so a slice that already
+    // meets the line bound cannot fit.
+    if end - start + 1 >= NATIVE_TOOL_LINE_BOUND || !line_fits(compact_line_len(page, start, end)) {
+        return Err(oversize(&page.path));
+    }
+    Ok(end)
+}
+
+/// Largest char-boundary end at or after `start` whose compact JSON
+/// line fits the native tool bound. One forward pass; escaped length
+/// is accumulated, not recomputed, and no JSON string is built.
+fn fitting_end(page: &TextPage, start: usize) -> Result<usize> {
+    let text = page.text.as_str();
+    let limit = start
+        .saturating_add(NATIVE_TOOL_LINE_BOUND.saturating_sub(1))
+        .min(text.len());
+    let base = compact_line_len(page, start, start) - decimal_len(start);
+    let mut end = start;
+    let mut escaped = 0usize;
+    let mut i = start;
+    while i < limit {
+        let ch_end = i + text[i..].chars().next().map(char::len_utf8).unwrap_or(0);
+        if ch_end > limit {
+            break;
+        }
+        let mut add = 0;
+        for &b in &text.as_bytes()[i..ch_end] {
+            add += json_byte_escape_len(b);
+        }
+        let line = base + decimal_len(ch_end) + escaped + add;
+        if !line_fits(line) {
+            break;
+        }
+        escaped += add;
+        end = ch_end;
+        i = ch_end;
+    }
+    let line = base + decimal_len(end) + escaped;
+    if !line_fits(line) {
+        return Err(oversize(&page.path));
+    }
+    debug_assert_eq!(
+        line,
+        serde_json::to_string(&ranged_value(page, start, end))
+            .map(|encoded| encoded.len())
+            .unwrap_or(usize::MAX)
+    );
+    Ok(end)
 }
 
 /// `wiki write` — a text page. `if_rev` is the optimistic-concurrency
@@ -1852,6 +2075,7 @@ pub fn history(pm: &Pm, caller: &Caller, path: &str, limit: usize) -> Result<Val
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn segs(path: &str) -> Vec<&str> {
         if path.is_empty() {
@@ -2048,6 +2272,231 @@ mod tests {
         assert_eq!(agent().actor(), "swe-1");
         assert_eq!(Caller::User("f".into()).actor(), "f (ui)");
         assert_eq!(Caller::Public.actor(), "anonymous (ui)");
+    }
+
+    fn body_range<'a>(offset: u64, bytes: Option<u64>, rev: Option<&'a str>) -> BodyRange<'a> {
+        BodyRange { offset, bytes, rev }
+    }
+
+    fn range_pm() -> (tempfile::TempDir, Pm) {
+        let root = tempfile::TempDir::new().unwrap();
+        let pm = Pm::init(&root.path().join("pm")).unwrap();
+        (root, pm)
+    }
+
+    /// CAD-1456: a large original is readable in revision-pinned ranges.
+    /// The compact line stays under the native tool bound, slices
+    /// concatenate to the original, and a later revision is not mixed in.
+    #[test]
+    fn bounded_ranges_pin_one_revision_and_cover_a_large_original() {
+        let (_root, pm) = range_pm();
+        let path = "global/large.md";
+        let original = format!("BODYSTART{}", "a".repeat(60_000));
+        write(&pm, &Caller::Operator, path, &original, None).unwrap();
+        let before = std::fs::read(vault_dir(&pm).unwrap().join(path)).unwrap();
+
+        let full = read(&pm, &Caller::Operator, path).unwrap();
+        assert!(
+            full.get("range").is_none(),
+            "an unbounded read stays unbounded"
+        );
+        assert_eq!(full["text"].as_str().unwrap(), original);
+        let rev = full["rev"].as_str().unwrap().to_string();
+
+        let mut got = String::new();
+        let mut offset = 0u64;
+        for _ in 0..8 {
+            let page = read_range(
+                &pm,
+                &Caller::Operator,
+                path,
+                body_range(offset, None, Some(&rev)),
+            )
+            .unwrap();
+            let line = serde_json::to_string(&page).unwrap();
+            assert!(
+                line.len() + 1 < NATIVE_TOOL_LINE_BOUND,
+                "range line is {} bytes",
+                line.len() + 1
+            );
+            assert_eq!(page["path"].as_str(), Some(path));
+            assert_eq!(page["rev"].as_str(), Some(rev.as_str()));
+            assert_eq!(page["range"]["start"].as_u64().unwrap(), offset);
+            let end = page["range"]["end"].as_u64().unwrap();
+            let total = page["range"]["total"].as_u64().unwrap();
+            assert_eq!(total, original.len() as u64);
+            assert!(end > offset && end <= total);
+            let text = page["text"].as_str().unwrap();
+            assert_eq!(
+                text.as_bytes(),
+                &original.as_bytes()[offset as usize..end as usize]
+            );
+            got.push_str(text);
+            offset = end;
+            if offset == total {
+                break;
+            }
+        }
+        assert_eq!(got, original);
+        assert_eq!(
+            std::fs::read(vault_dir(&pm).unwrap().join(path)).unwrap(),
+            before
+        );
+
+        let err = read_range(
+            &pm,
+            &Caller::Operator,
+            path,
+            body_range(0, Some(original.len() as u64), None),
+        )
+        .unwrap_err();
+        let err = err.to_string();
+        assert!(err.contains("50000"), "{err}");
+        assert!(!err.contains("BODYSTART"), "{err}");
+
+        write(&pm, &Caller::Operator, path, "NEXTVERSION-SENTINEL", None).unwrap();
+        let mismatch = read_range(
+            &pm,
+            &Caller::Operator,
+            path,
+            body_range(0, Some(4), Some(&rev)),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(mismatch.contains(&rev), "{mismatch}");
+        assert!(!mismatch.contains("NEXTVERSION-SENTINEL"), "{mismatch}");
+        assert!(!mismatch.contains("BODYSTART"), "{mismatch}");
+    }
+
+    #[test]
+    fn range_edges_are_exact_utf8_boundaries() {
+        let (_root, pm) = range_pm();
+        let path = "global/chars.md";
+        let text = "a\u{00e9}b";
+        assert_eq!(text.len(), 4);
+        write(&pm, &Caller::Operator, path, text, None).unwrap();
+
+        let mid = read_range(&pm, &Caller::Operator, path, body_range(1, Some(2), None)).unwrap();
+        assert_eq!(mid["text"], "\u{00e9}");
+        assert_eq!(mid["range"]["start"].as_u64(), Some(1));
+        assert_eq!(mid["range"]["end"].as_u64(), Some(3));
+        assert_eq!(mid["range"]["total"].as_u64(), Some(4));
+
+        let split = read_range(&pm, &Caller::Operator, path, body_range(0, Some(2), None))
+            .unwrap_err()
+            .to_string();
+        assert!(split.contains("UTF-8"), "{split}");
+        let inside = read_range(&pm, &Caller::Operator, path, body_range(2, Some(1), None))
+            .unwrap_err()
+            .to_string();
+        assert!(inside.contains("UTF-8"), "{inside}");
+
+        let eof = read_range(&pm, &Caller::Operator, path, body_range(4, Some(10), None)).unwrap();
+        assert_eq!(eof["text"], "");
+        assert_eq!(eof["range"]["start"].as_u64(), Some(4));
+        assert_eq!(eof["range"]["end"].as_u64(), Some(4));
+        let empty = read_range(&pm, &Caller::Operator, path, body_range(0, Some(0), None)).unwrap();
+        assert_eq!(empty["text"], "");
+        assert_eq!(empty["range"]["end"].as_u64(), Some(0));
+
+        let past = read_range(&pm, &Caller::Operator, path, body_range(5, None, None))
+            .unwrap_err()
+            .to_string();
+        assert!(past.contains("past"), "{past}");
+        assert!(!past.contains('\u{00e9}'));
+    }
+
+    #[test]
+    fn range_read_denies_the_same_callers_and_leaves_bytes_in_place() {
+        let (root, pm) = range_pm();
+        let secret = "DENY-SENTINEL-private";
+        write(
+            &pm,
+            &Caller::Operator,
+            "users/fable/secret.md",
+            secret,
+            None,
+        )
+        .unwrap();
+        let denied = read_range(
+            &pm,
+            &agent(),
+            "users/fable/secret.md",
+            body_range(0, Some(1), None),
+        )
+        .unwrap_err()
+        .to_string();
+        let full = read(&pm, &agent(), "users/fable/secret.md")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(denied, full);
+        assert!(!denied.contains("DENY-SENTINEL"), "{denied}");
+        assert_eq!(
+            std::fs::read(vault_dir(&pm).unwrap().join("users/fable/secret.md")).unwrap(),
+            secret.as_bytes()
+        );
+
+        mkdir(&pm, &Caller::Operator, "global/folder").unwrap();
+        let dir = read_range(
+            &pm,
+            &Caller::Operator,
+            "global/folder",
+            body_range(0, None, None),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(dir.contains("text page"), "{dir}");
+
+        let bad = vault_dir(&pm).unwrap().join("global/bad.md");
+        let raw = [0xff, 0xfe, b'x'];
+        std::fs::write(&bad, raw).unwrap();
+        let utf8 = read_range(
+            &pm,
+            &Caller::Operator,
+            "global/bad.md",
+            body_range(0, Some(1), None),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(utf8.contains("UTF-8"), "{utf8}");
+        assert_eq!(std::fs::read(&bad).unwrap(), raw);
+
+        let state = root.path().join("state");
+        let uploads = state.join(UPLOAD_DIR);
+        std::fs::create_dir_all(&uploads).unwrap();
+        let tmp = uploads.join("a.bin");
+        std::fs::write(&tmp, b"not-text-blob").unwrap();
+        put_blob(
+            &pm,
+            &state,
+            &Caller::Operator,
+            "global/a.bin",
+            &tmp,
+            None,
+            None,
+        )
+        .unwrap();
+        let blob = read_range(
+            &pm,
+            &Caller::Operator,
+            "global/a.bin",
+            body_range(0, Some(4), None),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(blob.contains("text page"), "{blob}");
+        assert!(!blob.contains("not-text-blob"), "{blob}");
+    }
+
+    #[test]
+    fn json_u64_rejects_non_integers() {
+        let params = json!({"ok": 0, "float": 1.5, "neg": -1, "str": "1", "flag": true});
+        assert_eq!(json_u64(&params, "ok").unwrap(), Some(0));
+        assert_eq!(json_u64(&params, "missing").unwrap(), None);
+        assert!(json_u64(&params, "float").is_err());
+        assert!(json_u64(&params, "neg").is_err());
+        assert!(json_u64(&params, "str").is_err());
+        assert!(json_u64(&params, "flag").is_err());
     }
 
     #[test]

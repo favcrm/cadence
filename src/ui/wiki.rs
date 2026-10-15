@@ -98,12 +98,15 @@ pub(super) fn read(
     }
 }
 
-/// `GET /api/wiki/file?path=` — text comes back as the daemon's JSON;
-/// a blob page streams `.blobs/<sha256>` itself: byte ranges for
-/// seeking, `attachment` + octet-stream for everything but the small
-/// inline allowlist (image/video/pdf), and a sandboxed CSP either way.
-/// SVG and HTML are NEVER inline — a rendered wiki attachment must not
-/// drive the board's write API.
+/// `GET /api/wiki/file?path=` — text comes back as the daemon's JSON.
+/// Optional `offset`, `bytes`, and `rev` are the same bounded original
+/// read as `wiki_read`: absent, the reply is the whole page; present,
+/// the daemon returns one range or refuses with no body. A blob page
+/// streams `.blobs/<sha256>` itself when no range query is set: byte
+/// ranges for seeking, `attachment` + octet-stream for everything but
+/// the small inline allowlist (image/video/pdf), and a sandboxed CSP
+/// either way. SVG and HTML are NEVER inline — a rendered wiki
+/// attachment must not drive the board's write API.
 fn file_response(
     request: &Request,
     query: &dyn Fn(&str) -> Option<String>,
@@ -114,11 +117,30 @@ fn file_response(
     let Some(path) = query("path") else {
         return err_response(400, "wiki file needs ?path=");
     };
-    let page = match client::rpc(
-        state_dir,
-        "wiki_read",
-        json!({"path": path, "wiki_as": wiki_as}),
-    ) {
+    let mut params = json!({"path": path, "wiki_as": wiki_as});
+    if let Some(raw) = query("offset") {
+        match raw.parse::<u64>() {
+            Ok(n) => params["offset"] = json!(n),
+            Err(_) => {
+                return err_response(400, "wiki file offset must be a non-negative integer");
+            }
+        }
+    }
+    if let Some(raw) = query("bytes") {
+        match raw.parse::<u64>() {
+            Ok(n) => params["bytes"] = json!(n),
+            Err(_) => {
+                return err_response(400, "wiki file bytes must be a non-negative integer");
+            }
+        }
+    }
+    if let Some(rev) = query("rev") {
+        if rev.is_empty() {
+            return err_response(400, "wiki file rev must be a non-empty string");
+        }
+        params["rev"] = json!(rev);
+    }
+    let page = match client::rpc(state_dir, "wiki_read", params) {
         Ok(v) => v,
         Err(e) => return write_err(&e),
     };

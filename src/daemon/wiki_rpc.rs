@@ -190,7 +190,27 @@ impl Shared {
     pub(super) fn rpc_wiki_read(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         Self::reject_wiki_fields(params)?;
         let caller = self.wiki_caller(params, peer_pid, "wiki read")?;
-        wiki::read(&self.pm()?, &caller, Self::wiki_path(params)?)
+        let path = Self::wiki_path(params)?;
+        let offset = wiki::json_u64(params, "offset")?;
+        let bytes = wiki::json_u64(params, "bytes")?;
+        let rev = match params.get("rev") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(rev)) => Some(rev.as_str()),
+            Some(_) => return Err(Error::rejected("wiki read refused: 'rev' must be a string")),
+        };
+        if offset.is_none() && bytes.is_none() && rev.is_none() {
+            return wiki::read(&self.pm()?, &caller, path);
+        }
+        wiki::read_range(
+            &self.pm()?,
+            &caller,
+            path,
+            wiki::BodyRange {
+                offset: offset.unwrap_or(0),
+                bytes,
+                rev,
+            },
+        )
     }
 
     pub(super) fn rpc_wiki_write(&self, params: &Value, peer_pid: u32) -> Result<Value> {

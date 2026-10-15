@@ -416,10 +416,18 @@ titles, headings and ~4 KiB chunks) and returns candidates, not evidence.
    bash call, and each `cadence wiki cat <path> --meta` in a separate standalone
    bash call. Do not pipe, redirect, truncate with `head` or byte limits,
    echo/wrap, or combine these calls with any other command. `--meta` includes
-   the body and revision, so fetch each page once. If the display is clipped,
+   the body and revision. When that JSON line would exceed the native tool's
+   50000-byte line bound, read a bounded range instead:
+   `cadence wiki cat <path> --offset <byte> --bytes <n> --rev <rev>`.
+   Omit `--rev` on the first range; pass the returned original `rev` on every
+   later range of that page. A different revision is refused and returns no
+   body, so ranges are never combined across versions. The reply is one JSON
+   line with the canonical path, that revision, the exact byte range (`start`
+   inclusive, `end` exclusive, `total`) and the readable UTF-8 text. Do not
+   shell-slice, raise a cap, or copy the page. If the display is clipped,
    inspect the owned native full-output artifact rather than repeating the wiki
-   fetch. Finish the complete JSON output before decoding. Count duplicate and
-   `--meta` calls against the 8-read limit. Corroboration is optional: include
+   fetch. Finish the complete JSON output before decoding. Count duplicate,
+   `--meta`, and range calls against the 8-read limit. Corroboration is optional: include
    it only after reading that source and its revision; omit unchecked extras.
    A negative caveat such as "I did not read X" is not a citation; positive
    corroboration or mixed claims still require a source read and bound citation.
