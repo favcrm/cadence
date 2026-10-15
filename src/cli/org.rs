@@ -504,10 +504,10 @@ fn tracker_pin_conflicts(tracker: Option<&Path>) -> bool {
     let Some(tracker) = tracker else {
         return false;
     };
-    match std::env::var_os("CADENCE_PM_DIR") {
-        Some(inherited) if Path::new(&inherited) == tracker => false,
-        _ => true,
-    }
+    !matches!(
+        std::env::var_os("CADENCE_PM_DIR"),
+        Some(inherited) if Path::new(&inherited) == tracker
+    )
 }
 
 /// The one executing message, or `None` when there is not exactly one
