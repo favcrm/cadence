@@ -351,7 +351,7 @@ export class ScreenChannel extends FrameChannel {
     const records = accepts.includes(SCREEN_RECORDS_V1);
     if (records !== (this.receipt.host_contract === SCREEN_RECORDS_V1) || records && (shape !== "v2" || !accepts.includes(SCREEN_V2) || wantsActions(ready.accepts) || !this.receipt.action_token || !this.actions)) return false;
     this.records = records;
-    this.crmLocale = records && this.receipt.tag === "crm" && accepts.includes(CRM_LOCALE_V1);
+    this.crmLocale = records && this.receipt.tag === "crm" && this.projection.installation.name === "crm" && accepts.includes(CRM_LOCALE_V1);
     this.shape = shape;
     // Record the tool/action opt-in: the child may then send `tool` ops,
     // which only run when the host holds a live mount action context.
@@ -413,7 +413,7 @@ export class ScreenChannel extends FrameChannel {
     // the released `screen-actions.v1` SDK rejects the unknown root field.
     const projection: ScreenPush = this.records ? { ...this.projection, actions: [...(this.receipt.operations ?? [])] } : { ...this.projection };
     // Presentation negotiation grants no actions. Older/other peers retain their exact shape.
-    if (!this.crmLocale || projection.tag !== "crm" || !["en", "zh-TW"].includes(projection.presentation_locale ?? "")) delete projection.presentation_locale;
+    if (!this.crmLocale || projection.tag !== "crm" || projection.installation.name !== "crm" || !["en", "zh-TW"].includes(projection.presentation_locale ?? "")) delete projection.presentation_locale;
     delete projection.run_receipts;
     if (!this.records && this.shape === "v2" && this.wantsMedia && this.actions?.planner && projection.actions?.includes("run.start")) {
       projection.run_receipts = 1;

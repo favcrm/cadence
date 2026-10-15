@@ -134,7 +134,7 @@ try {
   if (hostDiagnostics.length) throw new Error(ts.formatDiagnosticsWithColorAndContext(hostDiagnostics, { getCurrentDirectory: () => ui, getCanonicalFileName: (f) => f, getNewLine: () => "\n" }));
   console.log("Host typecheck: passed");
   await build({
-    configFile: false, root: ui,
+    configFile: false, root: ui, publicDir: false,
     plugins: [react(), tailwind(), {
       name: "screen-ui-entry-and-boundary",
       transform(code, id) {

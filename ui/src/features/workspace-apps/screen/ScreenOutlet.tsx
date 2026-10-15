@@ -33,7 +33,7 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions,
   const navigationCallbacks = useRef({ onRoute, onCommand, onNavigation, href });
   navigationCallbacks.current = { onRoute, onCommand, onNavigation, href };
   const mounted = useRef<MountReceipt | null>(null);
-  const decorate = (p: ScreenPush, receipt: MountReceipt): ScreenPush => receipt.host_contract === "screen-records.v1" ? withReadObservations({ ...p, ...(receipt.tag === "crm" ? { presentation_locale: presentationLocale.current } : {}), route: routeFromHref(receipt.navigation, receipt.tag, navigationCallbacks.current.href), actions: receipt.operations ?? [] }, receipt.display_scope_key!, receipt.operations ?? []) : p;
+  const decorate = (p: ScreenPush, receipt: MountReceipt): ScreenPush => receipt.host_contract === "screen-records.v1" ? withReadObservations({ ...p, ...(p.installation.name === "crm" && receipt.tag === "crm" ? { presentation_locale: presentationLocale.current } : {}), route: routeFromHref(receipt.navigation, receipt.tag, navigationCallbacks.current.href), actions: receipt.operations ?? [] }, receipt.display_scope_key!, receipt.operations ?? []) : p;
   const container = useRef<HTMLDivElement>(null);
   const channel = useRef<ScreenChannel | null>(null);
   const latest = useRef(projection);
@@ -90,7 +90,7 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions,
       } else if (c.operation === "screen.preview.show") {
         const a = c.args;
         const anchor = a.anchor;
-        if (!exact(a, ["preview_id", "document", "anchor", "mode"]) || typeof a.preview_id !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(a.preview_id) || typeof a.document !== "string" || new TextEncoder().encode(a.document).byteLength > 49152 || a.mode !== "draft" && a.mode !== "saved" || anchor !== "footer" && (!object(anchor) || Object.keys(anchor).sort().join() !== "h,w,x,y" || ![anchor.x, anchor.y, anchor.w, anchor.h].every(n => typeof n === "number" && Number.isFinite(n) && n >= 0 && n <= 16384))) throw new Error("Invalid preview command");
+        if (!exact(a, ["preview_id", "document", "anchor", "mode"]) || typeof a.preview_id !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(a.preview_id) || typeof a.document !== "string" || new TextEncoder().encode(a.document).byteLength > 49152 || a.mode !== "draft" && a.mode !== "saved" || anchor !== "footer" && (!object(anchor) || Object.keys(anchor).sort().join() !== "h,w,x,y" || ![anchor.x, anchor.y].every(n => typeof n === "number" && Number.isFinite(n) && Math.abs(n) <= 16384) || ![anchor.w, anchor.h].every(n => typeof n === "number" && Number.isFinite(n) && n >= 0 && n <= 16384))) throw new Error("Invalid preview command");
         setPreview({ id: a.preview_id, document: a.document, anchor: anchor as InertPreview["anchor"], mode: a.mode });
       } else if (c.operation === "screen.preview.clear") {
         if (!exact(c.args, ["preview_id"]) || typeof c.args.preview_id !== "string") throw new Error("Invalid preview clear");
