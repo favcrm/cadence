@@ -520,19 +520,9 @@ pub fn package_digest(dir: &Path) -> Result<String> {
 pub fn resolve_package(spec: &str, root: &Path) -> Result<ProviderPackage> {
     let (name, pin, digest) = parse_package_pin(spec)?;
     let dir = root.join(name);
-    let manifest = dir.join("package.json");
-    let text = std::fs::read_to_string(&manifest).map_err(|_| {
-        Error::rejected(format!(
-            "pi provider package '{spec}' is not installed under {} — install \
-             it as the operator first (`pi install {name}@{pin}`) (CAD-559)",
-            root.display()
-        ))
-    })?;
-    let pkg: Value = serde_json::from_str(&text).map_err(|e| {
-        Error::rejected(format!(
-            "pi provider package '{spec}': package.json is not valid JSON: {e}"
-        ))
-    })?;
+    // The seed is part of dependency discovery too: apply the same
+    // descriptor, byte and nonblocking bounds before parsing or cloning it.
+    let pkg = dep_manifest(&dir, spec, name)?;
     let installed = pkg.get("version").and_then(Value::as_str).unwrap_or("");
     if installed != pin {
         return Err(Error::rejected(format!(

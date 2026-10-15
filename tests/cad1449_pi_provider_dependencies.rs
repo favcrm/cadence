@@ -428,7 +428,10 @@ fn pinned_extension_dependency_closure_confined() {
 /// leave the npm tree/sentinel ungranted — a fail-closed resolver may
 /// refuse the launch outright, but no path outside the declared closure
 /// may become readable. A missing OPTIONAL dependency and a dependency
-/// cycle resolve without failing and without extra grants.
+/// cycle resolve without failing and without extra grants. An oversized
+/// but otherwise VALID seed package.json (>1 MiB) must likewise refuse:
+/// the pinned package's own manifest read is part of bounded dependency
+/// metadata discovery, not exempt from it.
 #[test]
 fn malformed_dependency_metadata_never_widens() {
     let _guard = env_lock();
@@ -631,4 +634,42 @@ fn malformed_dependency_metadata_never_widens() {
             "dep-x bytes leaked under the cyclic-closure policy"
         );
     }
+
+    // 6) Oversized SEED manifest: the pinned package's own package.json
+    // is syntactically valid JSON carrying the pinned version,
+    // pi.extensions and a real dependency — padded past the 1 MiB
+    // metadata bound by an ignored string field. The old uncapped seed
+    // read accepted this file and fed it to the closure walk; the
+    // bounded seed read must refuse it, so a fail-closed resolve leaves
+    // the pinned provider dir, the npm root, the sentinel and unrelated
+    // packages ungranted. Save and restore the valid manifest bytes so
+    // the fixture is unchanged afterwards.
+    let seed_manifest = npm.join("pi-ext/package.json");
+    let saved_manifest = std::fs::read(&seed_manifest).unwrap();
+    let padding = "x".repeat(2 * 1024 * 1024);
+    std::fs::write(
+        &seed_manifest,
+        format!(
+            r#"{{"name":"pi-ext","version":"1.0.0","pi":{{"extensions":["./dist/index.js"]}},"dependencies":{{"dep-a":"1.0.0"}},"pad":"{padding}"}}"#
+        ),
+    )
+    .unwrap();
+    let policy = host.policy();
+    for protected in [
+        npm.join("pi-ext"),
+        npm.join("dep-x"),
+        scope_other.clone(),
+        npm.clone(),
+        sentinel.clone(),
+    ] {
+        assert!(
+            !policy
+                .read
+                .iter()
+                .chain(policy.write.iter())
+                .any(|p| protected.starts_with(p)),
+            "oversized seed manifest granted {protected:?}: {policy:?}"
+        );
+    }
+    std::fs::write(&seed_manifest, &saved_manifest).unwrap();
 }
