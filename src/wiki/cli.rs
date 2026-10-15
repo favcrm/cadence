@@ -26,11 +26,25 @@ pub enum WikiAction {
     },
     /// Print a page. A blob page streams its bytes; `--meta` prints
     /// its JSON metadata (including the text page's revision) instead.
+    /// `--offset` / `--bytes` / `--rev` read one original-text range as
+    /// a single JSON line under the native tool line bound.
     Cat {
         path: String,
         /// Show the blob pointer (sha256/size/mime) rather than bytes.
         #[arg(long)]
         meta: bool,
+        /// UTF-8 byte offset into the original text. With `--bytes` or
+        /// `--rev`, the reply is the bounded range, not the raw page.
+        #[arg(long)]
+        offset: Option<u64>,
+        /// Maximum original bytes to return. The end is exclusive and
+        /// must fall on a UTF-8 character boundary.
+        #[arg(long)]
+        bytes: Option<u64>,
+        /// Original revision (`fnv1a:…` from a prior read). A different
+        /// revision is refused and no body is returned.
+        #[arg(long)]
+        rev: Option<String>,
     },
     /// Write a page: text from `-m`/`--file`/stdin, or a binary blob
     /// with `--blob --file`.
@@ -139,7 +153,37 @@ pub fn run(action: &WikiAction, state_dir: &Path) -> Result<i32> {
             entries(&out);
             Ok(0)
         }
-        WikiAction::Cat { path, meta } => {
+        WikiAction::Cat {
+            path,
+            meta,
+            offset,
+            bytes,
+            rev,
+        } => {
+            if offset.is_some() || bytes.is_some() || rev.is_some() {
+                let mut params = json!({"path": path});
+                if let Some(offset) = offset {
+                    params["offset"] = json!(offset);
+                }
+                if let Some(bytes) = bytes {
+                    params["bytes"] = json!(bytes);
+                }
+                if let Some(rev) = rev {
+                    params["rev"] = json!(rev);
+                }
+                let out = rpc(state_dir, "wiki_read", params)?;
+                let line = serde_json::to_string(&out)
+                    .map_err(|e| Error::rejected(format!("wiki cat '{path}' range: {e}")))?;
+                if line.len() + 1 >= super::NATIVE_TOOL_LINE_BOUND {
+                    return Err(Error::rejected(format!(
+                        "wiki cat '{path}' refused: the range exceeds the \
+                         {}-byte native tool line bound",
+                        super::NATIVE_TOOL_LINE_BOUND
+                    )));
+                }
+                println!("{line}");
+                return Ok(0);
+            }
             let out = rpc(state_dir, "wiki_read", json!({"path": path}))?;
             match out["kind"].as_str() {
                 Some("text") if *meta => {

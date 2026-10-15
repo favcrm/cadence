@@ -58,7 +58,25 @@ cadence wiki put global/handbook.pdf --blob --file handbook.pdf --if-rev none
 cadence wiki search onboarding --path global --json
 cadence wiki cat global/onboarding.md --meta
 cadence wiki cat global/onboarding.md
+cadence wiki cat global/onboarding.md --offset 0 --bytes 4096
+cadence wiki cat global/onboarding.md --offset 4096 --rev fnv1a:0123456789abcdef
 ```
+
+`cat --meta` returns the whole text page and its revision as one JSON line.
+A page whose line would exceed the native tool's 50000-byte line bound is
+read with `--offset` and optional `--bytes`. The reply is one compact JSON
+line: canonical `path`, original `rev` (the whole page, not the slice),
+`range` (`start` inclusive, `end` exclusive, `total` bytes of the original)
+and the readable UTF-8 `text`. `text` is exactly the original bytes
+`[start, end)`. When `--bytes` is omitted, `end` is the last byte actually
+returned under the line bound, not a longer requested length. An explicit
+range that would pass the bound is refused rather than returned short.
+Omit `--rev` on the first range and pass that returned revision on every
+later range. A different revision is refused and no body is returned, so
+ranges are never combined across versions. An offset or end inside a UTF-8
+character is refused and no partial character is returned. An unauthorized
+caller gets the same refusal as `cat`, with no body. The read uses the same
+caller allowlist as `cat`; it does not copy the page or change the text cap.
 
 `--if-rev none` is create-only. For an update, read the current revision with
 `cat --meta`, then pass that value to `put --if-rev <rev>`; a conflict means
@@ -112,12 +130,20 @@ backup retention or eventual garbage collection.
 ## Agent retrieval
 
 The master uses `cadence wiki search <terms> --json`, reads selected pages
-with `cadence wiki cat <path>`, and cites their paths. Registered native agents
-use the same CLI under their connection-derived identity. A connected board
+with `cadence wiki cat <path>`, and cites their paths. A page that does not
+fit the native tool line bound is read with `cat --offset/--bytes/--rev`
+instead of a shell slice. Registered native agents use the same CLI under their connection-derived identity. A connected board
 client uses `GET /api/wiki/search?q=<terms>&path=<scope>` and then
 `GET /api/wiki/file?path=<selected page>`. Text pages return JSON with the
-full text and revision. The board's existing session or attributed-agent
-identity is required; the permission-prompt MCP server is not a wiki API.
+full text and revision. The same route accepts optional `offset`, `bytes`,
+and `rev` query parameters and returns the bounded range read above; a bad
+integer or empty revision is refused before the page is read. Omit them to
+keep the whole-page reply. A verified `wikienv_` read of that same path is
+the hosted hop: it forwards those three query parameters only after the
+envelope's signed prefix check. A path outside that prefix is refused
+before the daemon reads the page, and the prefix ceiling is unchanged.
+The board's existing session or attributed-agent identity is required; the
+permission-prompt MCP server is not a wiki API.
 
 Search uses SQLite FTS5 term matching and BM25 ranking over titles, headings,
 and approximately 4 KiB text chunks. It is lexical retrieval, so the agent

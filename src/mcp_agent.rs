@@ -81,8 +81,12 @@ fn tools() -> Value {
              "q":{"type":"string","description":"Scoped keywords; all tokens must match; first 12 tokens only."},
              "path":{"type":"string","description":"Optional authorized wiki folder prefix, e.g. global, projects/<key>, or global/pms/eva."}},
              "required":["q"],"additionalProperties":false}},
-        {"name":"wiki_read","description":"Read a visible wiki page with source metadata (path, revision, status). Read every source you cite; cite the path and revision, plus the section or PDF page when known.",
-         "inputSchema":{"type":"object","properties":{"path":{"type":"string"}},
+        {"name":"wiki_read","description":"Read a visible wiki page with its canonical path and original revision. Cite that path and revision, plus the section or PDF page when known. A full page whose JSON line would exceed the native tool line bound (50000 bytes) must be read with offset and bytes. Pass the returned rev on every later range of that page; a different revision is refused and returns no body. offset is a UTF-8 byte index, bytes is the exclusive length, and the reply's range is the exact slice.",
+         "inputSchema":{"type":"object","properties":{
+             "path":{"type":"string"},
+             "offset":{"type":"integer","minimum":0,"description":"UTF-8 byte offset into the original. Omit for the start, or for a full read when the page fits."},
+             "bytes":{"type":"integer","minimum":0,"description":"Maximum original bytes. Omit to take the longest slice that fits the line bound."},
+             "rev":{"type":"string","description":"Original revision from an earlier range of this page. Required on every range after the first."}},
              "required":["path"],"additionalProperties":false}},
         {"name":"issue_show","description":"Read one Cadence issue by ID.",
          "inputSchema":{"type":"object","properties":{"id":{"type":"string"}},
@@ -151,15 +155,7 @@ fn command_args(name: &str, args: &Value) -> Result<Vec<String>> {
             }
             Ok(out)
         }
-        "wiki_read" => {
-            let args = fields(args, &["path"], &["path"])?;
-            Ok(vec![
-                "wiki".into(),
-                "cat".into(),
-                positional(args["path"].as_str().unwrap())?,
-                "--meta".into(),
-            ])
-        }
+        "wiki_read" => wiki_read_args(args),
         "issue_show" => {
             let args = fields(args, &["id"], &["id"])?;
             let id = args["id"].as_str().unwrap();
@@ -170,6 +166,63 @@ fn command_args(name: &str, args: &Value) -> Result<Vec<String>> {
         }
         _ => Err(Error::rejected("unknown Cadence agent tool")),
     }
+}
+
+fn tool_u64(object: &Map<String, Value>, key: &str) -> Result<Option<u64>> {
+    match object.get(key) {
+        None => Ok(None),
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .ok_or_else(|| {
+                Error::rejected(format!(
+                    "tool argument '{key}' must be a non-negative integer"
+                ))
+            })
+            .map(Some),
+        Some(_) => Err(Error::rejected(format!(
+            "tool argument '{key}' must be a non-negative integer"
+        ))),
+    }
+}
+
+fn wiki_read_args(args: &Value) -> Result<Vec<String>> {
+    let object = args
+        .as_object()
+        .ok_or_else(|| Error::rejected("tool arguments must be an object"))?;
+    if let Some(key) = object
+        .keys()
+        .find(|key| !matches!(key.as_str(), "path" | "offset" | "bytes" | "rev"))
+    {
+        return Err(Error::rejected(format!("unexpected tool argument '{key}'")));
+    }
+    let path = object
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| Error::rejected("required string argument 'path' is missing"))?;
+    let offset = tool_u64(object, "offset")?;
+    let bytes = tool_u64(object, "bytes")?;
+    let rev = match object.get("rev") {
+        None => None,
+        Some(Value::String(rev)) if !rev.is_empty() => Some(positional(rev)?),
+        Some(_) => return Err(Error::rejected("tool argument 'rev' must be a string")),
+    };
+    // `rev` is moved into argv below; the unbounded flag has to be known first.
+    let unbounded = offset.is_none() && bytes.is_none() && rev.is_none();
+    let mut argv = vec!["wiki".into(), "cat".into(), positional(path)?];
+    if let Some(offset) = offset {
+        argv.extend(["--offset".into(), offset.to_string()]);
+    }
+    if let Some(bytes) = bytes {
+        argv.extend(["--bytes".into(), bytes.to_string()]);
+    }
+    if let Some(rev) = rev {
+        argv.extend(["--rev".into(), rev]);
+    }
+    if unbounded {
+        argv.push("--meta".into());
+    }
+    Ok(argv)
 }
 
 fn invoke(state_dir: &Path, alias: &str, argv: &[String]) -> Result<String> {

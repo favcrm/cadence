@@ -102,7 +102,7 @@ pub const WIKI_ACTIONS: &[&str] = &["enumerate", "read", "write"];
 fn wiki_argument_keys(action: &str) -> &'static [&'static str] {
     match action {
         "enumerate" => &["path", "q"],
-        "read" => &["path"],
+        "read" => &["path", "offset", "bytes", "rev"],
         "write" => &["path", "text", "if_rev"],
         _ => &[],
     }
