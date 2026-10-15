@@ -154,7 +154,7 @@ store/plans.rs	guarded-store-and-read-queries	guarded_write	11
 store/plans.rs	guarded-store-and-read-queries	prepare	1
 store/platform.rs	guarded-store-and-read-queries	execute	15
 store/platform.rs	guarded-store-and-read-queries	guarded_write	11
-store/schema.rs	sqlite-schema-owner-and-restricted-recovery	execute	110
+store/schema.rs	sqlite-schema-owner-and-restricted-recovery	execute	112
 store/schema.rs	sqlite-schema-owner-and-restricted-recovery	guarded_write	2
 store/schema.rs	sqlite-schema-owner-and-restricted-recovery	open	3
 store/schema.rs	sqlite-schema-owner-and-restricted-recovery	prepare	27
