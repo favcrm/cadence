@@ -1,5 +1,5 @@
 import { ASSET_BYTES_MAX, ASSET_DATA_URL, ORIGINAL_DOWNLOAD_VERB, parseChild, parseInit, pushedAssetRefs, shapeFor, shapeOf,
-  wantsActions, wantsMedia, isMediaVerb, SCREEN_MEDIA_V1, TOOL_ALIAS, ASSET_REF, SCREEN_RECORDS_V1, SCREEN_V2, RECORD_OPERATIONS, RECORD_CALL_VERBS, RECORD_SLOT_VERBS, CALL_VERBS, SLOT_VERBS,
+  wantsActions, wantsMedia, isMediaVerb, SCREEN_MEDIA_V1, TOOL_ALIAS, ASSET_REF, SCREEN_RECORDS_V1, CRM_LOCALE_V1, SCREEN_V2, RECORD_OPERATIONS, RECORD_CALL_VERBS, RECORD_SLOT_VERBS, CALL_VERBS, SLOT_VERBS,
   type ScreenNavigation,
   type ActionResult, type AssetReply, type CallRequest, type CallVerb, type ChildToHost, type MediaVerb, type ReplyMessage, type ScreenPush,
   type Shape, type SlotRequest, type ToolRequest } from "./screenProtocol";
@@ -203,6 +203,7 @@ export class ScreenChannel extends FrameChannel {
     super(source, receipt, removeFrame, failed, onReady);
   }
   private records = false;
+  private crmLocale = false;
   protected state(data: string): void {
     const nav = this.receipt.navigation;
     if (!this.ready || this.closed || !this.records || this.receipt.tag !== "crm" ||
@@ -348,6 +349,7 @@ export class ScreenChannel extends FrameChannel {
     const records = accepts.includes(SCREEN_RECORDS_V1);
     if (records !== (this.receipt.host_contract === SCREEN_RECORDS_V1) || records && (shape !== "v2" || !accepts.includes(SCREEN_V2) || wantsActions(ready.accepts) || !this.receipt.action_token || !this.actions)) return false;
     this.records = records;
+    this.crmLocale = records && this.receipt.tag === "crm" && accepts.includes(CRM_LOCALE_V1);
     this.shape = shape;
     // Record the tool/action opt-in: the child may then send `tool` ops,
     // which only run when the host holds a live mount action context.
@@ -408,6 +410,8 @@ export class ScreenChannel extends FrameChannel {
     // CAD-1447: the marker also requires the child's `screen-media.v1` opt-in —
     // the released `screen-actions.v1` SDK rejects the unknown root field.
     const projection: ScreenPush = this.records ? { ...this.projection, actions: [...(this.receipt.operations ?? [])] } : { ...this.projection };
+    // Presentation negotiation grants no actions. Older/other peers retain their exact shape.
+    if (!this.crmLocale || projection.tag !== "crm" || !["en", "zh-TW"].includes(projection.presentation_locale ?? "")) delete projection.presentation_locale;
     delete projection.run_receipts;
     if (!this.records && this.shape === "v2" && this.wantsMedia && this.actions?.planner && projection.actions?.includes("run.start")) {
       projection.run_receipts = 1;

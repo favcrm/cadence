@@ -87,6 +87,8 @@ export interface ScreenNavigation { section_query: string; default_section: stri
 export interface ScreenRoute { section: string; view: "list" | "new"; record_id: string | null; segment_id: string | null }
 export interface ReadObservation { operation: string; args: ActionArgs; data: unknown }
 export const SCREEN_RECORDS_V1 = "screen-records.v1";
+/** CRM presentation data only; never an operation or permission. */
+export const CRM_LOCALE_V1 = "crm-locale.v1";
 /** Larger envelopes are admitted only after verified records negotiation and rights. */
 export function recordArgsLimit(verb: string): number {
   return ["records.csv.preview", "records.csv.import", "records.csv.confirm"].includes(verb) ? 327680
@@ -168,7 +170,7 @@ export const SCREEN_ACTIONS_V1 = "screen-actions.v1";
  *  nothing: dispatch still needs the minted receipt's declared
  *  `media.may` permission and its action token. */
 export const SCREEN_MEDIA_V1 = "screen-media.v1";
-export type Accept = typeof PUBLISH_INTENTS_V1 | typeof SCREEN_V2 | typeof SCREEN_ACTIONS_V1 | typeof SCREEN_MEDIA_V1 | typeof SCREEN_RECORDS_V1;
+export type Accept = typeof PUBLISH_INTENTS_V1 | typeof SCREEN_V2 | typeof SCREEN_ACTIONS_V1 | typeof SCREEN_MEDIA_V1 | typeof SCREEN_RECORDS_V1 | typeof CRM_LOCALE_V1;
 /** The negotiated PUSH shape: the exact CAD-1006 v1, v1 plus
  *  publish-intents.v1, or the v2 projection. */
 export type Shape = "v1" | "intents" | "v2";
@@ -424,6 +426,8 @@ export interface ScreenPush {
   /** Records-negotiated display only, never authority. */
   route?: ScreenRoute;
   read_observations?: ReadObservation[];
+  /** Host-selected presentation only, for CRM records peers opting into crm-locale.v1. */
+  presentation_locale?: "en" | "zh-TW";
 }
 
 export type HostToChild = ScreenPush | AssetReply | ReplyMessage;
@@ -496,7 +500,7 @@ export function parseChild(data: unknown, records?: readonly string[]): ChildToH
     Object.keys(d).sort().join() === "accepts,op,v" && d.v === 1 && d.op === "ready" &&
     Array.isArray(d.accepts) && d.accepts.length >= 1 && d.accepts.length <= 3 &&
     new Set(d.accepts).size === d.accepts.length &&
-    d.accepts.every(a => a === PUBLISH_INTENTS_V1 || a === SCREEN_V2 || a === SCREEN_ACTIONS_V1 || a === SCREEN_MEDIA_V1 || a === SCREEN_RECORDS_V1)
+    d.accepts.every(a => a === PUBLISH_INTENTS_V1 || a === SCREEN_V2 || a === SCREEN_ACTIONS_V1 || a === SCREEN_MEDIA_V1 || a === SCREEN_RECORDS_V1 || a === CRM_LOCALE_V1)
   ) {
     return { v: 1, op: "ready", accepts: [...d.accepts] as Accept[] };
   }
@@ -560,7 +564,7 @@ export function parseChild(data: unknown, records?: readonly string[]): ChildToH
   return null;
 }
 
-const V2_TOP = ["sources", "defaults", "readiness", "actions", "run_receipts", "original_downloads", "route", "read_observations"] as const;
+const V2_TOP = ["sources", "defaults", "readiness", "actions", "run_receipts", "original_downloads", "route", "read_observations", "presentation_locale"] as const;
 const V2_RUN = ["created", "closed", "phase", "steps", "inputs_used", "caption_excerpt", "artifact_id",
   "review", "approved", "source_post_id", "refusal", "image_ref"] as const;
 /** The publish-intents.v1 shape: every screen.v2 field is removed. */

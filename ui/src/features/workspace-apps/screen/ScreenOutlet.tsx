@@ -7,7 +7,7 @@ import { type SlotView } from "./screenSlot";
 import ScreenSlotLayer from "./ScreenSlotLayer";
 import { parseDraftImageRef, type ScreenPush } from "./screenProtocol";
 import { workspaceApps } from "../workspaceApps";
-import { useTranslate } from "../../../lib/locale";
+import { useLocale } from "../../../lib/locale";
 import { downscaleToDataUrl } from "./screenAssets";
 import { registerNavigationGuard, useHref } from "../../../lib/useLocation";
 import { recordServices, object, exact, type HostCommand } from "./screenServices";
@@ -26,12 +26,14 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions,
   onCommand?: (command: HostCommand) => void;
   onNavigation?: (navigation: ScreenNavigation | null) => void;
 }) {
-  const t = useTranslate();
+  const { t, locale } = useLocale();
+  const presentationLocale = useRef(locale);
+  presentationLocale.current = locale;
   const href = useHref();
   const navigationCallbacks = useRef({ onRoute, onCommand, onNavigation, href });
   navigationCallbacks.current = { onRoute, onCommand, onNavigation, href };
   const mounted = useRef<MountReceipt | null>(null);
-  const decorate = (p: ScreenPush, receipt: MountReceipt): ScreenPush => receipt.host_contract === "screen-records.v1" ? withReadObservations({ ...p, route: routeFromHref(receipt.navigation, receipt.tag, navigationCallbacks.current.href), actions: receipt.operations ?? [] }, receipt.display_scope_key!, receipt.operations ?? []) : p;
+  const decorate = (p: ScreenPush, receipt: MountReceipt): ScreenPush => receipt.host_contract === "screen-records.v1" ? withReadObservations({ ...p, ...(receipt.tag === "crm" ? { presentation_locale: presentationLocale.current } : {}), route: routeFromHref(receipt.navigation, receipt.tag, navigationCallbacks.current.href), actions: receipt.operations ?? [] }, receipt.display_scope_key!, receipt.operations ?? []) : p;
   const container = useRef<HTMLDivElement>(null);
   const channel = useRef<ScreenChannel | null>(null);
   const latest = useRef(projection);
@@ -198,7 +200,7 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions,
       }
     };
   }, [scope]);
-  useEffect(() => { if (mounted.current) channel.current?.update(decorate(projection, mounted.current)); }, [projection, href]);
+  useEffect(() => { if (mounted.current) channel.current?.update(decorate(projection, mounted.current)); }, [projection, href, locale]);
   return <>
     <div aria-label={t("Installed app screen")} style={{ position: "relative", flex: "1 1 0%", minHeight: 0, height: "100%", display: state === "ready" ? "block" : "none" }}>
       <div ref={container} style={{ position: "absolute", inset: 0 }} />

@@ -1282,7 +1282,10 @@ impl RecordStore {
     pub fn app_content_show(&self, context: &str, campaign: &str) -> Result<Value> {
         let conn = self.conn();
         let row = self.content_row(&conn, context, campaign)?.ok_or_else(|| {
-            Error::rejected("email content is unavailable for this installation and context")
+            Error::invalid(
+                "app_content_missing",
+                "email content is unavailable for this installation and context",
+            )
         })?;
         Ok(json!({"content": self.content_doc_json(context, campaign, row)}))
     }

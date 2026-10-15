@@ -27,6 +27,7 @@ export type { LinkProps } from "../../src/ui/Link";
 export * from "../../src/ui/icons";
 export { Select } from "../../src/ui/Select";
 export type { SelectProps, SelectOption } from "../../src/ui/Select";
+export { LocaleTextProvider } from "../../src/lib/localeText";
 export { ApiError } from "../../src/lib/apiError";
 export { Resource, QueryCache } from "../../src/lib/cache";
 export type { ResourceState, ResourceStatus, ResourceOptions } from "../../src/lib/cache";

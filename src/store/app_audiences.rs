@@ -1127,7 +1127,7 @@ impl RecordStore {
             )
             .optional()
             .map_err(|e| Error::internal(e.to_string()))?
-            .ok_or_else(|| Error::rejected("audience freeze is unavailable for this installation and context"))?;
+            .ok_or_else(|| Error::invalid("app_audience_freeze_missing", "audience freeze is unavailable for this installation and context"))?;
         let base_raw: Value = serde_json::from_str(&base_text)
             .map_err(|_| Error::rejected("audience freeze is corrupt"))?;
         let base = AudienceBase::parse(&base_raw)

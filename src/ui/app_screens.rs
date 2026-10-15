@@ -261,6 +261,10 @@ pub(super) fn service(
             None,
         );
     };
+    let operation = body
+        .get("operation")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     body["token"] = json!(token);
     body["key"] = json!(key);
     body["origin"] = json!(origin);
@@ -270,6 +274,17 @@ pub(super) fn service(
             if error.kind() == "rejected" && error.code() == Some("screen_access_denied") =>
         {
             super::coded_response(403, "forbidden", "screen service access unavailable", None)
+        }
+        Err(error)
+            if error.kind() == "rejected"
+                && method == "app_screen_service_call"
+                && matches!(
+                    (operation.as_deref(), error.code()),
+                    (Some("audience.show"), Some("app_audience_freeze_missing"))
+                        | (Some("content.show"), Some("app_content_missing"))
+                ) =>
+        {
+            super::coded_response(404, "not_found", &error.to_string(), None)
         }
         Err(error) if error.kind() == "conflict" => {
             super::coded_response(409, "conflict", &error.to_string(), error.revision())
