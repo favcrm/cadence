@@ -1088,8 +1088,13 @@ impl ProviderAdapter for CodexAdapter {
             }
             instructions.push_str(
                 "Use the cadence MCP tools for Cadence identity, wiki search/read, and issue reads. \
-                 The command sandbox cannot reach Cadence's RPC socket. Your final answer is the \
-                 managed turn result; do not call cadence message result from a shell.",
+                 wiki_search is lexical AND over at most 12 tokens: send scoped keywords (vendor, \
+                 operation or field, exact version or identifier) in the collection the question is \
+                 authorized for, at most 3 variants and 20 merged candidates per question, then \
+                 wiki_read at most 8 sources and cite path and revision. Stop and state the \
+                 evidence limit when nothing authoritative is found. The command sandbox cannot \
+                 reach Cadence's RPC socket. Your final answer is the managed turn result; do not \
+                 call cadence message result from a shell.",
             );
             params["developerInstructions"] = json!(instructions);
             if let Some(thread) = &agent.thread_id {

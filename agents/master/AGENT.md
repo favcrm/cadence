@@ -78,6 +78,50 @@ Look around (read-only):
   `cadence wiki cat <path> --meta` when its revision matters. PDF search
   results point to an extracted-text page whose `source_path` identifies
   the original upload. Treat a failed or empty extraction as no source text.
+
+  Wiki search is LEXICAL AND: every token in `q` must match, punctuation
+  splits tokens, and only the first 12 tokens are used (256 bytes max). A
+  full question usually matches nothing. Turn each question into scoped
+  keywords: vendor/product, the operation or field name, and the exact
+  version or identifier (for example `<vendor> <operation>`,
+  `<product> <field> <version>`). Drop filler words. Narrow with `--path` to the collection
+  the question is authorized for: an organization or global folder, a project
+  folder (`projects/<key>`), or a private folder your identity may read. PMS
+  vendor pages are one example (`global/pms/<vendor>`); do not narrow every
+  question to PMS. Run EACH `cadence wiki search "keywords" --json [--path ...]`
+  as its own standalone bash call, and EACH `cadence wiki cat <path> --meta` as
+  another standalone bash call. Do not pipe, redirect, truncate with `head` or
+  byte limits, echo/wrap, or combine these calls with any other command. `--meta`
+  already returns the body and revision: one fetch per page. If its display is
+  clipped, inspect the owned native full-output artifact; do not repeat the wiki
+  fetch. Finish the complete JSON output before decoding it. Count duplicate and
+  `--meta` reads against the limit of 8. Corroboration is optional: include it
+  only after actually reading that source and its revision; omit unchecked extras.
+  A negative caveat such as "I did not read X" is not a citation, and adding
+  positive corroboration or mixed claims about X still requires a bound citation.
+  Budget per question: at most 3 query variants, at most 20 merged candidates,
+  at most 8 source reads. Never answer from a hit alone. An empty result for
+  one variant is not proof of absence. When no authoritative source supports
+  an answer, say so and name the queries tried; do not invent an endpoint,
+  field, date or protocol. Preserve versions: if sources disagree by
+  version, report the conflict rather than blending it. Answer the question
+  directly; add corroboration only after reading that source in this turn. For
+  an API operation, give the documented operationId and critical required
+  inputs, identifier precedence and mode flags when the source states them.
+  For critical typed fields include their documented type and required/optional
+  status. Include the source section or original PDF page in the citation where
+  known. Keep the full `--meta` JSON before decoding. A negative note ("I did not
+  read X") supports no claim. Every citation must retain the canonical wiki
+  path: `<wiki path> @ rev <rev>`; a title or version cannot replace the path.
+  Navigation pages, indexes and links establish discovery, not the contents or
+  protocol claims of a linked document. For a specific supplied source, read
+  its actual body; if unavailable, empty or unreadable, state the limitation.
+  Never silently substitute a same-named remote file or newer edition. An
+  authorized external counterpart must be labeled and cited as a different
+  source with its actual URL and version, not as the supplied file. Describe
+  conflicting versions separately. Metadata such as `superseded_by` alone does
+  not establish deployment, applicability or current approval; say those are
+  unknown without corroborating evidence.
 - `cadence master summary --since 24h` — what happened since then (plans,
   moved tickets, reports, open questions); add `--post` to put it in your
   thread.
