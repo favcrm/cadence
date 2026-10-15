@@ -563,6 +563,11 @@ impl Shared {
                                 return Ok(first);
                             }
                             // CAD-1076: one retry on a fresh session.
+                            // Offered only for a master history refusal
+                            // before any tool. A serialized-body refusal
+                            // after a tool is not offered — retrying
+                            // would replay work that already ran, and
+                            // that turn stays failed with its limitation.
                             let prompt =
                                 self.after_session_reset(&agent, &message, slot.as_deref(), &first);
                             adapter.run_turn_slotted(

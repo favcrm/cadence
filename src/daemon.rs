@@ -1487,6 +1487,9 @@ impl Shared {
     /// 64 000-character per-message limit, so that one retry is refused
     /// too and the message fails with the provider's 400. It never
     /// loops. Lifting the limit depends on AOS-136 (gateway limits).
+    /// This is only the pre-tool continuation. A serialized-body refusal
+    /// after a tool does not reach here: the adapter leaves the turn
+    /// failed instead of replaying work that already ran.
     fn after_session_reset(
         &self,
         agent: &store::Agent,

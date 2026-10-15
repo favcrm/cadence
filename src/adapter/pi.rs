@@ -17,6 +17,13 @@
 //!   continuation remains — ends the turn.
 //! - `message_end` for an assistant message is the authoritative text;
 //!   `stopReason` `aborted`/`error` maps to interrupted/failed.
+//! - A master `400` `invalid_request` before any tool is the CAD-1076
+//!   fresh-session continuation. Pi builds the provider HTTP body in
+//!   its own process; this adapter only sends `prompt` and cannot
+//!   measure that body or disable tools for a later prompt. A
+//!   serialized-body refusal after a tool is therefore not continued:
+//!   the turn fails with an explicit limitation and nothing is replayed.
+//!   A token or context-window refusal is not that body refusal.
 //! - `tool_execution_start`/`_end` → one `cadence/tool_use` /
 //!   `cadence/tool_result` event each (redacted one-line summaries via
 //!   `crate::store::tool_*_summary`, never raw I/O).
@@ -1881,23 +1888,115 @@ fn write_pi_guard(
     Ok(path)
 }
 
+/// Pi's display form of a provider HTTP error (`formatProviderError`):
+/// `400 {…}` or `400: {…}`. Anything that is not that JSON body is
+/// absent — a rate limit or a bare status is not a history refusal.
+fn provider_error_body(error: &str) -> Option<Value> {
+    let rest = error.trim_start().strip_prefix("400")?;
+    let rest = rest.strip_prefix(':').unwrap_or(rest).trim();
+    serde_json::from_str(rest).ok()
+}
+
 /// CAD-1076: the provider refused the request itself — HTTP 400 whose
-/// JSON body carries `code: "invalid_request"` (the AgenticOS gateway's
-/// answer to a history over its schema limits; Pi renders it as
-/// `400 {…}` or `400: {…}`). A rate limit, an outage, a credential
-/// error or any other code never matches.
-fn history_rejected(error: &str) -> bool {
-    let Some(body) = error.trim_start().strip_prefix("400") else {
-        return false;
-    };
-    let body = body.strip_prefix(':').unwrap_or(body).trim();
-    let Ok(body) = serde_json::from_str::<Value>(body) else {
-        return false;
-    };
+/// JSON body carries `code: "invalid_request"`. A rate limit, an
+/// outage, a credential error or any other code never matches.
+/// [`serialized_body_rejected`] is the narrower serialized-body case;
+/// it does not invent a byte cap the provider did not state.
+fn history_rejected(body: &Value) -> bool {
     body.get("code")
         .or_else(|| body.pointer("/error/code"))
         .and_then(Value::as_str)
         == Some("invalid_request")
+}
+
+/// The provider refused the serialized HTTP body, as opposed to a token
+/// or context-window limit. The provider's own message is the evidence;
+/// this does not apply a locally chosen byte cap.
+fn serialized_body_rejected(body: &Value) -> bool {
+    if !history_rejected(body) {
+        return false;
+    }
+    let Some(message) = body
+        .get("message")
+        .or_else(|| body.pointer("/error/message"))
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    let lower = message.to_ascii_lowercase();
+    !lower.contains("token")
+        && !lower.contains("context window")
+        && !lower.contains("context length")
+        && !lower.contains("context_length")
+        && lower.contains("request body")
+        && (lower.contains("kib") || lower.contains("byte"))
+}
+
+/// Outcome of one settled Pi turn. `reset_session` is the only supported
+/// continuation: a master history refusal before any tool, which the
+/// daemon answers with one fresh session and the same message. After a
+/// tool, `prompt` can still call tools, and Pi exposes no command that
+/// continues from retained evidence with tools disabled. The turn stays
+/// failed with [`serialized_body_limitation`] and is not submitted again.
+struct PiSettlement {
+    status: &'static str,
+    error: Option<String>,
+    reset_session: bool,
+    limited: bool,
+}
+
+fn settle_pi_turn(acc: &mut TurnAcc, master: bool, interrupted_here: bool) -> PiSettlement {
+    let aborted = acc.stop.as_deref() == Some("aborted");
+    let (status, mut error) = if aborted || (interrupted_here && acc.error.is_some()) {
+        ("interrupted", None)
+    } else if let Some(err) = acc.error.take() {
+        ("failed", Some(err))
+    } else if acc.stop.as_deref() == Some("error") {
+        (
+            "failed",
+            Some("pi turn ended with stopReason 'error'".to_string()),
+        )
+    } else {
+        ("completed", None)
+    };
+    let body = error.as_deref().and_then(provider_error_body);
+    // The no-tools guard is the side-effect boundary. Do not drop it
+    // for a serialized-body refusal: a fresh prompt would replay
+    // work that already ran.
+    let reset_session =
+        status == "failed" && !acc.tools && master && body.as_ref().is_some_and(history_rejected);
+    let limited = match error.take() {
+        Some(original)
+            if status == "failed"
+                && acc.tools
+                && body.as_ref().is_some_and(serialized_body_rejected) =>
+        {
+            error = Some(serialized_body_limitation(&original));
+            true
+        }
+        other => {
+            error = other;
+            false
+        }
+    };
+    PiSettlement {
+        status,
+        error,
+        reset_session,
+        limited,
+    }
+}
+
+fn serialized_body_limitation(original: &str) -> String {
+    format!(
+        "The provider rejected the serialized request body. This is not a token \
+         or context-window limit. A tool already ran, so this turn was not \
+         submitted again and its effects were not replayed. The original user \
+         message, recorded tool evidence, and actor permissions are unchanged. \
+         Continuation is not available: a new prompt can still call tools, and \
+         Pi has no command that continues from retained evidence without \
+         replaying them. Provider error: {original}"
+    )
 }
 
 /// One in-flight command's response slot.
@@ -1978,7 +2077,8 @@ struct Shared {
     guard_receipts: Mutex<HashMap<String, GuardReceipt>>,
     /// CAD-1076: the last master turn the provider refused before any
     /// work — the one turn [`ProviderAdapter::reset_rejected_session`]
-    /// may reset for.
+    /// may reset for. A serialized-body refusal after a tool is never
+    /// stored here.
     rejected_turn: Mutex<Option<String>>,
 }
 
@@ -3133,7 +3233,7 @@ impl ProviderAdapter for PiAdapter {
             }
         })();
         *self.shared.active_turn.lock().unwrap() = None;
-        let acc = waited?;
+        let mut acc = waited?;
         if guarded {
             // The actor cannot dispatch its next kickoff until this returns.
             // Settlement has closed runtime admission. Clear any accepted but
@@ -3146,30 +3246,24 @@ impl ProviderAdapter for PiAdapter {
             })?;
         }
         let interrupted_here = self.shared.interrupt_at.lock().unwrap().take().is_some();
-        let aborted = acc.stop.as_deref() == Some("aborted");
-        let (status, error) = if aborted || (interrupted_here && acc.error.is_some()) {
-            ("interrupted", None)
-        } else if let Some(err) = acc.error {
-            ("failed", Some(err))
-        } else if acc.stop.as_deref() == Some("error") {
-            (
-                "failed",
-                Some("pi turn ended with stopReason 'error'".to_string()),
-            )
-        } else {
-            ("completed", None)
-        };
-        *self.shared.rejected_turn.lock().unwrap() = (status == "failed"
-            && !acc.tools
-            && self.shared.master.load(Ordering::SeqCst)
-            && error.as_deref().is_some_and(history_rejected))
-        .then(|| turn_id.clone());
+        let master = self.shared.master.load(Ordering::SeqCst);
+        let settled = settle_pi_turn(&mut acc, master, interrupted_here);
+        if settled.limited {
+            // Durable failure record. Tool bodies stay on the thread
+            // entries already recorded; this event only classifies the
+            // refusal and states that the turn was not replayed.
+            self.shared.emit(
+                "cadence/serialized_body_limited",
+                &json!({"turn": turn_id, "replayed": false}),
+            );
+        }
+        *self.shared.rejected_turn.lock().unwrap() = settled.reset_session.then(|| turn_id.clone());
         Ok(TurnResult {
             turn_id,
-            status: status.to_string(),
+            status: settled.status.to_string(),
             text: acc.text.unwrap_or_default(),
             stop_reason: acc.stop,
-            error,
+            error: settled.error,
         })
     }
 
@@ -3437,5 +3531,286 @@ mod cad1098_tests {
             first,
             "the Home rules carried into the app guard"
         );
+    }
+}
+
+#[cfg(test)]
+mod cad1457_tests {
+    use super::*;
+    use super::{AdapterHooks, ProviderAdapter};
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Arc, Mutex};
+
+    const USER: &str = "keep this user input";
+    const GENERIC_BODY: &str =
+        "400: {\"message\":\"Request body exceeds 100 bytes.\",\"code\":\"invalid_request\"}";
+    const TOKEN: &str = "400: {\"message\":\"maximum context length is 262144 tokens\",\"code\":\"invalid_request\"}";
+
+    struct Stop {
+        adapter: Option<PiAdapter>,
+        dir: Option<tempfile::TempDir>,
+    }
+
+    impl Drop for Stop {
+        fn drop(&mut self) {
+            if let Some(adapter) = self.adapter.take() {
+                adapter.close();
+            }
+            self.dir.take();
+        }
+    }
+
+    fn hooks(events: Arc<Mutex<Vec<(String, Value)>>>) -> AdapterHooks {
+        AdapterHooks {
+            on_event: Box::new(move |method, params| {
+                events
+                    .lock()
+                    .unwrap()
+                    .push((method.to_string(), params.clone()));
+            }),
+            on_request: Box::new(|_| {}),
+        }
+    }
+
+    fn script(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("pi-rpc");
+        let mut file = std::fs::File::create(&path).unwrap();
+        write!(
+            file,
+            r#"#!/usr/bin/python3
+import json, os, sys
+mode = os.environ.get("CAD1457_MODE", "after")
+error = os.environ.get("CAD1457_ERROR", "")
+log_path = os.environ["CAD1457_LOG"]
+
+def record(req):
+    with open(log_path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(req, separators=(",", ":")) + "\n")
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+def respond(req):
+    emit({{"id": req.get("id"), "type": "response", "command": req.get("type"), "success": True}})
+
+def fail_turn(stop):
+    emit({{
+        "type": "message_end",
+        "message": {{
+            "role": "assistant",
+            "content": [{{"type": "text", "text": "partial answer"}}],
+            "stopReason": stop,
+            "errorMessage": error,
+        }},
+    }})
+    emit({{"type": "agent_settled"}})
+
+for raw in sys.stdin:
+    raw = raw.strip()
+    if not raw:
+        continue
+    try:
+        req = json.loads(raw)
+    except json.JSONDecodeError:
+        continue
+    record(req)
+    kind = req.get("type")
+    if kind == "prompt":
+        respond(req)
+        if mode == "cancel":
+            continue
+        if mode == "after":
+            emit({{
+                "type": "tool_execution_start",
+                "toolName": "bash",
+                "toolCallId": "tool-1",
+                "args": {{"command": "cadence wiki put agents/master/knowledge/note.md --file /tmp/note"}},
+            }})
+            emit({{
+                "type": "tool_execution_end",
+                "toolCallId": "tool-1",
+                "isError": False,
+                "result": {{"content": [{{"type": "text", "text": "wrote"}}]}},
+            }})
+        fail_turn("error")
+    elif kind == "abort":
+        fail_turn("aborted")
+    else:
+        respond(req)
+"#
+        )
+        .unwrap();
+        let mut mode = file.metadata().unwrap().permissions();
+        mode.set_mode(0o755);
+        std::fs::set_permissions(&path, mode).unwrap();
+        path
+    }
+
+    fn launch(
+        mode: &str,
+        error: &str,
+        master: bool,
+    ) -> (Stop, std::path::PathBuf, Arc<Mutex<Vec<(String, Value)>>>) {
+        let dir = tempfile::tempdir().unwrap();
+        let script = script(dir.path());
+        let log = dir.path().join("stderr.log");
+        let commands = dir.path().join("commands.jsonl");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let env = ProviderEnv::default();
+        let adapter = PiAdapter::new(hooks(Arc::clone(&events)), &log, &env, None);
+        let generation = "cad1457".to_string();
+        *adapter.shared.generation.lock().unwrap() = generation.clone();
+        adapter.shared.master.store(master, Ordering::SeqCst);
+        adapter.shared.dead.store(false, Ordering::SeqCst);
+        adapter.shared.guard_ready.store(false, Ordering::SeqCst);
+        *adapter.shared.idle_window.lock().unwrap() = Duration::from_secs(5);
+        let transport =
+            adapter.transport_for(&[script.to_string_lossy().to_string()], master, &generation);
+        transport
+            .launch(
+                dir.path().to_str().unwrap(),
+                &log,
+                &[
+                    ("CAD1457_MODE".to_string(), mode.to_string()),
+                    ("CAD1457_ERROR".to_string(), error.to_string()),
+                    (
+                        "CAD1457_LOG".to_string(),
+                        commands.to_string_lossy().to_string(),
+                    ),
+                ],
+            )
+            .unwrap();
+        *adapter.transport.write().unwrap() = transport;
+        (
+            Stop {
+                adapter: Some(adapter),
+                dir: Some(dir),
+            },
+            commands,
+            events,
+        )
+    }
+
+    fn commands(path: &std::path::Path) -> Vec<Value> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    fn count(frames: &[Value], kind: &str) -> usize {
+        frames
+            .iter()
+            .filter(|frame| frame.get("type").and_then(Value::as_str) == Some(kind))
+            .count()
+    }
+
+    #[test]
+    fn after_tool_body_rejection_does_not_submit_the_tool_again() {
+        let (stop, log, events) = launch("after", GENERIC_BODY, true);
+        let adapter = stop.adapter.as_ref().unwrap();
+        let result = adapter.run_turn(USER, "m1", &|_| {}).unwrap();
+        assert_eq!(result.status, "failed");
+        assert_eq!(result.text, "partial answer");
+        let error = result.error.as_deref().unwrap();
+        assert!(error.contains(GENERIC_BODY));
+        assert!(!error.contains("256"));
+        assert!(!error.contains("KiB"));
+        assert!(!adapter.reset_rejected_session(&result).unwrap());
+        let frames = commands(&log);
+        assert_eq!(count(&frames, "prompt"), 1);
+        assert_eq!(count(&frames, "new_session"), 0);
+        assert!(frames.iter().any(|frame| {
+            frame.get("type").and_then(Value::as_str) == Some("prompt")
+                && frame
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .is_some_and(|message| message.contains(USER))
+        }));
+        let seen = events.lock().unwrap();
+        assert!(seen.iter().any(|(method, _)| method == "cadence/tool_use"));
+        assert!(seen
+            .iter()
+            .any(|(method, _)| method == "cadence/tool_result"));
+        assert!(seen.iter().any(|(method, params)| {
+            method == "cadence/serialized_body_limited"
+                && params.get("replayed").and_then(Value::as_bool) == Some(false)
+        }));
+        assert!(adapter.shared.master.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn before_tool_body_rejection_still_resets_once() {
+        let (stop, log, events) = launch("before", GENERIC_BODY, true);
+        let adapter = stop.adapter.as_ref().unwrap();
+        let result = adapter.run_turn(USER, "m1", &|_| {}).unwrap();
+        assert_eq!(result.status, "failed");
+        assert_eq!(result.error.as_deref(), Some(GENERIC_BODY));
+        assert!(adapter.reset_rejected_session(&result).unwrap());
+        let frames = commands(&log);
+        assert_eq!(count(&frames, "prompt"), 1);
+        assert_eq!(count(&frames, "new_session"), 1);
+        assert!(!events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(method, _)| { method == "cadence/serialized_body_limited" }));
+        let (worker, worker_log, _) = launch("before", GENERIC_BODY, false);
+        let worker_adapter = worker.adapter.as_ref().unwrap();
+        let worker_result = worker_adapter.run_turn(USER, "m2", &|_| {}).unwrap();
+        assert_eq!(worker_result.error.as_deref(), Some(GENERIC_BODY));
+        assert!(!worker_adapter
+            .reset_rejected_session(&worker_result)
+            .unwrap());
+        assert!(!worker_adapter.shared.master.load(Ordering::SeqCst));
+        assert_eq!(count(&commands(&worker_log), "new_session"), 0);
+    }
+
+    #[test]
+    fn token_refusal_is_not_treated_as_a_body_limitation() {
+        let (stop, _, _) = launch("before", TOKEN, true);
+        let adapter = stop.adapter.as_ref().unwrap();
+        let before = adapter.run_turn(USER, "m1", &|_| {}).unwrap();
+        assert_eq!(before.status, "failed");
+        assert_eq!(before.error.as_deref(), Some(TOKEN));
+        assert!(adapter.reset_rejected_session(&before).unwrap());
+
+        let (stop, log, events) = launch("after", TOKEN, true);
+        let adapter = stop.adapter.as_ref().unwrap();
+        let after = adapter.run_turn(USER, "m2", &|_| {}).unwrap();
+        assert_eq!(after.status, "failed");
+        assert_eq!(after.error.as_deref(), Some(TOKEN));
+        assert!(!adapter.reset_rejected_session(&after).unwrap());
+        assert_eq!(count(&commands(&log), "prompt"), 1);
+        assert_eq!(count(&commands(&log), "new_session"), 0);
+        assert!(!events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(method, _)| { method == "cadence/serialized_body_limited" }));
+    }
+
+    #[test]
+    fn cancellation_does_not_reset_or_continue() {
+        let (stop, log, events) = launch("cancel", GENERIC_BODY, true);
+        let adapter = stop.adapter.as_ref().unwrap();
+        let result = adapter
+            .run_turn(USER, "m1", &|_| adapter.interrupt())
+            .unwrap();
+        assert_eq!(result.status, "interrupted");
+        assert!(result.error.is_none());
+        assert!(!adapter.reset_rejected_session(&result).unwrap());
+        let frames = commands(&log);
+        assert_eq!(count(&frames, "prompt"), 1);
+        assert_eq!(count(&frames, "abort"), 1);
+        assert_eq!(count(&frames, "new_session"), 0);
+        assert!(!events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(method, _)| { method == "cadence/serialized_body_limited" }));
     }
 }
