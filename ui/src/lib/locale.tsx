@@ -1,5 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { Meta } from "./types";
+import type { PrivateOperation } from "./privateSession";
+import { beginPrivateOperation, privateFetch, privateReadsAllowed, withPrivateOperation } from "./privateSession";
 
 export type Locale = "en" | "zh-TW";
 type Scope = "user" | "organization";
@@ -186,28 +188,36 @@ function storeLocalLocale(value: Locale | null): void {
   }
 }
 
-async function readPreferences(): Promise<Preferences> {
-  const response = await fetch("/api/locale", { headers: { "X-Cadence-Board": "1" } });
-  if (!response.ok) throw new Error(`Locale preferences unavailable (${response.status})`);
-  const value = await response.json() as Partial<Preferences>;
+function decodePreferences(value: unknown): Preferences {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Invalid locale preferences response");
+  }
+  const organizationLocale = "organization_locale" in value ? value.organization_locale : null;
+  const userLocale = "user_locale" in value ? value.user_locale : null;
   return {
-    organization_locale: validLocale(value.organization_locale) ? value.organization_locale : null,
-    user_locale: validLocale(value.user_locale) ? value.user_locale : null,
+    organization_locale: validLocale(organizationLocale) ? organizationLocale : null,
+    user_locale: validLocale(userLocale) ? userLocale : null,
   };
 }
 
-async function writePreference(scope: Scope, locale: Locale | null): Promise<Preferences> {
-  const response = await fetch("/api/locale", {
+async function readPreferences(operation: PrivateOperation): Promise<Preferences> {
+  const response = await privateFetch("/api/locale", { headers: { "X-Cadence-Board": "1" } }, operation);
+  if (!response.ok) throw new Error(`Locale preferences unavailable (${response.status})`);
+  const value: unknown = await response.json();
+  operation.assertCurrent();
+  return decodePreferences(value);
+}
+
+async function writePreference(scope: Scope, locale: Locale | null, operation: PrivateOperation): Promise<Preferences> {
+  const response = await privateFetch("/api/locale", {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Cadence-Board": "1" },
     body: JSON.stringify({ scope, locale }),
-  });
+  }, operation);
   if (!response.ok) throw new Error(`Locale preference write refused (${response.status})`);
-  const value = await response.json() as Partial<Preferences>;
-  return {
-    organization_locale: validLocale(value.organization_locale) ? value.organization_locale : null,
-    user_locale: validLocale(value.user_locale) ? value.user_locale : null,
-  };
+  const value: unknown = await response.json();
+  operation.assertCurrent();
+  return decodePreferences(value);
 }
 
 interface LocaleContextValue {
@@ -243,13 +253,21 @@ export function LocaleProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     const request = ++requestId.current;
-    if (!identity) {
-      return;
-    }
-    readPreferences()
-      .then((next) => { if (request === requestId.current) setStoredPreferences({ identity, value: next }); })
-      .catch(() => { if (request === requestId.current) setStoredPreferences(null); });
-    return () => { requestId.current += 1; };
+    if (!identity || !privateReadsAllowed()) return;
+    const operation = beginPrivateOperation();
+    void readPreferences(operation)
+      .then((next) => {
+        operation.assertCurrent();
+        if (request === requestId.current) setStoredPreferences({ identity, value: next });
+      })
+      .catch(() => {
+        if (!operation.signal.aborted && request === requestId.current) setStoredPreferences(null);
+      })
+      .finally(() => operation.dispose());
+    return () => {
+      requestId.current += 1;
+      operation.dispose();
+    };
   }, [identity]);
 
   const preferences = storedPreferences?.identity === identity ? storedPreferences.value : null;
@@ -270,13 +288,12 @@ export function LocaleProvider({ children }: { children: ReactNode }) {
     }
     const generation = ++requestId.current;
     const writeIdentity = identity;
-    const next = await writePreference(scope, value);
-    // A write that settled after the session or request generation moved
-    // on belongs to the old identity — it must not evict the new one's
-    // already-loaded preferences.
-    if (writeIdentity !== null && generation === requestId.current) {
-      setStoredPreferences({ identity: writeIdentity, value: next });
-    }
+    await withPrivateOperation(async (operation) => {
+      const next = await writePreference(scope, value, operation);
+      operation.assertCurrent();
+      // A retired save must neither resolve successfully nor evict a later identity's preferences.
+      if (generation === requestId.current) setStoredPreferences({ identity: writeIdentity, value: next });
+    });
   }, [identity]);
 
   const context = useMemo<LocaleContextValue>(() => ({

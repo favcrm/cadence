@@ -1192,6 +1192,8 @@ same-session queued files for explicit **Retry uploads**, never automatic
 replay after verification; an identity reset discards those files. Verification
 retry restores the previous live control's keyboard focus or returns focus to
 the admitted workspace.
+Hosted language-preference reads and saves share the same operation lifetime
+and typed session-refusal boundary. Local language choices remain browser-only.
 
 Private SSE uses authenticated fetch streaming rather than URL-carried tab
 keys. The server revalidates the live session every five seconds with a
