@@ -46,6 +46,7 @@ use cadence_agent::upgrade::{
     COMPLETION_WORKFLOW, MAIN, MANIFEST, PROMOTION_BUNDLE, RECEIPT_FILE, SHA_FILE,
     SOURCE_FACTS_FILE, STAGING_WORKFLOW, TARGET, WORKFLOW,
 };
+use cadence_agent::upgrade::{run, Layout, Request, Target};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -509,7 +510,7 @@ fn source_for(base: &str) -> cadence_agent::error::Result<HttpGh> {
 fn cad1455_complete_package_fetches_and_proves_over_real_http() {
     let pkg = members(false);
     let archive = tar_gz(&pkg.members);
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (env, result) = with_tools(&pkg, |_| {
         let server = serve(routes(SOURCE_SHA, &archive));
         let src = source_for(&server.base)?;
@@ -535,7 +536,7 @@ fn cad1455_complete_package_fetches_and_proves_over_real_http() {
 fn cad1455_over_bound_member_never_reaches_filesystem_extraction() {
     let pkg = members(true);
     let archive = tar_gz(&pkg.members);
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (env, result) = with_tools(&pkg, |_| {
         let server = serve(routes(SOURCE_SHA, &archive));
         let src = source_for(&server.base)?;
@@ -570,7 +571,7 @@ fn cad1455_duplicate_member_refuses_over_real_fetch() {
         .clone();
     pkg.members.push((SHA_FILE.into(), sha)); // duplicate member name
     let archive = tar_gz(&pkg.members);
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (_env, result) = with_tools(&pkg, |_| {
         let server = serve(routes(SOURCE_SHA, &archive));
         let src = source_for(&server.base)?;
@@ -579,4 +580,269 @@ fn cad1455_duplicate_member_refuses_over_real_fetch() {
     if result.is_ok() {
         panic!("a duplicate member must refuse");
     }
+}
+
+// ---------------------------------------------------------------------------
+// CAD-1455 no-backward pair (independently maintained transport copy;
+// the implementer may not edit or weaken this file).
+//
+// The same complete, verified published package reaches the REAL
+// `upgrade::run` LatestMain resolution over loopback HTTP with a real
+// installed `Current::Link`. `refuse_backwards` must make an installed
+// current that the older candidate cannot prove descendant FAIL
+// CLOSED (unknown is not authorization to move backward), while a
+// current that IS a recorded ancestor of the candidate stays a dry-run
+// positive through every real gate (HTTP fetch, bounded members,
+// offline retained proof, manifest/checksum).
+//
+// Private layout only: `releases`/`link` under the test's own tempdir;
+// `Layout::detect` and every production path are untouched. `dry_run`
+// never installs, repoints or executes a candidate — the link target
+// and bytes are asserted unchanged after both runs.
+// ---------------------------------------------------------------------------
+
+/// The installed-current state for the pair: a private releases dir, a
+/// `link` symlink to `<releases>/<cur>/cadence` (placeholder bytes —
+/// `current()` reads the sha off the link target, never the file).
+/// Returns (tempdir keeping paths alive, layout, link target).
+fn seeded_layout(cur: &str) -> (tempfile::TempDir, Layout, PathBuf) {
+    let dir = tempfile::Builder::new()
+        .prefix("c1455-nb-layout-")
+        .tempdir()
+        .unwrap();
+    let releases = dir.path().join("releases");
+    let bin_dir = releases.join(cur);
+    fs::create_dir_all(&bin_dir).unwrap();
+    let cur_bin = bin_dir.join(BINARY);
+    fs::write(&cur_bin, b"placeholder-installed-current").unwrap();
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&cur_bin, &link).unwrap();
+    let layout = Layout {
+        releases: releases.clone(),
+        link: link.clone(),
+    };
+    (dir, layout, cur_bin)
+}
+
+fn latest_main_request() -> Request {
+    Request {
+        target: Target::LatestMain,
+        dry_run: true,
+        allow_unattested: false,
+        backup_state_dir: None,
+    }
+}
+
+/// POSITIVE: the installed current is a recorded ancestor of the
+/// published candidate — the forward move is what latest-main is for.
+/// The SAME real path (catalogue → package fetch → member bounds →
+/// retained proof → resolution → compare) must return Ok with
+/// `would_repoint: true`, proving every gate on the pair is clear and
+/// the refusal below is the no-backward rule itself, not harness noise.
+#[test]
+fn cad1455_latest_main_dry_run_repoints_from_candidate_ancestor() {
+    let pkg = members(false);
+    let archive = tar_gz(&pkg.members);
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (_env, result) = with_tools(&pkg, |_| {
+        let server = serve(routes(SOURCE_SHA, &archive));
+        let (_dir, layout, _cur_bin) = seeded_layout(ANCESTOR1);
+        let src = source_for(&server.base)?;
+        run(&src, &layout, &latest_main_request())
+    });
+    let report = result.expect(
+        "an installed ancestor of the published candidate must resolve, verify \
+         and plan the forward repoint — the real latest-main path",
+    );
+    assert_eq!(report["to_sha"], SOURCE_SHA);
+    assert_eq!(report["from_sha"], ANCESTOR1);
+    assert_eq!(report["would_repoint"], true, "report: {report}");
+    assert_eq!(report["dry_run"], true);
+}
+
+/// DECISIVE NEGATIVE (behavioral): the SAME complete package resolves
+/// SOURCE_SHA while the installed link names a current that is NOT in
+/// the published candidate's signed ancestor set (a newer main commit
+/// recorded after the candidate, or any sha the snapshot cannot
+/// place). For latest-main a candidate that cannot prove the current
+/// is its ancestor must FAIL CLOSED — a published source's `compare`
+/// answers `ahead` only relative to its own candidate and answers
+/// `None` here — exactly as live GitHub's unknown ordering refuses.
+/// At frozen 043 `refuse_backwards` only rejects `compare(to,from)
+/// == ahead`, so this currently resolves Ok with `would_repoint: true`
+/// (the ticket's no-backward acceptance broken); this assertion is the
+/// RED the fix flips, observed through the real run, not a fake
+/// compare or a private guard call. The link must be untouched either
+/// way (dry-run never repoints).
+#[test]
+fn cad1455_latest_main_refuses_when_current_not_in_candidate_ancestors() {
+    // A full sha absent from the fixture's ancestors
+    // [ANCESTOR1, ANCESTOR2, SOURCE_SHA] and not the candidate — the
+    // descendant relation is unproven, never disproven.
+    const NEWER_CURRENT: &str = "7777777777777777777777777777777777777777";
+    let pkg = members(false);
+    let archive = tar_gz(&pkg.members);
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (env, outcome) = with_tools(&pkg, |_| {
+        let server = serve(routes(SOURCE_SHA, &archive));
+        let (dir, layout, cur_bin) = seeded_layout(NEWER_CURRENT);
+        let result =
+            source_for(&server.base).and_then(|src| run(&src, &layout, &latest_main_request()));
+        (dir, result, layout, cur_bin)
+    });
+    let (_dir, result, layout, cur_bin) = outcome;
+    // Whatever the verdict, a dry-run must leave the private link and
+    // the installed placeholder exactly as seeded.
+    assert_eq!(
+        fs::read_link(&layout.link).ok().as_deref(),
+        Some(cur_bin.as_path()),
+        "the link target changed"
+    );
+    assert_eq!(
+        fs::read(&cur_bin).unwrap(),
+        b"placeholder-installed-current"
+    );
+    let calls = tar_calls(&env);
+    assert!(
+        !calls.is_empty(),
+        "the run must have fetched and proven the real package before refusing"
+    );
+    if let Ok(report) = result {
+        panic!(
+            "NO-BACKWARD GUARD GAP: --latest-main planned a move from installed \
+             {NEWER_CURRENT} — outside published candidate {SOURCE_SHA}'s signed \
+             ancestors — to that older candidate (would_repoint={}). An unknown \
+             descendant relation must fail closed for a published source; the \
+             ticket's no-backward acceptance requires a refusal here. \
+             report: {report}",
+            report["would_repoint"]
+        );
+    } // Err: the required closed refusal
+}
+
+// ---------------------------------------------------------------------------
+// CAD-1455 atomic-verified-install reuse pair (same maintained copy).
+//
+// `upgrade::run` may reuse an on-disk published release ONLY when the
+// recorded checksum and manifest agree with the verified published
+// bytes (`reusable`). At frozen 043 the `source` match arm checks
+// `installed_path.is_file() && digest.is_some()` — `digest` comes from
+// the proof, not the reuse decision — so any regular file at
+// `<releases>/<sha>/cadence` reports `installed-release` and skips the
+// captured verified package: tampered/wrong local bytes would be the
+// installed artifact the link repoints to. The ticket's
+// atomic-verified-install + "tampered inputs cannot cause a link
+// change" acceptance requires the captured `published-release` path
+// (or a legitimate closed refusal before the plan) whenever the local
+// copy does not prove the verified digest — and a genuine verified
+// copy to still reuse, proving the reuse gate itself stays open only
+// for matching bytes.
+// ---------------------------------------------------------------------------
+
+/// POSITIVE: an on-disk candidate that IS the verified published copy
+/// (exact fixture `cadence`, `cadence.sha256`, `manifest.json` bytes)
+/// must report `installed-release` — reuse is preserved for bytes that
+/// prove the digest, and this clears every real gate so the negative
+/// below isolates the reuse decision itself.
+#[test]
+fn cad1455_latest_main_dry_run_reuses_verified_published_copy() {
+    let pkg = members(false);
+    let archive = tar_gz(&pkg.members);
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (_env, outcome) = with_tools(&pkg, |_| {
+        let server = serve(routes(SOURCE_SHA, &archive));
+        let (dir, layout, cur_bin) = seeded_layout(ANCESTOR1);
+        // The genuine verified candidate: the exact package members
+        // the retained proof will verify, on disk under the real
+        // release layout.
+        let rel = layout.release_dir(SOURCE_SHA);
+        fs::create_dir_all(&rel).unwrap();
+        for name in [BINARY, SHA_FILE, MANIFEST] {
+            let bytes = &pkg.members.iter().find(|(n, _)| n == name).unwrap().1;
+            fs::write(rel.join(name), bytes).unwrap();
+        }
+        let result =
+            source_for(&server.base).and_then(|src| run(&src, &layout, &latest_main_request()));
+        (dir, result, layout, cur_bin)
+    });
+    let (_dir, result, _layout, _cur_bin) = outcome;
+    let report = result.expect(
+        "a verified on-disk published copy must resolve and plan reuse — \
+         the real fetch/proof path stays intact",
+    );
+    assert_eq!(report["to_sha"], SOURCE_SHA);
+    assert_eq!(
+        report["source"], "installed-release",
+        "a genuine verified copy must reuse: {report}"
+    );
+    assert_eq!(report["would_repoint"], true, "report: {report}");
+}
+
+/// DECISIVE NEGATIVE (behavioral): the SAME complete package resolves
+/// while a regular file at `<releases>/<SOURCE_SHA>/cadence` holds
+/// WRONG bytes beside the package's own valid SHA_FILE/MANIFEST. The
+//  copy does not hash to the verified digest, so it must NOT be
+/// treated as the installed release: the run must plan the captured
+/// `published-release` install (or refuse closed before the plan) —
+/// never report the unverified bytes as the source. At 043 the
+/// `source` arm keys on file-existence plus the proof's digest, so it
+/// reports `installed-release` here (the false-reuse gap); this
+/// assertion is the RED the fix flips. `would_repoint` is required
+/// true only when the run plans a repoint at all — a refusal must not
+/// produce one.
+#[test]
+fn cad1455_latest_main_dry_run_never_reuses_wrong_local_bytes() {
+    let pkg = members(false);
+    let archive = tar_gz(&pkg.members);
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (env, outcome) = with_tools(&pkg, |_| {
+        let server = serve(routes(SOURCE_SHA, &archive));
+        let (dir, layout, cur_bin) = seeded_layout(ANCESTOR1);
+        // Wrong regular bytes where the candidate would sit; the
+        // recorded checksum/manifest are the package's own valid
+        // members (only the binary content diverges).
+        let rel = layout.release_dir(SOURCE_SHA);
+        fs::create_dir_all(&rel).unwrap();
+        fs::write(rel.join(BINARY), b"WRONG-not-the-published-bytes").unwrap();
+        for name in [SHA_FILE, MANIFEST] {
+            let bytes = &pkg.members.iter().find(|(n, _)| n == name).unwrap().1;
+            fs::write(rel.join(name), bytes).unwrap();
+        }
+        let wrong = fs::read(rel.join(BINARY)).unwrap();
+        let result =
+            source_for(&server.base).and_then(|src| run(&src, &layout, &latest_main_request()));
+        (dir, result, layout, cur_bin, wrong)
+    });
+    let (dir, result, layout, _cur_bin, wrong) = outcome;
+    let calls = tar_calls(&env);
+    assert!(
+        !calls.is_empty(),
+        "the run must have fetched and proven the real package before the verdict"
+    );
+    // The seeded wrong bytes must still be on disk after a dry-run.
+    assert_eq!(
+        fs::read(dir.path().join("releases").join(SOURCE_SHA).join(BINARY)).unwrap(),
+        wrong
+    );
+    assert_eq!(
+        fs::read_link(&layout.link).ok().as_deref(),
+        Some(layout.binary(ANCESTOR1).as_path()),
+        "the link target changed"
+    );
+    if let Ok(report) = result {
+        assert_ne!(
+            report["source"], "installed-release",
+            "FALSE-REUSE GUARD GAP: unverified local bytes at \
+             <releases>/{SOURCE_SHA}/cadence were reported as the installed \
+             release, skipping the captured verified package — the link \
+             would repoint to bytes that never proved the published digest. \
+             The atomic-verified-install acceptance requires the captured \
+             `published-release` plan (or a closed refusal) here. \
+             report: {report}"
+        );
+        assert_eq!(
+            report["source"], "published-release",
+            "the captured verified package must be the install source: {report}"
+        );
+    } // Err: a legitimate closed refusal is acceptable
 }

@@ -56,6 +56,9 @@ const TARGET_TRIPLE: &str = "x86_64-linux";
 const RUNNER: &str = "ubuntu-22.04";
 const ASSET: &str = "cadence-v0.2.0-x86_64-linux.tar.gz";
 const PROFILE_PUBLIC_CLIENT: &str = "public-client";
+// The AOS-255 release namespace's product segment — a release id, not a
+// worktree branch: `cadence/<profile>/<tag>` on the owned source.
+const PRODUCT: &str = "cadence";
 
 /// Member names the consumer requires (bind the shipped constants).
 const PUB_RECEIPT_NAME: &str = cadence_agent::upgrade::PUBLICATION_RECEIPT; // publication-receipt.json
@@ -323,7 +326,7 @@ fn client_routes(with_receipt: bool) -> (Vec<(String, Vec<u8>)>, String, String)
         objs.push((art(PUB_RECEIPT_BUNDLE_NAME), PUB_BUNDLE_BYTES.to_vec()));
     }
     let entry = json!({
-        "id":format!("cadence/{PROFILE_PUBLIC_CLIENT}/{TAG}"),"product":"cadence","version":TAG,
+        "id":format!("{PRODUCT}/{PROFILE_PUBLIC_CLIENT}/{TAG}"),"product":PRODUCT,"version":TAG,
         "sourceSha":SOURCE_SHA,"profile":PROFILE_PUBLIC_CLIENT,"visibility":"public","status":"published",
         "publishedAt":"2026-10-15T00:00:00Z","withdrawnAt":null,"recordedAt":"2026-10-15T00:00:00Z",
         "productionCandidateId":null,"artifacts":meta,
@@ -332,7 +335,7 @@ fn client_routes(with_receipt: bool) -> (Vec<(String, Vec<u8>)>, String, String)
         (format!("/v1/cadence/releases/cadence/{PROFILE_PUBLIC_CLIENT}/{TAG}"),
          serde_json::to_vec(&json!({"ok":true,"data":{"entry":entry,"artifacts":urls}})).unwrap()),
         (format!("/v1/cadence/releases/latest?product=cadence&profile={PROFILE_PUBLIC_CLIENT}"),
-         serde_json::to_vec(&json!({"ok":true,"data":{"product":"cadence","profile":PROFILE_PUBLIC_CLIENT,"entry":entry}})).unwrap()),
+         serde_json::to_vec(&json!({"ok":true,"data":{"product":PRODUCT,"profile":PROFILE_PUBLIC_CLIENT,"entry":entry}})).unwrap()),
     ];
     routes.extend(objs);
     (routes, archive_sha, receipt_sha)

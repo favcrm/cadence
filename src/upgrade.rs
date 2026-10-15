@@ -1784,9 +1784,10 @@ pub fn run(src: &dyn ReleaseSource, layout: &Layout, req: &Request) -> Result<Va
     // published bytes AND its recorded checksum/manifest agree (the
     // same bar a downloaded install leaves behind); the proof's
     // captured package replaces anything else.
+    let mut published_reusable = false;
     if let Some(proof) = &published_proof {
         let verified_digest = sha256_file(&proof.captured.dir.join(BINARY))?;
-        let reusable = installed_path.is_file()
+        published_reusable = installed_path.is_file()
             && check_sha256(&installed_path, &layout.release_dir(&sha).join(SHA_FILE))
                 .is_ok_and(|d| d == verified_digest)
             && layout.release_dir(&sha).join(MANIFEST).is_file()
@@ -1796,7 +1797,7 @@ pub fn run(src: &dyn ReleaseSource, layout: &Layout, req: &Request) -> Result<Va
                 &verified_digest,
             )
             .is_ok();
-        if reusable {
+        if published_reusable {
             verified.insert(
                 "download".into(),
                 json!("skipped — the verified published build is already installed"),
@@ -1833,7 +1834,7 @@ pub fn run(src: &dyn ReleaseSource, layout: &Layout, req: &Request) -> Result<Va
     // which route produced the install.
     let mut published_path: Option<PathBuf> = None;
     let source = match &published_proof {
-        Some(_) if installed_path.is_file() && digest.is_some() => {
+        Some(_) if published_reusable => {
             // Reused the already-installed verified copy; the proof's
             // workspace only verifies, it is not installed from.
             "installed-release"
@@ -1948,7 +1949,7 @@ pub fn run(src: &dyn ReleaseSource, layout: &Layout, req: &Request) -> Result<Va
         "link": layout.link,
         "installed": installed,
         "repointed": repointed,
-        "would_install": req.dry_run && source == "ci-artifact",
+        "would_install": req.dry_run && matches!(source, "ci-artifact" | "published-release"),
         "would_repoint": req.dry_run && link_changed,
         "verified": Value::Object(verified),
         "backup": backup,
@@ -1970,6 +1971,16 @@ fn refuse_backwards(src: &dyn ReleaseSource, from: Option<&str>, to: &str) -> Re
     let Some(from) = from.filter(|f| *f != to) else {
         return Ok(());
     };
+    // Publication-time facts cannot place a newer or unknown installed
+    // commit. Latest-mode must prove a forward move, not treat an
+    // unanswerable reverse comparison as permission to downgrade.
+    if src.published() && src.compare(from, to)?.as_deref() != Some("ahead") {
+        return Err(Error::rejected(format!(
+            "the published --latest-main release {to} is not proven newer than the linked \
+             {from} — refusing backwards or unknown ancestry. To downgrade on purpose, \
+             pass --sha {to} explicitly"
+        )));
+    }
     if src.compare(to, from)?.as_deref() == Some("ahead") {
         return Err(Error::rejected(format!(
             "--latest-main resolved {to}, which is older than the linked {from} (an \
