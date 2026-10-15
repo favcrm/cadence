@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import "./notifications.css";
 import Button from "../../ui/Button";
 import { IconCheck, IconClose, IconSettings, IconThreads } from "../../ui/icons";
 import { navigate } from "../../lib/useLocation";
