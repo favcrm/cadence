@@ -105,11 +105,69 @@ jobs:
             (.sha256|test("^[0-9a-f]{64}$")) and
             .promotion_run_id == $run and
             .promotion_run_attempt == $attempt' "$receipt" >/dev/null
-          echo "source_sha=$(jq -r .source_sha "$receipt")" >> "$GITHUB_OUTPUT"
+          source_sha=$(jq -r .source_sha "$receipt")
+          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
           echo "ci_run_id=$(jq -r .ci_run_id "$receipt")" >> "$GITHUB_OUTPUT"
           echo "ci_run_attempt=$(jq -r .ci_run_attempt "$receipt")" >> "$GITHUB_OUTPUT"
           echo "sha256=$(jq -r .sha256 "$receipt")" >> "$GITHUB_OUTPUT"
           echo "receipt_sha256=$(sha256sum "$receipt" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          # The same run's retained evidence carries the exact
+          # manifest.json bytes; re-check its receipt is byte-identical
+          # to the promoted one before its manifest is bound.
+          mkdir -p "$RUNNER_TEMP/evidence"
+          gh run download "$UPSTREAM_ID" --repo "$REPO" \
+            --name "production-evidence-$source_sha" --dir "$RUNNER_TEMP/evidence"
+          test -f "$RUNNER_TEMP/evidence/manifest.json"
+          cmp -s "$receipt" "$RUNNER_TEMP/evidence/production-candidate.json"
+          echo "manifest_sha256=$(sha256sum "$RUNNER_TEMP/evidence/manifest.json" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      # CAD-1455: the offline verifier cannot re-ask GitHub for
+      # on-main/ancestry/schema checks, so the completed-promotion
+      # producer signs the facts those guards consumed — observed at
+      # PUBLICATION time from the trusted repository git graph, never
+      # from package bytes. This is an authenticated snapshot of
+      # eligibility at promotion, not a live lookup.
+      - name: Derive signed source facts from the trusted git graph
+        id: facts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SOURCE_SHA: ${{ steps.candidate.outputs.source_sha }}
+          MAIN_HEAD: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          git clone --quiet --filter=blob:none --no-checkout \
+            "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "$RUNNER_TEMP/graph"
+          cd "$RUNNER_TEMP/graph"
+          git fetch --quiet origin "$SOURCE_SHA" main
+          # The observed main head must contain the candidate; this is
+          # the publication-time ancestry fact, not a live claim.
+          observed_main=$(git rev-parse origin/main)
+          test "$observed_main" = "$MAIN_HEAD"
+          git merge-base --is-ancestor "$SOURCE_SHA" origin/main
+          # Bounded deduplicated ancestor list INCLUDING the candidate,
+          # oldest first. Refuse rather than truncate on overflow.
+          git rev-list --reverse "$SOURCE_SHA" > "$RUNNER_TEMP/ancestors.txt"
+          count=$(wc -l < "$RUNNER_TEMP/ancestors.txt")
+          test "$count" -ge 1 -a "$count" -le 20000
+          test "$(sort -u "$RUNNER_TEMP/ancestors.txt" | wc -l)" = "$count"
+          test "$(tail -1 "$RUNNER_TEMP/ancestors.txt")" = "$SOURCE_SHA"
+          # SCHEMA_VERSION from src/rollout.rs at the exact candidate
+          # SHA, using the same parse rule the verifier applies.
+          git show "$SOURCE_SHA:src/rollout.rs" > "$RUNNER_TEMP/rollout.rs"
+          schema_version=$(sed -n 's/^ *pub const SCHEMA_VERSION: i64 = \([0-9][0-9]*\);/\1/p' "$RUNNER_TEMP/rollout.rs")
+          test -n "$schema_version"
+          ancestors_json=$(jq -R . "$RUNNER_TEMP/ancestors.txt" | jq -s .)
+          jq -n \
+            --argjson schema 1 \
+            --arg source "$SOURCE_SHA" \
+            --arg main "$observed_main" \
+            --argjson ancestors "$ancestors_json" \
+            --argjson sv "$schema_version" \
+            '{schema: $schema, source_sha: $source, observed_main_head: $main,
+              ancestors: $ancestors, schema_version: $sv}' \
+            > "$RUNNER_TEMP/source-facts.json"
+          jq . "$RUNNER_TEMP/source-facts.json"
+          echo "facts_sha256=$(sha256sum "$RUNNER_TEMP/source-facts.json" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
       - name: Emit the closed completion receipt
         env:
           SOURCE_SHA: ${{ steps.candidate.outputs.source_sha }}
@@ -117,6 +175,8 @@ jobs:
           CI_RUN_ATTEMPT: ${{ steps.candidate.outputs.ci_run_attempt }}
           BINARY_SHA256: ${{ steps.candidate.outputs.sha256 }}
           RECEIPT_SHA256: ${{ steps.candidate.outputs.receipt_sha256 }}
+          FACTS_SHA256: ${{ steps.facts.outputs.facts_sha256 }}
+          MANIFEST_SHA256: ${{ steps.candidate.outputs.manifest_sha256 }}
           PROMOTION_HEAD_SHA: ${{ steps.upstream.outputs.promotion_head_sha }}
           UPSTREAM_ID: ${{ github.event.workflow_run.id }}
           UPSTREAM_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
@@ -124,8 +184,9 @@ jobs:
           set -euo pipefail
           # A small closed receipt: the proven promotion run, its head,
           # the exact attested receipt bytes, the promoted source and
-          # binary digest, and this completing run's own head (the
-          # completion signer) — kept separate, never equated.
+          # binary digest, the signed source-facts and manifest digests,
+          # and this completing run's own head (the completion signer) —
+          # kept separate, never equated.
           jq -n \
             --argjson schema 1 \
             --argjson run "$UPSTREAM_ID" \
@@ -136,6 +197,8 @@ jobs:
             --argjson ci_id "$CI_RUN_ID" \
             --argjson ci_attempt "$CI_RUN_ATTEMPT" \
             --arg binary "$BINARY_SHA256" \
+            --arg facts "$FACTS_SHA256" \
+            --arg manifest "$MANIFEST_SHA256" \
             --argjson completion_run "$GITHUB_RUN_ID" \
             --argjson completion_attempt "$GITHUB_RUN_ATTEMPT" \
             --arg completion_head "$GITHUB_SHA" \
@@ -149,6 +212,8 @@ jobs:
               ci_run_id: $ci_id,
               ci_run_attempt: $ci_attempt,
               binary_sha256: $binary,
+              source_facts_sha256: $facts,
+              manifest_sha256: $manifest,
               completion_run_id: $completion_run,
               completion_run_attempt: $completion_attempt,
               completion_head_sha: $completion_head
@@ -170,6 +235,8 @@ jobs:
           mkdir -p "$RUNNER_TEMP/completion"
           cp "$RUNNER_TEMP/promotion-completion.json" "$RUNNER_TEMP/completion/promotion-completion.json"
           cp "$RUNNER_TEMP/proof/production-candidate.json" "$RUNNER_TEMP/completion/production-candidate.json"
+          cp "$RUNNER_TEMP/source-facts.json" "$RUNNER_TEMP/completion/source-facts.json"
+          cp "$RUNNER_TEMP/evidence/manifest.json" "$RUNNER_TEMP/completion/manifest.json"
           (cd "$RUNNER_TEMP" && gh attestation download promotion-completion.json \
             --repo "$REPO" --digest-alg sha256)
           mv "$RUNNER_TEMP"/sha256-*.jsonl "$RUNNER_TEMP/completion/completion-attestation.jsonl"
@@ -181,6 +248,8 @@ jobs:
             ${{ runner.temp }}/completion/promotion-completion.json
             ${{ runner.temp }}/completion/completion-attestation.jsonl
             ${{ runner.temp }}/completion/production-candidate.json
+            ${{ runner.temp }}/completion/source-facts.json
+            ${{ runner.temp }}/completion/manifest.json
           if-no-files-found: error
           retention-days: 90
           overwrite: true

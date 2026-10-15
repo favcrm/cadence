@@ -118,6 +118,10 @@ pub const PROMOTION_BUNDLE: &str = "promotion-attestation.jsonl";
 pub const BUILD_BUNDLE: &str = "build-attestation.jsonl";
 pub const COMPLETION_FILE: &str = "promotion-completion.json";
 pub const COMPLETION_BUNDLE: &str = "completion-attestation.jsonl";
+/// The producer-signed publication-time source facts the offline
+/// verifier consumes for on-main/ancestry/schema checks it cannot
+/// re-ask GitHub about.
+pub const SOURCE_FACTS_FILE: &str = "source-facts.json";
 /// The trusted main workflow that attests the completed-promotion
 /// receipt after the upstream `staging.yml` run has already succeeded.
 pub const COMPLETION_WORKFLOW: &str = "promotion-completion.yml";
@@ -270,16 +274,20 @@ pub trait ReleaseSource {
     fn verify_attestation(&self, binary: &Path, sha: &str) -> Result<String>;
     /// CAD-1455: prove a retained evidence package offline. `dir` holds
     /// [`BINARY`], [`SHA_FILE`], [`MANIFEST`], [`RECEIPT_FILE`],
-    /// [`PROMOTION_BUNDLE`], [`BUILD_BUNDLE`], [`COMPLETION_FILE`] and
-    /// [`COMPLETION_BUNDLE`]; a package `trusted_root.jsonl` is untrusted
-    /// transport data and is never consulted. The verification must not
-    /// contact GitHub and must bind the receipt's exact bytes, the
-    /// binary's exact bytes and a completed-promotion receipt to the
-    /// recorded `source_sha`. On success the returned [`RetainedProof`]
-    /// keeps the captured workspace alive so a later install consumes
-    /// the same verified bytes. Sources that cannot prove that
-    /// (including this online `gh` path, which keeps its live-API
-    /// proof) refuse.
+    /// [`PROMOTION_BUNDLE`], [`BUILD_BUNDLE`], [`COMPLETION_FILE`],
+    /// [`COMPLETION_BUNDLE`] and [`SOURCE_FACTS_FILE`]; a package
+    /// `trusted_root.jsonl` is untrusted transport data and is never
+    /// consulted. The verification must not contact GitHub and must
+    /// bind the receipt's exact bytes, the binary's exact bytes, a
+    /// completed-promotion receipt and its signed source-facts/manifest
+    /// digests to the recorded `source_sha`. On success the returned
+    /// [`RetainedProof`] keeps the captured workspace alive so a later
+    /// install consumes the same verified bytes, and carries the
+    /// signed *publication-time* eligibility snapshot (on-main,
+    /// ancestry, schema as observed at promotion) — an authenticated
+    /// record, never a fresh live main lookup, and unable to know a
+    /// later main rewrite. Sources that cannot prove that (including
+    /// this online `gh` path, which keeps its live-API proof) refuse.
     fn verify_retained(&self, dir: &Path) -> Result<RetainedProof> {
         let _ = dir;
         Err(Error::rejected(
@@ -751,6 +759,10 @@ const RECEIPT_MAX: u64 = 64 * 1024;
 const BUNDLE_MAX: u64 = 32 * 1024 * 1024;
 const MANIFEST_MAX: u64 = 64 * 1024;
 const SHA_FILE_MAX: u64 = 4096;
+/// `source-facts.json` holds the bounded ancestor list; the producer
+/// refuses rather than truncate beyond this many entries.
+const SOURCE_FACTS_ANCESTORS_MAX: usize = 20_000;
+const SOURCE_FACTS_MAX: u64 = 8 * 1024 * 1024;
 /// The release binary is bounded too: a real build is a few hundred MB
 /// at most; an absurd package member is refused before it is copied.
 const BINARY_MAX: u64 = 512 * 1024 * 1024;
@@ -836,6 +848,7 @@ fn capture_package(dir: &Path) -> Result<Captured> {
         (BUILD_BUNDLE, BUNDLE_MAX),
         (COMPLETION_FILE, RECEIPT_MAX),
         (COMPLETION_BUNDLE, BUNDLE_MAX),
+        (SOURCE_FACTS_FILE, SOURCE_FACTS_MAX),
         (SHA_FILE, SHA_FILE_MAX),
         (MANIFEST, MANIFEST_MAX),
     ] {
@@ -960,10 +973,16 @@ impl OfflineGh {
 }
 
 /// The authenticated facts an offline verification reports back: the
-/// signer workflow's commit (certificate source-repository digest) and
-/// the subject digest the statement was verified over. Both come from
+/// attestation's source-repository digest (the commit the verified
+/// certificate records as its source — with the exact non-reusable
+/// workflow profiles pinned here, the run's head commit) and the
+/// subject digest the statement was verified over. Both come from
 /// `gh`'s `--format json` `verificationResult`, never from the caller.
 pub struct BundleFacts {
+    /// `signature.certificate.sourceRepositoryDigest`: the source
+    /// repo/run-context commit the certificate attests, meaningful as
+    /// a run-head comparison only because the exact in-repo workflow
+    /// profile is pinned — not a generic reusable signer-workflow id.
     pub signer_sha: String,
     pub subject_digest: String,
 }
@@ -971,7 +990,9 @@ pub struct BundleFacts {
 /// A retained evidence package proven offline, with its captured
 /// workspace kept alive so the install step can consume the same
 /// verified bytes. `source_sha` is the promoted commit the receipt
-/// binds; `completion` is the attested completed-promotion receipt.
+/// binds; `completion` is the attested completed-promotion receipt;
+/// `facts` is the signed publication-time eligibility snapshot the
+/// offline on-main/ancestry/schema guards consume.
 pub struct RetainedProof {
     /// The captured package directory (owned, immutable for the op).
     pub captured: Captured,
@@ -979,14 +1000,19 @@ pub struct RetainedProof {
     pub source_sha: String,
     /// The completed-promotion receipt as parsed from the package.
     pub completion: CompletionReceipt,
+    /// The signed publication-time source facts (on-main, ancestry and
+    /// schema observed at promotion, never a live lookup).
+    pub facts: SourceFacts,
 }
 
 /// The closed completion receipt `promotion-completion.yml` emits and
 /// attests after the upstream `staging.yml` run has already succeeded.
 /// It binds the proven promotion run, its head SHA (the promotion
 /// signer's commit), the exact promoted receipt bytes, the promoted
-/// `source_sha`/`binary_sha256`, and this completing run's own head —
-/// all kept distinct; no field is equated with another.
+/// `source_sha`/`binary_sha256`, the signed `source-facts.json` and
+/// `manifest.json` digests (so neither can be swapped later), and this
+/// completing run's own head — all kept distinct; no field is equated
+/// with another.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompletionReceipt {
@@ -999,6 +1025,8 @@ pub struct CompletionReceipt {
     pub ci_run_id: u64,
     pub ci_run_attempt: u64,
     pub binary_sha256: String,
+    pub source_facts_sha256: String,
+    pub manifest_sha256: String,
     pub completion_run_id: u64,
     pub completion_run_attempt: u64,
     pub completion_head_sha: String,
@@ -1014,9 +1042,59 @@ fn completion_fields(c: &CompletionReceipt) -> bool {
         && c.ci_run_id != 0
         && c.ci_run_attempt != 0
         && is_sha256_hex(&c.binary_sha256)
+        && is_sha256_hex(&c.source_facts_sha256)
+        && is_sha256_hex(&c.manifest_sha256)
         && c.completion_run_id != 0
         && c.completion_run_attempt != 0
         && is_full_sha(&c.completion_head_sha)
+}
+
+/// The publication-time source facts the completed-promotion producer
+/// signs: what the online path's `on_main`/`compare`/`schema_version`
+/// queries answered, fixed at promotion time. `observed_main_head` is
+/// the main head the producer saw when it proved ancestry; `ancestors`
+/// is the bounded deduplicated commit list including `source_sha` so a
+/// later no-backward check can test membership without an API;
+/// `schema_version` is `SCHEMA_VERSION` in `src/rollout.rs` at
+/// `source_sha`, parsed by the same rule [`parse_schema_version`] uses.
+/// This is an authenticated snapshot of eligibility at publication —
+/// never a live main lookup, and it cannot know a later main rewrite.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceFacts {
+    pub schema: u64,
+    pub source_sha: String,
+    pub observed_main_head: String,
+    pub ancestors: Vec<String>,
+    pub schema_version: i64,
+}
+
+fn source_facts_fields(f: &SourceFacts) -> bool {
+    f.schema == 1
+        && is_full_sha(&f.source_sha)
+        && is_full_sha(&f.observed_main_head)
+        && !f.ancestors.is_empty()
+        && f.ancestors.len() <= SOURCE_FACTS_ANCESTORS_MAX
+        && f.ancestors.iter().all(|a| is_full_sha(a))
+        // deduplicated, ending at the candidate itself
+        && f.ancestors.last().map(String::as_str) == Some(f.source_sha.as_str())
+        && {
+            let mut dedup = f.ancestors.clone();
+            dedup.sort();
+            dedup.dedup();
+            dedup.len() == f.ancestors.len()
+        }
+}
+
+/// Parse the closed source-facts file on its own field merits; the
+/// completion receipt's `source_facts_sha256` binds its exact bytes.
+fn parse_source_facts(text: &str) -> Result<SourceFacts> {
+    let facts: SourceFacts = serde_json::from_str(text)
+        .map_err(|e| Error::rejected(format!("invalid source facts: {e}")))?;
+    if !source_facts_fields(&facts) {
+        return Err(Error::rejected("source facts fail their own schema"));
+    }
+    Ok(facts)
 }
 
 /// Parse the closed completion receipt on its own field merits; the
@@ -1034,12 +1112,12 @@ fn parse_completion_receipt(text: &str) -> Result<CompletionReceipt> {
 /// Read `gh attestation verify --format json` output: a list of verified
 /// entries, each carrying `verificationResult.statement.subject` (the
 /// attested artifacts) and `verificationResult.signature.certificate`
-/// (the signer identity, populated from the OIDC token — not forgeable
-/// by the workflow). At least one subject entry must name
-/// `expect_subject` with digest `expect_digest`, no subject may name a
-/// *different* artifact, and all certificates must agree on one signer
-/// SHA. An entry with an empty subject list is refused, not accepted
-/// vacuously. Returns [`BundleFacts`] for the caller's report.
+/// (populated from the OIDC token — not forgeable by the workflow). At
+/// least one subject entry must name `expect_subject` with digest
+/// `expect_digest`, no subject may name a *different* artifact, and all
+/// certificates must agree on one source-repository digest. An entry
+/// with an empty subject list is refused, not accepted vacuously.
+/// Returns [`BundleFacts`] for the caller's report.
 fn check_subjects(out: &[u8], expect_subject: &str, expect_digest: &str) -> Result<BundleFacts> {
     let value: Value = serde_json::from_slice(out)
         .map_err(|e| Error::internal(format!("unreadable attestation verification output: {e}")))?;
@@ -1086,7 +1164,7 @@ fn check_subjects(out: &[u8], expect_subject: &str, expect_digest: &str) -> Resu
         match &signer {
             Some(previous) if previous != sha => {
                 return Err(Error::rejected(
-                    "attestation entries disagree on the signer commit — refusing",
+                    "attestation entries disagree on the source-repository commit — refusing",
                 ));
             }
             _ => signer = Some(sha.to_string()),
@@ -1214,8 +1292,8 @@ impl ReleaseSource for OfflineGh {
         let main_ref = format!("refs/heads/{MAIN}");
         // One promotion verification: crypto + exact staging.yml/main
         // cert identity + signer-repo + runner policy against the
-        // embedded root. The certificate's signer commit is the
-        // authentic fact reported back.
+        // embedded root. The certificate's source-repository digest is
+        // the authentic run-head fact reported back.
         let promotion = self.verify_bundle(
             &receipt_path,
             &pkg.join(PROMOTION_BUNDLE),
@@ -1258,15 +1336,15 @@ impl ReleaseSource for OfflineGh {
                  digests as the attested candidate — refusing",
             ));
         }
-        // The promotion signer and completing signer are distinct
-        // commits and neither needs to equal source_sha; but the
-        // receipts' recorded heads must match their verified
-        // certificates exactly, so a receipt naming another commit
-        // refuses.
+        // The promotion and completion runs are distinct commits and
+        // neither needs to equal source_sha; but each receipt's
+        // recorded head must match its verified certificate's
+        // source-repository digest exactly, so a receipt naming
+        // another commit refuses.
         if completion_receipt.promotion_head_sha != promotion.signer_sha {
             return Err(Error::rejected(
                 "completion receipt's promotion head differs from the attested \
-                 staging.yml signer commit — refusing",
+                 staging.yml run-head commit — refusing",
             ));
         }
         let completion = self.verify_bundle(
@@ -1286,10 +1364,42 @@ impl ReleaseSource for OfflineGh {
         if completion_receipt.completion_head_sha != completion.signer_sha {
             return Err(Error::rejected(
                 "completion receipt's recorded head differs from its attested \
-                 signer commit — refusing",
+                 run-head commit — refusing",
             ));
         }
-        let build = self.verify_bundle(
+        // The signed publication-time facts are what the offline
+        // on-main/ancestry/schema guards consume: their captured bytes
+        // must hash to the digest the completion receipt binds, then
+        // parse closed and name the same source. The manifest's
+        // captured bytes must likewise hash to its bound digest before
+        // its contents are trusted.
+        let facts_path = pkg.join(SOURCE_FACTS_FILE);
+        let facts_bytes = fs::read(&facts_path).map_err(|e| {
+            Error::rejected(format!(
+                "retained package has no source facts ({}): {e} — refusing; \
+                 publication-time eligibility is unproven",
+                facts_path.display()
+            ))
+        })?;
+        if sha256_bytes(&facts_bytes) != completion_receipt.source_facts_sha256 {
+            return Err(Error::rejected(
+                "source facts digest does not match the attested completion receipt — refusing",
+            ));
+        }
+        let facts = parse_source_facts(&String::from_utf8_lossy(&facts_bytes))?;
+        if facts.source_sha != candidate.source_sha {
+            return Err(Error::rejected(
+                "source facts name a different candidate than the attested receipt — refusing",
+            ));
+        }
+        let manifest_path = pkg.join(MANIFEST);
+        let manifest_bytes = fs::read(&manifest_path)?;
+        if sha256_bytes(&manifest_bytes) != completion_receipt.manifest_sha256 {
+            return Err(Error::rejected(
+                "manifest digest does not match the attested completion receipt — refusing",
+            ));
+        }
+        self.verify_bundle(
             &binary,
             &pkg.join(BUILD_BUNDLE),
             &root,
@@ -1307,27 +1417,12 @@ impl ReleaseSource for OfflineGh {
                 candidate.sha256
             )));
         }
-        check_manifest(&pkg.join(MANIFEST), &candidate.source_sha, &recorded)?;
-        // Read the parsed completion receipt back out of the captured
-        // bytes for the caller's report (the verified bundle is the
-        // authority; this JSON is a label, not the proof).
-        let completion_receipt =
-            parse_completion_receipt(&String::from_utf8_lossy(&completion_bytes))?;
-        let _ = format!(
-            "retained package verified offline: promotion (staging.yml run {}/{}, signer {}), \
-             completion (promotion-completion.yml signer {}), build (ci.yml signer {}) — \
-             source_sha {}",
-            candidate.promotion_run_id,
-            candidate.promotion_run_attempt,
-            promotion.signer_sha,
-            completion.signer_sha,
-            build.signer_sha,
-            candidate.source_sha
-        );
+        check_manifest(&manifest_path, &candidate.source_sha, &recorded)?;
         Ok(RetainedProof {
             captured,
             source_sha: candidate.source_sha.clone(),
             completion: completion_receipt,
+            facts,
         })
     }
 }
@@ -2341,6 +2436,8 @@ mod backup_pair_tests {
             "ci_run_id": 11,
             "ci_run_attempt": 3,
             "binary_sha256": "d".repeat(64),
+            "source_facts_sha256": "f".repeat(64),
+            "manifest_sha256": "0".repeat(64),
             "completion_run_id": 21,
             "completion_run_attempt": 1,
             "completion_head_sha": "e".repeat(40)
@@ -2360,6 +2457,45 @@ mod backup_pair_tests {
         v = serde_json::from_str(&receipt).unwrap();
         v["binary_sha256"] = json!("zz");
         assert!(parse_completion_receipt(&v.to_string()).is_err());
+    }
+
+    /// The closed source-facts parser enforces the same schema
+    /// discipline: a nonempty deduplicated full-SHA ancestor list
+    /// ending at the candidate, plus the publication-time schema.
+    #[test]
+    fn cad1455_source_facts_is_closed() {
+        let candidate = "a".repeat(40);
+        let parent = "b".repeat(40);
+        let facts = json!({
+            "schema": 1,
+            "source_sha": candidate,
+            "observed_main_head": "c".repeat(40),
+            "ancestors": [parent, candidate],
+            "schema_version": 46
+        })
+        .to_string();
+        let parsed = parse_source_facts(&facts).unwrap();
+        assert_eq!(parsed.source_sha, candidate);
+        assert_eq!(parsed.ancestors.len(), 2);
+        assert_eq!(parsed.schema_version, 46);
+        let mut v: Value = serde_json::from_str(&facts).unwrap();
+        v["extra"] = json!(true);
+        assert!(parse_source_facts(&v.to_string()).is_err());
+        // The candidate must be the list's tail.
+        v = serde_json::from_str(&facts).unwrap();
+        v["ancestors"] = json!([candidate, parent]);
+        assert!(parse_source_facts(&v.to_string()).is_err());
+        // Duplicates refuse.
+        v = serde_json::from_str(&facts).unwrap();
+        v["ancestors"] = json!([parent, parent, candidate]);
+        assert!(parse_source_facts(&v.to_string()).is_err());
+        // An empty list and a non-SHA entry refuse.
+        v = serde_json::from_str(&facts).unwrap();
+        v["ancestors"] = json!([]);
+        assert!(parse_source_facts(&v.to_string()).is_err());
+        v = serde_json::from_str(&facts).unwrap();
+        v["ancestors"] = json!(["zz", candidate]);
+        assert!(parse_source_facts(&v.to_string()).is_err());
     }
 
     /// The retained candidate parser accepts the closed schema only and
