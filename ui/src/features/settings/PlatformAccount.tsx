@@ -2,9 +2,10 @@ import { useCallback, useEffect, useState } from "react";
 import Button from "../../ui/Button";
 import { IconRefresh } from "../../ui/icons";
 import { sessionHeaders } from "../../lib/sessionKey";
-import { privateFetch } from "../../lib/privateSession";
+import { privateFetch, withPrivateOperation } from "../../lib/privateSession";
 import {
   displayAmount,
+  isPlatformAccount,
   safeManageUrl,
   type PlatformAccount as Account,
 } from "./accountDisplay";
@@ -22,13 +23,17 @@ export default function PlatformAccount() {
     setLoading(true);
     setError(false);
     try {
-      const response = await privateFetch("/api/platform-account", {
-        headers: sessionHeaders(),
+      await withPrivateOperation(async (op) => {
+        const response = await privateFetch("/api/platform-account", {
+          headers: sessionHeaders(),
+        }, op);
+        if (!response.ok) throw new Error("Account request failed");
+        const next: unknown = await response.json();
+        op.assertCurrent();
+        if (!isPlatformAccount(next)) throw new Error("Account request failed");
+        setData(next);
+        setCheckedAt(new Date());
       });
-      if (!response.ok) throw new Error("Account request failed");
-      const next = (await response.json()) as Account;
-      setData(next);
-      setCheckedAt(new Date());
     } catch {
       setError(true);
     } finally {

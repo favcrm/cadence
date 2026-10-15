@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { api } from "../../lib/api";
 import { fmtBytes } from "../../lib/fmt";
 import { useTranslate } from "../../lib/locale";
-import { onPrivateReadsPaused, privateFetch, privateReadsAllowed, privateSessionGeneration } from "../../lib/privateSession";
+import { beginPrivateOperation, onPrivateReadsPaused, privateFetch, privateReadsAllowed, privateSessionGeneration, type PrivateOperation } from "../../lib/privateSession";
 import { sessionHeaders, sessionKey } from "../../lib/sessionKey";
 import { Attach } from "./Attach";
 import { type IssuePageProps as Props } from "./issuePageProps";
@@ -20,9 +20,17 @@ function Artifact({ id, name, image = false }: { id: string; name: string; image
 
   useEffect(() => {
     const abort = new AbortController();
+    let operation: PrivateOperation | null = null;
+    try {
+      operation = beginPrivateOperation(abort.signal);
+    } catch {
+      return () => abort.abort();
+    }
+    if (operation === null) return () => abort.abort();
+    const session = operation;
     let url: string | null = null;
     let reader: FileReader | null = null;
-    const current = () => !abort.signal.aborted && privateReadsAllowed()
+    const current = () => !abort.signal.aborted && !session.signal.aborted && privateReadsAllowed()
       && privateSessionGeneration() === generation && sessionKey() === key;
     const dispose = () => {
       abort.abort();
@@ -46,10 +54,11 @@ function Artifact({ id, name, image = false }: { id: string; name: string; image
       credentials: "same-origin",
       headers: sessionHeaders(),
       signal: abort.signal,
-    })
-      .then(async (response) => {
+    }, session)
+    .then(async (response) => {
         if (!response.ok) throw new Error("Artifact could not be loaded");
         const blob = await response.blob();
+        session.assertCurrent();
         if (!current()) return;
         // Only raster images may open inline. Other blobs lose the server's
         // sandbox header, so they must download rather than navigate.
@@ -73,6 +82,7 @@ function Artifact({ id, name, image = false }: { id: string; name: string; image
       .catch(() => { if (current()) setFailed(true); });
     return () => {
       stop();
+      session.dispose();
       dispose();
     };
   }, [id, name, image, key, generation, attempt]);

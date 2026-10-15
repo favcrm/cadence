@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { sessionHeaders } from "../../../lib/sessionKey";
-import { onPrivateReadsPaused, privateFetch, privateReadsAllowed, privateSessionGeneration } from "../../../lib/privateSession";
+import { beginPrivateOperation, onPrivateReadsPaused, privateFetch, privateReadsAllowed, privateSessionGeneration, type PrivateOperation } from "../../../lib/privateSession";
 import { parseMount, ScreenChannel, type AssetLoader, type ScreenActions } from "./screenLifecycle";
 import { invokeTool, revokeTool } from "./screenActions";
 import { type SlotView } from "./screenSlot";
@@ -33,6 +33,15 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions 
     const generation = privateSessionGeneration();
     const controller = new AbortController();
     const unsubscribe = onPrivateReadsPaused(() => controller.abort());
+    let operation: PrivateOperation | null = null;
+    try {
+      operation = beginPrivateOperation(controller.signal);
+    } catch {
+      unsubscribe();
+      return;
+    }
+    if (operation === null) return;
+    const session = operation;
     let retired = false;
     let owned: ScreenChannel | null = null;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -51,10 +60,11 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions 
           method: "POST", credentials: "same-origin", cache: "no-store", signal: controller.signal,
           headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
           body: JSON.stringify(current.context_id ? { context_id: current.context_id } : {}),
-        });
+        }, session);
         if (!response.ok) throw new Error("Screen mount refused");
         const receipt = parseMount(await response.json(), current.tag);
         if (!receipt) throw new Error("Invalid screen mount receipt");
+        session.assertCurrent();
         if (retired || controller.signal.aborted || !privateReadsAllowed() || generation !== privateSessionGeneration() || !container.current) return;
         const frame = document.createElement("iframe");
         frame.title = current.installation.title;
@@ -94,7 +104,7 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions 
         frame.addEventListener("load", () => owned?.load());
         timer = setTimeout(() => { owned?.close(true); }, 10000);
       } catch {
-        if (!retired && !controller.signal.aborted && privateReadsAllowed() && generation === privateSessionGeneration()) {
+        if (!retired && !session.signal.aborted && !controller.signal.aborted && privateReadsAllowed() && generation === privateSessionGeneration()) {
           owned?.close(); container.current?.replaceChildren(); fail();
         }
       }
@@ -102,6 +112,7 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions 
     return () => {
       retired = true;
       unsubscribe();
+      session.dispose();
       controller.abort();
       clearTimeout(timer);
       window.removeEventListener("message", onMessage);

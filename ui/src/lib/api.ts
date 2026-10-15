@@ -1,7 +1,14 @@
 import type { LanePayload } from "../features/issues/lane";
 import { ConditionalGet } from "./conditionalGet";
 import { sessionKey, sessionHeaders } from "./sessionKey";
-import { onPrivateReadsPaused, privateFetch, privateReadsAllowed, privateSessionGeneration } from "./privateSession";
+import {
+  bindPrivateAbort,
+  privateFetch,
+  privateReadsAllowed,
+  privateSessionGeneration,
+  usingPrivateOperation,
+  type PrivateOperation,
+} from "./privateSession";
 import type {
   AgentDetail,
   AgentsPayload,
@@ -139,31 +146,31 @@ const conditional = new ConditionalGet(
   (input, init) => fetch(input, init),
   () => `${sessionKey() ?? ""}:${privateSessionGeneration()}`,
 );
-const privateRequests = new Set<AbortController>();
-onPrivateReadsPaused(() => {
-  for (const request of privateRequests) request.abort();
-  privateRequests.clear();
-});
 
-async function get<T>(path: string, signal?: AbortSignal): Promise<T> {
+async function readConditional<T>(path: string, signal: AbortSignal | undefined, operation: PrivateOperation | null): Promise<T> {
   const protectedRead = !path.startsWith("/api/meta");
-  if (protectedRead && !privateReadsAllowed()) throw new Error("Session verification required");
-  const generation = privateSessionGeneration();
+  const generation = operation?.generation ?? privateSessionGeneration();
+  if (protectedRead) operation?.assertCurrent();
   const controller = new AbortController();
-  const abort = () => controller.abort();
-  signal?.addEventListener("abort", abort, { once: true });
-  if (signal?.aborted) controller.abort();
-  if (protectedRead) privateRequests.add(controller);
+  const stopCaller = signal ? bindPrivateAbort(controller, signal) : () => {};
+  const stopOperation = operation ? bindPrivateAbort(controller, operation.signal) : () => {};
+  const stop = () => {
+    stopCaller();
+    stopOperation();
+  };
   try {
+    if (controller.signal.aborted) throw new DOMException("The private session changed", "AbortError");
     const { response: resp, value } = await conditional.get<T>(path, sessionHeaders(), controller.signal);
-    if (generation !== privateSessionGeneration() || (protectedRead && !privateReadsAllowed())) {
+    if (operation) operation.assertCurrent();
+    else if (generation !== privateSessionGeneration() || (protectedRead && !privateReadsAllowed())) {
       throw new Error("Session changed during request");
     }
     if (!resp.ok && !(resp.status === 304 && value !== undefined)) {
       const body = await resp.json().catch(() => null);
-      if (generation !== privateSessionGeneration()) throw new Error("Session changed during response");
+      if (operation) operation.assertCurrent();
+      else if (generation !== privateSessionGeneration()) throw new Error("Session changed during response");
       const code = body?.code ?? body?.error?.code;
-      if (protectedRead && resp.status === 401 && (code === "board_session_required" || code === "operator_session_required")) {
+      if (protectedRead && resp.status === 401 && (code === "board_session_required" || code === "operator_session_required") && typeof window !== "undefined") {
         window.dispatchEvent(new Event("cadence:session-required"));
       }
       throw new ApiError(
@@ -172,11 +179,18 @@ async function get<T>(path: string, signal?: AbortSignal): Promise<T> {
         body ? { ...body, code } : undefined,
       );
     }
+    if (operation) operation.assertCurrent();
     return value as T;
   } finally {
-    privateRequests.delete(controller);
-    signal?.removeEventListener("abort", abort);
+    stop();
   }
+}
+
+async function get<T>(path: string, signal?: AbortSignal, operation?: PrivateOperation): Promise<T> {
+  const protectedRead = !path.startsWith("/api/meta");
+  if (!protectedRead) return readConditional<T>(path, signal, null);
+  if (!operation && !privateReadsAllowed()) throw new Error("Session verification required");
+  return usingPrivateOperation(operation, (op) => readConditional<T>(path, signal, op), signal);
 }
 
 export interface WriteResp {
@@ -205,51 +219,54 @@ async function write<T extends object | undefined>(
   method: "POST" | "PATCH" | "DELETE",
   path: string,
   body?: T,
+  operation?: PrivateOperation,
 ): Promise<WriteResp> {
-  const generation = privateSessionGeneration();
-  const resp = await privateFetch(path, {
-    method,
-    headers: {
-      "Content-Type": "application/json",
-      "X-Cadence-Board": "1",
-      ...sessionHeaders(),
-    },
-    body: body === undefined ? undefined : JSON.stringify(body),
+  return usingPrivateOperation(operation, async (op) => {
+    const resp = await privateFetch(path, {
+      method,
+      headers: {
+        "Content-Type": "application/json",
+        "X-Cadence-Board": "1",
+        ...sessionHeaders(),
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    }, op);
+    const parsed = await resp.json().catch(() => null);
+    op.assertCurrent();
+    if (!resp.ok) {
+      throw new ApiError(
+        parsed?.error ?? `${resp.status} ${resp.statusText}`,
+        resp.status,
+        parsed ?? undefined,
+      );
+    }
+    return parsed as WriteResp;
   });
-  const parsed = await resp.json().catch(() => null);
-  if (generation !== privateSessionGeneration()) throw new Error("Session changed during response");
-  if (!resp.ok) {
-    throw new ApiError(
-      parsed?.error ?? `${resp.status} ${resp.statusText}`,
-      resp.status,
-      parsed ?? undefined,
-    );
-  }
-  return parsed as WriteResp;
 }
 
 /** A board write that answers its own JSON (not an issue `WriteResp`). */
-async function post<T>(path: string, body: object): Promise<T> {
-  const generation = privateSessionGeneration();
-  const resp = await privateFetch(path, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Cadence-Board": "1",
-      ...sessionHeaders(),
-    },
-    body: JSON.stringify(body),
+async function post<T>(path: string, body: object, operation?: PrivateOperation): Promise<T> {
+  return usingPrivateOperation(operation, async (op) => {
+    const resp = await privateFetch(path, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Cadence-Board": "1",
+        ...sessionHeaders(),
+      },
+      body: JSON.stringify(body),
+    }, op);
+    const parsed = await resp.json().catch(() => null);
+    op.assertCurrent();
+    if (!resp.ok) {
+      throw new ApiError(
+        parsed?.error ?? `${resp.status} ${resp.statusText}`,
+        resp.status,
+        parsed ?? undefined,
+      );
+    }
+    return parsed as T;
   });
-  const parsed = await resp.json().catch(() => null);
-  if (generation !== privateSessionGeneration()) throw new Error("Session changed during response");
-  if (!resp.ok) {
-    throw new ApiError(
-      parsed?.error ?? `${resp.status} ${resp.statusText}`,
-      resp.status,
-      parsed ?? undefined,
-    );
-  }
-  return parsed as T;
 }
 
 /** A plan decision's request: approve takes nothing, reject a reason. */
@@ -313,13 +330,14 @@ export const api = {
     get<{ id: string; history: IssueHistoryEntry[] }>(
       `/api/issues/${id}/history?limit=${limit}`,
     ),
-  file: async (id: string) => {
-    const generation = privateSessionGeneration();
-    const resp = await privateFetch(`/api/issues/${id}/file`, { headers: sessionHeaders() });
-    if (!resp.ok) throw new ApiError(`${resp.status} ${resp.statusText}`, resp.status);
-    const text = await resp.text();
-    if (generation !== privateSessionGeneration()) throw new Error("Session changed during response");
-    return text;
+  file: async (id: string, operation?: PrivateOperation) => {
+    return usingPrivateOperation(operation, async (op) => {
+      const resp = await privateFetch(`/api/issues/${id}/file`, { headers: sessionHeaders() }, op);
+      if (!resp.ok) throw new ApiError(`${resp.status} ${resp.statusText}`, resp.status);
+      const text = await resp.text();
+      op.assertCurrent();
+      return text;
+    });
   },
   agents: () => get<AgentsPayload>("/api/agents"),
   agent: (alias: string) =>
@@ -401,30 +419,32 @@ export const api = {
     },
   ) => write("POST", `/api/issues/${encodeURIComponent(id)}/kickoff`, body),
 
-  attach: async (id: string, name: string, data: Blob): Promise<WriteResp> => {
-    const generation = privateSessionGeneration();
-    const resp = await privateFetch(
-      `/api/issues/${id}/artifacts?name=${encodeURIComponent(name)}`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/octet-stream",
-          "X-Cadence-Board": "1",
-      ...sessionHeaders(),
+  attach: async (id: string, name: string, data: Blob, operation?: PrivateOperation): Promise<WriteResp> => {
+    return usingPrivateOperation(operation, async (op) => {
+      const resp = await privateFetch(
+        `/api/issues/${id}/artifacts?name=${encodeURIComponent(name)}`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/octet-stream",
+            "X-Cadence-Board": "1",
+            ...sessionHeaders(),
+          },
+          body: data,
         },
-        body: data,
-      },
-    );
-    const parsed = await resp.json().catch(() => null);
-    if (generation !== privateSessionGeneration()) throw new Error("Session changed during response");
-    if (!resp.ok) {
-      throw new ApiError(
-        parsed?.error ?? `${resp.status} ${resp.statusText}`,
-        resp.status,
-        parsed ?? undefined,
+        op,
       );
-    }
-    return parsed as WriteResp;
+      const parsed = await resp.json().catch(() => null);
+      op.assertCurrent();
+      if (!resp.ok) {
+        throw new ApiError(
+          parsed?.error ?? `${resp.status} ${resp.statusText}`,
+          resp.status,
+          parsed ?? undefined,
+        );
+      }
+      return parsed as WriteResp;
+    });
   },
 
   artifactUrl: (id: string, name: string) =>
@@ -457,6 +477,7 @@ export const api = {
     app?: { install_id: string; context_id?: string },
     conversation?: string,
     attachments?: { id: string }[],
+    operation?: PrivateOperation,
   ) =>
     post<Record<string, unknown>>(
       `/api/threads/${encodeURIComponent(alias)}/messages`,
@@ -471,6 +492,7 @@ export const api = {
         // grammar and existence, never the client's metadata.
         ...(attachments && attachments.length > 0 ? { attachments } : {}),
       },
+      operation,
     ),
   /** `POST /api/chat/upload` — one retained chat attachment (CAD-1168).
    *  Operator-only multipart; returns the daemon-minted row. `signal`
@@ -580,7 +602,7 @@ export const api = {
    * conversation is made under (the daemon proves install, context and
    * campaign); `subject` (`campaign:<id>`) is idempotent, none always makes a new one.
    */
-  conversationCreate: (installId: string, contextId: string, subject?: string) =>
+  conversationCreate: (installId: string, contextId: string, subject?: string, operation?: PrivateOperation) =>
     post<Record<string, unknown>>(
       `/api/app-installations/${encodeURIComponent(installId)}/conversations`,
       {
@@ -588,6 +610,7 @@ export const api = {
         ...(contextId !== "" ? { context_id: contextId } : {}),
         ...(subject ? { subject } : {}),
       },
+      operation,
     ),
   /**
    * `POST /api/needs/<verb>` — the rail's snooze/dismiss (CAD-574);

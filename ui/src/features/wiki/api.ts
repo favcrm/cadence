@@ -1,5 +1,5 @@
 import { sessionHeaders } from "../../lib/sessionKey";
-import { privateFetch, privateReadsAllowed, privateSessionGeneration } from "../../lib/privateSession";
+import { privateFetch, privateReadsAllowed, privateSessionGeneration, usingPrivateOperation, type PrivateOperation } from "../../lib/privateSession";
 import type { WikiVersion } from "./history";
 import type { SearchHit } from "./search";
 import { normalizeListing, normalizePage, normalizeSearch, normalizeHistory } from "./wire";
@@ -146,20 +146,30 @@ export function blobPage(entry: WikiEntry): WikiPage {
   };
 }
 
-function get<T>(url: string): Promise<T> {
-  return privateFetch(url, { headers: sessionHeaders() }).then(json<T>);
+function get<T>(url: string, operation?: PrivateOperation): Promise<T> {
+  return usingPrivateOperation(operation, async (op) => {
+    const resp = await privateFetch(url, { headers: sessionHeaders() }, op);
+    const value = await json<T>(resp);
+    op.assertCurrent();
+    return value;
+  });
 }
 
-function send<T>(method: "PUT" | "POST", url: string, body: object): Promise<T> {
-  return privateFetch(url, {
-    method,
-    headers: {
-      "Content-Type": "application/json",
-      "X-Cadence-Board": "1",
-      ...sessionHeaders(),
-    },
-    body: JSON.stringify(body),
-  }).then(json<T>);
+function send<T>(method: "PUT" | "POST", url: string, body: object, operation?: PrivateOperation): Promise<T> {
+  return usingPrivateOperation(operation, async (op) => {
+    const resp = await privateFetch(url, {
+      method,
+      headers: {
+        "Content-Type": "application/json",
+        "X-Cadence-Board": "1",
+        ...sessionHeaders(),
+      },
+      body: JSON.stringify(body),
+    }, op);
+    const value = await json<T>(resp);
+    op.assertCurrent();
+    return value;
+  });
 }
 
 export function lsQuery(path: string): string {
@@ -175,15 +185,18 @@ export function fileQuery(path: string): string {
  * URLs. Callers render data: images or local blob: previews/downloads and
  * must fence their own asynchronous encoding and revoke owned object URLs.
  */
-export async function wikiBlob(path: string, signal?: AbortSignal): Promise<Blob> {
+export async function wikiBlob(path: string, signal?: AbortSignal, operation?: PrivateOperation): Promise<Blob> {
   const generation = privateSessionGeneration();
-  const resp = await privateFetch(fileQuery(path), { headers: sessionHeaders(), signal });
-  const value = resp.ok ? await resp.blob() : await resp.json().catch(() => null);
-  if (signal?.aborted || generation !== privateSessionGeneration() || !privateReadsAllowed()) {
-    throw new DOMException("The private session changed", "AbortError");
-  }
-  if (!resp.ok) throw wikiErrorFrom(resp.status, value);
-  return value as Blob;
+  return usingPrivateOperation(operation, async (op) => {
+    const resp = await privateFetch(fileQuery(path), { headers: sessionHeaders(), signal }, op);
+    const value = resp.ok ? await resp.blob() : await resp.json().catch(() => null);
+    op.assertCurrent();
+    if (signal?.aborted || generation !== privateSessionGeneration() || !privateReadsAllowed()) {
+      throw new DOMException("The private session changed", "AbortError");
+    }
+    if (!resp.ok) throw wikiErrorFrom(resp.status, value);
+    return value as Blob;
+  }, signal);
 }
 
 export function searchQuery(query: string, type?: string, path?: string): string {

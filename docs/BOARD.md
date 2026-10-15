@@ -1179,6 +1179,14 @@ older pending verification; a feature's ordinary role-based `403` does not
 sign the board session out. Signed-in members pass the read boundary without
 operator privileges. Authentication and write authority remain separate.
 
+Private async work owns one operation across response headers, body decoding
+and any follow-up mutation or navigation. Pause, caller cancellation or
+session reset permanently abandons that operation; re-verification cannot
+revive it. A paused draft may be retried explicitly with a fresh operation.
+Cancellation uses baseline-compatible signal forwarding, not `AbortSignal.any`.
+Already-accepted server mutations are not rolled back by abandoning a client
+continuation.
+
 Private SSE uses authenticated fetch streaming rather than URL-carried tab
 keys. The server revalidates the live session every five seconds with a
 two-second validation deadline; thread polls add at most two seconds.
@@ -1431,7 +1439,7 @@ quick-add, drag, edit, link/ref, attach and comment controls.
 | `GET /api/overview` | the Overview screen payload: `needs_me`, `drift`, `projects`, `github`, `daemon`, `generated_at` — same shape as `cadence overview --json` |
 | `GET /api/stream` | server-sent events — `event: issues` on tracker change, `event: jobs`/`event: agents`/`event: monitoring` on daemon state change; each frame's data names the board resources it invalidates (`{"resources":["agents","issue","overview"]}`); `: ping` immediately and every 15 s of silence; `405` on HEAD; deltas only (baselines at connect) |
 | `GET /api/threads/<alias>?after=&limit=` | one page of the agent's durable chat (CAD-319) over the daemon's `thread_read`: `{thread, entries, cursor}`; `?tail=1` (the newest page) or `?before=<seq>` read backwards and add `more_before` (CAD-328; `400` combined with `after`); `404` unknown alias, `501` a daemon without threads. Any admitted board reader can read agent threads, as with `/api/agents/<alias>`; private local/hosted admission happens first. A live turn token quoted in thread prose is only redacted at `export` |
-| `GET /api/threads/<alias>/stream` | server-sent events — one `event: entry` frame per thread entry with `id: <seq>`; resumes after `Last-Event-ID` (else `?after=`); `: ping` on each 15 s idle poll; `event: error` while the daemon is unreachable; `405` on HEAD |
+| `GET /api/threads/<alias>/stream` | server-sent events — one `event: entry` frame per thread entry with `id: <seq>`; resumes after `Last-Event-ID` (else `?after=`); `: ping` on each idle poll; closes when a daemon poll fails or session admission is lost; the authenticated UI reconnects from the last event ID; `405` on HEAD |
 | `GET /api/master/summary?since=<epoch secs>` | "since you left" (CAD-328) over the daemon's `master_summary` (CAD-339), never posted to the thread: plans proposed and decided, tickets moved, reports, open questions, `routing_backlog`; `400` without a numeric `since`, `501 unsupported_daemon` on a daemon without the master, `503` daemon down |
 
 ### API — writes

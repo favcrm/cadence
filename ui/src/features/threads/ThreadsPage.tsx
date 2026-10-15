@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { ApiError, api } from "../../lib/api";
+import { withPrivateOperation } from "../../lib/privateSession";
 import { resources } from "../../lib/resources";
 import { useResource } from "../../lib/useResource";
 import { navigate, useHref } from "../../lib/useLocation";
@@ -855,9 +856,12 @@ function OperatorComposer({
       onSend={async ({ body, refs, attachments }) => {
         const key = JSON.stringify({ alias, body: body.trim(), refs, attachments: attachments ?? [] });
         if (envelope.current?.key !== key) envelope.current = { key, id: newMessageId() };
-        await api.threadSend(alias, body, envelope.current.id, refs, undefined, undefined, attachments);
-        envelope.current = null;
-        onSent();
+        await withPrivateOperation(async (op) => {
+          await api.threadSend(alias, body, envelope.current!.id, refs, undefined, undefined, attachments, op);
+          op.assertCurrent();
+          envelope.current = null;
+          onSent();
+        });
       }}
       refocusAfterSend
       attach

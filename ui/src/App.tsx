@@ -59,8 +59,7 @@ import SignIn from "./features/auth/SignIn";
 import { kickoffBlock as operatorKickoffBlock, writeBlock } from "./features/auth/gate";
 import { WriteGate } from "./features/auth/WriteGate";
 import { sessionHeaders } from "./lib/sessionKey";
-import { privateFetch, privateReadsAllowed, privateSessionGeneration } from "./lib/privateSession";
-import type { PlatformAccount as PlatformAccountInfo } from "./features/settings/accountDisplay";
+import { privateReadsAllowed, privateSessionGeneration, withPrivateOperation } from "./lib/privateSession";
 import { buildChanged, serverBuild, subscribeSse, UI_BUILD } from "./lib/sse";
 import { runningRelease } from "./lib/fmt";
 import { applyDraft, composerField, sessionStore, stashDraft, takeDraft } from "./lib/draft";
@@ -209,13 +208,15 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
       return;
     }
     const abort = new AbortController();
-    privateFetch("/api/platform-account", { headers: sessionHeaders(), signal: abort.signal })
-      .then((resp) => (resp.ok ? (resp.json() as Promise<PlatformAccountInfo>) : null))
-      .then((data) => {
-        const name = data?.account?.company.name?.trim();
-        if (!abort.signal.aborted) setOrgName(name || "Cadence");
-      })
-      .catch(() => undefined);
+    void withPrivateOperation(async (operation) => {
+      const response = await operation.fetch("/api/platform-account", { headers: sessionHeaders() });
+      const data: unknown = response.ok ? await response.json() : null;
+      operation.assertCurrent();
+      const account = data && typeof data === "object" && "account" in data ? data.account : null;
+      const company = account && typeof account === "object" && "company" in account ? account.company : null;
+      const name = company && typeof company === "object" && "name" in company && typeof company.name === "string" ? company.name.trim() : "";
+      setOrgName(name || "Cadence");
+    }, abort.signal).catch(() => undefined);
     return () => abort.abort();
   }, [meta?.platform_account_configured, meta === null]);
 
@@ -842,7 +843,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
                 health={health}
                 onRefresh={refresh}
               >
-                <SignIn meta={meta} onChange={refresh} access={viewer.access} onRetryWorkspace={reload} />
+                <SignIn meta={meta} onChange={refresh} access={viewer.access} recheckFinished={recheckFinished} onRetryWorkspace={reload} />
               </StatusChips>
             </div>
           </div>

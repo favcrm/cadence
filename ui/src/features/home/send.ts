@@ -1,5 +1,6 @@
-import { api, type ApiError } from "../../lib/api";
+import { api } from "../../lib/api";
 import { resources } from "../../lib/resources";
+import { usingPrivateOperation, type PrivateOperation } from "../../lib/privateSession";
 import type { ThreadRef } from "../../lib/types";
 import { MASTER } from "./master";
 import { addPending, newMessageId, settlePending } from "./thread";
@@ -17,22 +18,29 @@ export function sendToMaster(
   refs?: ThreadRef[],
   attachments?: { id: string }[],
   conversation?: string,
+  operation?: PrivateOperation,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   const body = text.trim();
   if (!body) return Promise.resolve({ ok: false, error: "Nothing to send." });
   const store = resources.masterThread;
-  store.write((s) => addPending(s, message, body, Date.now(), refs, attachments, undefined, conversation));
-  return api
-    .threadSend(MASTER, body, message, refs, undefined, conversation, attachments)
-    .then(() => {
+  return usingPrivateOperation(operation, async (op) => {
+    try {
+      op.assertCurrent();
+      store.write((s) => addPending(s, message, body, Date.now(), refs, attachments, undefined, conversation));
+      await api.threadSend(MASTER, body, message, refs, undefined, conversation, attachments, op);
+      op.assertCurrent();
       store.write((s) => settlePending(s, message, { ok: true }));
       // The send queued a turn — refresh the header's state soon.
       void resources.masterState.refresh();
       return { ok: true as const };
-    })
-    .catch((e: ApiError) => {
-      const error = e.message ?? String(e);
+    } catch (e: unknown) {
+      const error = e instanceof Error ? (e.message || "The private session changed") : String(e);
       store.write((s) => settlePending(s, message, { ok: false, error }));
       return { ok: false as const, error };
-    });
+    }
+  }).catch((e: unknown) => {
+    const error = e instanceof Error ? (e.message || "The private session changed") : String(e);
+    store.write((s) => settlePending(s, message, { ok: false, error }));
+    return { ok: false as const, error };
+  });
 }

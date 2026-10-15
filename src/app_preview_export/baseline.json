@@ -1,6 +1,6 @@
 {
   "contract": "app-screen-projection-fixtures/2",
-  "artifact_sha256": "2445858cef3477097d9a0744756b3ff76b31023ab24f529c83c5d431ab043d02",
+  "artifact_sha256": "017050ff6ab48076e845761490ccdfd7515c9135f71098efa6cc3d34145b3a16",
   "golden_sha256": "371c6a2e832809c78af679556896fd2195dc0694e1fefe178d5b6fcecf72cb35",
   "scenarios": [
     "empty",
@@ -25,15 +25,15 @@
     },
     {
       "path": "ui/src/lib/api.ts",
-      "sha256": "ea86f28f30baef0bbe50d684f8946da90cbb4c0a03be03a078d1ecd3dd0afa87"
+      "sha256": "50ba6548ecc510b02907de6d90d835842d7398e9efc9c886fdc9a6d520d8c363"
     },
     {
       "path": "ui/src/lib/conditionalGet.ts",
-      "sha256": "d7f05e0b2c22fecddf301590f0d275d3c19b49f1781ac5fe1c344ad7396c1bbd"
+      "sha256": "72af19c82cad21cab685f57d251f65eb1e44a60ab6941f98d9baca0d9cf45df4"
     },
     {
       "path": "ui/src/lib/privateSession.ts",
-      "sha256": "4426a2d500427042dfdc1cd2992c6364d754b57ffd9dcd71f48b8d77dd9b2428"
+      "sha256": "6416106872baebbee2c736b3c32fdfdffe029366b1660ff9c070c427d213559e"
     },
     {
       "path": "ui/src/lib/sessionKey.ts",

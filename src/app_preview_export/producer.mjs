@@ -12,6 +12,7 @@ var ConditionalGet = class {
 		this.identity = identity;
 	}
 	async get(path, headers, signal) {
+		if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
 		const scope = this.identity();
 		if (scope !== this.scope) {
 			this.entries.clear();
@@ -26,6 +27,7 @@ var ConditionalGet = class {
 			cache: "no-store",
 			signal: signal ?? null
 		});
+		if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
 		if (scope !== this.identity()) throw new Error("Session changed during request; retry with the current session");
 		if (response.status === 304 && previous) return {
 			response,
@@ -36,6 +38,7 @@ var ConditionalGet = class {
 			return { response };
 		}
 		const value = await response.json();
+		if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
 		if (scope !== this.identity()) throw new Error("Session changed during response decoding; retry with the current session");
 		const etag = response.headers?.get("ETag");
 		if (etag && scope === this.identity()) {
@@ -74,25 +77,8 @@ function sessionKey() {
 //#endregion
 //#region src/lib/privateSession.ts
 var generation = 0;
-var pauses = /* @__PURE__ */ new Set();
 var privateSessionGeneration = () => generation;
-function onPrivateReadsPaused(pause) {
-	pauses.add(pause);
-	return () => {
-		pauses.delete(pause);
-	};
-}
-var pendingReads = /* @__PURE__ */ new Set();
-onPrivateReadsPaused(() => {
-	for (const controller of pendingReads) controller.abort();
-	pendingReads.clear();
-});
 new ConditionalGet((input, init) => fetch(input, init), () => `${sessionKey() ?? ""}:${privateSessionGeneration()}`);
-var privateRequests = /* @__PURE__ */ new Set();
-onPrivateReadsPaused(() => {
-	for (const request of privateRequests) request.abort();
-	privateRequests.clear();
-});
 //#endregion
 //#region src/features/workspace-apps/screen/screenProtocol.ts
 /** CAD-1123 HP3 — the closed verb sets. A verb outside its set closes the

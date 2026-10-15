@@ -30,7 +30,7 @@
  * plain Node test.
  */
 import { api, ApiError, type ChatFileDestination, type ChatFileRow } from "../../../lib/api";
-import { onPrivateSessionReset } from "../../../lib/privateSession";
+import { beginPrivateOperation, onPrivateSessionReset, privateSessionGeneration, type PrivateOperation } from "../../../lib/privateSession";
 import type { ThreadRef } from "../../../lib/types";
 import {
   attachFits,
@@ -565,12 +565,26 @@ function startUpload(
   const controller = new AbortController();
   controllers.set(itemKey, controller);
   const stillOwned = () => uploadStillOwned(itemKey, generation, controller);
+  let operation: PrivateOperation;
+  try {
+    operation = beginPrivateOperation(controller.signal);
+  } catch (e: unknown) {
+    controllers.delete(itemKey);
+    if (!stillOwned()) return;
+    patch(itemKey, generation, {
+      status: "failed",
+      error: userUploadError(e instanceof Error ? e.message : String(e)),
+      permanent: false,
+    });
+    return;
+  }
   void (async () => {
     try {
       let destination = capturedDestination;
       if (destination?.app && destination.conversation === undefined) {
         if (!destination.prepareConversation) throw new Error("This app attachment has no prepared conversation destination.");
         const conversation = await destination.prepareConversation(stillOwned);
+        operation.assertCurrent();
         if (!stillOwned()) return;
         destination = { ...destination, conversation, prepareConversation: undefined };
         if (destination.app && destination.subject !== undefined) {
@@ -589,10 +603,14 @@ function startUpload(
       // One transfer at a time: the daemon's quota lock refuses a
       // concurrent upload instead of waiting, so a multi-file drop must
       // queue here. A row removed while it waits never starts.
+      operation.assertCurrent();
       const row: ChatFileRow | null = await oneAtATime(() =>
-        stillOwned() ? api.chatFileUpload(file, controller.signal, uploadDestination(destination)) : Promise.resolve(null),
+        stillOwned() && !operation.signal.aborted
+          ? api.chatFileUpload(file, controller.signal, uploadDestination(destination))
+          : Promise.resolve(null),
       );
-      if (row === null || !stillOwned()) return;
+      operation.assertCurrent();
+      if (row === null || !stillOwned() || operation.generation !== privateSessionGeneration()) return;
       controllers.delete(itemKey);
       patch(itemKey, generation, { status: "ready", id: row.id, name: row.name, mime: row.mime, destination });
       try {
@@ -607,6 +625,14 @@ function startUpload(
       // conversation preparation: its late result must not select, upload,
       // resurrect or fail a row that is no longer its own.
       if (!stillOwned()) return;
+      if (operation.signal.aborted || operation.generation !== privateSessionGeneration()) {
+        patch(itemKey, generation, {
+          status: "failed",
+          error: "The private session changed",
+          permanent: false,
+        });
+        return;
+      }
       if (e instanceof ApiError && e.status >= 400 && e.status < 600) {
         try {
           capturedDestination?.refreshCapability?.();
@@ -619,6 +645,8 @@ function startUpload(
         error: userUploadError(e instanceof Error ? e.message : String(e)),
         permanent: e instanceof ApiError && isPermanentUploadFailure(e.status),
       });
+    } finally {
+      operation.dispose();
     }
   })();
 }

@@ -42,7 +42,7 @@ const mk = (id: string, name: string, title: string) => ({
 });
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { "Content-Type": "application/json" } });
 let mode: "ok" | "fail" | "busy-once" = "ok";
-let operator = true;
+let operator: boolean | null = true;
 let listCalls = 0;
 globalThis.fetch = (async (input: unknown) => {
   const path = String(input);
@@ -135,6 +135,34 @@ for (let i = 0; i < 10; i++) await flush();
 assert(listCalls === 0, "a non-operator session does not load the installation list");
 assert(!host2.querySelector('aside nav[aria-label="Primary"] [role="status"]'), "no installation notice for a non-operator");
 await React.act(async () => { root2.unmount(); });
+
+// A completed workspace recheck exposes an actionable retry in the mobile
+// menu too; opening that menu must not restart the shared wait.
+operator = null;
+let finishRecovery: (() => void) | undefined;
+const nativeTimeout = win.setTimeout.bind(win);
+win.setTimeout = (callback: (...args: unknown[]) => void, delay?: number, ...args: unknown[]) => {
+  if (delay === 60_000) {
+    finishRecovery = () => callback(...args);
+    return nativeTimeout(() => undefined, 0);
+  }
+  return nativeTimeout(callback, delay, ...args);
+};
+let reloads = 0;
+Object.defineProperty(win.location, "reload", { value: () => { reloads++; }, configurable: true });
+const root3 = createRoot(host2);
+await React.act(async () => { root3.render(React.createElement(App)); });
+await settle(() => assert(finishRecovery, "workspace recheck has started"));
+await React.act(async () => { finishRecovery!(); });
+const menu = host2.querySelector<HTMLButtonElement>('button[aria-controls="mobile-navigation"]');
+assert(menu, "mobile navigation can be opened");
+await React.act(async () => { menu.click(); });
+const workspaceRetry = Array.from(host2.querySelectorAll<HTMLButtonElement>("#mobile-navigation button")).find((button) => button.textContent?.trim() === "Retry workspace");
+assert(workspaceRetry && !workspaceRetry.disabled, "completed recovery is actionable after opening the mobile menu");
+await React.act(async () => { workspaceRetry.click(); });
+assert(reloads === 1, "mobile workspace retry performs the recovery reload");
+await React.act(async () => { root3.unmount(); });
+win.setTimeout = nativeTimeout;
 console.log("sidebar busy checks passed");
 }
 void main();

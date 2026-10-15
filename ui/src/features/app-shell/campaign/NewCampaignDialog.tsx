@@ -13,6 +13,7 @@ import { friendlyAudienceError, newAudienceId } from "../segmentGrammar";
 import Field from "../shared/Field";
 import { setLanding } from "./landing";
 import { useLocale } from "../../../lib/locale";
+import { beginPrivateOperation, onPrivateReadsPaused, type PrivateOperation } from "../../../lib/privateSession";
 
 /**
  * New campaign (CAD-1058): a short modal — a human name, how to start,
@@ -71,16 +72,48 @@ export default function NewCampaignDialog({
   const [campaignId] = useState(() => newAudienceId("cmp"));
   const [saved, setSaved] = useState(false);
   const nameRef = useRef<HTMLInputElement | null>(null);
+  const submitRef = useRef<PrivateOperation | null>(null);
 
   useEffect(() => {
     nameRef.current?.focus();
   }, []);
   useEffect(() => {
+    return () => {
+      const current = submitRef.current;
+      submitRef.current = null;
+      current?.dispose();
+      setPending(false);
+    };
+  }, []);
+  useEffect(() => onPrivateReadsPaused(() => {
+    const current = submitRef.current;
+    if (current === null) return;
+    submitRef.current = null;
+    current.dispose();
+    setPending(false);
+  }), []);
+  useEffect(() => {
     const controller = new AbortController();
+    let session: PrivateOperation | undefined;
+    try {
+      session = beginPrivateOperation(controller.signal);
+    } catch {
+      return () => controller.abort();
+    }
+    if (session === undefined) return () => controller.abort();
+    const operation = session;
+    let current = true;
+    const stopPause = onPrivateReadsPaused(() => {
+      current = false;
+      controller.abort();
+      operation.dispose();
+    });
     audienceClient
-      .segmentList(scope)
+      .segmentList(scope, operation)
       .then((value) => {
-        if (controller.signal.aborted) return;
+        if (!current || controller.signal.aborted || operation.signal.aborted) return;
+        operation.assertCurrent();
+        if (!current || controller.signal.aborted || operation.signal.aborted) return;
         const rows = (value as { segments?: unknown } | null)?.segments;
         setSegments(
           Array.isArray(rows)
@@ -93,17 +126,24 @@ export default function NewCampaignDialog({
         );
       })
       .catch((e: unknown) => {
-        if (!controller.signal.aborted) {
-          const message = friendlyAudienceError(e);
-          setError(
-            message === "The audience request was refused — retry." ||
-              message === "Your session expired or the connection dropped — reload the page to sign in again."
-              ? t(message)
-              : message,
-          );
-        }
+        if (!current || controller.signal.aborted || operation.signal.aborted) return;
+        const message = friendlyAudienceError(e);
+        setError(
+          message === "The audience request was refused — retry." ||
+            message === "Your session expired or the connection dropped — reload the page to sign in again."
+            ? t(message)
+            : message,
+        );
+      })
+      .finally(() => {
+        if (current) operation.dispose();
       });
-    return () => controller.abort();
+    return () => {
+      current = false;
+      stopPause();
+      controller.abort();
+      operation.dispose();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scope.installId, scope.contextId]);
 
@@ -131,7 +171,23 @@ export default function NewCampaignDialog({
       setError(t("Paste the email HTML to start from it."));
       return;
     }
+    if (submitRef.current !== null) return;
     setPending(true);
+    let operation: PrivateOperation;
+    try {
+      operation = beginPrivateOperation();
+    } catch (e) {
+      setPending(false);
+      const message = friendlyCampaignError(e);
+      setError(
+        message === "The campaign request was refused — retry." ||
+          message === "Your session expired or the connection dropped — reload the page to sign in again."
+          ? t(message)
+          : message,
+      );
+      return;
+    }
+    submitRef.current = operation;
     try {
       if (!saved) {
         const body =
@@ -148,7 +204,8 @@ export default function NewCampaignDialog({
           name: trimmed,
           subject: trimmed,
           ...body,
-        });
+        }, operation);
+        operation.assertCurrent();
         setSaved(true);
       }
       if (start === "ai") {
@@ -156,7 +213,8 @@ export default function NewCampaignDialog({
         try {
           // CAD-1098: the brief goes to this campaign's own conversation
           // (opened idempotently, then selected for the chat panel).
-          const conversation = await openCampaignConversation(scope.installId, scope.contextId, campaignId);
+          const conversation = await openCampaignConversation(scope.installId, scope.contextId, campaignId, operation);
+          operation.assertCurrent();
           await api.threadSend(
             MASTER,
             text,
@@ -164,8 +222,12 @@ export default function NewCampaignDialog({
             undefined,
             { install_id: scope.installId, context_id: scope.contextId },
             conversation ?? undefined,
+            undefined,
+            operation,
           );
+          operation.assertCurrent();
         } catch (e) {
+          if (submitRef.current !== operation || operation.signal.aborted) throw e;
           setError(
             `${t("The campaign is saved, but the brief was not sent to the assistant:")} ${
               e instanceof ApiError ? e.message : t("request failed")
@@ -173,10 +235,13 @@ export default function NewCampaignDialog({
           );
           return;
         }
+        operation.assertCurrent();
         void resources.masterState.refresh();
       }
+      operation.assertCurrent();
       land();
     } catch (e) {
+      if (submitRef.current !== operation || operation.signal.aborted) return;
       const message = friendlyCampaignError(e);
       setError(
         message === "The campaign request was refused — retry." ||
@@ -185,7 +250,11 @@ export default function NewCampaignDialog({
           : message,
       );
     } finally {
-      setPending(false);
+      if (submitRef.current === operation) {
+        submitRef.current = null;
+        operation.dispose();
+        setPending(false);
+      }
     }
   };
 

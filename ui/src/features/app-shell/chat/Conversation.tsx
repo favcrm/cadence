@@ -10,6 +10,7 @@ import {
   type ReactNode,
 } from "react";
 import { api, ApiError } from "../../../lib/api";
+import { privateSessionGeneration, usingPrivateOperation, withPrivateOperation, type PrivateOperation } from "../../../lib/privateSession";
 import { resources, threadReader } from "../../../lib/resources";
 import { streamInto } from "../../../lib/sse";
 import { useQuery, useResource } from "../../../lib/useResource";
@@ -571,6 +572,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           const created = await createConversation(app.install_id, app.context_id ?? "", draftSubject, {
             shouldSelect: () => stillOwned() && isCurrentUploadOrigin(),
           });
+          if (!stillOwned()) throw new DOMException("upload canceled", "AbortError");
           return created.id;
         },
         refreshCapability: onFileUploadUnavailable,
@@ -688,25 +690,50 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       refs?: ThreadRef[],
       attachments?: { id: string }[],
       app?: { install_id: string; context_id?: string },
+      operation?: PrivateOperation,
     ) => {
       const origin = { key: composerKeyRef.current, visit: visitRef.current, frame: frameRef.current };
-      return api
-        .threadSend(MASTER, body, message, refs, app, id ?? undefined, attachments)
-        .then(() => {
+      const ownedAt = dest.get().data?.pending.find((row) => row.message === message)?.at;
+      return usingPrivateOperation(operation, async (op) => {
+        const releaseAbandoned = () => {
+          if (op.generation !== privateSessionGeneration()) return;
+          const pending = dest.get().data?.pending.find((row) => row.message === message);
+          if (!pending || pending.at !== ownedAt || pending.state !== "sending") return;
+          dest.write((s) => settlePending(s, message, { ok: false, error: "The private session changed" }));
+        };
+        const onAbort = () => releaseAbandoned();
+        op.signal.addEventListener("abort", onAbort);
+        try {
+          await api.threadSend(MASTER, body, message, refs, app, id ?? undefined, attachments, op);
+          op.assertCurrent();
           dest.write((s) => settlePending(s, message, { ok: true }));
           void resources.masterState.refresh();
-        })
-        .catch((e: ApiError) => {
+        } catch (e: unknown) {
+          if (op.signal.aborted || op.generation !== privateSessionGeneration()) {
+            releaseAbandoned();
+            return;
+          }
+          const error = e instanceof Error ? (e.message || "The private session changed") : String(e);
+          op.assertCurrent();
           if (
             storeRef.current === dest &&
             composerKeyRef.current === origin.key &&
             visitRef.current === origin.visit &&
             frameRef.current === origin.frame
           ) {
-            setSendError(e.message ?? String(e));
+            setSendError(error);
           }
-          dest.write((s) => settlePending(s, message, { ok: false, error: e.message ?? String(e) }));
-        });
+          dest.write((s) => settlePending(s, message, { ok: false, error }));
+        } finally {
+          op.signal.removeEventListener("abort", onAbort);
+        }
+      }).catch((e: unknown) => {
+        if (e instanceof DOMException && e.name === "AbortError") return;
+        const error = e instanceof Error ? (e.message || "The private session changed") : String(e);
+        const pending = dest.get().data?.pending.find((row) => row.message === message);
+        if (!pending || pending.at !== ownedAt || pending.state !== "sending") return;
+        dest.write((s) => settlePending(s, message, { ok: false, error }));
+      });
     },
     [],
   );
@@ -716,7 +743,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
    *  and captured destination, and the send goes to the captured
    *  conversation — never the route's current selection. */
   const adopt = useCallback(
-    (dest: typeof store, id: string | null, envelope: OutboxEnvelope) => {
+    (dest: typeof store, id: string | null, envelope: OutboxEnvelope, operation?: PrivateOperation) => {
       dest.write((s) =>
         addPending(
           s,
@@ -728,7 +755,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
           envelope.app,
         ),
       );
-      void deliver(
+      return deliver(
         dest,
         id,
         envelope.message,
@@ -736,6 +763,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         envelope.refs,
         envelope.attachments,
         envelope.app,
+        operation,
       );
     },
     [deliver],
@@ -769,49 +797,57 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         setSendError(text);
       }
     };
-    /** Record the failure on the original envelope — but only while the
-     *  outbox still owns this exact message. A discarded envelope is
-     *  never resurrected by its late callback. */
+    /** Record the failure on this envelope object only. A retry, discard,
+     *  or reset replaces that object, so a late callback cannot clear it. */
     const recordFailure = (text: string) => {
-      const held = outboxFor(originKey);
-      if (held === null || held.message !== envelope.message) return;
+      if (outboxFor(originKey) !== envelope) return;
       putOutbox(originKey, { ...envelope, state: "failed", error: text });
     };
-    let creation: ReturnType<typeof createConversation>;
-    try {
-      creation = createConversation(capturedInstall, capturedContext, create, {
-        shouldSelect: () =>
-          composerKeyRef.current === originKey &&
-          visitRef.current === origin.visit &&
-          frameRef.current === origin.frame,
-      });
-    } catch (e) {
-      const text = e instanceof ApiError ? e.message : String(e);
-      alert(text);
-      recordFailure(text);
-      return Promise.reject(e);
-    }
-    return creation.then(
-      (c) => {
+    return usingPrivateOperation(undefined, async (op) => {
+      const onAbort = () => {
+        if (op.generation !== privateSessionGeneration()) return;
+        recordFailure("The private session changed");
+      };
+      op.signal.addEventListener("abort", onAbort);
+      try {
+        const created = await createConversation(capturedInstall, capturedContext, create, {
+          shouldSelect: () =>
+            composerKeyRef.current === originKey &&
+            visitRef.current === origin.visit &&
+            frameRef.current === origin.frame,
+          operation: op,
+        });
+        op.assertCurrent();
         // The operator may have discarded the envelope while creation was
         // in flight: a request with no remaining owner is never adopted
         // or sent.
         const held = outboxFor(originKey);
         if (held === null || held.message !== envelope.message) return;
-        const key = `app|${capturedInstall}|${c.id}`;
+        const key = `app|${capturedInstall}|${created.id}`;
         moveComposerScope(originKey, key, create);
-        adopt(conversationThread(c.id), c.id, envelope);
+        const sent = adopt(conversationThread(created.id), created.id, envelope, op);
         // The destination's pending row now owns this exact message;
         // remove only this message's entry, never a different owner's.
         removeOutbox(originKey, envelope.message);
-      },
-      (e: unknown) => {
-        const text = e instanceof ApiError ? e.message : String(e);
+        await sent;
+      } catch (e) {
+        if (op.signal.aborted || op.generation !== privateSessionGeneration()) {
+          onAbort();
+          throw e;
+        }
+        const text = e instanceof ApiError ? e.message : e instanceof Error ? e.message : String(e);
         alert(text);
         recordFailure(text);
         throw e;
-      },
-    );
+      } finally {
+        op.signal.removeEventListener("abort", onAbort);
+      }
+    }).catch((e: unknown) => {
+      if (e instanceof DOMException && e.name === "AbortError") return;
+      const text = e instanceof Error ? e.message : String(e);
+      recordFailure(text);
+      throw e;
+    });
   };
 
   const send = (body: string, refs: ThreadRef[], attachments?: { id: string }[]): Promise<void> => {
@@ -1331,16 +1367,21 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
             sendIntent: async (intent) => {
               const message = newMessageId();
               try {
-                await api.threadSend(
-                  MASTER,
-                  JSON.stringify(intent),
-                  message,
-                  undefined,
-                  sendApp,
-                  convId ?? undefined,
-                );
-                void store.refresh();
-                void resources.masterState.refresh();
+                await withPrivateOperation(async (op) => {
+                  await api.threadSend(
+                    MASTER,
+                    JSON.stringify(intent),
+                    message,
+                    undefined,
+                    sendApp,
+                    convId ?? undefined,
+                    undefined,
+                    op,
+                  );
+                  op.assertCurrent();
+                  void store.refresh();
+                  void resources.masterState.refresh();
+                });
                 return null;
               } catch (e: unknown) {
                 return e instanceof ApiError ? e.message : String(e);

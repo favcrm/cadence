@@ -1,5 +1,5 @@
 import type { Resource } from "./cache";
-import { onPrivateReadsPaused, privateFetch, privateReadsAllowed, privateSessionGeneration } from "./privateSession";
+import { beginPrivateOperation, bindPrivateAbort, onPrivateReadsPaused, privateFetch, privateReadsAllowed, privateSessionGeneration, withPrivateOperation, type PrivateOperation } from "./privateSession";
 import { sessionHeaders } from "./sessionKey";
 
 // Filled by vite `define` at build time — undefined in plain-node tests.
@@ -37,8 +37,12 @@ export function buildChanged(server: string | null | undefined, local: string): 
 /** `GET /api/version` — the serving build while the stream is down. */
 export async function serverBuild(): Promise<string | null> {
   try {
-    const resp = await privateFetch("/api/version", { headers: sessionHeaders() });
-    return resp.ok ? parseBuild(await resp.text()) : null;
+    return await withPrivateOperation(async (op) => {
+      const resp = await privateFetch("/api/version", { headers: sessionHeaders() }, op);
+      const text = resp.ok ? await resp.text() : "";
+      op.assertCurrent();
+      return resp.ok ? parseBuild(text) : null;
+    });
   } catch {
     return null;
   }
@@ -144,8 +148,11 @@ async function probeStatus(url: string): Promise<number | null> {
   const abort = new AbortController();
   try {
     if (!privateReadsAllowed()) return null;
-    const resp = await privateFetch(url, { signal: abort.signal, headers: { Accept: "text/event-stream", ...sessionHeaders() } });
-    return resp.status;
+    return await withPrivateOperation(async (op) => {
+      const resp = await privateFetch(url, { signal: abort.signal, headers: { Accept: "text/event-stream", ...sessionHeaders() } }, op);
+      op.assertCurrent();
+      return resp.status;
+    }, abort.signal);
   } catch {
     return null;
   } finally {
@@ -167,6 +174,16 @@ export function withResume(url: string, lastEventId: string | null): string {
 function openAuthenticatedStream(url: string): EventSourceLike {
   const generation = privateSessionGeneration();
   const controller = new AbortController();
+  let operation: PrivateOperation | null = null;
+  let stopFollow = () => {};
+  if (privateReadsAllowed()) {
+    try {
+      operation = beginPrivateOperation();
+      stopFollow = bindPrivateAbort(controller, operation.signal);
+    } catch {
+      operation = null;
+    }
+  }
   const listeners = new Map<string, Set<(event: MessageEvent<string>) => void>>();
   const source: EventSourceLike = {
     readyState: 0,
@@ -178,24 +195,28 @@ function openAuthenticatedStream(url: string): EventSourceLike {
       handlers.add(listener);
     },
     close() {
+      stopFollow();
+      operation?.dispose();
+      operation = null;
       controller.abort();
       Object.assign(source, { readyState: CLOSED });
     },
   };
   void (async () => {
     try {
-      const response = await fetch(url, {
+      const op = operation;
+      if (!op || op.signal.aborted) throw new Error("Session verification required");
+      const response = await op.fetch(url, {
         headers: { Accept: "text/event-stream", ...sessionHeaders() },
         signal: controller.signal,
         cache: "no-store",
         credentials: "same-origin",
       });
+      op.assertCurrent();
       if (controller.signal.aborted || generation !== privateSessionGeneration()) return;
       if (!response.ok || !response.body) {
-        if (response.status === 401) window.dispatchEvent(new Event("cadence:session-required"));
         throw new Error("Stream unavailable");
       }
-      if (controller.signal.aborted) return;
       Object.assign(source, { readyState: 1 });
       source.onopen?.(new Event("open"));
       const reader = response.body.getReader();
@@ -208,7 +229,10 @@ function openAuthenticatedStream(url: string): EventSourceLike {
         if (value === "") {
           if (data.length) {
             const event = { data: data.join("\n"), lastEventId: lastId } as MessageEvent<string>;
-            for (const listener of listeners.get(eventType) ?? []) listener(event);
+            for (const listener of listeners.get(eventType) ?? []) {
+              op.assertCurrent();
+              listener(event);
+            }
           }
           eventType = "message";
           data = [];
@@ -226,6 +250,7 @@ function openAuthenticatedStream(url: string): EventSourceLike {
       try {
         while (!controller.signal.aborted) {
           const chunk = await reader.read();
+          op.assertCurrent();
           if (chunk.done) break;
           buffer += decoder.decode(chunk.value, { stream: true });
           for (;;) {
@@ -244,6 +269,11 @@ function openAuthenticatedStream(url: string): EventSourceLike {
       if (controller.signal.aborted) return;
       Object.assign(source, { readyState: CLOSED });
       source.onerror?.(new Event("error"));
+    } finally {
+      stopFollow();
+      operation?.dispose();
+      operation = null;
+      controller.abort();
     }
   })();
   return source;

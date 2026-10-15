@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../../../lib/api";
-import { onPrivateSessionReset, privateReadsAllowed, privateSessionGeneration } from "../../../lib/privateSession";
+import { onPrivateReadsPaused, onPrivateSessionReset, privateReadsAllowed, privateSessionGeneration } from "../../../lib/privateSession";
 import { parseAppChat, type AppChat } from "./contract";
 
 export interface FileUploadProjection {
@@ -68,8 +68,8 @@ export async function loadAppChatProjection(
     } catch {
       found = null;
     }
-    if (generation !== privateSessionGeneration() || !privateReadsAllowed()) return null;
-    if (latestRequest.get(key) === requestId) cache.set(key, found);
+    if (generation !== privateSessionGeneration() || !privateReadsAllowed() || latestRequest.get(key) !== requestId) return null;
+    cache.set(key, found);
     return found;
   })().finally(() => {
     if (inflight.get(key)?.id === requestId) inflight.delete(key);
@@ -140,3 +140,7 @@ export function resetAppChatCache(): void {
 }
 
 onPrivateSessionReset(resetAppChatCache);
+onPrivateReadsPaused(() => {
+  latestRequest.clear();
+  inflight.clear();
+});

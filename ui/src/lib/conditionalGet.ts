@@ -7,6 +7,7 @@ export class ConditionalGet {
   constructor(private readonly request: typeof fetch = fetch, private readonly identity: () => string | null = () => null) {}
 
   async get<T>(path: string, headers: Record<string, string>, signal?: AbortSignal): Promise<{ response: Response; value?: T }> {
+    if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
     const scope = this.identity();
     if (scope !== this.scope) {
       this.entries.clear();
@@ -18,6 +19,7 @@ export class ConditionalGet {
       cache: "no-store",
       signal: signal ?? null,
     });
+    if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
     if (scope !== this.identity()) {
       throw new Error("Session changed during request; retry with the current session");
     }
@@ -29,6 +31,7 @@ export class ConditionalGet {
       return { response };
     }
     const value = await response.json() as T;
+    if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
     if (scope !== this.identity()) {
       throw new Error("Session changed during response decoding; retry with the current session");
     }

@@ -1,5 +1,5 @@
 import { cache } from "../../lib/resources";
-import { privateFetch } from "../../lib/privateSession";
+import { privateFetch, withPrivateOperation } from "../../lib/privateSession";
 import { sessionHeaders } from "../../lib/sessionKey";
 import type { SetupReport } from "./checks";
 
@@ -7,15 +7,24 @@ import type { SetupReport } from "./checks";
 export const SETUP_ON_HOST = "setup runs on the host";
 
 async function fetchSetup(fresh: boolean): Promise<SetupReport> {
-  const resp = await privateFetch(fresh ? "/api/setup?fresh=1" : "/api/setup", {
-    headers: sessionHeaders(),
+  return withPrivateOperation(async (op) => {
+    const resp = await privateFetch(fresh ? "/api/setup?fresh=1" : "/api/setup", {
+      headers: sessionHeaders(),
+    }, op);
+    // A feature 403 is host-only setup, not a session loss.
+    if (resp.status === 403) {
+      op.assertCurrent();
+      throw new Error(SETUP_ON_HOST);
+    }
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => null);
+      op.assertCurrent();
+      throw new Error(body?.error ?? `${resp.status} ${resp.statusText}`);
+    }
+    const report = await resp.json() as SetupReport;
+    op.assertCurrent();
+    return report;
   });
-  if (resp.status === 403) throw new Error(SETUP_ON_HOST);
-  if (!resp.ok) {
-    const body = await resp.json().catch(() => null);
-    throw new Error(body?.error ?? `${resp.status} ${resp.statusText}`);
-  }
-  return resp.json() as Promise<SetupReport>;
 }
 
 /**
