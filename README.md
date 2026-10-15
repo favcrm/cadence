@@ -127,15 +127,16 @@ docs/       working docs — the context-manifest set stays tracked
 
 For proposals, quotations, reports and letters, give the drafting agent
 [`skills/company-outputs/SKILL.md`](skills/company-outputs/SKILL.md).
-It separates company profiles from request facts, confirms the proposed
-solution before authoring, and requires actual output checks. It reuses
-the existing business-document operations where their contracts fit.
-Native templates currently support quotation/invoice DOCX drafts, not
-arbitrary proposals or XLSX templates. `cadence skill install` installs
+It confirms the proposed solution before authoring, then applies one exact
+Cadence template version: guidelines and reference files for an authoring
+pack, or the existing quotation/invoice DOCX, calculation and export path.
+There is no parallel company-profile registry. An authoring pack has no
+DOCX source, prices or PDF export; the user prints or exports the final PDF.
+`cadence skill install` installs
 the three public guidance skills in separate directories under
 `~/.agents/skills/`; the scoped `company-outputs` install also supplies
 business-document guidance without refreshing the core Cadence protocol.
-Company-private profiles, renderer scripts/images and trial data are not bundled.
+Company-private material, renderer scripts/images and trial data are not bundled.
 
 Codex discovers the canonical directory; Claude/Cursor/Copilot use provider
 symlinks. Existing real provider entries are preserved and reported as skipped,
