@@ -255,12 +255,15 @@ fn enumerate(
     json_ok(json!({"path": body["path"], "entries": entries}))
 }
 
-/// `GET /api/wiki/file`: a text page, only inside the read ceiling.
-/// Optional `offset`, `bytes`, and `rev` are the bounded original read.
-/// They are validated and forwarded only after the signed prefix check,
-/// so a path outside the envelope is still `insufficient_scope` and the
-/// daemon does not see the page. A bad integer or an empty revision is
-/// refused before that read. Omit all three to keep the whole-page reply.
+/// `GET /api/wiki/file`: a page inside the read ceiling. Optional
+/// `offset`, `bytes`, and `rev` are the bounded original read. They
+/// are validated and forwarded only after the signed prefix check, so
+/// a path outside the envelope is still `insufficient_scope` and the
+/// daemon does not see the page. A bad integer or an empty revision
+/// is refused before that read. Omit all three for the whole-page
+/// reply: text JSON, or blob pointer metadata. A blob range returns
+/// the daemon's compact JSON (`data_base64` and `range`), never the
+/// raw blob and never a line past the native tool bound.
 fn read(
     query: &dyn Fn(&str) -> Option<String>,
     state_dir: &std::path::Path,
@@ -313,10 +316,27 @@ fn read(
         params["rev"] = json!(rev);
     }
     match client::rpc(state_dir, "wiki_read", params) {
-        Ok(v) => json_ok(v),
+        Ok(v) => bounded_range_json(v),
         Err(e) => write_err(&e),
     }
 }
+
+fn bounded_range_json(v: Value) -> HttpResp {
+    if v.get("range").is_some() || v.get("data_base64").is_some() {
+        match serde_json::to_vec(&v) {
+            Ok(body) if body.len().saturating_add(1) < crate::wiki::NATIVE_TOOL_LINE_BOUND => {}
+            _ => {
+                return refuse(
+                    400,
+                    "invalid_request",
+                    "wiki file range exceeds the native tool line bound",
+                );
+            }
+        }
+    }
+    json_ok(v)
+}
+
 
 /// `PUT /api/wiki/file` JSON `{path,text,if_rev?}`. The write runs the
 /// daemon's `wiki_write` (the existing mutation path) under the
