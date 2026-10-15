@@ -916,8 +916,15 @@ fn upload_once(
     logical_path: &str,
     file_name: &str,
     bytes: &[u8],
+    deadline: Instant,
 ) -> Result<(u16, Option<u64>, Option<Value>)> {
-    let envelope = authorize(target, cred, Surface::Wiki, &["wiki.write"], AUTH_TIMEOUT)?;
+    let envelope = authorize(
+        target,
+        cred,
+        Surface::Wiki,
+        &["wiki.write"],
+        request_timeout(deadline, AUTH_TIMEOUT)?,
+    )?;
     let mut random = [0u8; 16];
     getrandom::fill(&mut random).map_err(|_| reject("unable to create upload boundary"))?;
     let boundary = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random);
@@ -927,8 +934,9 @@ fn upload_once(
         ("path", logical_path),
     ];
     let body = crate::wiki::upload::build_multipart(&boundary, &fields, file_name, bytes);
+    let timeout = request_timeout(deadline, CALL_TIMEOUT)?;
     let builder = ureq::Agent::config_builder()
-        .timeout_global(Some(CALL_TIMEOUT))
+        .timeout_global(Some(timeout))
         .http_status_as_error(false)
         .max_redirects(0)
         .proxy(None);
@@ -1024,14 +1032,28 @@ fn upload_file_in(
     wake_timeout: u64,
     note: impl Fn(&str),
 ) -> Result<Value> {
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(wake_timeout))
+        .ok_or_else(|| reject("invalid wake timeout"))?;
+    if wake_timeout == 0 {
+        return Err(Error::busy_coded(
+            "waking",
+            format!(
+                "org '{}' is still waking after {}s — retry, or pass a \
+                 larger --wake-timeout",
+                target.org, wake_timeout
+            ),
+        ));
+    }
     if !overwrite {
         let (parent, name) = crate::wiki::upload::split_logical(logical_path);
         let mut args = Map::new();
         args.insert("path".into(), json!(parent));
-        let listing = call_verb_in(
+        let listing = call_verb_until(
             target,
             "enumerate",
             args,
+            deadline,
             wake_timeout,
             dir,
             &note,
@@ -1053,8 +1075,8 @@ fn upload_file_in(
             )));
         }
     }
-    let deadline = Instant::now() + Duration::from_secs(wake_timeout);
     loop {
+        request_timeout(deadline, AUTH_TIMEOUT)?;
         let cred = renewed_credential(dir, target, deadline)?;
         if !cred.capabilities.is_empty() && !cred.capabilities.iter().any(|c| c == "wiki.write") {
             return Err(reject(
@@ -1069,7 +1091,7 @@ fn upload_file_in(
             ));
         }
         let (status, retry_after, body) =
-            upload_once(target, &cred, logical_path, file_name, bytes)?;
+            upload_once(target, &cred, logical_path, file_name, bytes, deadline)?;
         // A refusal names the status and the contract's error code only: the
         // raw body could carry anything, so it is never echoed.
         let conflict = status == 409 && body.as_ref().is_some_and(|b| b.get("conflict").is_some());
@@ -1082,7 +1104,20 @@ fn upload_file_in(
             Verdict::Done(result) => return result,
             Verdict::Conflict(_) => return Err(reject("remote upload conflicted")),
             Verdict::Waking(wait) => {
-                if Instant::now() + wait > deadline {
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .filter(|remaining| !remaining.is_zero())
+                    .ok_or_else(|| {
+                        Error::busy_coded(
+                            "waking",
+                            format!(
+                                "org '{}' is still waking after {}s — retry, or pass a \
+                                 larger --wake-timeout",
+                                target.org, wake_timeout
+                            ),
+                        )
+                    })?;
+                if wait >= remaining {
                     return Err(Error::busy_coded(
                         "waking",
                         format!(
@@ -1498,6 +1533,33 @@ fn call_verb_in(
     sleep: impl Fn(Duration),
 ) -> Result<RemoteAnswer> {
     // I2: an unlisted verb is refused before a credential is even loaded.
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(wake_timeout))
+        .ok_or_else(|| reject("invalid wake timeout"))?;
+    call_verb_until(
+        target,
+        verb,
+        arguments,
+        deadline,
+        wake_timeout,
+        dir,
+        note,
+        sleep,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn call_verb_until(
+    target: &RemoteTarget,
+    verb: &str,
+    arguments: Map<String, Value>,
+    deadline: Instant,
+    wake_timeout: u64,
+    dir: &Path,
+    note: impl Fn(&str),
+    sleep: impl Fn(Duration),
+) -> Result<RemoteAnswer> {
+    // I2: an unlisted verb is refused before a credential is even loaded.
     let surface = if REMOTE_VERBS.contains(&verb) {
         Surface::Cli
     } else if WIKI_ACTIONS.contains(&verb) {
@@ -1515,9 +1577,6 @@ fn call_verb_in(
             )));
         }
     }
-    let deadline = Instant::now()
-        .checked_add(Duration::from_secs(wake_timeout))
-        .ok_or_else(|| reject("invalid wake timeout"))?;
     let budget_over = || -> Error {
         Error::busy_coded(
             "waking",
