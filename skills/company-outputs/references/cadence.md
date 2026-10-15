@@ -24,7 +24,11 @@ Reuse the inspected `skills/business-documents/scripts/run_isolated.py` wrapper 
 
 ## Consumption
 
-This repository keeps auxiliary skills as directories under `skills/`, consumed by providing the checked-out entry point to an authorised worker (as documented in `business-documents/OPERATOR.md`). `cadence skill install` embeds/installs only the Cadence protocol; it does not install this directory. A portable archive can contain `company-outputs/SKILL.md` and its references, excluding company data and trial artifacts. Local unpack/read validation demonstrates packaging and consumption only, not hosted installation or automatic runtime discovery.
+With a binary built from this installer revision, `cadence skill install` installs the separate cadence, company-outputs and business-documents public guidance under `~/.agents/skills/`. `cadence skill install company-outputs` installs this workflow, all four references and its business-document guidance dependency without refreshing the core protocol. `cadence skill status` reports the root and `skills[]` file/content/link state. Older binaries may install only the protocol; inspect their help/status rather than assuming availability.
+
+Codex uses the canonical directory; Claude/Cursor/Copilot receive symlinks. Foreign real provider entries remain untouched and are reported, so an occupied slot does not prove discovery of this version. Native Pi disables skills, confined agents may not see the operator home, and remote/hosted workers do not inherit these local files automatically. Supply approved task guidance through their normal accessible path when needed; never widen permissions or change auth to make discovery pass. Already-running contexts may need the next task/session to discover or load guidance.
+
+This installs guidance, not renderer scripts, pinned images, company-private profiles or business-document authority. The existing bounded-tool prerequisites still apply. A portable archive may contain this SKILL.md and its references without private/trial data. Filesystem installation and a provider's skill inventory establish only local availability, not model execution, native rendering or hosted installation.
 
 ## Native acceptance boundary
 
