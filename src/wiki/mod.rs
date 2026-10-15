@@ -37,7 +37,7 @@
 //! layer additionally refuses any symlinked component.
 
 use std::collections::BTreeSet;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -881,15 +881,22 @@ pub fn read(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
 }
 
 /// Bounded original-body read. Same authorization and sandbox path as
-/// [`read`]. The reply adds the exact byte range. It does not copy the
-/// page or raise [`TEXT_CAP`].
+/// [`read`]. A text page adds `text` and `range`. A blob page keeps the
+/// pointer metadata and adds `range` plus `data_base64` (standard
+/// base64 of that byte slice). A directory is refused. The reply does
+/// not copy the page or raise [`TEXT_CAP`].
 pub fn read_range(pm: &Pm, caller: &Caller, path: &str, range: BodyRange<'_>) -> Result<Value> {
-    let Opened::Text(page) = open_page(pm, caller, path)? else {
-        return Err(Error::rejected(format!(
-            "wiki read '{path}' refused: a range read needs a text page — \
-             directories and blobs have no original text range"
-        )));
-    };
+    match open_page(pm, caller, path)? {
+        Opened::Text(page) => text_read_range(page, range),
+        Opened::Blob(meta) => blob_read_range(pm, &meta, range),
+        Opened::Dir { .. } => Err(Error::rejected(format!(
+            "wiki read '{path}' refused: a range read needs a text page or blob — \
+             directories have no original text range"
+        ))),
+    }
+}
+
+fn text_read_range(page: TextPage, range: BodyRange<'_>) -> Result<Value> {
     if let Some(want) = range.rev {
         if want != page.rev {
             return Err(Error::rejected(format!(
@@ -918,6 +925,254 @@ pub fn read_range(pm: &Pm, caller: &Caller, path: &str, range: BodyRange<'_>) ->
         None => fitting_end(&page, start)?,
     };
     Ok(ranged_value(&page, start, end))
+}
+
+struct BlobView<'a> {
+    path: &'a str,
+    sha256: &'a str,
+    size: u64,
+    mime: &'a str,
+    name: &'a str,
+    rev: &'a str,
+}
+
+fn blob_str<'a>(meta: &'a Value, key: &str, path: &str) -> Result<&'a str> {
+    meta.get(key).and_then(Value::as_str).ok_or_else(|| {
+        Error::rejected(format!(
+            "wiki read '{path}' refused: blob pointer '{key}' is not a string"
+        ))
+    })
+}
+
+fn blob_view(meta: &Value) -> Result<BlobView<'_>> {
+    let path = blob_str(meta, "path", "")?;
+    let sha256 = blob_str(meta, "sha256", path)?;
+    if sha256.len() != 64
+        || !sha256
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(Error::rejected(format!(
+            "wiki read '{path}' refused: blob pointer sha256 is not 64 lowercase hex digits"
+        )));
+    }
+    let size = meta.get("size").and_then(Value::as_u64).ok_or_else(|| {
+        Error::rejected(format!(
+            "wiki read '{path}' refused: blob pointer size is not a non-negative integer"
+        ))
+    })?;
+    Ok(BlobView {
+        mime: blob_str(meta, "mime", path)?,
+        name: blob_str(meta, "name", path)?,
+        rev: blob_str(meta, "rev", path)?,
+        path,
+        sha256,
+        size,
+    })
+}
+
+fn blob_ranged_value(view: &BlobView<'_>, start: u64, end: u64, data_base64: String) -> Value {
+    let mut value = json!({
+        "path": view.path,
+        "kind": "blob",
+        "sha256": view.sha256,
+        "size": view.size,
+        "mime": view.mime,
+        "name": view.name,
+        "rev": view.rev,
+        "range": {"start": start, "end": end, "total": view.size},
+    });
+    value["data_base64"] = Value::String(data_base64);
+    value
+}
+
+fn b64_len(n: usize) -> usize {
+    n.div_ceil(3).saturating_mul(4)
+}
+
+fn decimal_len_u64(n: u64) -> usize {
+    if n == 0 {
+        1
+    } else {
+        (n.ilog10() as usize) + 1
+    }
+}
+
+/// Compact length of [`blob_ranged_value`]. Base64 uses the standard
+/// alphabet, which needs no JSON escape. Key order matches `json!`.
+fn blob_line_len(view: &BlobView<'_>, start: u64, end: u64) -> usize {
+    let Ok(n) = usize::try_from(end.saturating_sub(start)) else {
+        return usize::MAX;
+    };
+    if n >= NATIVE_TOOL_LINE_BOUND {
+        return usize::MAX;
+    }
+    "{\"data_base64\":".len()
+        + 2
+        + b64_len(n)
+        + ",\"kind\":\"blob\",\"mime\":".len()
+        + json_string_len(view.mime)
+        + ",\"name\":".len()
+        + json_string_len(view.name)
+        + ",\"path\":".len()
+        + json_string_len(view.path)
+        + ",\"range\":{\"end\":".len()
+        + decimal_len_u64(end)
+        + ",\"start\":".len()
+        + decimal_len_u64(start)
+        + ",\"total\":".len()
+        + decimal_len_u64(view.size)
+        + "},\"rev\":".len()
+        + json_string_len(view.rev)
+        + ",\"sha256\":".len()
+        + json_string_len(view.sha256)
+        + ",\"size\":".len()
+        + decimal_len_u64(view.size)
+        + "}".len()
+}
+
+fn blob_fits(view: &BlobView<'_>, start: u64, end: u64) -> bool {
+    if end < start {
+        return false;
+    }
+    let len = blob_line_len(view, start, end);
+    len.checked_add(1)
+        .is_some_and(|n| n < NATIVE_TOOL_LINE_BOUND)
+}
+
+fn blob_end(view: &BlobView<'_>, start: u64, bytes: Option<u64>) -> Result<u64> {
+    let total = view.size;
+    let end = match bytes {
+        Some(n) => start.saturating_add(n).min(total),
+        None => {
+            let mut lo = start;
+            let mut hi = total;
+            let mut best = None;
+            while lo <= hi {
+                let mid = lo + (hi - lo) / 2;
+                if blob_fits(view, start, mid) {
+                    best = Some(mid);
+                    if mid == total {
+                        break;
+                    }
+                    lo = mid + 1;
+                } else if mid == start {
+                    break;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            best.ok_or_else(|| oversize(view.path))?
+        }
+    };
+    if !blob_fits(view, start, end) {
+        return Err(oversize(view.path));
+    }
+    Ok(end)
+}
+
+fn blob_read_range(pm: &Pm, meta: &Value, range: BodyRange<'_>) -> Result<Value> {
+    let view = blob_view(meta)?;
+    if let Some(want) = range.rev {
+        if want != view.rev {
+            return Err(Error::rejected(format!(
+                "wiki read '{}' refused: revision '{want}' is not the original \
+                 revision '{}' — ranges are not combined across revisions",
+                view.path, view.rev
+            )));
+        }
+    }
+    if range.offset > view.size {
+        return Err(Error::rejected(format!(
+            "wiki read '{}' refused: offset {} is past the original {} bytes",
+            view.path, range.offset, view.size
+        )));
+    }
+    let start = range.offset;
+    let end = blob_end(&view, start, range.bytes)?;
+    let bytes = read_blob_slice(pm, &view, start, end)?;
+    use base64::Engine;
+    let data_base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let value = blob_ranged_value(&view, start, end, data_base64);
+    debug_assert_eq!(
+        blob_line_len(&view, start, end),
+        serde_json::to_string(&value)
+            .map(|encoded| encoded.len())
+            .unwrap_or(usize::MAX)
+    );
+    Ok(value)
+}
+
+/// Read only the requested slice of an immutable, content-addressed object.
+/// Upload verifies its digest; remote cat verifies the assembled bytes once.
+fn read_blob_slice(pm: &Pm, view: &BlobView<'_>, start: u64, end: u64) -> Result<Vec<u8>> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let vault = vault_dir(pm)?;
+    let blobs = blobs_dir(&vault);
+    match blobs.symlink_metadata() {
+        Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {}
+        Ok(_) => {
+            return Err(Error::rejected(format!(
+                "wiki read '{}' refused: blob store is not a real directory",
+                view.path
+            )))
+        }
+        Err(e) => {
+            return Err(Error::rejected(format!(
+                "wiki read '{}' refused: blob store is unavailable: {e}",
+                view.path
+            )))
+        }
+    }
+    let object = blobs.join(view.sha256);
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&object)
+        .map_err(|_| {
+            Error::rejected(format!(
+                "wiki read '{}' refused: blob object is not a regular file",
+                view.path
+            ))
+        })?;
+    let meta = file.metadata().map_err(|e| {
+        Error::rejected(format!(
+            "wiki read '{}' refused: blob object is unreadable: {e}",
+            view.path
+        ))
+    })?;
+    if !meta.is_file() || meta.file_type().is_symlink() {
+        return Err(Error::rejected(format!(
+            "wiki read '{}' refused: blob object is not a regular file",
+            view.path
+        )));
+    }
+    if meta.len() != view.size {
+        return Err(Error::rejected(format!(
+            "wiki read '{}' refused: blob object is {} bytes, pointer size is {}",
+            view.path,
+            meta.len(),
+            view.size
+        )));
+    }
+    let len = usize::try_from(end - start).unwrap_or(usize::MAX);
+    let mut buf = vec![0u8; len];
+    if len > 0 {
+        file.seek(SeekFrom::Start(start)).map_err(|e| {
+            Error::rejected(format!(
+                "wiki read '{}' refused: blob object is unreadable: {e}",
+                view.path
+            ))
+        })?;
+        file.read_exact(&mut buf).map_err(|_| {
+            Error::rejected(format!(
+                "wiki read '{}' refused: blob object is shorter than its pointer",
+                view.path
+            ))
+        })?;
+    }
+    Ok(buf)
 }
 
 /// Optional JSON integer field. Absent is `None`. A float, a negative,
@@ -2482,10 +2737,144 @@ mod tests {
             "global/a.bin",
             body_range(0, Some(4), None),
         )
+        .unwrap();
+        assert_eq!(blob["kind"], "blob");
+        assert_eq!(blob["range"]["start"], 0);
+        assert_eq!(blob["range"]["end"], 4);
+        assert_eq!(blob["range"]["total"], b"not-text-blob".len() as u64);
+        assert!(blob.get("text").is_none(), "{blob}");
+        let encoded = blob["data_base64"].as_str().unwrap();
+        use base64::Engine;
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        assert_eq!(raw, b"not-");
+        let line = serde_json::to_string(&blob).unwrap();
+        assert!(line.len() + 1 < NATIVE_TOOL_LINE_BOUND, "{}", line.len());
+        assert!(!line.contains("not-text-blob"), "{line}");
+        let rev = blob["rev"].as_str().unwrap().to_string();
+        let rest = read_range(
+            &pm,
+            &Caller::Operator,
+            "global/a.bin",
+            body_range(4, None, Some(&rev)),
+        )
+        .unwrap();
+        assert_eq!(rest["rev"], rev);
+        assert_eq!(rest["sha256"], blob["sha256"]);
+        assert_eq!(rest["range"]["start"], 4);
+        assert_eq!(rest["range"]["end"], b"not-text-blob".len() as u64);
+        let tail = base64::engine::general_purpose::STANDARD
+            .decode(rest["data_base64"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(tail, b"text-blob");
+        let stale = read_range(
+            &pm,
+            &Caller::Operator,
+            "global/a.bin",
+            body_range(0, Some(4), Some("fnv1a:0000000000000000")),
+        )
         .unwrap_err()
         .to_string();
-        assert!(blob.contains("text page"), "{blob}");
-        assert!(!blob.contains("not-text-blob"), "{blob}");
+        assert!(stale.contains("revision"), "{stale}");
+        assert!(!stale.contains("not-text"), "{stale}");
+        let meta_only = read(&pm, &Caller::Operator, "global/a.bin").unwrap();
+        assert!(meta_only.get("data_base64").is_none(), "{meta_only}");
+        assert!(meta_only.get("range").is_none(), "{meta_only}");
+        assert_eq!(meta_only["sha256"], blob["sha256"]);
+        let object = blobs_dir(&vault_dir(&pm).unwrap()).join(blob["sha256"].as_str().unwrap());
+        assert_eq!(std::fs::read(&object).unwrap(), b"not-text-blob");
+        std::fs::write(&object, b"short").unwrap();
+        let short = read_range(
+            &pm,
+            &Caller::Operator,
+            "global/a.bin",
+            body_range(0, Some(4), Some(&rev)),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(short.contains("pointer size"), "{short}");
+        assert!(!short.contains("data_base64"), "{short}");
+        std::fs::write(&object, b"not-text-blob").unwrap();
+        let empty_tmp = uploads.join("empty.bin");
+        std::fs::write(&empty_tmp, b"").unwrap();
+        put_blob(
+            &pm,
+            &state,
+            &Caller::Operator,
+            "global/empty.bin",
+            &empty_tmp,
+            None,
+            None,
+        )
+        .unwrap();
+        let empty = read_range(
+            &pm,
+            &Caller::Operator,
+            "global/empty.bin",
+            body_range(0, None, None),
+        )
+        .unwrap();
+        assert_eq!(empty["data_base64"], "");
+        assert_eq!(empty["range"]["start"], 0);
+        assert_eq!(empty["range"]["end"], 0);
+        assert_eq!(empty["range"]["total"], 0);
+        assert_eq!(empty["size"], 0);
+
+        let wide_tmp = uploads.join("wide.bin");
+        std::fs::write(&wide_tmp, vec![0xA5u8; 60_000]).unwrap();
+        put_blob(
+            &pm,
+            &state,
+            &Caller::Operator,
+            "global/wide.bin",
+            &wide_tmp,
+            None,
+            None,
+        )
+        .unwrap();
+        let refused = read_range(
+            &pm,
+            &Caller::Operator,
+            "global/wide.bin",
+            body_range(0, Some(50_000), None),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            refused.contains("50000-byte native tool line bound"),
+            "{refused}"
+        );
+        assert!(!refused.contains("data_base64"), "{refused}");
+        let fitted = read_range(
+            &pm,
+            &Caller::Operator,
+            "global/wide.bin",
+            body_range(0, None, None),
+        )
+        .unwrap();
+        let n = (fitted["range"]["end"].as_u64().unwrap()
+            - fitted["range"]["start"].as_u64().unwrap()) as usize;
+        let line = serde_json::to_string(&fitted).unwrap();
+        assert!(n < 40_000, "slice {n} did not reserve base64 and metadata");
+        assert!(
+            line.len() > n,
+            "compact JSON must count base64 and metadata"
+        );
+        assert!(line.len() + 1 < NATIVE_TOOL_LINE_BOUND, "{}", line.len());
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(fitted["data_base64"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(raw, vec![0xA5u8; n]);
+        let past = read_range(
+            &pm,
+            &Caller::Operator,
+            "global/wide.bin",
+            body_range(0, Some(n as u64 + 1), None),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(past.contains("50000-byte native tool line bound"), "{past}");
     }
 
     #[test]
