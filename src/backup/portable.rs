@@ -445,7 +445,14 @@ const CATALOG: &[(&str, &[&str])] = &[
             "context_id",
             "uploader",
             "created",
+            "user_id",
+            "thread_id",
+            "location_version",
         ],
+    ),
+    (
+        "chat_upload_accounts",
+        &["id", "principal_hash", "authority", "created"],
     ),
     (
         "cloud_dispatch_outbox",

@@ -530,10 +530,12 @@ function uploadStillOwned(itemKey: string, generation: number, controller: Abort
 function uploadDestination(destination: AttachDestination | undefined): ChatFileDestination | undefined {
   if (destination === undefined) return undefined;
   if (destination.app === undefined) {
-    if (destination.conversation !== undefined || destination.subject !== undefined || destination.prepareConversation) {
-      throw new Error("An app attachment cannot fall back to the Home upload destination.");
+    if (destination.subject !== undefined || destination.prepareConversation) {
+      throw new Error("A Home attachment cannot select an app subject.");
     }
-    return undefined;
+    return destination.conversation === undefined
+      ? undefined
+      : { conversation: destination.conversation };
   }
   if (destination.conversation === undefined) {
     throw new Error("This app attachment has no conversation destination.");

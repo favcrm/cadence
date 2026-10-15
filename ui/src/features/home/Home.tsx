@@ -22,6 +22,7 @@ import {
   type TurnState,
 } from "./master";
 import Composer from "./Composer";
+import type { AttachDestination } from "../app-shell/chat/attach";
 import { atTail, jumpLabel, tailTop } from "./dock";
 import MasterChips from "./MasterChips";
 import NeedsRail from "./NeedsRail";
@@ -347,8 +348,13 @@ function Examples({ onPick, disabled }: { onPick: (text: string) => void; disabl
   );
 }
 
-const retry = (message: string, text: string, refs?: ThreadRef[], attachments?: { id: string }[]) =>
-  sendToMaster(text, message, refs, attachments);
+const retry = (
+  message: string,
+  text: string,
+  refs?: ThreadRef[],
+  attachments?: { id: string }[],
+  conversation?: string,
+) => sendToMaster(text, message, refs, attachments, conversation);
 const discard = (message: string) => resources.masterThread.write((s) => discardPending(s, message));
 
 /**
@@ -379,7 +385,13 @@ const ThreadList = memo(function ThreadList({
   readOnly: boolean;
   onOpenIssue: (id: string) => void;
   liveAfter: number;
-  onRetry: (message: string, text: string, refs?: ThreadRef[]) => void;
+  onRetry: (
+    message: string,
+    text: string,
+    refs?: ThreadRef[],
+    attachments?: { id: string }[],
+    conversation?: string,
+  ) => void;
   /** The live turn's start (epoch s) while it works; null otherwise. */
   working: { since: number | null } | null;
 }) {
@@ -489,6 +501,11 @@ export default function Home({
   const items = useMemo(() => threadItems(thread.data), [thread.data]);
   const loaded = thread.data !== null;
   const moreBefore = thread.data?.moreBefore === true;
+  const homeConversation = thread.data?.conversation;
+  const attachDestination: AttachDestination | undefined = loaded && !missing
+    ? homeConversation ? { conversation: homeConversation } : {}
+    : undefined;
+  const canAttach = !readOnly && attachDestination !== undefined;
 
   const masterRow = agents.data?.agents.find((a) => a.alias === MASTER);
   const submitting = (thread.data?.pending ?? []).some((p) => p.state !== "failed");
@@ -605,9 +622,15 @@ export default function Home({
     setGlideTick((n) => n + 1);
   }, []);
   const onRetrySend = useCallback(
-    (message: string, text: string, refs?: ThreadRef[], attachments?: { id: string }[]) => {
+    (
+      message: string,
+      text: string,
+      refs?: ThreadRef[],
+      attachments?: { id: string }[],
+      conversation?: string,
+    ) => {
       engage();
-      retry(message, text, refs, attachments);
+      retry(message, text, refs, attachments, conversation);
     },
     [engage],
   );
@@ -961,7 +984,19 @@ export default function Home({
           )}
 
           <div className="chatdock" ref={dockRef} data-chat-dock>
-            <Composer block={block} seed={seed} onCommand={runCommand} onSent={engage} />
+            <Composer
+              block={block}
+              seed={seed}
+              onCommand={runCommand}
+              onSent={engage}
+              attachEnabled={canAttach}
+              attachDestination={attachDestination}
+              attachReason={readOnly
+                ? "The board is read-only."
+                : missing
+                  ? "The Master conversation is unavailable."
+                  : "A Home conversation must be ready before attaching files."}
+            />
           </div>
         </div>
       </section>

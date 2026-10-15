@@ -10,8 +10,8 @@ backup/portable.rs	private-portable-copy-and-staged-validation	execute	11
 backup/portable.rs	private-portable-copy-and-staged-validation	open	5
 backup/portable.rs	private-portable-copy-and-staged-validation	prepare	4
 backup/portable.rs	private-portable-copy-and-staged-validation	transaction	1
-backup/portable_acceptance.rs	test-fixtures	execute	21
-backup/portable_acceptance.rs	test-fixtures	open	16
+backup/portable_acceptance.rs	test-fixtures	execute	22
+backup/portable_acceptance.rs	test-fixtures	open	17
 backup/portable_acceptance.rs	test-fixtures	prepare	4
 backup/portable_activate.rs	read-only-portable-activation-inventory	open	1
 backup/portable_activate.rs	read-only-portable-activation-inventory	prepare	1
@@ -121,8 +121,8 @@ store/app_tools.rs	guarded-store-and-read-queries	prepare	2
 store/business_templates.rs	guarded-store-and-read-queries	execute	4
 store/business_templates.rs	guarded-store-and-read-queries	guarded_write	3
 store/business_templates.rs	guarded-store-and-read-queries	prepare	1
-store/chat_files.rs	guarded-store-and-read-queries	execute	1
-store/chat_files.rs	guarded-store-and-read-queries	guarded_write	1
+store/chat_files.rs	guarded-store-and-read-queries	execute	3
+store/chat_files.rs	guarded-store-and-read-queries	guarded_write	3
 store/chat_files.rs	guarded-store-and-read-queries	open	1
 store/chat_files.rs	guarded-store-and-read-queries	prepare	1
 store/conversations.rs	inline-test-store-fixtures	open	1
@@ -154,10 +154,10 @@ store/plans.rs	guarded-store-and-read-queries	guarded_write	11
 store/plans.rs	guarded-store-and-read-queries	prepare	1
 store/platform.rs	guarded-store-and-read-queries	execute	15
 store/platform.rs	guarded-store-and-read-queries	guarded_write	11
-store/schema.rs	sqlite-schema-owner-and-restricted-recovery	execute	106
+store/schema.rs	sqlite-schema-owner-and-restricted-recovery	execute	110
 store/schema.rs	sqlite-schema-owner-and-restricted-recovery	guarded_write	2
 store/schema.rs	sqlite-schema-owner-and-restricted-recovery	open	3
-store/schema.rs	sqlite-schema-owner-and-restricted-recovery	prepare	25
+store/schema.rs	sqlite-schema-owner-and-restricted-recovery	prepare	27
 store/seal.rs	sqlite-guard-owner-and-inline-tests	execute	44
 store/seal.rs	sqlite-guard-owner-and-inline-tests	guarded_write	21
 store/seal.rs	sqlite-guard-owner-and-inline-tests	open	22
@@ -222,6 +222,7 @@ store/writer_census.rs	lexical-census-test-fixture-strings	execute	1
 store/writer_census.rs	lexical-census-test-fixture-strings	open	2
 ui/app_social_drafts.rs	read-only-store-app-view	open	1
 ui/apps.rs	read-only-store-app-view	prepare	1
+ui/cad1337_acceptance.rs	independent-http-acceptance-fixtures	open	4
 wiki/index.rs	separate-wiki-index-db	execute	5
 wiki/index.rs	separate-wiki-index-db	open	2
 wiki/index.rs	separate-wiki-index-db	prepare	2
@@ -238,6 +239,14 @@ daemon/cad1327_acceptance.rs	independent-daemon-acceptance-fixtures	execute	1
 daemon/cad1327_acceptance.rs	independent-daemon-acceptance-fixtures	open	1
 daemon/cad1415_app_actions_acceptance.rs	independent-daemon-acceptance-fixtures	execute	2
 daemon/cad1415_app_actions_acceptance.rs	independent-daemon-acceptance-fixtures	open	1
+daemon/cad1337_acceptance.rs	independent-daemon-acceptance-fixtures	execute	1
+daemon/cad1337_acceptance.rs	independent-daemon-acceptance-fixtures	open	2
+daemon/cad1337_acceptance.rs	independent-daemon-acceptance-fixtures	prepare	1
+daemon/cad1337_migration_acceptance.rs	independent-daemon-acceptance-fixtures	execute	1
+daemon/cad1337_migration_acceptance.rs	independent-daemon-acceptance-fixtures	open	4
+daemon/cad1337_repair_acceptance.rs	test-fixtures	execute	2
+daemon/cad1337_repair_acceptance.rs	test-fixtures	open	6
+daemon/cad1337_repair_acceptance.rs	test-fixtures	prepare	1
 daemon/conversations_acceptance.rs	independent-daemon-acceptance-fixtures	execute	5
 daemon/conversations_acceptance.rs	independent-daemon-acceptance-fixtures	open	4
 daemon/campaign_clone_acceptance.rs	independent-daemon-acceptance-fixtures	open	1

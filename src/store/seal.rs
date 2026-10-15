@@ -58,17 +58,16 @@ fn raw_lease_refusal(reason: String) -> rusqlite::Error {
 /// standalone `app_tool_claims`/`app_tool_results` tables and one retrofitted `app_run_failures` — they touch no
 /// sealed/witnessed surface, so the guard's assumptions are unchanged.
 /// v37 (CAD-1168) adds only the `chat_files` table, likewise. v38/v39
-/// (CAD-818 threads) add tables and a backfill, touching no sealed surface.
-/// v40 (CAD-1393) adds only the `business_template_*` tables and their
-/// triggers, which touch no sealed/witnessed surface.
-/// v41 (CAD-1380/AOS-216) adds the standalone `assistants`,
-/// `assist_requests` and `job_subscribers` tables, v42 adds member-request
-/// provenance columns + the `assist_stall_checks` table, and v43 adds the
-/// standalone `assist_job_shares` table, and v44 (CAD-1412) adds only the
-/// human room tables. None touch a sealed/witnessed surface, so the bound
-/// extends to 45 (v45 CAD-1365 adds only app_media_* tables).
+/// (CAD-818 threads) add participant identity, topics, subscriptions and the
+/// shared transcript, touching no sealed surface. v40 (CAD-1393) adds only the
+/// `business_template_*` tables and their triggers. v41-v43 (CAD-1380/AOS-216)
+/// add member-assistant tables and provenance; v44 (CAD-1412) adds human room
+/// tables; v45 (CAD-1365) adds only the metadata-only app_media_* tables.
+/// v46 (CAD-1337) adds nullable upload ownership/location metadata,
+/// the account registry and upload indexes. None touch a sealed/witnessed
+/// surface, so the bound extends to 46.
 #[allow(dead_code)]
-const PROTECTED_SCHEMA_MAX: i64 = 45;
+const PROTECTED_SCHEMA_MAX: i64 = 46;
 
 /// Arm level + transaction-control phase, shared between the `Store` and
 /// the connection's authorizer. Atomic because the authorizer callback must
@@ -2509,12 +2508,12 @@ mod tests {
         // This is malformed metadata, not evidence of native owner authority.
         let fixture = Connection::open(&db).unwrap();
         fixture
-            .execute("UPDATE schema_version SET version=46", [])
+            .execute("UPDATE schema_version SET version=47", [])
             .unwrap();
         drop(fixture);
         store
             .propose_close(
-                &permit(&db, OwnerOp::Close, b"schema-44", "attempt-44", "art", 44),
+                &permit(&db, OwnerOp::Close, b"schema-45", "attempt-45", "art", 44),
                 "test",
             )
             .unwrap();
@@ -2538,8 +2537,8 @@ mod tests {
             .witness_commit(&permit(
                 &db,
                 OwnerOp::Witness,
-                b"schema-44",
-                "attempt-44",
+                b"schema-45",
+                "attempt-45",
                 "art",
                 44,
             ))
@@ -2577,8 +2576,8 @@ mod tests {
     }
 
     #[test]
-    fn current_schema45_owner_witness_refuses_future46() {
-        // Positive control: a real current (45) database is accepted by the real guard.
+    fn current_schema44_owner_witness_refuses_future45() {
+        // Positive control: a real current (46) database is accepted by the real guard.
         {
             let dir = TempDir::new().unwrap();
             let (db, store) = open_legacy(&dir);
@@ -2586,35 +2585,35 @@ mod tests {
                 .conn()
                 .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(actual, 45, "current contract schema must be 45");
+            assert_eq!(actual, 46, "current contract schema must be 46");
             store
                 .propose_close(
-                    &permit(&db, OwnerOp::Close, b"c44", "a44", "art", 1),
+                    &permit(&db, OwnerOp::Close, b"c45", "a45", "art", 1),
                     "test",
                 )
                 .unwrap();
             store
-                .witness_commit(&permit(&db, OwnerOp::Witness, b"c44", "a44", "art", 1))
-                .expect("schema 44 must be accepted by the real guard");
+                .witness_commit(&permit(&db, OwnerOp::Witness, b"c45", "a45", "art", 1))
+                .expect("schema 46 must be accepted by the real guard");
             let witnessed: i64 = store
                 .conn()
                 .query_row("SELECT db_schema FROM owner_witness", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(witnessed, 45, "positive control must record db_schema 45");
+            assert_eq!(witnessed, 46, "positive control must record db_schema 46");
         }
-        // Bad case: a separate store, forged schema_version 46 (above
+        // Bad case: a separate store, forged schema_version 47 (above
         // PROTECTED_SCHEMA_MAX) via raw SQLite.
         let dir = TempDir::new().unwrap();
         let (db, store) = open_legacy(&dir);
         // Raw connection bypasses Store's authorizer, as the existing fixture does.
         let fixture = Connection::open(&db).unwrap();
         fixture
-            .execute("UPDATE schema_version SET version=46", [])
+            .execute("UPDATE schema_version SET version=47", [])
             .unwrap();
         drop(fixture);
         store
             .propose_close(
-                &permit(&db, OwnerOp::Close, b"c44", "a44", "art", 1),
+                &permit(&db, OwnerOp::Close, b"c45", "a45", "art", 1),
                 "test",
             )
             .unwrap();
@@ -2633,11 +2632,11 @@ mod tests {
             .query_row("SELECT count(*) FROM events", [], |r| r.get(0))
             .unwrap();
         let err = store
-            .witness_commit(&permit(&db, OwnerOp::Witness, b"c44", "a44", "art", 1))
+            .witness_commit(&permit(&db, OwnerOp::Witness, b"c45", "a45", "art", 1))
             .unwrap_err();
         assert!(
             matches!(&err, Error::Rejected(message) if message == "owner witness database schema is unsupported"),
-            "forged schema 46 must fail at the actual schema guard, got: {err}"
+            "forged schema 47 must fail at the actual schema guard, got: {err}"
         );
         let latch_after: (i64, i64, Vec<u8>, String, Option<String>, i64) = store
             .conn()

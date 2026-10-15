@@ -35,6 +35,42 @@ pub(super) fn open_migration_for_test(path: &Path) -> Result<Store> {
         .map(|(store, _)| store)
 }
 
+fn validate_chat_file_owner_shape(conn: &Connection) -> Result<()> {
+    let columns = {
+        let mut stmt = conn.prepare("PRAGMA table_info(chat_files)")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (name, declared_type) in [
+        ("user_id", "TEXT"),
+        ("thread_id", "TEXT"),
+        ("location_version", "INTEGER"),
+    ] {
+        if let Some((_, actual_type, not_null, default, primary_key)) =
+            columns.iter().find(|(column, ..)| column == name)
+        {
+            if !actual_type.eq_ignore_ascii_case(declared_type)
+                || *not_null != 0
+                || default.is_some()
+                || *primary_key != 0
+            {
+                return Err(Error::rejected(format!(
+                    "chat_files.{name} has an unsupported schema shape"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Read-only open of the daemon store from another process, with the
 /// shared busy timeout — never creates or migrates the file.
 pub(crate) fn open_read_only(path: &Path) -> rusqlite::Result<Connection> {
@@ -253,6 +289,9 @@ impl Store {
             )?;
             let version: i64 =
                 conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0))?;
+            // Refuse malformed attachment ownership before committing the
+            // bootstrap or executing any historical migration.
+            validate_chat_file_owner_shape(&bootstrap)?;
             if version < 1 {
                 conn.execute_batch(
                     "CREATE TABLE IF NOT EXISTS agents(
@@ -1214,6 +1253,44 @@ impl Store {
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 tx.execute_batch(super::app_media::SCHEMA)?;
                 tx.execute("UPDATE schema_version SET version=45", [])?;
+                tx.commit()?;
+            }
+            if version < 46 {
+                // CAD-1337: authenticated upload ownership/location follows
+                // the main v41-v45 migrations. Existing attachment rows stay
+                // legacy/null; no bytes or ownership are migrated.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                validate_chat_file_owner_shape(&tx)?;
+                tx.execute_batch(super::chat_files::ACCOUNT_SCHEMA)?;
+                let columns: Vec<String> = tx
+                    .prepare("PRAGMA table_info(chat_files)")?
+                    .query_map([], |row| row.get(1))?
+                    .collect::<rusqlite::Result<_>>()?;
+                for (name, sql) in [
+                    ("user_id", "ALTER TABLE chat_files ADD COLUMN user_id TEXT"),
+                    (
+                        "thread_id",
+                        "ALTER TABLE chat_files ADD COLUMN thread_id TEXT",
+                    ),
+                    (
+                        "location_version",
+                        "ALTER TABLE chat_files ADD COLUMN location_version INTEGER",
+                    ),
+                ] {
+                    if !columns.iter().any(|column| column == name) {
+                        tx.execute(sql, [])?;
+                    }
+                }
+                tx.execute_batch(
+                    "DROP INDEX IF EXISTS chat_files_sha_scope;
+                     CREATE UNIQUE INDEX IF NOT EXISTS chat_files_sha_scope_legacy
+                       ON chat_files(sha256, scope, context_id)
+                       WHERE user_id IS NULL AND thread_id IS NULL;
+                     CREATE UNIQUE INDEX IF NOT EXISTS chat_files_sha_owner_thread
+                       ON chat_files(sha256, scope, context_id, user_id, thread_id)
+                       WHERE user_id IS NOT NULL AND thread_id IS NOT NULL;",
+                )?;
+                tx.execute("UPDATE schema_version SET version=46", [])?;
                 tx.commit()?;
             }
             if let Some(crossing) = permit.crossing {

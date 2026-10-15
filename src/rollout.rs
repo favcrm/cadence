@@ -50,16 +50,16 @@ use crate::store::{self, Store};
 /// standalone tool-invocation receipts — new tables only.
 /// v36 (CAD-1282): `app_run_failures`, retrofitted for stores that passed the
 /// `version < 20` block before CAD-1171 added it — one idempotent table.
-/// v37 (CAD-1168): the retained `chat_files` table.
-/// v40 (CAD-1393): company document template versions and their drafts.
-/// v41 (CAD-1380/AOS-216): the `assistants`, `assist_requests` and
-/// `job_subscribers` tables — standalone, new objects only.
-/// v42 (CAD-1380/AOS-216): member job-request provenance columns on
-/// `assist_requests` and the `assist_stall_checks` table.
-/// v43 (CAD-1380/AOS-216): the owner-granted `assist_job_shares` table.
-/// v44 (CAD-1412): human principals, rooms, membership and read markers.
-/// v45 (CAD-1365): the metadata-only `app_media_*` tables.
-pub const SCHEMA_VERSION: i64 = 45;
+/// v37 (CAD-1168): the retained `chat_files` table; v38 adds durable agent
+/// and message participant identity; v39 adds topics, subscriptions and the
+/// shared transcript; v40 (CAD-1393) adds company document template versions
+/// and their drafts. v41 (CAD-1380/AOS-216) adds the `assistants`,
+/// `assist_requests` and `job_subscribers` tables; v42 adds member job-request
+/// provenance and `assist_stall_checks`; v43 adds `assist_job_shares`; v44
+/// (CAD-1412) adds human principals, rooms, membership and read markers; v45
+/// (CAD-1365) adds the metadata-only `app_media_*` tables; v46 (CAD-1337)
+/// adds authenticated upload ownership and location metadata.
+pub const SCHEMA_VERSION: i64 = 46;
 
 /// Last schema that has no lease table. The bootstrap opt-in covers
 /// only this version.
@@ -3352,7 +3352,8 @@ mod tests {
         // `assist_stall_checks`; v43 adds the owner-granted
         // `assist_job_shares` entitlement; CAD-1412: v44 adds the human
         // room tables, and v45 (CAD-1365) adds the app_media_* tables.
-        assert_eq!(SCHEMA_VERSION, 45);
+        // CAD-1337: v46 adds authenticated upload ownership/location.
+        assert_eq!(SCHEMA_VERSION, 46);
     }
 
     struct MigrationHolder;

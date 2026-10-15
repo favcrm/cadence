@@ -1590,7 +1590,8 @@ pub(crate) fn write_route(
             send(request, err_response(405, "method not allowed"));
             return;
         }
-        let resp = threads::post_upload(&mut request, state_dir);
+        let proof = operator::chat_upload_session_proof(&request, opts);
+        let resp = threads::post_upload(&mut request, state_dir, proof);
         send(request, resp);
         return;
     }
@@ -1613,7 +1614,10 @@ pub(crate) fn write_route(
                     );
                     return;
                 }
-                relay => threads::post_message(&mut request, state_dir, alias, relay),
+                relay => {
+                    let proof = operator::chat_upload_session_proof(&request, opts);
+                    threads::post_message(&mut request, state_dir, alias, proof, relay)
+                }
             }
         };
         send(request, resp);

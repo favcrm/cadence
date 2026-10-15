@@ -941,6 +941,19 @@ pub(crate) fn session_token_for(
     session_cookie(request, opts, origin)
 }
 
+/// The live request's internal session proof for a native relay. The proof
+/// is never accepted from multipart fields and is rechecked by the daemon.
+pub(super) fn chat_upload_session_proof(request: &Request, opts: &ServeOpts) -> Option<Value> {
+    let origin = request_origin_kind(request, opts)?;
+    let token = session_token_for(request, opts, origin)?;
+    let key = if origin == Origin::Public {
+        String::new()
+    } else {
+        session_key(request)
+    };
+    Some(json!({ "token": token, "key": key, "origin": origin.as_str() }))
+}
+
 /// The session token the request presents for `origin`, if any.
 fn session_cookie(request: &Request, opts: &ServeOpts, origin: Origin) -> Option<String> {
     // The public surface reads both the `__Host-` name and the worker's

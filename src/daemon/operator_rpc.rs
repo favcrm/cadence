@@ -40,6 +40,12 @@ use super::{
 use crate::error::{Error, Result};
 use crate::operator_auth::{self as auth, Origin};
 
+fn authenticated_principal_hash(issuer: &str, workspace: &str, subject: &str) -> String {
+    auth::digest(&format!(
+        "cadence:authenticated-principal:v1\0{issuer}\0{workspace}\0{subject}"
+    ))
+}
+
 fn origin_param(params: &Value) -> Result<Origin> {
     let raw = required_str(params, "origin")?;
     // `public` (CAD-526) is deliberately excluded: a public session is
@@ -71,6 +77,8 @@ struct Audit {
 
 /// One prepared frame of a batch mutation: its audit record and the safe rows it names.
 type Frames = Vec<(Audit, Vec<auth::AuditTarget>)>;
+
+const UPLOAD_ACCOUNT_SETUP_COMPENSATION_REASON: &str = "upload_account_setup_compensation";
 
 /// The verified human a row names: a signed-session snapshot, labelled as such.
 fn human_json(t: &auth::AuditTarget) -> Value {
@@ -170,6 +178,25 @@ fn stolen_audit(
     }
 }
 
+/// A server-side compensation for a public session whose upload-account
+/// setup failed after the prepared open was durably applied.
+fn upload_account_setup_compensation_audit(
+    company: Option<String>,
+    request: &str,
+    targets: &[auth::AuditTarget],
+) -> Audit {
+    Audit {
+        action: "board_session_revoked",
+        actor_kind: "system",
+        human: Value::Null,
+        company,
+        resource: resource_of(targets),
+        reason: UPLOAD_ACCOUNT_SETUP_COMPENSATION_REASON,
+        agent: None,
+        request: request.to_string(),
+    }
+}
+
 /// An operator-secret action on the local CLI path: never a human.
 fn operator_audit(
     reason: &'static str,
@@ -236,7 +263,13 @@ impl Shared {
         self.operator_with_secret("ui login", params, peer_pid)?;
         let origin = origin_param(params)?;
         let now = self.operator_now();
-        let nonce = self.operator_auth().mint(origin, now)?;
+        // This shared local account denotes the authority established by
+        // the native secret-gated login, not a guessed human or process ID.
+        let principal = auth::digest("cadence:local-administrative-authority:v1");
+        let account_id = self.store.chat_upload_account(&principal, "local-admin")?;
+        let nonce = self
+            .operator_auth()
+            .mint_for_account(origin, now, account_id)?;
         let _ = self.store.event_public(
             DAEMON_ALIAS,
             "operator_link_minted",
@@ -415,10 +448,16 @@ impl Shared {
             email: String::new(),
             name: String::new(),
             role: "operator".to_string(),
-            handle: verified.subject_id,
+            handle: verified.subject_id.clone(),
         };
         let now = self.operator_now();
-        let opened = auth.open_device(user, origin, user_agent, now)?;
+        let principal = authenticated_principal_hash(
+            &authority_now.issuer,
+            &verified.org,
+            &verified.subject_id,
+        );
+        let account_id = self.store.chat_upload_account(&principal, "device")?;
+        let opened = auth.open_device_account(user, origin, user_agent, now, Some(account_id))?;
         let _ = self.store.event_public(
             DAEMON_ALIAS,
             "operator_device_session_opened",
@@ -626,6 +665,8 @@ impl Shared {
             company: config.company.clone(),
             host: config.host.clone(),
         };
+        let principal =
+            authenticated_principal_hash(&config.issuer, &config.company, &identity.user().sub);
         // CAD-1374: a native daemon's board realm must match its captured
         // realm before any session opens; a standalone one saves the realm
         // it verified under. Captured mode is never re-read here.
@@ -656,7 +697,12 @@ impl Shared {
             Err(e) => {
                 // Prepared accepted and the Auth write failed: uncertain.
                 if let (Some(a), Some(row)) = (audit, opened_row) {
-                    self.finish_uncertain(&a, std::slice::from_ref(&row));
+                    if self
+                        .finish_uncertain(&a, std::slice::from_ref(&row))
+                        .is_err()
+                    {
+                        return Err(self.terminal_unavailable());
+                    }
                 }
                 return Err(e);
             }
@@ -674,7 +720,41 @@ impl Shared {
                     Some(company.as_str()),
                 ))
             }
-            Some(opened) => {
+            Some(mut opened) => {
+                let account_binding = self
+                    .store
+                    .chat_upload_account(&principal, "authenticated")
+                    .and_then(|account_id| {
+                        self.operator_auth()
+                            .bind_account(&opened.token, &account_id)
+                    });
+                opened.session = match account_binding {
+                    Ok(session) => session,
+                    Err(error) => {
+                        // The public open already changed durable Auth state. Keep
+                        // its prepared frame uncertain, then compensate through
+                        // the same audited intent/settlement path as other revokes.
+                        let open_uncertain = match audit.as_ref().zip(opened_row.as_ref()) {
+                            Some((a, row)) => self.finish_uncertain(a, std::slice::from_ref(row)),
+                            None => Err(self.terminal_unavailable()),
+                        };
+                        let mut frames = Frames::new();
+                        let cleanup = self.operator_auth().revoke_token_with_intent(
+                            &opened.token,
+                            |targets| {
+                                frames = self.prepare_groups(targets, |company, rows| {
+                                    upload_account_setup_compensation_audit(company, &request, rows)
+                                })?;
+                                Ok(())
+                            },
+                        );
+                        let cleanup = self.settle_frames(frames, cleanup.map(usize::from));
+                        if open_uncertain.is_err() || !matches!(cleanup, Ok(1)) {
+                            return Err(self.terminal_unavailable());
+                        }
+                        return Err(error);
+                    }
+                };
                 let _ = self.store.event_public(
                     DAEMON_ALIAS,
                     "board_session_opened",
@@ -836,12 +916,11 @@ impl Shared {
     }
 
     /// The `Auth` write failed after `prepared` was accepted: the outcome is
-    /// unknown. Write it as uncertain (best effort) and never as a clean no-op.
-    fn finish_uncertain(&self, a: &Audit, targets: &[auth::AuditTarget]) {
+    /// unknown. Record uncertainty and never claim a clean no-op.
+    fn finish_uncertain(&self, a: &Audit, targets: &[auth::AuditTarget]) -> Result<()> {
         let payload = self.audit_payload(a, targets, "uncertain");
-        let _ = self
-            .store
-            .event_public(DAEMON_ALIAS, "board_session_mutation_finished", payload);
+        self.store
+            .event_public(DAEMON_ALIAS, "board_session_mutation_finished", payload)
     }
 
     /// Prepare one frame per company group, all BEFORE any `Auth` write. A
@@ -868,10 +947,17 @@ impl Shared {
     fn settle_frames(&self, frames: Frames, result: Result<usize>) -> Result<usize> {
         match result {
             Err(e) => {
+                let mut recorded = true;
                 for (a, rows) in &frames {
-                    self.finish_uncertain(a, rows);
+                    if self.finish_uncertain(a, rows).is_err() {
+                        recorded = false;
+                    }
                 }
-                Err(e)
+                if recorded {
+                    Err(e)
+                } else {
+                    Err(self.terminal_unavailable())
+                }
             }
             Ok(n) => {
                 let mut all = true;
@@ -890,7 +976,7 @@ impl Shared {
     fn terminal_unavailable(&self) -> Error {
         Error::invalid(
             "state_outcome_unavailable",
-            "the session change may have happened, but its completion record could not be written; prepared record retained, not retried",
+            "the session change may have happened, but its durable outcome could not be confirmed; prepared record retained, not retried",
         )
     }
 

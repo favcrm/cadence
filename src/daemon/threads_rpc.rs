@@ -213,11 +213,12 @@ impl Shared {
                         | "conversation"
                         | "attachments"
                         | "public_session"
+                        | "session"
                 )
             }) {
                 return Err(Error::rejected(format!(
                     "thread send takes alias, text, message, refs, app, conversation \
-                     and attachments only; field '{field}' is not accepted"
+                     and the server-held session proofs only; field '{field}' is not accepted"
                 )));
             }
         }

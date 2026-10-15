@@ -526,6 +526,84 @@ impl Store {
         attachments: Option<&Value>,
         human: Option<&Value>,
     ) -> Result<(bool, String)> {
+        self.enqueue_steered_for_with_conversation(
+            alias,
+            expected_uid,
+            body,
+            reply_to,
+            id,
+            source,
+            task_id,
+            issue,
+            worktree,
+            sender,
+            steer,
+            refs,
+            app,
+            attachments,
+            None,
+            human,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_steered_with_conversation(
+        &self,
+        alias: &str,
+        body: &str,
+        reply_to: Option<&str>,
+        id: &str,
+        source: &str,
+        task_id: Option<&str>,
+        issue: Option<&str>,
+        worktree: Option<&str>,
+        sender: &Sender,
+        steer: &Steer,
+        refs: Option<&Value>,
+        app: Option<&Value>,
+        attachments: Option<&Value>,
+        conversation: Option<&str>,
+    ) -> Result<(bool, String)> {
+        self.enqueue_steered_for_with_conversation(
+            alias,
+            None,
+            body,
+            reply_to,
+            id,
+            source,
+            task_id,
+            issue,
+            worktree,
+            sender,
+            steer,
+            refs,
+            app,
+            attachments,
+            conversation,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn enqueue_steered_for_with_conversation(
+        &self,
+        alias: &str,
+        expected_uid: Option<&str>,
+        body: &str,
+        reply_to: Option<&str>,
+        id: &str,
+        source: &str,
+        task_id: Option<&str>,
+        issue: Option<&str>,
+        worktree: Option<&str>,
+        sender: &Sender,
+        steer: &Steer,
+        refs: Option<&Value>,
+        app: Option<&Value>,
+        attachments: Option<&Value>,
+        conversation: Option<&str>,
+        human: Option<&Value>,
+    ) -> Result<(bool, String)> {
         self.write_tx(|conn| {
             let tx = &mut *conn;
             if let Some(uid) = expected_uid {
@@ -561,7 +639,7 @@ impl Store {
                     .map(|m| self.supersedable_in(&tx, alias, m))
                     .collect::<Result<Vec<_>>>()?
             };
-            let out = self.enqueue_tx_human(
+            let out = self.enqueue_tx_with_conversation(
                 &tx,
                 alias,
                 body,
@@ -573,10 +651,12 @@ impl Store {
                 worktree,
                 sender,
                 steer.priority,
+                false,
                 refs,
                 app,
                 attachments,
                 human,
+                conversation,
             )?;
             for old in &superseded {
                 self.supersede_in(&tx, old, id, steer)?;
@@ -1086,7 +1166,7 @@ impl Store {
                 return Err(Error::rejected(format!(
                     "native nudge disposition must be queued|skipped_inactive|rejected|unknown, \
                      not '{other}'"
-                )))
+                )));
             }
         };
         self.write_tx(|conn| {
@@ -1162,7 +1242,7 @@ impl Store {
         app: Option<&Value>,
         attachments: Option<&Value>,
     ) -> Result<(bool, String)> {
-        self.enqueue_tx_human(
+        self.enqueue_tx_with_conversation(
             tx,
             alias,
             body,
@@ -1174,9 +1254,11 @@ impl Store {
             worktree,
             sender,
             priority,
+            false,
             refs,
             app,
             attachments,
+            None,
             None,
         )
     }
@@ -1201,7 +1283,7 @@ impl Store {
         attachments: Option<&Value>,
         human: Option<&Value>,
     ) -> Result<(bool, String)> {
-        self.enqueue_tx_as(
+        self.enqueue_tx_with_conversation(
             tx,
             alias,
             body,
@@ -1218,40 +1300,13 @@ impl Store {
             app,
             attachments,
             human,
+            None,
         )
     }
 
-    /// CAD-819: the uid of a live agent row, `None` when the alias is gone
-    /// (a routed copy from a removed agent keeps its origin, not a uid).
-    pub(super) fn agent_uid_of_in(
-        &self,
-        tx: &impl super::StoreConn,
-        alias: &str,
-    ) -> Result<Option<String>> {
-        Ok(self.agent_opt_in(tx, alias)?.map(|a| a.uid))
-    }
-
-    /// CAD-819: the stored participant identity for a daemon-derived
-    /// sender: `(uid, label)`. An agent sender carries its uid and alias;
-    /// the operator stores the fixed `operator` label with no uid; an
-    /// unattributed caller stores neither (an unknown sender).
-    fn sender_identity_in(
-        &self,
-        tx: &impl super::StoreConn,
-        sender: &Sender,
-    ) -> Result<(Option<String>, Option<String>)> {
-        Ok(match sender {
-            Sender::Agent(alias) => (Some(self.agent_in(tx, alias)?.uid), Some(alias.clone())),
-            Sender::Operator | Sender::OperatorChat => (None, Some("operator".into())),
-            // CAD-1380: a member is attributed by label only, never as the
-            // operator and never with an agent uid.
-            Sender::Member(_) | Sender::VerifiedMember(_) => (None, Some("member".into())),
-            Sender::Unattributed => (None, None),
-        })
-    }
-
+    /// Transactional enqueue with optional human attribution and conversation.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn enqueue_tx_as(
+    pub(super) fn enqueue_tx_with_conversation(
         &self,
         tx: &impl super::StoreConn,
         alias: &str,
@@ -1269,6 +1324,7 @@ impl Store {
         app: Option<&Value>,
         attachments: Option<&Value>,
         human: Option<&Value>,
+        conversation: Option<&str>,
     ) -> Result<(bool, String)> {
         if !daemon {
             crate::proto::caller_message(id, source)?;
@@ -1310,7 +1366,8 @@ impl Store {
                 && Self::entry_refs_in(tx, id)? == refs.cloned()
                 && Self::entry_app_in(tx, id)? == app.cloned()
                 && Self::entry_attachments_in(tx, id)? == attachments.cloned()
-                && Self::entry_human_in(tx, id)? == human.cloned();
+                && Self::entry_human_in(tx, id)? == human.cloned()
+                && Self::entry_conversation_in(tx, id)?.as_deref() == conversation;
             if !same {
                 return Err(Error::rejected(
                     "Message id was already used with different content",
@@ -1379,9 +1436,79 @@ impl Store {
                 app,
                 attachments,
                 human,
+                conversation,
             )?;
         }
         Ok((false, "queued".to_string()))
+    }
+    /// CAD-819: the uid of a live agent row, `None` when the alias is gone
+    /// (a routed copy from a removed agent keeps its origin, not a uid).
+    pub(super) fn agent_uid_of_in(
+        &self,
+        tx: &impl super::StoreConn,
+        alias: &str,
+    ) -> Result<Option<String>> {
+        Ok(self.agent_opt_in(tx, alias)?.map(|a| a.uid))
+    }
+
+    /// CAD-819: the stored participant identity for a daemon-derived
+    /// sender: `(uid, label)`. An agent sender carries its uid and alias;
+    /// the operator stores the fixed `operator` label with no uid; an
+    /// unattributed caller stores neither (an unknown sender).
+    fn sender_identity_in(
+        &self,
+        tx: &impl super::StoreConn,
+        sender: &Sender,
+    ) -> Result<(Option<String>, Option<String>)> {
+        Ok(match sender {
+            Sender::Agent(alias) => (Some(self.agent_in(tx, alias)?.uid), Some(alias.clone())),
+            Sender::Operator | Sender::OperatorChat => (None, Some("operator".into())),
+            // CAD-1380: a member is attributed by label only, never as the
+            // operator and never with an agent uid.
+            Sender::Member(_) | Sender::VerifiedMember(_) => (None, Some("member".into())),
+            Sender::Unattributed => (None, None),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn enqueue_tx_as(
+        &self,
+        tx: &impl super::StoreConn,
+        alias: &str,
+        body: &str,
+        reply_to: Option<&str>,
+        id: &str,
+        source: &str,
+        task_id: Option<&str>,
+        issue: Option<&str>,
+        worktree: Option<&str>,
+        sender: &Sender,
+        priority: Priority,
+        daemon: bool,
+        refs: Option<&Value>,
+        app: Option<&Value>,
+        attachments: Option<&Value>,
+        human: Option<&Value>,
+    ) -> Result<(bool, String)> {
+        self.enqueue_tx_with_conversation(
+            tx,
+            alias,
+            body,
+            reply_to,
+            id,
+            source,
+            task_id,
+            issue,
+            worktree,
+            sender,
+            priority,
+            daemon,
+            refs,
+            app,
+            attachments,
+            human,
+            None,
+        )
     }
 
     pub(super) fn message_in(
@@ -1970,7 +2097,7 @@ impl Store {
                 _ => {
                     return Err(Error::rejected(format!(
                         "since '{since}' is neither a message id of '{alias}' nor a timestamp"
-                    )))
+                    )));
                 }
             }
         }

@@ -113,7 +113,10 @@ pub const REFUSED_COMMAND: &str = "false";
 /// set their mocks here — the environment is shared by every daemon
 /// in the process, so a mock installed there reaches all of them.
 #[derive(Clone, Default)]
-pub struct ProviderEnv(Arc<RwLock<BTreeMap<String, String>>>);
+pub struct ProviderEnv(
+    Arc<RwLock<BTreeMap<String, String>>>,
+    Option<std::path::PathBuf>,
+);
 
 impl ProviderEnv {
     /// An env whose every provider command is [`REFUSED_COMMAND`]: for
@@ -194,6 +197,17 @@ impl ProviderEnv {
             self.set(name, value);
         }
         Ok(())
+    }
+
+    /// Bind this environment to the daemon's immutable, checked workspace.
+    /// The authority is outside the mutable environment map and is inherited
+    /// by clones without being exposed through `set`, `remove` or `vars`.
+    pub(crate) fn with_workspace(&self, workspace: std::path::PathBuf) -> Self {
+        Self(Arc::clone(&self.0), Some(workspace))
+    }
+
+    pub(crate) fn workspace(&self) -> Option<&std::path::Path> {
+        self.1.as_deref()
     }
 
     pub fn set(&self, name: &str, value: impl Into<String>) {

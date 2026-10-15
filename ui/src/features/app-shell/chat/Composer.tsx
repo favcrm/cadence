@@ -99,8 +99,8 @@ export interface ComposerProps {
   className?: string;
   /** Extra form attributes — Home's `data-composer` hook is one. */
   formProps?: Record<string, string | undefined>;
-  /** The shared Attach picker/drop/chips. The app shell enables it only
-   *  from the live native projection; Home keeps its historical shape. */
+  /** The shared Attach picker/drop/chips. App mode enables it only from
+   *  the live native projection; Home binds to its native Master thread. */
   attach?: boolean | {
     enabled: boolean;
     reason: string;

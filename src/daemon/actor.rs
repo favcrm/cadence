@@ -69,6 +69,13 @@ impl Shared {
             self.wake();
             return Ok(false);
         }
+        if crate::master::is_master(alias) {
+            crate::home::validate_workspace_isolated(
+                &self.upload_workspace_dir,
+                &self.state_dir,
+                &self.provider_env,
+            )?;
+        }
         if enable {
             self.store.set_enabled(alias, true)?;
         }

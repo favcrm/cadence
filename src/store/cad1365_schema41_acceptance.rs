@@ -1,14 +1,14 @@
-// Independent CAD-1365 acceptance: owner-witness schema-45 compatibility.
+// Independent CAD-1365 acceptance: historical schema-45 media compatibility at current schema 46.
 //
 // Included inside `seal::tests` (`include!`). Scope: the real
-// `witness_commit` schema guard must accept an ACTUAL schema 45 database
-// only when the three CAD-1365 media TABLES are present in sqlite_master,
-// must keep accepting a genuine schema 40 database and a genuine physical
-// schema 44 database (the three media tables absent), and must keep
-// refusing a forged schema 45 stamp on a physical 44 database, a schema 45
-// database missing a media table, and a future schema 46 with the exact
-// existing message, leaving the sealed latch, owner_witness rows and
-// business events unchanged.
+// `witness_commit` schema guard must accept an ACTUAL current schema 46
+// database only when the three CAD-1365 media TABLES (introduced at schema
+// 45) are present in sqlite_master, must keep accepting a genuine schema 40
+// database and a genuine physical schema 44 database (the three media tables
+// absent), and must keep refusing a forged schema 45 stamp on a physical 44
+// database, a current schema 46 database missing a media table, and a future
+// schema 47 with the exact existing message, leaving the sealed latch,
+// owner_witness rows and business events unchanged.
 // Synthetic permits come from the existing test-only factory; no runtime
 // authority is minted and no HTTP or native path is exercised.
 
@@ -16,7 +16,7 @@ const CAD1365_S41_MSG: &str = "owner witness database schema is unsupported";
 const CAD1365_S41_CHALLENGE: &[u8] = b"cad1365-s41";
 const CAD1365_S41_ATTEMPT: &str = "attempt-s41";
 
-/// A genuine schema 40 fixture: a fresh (migrated to 45) store with the
+/// A genuine schema 40 fixture: a fresh (migrated to 46) store with the
 /// three CAD-1365 media tables dropped in FK-safe order, stamped 40.
 fn cad1365_s41_v40_fixture(dir: &TempDir) -> (std::path::PathBuf, Store) {
     let (db, store) = open_legacy(dir);
@@ -33,7 +33,7 @@ fn cad1365_s41_v40_fixture(dir: &TempDir) -> (std::path::PathBuf, Store) {
     (db, store)
 }
 
-/// A physical schema 44 fixture: a fresh (migrated to 45) store with ONLY
+/// A physical schema 44 fixture: a fresh (migrated to 46) store with ONLY
 /// the three CAD-1365 media tables dropped, stamped 44. The result must
 /// match a main schema 44 database: no `app_media*` object remains.
 fn cad1365_s45_v44_fixture(dir: &TempDir) -> (std::path::PathBuf, Store) {
@@ -108,8 +108,8 @@ fn cad1365_s41_witness(db: &std::path::Path, store: &Store) -> Result<u64> {
 
 #[test]
 fn cad1365_schema45_owner_witness_acceptance() {
-    // 1. Actual fresh schema 45 (all three media tables present) is accepted
-    //    and the witness records db_schema 45.
+    // 1. Actual fresh schema 46 (all three media tables introduced at v45)
+    //    is accepted and the witness records db_schema 46.
     {
         let dir = TempDir::new().unwrap();
         let (db, store) = open_legacy(&dir);
@@ -117,15 +117,15 @@ fn cad1365_schema45_owner_witness_acceptance() {
             .conn()
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(actual, 45, "fresh store must migrate to schema 45");
+        assert_eq!(actual, 46, "fresh store must migrate to schema 46");
         cad1365_s41_seal(&db, &store);
         cad1365_s41_witness(&db, &store)
-            .expect("actual schema 45 with media tables must be accepted");
+            .expect("actual schema 46 with media tables must be accepted");
         let witnessed: i64 = store
             .conn()
             .query_row("SELECT db_schema FROM owner_witness", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(witnessed, 45, "witness must record actual schema 45");
+        assert_eq!(witnessed, 46, "witness must record actual schema 46");
     }
 
     // 2. Genuine schema 40 (media tables absent, stamped 40) is still accepted.
@@ -176,7 +176,7 @@ fn cad1365_schema45_owner_witness_acceptance() {
         assert_eq!(cad1365_s41_snapshot(&store), before, "refusal changed state");
     }
 
-    // 5. Real fresh schema 45 with one media table missing (emptied fixture)
+    // 5. Real fresh schema 46 with one media table missing (emptied fixture)
     //    refuses with the same exact message and no state change.
     {
         let dir = TempDir::new().unwrap();
@@ -190,25 +190,25 @@ fn cad1365_schema45_owner_witness_acceptance() {
         let err = cad1365_s41_witness(&db, &store).unwrap_err();
         assert!(
             matches!(&err, Error::Rejected(message) if message == CAD1365_S41_MSG),
-            "schema 45 missing a media table must fail at the actual guard, got: {err}"
+            "schema 46 missing a media table must fail at the actual guard, got: {err}"
         );
         assert_eq!(cad1365_s41_snapshot(&store), before, "refusal changed state");
     }
 
-    // 6. Unknown future schema 46 is refused with the same exact message.
+    // 6. Unknown future schema 47 is refused with the same exact message.
     {
         let dir = TempDir::new().unwrap();
         let (db, store) = open_legacy(&dir);
         Connection::open(&db)
             .unwrap()
-            .execute("UPDATE schema_version SET version=46", [])
+            .execute("UPDATE schema_version SET version=47", [])
             .unwrap();
         cad1365_s41_seal(&db, &store);
         let before = cad1365_s41_snapshot(&store);
         let err = cad1365_s41_witness(&db, &store).unwrap_err();
         assert!(
             matches!(&err, Error::Rejected(message) if message == CAD1365_S41_MSG),
-            "future schema 46 must fail at the actual guard, got: {err}"
+            "future schema 47 must fail at the actual guard, got: {err}"
         );
         assert_eq!(cad1365_s41_snapshot(&store), before, "refusal changed state");
     }

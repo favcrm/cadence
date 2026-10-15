@@ -46,8 +46,9 @@ impl Master {
         env.set("CADENCE_PI_COMMAND", format!("python3 {}", fake.display()));
         env.set("CADENCE_PM_DIR", pm.to_str().unwrap());
         env.set("HOME", home.to_str().unwrap());
-        // This host may lack Landlock; the master then needs --unconfined.
-        env.set(master::TEST_NO_LANDLOCK, "1");
+        // The daemon runs in this test binary; use the real CLI confiner.
+        env.set("CADENCE_CONFINE_COMMAND", env!("CARGO_BIN_EXE_cadence"));
+        env.set(master::CONFINE_EXTRA_READ_ENV, fake.to_str().unwrap());
         let stop = Arc::new(AtomicBool::new(false));
         let opts = daemon::ServeOptions {
             provider_env: env,
@@ -66,8 +67,7 @@ impl Master {
         m.until("daemon health", || {
             client::rpc_timeout(&m.state, "health", json!({}), Duration::from_secs(1)).is_ok()
         });
-        let unconfined = json!({"provider": "pi", "unconfined": true});
-        m.rpc("master_start", unconfined);
+        m.rpc("master_start", json!({"provider": "pi"}));
         let boot = m.rpc("agent_show", json!({"alias": "master"}))["messages"][0]["id"].clone();
         let boot = m.settled(boot.as_str().unwrap());
         assert_eq!(boot["state"], "completed", "bootstrap: {boot}");

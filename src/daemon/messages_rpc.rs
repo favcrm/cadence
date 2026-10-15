@@ -145,7 +145,7 @@ impl Shared {
             Some(_) => {
                 return Err(Error::rejected(
                     "supersedes must be an array of message ids",
-                ))
+                ));
             }
         };
         // CAD-250: `--nudge` — turnless steering for a live pty pane. The
@@ -238,7 +238,9 @@ impl Shared {
                 "endpoint",
             ] {
                 if params.get(field).is_some() {
-                    return Err(Error::rejected(format!("send --nudge: '{field}' is not accepted; sender and runtime binding are daemon-derived")));
+                    return Err(Error::rejected(format!(
+                        "send --nudge: '{field}' is not accepted; sender and runtime binding are daemon-derived"
+                    )));
                 }
             }
             if steer.is_steering() {
@@ -379,19 +381,22 @@ impl Shared {
             }
             Some(_) => return Err(Error::rejected("conversation must be a string id")),
         };
-        let app = match (app, conversation) {
+        let (app, home_conversation) = match (app, conversation) {
             (Some(mut app), Some(id)) => {
                 self.verify_conversation_selector(&alias, &app, id)?;
                 app["conversation"] = json!(id);
-                Some(app)
+                (Some(app), None)
             }
-            (None, Some(_)) => {
-                return Err(Error::rejected(
-                    "conversation needs a verified app binding — without one a \
-                     send lands in the home thread",
-                ))
+            (None, Some(id)) => {
+                if !crate::master::is_master(&alias) {
+                    return Err(Error::rejected(
+                        "only the Master can select a Home conversation",
+                    ));
+                }
+                self.prove_home_conversation(Some(id))?;
+                (None, Some(id.to_string()))
             }
-            (app, None) => app,
+            (app, None) => (app, None),
         };
         // CAD-1168: `thread_send`'s `attachments` — retained-file ids
         // resolved to their stored metadata rows (existence + size
@@ -420,10 +425,37 @@ impl Shared {
                      other agents cannot read retained chat files",
                 ));
             }
-            Some(v) => Some(thread_attachments(self, v, app.as_ref())?),
+            Some(v) => {
+                let account_id = params
+                    .get("session")
+                    .map(|proof| self.chat_upload_session_account(proof))
+                    .transpose()?
+                    .flatten();
+                let home_thread = if app.is_none() {
+                    Some(match home_conversation.as_deref() {
+                        Some(selected) => selected.to_string(),
+                        None => self.prove_home_conversation(None)?,
+                    })
+                } else {
+                    None
+                };
+                Some(thread_attachments(
+                    self,
+                    v,
+                    app.as_ref(),
+                    account_id.as_deref(),
+                    params.get("session").is_some(),
+                    home_thread.as_deref().unwrap_or_default(),
+                )?)
+            }
         };
         // CAD-1098: app conversations are the master's. Another agent has
         // no per-conversation session, so an app binding to it is refused.
+        if home_conversation.is_some() && sender != store::Sender::OperatorChat {
+            return Err(Error::rejected(
+                "Home conversation is a thread_send-only selector",
+            ));
+        }
         if app.is_some() && !crate::master::is_master(&alias) {
             return Err(Error::rejected(
                 "an app binding is only for the master's chat — other agents \
@@ -475,7 +507,7 @@ impl Shared {
                 "turn_id": stored.turn_id, "delivery": "native_turn_steering", "disposition": stored.result}),
             );
         }
-        let (duplicate, state) = self.store.enqueue_steered_with_human_for(
+        let (duplicate, state) = self.store.enqueue_steered_for_with_conversation(
             &alias,
             expected_uid,
             text,
@@ -490,6 +522,7 @@ impl Shared {
             refs.as_ref(),
             app.as_ref(),
             attachments.as_ref(),
+            home_conversation.as_deref(),
             human,
         )?;
         // Each superseded row's `reply_to` got a notice in the same
@@ -533,7 +566,7 @@ impl Shared {
                 _ => {
                     return Err(Error::rejected(
                         "app mail inspection requires operator proof",
-                    ))
+                    ));
                 }
             }
         }
@@ -972,7 +1005,7 @@ impl Shared {
                         prior["result"].as_str().unwrap_or("unknown"),
                         prior["by"].as_str().unwrap_or("unknown"),
                     ),
-                )
+                );
             }
             Err(e) => return fail("message", format!("recovery record lookup failed: {e}")),
         }
@@ -1383,7 +1416,7 @@ impl Shared {
             other => {
                 return Err(Error::rejected(format!(
                     "Report kind must be ack or result, not '{other}'"
-                )))
+                )));
             }
         }
         self.wake();

@@ -1077,8 +1077,16 @@ impl Store {
         app: Option<&Value>,
         attachments: Option<&Value>,
         human: Option<&Value>,
+        conversation: Option<&str>,
     ) -> Result<()> {
-        let entry = message_entry(sender, source, body, id, refs, app, attachments, human);
+        let mut entry = message_entry(sender, source, body, id, refs, app, attachments, human);
+        if let Some(conversation) = conversation {
+            entry
+                .payload
+                .as_mut()
+                .ok_or_else(|| Error::internal("thread message entry is missing its payload"))?
+                ["conversation"] = json!(conversation);
+        }
         // CAD-1098: a verified App binding lands the message in the
         // conversation the server resolves (the client's selector is
         // checked, never trusted). The thread is fixed here, in the
@@ -1092,6 +1100,13 @@ impl Store {
                     binding.context,
                     binding.conversation,
                 )?;
+                Self::thread_write_in(tx, &thread, entry)?;
+                return Ok(());
+            }
+            if let Some(id) = conversation {
+                let thread = Self::thread_by_id_in(tx, id)?
+                    .filter(|t| t.alias == alias && t.install_id.is_none() && !t.archived)
+                    .ok_or_else(|| Error::rejected("Unknown or unavailable Home conversation"))?;
                 Self::thread_write_in(tx, &thread, entry)?;
                 return Ok(());
             }
@@ -1214,6 +1229,14 @@ impl Store {
         id: &str,
     ) -> Result<Option<Value>> {
         Self::entry_payload_field_in(tx, id, "attachments")
+    }
+
+    pub(super) fn entry_conversation_in(
+        tx: &impl super::StoreConn,
+        id: &str,
+    ) -> Result<Option<String>> {
+        Ok(Self::entry_payload_field_in(tx, id, "conversation")?
+            .and_then(|value| value.as_str().map(str::to_string)))
     }
 
     /// One named field of the enqueue note's payload for `id`, `None`

@@ -1,5 +1,6 @@
 import type { ThreadRef } from "../../lib/types";
 import SharedComposer from "../app-shell/chat/Composer";
+import type { AttachDestination } from "../app-shell/chat/attach";
 import { sendToMaster } from "./send";
 import { newMessageId } from "./thread";
 
@@ -20,12 +21,18 @@ export default function Composer({
   seed,
   onCommand,
   onSent,
+  attachEnabled = true,
+  attachDestination,
+  attachReason = "A writable Home conversation is required to attach files.",
 }: {
   block: string | null;
   seed: { text: string; n: number; refs?: ThreadRef[] };
   onCommand: (name: string, arg: string) => void;
   /** Enter or the button actually submitted — chat, slash, or an Ask-master draft. */
   onSent: () => void;
+  attachEnabled?: boolean;
+  attachDestination?: AttachDestination;
+  attachReason?: string;
 }) {
   return (
     <SharedComposer
@@ -36,10 +43,14 @@ export default function Composer({
       onCommand={onCommand}
       onSubmitted={onSent}
       onSend={({ body, refs, attachments }) => {
-        void sendToMaster(body, newMessageId(), refs, attachments);
+        void sendToMaster(body, newMessageId(), refs, attachments, attachDestination?.conversation);
       }}
       refocusAfterSend
-      attach
+      attach={{
+        enabled: attachEnabled,
+        reason: attachReason,
+        destination: attachDestination,
+      }}
       className="card p-2.5 relative"
       placeholder="Message Assistant…"
       ariaLabel="Message to Assistant"

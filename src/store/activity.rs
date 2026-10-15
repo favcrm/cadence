@@ -1320,7 +1320,19 @@ fn session_row(
                 && human.is_null()
                 && (denied || by_agent || action == "board_session_logged_out")
         }
-        "operator" => revoke && !by_agent && agent.is_none() && human.is_null(),
+        "operator" => {
+            revoke
+                && reason != "upload_account_setup_compensation"
+                && !by_agent
+                && agent.is_none()
+                && human.is_null()
+        }
+        "system" => {
+            action == "board_session_revoked"
+                && reason == "upload_account_setup_compensation"
+                && agent.is_none()
+                && human.is_null()
+        }
         "unknown" => {
             agent.is_none()
                 && human.is_null()
@@ -1369,6 +1381,7 @@ fn session_reason_ok(action: &str, reason: &str) -> bool {
                 | "operator_revoke"
                 | "operator_revoke_all"
                 | "operator_secret_rotate"
+                | "upload_account_setup_compensation"
         ),
         _ => false,
     }

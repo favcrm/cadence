@@ -635,8 +635,14 @@ fn launch_command(
     let command = build_command(env, agent, state_dir)?;
     if master_confined(env, agent) {
         let (confine, policy) = pi_master_confinement(env, state_dir);
+        let policy = crate::home::validate_policy_for_env(policy, env)?;
         let argv = crate::master::confine_argv(&confine, &policy, &command);
         return Ok((argv, Some(policy)));
+    }
+    if crate::master::is_master(&agent.alias) && env.workspace().is_some() {
+        return Err(Error::rejected(
+            "cannot isolate operational upload workspace without effective Master confinement",
+        ));
     }
     if !worker_confined(agent) {
         return Ok((command, None));

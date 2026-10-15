@@ -57,6 +57,15 @@ CREATE UNIQUE INDEX IF NOT EXISTS chat_files_sha_scope
     ON chat_files(sha256, scope, context_id);
 ";
 
+/// The account registry introduced in schema v38, separate from the shipped v37 DDL.
+pub(crate) const ACCOUNT_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS chat_upload_accounts(
+    id TEXT PRIMARY KEY,
+    principal_hash TEXT NOT NULL UNIQUE,
+    authority TEXT NOT NULL,
+    created REAL NOT NULL);
+";
+
 /// Custody leaf under `<workspace>/.cadence/`: `chat-files/`.
 pub const CHAT_FILES_DIR: &str = "chat-files";
 
@@ -82,6 +91,12 @@ pub struct ChatFile {
     pub scope: String,
     pub context_id: String,
     pub uploader: String,
+    /// New-format authenticated owner; `None` on immutable legacy rows.
+    pub user_id: Option<String>,
+    /// Verified native conversation id; `None` on legacy rows.
+    pub thread_id: Option<String>,
+    /// Custody layout version; `None` selects the checked legacy roots only.
+    pub location_version: Option<i64>,
     pub created: f64,
 }
 
@@ -136,6 +151,22 @@ impl ChatFile {
     /// Refuse unless this is a genuine Home row — the legacy rows and
     /// every operator upload that named no app. App data is never
     /// relabeled Home, and a Home row never carries a context.
+    /// New-format ownership must match both the authenticated account and
+    /// the exact verified native conversation. Legacy rows never match.
+    pub fn operational_scope_matches(&self, user_id: &str, thread_id: &str) -> Result<()> {
+        if self.user_id.as_deref() != Some(user_id)
+            || self.thread_id.as_deref() != Some(thread_id)
+            || self.location_version != Some(1)
+            || !valid_upload_account_id(user_id)
+            || !valid_native_thread_id(thread_id)
+        {
+            return Err(Error::rejected(
+                "attachment is not bound to this authenticated account and conversation",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn home_scope(&self) -> Result<()> {
         if self.scope != CHAT_FILE_SCOPE_HOME || !self.context_id.is_empty() {
             return Err(Error::rejected(format!(
@@ -186,6 +217,9 @@ impl ChatFile {
             "scope": self.scope,
             "context_id": self.context_id,
             "uploader": self.uploader,
+            "user_id": self.user_id,
+            "thread_id": self.thread_id,
+            "location_version": self.location_version,
             "created": self.created,
         })
     }
@@ -232,11 +266,33 @@ impl ChatFile {
 /// roots keeps daemon adapter signatures clear without hiding authority in a flag.
 pub struct ChatFileStorageRoots<'a> {
     pub state_dir: &'a Path,
+    /// Legacy PM-rooted custody used only by compatibility APIs.
+    pub workspace_dir: &'a Path,
+}
+
+/// Explicit versioned custody roots for new writes and checked reads. Legacy
+/// bytes remain rooted at the daemon's PM directory; new bytes are rooted at
+/// the resolved operational workspace.
+pub struct ChatFileOperationalRoots<'a> {
+    pub state_dir: &'a Path,
+    pub legacy_workspace_dir: &'a Path,
     pub workspace_dir: &'a Path,
 }
 
 /// The daemon-minted id grammar — `chf-` + 32 lowercase hex. Checked at
 /// every caller-supplied boundary so a forged id never reaches a path.
+pub fn valid_upload_account_id(id: &str) -> bool {
+    id.len() == 36
+        && id.starts_with("acu-")
+        && id[4..]
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+pub fn valid_native_thread_id(id: &str) -> bool {
+    crate::proto::identifier(id, "conversation ID").is_ok()
+}
+
 pub fn valid_id(id: &str) -> bool {
     id.len() == 36
         && id.starts_with("chf-")
@@ -350,6 +406,73 @@ pub fn text_kind(mime: &str) -> bool {
 }
 
 impl Store {
+    /// Resolve a durable account for a server-verified principal. The principal
+    /// is hashed before storage; display names and caller-supplied labels must
+    /// never be passed here. Concurrent registration converges on one ID.
+    pub fn chat_upload_account(&self, principal_hash: &str, authority: &str) -> Result<String> {
+        if principal_hash.len() != 64
+            || !principal_hash
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || authority.is_empty()
+            || authority.len() > 48
+            || !authority
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b == b'-')
+        {
+            return Err(Error::rejected("upload account principal is malformed"));
+        }
+        self.write_tx(|conn| {
+            conn.execute(
+                "INSERT INTO chat_upload_accounts(id, principal_hash, authority, created) \
+                 VALUES(?,?,?,?) ON CONFLICT(principal_hash) DO NOTHING",
+                params![
+                    format!("acu-{}", uuid::Uuid::new_v4().simple()),
+                    principal_hash,
+                    authority,
+                    now()
+                ],
+            )?;
+            conn.query_row(
+                "SELECT id FROM chat_upload_accounts WHERE principal_hash=?",
+                [principal_hash],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+        })
+    }
+
+    /// Whether a canonical account ID names a durable registered principal.
+    pub fn chat_upload_account_registered(&self, id: &str) -> Result<bool> {
+        if id.len() != 36
+            || !id.starts_with("acu-")
+            || !id[4..]
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Ok(false);
+        }
+        let conn = self.conn();
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM chat_upload_accounts WHERE id=?)",
+            [id],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Look up an account already established by an authenticated native
+    /// operation. Unlike registration this never creates authority.
+    pub fn existing_chat_upload_account(&self, principal_hash: &str) -> Result<Option<String>> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT id FROM chat_upload_accounts WHERE principal_hash=?",
+            [principal_hash],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     /// The staged upload lands as a retained attachment. `tmp` must be
     /// a regular file directly under `<state>/wiki-uploads/` (the
     /// shared staging dir the board writes): the caller's parent is
@@ -466,7 +589,7 @@ impl Store {
                 return Ok(existing);
             }
         }
-        enforce_workspace_quota(self, &root, scope, bytes.len() as u64)?;
+        enforce_workspace_quota(self, &root, roots.workspace_dir, scope, bytes.len() as u64)?;
 
         // Anonymous custody stage: write exactly the checked bytes and
         // re-read them bounded, so what is published is provably what
@@ -502,6 +625,9 @@ impl Store {
                 scope: scope.to_string(),
                 context_id: context_id.to_string(),
                 uploader: uploader.to_string(),
+                user_id: None,
+                thread_id: None,
+                location_version: None,
                 created: now(),
             };
             tx.execute(
@@ -523,6 +649,156 @@ impl Store {
         })
     }
 
+    /// Retain a new original in the operational `users/<id>/threads/<id>/uploads`
+    /// tree. The legacy PM root is used only for the shared quota lock; the
+    /// anonymous custody stage and final hard link are on the destination
+    /// operational filesystem, and ownership is versioned in SQLite.
+    pub fn chat_file_put_for_user(
+        &self,
+        roots: ChatFileOperationalRoots<'_>,
+        tmp: &Path,
+        name: &str,
+        scope: &str,
+        context_id: &str,
+        owner: (&str, &str),
+    ) -> Result<ChatFile> {
+        let (user_id, thread_id) = owner;
+        if !valid_upload_account_id(user_id) || !valid_native_thread_id(thread_id) {
+            return Err(Error::rejected(
+                "chat upload requires a registered account and verified native conversation",
+            ));
+        }
+        let legacy_root = workspace_blob_dir(roots.legacy_workspace_dir, true)?
+            .ok_or_else(|| Error::rejected("legacy quota-lock directory is unavailable"))?;
+        let name = sanitize_name(name)?;
+        let Some(src) = open_upload_source(roots.state_dir, tmp)? else {
+            return Err(Error::rejected("chat upload staging file is missing"));
+        };
+        let meta = src.metadata()?;
+        if !meta.is_file() || meta.len() == 0 || meta.len() > CHAT_FILE_MAX_BYTES {
+            return Err(Error::rejected(
+                "chat upload must be a nonempty regular file within the size cap",
+            ));
+        }
+        let _quota_lock = acquire_workspace_quota_lock(&legacy_root)?;
+        let bytes = read_bounded_file(&src, CHAT_FILE_MAX_BYTES)?;
+        if bytes.len() as u64 != meta.len() {
+            return Err(Error::rejected(
+                "chat upload staging changed while it was read",
+            ));
+        }
+        let sha256 = sha256_hex(&bytes);
+        let mime = check_kind(&name, sniff_head(&bytes))?.to_string();
+        if text_kind(&mime) {
+            let text = std::str::from_utf8(&bytes)
+                .map_err(|e| Error::rejected(format!("chat upload is not UTF-8 text: {e}")))?;
+            crate::secret::guard(&format!("chat-file/{name}"), text)?;
+        }
+        if let Some(existing) =
+            self.chat_file_by_user_sha(&sha256, scope, context_id, user_id, thread_id)?
+        {
+            let actual = read_user_attachment(roots.workspace_dir, &existing)?;
+            self.chat_file_ready_checked_bytes(&existing, actual)?;
+            return Ok(existing);
+        }
+        enforce_workspace_quota(
+            self,
+            &legacy_root,
+            roots.workspace_dir,
+            scope,
+            bytes.len() as u64,
+        )?;
+        let id = format!("chf-{}", uuid::Uuid::new_v4().simple());
+        let users = workspace_users_dir(roots.workspace_dir, true)?
+            .ok_or_else(|| Error::rejected("operational users directory is unavailable"))?;
+        let target = open_user_attachment_dir(&users, user_id, thread_id, &id, true)?
+            .ok_or_else(|| Error::rejected("operational attachment directory is unavailable"))?;
+        // Stage on the destination filesystem: immutable linkat publication
+        // must not depend on the tracker and operational workspace sharing a
+        // device. The legacy root remains only the shared quota lock/census.
+        let stage = write_stage_at(&target, &bytes)?;
+        if stage.read_back(CHAT_FILE_MAX_BYTES)? != bytes {
+            return Err(Error::rejected(
+                "chat upload custody stage changed before publication",
+            ));
+        }
+        publish_attachment_at(&stage, &target, &name)?;
+        self.write_tx(|conn| {
+            if let Some(existing) = Self::chat_file_by_user_sha_in(
+                conn, &sha256, scope, context_id, user_id, thread_id,
+            )? {
+                return Ok(existing);
+            }
+            let file = ChatFile {
+                id,
+                sha256,
+                size: bytes.len() as u64,
+                mime,
+                name,
+                scope: scope.to_string(),
+                context_id: context_id.to_string(),
+                uploader: user_id.to_string(),
+                user_id: Some(user_id.to_string()),
+                thread_id: Some(thread_id.to_string()),
+                location_version: Some(1),
+                created: now(),
+            };
+            conn.execute(
+                "INSERT INTO chat_files(
+                   id,sha256,size,mime,name,scope,context_id,uploader,created,
+                   user_id,thread_id,location_version)
+                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                params![
+                    file.id,
+                    file.sha256,
+                    file.size as i64,
+                    file.mime,
+                    file.name,
+                    file.scope,
+                    file.context_id,
+                    file.uploader,
+                    file.created,
+                    file.user_id,
+                    file.thread_id,
+                    file.location_version,
+                ],
+            )?;
+            Ok(file)
+        })
+    }
+
+    fn chat_file_by_user_sha(
+        &self,
+        sha256: &str,
+        scope: &str,
+        context_id: &str,
+        user_id: &str,
+        thread_id: &str,
+    ) -> Result<Option<ChatFile>> {
+        let conn = self.conn();
+        Self::chat_file_by_user_sha_in(&*conn, sha256, scope, context_id, user_id, thread_id)
+    }
+
+    fn chat_file_by_user_sha_in(
+        tx: &impl super::StoreConn,
+        sha256: &str,
+        scope: &str,
+        context_id: &str,
+        user_id: &str,
+        thread_id: &str,
+    ) -> Result<Option<ChatFile>> {
+        Ok(tx
+            .query_row(
+                "SELECT id,sha256,size,mime,name,scope,context_id,uploader,created,
+                        user_id,thread_id,location_version
+                 FROM chat_files WHERE sha256=? AND scope=? AND context_id=?
+                   AND user_id=? AND thread_id=? AND location_version=1",
+                params![sha256, scope, context_id, user_id, thread_id],
+                row_chat_file,
+            )
+            .optional()?)
+    }
+
     fn chat_file_by_sha_in(
         tx: &impl super::StoreConn,
         sha256: &str,
@@ -531,8 +807,10 @@ impl Store {
     ) -> Result<Option<ChatFile>> {
         Ok(tx
             .query_row(
-                "SELECT id,sha256,size,mime,name,scope,context_id,uploader,created
-                 FROM chat_files WHERE sha256=? AND scope=? AND context_id=?",
+                "SELECT id,sha256,size,mime,name,scope,context_id,uploader,created,
+                        user_id,thread_id,location_version
+                 FROM chat_files WHERE sha256=? AND scope=? AND context_id=?
+                   AND user_id IS NULL AND thread_id IS NULL",
                 params![sha256, scope, context_id],
                 row_chat_file,
             )
@@ -544,7 +822,8 @@ impl Store {
         let conn = self.conn();
         Ok(conn
             .query_row(
-                "SELECT id,sha256,size,mime,name,scope,context_id,uploader,created
+                "SELECT id,sha256,size,mime,name,scope,context_id,uploader,created,
+                        user_id,thread_id,location_version
                  FROM chat_files WHERE id=?",
                 [id],
                 row_chat_file,
@@ -575,6 +854,29 @@ impl Store {
         file: &ChatFile,
     ) -> Result<Value> {
         file.read_projection(read_workspace_blob(workspace_dir, file)?)
+    }
+
+    /// Read versioned custody without crossing between the legacy PM
+    /// root and the operational account tree.
+    pub fn chat_file_read_row_in_roots(
+        &self,
+        legacy_workspace: &Path,
+        workspace: &Path,
+        file: &ChatFile,
+    ) -> Result<Value> {
+        match file.location_version {
+            Some(1) => {
+                validate_operational_row(file)?;
+                file.read_projection(read_user_attachment(workspace, file)?)
+            }
+            None | Some(0) => {
+                validate_legacy_row(file)?;
+                self.chat_file_read_row_in_workspace(legacy_workspace, file)
+            }
+            _ => Err(Error::rejected(
+                "attachment location version is unsupported",
+            )),
+        }
     }
 
     /// Checked readiness for one retained text row against the bytes on
@@ -609,6 +911,41 @@ impl Store {
         }
         let bytes = read_workspace_blob(workspace_dir, file)?;
         self.chat_file_ready_checked_bytes(file, bytes)
+    }
+
+    pub fn chat_file_ready_checked_in_roots(
+        &self,
+        legacy_workspace: &Path,
+        workspace: &Path,
+        file: &ChatFile,
+        cap: u64,
+    ) -> Result<Vec<u8>> {
+        let cap = cap.min(CHAT_FILE_MAX_BYTES);
+        if !text_kind(&file.mime) {
+            return Err(Error::rejected(format!(
+                "attachment '{}' is not a ready text source — only txt, md and csv rows can be referenced",
+                file.id
+            )));
+        }
+        if file.size > cap {
+            return Err(Error::rejected(format!(
+                "attachment '{}' is {} bytes — over the {cap}-byte read cap",
+                file.id, file.size
+            )));
+        }
+        match file.location_version {
+            Some(1) => {
+                validate_operational_row(file)?;
+                self.chat_file_ready_checked_bytes(file, read_user_attachment(workspace, file)?)
+            }
+            None | Some(0) => {
+                validate_legacy_row(file)?;
+                self.chat_file_ready_checked_in_workspace(legacy_workspace, file, cap)
+            }
+            _ => Err(Error::rejected(
+                "attachment location version is unsupported",
+            )),
+        }
     }
 
     fn chat_file_ready_checked_bytes(&self, file: &ChatFile, bytes: Vec<u8>) -> Result<Vec<u8>> {
@@ -656,6 +993,9 @@ fn row_chat_file(r: &rusqlite::Row<'_>) -> rusqlite::Result<ChatFile> {
         context_id: r.get(6)?,
         uploader: r.get(7)?,
         created: r.get(8)?,
+        user_id: r.get(9)?,
+        thread_id: r.get(10)?,
+        location_version: r.get(11)?,
     })
 }
 
@@ -690,6 +1030,38 @@ fn validated_digest(sha256: &str) -> Result<&str> {
 /// Open the workspace custody and read the row's blob, digest-verified.
 /// A genuinely absent custody directory or blob refuses (the retained
 /// bytes are missing); an aliased, non-regular or corrupt entry refuses.
+fn validate_operational_row(file: &ChatFile) -> Result<()> {
+    let user_id = file.user_id.as_deref().unwrap_or_default();
+    let thread_id = file.thread_id.as_deref().unwrap_or_default();
+    if !valid_upload_account_id(user_id)
+        || !valid_native_thread_id(thread_id)
+        || !valid_id(&file.id)
+    {
+        return Err(Error::rejected(
+            "new-format attachment has malformed account, conversation or attachment ownership",
+        ));
+    }
+    match ChatFile::parse_scope(&file.scope)? {
+        None => file.home_scope()?,
+        Some((_, conversation)) if conversation == thread_id => {}
+        Some(_) => {
+            return Err(Error::rejected(
+                "new-format app attachment location does not match its conversation scope",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_legacy_row(file: &ChatFile) -> Result<()> {
+    if file.user_id.is_some() || file.thread_id.is_some() {
+        return Err(Error::rejected(
+            "legacy attachment unexpectedly carries new-format ownership metadata",
+        ));
+    }
+    Ok(())
+}
+
 fn read_workspace_blob(workspace_dir: &Path, file: &ChatFile) -> Result<Vec<u8>> {
     let digest = validated_digest(&file.sha256)?;
     let root = workspace_blob_dir(workspace_dir, false)?;
@@ -828,6 +1200,328 @@ fn workspace_blob_dir(workspace: &Path, create: bool) -> Result<Option<PinnedBlo
             "descriptor-pinned workspace custody is unsupported on this platform",
         ))
     }
+}
+
+/// Open/create the operational users tree beneath the authoritative
+/// workspace. Components are descriptor-walked without following symlinks;
+/// the first-use ignore rule prevents user originals becoming tracked files.
+fn workspace_users_dir(workspace: &Path, create: bool) -> Result<Option<PinnedBlobDir>> {
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
+        if !workspace.is_absolute() {
+            return Err(Error::rejected("operational workspace must be absolute"));
+        }
+        let root_fd = unsafe {
+            libc::open(
+                c"/".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if root_fd < 0 {
+            return Err(Error::rejected(
+                "cannot open filesystem root for operational workspace",
+            ));
+        }
+        let mut current = unsafe { OwnedFd::from_raw_fd(root_fd) };
+        for component in workspace.components() {
+            let part = match component {
+                std::path::Component::RootDir => continue,
+                std::path::Component::Normal(part) => part,
+                _ => return Err(Error::rejected("operational workspace is not normalized")),
+            };
+            let mut parent_stat: libc::stat = unsafe { std::mem::zeroed() };
+            let daemon_uid = unsafe { libc::geteuid() };
+            if unsafe { libc::fstat(current.as_raw_fd(), &mut parent_stat) } != 0
+                || (parent_stat.st_uid != 0 && parent_stat.st_uid != daemon_uid)
+                || (parent_stat.st_mode & 0o022 != 0 && parent_stat.st_mode & libc::S_ISVTX == 0)
+            {
+                return Err(Error::rejected(
+                    "operational workspace parent has unsafe ownership or writable mode",
+                ));
+            }
+            let name = CString::new(part.as_bytes())
+                .map_err(|_| Error::rejected("operational workspace path is invalid"))?;
+            let mut fd = unsafe {
+                libc::openat(
+                    current.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
+                if !create {
+                    return Ok(None);
+                }
+                if unsafe { libc::mkdirat(current.as_raw_fd(), name.as_ptr(), 0o700) } != 0
+                    && std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST)
+                {
+                    return Err(Error::rejected("cannot create operational workspace root"));
+                }
+                fd = unsafe {
+                    libc::openat(
+                        current.as_raw_fd(),
+                        name.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+            }
+            if fd < 0 {
+                return Err(Error::rejected(
+                    "operational workspace is aliased or unavailable",
+                ));
+            }
+            current = unsafe { OwnedFd::from_raw_fd(fd) };
+        }
+        let mut workspace_stat: libc::stat = unsafe { std::mem::zeroed() };
+        let daemon_uid = unsafe { libc::geteuid() };
+        if unsafe { libc::fstat(current.as_raw_fd(), &mut workspace_stat) } != 0
+            || workspace_stat.st_uid != daemon_uid
+            || workspace_stat.st_mode & 0o022 != 0
+        {
+            return Err(Error::rejected(
+                "operational workspace must be daemon-owned and not group/other writable",
+            ));
+        }
+        let name = c"users";
+        let mut fd = unsafe {
+            libc::openat(
+                current.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
+            if !create {
+                return Ok(None);
+            }
+            if unsafe { libc::mkdirat(current.as_raw_fd(), name.as_ptr(), 0o700) } != 0
+                && std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST)
+            {
+                return Err(Error::rejected("cannot create operational users directory"));
+            }
+            fd = unsafe {
+                libc::openat(
+                    current.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+        }
+        if fd < 0 {
+            return Err(Error::rejected(
+                "operational users directory is aliased or unavailable",
+            ));
+        }
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut stat) } != 0
+            || stat.st_uid != unsafe { libc::geteuid() }
+            || stat.st_mode & 0o077 != 0
+        {
+            unsafe { libc::close(fd) };
+            return Err(Error::rejected(
+                "operational users directory must be daemon-owned and private",
+            ));
+        }
+        let users = unsafe { OwnedFd::from_raw_fd(fd) };
+        if create {
+            ensure_custody_gitignore(users.as_raw_fd())?;
+        }
+        Ok(Some(PinnedBlobDir { fd: users }))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (workspace, create);
+        Err(Error::rejected(
+            "descriptor-pinned operational custody is unsupported on this platform",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn open_user_attachment_dir(
+    users: &PinnedBlobDir,
+    user_id: &str,
+    thread_id: &str,
+    attachment_id: &str,
+    create: bool,
+) -> Result<Option<PinnedBlobDir>> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    if !valid_upload_account_id(user_id)
+        || !valid_native_thread_id(thread_id)
+        || !valid_id(attachment_id)
+    {
+        return Err(Error::rejected(
+            "stored upload location fields are malformed",
+        ));
+    }
+    let components = [user_id, "threads", thread_id, "uploads", attachment_id];
+    let duplicate = unsafe { libc::fcntl(users.fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+    if duplicate < 0 {
+        return Err(Error::rejected(
+            "cannot duplicate operational users directory",
+        ));
+    }
+    let mut current = unsafe { OwnedFd::from_raw_fd(duplicate) };
+    for part in components {
+        let name = std::ffi::CString::new(part)
+            .map_err(|_| Error::rejected("stored upload path is malformed"))?;
+        let mut fd = unsafe {
+            libc::openat(
+                current.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
+            if !create {
+                return Ok(None);
+            }
+            if unsafe { libc::mkdirat(current.as_raw_fd(), name.as_ptr(), 0o700) } != 0
+                && std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST)
+            {
+                return Err(Error::rejected("cannot create private upload directory"));
+            }
+            fd = unsafe {
+                libc::openat(
+                    current.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+        }
+        if fd < 0 {
+            return Err(Error::rejected(
+                "private upload path is aliased or unavailable",
+            ));
+        }
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut stat) } != 0
+            || stat.st_uid != unsafe { libc::geteuid() }
+            || stat.st_mode & 0o077 != 0
+        {
+            unsafe { libc::close(fd) };
+            return Err(Error::rejected(
+                "private upload path has unsafe ownership or mode",
+            ));
+        }
+        current = unsafe { OwnedFd::from_raw_fd(fd) };
+    }
+    Ok(Some(PinnedBlobDir { fd: current }))
+}
+
+#[cfg(not(unix))]
+fn open_user_attachment_dir(
+    _users: &PinnedBlobDir,
+    _user_id: &str,
+    _thread_id: &str,
+    _attachment_id: &str,
+    _create: bool,
+) -> Result<Option<PinnedBlobDir>> {
+    Err(Error::rejected(
+        "descriptor-pinned upload custody is unsupported",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn publish_attachment_at(stage: &PinnedStage, target: &PinnedBlobDir, name: &str) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    if sanitize_name(name)? != name {
+        return Err(Error::rejected("host-validated upload filename changed"));
+    }
+    let name = std::ffi::CString::new(name)
+        .map_err(|_| Error::rejected("host-validated upload filename is invalid"))?;
+    let mut rc = unsafe {
+        libc::linkat(
+            stage.file.as_raw_fd(),
+            c"".as_ptr(),
+            target.fd.as_raw_fd(),
+            name.as_ptr(),
+            libc::AT_EMPTY_PATH,
+        )
+    };
+    if rc != 0
+        && matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EPERM) | Some(libc::EINVAL)
+        )
+    {
+        let procfd = std::ffi::CString::new(format!("/proc/self/fd/{}", stage.file.as_raw_fd()))
+            .expect("formatted procfd contains no NUL");
+        rc = unsafe {
+            libc::linkat(
+                libc::AT_FDCWD,
+                procfd.as_ptr(),
+                target.fd.as_raw_fd(),
+                name.as_ptr(),
+                libc::AT_SYMLINK_FOLLOW,
+            )
+        };
+    }
+    if rc != 0 {
+        return Err(Error::rejected(format!(
+            "cannot publish immutable upload without replacing an existing file: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn publish_attachment_at(_stage: &PinnedStage, _target: &PinnedBlobDir, _name: &str) -> Result<()> {
+    Err(Error::rejected(
+        "anonymous immutable upload publication is unsupported",
+    ))
+}
+
+#[cfg(unix)]
+fn read_user_attachment(workspace: &Path, file: &ChatFile) -> Result<Vec<u8>> {
+    let user_id = file
+        .user_id
+        .as_deref()
+        .ok_or_else(|| Error::rejected("new-format attachment has no account owner"))?;
+    let thread_id = file
+        .thread_id
+        .as_deref()
+        .ok_or_else(|| Error::rejected("new-format attachment has no conversation binding"))?;
+    let users = workspace_users_dir(workspace, false)?
+        .ok_or_else(|| Error::rejected("operational users directory is missing"))?;
+    let dir = open_user_attachment_dir(&users, user_id, thread_id, &file.id, false)?
+        .ok_or_else(|| Error::rejected("operational attachment directory is missing"))?;
+    if sanitize_name(&file.name)? != file.name {
+        return Err(Error::rejected("stored upload filename is malformed"));
+    }
+    let name = std::ffi::CString::new(file.name.as_str())
+        .map_err(|_| Error::rejected("stored upload filename is malformed"))?;
+    let fd = unsafe {
+        libc::openat(
+            dir.fd.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(Error::rejected(
+            "operational attachment is missing or aliased",
+        ));
+    }
+    let opened = unsafe { std::fs::File::from_raw_fd(fd) };
+    let bytes = read_bounded_file(&opened, CHAT_FILE_MAX_BYTES)?;
+    if bytes.is_empty() || bytes.len() as u64 != file.size || sha256_hex(&bytes) != file.sha256 {
+        return Err(Error::rejected(
+            "operational attachment failed size or digest verification",
+        ));
+    }
+    Ok(bytes)
+}
+
+#[cfg(not(unix))]
+fn read_user_attachment(_workspace: &Path, _file: &ChatFile) -> Result<Vec<u8>> {
+    Err(Error::rejected(
+        "descriptor-pinned upload custody is unsupported",
+    ))
 }
 
 /// The workspace is the tracker's git working tree: keep custody bytes out
@@ -1011,7 +1705,7 @@ fn acquire_workspace_quota_lock(_root: &PinnedBlobDir) -> Result<()> {
 
 #[cfg(unix)]
 struct QuotaFile {
-    name: Vec<u8>,
+    path: Vec<u8>,
     device: libc::dev_t,
     inode: libc::ino_t,
     size: u64,
@@ -1121,13 +1815,134 @@ fn quota_scan_dir(fd: std::os::fd::RawFd) -> Result<Vec<QuotaFile>> {
             ));
         }
         files.push(QuotaFile {
-            name: raw.to_bytes().to_vec(),
+            path: raw.to_bytes().to_vec(),
             device: stat.st_dev,
             inode: stat.st_ino,
             size: stat.st_size as u64,
         });
     }
     Ok(files)
+}
+
+#[cfg(unix)]
+fn quota_scan_user_tree(root: &PinnedBlobDir) -> Result<Vec<QuotaFile>> {
+    use std::os::fd::AsRawFd;
+    fn walk(
+        fd: std::os::fd::RawFd,
+        prefix: &[u8],
+        depth: usize,
+        entries: &mut u64,
+        files: &mut Vec<QuotaFile>,
+    ) -> Result<()> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        if depth > 8 {
+            return Err(Error::rejected(
+                "quota accounting found excessive upload-directory depth",
+            ));
+        }
+        let scan_fd = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+        if scan_fd < 0 {
+            return Err(Error::rejected(
+                "quota accounting could not duplicate a users directory",
+            ));
+        }
+        let dir = unsafe { libc::fdopendir(scan_fd) };
+        if dir.is_null() {
+            unsafe { libc::close(scan_fd) };
+            return Err(Error::rejected(
+                "quota accounting could not enumerate a users directory",
+            ));
+        }
+        let dir = QuotaDir(dir);
+        loop {
+            clear_errno();
+            let entry = unsafe { libc::readdir(dir.0) };
+            if entry.is_null() {
+                if std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .is_some_and(|code| code != 0)
+                {
+                    return Err(Error::rejected(
+                        "quota accounting users scan was incomplete",
+                    ));
+                }
+                break;
+            }
+            let raw = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+            if matches!(raw.to_bytes(), b"." | b"..")
+                || (depth == 0 && raw.to_bytes() == b".gitignore")
+            {
+                continue;
+            }
+            *entries = entries
+                .checked_add(1)
+                .ok_or_else(|| Error::rejected("quota entry count overflow"))?;
+            if *entries > 10_000 {
+                return Err(Error::rejected(
+                    "quota accounting refuses an excessive users tree",
+                ));
+            }
+            let name = raw.to_owned();
+            let child = unsafe {
+                libc::openat(
+                    fd,
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                )
+            };
+            if child < 0 {
+                return Err(Error::rejected(
+                    "quota accounting found an unreadable or aliased upload entry",
+                ));
+            }
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            if unsafe { libc::fstat(child, stat.as_mut_ptr()) } != 0 {
+                unsafe { libc::close(child) };
+                return Err(Error::rejected(
+                    "quota accounting could not inspect an upload entry",
+                ));
+            }
+            let stat = unsafe { stat.assume_init() };
+            match stat.st_mode & libc::S_IFMT {
+                libc::S_IFDIR => {
+                    let mut nested = prefix.to_vec();
+                    nested.push(b'/');
+                    nested.extend_from_slice(raw.to_bytes());
+                    let nested_fd = unsafe { OwnedFd::from_raw_fd(child) };
+                    walk(nested_fd.as_raw_fd(), &nested, depth + 1, entries, files)?;
+                }
+                libc::S_IFREG if stat.st_size >= 0 => {
+                    unsafe { libc::close(child) };
+                    let mut path = prefix.to_vec();
+                    path.push(b'/');
+                    path.extend_from_slice(raw.to_bytes());
+                    files.push(QuotaFile {
+                        path,
+                        device: stat.st_dev,
+                        inode: stat.st_ino,
+                        size: stat.st_size as u64,
+                    });
+                }
+                _ => {
+                    unsafe { libc::close(child) };
+                    return Err(Error::rejected(
+                        "quota accounting refuses non-regular or ambiguous upload entries",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+    let mut files = Vec::new();
+    walk(root.fd.as_raw_fd(), b"users", 0, &mut 0, &mut files)?;
+    Ok(files)
+}
+
+#[cfg(not(unix))]
+fn quota_scan_user_tree(_root: &PinnedBlobDir) -> Result<Vec<QuotaFile>> {
+    Err(Error::rejected(
+        "quota accounting is unsupported on this platform",
+    ))
 }
 
 /// The stable code a quota refusal carries (the board maps it to 413).
@@ -1142,6 +1957,7 @@ fn quota_reached(which: &str) -> Error {
 
 struct QuotaMetadataLedger {
     known_blobs: std::collections::HashSet<(Vec<u8>, u64)>,
+    known_user_paths: std::collections::HashSet<(Vec<u8>, u64)>,
     bucket_bytes: u64,
     bucket_objects: u64,
     metadata_objects: u64,
@@ -1161,11 +1977,13 @@ fn quota_metadata_ledger(store: &Store, scope: &str) -> Result<QuotaMetadataLedg
     };
     let conn = store.conn();
     let mut stmt = conn.prepare(
-        "SELECT id,sha256,size,mime,name,scope,context_id,uploader,created FROM chat_files",
+        "SELECT id,sha256,size,mime,name,scope,context_id,uploader,created,
+                user_id,thread_id,location_version FROM chat_files",
     )?;
     let mut rows = stmt.query([])?;
     let mut ledger = QuotaMetadataLedger {
         known_blobs: std::collections::HashSet::new(),
+        known_user_paths: std::collections::HashSet::new(),
         bucket_bytes: 0,
         bucket_objects: 0,
         metadata_objects: 0,
@@ -1190,9 +2008,36 @@ fn quota_metadata_ledger(store: &Store, scope: &str) -> Result<QuotaMetadataLedg
         if ledger.metadata_objects > INSTANCE_OBJECTS {
             return Err(quota_reached("instance"));
         }
-        ledger
-            .known_blobs
-            .insert((file.sha256.as_bytes().to_vec(), file.size));
+        match (
+            file.location_version,
+            file.user_id.as_deref(),
+            file.thread_id.as_deref(),
+        ) {
+            (None, None, None) => {
+                ledger
+                    .known_blobs
+                    .insert((file.sha256.as_bytes().to_vec(), file.size));
+            }
+            (Some(1), Some(user), Some(thread))
+                if valid_upload_account_id(user)
+                    && valid_native_thread_id(thread)
+                    && valid_id(&file.id)
+                    && sanitize_name(&file.name).ok().as_deref() == Some(file.name.as_str()) =>
+            {
+                let path = format!(
+                    "users/{user}/threads/{thread}/uploads/{}/{}",
+                    file.id, file.name
+                );
+                ledger
+                    .known_user_paths
+                    .insert((path.into_bytes(), file.size));
+            }
+            _ => {
+                return Err(Error::rejected(
+                    "quota accounting found malformed versioned ownership metadata",
+                ));
+            }
+        }
         if same_bucket {
             ledger.bucket_bytes = ledger
                 .bucket_bytes
@@ -1210,6 +2055,7 @@ fn quota_metadata_ledger(store: &Store, scope: &str) -> Result<QuotaMetadataLedg
 fn enforce_workspace_quota(
     store: &Store,
     root: &PinnedBlobDir,
+    workspace_dir: &Path,
     scope: &str,
     new_size: u64,
 ) -> Result<()> {
@@ -1219,16 +2065,24 @@ fn enforce_workspace_quota(
     const BUCKET_OBJECTS: u64 = 250;
     #[cfg(unix)]
     {
-        let observed = quota_scan_dir(root.fd.as_raw_fd())?;
+        let mut observed = quota_scan_dir(root.fd.as_raw_fd())?;
+        if let Some(users) = workspace_users_dir(workspace_dir, false)? {
+            observed.extend(quota_scan_user_tree(&users)?);
+        }
         let ledger = quota_metadata_ledger(store, scope)?;
         let known_blobs = ledger.known_blobs;
+        let known_user_paths = ledger.known_user_paths;
         let bucket_bytes = ledger.bucket_bytes;
         let bucket_metadata = ledger.bucket_objects;
         let metadata_objects = ledger.metadata_objects;
         let mut physical =
             std::collections::HashMap::<(libc::dev_t, libc::ino_t), (u64, bool)>::new();
         for file in observed {
-            let known = known_blobs.contains(&(file.name, file.size));
+            let known = if file.path.starts_with(b"users/") {
+                known_user_paths.contains(&(file.path, file.size))
+            } else {
+                known_blobs.contains(&(file.path, file.size))
+            };
             let entry = physical
                 .entry((file.device, file.inode))
                 .or_insert((file.size, false));

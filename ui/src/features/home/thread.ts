@@ -49,11 +49,15 @@ export interface PendingMessage {
    *  resends to this original destination, never the route's current
    *  installation/context. */
   app?: { install_id: string; context_id?: string };
+  /** CAD-1337: selected Home conversation is part of the retry envelope. */
+  conversation?: string;
 }
 
 export interface ThreadState {
   /** False when the master has no thread yet (`thread: null`). */
   exists: boolean;
+  /** Server-issued Home conversation id; absent for legacy/unusable pages. */
+  conversation?: string;
   /** The thread endpoint answered 404: no such agent is registered. */
   missing?: boolean;
   /** Older entries exist on the server than the ones held; null when
@@ -141,8 +145,14 @@ export function mergePage(
   const entries = (page.entries ?? []).map(asEntry).filter((e): e is ThreadEntry => e !== null);
   const merged = mergeEntries(state, entries);
   const found = merged.missing ? { ...merged, missing: false } : merged;
-  if (found.exists || page.thread == null) return found;
-  return { ...found, exists: true };
+  const wireThread = page.thread && typeof page.thread === "object"
+    ? (page.thread as Record<string, unknown>)
+    : null;
+  const conversation =
+    typeof wireThread?.id === "string" && wireThread.id.length > 0 ? wireThread.id : undefined;
+  const exists = found.exists || page.thread != null;
+  if (found.exists === exists && found.conversation === conversation) return found;
+  return { ...found, exists, conversation };
 }
 
 /** Add an optimistic message (or mark a retried one sending again). */
@@ -154,10 +164,11 @@ export function addPending(
   refs?: { kind: string; id: string }[],
   attachments?: { id: string }[],
   app?: { install_id: string; context_id?: string },
+  conversation?: string,
 ): ThreadState {
   const base = state ?? EMPTY_THREAD;
   const rest = base.pending.filter((p) => p.message !== message);
-  return { ...base, pending: [...rest, { message, text, state: "sending", at, refs, attachments, app }] };
+  return { ...base, pending: [...rest, { message, text, state: "sending", at, refs, attachments, app, conversation }] };
 }
 
 /** The POST answered: sent (awaiting its stored entry) or failed. */
