@@ -83,12 +83,12 @@ function fixture() {
     assert.deepEqual(request.args, args);
     return Object.assign(request, { result });
   }
-  function reply(request: RequestInput, status = 200, pauseText = false): HeldText | null {
+  function reply(request: RequestInput, status = 200, pauseText = false, responseRaw?: unknown): HeldText | null {
     assert.equal(request.answered, false, 'Every controlled response is completed once');
     request.answered = true;
-    const raw = status === 200
+    const raw = responseRaw === undefined ? (status === 200
       ? { preview_id: request.args.preview_id, host_command: { operation: request.operation, args: request.args } }
-      : { code: 'preview_fixture_refused' };
+      : { code: 'preview_fixture_refused' }) : responseRaw;
     const response = new Response(JSON.stringify(raw), { status, headers: { 'Content-Type': 'application/json' } });
     if (pauseText) {
       const body = deferred<string>(), entered = deferred<void>();
@@ -225,6 +225,27 @@ for (const boundary of ['retire', 'not-current']) {
     }
   }
 }
+
+check('late-old-malformed-envelope-after-new-success', async f => {
+  await f.initial();
+  const old = f.start(SHOW, showArgs(idA, 'old-malformed-pending'));
+  const newer = f.start(SHOW, showArgs(idA, 'newest-valid-success'));
+  await f.success(newer);
+  assert.equal(f.commands.length, 2, 'Positive control: initial and newer valid shows each deliver once');
+  assert.deepEqual(f.display, newer.args, 'Positive control: newer same-ID display is visible');
+  f.reply(old, 200, false, {
+    preview_id: idA,
+    host_command: { operation: SHOW, args: old.args, forged: true },
+  });
+  const result = await old.result;
+  assert.equal(result.ok, false, 'Stale 200 reply must still pass closed host-command envelope validation');
+  if (result.ok) throw new Error('Malformed stale envelope unexpectedly claimed success');
+  assert.equal(result.refusal.code, 'failed', 'Malformed stale envelope is a failed reply, not authorization retirement');
+  assert.equal(f.commands.length, 2, 'Malformed stale reply must emit no show or cleanup command');
+  assert.equal(f.refused, 0, 'Malformed stale reply must emit no refused callback');
+  assert.equal(f.requests.length, 3, 'Malformed stale reply must cause no extra fetch/RPC');
+  assert.deepEqual(f.display, newer.args, 'Malformed stale reply must leave the newer same-ID display unchanged');
+});
 
 export async function runScreenPreviewRefusalCheck() {
   const processLike = (globalThis as unknown as { process?: { argv: string[]; exitCode?: number } }).process;
