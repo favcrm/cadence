@@ -9,7 +9,7 @@ import { parseDraftImageRef, type ScreenPush } from "./screenProtocol";
 import { workspaceApps } from "../workspaceApps";
 import { useTranslate } from "../../../lib/locale";
 import { downscaleToDataUrl } from "./screenAssets";
-import { useHref } from "../../../lib/useLocation";
+import { registerNavigationGuard, useHref } from "../../../lib/useLocation";
 import { recordServices, object, exact, type HostCommand } from "./screenServices";
 import { admitDisplaySession, purgeDisplayCache, withReadObservations } from "./screenDisplayCache";
 import InertPreviewLayer, { type InertPreview } from "./InertPreviewLayer";
@@ -67,6 +67,17 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions,
     let actionToken: string | null = null;
     let services: ReturnType<typeof recordServices> | null = null;
     const isCurrent = () => !retired && !controller.signal.aborted && !session.signal.aborted && privateReadsAllowed() && generation === privateSessionGeneration() && JSON.stringify([latest.current.install_id, latest.current.digest, latest.current.tag, latest.current.context_id]) === scope;
+    let releaseLeaveGuard: (() => void) | null = null;
+    const warnBeforeUnload = (event: BeforeUnloadEvent) => {
+      if (!releaseLeaveGuard || !isCurrent() || owned !== channel.current) return;
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    const clearLeaveGuard = () => {
+      releaseLeaveGuard?.();
+      releaseLeaveGuard = null;
+      window.removeEventListener("beforeunload", warnBeforeUnload);
+    };
     const command = (c: HostCommand) => {
       if (!isCurrent() || !mounted.current) return;
       if (c.operation === "screen.route.patch") {
@@ -89,7 +100,7 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions,
     };
     setState("loading");
     setSlot(null); setLink(null); setPreview(null); setRemoteImages([]);
-    const fail = () => { if (isCurrent()) { services?.retire(); mounted.current = null; navigationCallbacks.current.onNavigation?.(null); setPreview(null); setSlot(null); setState("fallback"); } };
+    const fail = () => { clearLeaveGuard(); if (isCurrent()) { services?.retire(); mounted.current = null; navigationCallbacks.current.onNavigation?.(null); setPreview(null); setSlot(null); setState("fallback"); } };
     const onMessage = (event: MessageEvent) => owned?.receive(event);
     window.addEventListener("message", onMessage);
     void (async () => {
@@ -127,7 +138,7 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions,
         // appends this token on the invoke relay.
         actionToken = receipt.action_token ?? null;
         owned = new ScreenChannel(frame.contentWindow, receipt, decorate(latest.current, receipt),
-          () => frame.remove(), fail, () => { if (isCurrent()) { clearTimeout(timer); setState("ready"); navigationCallbacks.current.onNavigation?.(receipt.navigation ?? null); } },
+          () => { clearLeaveGuard(); frame.remove(); }, fail, () => { if (isCurrent()) { clearTimeout(timer); setState("ready"); navigationCallbacks.current.onNavigation?.(receipt.navigation ?? null); } },
           async ref => {
             const draft=parseDraftImageRef(ref);
             if(draft&&actionToken){
@@ -145,7 +156,14 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions,
             onLink: url => { if (isCurrent()) setLink(url); },
             ...(actionToken ? { invoke: (alias: string, input: Record<string, unknown>, requestId: string, scope?:import("./screenProtocol").GenerationScope) =>
               invokeTool(actionToken!, alias, input, requestId, scope) } : {}),
-          } : undefined);
+          } : undefined, undefined, unsaved => {
+            if (!isCurrent() || mounted.current !== receipt || channel.current !== owned) return;
+            clearLeaveGuard();
+            if (!unsaved) return;
+            releaseLeaveGuard = registerNavigationGuard(() => !isCurrent() || channel.current !== owned ||
+              window.confirm("Your email draft has not been saved. Leave this page and discard those local edits?"));
+            window.addEventListener("beforeunload", warnBeforeUnload);
+          });
         channel.current = owned;
         frame.addEventListener("load", () => owned?.load());
         timer = setTimeout(() => { owned?.close(true); }, 10000);
@@ -159,6 +177,7 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions,
       retired = true;
       unsubscribe();
       session.dispose();
+      clearLeaveGuard();
       services?.retire();
       mounted.current = null;
       navigationCallbacks.current.onNavigation?.(null);

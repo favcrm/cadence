@@ -133,6 +133,8 @@ export abstract class FrameChannel {
   protected slot(_request: SlotRequest): void { this.close(true); }
   protected tool(_request: ToolRequest): void { this.close(true); }
   protected recordsRights(): readonly string[] | undefined { return undefined; }
+  /** Opaque state is ignored unless this frame kind explicitly understands it. */
+  protected state(_data: string): void {}
   receive(event: Pick<MessageEvent, "origin" | "source" | "data" | "ports">): void {
     if (this.closed || event.source !== this.source) return;
     if (event.origin !== "null") {
@@ -165,7 +167,8 @@ export abstract class FrameChannel {
         else if (child.op === "slot") this.slot(child);
         else this.tool(child);
       }
-      // Opaque local draft state is deliberately not persisted in the first release.
+      if (child.op === "state") this.state(child.data);
+      // No local draft content is persisted.
     };
     this.port.onmessageerror = () => this.close(true);
     this.port.start();
@@ -196,10 +199,27 @@ export class ScreenChannel extends FrameChannel {
   constructor(source: Window, receipt: MountReceipt, private projection: ScreenPush,
     removeFrame: () => void, failed: () => void, onReady: () => void,
     private loadAsset: AssetLoader = async () => null, private actions?: ScreenActions,
-    private clock?: () => number) {
+    private clock?: () => number, private onUnsaved?: (unsaved: boolean) => void) {
     super(source, receipt, removeFrame, failed, onReady);
   }
   private records = false;
+  protected state(data: string): void {
+    const nav = this.receipt.navigation;
+    if (!this.ready || this.closed || !this.records || this.receipt.tag !== "crm" ||
+        this.projection.installation.name !== "crm" || nav?.section_query !== "crm" ||
+        !nav.sections.some(s => s.id === "campaigns") || data.length > 128 ||
+        new TextEncoder().encode(data).byteLength > 128) return;
+    // This closed boolean is a warning hint, never navigation/effect authority.
+    // Unknown or malformed opaque state must not clear an existing warning.
+    try {
+      const value: unknown = JSON.parse(data);
+      if (!value || typeof value !== "object" || Array.isArray(value)) return;
+      const state = value as Record<string, unknown>;
+      if (Object.keys(state).sort().join() !== "contract,unsaved" ||
+          state.contract !== "crm-leave.v1" || typeof state.unsaved !== "boolean") return;
+      this.onUnsaved?.(state.unsaved);
+    } catch { /* Ignore other opaque state, without changing the warning. */ }
+  }
   private csvBusy = false;
   private csvSlot: string | null = null;
   protected recordsRights(): readonly string[] | undefined { return this.records ? this.receipt.operations ?? [] : undefined; }
