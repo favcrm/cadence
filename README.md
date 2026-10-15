@@ -130,7 +130,13 @@ For proposals, quotations, reports and letters, give the drafting agent
 It confirms the proposed solution before authoring, then applies one exact
 Cadence template version: guidelines and reference files for an authoring
 pack, or the existing quotation/invoice DOCX, calculation and export path.
-There is no parallel company-profile registry. An authoring pack has no
+There is no parallel company-profile registry. When a deliverable has a
+visual standard, the skill conditionally loads shared document-design
+guidance: inspect an authoring pack's actual references, keep a short style
+guide in that pack's guidelines, and compare the authored output. A
+quotation or invoice keeps the approved DOCX as its presentation
+standard; a reference pack may inform review only. That guidance
+adds no renderer and no PDF service. An authoring pack has no
 DOCX source, prices or PDF export; the user prints or exports the final PDF.
 `cadence skill install` installs
 the three public guidance skills in separate directories under
