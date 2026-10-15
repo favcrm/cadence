@@ -30,6 +30,8 @@ export interface RecordHost { current(): boolean; command(command: HostCommand):
 export function recordServices(receipt: MountReceipt, domain: string, host: RecordHost) {
   const csv = new Map<string, { token: string; expires: number }>();
   let retired = false;
+  let previewRevision = 0;
+  let latestShow: { id: string; revision: number } | null = null;
   const current = () => !retired && host.current();
   const permitted = (op: string) => current() && receipt.host_contract === "screen-records.v1" && receipt.operations?.includes(op) && receipt.action_token;
   async function post(path: "call" | "slot-prepare" | "slot-confirm", body: ActionArgs): Promise<unknown> {
@@ -53,12 +55,12 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
     if (current() && error instanceof ApiError && [401, 403].includes(error.status)) { retired = true; purgeDisplayCache(); host.refused(); }
     return refusal(error);
   }
-  function deliver(raw: unknown): unknown {
+  function deliver(raw: unknown, executeCommand = true): unknown {
     if (!current()) throw new ApiError("Mount retired", 403);
     if (object(raw) && raw.host_command !== undefined) {
       const c = raw.host_command;
       if (!object(c) || !exact(c, ["operation", "args", "conversation_id"]) || typeof c.operation !== "string" || !object(c.args) || (c.conversation_id !== undefined && c.conversation_id !== null && (typeof c.conversation_id !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(c.conversation_id)))) throw new ApiError("Invalid host command", 502);
-      host.command(c as unknown as HostCommand);
+      if (executeCommand) host.command(c as unknown as HostCommand);
     }
     return sanitized(raw);
   }
@@ -67,13 +69,24 @@ export function recordServices(receipt: MountReceipt, domain: string, host: Reco
     async call(operation: RecordCallVerb, args: ActionArgs): Promise<ActionResult> {
       if (!permitted(operation) || !(RECORD_CALL_VERBS as readonly string[]).includes(operation)) return { ok: false, refusal: { code: "forbidden", text: "This operation is unavailable." } };
       const epoch = displayEpoch(domain);
+      const previewId = (operation === "screen.preview.show" || operation === "screen.preview.clear") && typeof args.preview_id === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(args.preview_id) ? args.preview_id : null;
+      let revision = previewRevision;
+      if (previewId && operation === "screen.preview.show") {
+        revision = ++previewRevision;
+        latestShow = { id: previewId, revision };
+      } else if (previewId && operation === "screen.preview.clear" && latestShow?.id === previewId) latestShow = null;
       try {
         const raw = await post("call", { operation, args });
-        const data = deliver(raw);
+        const stalePreview = !!previewId && ((operation === "screen.preview.show" && (latestShow?.id !== previewId || latestShow.revision !== revision)) || (operation === "screen.preview.clear" && latestShow?.id === previewId && latestShow.revision > revision));
+        const data = deliver(raw, !stalePreview);
         if (WRITES.has(operation)) invalidateDisplay(domain);
         else if (receipt.display_scope_key) observeRead(receipt.display_scope_key, receipt.display_session_key!, domain, operation, args, data, epoch);
         return { ok: true, data };
-      } catch (error) { return { ok: false, refusal: failed(error) }; }
+      } catch (error) {
+        const refusal = failed(error);
+        if (current() && previewId && operation === "screen.preview.show" && latestShow?.id === previewId && latestShow.revision === revision) host.command({ operation: "screen.preview.clear", args: { preview_id: previewId } });
+        return { ok: false, refusal };
+      }
     },
     async planner(operation: RecordSlotVerb, args: ActionArgs): Promise<SlotPlan | ActionRefusal> {
       if (!permitted(operation) || !(RECORD_SLOT_VERBS as readonly string[]).includes(operation)) return { code: "forbidden", text: "This operation is unavailable." };
