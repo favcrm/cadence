@@ -205,7 +205,9 @@ const path = require("path");
 const proc = (globalThis as any).process;
 const cssPath = path.join(proc.cwd(), "src/features/app-shell/app-shell.css");
 assert(fs.existsSync(cssPath), `shipped CSS present at ${cssPath}`);
-const css: string = fs.readFileSync(cssPath, "utf8");
+const foundationPath = path.join(proc.cwd(), "screen-ui/src/foundation.css");
+assert(fs.existsSync(foundationPath), `shared foundation present at ${foundationPath}`);
+const css: string = fs.readFileSync(cssPath, "utf8") + "\n" + fs.readFileSync(foundationPath, "utf8");
 const block = (selector: string): string => {
   const match = css.match(new RegExp(`${selector}\\s*\\{([^}]*)\\}`));
   assert(match, `CSS block exists: ${selector}`);
@@ -226,6 +228,12 @@ assert(/flex-wrap:\s*wrap/.test(block("\\.crm-pager")), "pager wraps at narrow w
 const stylesPath = path.join(proc.cwd(), "src/styles.css");
 assert(fs.existsSync(stylesPath), `shared styles present at ${stylesPath}`);
 const stylesCss: string = fs.readFileSync(stylesPath, "utf8");
+// The foundation must be shipped through the host's SDK base import.
+const basePath = path.join(proc.cwd(), "screen-ui/src/base.css");
+assert(fs.existsSync(basePath), `SDK base present at ${basePath}`);
+const baseCss: string = fs.readFileSync(basePath, "utf8");
+assert(/^@import "\.\.\/screen-ui\/src\/base\.css";$/m.test(stylesCss), "host styles import the SDK base");
+assert(/^@import "\.\/foundation\.css";$/m.test(baseCss), "SDK base imports the shared foundation");
 const stylesBlock = (selector: string): string => {
   const match = stylesCss.match(new RegExp(`${selector}\\s*\\{([^}]*)\\}`));
   assert(match, `CSS block exists: ${selector}`);
