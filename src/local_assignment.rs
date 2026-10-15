@@ -1943,7 +1943,7 @@ impl<H: CoordHttp> Coordinator<H> {
             "enrollment": if lane == "provider.draft" {
                 Some(json!({
                     "caller": "local_operator",
-                    "argv": ["cadence", "--org", "local", "platform", "enroll",
+                    "argv": ["cadence", "--org", "local", "connection", "create",
                         "agenticos_external", "--account", self.org_id,
                         "--scope", "provider.draft", "--token-stdin"],
                     "stdin_file": path.display().to_string(),
