@@ -406,6 +406,15 @@ impl Drop for StopReservation<'_> {
 /// generation, pane pid, native session — one row per live PTY alias.
 type ShutdownFacts = HashMap<String, (String, u32, String)>;
 
+/// CAD-XXXX test seam: the platform membership lookup
+/// `current_public_hash_from` calls when `membership_lookup_for_test` is
+/// set — hash, subject, company, instance in, the fresh role answer or an
+/// outage error out. Never constructed outside `#[cfg(test)]`.
+#[cfg(test)]
+type MembershipLookupForTest = Box<
+    dyn Fn(&str, &str, &str, &str) -> Result<Option<crate::board_identity::Role>> + Send + Sync,
+>;
+
 pub struct Shared {
     pub store: Store,
     /// Broadcast on any queue/event change.
@@ -544,6 +553,13 @@ pub struct Shared {
     /// CAD-1374: the platform membership mode, captured once at startup
     /// from the same `hosted` value the lease was acquired with.
     membership_mode: public_membership::MembershipMode,
+    /// CAD-XXXX: test-only injection for the platform membership lookup —
+    /// when set, `current_public_hash_from` resolves the fresh platform role
+    /// through this closure instead of the private `api.internal` POST, so a
+    /// `#[cfg(test)]` driver can route a synthetic outage or answer through
+    /// the real authority mapping. Production never sets it.
+    #[cfg(test)]
+    membership_lookup_for_test: Option<MembershipLookupForTest>,
     /// CAD-366: where enrolled platform credential bytes live — the
     /// host's keychain when usable, else the daemon-owned `0600`
     /// store under the state dir (ADR 0006 §5.3).
@@ -904,6 +920,8 @@ impl Shared {
                 .unwrap_or_else(|| Arc::new(crate::issue::time::now_epoch)),
             board_jwks: Mutex::new(crate::board_identity::JwksCache::default()),
             membership_mode: membership,
+            #[cfg(test)]
+            membership_lookup_for_test: None,
             platform_custody: crate::platform::Custody::open(state_dir)?,
             platform_custody_lock: Box::leak(Box::new(Mutex::new(()))),
             crm_send_workers: Mutex::new(std::collections::HashSet::new()),

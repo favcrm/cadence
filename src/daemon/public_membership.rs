@@ -55,8 +55,7 @@ pub(crate) enum Authority {
         view: Box<SessionView>,
     },
     /// Not authoritative: unknown, revoked, expired, userless, realm-mismatched,
-    /// the platform answered no membership (and the row was tombstoned), or a
-    /// transient outage. An outage never clears the row.
+    /// or the platform answered no membership (and the row was tombstoned).
     Denied,
 }
 
@@ -228,6 +227,23 @@ impl Shared {
                 view: Box::new(with_effective_role(view, role)),
             });
         };
+        // CAD-XXXX test seam: when a `#[cfg(test)]` driver installed a
+        // synthetic lookup on `Shared`, resolve the fresh platform role
+        // through it so the real mapping below sees the injected outcome
+        // verbatim. Production builds carry no field and always call the
+        // private `api.internal` transport.
+        #[cfg(test)]
+        let fresh = match &self.membership_lookup_for_test {
+            Some(lookup) => lookup(&hash, &user.sub, &ctx.company, &ctx.instance),
+            None => crate::board_membership::lookup_current_membership_by_digest(
+                &hash,
+                &user.sub,
+                &ctx.company,
+                &ctx.instance,
+                &self.board_jwks,
+            ),
+        };
+        #[cfg(not(test))]
         let fresh = crate::board_membership::lookup_current_membership_by_digest(
             &hash,
             &user.sub,
@@ -235,11 +251,9 @@ impl Shared {
             &ctx.instance,
             &self.board_jwks,
         );
-        let fresh = match fresh {
-            Ok(role) => role,
-            // A transient outage is never authority, and never clears the row.
-            Err(_) => return Ok(Authority::Denied),
-        };
+        // A transient outage is unavailable, not evidence that the session
+        // was revoked. Propagate it without granting cached authority.
+        let fresh = fresh?;
         let Some(fresh_role) = fresh else {
             self.revoke_public_authority(&hash, &view, &user.sub, &saved)?;
             return Ok(Authority::Denied);
@@ -316,8 +330,8 @@ impl Shared {
             // A fresh decision that names a member or another identity is a
             // proved absence of the owner binding.
             Authority::Granted { .. } => Err(revoked()),
-            // Denied is ambiguous (outage, or an unproved refusal): authority
-            // is not proven, and it is not asserted as revoked.
+            // Denied is an unproved refusal: authority is not proven, and it
+            // is not asserted as revoked. Lookup outages propagate above.
             Authority::Denied => Err(Error::gate_coded(
                 "human_authority_unavailable",
                 "the approving owner's current board authority cannot be proven; new privileged dispatch is refused",
@@ -408,5 +422,137 @@ impl Shared {
             }
         }
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::daemon::{ServeOptions, Shared};
+    use crate::operator_auth::BoardUser;
+    use std::sync::Arc;
+
+    const COMPANY: &str = "co_outage";
+    const INSTANCE: &str = "inst0001";
+    const ISSUER: &str = "http://127.0.0.1:3999";
+    const HOST: &str = "outage.board.localhost:3111";
+
+    fn realm() -> PublicRealm {
+        PublicRealm {
+            issuer: ISSUER.to_string(),
+            company: COMPANY.to_string(),
+            host: HOST.to_string(),
+        }
+    }
+
+    /// A `Shared` captured in `Native` mode (native markers present, no
+    /// lease), serving `realm()`, with one live bound public session row
+    /// for `sub`/`role`. The closure is installed as the test-only
+    /// membership lookup, so `current_public_session` resolves the fresh
+    /// platform answer through it instead of `api.internal`.
+    fn native_shared(
+        dir: &std::path::Path,
+        sub: &str,
+        role: &str,
+        lookup: impl Fn(&str, &str, &str, &str) -> Result<Option<Role>> + Send + Sync + 'static,
+    ) -> (Arc<Shared>, String) {
+        crate::board_identity::write_config(
+            dir,
+            &crate::board_identity::Config {
+                host: HOST.to_string(),
+                issuer: ISSUER.to_string(),
+                company: COMPANY.to_string(),
+            },
+        )
+        .unwrap();
+        let opts = ServeOptions::default();
+        opts.provider_env
+            .set("CADENCE_PM_DIR", dir.join("no-pm").to_str().unwrap());
+        for (name, value) in [
+            (ENV_COMPANY, COMPANY),
+            (ENV_INSTANCE, INSTANCE),
+            (ENV_BOARD_HOST, HOST),
+            (ENV_BOARD_ISSUER, ISSUER),
+            (ENV_BOARD_COMPANY, COMPANY),
+        ] {
+            opts.provider_env.set(name, value);
+        }
+        let mut shared = Shared::new(dir, &opts).unwrap_or_else(|e| panic!("Shared::new: {e}"));
+        Arc::get_mut(&mut shared)
+            .expect("fresh Shared has one Arc")
+            .membership_lookup_for_test = Some(Box::new(lookup));
+        let opened = shared
+            .operator_auth()
+            .open_public_bound(
+                BoardUser {
+                    sub: sub.to_string(),
+                    email: format!("{sub}@example.test"),
+                    name: sub.to_string(),
+                    role: role.to_string(),
+                    handle: sub.to_string(),
+                },
+                "outage-jti",
+                shared.operator_now() + 60,
+                "outage-test",
+                realm(),
+                shared.operator_now(),
+            )
+            .unwrap()
+            .expect("fresh jti opens a public session");
+        (shared, opened.token)
+    }
+
+    /// CAD-XXXX regression: a native-mode membership lookup outage must NOT
+    /// collapse into `Authority::Denied` — the indistinguishable answer an
+    /// authoritative "no membership" also gives. On `board_session_check`
+    /// `Denied` becomes `{valid:false}` (the board bounces to sign-in, 401),
+    /// while a lookup `Err` must surface as an error (the board's
+    /// `daemon_unavailable` 503). `Ok(None)` — an authenticated absence —
+    /// stays `Denied`; only the outage is distinct.
+    ///
+    /// Driven through the real `current_public_session` →
+    /// `current_public_hash_from` mapping over a real stored session, with
+    /// only the network lookup result injected (test-only seam). RED on the
+    /// deployed build: it maps `Err(_) => Ok(Authority::Denied)`.
+    #[test]
+    fn lookup_outage_is_unavailable_not_authoritative_denied() {
+        let dir = tempfile::tempdir().unwrap();
+        let (shared, token) = native_shared(dir.path(), "outage-user", "member", |_, _, _, _| {
+            Err(Error::invalid(
+                "capability_unavailable",
+                "board membership could not be confirmed",
+            ))
+        });
+        let answered = shared.current_public_session(&token);
+        let error = match answered {
+            Err(error) => error,
+            Ok(_) => panic!(
+                "a membership lookup outage must surface as an unavailable error \
+                 (board answers 503), not collapse into Denied → invalid session"
+            ),
+        };
+        assert_eq!(
+            error.code(),
+            Some("capability_unavailable"),
+            "the outage error must be a capability_unavailable refusal, not \
+             a session rejection: {error}"
+        );
+    }
+
+    /// Control for the outage case: an AUTHENTICATED absence — the platform
+    /// answered, `role: null` — is the real `Denied`, an invalid session
+    /// that must not be mistaken for an outage. The tombstone path writes
+    /// `public_authority_revoked` and revokes the row; both stay exercised.
+    #[test]
+    fn authenticated_absence_is_still_denied_not_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let (shared, token) =
+            native_shared(dir.path(), "gone-user", "member", |_, _, _, _| Ok(None));
+        let answered = shared.current_public_session(&token).unwrap();
+        assert!(
+            matches!(answered, Authority::Denied),
+            "an authenticated absence must stay Denied (invalid session, 401), \
+             never the outage error"
+        );
     }
 }
