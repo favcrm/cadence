@@ -56,6 +56,10 @@ const COMPANY_OUTPUTS: BundledSkill = BundledSkill {
             include_str!("../skills/company-outputs/references/cadence.md"),
         ),
         (
+            "references/document-design.md",
+            include_str!("../skills/company-outputs/references/document-design.md"),
+        ),
+        (
             "SKILL.md",
             include_str!("../skills/company-outputs/SKILL.md"),
         ),
