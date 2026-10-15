@@ -441,6 +441,11 @@ pub(crate) fn start_inner(
                 "board public-only mode cannot change while the UI is running — stop the UI, then start it with the new mode",
             ));
         }
+        if eff.allow_anonymous_reads != recorded.allow_anonymous_reads {
+            return Err(Error::rejected(
+                "anonymous read policy cannot change while the UI is running — stop the UI, then start it with the new policy",
+            ));
+        }
         // CAD-841: device login is deliberately absent from the
         // running-change refuses — the daemon owns the config now, and
         // a `--device-login-*` flag push on an already-running board is
@@ -671,6 +676,7 @@ pub(crate) fn start_inner(
                             "url": format!("http://{host}:{port}"),
                             "tailnet_url": eff.tailscale.as_ref().map(|t| t.url()),
                             "read_only": eff.read_only,
+                            "anonymous_reads": eff.allow_anonymous_reads,
                             "gateway": "http://cadence.localhost:18000",
                             "log": state_dir.join("ui.log"),
                             // CAD-313: board writes need the operator's session.
@@ -814,6 +820,7 @@ pub(crate) fn status(state_dir: &Path) -> Result<i32> {
                 "allow_hosts": opts.allow_hosts,
                 "allow_origins": opts.allow_origins,
                 "read_only": opts.read_only,
+                "allow_anonymous_reads": opts.allow_anonymous_reads,
             },
             "tailnet_url": opts.tailscale.as_ref().map(|t| t.url()),
             // CAD-526: the public sign-in surface, when configured.

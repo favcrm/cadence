@@ -1,11 +1,15 @@
 import { cache } from "../../lib/resources";
+import { privateFetch } from "../../lib/privateSession";
+import { sessionHeaders } from "../../lib/sessionKey";
 import type { SetupReport } from "./checks";
 
 /** The error a refused `/api/setup` (read-only board, tailnet viewer) reads as. */
 export const SETUP_ON_HOST = "setup runs on the host";
 
 async function fetchSetup(fresh: boolean): Promise<SetupReport> {
-  const resp = await fetch(fresh ? "/api/setup?fresh=1" : "/api/setup");
+  const resp = await privateFetch(fresh ? "/api/setup?fresh=1" : "/api/setup", {
+    headers: sessionHeaders(),
+  });
   if (resp.status === 403) throw new Error(SETUP_ON_HOST);
   if (!resp.ok) {
     const body = await resp.json().catch(() => null);

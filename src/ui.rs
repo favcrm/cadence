@@ -2,12 +2,12 @@
 //! (tiny_http, no async runtime — the daemon is plain threads too)
 //! serving the built SPA plus a JSON API on loopback.
 //!
-//! Reads need no auth; operator authority is a session (CAD-313, ADR
-//! 0004): a `cadence ui login` link exchanged for an HttpOnly cookie plus
-//! a page-held `X-Cadence-Session` key, both of which the daemon checks
-//! on every operator write — [`operator`] says exactly who
-//! is trusted as the operator, and no relay, header or missing pane tie
-//! ever is. The rest is containment: loopback bind, no CORS headers, a
+//! Private reads require a live session; unsigned local browsing is an
+//! explicit persisted policy. Operator authority is a session (CAD-313,
+//! ADR 0004): a `cadence ui login` link exchanged for an HttpOnly cookie
+//! plus a tab-held `X-Cadence-Session` key, checked by the daemon.
+//! [`operator`] defines the stronger caller proof used for writes.
+//! The rest is containment: loopback bind, no CORS headers, a
 //! Host allowlist against DNS rebinding, id grammar checked before any
 //! path is touched, and no file reads outside the PM dir or `--dist`.
 //! Writes are I2: POST/PATCH/DELETE routes must pass four cross-site
@@ -131,12 +131,19 @@ pub struct UiFlags {
     /// `https://<name>.ts.net:9450` for a tailnet-shared board.
     #[arg(long = "allow-origin")]
     pub allow_origins: Vec<String>,
-    /// Refuse every write route with 403; the SPA hides edit controls.
+    /// Refuse workspace writes with 403; sign-in remains available.
     #[arg(long, overrides_with = "no_read_only")]
     pub read_only: bool,
     /// Clear a persisted --read-only.
     #[arg(long, overrides_with = "read_only")]
     pub no_read_only: bool,
+    /// Allow unsigned reads on local boards. Writes still require their
+    /// normal session and caller proof; hosted boards never allow this.
+    #[arg(long, overrides_with = "no_allow_anonymous_reads")]
+    pub allow_anonymous_reads: bool,
+    /// Clear a persisted --allow-anonymous-reads.
+    #[arg(long, overrides_with = "allow_anonymous_reads")]
+    pub no_allow_anonymous_reads: bool,
     /// Hosted board: accept protected traffic only on the configured
     /// AgenticOS public Host. `CADENCE_BOARD_PUBLIC_ONLY=1` also enables
     /// this during `cadence setup`; the choice persists in ui.json.
@@ -231,8 +238,8 @@ pub enum UiAction {
     },
     /// Report UI server health and the persisted options.
     Status,
-    /// Print a single-use sign-in link for the board (CAD-313). Board
-    /// writes need the operator's session; this link opens one. Run it
+    /// Print a single-use sign-in link for the board (CAD-313). Private
+    /// reads and operator writes need a session; this link opens one. Run it
     /// from your own shell — agents are refused. The link is valid for
     /// 2 minutes and one browser; the secret it proves never leaves the
     /// state dir.
@@ -320,7 +327,7 @@ pub enum TailscaleAction {
         /// Tailscale https port [default: 9450].
         #[arg(long, default_value_t = 9450)]
         port: u16,
-        /// Make every write route answer 403 — browse-only sharing.
+        /// Refuse workspace writes while retaining sign-in and sign-out.
         #[arg(long)]
         read_only: bool,
     },
@@ -518,6 +525,7 @@ pub struct UiOpts {
     pub allow_hosts: Vec<String>,
     pub allow_origins: Vec<String>,
     pub read_only: bool,
+    pub allow_anonymous_reads: bool,
     pub board_public_only: bool,
     pub tailscale: Option<TailscaleOpts>,
     /// The AgenticOS board-identity configuration (CAD-526).
@@ -538,6 +546,7 @@ pub struct ServeOpts {
     /// Operator `--allow-origin` plus the tailnet https origin.
     pub allow_origins: Vec<String>,
     pub read_only: bool,
+    pub allow_anonymous_reads: bool,
     pub board_public_only: bool,
     /// Tailscale sharing armed: `(dns_name, https_port)` — the trust
     /// rule for `Tailscale-User-*` headers and the `/api/meta` URL.
@@ -796,6 +805,8 @@ pub(crate) fn resolve_opts(flags: &UiFlags, persisted: &UiOpts) -> Result<(UiOpt
         } else {
             flags.read_only || persisted.read_only
         },
+        allow_anonymous_reads: !flags.no_allow_anonymous_reads
+            && (flags.allow_anonymous_reads || persisted.allow_anonymous_reads),
         board_public_only: flags.board_public_only
             || persisted.board_public_only
             || env_public_only,
@@ -808,6 +819,11 @@ pub(crate) fn resolve_opts(flags: &UiFlags, persisted: &UiOpts) -> Result<(UiOpt
     if eff.board_public_only && eff.board.is_none() {
         return Err(Error::rejected(
             "board public-only mode requires a public board identity",
+        ));
+    }
+    if eff.allow_anonymous_reads && (eff.board_public_only || eff.board.is_some()) {
+        return Err(Error::rejected(
+            "anonymous reads are local-only — clear --allow-anonymous-reads before configuring a hosted board",
         ));
     }
     if eff.tailscale.is_some() {
@@ -1091,6 +1107,7 @@ pub(crate) fn serve_opts(eff: &UiOpts) -> Result<ServeOpts> {
         allow_hosts,
         allow_origins,
         read_only: eff.read_only,
+        allow_anonymous_reads: eff.allow_anonymous_reads,
         board_public_only: eff.board_public_only,
         tailnet,
         tailscaled_socket: None,
@@ -1245,6 +1262,56 @@ mod tests {
                 .1
                 .board_public_only
         );
+    }
+
+    #[test]
+    fn anonymous_read_policy_persists_and_explicitly_clears() {
+        let state = tempfile::TempDir::new().unwrap();
+        let flags = UiFlags {
+            allow_anonymous_reads: true,
+            ..Default::default()
+        };
+        let (enabled, serve) = super::resolve_opts(&flags, &UiOpts::default()).unwrap();
+        assert!(serve.allow_anonymous_reads);
+        super::save_opts(state.path(), &enabled).unwrap();
+        let restored = super::load_opts_strict(state.path()).unwrap();
+        assert!(
+            super::resolve_opts(&UiFlags::default(), &restored)
+                .unwrap()
+                .1
+                .allow_anonymous_reads
+        );
+        let (disabled, serve) = super::resolve_opts(
+            &UiFlags {
+                no_allow_anonymous_reads: true,
+                ..Default::default()
+            },
+            &restored,
+        )
+        .unwrap();
+        assert!(!serve.allow_anonymous_reads);
+        super::save_opts(state.path(), &disabled).unwrap();
+        assert!(
+            !super::load_opts_strict(state.path())
+                .unwrap()
+                .allow_anonymous_reads
+        );
+        let mut hosted = restored;
+        hosted.board = Some(super::PublicBoard {
+            host: "acme.board.localhost:3111".to_string(),
+            issuer: "http://api.internal".to_string(),
+            company: "co_1".to_string(),
+            authorize_url: "http://api.internal/v2/board/authorize".to_string(),
+        });
+        assert!(super::resolve_opts(&UiFlags::default(), &hosted).is_err());
+        assert!(super::resolve_opts(
+            &UiFlags {
+                no_allow_anonymous_reads: true,
+                ..Default::default()
+            },
+            &hosted,
+        )
+        .is_ok());
     }
 
     #[test]

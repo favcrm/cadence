@@ -1,5 +1,6 @@
 import { ApiError } from "../../lib/api";
 import { sessionHeaders } from "../../lib/sessionKey";
+import { privateFetch } from "../../lib/privateSession";
 import { assertRecordId, assertScope, type HostScope } from "./hostActions";
 
 /**
@@ -110,7 +111,7 @@ export const audiencePaths = {
 };
 
 async function post<T>(path: string, body: Record<string, unknown>): Promise<T> {
-  const response = await fetch(path, {
+  const response = await privateFetch(path, {
     method: "POST",
     credentials: "same-origin",
     cache: "no-store",
@@ -126,7 +127,7 @@ async function post<T>(path: string, body: Record<string, unknown>): Promise<T> 
 }
 
 async function get<T>(path: string): Promise<T> {
-  const response = await fetch(path, {
+  const response = await privateFetch(path, {
     credentials: "same-origin",
     cache: "no-store",
     headers: { ...sessionHeaders() },

@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { sessionHeaders } from "../../../lib/sessionKey";
+import { onPrivateReadsPaused, privateFetch, privateReadsAllowed, privateSessionGeneration } from "../../../lib/privateSession";
 import { useTranslate } from "../../../lib/locale";
 import { parseMount } from "../../workspace-apps/screen/screenLifecycle";
 import { ChatChannel, type FrameDirective } from "./chatChannel";
@@ -40,7 +41,9 @@ export default function ChatFrame({
   failRef.current = onFail;
   const [state, setState] = useState<"loading" | "ready">("loading");
   useLayoutEffect(() => {
+    const generation = privateSessionGeneration();
     const controller = new AbortController();
+    const unsubscribe = onPrivateReadsPaused(() => controller.abort());
     let retired = false;
     let owned: ChatChannel | null = null;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -52,7 +55,7 @@ export default function ChatFrame({
     window.addEventListener("message", onMessage);
     void (async () => {
       try {
-        const response = await fetch(
+        const response = await privateFetch(
           `/api/app-installations/${encodeURIComponent(installId)}/screens/${encodeURIComponent(tag)}/mount`,
           {
             method: "POST", credentials: "same-origin", cache: "no-store", signal: controller.signal,
@@ -63,7 +66,7 @@ export default function ChatFrame({
         if (!response.ok) throw new Error("Preview mount refused");
         const receipt = parseMount(await response.json(), tag);
         if (!receipt) throw new Error("Invalid preview mount receipt");
-        if (retired || !container.current) return;
+        if (retired || controller.signal.aborted || !privateReadsAllowed() || generation !== privateSessionGeneration() || !container.current) return;
         const frame = document.createElement("iframe");
         frame.title = "App preview";
         frame.setAttribute("sandbox", "allow-scripts");
@@ -78,11 +81,14 @@ export default function ChatFrame({
         frame.addEventListener("load", () => owned?.load());
         timer = setTimeout(() => { owned?.close(true); }, READY_MS);
       } catch {
-        if (!retired) { owned?.close(); container.current?.replaceChildren(); fail(); }
+        if (!retired && !controller.signal.aborted && privateReadsAllowed() && generation === privateSessionGeneration()) {
+          owned?.close(); container.current?.replaceChildren(); fail();
+        }
       }
     })();
     return () => {
       retired = true;
+      unsubscribe();
       controller.abort();
       clearTimeout(timer);
       window.removeEventListener("message", onMessage);

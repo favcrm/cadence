@@ -1,6 +1,7 @@
 import type { LanePayload } from "../features/issues/lane";
 import { ConditionalGet } from "./conditionalGet";
 import { sessionKey, sessionHeaders } from "./sessionKey";
+import { onPrivateReadsPaused, privateFetch, privateReadsAllowed, privateSessionGeneration } from "./privateSession";
 import type {
   AgentDetail,
   AgentsPayload,
@@ -134,19 +135,48 @@ export class ApiError extends Error {
   }
 }
 
-const conditional = new ConditionalGet((input, init) => fetch(input, init), sessionKey);
+const conditional = new ConditionalGet(
+  (input, init) => fetch(input, init),
+  () => `${sessionKey() ?? ""}:${privateSessionGeneration()}`,
+);
+const privateRequests = new Set<AbortController>();
+onPrivateReadsPaused(() => {
+  for (const request of privateRequests) request.abort();
+  privateRequests.clear();
+});
 
 async function get<T>(path: string, signal?: AbortSignal): Promise<T> {
-  const { response: resp, value } = await conditional.get<T>(path, sessionHeaders(), signal);
-  if (!resp.ok && !(resp.status === 304 && value !== undefined)) {
-    const body = await resp.json().catch(() => null);
-    throw new ApiError(
-      body?.error ?? `${resp.status} ${resp.statusText}`,
-      resp.status,
-      body ?? undefined,
-    );
+  const protectedRead = !path.startsWith("/api/meta");
+  if (protectedRead && !privateReadsAllowed()) throw new Error("Session verification required");
+  const generation = privateSessionGeneration();
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  signal?.addEventListener("abort", abort, { once: true });
+  if (signal?.aborted) controller.abort();
+  if (protectedRead) privateRequests.add(controller);
+  try {
+    const { response: resp, value } = await conditional.get<T>(path, sessionHeaders(), controller.signal);
+    if (generation !== privateSessionGeneration() || (protectedRead && !privateReadsAllowed())) {
+      throw new Error("Session changed during request");
+    }
+    if (!resp.ok && !(resp.status === 304 && value !== undefined)) {
+      const body = await resp.json().catch(() => null);
+      if (generation !== privateSessionGeneration()) throw new Error("Session changed during response");
+      const code = body?.code ?? body?.error?.code;
+      if (protectedRead && resp.status === 401 && code === "board_session_required") {
+        window.dispatchEvent(new Event("cadence:session-required"));
+      }
+      throw new ApiError(
+        typeof body?.error === "string" ? body.error : body?.error?.message ?? `${resp.status} ${resp.statusText}`,
+        resp.status,
+        body ? { ...body, code } : undefined,
+      );
+    }
+    return value as T;
+  } finally {
+    privateRequests.delete(controller);
+    signal?.removeEventListener("abort", abort);
   }
-  return value as T;
 }
 
 export interface WriteResp {
@@ -176,7 +206,8 @@ async function write<T extends object | undefined>(
   path: string,
   body?: T,
 ): Promise<WriteResp> {
-  const resp = await fetch(path, {
+  const generation = privateSessionGeneration();
+  const resp = await privateFetch(path, {
     method,
     headers: {
       "Content-Type": "application/json",
@@ -186,6 +217,7 @@ async function write<T extends object | undefined>(
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const parsed = await resp.json().catch(() => null);
+  if (generation !== privateSessionGeneration()) throw new Error("Session changed during response");
   if (!resp.ok) {
     throw new ApiError(
       parsed?.error ?? `${resp.status} ${resp.statusText}`,
@@ -198,7 +230,8 @@ async function write<T extends object | undefined>(
 
 /** A board write that answers its own JSON (not an issue `WriteResp`). */
 async function post<T>(path: string, body: object): Promise<T> {
-  const resp = await fetch(path, {
+  const generation = privateSessionGeneration();
+  const resp = await privateFetch(path, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -208,6 +241,7 @@ async function post<T>(path: string, body: object): Promise<T> {
     body: JSON.stringify(body),
   });
   const parsed = await resp.json().catch(() => null);
+  if (generation !== privateSessionGeneration()) throw new Error("Session changed during response");
   if (!resp.ok) {
     throw new ApiError(
       parsed?.error ?? `${resp.status} ${resp.statusText}`,
@@ -280,36 +314,18 @@ export const api = {
       `/api/issues/${id}/history?limit=${limit}`,
     ),
   file: async (id: string) => {
-    const resp = await fetch(`/api/issues/${id}/file`);
+    const generation = privateSessionGeneration();
+    const resp = await privateFetch(`/api/issues/${id}/file`, { headers: sessionHeaders() });
     if (!resp.ok) throw new ApiError(`${resp.status} ${resp.statusText}`, resp.status);
-    return resp.text();
+    const text = await resp.text();
+    if (generation !== privateSessionGeneration()) throw new Error("Session changed during response");
+    return text;
   },
   agents: () => get<AgentsPayload>("/api/agents"),
   agent: (alias: string) =>
     get<AgentDetail>(`/api/agents/${encodeURIComponent(alias)}`),
   monitorAck: (monitor: string, alert: number) =>
-    fetch(
-      `/api/monitors/${encodeURIComponent(monitor)}/alerts/${alert}/ack`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Cadence-Board": "1",
-      ...sessionHeaders(),
-        },
-        body: "{}",
-      },
-    ).then(async (resp) => {
-      const parsed = await resp.json().catch(() => null);
-      if (!resp.ok) {
-        throw new ApiError(
-          parsed?.error ?? `${resp.status} ${resp.statusText}`,
-          resp.status,
-          parsed ?? undefined,
-        );
-      }
-      return parsed as { ok: boolean; alert: unknown };
-    }),
+    post<{ ok: boolean; alert: unknown }>(`/api/monitors/${encodeURIComponent(monitor)}/alerts/${alert}/ack`, {}),
   memories: (opts: { project?: string; status?: string; type?: string } = {}) => {
     const q = new URLSearchParams();
     if (opts.project) q.set("project", opts.project);
@@ -386,7 +402,8 @@ export const api = {
   ) => write("POST", `/api/issues/${encodeURIComponent(id)}/kickoff`, body),
 
   attach: async (id: string, name: string, data: Blob): Promise<WriteResp> => {
-    const resp = await fetch(
+    const generation = privateSessionGeneration();
+    const resp = await privateFetch(
       `/api/issues/${id}/artifacts?name=${encodeURIComponent(name)}`,
       {
         method: "POST",
@@ -399,6 +416,7 @@ export const api = {
       },
     );
     const parsed = await resp.json().catch(() => null);
+    if (generation !== privateSessionGeneration()) throw new Error("Session changed during response");
     if (!resp.ok) {
       throw new ApiError(
         parsed?.error ?? `${resp.status} ${resp.statusText}`,
@@ -921,22 +939,5 @@ async function writeSettings(body: {
   expected_revision: number;
   config: ModelDefaultsConfig;
 }): Promise<ModelDefaultsSnapshot> {
-  const resp = await fetch("/api/settings/model-defaults", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Cadence-Board": "1",
-      ...sessionHeaders(),
-    },
-    body: JSON.stringify(body),
-  });
-  const parsed = await resp.json().catch(() => null);
-  if (!resp.ok) {
-    throw new ApiError(
-      parsed?.error ?? `${resp.status} ${resp.statusText}`,
-      resp.status,
-      parsed ?? undefined,
-    );
-  }
-  return parsed as ModelDefaultsSnapshot;
+  return post<ModelDefaultsSnapshot>("/api/settings/model-defaults", body);
 }

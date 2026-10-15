@@ -1,7 +1,7 @@
 //! `/api/stream` — server-sent events. One open connection per tab
 //! carries the read model's invalidation frames: `stream_events`
 //! subscribes and writes each frame straight onto the socket until the
-//! client or the watcher drops it.
+//! client, watcher, or live-session validation closes it.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -136,11 +136,19 @@ pub(crate) fn stream_hello(entities: bool) -> String {
     format!("event: hello\ndata: {data}\n\n")
 }
 
-pub(crate) fn stream_events(request: Request, state_dir: &Path, pm_dir: &Path) {
+pub(super) fn stream_events(
+    request: Request,
+    state_dir: &Path,
+    pm_dir: &Path,
+    mut admission: super::operator::ReadAdmission,
+) {
     let entities = request
         .url()
         .split_once('?')
         .is_some_and(|(_, q)| q.split('&').any(|part| part == "entities=1"));
+    if !admission.still_live(state_dir) {
+        return;
+    }
     let mut w = request.into_writer();
     // Join the board's shared watcher before the head goes out: the
     // first subscriber's baseline is taken inside `subscribe`, so the
@@ -171,7 +179,11 @@ pub(crate) fn stream_events(request: Request, state_dir: &Path, pm_dir: &Path) {
     // client would never surface without a write.
     let mut ping_at = Instant::now() + Duration::from_secs(15);
     loop {
-        match rx.recv_timeout(Duration::from_secs(15)) {
+        let next = rx.recv_timeout(admission.wait_timeout());
+        if !admission.still_live(state_dir) {
+            return;
+        }
+        match next {
             Ok(f) if &*f == read_model::HEARTBEAT => {}
             Ok(f) => {
                 if !entities && f.starts_with("event: aggregates\n") {

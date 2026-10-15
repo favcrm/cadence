@@ -1,4 +1,5 @@
-import type { StorageLike } from "../../lib/draft";
+import { sessionStore, type StorageLike } from "../../lib/draft";
+import { onPrivateSessionReset } from "../../lib/privateSession";
 import { WikiError } from "./api";
 
 /**
@@ -17,6 +18,19 @@ export interface WikiDraft {
 }
 
 const DRAFT_PREFIX = "cadence.wiki.draft:";
+
+onPrivateSessionReset(() => {
+  const storage = sessionStore();
+  if (!storage) return;
+  try {
+    for (let index = storage.length - 1; index >= 0; index -= 1) {
+      const key = storage.key(index);
+      if (key?.startsWith(DRAFT_PREFIX)) storage.removeItem(key);
+    }
+  } catch {
+    // Optional storage must not prevent the other private caches from clearing.
+  }
+});
 
 export function draftKey(path: string): string {
   return `${DRAFT_PREFIX}${path}`;

@@ -3,6 +3,7 @@ import { api, ApiError } from "../../lib/api";
 import { cache, resources } from "../../lib/resources";
 import { useQuery } from "../../lib/useResource";
 import type { Resource } from "../../lib/cache";
+import { onPrivateSessionReset, privateReadsAllowed, privateSessionGeneration } from "../../lib/privateSession";
 import type { MasterState, ThreadRef } from "../../lib/types";
 import { EMPTY_THREAD, loadThread, type PageReader, type ThreadEntry, type ThreadState, type PendingMessage } from "../home/thread";
 
@@ -141,6 +142,13 @@ export function createConversation(
   subject?: string,
   options: { shouldSelect?: () => boolean } = {},
 ): Promise<Conversation> {
+  const generation = privateSessionGeneration();
+  const requireCurrentSession = () => {
+    if (generation !== privateSessionGeneration() || !privateReadsAllowed()) {
+      throw new DOMException("The private session changed", "AbortError");
+    }
+  };
+  requireCurrentSession();
   // The full captured creation binding is the identity: install, context
   // and subject. Context is part of it — the daemon proves the scope on
   // create, so two requests for the same subject under different contexts
@@ -151,12 +159,15 @@ export function createConversation(
     const run = api
       .conversationCreate(installId, contextId, subject)
       .then((raw) => {
+        requireCurrentSession();
         const c = parseConversation(raw.conversation);
         if (!c) throw new Error("The assistant did not return a conversation.");
         return c;
       })
       .then(async (c) => {
+        requireCurrentSession();
         await conversationList(installId).refresh();
+        requireCurrentSession();
         return c;
       })
       .finally(() => {
@@ -167,6 +178,7 @@ export function createConversation(
   }
   const epoch = selectionEpoch;
   return request.then((conversation) => {
+    requireCurrentSession();
     if (selectionEpoch === epoch && (options.shouldSelect?.() ?? true)) {
       selectConversation(installId, conversation.id);
     }
@@ -196,8 +208,10 @@ export async function autoSelectCampaignConversation(
   installId: string,
   campaignId: string,
 ): Promise<void> {
+  const generation = privateSessionGeneration();
   const res = conversationList(installId);
   if (res.get().data === null) await res.refresh();
+  if (generation !== privateSessionGeneration() || !privateReadsAllowed()) return;
   const existing = res.get().data?.conversations.find((c) => c.subject === campaignSubject(campaignId));
   if (existing) return selectConversation(installId, existing.id);
   if (res.get().data?.legacy === false) setDraftSubject(installId, campaignSubject(campaignId));
@@ -351,6 +365,26 @@ export function setCollapsed(installId: string, collapsed: boolean) {
   writeKey(`chat-collapsed:${installId}`, collapsed ? "1" : "0");
   notify();
 }
+
+onPrivateSessionReset(() => {
+  inflight.clear();
+  selectionEpoch += 1;
+  selectionActionEpochs.clear();
+  drafts.clear();
+  outbox.clear();
+  memory.clear();
+  try {
+    const storage = globalThis.localStorage;
+    for (let index = storage.length - 1; index >= 0; index -= 1) {
+      const key = storage.key(index);
+      if (key?.startsWith("chat-conv:") || key?.startsWith("chat-collapsed:")) storage.removeItem(key);
+    }
+  } catch {
+    // Storage may be blocked; the private in-memory selection is still gone.
+  }
+  notify();
+  outboxNotify();
+});
 
 /** The conversation to show: the stored pick if it still exists, else General. */
 export function resolveSelected(list: Conversation[], stored: string | null): Conversation | null {

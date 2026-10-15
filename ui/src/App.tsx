@@ -54,11 +54,12 @@ import BuildUpdateNotice from "./ui/BuildUpdateNotice";
 import HeaderSearch from "./ui/HeaderSearch";
 import Setup from "./features/setup/Setup";
 import SetupNudge from "./features/setup/SetupNudge";
-import Login from "./features/auth/Login";
+import AuthBoundary from "./features/auth/AuthBoundary";
 import SignIn from "./features/auth/SignIn";
 import { kickoffBlock as operatorKickoffBlock, writeBlock } from "./features/auth/gate";
 import { WriteGate } from "./features/auth/WriteGate";
-import { sessionHeaders, sessionKey, setSessionKey } from "./lib/sessionKey";
+import { sessionHeaders } from "./lib/sessionKey";
+import { privateFetch, privateReadsAllowed, privateSessionGeneration } from "./lib/privateSession";
 import type { PlatformAccount as PlatformAccountInfo } from "./features/settings/accountDisplay";
 import { buildChanged, serverBuild, subscribeSse, UI_BUILD } from "./lib/sse";
 import { runningRelease } from "./lib/fmt";
@@ -131,7 +132,12 @@ const SCREEN_LABEL: Record<Screen, string> = {
 const overviewOn = (s: Screen) => s === "home" || s === "overview";
 
 export default function App() {
-  const { setSession, t } = useLocale();
+  return <AuthBoundary>{(meta, recheck) => <Workspace meta={meta} recheck={recheck} />}</AuthBoundary>;
+}
+
+/** All private routes, subscriptions and effects live below read admission. */
+function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boolean> }) {
+  const { t } = useLocale();
   // App selection lives in the URL — the route (`/projects/cadence`) plus
   // `?view=list&issue=CAD-16` — so a refresh or pasted link restores it.
   const href = useHref();
@@ -169,9 +175,7 @@ export default function App() {
   const projects = projectsState.data ?? [];
   const agents = agentsState.data;
   const [health, setHealth] = useState<Health | null>(null);
-  const [meta, setMeta] = useState<Meta | null>(null);
   const [updateBanner, setUpdateBanner] = useState<UpdateBanner | null>(null);
-  useEffect(() => setSession(meta), [meta, setSession]);
   // The open drawer's detail, cached per id: reopening a drawer paints
   // the last payload while it revalidates.
   const detailState = useMaybeResource(openId ? resources.issue(openId) : null);
@@ -205,7 +209,7 @@ export default function App() {
       return;
     }
     const abort = new AbortController();
-    fetch("/api/platform-account", { headers: sessionHeaders(), signal: abort.signal })
+    privateFetch("/api/platform-account", { headers: sessionHeaders(), signal: abort.signal })
       .then((resp) => (resp.ok ? (resp.json() as Promise<PlatformAccountInfo>) : null))
       .then((data) => {
         const name = data?.account?.company.name?.trim();
@@ -285,201 +289,30 @@ export default function App() {
     if (overviewWanted) void resources.overview.revalidate();
   }, [overviewWanted]);
 
-  // Full re-read: first load, the refresh button, focus and the poll.
-  // Each resource joins a request already in flight instead of stacking.
-  // The operator proof walks /proc on the server: ask for it once per
-  // page load and keep the answer across the 30 s polls.
-  // The proof belongs to one credential/session and board mode. Switching
-  // accounts must clear it even when both sessions report signed_in=true.
-  // CAD-1193: the meta read itself is bounded — an overlapping 30 s poll
-  // or an aborted fetch joins the in-flight request instead of stacking
-  // a second one, and a timed-out or failed probe is `unknown`, never a
-  // sign-out and never a resolved non-operator.
-  const operatorKnown = useRef(false);
-  const metaIdentity = useRef<string | null>(null);
-  const metaKey = useRef<string | null>(null);
-  const metaRequest = useRef(0);
-  const metaInFlight = useRef<{ scope: string; promise: Promise<Meta | null> } | null>(null);
-  const [credentialGeneration, setCredentialGeneration] = useState(0);
-  // CAD-1193: the two unknowns stay distinct. `meta === null` alone is
-  // "checking"; a completed probe that could not answer — the fetch
-  // failed/aborted, or the server answered `operator: null` /
-  // `signed_in: null` — marks the check `unavailable` so the surfaces
-  // can say access could not be confirmed and offer a bounded retry,
-  // instead of showing "Checking…" forever. Never a sign-out, never a
-  // resolved non-operator, and never authority: only an answered probe
-  // clears it.
-  const [metaUnavailable, setMetaUnavailable] = useState(false);
-  const [recheckFinished, setRecheckFinished] = useState(false);
-
-  useEffect(() => {
-    if (!metaUnavailable) {
-      setRecheckFinished(false);
-      return;
-    }
-    setRecheckFinished(false);
-    const finish = window.setTimeout(() => setRecheckFinished(true), 60_000);
-    return () => window.clearTimeout(finish);
-  }, [metaUnavailable]);
-
-  /** One bounded meta read. The same tab key shares one in-flight
-   *  request; a different key (sign-in/sign-out) starts a fresh probe
-   *  and supersedes the old one's answer. A fetch that aborts or a
-   *  server that cannot answer yields `null` — unknown — which the
-   *  caller turns into an honest unavailable state, never false. */
-  const metaProbe = useCallback((withOperator: boolean, key: string | null): Promise<Meta | null> => {
-    // The credential scopes the cache: a probe under another key must
-    // never answer this one. The operator flag is part of the scope —
-    // a bare poll cannot satisfy a proof request.
-    const scope = `${key ?? ""}${withOperator ? "|operator" : ""}`;
-    const inFlight = metaInFlight.current;
-    if (inFlight && inFlight.scope === scope) return inFlight.promise;
-    const controller = new AbortController();
-    // The server bounds its own dependency reads at ~5 s; the client
-    // bound sits just above so a wedged connection cannot hold the
-    // access state open indefinitely.
-    const timeout = window.setTimeout(() => controller.abort(), 8_000);
-    const promise = api
-      .meta(withOperator, controller.signal)
-      .then((next) => {
-        window.clearTimeout(timeout);
-        if (metaInFlight.current?.promise === promise) metaInFlight.current = null;
-        return next;
-      })
-      .catch(() => {
-        window.clearTimeout(timeout);
-        if (metaInFlight.current?.promise === promise) metaInFlight.current = null;
-        return null;
-      });
-    metaInFlight.current = { scope, promise };
-    return promise;
-  }, []);
-
-  const refresh = useCallback((forceProof = false) => {
-    api.health().then(setHealth).catch(() => setHealth(null));
-    const request = ++metaRequest.current;
-    const sentKey = sessionKey();
-    if (sentKey !== metaKey.current) {
-      metaKey.current = sentKey;
-      metaIdentity.current = null;
-      operatorKnown.current = false;
-      metaInFlight.current = null;
-      setCredentialGeneration((generation) => generation + 1);
-      setMeta(null);
-      // A new credential owns its own check from scratch — the last
-      // key's outcome (including its failure) never follows it.
-      setMetaUnavailable(false);
-    }
-    // An explicit re-probe (the Retry an unavailable check offers)
-    // re-runs the real `?operator=1` proof; it never reuses the bare
-    // poll's in-flight request or its unproven answer. The flag is
-    // strictly `=== true` — event handlers that pass `refresh` a
-    // truthy argument (a click's MouseEvent) stay bare polls.
-    const asked = forceProof === true || !operatorKnown.current;
-    let expectedKey = sentKey;
-    const current = () => request === metaRequest.current && sessionKey() === expectedKey;
-    metaProbe(asked, sentKey).then((next) => {
-      if (!current() || next === null) {
-        if (next === null && current()) {
-          // The probe could not answer — access drops to unknown:
-          // write controls gate while the board re-checks, and the
-          // operator role is re-asked next refresh. The tab key itself
-          // is NOT cleared — only a server-proven `signed_in: false`
-          // below does that.
-          operatorKnown.current = false;
-          setMeta(null);
-          setMetaUnavailable(true);
-        }
-        return;
-      }
-      const identity = JSON.stringify([next.signed_in ?? null, next.session?.id ?? null, next.read_only]);
-      const changed = metaIdentity.current !== null && identity !== metaIdentity.current;
-      metaIdentity.current = identity;
-      // A key the server refused (expired, revoked) is dropped — only
-      // the very key this request carried, and only on a proven
-      // `signed_in: false`, never on a null or a failed probe.
-      if (next.signed_in === false && sentKey) {
-        setSessionKey(null);
-        metaKey.current = null;
-        metaInFlight.current = null;
-        expectedKey = null;
-        setCredentialGeneration((generation) => generation + 1);
-      }
-      if (changed && !asked) {
-        operatorKnown.current = false;
-        // The follow-up proof gets a payload without an `operator`
-        // field, so it cannot confuse a stale value for a new answer.
-        setMeta({ ...next, operator: undefined });
-        setMetaUnavailable(true);
-        metaProbe(true, sentKey).then((fresh) => {
-          if (!current() || fresh === null) return;
-          metaIdentity.current = JSON.stringify([fresh.signed_in ?? null, fresh.session?.id ?? null, fresh.read_only]);
-          operatorKnown.current = typeof fresh.operator === "boolean";
-          setMeta(fresh);
-          setMetaUnavailable(fresh.operator === null || fresh.operator === undefined);
-        });
-        return;
-      }
-      if (typeof next.operator === "boolean") {
-        operatorKnown.current = true;
-        // A proven role — the check answered; unknown is behind us.
-        setMetaUnavailable(false);
-      } else if (next.operator === null && asked) {
-        // The asked proof answered but its dependencies could not —
-        // the completed check is unavailable, not still checking.
-        setMetaUnavailable(true);
-      } else if (!asked) {
-        if (next.signed_in === null) {
-          // The session check itself could not answer — the cached
-          // authority is dropped below and the check reports
-          // unavailable. A recovered session changes the identity and
-          // re-proves through the `changed` path above.
-          setMetaUnavailable(true);
-        } else {
-          // A bare poll never asks the proof, so `operator: null` here
-          // says nothing about the role: the previously proven one is
-          // preserved below and the check stays answered — an
-          // unrequested `null` is not an unavailable verdict.
-          setMetaUnavailable(false);
-        }
-      } else {
-        // An asked probe answered without an `operator` field at all
-        // (a pre-CAD-432 daemon): the proof never ran, so the state is
-        // unavailable rather than a resolved role or a pending check.
-        setMetaUnavailable(true);
-      }
-      // The preserved role rides only an unchanged, session-verified
-      // bare poll: an asked answer, an identity change, or a null
-      // session check drops it to `undefined` rather than guessing.
-      setMeta((prev) => ({
-        ...next,
-        operator: next.operator ?? (!asked && !changed && next.signed_in !== null ? prev?.operator : undefined),
-      }));
+  // Bootstrap is owned by AuthBoundary. A private refresh first verifies
+  // the current session; failed verification pauses this entire Activity.
+  const refresh = useCallback(() => {
+    const generation = privateSessionGeneration();
+    void recheck().then((verified) => {
+      if (!verified || !privateReadsAllowed() || generation !== privateSessionGeneration()) return;
+      api.health().then(setHealth).catch(() => setHealth(null));
+      void resources.projects.refresh();
+      void resources.issues.refresh();
+      void resources.agents.refresh();
+      if (overviewWantedRef.current) void resources.overview.refresh();
+      loadDetail();
     });
-    void resources.projects.refresh();
-    void resources.issues.refresh();
-    void resources.agents.refresh();
-    if (overviewWantedRef.current) void resources.overview.refresh();
-    loadDetail();
-  }, [loadDetail, metaProbe]);
-
-  // The Retry an unavailable access check offers (CAD-1193): a real
-  // re-probe of this credential's metadata — a fresh `?operator=1`
-  // read, never the bare poll the proof was skipped on. The failed
-  // probe's slot is dropped so the same key starts one new bounded
-  // request instead of joining a settled-null promise, and
-  // `operatorKnown` resets so the answer is asked for, not assumed.
-  // Never a reload, never a sign-in, and never a key clear: ownership
-  // rules in `refresh` are unchanged.
-  const retryAccess = useCallback(() => {
-    metaInFlight.current = null;
-    operatorKnown.current = false;
-    refresh(true);
-  }, [refresh]);
+  }, [loadDetail, recheck]);
+  const retryAccess = useCallback(() => { void recheck(); }, [recheck]);
+  const metaUnavailable = meta.operator === null || meta.operator === undefined;
+  const [recheckFinished, setRecheckFinished] = useState(false);
   useEffect(() => {
-    refresh();
-    return () => { metaRequest.current++; };
-  }, [refresh]);
+    setRecheckFinished(false);
+    if (!metaUnavailable) return;
+    const timer = window.setTimeout(() => setRecheckFinished(true), 60_000);
+    return () => window.clearTimeout(timer);
+  }, [metaUnavailable]);
+  useEffect(() => { refresh(); }, [refresh]);
 
   const reconcile = useCallback(() => {
     // A GET begun before subscription can still be in flight. Invalidate
@@ -1009,7 +842,7 @@ export default function App() {
                 health={health}
                 onRefresh={refresh}
               >
-                <SignIn meta={meta} onChange={refresh} access={viewer.access} recheckFinished={recheckFinished} onRetryWorkspace={reload} />
+                <SignIn meta={meta} onChange={refresh} access={viewer.access} onRetryWorkspace={reload} />
               </StatusChips>
             </div>
           </div>
@@ -1136,7 +969,6 @@ export default function App() {
         )}
         {route.screen === "projects" && route.section === "issues" && (
           <Board
-            key={credentialGeneration}
             issues={issuesState}
             onRetry={() => void resources.issues.refresh()}
             projects={projects}
@@ -1283,14 +1115,6 @@ export default function App() {
           <Update viewer={viewer} />
         )}
         {route.screen === "settings" && route.section === "permissions" && <MasterPermissions viewer={{ ...viewer, boardReadOnly, signedIn: meta?.signed_in === true, sessionId: meta?.session?.id ?? null }} />}
-        {screen === "login" && (
-          <Login
-            onSignedIn={() => {
-              refresh();
-              window.setTimeout(() => goRoute({ screen: "home" }), 900);
-            }}
-          />
-        )}
         {screen === "notFound" && (
           <main className="px-4 lg:px-8 pt-10 pb-9">
             <h1 className="text-section font-semibold text-ink-100">{t("Nothing lives here")}</h1>

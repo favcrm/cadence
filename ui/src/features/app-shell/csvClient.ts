@@ -1,5 +1,6 @@
 import { ApiError } from "../../lib/api";
 import { sessionHeaders } from "../../lib/sessionKey";
+import { privateFetch } from "../../lib/privateSession";
 import { assertCleanBody, assertScope, listPath, type HostScope } from "./hostActions";
 
 /**
@@ -199,7 +200,7 @@ export function checkCsvText(csvText: string): void {
 }
 
 async function post<T>(path: string, body: Record<string, unknown>): Promise<T> {
-  const response = await fetch(path, {
+  const response = await privateFetch(path, {
     method: "POST",
     credentials: "same-origin",
     cache: "no-store",

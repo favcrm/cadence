@@ -123,14 +123,14 @@ export default function AccountMenu({
     signingOut.current = true;
     setBusy(true);
     closeSession()
+      .then(() => onChange())
       .catch(() => undefined)
       .finally(() => {
         signingOut.current = false;
         setBusy(false);
-        onChange();
       });
   };
-  // A read-only board shows nothing that writes: the logout route skips the read-only guard.
+  // Read-only blocks workspace writes, not ending your own session.
   const canWrite = !meta.read_only;
   const avatar = trigger === "avatar";
   const role = user?.role || "operator";
@@ -240,9 +240,9 @@ export default function AccountMenu({
               {t("Settings")}
             </Link>
           )}
-          {canWrite && (<button type="button" disabled={busy} onClick={signOut} className="block w-full rounded px-2 py-1.5 text-left text-label text-ink-200 hover:bg-ink-800 disabled:opacity-60">
+          <button type="button" disabled={busy} onClick={signOut} className="block w-full rounded px-2 py-1.5 text-left text-label text-ink-200 hover:bg-ink-800 disabled:opacity-60">
             {t("Sign out")}
-          </button>)}
+          </button>
           {footer}
         </div>
       )}

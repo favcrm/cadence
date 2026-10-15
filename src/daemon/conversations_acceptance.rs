@@ -1250,12 +1250,13 @@ fn i1_board_http_refuses_agents_on_every_conversation_route_like_the_rpc() {
     ];
     for (method, path, body) in &routes {
         let (status, reply) = board.call(agent, method, path, body.clone());
-        assert_eq!(status, 403, "{method} {path}: {reply}");
-        assert_eq!(
-            reply["check"],
-            json!("operator_only"),
-            "{method} {path}: {reply}"
-        );
+        if *method == "GET" {
+            assert_eq!(status, 401, "{method} {path}: {reply}");
+            assert_eq!(reply["code"], "operator_session_required", "{reply}");
+        } else {
+            assert_eq!(status, 403, "{method} {path}: {reply}");
+            assert_eq!(reply["check"], "operator_only", "{reply}");
+        }
     }
     assert_eq!(
         (
@@ -1299,12 +1300,13 @@ fn i1_board_http_refuses_agents_on_every_conversation_route_like_the_rpc() {
             &format!("/api/threads/master/conversations?install={crm}"),
             None,
         );
-        assert_eq!(status, 404, "{who}: {reply}");
-        assert_eq!(
-            reply["error"],
-            json!("no such thread route"),
-            "{who}: {reply}"
-        );
+        if who == agent {
+            assert_eq!(status, 401, "{who}: {reply}");
+            assert_eq!(reply["code"], "operator_session_required", "{reply}");
+        } else {
+            assert_eq!(status, 404, "{who}: {reply}");
+            assert_eq!(reply["error"], "no such thread route", "{reply}");
+        }
     }
 }
 
@@ -1644,8 +1646,11 @@ fn chat_descriptor_board_route_refuses_agents_and_404s_every_missing_case() {
     let forged = "/api/app-installations/no-such-install/chat-descriptor";
     for path in [crm_path.as_str(), forged] {
         let (status, reply) = board.call("agent:w1", "GET", path, None);
-        assert_eq!(status, 403, "{path}: {reply}");
-        assert_eq!(reply["check"], json!("operator_only"), "{path}: {reply}");
+        assert_eq!(status, 401, "{path}: {reply}");
+        assert_eq!(
+            reply["code"], "operator_session_required",
+            "{path}: {reply}"
+        );
     }
     let (status, reply) = board.call("operator", "GET", &crm_path, None);
     assert_eq!(status, 200, "{reply}");

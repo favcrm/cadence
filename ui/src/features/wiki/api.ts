@@ -1,4 +1,5 @@
 import { sessionHeaders } from "../../lib/sessionKey";
+import { privateFetch, privateReadsAllowed, privateSessionGeneration } from "../../lib/privateSession";
 import type { WikiVersion } from "./history";
 import type { SearchHit } from "./search";
 import { normalizeListing, normalizePage, normalizeSearch, normalizeHistory } from "./wire";
@@ -146,11 +147,11 @@ export function blobPage(entry: WikiEntry): WikiPage {
 }
 
 function get<T>(url: string): Promise<T> {
-  return fetch(url, { headers: sessionHeaders() }).then(json<T>);
+  return privateFetch(url, { headers: sessionHeaders() }).then(json<T>);
 }
 
 function send<T>(method: "PUT" | "POST", url: string, body: object): Promise<T> {
-  return fetch(url, {
+  return privateFetch(url, {
     method,
     headers: {
       "Content-Type": "application/json",
@@ -170,35 +171,19 @@ export function fileQuery(path: string): string {
 }
 
 /**
- * The file route's query URL for a blob page. It is a plain URL: it carries
- * no session header, so an element that requests it directly is refused by
- * the operator proof. Image previews use `wikiBlob`; video and PDF elements
- * still request this URL, unchanged by CAD-1388.
+ * Blob bytes are fetched with this tab's session header, never by element
+ * URLs. Callers render data: images or local blob: previews/downloads and
+ * must fence their own asynchronous encoding and revoke owned object URLs.
  */
-export function wikiFileUrl(path: string): string {
-  return fileQuery(path);
-}
-
-/**
- * The bytes of a blob page, fetched with the session header. An `<img>`
- * cannot send `X-Cadence-Session`, so image previews load through this and
- * render a data URL instead of `wikiFileUrl`.
- */
-export function wikiBlob(path: string, signal?: AbortSignal): Promise<Blob> {
-  return fetch(wikiFileUrl(path), { headers: sessionHeaders(), signal }).then(async (resp) => {
-    if (!resp.ok) throw wikiErrorFrom(resp.status, await resp.json().catch(() => null));
-    return resp.blob();
-  });
-}
-
-/**
- * The raw bytes of a text page for the Download action: the file route
- * answers JSON by default (CAD-580), and `raw=1` asks for the file
- * itself. A contract question is open on CAD-580; if it settles on
- * another flag this is the one place to change.
- */
-export function wikiRawUrl(path: string): string {
-  return `${fileQuery(path)}&raw=1`;
+export async function wikiBlob(path: string, signal?: AbortSignal): Promise<Blob> {
+  const generation = privateSessionGeneration();
+  const resp = await privateFetch(fileQuery(path), { headers: sessionHeaders(), signal });
+  const value = resp.ok ? await resp.blob() : await resp.json().catch(() => null);
+  if (signal?.aborted || generation !== privateSessionGeneration() || !privateReadsAllowed()) {
+    throw new DOMException("The private session changed", "AbortError");
+  }
+  if (!resp.ok) throw wikiErrorFrom(resp.status, value);
+  return value as Blob;
 }
 
 export function searchQuery(query: string, type?: string, path?: string): string {

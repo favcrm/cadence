@@ -1,5 +1,6 @@
 import { ApiError } from "../../lib/api";
 import { sessionHeaders } from "../../lib/sessionKey";
+import { privateFetch } from "../../lib/privateSession";
 
 /**
  * CAD-818 Threads wire client. Shapes follow the IMPLEMENTED daemon
@@ -178,7 +179,7 @@ function invalid(message: string): never {
 const part = encodeURIComponent;
 
 async function send<T>(method: "GET" | "POST", path: string, body?: object): Promise<T> {
-  const resp = await fetch(path, {
+  const resp = await privateFetch(path, {
     method,
     credentials: "same-origin",
     cache: "no-store",

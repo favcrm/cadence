@@ -1,5 +1,6 @@
 import { ApiError } from "../../lib/api";
 import { sessionHeaders } from "../../lib/sessionKey";
+import { privateFetch } from "../../lib/privateSession";
 
 /**
  * CAD-1412 human rooms wire client (`/api/human-threads/*`, same origin).
@@ -62,7 +63,7 @@ export interface HumanAskReceipt {
 }
 
 async function call<T>(method: "GET" | "POST" | "DELETE", path: string, body?: object): Promise<T> {
-  const resp = await fetch(path, {
+  const resp = await privateFetch(path, {
     method,
     credentials: "same-origin",
     cache: "no-store",

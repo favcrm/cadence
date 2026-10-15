@@ -1,5 +1,6 @@
 import { ApiError } from "../../lib/api";
 import { sessionHeaders } from "../../lib/sessionKey";
+import { privateFetch } from "../../lib/privateSession";
 
 /**
  * Typed host action client for installed-App record screens (CAD-802).
@@ -125,7 +126,7 @@ export function updatePath(scope: HostScope, recordId: string): string {
 }
 
 async function request<T>(path: string, body?: Record<string, unknown>): Promise<T> {
-  const response = await fetch(path, {
+  const response = await privateFetch(path, {
     method: body === undefined ? "GET" : "POST",
     credentials: "same-origin",
     cache: "no-store",

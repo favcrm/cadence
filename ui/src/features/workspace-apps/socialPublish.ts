@@ -1,5 +1,6 @@
 import { ApiError } from "../../lib/api";
 import { sessionHeaders } from "../../lib/sessionKey";
+import { privateFetch } from "../../lib/privateSession";
 
 /** CAD-787 product client for the publish decision surface.
  *
@@ -257,7 +258,7 @@ session; transport mirrors workspaceApps/hostActions (same-origin
 credentials, session headers, board marker on writes). */
 async function request<T>(path: string, signal?: AbortSignal, body?: Record<string, unknown>, allowed: readonly string[] = SCHEDULE_KEYS): Promise<T> {
   if (body !== undefined) assertCleanBody(body, allowed);
-  const response = await fetch(sameOrigin(path), {
+  const response = await privateFetch(sameOrigin(path), {
     method: body === undefined ? "GET" : "POST", signal,
     credentials: "same-origin", cache: "no-store",
     headers: body === undefined ? sessionHeaders() : {

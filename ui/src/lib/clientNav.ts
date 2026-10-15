@@ -2,8 +2,8 @@
  * In-app clicks (CAD-609). A plain left click on a same-origin link
  * stays in the SPA — `history.pushState`, not a document load — so the
  * wiki tree keeps the folders it has expanded. Open-in-new-tab, a
- * download, and `/api/` (file bytes live there) keep the browser's own
- * navigation. Real `href`s stay on the anchor.
+ * download, `/api/` file bytes, and reserved `/__platform/` auth handoffs
+ * keep the browser's own navigation. Real `href`s stay on the anchor.
  */
 
 export interface ClientNavClick {
@@ -37,6 +37,7 @@ export function clientNavHref(click: ClientNavClick): string | null {
   }
   if (url.origin !== click.origin) return null;
   if (url.pathname === "/api" || url.pathname.startsWith("/api/")) return null;
+  if (url.pathname === "/__platform" || url.pathname.startsWith("/__platform/")) return null;
   return `${url.pathname}${url.search}${url.hash}`;
 }
 

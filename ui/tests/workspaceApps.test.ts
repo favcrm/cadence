@@ -64,8 +64,29 @@ async function main() {
   equal(latest().path, "/api/app-installations", "Canonical catalog path");
   equal(latest().init.credentials, "same-origin", "Requests retain same-origin cookie admission");
   equal(latest().init.cache, "no-store", "Private receipts are not cached across operator sessions");
-  assert(latest().init.signal === controller.signal, "Caller cancellation reaches fetch");
   equal(new Headers(latest().init.headers).get("X-Cadence-Session"), "qa-tab-session", "Reads carry this tab's second credential");
+
+  // Auth cancellation may compose another signal; verify behavior, not identity.
+  const normalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = (input, init) => new Promise<Response>((_resolve, reject) => {
+      calls.push({ path: String(input), init: init ?? {} });
+      const signal = init?.signal;
+      assert(signal, "Private catalog requests are abortable");
+      const cancelled = () => reject(new DOMException("Caller cancelled request", "AbortError"));
+      if (signal.aborted) cancelled();
+      else signal.addEventListener("abort", cancelled, { once: true });
+    });
+    const caller = new AbortController();
+    const pending = workspaceApps.installations(caller.signal);
+    const forwarded = latest().init.signal;
+    assert(forwarded, "Catalog fetch receives its cancellation signal");
+    caller.abort();
+    assert(forwarded.aborted, "Caller abort propagates to the active fetch");
+    await rejected(() => pending, (error) => error instanceof DOMException && error.name === "AbortError", "Caller cancellation rejects the catalog request");
+  } finally {
+    globalThis.fetch = normalFetch;
+  }
 
   const context = { id: "context-a", revision: 4, digest: "context-digest", state: "active" };
   reply = { contexts: [context] };

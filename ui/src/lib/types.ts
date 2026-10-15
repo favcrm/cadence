@@ -859,7 +859,9 @@ export interface AgentDetail {
 export interface Meta {
   platform_account_configured?: boolean;
   read_only: boolean;
-  /** CAD-313: this browser holds a live operator session. Absent on a
+  /** Explicit local unsigned-read policy. Missing/false never admits a workspace. */
+  anonymous_reads?: boolean;
+  /** CAD-313: this browser holds a live session (member or operator). Absent on a
    *  server that predates sessions. CAD-1193: `null` when the session
    *  check could not answer inside the metadata budget — an unknown,
    *  never a sign-out. */

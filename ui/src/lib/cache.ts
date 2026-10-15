@@ -35,6 +35,8 @@
  * state machine is unit-tested in plain node (see tests/cache.test.ts).
  */
 
+import { onPrivateReadsPaused, onPrivateSessionReset, privateReadsAllowed } from "./privateSession";
+
 export type ResourceStatus = "loading" | "ok" | "stale" | "failed" | "empty";
 
 export interface ResourceState<T> {
@@ -77,6 +79,8 @@ export class Resource<T> {
   private trailing = false;
   /** Bumped by every local write; a fetch from an older one is dropped. */
   private generation = 0;
+  /** Access-boundary epoch: old requests cannot repopulate a paused/reset store. */
+  private epoch = 0;
   /** Invalidated while nobody watched: the next `revalidate` fetches. */
   private invalid = false;
   private readonly listeners = new Set<() => void>();
@@ -116,9 +120,11 @@ export class Resource<T> {
    * keep the default fetcher. Joins any request already in flight.
    */
   refreshUsing = (fetcher: () => Promise<T>): Promise<void> => {
+    if (!privateReadsAllowed()) return Promise.resolve();
     if (this.inflight) return this.inflight;
     this.invalid = false;
     const started = this.generation;
+    const epoch = this.epoch;
     this.set({
       inFlight: true,
       // With nothing loaded a retry is a load, not a standing failure.
@@ -126,6 +132,7 @@ export class Resource<T> {
     });
     const run = fetcher().then(
       (data) => {
+        if (epoch !== this.epoch) return;
         if (this.generation !== started) {
           // A local write landed while this was in flight: its data is
           // newer than this answer. Drop it and ask again.
@@ -140,6 +147,7 @@ export class Resource<T> {
         });
       },
       (e: unknown) => {
+        if (epoch !== this.epoch) return;
         // A local write since the request started is fresher than any
         // failure of it.
         if (this.generation !== started) return;
@@ -153,6 +161,7 @@ export class Resource<T> {
       },
     );
     this.inflight = run.finally(() => {
+      if (epoch !== this.epoch) return;
       this.inflight = null;
       if (this.trailing) {
         this.trailing = false;
@@ -237,6 +246,22 @@ export class Resource<T> {
     this.set({ data, status });
   };
 
+  /** Stop trailing work without throwing away same-session observations. */
+  pause = (): void => {
+    this.epoch += 1;
+    this.inflight = null;
+    this.trailing = false;
+    this.invalid = true;
+    this.set({ inFlight: false });
+  };
+
+  /** Clear private observations while keeping shared resource handles valid. */
+  reset = (): void => {
+    this.pause();
+    this.generation += 1;
+    this.set({ data: null, status: "loading", error: null, asOf: null, inFlight: false });
+  };
+
   private set(patch: Partial<ResourceState<T>>): void {
     this.state = { ...this.state, ...patch };
     for (const listener of this.listeners) listener();
@@ -257,6 +282,12 @@ export class QueryCache {
   /** `maxIdle`: family stores kept while nobody subscribes (oldest go first). */
   constructor(opts: { maxIdle?: number } = {}) {
     this.maxIdle = opts.maxIdle ?? 32;
+    onPrivateReadsPaused(() => {
+      for (const entry of this.entries.values()) entry.pause();
+    });
+    onPrivateSessionReset(() => {
+      for (const entry of this.entries.values()) entry.reset();
+    });
   }
 
   resource<T>(key: string, fetcher: () => Promise<T>, opts?: ResourceOptions<T>): Resource<T> {

@@ -1,5 +1,6 @@
 import { ApiError } from "../../lib/api";
 import { sessionHeaders } from "../../lib/sessionKey";
+import { privateFetch } from "../../lib/privateSession";
 
 /**
  * Typed host action client for versioned campaign email content (CAD-782).
@@ -152,7 +153,7 @@ export const contentPaths = {
 // `body` undefined sends no body at all: routes such as proposal discard
 // take only URL IDs and the host refuses any body, even `{}`.
 async function post<T>(path: string, body?: Record<string, unknown>): Promise<T> {
-  const resp = await fetch(path, {
+  const resp = await privateFetch(path, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
@@ -175,7 +176,7 @@ async function post<T>(path: string, body?: Record<string, unknown>): Promise<T>
 }
 
 async function get<T>(path: string): Promise<T> {
-  const resp = await fetch(path, { headers: { ...sessionHeaders() } });
+  const resp = await privateFetch(path, { headers: { ...sessionHeaders() } });
   // Reads surface the host refusal verbatim (an unknown, foreign or
   // stale ID must read as the server's reason, never a bare status).
   const value = await resp.json().catch(() => null);

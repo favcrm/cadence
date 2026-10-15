@@ -1,5 +1,6 @@
 import { ApiError } from "../../lib/api";
 import { sessionHeaders, sessionKey } from "../../lib/sessionKey";
+import { onPrivateReadsPaused, onPrivateSessionReset, privateFetch, privateReadsAllowed, privateSessionGeneration } from "../../lib/privateSession";
 import type { Agent } from "../../lib/types";
 
 export type { Agent };
@@ -248,19 +249,43 @@ async function readBounded(response: Response): Promise<ArrayBuffer> {
   return out.buffer as ArrayBuffer;
 }
 
+const privateRequests = new Set<AbortController>();
+onPrivateReadsPaused(() => {
+  for (const controller of privateRequests) controller.abort();
+  privateRequests.clear();
+});
+
 async function request<T>(path: string, signal?: AbortSignal, body?: object): Promise<T> {
-  const response = await fetch(path, {
-    method: body === undefined ? "GET" : "POST", signal,
-    credentials: "same-origin", cache: "no-store",
-    headers: body === undefined ? sessionHeaders() : {
-      "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders(),
-    },
-    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-  });
-  const value = await response.json().catch(() => null);
-  if (!response.ok) throw new ApiError(value?.error ?? `${response.status} ${response.statusText}`, response.status, typeof value?.code === "string" ? { code: value.code } : undefined);
-  if (value === null) throw new ApiError("The server returned an invalid app receipt", 502);
-  return value as T;
+  const read = body === undefined;
+  if (read && !privateReadsAllowed()) throw new DOMException("Session verification required", "AbortError");
+  const generation = privateSessionGeneration();
+  const controller = read ? new AbortController() : null;
+  const abort = () => controller?.abort();
+  if (controller) {
+    privateRequests.add(controller);
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) controller.abort();
+  }
+  try {
+    const response = await fetch(path, {
+      method: read ? "GET" : "POST", signal: controller?.signal ?? signal,
+      credentials: "same-origin", cache: "no-store",
+      headers: read ? sessionHeaders() : {
+        "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders(),
+      },
+      ...(read ? {} : { body: JSON.stringify(body) }),
+    });
+    const value = await response.json().catch(() => null);
+    if (generation !== privateSessionGeneration() || controller?.signal.aborted || (read && !privateReadsAllowed())) {
+      throw new DOMException("The private session changed", "AbortError");
+    }
+    if (!response.ok) throw new ApiError(value?.error ?? `${response.status} ${response.statusText}`, response.status, typeof value?.code === "string" ? { code: value.code } : undefined);
+    if (value === null) throw new ApiError("The server returned an invalid app receipt", 502);
+    return value as T;
+  } finally {
+    if (controller) privateRequests.delete(controller);
+    signal?.removeEventListener("abort", abort);
+  }
 }
 
 /** One of the company's connected Instagram accounts (CAD-1290). */
@@ -331,26 +356,41 @@ export const workspaceApps = {
   socialDraftAction: (operation: "create"|"list"|"show"|"update"|"discard"|"sources/show"|"sources/save"|"effect-stage", body: Record<string, unknown> & { alias: string }) =>
     request<Record<string, unknown>>(`/api/app-social-drafts/${operation}`, undefined, toolActionBody(body)),
   socialDraftAsset: async (body:{action_token:string;alias:string;draft_id:string}):Promise<{bytes:ArrayBuffer;mime:string}> => {
-    const response=await fetch("/api/app-social-drafts/asset",{method:"POST",credentials:"same-origin",cache:"no-store",
-      headers:{"Content-Type":"application/json","X-Cadence-Board":"1",...sessionHeaders()},body:JSON.stringify(toolActionBody(body))});
-    if(!response.ok) { const value=await response.json().catch(()=>null); throw new ApiError(value?.error??`${response.status} ${response.statusText}`,response.status); }
-    const mime=response.headers.get("Content-Type")??"";
-    if(!["image/jpeg","image/png"].includes(mime)) throw new ApiError("The server returned an invalid social image",502);
-    return {bytes:await response.arrayBuffer(),mime};
+    const generation = privateSessionGeneration();
+    const controller = new AbortController();
+    const unsubscribe = onPrivateReadsPaused(() => controller.abort());
+    try {
+      const response=await privateFetch("/api/app-social-drafts/asset",{method:"POST",credentials:"same-origin",cache:"no-store",signal:controller.signal,
+        headers:{"Content-Type":"application/json","X-Cadence-Board":"1",...sessionHeaders()},body:JSON.stringify(toolActionBody(body))});
+      if(!response.ok) { const value=await response.json().catch(()=>null); throw new ApiError(value?.error??`${response.status} ${response.statusText}`,response.status); }
+      const mime=response.headers.get("Content-Type")??"";
+      if(!["image/jpeg","image/png"].includes(mime)) throw new ApiError("The server returned an invalid social image",502);
+      const bytes = await response.arrayBuffer();
+      if (controller.signal.aborted || !privateReadsAllowed() || generation !== privateSessionGeneration()) {
+        throw new DOMException("The private session changed", "AbortError");
+      }
+      return { bytes, mime };
+    } finally { unsubscribe(); }
   },
   /** CAD-1365: the native original bytes for `{action_token, asset_id}` only. The response is bounded
    *  (10 MiB, allowlisted image MIME) and the request lifetime is capped; the caller owns the bytes. */
   originalMedia: async (body: { action_token: string; asset_id: string }): Promise<{ bytes: ArrayBuffer; mime: string }> => {
+    const generation = privateSessionGeneration();
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), ORIGINAL_MEDIA_TIMEOUT_MS);
+    const unsubscribe = onPrivateReadsPaused(() => controller.abort());
     try {
-      const response = await fetch("/api/app-media/original", { method: "POST", credentials: "same-origin", cache: "no-store", signal: controller.signal,
+      const response = await privateFetch("/api/app-media/original", { method: "POST", credentials: "same-origin", cache: "no-store", signal: controller.signal,
         headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() }, body: JSON.stringify(body) });
       if (!response.ok) { const value = await response.json().catch(() => null); throw new ApiError(value?.error ?? `${response.status} ${response.statusText}`, response.status, typeof value?.code === "string" ? { code: value.code } : undefined); }
       const mime = response.headers.get("Content-Type") ?? "";
       if (!ORIGINAL_MIME.includes(mime)) throw new ApiError("The server returned an invalid original image", 502);
-      return { bytes: await readBounded(response), mime };
-    } finally { clearTimeout(timer); }
+      const bytes = await readBounded(response);
+      if (controller.signal.aborted || !privateReadsAllowed() || generation !== privateSessionGeneration()) {
+        throw new DOMException("The private session changed", "AbortError");
+      }
+      return { bytes, mime };
+    } finally { clearTimeout(timer); unsubscribe(); }
   },
   artifact: (id: string, signal?: AbortSignal) => request<TextArtifact>(`/api/app-run-artifacts/${part(id)}`, signal),
   stageEffect: async (id: string, body: { artifact_id: string; slot: string; request_id: string; title: string }) => (await request<{ effect: AppEffect }>(`${run(id)}/effects`, undefined, body)).effect,
@@ -527,8 +567,8 @@ export function readWorkspaceAppSnapshot(installId: string): WorkspaceAppSnapsho
 }
 
 /** Record the snapshot a successful read produced. */
-export function writeWorkspaceAppSnapshot(installId: string, data: WorkspaceAppSnapshot, session = sessionKey()): void {
-  if (session !== sessionKey()) return;
+export function writeWorkspaceAppSnapshot(installId: string, data: WorkspaceAppSnapshot, session = sessionKey(), generation = privateSessionGeneration()): void {
+  if (session !== sessionKey() || generation !== privateSessionGeneration() || !privateReadsAllowed()) return;
   snapshots.set(installId, { at: Date.now(), session, data });
 }
 
@@ -549,7 +589,8 @@ const snapshotReads = new Map<string, SnapshotRead>();
 export function readWorkspaceAppSnapshotFresh(installId: string, signal?: AbortSignal): Promise<WorkspaceAppSnapshot> {
   if (signal?.aborted) return Promise.reject(new DOMException("The operation was aborted", "AbortError"));
   const requestSession = sessionKey();
-  const key = JSON.stringify([installId, requestSession]);
+  const generation = privateSessionGeneration();
+  const key = JSON.stringify([installId, requestSession, generation]);
   let flight = snapshotReads.get(key);
   if (!flight) {
     const controller = new AbortController();
@@ -565,9 +606,11 @@ export function readWorkspaceAppSnapshotFresh(installId: string, signal?: AbortS
         workspaceApps.effects(installId, undefined, controller.signal),
       ]);
       if (controller.signal.aborted) throw new DOMException("The operation was aborted", "AbortError");
-      if (requestSession !== sessionKey()) throw new ApiError("The session changed while loading this app", 401);
+      if (requestSession !== sessionKey() || generation !== privateSessionGeneration() || !privateReadsAllowed()) {
+        throw new ApiError("The session changed while loading this app", 401);
+      }
       const data = { installation, contexts, bindings, connections, agents, runs, effects };
-      writeWorkspaceAppSnapshot(installId, data, requestSession);
+      writeWorkspaceAppSnapshot(installId, data, requestSession, generation);
       return data;
     })().finally(() => {
       created.settled = true;
@@ -607,7 +650,7 @@ export function prefetchWorkspaceApp(installId: string): void {
   if (readWorkspaceAppSnapshot(installId) !== null) return;
   const task = readWorkspaceAppSnapshotFresh(installId)
     .catch(() => null)
-    .finally(() => { prefetching.delete(installId); });
+    .finally(() => { if (prefetching.get(installId) === task) prefetching.delete(installId); });
   prefetching.set(installId, task);
 }
 
@@ -624,9 +667,12 @@ export function readInstallationsSnapshot(): Installation[] | null {
 /** Fresh read of the installations list; stores the snapshot. */
 export async function readInstallationsFresh(signal?: AbortSignal): Promise<Installation[]> {
   const requestSession = sessionKey();
+  const generation = privateSessionGeneration();
   const rows = await workspaceApps.installations(signal);
   if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
-  if (requestSession !== sessionKey()) throw new ApiError("The session changed while loading apps", 401);
+  if (requestSession !== sessionKey() || generation !== privateSessionGeneration() || !privateReadsAllowed()) {
+    throw new ApiError("The session changed while loading apps", 401);
+  }
   installationsSnapshot = { at: Date.now(), session: requestSession, rows };
   return rows;
 }
@@ -634,3 +680,11 @@ export async function readInstallationsFresh(signal?: AbortSignal): Promise<Inst
 export function dropInstallationsSnapshot(): void {
   installationsSnapshot = null;
 }
+
+onPrivateSessionReset(() => {
+  for (const flight of snapshotReads.values()) flight.controller.abort();
+  snapshotReads.clear();
+  snapshots.clear();
+  prefetching.clear();
+  dropInstallationsSnapshot();
+});

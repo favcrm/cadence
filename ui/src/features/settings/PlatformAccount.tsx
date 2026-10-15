@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import Button from "../../ui/Button";
 import { IconRefresh } from "../../ui/icons";
 import { sessionHeaders } from "../../lib/sessionKey";
+import { privateFetch } from "../../lib/privateSession";
 import {
   displayAmount,
   safeManageUrl,
@@ -21,7 +22,7 @@ export default function PlatformAccount() {
     setLoading(true);
     setError(false);
     try {
-      const response = await fetch("/api/platform-account", {
+      const response = await privateFetch("/api/platform-account", {
         headers: sessionHeaders(),
       });
       if (!response.ok) throw new Error("Account request failed");

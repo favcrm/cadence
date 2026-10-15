@@ -1,4 +1,6 @@
 import type { Resource } from "./cache";
+import { onPrivateReadsPaused, privateFetch, privateReadsAllowed, privateSessionGeneration } from "./privateSession";
+import { sessionHeaders } from "./sessionKey";
 
 // Filled by vite `define` at build time — undefined in plain-node tests.
 declare const __CADENCE_BUILD__: string | undefined;
@@ -35,7 +37,7 @@ export function buildChanged(server: string | null | undefined, local: string): 
 /** `GET /api/version` — the serving build while the stream is down. */
 export async function serverBuild(): Promise<string | null> {
   try {
-    const resp = await fetch("/api/version");
+    const resp = await privateFetch("/api/version", { headers: sessionHeaders() });
     return resp.ok ? parseBuild(await resp.text()) : null;
   } catch {
     return null;
@@ -141,7 +143,8 @@ export function isPermanent(status: number | null): boolean {
 async function probeStatus(url: string): Promise<number | null> {
   const abort = new AbortController();
   try {
-    const resp = await fetch(url, { signal: abort.signal, headers: { Accept: "text/event-stream" } });
+    if (!privateReadsAllowed()) return null;
+    const resp = await privateFetch(url, { signal: abort.signal, headers: { Accept: "text/event-stream", ...sessionHeaders() } });
     return resp.status;
   } catch {
     return null;
@@ -159,8 +162,95 @@ export function withResume(url: string, lastEventId: string | null): string {
   return `${path}?${q.toString()}`;
 }
 
+/** Fetch-backed SSE keeps the local tab credential in a header, never a URL.
+ * subscribeSse owns reconnect/backoff; this adapter owns one connection. */
+function openAuthenticatedStream(url: string): EventSourceLike {
+  const generation = privateSessionGeneration();
+  const controller = new AbortController();
+  const listeners = new Map<string, Set<(event: MessageEvent<string>) => void>>();
+  const source: EventSourceLike = {
+    readyState: 0,
+    onopen: null,
+    onerror: null,
+    addEventListener(type, listener) {
+      let handlers = listeners.get(type);
+      if (!handlers) { handlers = new Set(); listeners.set(type, handlers); }
+      handlers.add(listener);
+    },
+    close() {
+      controller.abort();
+      Object.assign(source, { readyState: CLOSED });
+    },
+  };
+  void (async () => {
+    try {
+      const response = await fetch(url, {
+        headers: { Accept: "text/event-stream", ...sessionHeaders() },
+        signal: controller.signal,
+        cache: "no-store",
+        credentials: "same-origin",
+      });
+      if (controller.signal.aborted || generation !== privateSessionGeneration()) return;
+      if (!response.ok || !response.body) {
+        if (response.status === 401) window.dispatchEvent(new Event("cadence:session-required"));
+        throw new Error("Stream unavailable");
+      }
+      if (controller.signal.aborted) return;
+      Object.assign(source, { readyState: 1 });
+      source.onopen?.(new Event("open"));
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let eventType = "message";
+      let data: string[] = [];
+      let lastId = "";
+      const line = (value: string) => {
+        if (value === "") {
+          if (data.length) {
+            const event = { data: data.join("\n"), lastEventId: lastId } as MessageEvent<string>;
+            for (const listener of listeners.get(eventType) ?? []) listener(event);
+          }
+          eventType = "message";
+          data = [];
+          return;
+        }
+        if (value.startsWith(":")) return;
+        const colon = value.indexOf(":");
+        const field = colon < 0 ? value : value.slice(0, colon);
+        let content = colon < 0 ? "" : value.slice(colon + 1);
+        if (content.startsWith(" ")) content = content.slice(1);
+        if (field === "data") data.push(content);
+        else if (field === "event") eventType = content || "message";
+        else if (field === "id" && !content.includes("\0")) lastId = content;
+      };
+      try {
+        while (!controller.signal.aborted) {
+          const chunk = await reader.read();
+          if (chunk.done) break;
+          buffer += decoder.decode(chunk.value, { stream: true });
+          for (;;) {
+            const end = buffer.search(/[\r\n]/);
+            if (end < 0 || (buffer[end] === "\r" && end === buffer.length - 1)) break;
+            const width = buffer[end] === "\r" && buffer[end + 1] === "\n" ? 2 : 1;
+            line(buffer.slice(0, end));
+            buffer = buffer.slice(end + width);
+          }
+        }
+      } finally {
+        reader.releaseLock();
+      }
+      if (!controller.signal.aborted) throw new Error("Stream ended");
+    } catch {
+      if (controller.signal.aborted) return;
+      Object.assign(source, { readyState: CLOSED });
+      source.onerror?.(new Event("error"));
+    }
+  })();
+  return source;
+}
+
 export function subscribeSse(opts: SseOptions): SseSubscription {
-  const open = opts.open ?? ((url: string) => new EventSource(url) as EventSourceLike);
+  const open = opts.open ?? openAuthenticatedStream;
   const probe = opts.probe ?? probeStatus;
   const schedule =
     opts.schedule ??
@@ -197,7 +287,7 @@ export function subscribeSse(opts: SseOptions): SseSubscription {
 
   const connect = () => {
     cancelTimer = null;
-    if (closed) return;
+    if (closed || !privateReadsAllowed()) return;
     const url = withResume(opts.url, lastId);
     const es = open(url);
     source = es;
@@ -252,19 +342,19 @@ export function subscribeSse(opts: SseOptions): SseSubscription {
     };
   };
 
-  connect();
-  return {
-    close() {
-      closed = true;
-      cancelTimer?.();
-      cancelTimer = null;
-      cancelProbe?.();
-      cancelProbe = null;
-      source?.close();
-      source = null;
-    },
-    lastEventId: () => lastId,
+  const close = () => {
+    closed = true;
+    cancelTimer?.();
+    cancelTimer = null;
+    cancelProbe?.();
+    cancelProbe = null;
+    source?.close();
+    source = null;
+    unpause();
   };
+  const unpause = onPrivateReadsPaused(close);
+  connect();
+  return { close, lastEventId: () => lastId };
 }
 
 /**

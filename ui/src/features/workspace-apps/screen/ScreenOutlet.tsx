@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { sessionHeaders } from "../../../lib/sessionKey";
+import { onPrivateReadsPaused, privateFetch, privateReadsAllowed, privateSessionGeneration } from "../../../lib/privateSession";
 import { parseMount, ScreenChannel, type AssetLoader, type ScreenActions } from "./screenLifecycle";
 import { invokeTool, revokeTool } from "./screenActions";
 import { type SlotView } from "./screenSlot";
@@ -29,7 +30,9 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions 
   const [state, setState] = useState<"loading" | "ready" | "fallback">("loading");
   const scope = JSON.stringify([projection.install_id, projection.digest, projection.tag, projection.context_id]);
   useLayoutEffect(() => {
+    const generation = privateSessionGeneration();
     const controller = new AbortController();
+    const unsubscribe = onPrivateReadsPaused(() => controller.abort());
     let retired = false;
     let owned: ScreenChannel | null = null;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -44,7 +47,7 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions 
     void (async () => {
       try {
         const current = latest.current;
-        const response = await fetch(`/api/app-installations/${encodeURIComponent(current.install_id)}/screens/${encodeURIComponent(current.tag)}/mount`, {
+        const response = await privateFetch(`/api/app-installations/${encodeURIComponent(current.install_id)}/screens/${encodeURIComponent(current.tag)}/mount`, {
           method: "POST", credentials: "same-origin", cache: "no-store", signal: controller.signal,
           headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
           body: JSON.stringify(current.context_id ? { context_id: current.context_id } : {}),
@@ -52,7 +55,7 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions 
         if (!response.ok) throw new Error("Screen mount refused");
         const receipt = parseMount(await response.json(), current.tag);
         if (!receipt) throw new Error("Invalid screen mount receipt");
-        if (retired || !container.current) return;
+        if (retired || controller.signal.aborted || !privateReadsAllowed() || generation !== privateSessionGeneration() || !container.current) return;
         const frame = document.createElement("iframe");
         frame.title = current.installation.title;
         frame.setAttribute("sandbox", "allow-scripts");
@@ -91,11 +94,14 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions 
         frame.addEventListener("load", () => owned?.load());
         timer = setTimeout(() => { owned?.close(true); }, 10000);
       } catch {
-        if (!retired) { owned?.close(); container.current?.replaceChildren(); fail(); }
+        if (!retired && !controller.signal.aborted && privateReadsAllowed() && generation === privateSessionGeneration()) {
+          owned?.close(); container.current?.replaceChildren(); fail();
+        }
       }
     })();
     return () => {
       retired = true;
+      unsubscribe();
       controller.abort();
       clearTimeout(timer);
       window.removeEventListener("message", onMessage);

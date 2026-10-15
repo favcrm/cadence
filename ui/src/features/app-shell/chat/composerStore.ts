@@ -30,6 +30,7 @@
  * plain Node test.
  */
 import { api, ApiError, type ChatFileDestination, type ChatFileRow } from "../../../lib/api";
+import { onPrivateSessionReset } from "../../../lib/privateSession";
 import type { ThreadRef } from "../../../lib/types";
 import {
   attachFits,
@@ -209,6 +210,7 @@ function publish(cell: DraftCell): void {
 /** Drop an idle, empty family — never one holding an in-flight handoff,
  *  parked bundles or a queue with rows. */
 function pruneFamily(family: Family): void {
+  if (families.get(family.key) !== family) return;
   if (family.listeners.size > 0) return;
   family.saved = family.saved.filter((record) => {
     const cell = slotsById.get(record.slot);
@@ -921,3 +923,21 @@ export function composerScope(key: string, slot?: number): ComposerScope | null 
 export function composerDraft(key: string, slot?: number): string {
   return slotOf(key, slot)?.text ?? "";
 }
+
+onPrivateSessionReset(() => {
+  for (const controller of controllers.values()) controller.abort();
+  controllers.clear();
+  const previous = [...families.values()];
+  families.clear();
+  slotsById.clear();
+  queues.clear();
+  appliedSeeds.clear();
+  reservations.clear();
+  uploadTail = Promise.resolve();
+  // Keep row, slot and reservation ids monotonic: old settlements cannot
+  // acquire a newly created session's draft or attachment.
+  for (const family of previous) {
+    for (const listener of family.listeners) listener();
+  }
+  for (const listener of savedListeners) listener();
+});

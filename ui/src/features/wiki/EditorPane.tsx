@@ -1,6 +1,7 @@
 import { useEffect, useId, useRef, useState } from "react";
 import type { Route } from "../../lib/router";
 import { sessionStore } from "../../lib/draft";
+import { privateSessionGeneration } from "../../lib/privateSession";
 import { navigate } from "../../lib/useLocation";
 import { useTranslate } from "../../lib/locale";
 import Md from "../../ui/Md";
@@ -78,6 +79,7 @@ export default function EditorPane({
   const browseHref = navHref({ screen: "wiki", mode: "browse", path, query: null });
 
   useEffect(() => {
+    const generation = privateSessionGeneration();
     activeRef.current = true;
     let cancelled = false;
     setStatus("loading");
@@ -113,7 +115,7 @@ export default function EditorPane({
       activeRef.current = false;
       cancelled = true;
       window.clearTimeout(stashTimer.current);
-      if (storage && pendingDraft.current) stashDraft(storage, pendingDraft.current);
+      if (generation === privateSessionGeneration() && storage && pendingDraft.current) stashDraft(storage, pendingDraft.current);
       pendingDraft.current = null;
     };
   }, [path]);
@@ -123,10 +125,11 @@ export default function EditorPane({
     setText(value);
     setDirty(true);
     const storage = sessionStore();
+    const generation = privateSessionGeneration();
     window.clearTimeout(stashTimer.current);
     pendingDraft.current = { path, text: value, baseRev: baseRevRef.current, at: Date.now() };
     stashTimer.current = window.setTimeout(() => {
-      if (storage && pendingDraft.current) stashDraft(storage, pendingDraft.current);
+      if (generation === privateSessionGeneration() && storage && pendingDraft.current) stashDraft(storage, pendingDraft.current);
       pendingDraft.current = null;
     }, 400);
   };
@@ -142,9 +145,11 @@ export default function EditorPane({
     window.clearTimeout(stashTimer.current);
     pendingDraft.current = null;
     const storage = sessionStore();
+    const generation = privateSessionGeneration();
     if (storage) stashDraft(storage, { path, text, baseRev: baseRevRef.current, at: Date.now() });
     try {
       const page = await wiki.save(path, text, baseRevRef.current);
+      if (generation !== privateSessionGeneration()) return;
       // A newer editor may have written another draft while this request ran.
       if (storage && readDraft(storage, path)?.text === text) dropDraft(storage, path);
       if (!activeRef.current) return;
@@ -155,6 +160,7 @@ export default function EditorPane({
       onSaved();
       navigate(browseHref);
     } catch (e) {
+      if (generation !== privateSessionGeneration()) return;
       if (!activeRef.current) return;
       const refused = conflictFrom(e);
       if (refused) {
@@ -175,8 +181,10 @@ export default function EditorPane({
   };
 
   const reload = async () => {
+    const generation = privateSessionGeneration();
     try {
       const fresh = await wiki.file(path);
+      if (generation !== privateSessionGeneration()) return;
       window.clearTimeout(stashTimer.current);
       pendingDraft.current = null;
       const storage = sessionStore();

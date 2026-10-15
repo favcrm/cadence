@@ -1,4 +1,5 @@
 import { sessionHeaders } from "../../lib/sessionKey";
+import { privateFetch } from "../../lib/privateSession";
 
 /**
  * The company document-template HTTP surface (CAD-1393). Each call relays
@@ -126,12 +127,12 @@ export class TemplateError extends Error {
 }
 
 async function read<T>(url: string): Promise<T> {
-  const resp = await fetch(url, { headers: sessionHeaders() });
+  const resp = await privateFetch(url, { headers: sessionHeaders() });
   return answer<T>(resp);
 }
 
 async function write<T>(url: string, body: unknown): Promise<T> {
-  const resp = await fetch(url, {
+  const resp = await privateFetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
     body: JSON.stringify(body),

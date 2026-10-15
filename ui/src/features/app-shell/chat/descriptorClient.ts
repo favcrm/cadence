@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../../../lib/api";
+import { onPrivateSessionReset, privateReadsAllowed, privateSessionGeneration } from "../../../lib/privateSession";
 import { parseAppChat, type AppChat } from "./contract";
 
 export interface FileUploadProjection {
@@ -38,6 +39,8 @@ export async function loadAppChatProjection(
   kind: string,
   refresh = false,
 ): Promise<AppChatProjection | null> {
+  if (!privateReadsAllowed()) return null;
+  const generation = privateSessionGeneration();
   const key = `${installId}\u0000${digest}\u0000${kind}`;
   if (!refresh && cache.has(key)) return cache.get(key) ?? null;
   const pending = inflight.get(key);
@@ -65,6 +68,7 @@ export async function loadAppChatProjection(
     } catch {
       found = null;
     }
+    if (generation !== privateSessionGeneration() || !privateReadsAllowed()) return null;
     if (latestRequest.get(key) === requestId) cache.set(key, found);
     return found;
   })().finally(() => {
@@ -128,9 +132,11 @@ export function useAppChatProjection(
   };
 }
 
-/** Test seam: forget every cached descriptor. */
+/** Forget descriptors and invalidate every pending cache writer. */
 export function resetAppChatCache(): void {
   cache.clear();
   latestRequest.clear();
   inflight.clear();
 }
+
+onPrivateSessionReset(resetAppChatCache);

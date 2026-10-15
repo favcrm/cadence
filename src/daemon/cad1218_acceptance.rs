@@ -973,8 +973,8 @@ fn cad1218_board_approval_state_read_is_operator_only_and_leaks_nothing() {
 
     // --- callers (the caller is the only difference) ---
     let (status, body) = board.get("agent:worker", None, &read);
-    assert_eq!(status, 403, "{body}");
-    assert_eq!(body["check"], "operator_only", "{body}");
+    assert_eq!(status, 401, "{body}");
+    assert_eq!(body["code"], "operator_session_required", "{body}");
     read_refused((status, body), &ids, "agent without a session");
     let (status, body) = board.get("unproven", Some(&operator), &read);
     assert_eq!(status, 403, "{body}");

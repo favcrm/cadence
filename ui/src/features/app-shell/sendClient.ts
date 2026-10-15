@@ -1,6 +1,7 @@
 import { ApiError } from "../../lib/api";
 import { hostErrorText } from "./shared/hostErrors";
 import { sessionHeaders } from "../../lib/sessionKey";
+import { privateFetch } from "../../lib/privateSession";
 import { assertRecordId, assertScope, type HostScope } from "./hostActions";
 
 /**
@@ -64,7 +65,7 @@ function assertClean(body: Record<string, unknown>, allowed: readonly string[], 
 const part = encodeURIComponent;
 
 async function post<T>(path: string, body: Record<string, unknown>): Promise<T> {
-  const resp = await fetch(path, {
+  const resp = await privateFetch(path, {
     method: "POST",
     credentials: "same-origin",
     cache: "no-store",
@@ -86,7 +87,7 @@ async function post<T>(path: string, body: Record<string, unknown>): Promise<T> 
 }
 
 async function get<T>(path: string): Promise<T> {
-  const resp = await fetch(path, {
+  const resp = await privateFetch(path, {
     credentials: "same-origin",
     cache: "no-store",
     headers: { ...sessionHeaders() },

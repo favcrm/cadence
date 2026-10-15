@@ -1,6 +1,7 @@
 import { useEffect, useState, type KeyboardEvent, type ReactNode, type RefCallback } from "react";
 import { useWriteBlock } from "../auth/WriteGate";
 import { api } from "../../lib/api";
+import { privateSessionGeneration } from "../../lib/privateSession";
 import { resources } from "../../lib/resources";
 import { useMaybeResource } from "../../lib/useResource";
 import AnswerForm, { READ_ONLY_COPY, useAnswer } from "./AnswerForm";
@@ -209,9 +210,11 @@ export default function TodoCard({
     );
   };
   const fixIt = () => {
+    const generation = privateSessionGeneration();
     sendingTodo(need);
     setError(null);
     void sendToMaster(fixPrompt(need, template), undefined, needRefs(need)).then((r) => {
+      if (generation !== privateSessionGeneration()) return;
       settleTodo(need, r.ok);
       if (r.ok) {
         onSent();
