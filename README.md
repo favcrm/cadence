@@ -128,6 +128,8 @@ not proof of seeing the bundled version. Status reports each skill's files and
 links; a missing/stale reference is not a healthy install. Setup observes existing
 partial/stale installs without rewriting them; explicit install is the refresh.
 Daemon startup sync keeps the existing sandbox no-write guard.
+Canonical bundled-file symlinks are refused before reading or writing them,
+without rewriting their targets.
 
 Discovery is provider-specific, not a live-context reload or hosted rollout.
 Pi currently disables native skill loading, confined agents may lack access,

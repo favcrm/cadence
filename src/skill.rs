@@ -109,6 +109,15 @@ pub fn sync(home: &Path, force: bool, target: Option<&str>) -> Result<Value> {
         let mut written = Vec::new();
         for &(relative, content) in skill.files {
             let file = dir.join(relative);
+            if file
+                .symlink_metadata()
+                .is_ok_and(|meta| meta.file_type().is_symlink())
+            {
+                return Err(Error::rejected(format!(
+                    "refusing to write canonical skill-file symlink {}",
+                    file.display()
+                )));
+            }
             let stale = force
                 || std::fs::read(&file)
                     .map(|bytes| bytes != content.as_bytes())

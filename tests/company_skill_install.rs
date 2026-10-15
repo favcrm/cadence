@@ -130,6 +130,30 @@ fn assert_home_empty(fixture: &Fixture) {
 }
 
 #[test]
+fn canonical_file_symlinks_are_rejected_without_rewriting_external_targets() {
+    for force in [false, true] {
+        let fixture = Fixture::new();
+        let outside = fixture.root.path().join("private-quotation.md");
+        let private_content = b"synthetic private quotation: preserve exactly\n";
+        write_file(&outside, private_content);
+        let link = fixture
+            .canonical("company-outputs")
+            .join("references/workflow.md");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        let result = skill::sync(&fixture.home, force, Some("company-outputs"));
+
+        assert!(
+            fs::read(&outside).unwrap() == private_content,
+            "private target was overwritten (force={force})"
+        );
+        assert!(result.is_err(), "canonical symlink must be refused");
+        assert_eq!(fs::read_link(&link).unwrap(), outside);
+    }
+}
+
+#[test]
 fn status_detects_missing_and_stale_references_and_sync_repairs_without_rewriting_matches() {
     let fixture = Fixture::new();
     fixture.cli_json(&["skill", "install"]);
