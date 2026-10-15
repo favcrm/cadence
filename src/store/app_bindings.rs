@@ -52,6 +52,21 @@ fn validate_config(install: &str, context: Option<&str>, config: &Value) -> Resu
             "binding configuration scope does not match its installation/context",
         ));
     }
+    if config["provider"] == crate::platform::account_media::PLATFORM {
+        let source: crate::platform::account_media::AccountSource =
+            serde_json::from_value(config["account_source"].clone()).map_err(|_| {
+                Error::rejected("account image binding requires an exact source receipt")
+            })?;
+        if config["account"] != source.handle() || config["connection_kind"] != "builtin" {
+            return Err(Error::rejected(
+                "account image binding source does not match its connection",
+            ));
+        }
+    } else if config.get("account_source").is_some() {
+        return Err(Error::rejected(
+            "only account images accept an account source receipt",
+        ));
+    }
     if serde_json::to_vec(config)?.len() > CONFIG_BYTES {
         return Err(Error::rejected("binding configuration exceeds 16 KiB"));
     }
@@ -79,6 +94,7 @@ fn binding_material_same(old: &Value, new: &Value) -> bool {
         "connection_revision",
         "provider",
         "account",
+        "account_source",
         "registration_digest",
         "descriptor_revision",
         "mapping",
@@ -881,6 +897,19 @@ impl Store {
         let next = binding_in(&tx, install, id)?;
         Ok(json!({"binding":next}))
         })
+    }
+
+    /// History is authoritative even across package versions and revocation.
+    pub fn app_binding_slot_recorded(
+        &self,
+        install: &str,
+        context: Option<&str>,
+        slot: &str,
+    ) -> Result<bool> {
+        Ok(self.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM app_bindings WHERE install_id=? AND scope_key=? AND slot=?)",
+            params![install, scope_key(context), slot], |row| row.get(0),
+        )?)
     }
 
     pub fn app_binding_for_slot(

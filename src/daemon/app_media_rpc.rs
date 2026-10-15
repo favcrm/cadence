@@ -267,7 +267,9 @@ impl Shared {
         let proven = self.store.app_media_original(asset_id)?;
         let pm_dir = self.pm_dir()?;
         let pm = self.pm_at(&pm_dir)?;
-        let (header, bytes) = workspace::with_runtime_snapshot_pair(
+        let mut account_source = None;
+        let mut account_fetch = None;
+        let prepared = workspace::with_runtime_snapshot_pair(
             &pm,
             &ctx.install_id,
             &proven.install_id,
@@ -294,6 +296,16 @@ impl Shared {
                     "bytes": proven.bytes,
                     "media_type": proven.media_type,
                 });
+                if provider == crate::platform::account_media::PLATFORM {
+                    // Freeze the FULL source, not just the durable account handle.
+                    // The broker checks this exact lineage before renewal/GET.
+                    let identity = crate::platform::account_media::current_identity(config)
+                        .map_err(Error::rejected)?;
+                    let frozen = crate::platform::agenticos_external::AgenticosExternalAdapter::account_image(identity.clone())?;
+                    account_source = Some(identity);
+                    account_fetch = Some((frozen, credential, descriptor));
+                    return Ok(None);
+                }
                 let (media_type, bytes) = adapter
                     .read_app_media_original(&credential, config, &descriptor)
                     .map_err(Error::rejected)?;
@@ -314,9 +326,59 @@ impl Shared {
                     "bytes": bytes.len() as u64,
                     "sha256": format!("sha256:{:x}", Sha256::digest(&bytes)),
                 });
-                Ok((header, bytes))
+                Ok(Some((header, bytes)))
             },
         )?;
+        let (header, bytes) = if let Some((adapter, credential, descriptor)) = account_fetch {
+            // No PM, custody or release guard survives the preparation callback.
+            let (media_type, bytes) = crate::platform::PlatformAdapter::read_app_media_original(
+                &adapter,
+                &credential,
+                &proven.proof.config,
+                &descriptor,
+            )
+            .map_err(Error::rejected)?;
+            workspace::with_runtime_snapshot_pair(
+                &pm,
+                &ctx.install_id,
+                &proven.install_id,
+                |caller, producer| {
+                    let _custody = self
+                        .platform_custody_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let _release = self
+                        .app_release_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    self.original_runtime_current(&ctx, &proven, caller, producer)?;
+                    self.original_mount_current(token, key, origin, action_token, &ctx)?;
+                    let current =
+                        crate::platform::account_media::current_identity(&proven.proof.config)
+                            .map_err(Error::rejected)?;
+                    if account_source.as_ref() != Some(&current) {
+                        return Err(Error::rejected(
+                            "media original account source changed during retrieval",
+                        ));
+                    }
+                    crate::platform::refuse_leak(
+                        "media original",
+                        &descriptor.to_string(),
+                        &credential,
+                    )?;
+                    Ok((
+                        json!({
+                            "transfer": "app-media-original/1", "asset_id": asset_id,
+                            "media_type": media_type, "bytes": bytes.len() as u64,
+                            "sha256": format!("sha256:{:x}", Sha256::digest(&bytes)),
+                        }),
+                        bytes,
+                    ))
+                },
+            )?
+        } else {
+            prepared.ok_or_else(|| Error::internal("media original preparation is absent"))?
+        };
         let delivery = OriginalDelivery {
             shared: self,
             pm: &pm,
@@ -325,6 +387,7 @@ impl Shared {
             key,
             origin,
             proven: &proven,
+            account_source,
             expected: ctx,
         };
         deliver(&header, &bytes, &delivery)
@@ -662,6 +725,7 @@ pub(super) struct OriginalDelivery<'a> {
     key: &'a str,
     origin: Origin,
     proven: &'a crate::store::app_media::MediaOriginalProof,
+    account_source: Option<crate::remote_cli::AccountImageIdentity>,
     expected: ToolContext,
 }
 
@@ -696,6 +760,14 @@ impl OriginalDelivery<'_> {
                     self.action_token,
                     &self.expected,
                 )?;
+                if let Some(expected) = &self.account_source {
+                    let current =
+                        crate::platform::account_media::current_identity(&self.proven.proof.config)
+                            .map_err(Error::rejected)?;
+                    if &current != expected {
+                        return Err(refused());
+                    }
+                }
                 let mut auth = self.shared.operator_auth();
                 if !auth.live_hash(&self.expected.session, self.shared.operator_now())? {
                     return Err(refused());

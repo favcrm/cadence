@@ -1692,7 +1692,15 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     send(request, response);
                     return;
                 }
-                let response = app_release::handle(&mut request, state_dir, route, false);
+                let relay = operator::public_relay(&request, opts);
+                let response = app_release::handle_with_relay(
+                    &mut request,
+                    state_dir,
+                    route,
+                    false,
+                    relay,
+                    opts,
+                );
                 send(request, response);
                 return;
             }

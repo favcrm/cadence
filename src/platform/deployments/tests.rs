@@ -366,7 +366,15 @@ fn hosted_lease_attach_without_external_url_exposes_only_builtin_source_and_medi
     );
     crate::platform::agenticos_external::attach(&mut opts).unwrap();
     crate::platform::agenticos_external::attach(&mut opts).unwrap();
-    assert_eq!(opts.platforms.len(), 1);
+    assert_eq!(
+        opts.platforms
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["account-images", "agenticos_external"]
+            .into_iter()
+            .collect()
+    );
     let adapter = opts
         .platforms
         .get("agenticos_external")

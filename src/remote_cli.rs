@@ -469,7 +469,25 @@ fn renewed_credential_with(
             "remote command deadline elapsed before session renewal",
         ));
     }
-    let mut cred = load_credential(dir, target)?;
+    let cred = load_credential(dir, target)?;
+    renew_credential_locked(dir, target, deadline, cred, post)
+}
+
+/// Caller holds the source lock, including any frozen-identity check.
+fn renew_credential_locked(
+    dir: &Path,
+    target: &RemoteTarget,
+    deadline: Instant,
+    mut cred: Credential,
+    post: impl FnOnce(
+        &Path,
+        &str,
+        &str,
+        &str,
+        Value,
+        Instant,
+    ) -> Result<crate::remote_enrollment::IssuerAnswer>,
+) -> Result<Credential> {
     let at = now()?;
     let due = cred.pending.is_some() || cred.expires_at <= at.saturating_add(RENEW_BEFORE);
     if !due {
@@ -1542,6 +1560,260 @@ fn call_verb_in(
             }
         }
     }
+}
+
+/// Non-secret saved-login identity. Generation and bearer rotation are not
+/// identity changes; a different login session is. Deserialization grants no
+/// authority: every operation compares this receipt with private custody.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccountImageIdentity {
+    pub org: String,
+    pub organization_id: String,
+    pub audience: String,
+    pub issuer: String,
+    pub subject_id: String,
+    pub session_id: String,
+    pub absolute_expires_at: u64,
+}
+
+#[derive(Debug, Clone)]
+pub enum AccountImageOperation {
+    Quote,
+    Submit {
+        input: Value,
+        idempotency_key: String,
+    },
+    Job {
+        job_id: String,
+    },
+    Artifact {
+        reference: String,
+    },
+}
+
+/// JSON operations use `body`; only Artifact returns `bytes`/`content_type`.
+/// Neither representation contains a credential or a caller-selected URL.
+pub struct AccountImageResponse {
+    pub status: u16,
+    pub body: Option<Value>,
+    pub content_type: Option<String>,
+    pub bytes: Vec<u8>,
+}
+
+impl AccountImageIdentity {
+    pub fn target(&self) -> RemoteTarget {
+        RemoteTarget {
+            org: self.org.clone(),
+            endpoint: self.audience.clone(),
+            org_id: self.organization_id.clone(),
+        }
+    }
+}
+
+fn account_image_identity_from(
+    target: &RemoteTarget,
+    cred: &Credential,
+) -> Result<AccountImageIdentity> {
+    crate::proto::identifier(&target.org, "saved account")?;
+    let at = now()?;
+    let issuer = cred.issuer.as_deref().filter(|s| !s.is_empty());
+    let subject = cred.subject_id.as_deref().filter(|s| valid_id(s));
+    let (Some(issuer), Some(subject)) = (issuer, subject) else {
+        return Err(reject(
+            "saved account identity is missing or expired — run `cadence login` again",
+        ));
+    };
+    if cred.organization_slug.as_deref() != Some(target.org.as_str())
+        || cred.organization_id != target.org_id
+        || cred.audience != target.endpoint
+        || !valid_capabilities(&cred.capabilities)
+    {
+        return Err(reject(
+            "saved account identity does not match its selected destination",
+        ));
+    }
+    // A renewable record must stay renewable: never downgrade a malformed,
+    // removed or replaced session to an old access-only approval.
+    let (session_id, absolute_expires_at) = match &cred.cli_session {
+        Some(session) => {
+            if !session.session_id.strip_prefix("hcs_").is_some_and(|id| {
+                id.len() == 36 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            }) || session.generation == 0
+                || !valid_token(&session.refresh_token, "hcr_")
+                || session.device_label.is_empty()
+                || session.device_label.len() > 120
+                || session.idle_expires_at <= at
+                || session.absolute_expires_at <= at
+                || session.idle_expires_at > session.absolute_expires_at
+            {
+                return Err(reject(
+                    "saved renewable account identity is invalid or expired",
+                ));
+            }
+            (session.session_id.clone(), session.absolute_expires_at)
+        }
+        None if cred.expires_at > at.saturating_add(SKEW) && cred.pending.is_none() => {
+            use sha2::{Digest, Sha256};
+            // Internal non-secret lineage for a login with no issuer credential
+            // id. A replacement bearer changes the source, never its authority.
+            (
+                format!(
+                    "access-sha256:{:x}",
+                    Sha256::digest(cred.access_token.as_bytes())
+                ),
+                cred.expires_at,
+            )
+        }
+        None => {
+            return Err(reject(
+                "saved account login expired — run `cadence login` again",
+            ))
+        }
+    };
+    Ok(AccountImageIdentity {
+        org: target.org.clone(),
+        organization_id: cred.organization_id.clone(),
+        audience: cred.audience.clone(),
+        issuer: issuer.to_owned(),
+        subject_id: subject.to_owned(),
+        session_id,
+        absolute_expires_at,
+    })
+}
+
+/// Saved remote destinations from the CLI org registry. This read-only view
+/// deliberately ignores `selected` and CADENCE_ORG: inventory is not selection
+/// or authority. Each row still has to pass private credential identity checks.
+pub fn account_image_targets() -> Result<Vec<RemoteTarget>> {
+    let dir = auth_dir(None)?;
+    let path = dir
+        .parent()
+        .ok_or_else(|| reject("saved org registry directory unavailable"))?
+        .join("orgs.json");
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } || meta.len() > 65536 {
+        return Err(reject(
+            "saved org registry must be a bounded owned regular file",
+        ));
+    }
+    let mut raw = Vec::new();
+    file.take(65537).read_to_end(&mut raw)?;
+    if raw.len() > 65536 {
+        return Err(reject("saved org registry exceeds 64 KiB"));
+    }
+    let registry: Value =
+        serde_json::from_slice(&raw).map_err(|_| reject("invalid saved org registry"))?;
+    let rows = registry["connections"]
+        .as_array()
+        .ok_or_else(|| reject("invalid saved org registry"))?;
+    let mut targets = Vec::new();
+    let mut names = std::collections::HashSet::new();
+    for row in rows {
+        let org = row["selection"]["org"]
+            .as_str()
+            .ok_or_else(|| reject("saved org name is missing"))?;
+        crate::proto::identifier(org, "saved org")?;
+        if !names.insert(org) {
+            return Err(reject("duplicate saved org"));
+        }
+        match row["destination"]["mode"].as_str() {
+            Some("local") => continue,
+            Some("remote") => {}
+            _ => return Err(reject("invalid saved org destination")),
+        }
+        let endpoint = row["destination"]["endpoint"]
+            .as_str()
+            .ok_or_else(|| reject("saved org audience is missing"))?;
+        let org_id = row["destination"]["org_id"]
+            .as_str()
+            .filter(|id| valid_id(id))
+            .ok_or_else(|| reject("saved org workspace is missing"))?;
+        targets.push(RemoteTarget {
+            org: org.to_owned(),
+            endpoint: endpoint.to_owned(),
+            org_id: org_id.to_owned(),
+        });
+    }
+    targets.sort_by(|a, b| a.org.cmp(&b.org));
+    Ok(targets)
+}
+
+/// Offline discovery only: no renewal, default lookup or account request.
+/// The target is the already selected saved org, not a billing authority.
+pub fn account_image_identity(target: &RemoteTarget) -> Result<AccountImageIdentity> {
+    crate::proto::identifier(&target.org, "saved account")?;
+    let dir = auth_dir(None)?;
+    // Writers atomically replace the private file. Offline discovery must
+    // never wait on a login lock held across renewal/network I/O.
+    let identity = account_image_identity_from(target, &read_credential_metadata(&dir, target)?)?;
+    crate::remote_enrollment::validate_account_image_destination(
+        &dir,
+        &identity.issuer,
+        &identity.audience,
+    )?;
+    Ok(identity)
+}
+
+/// Custody owns renewal and the fixed image HTTP operation. The source lock
+/// serializes logout/replacement with the entire operation, not only refresh.
+/// Check the frozen identity BEFORE any renewal POST and again afterwards.
+pub fn account_image_request(
+    identity: &AccountImageIdentity,
+    operation: AccountImageOperation,
+    timeout_secs: u64,
+) -> Result<AccountImageResponse> {
+    crate::proto::identifier(&identity.org, "saved account")?;
+    if !(1..=120).contains(&timeout_secs) {
+        return Err(reject(
+            "account image timeout is outside the supported bound",
+        ));
+    }
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let dir = auth_dir(None)?;
+    let target = identity.target();
+    let _lock = private_lock(&dir, &identity.org, deadline)?;
+    let cred = load_credential(&dir, &target)?;
+    if account_image_identity_from(&target, &cred)? != *identity {
+        return Err(reject(
+            "saved account source changed; frozen image authority is stale",
+        ));
+    }
+    crate::remote_enrollment::validate_account_image_destination(
+        &dir,
+        &identity.issuer,
+        &identity.audience,
+    )?;
+    if cred.cli_session.is_some() {
+        renew_credential_locked(
+            &dir,
+            &target,
+            deadline,
+            cred,
+            crate::remote_enrollment::cli_session_post_detailed,
+        )?;
+    }
+    let cred = load_credential(&dir, &target)?;
+    if account_image_identity_from(&target, &cred)? != *identity {
+        return Err(reject("saved account source changed during renewal"));
+    }
+    crate::remote_enrollment::account_image_send(
+        &dir,
+        &identity.issuer,
+        &identity.audience,
+        &cred.access_token,
+        operation,
+        deadline,
+    )
 }
 
 /// CAD-1429: a Publish Web management request. Only a verified, live `hct_`
@@ -3252,3 +3524,7 @@ mod tests {
 #[cfg(test)]
 #[path = "remote_cli_renewal_acceptance.rs"]
 mod renewal_acceptance;
+
+#[cfg(test)]
+#[path = "remote_cli/cad1459_account_image_acceptance.rs"]
+pub(crate) mod cad1459_account_image_acceptance;

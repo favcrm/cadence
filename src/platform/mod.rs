@@ -7,6 +7,7 @@
 //! `enroll` takes them, hands them to [`custody`], and records a
 //! fingerprint; every result, event and refusal carries handles only.
 
+pub mod account_media;
 pub mod adapter;
 pub mod agenticos;
 pub mod agenticos_external;

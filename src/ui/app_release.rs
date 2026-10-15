@@ -1,5 +1,5 @@
 //! Operator controls for app bindings and reviewed artifact release.
-use super::{err_response, json_response, read_body, HttpResp};
+use super::{app_screens, err_response, json_response, operator, read_body, HttpResp, ServeOpts};
 use crate::{client, error::Error};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -260,6 +260,36 @@ pub(super) fn handle(
     route: Route<'_>,
     write: bool,
 ) -> HttpResp {
+    handle_inner(
+        request,
+        state,
+        route,
+        write,
+        operator::PublicRelay::NotPublic,
+        None,
+    )
+}
+
+/// Quote ownership is the request's native session, never this relay's PID.
+pub(super) fn handle_with_relay(
+    request: &mut Request,
+    state: &Path,
+    route: Route<'_>,
+    write: bool,
+    relay: operator::PublicRelay,
+    opts: &ServeOpts,
+) -> HttpResp {
+    handle_inner(request, state, route, write, relay, Some(opts))
+}
+
+fn handle_inner(
+    request: &mut Request,
+    state: &Path,
+    route: Route<'_>,
+    write: bool,
+    relay: operator::PublicRelay,
+    opts: Option<&ServeOpts>,
+) -> HttpResp {
     if request
         .url()
         .split_once('?')
@@ -284,6 +314,18 @@ pub(super) fn handle(
             Route::Quote(install, context, slot) => {
                 let mut params = scoped(Some(install), context);
                 params["slot"] = json!(slot);
+                let Some((token, key, origin)) =
+                    opts.and_then(|opts| app_screens::request_credentials(request, opts))
+                else {
+                    return Err(err_response(
+                        403,
+                        "capability quote needs a live operator session",
+                    ));
+                };
+                params["token"] = json!(token);
+                params["key"] = json!(key);
+                params["origin"] = json!(origin);
+                operator::relay_owner_proof(&mut params, relay)?;
                 ("app_binding_quote", params)
             }
             Route::Update(install, binding) => {
@@ -566,3 +608,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "app_release/cad1459_account_quote_acceptance.rs"]
+mod cad1459_account_quote_acceptance;

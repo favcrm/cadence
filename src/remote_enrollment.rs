@@ -950,6 +950,175 @@ pub(crate) fn cli_session_post_for_test(
     cli_session_post_with(dir, issuer, path, bearer, body, deadline, send)
 }
 
+/// The account image door uses the saved canonical board audience, never the
+/// issuer's media origin. Trust remains the normal login trust; no media pin
+/// or ingress credential is added (issuer-only Access secrets stay there).
+pub(crate) fn validate_account_image_destination(
+    dir: &Path,
+    issuer: &str,
+    audience: &str,
+) -> Result<()> {
+    origin(audience, cfg!(test))?;
+    validate_cli_session_pin(dir, issuer)
+}
+
+pub(crate) fn account_image_send(
+    dir: &Path,
+    issuer: &str,
+    audience: &str,
+    bearer: &str,
+    operation: crate::remote_cli::AccountImageOperation,
+    deadline: Instant,
+) -> Result<crate::remote_cli::AccountImageResponse> {
+    use crate::remote_cli::{AccountImageOperation as Op, AccountImageResponse};
+    const JSON_CAP: u64 = 256 * 1024;
+    const ARTIFACT_CAP: u64 = 10 * 1024 * 1024;
+    let segment = |value: &str| {
+        (5..=84).contains(&value.len())
+            && value.starts_with("med_")
+            && value[4..]
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+    };
+    let (path, submit, artifact) = match operation {
+        Op::Quote => ("/__platform/media/price/image".to_owned(), None, false),
+        Op::Submit {
+            input,
+            idempotency_key,
+        } => {
+            let object = input
+                .as_object()
+                .ok_or_else(|| reject("account image input must be an object"))?;
+            if object.len() != 4
+                || !["model", "prompt", "aspectRatio", "max_charge_minor"]
+                    .iter()
+                    .all(|key| object.contains_key(*key))
+                || input["model"] != "openai/gpt-image-2.5"
+                || input["prompt"].as_str().is_none_or(|p| p.trim().is_empty())
+                || input["aspectRatio"] != "1:1"
+                || input["max_charge_minor"]
+                    .as_u64()
+                    .is_none_or(|n| !(1..=1_000_000_000).contains(&n))
+                || !(8..=128).contains(&idempotency_key.len())
+                || !idempotency_key
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+            {
+                return Err(reject(
+                    "account image submit is outside the reviewed image contract",
+                ));
+            }
+            let bytes =
+                serde_json::to_vec(&input).map_err(|_| reject("invalid account image input"))?;
+            if bytes.len() as u64 > JSON_CAP {
+                return Err(reject("account image input exceeds 256 KiB"));
+            }
+            (
+                "/__platform/media/image".to_owned(),
+                Some((bytes, idempotency_key)),
+                false,
+            )
+        }
+        Op::Job { job_id } if segment(&job_id) => {
+            (format!("/__platform/media/jobs/{job_id}"), None, false)
+        }
+        Op::Artifact { reference } => {
+            let valid = reference.split_once('.').is_some_and(|(job, digest)| {
+                segment(job)
+                    && digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            });
+            if !valid {
+                return Err(reject("account image artifact reference refused"));
+            }
+            (
+                format!("/__platform/media/artifacts/{reference}"),
+                None,
+                true,
+            )
+        }
+        _ => return Err(reject("account image job reference refused")),
+    };
+    validate_account_image_destination(dir, issuer, audience)?;
+    let end = deadline
+        .min(Instant::now() + std::time::Duration::from_secs(if artifact { 60 } else { 20 }));
+    if Instant::now() >= end {
+        return Err(Error::busy_coded(
+            "timeout",
+            "account image operation deadline elapsed",
+        ));
+    }
+    let agent = issuer_agent(
+        ureq::Agent::config_builder()
+            .timeout_global(Some(end.saturating_duration_since(Instant::now())))
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .proxy(None),
+    );
+    let url = format!("{audience}{path}");
+    let authorization = format!("Bearer {bearer}");
+    let mut response = match submit {
+        Some((bytes, key)) => agent
+            .post(&url)
+            .header("Authorization", &authorization)
+            .header("Content-Type", "application/json")
+            .header("Idempotency-Key", &key)
+            .send(bytes.as_slice()),
+        None => agent
+            .get(&url)
+            .header("Authorization", &authorization)
+            .call(),
+    }
+    .map_err(|_| reject("account image operation could not be confirmed"))?;
+    let status = response.status().as_u16();
+    if (300..400).contains(&status) {
+        return Err(reject("account image redirect refused"));
+    }
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| v.len() <= 128)
+        .map(str::to_owned);
+    let cap = if artifact && status == 200 {
+        ARTIFACT_CAP
+    } else {
+        JSON_CAP
+    };
+    let mut bytes = Vec::new();
+    response
+        .body_mut()
+        .as_reader()
+        .take(cap + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > cap {
+        return Err(Error::invalid(
+            "account_image_response_too_large",
+            "account image response exceeds its operation bound",
+        ));
+    }
+    validate_account_image_destination(dir, issuer, audience)?;
+    if artifact && status == 200 {
+        Ok(AccountImageResponse {
+            status,
+            body: None,
+            content_type,
+            bytes,
+        })
+    } else {
+        let body = serde_json::from_slice(&bytes)
+            .map_err(|_| reject("account image response was not JSON"))?;
+        Ok(AccountImageResponse {
+            status,
+            body: Some(body),
+            content_type: None,
+            bytes: Vec::new(),
+        })
+    }
+}
+
 /// CAD-1429: one Publish Web management request to the verified PUBLIC
 /// issuer, never to the board audience. Board hosts are answered by the board
 /// catch-all before any `/v1` route, so `/v1/web-sites` must go to the issuer
@@ -957,6 +1126,7 @@ pub(crate) fn cli_session_post_for_test(
 /// issuer is the one the caller verified (never a request argument), the
 /// trusted-issuer pin and Access ingress are checked as for every issuer call,
 /// and redirects are refused. Returns `(status, parsed JSON body)`.
+///
 /// One Publish Web management request: the verb, the namespace path, the
 /// bearer, the contract headers and an optional body.
 pub struct WebRequest<'a> {

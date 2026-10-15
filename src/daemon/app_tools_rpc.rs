@@ -412,6 +412,69 @@ impl Shared {
         let input = input.clone();
         let pm_dir = self.pm_dir()?;
         let pm = self.pm_at(&pm_dir)?;
+        let account_actor = self.account_image_actor_for_session(&ctx.session)?;
+        let prepared = workspace::with_runtime_snapshot(&pm, &ctx.install_id, |bundle, files| {
+            let _custody = self
+                .platform_custody_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let _release = self
+                .app_release_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let status = self
+                .store
+                .app_capability_status(&ctx.install_id, required_str(bundle, "digest")?)?;
+            if bundle["digest"] != ctx.digest
+                || status["state"] != "approved"
+                || status["epoch"].as_i64() != Some(ctx.approval_epoch)
+            {
+                return Err(Error::rejected("installation approval changed since mount"));
+            }
+            let manifest = crate::issue::app::parse_manifest(
+                files
+                    .get("app.md")
+                    .ok_or_else(|| Error::rejected("installation manifest unavailable"))?,
+            )?;
+            let declaration = manifest
+                .capabilities
+                .get(slot)
+                .ok_or_else(|| Error::rejected("tool capability slot is undeclared"))?;
+            declaration.validate()?;
+            if !matches!(declaration.effect.as_str(), "read" | "draft") {
+                return Err(Error::rejected(
+                    "standalone tools never run a send/publish effect",
+                ));
+            }
+            if self
+                .store
+                .app_tool_result_for_request(request_id)?
+                .is_some()
+            {
+                return Ok(None);
+            }
+            let proof = self
+                .app_binding_auto_image(
+                    &ctx.install_id,
+                    ctx.context_id.as_deref(),
+                    slot,
+                    &account_actor,
+                    bundle,
+                    files,
+                )?
+                .ok_or_else(|| Error::rejected("tool capability binding is absent"))?;
+            self.app_account_binding_owned(&account_actor, &proof)?;
+            let request = self.prepare_app_capability_quote(&proof)?;
+            Ok(Some((proof, request)))
+        })?;
+        let quoted = prepared
+            .map(|(proof, request)| -> Result<_> { Ok((proof, request.fetch()?)) })
+            .transpose()?;
+        if self.account_image_actor_for_session(&ctx.session)? != account_actor {
+            return Err(Error::rejected(
+                "tool native actor changed during price discovery",
+            ));
+        }
         workspace::with_runtime_snapshot(&pm, &ctx.install_id, |bundle, files| {
             let _custody = self
                 .platform_custody_lock
@@ -534,9 +597,50 @@ impl Shared {
                 }
                 saved_handle = Some(requested);
             }
-            // Re-quote at invoke — the operator's session is the approval;
-            // the adapter re-enforces the charge ceiling at execution.
-            let quote = self.app_capability_quote(&proof)?;
+            // The live price was fetched outside PM/custody/release locks.
+            // Recheck the exact receipt and native session before any claim.
+            let (quoted_proof, quote) = quoted
+                .as_ref()
+                .ok_or_else(|| Error::rejected("tool receipt changed during price discovery"))?;
+            if quoted_proof.digest != proof.digest
+                || quoted_proof.id != proof.id
+                || quoted_proof.revision != proof.revision
+                || quoted_proof.config != proof.config
+            {
+                return Err(Error::rejected(
+                    "tool binding changed during price discovery",
+                ));
+            }
+            self.account_image_actor_live(&account_actor)?;
+            self.app_account_binding_owned(&account_actor, &proof)?;
+            self.app_binding_receipt_current(
+                &ctx.install_id,
+                ctx.context_id.as_deref(),
+                slot,
+                &proof,
+                bundle,
+                files,
+            )?;
+            self.recheck_app_capability_quote(&proof, quote)?;
+            if !ctx.session.is_empty()
+                && !self
+                    .tool_contexts
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .values()
+                    .any(|current| {
+                        current.session == ctx.session
+                            && current.install_id == ctx.install_id
+                            && current.tag == ctx.tag
+                            && current.generation == ctx.generation
+                            && current.mount == ctx.mount
+                            && current.mount.is_some()
+                            && current.issued == ctx.issued
+                            && current.issued.elapsed() < TOOL_CTX_TTL
+                    })
+            {
+                return Err(Error::rejected("tool mount changed during price discovery"));
+            }
             if ceiling_micros.is_some_and(|ceiling| quote.total_price_micros > ceiling) {
                 return Err(Error::rejected(format!(
                     "price_changed: the live price {} micros is above the confirmed {} micros",
