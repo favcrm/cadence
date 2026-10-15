@@ -163,7 +163,7 @@ async function get<T>(path: string, signal?: AbortSignal): Promise<T> {
       const body = await resp.json().catch(() => null);
       if (generation !== privateSessionGeneration()) throw new Error("Session changed during response");
       const code = body?.code ?? body?.error?.code;
-      if (protectedRead && resp.status === 401 && code === "board_session_required") {
+      if (protectedRead && resp.status === 401 && (code === "board_session_required" || code === "operator_session_required")) {
         window.dispatchEvent(new Event("cadence:session-required"));
       }
       throw new ApiError(

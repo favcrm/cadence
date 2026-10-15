@@ -255,6 +255,14 @@ onPrivateReadsPaused(() => {
   privateRequests.clear();
 });
 
+function appResponseError(response: Response, value: unknown): ApiError {
+  const body = value as { code?: unknown; error?: string | { code?: unknown; message?: unknown } } | null;
+  const nested = typeof body?.error === "object" ? body.error : null;
+  const code = typeof body?.code === "string" ? body.code : typeof nested?.code === "string" ? nested.code : undefined;
+  const message = typeof body?.error === "string" ? body.error : typeof nested?.message === "string" ? nested.message : `${response.status} ${response.statusText}`;
+  return new ApiError(message, response.status, code ? { code } : undefined);
+}
+
 async function request<T>(path: string, signal?: AbortSignal, body?: object): Promise<T> {
   const read = body === undefined;
   if (read && !privateReadsAllowed()) throw new DOMException("Session verification required", "AbortError");
@@ -279,7 +287,13 @@ async function request<T>(path: string, signal?: AbortSignal, body?: object): Pr
     if (generation !== privateSessionGeneration() || controller?.signal.aborted || (read && !privateReadsAllowed())) {
       throw new DOMException("The private session changed", "AbortError");
     }
-    if (!response.ok) throw new ApiError(value?.error ?? `${response.status} ${response.statusText}`, response.status, typeof value?.code === "string" ? { code: value.code } : undefined);
+    if (!response.ok) {
+      const error = appResponseError(response, value);
+      if (response.status === 401 && (error.code === "operator_session_required" || error.code === "board_session_required") && typeof window !== "undefined") {
+        window.dispatchEvent(new Event("cadence:session-required"));
+      }
+      throw error;
+    }
     if (value === null) throw new ApiError("The server returned an invalid app receipt", 502);
     return value as T;
   } finally {
@@ -362,7 +376,7 @@ export const workspaceApps = {
     try {
       const response=await privateFetch("/api/app-social-drafts/asset",{method:"POST",credentials:"same-origin",cache:"no-store",signal:controller.signal,
         headers:{"Content-Type":"application/json","X-Cadence-Board":"1",...sessionHeaders()},body:JSON.stringify(toolActionBody(body))});
-      if(!response.ok) { const value=await response.json().catch(()=>null); throw new ApiError(value?.error??`${response.status} ${response.statusText}`,response.status); }
+      if (!response.ok) throw appResponseError(response, await response.json().catch(() => null));
       const mime=response.headers.get("Content-Type")??"";
       if(!["image/jpeg","image/png"].includes(mime)) throw new ApiError("The server returned an invalid social image",502);
       const bytes = await response.arrayBuffer();
@@ -382,7 +396,7 @@ export const workspaceApps = {
     try {
       const response = await privateFetch("/api/app-media/original", { method: "POST", credentials: "same-origin", cache: "no-store", signal: controller.signal,
         headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() }, body: JSON.stringify(body) });
-      if (!response.ok) { const value = await response.json().catch(() => null); throw new ApiError(value?.error ?? `${response.status} ${response.statusText}`, response.status, typeof value?.code === "string" ? { code: value.code } : undefined); }
+      if (!response.ok) throw appResponseError(response, await response.json().catch(() => null));
       const mime = response.headers.get("Content-Type") ?? "";
       if (!ORIGINAL_MIME.includes(mime)) throw new ApiError("The server returned an invalid original image", 502);
       const bytes = await readBounded(response);

@@ -52,7 +52,12 @@ export async function privateFetch(input: RequestInfo | URL, init?: RequestInit)
     const response = await fetch(input, { ...init, signal });
     if (!admitted || started !== generation) throw new Error("Session changed during request");
     if (response.status === 401 && typeof window !== "undefined") {
-      window.dispatchEvent(new Event("cadence:session-required"));
+      const body = await response.clone().json().catch(() => null);
+      if (!admitted || started !== generation) throw new Error("Session changed during response");
+      const code = body?.code ?? body?.error?.code;
+      if (code === "operator_session_required" || code === "board_session_required") {
+        window.dispatchEvent(new Event("cadence:session-required"));
+      }
     }
     return response;
   } finally {

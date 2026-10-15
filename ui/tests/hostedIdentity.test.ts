@@ -73,7 +73,8 @@ async function boundaryChecks() {
   const { privateSessionGeneration, privateReadsAllowed } = require("../src/lib/privateSession") as typeof PrivateSessionModule;
   const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
   const signedIn = { ...base, hosted: false, operator: false, session: { id: "local-member", origin: "loopback", created: 1700000000, last_used: 1700000000, idle_expires_at: 4102444800, expires_at: 4102444800, user_agent: "test", user: { sub: "member", name: "Member", email: "member@example.test", handle: "member", role: "member" } } };
-  let response = () => json(signedIn);
+  let response: () => Response | Promise<Response> = () => json(signedIn);
+  let projectsResponse = () => json({ projects: [{ key: "private-project" }] });
   const proofHeaders: (string | null)[] = [];
   let lateRead: ((response: Response) => void) | undefined;
   let privateRequests = 0, effects = 0, cleanups = 0;
@@ -86,7 +87,7 @@ async function boundaryChecks() {
       return response();
     }
     privateRequests++;
-    if (url.pathname === "/api/projects") return json({ projects: [{ key: "private-project" }] });
+    if (url.pathname === "/api/projects") return projectsResponse();
     if (url.pathname === "/api/issues") return new Promise<Response>((resolve) => { lateRead = resolve; });
     throw new Error(`Unexpected boundary request ${url.pathname}`);
   };
@@ -153,6 +154,32 @@ async function boundaryChecks() {
     await retry();
     assert(host.querySelector("output")?.textContent === "unsaved private draft", "same-session recovery restores the in-memory draft");
     assert(effects > 1, "private effects resume after recovery");
+
+    // A newer authoritative refusal supersedes an already validated but delayed
+    // metadata response. Neither envelope may restore the old private draft.
+    for (const refusal of [
+      { error: { message: "Session required", code: "board_session_required" } },
+      { error: "Session required", code: "operator_session_required" },
+    ]) {
+      let delayedProof: ((reply: Response) => void) | undefined;
+      response = () => new Promise<Response>((resolve) => { delayedProof = resolve; });
+      await focus();
+      assert(delayedProof, "a successful metadata proof can still be in flight at refusal");
+      const beforeRefusal = privateSessionGeneration();
+      projectsResponse = () => json(refusal, 401);
+      await React.act(async () => { await api.projects().catch(() => undefined); });
+      delayedProof(json(signedIn));
+      await flush();
+      assert(!host.querySelector("[data-private-workspace]"), "a delayed pre-refusal metadata success cannot reveal private content again");
+      assert(!privateReadsAllowed() && privateSessionGeneration() > beforeRefusal, "confirmed read refusal withdraws admission and invalidates old observations");
+      assert(projects.get().data === null, "confirmed read refusal clears the prior private query cache");
+      projectsResponse = () => json({ projects: [{ key: "private-project" }] });
+      response = () => json(signedIn);
+      await React.act(async () => setSessionKey("existing-local-key"));
+      await focus();
+      assert(host.querySelector("output")?.textContent === "", "new verification after refusal cannot recover the expired draft");
+      await React.act(async () => (host.querySelector("[data-private-workspace] button") as HTMLButtonElement).click());
+    }
 
     // Hold a real API read across confirmed identity loss.
     const stale = api.issues().then(() => false, () => true);

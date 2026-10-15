@@ -194,9 +194,19 @@ export default function AuthBoundary({ children }: {
       publish({ ...stateRef.current, status: "unavailable" });
     };
     const required = () => {
-      pausePrivateReads();
-      publish({ ...stateRef.current, status: "checking" });
-      void recheck();
+      // A confirmed refusal supersedes even an older successful proof still
+      // in flight. Recovery must verify anew, never join that stale probe.
+      const previous = stateRef.current;
+      const expired = previous.accepted !== null || identity.current !== null || sessionKey() !== null || previous.status === "expired";
+      sequence.current += 1;
+      inFlight.current?.controller.abort();
+      inFlight.current = null;
+      discard();
+      if (sessionKey() !== null) {
+        credential.current = null;
+        setSessionKey(null);
+      }
+      publish({ ...previous, status: expired ? "expired" : "signedout", accepted: null, generation: privateSessionGeneration() });
     };
     const focused = () => { if (!document.hidden) void recheck(); };
     window.addEventListener("cadence:session-changed", changed);

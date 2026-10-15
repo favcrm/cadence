@@ -131,6 +131,39 @@ async function main() {
   equal(await workspaceApps.outbox("effect-a"), reply, "Outbox keeps app scope and durable provenance instead of inventing site ownership");
   equal(latest().path, "/api/outbox?effect_id=effect-a", "Only matching actual Local item is read");
 
+
+  const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const authEvents = new EventTarget();
+  Object.defineProperty(globalThis, "window", { configurable: true, value: authEvents });
+  let refusals = 0;
+  authEvents.addEventListener("cadence:session-required", () => { refusals += 1; });
+  try {
+    for (const [code, envelope] of [
+      ["operator_session_required", { error: "Local operator session expired", code: "operator_session_required" }],
+      ["board_session_required", { error: { message: "Hosted board session expired", code: "board_session_required" } }],
+    ] as const) {
+      status = 401; reply = envelope;
+      const message = typeof envelope.error === "string" ? envelope.error : envelope.error.message;
+      const beforeRefusal = refusals;
+      await rejected(() => workspaceApps.detail("install-a"), error =>
+        error instanceof ApiError && error.status === 401 && error.code === code && error.message === message,
+      "Both auth refusal envelopes preserve their readable message and code");
+      equal(refusals, beforeRefusal + 1, "A confirmed private read refusal immediately notifies the session gate");
+    }
+    status = 403; reply = { error: { code: "board_session_required", message: "Role cannot read this app" } };
+    const beforePermission = refusals;
+    await rejected(() => workspaceApps.detail("install-a"), error =>
+      error instanceof ApiError && error.status === 403 && error.message === "Role cannot read this app",
+    "A role refusal remains a readable permission error");
+    equal(refusals, beforePermission, "A normal role 403 does not log out the operator");
+    status = 401; reply = { code: "other_auth_failure", error: "Not a board-session refusal" };
+    await rejected(() => workspaceApps.detail("install-a"), error => error instanceof ApiError && error.status === 401,
+      "An unrelated 401 remains an API error");
+    equal(refusals, beforePermission, "An unrecognized 401 does not confirm board session loss");
+  } finally {
+    if (originalWindow) Object.defineProperty(globalThis, "window", originalWindow);
+    else Reflect.deleteProperty(globalThis, "window");
+  }
   let before = calls.length;
   status = 409; reply = { error: "authority revision changed" };
   await rejected(() => workspaceApps.decideEffect("effect-a", { digest: "stale", decision: "accept" }), e => e instanceof ApiError && e.status === 409 && e.message === "authority revision changed", "Stale authority is a typed refusal");
