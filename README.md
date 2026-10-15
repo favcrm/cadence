@@ -96,7 +96,7 @@ Task worktrees live under `.cadence/wt/` inside the repo checkout.
 src/        CLI, daemon and provider adapters (Rust)
 ui/         the board (React + Vite; features/ + lib/ + ui/)
 skills/     agent skills — cadence (installed by `cadence skill install`),
-            agent-handover
+            agent-handover, business-documents, company-outputs, sop-workshop
 agents/     master-agent seed files
 contracts/  versioned platform schemas and worked vectors
 workflows/  reusable workflow templates
@@ -105,6 +105,18 @@ scripts/    install, CI and review helpers
 docs/       working docs — the context-manifest set stays tracked
             (docs/cadence/project-context.yaml indexes it)
 ```
+
+## Company outputs
+
+For proposals, quotations, reports and letters, give the drafting agent
+[`skills/company-outputs/SKILL.md`](skills/company-outputs/SKILL.md).
+It separates company profiles from request facts, confirms the proposed
+solution before authoring, and requires actual output checks. It reuses
+the existing business-document operations where their contracts fit.
+Native templates currently support quotation/invoice DOCX drafts, not
+arbitrary proposals or XLSX templates. `cadence skill install` installs
+the Cadence protocol only; providing this checked-out entry point is
+explicit skill consumption, not automatic hosted installation.
 
 ## Principles
 
