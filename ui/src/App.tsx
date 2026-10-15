@@ -176,7 +176,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   const issues = issuesState.data ?? [];
   const projects = projectsState.data ?? [];
   const agents = agentsState.data;
-  const [health, setHealth] = useState<Health | null>(null);
+  const [health, setHealth] = useState<Health | null | "unavailable">(null);
   const [updateBanner, setUpdateBanner] = useState<UpdateBanner | null>(null);
   // The open drawer's detail, cached per id: reopening a drawer paints
   // the last payload while it revalidates.
@@ -298,11 +298,19 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
 
   // Bootstrap is owned by AuthBoundary. A private refresh first verifies
   // the current session; failed verification pauses this entire Activity.
+  const healthRequest = useRef(0);
   const refresh = useCallback(() => {
     const generation = privateSessionGeneration();
     void recheck().then((verified) => {
       if (!verified || !privateReadsAllowed() || generation !== privateSessionGeneration()) return;
-      api.health().then(setHealth).catch(() => setHealth(null));
+      const healthProbe = ++healthRequest.current;
+      api.health()
+        .then((next) => {
+          if (healthProbe === healthRequest.current) setHealth(next);
+        })
+        .catch(() => {
+          if (healthProbe === healthRequest.current) setHealth("unavailable");
+        });
       void resources.projects.refresh();
       void resources.issues.refresh();
       void resources.agents.refresh();
