@@ -5,6 +5,8 @@
 //! fixed lease-owned door with no bearer; the Worker derives the company.
 #[cfg(test)]
 mod cad1365_original_artifact_acceptance;
+#[cfg(test)]
+mod cad1446_image_max_acceptance;
 pub(crate) mod image;
 pub mod media_import;
 pub mod publish;
@@ -614,8 +616,8 @@ impl AgenticosExternalAdapter {
             None => image_prompt(authority, input)
                 .map_err(|detail| ImageFailure::refused(R::PlanInvalid, detail))?,
         };
-        // The frozen quote still proves shape (schema/currency/units); its
-        // amount is recorded, never enforced as a charge ceiling.
+        // The frozen approval maximum uses the same micro-USD units as
+        // AgenticOS chargeMinor; submit it for enforcement before reservation.
         let quoted = frozen_charge_ceiling(authority)
             .map_err(|detail| ImageFailure::refused(R::PlanInvalid, detail))?;
         let token = self
@@ -634,6 +636,7 @@ impl AgenticosExternalAdapter {
                 "model": IMAGE_MODEL,
                 "prompt": prompt,
                 "aspectRatio": "1:1",
+                "max_charge_minor": quoted,
             }))
             .map_err(|_| uncertain_submit())?;
         let status = response.status().as_u16();
