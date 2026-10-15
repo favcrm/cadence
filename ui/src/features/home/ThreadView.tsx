@@ -160,7 +160,7 @@ export function ThreadItemView({
     case "operator":
       return (
         <Bubble who={t("You")} at={time(item.entry.created)} me density={density}>
-          <div className={`inline-block text-left px-3 py-2 bg-accent/10 border border-accent/20 ${USER_BUBBLE} ${bodyText} text-ink-100 break-words`}>
+          <div className={`inline-block min-w-0 max-w-full text-left px-3 py-2 bg-accent/10 border border-accent/20 ${USER_BUBBLE} ${bodyText} text-ink-100 break-words`}>
             <span className="whitespace-pre-wrap [overflow-wrap:anywhere]">{item.entry.text}</span>
             <AttachmentRows files={entryAttachments(item.entry.payload)} />
           </div>

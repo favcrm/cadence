@@ -508,6 +508,11 @@
   align-items: center;
   gap: 0.375rem;
   margin-top: 0.375rem;
+  /* Contain inside the inline-block operator bubble at narrow widths:
+     a flex row's max-content is the single-line sum of its chips, so
+     bound it to the bubble's width and let the chips wrap (CAD-1462). */
+  min-width: 0;
+  max-width: 100%;
 }
 .sentchip {
   display: inline-flex;
