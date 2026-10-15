@@ -41,6 +41,7 @@ ME_PATH = "/api/human-threads/me"
 REBIND_PATH = "/api/human-threads/push/subscriptions/rebind"
 COOKIE_NAME = "__Host-aos-board-session"
 REFUSAL_STATUSES = {400, 401, 403, 409, 422}
+VERIFIED_PUBLIC_HOST = None
 
 
 class NotRun(Exception):
@@ -112,13 +113,15 @@ def forged_signature(assertion):
 
 def http_request(base_url, method, path, cookie_value=None, body=None):
     u = urllib.parse.urlsplit(base_url)
+    if not VERIFIED_PUBLIC_HOST:
+        raise NotRun("receipt-verified public_host is required for HTTP transport")
     conn = http.client.HTTPConnection(u.hostname, u.port, timeout=10)
-    headers = {"Host": u.netloc}
+    headers = {"Host": VERIFIED_PUBLIC_HOST}
     if cookie_value is not None:
         headers["Cookie"] = f"{COOKIE_NAME}={cookie_value}"
     if method == "POST":
         headers.update({"Content-Type": "application/json", "X-Cadence-Board": "1",
-                        "Origin": f"{u.scheme}://{u.netloc}", "Sec-Fetch-Site": "same-origin"})
+                        "Origin": f"{u.scheme}://{VERIFIED_PUBLIC_HOST}", "Sec-Fetch-Site": "same-origin"})
     payload = None if body is None else json.dumps(body, separators=(",", ":")).encode("utf-8")
     try:
         conn.request(method, path, body=payload, headers=headers)
@@ -221,7 +224,11 @@ def run(args):
     helper = rotation_driver()
     target = argparse.Namespace(base_url=args.base_url, binary=args.binary,
                                 state_dir=args.state_dir, receipt=args.receipt, socket=None)
-    helper.verify_target(target)
+    public_host, _ = helper.protected_driver().verify_target(target)
+    if not public_host:
+        raise NotRun("receipt has no verified public_host for session HTTP transport")
+    global VERIFIED_PUBLIC_HOST
+    VERIFIED_PUBLIC_HOST = public_host
     db = helper.open_native_db(args.state_dir)
     try:
         prior_a = cookie(args.prior_a_cookie)

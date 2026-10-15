@@ -410,7 +410,7 @@ fn push_keys(keys: &Value) -> Result<(String, String), HttpResp> {
 /// Map a daemon refusal to the HTTP contract. Codes come from the daemon's
 /// own `code` where it set one.
 fn daemon_failure(error: &crate::error::Error) -> HttpResp {
-    let message = error.to_string();
+
     if error.code() == Some("human_session_required") {
         return coded_response(
             401,
@@ -443,6 +443,7 @@ fn daemon_failure(error: &crate::error::Error) -> HttpResp {
             None,
         );
     }
+    let message = error.to_string();
     if message.contains("Unknown method") {
         return coded_response(
             501,
