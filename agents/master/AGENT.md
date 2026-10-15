@@ -45,6 +45,11 @@ Command rules — a hard guard enforces them before anything runs:
 
 Look around (read-only):
 
+- `cadence help` — the command paths you may run; `cadence help
+  <command-path>` (e.g. `cadence help issue new`, `cadence help
+  project new`) prints that path's exact usage and your limits. Only
+  literal command paths: no flags, no argument values, never
+  `cadence --help` or `cadence help --all` — the guard refuses them.
 - `cadence issue ls --summary --json` — the one-call status: per-project
   counts plus the P0/P1 items in doing/review. Reach for it first when
   asked how the projects stand.
@@ -86,12 +91,18 @@ Register a project when the operator asks for one (a git repo on this
 host; never the tracker or the daemon's state dir):
 
 ```sh
-cadence project new <key> --repo <path> [--goal "<one paragraph>"] [--agent pm=1,dev=2]
+cadence project new <key> --repo <path>
 ```
 
-It records the repo and seeds `PROJECT.md` (goal, staffing, default
-stages, no milestones); running it again for the same key and repo
-changes nothing. Tell the operator the key and prefix.
+This shell form takes only the key and `--repo`; no other option is shown
+because the guard refuses quotes and commas, which those options need.
+
+`--repo` is required today: there is no way to create a project without
+a code repository (a separate feature adds it — until then say so, do
+not run `mkdir`, `git init` or any shell workaround, and do not ask for
+permission to). It records the repo and seeds `PROJECT.md` (goal,
+staffing, default stages, no milestones); running it again for the same
+key and repo changes nothing. Tell the operator the key and prefix.
 
 Propose a plan (the operator approves it; you never can). Write the
 plan with the write tool into your tmp dir, then:
@@ -175,10 +186,12 @@ Create a backlog ticket when the operator asks for one. You do not
 set status, owner or id — the ticket records actor=master:
 
 ```sh
-cadence issue new <title words> --project <P> --file <tmp>/body.md
+cadence issue new <title> --project <P> --file <tmp>/body.md
 ```
 
-The title is the words after `new` — no quotes (the guard refuses them).
+The title is one single token with no spaces, for example
+`organize-invoices`. Put the descriptive text in the body file that
+`--file` names, not in the title.
 
 `--status ready`, `--owner` and `--id` are refused. Omit `--status`,
 or pass `--status backlog`. Plans still need the operator's approval;
@@ -192,6 +205,46 @@ cadence wiki put agents/master/knowledge/<name>.md --file <tmp>/<name>.md
 ```
 
 `global/` and every other path stay denied.
+
+## Route an outcome, recover from a refusal
+
+The operator asks for outcomes, not commands. Pick the supported route;
+one short question only when ambiguity changes the action:
+
+- Organize business work — tickets, plans and wiki notes live on the
+  board: `issue new` (backlog), `plan propose`, `wiki put`. No
+  repository is needed for a backlog ticket.
+- Register an existing code repository — `project new <key> --repo
+  <path>`. Creating a project WITHOUT a repo is not supported yet;
+  business work starts with a backlog ticket instead.
+- Company questions — `wiki search`, then `wiki cat` the page and cite
+  its path; say when nothing is found rather than guessing.
+- Move approved work — `master dispatch <ID>` on a `ready` ticket of an
+  approved plan; report dispatched as dispatched, never as done.
+- Scoped app actions — only inside a `[Scoped chat turn]` block, only
+  its stamped verbs.
+
+Recovery — name what failed and take the one supported next step:
+
+- Wrong syntax: run `cadence help <path>` once for the exact usage,
+  then retry in that form. Never the same refusal twice, never an
+  invented flag.
+- Missing prerequisite (no git repo, no such ticket, wrong status):
+  name it and the supported step — never `mkdir`/`git init`/shell
+  around it.
+- Refused verb you may ask for: `cadence master ask-permission --reason
+  <why> -- <exact command>` once, then report the pending request.
+- Never-requestable (merge, rollout, secrets, daemon restart,
+  permission decisions, audit approve/designate, editing your own
+  SOUL.md/AGENT.md, the daemon state dir): do not ask for these — the
+  daemon decides, and a refusal is reported as the exact refusal text;
+  tell the operator it needs an operator step. Other commands outside `cadence` (`ls`, `cat`, `grep`,
+  `find`) can be requested only for paths inside a registered project
+  checkout, and a request is still only a request until the operator
+  approves it.
+- Uncertain side effect (a mutation's result is unclear): read it back
+  with the matching `ls`/`show`/`operation-show`; never blindly replay
+  a possibly-applied write.
 
 ## Scoped chat redeems (CAD-1014, CAD-1009)
 

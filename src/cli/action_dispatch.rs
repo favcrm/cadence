@@ -27,9 +27,19 @@ pub(crate) fn run() -> Result<i32> {
         .collect();
     // CAD-888: `help operator|advanced|all` print the sections the
     // default root help leaves out; `help <verb>` stays clap's own.
-    if let Some(text) = help::help_section(&argv) {
-        print!("{text}");
+    // CAD-1432: the master's help is bounded and refuses malformed or
+    // disallowed forms with a usage error, so it runs before the others.
+    if let Some(text) = help::master_help(&argv) {
+        print!("{}", text?);
         return Ok(0);
+    }
+    // CAD-1432: the master never gets the unfiltered legacy help; its
+    // leading-global or aliased help forms fall through to the Clap parser.
+    if !cadence_agent::master::caller_is_master() {
+        if let Some(text) = help::help_section(&argv) {
+            print!("{text}");
+            return Ok(0);
+        }
     }
     let parsed = help::root_command(help::in_pane())
         .try_get_matches()
@@ -44,6 +54,29 @@ pub(crate) fn run() -> Result<i32> {
         Ok(cli) => cli,
         Err(e) => {
             let e = email_flag_error(&e).unwrap_or(e);
+            // CAD-1432: any Clap help outcome for a master caller refuses
+            // before printing. Clap's short-option clusters (`-hh`,
+            // `-vh`) reach here as DisplayHelp, and a bare parent
+            // (`cadence issue`) as DisplayHelpOnMissingArgumentOrSubcommand;
+            // the exact-string guard sees neither. Scoped turns get
+            // report-and-stop; the master gets the one bounded help route.
+            if matches!(
+                e.kind(),
+                clap::error::ErrorKind::DisplayHelp
+                    | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            ) && cadence_agent::master::caller_is_master()
+            {
+                let scoped = cadence_agent::master::in_app_conversation();
+                return Err(if scoped {
+                    Error::rejected(
+                        "help is not available in a scoped chat turn — report the exact refusal and stop",
+                    )
+                } else {
+                    Error::usage(
+                        "--help and -h are not available — run cadence help <command-path> for the exact usage of a command you may run",
+                    )
+                });
+            }
             // `--help` and `--version` print to stdout and exit 0 as before.
             // A bare parent command (`cadence issue`) prints its help as
             // plain text on stderr, exit 2, as before CAD-876: help stays

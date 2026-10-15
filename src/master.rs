@@ -117,6 +117,15 @@ const AGENT_TEMPLATE: &str = include_str!("../agents/master/AGENT.md");
 /// Never a bare `Bash(cadence *)`: `cadence build-slot run -- <argv>`
 /// execs anything (review round 1, C1).
 pub const CLAUDE_ALLOWED_TOOLS: &[&str] = &[
+    // CAD-1432: read-only command discovery. `help` with no argument
+    // lists only the paths this profile may run; `help <path>` renders
+    // clap usage for one admitted path. The Pi guard admits only a
+    // path that is itself on this allowlist — flags, argument values
+    // and unknown/disallowed paths refuse inside the guard, so
+    // `cadence help` can never describe a command the master cannot
+    // run, and admitting help never admits the verb it describes.
+    "Bash(cadence help)",
+    "Bash(cadence help *)",
     "Bash(cadence issue ls)",
     "Bash(cadence issue ls *)",
     "Bash(cadence issue show *)",
@@ -212,6 +221,8 @@ pub enum Profile {
 /// profile has no `issue`, `plan`, `report`, `wiki`, `agent`, `master`,
 /// `overview`, `status`, `thread` or `project` verb — and no health verb:
 /// the `health` RPC returns fleet metadata an app turn does not need.
+/// It also has no `help` (CAD-1432): a scoped turn's daemon-written
+/// reference is complete, so help and `--help` probing stay refused.
 /// `attachment read` is in BOTH (CAD-1168): an app conversation's turn
 /// reads the file its own message carried — the read binds to the live
 /// turn daemon-side, and the envelope is the only place an id comes from.
@@ -225,6 +236,34 @@ pub fn allowed_tools(profile: Profile) -> Vec<&'static str> {
                 || *t == "Bash(cadence attachment read *)"
         })
         .collect()
+}
+
+/// The command paths (stems after `cadence`, e.g. `issue ls`,
+/// `wiki put`) `cadence help <path>` may describe for `profile` —
+/// every allowlisted stem except `help` itself, plus each of their
+/// parent paths (`issue`, `app`, `attachment`, …). A path a profile
+/// cannot run is never a help path for it.
+pub fn help_paths(profile: Profile) -> Vec<String> {
+    let stems: Vec<String> = allowed_tools(profile)
+        .iter()
+        .filter_map(|t| t.strip_prefix("Bash(cadence "))
+        .filter_map(|t| t.strip_suffix(')'))
+        .map(|t| t.strip_suffix(" *").unwrap_or(t).to_string())
+        .filter(|s| s != "help")
+        .collect();
+    let mut paths = stems.clone();
+    for stem in &stems {
+        let toks: Vec<&str> = stem.split_whitespace().collect();
+        for i in 1..toks.len() {
+            let parent = toks[..i].join(" ");
+            if !paths.contains(&parent) {
+                paths.push(parent);
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 /// Defense in depth only (CAD-1098 I6): an app session's environment
@@ -1657,6 +1696,33 @@ mod tests {
                 "AGENT.md is missing the command rule `{rule}`"
             );
         }
+    }
+
+    /// CAD-1432: `cadence help` is allowlisted for Home only, and its
+    /// admitted paths are exactly the profile's own stems plus their
+    /// parents — never `help` itself, and nothing for an app session
+    /// beyond `attachment`/`app` paths (an app turn gets no help rules,
+    /// so its `cadence help …` is refused before this is consulted).
+    #[test]
+    fn help_paths_follow_the_profile_allowlist() {
+        let home = help_paths(Profile::Home);
+        assert!(home.contains(&"issue ls".to_string()));
+        assert!(home.contains(&"issue".to_string()));
+        assert!(home.contains(&"project new".to_string()));
+        assert!(home.contains(&"wiki put".to_string()));
+        assert!(home.contains(&"app audience segment-assistant-ls".to_string()));
+        assert!(home.contains(&"app".to_string()));
+        assert!(!home.iter().any(|p| p == "help" || p.starts_with("help ")));
+        // Every stem contributes its path; a parent of nothing is absent.
+        assert!(!home.contains(&"nonexistent".to_string()));
+        let app = help_paths(Profile::App);
+        assert!(
+            app.iter().all(|p| p == "app"
+                || p.starts_with("app ")
+                || p == "attachment"
+                || p.starts_with("attachment ")),
+            "{app:?}"
+        );
     }
 
     /// CAD-1009: the scoped-chat section of AGENT.md matches what the

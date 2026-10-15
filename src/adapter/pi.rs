@@ -1404,6 +1404,13 @@ export default function (pi) {
   // `Bash(cadence <verb…> *)` forms — they need at least one arg.
   const RULES = __RULES__;
   const AGENTICOS_READ_TOOLS = __AGENTICOS_READ_TOOLS__;
+  // CAD-1432: the command paths `cadence help <path>` may describe
+  // for this profile — its own allowlisted stems plus their parents.
+  // Empty for an app session: scoped turns have no help at all.
+  const HELP_PATHS = __HELP_PATHS__;
+  // CAD-1432: only the Home profile has help at all; a scoped turn is
+  // refused with report-and-stop and no help or permission suggestion.
+  const HELP_ALLOWED = __HELP_ALLOWED__;
   // The master's own tmp dir — Pi's bash spills long output here
   // (CAD-552) and the write tool stages `--file` input here (CAD-614).
   // Lexical normalization refuses `..` and prefix siblings; a second
@@ -1428,20 +1435,31 @@ export default function (pi) {
       return "every command starts `cadence` — no env prefixes (`FOO=bar cadence …`), wrappers (`bash -c …`) or other programs";
     }
     const rest = argv.slice(1);
+    // CAD-1432: every help probe refuses, on any verb and at the root.
+    if (piHelpProbe(rest)) {
+      return HELP_ALLOWED
+        ? "--help and -h are not available — run cadence help <command-path> for the exact usage of a command you may run"
+        : "help probes are not available in a scoped chat turn — report the exact refusal and stop";
+    }
     const allowed = RULES.some(
       (r) =>
         r.argv.every((tok, i) => rest[i] === tok) &&
         (r.args ? rest.length > r.argv.length : rest.length === r.argv.length),
     );
     if (!allowed) {
-      return (
-        "not an allowlisted verb — allowed: " +
-        RULES.map((r) => "cadence " + r.argv.join(" ") + (r.args ? " …" : "")).join("; ") +
-        ". request approval with: cadence master ask-permission --reason refused -- " +
-        cmd
-      );
+      const verbs = RULES.map((r) => "cadence " + r.argv.join(" ") + (r.args ? " …" : "")).join("; ");
+      return HELP_ALLOWED
+        ? "outside the admitted command surface — allowed: " + verbs +
+          ". For the exact usage of an admitted verb: cadence help <verb>"
+        : "outside this scoped turn's admitted verbs — allowed: " + verbs +
+          ". Report the exact refusal and stop";
     }
-    return piIssueNewLimits(rest) || piWikiPutLimits(rest) || piFileArgLimits(rest);
+    return (
+      piHelpLimits(rest) ||
+      piIssueNewLimits(rest) ||
+      piWikiPutLimits(rest) ||
+      piFileArgLimits(rest)
+    );
   }
   function piGuardAllows(cmd) {
     return piGuardRefusal(cmd) === null;
@@ -1533,6 +1551,83 @@ export default function (pi) {
       }
     }
     return n;
+  }
+  // CAD-1432: `cadence help` and `cadence help <path>` only — every
+  // token after `help` is a literal subcommand word of an admitted
+  // path for THIS profile (no `help` target itself, no argument
+  // values, no `--flags`, no unknown or disallowed paths, no
+  // `--help`-style alternatives). Scoped app turns emit no `help`
+  // rule at all, so this runs only under the Home profile.
+  // CAD-1432: a help probe is `--help`, or a single-dash option cluster
+  // with an `h` (`-h`, `-hh`, `-vh`, `-h=x`, `-h1`) before any standalone
+  // `--`. Everything after `--` is payload, and `--name=value` is a value,
+  // never a flag. No admitted master verb takes an attached short option,
+  // so the cluster test cannot hide a real value. Clap's DisplayHelp catch
+  // is the authoritative safety net.
+  function piHelpProbe(rest) {
+    for (const t of rest) {
+      if (t === "--") {
+        return false;
+      }
+      if (t === "--help" || (/^-[A-Za-z]/.test(t) && /^-[A-Za-z]*h/.test(t))) {
+        return true;
+      }
+    }
+    return false;
+  }
+  // CAD-1432: a help-shaped `cadence` command — a help probe, `help` after
+  // any leading global options or after an admitted path (`issue help`), or
+  // a bare command path that is not itself admitted. The tool call refuses
+  // these before any grant peek or permission request.
+  function piHelpRefused(cmd) {
+    if (typeof cmd !== "string" || !/^[A-Za-z0-9 ._\/=:-]+$/.test(cmd)) {
+      return false;
+    }
+    const argv = cmd.split(" ").filter((t) => t.length > 0);
+    if (argv[0] !== "cadence") {
+      return false;
+    }
+    const rest = argv.slice(1);
+    if (piHelpProbe(rest)) {
+      return true;
+    }
+    // Leading options before the verb: the globals, plus `--json`, which the
+    // acceptance corpus also puts before `help`.
+    let i = 0;
+    while (/^--(state-dir|org|wake-timeout|json)(=|$)/.test(rest[i] ?? "")) {
+      i += rest[i].includes("=") || rest[i] === "--json" ? 1 : 2;
+    }
+    const tail = rest.slice(i);
+    if (tail.length === 0 || tail[0] === "help") {
+      return true;
+    }
+    const path = tail.join(" ");
+    if (tail.indexOf("help") > 0 && HELP_PATHS.includes(tail.slice(0, tail.indexOf("help")).join(" "))) {
+      return true;
+    }
+    // A bare parent (`issue`, `app`) makes clap print help; a leaf does not.
+    return HELP_PATHS.includes(path) && HELP_PATHS.some((p) => p.startsWith(path + " "));
+  }
+  function piHelpLimits(rest) {
+    if (rest[0] !== "help") {
+      return null;
+    }
+    const target = rest.slice(1);
+    if (!target.length) {
+      return null; // bare `cadence help` — the exact-match rule admits it
+    }
+    if (
+      !target.every((t) => /^[a-z][a-z0-9-]*$/.test(t)) ||
+      !HELP_PATHS.includes(target.join(" "))
+    ) {
+      return (
+        "help takes no arguments — usage: cadence help, or cadence help <command-path> " +
+        "where <command-path> is a command you may run (" +
+        HELP_PATHS.join(", ") +
+        "); flags and argument values are refused"
+      );
+    }
+    return null;
   }
   // Backlog creation only. `--status backlog` is the one accepted
   // override; `--owner` and `--id` are operator overrides.
@@ -1627,22 +1722,37 @@ export default function (pi) {
       return false;
     }
   }
+  // The daemon's answer is the only evidence: a filed request is reported
+  // as pending, a canonical refusal as its own reason, and anything else as
+  // unconfirmed. Nothing here claims an approval.
   function piMaybeAsk(cmd) {
     if (typeof cmd !== "string" || !/^[A-Za-z0-9 ._\/=:-]+$/.test(cmd)) {
-      return;
+      return null;
     }
     const argv = cmd.split(" ").filter((t) => t.length > 0);
     const tool = argv[0];
     if (tool !== "cadence" && tool !== "ls" && tool !== "cat" && tool !== "grep" && tool !== "find") {
-      return;
+      return null;
     }
     try {
-      spawnSync(
+      const r = spawnSync(
         "cadence",
         ["master", "ask-permission", "--reason", "guard refused a requestable command", "--"].concat(argv),
         { encoding: "utf8", timeout: 8000, cwd: process.cwd() },
       );
+      if (r.status === 0) {
+        const body = JSON.parse(r.stdout);
+        if (body && typeof body.id === "string") {
+          return "Permission request " + body.id + " is pending with the operator; do not retry this command until it is allowed.";
+        }
+      } else {
+        const err = JSON.parse(r.stderr);
+        if (err && typeof err.error === "string") {
+          return "Permission request not filed: " + err.error + ".";
+        }
+      }
     } catch (e) {}
+    return "The permission status could not be confirmed; report and stop, and do not retry.";
   }
   pi.on("tool_call", async (event) => {
     if (AGENTICOS_READ_TOOLS.includes(event.toolName)) {
@@ -1676,11 +1786,17 @@ export default function (pi) {
     const cmd = String(event.input?.command ?? "");
     const refusal = piGuardRefusal(cmd);
     if (refusal !== null) {
+      // CAD-1432: help-shaped refusals, and every refusal in a scoped turn,
+      // stop here: no grant peek and no permission request, so an older
+      // grant cannot route around a closed help surface.
+      if (!HELP_ALLOWED || piHelpRefused(cmd)) {
+        return { block: true, reason: `cadence master refused bash '${cmd}': ${refusal}` };
+      }
       if (piGrantAllows(cmd)) {
         return;
       }
-      piMaybeAsk(cmd);
-      return { block: true, reason: `cadence master refused bash '${cmd}': ${refusal}` };
+      const note = piMaybeAsk(cmd);
+      return { block: true, reason: `cadence master refused bash '${cmd}': ${refusal}` + (note ? " " + note : "") };
     }
   });
 }
@@ -1720,6 +1836,18 @@ fn write_pi_guard(
     // escaping of its own.
     let source = PI_GUARD_HEAD
         .replace("__RULES__", &json!(pi_guard_rules(profile)).to_string())
+        .replace(
+            "__HELP_PATHS__",
+            &json!(crate::master::help_paths(profile)).to_string(),
+        )
+        .replace(
+            "__HELP_ALLOWED__",
+            if matches!(profile, crate::master::Profile::Home) {
+                "true"
+            } else {
+                "false"
+            },
+        )
         .replace(
             "__AGENTICOS_READ_TOOLS__",
             &json!(if agenticos_reads {
