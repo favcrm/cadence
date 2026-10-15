@@ -1,0 +1,186 @@
+name: promotion-completion
+
+# CAD-1455: a promoted receipt's own attestation proves staging.yml ran,
+# not that it concluded — the receipt is signed while its run is still in
+# progress. This separate trusted main workflow fires only after a
+# staging.yml workflow_dispatch run on main completes, re-queries the
+# upstream run's final state and its required gates, binds the promoted
+# candidate's exact receipt/binary/source facts into a small closed
+# completion receipt, and attests THAT receipt after completion. The
+# completion signer is this workflow at refs/heads/main on its own head
+# SHA — distinct from both the promoted binary's source_sha and the
+# promotion signer's, never equated.
+#
+# No extra operator approval: the original production-environment
+# approval in staging.yml stays authoritative; this only records that
+# the run already authorized finished successfully.
+on:
+  workflow_run:
+    workflows: [staging]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  complete:
+    # Only a same-repo main workflow_dispatch promotion that actually
+    # succeeded may be recorded as completed. Schedule/workflow_run
+    # selector ticks and failed runs are skipped, not attested.
+    if: >
+      github.event.workflow_run.event == 'workflow_dispatch' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.path == '.github/workflows/staging.yml'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Re-query the upstream promotion's final state and gates
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          UPSTREAM_ID: ${{ github.event.workflow_run.id }}
+          UPSTREAM_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: |
+          set -euo pipefail
+          # Re-fetch the exact upstream run rather than trusting the
+          # webhook payload: the event fields are re-proven server-side.
+          run=$(gh api "repos/$REPO/actions/runs/$UPSTREAM_ID")
+          echo "$run" | jq -e \
+            --argjson attempt "$UPSTREAM_ATTEMPT" \
+            --arg repo "$REPO" '
+            .id == (env.UPSTREAM_ID|tonumber) and
+            .run_attempt == $attempt and
+            .path == ".github/workflows/staging.yml" and
+            .event == "workflow_dispatch" and
+            .head_branch == "main" and
+            .status == "completed" and
+            .conclusion == "success" and
+            .repository.full_name == $repo and
+            .head_repository.full_name == $repo' >/dev/null
+          # The required gates must each have completed successfully on
+          # the run's latest attempt (same names the online path checks).
+          jobs=$(gh api "repos/$REPO/actions/runs/$UPSTREAM_ID/jobs?per_page=100")
+          for gate in stage promote; do
+            echo "$jobs" | jq -e --arg gate "$gate" '
+              [.jobs[] | select(.name == $gate)] as $g |
+              ($g | length > 0) and
+              ($g | all(.status == "completed" and .conclusion == "success"))' >/dev/null
+          done
+          echo "$run" | jq -r '.head_sha' > "$RUNNER_TEMP/promotion-head-sha"
+          echo "promotion_head_sha=$(cat "$RUNNER_TEMP/promotion-head-sha")" >> "$GITHUB_OUTPUT"
+      - name: Fetch the promoted candidate and bind its exact facts
+        id: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          UPSTREAM_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/proof"
+          gh run download "$UPSTREAM_ID" --repo "$REPO" \
+            --name production-candidate --dir "$RUNNER_TEMP/proof"
+          receipt="$RUNNER_TEMP/proof/production-candidate.json"
+          test -f "$receipt"
+          # Closed schema and nonzero fields; the upstream run id and
+          # attempt must be exactly the ones this run attests.
+          jq -e \
+            --argjson run "$UPSTREAM_ID" \
+            --argjson attempt "${{ github.event.workflow_run.run_attempt }}" '
+            .schema == 1 and
+            (.source_sha|test("^[0-9a-f]{40}$")) and
+            .ci_run_id > 0 and .ci_run_attempt > 0 and
+            (.sha256|test("^[0-9a-f]{64}$")) and
+            .promotion_run_id == $run and
+            .promotion_run_attempt == $attempt' "$receipt" >/dev/null
+          echo "source_sha=$(jq -r .source_sha "$receipt")" >> "$GITHUB_OUTPUT"
+          echo "ci_run_id=$(jq -r .ci_run_id "$receipt")" >> "$GITHUB_OUTPUT"
+          echo "ci_run_attempt=$(jq -r .ci_run_attempt "$receipt")" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(jq -r .sha256 "$receipt")" >> "$GITHUB_OUTPUT"
+          echo "receipt_sha256=$(sha256sum "$receipt" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - name: Emit the closed completion receipt
+        env:
+          SOURCE_SHA: ${{ steps.candidate.outputs.source_sha }}
+          CI_RUN_ID: ${{ steps.candidate.outputs.ci_run_id }}
+          CI_RUN_ATTEMPT: ${{ steps.candidate.outputs.ci_run_attempt }}
+          BINARY_SHA256: ${{ steps.candidate.outputs.sha256 }}
+          RECEIPT_SHA256: ${{ steps.candidate.outputs.receipt_sha256 }}
+          PROMOTION_HEAD_SHA: ${{ steps.upstream.outputs.promotion_head_sha }}
+          UPSTREAM_ID: ${{ github.event.workflow_run.id }}
+          UPSTREAM_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: |
+          set -euo pipefail
+          # A small closed receipt: the proven promotion run, its head,
+          # the exact attested receipt bytes, the promoted source and
+          # binary digest, and this completing run's own head (the
+          # completion signer) — kept separate, never equated.
+          jq -n \
+            --argjson schema 1 \
+            --argjson run "$UPSTREAM_ID" \
+            --argjson attempt "$UPSTREAM_ATTEMPT" \
+            --arg head "$PROMOTION_HEAD_SHA" \
+            --arg receipt "$RECEIPT_SHA256" \
+            --arg source "$SOURCE_SHA" \
+            --argjson ci_id "$CI_RUN_ID" \
+            --argjson ci_attempt "$CI_RUN_ATTEMPT" \
+            --arg binary "$BINARY_SHA256" \
+            --argjson completion_run "$GITHUB_RUN_ID" \
+            --argjson completion_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg completion_head "$GITHUB_SHA" \
+            '{
+              schema: $schema,
+              promotion_run_id: $run,
+              promotion_run_attempt: $attempt,
+              promotion_head_sha: $head,
+              receipt_sha256: $receipt,
+              source_sha: $source,
+              ci_run_id: $ci_id,
+              ci_run_attempt: $ci_attempt,
+              binary_sha256: $binary,
+              completion_run_id: $completion_run,
+              completion_run_attempt: $completion_attempt,
+              completion_head_sha: $completion_head
+            }' > "$RUNNER_TEMP/promotion-completion.json"
+          cat "$RUNNER_TEMP/promotion-completion.json" >> "$GITHUB_STEP_SUMMARY"
+      # The completion receipt is attested AFTER the upstream run is
+      # proven complete — unlike the mid-run staging receipt, its
+      # signature covers final success.
+      - name: Attest the completion receipt
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/promotion-completion.json
+      - name: Retain the completion evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/completion"
+          cp "$RUNNER_TEMP/promotion-completion.json" "$RUNNER_TEMP/completion/promotion-completion.json"
+          cp "$RUNNER_TEMP/proof/production-candidate.json" "$RUNNER_TEMP/completion/production-candidate.json"
+          (cd "$RUNNER_TEMP" && gh attestation download promotion-completion.json \
+            --repo "$REPO" --digest-alg sha256)
+          mv "$RUNNER_TEMP"/sha256-*.jsonl "$RUNNER_TEMP/completion/completion-attestation.jsonl"
+          ls -l "$RUNNER_TEMP/completion"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: promotion-completion-${{ steps.candidate.outputs.source_sha }}
+          path: |
+            ${{ runner.temp }}/completion/promotion-completion.json
+            ${{ runner.temp }}/completion/completion-attestation.jsonl
+            ${{ runner.temp }}/completion/production-candidate.json
+          if-no-files-found: error
+          retention-days: 90
+          overwrite: true

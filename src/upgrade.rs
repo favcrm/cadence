@@ -58,7 +58,7 @@
 
 use std::cell::RefCell;
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read};
 use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -104,15 +104,23 @@ pub fn is_full_sha(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+/// A successful dispatch includes staging and production approval.
 /// Files of a retained evidence package (CAD-1455), next to [`BINARY`],
 /// [`SHA_FILE`] and [`MANIFEST`]: the exact promoted receipt bytes,
-/// their `staging.yml` attestation bundle and the binary's `ci.yml`
-/// build-provenance bundle. The package also carries `trusted_root.jsonl`,
-/// but that is untrusted transport data only — the verifier anchors to
-/// the embedded [`TRUSTED_ROOT_SNAPSHOT`], never to package bytes.
+/// their `staging.yml` attestation bundle, the binary's `ci.yml`
+/// build-provenance bundle, and the completed-promotion receipt with
+/// its `promotion-completion.yml` bundle. The package also carries
+/// `trusted_root.jsonl`, but that is untrusted transport data only —
+/// the verifier anchors to the embedded [`TRUSTED_ROOT_SNAPSHOT`],
+/// never to package bytes.
 pub const RECEIPT_FILE: &str = "production-candidate.json";
 pub const PROMOTION_BUNDLE: &str = "promotion-attestation.jsonl";
 pub const BUILD_BUNDLE: &str = "build-attestation.jsonl";
+pub const COMPLETION_FILE: &str = "promotion-completion.json";
+pub const COMPLETION_BUNDLE: &str = "completion-attestation.jsonl";
+/// The trusted main workflow that attests the completed-promotion
+/// receipt after the upstream `staging.yml` run has already succeeded.
+pub const COMPLETION_WORKFLOW: &str = "promotion-completion.yml";
 
 /// The restart command printed when `--restart` was not given.
 pub fn restart_command(as_identity: Option<&str>) -> String {
@@ -262,12 +270,17 @@ pub trait ReleaseSource {
     fn verify_attestation(&self, binary: &Path, sha: &str) -> Result<String>;
     /// CAD-1455: prove a retained evidence package offline. `dir` holds
     /// [`BINARY`], [`SHA_FILE`], [`MANIFEST`], [`RECEIPT_FILE`],
-    /// [`PROMOTION_BUNDLE`], [`BUILD_BUNDLE`] and [`TRUSTED_ROOT`]; the
-    /// verification must not contact GitHub and must bind the receipt's
-    /// exact bytes and the binary's exact bytes to the recorded
-    /// `source_sha`. Sources that cannot prove that (including this
-    /// online `gh` path, which keeps its live-API proof) refuse.
-    fn verify_retained(&self, dir: &Path) -> Result<String> {
+    /// [`PROMOTION_BUNDLE`], [`BUILD_BUNDLE`], [`COMPLETION_FILE`] and
+    /// [`COMPLETION_BUNDLE`]; a package `trusted_root.jsonl` is untrusted
+    /// transport data and is never consulted. The verification must not
+    /// contact GitHub and must bind the receipt's exact bytes, the
+    /// binary's exact bytes and a completed-promotion receipt to the
+    /// recorded `source_sha`. On success the returned [`RetainedProof`]
+    /// keeps the captured workspace alive so a later install consumes
+    /// the same verified bytes. Sources that cannot prove that
+    /// (including this online `gh` path, which keeps its live-API
+    /// proof) refuse.
+    fn verify_retained(&self, dir: &Path) -> Result<RetainedProof> {
         let _ = dir;
         Err(Error::rejected(
             "this release source cannot verify a retained offline package; \
@@ -710,15 +723,18 @@ fn cert_identity(repo: &str, workflow: &str, source_ref: &str) -> String {
 }
 
 /// The Sigstore/GitHub trusted root the offline verifier anchors to.
-/// This is a *reviewed snapshot* captured from the installed `gh` CLI's
-/// own TUF-resolved `gh attestation trusted-root` output (public-good +
-/// GitHub Sigstore instances), not a credential and not package data:
-/// an attested artifact can never supply its own trust anchor, so the
-/// package's `trusted_root.jsonl` is untrusted transport data and this
-/// embedded snapshot is the only root the verifier passes to
-/// `--custom-trusted-root`. Refreshing it means capturing the same
-/// official source again and re-pinning its sha256 in review, never
-/// trusting producer bytes.
+/// This is a *proposed* snapshot newly captured from the installed `gh`
+/// CLI's own TUF-resolved `gh attestation trusted-root` output
+/// (public-good `tuf-repo-cdn.sigstore.dev` + GitHub `tuf-repo.github.com`
+/// instances), not a credential and not package data: an attested
+/// artifact can never supply its own trust anchor, so the package's
+/// `trusted_root.jsonl` is untrusted transport data and this embedded
+/// snapshot is the only root the verifier passes to
+/// `--custom-trusted-root`. It is source material pending independent
+/// review — its provenance and sha256 are recorded below so a reviewer
+/// can re-derive it from the same official source before trusting it.
+/// Refreshing it means capturing the same official source again and
+/// re-pinning its sha256 in review, never trusting producer bytes.
 pub const TRUSTED_ROOT_SNAPSHOT: &str = include_str!("upgrade/trusted_root.jsonl");
 
 /// SHA-256 of [`TRUSTED_ROOT_SNAPSHOT`], recorded at capture so the
@@ -745,9 +761,13 @@ const BINARY_MAX: u64 = 512 * 1024 * 1024;
 /// what is copied; the verifier then reads only the captured copy, so a
 /// mutable attacker path can never be re-read mid-check.
 fn capture_bounded(path: &Path, max: u64, dest: &Path, what: &str) -> Result<()> {
+    // O_NONBLOCK alongside O_NOFOLLOW: a FIFO or device would otherwise
+    // block the open before its type is ever checked. Only a regular
+    // file of a bounded size is accepted, and the copy itself is hard-
+    // capped so a file that grows mid-read cannot fill the disk.
     let src = fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .map_err(|e| {
             Error::rejected(format!(
@@ -770,12 +790,20 @@ fn capture_bounded(path: &Path, max: u64, dest: &Path, what: &str) -> Result<()>
             meta.len()
         )));
     }
-    let mut src = src;
     let mut dst = fs::File::create(dest)?;
+    let mut src = src.take(max + 1);
     let copied = std::io::copy(&mut src, &mut dst)?;
+    if copied > max {
+        return Err(Error::rejected(format!(
+            "{} ({what}) exceeded {max} bytes while it was captured — refusing \
+             the retained package",
+            path.display()
+        )));
+    }
     if copied != meta.len() {
         return Err(Error::rejected(format!(
-            "{} ({what}) grew while it was captured — refusing the retained package",
+            "{} ({what}) changed size while it was captured — refusing the \
+             retained package",
             path.display()
         )));
     }
@@ -784,11 +812,14 @@ fn capture_bounded(path: &Path, max: u64, dest: &Path, what: &str) -> Result<()>
 }
 
 /// A package captured into an owned workspace. The verifier reads and
-/// hashes only these copies, never the caller's paths again; the
-/// install step can consume the same captured subjects.
-struct Captured {
+/// hashes only these copies, never the caller's paths again. The
+/// workspace is owned by [`RetainedProof`] so the captured subjects
+/// stay alive and immutable for the operation — the install step can
+/// consume these exact verified bytes, not re-read attacker paths.
+pub struct Captured {
     _workspace: tempfile::TempDir,
-    dir: PathBuf,
+    /// The captured package directory.
+    pub dir: PathBuf,
 }
 
 /// Copy the package's small entries into a fresh owned directory and
@@ -803,6 +834,8 @@ fn capture_package(dir: &Path) -> Result<Captured> {
         (RECEIPT_FILE, RECEIPT_MAX),
         (PROMOTION_BUNDLE, BUNDLE_MAX),
         (BUILD_BUNDLE, BUNDLE_MAX),
+        (COMPLETION_FILE, RECEIPT_MAX),
+        (COMPLETION_BUNDLE, BUNDLE_MAX),
         (SHA_FILE, SHA_FILE_MAX),
         (MANIFEST, MANIFEST_MAX),
     ] {
@@ -891,8 +924,12 @@ impl OfflineGh {
             &self.repo,
             "--cert-identity",
             &identity,
+            "--cert-oidc-issuer",
+            "https://token.actions.githubusercontent.com",
             "--signer-repo",
             &self.repo,
+            "--source-ref",
+            source_ref,
             "--deny-self-hosted-runners",
             "--format",
             "json",
@@ -929,6 +966,69 @@ impl OfflineGh {
 pub struct BundleFacts {
     pub signer_sha: String,
     pub subject_digest: String,
+}
+
+/// A retained evidence package proven offline, with its captured
+/// workspace kept alive so the install step can consume the same
+/// verified bytes. `source_sha` is the promoted commit the receipt
+/// binds; `completion` is the attested completed-promotion receipt.
+pub struct RetainedProof {
+    /// The captured package directory (owned, immutable for the op).
+    pub captured: Captured,
+    /// The promoted `source_sha` the receipts and manifest bind.
+    pub source_sha: String,
+    /// The completed-promotion receipt as parsed from the package.
+    pub completion: CompletionReceipt,
+}
+
+/// The closed completion receipt `promotion-completion.yml` emits and
+/// attests after the upstream `staging.yml` run has already succeeded.
+/// It binds the proven promotion run, its head SHA (the promotion
+/// signer's commit), the exact promoted receipt bytes, the promoted
+/// `source_sha`/`binary_sha256`, and this completing run's own head —
+/// all kept distinct; no field is equated with another.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompletionReceipt {
+    pub schema: u64,
+    pub promotion_run_id: u64,
+    pub promotion_run_attempt: u64,
+    pub promotion_head_sha: String,
+    pub receipt_sha256: String,
+    pub source_sha: String,
+    pub ci_run_id: u64,
+    pub ci_run_attempt: u64,
+    pub binary_sha256: String,
+    pub completion_run_id: u64,
+    pub completion_run_attempt: u64,
+    pub completion_head_sha: String,
+}
+
+fn completion_fields(c: &CompletionReceipt) -> bool {
+    c.schema == 1
+        && c.promotion_run_id != 0
+        && c.promotion_run_attempt != 0
+        && is_full_sha(&c.promotion_head_sha)
+        && is_sha256_hex(&c.receipt_sha256)
+        && is_full_sha(&c.source_sha)
+        && c.ci_run_id != 0
+        && c.ci_run_attempt != 0
+        && is_sha256_hex(&c.binary_sha256)
+        && c.completion_run_id != 0
+        && c.completion_run_attempt != 0
+        && is_full_sha(&c.completion_head_sha)
+}
+
+/// Parse the closed completion receipt on its own field merits; the
+/// attestation over its exact bytes plus the captured receipt binding
+/// prove it, not a live run query.
+fn parse_completion_receipt(text: &str) -> Result<CompletionReceipt> {
+    let receipt: CompletionReceipt = serde_json::from_str(text)
+        .map_err(|e| Error::rejected(format!("invalid completion receipt: {e}")))?;
+    if !completion_fields(&receipt) {
+        return Err(Error::rejected("completion receipt fails its own schema"));
+    }
+    Ok(receipt)
 }
 
 /// Read `gh attestation verify --format json` output: a list of verified
@@ -1060,9 +1160,9 @@ impl ReleaseSource for OfflineGh {
 
     /// Prove a retained package's bytes offline, in order:
     ///
-    /// 1. the package is copied into an owned capture workspace (no
-    ///    final-symlink following, bounded regular files, size
-    ///    rechecked), and only the captured bytes are ever read,
+    /// 1. the package is copied into an owned capture workspace
+    ///    (`O_NOFOLLOW|O_NONBLOCK`, bounded hard-read-capped files,
+    ///    size-rechecked), and only the captured bytes are ever read,
     ///    hashed or handed to `gh`;
     /// 2. the captured receipt parses as the closed
     ///    [`ProductionCandidate`] and its `sha256` names the captured
@@ -1070,31 +1170,29 @@ impl ReleaseSource for OfflineGh {
     /// 3. the promotion bundle — `staging.yml` at `refs/heads/main` —
     ///    is verified against the embedded trusted-root snapshot over
     ///    the receipt's exact captured bytes; the certificate's signer
-    ///    commit is reported, not pinned to `source_sha` (they
-    ///    legitimately differ);
+    ///    commit is reported, not pinned to `source_sha`;
     /// 4. the captured `cadence.sha256` and `manifest.json` agree with
     ///    the receipt's `sha256`/`source_sha`;
     /// 5. the build bundle — `ci.yml` at `refs/heads/main` on
     ///    `source_sha` as `--source-digest` — attests the binary's
-    ///    exact captured bytes.
+    ///    exact captured bytes;
+    /// 6. the completion receipt parses as its closed schema, binds
+    ///    the same `source_sha`/receipt/binary digests and promotion
+    ///    run, and its `promotion-completion.yml` bundle verifies over
+    ///    the captured completion bytes — proving the promotion run
+    ///    *concluded successfully*, not just that it ran.
     ///
-    /// Only then is the binary verified to the CI build *and* to an
-    /// attested production candidate bound to a named promotion run.
-    /// A build signature alone, or a valid signature over tampered or
-    /// unsigned receipt metadata, refuses.
-    ///
-    /// The promotion receipt's signature proves the promotion *ran*
-    /// and which run/attempt/head it ran at; it cannot prove the run
-    /// *concluded successfully*, because the receipt is attested while
-    /// that run is still in progress. Final run-success eligibility
-    /// (completed/success + stage/promote gates) stays an online
-    /// query this source refuses; a consumer that needs it must get
-    /// the completed-run record from the catalogue contract or an
-    /// online re-check. This keeps the gate closed rather than
-    /// inventing success.
-    fn verify_retained(&self, dir: &Path) -> Result<String> {
+    /// Only then is the binary verified to the CI build *and* to a
+    /// completed approved production promotion. A build signature
+    /// alone, a mid-run receipt alone, or a valid signature over
+    /// tampered/unsigned metadata all refuse — and so does a missing
+    /// or unverifiable completion receipt. The returned
+    /// [`RetainedProof`] owns the captured workspace so the install
+    /// step can consume the identical verified bytes; no path is
+    /// re-read after capture.
+    fn verify_retained(&self, dir: &Path) -> Result<RetainedProof> {
         let captured = capture_package(dir)?;
-        let pkg = &captured.dir;
+        let pkg = captured.dir.clone();
         // The embedded snapshot is the trust anchor; write it into the
         // workspace for `gh --custom-trusted-root`. The package's own
         // trusted_root.jsonl is transport data and is never read here.
@@ -1117,7 +1215,7 @@ impl ReleaseSource for OfflineGh {
         // One promotion verification: crypto + exact staging.yml/main
         // cert identity + signer-repo + runner policy against the
         // embedded root. The certificate's signer commit is the
-        // authentic fact reported back; no second pass re-pins it.
+        // authentic fact reported back.
         let promotion = self.verify_bundle(
             &receipt_path,
             &pkg.join(PROMOTION_BUNDLE),
@@ -1129,6 +1227,68 @@ impl ReleaseSource for OfflineGh {
             &receipt_sha,
             "promotion",
         )?;
+        // The completed-promotion receipt is the eligibility proof the
+        // mid-run receipt cannot give: it must parse, bind the same
+        // promotion run, source and digests, and its own
+        // promotion-completion.yml bundle must verify over its captured
+        // bytes. Missing or unverifiable completion refuses the whole
+        // package — a catalogue or the mid-run receipt alone never
+        // stands in for completed eligibility.
+        let completion_path = pkg.join(COMPLETION_FILE);
+        let completion_bytes = fs::read(&completion_path).map_err(|e| {
+            Error::rejected(format!(
+                "retained package has no completed-promotion receipt ({}): {e} — \
+                 refusing; the promotion's final success is unproven",
+                completion_path.display()
+            ))
+        })?;
+        let completion_sha = sha256_bytes(&completion_bytes);
+        let completion_receipt =
+            parse_completion_receipt(&String::from_utf8_lossy(&completion_bytes))?;
+        if completion_receipt.source_sha != candidate.source_sha
+            || completion_receipt.promotion_run_id != candidate.promotion_run_id
+            || completion_receipt.promotion_run_attempt != candidate.promotion_run_attempt
+            || completion_receipt.receipt_sha256 != receipt_sha
+            || completion_receipt.binary_sha256 != digest
+            || completion_receipt.ci_run_id != candidate.ci_run_id
+            || completion_receipt.ci_run_attempt != candidate.ci_run_attempt
+        {
+            return Err(Error::rejected(
+                "completion receipt does not bind the same promotion run, source and \
+                 digests as the attested candidate — refusing",
+            ));
+        }
+        // The promotion signer and completing signer are distinct
+        // commits and neither needs to equal source_sha; but the
+        // receipts' recorded heads must match their verified
+        // certificates exactly, so a receipt naming another commit
+        // refuses.
+        if completion_receipt.promotion_head_sha != promotion.signer_sha {
+            return Err(Error::rejected(
+                "completion receipt's promotion head differs from the attested \
+                 staging.yml signer commit — refusing",
+            ));
+        }
+        let completion = self.verify_bundle(
+            &completion_path,
+            &pkg.join(COMPLETION_BUNDLE),
+            &root,
+            COMPLETION_WORKFLOW,
+            &main_ref,
+            None,
+            COMPLETION_FILE,
+            &completion_sha,
+            "completion",
+        )?;
+        // The certificate is authoritative for the completing run's
+        // head; the receipt's recorded head must match it, so a receipt
+        // claiming another commit refuses.
+        if completion_receipt.completion_head_sha != completion.signer_sha {
+            return Err(Error::rejected(
+                "completion receipt's recorded head differs from its attested \
+                 signer commit — refusing",
+            ));
+        }
         let build = self.verify_bundle(
             &binary,
             &pkg.join(BUILD_BUNDLE),
@@ -1148,17 +1308,27 @@ impl ReleaseSource for OfflineGh {
             )));
         }
         check_manifest(&pkg.join(MANIFEST), &candidate.source_sha, &recorded)?;
-        Ok(format!(
-            "retained package verified offline: promotion (staging.yml run {}/{}, \
-             signer {}, receipt sha256 {receipt_sha}) + build (ci.yml signer {}, \
-             subject sha256 {}) — source_sha {}",
+        // Read the parsed completion receipt back out of the captured
+        // bytes for the caller's report (the verified bundle is the
+        // authority; this JSON is a label, not the proof).
+        let completion_receipt =
+            parse_completion_receipt(&String::from_utf8_lossy(&completion_bytes))?;
+        let _ = format!(
+            "retained package verified offline: promotion (staging.yml run {}/{}, signer {}), \
+             completion (promotion-completion.yml signer {}), build (ci.yml signer {}) — \
+             source_sha {}",
             candidate.promotion_run_id,
             candidate.promotion_run_attempt,
             promotion.signer_sha,
+            completion.signer_sha,
             build.signer_sha,
-            build.subject_digest,
             candidate.source_sha
-        ))
+        );
+        Ok(RetainedProof {
+            captured,
+            source_sha: candidate.source_sha.clone(),
+            completion: completion_receipt,
+        })
     }
 }
 
@@ -2155,6 +2325,41 @@ mod backup_pair_tests {
         assert!(check_subjects(&empty, "cadence", &sha).is_err());
         // Empty entry list is refused.
         assert!(check_subjects(b"[]", "cadence", &sha).is_err());
+    }
+
+    /// The closed completion receipt parser enforces the same schema
+    /// discipline; it binds run/source/digest facts, never a live run.
+    #[test]
+    fn cad1455_completion_receipt_is_closed() {
+        let receipt = json!({
+            "schema": 1,
+            "promotion_run_id": 7,
+            "promotion_run_attempt": 2,
+            "promotion_head_sha": "a".repeat(40),
+            "receipt_sha256": "b".repeat(64),
+            "source_sha": "c".repeat(40),
+            "ci_run_id": 11,
+            "ci_run_attempt": 3,
+            "binary_sha256": "d".repeat(64),
+            "completion_run_id": 21,
+            "completion_run_attempt": 1,
+            "completion_head_sha": "e".repeat(40)
+        })
+        .to_string();
+        let parsed = parse_completion_receipt(&receipt).unwrap();
+        assert_eq!(parsed.source_sha, "c".repeat(40));
+        assert_eq!(parsed.completion_run_id, 21);
+        // An extra field is refused by deny_unknown_fields.
+        let mut v: Value = serde_json::from_str(&receipt).unwrap();
+        v["extra"] = json!(true);
+        assert!(parse_completion_receipt(&v.to_string()).is_err());
+        // A zero id or malformed sha fails the field check.
+        v = serde_json::from_str(&receipt).unwrap();
+        v["promotion_run_id"] = json!(0);
+        assert!(parse_completion_receipt(&v.to_string()).is_err());
+        v = serde_json::from_str(&receipt).unwrap();
+        v["binary_sha256"] = json!("zz");
+        assert!(parse_completion_receipt(&v.to_string()).is_err());
     }
 
     /// The retained candidate parser accepts the closed schema only and
