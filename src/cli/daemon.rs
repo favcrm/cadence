@@ -97,9 +97,9 @@ pub(super) fn run(state_dir: PathBuf, action: DaemonAction) -> Result<i32> {
             if cadence_agent::sandbox::profile().is_some() {
                 eprintln!("skill: skipped (sandbox profile)");
             } else {
-                match home_dir().map(|h| cadence_agent::skill::sync(&h, false)) {
+                match home_dir().map(|h| cadence_agent::skill::sync(&h, false, None)) {
                     Ok(Ok(report)) if report["wrote"].as_bool().unwrap_or(false) => {
-                        eprintln!("skill: refreshed {}", report["installed"])
+                        eprintln!("skill: refreshed {}", report["root"])
                     }
                     Ok(Err(e)) => eprintln!("skill: refresh failed: {e}"),
                     _ => {}

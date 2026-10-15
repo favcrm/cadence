@@ -446,8 +446,8 @@ fn skill_check() -> Check {
         "skill",
         |ctx| {
             let status = crate::skill::status(&ctx.home);
-            let path = status["path"].as_str().unwrap_or("").to_string();
-            if status["installed"] != true {
+            let path = status["root"].as_str().unwrap_or("").to_string();
+            if status["has_files"] != true {
                 return match &ctx.sandbox {
                     Some(name) => Found::Unknown(format!(
                         "not installed; the sandbox profile ({name}) never writes the \
@@ -456,16 +456,23 @@ fn skill_check() -> Check {
                     None => Found::Absent("not installed".into()),
                 };
             }
-            // Installed: setup never rewrites it. Another binary's copy —
-            // older or newer — and a link the operator removed stay as
-            // they are; `skill install` is the explicit refresh.
+            // Any existing files make this an observed install, including a
+            // partial bundle. Only explicit `skill install` refreshes it.
             let mut differs = Vec::new();
-            if status["content_match"] != true {
-                differs.push("SKILL.md content".to_string());
-            }
-            for (dir, state) in status["links"].as_object().into_iter().flatten() {
-                if state != "ok" && state != "foreign" {
-                    differs.push(format!("{dir} link {}", state.as_str().unwrap_or("?")));
+            for skill in status["skills"].as_array().into_iter().flatten() {
+                let name = skill["name"].as_str().unwrap_or("skill");
+                if skill["installed"] != true {
+                    differs.push(format!("{name} files missing"));
+                } else if skill["content_match"] != true {
+                    differs.push(format!("{name} content"));
+                }
+                for (dir, state) in skill["links"].as_object().into_iter().flatten() {
+                    if state != "ok" && state != "foreign" {
+                        differs.push(format!(
+                            "{name} {dir} link {}",
+                            state.as_str().unwrap_or("?")
+                        ));
+                    }
                 }
             }
             if differs.is_empty() {
@@ -487,10 +494,10 @@ fn skill_check() -> Check {
         },
     )
     .apply(|ctx| {
-        let report = crate::skill::sync(&ctx.home, false)?;
+        let report = crate::skill::sync(&ctx.home, false, None)?;
         Ok(Applied::Created(format!(
             "installed {}",
-            report["installed"].as_str().unwrap_or("the skill")
+            report["root"].as_str().unwrap_or("the skill bundle")
         )))
     })
 }
@@ -1625,16 +1632,6 @@ mod tests {
         std::fs::remove_file(&link).unwrap();
         let out = run_checks(&ctx, &[skill_check()], |_| {});
         assert_eq!(out[0].status, Status::Unknown, "{:?}", out[0]);
-        assert!(
-            out[0].detail.contains("differs from this binary"),
-            "{:?}",
-            out[0]
-        );
-        assert!(out[0]
-            .fix
-            .as_deref()
-            .unwrap()
-            .ends_with("cadence skill install"));
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
             "operator's own skill\n"
