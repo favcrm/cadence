@@ -661,7 +661,7 @@ fn dep_manifest(dir: &Path, spec: &str, dep: &str) -> Result<Value> {
     };
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(&path)
         .map_err(|_| {
             bad(format!(
