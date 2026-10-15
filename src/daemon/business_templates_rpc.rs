@@ -8,7 +8,7 @@
 
 use super::caller_rule::Who;
 use super::*;
-use crate::business_templates::{parse_spec, DocumentData};
+use crate::business_templates::{parse_definition, DocumentData, TemplateDefinition};
 
 /// Request fields that would name a company or an actor. Refused, never
 /// read: scope and identity come from the connection alone.
@@ -46,22 +46,25 @@ impl Shared {
             "business_template_create" => {
                 self.business_template_caller("template create", params, peer_pid)?;
                 let name = required_str(params, "name")?;
-                let source = source_param(params)?;
-                let spec = parse_spec(spec_param(params)?)?;
-                let version = self
-                    .store
-                    .business_template_add_version(name, None, &source, &spec)?;
+                let definition = parse_definition(spec_param(params)?)?;
+                let source = definition_source(params, &definition)?;
+                let version =
+                    self.store
+                        .business_template_add_version(name, None, &source, &definition)?;
                 Ok(template_json(&version))
             }
             "business_template_revise" => {
                 self.business_template_caller("template revise", params, peer_pid)?;
                 let name = required_str(params, "name")?;
                 let base = version_param(params, "base")?;
-                let source = source_param(params)?;
-                let spec = parse_spec(spec_param(params)?)?;
-                let version =
-                    self.store
-                        .business_template_add_version(name, Some(base), &source, &spec)?;
+                let definition = parse_definition(spec_param(params)?)?;
+                let source = definition_source(params, &definition)?;
+                let version = self.store.business_template_add_version(
+                    name,
+                    Some(base),
+                    &source,
+                    &definition,
+                )?;
                 Ok(template_json(&version))
             }
             "business_template_intake" => {
@@ -101,9 +104,10 @@ impl Shared {
                     .ok_or_else(|| {
                         Error::rejected(format!("template '{name}' has no version {version}"))
                     })?;
+                let spec = row.spec.financial()?;
                 let draft = crate::business_templates::build_draft(
-                    &row.spec,
-                    &crate::business_templates::sample_data(&row.spec),
+                    spec,
+                    &crate::business_templates::sample_data(spec),
                 )?;
                 let out = if self.hosted_business_documents.is_some() {
                     crate::business_export::hosted::export_sample(&source, &draft.context())?
@@ -207,6 +211,21 @@ impl Shared {
             }
             other => Err(Error::internal(format!("not a template method: {other}"))),
         }
+    }
+}
+
+/// Financial versions require the historical base64 DOCX. Authoring packs
+/// omit `source` (or send an empty string) and never accept a document.
+fn definition_source(params: &Value, definition: &TemplateDefinition) -> Result<Vec<u8>> {
+    match definition {
+        TemplateDefinition::Financial(_) => source_param(params),
+        TemplateDefinition::Authoring(_) => match params.get("source") {
+            None | Some(Value::Null) => Ok(Vec::new()),
+            Some(Value::String(text)) if text.is_empty() => Ok(Vec::new()),
+            Some(_) => Err(Error::rejected(
+                "authoring reference packs do not accept a DOCX source",
+            )),
+        },
     }
 }
 

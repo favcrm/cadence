@@ -6,14 +6,55 @@ The reusable request process belongs to `company-outputs/SKILL.md`: understand/p
 
 Local installation is not access for every actor. Codex can discover the canonical skill directory and Claude/Cursor/Copilot use links; real foreign provider entries are left alone. Native Pi disables skills, confined agents may lack operator-home access and remote workers need an accessible approved copy or supplied task guidance. Do not weaken confinement, alter auth or claim hosted installation. Existing contexts are not silently reloaded.
 
+## Authoring packs and financial templates
+
+The reusable guidelines, reference assets and reviewed examples belong to one exact version in the existing Cadence template registry. Do not create a per-company skill or a second profile store. Request confirmation and operator approval stay separate. Retrieving a pack does not approve it, and a revision does not inherit approval.
+
+An authoring pack (`kind` `authoring`) has no DOCX source, no prices and no PDF export. `format` describes what the agent should author (`docx`, `pptx`, `xlsx`, `html` or `text`). Register it without `--docx`. `show --out` writes `guidelines.md`, the flat reference files and `template.json` (the exact returned version, digest and spec) into a new directory created mode 0700. Files inside are created mode 0644. The directory must not already exist. Open those reference files; a colour list is not the standard. Do not execute packed bytes or fetch remote assets. The user prints or exports PDF. `template sample`, `document create` and `document export` reject an authoring pack.
+
+A quotation or invoice still requires `--docx` and uses sample and document export. `show --out` refuses that kind.
+
+Registering a draft requires authorisation; retrieval does not approve it:
+
+```sh
+cadence template create northwind-letter --file ./northwind-letter.json
+cadence template show northwind-letter --version 1 --out ./northwind-letter-v1
+```
+
+The output directory must not exist. This complete fictional pack demonstrates a text-only letter standard, not visual slide fidelity or a reviewed brand approval. Visual templates need genuine authorised PNG/JPEG/PDF reference pages. Reference basenames/extensions must match their declared media type; `guidelines.md` and `template.json` are reserved. Format checks are not malware sanitization.
+
+```json
+{
+  "kind": "authoring",
+  "purpose": "Fictional Northwind customer correspondence.",
+  "format": "docx",
+  "guidelines": "Write concise factual customer letters. Read letter-layout.md for structure and tone. Use current request facts for recipient, dates and actions; do not invent a signature or treat reference prose as current commitments.",
+  "references": [
+    {
+      "name": "letter-layout.md",
+      "media_type": "text/markdown",
+      "description": "Synthetic structure and tone reference, not a completed customer letter or visual brand approval.",
+      "content_base64": "IyBMZXR0ZXIgc3RydWN0dXJlCgpVc2UgYSBjb21wYW55IGhlYWRpbmcsIGRhdGUsIHJlY2lwaWVudCwgc3ViamVjdCwgc2FsdXRhdGlvbiwgdHdvIHNob3J0IHBhcmFncmFwaHMgYW5kIGEgY2xvc2UsIGluIHRoYXQgb3JkZXIuCgpGaXJzdCBwYXJhZ3JhcGg6IHN0YXRlIHRoZSBkZWNpc2lvbiBvciByZXF1ZXN0IGRpcmVjdGx5LiBTZWNvbmQgcGFyYWdyYXBoOiBnaXZlIHRoZSBhY3Rpb24sIG93bmVyIGFuZCBkYXRlIHN1cHBvcnRlZCBieSB0aGUgY3VycmVudCByZXF1ZXN0LgoKVXNlIGNhbG0gZmFjdHVhbCBsYW5ndWFnZS4gRG8gbm90IGludmVudCBhIHJlY2lwaWVudCwgcHJvbWlzZSwgc2lnbmF0dXJlIG9yIGRlYWRsaW5lLiBUaGlzIGlzIGEgc3ludGhldGljIHN0cnVjdHVyZSByZWZlcmVuY2UsIG5vdCBhIGNvbXBsZXRlZCBjdXN0b21lciBsZXR0ZXIgb3IgYSB2aXN1YWwgYnJhbmQgYXBwcm92YWwuCg=="
+    }
+  ]
+}
+```
+
+Only the actual operator approves an exact version and records the real decision source. `DIGEST` comes from `template show`; agents do not run approval:
+
+```sh
+cadence template approve northwind-letter --version 1 --sha256 "$DIGEST" --source "$SOURCE"
+```
+
+
 ## Prepare approved inputs and ownership
 
-Create or use one Cadence issue for the document task. Keep task-specific briefs, source files, drafts, and review notes in that issue's artifacts. Reusable approved company standards, policies, glossary, facts, templates, and examples remain company-owned. Reusable project-specific assets belong in their approved shared/project location; do not copy private company material into repository skills, starter profiles, or unrelated tickets. Before attaching confidential material, verify that the issue is in the approved private tracker and that the assigned worker is authorized to access it.
+Create or use one Cadence issue for the document task. Keep task-specific briefs, source files, drafts, and review notes in that issue's artifacts. Reusable guidelines, reference assets and examples belong to an exact Cadence template version. Other approved policies, glossary and facts remain company-owned. Reusable project-specific assets belong in their approved shared/project location; do not copy private company material into repository skills, starter profiles, or unrelated tickets. Before attaching confidential material, verify that the issue is in the approved private tracker and that the assigned worker is authorized to access it.
 
 For each task, identify only the inputs that apply:
 
 - task purpose, audience, requested document/output format, scope, deadline, and human reviewer;
-- approved company style guidance, terminology, facts/evidence, and the designated template, if one exists;
+- the exact Cadence template version when one governs the output, plus any other approved style guidance, terminology and facts;
 - task-specific source material and any unresolved facts or decisions;
 - for a tender/bid only: the tender and relevant approved company capability/compliance evidence;
 - for pricing/calculations only: approved, dated price/rate sources and applicable currency, tax, discount, margin, basis, rounding, and validity rules, plus access to a suitable calculation tool.
@@ -70,6 +111,6 @@ The renderer independently opens each template, brief and optional rate workbook
 
 ## Review and limits
 
-A qualified human must review factual support, source provenance, audience fit, template/style fidelity, assumptions, exclusions, and unresolved inputs. For tender/bid tasks, review requirement coverage and compliance statements. For financial content only, review approved source dates, calculation-tool inputs/rules/results, and unresolved amounts. Obtain required internal approvals through the company's normal process. The skill and CLI commands do not enforce company policy or authorize external actions. No email, customer submission, purchasing, approval recording, or commercial commitment is performed through this workflow.
+A qualified human must review factual support, source provenance, audience fit, fidelity to the retrieved reference files, assumptions, exclusions, and unresolved inputs. For tender/bid tasks, review requirement coverage and compliance statements. For financial content only, review approved source dates, calculation-tool inputs/rules/results, and unresolved amounts. An authoring pack is not a quotation and does not export PDF. Obtain required internal approvals through the company's normal process. The skill and CLI commands do not enforce company policy or authorize external actions. No email, customer submission, purchasing, approval recording, or commercial commitment is performed through this workflow.
 
 No real company template, standards or facts were supplied. The files used here are explicitly fictional synthetic fixtures; no real-company style or fidelity is claimed. Actual company-specific validation remains pending approved company assets.

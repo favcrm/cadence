@@ -13,8 +13,8 @@ use serde_json::Value;
 
 use super::{now, Store, StoreConn};
 use crate::business_templates::{
-    build_draft, check_approvable, check_docx_package, content_digest, sha256_hex, DocumentData,
-    TemplateSpec,
+    build_draft, check_definition_approvable, content_digest, retained_source, sha256_hex,
+    validate_definition, DocumentData, TemplateDefinition,
 };
 use crate::error::{Error, Result};
 
@@ -78,7 +78,7 @@ pub struct TemplateVersion {
     pub source_sha256: String,
     pub approved_source: Option<String>,
     pub created: f64,
-    pub spec: TemplateSpec,
+    pub spec: TemplateDefinition,
 }
 
 impl TemplateVersion {
@@ -184,7 +184,7 @@ fn version_in(
     else {
         return Ok(None);
     };
-    let spec: TemplateSpec = serde_json::from_str(&spec_json)
+    let spec: TemplateDefinition = serde_json::from_str(&spec_json)
         .map_err(|e| Error::internal(format!("stored template spec is unreadable: {e}")))?;
     Ok(Some(TemplateVersion {
         name,
@@ -202,26 +202,27 @@ fn version_in(
 
 impl Store {
     /// Create version 1 of `name`, or revise it into the next version from
-    /// `based_on`. The DOCX source is retained immutably (by SHA-256) and
-    /// the version digest binds those bytes and the spec. Both paths write
-    /// a `draft`; no path touches an existing version.
+    /// `based_on`. A financial version retains its DOCX. An authoring pack
+    /// retains an empty source blob; its guidelines and references live in
+    /// `spec_json`. The version digest binds those retained bytes and the
+    /// canonical definition. Both paths write a `draft`; no path touches
+    /// an existing version.
     pub fn business_template_add_version(
         &self,
         name: &str,
         based_on: Option<i64>,
         source: &[u8],
-        spec: &TemplateSpec,
+        definition: &TemplateDefinition,
     ) -> Result<TemplateVersion> {
         check_name(name)?;
-        check_docx_package(source)?;
+        validate_definition(definition)?;
+        let source = retained_source(definition, source)?;
         let company = self.connection_workspace_id()?;
         let source_sha = sha256_hex(source);
-        let digest = content_digest(&source_sha, spec)?;
-        let spec_json = serde_json::to_string(spec).map_err(|e| Error::internal(e.to_string()))?;
-        let kind = match spec.kind {
-            crate::business_templates::DocumentKind::Quotation => "quotation",
-            crate::business_templates::DocumentKind::Invoice => "invoice",
-        };
+        let digest = content_digest(&source_sha, definition)?;
+        let spec_json =
+            serde_json::to_string(definition).map_err(|e| Error::internal(e.to_string()))?;
+        let kind = definition.kind();
         self.write_tx(|conn| {
             let tx = &mut *conn;
             let latest: Option<i64> = tx.query_row(
@@ -269,7 +270,7 @@ impl Store {
                 source_sha256: source_sha,
                 approved_source: None,
                 created,
-                spec: spec.clone(),
+                spec: definition.clone(),
             })
         })
     }
@@ -307,8 +308,9 @@ impl Store {
     }
 
     /// Approve exactly the content whose digest the approver read. Only a
-    /// `draft` moves; confirmed calculation rules are required. The caller
-    /// has already proved an operator connection.
+    /// `draft` moves. Financial versions still need confirmed calculation
+    /// rules; a structurally valid authoring pack has none. The caller has
+    /// already proved an operator connection.
     pub fn business_template_approve(
         &self,
         name: &str,
@@ -341,7 +343,7 @@ impl Store {
                     "the digest does not match this version's content; show the version and approve its exact digest",
                 ));
             }
-            check_approvable(&row.spec)?;
+            check_definition_approvable(&row.spec)?;
             tx.execute(
                 "UPDATE business_template_versions SET status='approved', approved_source=?, approved_at=?
                  WHERE company_id=? AND name=? AND version=? AND status='draft'",
@@ -371,7 +373,7 @@ impl Store {
                     "template '{name}' version {version} is not approved; approve it before creating documents"
                 )));
             }
-            let draft = build_draft(&row.spec, data)?;
+            let draft = build_draft(row.spec.financial()?, data)?;
             let id = format!("doc-{}", uuid::Uuid::new_v4().simple());
             let input_json =
                 serde_json::to_string(data).map_err(|e| Error::internal(e.to_string()))?;
