@@ -955,11 +955,17 @@ fn pi_confine_inputs(
     if let Ok(Some(path)) = agenticos_read_extension(env) {
         extra_read.push(path);
     }
-    // CAD-559: exactly the pinned provider package dirs — read-only.
-    // `build_command` resolves the same list and refuses the launch on
-    // a bad pin, so a policy with an unresolvable package never runs.
+    // CAD-559: exactly the pinned provider package dirs — read-only,
+    // plus each package's installed runtime dependency dirs (CAD-1449:
+    // without them the extension's `require`/`import` fails
+    // MODULE_NOT_FOUND inside the sandbox). `build_command` resolves
+    // the same list and refuses the launch on a bad pin or closure,
+    // so a policy with an unresolvable package never runs.
     if let Ok(packages) = provider_packages(env) {
-        extra_read.extend(packages.iter().map(|p| p.dir.clone()));
+        for pkg in &packages {
+            extra_read.push(pkg.dir.clone());
+            extra_read.extend(pkg.deps.iter().cloned());
+        }
     }
     crate::master::ConfineInputs {
         state_dir: state_dir.to_path_buf(),
