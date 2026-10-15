@@ -41,6 +41,9 @@ pub mod inbox;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) mod installer_bundle;
 pub mod issue;
+#[cfg(test)]
+mod issuer_tls_fixture;
+pub(crate) mod issuer_transport;
 pub mod lease;
 pub mod master;
 pub mod master_perm;

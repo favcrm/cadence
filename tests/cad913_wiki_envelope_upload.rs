@@ -619,3 +619,86 @@ fn wiki_envelope_upload_refuses_before_staging_and_commits_only_verified_targets
         "read-only board staged or mutated data"
     );
 }
+
+impl Rig {
+    /// A raw HTTP request to the board with the envelope bearer and the seam
+    /// headers. Returns `(status, parsed JSON body)`. The body is bounded.
+    fn raw(&self, method: &str, path: &str, bearer: &str, body: Option<&Value>) -> (u16, Value) {
+        let mut socket = TcpStream::connect(("127.0.0.1", self.port)).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(15)))
+            .unwrap();
+        let payload = body.map(|b| b.to_string()).unwrap_or_default();
+        write!(
+            socket,
+            "{method} {path} HTTP/1.1\r\nHost: {HOST}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\nX-Cadence-Test-As: operator\r\n\
+             X-Cadence-Test-Token: {}\r\nAuthorization: Bearer wikienv_{bearer}\r\n\r\n{payload}",
+            payload.len(),
+            self.seam
+        )
+        .unwrap();
+        let mut response = Vec::new();
+        socket.read_to_end(&mut response).unwrap();
+        let at = response.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let status = String::from_utf8_lossy(&response[..at])
+            .lines()
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let value = serde_json::from_slice(&response[at + 4..])
+            .unwrap_or_else(|_| json!({"raw": String::from_utf8_lossy(&response[at + 4..])}));
+        (status, value)
+    }
+}
+
+/// CAD-1434 / AOS-243 native write/read: the real board `PUT`/`GET
+/// /api/wiki/file` route, the real envelope verifier, the real container
+/// prefix gate, and the real daemon `wiki_write`/`wiki_read` RPC. Nothing is
+/// recorded or faked. A write outside the signed prefix is refused with no
+/// daemon mutation; the signed own-path write succeeds and reads back through
+/// the daemon.
+#[test]
+fn wiki_write_and_read_are_denied_outside_the_signed_prefix_and_allowed_on_it() {
+    let rig = Rig::start();
+    let token = rig.sign(&rig.claims("native-write-read"));
+
+    // Outside the signed write prefix: refused by the container gate before any
+    // daemon mutation. The shared snapshot must not change.
+    let before = rig.snapshot();
+    let (status, body) = rig.raw(
+        "PUT",
+        "/api/wiki/file",
+        &token,
+        Some(&json!({"path": "global/outside/escape.md", "text": "escape"})),
+    );
+    assert_eq!(status, 403, "outside-prefix write: {body}");
+    assert_eq!(body["error"]["code"], "insufficient_scope", "{body}");
+    assert_eq!(rig.snapshot(), before, "outside-prefix write mutated data");
+
+    // Inside the signed prefix: the daemon writes it, and the daemon reads it back.
+    // An envelope is single-use (its jti is consumed by the first request), so each
+    // request mints a fresh envelope, as the real client does per command.
+    let own = format!("{PREFIX}native.md");
+    let write_token = rig.sign(&rig.claims("native-own-write"));
+    let (status, body) = rig.raw(
+        "PUT",
+        "/api/wiki/file",
+        &write_token,
+        Some(&json!({"path": own, "text": "native own-path text"})),
+    );
+    assert_eq!(status, 200, "own-path write: {body}");
+    let read_token = rig.sign(&rig.claims("native-own-read"));
+    let (status, read) = rig.raw(
+        "GET",
+        &format!("/api/wiki/file?path={own}"),
+        &read_token,
+        None,
+    );
+    assert_eq!(status, 200, "own-path read: {read}");
+    assert_eq!(read["text"], "native own-path text", "{read}");
+}

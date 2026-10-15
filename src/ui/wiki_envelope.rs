@@ -122,6 +122,18 @@ fn peek_kid(env: &str) -> Result<String, HttpResp> {
 static CLI_JWKS: std::sync::Mutex<board_identity::JwksCache> =
     std::sync::Mutex::new(board_identity::JwksCache::new());
 
+/// CAD-1434 / AOS-243 test seam: prime the process-wide JWKS cache through the
+/// SAME `JwksCache::key` that `grant_of` calls, so the production `fetch_keys`
+/// fetch and parser populate it. There is no key setter: the only way a key
+/// enters the cache is the real issuer fetch. The native request thread does
+/// not inherit a thread-local TLS fixture, so the controller primes here on its
+/// own thread before any native call. Test builds only.
+#[cfg(all(test, feature = "test-seam"))]
+pub(crate) fn prime_jwks_for_test(issuer: &str, kid: &str, now: i64) -> crate::Result<()> {
+    let mut cache = CLI_JWKS.lock().unwrap_or_else(|e| e.into_inner());
+    cache.key(issuer, kid, now).map(|_| ())
+}
+
 /// `wikienv_` requests on `/api/wiki/<tail>`. Only the translated routes
 /// are served; a verified envelope whose scope or prefix does not cover
 /// the action is refused before the daemon sees it.
@@ -407,6 +419,7 @@ fn consume_jti(state_dir: &std::path::Path, grant: &WikiGrant) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
     fn verified_upload_grant(actor: &str, prefix: &str) -> WikiGrant {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -486,6 +499,24 @@ mod tests {
             }
             assert!(upload_path(None, &grant).is_err());
         }
+    }
+
+    /// The container's path denial is a real 403 `insufficient_scope` body on a
+    /// verified member grant. This is the exact shape the client decoder reads.
+    #[test]
+    fn a_member_upload_outside_its_signed_prefix_is_403_insufficient_scope() {
+        let grant = verified_upload_grant("users/u", "users/u/");
+        let refusal = match upload_path(Some("projects/x/a.pdf".into()), &grant) {
+            Ok(_) => panic!("a path outside the signed member prefix was accepted"),
+            Err(refusal) => refusal,
+        };
+        assert_eq!(refusal.status_code(), StatusCode(403));
+        let mut body = String::new();
+        refusal.into_reader().read_to_string(&mut body).unwrap();
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["ok"], json!(false));
+        assert_eq!(parsed["error"]["code"], json!("insufficient_scope"));
+        assert!(parsed["error"]["message"].is_string());
     }
 
     /// The daemon's checked-conflict answer for a stale `if_rev`.

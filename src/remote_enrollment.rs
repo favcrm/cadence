@@ -679,7 +679,7 @@ fn require_login_issuer(dir: &Path, issuer: &str) -> Result<()> {
 /// pinned issuer only, never an AgenticOS identity or a board credential.
 #[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct AccessIngress {
+pub(crate) struct AccessIngress {
     issuer: String,
     client_id: String,
     client_secret: String,
@@ -759,6 +759,141 @@ pub fn cli_session_post(
     body: Value,
     deadline: Instant,
 ) -> Result<(u16, Value)> {
+    let answer = cli_session_post_detailed(dir, issuer, path, bearer, body, deadline)?;
+    Ok((answer.status, answer.body))
+}
+
+/// The issuer's correlation headers, read only when they are exactly the values
+/// the AOS renewal route emits (`x-cadence-hop: issuer` and a UUID id). They are
+/// diagnostic only: they never authorize anything and never change a status.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct IssuerCorrelation {
+    pub(crate) request_id: String,
+}
+
+/// Test-only: run the production header validator on values a fake issuer would
+/// send. The production send and the tests share this one validator.
+#[cfg(test)]
+pub(crate) fn correlation_from_header_values(
+    hop: Option<&str>,
+    request_id: Option<&str>,
+) -> Option<IssuerCorrelation> {
+    let mut headers = ureq::http::HeaderMap::new();
+    if let Some(hop) = hop {
+        headers.insert("x-cadence-hop", hop.parse().ok()?);
+    }
+    if let Some(id) = request_id {
+        headers.insert("x-cadence-request-id", id.parse().ok()?);
+    }
+    issuer_correlation(&headers)
+}
+
+/// One renewal or revoke answer: the status, the parsed body, and the safe
+/// correlation when the issuer sent a valid one. `correlation` is `None` for an
+/// old issuer, for a malformed header, or for a success answer that carries none.
+pub(crate) struct IssuerAnswer {
+    pub(crate) status: u16,
+    pub(crate) body: Value,
+    pub(crate) correlation: Option<IssuerCorrelation>,
+}
+
+/// Read the AOS issuer's correlation headers. Only `x-cadence-hop: issuer` and a
+/// bounded lowercase-or-uppercase UUID id are accepted; any other value is
+/// dropped, so no arbitrary header text reaches a message or a log.
+fn issuer_correlation(headers: &ureq::http::HeaderMap) -> Option<IssuerCorrelation> {
+    let hop = headers.get("x-cadence-hop")?.to_str().ok()?;
+    if hop != "issuer" {
+        return None;
+    }
+    let id = headers.get("x-cadence-request-id")?.to_str().ok()?;
+    let shaped = id.len() == 36
+        && id.bytes().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        });
+    shaped.then(|| IssuerCorrelation {
+        request_id: id.to_owned(),
+    })
+}
+
+/// The production renewal or revoke POST, returning the status, body and the
+/// validated issuer correlation. Only renewal reads the correlation; the legacy
+/// `cli_session_post` discards it.
+pub(crate) fn cli_session_post_detailed(
+    dir: &Path,
+    issuer: &str,
+    path: &str,
+    bearer: &str,
+    body: Value,
+    deadline: Instant,
+) -> Result<IssuerAnswer> {
+    cli_session_post_with(
+        dir,
+        issuer,
+        path,
+        bearer,
+        body,
+        deadline,
+        send_issuer_request,
+    )
+}
+
+/// The production wire call: strict TLS, no redirects, no proxy, bounded
+/// timeout. It is the only transport a real renewal can use.
+fn send_issuer_request(
+    url: &str,
+    bearer: &str,
+    access: Option<&AccessIngress>,
+    body: &Value,
+    timeout: Duration,
+) -> Result<(u16, Vec<u8>, Option<IssuerCorrelation>)> {
+    let builder = ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .proxy(None);
+    let mut request = crate::issuer_transport::agent(builder)
+        .post(url)
+        .header("Authorization", &format!("Bearer {bearer}"));
+    if let Some(access) = access {
+        request = request
+            .header("CF-Access-Client-Id", &access.client_id)
+            .header("CF-Access-Client-Secret", &access.client_secret);
+    }
+    let response = request
+        .send_json(body)
+        .map_err(|_| reject("Hosted CLI session request failed"))?;
+    let status = response.status().as_u16();
+    // Read the correlation headers before the body is consumed.
+    let correlation = issuer_correlation(response.headers());
+    let mut bytes = Vec::new();
+    response
+        .into_body()
+        .as_reader()
+        .take(MAX_RESPONSE + 1)
+        .read_to_end(&mut bytes)?;
+    Ok((status, bytes, correlation))
+}
+
+/// `cli_session_post` with the wire call injected. Every check before the send
+/// and every response guard after it are the production code; only the bytes
+/// on the wire come from `send`. Production passes `send_issuer_request`.
+/// Tests pass a closure, which is never reachable from config or environment.
+fn cli_session_post_with(
+    dir: &Path,
+    issuer: &str,
+    path: &str,
+    bearer: &str,
+    body: Value,
+    deadline: Instant,
+    send: impl FnOnce(
+        &str,
+        &str,
+        Option<&AccessIngress>,
+        &Value,
+        Duration,
+    ) -> Result<(u16, Vec<u8>, Option<IssuerCorrelation>)>,
+) -> Result<IssuerAnswer> {
     if !matches!(
         path,
         "/v1/hosted-cadence/cli-session/renew" | "/v1/hosted-cadence/cli-session/revoke"
@@ -777,48 +912,42 @@ pub fn cli_session_post(
             "remote command deadline elapsed before session request",
         ));
     }
-    let config = ureq::Agent::config_builder()
-        .timeout_global(Some(
-            request_deadline.saturating_duration_since(Instant::now()),
-        ))
-        .http_status_as_error(false)
-        .max_redirects(0)
-        .proxy(None)
-        .build();
-    let mut request = ureq::Agent::new_with_config(config)
-        .post(format!("{issuer}{path}"))
-        .header("Authorization", &format!("Bearer {bearer}"));
-    if let Some(access) = access.as_ref() {
-        request = request
-            .header("CF-Access-Client-Id", &access.client_id)
-            .header("CF-Access-Client-Secret", &access.client_secret);
-    }
-    if Instant::now() >= request_deadline {
-        return Err(Error::busy_coded(
-            "timeout",
-            "remote command deadline elapsed before session request",
-        ));
-    }
-    let response = request
-        .send_json(body)
-        .map_err(|_| reject("Hosted CLI session request failed"))?;
-    let status = response.status().as_u16();
+    let timeout = request_deadline.saturating_duration_since(Instant::now());
+    let url = format!("{issuer}{path}");
+    let (status, bytes, correlation) = send(&url, bearer, access.as_ref(), &body, timeout)?;
     if (300..400).contains(&status) {
         return Err(reject("Hosted issuer redirect refused"));
     }
-    let mut bytes = Vec::new();
-    response
-        .into_body()
-        .as_reader()
-        .take(MAX_RESPONSE + 1)
-        .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_RESPONSE {
         return Err(reject("Hosted issuer response too large"));
     }
     let value = serde_json::from_slice(&bytes)
         .map_err(|_| reject("Invalid hosted CLI session response"))?;
     confirm_login_access_ingress(dir, &issuer, &access)?;
-    Ok((status, value))
+    Ok(IssuerAnswer {
+        status,
+        body: value,
+        correlation,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn cli_session_post_for_test(
+    dir: &Path,
+    issuer: &str,
+    path: &str,
+    bearer: &str,
+    body: Value,
+    deadline: Instant,
+    send: impl FnOnce(
+        &str,
+        &str,
+        Option<&AccessIngress>,
+        &Value,
+        Duration,
+    ) -> Result<(u16, Vec<u8>, Option<IssuerCorrelation>)>,
+) -> Result<IssuerAnswer> {
+    cli_session_post_with(dir, issuer, path, bearer, body, deadline, send)
 }
 
 /// CAD-1429: one Publish Web management request to the verified PUBLIC
@@ -936,17 +1065,11 @@ pub fn web_issuer_request(
 /// (for example `assets/app-abc123.js` as `assets%2Fapp-abc123.js`). Every other
 /// route refuses `%2F` and `%5C`, traversal, a query or fragment, and any
 /// double-encoded or malformed escape.
-/// The one construction point for issuer agents. Production builds the agent
-/// from the finished config; the test build routes through the CAD-1429 TLS
-/// fixture, which is inert unless a test installs it.
-#[cfg(not(test))]
+/// The one construction point for issuer agents. Production uses the caller's
+/// finished config; tests may additionally route through the installed issuer
+/// fixtures, with the canonical transport selecting their precedence.
 fn issuer_agent(builder: ureq::config::ConfigBuilder<ureq::typestate::AgentScope>) -> ureq::Agent {
-    ureq::Agent::new_with_config(builder.build())
-}
-
-#[cfg(test)]
-fn issuer_agent(builder: ureq::config::ConfigBuilder<ureq::typestate::AgentScope>) -> ureq::Agent {
-    crate::test_web_issuer_tls::agent(builder)
+    crate::issuer_transport::agent(builder)
 }
 
 fn web_management_path(path: &str) -> bool {
@@ -1351,12 +1474,12 @@ fn post_public_with_access(
     if access.is_some() {
         origin(issuer, cfg!(test))?;
     }
-    let config = ureq::Agent::config_builder()
+    let builder = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(20)))
         .http_status_as_error(false)
         .max_redirects(0)
         .proxy(None);
-    let mut request = issuer_agent(config).post(format!("{issuer}{path}"));
+    let mut request = issuer_agent(builder).post(format!("{issuer}{path}"));
     if let Some(access) = access {
         if access.issuer != issuer {
             return Err(reject("Hosted Access ingress issuer changed"));
@@ -1775,6 +1898,18 @@ fn login_grant(
         cli_session,
         token: field(credential, "access_token")?.to_string(),
     })
+}
+
+/// Test controller access to the unchanged strict owner login parser.
+#[cfg(all(test, feature = "test-seam"))]
+pub(crate) fn login_grant_for_test(value: &Value, issuer: &str) -> Result<LoginGrant> {
+    login_grant(
+        value,
+        None,
+        Some("lc"),
+        issuer,
+        &["cli.read", "cli.write", "wiki.read", "wiki.write"],
+    )
 }
 
 impl LoginGrant {
@@ -2218,6 +2353,29 @@ fn enroll_child_locked(
 
 #[cfg(test)]
 mod tests {
+    /// The production header validator: exact `issuer` hop, bounded UUID id,
+    /// header names matched case-insensitively. Anything else yields no id.
+    #[test]
+    fn issuer_correlation_accepts_only_the_exact_issuer_hop_and_a_uuid() {
+        let id = "0b2e1f4a-7c3d-4e5f-8a9b-1c2d3e4f5a6b";
+        let good = super::correlation_from_header_values(Some("issuer"), Some(id)).unwrap();
+        assert_eq!(good.request_id, id);
+        assert!(super::correlation_from_header_values(Some("Issuer"), Some(id)).is_none());
+        assert!(super::correlation_from_header_values(Some("issuer "), Some(id)).is_none());
+        assert!(super::correlation_from_header_values(Some("board"), Some(id)).is_none());
+        assert!(super::correlation_from_header_values(Some("issuer"), Some("0b2e1f4a")).is_none());
+        assert!(super::correlation_from_header_values(
+            Some("issuer"),
+            Some("0b2e1f4a_7c3d-4e5f-8a9b-1c2d3e4f5a6b")
+        )
+        .is_none());
+        assert!(super::correlation_from_header_values(
+            Some("issuer"),
+            Some("0b2e1f4a-7c3d-4e5f-8a9b-1c2d3e4f5a6g")
+        )
+        .is_none());
+    }
+
     use super::*;
     use crate::remote_result_outbox::{deliver_with, ResultCommand, ResultOutbox};
     use std::io::{BufRead, BufReader};
@@ -5309,3 +5467,7 @@ mod tests {
 #[cfg(test)]
 #[path = "remote_enrollment_cli_lock_acceptance.rs"]
 mod cli_lock_acceptance;
+
+#[cfg(test)]
+#[path = "remote_enrollment_tls_acceptance.rs"]
+mod tls_acceptance;

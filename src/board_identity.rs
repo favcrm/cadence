@@ -291,11 +291,7 @@ pub struct PublicKey {
 /// Bounded body, strict shape, `fail closed`: any transport, status or
 /// schema error is an `Err` and verifies nothing.
 pub fn fetch_keys(issuer: &str) -> Result<Vec<PublicKey>> {
-    let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(JWKS_TIMEOUT))
-        .http_status_as_error(false)
-        .build();
-    let agent = ureq::Agent::new_with_config(agent);
+    let agent = crate::issuer_transport::jwks_agent(JWKS_TIMEOUT);
     let url = format!(
         "{}/.well-known/agenticos-board-jwks.json",
         issuer.trim_end_matches('/')
