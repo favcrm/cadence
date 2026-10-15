@@ -1079,7 +1079,11 @@ fn check_catalog(db: &Path) -> Result<()> {
             ))?
             .query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
-        if cols.iter().map(String::as_str).ne(expected.iter().copied()) {
+        // Column order is physical (ALTER appends), so compare names as an
+        // exact unordered set. SQLite column names are unique per table.
+        let actual: std::collections::BTreeSet<&str> = cols.iter().map(String::as_str).collect();
+        let wanted: std::collections::BTreeSet<&str> = expected.iter().copied().collect();
+        if cols.len() != expected.len() || actual != wanted {
             return Err(Error::rejected(format!(
                 "portable export refuses: table {table} columns do not match the known catalog"
             )));

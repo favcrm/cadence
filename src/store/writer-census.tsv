@@ -17,7 +17,9 @@ backup/portable_activate.rs	read-only-portable-activation-inventory	open	1
 backup/portable_activate.rs	read-only-portable-activation-inventory	prepare	1
 backup/portable_activate_selftest.rs	test-fixtures	execute	1
 backup/portable_activate_selftest.rs	test-fixtures	open	2
-backup/portable_selftest.rs	test-fixtures	open	1
+backup/portable_selftest.rs	test-fixtures	execute	2
+backup/portable_selftest.rs	test-fixtures	open	5
+backup/portable_selftest.rs	test-fixtures	prepare	1
 backup/tests.rs	test-fixtures	execute	22
 backup/tests.rs	test-fixtures	open	24
 bin/cadence-agent-exec/main.rs	capability-seal-non-sqlite-prepare	prepare	1

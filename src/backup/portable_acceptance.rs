@@ -78,6 +78,10 @@ fn git(dir: &Path, args: &[&str]) -> String {
             "core.hooksPath=/dev/null",
             "-c",
             "init.defaultBranch=main",
+            // Git 2.55 spawns detached post-commit background maintenance that
+            // races byte-for-byte snapshot assertions on fixture trees.
+            "-c",
+            "maintenance.auto=false",
         ])
         .args(args)
         .env("GIT_CONFIG_NOSYSTEM", "1")
