@@ -117,6 +117,23 @@ fn refused() -> Error {
     )
 }
 
+/// The same refusal, tagged with a fixed diagnostic phase so a 503 can show
+/// WHERE the lookup failed. `phase` is always one of a small set of static
+/// constants — request, transport, http_status, body, envelope, jwks, proof.
+/// `status` carries only the numeric HTTP status for `http_status`; no raw
+/// error text, body, header, URL, proof, claim, digest, nonce or sub value is
+/// ever appended.
+fn refused_phase(phase: &'static str, status: Option<u16>) -> Error {
+    let mut msg = String::from("board membership could not be confirmed (");
+    msg.push_str(phase);
+    if let Some(code) = status {
+        msg.push(' ');
+        msg.push_str(&code.to_string());
+    }
+    msg.push(')');
+    Error::invalid("capability_unavailable", msg)
+}
+
 fn bounded_text(s: &str, max: usize) -> bool {
     !s.is_empty() && s.len() <= max && !s.chars().any(char::is_control)
 }
@@ -295,7 +312,7 @@ pub fn lookup_current_membership(
     jwks: &Mutex<JwksCache>,
 ) -> Result<Option<Role>> {
     if raw_cookie.is_empty() {
-        return Err(refused());
+        return Err(refused_phase("request", None));
     }
     lookup_current_membership_by_digest(
         &session_digest(raw_cookie),
@@ -320,7 +337,8 @@ pub fn lookup_current_membership_by_digest(
     trusted_instance: &str,
     jwks: &Mutex<JwksCache>,
 ) -> Result<Option<Role>> {
-    let request = check_request(session, authenticated_sub)?;
+    let request =
+        check_request(session, authenticated_sub).map_err(|_| refused_phase("request", None))?;
     let expected = Expected {
         company: trusted_company,
         instance: trusted_instance,
@@ -329,7 +347,7 @@ pub fn lookup_current_membership_by_digest(
         nonce: &request.nonce,
     };
     if !expected_ok(&expected) {
-        return Err(refused());
+        return Err(refused_phase("request", None));
     }
 
     let agent = ureq::Agent::config_builder()
@@ -340,26 +358,113 @@ pub fn lookup_current_membership_by_digest(
     let mut resp = agent
         .post(CHECK_URL)
         .send_json(&request)
-        .map_err(|_| refused())?;
+        .map_err(|_| refused_phase("transport", None))?;
     if resp.status() != 200 {
-        return Err(refused());
+        return Err(refused_phase("http_status", Some(resp.status().as_u16())));
     }
     let bytes = resp
         .body_mut()
         .with_config()
         .limit(RESPONSE_MAX)
         .read_to_vec()
-        .map_err(|_| refused())?;
-    let token = envelope_proof(&bytes).ok_or_else(refused)?;
+        .map_err(|_| refused_phase("body", None))?;
+    let token = envelope_proof(&bytes).ok_or_else(|| refused_phase("envelope", None))?;
 
     // The key id comes from the bounded header. The key is looked up on the
     // fixed issuer, and `now` is read after the network and key fetches.
-    let kid = split(&token).ok_or_else(refused)?.header.kid;
+    let kid = split(&token)
+        .ok_or_else(|| refused_phase("proof", None))?
+        .header
+        .kid;
     let key = {
         let mut cache = jwks.lock().unwrap_or_else(|e| e.into_inner());
+        let now = now_unix().map_err(|_| refused_phase("jwks", None))?;
         cache
-            .key(ISSUER, &kid, now_unix()?)
-            .map_err(|_| refused())?
+            .key(ISSUER, &kid, now)
+            .map_err(|_| refused_phase("jwks", None))?
     };
-    verify_proof(&token, &expected, &key, now_unix()?)
+    let now = now_unix().map_err(|_| refused_phase("proof", None))?;
+    verify_proof(&token, &expected, &key, now).map_err(|_| refused_phase("proof", None))
+}
+
+#[cfg(test)]
+mod refusal_redaction_acceptance {
+    use super::*;
+
+    fn assert_safe_refusal(error: &Error, phase: &str, status: Option<u16>, forbidden: &[&str]) {
+        assert_eq!(error.code(), Some("capability_unavailable"));
+        assert_eq!(error.kind(), "rejected");
+        let message = error.to_string();
+        let suffix = match status {
+            Some(code) => format!("({phase} {code})"),
+            None => format!("({phase})"),
+        };
+        assert!(message.ends_with(&suffix), "unexpected refusal: {message}");
+        assert!(message.len() <= 64, "refusal is not bounded: {message}");
+        for value in forbidden {
+            assert!(
+                !message.contains(value),
+                "refusal leaked sensitive value {value:?}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn refusal_phases_are_bounded_and_retain_only_http_status() {
+        for phase in ["request", "transport", "body", "envelope", "jwks", "proof"] {
+            let error = refused_phase(phase, None);
+            assert_safe_refusal(&error, phase, None, &[]);
+        }
+
+        let error = refused_phase("http_status", Some(503));
+        assert_safe_refusal(&error, "http_status", Some(503), &[]);
+    }
+
+    #[test]
+    fn lookup_request_refusal_redacts_request_material_and_grants_nothing() {
+        let cookie = "cookie-secret-sentinel";
+        let subject = "subject-secret-sentinel\n";
+        let token = "proof-secret-sentinel";
+        let nonce = "nonce-secret-sentinel";
+        let digest = session_digest(cookie);
+        let url = "http://api.internal/v1/runtime/cadence/member/check";
+        let body = "raw-response-body-sentinel";
+        let jwks = Mutex::new(JwksCache::new());
+
+        let result = lookup_current_membership(cookie, subject, "company", "instance1", &jwks);
+        let error = result.expect_err("malformed request must be refused before lookup");
+        assert_safe_refusal(
+            &error,
+            "request",
+            None,
+            &[cookie, subject, token, nonce, &digest, url, body],
+        );
+    }
+
+    #[test]
+    fn invalid_proof_refusal_is_generic_and_redacted() {
+        let token = "proof-secret-sentinel";
+        let session = "a".repeat(64);
+        let nonce = "b".repeat(32);
+        let expected = Expected {
+            company: "company",
+            instance: "instance1",
+            sub: "subject-secret-sentinel",
+            session: &session,
+            nonce: &nonce,
+        };
+        let key = PublicKey {
+            kid: "kid-secret-sentinel".to_string(),
+            x: [0; 32],
+        };
+
+        let error = verify_proof(token, &expected, &key, 1_700_000_000)
+            .expect_err("malformed proof must not grant membership");
+        assert_eq!(error.code(), Some("capability_unavailable"));
+        assert_eq!(error.kind(), "rejected");
+        assert_eq!(error.to_string(), "board membership could not be confirmed");
+        for value in [token, "subject-secret-sentinel", "kid-secret-sentinel"] {
+            assert!(!error.to_string().contains(value));
+        }
+    }
 }
