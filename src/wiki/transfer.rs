@@ -7,7 +7,14 @@
 //! Crash boundaries:
 //! - staged bytes are fsynced before the Store `received` row moves forward;
 //!   a later call trusts the regular file when the row lags;
-//! - a wiki commit that lands without its outcome row is recognized from
+//! - `unresolved` is written before `write`, `mkdir`, or `put_blob`. A crash
+//!   in the writer is not a fresh `pending` entry. An unresolved attempt
+//!   reconciles only an actually committed matching revision and hash; it
+//!   does not publish again when the residue disappears;
+//! - an empty manifest root is complete only after `committed_dir` proves
+//!   it. An uncommitted root, or a crash after the root attempt marker, stays
+//!   open and is not repair-committed;
+//! - a wiki commit that lands without its final outcome row is recognized from
 //!   the committed tree, not the worktree, and is not published again.
 //!   Desired bytes that are absent or different in HEAD stay `unresolved`
 //!   and keep their staged input; apply does not commit them itself;
@@ -42,6 +49,8 @@ use crate::issue::Pm;
 use crate::store::wiki_transfers::{self, EntryOutcome, EntryRow, JobHead};
 use crate::store::Store;
 
+mod export_read;
+
 /// Manifest schema this daemon accepts.
 pub const MANIFEST_VERSION: u32 = 1;
 /// Largest manifest, serialized.
@@ -62,6 +71,12 @@ pub const MAX_SOURCE_ID_LEN: usize = 128;
 pub const STATUS_PAGE_MAX: u64 = 32;
 /// Private staging directory under the daemon state dir.
 pub const STAGING_DIR: &str = "wiki-transfers";
+/// Implicit-root fence: mkdir has not been attempted.
+const ROOT_FRESH: &str = "fresh";
+/// Implicit-root fence: an uncommitted root was seen, or mkdir was attempted.
+const ROOT_UNRESOLVED: &str = "unresolved";
+/// Implicit-root fence: HEAD contains the directory.
+const ROOT_PROVED: &str = "proved";
 
 /// One file or directory in a transfer manifest.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -377,27 +392,56 @@ fn pin_live(pm: &Pm, caller: &Caller, manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
-fn current_rev(pm: &Pm, caller: &Caller, path: &str) -> Result<String> {
-    match read(pm, caller, path) {
-        Ok(page) => Ok(page["rev"].as_str().unwrap_or(ABSENT).to_string()),
-        Err(error) if missing(&error) => Ok(ABSENT.to_string()),
-        Err(error) => Err(error),
-    }
+enum RootStatus {
+    Ready {
+        created: bool,
+    },
+    /// The root is not a committed directory. Finish stays open.
+    Unproved,
 }
 
-/// Create the destination directory when the manifest named no root entry.
-/// An existing directory is left untouched. A file is never overwritten.
-fn ensure_root(pm: &Pm, caller: &Caller, root: &str) -> Result<bool> {
+/// Prove the manifest root is a committed directory. An existing uncommitted
+/// directory is fenced and left uncommitted. A missing directory is fenced
+/// before `mkdir` and is not created again when that attempt is still
+/// unproved, including when the residue has disappeared.
+fn ensure_root(
+    store: &Store,
+    pm: &Pm,
+    caller: &Caller,
+    job_id: &str,
+    root: &str,
+) -> Result<RootStatus> {
     let segs: Vec<&str> = root.split('/').collect();
     allowed(caller, Op::Write, &segs)?;
+    if committed_dir(pm, root)? {
+        store.wiki_transfer_note_root_attempt(job_id, ROOT_PROVED)?;
+        return Ok(RootStatus::Ready { created: false });
+    }
+    let job = store.wiki_transfer_job(job_id)?.ok_or_else(not_found)?;
+    if job.root_attempt != ROOT_FRESH {
+        return Ok(RootStatus::Unproved);
+    }
     match read(pm, caller, root) {
-        Ok(page) if page["kind"] == "dir" => Ok(false),
+        Ok(page) if page["kind"] == "dir" => {
+            store.wiki_transfer_note_root_attempt(job_id, ROOT_UNRESOLVED)?;
+            Ok(RootStatus::Unproved)
+        }
         Ok(_) => Err(reject(format!(
             "wiki transfer finish refused: '{root}' is a file and was not overwritten"
         ))),
         Err(error) if missing(&error) => {
-            mkdir(pm, caller, root)?;
-            Ok(true)
+            store.wiki_transfer_note_root_attempt(job_id, ROOT_UNRESOLVED)?;
+            match mkdir(pm, caller, root) {
+                Ok(_) => match committed_dir(pm, root) {
+                    Ok(true) => {
+                        store.wiki_transfer_note_root_attempt(job_id, ROOT_PROVED)?;
+                        Ok(RootStatus::Ready { created: true })
+                    }
+                    Ok(false) => Ok(RootStatus::Unproved),
+                    Err(_) => Ok(RootStatus::Unproved),
+                },
+                Err(_) => Ok(RootStatus::Unproved),
+            }
         }
         Err(error) => Err(error),
     }
@@ -573,6 +617,7 @@ pub fn begin(
         root: manifest.root.clone(),
         owner_key: owner.to_string(),
         state: "open".into(),
+        root_attempt: ROOT_FRESH.into(),
     };
     let entries = manifest
         .entries
@@ -743,6 +788,17 @@ pub fn apply(
         discard_stage(state_dir, job_id, entry_id)?;
         return Ok(entry_value(&entry));
     }
+    // An attempt that is already unresolved never becomes a new publication,
+    // even when the staged bytes are gone or the original if_rev still matches.
+    if entry.outcome == "unresolved" {
+        return record_publish(
+            store,
+            state_dir,
+            job_id,
+            &entry,
+            reconcile_fenced(pm, caller, &entry)?,
+        );
+    }
     if entry.kind != "dir" {
         let Some((path, len)) = staged_len(state_dir, job_id, entry_id)? else {
             return Err(reject(
@@ -782,7 +838,22 @@ pub fn apply(
             }));
         }
     }
-    let outcome = publish_entry(pm, state_dir, caller, job_id, &entry)?;
+    record_publish(
+        store,
+        state_dir,
+        job_id,
+        &entry,
+        publish_entry(store, pm, state_dir, caller, job_id, &entry)?,
+    )
+}
+
+fn record_publish(
+    store: &Store,
+    state_dir: &Path,
+    job_id: &str,
+    entry: &EntryRow,
+    outcome: Published,
+) -> Result<Value> {
     store.wiki_transfer_record_outcome(
         job_id,
         &entry.entry_id,
@@ -798,11 +869,11 @@ pub fn apply(
     // An unproved publication stays restartable. Known terminal outcomes
     // have already consumed the staged input.
     if outcome.outcome != "unresolved" {
-        discard_stage(state_dir, job_id, entry_id)?;
+        discard_stage(state_dir, job_id, &entry.entry_id)?;
     }
     let mut body = json!({
         "job_id": job_id,
-        "entry_id": entry_id,
+        "entry_id": entry.entry_id,
         "path": entry.path,
         "outcome": outcome.outcome,
         "extraction": outcome.extraction,
@@ -849,18 +920,25 @@ struct Published {
 }
 
 fn publish_entry(
+    store: &Store,
     pm: &Pm,
     state_dir: &Path,
     caller: &Caller,
     job_id: &str,
     entry: &EntryRow,
 ) -> Result<Published> {
+    if entry.outcome == "unresolved" {
+        return reconcile_fenced(pm, caller, entry);
+    }
     if entry.kind == "dir" {
-        return publish_dir(pm, caller, entry);
+        return publish_dir(store, pm, caller, job_id, entry);
     }
     match publication(pm, caller, entry)? {
         Publication::Committed(rev) => return reconcile_match(pm, caller, entry, rev),
-        Publication::Uncommitted => return Ok(unresolved(entry)),
+        Publication::Uncommitted => {
+            note_attempt(store, job_id, entry)?;
+            return Ok(unresolved(entry));
+        }
         Publication::Absent => {}
     }
     let current = committed_rev(pm, entry)?;
@@ -875,33 +953,54 @@ fn publish_entry(
         });
     }
     if entry.kind == "text" {
-        let bytes = fs::read(stage_path(state_dir, job_id, &entry.entry_id))?;
-        let text = std::str::from_utf8(&bytes).map_err(|_| {
-            reject(format!(
-                "wiki transfer apply refused: '{}' is not UTF-8 text",
-                entry.path
-            ))
-        })?;
-        let wrote = write(pm, caller, &entry.path, text, Some(&entry.if_rev))?;
-        if wrote.get("conflict").is_some() {
-            return classify_publish_conflict(pm, caller, entry, &wrote);
-        }
-        let Some(rev) = committed_content_rev(pm, entry)? else {
-            return Ok(unresolved(entry));
-        };
-        return Ok(Published {
-            outcome: "applied",
-            rev: Some(rev),
-            extraction: "not_applicable",
-            extraction_rev: None,
-            source_hash: entry.sha256.clone(),
-            detail: None,
-        });
+        return publish_text(store, pm, state_dir, caller, job_id, entry);
     }
-    publish_blob(pm, state_dir, caller, job_id, entry)
+    publish_blob(store, pm, state_dir, caller, job_id, entry)
 }
 
-fn publish_dir(pm: &Pm, caller: &Caller, entry: &EntryRow) -> Result<Published> {
+fn publish_text(
+    store: &Store,
+    pm: &Pm,
+    state_dir: &Path,
+    caller: &Caller,
+    job_id: &str,
+    entry: &EntryRow,
+) -> Result<Published> {
+    let bytes = fs::read(stage_path(state_dir, job_id, &entry.entry_id))?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| {
+        reject(format!(
+            "wiki transfer apply refused: '{}' is not UTF-8 text",
+            entry.path
+        ))
+    })?;
+    note_attempt(store, job_id, entry)?;
+    let wrote = match write(pm, caller, &entry.path, text, Some(&entry.if_rev)) {
+        Ok(value) => value,
+        Err(error) => return classify_publish_error(pm, caller, entry, &error),
+    };
+    if wrote.get("conflict").is_some() {
+        return classify_publish_conflict(pm, caller, entry, &wrote);
+    }
+    let Some(rev) = committed_content_rev(pm, entry)? else {
+        return Ok(unresolved(entry));
+    };
+    Ok(Published {
+        outcome: "applied",
+        rev: Some(rev),
+        extraction: "not_applicable",
+        extraction_rev: None,
+        source_hash: entry.sha256.clone(),
+        detail: None,
+    })
+}
+
+fn publish_dir(
+    store: &Store,
+    pm: &Pm,
+    caller: &Caller,
+    job_id: &str,
+    entry: &EntryRow,
+) -> Result<Published> {
     match publication(pm, caller, entry)? {
         Publication::Committed(_) => {
             return Ok(Published {
@@ -913,11 +1012,17 @@ fn publish_dir(pm: &Pm, caller: &Caller, entry: &EntryRow) -> Result<Published> 
                 detail: None,
             });
         }
-        Publication::Uncommitted => return Ok(unresolved(entry)),
+        Publication::Uncommitted => {
+            note_attempt(store, job_id, entry)?;
+            return Ok(unresolved(entry));
+        }
         Publication::Absent => {}
     }
     match read(pm, caller, &entry.path) {
-        Ok(page) if page["kind"] == "dir" => return Ok(unresolved(entry)),
+        Ok(page) if page["kind"] == "dir" => {
+            note_attempt(store, job_id, entry)?;
+            return Ok(unresolved(entry));
+        }
         Ok(_) => {
             return Ok(Published {
                 outcome: "conflict",
@@ -931,7 +1036,22 @@ fn publish_dir(pm: &Pm, caller: &Caller, entry: &EntryRow) -> Result<Published> 
         Err(error) if missing(&error) => {}
         Err(error) => return Err(error),
     }
-    let made = mkdir(pm, caller, &entry.path)?;
+    note_attempt(store, job_id, entry)?;
+    let made = match mkdir(pm, caller, &entry.path) {
+        Ok(value) => value,
+        Err(error) => {
+            return Ok(Published {
+                outcome: "unresolved",
+                rev: None,
+                extraction: "not_applicable",
+                extraction_rev: None,
+                source_hash: None,
+                detail: Some(format!(
+                    "wiki transfer publication could not be proved ({error})"
+                )),
+            });
+        }
+    };
     if !committed_dir(pm, &entry.path)? {
         return Ok(unresolved(entry));
     }
@@ -972,6 +1092,41 @@ fn unresolved(entry: &EntryRow) -> Published {
         extraction_rev: None,
         source_hash: entry.sha256.clone(),
         detail: Some(detail.into()),
+    }
+}
+
+/// Durable boundary before `write`, `mkdir`, or `put_blob`. A crash after
+/// this row is indistinguishable from an unproved writer result, so resume
+/// cannot treat it as a fresh pending entry.
+fn note_attempt(store: &Store, job_id: &str, entry: &EntryRow) -> Result<()> {
+    store.wiki_transfer_record_outcome(
+        job_id,
+        &entry.entry_id,
+        &EntryOutcome {
+            outcome: "unresolved",
+            rev: None,
+            extraction: Some("not_applicable"),
+            extraction_rev: None,
+            source_hash: entry.sha256.as_deref(),
+            detail: Some("wiki transfer publication attempt is unproved"),
+        },
+    )
+}
+
+/// An already-fenced attempt may accept only a committed matching proof.
+/// Absence, a matching worktree, and a still-valid `if_rev` do not publish.
+fn reconcile_fenced(pm: &Pm, caller: &Caller, entry: &EntryRow) -> Result<Published> {
+    match publication(pm, caller, entry)? {
+        Publication::Committed(_) if entry.kind == "dir" => Ok(Published {
+            outcome: "skipped",
+            rev: None,
+            extraction: "not_applicable",
+            extraction_rev: None,
+            source_hash: None,
+            detail: None,
+        }),
+        Publication::Committed(rev) => reconcile_match(pm, caller, entry, rev),
+        Publication::Uncommitted | Publication::Absent => Ok(unresolved(entry)),
     }
 }
 
@@ -1208,7 +1363,7 @@ fn reconcile_match(
     entry: &EntryRow,
     rev: Option<String>,
 ) -> Result<Published> {
-    if entry.kind == "blob" && is_pdf(&entry.path) {
+    if entry.kind == "blob" && committed_blob_is_pdf(pm, caller, &entry.path)? {
         let hash = entry
             .sha256
             .as_deref()
@@ -1233,12 +1388,12 @@ fn reconcile_match(
     })
 }
 
-fn is_pdf(path: &str) -> bool {
-    path.rsplit('/')
-        .next()
-        .unwrap_or(path)
-        .to_ascii_lowercase()
-        .ends_with(".pdf")
+fn blob_is_pdf(page: &Value) -> bool {
+    page["mime"].as_str() == Some("application/pdf")
+}
+
+fn committed_blob_is_pdf(pm: &Pm, caller: &Caller, path: &str) -> Result<bool> {
+    Ok(blob_is_pdf(&read(pm, caller, path)?))
 }
 
 /// The generated extraction header is the only provenance. A matching body
@@ -1313,6 +1468,7 @@ fn extraction_of(
 }
 
 fn publish_blob(
+    store: &Store,
     pm: &Pm,
     state_dir: &Path,
     caller: &Caller,
@@ -1324,6 +1480,10 @@ fn publish_blob(
     fs::create_dir_all(&uploads)?;
     let tmp = uploads.join(format!("transfer-{}", uuid::Uuid::new_v4().simple()));
     fs::copy(&stage, &tmp)?;
+    if let Err(error) = note_attempt(store, job_id, entry) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
+    }
     let wrote = match put_blob(
         pm,
         state_dir,
@@ -1349,7 +1509,11 @@ fn publish_blob(
         .sha256
         .as_deref()
         .ok_or_else(|| reject("missing transfer hash"))?;
-    let (extraction, extraction_rev, detail) = if is_pdf(&entry.path) {
+    let pdf = match wrote["mime"].as_str() {
+        Some(mime) => mime == "application/pdf",
+        None => committed_blob_is_pdf(pm, caller, &entry.path)?,
+    };
+    let (extraction, extraction_rev, detail) = if pdf {
         extraction_of(pm, caller, &entry.path, hash)
     } else {
         ("not_applicable", None, None)
@@ -1467,8 +1631,13 @@ pub fn finish(
             "wiki transfer finish refused: entries are still pending",
         ));
     }
-    let root_created = match ensure_root(pm, caller, root) {
-        Ok(created) => created,
+    let root_created = match ensure_root(store, pm, caller, job_id, root) {
+        Ok(RootStatus::Ready { created }) => created,
+        Ok(RootStatus::Unproved) => {
+            return Err(reject(
+                "wiki transfer finish refused: root publication is not committed",
+            ));
+        }
         Err(error) => {
             let kick = store.wiki_transfer_finish(job_id, "failed", false)?;
             return Ok((
@@ -1498,8 +1667,7 @@ pub fn finish(
     let wants_index = root_created
         || state != "failed"
         || entries.iter().any(|entry| {
-            matches!(entry.outcome.as_str(), "applied" | "skipped")
-                && (entry.kind == "text" || is_pdf(&entry.path))
+            matches!(entry.outcome.as_str(), "applied" | "skipped") && indexes_entry(entry)
         });
     let kick = store.wiki_transfer_finish(job_id, state, wants_index)?;
     let index = index_label(pm, state_dir, caller, &entries);
@@ -1567,6 +1735,23 @@ pub fn status(
     }))
 }
 
+fn indexes_entry(entry: &EntryRow) -> bool {
+    entry.kind == "text" || (entry.kind == "blob" && blob_extraction_recorded(entry))
+}
+
+fn blob_extraction_recorded(entry: &EntryRow) -> bool {
+    entry
+        .extraction
+        .as_deref()
+        .is_some_and(|status| status != "not_applicable")
+}
+
+/// Pointer MIME is the detected format. A stored extraction other than
+/// `not_applicable` is the same fact kept for the receipt.
+fn blob_needs_extraction(entry: &EntryRow, page: &Value) -> bool {
+    blob_is_pdf(page) || blob_extraction_recorded(entry)
+}
+
 /// Live index receipt. Failed extraction is never `covered`. A later
 /// overwrite of a recorded revision is `superseded`. An intact revision
 /// set is `covered` only when the current committed index tree contains
@@ -1586,10 +1771,14 @@ fn index_label(pm: &Pm, state_dir: &Path, caller: &Caller, entries: &[EntryRow])
         let Some(recorded) = entry.rev.as_deref() else {
             return "pending".into();
         };
-        if !current_rev(pm, caller, &entry.path).is_ok_and(|live| live == recorded) {
+        let page = match read(pm, caller, &entry.path) {
+            Ok(page) => page,
+            Err(_) => return "superseded".into(),
+        };
+        if page["rev"].as_str() != Some(recorded) {
             return "superseded".into();
         }
-        if entry.kind == "blob" && !is_pdf(&entry.path) {
+        if entry.kind == "blob" && !blob_needs_extraction(entry, &page) {
             continue;
         }
         if entry.kind == "blob" {
@@ -1637,33 +1826,14 @@ fn export_dir_entry(pm: &Pm, caller: &Caller, item: &Value) -> Value {
     let path = item["path"].as_str().unwrap_or("");
     let name = item["name"].as_str().unwrap_or("");
     let listed = item["kind"].as_str().unwrap_or("");
-    let page = read(pm, caller, path).ok();
-    let kind = page
-        .as_ref()
-        .and_then(|p| p["kind"].as_str())
-        .unwrap_or(listed);
-    let rev = page.as_ref().and_then(|p| p["rev"].as_str());
-    let (size, sha) = match kind {
-        "text" => page
-            .as_ref()
-            .and_then(|p| p["text"].as_str())
-            .map(|text| (Some(text.len() as u64), Some(sha256_bytes(text.as_bytes()))))
-            .unwrap_or((None, None)),
-        "blob" => (
-            page.as_ref().and_then(|p| p["size"].as_u64()),
-            page.as_ref()
-                .and_then(|p| p["sha256"].as_str())
-                .map(str::to_string),
-        ),
-        _ => (None, None),
-    };
+    let meta = export_read::file_metadata(pm, caller, path).ok().flatten();
     json!({
-        "path": path,
+        "path": meta.as_ref().and_then(|page| page["path"].as_str()).unwrap_or(path),
         "name": name,
-        "kind": kind,
-        "rev": rev,
-        "size": size,
-        "sha256": sha,
+        "kind": meta.as_ref().and_then(|page| page["kind"].as_str()).unwrap_or(listed),
+        "rev": meta.as_ref().and_then(|page| page.get("rev")).cloned().unwrap_or(Value::Null),
+        "size": meta.as_ref().and_then(|page| page.get("size")).cloned().unwrap_or(Value::Null),
+        "sha256": meta.as_ref().and_then(|page| page.get("sha256")).cloned().unwrap_or(Value::Null),
     })
 }
 
@@ -1718,119 +1888,31 @@ pub fn export(
             "wiki transfer export refused: bytes must be 1 to {MAX_CHUNK_BYTES}"
         )));
     }
-    let page = read(pm, caller, path)?;
-    let kind = page["kind"].as_str().unwrap_or("");
-    if kind == "dir" {
-        let listing = ls(pm, caller, path)?;
-        let entries = listing["entries"].as_array().cloned().unwrap_or_default();
-        let start = usize::try_from(offset).unwrap_or(usize::MAX);
-        let slice = bounded_metadata_page(
-            entries
-                .iter()
-                .skip(start)
-                .take(STATUS_PAGE_MAX as usize)
-                .map(|item| export_dir_entry(pm, caller, item)),
-        )?;
-        let next = start.saturating_add(slice.len());
-        let next_offset = if next < entries.len() {
-            Some(next as u64)
-        } else {
-            None
-        };
-        return Ok(json!({
-            "path": page["path"],
-            "kind": "dir",
-            "entries": slice,
-            "next_offset": next_offset,
-        }));
+    if let Some(file) = export_read::file_export(pm, caller, path, offset, want, rev)? {
+        return Ok(file);
     }
-    if kind == "text" {
-        let full = &page;
-        let text = full["text"].as_str().unwrap_or("");
-        let live = full["rev"].as_str().unwrap_or("");
-        if let Some(pinned) = rev {
-            if pinned != live {
-                return Err(reject(format!(
-                    "wiki transfer export refused: revision '{pinned}' is not '{live}'"
-                )));
-            }
-        }
-        let total = text.len() as u64;
-        if offset > total {
-            return Err(reject(
-                "wiki transfer export refused: offset is past the text",
-            ));
-        }
-        // Base64 carries bytes, so a bounded slice may split a UTF-8 codepoint.
-        // The client verifies the complete hash and UTF-8 before publication.
-        let start = offset as usize;
-        let end = start.saturating_add(want as usize).min(text.len());
-        let slice = &text.as_bytes()[start..end];
-        let end = end as u64;
-        let next_offset = if end < total { Some(end) } else { None };
-        return Ok(json!({
-            "path": full["path"],
-            "kind": "text",
-            "rev": live,
-            "size": total,
-            "sha256": sha256_bytes(text.as_bytes()),
-            "offset": offset,
-            "data_base64": STANDARD.encode(slice),
-            "next_offset": next_offset,
-        }));
-    }
-    if kind == "blob" {
-        let live = page["rev"].as_str().unwrap_or("");
-        if let Some(pinned) = rev {
-            if pinned != live {
-                return Err(reject(format!(
-                    "wiki transfer export refused: revision '{pinned}' is not '{live}'"
-                )));
-            }
-        }
-        let hash = page["sha256"].as_str().unwrap_or("");
-        if !sha_ok(hash) {
-            return Err(reject(
-                "wiki transfer export refused: blob pointer has no hash",
-            ));
-        }
-        let declared = page["size"].as_u64().unwrap_or(0);
-        let file = blobs_dir(&vault_dir(pm)?).join(hash);
-        let mut handle = open_nofollow(&file)?;
-        let meta = handle.metadata()?;
-        if !meta.is_file() || meta.file_type().is_symlink() || meta.len() != declared {
-            return Err(reject(
-                "wiki transfer export refused: blob bytes do not match the pointer",
-            ));
-        }
-        // Originals are immutable and content-addressed at publication. The
-        // exporter verifies the whole pinned SHA before its atomic local write;
-        // rehashing a 100 MiB original for every 16 KiB slice would be quadratic.
-        if offset > declared {
-            return Err(reject(
-                "wiki transfer export refused: offset is past the blob",
-            ));
-        }
-        handle.seek(SeekFrom::Start(offset))?;
-        let mut buf = vec![0u8; want as usize];
-        let n = handle.read(&mut buf)?;
-        buf.truncate(n);
-        let end = offset + n as u64;
-        let next_offset = if end < declared { Some(end) } else { None };
-        return Ok(json!({
-            "path": page["path"],
-            "kind": "blob",
-            "rev": live,
-            "size": declared,
-            "sha256": hash,
-            "offset": offset,
-            "data_base64": STANDARD.encode(&buf),
-            "next_offset": next_offset,
-        }));
-    }
-    Err(reject(
-        "wiki transfer export refused: unsupported page kind",
-    ))
+    let listing = ls(pm, caller, path)?;
+    let entries = listing["entries"].as_array().cloned().unwrap_or_default();
+    let start = usize::try_from(offset).unwrap_or(usize::MAX);
+    let slice = bounded_metadata_page(
+        entries
+            .iter()
+            .skip(start)
+            .take(STATUS_PAGE_MAX as usize)
+            .map(|item| export_dir_entry(pm, caller, item)),
+    )?;
+    let next = start.saturating_add(slice.len());
+    let next_offset = if next < entries.len() {
+        Some(next as u64)
+    } else {
+        None
+    };
+    Ok(json!({
+        "path": listing["path"].as_str().unwrap_or(path),
+        "kind": "dir",
+        "entries": slice,
+        "next_offset": next_offset,
+    }))
 }
 
 /// Owner key for a daemon caller. `binding` is accepted only after the RPC
@@ -1877,7 +1959,7 @@ mod tests {
     use super::{generated_extraction_status, sha256_bytes, stage_path, STANDARD};
     use crate::issue::Pm;
     use crate::store::Store;
-    use crate::wiki::{blobs_dir, read, vault_dir, write, Caller, ABSENT};
+    use crate::wiki::{blobs_dir, put_blob, read, vault_dir, write, Caller, ABSENT};
     use base64::Engine;
     use std::fs;
 
@@ -2607,5 +2689,354 @@ mod tests {
             read(&pm, &Caller::Operator, path).unwrap()["sha256"].as_str(),
             Some(sha256_bytes(second).as_str())
         );
+    }
+
+    #[test]
+    fn unresolved_text_does_not_republish_after_residue_disappears() {
+        let (_root, pm, store, state) = fixture();
+        let bytes = b"hello";
+        let manifest = text_manifest("note.txt", bytes, ABSENT);
+        let caller = Caller::Operator;
+        let owner = "transfer-reconcile";
+        let started = begin(&store, &pm, &caller, owner, None, &manifest, 128).unwrap();
+        let job_id = started["job_id"].as_str().unwrap().to_string();
+        let request = JobRequest {
+            caller: &caller,
+            owner,
+            job_id: &job_id,
+            root: "global/box",
+        };
+        chunk(&store, &state, &request, "note", 0, &STANDARD.encode(bytes)).unwrap();
+        let dest = vault_dir(&pm).unwrap().join("global/box/note.txt");
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        fs::write(&dest, bytes).unwrap();
+        let body = apply(&store, &pm, &state, &request, "note").unwrap();
+        assert_eq!(body["outcome"], "unresolved", "{body}");
+        fs::remove_file(&dest).unwrap();
+        let head = head_commit(&pm);
+        let retry = apply(&store, &pm, &state, &request, "note").unwrap();
+        assert_eq!(retry["outcome"], "unresolved", "{retry}");
+        assert_eq!(head_commit(&pm), head);
+        assert!(!dest.exists());
+        assert!(stage_path(&state, &job_id, "note").is_file());
+        assert!(committed_bytes(&pm, "global/box/note.txt").is_none());
+        assert!(finish(&store, &pm, &state, &request).is_err());
+        assert_eq!(
+            store
+                .wiki_transfer_entry(&job_id, "note")
+                .unwrap()
+                .unwrap()
+                .outcome,
+            "unresolved"
+        );
+
+        write(
+            &pm,
+            &caller,
+            "global/box/note.txt",
+            std::str::from_utf8(bytes).unwrap(),
+            Some(ABSENT),
+        )
+        .unwrap();
+        let committed = head_commit(&pm);
+        let skipped = apply(&store, &pm, &state, &request, "note").unwrap();
+        assert_eq!(skipped["outcome"], "skipped", "{skipped}");
+        assert_eq!(head_commit(&pm), committed);
+        assert!(!stage_path(&state, &job_id, "note").exists());
+    }
+
+    #[test]
+    fn fenced_publication_attempt_is_not_replayed() {
+        let (_root, pm, store, state) = fixture();
+        let bytes = b"fenced";
+        let manifest = text_manifest("note.txt", bytes, ABSENT);
+        let caller = Caller::Operator;
+        let owner = "transfer-reconcile";
+        let started = begin(&store, &pm, &caller, owner, None, &manifest, 128).unwrap();
+        let job_id = started["job_id"].as_str().unwrap().to_string();
+        let request = JobRequest {
+            caller: &caller,
+            owner,
+            job_id: &job_id,
+            root: "global/box",
+        };
+        chunk(&store, &state, &request, "note", 0, &STANDARD.encode(bytes)).unwrap();
+        let entry = store.wiki_transfer_entry(&job_id, "note").unwrap().unwrap();
+        super::note_attempt(&store, &job_id, &entry).unwrap();
+        let head = head_commit(&pm);
+        let body = apply(&store, &pm, &state, &request, "note").unwrap();
+        assert_eq!(body["outcome"], "unresolved", "{body}");
+        assert_eq!(head_commit(&pm), head);
+        let dest = vault_dir(&pm).unwrap().join("global/box/note.txt");
+        assert!(!dest.exists());
+        assert!(stage_path(&state, &job_id, "note").is_file());
+        assert!(committed_bytes(&pm, "global/box/note.txt").is_none());
+        assert_eq!(
+            store
+                .wiki_transfer_entry(&job_id, "note")
+                .unwrap()
+                .unwrap()
+                .outcome,
+            "unresolved"
+        );
+        assert!(finish(&store, &pm, &state, &request).is_err());
+    }
+
+    #[test]
+    fn unresolved_directory_does_not_mkdir_after_residue_disappears() {
+        let (_root, pm, store, state) = fixture();
+        let manifest = Manifest {
+            version: 1,
+            source_id: "src".into(),
+            root: "global/box".into(),
+            entries: vec![ManifestEntry {
+                id: "nested".into(),
+                path: "nested".into(),
+                kind: "dir".into(),
+                size: 0,
+                sha256: None,
+                if_rev: ABSENT.into(),
+            }],
+        };
+        let caller = Caller::Operator;
+        let owner = "transfer-reconcile";
+        let started = begin(&store, &pm, &caller, owner, None, &manifest, 128).unwrap();
+        let job_id = started["job_id"].as_str().unwrap().to_string();
+        let request = JobRequest {
+            caller: &caller,
+            owner,
+            job_id: &job_id,
+            root: "global/box",
+        };
+        let dir = vault_dir(&pm).unwrap().join("global/box/nested");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(".gitkeep"), b"").unwrap();
+        let head = head_commit(&pm);
+        let body = apply(&store, &pm, &state, &request, "nested").unwrap();
+        assert_eq!(body["outcome"], "unresolved", "{body}");
+        assert_eq!(head_commit(&pm), head);
+        fs::remove_dir_all(&dir).unwrap();
+        let retry = apply(&store, &pm, &state, &request, "nested").unwrap();
+        assert_eq!(retry["outcome"], "unresolved", "{retry}");
+        assert_eq!(head_commit(&pm), head);
+        assert!(!dir.exists());
+        assert!(committed_bytes(&pm, "global/box/nested/.gitkeep").is_none());
+
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(".gitkeep"), b"").unwrap();
+        commit_paths(&pm, &[&tracker_rel(&pm, "global/box/nested/.gitkeep")]);
+        let committed = head_commit(&pm);
+        let skipped = apply(&store, &pm, &state, &request, "nested").unwrap();
+        assert_eq!(skipped["outcome"], "skipped", "{skipped}");
+        assert_eq!(head_commit(&pm), committed);
+        assert!(committed_bytes(&pm, "global/box/nested/.gitkeep").is_some());
+    }
+
+    fn empty_manifest(root: &str) -> Manifest {
+        Manifest {
+            version: 1,
+            source_id: "src".into(),
+            root: root.into(),
+            entries: vec![],
+        }
+    }
+
+    #[test]
+    fn uncommitted_empty_root_stays_open_until_committed_proof() {
+        let (_root, pm, store, state) = fixture();
+        let caller = Caller::Operator;
+        let owner = "transfer-reconcile";
+        let manifest = empty_manifest("global/empty");
+        let started = begin(&store, &pm, &caller, owner, None, &manifest, 64).unwrap();
+        let job_id = started["job_id"].as_str().unwrap().to_string();
+        let request = JobRequest {
+            caller: &caller,
+            owner,
+            job_id: &job_id,
+            root: "global/empty",
+        };
+        let dir = vault_dir(&pm).unwrap().join("global/empty");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(".gitkeep"), b"").unwrap();
+        let head = head_commit(&pm);
+        assert!(finish(&store, &pm, &state, &request).is_err());
+        assert_eq!(head_commit(&pm), head);
+        assert!(committed_bytes(&pm, "global/empty/.gitkeep").is_none());
+        let fenced = store.wiki_transfer_job(&job_id).unwrap().unwrap();
+        assert_eq!(fenced.state, "open");
+        assert_eq!(fenced.root_attempt, super::ROOT_UNRESOLVED);
+
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(finish(&store, &pm, &state, &request).is_err());
+        assert_eq!(head_commit(&pm), head);
+        assert!(!dir.exists());
+        assert_eq!(
+            store
+                .wiki_transfer_job(&job_id)
+                .unwrap()
+                .unwrap()
+                .root_attempt,
+            super::ROOT_UNRESOLVED
+        );
+
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(".gitkeep"), b"").unwrap();
+        commit_paths(&pm, &[&tracker_rel(&pm, "global/empty/.gitkeep")]);
+        let committed = head_commit(&pm);
+        let (body, _) = finish(&store, &pm, &state, &request).unwrap();
+        assert_eq!(body["state"], "complete", "{body}");
+        assert_eq!(body["index"], "covered", "{body}");
+        assert_eq!(head_commit(&pm), committed);
+        assert!(super::committed_dir(&pm, "global/empty").unwrap());
+        assert_eq!(
+            store
+                .wiki_transfer_job(&job_id)
+                .unwrap()
+                .unwrap()
+                .root_attempt,
+            super::ROOT_PROVED
+        );
+    }
+
+    #[test]
+    fn fenced_empty_root_attempt_does_not_mkdir() {
+        let (_root, pm, store, state) = fixture();
+        let caller = Caller::Operator;
+        let owner = "transfer-reconcile";
+        let manifest = empty_manifest("global/missing-root");
+        let started = begin(&store, &pm, &caller, owner, None, &manifest, 64).unwrap();
+        let job_id = started["job_id"].as_str().unwrap().to_string();
+        let request = JobRequest {
+            caller: &caller,
+            owner,
+            job_id: &job_id,
+            root: "global/missing-root",
+        };
+        store
+            .wiki_transfer_note_root_attempt(&job_id, super::ROOT_UNRESOLVED)
+            .unwrap();
+        let head = head_commit(&pm);
+        let dir = vault_dir(&pm).unwrap().join("global/missing-root");
+        assert!(finish(&store, &pm, &state, &request).is_err());
+        assert_eq!(head_commit(&pm), head);
+        assert!(!dir.exists());
+        assert!(!super::committed_dir(&pm, "global/missing-root").unwrap());
+        let job = store.wiki_transfer_job(&job_id).unwrap().unwrap();
+        assert_eq!(job.state, "open");
+        assert_eq!(job.root_attempt, super::ROOT_UNRESOLVED);
+    }
+
+    #[test]
+    fn absent_empty_root_is_committed_once() {
+        let (_root, pm, store, state) = fixture();
+        let caller = Caller::Operator;
+        let owner = "transfer-reconcile";
+        let manifest = empty_manifest("global/fresh-empty");
+        let started = begin(&store, &pm, &caller, owner, None, &manifest, 64).unwrap();
+        let job_id = started["job_id"].as_str().unwrap().to_string();
+        let request = JobRequest {
+            caller: &caller,
+            owner,
+            job_id: &job_id,
+            root: "global/fresh-empty",
+        };
+        let before = head_commit(&pm);
+        let (body, _) = finish(&store, &pm, &state, &request).unwrap();
+        assert_eq!(body["state"], "complete", "{body}");
+        assert_eq!(body["index"], "covered", "{body}");
+        assert_ne!(head_commit(&pm), before);
+        assert!(super::committed_dir(&pm, "global/fresh-empty").unwrap());
+        assert_eq!(
+            store
+                .wiki_transfer_job(&job_id)
+                .unwrap()
+                .unwrap()
+                .root_attempt,
+            super::ROOT_PROVED
+        );
+        let committed = head_commit(&pm);
+        let (retry, _) = finish(&store, &pm, &state, &request).unwrap();
+        assert_eq!(retry["state"], "complete", "{retry}");
+        assert_eq!(head_commit(&pm), committed);
+    }
+
+    #[test]
+    fn nonsuffix_pdf_failed_extraction_is_not_covered() {
+        let (_root, pm, store, state) = fixture();
+        let bytes = b"%PDF-1.4\nmalformed synthetic source\n";
+        let cases = [
+            ("report.bin", "failed", true),
+            ("report.dat", "failed", false),
+            ("scanfile", "empty", false),
+        ];
+        for (name, status, fresh) in cases {
+            let hash = sha256_bytes(bytes);
+            let full = format!("global/box/{name}");
+            let caller = Caller::Operator;
+            let sidecar = format!("{full}.extracted.md");
+            let page = generated_extraction_page(&full, &hash, status, "synthetic scan");
+            let if_rev = if fresh {
+                write(&pm, &caller, &sidecar, &page, Some(ABSENT)).unwrap();
+                ABSENT.to_string()
+            } else {
+                let tmp = state.join(super::UPLOAD_DIR).join(format!("upload-{name}"));
+                fs::create_dir_all(tmp.parent().unwrap()).unwrap();
+                fs::write(&tmp, bytes).unwrap();
+                let wrote =
+                    put_blob(&pm, &state, &caller, &full, &tmp, Some(&hash), Some(ABSENT)).unwrap();
+                assert_eq!(wrote["mime"], "application/pdf", "{name}");
+                write(&pm, &caller, &sidecar, &page, Some(ABSENT)).unwrap();
+                wrote["rev"].as_str().unwrap().to_string()
+            };
+            let manifest = Manifest {
+                version: 1,
+                source_id: "src".into(),
+                root: "global/box".into(),
+                entries: vec![ManifestEntry {
+                    id: "file".into(),
+                    path: name.into(),
+                    kind: "blob".into(),
+                    size: bytes.len() as u64,
+                    sha256: Some(hash.clone()),
+                    if_rev: if_rev.clone(),
+                }],
+            };
+            let started = begin(
+                &store,
+                &pm,
+                &caller,
+                "transfer-reconcile",
+                None,
+                &manifest,
+                256,
+            )
+            .unwrap();
+            let job_id = started["job_id"].as_str().unwrap().to_string();
+            let request = JobRequest {
+                caller: &caller,
+                owner: "transfer-reconcile",
+                job_id: &job_id,
+                root: "global/box",
+            };
+            chunk(&store, &state, &request, "file", 0, &STANDARD.encode(bytes)).unwrap();
+            let before = committed_bytes(&pm, &sidecar);
+            let head = head_commit(&pm);
+            let body = apply(&store, &pm, &state, &request, "file").unwrap();
+            assert_eq!(body["extraction"], status, "{name} {body}");
+            assert_ne!(body["extraction"], "not_applicable", "{name}");
+            let pointer = read(&pm, &caller, &full).unwrap();
+            assert_eq!(pointer["mime"], "application/pdf", "{name} {pointer}");
+            assert_eq!(committed_bytes(&pm, &sidecar), before, "{name}");
+            if !fresh {
+                assert_eq!(body["outcome"], "skipped", "{name} {body}");
+                assert_eq!(head_commit(&pm), head, "{name}");
+            } else {
+                assert_eq!(body["outcome"], "applied", "{name} {body}");
+            }
+            let (finished, _) = finish(&store, &pm, &state, &request).unwrap();
+            assert_eq!(finished["state"], "complete", "{name} {finished}");
+            assert_eq!(finished["index"], "pending", "{name} {finished}");
+            assert_ne!(finished["index"], "covered", "{name}");
+        }
     }
 }

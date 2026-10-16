@@ -4,9 +4,12 @@
 //! daemon-derived owner key. The owner key is a hash of the connection
 //! caller and, when the operator board relayed one, the verified envelope
 //! issuer, organization, audience and subject. Client identity fields never
-//! enter that key. Progress rows are updated only after the corresponding
-//! bytes or wiki commit are durable; a crash leaves the file or Git tree
-//! ahead of the row so the next call reconciles instead of publishing twice.
+//! enter that key. Staged bytes are recorded only after they are durable.
+//! A publication attempt is recorded before the canonical wiki writer, so a
+//! crash cannot look like a fresh pending entry. The implicit manifest root
+//! has its own attempt fence on the job and is not stored in an unrelated
+//! column. Resume may reconcile a committed match; it does not publish an
+//! unresolved attempt again.
 
 use rusqlite::params;
 use serde_json::{json, Value};
@@ -17,6 +20,8 @@ use super::{Store, StoreConn};
 use crate::error::{Error, Result};
 
 /// Schema v48. New tables only; nothing sealed or witnessed is altered.
+/// `root_attempt` is the implicit-root fence: `fresh`, `unresolved`, or
+/// `proved`. Entry outcome `unresolved` is the per-entry publication fence.
 pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS wiki_transfer_jobs(
     job_id TEXT PRIMARY KEY,
@@ -26,6 +31,7 @@ CREATE TABLE IF NOT EXISTS wiki_transfer_jobs(
     root TEXT NOT NULL,
     owner_key TEXT NOT NULL,
     state TEXT NOT NULL,
+    root_attempt TEXT NOT NULL DEFAULT 'fresh',
     index_kicked INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL
 );
@@ -61,6 +67,9 @@ pub struct JobHead {
     pub root: String,
     pub owner_key: String,
     pub state: String,
+    /// `fresh` until an implicit-root publication is attempted, then
+    /// `unresolved` or `proved`.
+    pub root_attempt: String,
 }
 
 #[derive(Clone, Debug)]
@@ -151,8 +160,8 @@ impl Store {
     pub(crate) fn wiki_transfer_insert(&self, job: &JobHead, entries: &[EntryRow]) -> Result<()> {
         self.write_tx(|conn| {
             conn.execute(
-                "INSERT INTO wiki_transfer_jobs(job_id,digest,manifest_json,source_id,root,owner_key,state,index_kicked,created_at)
-                 VALUES(?,?,?,?,?,?,?,0,?)",
+                "INSERT INTO wiki_transfer_jobs(job_id,digest,manifest_json,source_id,root,owner_key,state,root_attempt,index_kicked,created_at)
+                 VALUES(?,?,?,?,?,?,?,?,0,?)",
                 params![
                     job.job_id,
                     job.digest,
@@ -161,6 +170,7 @@ impl Store {
                     job.root,
                     job.owner_key,
                     job.state,
+                    job.root_attempt,
                     unix_now()
                 ],
             )
@@ -198,7 +208,7 @@ impl Store {
         self.read_tx(|conn| {
             let row = conn
                 .query_opt(
-                    "SELECT job_id,digest,manifest_json,source_id,root,owner_key,state FROM wiki_transfer_jobs WHERE job_id=?",
+                    "SELECT job_id,digest,manifest_json,source_id,root,owner_key,state,root_attempt FROM wiki_transfer_jobs WHERE job_id=?",
                     [job_id],
                     |row| {
                         Ok(JobHead {
@@ -209,6 +219,7 @@ impl Store {
                             root: row.get(4)?,
                             owner_key: row.get(5)?,
                             state: row.get(6)?,
+                            root_attempt: row.get(7)?,
                         })
                     },
                 )
@@ -269,6 +280,24 @@ impl Store {
             conn.execute(
                 "UPDATE wiki_transfer_entries SET received=? WHERE job_id=? AND entry_id=? AND received<?",
                 params![received as i64, job_id, entry_id, received as i64],
+            )
+            .map_err(db)?;
+            Ok(())
+        })
+    }
+
+    /// Implicit-root fence. `fresh`, `unresolved`, and `proved` are the only
+    /// values transfer writes. This is not an entry outcome and not the
+    /// index kick.
+    pub(crate) fn wiki_transfer_note_root_attempt(
+        &self,
+        job_id: &str,
+        attempt: &str,
+    ) -> Result<()> {
+        self.write_tx(|conn| {
+            conn.execute(
+                "UPDATE wiki_transfer_jobs SET root_attempt=? WHERE job_id=?",
+                params![attempt, job_id],
             )
             .map_err(db)?;
             Ok(())

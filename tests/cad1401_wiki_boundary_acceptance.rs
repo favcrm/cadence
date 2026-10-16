@@ -483,15 +483,6 @@ fn signed_wiki_http_boundary_intersects_native_acl_scope_prefix_and_replay() {
         json!({"path":escaped, "text":"elevated"}),
         Some(("insufficient_scope", 403)),
     ));
-    let mut member = rig.claims("native-member-acl");
-    member["actor"] = json!("users/member");
-    member["role_at_issue"] = json!("member");
-    negatives.push((
-        "signed grant cannot widen native member ACL".into(),
-        member,
-        put.clone(),
-        None,
-    ));
     let mut agent_operator = agent.clone();
     agent_operator["jti"] = json!("agent-as-operator");
     agent_operator["actor"] = json!("operator");
@@ -514,6 +505,52 @@ fn signed_wiki_http_boundary_intersects_native_acl_scope_prefix_and_replay() {
             &response,
         );
     }
+    let private_path = "users/other/private.md";
+    let private_text = "cad1401 other member private needle\n";
+    let seeded_private = rig.op(
+        "wiki_write",
+        json!({"path": private_path, "text": private_text, "if_rev": "none"}),
+    );
+    check(
+        &mut failures,
+        "operator seeds another member's private page",
+        seeded_private["committed"] == true,
+        &seeded_private,
+    );
+    let mut member = rig.claims("native-member-acl");
+    member["actor"] = json!("users/member");
+    member["role_at_issue"] = json!("member");
+    member["wiki_prefixes"] = json!(["users/other/"]);
+    member["prefix_grants"] = json!([
+        {"scope": "wiki.read", "prefixes": ["users/other/"]},
+        {"scope": "wiki.write", "prefixes": ["users/other/"]}
+    ]);
+    let before_private = rig.page_snapshot();
+    let cross_text = "cad1401 member cross-write must not land\n";
+    let cross = rig.call(
+        "PUT",
+        "/api/wiki/file",
+        Some(&rig.sign(&member)),
+        &json!({"path": private_path, "text": cross_text, "if_rev": "none"}),
+    );
+    let holds_private = |files: &[(String, Vec<u8>)]| {
+        files.iter().any(|(path, bytes)| {
+            path.ends_with("/users/other/private.md") && bytes.as_slice() == private_text.as_bytes()
+        })
+    };
+    check(
+        &mut failures,
+        "signed grant cannot widen native member ACL",
+        cross.0 == 400
+            && cross.2["error"].as_str().is_some()
+            && cross.2.get("conflict").is_none()
+            && cross.2["committed"] != true
+            && rig.page_snapshot() == before_private
+            && holds_private(&before_private.1)
+            && holds_private(&rig.page_snapshot().1)
+            && hides(&cross.2.to_string(), &[private_text, cross_text]),
+        &cross,
+    );
     // Cryptographic authenticity control: modify a real agent's signed actor
     // without re-signing. A 403 alone could otherwise be a blanket denial.
     let real_agent = rig.sign(&agent);
@@ -1509,22 +1546,114 @@ fn cad914_transfer_guard_creates_owned_job_and_refuses_invalid_manifest_retarget
         &signed_agent_operator,
     );
 
-    let mut member = rig.claims("cad914-signed-member");
-    member["actor"] = json!("users/member");
-    member["role_at_issue"] = json!("member");
-    let signed_member = rig.call(
+    let member_text = "cad914 delegated member page\n";
+    let member_manifest = transfer_manifest(
+        ROOT,
+        "cad914-member-source",
+        vec![manifest_entry(
+            "member",
+            "member.md",
+            member_text.as_bytes(),
+        )],
+    );
+    let jobs_at_member = transfer_job_ids(&rig);
+    let mut member_read = rig.claims("cad914-member-readonly");
+    member_read["actor"] = json!("users/member");
+    member_read["role_at_issue"] = json!("member");
+    member_read["scope"] = json!(["wiki.read"]);
+    member_read["wiki_prefixes"] = json!(["global/covered/"]);
+    member_read["prefix_grants"] = json!([{"scope": "wiki.read", "prefixes": ["global/covered/"]}]);
+    let member_readonly = rig.call(
         "PUT",
         "/api/wiki/transfer",
-        Some(&rig.sign(&member)),
-        &http_body,
+        Some(&rig.sign(&member_read)),
+        &json!({
+            "path": ROOT,
+            "transfer": {"op": "begin", "manifest": member_manifest},
+        }),
     );
     check(
         &mut failures,
-        "CAD914 signed member grant cannot write the operator transfer root",
-        (400..500).contains(&signed_member.0)
-            && hides(&signed_member.2.to_string(), &http_secrets)
+        "CAD914 read-only member grant cannot begin a transfer",
+        member_readonly.0 == 403
+            && member_readonly.2["error"]["code"] == "insufficient_scope"
+            && member_readonly.2["job_id"].as_str().is_none()
+            && transfer_job_ids(&rig) == jobs_at_member
             && transfer_effects(&rig) == baseline,
-        &signed_member,
+        &member_readonly,
+    );
+    let mut member_write = rig.claims("cad914-member-delegated");
+    member_write["actor"] = json!("users/member");
+    member_write["role_at_issue"] = json!("member");
+    let member_begin = rig.call(
+        "PUT",
+        "/api/wiki/transfer",
+        Some(&rig.sign(&member_write)),
+        &json!({
+            "path": ROOT,
+            "transfer": {"op": "begin", "manifest": member_manifest},
+        }),
+    );
+    let member_job = member_begin.2["job_id"].as_str().unwrap_or("").to_string();
+    let member_digest = member_begin.2["digest"].as_str().unwrap_or("").to_string();
+    let mut member_jobs = jobs_at_member.clone();
+    member_jobs.push(member_job.clone());
+    member_jobs.sort();
+    check(
+        &mut failures,
+        "CAD914 delegated member begin creates a distinct unpublished job",
+        member_begin.0 == 200
+            && begin_receipt(&member_begin.2, ROOT, "cad914-member-source")
+            && member_job != http_job
+            && member_job != job_id
+            && !member_digest.is_empty()
+            && member_digest != http_digest
+            && transfer_job_ids(&rig) == member_jobs
+            && transfer_effects(&rig) == baseline,
+        &member_begin,
+    );
+    member_write["jti"] = json!("cad914-member-status-operator");
+    let member_status = rig.call(
+        "POST",
+        "/api/wiki/job_status",
+        Some(&rig.sign(&member_write)),
+        &http_status_body,
+    );
+    member_write["jti"] = json!("cad914-member-apply-operator");
+    let member_apply = rig.call(
+        "PUT",
+        "/api/wiki/transfer",
+        Some(&rig.sign(&member_write)),
+        &json!({
+            "path": ROOT,
+            "transfer": {
+                "op": "apply",
+                "job_id": http_job,
+                "root": ROOT,
+                "entry_id": "fresh",
+            },
+        }),
+    );
+    let operator_still = rig.call(
+        "POST",
+        "/api/wiki/job_status",
+        Some(&rig.sign(&readonly("cad914-member-operator-intact"))),
+        &http_status_body,
+    );
+    check(
+        &mut failures,
+        "CAD914 delegated member cannot status or apply the operator job",
+        member_status.0 == 400
+            && member_status.2["job_id"].as_str().is_none()
+            && member_apply.0 == 400
+            && member_apply.2["outcome"].as_str() != Some("applied")
+            && hides(&member_status.2.to_string(), &http_secrets)
+            && hides(&member_apply.2.to_string(), &http_secrets)
+            && operator_still.0 == 200
+            && status_receipt(&operator_still.2, &http_job, &http_digest, ROOT, "http.md")
+            && transfer_job_ids(&rig) == member_jobs
+            && transfer_effects(&rig) == baseline,
+        (&member_status, &member_apply),
     );
 
     for (name, path) in [
@@ -1826,6 +1955,129 @@ fn cad914_transfer_guard_creates_owned_job_and_refuses_invalid_manifest_retarget
                 &[http_source, http_digest.as_str(), FRESH, KEEP_TEXT],
             ),
         &numeric_job,
+    );
+
+    let member_page = format!("{ROOT}/member.md");
+    member_write["jti"] = json!("cad914-member-chunk");
+    let member_chunk = rig.call(
+        "PUT",
+        "/api/wiki/transfer",
+        Some(&rig.sign(&member_write)),
+        &json!({
+            "path": ROOT,
+            "transfer": {
+                "op": "chunk",
+                "job_id": member_job,
+                "root": ROOT,
+                "entry_id": "member",
+                "offset": 0,
+                "data_base64": STANDARD.encode(member_text.as_bytes()),
+            },
+        }),
+    );
+    check(
+        &mut failures,
+        "CAD914 delegated member chunk stores its own page",
+        member_chunk.0 == 200
+            && member_chunk.2["job_id"].as_str() == Some(member_job.as_str())
+            && member_chunk.2["entry_id"].as_str() == Some("member")
+            && member_chunk.2["received"].as_u64() == Some(member_text.len() as u64),
+        &member_chunk,
+    );
+    member_write["jti"] = json!("cad914-member-apply");
+    let member_publish = rig.call(
+        "PUT",
+        "/api/wiki/transfer",
+        Some(&rig.sign(&member_write)),
+        &json!({
+            "path": ROOT,
+            "transfer": {
+                "op": "apply",
+                "job_id": member_job,
+                "root": ROOT,
+                "entry_id": "member",
+            },
+        }),
+    );
+    let member_files = rig.page_snapshot();
+    let holds = |files: &[(String, Vec<u8>)], suffix: &str, bytes: &[u8]| {
+        files
+            .iter()
+            .any(|(path, body)| path.ends_with(suffix) && body.as_slice() == bytes)
+    };
+    check(
+        &mut failures,
+        "CAD914 delegated member apply publishes only member.md",
+        member_publish.0 == 200
+            && member_publish.2["job_id"].as_str() == Some(member_job.as_str())
+            && member_publish.2["outcome"].as_str() == Some("applied")
+            && member_publish.2["path"].as_str() == Some(member_page.as_str())
+            && holds(&member_files.1, "/member.md", member_text.as_bytes())
+            && holds(&member_files.1, "/http.md", fresh)
+            && holds(&member_files.1, "/keep.md", KEEP_TEXT.as_bytes()),
+        &member_publish,
+    );
+    member_write["jti"] = json!("cad914-member-finish");
+    let member_finish = rig.call(
+        "PUT",
+        "/api/wiki/transfer",
+        Some(&rig.sign(&member_write)),
+        &json!({
+            "path": ROOT,
+            "transfer": {"op": "finish", "job_id": member_job, "root": ROOT},
+        }),
+    );
+    check(
+        &mut failures,
+        "CAD914 delegated member finish completes its own job and digest",
+        member_finish.0 == 200
+            && member_finish.2["job_id"].as_str() == Some(member_job.as_str())
+            && member_finish.2["digest"].as_str() == Some(member_digest.as_str())
+            && member_finish.2["root"].as_str() == Some(ROOT)
+            && member_finish.2["state"].as_str() == Some("complete"),
+        &member_finish,
+    );
+    member_write["jti"] = json!("cad914-member-export");
+    let member_export = rig.call(
+        "POST",
+        "/api/wiki/job_status",
+        Some(&rig.sign(&member_write)),
+        &json!({
+            "path": member_page,
+            "transfer": {"op": "export", "path": member_page},
+        }),
+    );
+    let member_decoded = member_export.2["data_base64"]
+        .as_str()
+        .and_then(|text| STANDARD.decode(text).ok());
+    let operator_after = rig.call(
+        "POST",
+        "/api/wiki/job_status",
+        Some(&rig.sign(&readonly("cad914-operator-after-member"))),
+        &http_status_body,
+    );
+    let owned_after = rpc_transfer(
+        &rig,
+        json!({"op": "status", "job_id": job_id, "root": ROOT}),
+    );
+    check(
+        &mut failures,
+        "CAD914 delegated member export leaves the operator job and keep page intact",
+        member_export.0 == 200
+            && member_export.2["path"].as_str() == Some(member_page.as_str())
+            && member_export.2["sha256"].as_str()
+                == Some(sha256_hex(member_text.as_bytes()).as_str())
+            && member_decoded.as_deref() == Some(member_text.as_bytes())
+            && operator_after.0 == 200
+            && operator_after.2["job_id"].as_str() == Some(http_job.as_str())
+            && operator_after.2["digest"].as_str() == Some(http_digest.as_str())
+            && operator_after.2["state"].as_str() == Some("complete")
+            && owned_after
+                .as_ref()
+                .is_ok_and(|value| status_receipt(value, &job_id, &digest, ROOT, "fresh.md"))
+            && holds(&rig.page_snapshot().1, "/keep.md", KEEP_TEXT.as_bytes())
+            && holds(&rig.page_snapshot().1, "/http.md", fresh),
+        &member_export,
     );
     assert!(
         failures.is_empty(),

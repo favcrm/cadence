@@ -89,7 +89,10 @@ trait Channel {
     /// `write` selects the mutating wiki action (`write` / local RPC).
     /// Reads use `job_status` remotely and the same RPC locally.
     fn transfer(&mut self, root: &str, op: Value, write: bool) -> Result<Value>;
-    /// Existing list/read. Remote reads may wake; this is not a transfer op.
+    /// Bounded ordinary read (`offset` 0, `bytes` 0) for a file, including
+    /// a large text page: metadata only, and no parent read scope. A
+    /// directory is enumerated. Absence is a new import root. Remote read
+    /// and enumerate may wake; transfer `job_status` / `write` must not.
     fn discover(&mut self, path: &str) -> Result<()>;
     /// Current destination revision from an existing read, never a new if_rev guess.
     fn current_rev(&mut self, path: &str) -> Result<String>;
@@ -119,11 +122,8 @@ impl Channel for LocalChannel<'_> {
     }
 
     fn discover(&mut self, path: &str) -> Result<()> {
-        match self.list_page(path) {
-            Ok(_) => Ok(()),
-            Err(error) if is_absent(&error) => Ok(()),
-            Err(error) => Err(error),
-        }
+        let read = self.read_page_bounded(path);
+        discover_read_or_list(read, || self.list_page(path))
     }
 
     fn current_rev(&mut self, path: &str) -> Result<String> {
@@ -204,11 +204,15 @@ impl Channel for RemoteChannel<'_> {
     fn discover(&mut self, path: &str) -> Result<()> {
         let mut args = Map::new();
         args.insert("path".into(), json!(path));
-        match self.guarded("enumerate", args, true) {
-            Ok(_) => Ok(()),
-            Err(error) if is_absent(&error) => Ok(()),
-            Err(error) => Err(error),
-        }
+        args.insert("offset".into(), json!(0));
+        args.insert("bytes".into(), json!(0));
+        // Wake only this ordinary read. `job_status` and `write` stay unwoken.
+        let read = self.guarded("read", args, true);
+        discover_read_or_list(read, || {
+            let mut args = Map::new();
+            args.insert("path".into(), json!(path));
+            self.guarded("enumerate", args, true)
+        })
     }
 
     fn current_rev(&mut self, path: &str) -> Result<String> {
@@ -573,21 +577,12 @@ fn export_wiki(
         .map_err(|e| Error::rejected(format!("wiki cp export plan: {e}")))?
     );
     check_export_dest(&dest, &root_or_file, &listed, request.update)?;
-    // Directory plans contain their children, not a synthetic root entry.
-    // Publish the destination directory even when the source has no children.
-    if listed.len() != 1 || !listed[0].path.is_empty() {
-        create_real_dir(&dest)?;
-    }
+    // One no-follow directory fd for the whole publication. Child directories
+    // and file names are created relative to it, including an empty source.
+    let anchor = ExportAnchor::open(&dest, &root_or_file, &listed)?;
     let mut failures = Vec::new();
     for entry in &listed {
-        if let Err(error) = write_export_entry(
-            channel,
-            &root_or_file,
-            &dest,
-            entry,
-            &listed,
-            request.update,
-        ) {
+        if let Err(error) = write_anchored(channel, &root_or_file, &anchor, entry, request.update) {
             failures.push(format!("{}: {error}", entry.path));
             break;
         }
@@ -730,6 +725,7 @@ fn collect_dir(
     Ok(())
 }
 
+#[cfg(test)]
 fn write_export_entry(
     channel: &mut dyn Channel,
     scope: &str,
@@ -738,38 +734,49 @@ fn write_export_entry(
     all: &[ExportEntry],
     update: bool,
 ) -> Result<()> {
-    let single = all.len() == 1 && entry.path.is_empty();
-    let dest = if single {
-        if is_real_dir(dest_root) {
-            let name = scope.rsplit('/').next().unwrap_or("export");
-            dest_root.join(name)
-        } else {
-            dest_root.to_path_buf()
-        }
-    } else {
-        dest_root.join(&entry.path)
-    };
+    let anchor = ExportAnchor::open(dest_root, scope, all)?;
+    write_anchored(channel, scope, &anchor, entry, update)
+}
+
+fn write_anchored(
+    channel: &mut dyn Channel,
+    scope: &str,
+    anchor: &ExportAnchor,
+    entry: &ExportEntry,
+    update: bool,
+) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
     if entry.kind == "dir" {
-        create_real_dir(&dest)?;
+        if anchor.single_name.is_some() {
+            return Err(Error::rejected(
+                "wiki export refused a directory where a file destination was selected",
+            ));
+        }
+        let _created = hold_relative_dir(&anchor.dir, Path::new(&entry.path))?;
         return Ok(());
     }
-    if let Some(parent) = dest.parent() {
-        create_real_dir(parent)?;
-    }
-    refuse_symlink_chain(&dest)?;
-    if let Ok(meta) = symlink_meta(&dest) {
-        if meta.file_type().is_symlink() {
-            return Err(refused_path(&dest, "symlink"));
-        }
-        if !meta.is_file() {
-            return Err(refused_path(&dest, "not a regular file"));
-        }
-    }
-    let parent = dest.parent().unwrap_or(Path::new("."));
-    let mut staged = tempfile::Builder::new()
-        .prefix(".cadence-transfer-")
-        .tempfile_in(parent)
-        .map_err(|e| Error::rejected(format!("cannot stage {}: {e}", dest.display())))?;
+
+    let (parent, name, display) = if let Some(single) = &anchor.single_name {
+        let parent = anchor.dir.try_clone().map_err(|err| {
+            Error::rejected(format!("wiki cp cannot hold export directory: {err}"))
+        })?;
+        let display = anchor
+            .root
+            .join(std::ffi::OsStr::from_bytes(single.as_bytes()));
+        (parent, single.clone(), display)
+    } else {
+        let rel = Path::new(&entry.path);
+        let parent_rel = rel.parent().unwrap_or(Path::new(""));
+        let leaf = rel
+            .file_name()
+            .ok_or_else(|| refused_path(rel, "unsupported path"))?;
+        let parent = hold_relative_dir(&anchor.dir, parent_rel)?;
+        let name = leaf_name(leaf, rel)?;
+        (parent, name, anchor.root.join(rel))
+    };
+    refuse_export_leaf(&parent, &name, &display, update)?;
+    let mut stage = PrivateStage::create(&parent, &display)?;
     let mut got = 0u64;
     while got < entry.size {
         let ask = (entry.size - got).min(CHUNK_BYTES as u64);
@@ -796,14 +803,14 @@ fn write_export_entry(
         {
             return Err(Error::rejected("export returned a short slice"));
         }
-        staged.write_all(&bytes)?;
+        stage.file.write_all(&bytes)?;
         got += bytes.len() as u64;
     }
     if got != entry.size {
         return Err(Error::rejected("export length mismatch"));
     }
-    staged.as_file().sync_all()?;
-    let (_, file_hash) = hash_open_file(staged.as_file_mut())?;
+    stage.file.sync_all()?;
+    let (_, file_hash) = hash_open_file(&mut stage.file)?;
     if let Some(want) = &entry.sha256 {
         if want != &file_hash {
             return Err(Error::rejected(format!(
@@ -814,8 +821,8 @@ fn write_export_entry(
     }
     if entry.kind == "text" {
         let mut text = Vec::new();
-        staged.as_file().rewind()?;
-        staged.as_file().read_to_end(&mut text)?;
+        stage.file.rewind()?;
+        stage.file.read_to_end(&mut text)?;
         if std::str::from_utf8(&text).is_err() {
             return Err(Error::rejected(format!(
                 "export '{}' is not UTF-8 text",
@@ -823,9 +830,10 @@ fn write_export_entry(
             )));
         }
     }
-    publish_export(staged, &dest, update)
-        .map_err(|error| Error::rejected(format!("cannot commit {}: {error}", dest.display())))?;
-    File::open(parent)?.sync_all()?;
+    commit_stage(&stage, &name, update, &display)?;
+    parent
+        .sync_all()
+        .map_err(|err| Error::rejected(format!("cannot sync {}: {err}", display.display())))?;
     Ok(())
 }
 
@@ -1610,10 +1618,30 @@ fn is_absent(error: &Error) -> bool {
 }
 
 /// Bounded `read` refuses a directory (`a range read needs a text page`).
-/// That is the directory case of an update pin, not a missing file.
+/// That is the directory case of discovery and an update pin, not a missing file.
 fn is_directory_range(error: &Error) -> bool {
     let text = error.to_string().to_ascii_lowercase();
     text.contains("range") && text.contains("director")
+}
+
+/// File discovery is the existing bounded read. A directory (range refusal,
+/// or an explicit `kind: dir`) is enumerated with the ordinary list action.
+/// Absence is success so a new import root does not require a parent read.
+fn discover_read_or_list(read: Result<Value>, list: impl FnOnce() -> Result<Value>) -> Result<()> {
+    let list_directory = match read {
+        Ok(body) => body.get("kind").and_then(Value::as_str) == Some("dir"),
+        Err(error) if is_absent(&error) => return Ok(()),
+        Err(error) if is_directory_range(&error) => true,
+        Err(error) => return Err(error),
+    };
+    if !list_directory {
+        return Ok(());
+    }
+    match list() {
+        Ok(_) => Ok(()),
+        Err(error) if is_absent(&error) => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn refused_path(path: &Path, why: &str) -> Error {
@@ -1858,30 +1886,137 @@ fn clear_errno() {
     }
 }
 
-/// Publish the staged export. Default is create-only: `persist_noclobber`
-/// refuses a destination that appeared after preflight and leaves those
-/// bytes untouched. `--update` replaces the destination. A failed persist
-/// drops the `NamedTempFile` (its `Drop` removes the private stage).
-fn publish_export(staged: tempfile::NamedTempFile, dest: &Path, update: bool) -> Result<()> {
-    if update {
-        staged.persist(dest).map_err(|error| {
-            let _ = error.file;
-            Error::rejected(error.error.to_string())
-        })?;
-    } else {
-        staged.persist_noclobber(dest).map_err(|error| {
-            let _ = error.file;
-            if error.error.kind() == std::io::ErrorKind::AlreadyExists
-                || error.error.raw_os_error() == Some(libc::EEXIST)
-            {
+/// Private export stage in a held directory fd. `Drop` unlinks only the
+/// stage name. After `renameat` that name is already gone, so cleanup
+/// cannot remove the published file.
+struct PrivateStage {
+    dir: OwnedFd,
+    name: CString,
+    file: File,
+}
+
+impl Drop for PrivateStage {
+    fn drop(&mut self) {
+        unsafe {
+            libc::unlinkat(self.dir.as_raw_fd(), self.name.as_ptr(), 0);
+        }
+    }
+}
+
+impl PrivateStage {
+    fn create(dir: &File, display: &Path) -> Result<Self> {
+        let flags =
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let mut last = None;
+        for _ in 0..8 {
+            let label = format!(".cadence-transfer-{}", hex_encode(stage_nonce()));
+            let name = CString::new(label).map_err(|_| {
                 Error::rejected(format!(
-                    "wiki cp refused to overwrite '{}' — pass --update",
-                    dest.display()
+                    "cannot stage {}: bad stage name",
+                    display.display()
                 ))
-            } else {
-                Error::rejected(error.error.to_string())
+            })?;
+            let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags, 0o600) };
+            if fd >= 0 {
+                let dup = unsafe { libc::fcntl(dir.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+                if dup < 0 {
+                    let err = std::io::Error::last_os_error();
+                    unsafe {
+                        libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0);
+                        libc::close(fd);
+                    }
+                    return Err(Error::rejected(format!(
+                        "cannot stage {}: {err}",
+                        display.display()
+                    )));
+                }
+                return Ok(Self {
+                    dir: unsafe { OwnedFd::from_raw_fd(dup) },
+                    name,
+                    file: File::from(unsafe { OwnedFd::from_raw_fd(fd) }),
+                });
             }
-        })?;
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EEXIST) {
+                return Err(Error::rejected(format!(
+                    "cannot stage {}: {err}",
+                    display.display()
+                )));
+            }
+            last = Some(err);
+        }
+        Err(Error::rejected(format!(
+            "cannot stage {}: {}",
+            display.display(),
+            last.map(|err| err.to_string())
+                .unwrap_or_else(|| "export stage was not created".to_string())
+        )))
+    }
+}
+
+fn stage_nonce() -> [u8; 16] {
+    let mut nonce = [0u8; 16];
+    if getrandom::fill(&mut nonce).is_ok() {
+        return nonce;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let mixed = (u128::from(std::process::id()) << 96) ^ nanos;
+    nonce.copy_from_slice(&mixed.to_ne_bytes());
+    nonce
+}
+
+/// Create-only links the stage under `dest` and leaves an existing name
+/// untouched. `--update` renames onto that name. Both operations use the
+/// held directory fd, never a reopened path.
+fn commit_stage(
+    stage: &PrivateStage,
+    dest: &std::ffi::CStr,
+    update: bool,
+    display: &Path,
+) -> Result<()> {
+    let rc = if update {
+        unsafe {
+            libc::renameat(
+                stage.dir.as_raw_fd(),
+                stage.name.as_ptr(),
+                stage.dir.as_raw_fd(),
+                dest.as_ptr(),
+            )
+        }
+    } else {
+        unsafe {
+            libc::linkat(
+                stage.dir.as_raw_fd(),
+                stage.name.as_ptr(),
+                stage.dir.as_raw_fd(),
+                dest.as_ptr(),
+                0,
+            )
+        }
+    };
+    if rc < 0 {
+        let err = std::io::Error::last_os_error();
+        if !update
+            && (err.kind() == std::io::ErrorKind::AlreadyExists
+                || err.raw_os_error() == Some(libc::EEXIST))
+        {
+            return Err(Error::rejected(format!(
+                "wiki cp refused to overwrite '{}' — pass --update",
+                display.display()
+            )));
+        }
+        return Err(Error::rejected(format!(
+            "cannot commit {}: {err}",
+            display.display()
+        )));
+    }
+    if !update {
+        unsafe {
+            libc::unlinkat(stage.dir.as_raw_fd(), stage.name.as_ptr(), 0);
+        }
     }
     Ok(())
 }
@@ -1902,31 +2037,241 @@ fn hash_open_file(file: &mut File) -> Result<(u64, String)> {
     Ok((size, hex_encode(hasher.finalize())))
 }
 
-fn create_real_dir(path: &Path) -> Result<()> {
-    if path.as_os_str().is_empty() {
-        return Ok(());
+struct ExportAnchor {
+    dir: File,
+    root: PathBuf,
+    single_name: Option<CString>,
+}
+
+impl ExportAnchor {
+    /// Hold the directory that will contain published names. A single file
+    /// whose destination is not already a real directory is published in
+    /// its parent; every other plan publishes inside `dest`.
+    fn open(dest: &Path, scope: &str, entries: &[ExportEntry]) -> Result<Self> {
+        let single = entries.len() == 1 && entries[0].path.is_empty();
+        if single && !is_real_dir(dest) {
+            let parent = match dest.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => parent,
+                _ => Path::new("/"),
+            };
+            let leaf = dest
+                .file_name()
+                .ok_or_else(|| refused_path(dest, "unsupported path"))?;
+            return Ok(Self {
+                dir: hold_export_dir(parent)?,
+                root: parent.to_path_buf(),
+                single_name: Some(leaf_name(leaf, dest)?),
+            });
+        }
+        let single_name = if single {
+            let base = scope
+                .rsplit('/')
+                .next()
+                .filter(|name| !name.is_empty())
+                .unwrap_or("export");
+            Some(leaf_name(std::ffi::OsStr::new(base), dest)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            dir: hold_export_dir(dest)?,
+            root: dest.to_path_buf(),
+            single_name,
+        })
     }
-    refuse_symlink_chain(path)?;
-    match symlink_meta(path) {
-        Ok(meta) if meta.file_type().is_symlink() => Err(refused_path(path, "symlink")),
-        Ok(meta) if meta.is_dir() => Ok(()),
-        Ok(_) => Err(refused_path(path, "not a directory")),
-        Err(_) => {
-            if let Some(parent) = path.parent() {
-                if parent != path {
-                    create_real_dir(parent)?;
+}
+
+/// Walk `path` from `/` with the same `O_NOFOLLOW` directory opens as
+/// [`open_contained`]. Missing components are created with `mkdirat` on
+/// the held parent. The returned fd, not the path, is the destination.
+fn hold_export_dir(path: &Path) -> Result<File> {
+    let abs = lexical_abs(path)?;
+    let mut current = File::from(open_root_dir()?);
+    let mut built = PathBuf::new();
+    built.push(Component::RootDir);
+    for component in abs.components() {
+        let Component::Normal(seg) = component else {
+            if matches!(component, Component::RootDir) {
+                continue;
+            }
+            return Err(refused_path(path, "unsupported path"));
+        };
+        let name = component_cstr(seg, path)?;
+        built.push(seg);
+        current = open_or_create_dir(&current, &name, &built)?;
+    }
+    Ok(current)
+}
+
+fn hold_relative_dir(root: &File, rel: &Path) -> Result<File> {
+    if rel.as_os_str().is_empty() {
+        return root.try_clone().map_err(|err| {
+            Error::rejected(format!("wiki cp cannot hold export directory: {err}"))
+        });
+    }
+    let mut current = root
+        .try_clone()
+        .map_err(|err| Error::rejected(format!("wiki cp cannot hold export directory: {err}")))?;
+    let mut built = PathBuf::new();
+    for component in rel.components() {
+        let Component::Normal(seg) = component else {
+            return Err(refused_path(rel, "unsupported path"));
+        };
+        let bytes = os_str_bytes(seg);
+        if bytes.is_empty()
+            || bytes == b"."
+            || bytes == b".."
+            || bytes.starts_with(b".")
+            || bytes.contains(&b'/')
+            || bytes.contains(&0)
+        {
+            return Err(refused_path(rel, "unsupported path"));
+        }
+        let name = component_cstr(seg, rel)?;
+        built.push(seg);
+        current = open_or_create_dir(&current, &name, &built)?;
+    }
+    Ok(current)
+}
+
+enum DirFail {
+    Missing,
+    Symlink,
+    NotDir,
+    Io(std::io::Error),
+}
+
+fn open_dir_at(parent: &File, name: &std::ffi::CStr) -> std::result::Result<File, DirFail> {
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    if fd < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ELOOP) || is_symlink_at(parent.as_raw_fd(), name) {
+            return Err(DirFail::Symlink);
+        }
+        if err.raw_os_error() == Some(libc::ENOENT) {
+            return Err(DirFail::Missing);
+        }
+        if err.raw_os_error() == Some(libc::ENOTDIR) {
+            return Err(DirFail::NotDir);
+        }
+        return Err(DirFail::Io(err));
+    }
+    let file = File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    if is_symlink_fd(file.as_raw_fd()) {
+        return Err(DirFail::Symlink);
+    }
+    match file.metadata() {
+        Ok(meta) if meta.is_dir() => Ok(file),
+        Ok(_) => Err(DirFail::NotDir),
+        Err(err) => Err(DirFail::Io(err)),
+    }
+}
+
+fn open_or_create_dir(parent: &File, name: &std::ffi::CStr, display: &Path) -> Result<File> {
+    match open_dir_at(parent, name) {
+        Ok(file) => Ok(file),
+        Err(DirFail::Missing) => {
+            let rc = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o777) };
+            let created = rc == 0;
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::EEXIST) {
+                    return Err(Error::rejected(format!(
+                        "wiki cp cannot create {}: {err}",
+                        display.display()
+                    )));
                 }
             }
-            fs::create_dir(path).map_err(|e| {
-                Error::rejected(format!("wiki cp cannot create {}: {e}", path.display()))
-            })?;
-            let meta = symlink_meta(path)?;
-            if meta.file_type().is_symlink() || !meta.is_dir() {
-                return Err(refused_path(path, "not a directory"));
+            let child = match open_dir_at(parent, name) {
+                Ok(file) => file,
+                Err(DirFail::Symlink) => return Err(refused_path(display, "symlink")),
+                Err(DirFail::NotDir) => return Err(refused_path(display, "not a directory")),
+                Err(DirFail::Missing) => {
+                    return Err(Error::rejected(format!(
+                        "wiki cp cannot create {}",
+                        display.display()
+                    )))
+                }
+                Err(DirFail::Io(err)) => {
+                    return Err(Error::rejected(format!(
+                        "wiki cp cannot create {}: {err}",
+                        display.display()
+                    )))
+                }
+            };
+            if created {
+                parent.sync_all().map_err(|err| {
+                    Error::rejected(format!("wiki cp cannot sync {}: {err}", display.display()))
+                })?;
             }
-            Ok(())
+            Ok(child)
         }
+        Err(DirFail::Symlink) => Err(refused_path(display, "symlink")),
+        Err(DirFail::NotDir) => Err(refused_path(display, "not a directory")),
+        Err(DirFail::Io(err)) => Err(Error::rejected(format!(
+            "wiki cp cannot open {}: {err}",
+            display.display()
+        ))),
     }
+}
+
+fn component_cstr(seg: &std::ffi::OsStr, display: &Path) -> Result<CString> {
+    CString::new(os_str_bytes(seg)).map_err(|_| {
+        Error::rejected(format!(
+            "wiki cp refused '{}': path contains an interior nul — nothing was sent",
+            display.display()
+        ))
+    })
+}
+
+fn leaf_name(seg: &std::ffi::OsStr, display: &Path) -> Result<CString> {
+    let bytes = os_str_bytes(seg);
+    if bytes.is_empty() || bytes == b"." || bytes == b".." || bytes.contains(&0) {
+        return Err(refused_path(display, "unsupported path"));
+    }
+    component_cstr(seg, display)
+}
+
+fn refuse_export_leaf(
+    dir: &File,
+    name: &std::ffi::CStr,
+    display: &Path,
+    update: bool,
+) -> Result<()> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ENOENT) {
+            return Ok(());
+        }
+        return Err(Error::rejected(format!(
+            "wiki cp cannot stat {}: {err}",
+            display.display()
+        )));
+    }
+    let kind = st.st_mode & libc::S_IFMT;
+    if kind == libc::S_IFLNK {
+        return Err(refused_path(display, "symlink"));
+    }
+    if kind != libc::S_IFREG {
+        return Err(refused_path(display, "not a regular file"));
+    }
+    if !update {
+        return Err(Error::rejected(format!(
+            "wiki cp refused to overwrite '{}' — pass --update",
+            display.display()
+        )));
+    }
+    Ok(())
 }
 
 fn refuse_symlink_chain(path: &Path) -> Result<()> {
@@ -2172,5 +2517,232 @@ mod tests {
         assert!(!progress["note"].decided);
         let mut unknown = Page { outcome: "guessed" };
         assert!(status_received(&mut unknown, "global/notes", "job-unresolved").is_err());
+    }
+
+    fn wiki_slice() -> Value {
+        json!({
+            "kind": "text",
+            "rev": "fnv1a:0123456789abcdef",
+            "size": 4,
+            "sha256": "12a435ec8454c6d1c90a1d92812b09af11bee711fbe524d56a8f26ea7c5ccee8",
+            "data_base64": base64::engine::general_purpose::STANDARD.encode(b"wiki"),
+        })
+    }
+
+    fn text_entry(path: &str) -> ExportEntry {
+        ExportEntry {
+            path: path.to_string(),
+            kind: "text".to_string(),
+            size: 4,
+            sha256: Some(
+                "12a435ec8454c6d1c90a1d92812b09af11bee711fbe524d56a8f26ea7c5ccee8".to_string(),
+            ),
+            rev: "fnv1a:0123456789abcdef".to_string(),
+        }
+    }
+
+    fn stage_leftovers(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|entry| {
+                let name = entry.unwrap().file_name();
+                let text = name.to_string_lossy().into_owned();
+                text.starts_with(".cadence-transfer-").then_some(text)
+            })
+            .collect()
+    }
+
+    /// The admitted directory is renamed to a symlink during the download.
+    /// Publication stays on the original inode: create-only leaves raced
+    /// bytes, and `--update` replaces only those bytes.
+    #[test]
+    fn export_parent_symlink_swap_cannot_publish_outside() {
+        struct Swap {
+            dest: PathBuf,
+            outside: PathBuf,
+            real: PathBuf,
+            plant: Option<Vec<u8>>,
+            swapped: bool,
+        }
+        impl Channel for Swap {
+            fn transfer(&mut self, _root: &str, _op: Value, _write: bool) -> Result<Value> {
+                if !self.swapped {
+                    fs::rename(&self.dest, &self.real).unwrap();
+                    std::os::unix::fs::symlink(&self.outside, &self.dest).unwrap();
+                    if let Some(bytes) = &self.plant {
+                        fs::write(self.real.join("page.txt"), bytes).unwrap();
+                    }
+                    self.swapped = true;
+                }
+                Ok(wiki_slice())
+            }
+            fn discover(&mut self, _path: &str) -> Result<()> {
+                Ok(())
+            }
+            fn current_rev(&mut self, _path: &str) -> Result<String> {
+                Ok(ABSENT.to_string())
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let dest = root.path().join("dest");
+        let outside = root.path().join("outside");
+        let real = root.path().join("real");
+        fs::create_dir(&dest).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let entry = text_entry("page.txt");
+        let listed = [entry.clone()];
+        check_export_dest(&dest, "global/docs", &listed, false).unwrap();
+        let raced = b"created-after-preflight";
+        write_export_entry(
+            &mut Swap {
+                dest: dest.clone(),
+                outside: outside.clone(),
+                real: real.clone(),
+                plant: Some(raced.to_vec()),
+                swapped: false,
+            },
+            "global/docs",
+            &dest,
+            &entry,
+            &listed,
+            false,
+        )
+        .unwrap_err();
+        assert!(dest.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(fs::read(real.join("page.txt")).unwrap(), raced);
+        assert!(!outside.join("page.txt").exists());
+        assert!(stage_leftovers(&real).is_empty());
+        assert!(stage_leftovers(&outside).is_empty());
+
+        let root = tempfile::tempdir().unwrap();
+        let dest = root.path().join("dest");
+        let outside = root.path().join("outside");
+        let real = root.path().join("real");
+        fs::create_dir(&dest).unwrap();
+        fs::create_dir(&outside).unwrap();
+        write_export_entry(
+            &mut Swap {
+                dest: dest.clone(),
+                outside: outside.clone(),
+                real: real.clone(),
+                plant: None,
+                swapped: false,
+            },
+            "global/docs",
+            &dest,
+            &entry,
+            &listed,
+            true,
+        )
+        .unwrap();
+        assert!(dest.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(fs::read(real.join("page.txt")).unwrap(), b"wiki");
+        assert!(!outside.join("page.txt").exists());
+        assert!(stage_leftovers(&real).is_empty());
+        assert!(stage_leftovers(&outside).is_empty());
+    }
+
+    /// A child directory is created on the held parent, then its path is
+    /// replaced with a symlink before publication. A destination that is
+    /// already a symlink is not a place to create directories.
+    #[test]
+    fn export_created_directory_does_not_follow_replaced_parent() {
+        struct SwapChild {
+            dest: PathBuf,
+            outside: PathBuf,
+            swapped: bool,
+        }
+        impl Channel for SwapChild {
+            fn transfer(&mut self, _root: &str, _op: Value, _write: bool) -> Result<Value> {
+                if !self.swapped {
+                    let nested = self.dest.join("nested");
+                    let saved = self.dest.join("nested-real");
+                    fs::rename(&nested, &saved).unwrap();
+                    std::os::unix::fs::symlink(&self.outside, &nested).unwrap();
+                    self.swapped = true;
+                }
+                Ok(wiki_slice())
+            }
+            fn discover(&mut self, _path: &str) -> Result<()> {
+                Ok(())
+            }
+            fn current_rev(&mut self, _path: &str) -> Result<String> {
+                Ok(ABSENT.to_string())
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let dest = root.path().join("dest");
+        let outside = root.path().join("outside");
+        fs::create_dir(&dest).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let entry = text_entry("nested/page.txt");
+        let listed = [entry.clone()];
+        check_export_dest(&dest, "global/docs", &listed, true).unwrap();
+        write_export_entry(
+            &mut SwapChild {
+                dest: dest.clone(),
+                outside: outside.clone(),
+                swapped: false,
+            },
+            "global/docs",
+            &dest,
+            &entry,
+            &listed,
+            true,
+        )
+        .unwrap();
+        assert!(dest
+            .join("nested")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            fs::read(dest.join("nested-real/page.txt")).unwrap(),
+            b"wiki"
+        );
+        assert!(fs::read_dir(&outside).unwrap().next().is_none());
+        assert!(stage_leftovers(&dest.join("nested-real")).is_empty());
+
+        let root = tempfile::tempdir().unwrap();
+        let dest = root.path().join("dest");
+        let outside = root.path().join("outside");
+        let real = root.path().join("real");
+        fs::create_dir(&dest).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::rename(&dest, &real).unwrap();
+        std::os::unix::fs::symlink(&outside, &dest).unwrap();
+        struct Idle(u32);
+        impl Channel for Idle {
+            fn transfer(&mut self, _root: &str, _op: Value, _write: bool) -> Result<Value> {
+                self.0 += 1;
+                Err(Error::rejected(
+                    "transfer ran after a symlinked destination",
+                ))
+            }
+            fn discover(&mut self, _path: &str) -> Result<()> {
+                Ok(())
+            }
+            fn current_rev(&mut self, _path: &str) -> Result<String> {
+                Ok(ABSENT.to_string())
+            }
+        }
+        let dir_entry = ExportEntry {
+            path: "nested".to_string(),
+            kind: "dir".to_string(),
+            size: 0,
+            sha256: None,
+            rev: ABSENT.to_string(),
+        };
+        let listed = [dir_entry];
+        let mut idle = Idle(0);
+        write_export_entry(&mut idle, "global/docs", &dest, &listed[0], &listed, false)
+            .unwrap_err();
+        assert_eq!(idle.0, 0);
+        assert!(!outside.join("nested").exists());
+        assert!(!real.join("nested").exists());
+        assert!(fs::read_dir(&outside).unwrap().next().is_none());
     }
 }

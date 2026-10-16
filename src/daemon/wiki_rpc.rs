@@ -20,6 +20,35 @@ use crate::wiki::{self, Caller};
 // bounded writes so completion/cleanup cannot race an in-flight chunk.
 static TRANSFER_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+struct WikiHuman {
+    realm: crate::operator_auth::PublicRealm,
+    sub: String,
+    session: String,
+    display: String,
+    role: crate::board_identity::Role,
+}
+
+impl WikiHuman {
+    fn receipt(&self) -> Value {
+        json!({
+            "company": self.realm.company,
+            "sub": self.sub,
+            "session": self.session,
+            "display": self.display,
+            "role": self.role.as_str(),
+        })
+    }
+
+    fn binding(&self) -> Value {
+        json!({
+            "issuer": self.realm.issuer,
+            "organization_id": self.realm.company,
+            "audience": self.realm.host,
+            "subject": self.sub,
+        })
+    }
+}
+
 impl Shared {
     /// The wiki caller: connection-derived, then reconciled with an
     /// optional `wiki_as` claim (module doc). An agent's project — the
@@ -87,7 +116,7 @@ impl Shared {
     /// non-empty token that is live, fresh and owner-or-member as the caller
     /// allows: a named `User` must be the session's own handle, an operator
     /// caller must be the owner, and an agent or public caller takes no proof.
-    fn wiki_human(&self, params: &Value, caller: &Caller, verb: &str) -> Result<Option<Value>> {
+    fn wiki_human(&self, params: &Value, caller: &Caller, verb: &str) -> Result<Option<WikiHuman>> {
         let token = match params.get("public_session") {
             None => return Ok(None),
             Some(Value::String(token)) if !token.is_empty() => token,
@@ -133,13 +162,13 @@ impl Shared {
             }
             _ => {}
         }
-        Ok(Some(json!({
-            "company": realm.company,
-            "sub": sub,
-            "session": view.id,
-            "display": display,
-            "role": role.as_str(),
-        })))
+        Ok(Some(WikiHuman {
+            realm,
+            sub,
+            session: view.id,
+            display,
+            role,
+        }))
     }
 
     /// CAD-1374: before a wiki mutation touches the tree, check the EXISTING
@@ -223,7 +252,9 @@ impl Shared {
         let path = Self::wiki_path(params)?;
         let text = required_str(params, "text")?;
         let if_rev = optional_str(params, "if_rev");
-        let human = self.wiki_human(params, &caller, "wiki write")?;
+        let human = self
+            .wiki_human(params, &caller, "wiki write")?
+            .map(|h| h.receipt());
         let pm = self.wiki_receipt(
             self.pm()?,
             &caller,
@@ -252,7 +283,9 @@ impl Shared {
         let tmp = PathBuf::from(required_str(params, "tmp")?);
         let sha256 = optional_str(params, "sha256");
         let if_rev = optional_str(params, "if_rev");
-        let human = self.wiki_human(params, &caller, "wiki put_blob")?;
+        let human = self
+            .wiki_human(params, &caller, "wiki put_blob")?
+            .map(|h| h.receipt());
         let pm = self.wiki_receipt(
             self.pm()?,
             &caller,
@@ -279,7 +312,9 @@ impl Shared {
         Self::reject_wiki_fields(params)?;
         let caller = self.wiki_caller(params, peer_pid, "wiki mkdir")?;
         let path = Self::wiki_path(params)?;
-        let human = self.wiki_human(params, &caller, "wiki mkdir")?;
+        let human = self
+            .wiki_human(params, &caller, "wiki mkdir")?
+            .map(|h| h.receipt());
         let pm = self.wiki_receipt(
             self.pm()?,
             &caller,
@@ -300,7 +335,9 @@ impl Shared {
         let caller = self.wiki_caller(params, peer_pid, "wiki mv")?;
         let from = required_str(params, "from")?;
         let to = required_str(params, "to")?;
-        let human = self.wiki_human(params, &caller, "wiki mv")?;
+        let human = self
+            .wiki_human(params, &caller, "wiki mv")?
+            .map(|h| h.receipt());
         // A `.trash/` source is an operator-only restore that `wiki::mv`
         // gates itself; only a real source path needs the ACL check here.
         let sources: Vec<(&str, wiki::Op)> = if from.starts_with(".trash/") {
@@ -355,7 +392,9 @@ impl Shared {
         Self::reject_wiki_fields(params)?;
         let caller = self.wiki_caller(params, peer_pid, "wiki rm")?;
         let path = Self::wiki_path(params)?;
-        let human = self.wiki_human(params, &caller, "wiki rm")?;
+        let human = self
+            .wiki_human(params, &caller, "wiki rm")?
+            .map(|h| h.receipt());
         let pm = self.wiki_receipt(
             self.pm()?,
             &caller,
@@ -464,15 +503,30 @@ impl Shared {
             None
         };
         let caller = self.wiki_caller(params, peer_pid, "wiki transfer")?;
-        let owner = wiki::transfer::owner_for(&caller.actor(), params.get("_transfer_binding"))?;
-        if matches!(op, "begin" | "chunk" | "finish") {
-            self.wiki_human(params, &caller, "wiki transfer")?;
+        let human = self.wiki_human(params, &caller, "wiki transfer")?;
+        let public_binding = human.as_ref().map(WikiHuman::binding);
+        let envelope_binding = params.get("_transfer_binding");
+        if let (Some(public), Some(envelope)) = (&public_binding, envelope_binding) {
+            if public != envelope {
+                return Err(Error::rejected(
+                    "wiki transfer refused: conflicting authority bindings",
+                ));
+            }
         }
+        let owner = wiki::transfer::owner_for(
+            &caller.actor(),
+            public_binding.as_ref().or(envelope_binding),
+        )?;
+        let receipt = if matches!(op, "apply" | "finish") {
+            human.as_ref().map(WikiHuman::receipt)
+        } else {
+            None
+        };
         match op {
             "begin" => self.transfer_begin(params, &caller, &owner),
             "chunk" => self.transfer_chunk(params, &caller, &owner),
-            "apply" => self.transfer_apply(params, peer_pid, &caller, &owner),
-            "finish" => self.transfer_finish(params, &caller, &owner),
+            "apply" => self.transfer_apply(params, &caller, &owner, receipt.as_ref()),
+            "finish" => self.transfer_finish(params, &caller, &owner, receipt.as_ref()),
             "status" => self.transfer_status(params, &caller, &owner),
             "export" => self.transfer_export(params, &caller),
             _ => Err(Error::rejected(format!(
@@ -539,34 +593,37 @@ impl Shared {
     fn transfer_apply(
         &self,
         params: &Value,
-        peer_pid: u32,
         caller: &wiki::Caller,
         owner: &str,
+        human: Option<&Value>,
     ) -> Result<Value> {
-        let _ = peer_pid;
         let job_id = required_str(params, "job_id")?;
         let root = required_str(params, "root")?;
         let entry_id = required_str(params, "entry_id")?;
-        let human = self.wiki_human(params, caller, "wiki transfer")?;
         let job = self
             .store
             .wiki_transfer_job(job_id)?
             .filter(|job| job.owner_key == owner && job.root == root)
             .ok_or_else(|| Error::rejected("wiki transfer job not found"))?;
-        let path = self
+        let entry = self
             .store
             .wiki_transfer_entry(job_id, entry_id)?
             .filter(|entry| {
                 entry.path.starts_with(&format!("{}/", job.root)) || entry.path == job.root
             })
-            .ok_or_else(|| Error::rejected("wiki transfer job not found"))?
-            .path;
+            .ok_or_else(|| Error::rejected("wiki transfer job not found"))?;
+        let action = match entry.kind.as_str() {
+            "text" => "wiki_written",
+            "blob" => "wiki_blob_uploaded",
+            "dir" => "wiki_directory_created",
+            _ => return Err(Error::internal("wiki transfer entry has an invalid kind")),
+        };
         let pm = self.wiki_receipt(
             self.pm()?,
             caller,
-            human.as_ref(),
-            "wiki_transferred",
-            &[(path.as_str(), wiki::Op::Write)],
+            human,
+            action,
+            &[(entry.path.as_str(), wiki::Op::Write)],
         )?;
         wiki::transfer::apply(
             &self.store,
@@ -582,10 +639,24 @@ impl Shared {
         )
     }
 
-    fn transfer_finish(&self, params: &Value, caller: &wiki::Caller, owner: &str) -> Result<Value> {
+    fn transfer_finish(
+        &self,
+        params: &Value,
+        caller: &wiki::Caller,
+        owner: &str,
+        human: Option<&Value>,
+    ) -> Result<Value> {
+        let root = required_str(params, "root")?;
+        let pm = self.wiki_receipt(
+            self.pm()?,
+            caller,
+            human,
+            "wiki_directory_created",
+            &[(root, wiki::Op::Write)],
+        )?;
         let (body, kick) = wiki::transfer::finish(
             &self.store,
-            &self.pm()?,
+            &pm,
             &self.state_dir,
             &wiki::transfer::JobRequest {
                 caller,

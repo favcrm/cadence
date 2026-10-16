@@ -289,12 +289,11 @@ pub(super) fn write(
 ) -> HttpResp {
     let (state_dir, pm_dir) = dirs;
     let wiki_as = wiki_as(caller);
-    // CAD-1374: every write attaches the server-held public session
-    // bearer (or refuses 401 on a public host with none) before any staging
-    // or RPC. Reads never reach this function.
+    // Attach the server-held session to writes and caller-owned transfer reads.
+    // Neither a caller-selected identity nor an absent public proof is relayed.
     let proof = match relay_proof {
         operator::PublicRelay::Missing => {
-            return err_response(401, "board session required for this write");
+            return err_response(401, "board session required for this request");
         }
         operator::PublicRelay::NotPublic => None,
         operator::PublicRelay::Proven(p) => Some(p.token().to_string()),
@@ -306,7 +305,7 @@ pub(super) fn write(
         params
     };
     match (tail, method) {
-        ("transfer", Method::Put) => {
+        ("transfer", Method::Put) | ("job_status", Method::Post) => {
             let body = match read_body(request, JSON_CAP) {
                 Ok(body) => body,
                 Err(resp) => return resp,
@@ -315,7 +314,7 @@ pub(super) fn write(
                 Ok(body) => body,
                 Err(resp) => return resp,
             };
-            match transfer_params(&body, true) {
+            match transfer_params(&body, tail == "transfer") {
                 Ok(params) => relay(state_dir, "wiki_transfer", with_proof(params), &wiki_as),
                 Err(resp) => resp,
             }
@@ -384,7 +383,7 @@ pub(super) fn write(
             }
         }
         ("upload", Method::Post) => upload(request, query, state_dir, pm_dir, &wiki_as, proof),
-        ("file" | "upload" | "mkdir" | "mv" | "rm" | "transfer", _) => {
+        ("file" | "upload" | "mkdir" | "mv" | "rm" | "transfer" | "job_status", _) => {
             err_response(405, "method not allowed")
         }
         _ => err_response(404, "no such wiki write route"),
