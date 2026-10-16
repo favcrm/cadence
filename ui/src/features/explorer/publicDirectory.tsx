@@ -4,7 +4,7 @@ import Button from "../../ui/Button";
 import Select from "../../ui/Select";
 import { useTranslate } from "../../lib/locale";
 import { sessionHeaders } from "../../lib/sessionKey";
-import { notifyAppsChanged } from "../workspace-apps/workspaceApps";
+import { appExplorer, notifyAppsChanged, type HomeInstallation } from "../workspace-apps/workspaceApps";
 import { useInstallations } from "../workspace-apps/useInstallations";
 import { installedAppHref } from "../apps/appViewModel";
 import type { Viewer } from "../projects/work";
@@ -333,6 +333,22 @@ export function PublicAppDetail({ id, viewer, onResolved }: { id: string; viewer
   const [abort, setAbort] = useState<AbortController | null>(null);
   const canInstall = viewer.operator === true && !viewer.readOnly;
   const installedState = useInstallations(canInstall, id);
+  const [homeInstall, setHomeInstall] = useState<HomeInstallation | null | undefined>(undefined);
+  useEffect(() => {
+    const controller = new AbortController();
+    setHomeInstall(undefined);
+    const packageKey = app?.app ?? id;
+    appExplorer.home(controller.signal)
+      .then((body) => {
+        if (controller.signal.aborted) return;
+        const found = body.installations.find((row) => row.name === packageKey && row.attention.state !== "removed") ?? null;
+        setHomeInstall(found);
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setHomeInstall(null);
+      });
+    return () => controller.abort();
+  }, [id, app?.app]);
   useEffect(() => {
     const controller = new AbortController();
     setApp(undefined); setError(null); setPhase("idle"); setConfirming(false);
@@ -420,7 +436,16 @@ export function PublicAppDetail({ id, viewer, onResolved }: { id: string; viewer
             <dt>{t("Version")}</dt><dd>{app.version}</dd>
             <dt>{t("Digest")}</dt><dd className="pubdir-digest">{app.digest}</dd>
           </dl>
-          {!canInstall && phase === "idle" && (
+          {!canInstall && phase === "idle" && homeInstall === undefined && (
+            <p className="text-label text-ink-400" role="status">{t("Checking this board…")}</p>
+          )}
+          {!canInstall && phase === "idle" && homeInstall && (
+            <>
+              <p className="pubdir-installed" role="status">{t("Installed on this board.")}</p>
+              <p className="text-label text-ink-400">{t("This connection cannot prove it is the host operator, so opening and installing stay on a browser running on this computer.")}</p>
+            </>
+          )}
+          {!canInstall && phase === "idle" && homeInstall === null && (
             <>
               <Button className="btn-primary" disabled>{t("Install")}</Button>
               <p className="text-label text-ink-400" role="status">{t("This browser is not the host operator, so install stays off.")}</p>
