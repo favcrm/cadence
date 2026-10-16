@@ -662,6 +662,12 @@ pub(crate) enum Commands {
         #[command(flatten)]
         steer: SteerArgs,
     },
+    /// Hosted coordination for this user's local agent (CAD-1460).
+    /// Requires a selected remote org. It does not run in the container.
+    LocalAgent {
+        #[command(subcommand)]
+        action: local_agent::LocalAgentAction,
+    },
     /// One-step issue dispatch: `issue start` (idempotent, owner =
     /// the worker) then exactly one templated kickoff message, a
     /// tracker comment and a `message` ref on the issue. With `--job`

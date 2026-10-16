@@ -24,6 +24,7 @@ fn fixture() -> (tempfile::TempDir, RemoteTarget, Credential, PendingRenewal) {
     let root = tempfile::tempdir().unwrap();
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let target = RemoteTarget {
+        identity: None,
         org: ORG.into(),
         endpoint: "https://acme.cadencecloud.app".into(),
         org_id: ORG_ID.into(),
@@ -112,6 +113,19 @@ fn forged_renewal_response_is_refused_before_credential_replacement() {
     let still_stored = load_credential(root.path(), &target).unwrap();
     assert_eq!(still_stored.access_token, OLD_ACCESS);
     assert_eq!(still_stored.cli_session.unwrap().refresh_token, OLD_REFRESH);
+}
+
+#[test]
+fn member_renewal_keeps_the_saved_capabilities() {
+    let (_root, target, prior, pending) = fixture();
+    let mut response = issuer_response(&prior, &pending, &target);
+    response["principal"]["current_role"] = json!("member");
+    validate_renewal_response(&response, &prior, &target, &pending)
+        .expect("member renewal must not be treated as an identity change");
+    assert_eq!(response["capabilities"], json!(prior.capabilities));
+
+    response["principal"]["current_role"] = json!("admin");
+    assert!(validate_renewal_response(&response, &prior, &target, &pending).is_err());
 }
 
 #[test]

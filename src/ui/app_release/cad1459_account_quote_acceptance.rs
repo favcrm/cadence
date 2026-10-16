@@ -153,6 +153,7 @@ fn quote_requires_native_browser_proof_and_access_only_login_needs_no_extra_gran
     let login_path = dir.join(format!("cli-{ORG}.json"));
     private_write(&login_path, &bytes);
     let identity = account_image_identity(&RemoteTarget {
+        identity: None,
         org: ORG.into(),
         endpoint: BOARD.into(),
         org_id: WORKSPACE.into(),

@@ -127,15 +127,27 @@ impl Surface {
     }
 }
 
-/// A resolved remote org destination — pinned once per invocation from the
-/// registry (`cli::org::resolve`). `org` is the registry name (the
-/// issuer-verified slug); `endpoint`/`org_id` came only from the verified
-/// grant at login. Nothing here is caller-mutable mid-command.
+/// A resolved remote org destination, pinned once per invocation.
+/// Ordinary selection reads the registry (`cli::org::resolve`): `org` is
+/// the issuer-verified slug, and `endpoint`/`org_id` come from the grant
+/// recorded at login. A managed caller with one live kickoff copies those
+/// three fields from that binding instead, then still requires the saved
+/// credential for this destination to name the original member and issuer.
+/// Nothing here is caller-mutable mid-command.
 #[derive(Clone, Debug)]
 pub struct RemoteTarget {
     pub org: String,
     pub endpoint: String,
     pub org_id: String,
+    /// Original actor identity for assignment-bound calls; checked on every
+    /// credential load, including renewal and post-resolution reloads.
+    pub identity: Option<CliIdentityPin>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CliIdentityPin {
+    pub subject_id: String,
+    pub issuer: String,
 }
 
 const SESSION_VERSION: &str = "hosted-cadence-cli-session.v1";
@@ -349,6 +361,17 @@ fn read_credential_metadata(dir: &Path, target: &RemoteTarget) -> Result<Credent
             "the stored credential belongs to a different workspace or host; \
              it is never sent to another destination — run `cadence login` again",
         ));
+    }
+    if let Some(identity) = &target.identity {
+        if identity.subject_id.is_empty()
+            || identity.issuer.is_empty()
+            || cred.subject_id.as_deref() != Some(identity.subject_id.as_str())
+            || cred.issuer.as_deref() != Some(identity.issuer.as_str())
+        {
+            return Err(reject(
+                "saved login changed member or issuer; the original assignment identity was retained",
+            ));
+        }
     }
     if !valid_token(&cred.access_token, "hct_") {
         return Err(reject("invalid remote credential"));
@@ -656,7 +679,9 @@ fn validate_renewal_response(
         || body["audience"] != target.endpoint
         || !exact_object(&body["principal"], &["kind", "current_role", "subject_id"])
         || body["principal"]["kind"] != "user"
-        || body["principal"]["current_role"] != "owner"
+        || body["principal"]["current_role"]
+            .as_str()
+            .is_none_or(|role| !crate::remote_enrollment::human_workspace_role(role))
         || body["principal"]["subject_id"].as_str() != prior.subject_id.as_deref()
         || !same_capabilities_json(&body["capabilities"], &prior.capabilities)
         || !exact_object(
@@ -1522,6 +1547,37 @@ pub fn logout(dir: &Path, target: &RemoteTarget) -> Result<i32> {
     Ok(0)
 }
 
+pub struct CliMaterial {
+    pub access_token: String,
+    pub subject_id: Option<String>,
+    pub issuer: Option<String>,
+}
+
+/// The live hosted CLI bearer for `target`, renewed when it is due.
+/// The subject and issuer come from the stored login, not from the caller.
+pub fn cli_material(dir: &Path, target: &RemoteTarget) -> Result<CliMaterial> {
+    cli_material_until(dir, target, Instant::now() + Duration::from_secs(20))
+}
+
+/// Same saved-login renewal as [`cli_material`], bounded by the caller's
+/// total deadline. The deadline covers lock, refresh, and return; it does
+/// not start a second clock.
+pub fn cli_material_until(
+    dir: &Path,
+    target: &RemoteTarget,
+    deadline: Instant,
+) -> Result<CliMaterial> {
+    let cred = renewed_credential(dir, target, deadline)?;
+    if !valid_token(&cred.access_token, "hct_") {
+        return Err(reject("invalid remote credential"));
+    }
+    Ok(CliMaterial {
+        access_token: cred.access_token,
+        subject_id: cred.subject_id,
+        issuer: cred.issuer,
+    })
+}
+
 /// Execute within the command-owned deadline. Continuations reuse it rather
 /// than starting a fresh wake budget for each range.
 pub fn call_verb(
@@ -1710,6 +1766,7 @@ pub struct AccountImageResponse {
 impl AccountImageIdentity {
     pub fn target(&self) -> RemoteTarget {
         RemoteTarget {
+            identity: None,
             org: self.org.clone(),
             endpoint: self.audience.clone(),
             org_id: self.organization_id.clone(),
@@ -1845,6 +1902,7 @@ pub fn account_image_targets() -> Result<Vec<RemoteTarget>> {
             .filter(|id| valid_id(id))
             .ok_or_else(|| reject("saved org workspace is missing"))?;
         targets.push(RemoteTarget {
+            identity: None,
             org: org.to_owned(),
             endpoint: endpoint.to_owned(),
             org_id: org_id.to_owned(),
@@ -2062,6 +2120,7 @@ mod tests {
 
     fn target(listener: &TcpListener) -> RemoteTarget {
         RemoteTarget {
+            identity: None,
             org: ORG.into(),
             endpoint: format!("http://{}", listener.local_addr().unwrap()),
             org_id: ORG_ID.into(),
@@ -2086,6 +2145,51 @@ mod tests {
     }
     fn store_credential(dir: &Path, endpoint: &str) {
         store_credential_at(dir, ORG, ORG_ID, endpoint, now().unwrap() + 300);
+    }
+
+    #[test]
+    fn assignment_identity_survives_saved_login_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut frozen = target(&listener);
+        frozen.identity = Some(CliIdentityPin {
+            subject_id: "user_original".into(),
+            issuer: "https://original.invalid".into(),
+        });
+        store_credential(dir.path(), &frozen.endpoint);
+        let path = dir.path().join(format!("cli-{ORG}.json"));
+        let mut original: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        original["subject_id"] = json!("user_original");
+        original["issuer"] = json!("https://original.invalid");
+        fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+        assert_eq!(
+            cli_material(dir.path(), &frozen).unwrap().access_token,
+            BRIDGE
+        );
+
+        for (subject, issuer) in [
+            (json!("user_replacement"), json!("https://original.invalid")),
+            (json!("user_original"), json!("https://replacement.invalid")),
+            (Value::Null, Value::Null),
+            (json!("user_original"), Value::Null),
+        ] {
+            let mut replacement = original.clone();
+            replacement["subject_id"] = subject;
+            replacement["issuer"] = issuer;
+            fs::write(&path, serde_json::to_vec(&replacement).unwrap()).unwrap();
+            assert!(cli_material(dir.path(), &frozen).is_err());
+            assert_eq!(
+                listener.accept().err().unwrap().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+        fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+        assert_eq!(
+            cli_material(dir.path(), &frozen).unwrap().access_token,
+            BRIDGE
+        );
     }
 
     fn read_request(socket: std::net::TcpStream) -> (std::net::TcpStream, Request) {
@@ -2661,6 +2765,7 @@ mod tests {
             .unwrap();
         store_credential(&dir, "https://acme.cadencecloud.app");
         let foreign = RemoteTarget {
+            identity: None,
             org: ORG.into(),
             endpoint: format!("http://{}", listener.local_addr().unwrap()),
             org_id: "ws_other".into(),
@@ -2853,6 +2958,7 @@ mod tests {
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         store_credential(dir, &endpoint);
         let target = RemoteTarget {
+            identity: None,
             org: ORG.into(),
             endpoint,
             org_id: ORG_ID.into(),
@@ -3103,6 +3209,7 @@ mod tests {
             .unwrap();
         let endpoint = "https://acme.cadencecloud.app";
         let target = RemoteTarget {
+            identity: None,
             org: ORG.into(),
             endpoint: endpoint.into(),
             org_id: ORG_ID.into(),
@@ -3227,6 +3334,7 @@ mod tests {
         std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o000))
             .unwrap();
         let target = RemoteTarget {
+            identity: None,
             org: ORG.into(),
             endpoint: "https://acme.cadencecloud.app".into(),
             org_id: ORG_ID.into(),
@@ -3256,6 +3364,7 @@ mod tests {
             .unwrap();
         let endpoint = "https://acme.cadencecloud.app";
         let target = RemoteTarget {
+            identity: None,
             org: ORG.into(),
             endpoint: endpoint.into(),
             org_id: ORG_ID.into(),
@@ -3315,6 +3424,7 @@ mod tests {
         )
         .unwrap();
         let target = RemoteTarget {
+            identity: None,
             org: ORG.into(),
             endpoint: "http://127.0.0.1:9".into(),
             org_id: ORG_ID.into(),
@@ -3432,6 +3542,7 @@ mod tests {
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         store_credential(dir, &endpoint);
         let target = RemoteTarget {
+            identity: None,
             org: ORG.into(),
             endpoint,
             org_id: ORG_ID.into(),
@@ -3607,6 +3718,7 @@ mod tests {
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         store_credential(dir, &endpoint);
         let target = RemoteTarget {
+            identity: None,
             org: ORG.into(),
             endpoint,
             org_id: ORG_ID.into(),

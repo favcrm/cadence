@@ -238,7 +238,9 @@ pub(crate) fn route_client_only(cli: Cli) -> Result<i32> {
         .map(|d| cadence_agent::home::guard_tracker(PathBuf::from(d)))
         .transpose()?;
     match org::resolve(cli.org.as_deref(), cli.state_dir.clone(), tracker)? {
-        org::Resolved::Remote(target) => remote::run(target, cli.command, cli.wake_timeout),
+        org::Resolved::Remote(target) => {
+            remote::run(target, cli.command, cli.wake_timeout, cli.state_dir.clone())
+        }
         org::Resolved::Local(_) => Err(local_command_refusal()),
     }
 }

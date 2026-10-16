@@ -990,9 +990,62 @@ pub(super) fn run(
     target: cadence_agent::remote_cli::RemoteTarget,
     command: Commands,
     wake_timeout: u64,
+    local_state: Option<std::path::PathBuf>,
 ) -> Result<i32> {
     if let Commands::Org { action } = command {
         return org::run(action);
+    }
+    if let Commands::LocalAgent { action } = &command {
+        return local_agent::run(&target, action, wake_timeout, local_state);
+    }
+    if let Commands::Dispatch { issue, to, job, .. } = &command {
+        if *job {
+            return Err(Error::usage(
+                "hosted dispatch does not open a job. Nothing was sent.",
+            ));
+        }
+        return local_agent::dispatch(&target, issue, to);
+    }
+    if let Commands::Issue {
+        action:
+            cadence_agent::issue::cli::IssueAction::Start {
+                id,
+                repo,
+                name,
+                base,
+                owner,
+                job,
+                pm,
+                spec,
+                assignee,
+                force,
+                by,
+                take_over,
+            },
+    } = &command
+    {
+        if *job
+            || base.is_some()
+            || owner.is_some()
+            || pm.is_some()
+            || spec.is_some()
+            || assignee.is_some()
+            || *force
+            || by.is_some()
+            || take_over.is_some()
+        {
+            return Err(Error::usage(
+                "hosted issue start accepts --repo and --name only. It claims this machine's local agent and does not open a job. Nothing was sent.",
+            ));
+        }
+        return local_agent::start(
+            &target,
+            id,
+            repo.as_deref(),
+            name.as_deref(),
+            wake_timeout,
+            local_state,
+        );
     }
     if let Commands::Wiki {
         action:

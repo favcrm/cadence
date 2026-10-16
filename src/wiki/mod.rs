@@ -5,7 +5,7 @@
 //! the served tracker's `wiki/` under the legacy layout):
 //!
 //! ```text
-//! global/                     operator-written shared knowledge
+//! global/                     shared knowledge (operator and members write)
 //! projects/<key>/             a project team's pages (agents write
 //!                             only their own project's)
 //! agents/<alias>/knowledge/   the agent's own pages (self-written)
@@ -118,6 +118,9 @@ impl Caller {
 pub enum Op {
     Read,
     Write,
+    /// `wiki rm`, and the source of `wiki mv`; uses the same namespace grant
+    /// as writing a page. Shared wiki collaboration includes moving/deleting.
+    Remove,
 }
 
 impl Op {
@@ -125,6 +128,7 @@ impl Op {
         match self {
             Op::Read => "read",
             Op::Write => "write",
+            Op::Remove => "rm",
         }
     }
 }
@@ -140,7 +144,7 @@ pub fn allowed(caller: &Caller, op: Op, segs: &[&str]) -> Result<()> {
     let no = |why: &str| -> Result<()> { Err(Error::rejected(format!("{}: {why}", verb()))) };
     // CAD-615: the operator's permission rules. Not a knowledge page,
     // not a profile write, not something the master can put.
-    if op == Op::Write && segs == ["agents", "master", "permissions.yaml"] {
+    if matches!(op, Op::Write | Op::Remove) && segs == ["agents", "master", "permissions.yaml"] {
         return no(
             "agents/master/permissions.yaml is operator-owned — only a permission decision writes it",
         );
@@ -149,25 +153,31 @@ pub fn allowed(caller: &Caller, op: Op, segs: &[&str]) -> Result<()> {
     match top {
         "" => match op {
             Op::Read => Ok(()),
-            Op::Write => no("the wiki root is not writable"),
+            Op::Write | Op::Remove => no("the wiki root is not writable"),
         },
         "global" => match op {
             Op::Read => Ok(()),
-            Op::Write => match caller {
+            Op::Write | Op::Remove => match caller {
                 Caller::Operator => Ok(()),
-                _ => no("global/ is operator-written; agents and users keep their own areas"),
+                Caller::User(_) if segs.len() > 1 => Ok(()),
+                Caller::User(_) => no("members mutate pages below global/, not the namespace root"),
+                _ => no(
+                    "global/ writes are the operator's and a board member's; agents keep their own areas",
+                ),
             },
         },
         "projects" => {
             if segs.len() == 1 {
                 return match op {
                     Op::Read => Ok(()),
-                    Op::Write => no("projects/ itself is not writable — write inside a project"),
+                    Op::Write | Op::Remove => {
+                        no("projects/ itself is not writable — write inside a project")
+                    }
                 };
             }
             match op {
                 Op::Read => Ok(()),
-                Op::Write => match caller {
+                Op::Write | Op::Remove => match caller {
                     Caller::Operator => Ok(()),
                     Caller::Agent { alias, project } if project.as_deref() == Some(segs[1]) => {
                         let _ = alias;
@@ -180,7 +190,10 @@ pub fn allowed(caller: &Caller, op: Op, segs: &[&str]) -> Result<()> {
                             .as_deref()
                             .unwrap_or("none — cwd is no project repo")
                     )),
-                    _ => no("only the operator and the project's own agents write projects/"),
+                    Caller::User(_) => Ok(()),
+                    Caller::Public => no(
+                        "only the operator, a board member, and the project's own agents write projects/",
+                    ),
                 },
             }
         }
@@ -189,26 +202,26 @@ pub fn allowed(caller: &Caller, op: Op, segs: &[&str]) -> Result<()> {
                 // `agents/` and `agents/<a>/` — listing folders.
                 return match op {
                     Op::Read => Ok(()),
-                    Op::Write => no("agent folders are layout — write under knowledge/ instead"),
+                    Op::Write | Op::Remove => no("agent folders are layout — write under knowledge/ instead"),
                 };
             }
             let area = segs[2];
             match area {
                 "profile" => match op {
                     Op::Read => Ok(()),
-                    Op::Write => no(
+                    Op::Write | Op::Remove => no(
                         "profiles are a read-only view of the agent's files — write \
                          through `cadence master edit` (agent_file_write)",
                     ),
                 },
                 "memory" => match op {
                     Op::Read => Ok(()),
-                    Op::Write => no("memory/ is a read-only view of the memory store — propose \
+                    Op::Write | Op::Remove => no("memory/ is a read-only view of the memory store — propose \
                          through `cadence memory`"),
                 },
                 "knowledge" => match op {
                     Op::Read => Ok(()),
-                    Op::Write => match caller {
+                    Op::Write | Op::Remove => match caller {
                         Caller::Operator => Ok(()),
                         Caller::Agent { alias, .. } if alias == segs[1] => Ok(()),
                         Caller::Agent { .. } => no("an agent writes only its own knowledge/"),
@@ -225,7 +238,7 @@ pub fn allowed(caller: &Caller, op: Op, segs: &[&str]) -> Result<()> {
                 return match (op, caller) {
                     (Op::Read, Caller::Operator | Caller::User(_)) => Ok(()),
                     (Op::Read, _) => no("users/ is private — only a member sees own entry"),
-                    (Op::Write, _) => no("users/ itself is not writable"),
+                    (Op::Write | Op::Remove, _) => no("users/ itself is not writable"),
                 };
             }
             match caller {
@@ -1594,7 +1607,7 @@ pub fn mv(pm: &Pm, caller: &Caller, from: &str, to: &str) -> Result<Value> {
             return Err(Error::rejected("wiki mv refused: source is the root"));
         }
         let segs_from: Vec<&str> = norm_from.split('/').collect();
-        allowed(caller, Op::Write, &segs_from)?;
+        allowed(caller, Op::Remove, &segs_from)?;
         if classify(&segs_from) != View::Real {
             unreachable!()
         }
@@ -1700,7 +1713,7 @@ pub fn rm(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
         return Err(Error::rejected("wiki rm '' refused: the root stays"));
     }
     let segs: Vec<&str> = norm.split('/').collect();
-    allowed(caller, Op::Write, &segs)?;
+    allowed(caller, Op::Remove, &segs)?;
     if classify(&segs) != View::Real {
         unreachable!()
     }
@@ -2373,22 +2386,30 @@ mod tests {
             (&op, Op::Read, "", true),
             (&public, Op::Read, "", true),
             (&op, Op::Write, "", false),
-            // global/: read by all, written by the operator only.
+            // global/: read by all; members may mutate pages, not the namespace root.
             (&op, Op::Read, "global/notes.md", true),
             (&agent(), Op::Read, "global/notes.md", true),
             (&public, Op::Read, "global/notes.md", true),
             (&user, Op::Read, "global/notes.md", true),
             (&op, Op::Write, "global/notes.md", true),
+            (&op, Op::Remove, "global/notes.md", true),
             (&agent(), Op::Write, "global/notes.md", false),
-            (&user, Op::Write, "global/notes.md", false),
+            (&agent(), Op::Remove, "global/notes.md", false),
+            (&user, Op::Write, "global/notes.md", true),
+            (&user, Op::Remove, "global/notes.md", true),
+            (&user, Op::Write, "global", false),
+            (&user, Op::Remove, "global", false),
             (&public, Op::Write, "global/notes.md", false),
-            // projects/<key>/: all read; write = operator + owning agent.
+            (&public, Op::Remove, "global/notes.md", false),
+            // projects/<key>/: all read; write = operator, owning agent, or a board member.
             (&op, Op::Read, "projects/cadence/a.md", true),
             (&public, Op::Read, "projects/cadence/a.md", true),
             (&agent(), Op::Write, "projects/cadence/a.md", true),
+            (&agent(), Op::Remove, "projects/cadence/a.md", true),
             (&agent(), Op::Write, "projects/other/a.md", false),
             (&agentless(), Op::Write, "projects/cadence/a.md", false),
-            (&user, Op::Write, "projects/cadence/a.md", false),
+            (&user, Op::Write, "projects/cadence/a.md", true),
+            (&user, Op::Remove, "projects/cadence/a.md", true),
             (&public, Op::Write, "projects/cadence/a.md", false),
             (&op, Op::Write, "projects", false),
             (&agent(), Op::Read, "projects", true),
@@ -2446,8 +2467,10 @@ mod tests {
             (&op, Op::Read, "users/fable/diary.md", true),
             (&user, Op::Read, "users/fable/diary.md", true),
             (&user, Op::Write, "users/fable/diary.md", true),
+            (&user, Op::Remove, "users/fable/diary.md", true),
             (&user2, Op::Read, "users/fable/diary.md", false),
             (&user2, Op::Write, "users/fable/diary.md", false),
+            (&user2, Op::Remove, "users/fable/diary.md", false),
             (&agent(), Op::Read, "users/fable/diary.md", false),
             (&agent(), Op::Write, "users/fable/diary.md", false),
             (&public, Op::Read, "users/fable/diary.md", false),

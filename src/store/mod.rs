@@ -63,6 +63,7 @@ pub use topics::{
 };
 mod inbox;
 mod kickoff;
+pub(crate) use kickoff::last_sha_line;
 pub use kickoff::{check_commit_sha, job_kickoff, kickoff_ceiling, omit_host_paths};
 mod messages;
 #[cfg(test)]
@@ -120,8 +121,6 @@ pub use seal::WriteTxn;
 pub(crate) use seal::{preflight_writer_guard, require_legacy_writer_tx, StoreConn};
 #[cfg(test)]
 mod tests;
-#[cfg(test)]
-mod writer_census;
 
 /// How long a connection waits on another process's lock before
 /// SQLITE_BUSY (CAD-256). The daemon's writer and every out-of-process

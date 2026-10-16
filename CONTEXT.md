@@ -19,3 +19,11 @@ Cadence coordinates people and agents doing work through apps and projects.
 **Destination**: Where a run's output is delivered, such as a repository, an outbox or a social account. A destination is not the owner of the app.
 
 **Connection**: An explicitly authorized route to an external or local capability. Using a connection requires permission for the particular action and context.
+
+**Provider account**: The identity a connection uses at a particular provider. Its meaning is provider-specific: a social destination account is not an AgenticOS billing workspace.
+
+**Local agent**: An agent executing on the user's machine. Dispatching work to a local agent does not request execution inside a hosted container.
+
+**Hosted coordination**: Shared tickets, assignments, messages, knowledge and results maintained for a workspace. The location of this coordination does not determine where an agent executes.
+
+**Assignment**: A delegation of work to a workspace member and their chosen agent. An assignment can wait for a local agent; assignment alone does not prove execution or process termination.

@@ -614,6 +614,15 @@ pub fn require_grant(
 /// match the recorded fingerprint so a custody/record tear (a crash
 /// between the custody write and the record write at rotate) refuses
 /// instead of proxying stale bytes.
+/// Missing enrollment is the only custody result a lane credential may
+/// replace. Fingerprint and custody tears stay their own errors.
+pub(crate) fn credential_enrollment_missing(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Rejected(message) if message.contains("no credential is enrolled")
+    )
+}
+
 pub fn load_credential(
     store: &Store,
     custody: &Custody,

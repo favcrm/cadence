@@ -39,6 +39,9 @@ docs/guides/*
 !docs/RELEASING.md
 !docs/REMOTE-RESULT-OUTBOX.md
 docs/design/*
+!docs/design/fixtures/
+docs/design/fixtures/*
+!docs/design/fixtures/hosted-cadence-local-assignment.v1.json
 docs/roles/*
 !docs/design/DEVELOPMENT-TEAM.md
 !docs/design/hosted-migration.md

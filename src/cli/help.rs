@@ -32,6 +32,10 @@ const CORE: &[(&str, &[(&str, &str)])] = &[
         &[
             ("send", "Enqueue a durable message to an agent"),
             ("dispatch", "Start an issue and send its worker the kickoff"),
+            (
+                "local-agent",
+                "Connect your local agent to hosted issue work",
+            ),
             ("join", "Join a new worker agent to a group"),
             ("agent", "List and manage registered agents"),
         ],

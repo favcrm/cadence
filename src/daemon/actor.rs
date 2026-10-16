@@ -819,9 +819,9 @@ impl Shared {
         Ok(())
     }
 
+    /// CAD-250: a nudge completes at its confirmed paste — no report
+    /// is owed, and the held turn (if any) is untouched.
     pub(super) fn complete(&self, message: &Message, result: TurnResult) -> Result<()> {
-        // CAD-250: a nudge completes at its confirmed paste — no report
-        // is owed, and the held turn (if any) is untouched.
         if message.is_nudge() {
             let delivered = json!({"status": "completed", "via": "pty_nudge",
                         "turn_id": result.turn_id});

@@ -1,29 +1,49 @@
 # AgenticOS issuer sign-in and hosted enrollment (CAD-539, CAD-717, CAD-729)
 
-CAD-539 authenticates a named principal with an AgenticOS issuer. It does
-**not** connect issue, message or team commands to hosted Cadence. Those commands
-still use the local daemon. Successful authentication reports
-`hosted_cadence: not_configured`; do not treat it as remote connectivity.
+Ordinary `cadence login` establishes the remote CLI/wiki session described in
+**Hosted login and remote org transport** below. Current workspace members do
+not need an owner-only login for routine collaboration. That session is not a
+provider billing or publishing credential.
 
-The protocol is pinned to AOS-49 draft PR 62, head
-`5c19a64ce1a530ba6728ceb49cd39fc41bff1300`. That PR has device API routes and a
-consent mockup; its web approval page is absent and the routes are not merged
-into AgenticOS main. These commands therefore require an explicitly configured
-issuer with that contract deployed before real sign-in is possible.
+The separate CAD-539 provider credential import (`--token-stdin`) does not
+connect issue, message or team commands to hosted Cadence. Its
+`hosted_cadence: not_configured` result describes that provider import, not an
+ordinary hosted-org login. Source support is not deployment evidence; the
+chosen issuer must serve the matching contract.
 
-## Browser or device sign-in
+## Provider-adapter and publishing consent
+
+Normal image-enabled apps use the signed-in funded-account media flow; that
+path does not require `provider.draft`. The optional legacy external-adapter
+and publisher setup commands below request separate financial consent:
 
 ```sh
-cadence login --issuer https://your-agenticos-api.example --org ws_company
+cadence --org <slug> local-agent tool --lane provider.draft
+cadence --org <slug> local-agent tool --lane publish.send
 ```
 
-The CLI requests `read draft`, prints the verification URL and user code,
-opens the browser, and polls the issuer. `--no-open` prints the same URL/code
-for completion on another device. No browser cookies are copied. Consent must
-approve the exact workspace ID supplied with `--org`; a different organization
-fails before persistence. Denial, expiry, slow-down and pending states follow
-the device contract. There is no automatic retry after an ambiguous failed
-exchange; restart login rather than reusing an uncertain one-time grant.
+These use the existing device consent endpoints, not a new token issuer.
+Success means `credential_saved`, with activation `not_checked`: neither
+command claims that a tool, connection or sender is already usable. The raw
+token file and a separate issuer/workspace/expiry binding stay private.
+
+For legacy draft tools, the response supplies a `connection create`
+argument vector and `stdin_file` for the **local operator**. That existing
+scoped-token path accepts the `agenticos_external` provider and its canonical
+workspace account; ordinary `platform enroll` is not that path. An unsupported
+legacy account is reported as `config_required` before financial consent;
+ordinary CLI/wiki collaboration is unaffected. Configure the external provider
+door for the issuer, enroll or rotate the credential through native custody,
+then select the connection in the authorized app. Existing custody policy,
+descriptor checks, app authority and budgets remain; no worker grants are
+created and there is no missing-enrollment token fallback.
+
+A publish grant writes the private credential file without registering a
+sender. If not already configured, publishing needs its explicit door URL and
+credential-file configuration. The command does not restart the daemon, send,
+spend or replace the CLI login. Standing publishing authorization still applies.
+Generic device lanes remain owner-approved financial authorization, not an
+additional owner requirement for ordinary CLI/wiki collaboration.
 
 ## Existing token and unattended verification
 
@@ -79,6 +99,11 @@ the remote org and credential. Use `cadence login --use` (or
 `cadence login <slug> --use`) to make it the saved default; without
 `--use`, the current default is unchanged. `--no-open` prints the approval
 URL and code without opening a browser.
+
+An owner or current member can approve ordinary collaboration. Both the portal
+and explicit org login request `cli.read`, `cli.write`, `wiki.read` and
+`wiki.write`; saved renewal retains the consented set. `--web` requests its
+separate CLI plus Publish Web set and does not silently add wiki consent.
 
 The default issuer is the compiled exact HTTPS origin
 `https://api-v2.agenticos.hk`; no issuer or workspace files are needed on
@@ -194,8 +219,12 @@ new login, and neither is retried.
    scope is granted; that the bearer still resolves to the same live
    credential; and that the signed grant is still inside the live ceiling. A
    refusal is `401` with a proven `reason` (for example `scope_not_granted`), or
-   a generic `401 unauthorized` when the bearer does not resolve. The gateway
-   does not check the requested target path against the signed prefixes.
+   a generic `401 unauthorized` when the bearer does not resolve. After argument
+   validation, it also checks every normalized target against the action's
+   signed prefixes **before any runtime wake**: both move legs and the combined
+   upload directory/filename. An out-of-prefix target is `403 insufficient_scope`;
+   a malformed path is `400`. Root enumeration remains available under a narrow
+   grant, with entries filtered by the container.
 2. **Container enforcement** (the Cadence container, before any daemon
    mutation). `src/ui/wiki_envelope.rs` checks the requested path against the
    signed grant (`contains` for reads and writes, `contains_file` for uploads,
@@ -205,8 +234,9 @@ new login, and neither is retried.
    daemon's own `wiki::allowed` ACL runs last, under that attribution.
 
 So a path denial appears as `403 insufficient_scope`, not as a gateway `401`.
-Authorization is the category; the action is to check the target path and the
-workspace role, then ask the owner. It is never a login.
+Authorization is the category: check the granted scope, current membership and
+target path. Routine shared wiki and issue work does not require an owner role.
+Another user's private pages and agent-owned areas remain protected.
 
 A board refusal also names its hop and a request id, for example
 `(hop board, request 0b2e1f4a-…)`. The id is a fresh UUID per refusal, used to

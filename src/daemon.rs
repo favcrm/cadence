@@ -1043,6 +1043,8 @@ impl Shared {
             // landed, so it closes non-fencing `unknown`, never replayed.
             let _ = shared.store.orphan_submitting_nudges("crash");
         }
+        // Hosted completion retries run after the socket is bound. Doing
+        // them here would hold startup on each remote timeout.
         Ok(shared)
     }
 
@@ -4651,6 +4653,23 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     }
     let listener = UnixListener::bind(&socket_path)?;
     listener.set_nonblocking(true)?;
+    // One process-lifetime reporter, after the listener exists. It reads
+    // kickoff bindings and the durable message store; shutdown does not join
+    // it, so an unreachable board cannot hold `stop_ctls`.
+    let _ = {
+        let shared = Arc::clone(&shared);
+        thread::spawn(move || {
+            let driver = crate::local_assignment::reporting::ReportDriver::new(&shared.state_dir);
+            while !shared.closing.load(Ordering::SeqCst) {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let _ = driver.tick(&shared.store, deadline);
+                let pause = Instant::now() + Duration::from_millis(250);
+                while Instant::now() < pause && !shared.closing.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(25));
+                }
+            }
+        })
+    };
     // Signal-driven shutdown: set the same flag as the rpc. Installed
     // before actors launch so a signal during relaunch — or a relaunch
     // failure — still reaches `shutdown` below rather than exiting
@@ -6303,7 +6322,7 @@ mod tests {
     }
 
     #[test]
-    fn cloud_prewrite_fails_the_message_without_recovery() {
+    fn cloud_prewrite_fails_and_preserves_a_hosted_failure_report() {
         use std::sync::atomic::AtomicUsize;
 
         let posts = Arc::new(AtomicUsize::new(0));
@@ -6392,6 +6411,35 @@ mod tests {
                 model_policy: None,
             })
             .unwrap();
+        crate::local_assignment::reporting::store_kickoff_binding(
+            &shared.state_dir,
+            "cad1460-prewrite-report",
+            "https://hosted-completion-regression.invalid",
+            &crate::local_assignment::Kickoff {
+                alias: "cloud-1",
+                issue_id: "CAD1460",
+                assignment_id: "hla_00000000000000000000000000000001",
+                worktree: cwd,
+                message_id: "prewrite-1",
+                claim_id: "hlc_00000000000000000000000000000001",
+                generation: 1,
+                organization_id: "ws_hosted_fail_probe",
+                audience: "https://hosted-completion-regression.invalid",
+                subject_id: Some("user_member"),
+                issuer: Some("https://hosted-completion-regression.invalid"),
+            },
+            "Synthetic terminal failure",
+        )
+        .unwrap();
+        let report_path = shared
+            .state_dir
+            .join("hosted-assignments")
+            .join("prewrite-1.bind");
+        let report = || {
+            std::fs::read(&report_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        };
         shared
             .store
             .enqueue("cloud-1", "do the task", None, "prewrite-1", "user")
@@ -6412,12 +6460,7 @@ mod tests {
         }
         let message = shared.store.message("prewrite-1").unwrap().unwrap();
         assert_eq!(message.state, "failed");
-        let blob = format!(
-            "{} {}",
-            message.result.unwrap_or(json!({})),
-            message.error.unwrap_or_default()
-        );
-        assert!(!blob.contains("unknown"), "{blob}");
+        assert!(report().unwrap()["pending_head"].is_null());
         assert_eq!(posts.load(Ordering::SeqCst), 0);
         let events = shared.store.events("cloud-1", 0, 40).unwrap();
         assert!(events.iter().all(|event| event.kind != "cloud_hold"));

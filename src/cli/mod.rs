@@ -42,6 +42,7 @@ mod issue;
 mod job;
 mod join;
 mod launch;
+mod local_agent;
 #[cfg(test)]
 #[path = "logout_auth_dir_acceptance.rs"]
 mod logout_auth_dir_acceptance;
@@ -182,8 +183,10 @@ pub(crate) struct Cli {
     #[arg(long, global = true)]
     state_dir: Option<PathBuf>,
     /// Select an org for this command — pins the destination once. Conflicts
-    /// with an explicit `--state-dir` or an inherited local binding; a
-    /// managed caller (`CADENCE_ALIAS`) cannot use it.
+    /// with an explicit `--state-dir` or a separate tracker pin. A managed
+    /// caller (`CADENCE_ALIAS`) may pass only the hosted org of its single
+    /// running assignment when the saved login is still that assignment's
+    /// original member; registry defaults and org switch stay refused.
     #[arg(long, global = true, value_name = "ORG")]
     org: Option<String>,
     /// Seconds a remote command waits while its org's container wakes

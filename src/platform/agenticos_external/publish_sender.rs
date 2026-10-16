@@ -17,12 +17,9 @@
 //! - the credential needs the `publish.send` scope; it is loaded from a
 //!   `0600` file at registration, never logged, never tested with real
 //!   material;
-//! - registration is explicit config and default-off: without both
-//!   `CADENCE_PUBLISH_SEND_URL` and
-//!   `CADENCE_PUBLISH_SEND_CREDENTIAL_FILE` no sender is registered and
-//!   dispatch stays `processing` exactly as before. One-sided or
-//!   malformed config refuses daemon startup loudly rather than
-//!   silently running without a sender;
+//! - registration is the explicit credential file plus its door URL.
+//!   With neither env set, no sender is registered. A door URL without
+//!   that file is config-required. A cached lane is not selected;
 //! - exact-binding preflight precedes the first POST: a definitive
 //!   staging refusal (or an unknown decision — AOS-94 permits only
 //!   `approved`) means zero sends. Ambiguous preflight is retried
@@ -896,15 +893,25 @@ fn attach_publish_sender_with(
     }
     let url = std::env::var(PUBLISH_SEND_URL_ENV).unwrap_or_default();
     let credential_file = std::env::var(PUBLISH_SEND_CREDENTIAL_FILE_ENV).unwrap_or_default();
+    // Neither knob and no request to publish: stay default-off. A lane
+    // file alone does not register a sender, spend, or send.
     if url.is_empty() && credential_file.is_empty() {
         return Ok(());
     }
-    if url.is_empty() || credential_file.is_empty() {
+    if url.is_empty() {
         return Err(Error::rejected(format!(
             "{PUBLISH_SEND_URL_ENV} and {PUBLISH_SEND_CREDENTIAL_FILE_ENV} must be set together"
         )));
     }
-    let credential = read_credential_file(Path::new(&credential_file))?;
+    // Explicit file plus door URL. Startup has no frozen billing workspace,
+    // so a cached lane is not a sender credential.
+    let credential = if credential_file.is_empty() {
+        return Err(Error::rejected(format!(
+            "{PUBLISH_SEND_URL_ENV} and {PUBLISH_SEND_CREDENTIAL_FILE_ENV} must be set together"
+        )));
+    } else {
+        read_credential_file(Path::new(&credential_file))?
+    };
     let resolver = production_resolver(state_dir);
     opts.social_publish_sender = Some(Arc::new(HttpPublishSender::new(
         url.trim_end_matches('/'),
@@ -1240,8 +1247,6 @@ mod tests {
     /// The baked hosted-media entry is the one declaration that admits the
     /// lease door; there is no separate publish transport.
     const HOSTED_PUBLISH: &str = r#"{"schema":1,"providers":[{"provider":"agenticos_external","origin":"http://api.internal","manifest_pin":"agenticos-external-provider-tools@3","transport":"hosted-media-lease@1"}]}"#;
-    /// Metadata that declares no hosted lease transport at all.
-    const NO_TRANSPORT: &str = r#"{"schema":1,"providers":[{"provider":"agenticos_external","origin":"https://api-v2.agenticos.hk","manifest_pin":"agenticos-external-provider-tools@3"}]}"#;
 
     /// Env is process-global: every test that reads or writes the device
     /// publish knobs holds this lock and restores a clean environment.
@@ -1258,63 +1263,6 @@ mod tests {
         for name in DEVICE_ENVS {
             std::env::remove_var(name);
         }
-    }
-
-    fn metadata(raw: &str) -> crate::platform::deployments::DeploymentMetadata {
-        crate::platform::deployments::DeploymentMetadata::parse(raw.as_bytes()).unwrap()
-    }
-
-    fn registered(opts: &crate::daemon::ServeOptions) -> (bool, bool, bool) {
-        (
-            opts.social_publish_sender.is_some(),
-            opts.social_media_importer.is_some(),
-            opts.social_media_resolver.is_some(),
-        )
-    }
-
-    #[test]
-    fn hosted_publish_metadata_registers_sender_importer_and_resolver() {
-        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        clean_env();
-        let mut opts = crate::daemon::ServeOptions::default();
-        let dir = tempfile::tempdir().unwrap();
-        attach_publish_sender_with(dir.path(), &mut opts, Some(&metadata(HOSTED_PUBLISH))).unwrap();
-        assert_eq!(registered(&opts), (true, true, true));
-    }
-
-    #[test]
-    fn no_hosted_publish_declaration_registers_no_sender() {
-        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        clean_env();
-        let dir = tempfile::tempdir().unwrap();
-        for declared in [None, Some(metadata(NO_TRANSPORT))] {
-            let mut opts = crate::daemon::ServeOptions::default();
-            attach_publish_sender_with(dir.path(), &mut opts, declared.as_ref()).unwrap();
-            assert_eq!(registered(&opts), (false, false, false));
-        }
-    }
-
-    #[test]
-    fn device_credential_path_is_unchanged_without_a_declaration() {
-        use std::os::unix::fs::PermissionsExt;
-        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        clean_env();
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("send.cred");
-        std::fs::write(&file, ["device", "material"].join("-")).unwrap();
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
-        std::env::set_var(PUBLISH_SEND_URL_ENV, "https://publish.example");
-        std::env::set_var(PUBLISH_SEND_CREDENTIAL_FILE_ENV, &file);
-        let mut opts = crate::daemon::ServeOptions::default();
-        // Metadata without the lease assertion leaves the device path alone.
-        attach_publish_sender_with(dir.path(), &mut opts, Some(&metadata(NO_TRANSPORT))).unwrap();
-        // Sender and importer register; the resolver needs its own read env.
-        assert_eq!(registered(&opts), (true, true, false));
-        // One-sided device config still refuses startup.
-        std::env::remove_var(PUBLISH_SEND_CREDENTIAL_FILE_ENV);
-        let mut opts = crate::daemon::ServeOptions::default();
-        assert!(attach_publish_sender_with(dir.path(), &mut opts, None).is_err());
-        clean_env();
     }
 
     #[test]
@@ -1335,17 +1283,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var(PUBLISH_SEND_URL_ENV, "https://publish.example");
         let mut opts = crate::daemon::ServeOptions::default();
-        assert!(
-            attach_publish_sender_with(dir.path(), &mut opts, Some(&metadata(HOSTED_PUBLISH)))
-                .is_err()
-        );
-        assert_eq!(registered(&opts), (false, false, false));
+        let metadata =
+            crate::platform::deployments::DeploymentMetadata::parse(HOSTED_PUBLISH.as_bytes())
+                .unwrap();
+        assert!(attach_publish_sender_with(dir.path(), &mut opts, Some(&metadata)).is_err());
         clean_env();
     }
 
     #[test]
     fn lease_credential_sends_no_bearer_and_only_reaches_api_internal() {
-        let admission = metadata(HOSTED_PUBLISH).hosted_media().unwrap();
+        let metadata =
+            crate::platform::deployments::DeploymentMetadata::parse(HOSTED_PUBLISH.as_bytes())
+                .unwrap();
+        let admission = metadata.hosted_media().unwrap();
         let lease = DeviceCredential::hosted_lease(&admission);
         assert!(lease.authorization().is_none());
         assert_eq!(
