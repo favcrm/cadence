@@ -280,6 +280,10 @@ impl Fx {
             agent_gc: Some(Default::default()),
             report_router: Some(0),
             checkup: Some(0),
+            // The publish driver ticks at its production 30 s default
+            // otherwise; the millisecond seam keeps due-effect dispatch
+            // prompt without a fixed-duration wait.
+            social_publish_driver_ms: Some(50),
             provider_deployments: Some(DeploymentMetadata::parse(HOSTED.as_bytes()).unwrap()),
             ..Default::default()
         };

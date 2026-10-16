@@ -61,7 +61,9 @@ jobs:
   # key and passes `save-if: false`: a queue ref saved ~1.4 GB per run that no
   # other ref could read, and the repo sat at 12.7 GB against a 10 GB limit.
   # release-artifact and release-build keep their own default-keyed caches
-  # (they run on main pushes and tags only). cross-build has no rust-cache.
+  # (they run on main pushes and tags only). cross-build restores the
+  # per-target cross-* keys its own cache-warm legs write — restore-only
+  # in the gates, like every other shared key.
   # The legacy cache-scope fixture was retired in CAD-1073.
   # CAD-409: with the merge queue (CAD-290), GitHub merges a queue entry by
   # moving main to the exact commit its merge_group run tested, so a push
@@ -275,14 +277,23 @@ jobs:
       - run: cargo clippy --all-targets --locked --features test-seam -- -D warnings
         if: ${{ needs.change-scope.outputs.rust != 'false' }}
 
-  # CAD-1088: one runner for the reduced floor and doctests. The old
-  # echo-only shard and separate doctest startup added dependency wait,
-  # not coverage. Preserve the required `test` name and all real commands.
-  test:
+  # CAD-1480: the suite (~1400 cpu-s) cannot fit the wall-time budget on
+  # one runner, so N shards each run a deterministic nextest
+  # `hash:k/N` partition at the proven `-j 2`. Every shard still runs
+  # scripts/run-result-tests with the same isolation, toolchain and
+  # rust-cache, and uploads its junit plus expected inventory. The
+  # aggregate `test` job below keeps the required check name and re-runs
+  # the full zero-target coverage guard over the merged shard reports —
+  # coverage can never shrink inside a partition.
+  test-shards:
     needs: [queue-evidence, change-scope]
     if: ${{ !cancelled() && needs.queue-evidence.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
     steps:
       - name: Not applicable — rust PR feedback gate
         if: ${{ needs.change-scope.outputs.rust == 'false' }}
@@ -301,7 +312,7 @@ jobs:
       # the test seam on and a 0-test target treated as a failure.
       # CAD-1105: then the lib unit tests, with PATH cut to the toolchain.
       # CAD-1214: then the unit tests inside the binary targets.
-      - name: Run every integration test target, the lib suite and the binary unit tests
+      - name: Run this shard's partition of the integration targets, lib and bins
         if: ${{ needs.change-scope.outputs.rust != 'false' }}
         env:
           CARGO_BUILD_JOBS: 4
@@ -321,7 +332,8 @@ jobs:
           # scope, and only as a re-validated one-identifier-per-line file
           # handed to the same run-result-tests runner — never an ambient
           # env, a shell-joined string, or a PR-provided path. The lib and
-          # bins suites and every zero-target guard are unchanged.
+          # bins suites and every zero-target guard are unchanged. The
+          # partition index comes from the matrix, not the environment.
           selection=
           if [ "${GITHUB_EVENT_NAME:-}" = pull_request ] && [ "$SCOPE" = tests ]; then
             selection="$RUNNER_TEMP/ci-test-selection"
@@ -333,10 +345,74 @@ jobs:
               exit 1
             fi
             echo "Running narrowed integration selection: $(tr '\n' ' ' < "$selection")"
-            scripts/run-result-tests --test-selection "$selection"
+            scripts/run-result-tests --test-selection "$selection" --partition "${{ matrix.shard }}/6" --jobs 4
           else
-            scripts/run-result-tests
+            scripts/run-result-tests --partition "${{ matrix.shard }}/6" --jobs 4
           fi
+      # Artifacts always land (even on a red shard) so the aggregate can
+      # prove where coverage stopped. junit.xml is required; the shard
+      # step already failed when it is missing.
+      - name: Upload shard junit and expected inventory
+        if: always() && needs.change-scope.outputs.rust != 'false'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-shard-${{ matrix.shard }}
+          path: |
+            target/nextest/cadence/junit.xml
+            target/nextest/cadence/expected-targets.txt
+          if-no-files-found: warn
+          retention-days: 1
+
+  # The required `test` check: merges every shard's junit and re-runs
+  # the zero-target coverage guard the single job used to run. A skipped
+  # shard set (docs-only PR scope) still resolves to a green no-op gate;
+  # a red shard or a hole in the merged report fails here.
+  test:
+    needs: [queue-evidence, change-scope, test-shards]
+    if: ${{ always() && needs.queue-evidence.outputs.tested != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Not applicable — rust PR feedback gate
+        if: ${{ needs.change-scope.outputs.rust == 'false' }}
+        run: echo 'rust commands not run for this PR scope; full integration gates still run in the merge queue.' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Require green shards before trusting their reports
+        if: ${{ needs.change-scope.outputs.rust != 'false' }}
+        run: |
+          if [ "${{ needs.test-shards.result }}" != "success" ]; then
+            echo "::error::test-shards finished as '${{ needs.test-shards.result }}'" >&2
+            exit 1
+          fi
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ needs.change-scope.outputs.rust != 'false' }}
+        with:
+          pattern: test-shard-*
+          path: junits
+      - name: Validate merged shard coverage and results
+        if: ${{ needs.change-scope.outputs.rust != 'false' }}
+        run: |
+          set -euo pipefail
+          files=(junits/*/junit.xml)
+          if [ "${#files[@]}" -ne 6 ]; then
+            echo "::error::expected 6 shard junit reports, found ${#files[@]}: ${files[*]:-none}" >&2
+            exit 1
+          fi
+          invs=(junits/*/expected-targets.txt)
+          if [ "${#invs[@]}" -ne 6 ]; then
+            echo "::error::expected 6 shard inventories, found ${#invs[@]}: ${invs[*]:-none}" >&2
+            exit 1
+          fi
+          first=${invs[0]}
+          for f in "${invs[@]}"; do
+            if ! cmp -s "$first" "$f"; then
+              echo "::error::shard inventories disagree: $first vs $f" >&2
+              exit 1
+            fi
+          done
+          package=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["name"])')
+          python3 scripts/check-test-junit.py --package "$package" \
+            --targets-file "$first" "${files[@]}"
 
   build:
     needs: [queue-evidence, change-scope]
@@ -515,6 +591,9 @@ jobs:
       # and no gate reads clippy objects from it.
       # CAD-1103: the gates' linker flag is part of the cargo fingerprint, so
       # the release leg warms the cache with the same flag the gates use.
+      # CAD-1480: NOT the test leg — test-shards link with the default linker
+      # so they keep restoring the existing gate-test cache; flipping the
+      # flag cold-misses every shard until a main push re-warms it.
       - name: Enable fast linker (release leg; same flags as the gates)
         if: matrix.profile == 'release'
         run: sh $GITHUB_WORKSPACE/scripts/ci-fast-linker enable
@@ -563,6 +642,38 @@ jobs:
       - name: sccache statistics
         if: ${{ !cancelled() }}
         run: sh $GITHUB_WORKSPACE/scripts/ci-sccache stats
+
+  # CAD-1480: warms the cross-build gates' per-target caches on merged
+  # code only — the same save-on-main-only rule as cache-warm. One leg
+  # per cross-build matrix row; `cargo test --no-run` covers the binary
+  # and the acceptance's dev-dependency tree in a single compile, and
+  # the gate's later `cargo build` sees a warm target dir either way.
+  cache-warm-cross:
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-linux
+            runner: ubuntu-22.04-arm
+          - target: aarch64-macos
+            runner: macos-14
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: scripts/ci-rust-toolchain --profile minimal
+      - id: cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: cross-${{ matrix.target }}
+          cache-on-failure: true
+      - name: Warm the cross-build test profile
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          CARGO_BUILD_JOBS: 4
+        run: cargo test --no-run --locked --test cad1425_client_update_refusal_acceptance
 
   # CAD-1131: build the release binary once per git TREE. A queue entry's
   # merge_group run builds the shipping binary in parallel with the gates
@@ -1486,14 +1597,23 @@ jobs:
         if: matrix.target == 'aarch64-macos'
         working-directory: ui
       - run: scripts/ci-rust-toolchain --profile minimal
-      - run: cargo build --locked
-      - run: target/debug/cadence --version
+      # CAD-1480: restore-only cache, warmed by cache-warm's cross legs on
+      # main pushes — gate jobs still never save a cache.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: cross-${{ matrix.target }}
+          save-if: false
+      # The acceptance links CARGO_BIN_EXE_cadence, so `cargo test` builds
+      # the binary too; run it first and let `cargo build` verify the
+      # production feature shape afterward.
       # CAD-1425: the client-update refusal acceptance runs on each native
       # leg; the cfg(macos) test is the real Apple Silicon outcome.
       - name: Run the CAD-1425 client update refusal acceptance
         env:
           CARGO_BUILD_JOBS: 4
         run: cargo test --locked --features test-seam --test cad1425_client_update_refusal_acceptance -- --test-threads 2
+      - run: cargo build --locked
+      - run: target/debug/cadence --version
 
   # CAD-109 backstop: gitleaks, an implementation independent of cadence's
   # in-process scanner, runs over the PR's own commits (base..head) with its

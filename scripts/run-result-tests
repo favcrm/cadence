@@ -6,8 +6,9 @@
 #    would otherwise run 0 tests and pass.
 #  - the post-run JUnit guard rejects any selected integration target without
 #    a runnable test, an empty lib suite, or a bins selection with no tests.
-#  - the pinned cadence nextest profile disables fail-fast and retries; -j 2
-#    parallelizes across targets with bounded concurrency.
+#  - the pinned cadence nextest profile disables fail-fast and retries;
+#    -j runs with bounded concurrency — 2 by default, --jobs N for the
+#    dedicated CI shard runners.
 #  - HOME/XDG/TMPDIR are private; toolchain homes pass through.
 #  - CAD-1197: every CADENCE_* variable is dropped before cargo runs, except
 #    CADENCE_SUITE_LOCK. A pane's CADENCE_PM_DIR/CADENCE_STATE_DIR once made
@@ -28,6 +29,13 @@
 #    flag is honored only when GITHUB_EVENT_NAME is exactly pull_request;
 #    any other event, a missing/empty file, an unknown or duplicate
 #    identifier refuses the run rather than narrowing or silently passing.
+#  - --partition K/N: splits the whole selected suite with nextest's
+#    deterministic hash partition (`--partition hash:K/N`) for the CI
+#    shard matrix. The format is validated locally (K,N positive ints,
+#    K <= N) before it ever reaches nextest. A partitioned run writes the
+#    same junit plus expected-targets.txt but skips the zero-target
+#    coverage guard — the CI aggregate re-runs that check over the
+#    merged shard reports, so coverage can never shrink between shards.
 set -euo pipefail
 caller_cwd=$PWD
 real_home=${HOME:-}
@@ -35,24 +43,56 @@ lane_build_slot=${CADENCE_BUILD_SLOT:-}
 original_xdg_data=${XDG_DATA_HOME:-$real_home/.local/share}
 manifest_path=
 selection_file=
+partition=
+jobs=2
 runner_args=("$@")
+partition_seen=0
+jobs_seen=0
 while [ "$#" -gt 0 ]; do
   case $1 in
-    --manifest-path|--test-selection)
+    --manifest-path|--test-selection|--partition|--jobs)
       if [ "$#" -lt 2 ]; then
-        echo "usage: $0 [--manifest-path CARGO_TOML] [--test-selection FILE]" >&2
+        echo "usage: $0 [--manifest-path CARGO_TOML] [--test-selection FILE] [--partition K/N] [--jobs N]" >&2
         exit 2
       fi
       case $1 in
         --manifest-path) manifest_path=$2 ;;
         --test-selection) selection_file=$2 ;;
+        --partition)
+          # repeat or empty flag is never a silent no-op
+          [ "$partition_seen" -eq 0 ] || { echo "::error::--partition given twice" >&2; exit 2; }
+          partition_seen=1; partition=$2 ;;
+        --jobs)
+          [ "$jobs_seen" -eq 0 ] || { echo "::error::--jobs given twice" >&2; exit 2; }
+          jobs_seen=1; jobs=$2 ;;
       esac
       shift 2 ;;
     *)
-      echo "usage: $0 [--manifest-path CARGO_TOML] [--test-selection FILE]" >&2
+      echo "usage: $0 [--manifest-path CARGO_TOML] [--test-selection FILE] [--partition K/N] [--jobs N]" >&2
       exit 2 ;;
   esac
 done
+if [ "$partition_seen" -eq 1 ]; then
+  # CAD-1480: CI shards split the whole selected suite with nextest's
+  # deterministic test-name hash partition. Only the strict K/N shape
+  # reaches nextest — never a raw caller string — the shard index must
+  # stay inside 1..N, and the length cap keeps oversized decimals out of
+  # arithmetic (bash -gt would misread or overflow them).
+  if ! [[ $partition =~ ^([0-9]{1,3})/([0-9]{1,3})$ ]]; then
+    echo "::error::--partition wants K/N (e.g. 2/6), got: $partition" >&2
+    exit 2
+  fi
+  part_k=$((10#${BASH_REMATCH[1]}))
+  part_n=$((10#${BASH_REMATCH[2]}))
+  if [ "$part_n" -lt 1 ] || [ "$part_k" -lt 1 ] || [ "$part_k" -gt "$part_n" ]; then
+    echo "::error::--partition $partition is outside 1..N" >&2
+    exit 2
+  fi
+fi
+if ! [[ $jobs =~ ^[0-9]{1,2}$ ]] || [ "$((10#$jobs))" -lt 1 ] || [ "$((10#$jobs))" -gt 16 ]; then
+  echo "::error::--jobs wants an integer in 1..16, got: $jobs" >&2
+  exit 2
+fi
 if [ -n "$manifest_path" ]; then
   case $manifest_path in
     /*) ;;
@@ -336,21 +376,35 @@ PY
 )
 workspace_dir=$(dirname "$manifest_for_coverage")
 junit_report=$workspace_dir/target/nextest/cadence/junit.xml
+# The expected integration inventory travels next to the junit so a
+# sharded CI run can hand both to the aggregate coverage check — the
+# aggregate never re-derives it.
+targets_report=$workspace_dir/target/nextest/cadence/expected-targets.txt
+mkdir -p "$(dirname "$junit_report")"
 rm -f "$junit_report"
+printf '%s\n' "${integration_targets[@]}" > "$targets_report"
 
 # One pinned nextest invocation replaces 56 serial cargo test invocations.
 # Its JUnit report is checked against the exact target list afterward so a
 # missing or zero-test target cannot silently shrink the required CI scope.
-# cargo-nextest honors CARGO for its Cargo subprocess while preserving PATH for
-# test processes. Under an admitted lane run this selects the compiler symlink
-# directly; tests retain the lane shim first on PATH but receive no slot identity.
+# A --partition run checks only that its own junit is well-formed; the CI
+# aggregate job re-runs the same full-coverage check over every shard's
+# merged report. cargo-nextest honors CARGO for its Cargo subprocess while
+# preserving PATH for test processes. Under an admitted lane run this
+# selects the compiler symlink directly; tests retain the lane shim first
+# on PATH but receive no slot identity.
+partition_args=()
+if [ -n "$partition" ]; then
+  partition_args=(--partition "hash:$part_k/$part_n")
+fi
 cargo_env=("PATH=$lib_path" "CADENCE_SUITE_LOCK_WAIT_SECS=$SUITE_LOCK_WAIT_SECS")
 if [ "$slot_admitted" -eq 1 ]; then
   cargo_env+=("CARGO=$compiler_dir/cargo")
 fi
 if ! env "${cargo_env[@]}" "$root/scripts/cadence-nextest" --locked --features test-seam \
     "${target_args[@]}" --lib --bins "${manifest_args[@]}" \
-    -j 2 2>&1 | tee "$scratch/nextest.log"; then
+    "${partition_args[@]}" \
+    -j "$jobs" 2>&1 | tee "$scratch/nextest.log"; then
   status=1
   printf '::error::integration target selection or test run failed: %s\n' \
     "${integration_targets[*]}" >&2
@@ -359,43 +413,14 @@ fi
 if [ ! -f "$junit_report" ]; then
   echo "::error::nextest did not produce its required JUnit report: $junit_report" >&2
   status=1
+elif [ -n "$partition" ]; then
+  if ! python3 "$root/scripts/check-test-junit.py" --package "$package_name" \
+      "$junit_report"; then
+    status=1
+  fi
 else
-  if ! python3 - "$junit_report" "$package_name" "${integration_targets[@]}" <<'PY'
-import sys
-import xml.etree.ElementTree as ET
-
-path, package, *expected = sys.argv[1:]
-try:
-    report = ET.parse(path).getroot()
-except (OSError, ET.ParseError) as error:
-    print(f"::error::could not read nextest JUnit report: {error}", file=sys.stderr)
-    raise SystemExit(1)
-
-suites = report.findall(".//testsuite")
-def has_runnable(suite):
-    return any(case.find("skipped") is None for case in suite.findall("testcase"))
-
-failed = False
-for target in expected:
-    name = f"{package}::{target}"
-    matches = [suite for suite in suites if suite.get("name") == name]
-    if not matches or not any(has_runnable(suite) for suite in matches):
-        print(f"::error::integration target {target} has no runnable tests", file=sys.stderr)
-        failed = True
-if not any(suite.get("name") == package and has_runnable(suite) for suite in suites):
-    print("::error::lib selection has no runnable tests", file=sys.stderr)
-    failed = True
-if not any(
-    suite.get("name", "").startswith(f"{package}::bin/") and has_runnable(suite)
-    for suite in suites
-):
-    print("::error::bins selection has no runnable tests", file=sys.stderr)
-    failed = True
-if failed:
-    raise SystemExit(1)
-print(f"validated {len(expected)} integration targets and runnable lib/bin suites")
-PY
-  then
+  if ! python3 "$root/scripts/check-test-junit.py" --package "$package_name" \
+      --targets-file "$targets_report" "$junit_report"; then
     status=1
   fi
 fi

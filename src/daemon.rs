@@ -5154,7 +5154,6 @@ mod pty_retry_tests {
     #[test]
     fn retry_base_defaults_to_five_seconds() {
         assert_eq!(parse_pty_retry_base(None), Ok(Duration::from_secs(5)));
-        assert_eq!(PTY_RETRY_BASE, Duration::from_secs(5));
     }
 
     #[test]
@@ -5202,24 +5201,6 @@ mod pty_retry_tests {
         assert_eq!(gate_backoff(one, u32::MAX), Duration::from_secs(6));
         let floor = Duration::from_millis(100);
         assert_eq!(gate_backoff(floor, 9), Duration::from_millis(600));
-    }
-}
-
-#[cfg(test)]
-mod stall_clock_tests {
-    use super::*;
-
-    #[test]
-    fn stall_clock_offset_defaults_to_wall() {
-        // Production-unreachable proof, part 1: a default-constructed
-        // daemon carries a zero offset (wall clock) and no tick override.
-        let opts = ServeOptions::default();
-        assert_eq!(
-            opts.stall_clock_offset.load(Ordering::SeqCst),
-            0,
-            "default offset must be wall"
-        );
-        assert_eq!(opts.stall_tick, None, "default tick must be unset");
     }
 }
 

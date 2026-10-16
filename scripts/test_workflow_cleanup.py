@@ -112,7 +112,7 @@ class CleanupTests(unittest.TestCase):
     def test_required_gates_still_have_real_checks_and_scope_wiring(self):
         ci = workflow("ci.yml")
         self.assertIn("  merge_group:", ci)
-        for name in ("fmt", "clippy", "test", "build", "ui"):
+        for name in ("fmt", "clippy", "test-shards", "build", "ui"):
             body = job(ci, name)
             self.assertIn("change-scope", body)
             self.assertIn("needs.queue-evidence.outputs.tested", body)
@@ -122,7 +122,22 @@ class CleanupTests(unittest.TestCase):
             for step in commands:
                 category = "ui" if name == "ui" else "rust"
                 self.assertIn(f"needs.change-scope.outputs.{category} != 'false'", step)
-        test = job(ci, "test")
+        # CAD-1480: the required `test` check is the shard aggregate — it
+        # runs on every shard outcome (never silently skipped), requires
+        # green shards, then re-runs the full zero-target coverage guard
+        # over the merged junit reports.
+        agg = job(ci, "test")
+        self.assertIn("needs: [queue-evidence, change-scope, test-shards]", agg)
+        self.assertIn("always()", agg)
+        self.assertIn("needs.test-shards.result", agg)
+        self.assertIn("download-artifact", agg)
+        self.assertIn("check-test-junit.py", agg)
+        self.assertIn("--targets-file", agg)
+        # CAD-1480: a shard that skips its junit OR its inventory fails
+        # here — both artifact counts are pinned to the matrix size.
+        self.assertIn("expected 6 shard junit", agg)
+        self.assertIn("expected 6 shard inventories", agg)
+        shards = job(ci, "test-shards")
         # CAD-1124: retiring the empty doctest invocation must retain BOTH
         # default-feature compilation gates, not just feature-on tests.
         rust_scope = "        if: ${{ needs.change-scope.outputs.rust != 'false' }}"
@@ -156,18 +171,40 @@ class CleanupTests(unittest.TestCase):
                     r"            exit 1\n"
                     r"          fi$")
         # CAD-1090: every tests/*.rs target, via the shared selection script.
-        self.assertIn("scripts/run-result-tests", test)
+        self.assertIn("scripts/run-result-tests", shards)
+        self.assertIn("--partition", shards)
         runner = (ROOT / "scripts/run-result-tests").read_text()
         self.assertIn("scripts/result-test-args", runner)
         # CAD-1334: one pinned nextest invocation keeps every selected
-        # integration target plus lib and bins, with bounded concurrency and
-        # a result-level guard against empty suites.
+        # integration target plus lib and bins, with bounded concurrency;
+        # the coverage guard lives in scripts/check-test-junit.py so the
+        # CI aggregate can re-run it over merged shard reports.
         for needle in ('scripts/cadence-nextest" --locked --features test-seam',
-                       '"${target_args[@]}" --lib --bins', '-j 2',
-                       'no runnable tests', 'junit_report=', 'HOME=',
+                       '"${target_args[@]}" --lib --bins', '-j "$jobs"',
+                       'check-test-junit.py', 'expected-targets.txt',
+                       '--partition "hash:', 'junit_report=', 'HOME=',
                        'XDG_CONFIG_HOME=', 'CARGO_BUILD_TARGET_DIR',
                        'unset CARGO_TARGET_DIR'):
             self.assertIn(needle, runner)
+        # CAD-1480: shard partitions are hash-strict — an empty, repeated
+        # or oversized argument must refuse before touching nextest.
+        for needle in ('partition_seen', 'jobs_seen',
+                       '--partition given twice', '--jobs given twice',
+                       '[0-9]{1,3})/([0-9]{1,3}', '10#${BASH_REMATCH[1]}',
+                       '[0-9]{1,2}$', '10#$jobs'):
+            self.assertIn(needle, runner)
+        # CAD-1480: shards deliberately do NOT enable the fast linker —
+        # -fuse-ld is part of the cargo fingerprint and flipping it would
+        # cold-miss every shard on the existing gate-test cache.
+        self.assertNotIn("ci-fast-linker", shards)
+        warm = job(ci, "cache-warm")
+        # the warm linker leg is release-only; test-leg fingerprints stay default
+        self.assertIn("Enable fast linker (release leg; same flags as the gates)", warm)
+        self.assertNotIn("test and release legs", warm)
+        junit = (ROOT / "scripts/check-test-junit.py").read_text()
+        for needle in ('no runnable tests', 'findall(".//testsuite")',
+                       'failure', '--targets-file', 'skipped'):
+            self.assertIn(needle, junit)
         selected = subprocess.run([str(ROOT / "scripts/result-test-args")],
                                   capture_output=True, text=True, check=True).stdout.split()
         self.assertIn("safety_floor", selected)

@@ -12,6 +12,14 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 filter = 'binary(cad1331_locale_member_refusal)'
 threads-required = 'num-test-threads'
 
+# CAD-1480: cad1374's explorer fixture has the same probe-then-bind port
+# race — it flaked once on a `-j 4` shard (AddrInUse). Reserving the pool
+# closes the window without lowering shard parallelism for the rest of
+# the suite.
+[[profile.cadence.overrides]]
+filter = 'binary(cad1374_explorer_attribution_acceptance)'
+threads-required = 'num-test-threads'
+
 [profile.cadence.junit]
 path = "junit.xml"
 report-skipped = "all"
