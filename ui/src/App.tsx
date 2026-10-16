@@ -878,6 +878,9 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
           <Home
             readOnly={readOnly}
             hosted={meta ? meta.hosted === true || meta.session?.origin === "public" : null}
+            viewerSub={meta?.session?.user?.sub ?? null}
+            viewerIsMember={meta?.session?.user?.role === "member"}
+            sessionId={meta?.session?.id ?? null}
             overview={overviewState}
             onOpenIssue={openIssue}
             overviewHref={hrefFor({ screen: "overview" })}

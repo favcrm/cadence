@@ -20,7 +20,7 @@ use super::write_path::{
 use super::{
     app_assistant, app_audiences, app_chat, app_content, app_contexts, app_explorer, app_records,
     app_release, app_runs, app_screens, approvals, apps, assist_route, business_templates,
-    cli_route, connections, crm_send, delivery_sync, home, lane, locale, operator,
+    cli_route, connections, crm_send, delivery_sync, home, lane, locale, member_assist, operator,
     platform_account, read_model, social_publish, stages, threads, topics, updates, wiki,
     wiki_envelope, work_conversations, workflows,
 };
@@ -1060,6 +1060,18 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
         // check. A browser session never satisfies it.
         if let Some(tail) = path.strip_prefix("/api/internal/notifications/") {
             let resp = notify_service::post(&mut request, &method, tail, state_dir, opts);
+            send(request, resp);
+            return;
+        }
+        // CAD-1485: `/api/member-assistant/<verb>` — the member's own
+        // browser chat. Cookie-facing twin of `/api/assist`: the public
+        // session cookie is the credential, and the route mints a fresh
+        // assistant envelope server-side (the AOS `board-authorize`
+        // issuer) before running the same member dispatch. Diverted ahead
+        // of the cookie gates alongside the assist family; the route's
+        // own write_guard + verified-session check run inside.
+        if let Some(tail) = path.strip_prefix("/api/member-assistant/") {
+            let resp = member_assist::post(&mut request, &method, tail, state_dir, pm_dir, opts);
             send(request, resp);
             return;
         }

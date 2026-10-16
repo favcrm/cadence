@@ -116,6 +116,47 @@ export interface ThreadPage {
   more_before?: boolean;
 }
 
+/** CAD-1485: `POST /api/member-assistant/state` — the member's assistant
+ *  binding (daemon-owned `to_json`) plus the bound conversation id. */
+export interface MemberAssistState {
+  assistant: {
+    org: string;
+    sub: string;
+    assistant_id: string;
+    alias: string;
+    conversation_id: string | null;
+    state: string;
+    bootstrap_state?: string | null;
+    authority_rev?: number;
+    created?: number;
+    updated?: number;
+  };
+  conversation_id: string | null;
+}
+
+/** `POST /api/member-assistant/history` — the member's bound conversation
+ *  page. `entries` carry the stored `role`/`kind`/`seq`; `cursor` is the
+ *  forward resume watermark. A member names no thread — the binding's
+ *  own conversation is always the read. */
+export interface MemberAssistHistory {
+  conversation: { id: string; alias: string; created?: string; updated?: string } | null;
+  entries: unknown[];
+  cursor?: number;
+  more_before?: boolean;
+}
+
+/** `POST /api/member-assistant/send` receipt: the accepted message id and
+ *  queue state. `queued`/`attention` tell the truth when the assistant's
+ *  endpoint could not start — the row stays queued, never a fabricated
+ *  reply. */
+export interface MemberAssistSend {
+  message: string;
+  state: string;
+  duplicate?: boolean;
+  queued?: boolean;
+  attention?: string;
+}
+
 export { ApiError } from "./apiError";
 
 const conditional = new ConditionalGet(
@@ -576,6 +617,26 @@ export const api = {
       xhr.send(form);
     }), signal);
   },
+  /** CAD-1485: `POST /api/member-assistant/state` — the signed-in member's
+   *  own assistant surface state (binding + bound conversation id). The
+   *  public session cookie is the only credential; the board mints the
+   *  assistant envelope server-side. Body is `{}`. */
+  memberAssistState: () =>
+    post<MemberAssistState>(`/api/member-assistant/state`, {}),
+  /** `POST /api/member-assistant/history` — a page of the member's bound
+   *  conversation. `after`/`before`/`tail`/`limit` match the daemon's own
+   *  fields; a member never names a thread (the binding owns it). */
+  memberAssistHistory: (page: {
+    after?: number;
+    before?: number;
+    tail?: boolean;
+    limit?: number;
+  }) => post<MemberAssistHistory>(`/api/member-assistant/history`, { ...page }),
+  /** `POST /api/member-assistant/send` — send `text` to the member's own
+   *  assistant. `message` is the client-chosen idempotent id a retry
+   *  reuses (one message, not two). */
+  memberAssistSend: (text: string, message: string) =>
+    post<MemberAssistSend>(`/api/member-assistant/send`, { text, message }),
   /** `GET /api/app-installations/<id>/chat-descriptor` (CAD-1110): the installed
    *  package's `app-chat.json`, pinned to the digest its install consented to. A
    *  404 means no descriptor (plain shared chat). */
