@@ -91,9 +91,9 @@ or unknown key is refused), is operator-only like install, and relays
 changed after the check is refused and the review asks for a fresh check.
 
 CAD-1422: the host's embedded built-in catalog is retired — `POST
-/api/app-catalog/install` and `builtin:<id>` sources refuse, and catalog
-discovery/marketplace installs moved to the AgenticOS Apps page
-(`https://app-v2.agenticos.hk/apps`). `GET /api/app-catalog*` still
+/api/app-catalog/install` and `builtin:<id>` sources refuse. Published apps
+are listed on the board at `/apps/explore` and `/apps/catalog/<id>`. Install
+stays operator-only and digest-pinned. `GET /api/app-catalog*` still
 answers for the catalog ids a historical `Source::Builtin` install or an
 open install request names — a tombstone row with the retired reason and
 the install's real state — and refuses anything else.
