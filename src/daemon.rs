@@ -82,6 +82,10 @@ mod cad1365_run_creator_acceptance;
 mod cad1415_app_actions_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1440_media_only_context_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad1473_host_redispatch;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad1473_independent_redispatch;
 mod caller_rule;
 #[cfg(all(test, feature = "test-seam"))]
 mod campaign_clone_acceptance;
@@ -664,6 +668,9 @@ pub struct Shared {
     /// Serializes an app's checked execution claim through bounded Local
     /// commit/readback against binding/context/custody mutations.
     app_release_lock: Mutex<()>,
+    /// Process-local host dispatch ownership. Durable capability claims still
+    /// decide recovery after restart; this set only suppresses live re-entry.
+    host_runs_in_flight: Mutex<HashSet<String>>,
     /// Serializes local CRM assistant permission checks and their bounded
     /// mutation/receipt writes. Never spans a network operation.
     app_assistant_lock: Mutex<()>,
@@ -990,6 +997,7 @@ impl Shared {
             screen_mint_rate: Mutex::new(HashMap::new()),
             tool_contexts: Mutex::new(HashMap::new()),
             app_release_lock: Mutex::new(()),
+            host_runs_in_flight: Mutex::new(HashSet::new()),
             app_assistant_lock: Mutex::new(()),
             member_job_lock: Mutex::new(()),
             app_release_claim_gate: opts.app_release_claim_gate.clone(),
