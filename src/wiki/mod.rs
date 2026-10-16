@@ -264,8 +264,7 @@ pub fn allowed(caller: &Caller, op: Op, segs: &[&str]) -> Result<()> {
 /// a `%2F` here is a literal name, never a decoded slash), segments
 /// starting `.` (which bars `.trash`, `.blobs`, `.git`, and dotfiles),
 /// `.blob` suffixes (managed pointer files), and over-long/over-deep
-/// paths. One trailing slash is the directory the board prints
-/// (`global/`) and is the same path without it. `//` still refuses.
+/// paths.
 pub fn normalize(path: &str) -> Result<String> {
     let bad = |why: &str| -> Result<String> {
         Err(Error::rejected(format!(
@@ -285,10 +284,6 @@ pub fn normalize(path: &str) -> Result<String> {
     if path.is_empty() {
         return Ok(String::new());
     }
-    // The board labels a folder `global/`. That is the directory, not
-    // an empty segment. Strip one trailing slash; `a//b` and `a/b//`
-    // still fail the empty-segment check below.
-    let path = path.strip_suffix('/').unwrap_or(&path);
     let mut segs = Vec::new();
     for seg in path.split('/') {
         if seg.is_empty() {
@@ -318,6 +313,18 @@ pub fn normalize(path: &str) -> Result<String> {
         return bad("path is too deep");
     }
     Ok(segs.join("/"))
+}
+
+/// A directory address as the board prints it (`global/`). One trailing
+/// slash names that directory. File writes and uploads stay on
+/// [`normalize`], so `a/b/` is still refused there. `//` still refuses.
+pub fn normalize_dir(path: &str) -> Result<String> {
+    let trimmed = if !path.starts_with('/') && path.len() > 1 && path.ends_with('/') {
+        &path[..path.len() - 1]
+    } else {
+        path
+    };
+    normalize(trimmed)
 }
 
 /// The vault this tracker serves — [`crate::home::vault_for`]:
@@ -589,7 +596,7 @@ fn blob_meta(pointer: &Path) -> Result<Value> {
 /// caller-visible names: blob pointer files appear once, under the
 /// logical name.
 pub fn ls(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
-    let norm = normalize(path)?;
+    let norm = normalize_dir(path)?;
     let segs: Vec<&str> = if norm.is_empty() {
         Vec::new()
     } else {
@@ -2520,6 +2527,7 @@ mod tests {
             "/abs",
             "/a/b",
             "a//b",
+            "a/b/",
             "a/b//",
             "global//",
             "a\\b",
@@ -2547,9 +2555,6 @@ mod tests {
         for (raw, want) in [
             ("", ""),
             ("global/notes.md", "global/notes.md"),
-            ("global/", "global"),
-            ("a/b/", "a/b"),
-            ("projects/cadence/", "projects/cadence"),
             ("projects/cadence/spec v2.md", "projects/cadence/spec v2.md"),
             (
                 "agents/swe-1/knowledge/日本語.md",
@@ -2569,6 +2574,18 @@ mod tests {
     /// A path under a missing folder is still missing.
     #[test]
     fn advertised_roots_list_empty_with_or_without_a_trailing_slash() {
+        assert!(
+            normalize("global/").is_err(),
+            "a file path keeps the trailing-slash refusal"
+        );
+        assert_eq!(normalize_dir("global/").unwrap(), "global");
+        assert_eq!(
+            normalize_dir("projects/cadence/").unwrap(),
+            "projects/cadence"
+        );
+        assert!(normalize_dir("a//b").is_err());
+        assert!(normalize_dir("a/b//").is_err());
+
         let root = tempfile::TempDir::new().unwrap();
         let pm = cad911_pm(root.path());
         let vault = vault_dir(&pm).unwrap();
