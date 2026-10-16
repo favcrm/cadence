@@ -566,7 +566,7 @@ impl Shared {
             caller,
             human.as_ref(),
             "wiki_transferred",
-            &[&path],
+            &[(path.as_str(), wiki::Op::Write)],
         )?;
         wiki::transfer::apply(
             &self.store,
