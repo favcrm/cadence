@@ -20,11 +20,17 @@ your pane environment has `CADENCE_ALIAS` and `CADENCE_STATE_DIR` set.
 - Fleet: `status`, `doctor`
 - Knowledge: `memory`, `wiki`
 
+Find a command without loading the tree: `cadence commands "comment issue"`
+returns JSON, at most five public paths. `cadence commands` lists the core
+verbs. `cadence schema issue comment` is that one command's flags and
+positionals, including how a body is passed on stdin (`--file -`).
+`cadence schema agent wait` is how to wait instead of polling. Search
+describes a command; it does not authorize it. Listers answer to both
+`ls` and `list`; `send` takes the recipient positionally or as `--to <alias>`.
+
 Everything else stays callable: `cadence help operator` lists the operator
 and advanced verbs, `cadence help all` lists every verb with its
-subcommands, and `cadence help <verb>` is one verb's own help. Listers
-answer to both `ls` and `list`; `send` takes the recipient positionally or
-as `--to <alias>`.
+subcommands, and `cadence help <verb>` is one verb's own help.
 
 `issue` is the one public unit of work. A plan is an epic in the
 `proposed` stage; the operator approves it before its tickets dispatch.

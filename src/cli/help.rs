@@ -103,6 +103,7 @@ const ADVANCED: &[&str] = &[
     "auth",
     "claude",
     "codex",
+    "commands",
     "cursor",
     "delivery",
     "devin",
@@ -121,6 +122,7 @@ const ADVANCED: &[&str] = &[
     "remote",
     "report",
     "resume",
+    "schema",
     "setup",
     "skill",
     "stop",
@@ -152,6 +154,20 @@ fn is_core(name: &str) -> bool {
     CORE.iter().any(|(_, v)| v.iter().any(|(n, _)| *n == name))
 }
 
+/// The core root verb's existing one-line summary, when `name` is core.
+pub(super) fn core_blurb(name: &str) -> Option<&'static str> {
+    CORE.iter()
+        .flat_map(|(_, verbs)| verbs.iter())
+        .find(|(n, _)| *n == name)
+        .map(|(_, blurb)| *blurb)
+}
+
+/// Core root command names in help order.
+pub(super) fn core_names() -> impl Iterator<Item = &'static str> {
+    CORE.iter()
+        .flat_map(|(_, verbs)| verbs.iter().map(|(n, _)| *n))
+}
+
 /// True inside a cadence-owned pane. Presentation only.
 pub(super) fn in_pane() -> bool {
     std::env::var_os("CADENCE_ALIAS").is_some_and(|v| !v.is_empty())
@@ -167,6 +183,8 @@ pub(super) fn root_help_text() -> String {
         }
         out.push('\n');
     }
+    out.push_str("Find a command: cadence commands <query>\n");
+    out.push_str("Inspect one path: cadence schema <command-path>\n");
     out.push_str("Details for one verb: cadence help <verb>");
     out
 }
