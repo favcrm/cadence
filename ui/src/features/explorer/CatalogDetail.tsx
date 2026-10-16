@@ -10,26 +10,21 @@ import { appErrorCopy, appLoadErrorCopy } from "./appErrors";
 import { Loading, Notice } from "../app-shell/shared/States";
 import { useTranslate } from "../../lib/locale";
 import "./explorer.css";
-
-/** The marketplace hand-off the retired page points at (CAD-1422). */
-const MARKETPLACE_URL = "https://app-v2.agenticos.hk/apps";
+import { PublicAppDetail } from "./publicDirectory";
 
 /**
- * One catalog app's detail (CAD-1129, `/apps/catalog/<id>`). The
- * built-in catalog is retired (CAD-1422): the daemon now answers a
- * tombstone (`retired`, `retired_reason`) for the catalog ids a
- * historical install or an open request still names, so this page shows
- * the retired reason and the install's real state — Open or Restore —
- * and hands fresh installs to the AgenticOS marketplace. It never shows
- * the old store page or an Install action for a retired source.
+ * One catalog app (`/apps/catalog/<id>`). A published public app renders
+ * here. A retired built-in id still shows its tombstone and real install
+ * state, with no marketplace hand-off and no Install for that source.
  */
 export default function CatalogDetail({ id, viewer }: { id: string; viewer: Viewer }) {
   const t = useTranslate();
+  const isOp = viewer.operator === true && !viewer.readOnly;
   const [card, setCard] = useState<CatalogCard | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
-  const isOp = viewer.operator === true && !viewer.readOnly;
+  const [publicHit, setPublicHit] = useState<"pending" | "yes" | "no">("pending");
   // CAD-1438: Open spells the canonical `/apps/<key>` route — for the
   // operator resolved against the verified install list, for a member
   // the key route itself proves the mapping before rendering anything.
@@ -39,6 +34,7 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
   const retired = card?.retired === true;
 
   useEffect(() => {
+    setPublicHit("pending");
     if (viewer.operator === null) return;
     const controller = new AbortController();
     setError(null);
@@ -56,6 +52,14 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
       .catch((e: unknown) => setNotice(appErrorCopy(e, "Restore didn't finish. Try again in a moment.")))
       .finally(() => setBusy(false));
   };
+
+  if (publicHit !== "no") {
+    return (
+      <main className="apps-detail px-4 lg:px-8 pt-4 pb-9 min-w-0" aria-label={t("app catalog detail")}>
+        <PublicAppDetail id={id} viewer={viewer} onResolved={(found) => setPublicHit(found ? "yes" : "no")} />
+      </main>
+    );
+  }
 
   if (viewer.operator === null) {
     return <main className="apps-detail px-4 lg:px-8 pt-4 pb-9" aria-label={t("app catalog detail")}>
@@ -222,16 +226,9 @@ export default function CatalogDetail({ id, viewer }: { id: string; viewer: View
               <span className="text-micro text-ink-500">{isOp ? "The restore window has closed." : "This app was removed. Ask an admin."}</span>
             )
           ) : retired ? (
-            <>
-              <a className="btn btn-primary btn-lg" href={MARKETPLACE_URL} target="_blank" rel="noopener noreferrer">
-                {t("Find it in the AgenticOS marketplace")}
-              </a>
-              <span className="text-micro text-ink-500">
-                {isOp
-                  ? t("The built-in source is retired — install the current release from the marketplace or a trusted Git checkout.")
-                  : t("The built-in source is retired — ask an admin about the current release.")}
-              </span>
-            </>
+            <span className="text-micro text-ink-500">
+              {t("The built-in source is retired. A current release appears in the public directory when it is published.")}
+            </span>
           ) : card.requested_by_me || card.state === "requested" ? (
             <>
               <Button className="btn-lg" disabled>Asked</Button>
