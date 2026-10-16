@@ -315,6 +315,18 @@ pub fn normalize(path: &str) -> Result<String> {
     Ok(segs.join("/"))
 }
 
+/// A directory address as the board prints it (`global/`). One trailing
+/// slash names that directory. File writes and uploads stay on
+/// [`normalize`], so `a/b/` is still refused there. `//` still refuses.
+pub fn normalize_dir(path: &str) -> Result<String> {
+    let trimmed = if !path.starts_with('/') && path.len() > 1 && path.ends_with('/') {
+        &path[..path.len() - 1]
+    } else {
+        path
+    };
+    normalize(trimmed)
+}
+
 /// The vault this tracker serves — [`crate::home::vault_for`]:
 /// `<home>/vault` under `CADENCE_HOME`, the served tracker's `wiki/`
 /// under the legacy layout (the daemon's tracker is instance-bound,
@@ -584,7 +596,7 @@ fn blob_meta(pointer: &Path) -> Result<Value> {
 /// caller-visible names: blob pointer files appear once, under the
 /// logical name.
 pub fn ls(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
-    let norm = normalize(path)?;
+    let norm = normalize_dir(path)?;
     let segs: Vec<&str> = if norm.is_empty() {
         Vec::new()
     } else {
@@ -782,9 +794,19 @@ pub fn ls(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
         Ok(_) => Err(Error::rejected(format!(
             "wiki ls '{norm}' refused: not a directory"
         ))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Error::rejected(format!(
-            "wiki ls '{norm}': no such directory"
-        ))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // The root always advertises these folders, and `users/`
+            // already lists as empty when the directory has not been
+            // created. `global/` and `projects/` must do the same, or
+            // an assistant copies the root listing, gets a tool error,
+            // and cannot tell "nothing filed here" from a broken wiki.
+            if matches!(segs[..], ["global"] | ["projects"]) {
+                return Ok(json!({"path": norm, "entries": []}));
+            }
+            Err(Error::rejected(format!(
+                "wiki ls '{norm}': no such directory"
+            )))
+        }
         Err(e) => Err(e.into()),
     }
 }
@@ -2506,6 +2528,8 @@ mod tests {
             "/a/b",
             "a//b",
             "a/b/",
+            "a/b//",
+            "global//",
             "a\\b",
             "a\0b",
             "a%2Fb",
@@ -2542,6 +2566,68 @@ mod tests {
         // NFC: the NFD form of é normalizes to the NFC byte string.
         let nfd = "projects/p/cafe\u{301}.md";
         assert_eq!(normalize(nfd).unwrap(), "projects/p/caf\u{e9}.md");
+    }
+
+    /// The root listing promises `global` and `projects` even before
+    /// anyone has created them, and the board prints those folders with
+    /// a trailing slash. Listing either form is an empty directory.
+    /// A path under a missing folder is still missing.
+    #[test]
+    fn advertised_roots_list_empty_with_or_without_a_trailing_slash() {
+        assert!(
+            normalize("global/").is_err(),
+            "a file path keeps the trailing-slash refusal"
+        );
+        assert_eq!(normalize_dir("global/").unwrap(), "global");
+        assert_eq!(
+            normalize_dir("projects/cadence/").unwrap(),
+            "projects/cadence"
+        );
+        assert!(normalize_dir("a//b").is_err());
+        assert!(normalize_dir("a/b//").is_err());
+
+        let root = tempfile::TempDir::new().unwrap();
+        let pm = cad911_pm(root.path());
+        let vault = vault_dir(&pm).unwrap();
+        let _ = std::fs::remove_dir_all(vault.join("global"));
+        let _ = std::fs::remove_dir_all(vault.join("projects"));
+
+        let root_names: Vec<_> = ls(&pm, &Caller::Operator, "").unwrap()["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(root_names.iter().any(|n| n == "global"), "{root_names:?}");
+        assert!(root_names.iter().any(|n| n == "projects"), "{root_names:?}");
+
+        for path in ["global", "global/", "projects", "projects/"] {
+            let got = ls(&pm, &Caller::Operator, path).unwrap_or_else(|e| panic!("{path}: {e}"));
+            assert_eq!(got["path"], path.trim_end_matches('/'), "{path}: {got}");
+            assert!(
+                got["entries"].as_array().unwrap().is_empty(),
+                "{path}: {got}"
+            );
+        }
+        let missing = ls(&pm, &Caller::Operator, "global/missing").unwrap_err();
+        assert!(
+            missing.to_string().contains("no such directory"),
+            "{missing}"
+        );
+
+        std::fs::create_dir_all(vault.join("global")).unwrap();
+        std::fs::write(vault.join("global/notes.md"), b"hello\n").unwrap();
+        for path in ["global", "global/"] {
+            let got = ls(&pm, &Caller::Operator, path).unwrap();
+            assert_eq!(got["path"], "global");
+            let names: Vec<_> = got["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["name"].as_str().unwrap().to_string())
+                .collect();
+            assert!(names.iter().any(|n| n == "notes.md"), "{path}: {names:?}");
+        }
     }
 
     #[test]
