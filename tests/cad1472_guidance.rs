@@ -747,8 +747,10 @@ sys.exit(1)
 }
 
 /// Restores a path mode if an assertion fails before the test does.
+#[cfg(feature = "test-seam")]
 struct Mode<'a>(&'a Path, u32);
 
+#[cfg(feature = "test-seam")]
 impl Drop for Mode<'_> {
     fn drop(&mut self) {
         let _ = fs::set_permissions(self.0, fs::Permissions::from_mode(self.1));
