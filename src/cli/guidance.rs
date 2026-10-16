@@ -173,6 +173,19 @@ pub(super) fn lines(guidance: &Value) -> Vec<String> {
     if let Some(session) = session {
         out.push(format!("guidance: {session}"));
     }
+    if let Some(daemon) = guidance.get("daemon").filter(|value| value.is_object()) {
+        if let Some(reason) = daemon.get("reason").and_then(Value::as_str) {
+            out.push(format!("guidance: {reason}"));
+        }
+        if daemon.get("build_differs_from_cli") == Some(&Value::Bool(true)) {
+            out.push("guidance: daemon build differs from this command".to_string());
+        }
+        if let Some(home) = daemon.get("home").and_then(Value::as_str) {
+            if home != "same-as-cli" {
+                out.push(format!("guidance: daemon home {home}"));
+            }
+        }
+    }
     out
 }
 
@@ -500,5 +513,42 @@ mod tests {
         assert_eq!(stale["status"]["file_match"], "needs-attention");
         assert_eq!(stale["status"]["provider_discovery"], "current");
         assert_eq!(std::fs::read(&reference).unwrap(), b"leave this stale\n");
+    }
+
+    #[test]
+    fn default_text_names_a_daemon_scope_that_differs_or_was_not_observed() {
+        let mut guidance = json!({
+            "guidance": "current",
+            "file_match": "current",
+            "provider_discovery": "current",
+            "daemon": {
+                "guidance": "not-checked",
+                "reason": "daemon home differs from this command and was not modified",
+                "home": "/tmp/other-home",
+                "build_differs_from_cli": true
+            }
+        });
+        let rendered = lines(&guidance);
+        assert!(rendered.iter().any(|line| line == "guidance: current"));
+        assert!(rendered.iter().any(|line| {
+            line == "guidance: daemon home differs from this command and was not modified"
+        }));
+        assert!(rendered
+            .iter()
+            .any(|line| line == "guidance: daemon build differs from this command"));
+        assert!(rendered
+            .iter()
+            .any(|line| line == "guidance: daemon home /tmp/other-home"));
+
+        guidance["daemon"] = json!({
+            "guidance": "not-checked",
+            "home": "same-as-cli",
+            "build_differs_from_cli": false
+        });
+        let same = lines(&guidance);
+        assert!(
+            !same.iter().any(|line| line.contains("daemon")),
+            "a matching daemon scope is not a second guidance claim: {same:?}"
+        );
     }
 }

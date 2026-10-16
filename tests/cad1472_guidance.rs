@@ -285,6 +285,10 @@ fn fresh_setup_reports_scope_without_touching_a_non_git_cwd_or_snapshot() {
         .unwrap()
         .contains("not a git checkout"));
     assert_eq!(scope["org"]["changed"], false);
+    assert_eq!(scope["file_match"], "current");
+    assert_eq!(scope["provider_discovery"], "current");
+    assert_eq!(scope["guidance"], "current");
+    assert_eq!(scope["live_session"], "not-checked");
     assert_eq!(scope["unmanaged_snapshots"][0]["active"], false);
     assert_ne!(scope["state_dir"], scope["tracker"]);
 

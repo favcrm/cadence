@@ -42,6 +42,18 @@ fn emit_scope(state_dir: &Path, json: bool) -> Result<()> {
         "unmanaged_snapshots": unmanaged,
         "changed_org": false,
     });
+    let scope = if let Ok(home) = super::home_dir() {
+        let status = cadence_agent::skill::status(&home);
+        let mut scope = scope;
+        scope["file_match"] = status["file_match"].clone();
+        scope["provider_discovery"] = status["provider_discovery"].clone();
+        scope["guidance"] = status["guidance"].clone();
+        scope["guidance_attention"] = status["attention"].clone();
+        scope["live_session"] = status["live_session"].clone();
+        scope
+    } else {
+        scope
+    };
     if json {
         print_json(&scope);
         return Ok(());
@@ -77,6 +89,18 @@ fn emit_scope(state_dir: &Path, json: bool) -> Result<()> {
         .or_else(|| scope["org"]["detail"].as_str().map(str::to_string))
         .unwrap_or_else(|| "no saved org".into());
     println!("         org          {org_line}");
+    if let Some(guidance) = scope["guidance"].as_str() {
+        println!(
+            "         guidance     {guidance} (file match {}, provider discovery {})",
+            scope["file_match"].as_str().unwrap_or("not-checked"),
+            scope["provider_discovery"]
+                .as_str()
+                .unwrap_or("not-checked")
+        );
+    }
+    if let Some(note) = scope["guidance_attention"].as_str() {
+        println!("         guidance     {note}");
+    }
     if let Some(rows) = scope["unmanaged_snapshots"].as_array() {
         for row in rows {
             println!(

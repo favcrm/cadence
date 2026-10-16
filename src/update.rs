@@ -189,6 +189,7 @@ pub fn open_private(path: &Path, append: bool, truncate: bool) -> Result<std::fs
 /// The run's exclusive hold on `<state>/update.lock` — released when it
 /// drops, or by the kernel when the process exits. Non-blocking: a
 /// second update refuses at once instead of queueing behind the first.
+#[derive(Debug)]
 pub struct RunLock {
     _file: std::fs::File,
 }
@@ -209,6 +210,23 @@ impl RunLock {
             )));
         }
         Ok(RunLock { _file: file })
+    }
+}
+
+/// `run` and `rollback` keep this alive until the caller drops it.
+/// Guidance sync has to happen before the lock drops, or a later update
+/// can switch builds and then be overwritten by the earlier post-step.
+#[derive(Debug)]
+pub struct LockedReport {
+    pub report: RunReport,
+    _lock: RunLock,
+}
+
+impl std::ops::Deref for LockedReport {
+    type Target = RunReport;
+
+    fn deref(&self) -> &Self::Target {
+        &self.report
     }
 }
 
@@ -1226,8 +1244,8 @@ fn restore_board(
 /// for a progress log, opens it and records the run's start and end —
 /// so the board's detached helper leaves a record that outlives the
 /// board reading it.
-pub fn run(host: &dyn UpdateHost, opts: &Options) -> Result<RunReport> {
-    let _lock = RunLock::acquire(host.state_dir())?;
+pub fn run(host: &dyn UpdateHost, opts: &Options) -> Result<LockedReport> {
+    let lock = RunLock::acquire(host.state_dir())?;
     let log = host.progress_log();
     if let Some(path) = &log {
         run_log_start(path, std::process::id(), host.identity(), host.now())?;
@@ -1239,7 +1257,10 @@ pub fn run(host: &dyn UpdateHost, opts: &Options) -> Result<RunReport> {
             Err(error) => run_log_fail(path, &error.to_string(), host.now()),
         }
     }
-    outcome
+    outcome.map(|report| LockedReport {
+        report,
+        _lock: lock,
+    })
 }
 
 /// [`run`]'s body, under the re-entry lock and with the log started.
@@ -1608,11 +1629,13 @@ pub fn previous_release(host: &dyn UpdateHost) -> Result<Option<String>> {
 
 /// `cadence update --rollback`: return to the previous release, restart,
 /// health check — and offer the backup restore when the schema changed.
-pub fn rollback(host: &dyn UpdateHost) -> Result<RunReport> {
+pub fn rollback(host: &dyn UpdateHost) -> Result<LockedReport> {
     // One mutation per state dir: the lock serialises a rollback against
     // a running update, and the lease it takes is what lets the daemon
-    // trust the marker this rollback writes (CAD-561 r2).
-    let _lock = RunLock::acquire(host.state_dir())?;
+    // trust the marker this rollback writes (CAD-561 r2). The same lock
+    // stays held until the caller drops the report, which is after
+    // guidance sync.
+    let lock = RunLock::acquire(host.state_dir())?;
     let layout = host.layout();
     let current = match upgrade::current(layout)? {
         Current::Link { sha, .. } => sha,
@@ -1637,7 +1660,10 @@ pub fn rollback(host: &dyn UpdateHost) -> Result<RunReport> {
     let lease = take_lease(host, &previous)?;
     let outcome = rollback_body(host, current, &previous);
     let _ = release_lease(host, &lease);
-    outcome
+    outcome.map(|report| LockedReport {
+        report,
+        _lock: lock,
+    })
 }
 
 /// [`rollback`]'s body, under the lock and the lease.
@@ -2021,6 +2047,20 @@ mod tests {
         assert!(report.install.is_none());
         assert!(report.lease.is_none());
         assert!(report.backup.is_none());
+    }
+
+    #[test]
+    fn the_update_lock_is_held_until_the_report_is_dropped() {
+        let host = Host::new(src(CUR, "unknown", 32), 33);
+        let report = run(&host, &Options::default()).unwrap();
+        assert!(report.report.check.up_to_date);
+        let held = RunLock::acquire(host.state_dir()).unwrap_err().to_string();
+        assert!(
+            held.contains("already running"),
+            "guidance sync has to run before this lock drops: {held}"
+        );
+        drop(report);
+        RunLock::acquire(host.state_dir()).unwrap();
     }
 
     #[test]
