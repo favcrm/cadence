@@ -323,7 +323,10 @@ impl Fx {
         )
     }
     fn login(&self, sub: &str, role: &str) -> Session {
-        let assertion = self.assertion(sub, role, &format!("jti-{sub}"));
+        self.login_with_jti(sub, role, &format!("jti-{sub}"))
+    }
+    fn login_with_jti(&self, sub: &str, role: &str, jti: &str) -> Session {
+        let assertion = self.assertion(sub, role, jti);
         let (status, response) = self.http(
             "POST",
             "/__platform/session",
@@ -1021,6 +1024,13 @@ fn cad914_public_session_transfer_has_subject_custody_and_canonical_receipts() {
         .is_err(),
         "unbound local operator inherited a public subject's job"
     );
+    let owner_a = fx.login_with_jti(sub, "owner", "transfer-owner-a-renewed");
+    let (status, resumed) = fx.transfer(&owner_a, false, root, json!({"op":"status","job_id":job}));
+    assert_eq!(status, 200, "{resumed}");
+    assert_eq!(
+        resumed["digest"], begun["digest"],
+        "session renewal changed job custody"
+    );
     for (id, bytes, relative, action) in [
         ("text", text.as_slice(), "page.md", "wiki_written"),
         (
@@ -1103,4 +1113,27 @@ fn cad914_public_session_transfer_has_subject_custody_and_canonical_receipts() {
         &format!("wiki/{empty_root}/.gitkeep"),
         "wiki_directory_created",
     );
+    let (status, removed) = fx.http(
+        "POST",
+        "/api/wiki/rm",
+        Some(&owner_a),
+        &json!({"path":empty_root}).to_string(),
+    );
+    assert_eq!(status, 200, "{removed}");
+    let removed_head = git(&fx.pm(), &["rev-parse", "HEAD"]);
+    let (status, stale) = fx.transfer(
+        &owner_a,
+        false,
+        empty_root,
+        json!({"op":"status","job_id":empty["job_id"]}),
+    );
+    assert_eq!(status, 200, "{stale}");
+    assert_eq!(stale["state"], "complete", "{stale}");
+    assert_eq!(stale["index"], "superseded", "{stale}");
+    assert_eq!(
+        git(&fx.pm(), &["rev-parse", "HEAD"]),
+        removed_head,
+        "reading a completed receipt recreated a removed root"
+    );
+    println!("OBSERVED_OK completed empty-root HTTP receipt after authorized removal: {stale}");
 }

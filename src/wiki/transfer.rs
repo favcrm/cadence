@@ -1670,7 +1670,7 @@ pub fn finish(
             matches!(entry.outcome.as_str(), "applied" | "skipped") && indexes_entry(entry)
         });
     let kick = store.wiki_transfer_finish(job_id, state, wants_index)?;
-    let index = index_label(pm, state_dir, caller, &entries);
+    let index = index_label(pm, state_dir, caller, root, &entries);
     Ok((
         json!({
             "job_id": job.job_id,
@@ -1721,7 +1721,7 @@ pub fn status(
     let index = if job.state == "open" {
         "pending".to_string()
     } else {
-        index_label(pm, state_dir, caller, &entries)
+        index_label(pm, state_dir, caller, root, &entries)
     };
     Ok(json!({
         "job_id": job.job_id,
@@ -1756,7 +1756,23 @@ fn blob_needs_extraction(entry: &EntryRow, page: &Value) -> bool {
 /// overwrite of a recorded revision is `superseded`. An intact revision
 /// set is `covered` only when the current committed index tree contains
 /// those revisions. The tree id and index counts stay out of the value.
-fn index_label(pm: &Pm, state_dir: &Path, caller: &Caller, entries: &[EntryRow]) -> String {
+fn index_label(
+    pm: &Pm,
+    state_dir: &Path,
+    caller: &Caller,
+    root: &str,
+    entries: &[EntryRow],
+) -> String {
+    if entries.is_empty() {
+        let live_root = super::vault_dir(pm)
+            .and_then(|vault| super::resolve(&vault, root))
+            .ok()
+            .and_then(|path| path.symlink_metadata().ok())
+            .is_some_and(|meta| meta.is_dir());
+        if !live_root || !committed_dir(pm, root).unwrap_or(false) {
+            return "superseded".into();
+        }
+    }
     let mut needed = Vec::new();
     for entry in entries {
         if !matches!(entry.outcome.as_str(), "applied" | "skipped") {
@@ -2958,6 +2974,13 @@ mod tests {
         let (retry, _) = finish(&store, &pm, &state, &request).unwrap();
         assert_eq!(retry["state"], "complete", "{retry}");
         assert_eq!(head_commit(&pm), committed);
+        super::super::rm(&pm, &caller, request.root).unwrap();
+        let removed = head_commit(&pm);
+        let stale = status(&store, &pm, &state, &request, 0, STATUS_PAGE_MAX).unwrap();
+        assert_eq!(stale["state"], "complete", "{stale}");
+        assert_eq!(stale["index"], "superseded", "{stale}");
+        assert!(read(&pm, &caller, request.root).is_err());
+        assert_eq!(head_commit(&pm), removed, "status recreated a removed root");
     }
 
     #[test]

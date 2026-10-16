@@ -148,16 +148,26 @@ staged input, and cannot finish. The command reports the job instead of silently
 committing an unproved file. After an authorized publication resolves the target,
 resume the same job; an already committed matching revision is skipped without
 another commit.
+An interrupted tracker write may also leave staged paths fenced against normal
+Wiki writes. An authorized operator must explicitly resolve those exact paths
+using the tracker's documented recovery procedure before resuming. Transfer
+resume does not repair the Git index or replay an uncertain publication.
 
 The reverse direction exports only the caller's tree, pins each file's
-revision and hash, stages the bytes privately, and publishes them with an
-atomic rename. It does not overwrite a local file unless `--update` is set.
+revision and hash, stages bytes privately, and publishes relative to held
+no-follow directory handles. Default publication is atomic and create-only;
+`--update` explicitly permits atomic replacement. A concurrently planted
+destination file is not overwritten without `--update`.
 
 Storage, extraction and search readiness are separate receipts. A PDF whose
 extraction fails retains its downloadable original but exits nonzero; failed
 or empty extraction is never reported as index-covered. Ordinary empty text
 files remain valid copies. Finishing a job coalesces index work; startup
 rechecks completed-job cache freshness without republishing source files.
+A completed empty-root job becomes `superseded` if its directory is removed
+or moved; status never recreates the root. Public-board jobs bind to the
+verified subject and realm, not a particular session token, so renewal keeps
+custody while another subject or an unbound local caller cannot inherit it.
 Private staged inputs are discarded only after terminal outcomes are durable;
 unresolved publication retains them for reconciliation.
 

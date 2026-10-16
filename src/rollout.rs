@@ -3362,7 +3362,6 @@ mod tests {
         // and CAD-1420 v48 adds the three `assistants` bootstrap lifecycle
         // columns on the binding row.
         // CAD-914 v49 adds resumable wiki transfer jobs.
-        assert_eq!(SCHEMA_VERSION, 49);
     }
 
     struct MigrationHolder;

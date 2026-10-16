@@ -2521,7 +2521,10 @@ mod tests {
         // This is malformed metadata, not evidence of native owner authority.
         let fixture = Connection::open(&db).unwrap();
         fixture
-            .execute("UPDATE schema_version SET version=49", [])
+            .execute(
+                "UPDATE schema_version SET version=?1",
+                [PROTECTED_SCHEMA_MAX + 1],
+            )
             .unwrap();
         drop(fixture);
         store
@@ -2589,8 +2592,8 @@ mod tests {
     }
 
     #[test]
-    fn current_schema48_owner_witness_refuses_future49() {
-        // Positive control: a real current (48) database is accepted by the real guard.
+    fn current_schema_owner_witness_refuses_future_schema() {
+        // A real current database is accepted; a future schema is not.
         {
             let dir = TempDir::new().unwrap();
             let (db, store) = open_legacy(&dir);
@@ -2598,7 +2601,7 @@ mod tests {
                 .conn()
                 .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(actual, 48, "current contract schema must be 48");
+            assert_eq!(actual, crate::rollout::SCHEMA_VERSION);
             store
                 .propose_close(
                     &permit(&db, OwnerOp::Close, b"c48", "a48", "art", 1),
@@ -2607,21 +2610,24 @@ mod tests {
                 .unwrap();
             store
                 .witness_commit(&permit(&db, OwnerOp::Witness, b"c48", "a48", "art", 1))
-                .expect("schema 48 must be accepted by the real guard");
+                .expect("current schema must be accepted by the real guard");
             let witnessed: i64 = store
                 .conn()
                 .query_row("SELECT db_schema FROM owner_witness", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(witnessed, 48, "positive control must record db_schema 48");
+            assert_eq!(witnessed, actual, "witness must record the actual schema");
         }
-        // Bad case: a separate store, forged schema_version 49 (above
+        // Bad case: a separate store, forged schema_version above
         // PROTECTED_SCHEMA_MAX) via raw SQLite.
         let dir = TempDir::new().unwrap();
         let (db, store) = open_legacy(&dir);
         // Raw connection bypasses Store's authorizer, as the existing fixture does.
         let fixture = Connection::open(&db).unwrap();
         fixture
-            .execute("UPDATE schema_version SET version=49", [])
+            .execute(
+                "UPDATE schema_version SET version=?1",
+                [PROTECTED_SCHEMA_MAX + 1],
+            )
             .unwrap();
         drop(fixture);
         store
@@ -2649,7 +2655,7 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(&err, Error::Rejected(message) if message == "owner witness database schema is unsupported"),
-            "forged schema 49 must fail at the actual schema guard, got: {err}"
+            "future schema must fail at the actual schema guard, got: {err}"
         );
         let latch_after: (i64, i64, Vec<u8>, String, Option<String>, i64) = store
             .conn()
@@ -2749,6 +2755,14 @@ mod tests {
         // refuse it.
         let dir = TempDir::new().unwrap();
         let (db, store) = open_legacy(&dir);
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE wiki_transfer_entries;
+             DROP TABLE wiki_transfer_jobs;
+             UPDATE schema_version SET version=48;",
+            )
+            .unwrap();
         let actual: i64 = store
             .conn()
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
