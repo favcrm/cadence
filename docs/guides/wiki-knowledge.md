@@ -120,6 +120,47 @@ Without `--overwrite`, the parent folder is listed first and an existing name is
 refused. That check is not atomic: a file created between the listing and the
 upload can still be replaced. Use `--overwrite` only for files you control.
 
+### Recursive copy (`wiki cp`)
+
+`cadence wiki cp SOURCE DEST --recursive [--update] [--resume JOB_ID] [--wait-index]`
+copies a tree. Exactly one operand is `wiki:<canonical-path>`; the other is
+local. `--org` selects the remote workspace once. Local and remote copies use
+the same transfer operations (`begin`, `chunk`, `apply`, `finish`, `status`,
+`export`). A directory source requires `--recursive`. Empty directories and
+empty files are kept. `.md`, `.markdown`, and `.txt` are text pages; other
+regular files are attachments.
+
+The command hashes the source and refuses symlinks, special files, and
+internal paths before it mutates the wiki. It prints the job id and digest
+before entry writes. Repeat the same source and `--resume JOB_ID` after an
+interruption. Resume reuses the admitted manifest and its destination revisions;
+it does not read those revisions again. An empty directory is admitted with no
+entries, and finish creates that root. `--update` pins the destination's
+current revisions and replaces changed bytes. Without it, identical content
+can be skipped, but changed existing pages are create-only. A partial job
+exits nonzero and names the job id. `--wait-index` polls that job's own
+status until the index is covered, the job fails, or the command deadline
+passes. It does not refresh the global index.
+
+The reverse direction exports only the caller's tree, pins each file's
+revision and hash, stages the bytes privately, and publishes them with an
+atomic rename. It does not overwrite a local file unless `--update` is set.
+
+Storage, extraction and search readiness are separate receipts. A PDF whose
+extraction fails retains its downloadable original but exits nonzero; failed
+or empty extraction is never reported as index-covered. Ordinary empty text
+files remain valid copies. Finishing a job coalesces index work; startup
+rechecks completed-job cache freshness without republishing source files.
+Private staged inputs are discarded only after their outcomes are durable.
+
+Native admission caps are 256 entries, a 256 KiB manifest, 100 MiB per file
+(also subject to configured wiki caps), 256 MiB total, and 16 KiB decoded
+chunks. Status and directory metadata are byte-bounded pages, at most 32
+entries each. Hosted forwarding retains its stricter **64 KiB whole-request**
+cap: a manifest accepted locally may be refused before hosted admission.
+Use a matching native/hosted release; local proof does not authorize an image
+repin, schema migration, or production write.
+
 ## Index health and repair
 
 An operator can inspect the derived index without triggering a rebuild:

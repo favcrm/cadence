@@ -92,6 +92,11 @@ struct Grant {
 #[derive(Clone, Debug)]
 pub struct WikiGrant {
     pub sub: String,
+    /// Verified board/company pins; transfer jobs retain this authority
+    /// namespace across fresh envelopes and daemon restarts.
+    pub issuer: String,
+    pub organization_id: String,
+    pub audience: String,
     /// `operator` only for a verified owner user; otherwise the
     /// namespaced `users/`, `service/` or `agents/` spelling.
     pub actor: String,
@@ -305,6 +310,9 @@ pub fn verify(
 
     Ok(WikiGrant {
         sub: claims.sub,
+        issuer: claims.iss,
+        organization_id: claims.organization_id,
+        audience: claims.aud,
         actor: claims.actor,
         jti: claims.jti,
         exp: claims.exp,
@@ -403,6 +411,9 @@ mod tests {
     fn grant(scopes: &[WikiScope], prefixes: &[(&str, &[&str])]) -> WikiGrant {
         WikiGrant {
             sub: "s".into(),
+            issuer: "https://issuer.example.test".into(),
+            organization_id: "fixture-company".into(),
+            audience: "https://board.example.test".into(),
             actor: "users/u".into(),
             jti: "j".into(),
             exp: 0,

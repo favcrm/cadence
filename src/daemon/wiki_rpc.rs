@@ -16,6 +16,10 @@ use super::*;
 
 use crate::wiki::{self, Caller};
 
+// A transfer write spans staged bytes, Git and Store progress. Serialize these
+// bounded writes so completion/cleanup cannot race an in-flight chunk.
+static TRANSFER_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 impl Shared {
     /// The wiki caller: connection-derived, then reconciled with an
     /// optional `wiki_as` claim (module doc). An agent's project — the
@@ -407,6 +411,225 @@ impl Shared {
     pub(super) fn rpc_wiki_index_refresh(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         self.operator_connection("wiki index refresh", params, peer_pid)?;
         self.wiki_index.refresh()
+    }
+
+    /// CAD-914: resumable wiki transfer. Caller identity is the connection.
+    /// `_transfer_binding` is the operator board's verified envelope tuple
+    /// `{issuer,organization_id,audience,subject}`. An agent connection that
+    /// supplies it is refused. A request without it uses the local owner
+    /// namespace. Export `path` must equal `root`.
+    pub(super) fn rpc_wiki_transfer(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        Self::reject_wiki_fields(params)?;
+        const ALLOWED: &[&str] = &[
+            "op",
+            "manifest",
+            "job_id",
+            "root",
+            "entry_id",
+            "offset",
+            "data_base64",
+            "limit",
+            "path",
+            "bytes",
+            "rev",
+            "wiki_as",
+            "public_session",
+            "_transfer_binding",
+        ];
+        let Some(fields) = params.as_object() else {
+            return Err(Error::rejected(
+                "wiki transfer refused: the request must be an object",
+            ));
+        };
+        if fields.keys().any(|key| !ALLOWED.contains(&key.as_str())) {
+            return Err(Error::rejected(
+                "wiki transfer refused: the request has an unsupported field",
+            ));
+        }
+        let connection = self.agent_caller(peer_pid, "wiki transfer")?;
+        if params.get("_transfer_binding").is_some() && !matches!(connection, AgentCaller::Operator)
+        {
+            return Err(Error::rejected(
+                "wiki transfer refused: agent-provided authority is refused",
+            ));
+        }
+        let op = required_str(params, "op")?;
+        let _write_guard = if matches!(op, "begin" | "chunk" | "apply" | "finish") {
+            Some(
+                TRANSFER_WRITE_LOCK
+                    .lock()
+                    .map_err(|_| Error::internal("wiki transfer write lock is poisoned"))?,
+            )
+        } else {
+            None
+        };
+        let caller = self.wiki_caller(params, peer_pid, "wiki transfer")?;
+        let owner = wiki::transfer::owner_for(&caller.actor(), params.get("_transfer_binding"))?;
+        if matches!(op, "begin" | "chunk" | "finish") {
+            self.wiki_human(params, &caller, "wiki transfer")?;
+        }
+        match op {
+            "begin" => self.transfer_begin(params, &caller, &owner),
+            "chunk" => self.transfer_chunk(params, &caller, &owner),
+            "apply" => self.transfer_apply(params, peer_pid, &caller, &owner),
+            "finish" => self.transfer_finish(params, &caller, &owner),
+            "status" => self.transfer_status(params, &caller, &owner),
+            "export" => self.transfer_export(params, &caller),
+            _ => Err(Error::rejected(format!(
+                "wiki transfer refused: unknown op '{op}'"
+            ))),
+        }
+    }
+
+    fn transfer_begin(&self, params: &Value, caller: &wiki::Caller, owner: &str) -> Result<Value> {
+        let root = required_str(params, "root")?;
+        let raw = params
+            .get("manifest")
+            .ok_or_else(|| Error::rejected("wiki transfer refused: begin needs a manifest"))?;
+        let raw_len = serde_json::to_string(raw)?.len();
+        let manifest: wiki::transfer::Manifest =
+            serde_json::from_value(raw.clone()).map_err(|error| {
+                Error::rejected(format!(
+                    "wiki transfer refused: manifest is invalid: {error}"
+                ))
+            })?;
+        if manifest.root != root {
+            return Err(Error::rejected(
+                "wiki transfer refused: manifest root does not match the request root",
+            ));
+        }
+        let job_id = optional_str(params, "job_id");
+        wiki::transfer::begin(
+            &self.store,
+            &self.pm()?,
+            caller,
+            owner,
+            job_id,
+            &manifest,
+            raw_len,
+        )
+    }
+
+    fn transfer_chunk(&self, params: &Value, caller: &wiki::Caller, owner: &str) -> Result<Value> {
+        let offset = wiki::json_u64(params, "offset")?
+            .ok_or_else(|| Error::rejected("wiki transfer chunk refused: offset is required"))?;
+        wiki::transfer::chunk(
+            &self.store,
+            &self.state_dir,
+            &wiki::transfer::JobRequest {
+                caller,
+                owner,
+                job_id: required_str(params, "job_id")?,
+                root: required_str(params, "root")?,
+            },
+            required_str(params, "entry_id")?,
+            offset,
+            required_str(params, "data_base64")?,
+        )
+    }
+
+    fn transfer_apply(
+        &self,
+        params: &Value,
+        peer_pid: u32,
+        caller: &wiki::Caller,
+        owner: &str,
+    ) -> Result<Value> {
+        let _ = peer_pid;
+        let job_id = required_str(params, "job_id")?;
+        let root = required_str(params, "root")?;
+        let entry_id = required_str(params, "entry_id")?;
+        let human = self.wiki_human(params, caller, "wiki transfer")?;
+        let job = self
+            .store
+            .wiki_transfer_job(job_id)?
+            .filter(|job| job.owner_key == owner && job.root == root)
+            .ok_or_else(|| Error::rejected("wiki transfer job not found"))?;
+        let path = self
+            .store
+            .wiki_transfer_entry(job_id, entry_id)?
+            .filter(|entry| {
+                entry.path.starts_with(&format!("{}/", job.root)) || entry.path == job.root
+            })
+            .ok_or_else(|| Error::rejected("wiki transfer job not found"))?
+            .path;
+        let pm = self.wiki_receipt(
+            self.pm()?,
+            caller,
+            human.as_ref(),
+            "wiki_transferred",
+            &[&path],
+        )?;
+        wiki::transfer::apply(
+            &self.store,
+            &pm,
+            &self.state_dir,
+            &wiki::transfer::JobRequest {
+                caller,
+                owner,
+                job_id,
+                root,
+            },
+            entry_id,
+        )
+    }
+
+    fn transfer_finish(&self, params: &Value, caller: &wiki::Caller, owner: &str) -> Result<Value> {
+        let (body, kick) = wiki::transfer::finish(
+            &self.store,
+            &self.pm()?,
+            &self.state_dir,
+            &wiki::transfer::JobRequest {
+                caller,
+                owner,
+                job_id: required_str(params, "job_id")?,
+                root: required_str(params, "root")?,
+            },
+        )?;
+        if kick {
+            self.wiki_index.kick();
+        }
+        Ok(body)
+    }
+
+    fn transfer_status(&self, params: &Value, caller: &wiki::Caller, owner: &str) -> Result<Value> {
+        let offset = wiki::json_u64(params, "offset")?.unwrap_or(0);
+        let limit = wiki::json_u64(params, "limit")?.unwrap_or(wiki::transfer::STATUS_PAGE_MAX);
+        wiki::transfer::status(
+            &self.store,
+            &self.pm()?,
+            &self.state_dir,
+            &wiki::transfer::JobRequest {
+                caller,
+                owner,
+                job_id: required_str(params, "job_id")?,
+                root: required_str(params, "root")?,
+            },
+            offset,
+            limit,
+        )
+    }
+
+    fn transfer_export(&self, params: &Value, caller: &wiki::Caller) -> Result<Value> {
+        let root = required_str(params, "root")?;
+        let path = required_str(params, "path")?;
+        if path != root {
+            return Err(Error::rejected(
+                "wiki transfer export refused: path does not match the request root",
+            ));
+        }
+        let offset = wiki::json_u64(params, "offset")?.unwrap_or(0);
+        let bytes = wiki::json_u64(params, "bytes")?;
+        let rev = match params.get("rev") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(rev)) => Some(rev.as_str()),
+            Some(_) => {
+                return Err(Error::rejected(
+                    "wiki transfer export refused: rev must be a string",
+                ))
+            }
+        };
+        wiki::transfer::export(&self.pm()?, caller, path, offset, bytes, rev)
     }
 }
 

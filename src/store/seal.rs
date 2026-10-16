@@ -67,9 +67,10 @@ fn raw_lease_refusal(reason: String) -> rusqlite::Error {
 /// the account registry and upload indexes. v47 (CAD-1423) adds notification
 /// preferences, push devices and private intents. v48 (CAD-1420) adds only
 /// the three `assistants` bootstrap lifecycle columns on the binding row.
-/// None touch a sealed/witnessed surface, so the bound extends to 48.
+/// v49 (CAD-914) adds wiki transfer job tables. None touch a sealed/witnessed
+/// surface, so the bound extends to 49.
 #[allow(dead_code)]
-const PROTECTED_SCHEMA_MAX: i64 = 48;
+const PROTECTED_SCHEMA_MAX: i64 = 49;
 
 /// Arm level + transaction-control phase, shared between the `Store` and
 /// the connection's authorizer. Atomic because the authorizer callback must

@@ -52,6 +52,8 @@ pub mod cli;
 pub mod envelope;
 pub mod index;
 pub mod ingest;
+pub mod transfer;
+pub mod transfer_client;
 pub mod upload;
 
 /// `if_rev` value meaning "the page does not exist yet" — a

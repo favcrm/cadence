@@ -63,7 +63,8 @@ use crate::store::{self, Store};
 /// private opaque notification intents; v48 (CAD-1420) adds the assistant
 /// bootstrap state, template version and revision columns on the `assistants`
 /// binding row.
-pub const SCHEMA_VERSION: i64 = 48;
+/// v49 (CAD-914) adds resumable wiki transfer jobs and entry progress.
+pub const SCHEMA_VERSION: i64 = 49;
 
 /// Last schema that has no lease table. The bootstrap opt-in covers
 /// only this version.
@@ -3360,7 +3361,8 @@ mod tests {
         // CAD-1423 v47 adds notification preferences, devices and intents;
         // and CAD-1420 v48 adds the three `assistants` bootstrap lifecycle
         // columns on the binding row.
-        assert_eq!(SCHEMA_VERSION, 48);
+        // CAD-914 v49 adds resumable wiki transfer jobs.
+        assert_eq!(SCHEMA_VERSION, 49);
     }
 
     struct MigrationHolder;

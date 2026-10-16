@@ -109,6 +109,7 @@ pub use plans::{current_verdict, AssigneeTask, Job, Task, Verdict, JOB_STATES};
 mod quota;
 mod schema;
 mod seal;
+pub(crate) mod wiki_transfers;
 pub(crate) use schema::open_read_only;
 pub use schema::{AdoptEntry, ConsumedMarker, RecoveryOutcome, Take};
 pub use seal::OpenMode;

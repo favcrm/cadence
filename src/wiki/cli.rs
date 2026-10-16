@@ -110,6 +110,24 @@ pub enum WikiAction {
         #[command(subcommand)]
         action: IndexAction,
     },
+    /// Copy between a local path and `wiki:<path>` (CAD-914).
+    /// Exactly one operand uses the `wiki:` prefix. A directory source
+    /// needs `--recursive`. `--update` pins current revisions and may
+    /// replace bytes; the default is create-only. `--resume` continues
+    /// one import job. `--wait-index` polls that job until the command
+    /// deadline.
+    Cp {
+        source: String,
+        dest: String,
+        #[arg(long)]
+        recursive: bool,
+        #[arg(long)]
+        update: bool,
+        #[arg(long)]
+        resume: Option<String>,
+        #[arg(long)]
+        wait_index: bool,
+    },
 }
 
 /// `cadence wiki index …` — the operator's index health and repair.
@@ -370,5 +388,23 @@ pub fn run(action: &WikiAction, state_dir: &Path) -> Result<i32> {
             crate::issue::cli::print_json(&out);
             Ok(0)
         }
+        WikiAction::Cp {
+            source,
+            dest,
+            recursive,
+            update,
+            resume,
+            wait_index,
+        } => super::transfer_client::copy_local(
+            state_dir,
+            &super::transfer_client::CopyRequest {
+                source,
+                dest,
+                recursive: *recursive,
+                update: *update,
+                resume: resume.as_deref(),
+                wait_index: *wait_index,
+            },
+        ),
     }
 }
