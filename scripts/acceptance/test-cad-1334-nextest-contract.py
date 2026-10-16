@@ -145,7 +145,9 @@ def write_fixture(directory: Path, names: list[str], *, zero_target: str | None 
     return manifest
 
 
-def invoke(manifest: Path, temp: Path, nextest: Path, *, fail_test: str | None = None
+def invoke(manifest: Path, temp: Path, nextest: Path, *, fail_test: str | None = None,
+           extra_args: list[str] | None = None,
+           extra_env: dict[str, str] | None = None
            ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env.pop("CADENCE_NEXTTEST_BIN", None)
@@ -165,10 +167,12 @@ def invoke(manifest: Path, temp: Path, nextest: Path, *, fail_test: str | None =
         env["CAD1334_FAIL_TEST"] = fail_test
     else:
         env.pop("CAD1334_FAIL_TEST", None)
-    return subprocess.run([str(RUNNER), "--manifest-path", str(manifest)], cwd=ROOT,
-                          env=env, text=True, stdout=subprocess.PIPE,
-                          stderr=subprocess.STDOUT, check=False)
-
+    if extra_env:
+        env.update(extra_env)
+    return subprocess.run(
+        [str(RUNNER), "--manifest-path", str(manifest), *(extra_args or [])],
+        cwd=ROOT, env=env, text=True, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, check=False)
 
 def expect_refusal(result: subprocess.CompletedProcess[str], category: str, detail: str) -> None:
     if result.returncode == 0:
@@ -231,6 +235,59 @@ def main() -> None:
         no_bins_manifest = write_fixture(temp / "zero-bins-fixture", names, bin_test=False)
         no_bins = invoke(no_bins_manifest, temp, nextest)
         expect_refusal(no_bins, "bins selection", "bin")
+
+        # CAD-1480: two partitions must split the suite exactly — disjoint
+        # marker sets, union equal to the full selection — and the merged
+        # junit must pass the aggregate coverage guard the CI `test` job
+        # runs. A malformed or out-of-range K/N refuses before any test.
+        # A dedicated build dir per shard run: the other fixtures reuse
+        # this package name inside the shared target dir, and their
+        # zero-test artifacts would poison a partitioned rebuild.
+        junits = temp / "shard-junits"
+        junits.mkdir()
+        shard_seen: list[set[str]] = []
+        for shard in (1, 2):
+            for marker in expected:
+                marker_path = temp / "markers" / marker
+                if marker_path.exists():
+                    marker_path.unlink()
+            part_target = str(temp / f"part-target-{shard}")
+            part = invoke(
+                manifest, temp, nextest,
+                extra_args=["--partition", f"{shard}/2"],
+                extra_env={
+                    "CARGO_TARGET_DIR": part_target,
+                    "CAD1334_EXPECT_CARGO_BUILD_TARGET_DIR": part_target,
+                })
+            if part.returncode != 0:
+                fail(f"partition {shard}/2 failed through CI runner:\n{part.stdout}")
+            shard_seen.append(
+                {path.name for path in (temp / "markers").iterdir()})
+            for artifact in ("junit.xml", "expected-targets.txt"):
+                src = manifest.parent / "target" / "nextest" / "cadence" / artifact
+                if not src.is_file():
+                    fail(f"partition {shard}/2 produced no {artifact}")
+                (junits / f"shard{shard}-{artifact}").write_bytes(src.read_bytes())
+        if shard_seen[0] & shard_seen[1]:
+            fail(f"partitions overlapped: {sorted(shard_seen[0] & shard_seen[1])}")
+        if shard_seen[0] | shard_seen[1] != expected:
+            fail(f"partition union != selection; missing="
+                 f"{expected - (shard_seen[0] | shard_seen[1])}")
+        merged = subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "check-test-junit.py"),
+             "--package", "cadence-1334-runner-fixture",
+             "--targets-file", str(junits / "shard1-expected-targets.txt"),
+             str(junits / "shard1-junit.xml"),
+             str(junits / "shard2-junit.xml")],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            check=False)
+        if merged.returncode != 0:
+            fail(f"merged shard junit failed the coverage guard:\n{merged.stdout}")
+        for bad in ("0/2", "3/2", "2/0", "x/y", "1"):
+            refused = invoke(manifest, temp, nextest,
+                             extra_args=["--partition", bad])
+            if refused.returncode == 0:
+                fail(f"runner accepted malformed --partition {bad!r}")
 
     print("CAD-1334 nextest runner acceptance passed")
 

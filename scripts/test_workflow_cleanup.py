@@ -112,7 +112,7 @@ class CleanupTests(unittest.TestCase):
     def test_required_gates_still_have_real_checks_and_scope_wiring(self):
         ci = workflow("ci.yml")
         self.assertIn("  merge_group:", ci)
-        for name in ("fmt", "clippy", "test", "build", "ui"):
+        for name in ("fmt", "clippy", "test-shards", "build", "ui"):
             body = job(ci, name)
             self.assertIn("change-scope", body)
             self.assertIn("needs.queue-evidence.outputs.tested", body)
@@ -122,7 +122,18 @@ class CleanupTests(unittest.TestCase):
             for step in commands:
                 category = "ui" if name == "ui" else "rust"
                 self.assertIn(f"needs.change-scope.outputs.{category} != 'false'", step)
-        test = job(ci, "test")
+        # CAD-1480: the required `test` check is the shard aggregate — it
+        # runs on every shard outcome (never silently skipped), requires
+        # green shards, then re-runs the full zero-target coverage guard
+        # over the merged junit reports.
+        agg = job(ci, "test")
+        self.assertIn("needs: [queue-evidence, change-scope, test-shards]", agg)
+        self.assertIn("always()", agg)
+        self.assertIn("needs.test-shards.result", agg)
+        self.assertIn("download-artifact", agg)
+        self.assertIn("check-test-junit.py", agg)
+        self.assertIn("--targets-file", agg)
+        shards = job(ci, "test-shards")
         # CAD-1124: retiring the empty doctest invocation must retain BOTH
         # default-feature compilation gates, not just feature-on tests.
         rust_scope = "        if: ${{ needs.change-scope.outputs.rust != 'false' }}"
@@ -156,18 +167,25 @@ class CleanupTests(unittest.TestCase):
                     r"            exit 1\n"
                     r"          fi$")
         # CAD-1090: every tests/*.rs target, via the shared selection script.
-        self.assertIn("scripts/run-result-tests", test)
+        self.assertIn("scripts/run-result-tests", shards)
+        self.assertIn("--partition", shards)
         runner = (ROOT / "scripts/run-result-tests").read_text()
         self.assertIn("scripts/result-test-args", runner)
         # CAD-1334: one pinned nextest invocation keeps every selected
-        # integration target plus lib and bins, with bounded concurrency and
-        # a result-level guard against empty suites.
+        # integration target plus lib and bins, with bounded concurrency;
+        # the coverage guard lives in scripts/check-test-junit.py so the
+        # CI aggregate can re-run it over merged shard reports.
         for needle in ('scripts/cadence-nextest" --locked --features test-seam',
-                       '"${target_args[@]}" --lib --bins', '-j 2',
-                       'no runnable tests', 'junit_report=', 'HOME=',
+                       '"${target_args[@]}" --lib --bins', '-j "$jobs"',
+                       'check-test-junit.py', 'expected-targets.txt',
+                       '--partition "hash:', 'junit_report=', 'HOME=',
                        'XDG_CONFIG_HOME=', 'CARGO_BUILD_TARGET_DIR',
                        'unset CARGO_TARGET_DIR'):
             self.assertIn(needle, runner)
+        junit = (ROOT / "scripts/check-test-junit.py").read_text()
+        for needle in ('no runnable tests', 'findall(".//testsuite")',
+                       'failure', '--targets-file', 'skipped'):
+            self.assertIn(needle, junit)
         selected = subprocess.run([str(ROOT / "scripts/result-test-args")],
                                   capture_output=True, text=True, check=True).stdout.split()
         self.assertIn("safety_floor", selected)

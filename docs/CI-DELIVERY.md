@@ -125,6 +125,11 @@ let that code poison the cache or exfiltrate the key. Therefore:
   `needs` it. It builds the profiles the gates use (the feature-on test
   profile and the release profile) so main fills the
   cache. It skips the builds when sccache did not enable.
+- `cache-warm-cross` (CAD-1480) is the same pattern for the cross-build
+  gates: `push` to `refs/heads/main` only, one leg per cross target, and
+  it writes only the `cross-<target>` rust-cache keys the cross-build
+  matrix restores with `save-if: false`. It holds no secrets and no
+  environment.
 - Every other job, including all gate jobs on `pull_request` and
   `merge_group` and on main pushes, gets only the read-only pair and no
   `environment:`.
