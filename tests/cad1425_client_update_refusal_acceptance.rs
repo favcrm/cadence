@@ -506,7 +506,13 @@ fn serve_catalogue(root: &Path, routes: Vec<(String, Vec<u8>)>) -> Catalogue {
         }
         match listener.accept() {
             Ok((mut s, _)) => {
+                // BSD/macOS accept() inherits the listener's O_NONBLOCK on the
+                // connected socket (Linux does not): force it back to blocking
+                // so multi-MB archive bodies cannot fail write_all early.
+                s.set_nonblocking(false)
+                    .expect("accepted stream must be blocking");
                 let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+                let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(30)));
                 let mut buf = Vec::new();
                 let mut c = [0u8; 8192];
                 loop {

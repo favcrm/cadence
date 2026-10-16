@@ -520,13 +520,14 @@ fn cad1479_explicit_https_override_attempted_and_refuses_without_fallback() {
     let root = Root::new();
     root.arm_state();
     let _env = root.bind_env();
+    // Closed owned loopback port: TCP refused at once, no external TEST-NET wait.
+    let override_origin = dead_base().replacen("http://", "https://", 1);
     let mut argv = vec![
         "cadence".to_string(),
         "update".to_string(),
         "--check".to_string(),
         "--release-source".to_string(),
-        // Reserved TEST-NET address: unroutable, so connect fails fast.
-        "https://192.0.2.1:1".to_string(),
+        override_origin,
     ];
     argv.extend(root.absent_link_args());
     let out = root.run(&argv);
