@@ -24,8 +24,14 @@ loader.prototype.require = function (this: unknown, id: string) {
 };
 const React = require("react") as typeof import("react");
 const { renderToStaticMarkup } = require("react-dom/server") as typeof import("react-dom/server");
-const { NavList, ProjectList } = require("../src/ui/NavList") as typeof import("../src/ui/NavList");
 const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
+const { NavList: NavListView, ProjectList: ProjectListView } = require("../src/ui/NavList") as typeof import("../src/ui/NavList");
+const { NavigationProvider } = require("../screen-ui/src/navigation") as typeof import("../screen-ui/src/navigation");
+const { hostNavigation } = require("../src/ui/hostNavigation") as typeof import("../src/ui/hostNavigation");
+const NavList = (props: React.ComponentProps<typeof NavListView>) =>
+  React.createElement(NavigationProvider, { adapter: hostNavigation, children: React.createElement(NavListView, props) });
+const ProjectList = (props: React.ComponentProps<typeof ProjectListView>) =>
+  React.createElement(NavigationProvider, { adapter: hostNavigation, children: React.createElement(ProjectListView, props) });
 const { NAV } = require("../src/lib/router") as typeof import("../src/lib/router");
 const fs = require("fs");
 

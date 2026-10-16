@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type React from "react";
 import Button from "../../../ui/Button";
-import { useTranslate } from "../../../lib/locale";
+import { useTranslate } from "../../../lib/localeText";
 
 /** A modal confirm: the operator's typed `expect` must equal
  *  `match` before `confirmLabel` enables. Esc cancels, the input

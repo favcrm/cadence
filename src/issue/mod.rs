@@ -19,6 +19,8 @@ pub mod app_view;
 pub mod areas;
 pub mod blocked;
 pub mod board;
+#[cfg(test)]
+mod cad811_screen_startup_acceptance;
 pub mod claim;
 pub mod cli;
 pub mod context;

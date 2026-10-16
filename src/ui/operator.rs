@@ -327,6 +327,21 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
         "/api/app-installations/*/screens/*/mount",
         RouteClass::OperatorOnly,
     ),
+    route(
+        "POST",
+        "/api/app-screen-services/call",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-screen-services/slot-prepare",
+        RouteClass::OperatorOnly,
+    ),
+    route(
+        "POST",
+        "/api/app-screen-services/slot-confirm",
+        RouteClass::OperatorOnly,
+    ),
     // CAD-1177: the standalone tool invoke — operator-only write; the
     // daemon re-proves the session + mount action context it relays.
     route(

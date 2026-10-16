@@ -60,7 +60,11 @@ async function mount(world: World, viewer = { operator: true, readOnly: false })
   };
   const React = require("react");
   const { createRoot } = require("react-dom/client");
-  const EmailSending = require("../src/features/settings/EmailSending").default;
+  const EmailSendingView = (require("../src/features/settings/EmailSending") as typeof import("../src/features/settings/EmailSending")).default;
+  const { NavigationProvider } = require("../screen-ui/src/navigation") as typeof import("../screen-ui/src/navigation");
+  const { hostNavigation } = require("../src/ui/hostNavigation") as typeof import("../src/ui/hostNavigation");
+  const EmailSending = (props: React.ComponentProps<typeof EmailSendingView>) =>
+    React.createElement(NavigationProvider, { adapter: hostNavigation, children: React.createElement(EmailSendingView, props) });
   const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { "Content-Type": "application/json" } });
   globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
     const url = new URL(String(input), "http://localhost");

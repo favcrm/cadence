@@ -11,6 +11,14 @@ import { browserStoredProjectView } from "./urlState";
  */
 
 const listeners = new Set<() => void>();
+let navigationGuard: (() => boolean) | null = null;
+
+/** Host-owned synchronous leave check. An older owner cannot remove its replacement. */
+export function registerNavigationGuard(guard: () => boolean): () => void {
+  const owned = () => guard();
+  navigationGuard = owned;
+  return () => { if (navigationGuard === owned) navigationGuard = null; };
+}
 
 function notify(): void {
   for (const listener of listeners) listener();
@@ -41,6 +49,7 @@ const snapshot = () => location.pathname + location.search;
 
 export function navigate(href: string, opts: { replace?: boolean } = {}): void {
   if (href === snapshot()) return;
+  if (navigationGuard && !navigationGuard()) return;
   if (opts.replace) history.replaceState(null, "", href);
   else history.pushState(null, "", href);
   notify();

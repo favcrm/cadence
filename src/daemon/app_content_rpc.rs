@@ -38,6 +38,7 @@
 //! assistant-mint route.
 use super::app_audiences_rpc::{audience_expected, audience_name, audience_predicates};
 use super::app_records_rpc::{csv_decisions, csv_text};
+use super::app_screen_services_rpc::ScreenServiceProof;
 use super::*;
 use crate::issue::app_catalog::workspace;
 use crate::store::app_content::{CloneOptions, Draft};
@@ -162,6 +163,17 @@ impl Shared {
         params: &Value,
         peer_pid: u32,
     ) -> Result<Value> {
+        self.rpc_app_content_with_proof(method, params, peer_pid, None)
+    }
+
+    pub(super) fn rpc_app_content_with_proof(
+        self: &Arc<Self>,
+        method: &str,
+        params: &Value,
+        peer_pid: u32,
+        proof: Option<&ScreenServiceProof>,
+    ) -> Result<Value> {
+        Self::screen_service_method(proof, method)?;
         self.operator_connection("app content management", params, peer_pid)?;
         // CAD-1374: only an owner save may carry the board's public session
         // proof; it is stripped before the store sees the params, and the
@@ -296,7 +308,6 @@ impl Shared {
         let install = required_str(params, "install_id")?;
         crate::proto::identifier(install, "installation ID")?;
         let context = required_str(params, "context_id")?;
-        let pm = self.pm_at(&self.pm_dir()?)?;
         let write = !matches!(
             method,
             "app_content_show"
@@ -308,225 +319,236 @@ impl Shared {
                 | "app_sender_binding_show"
                 | "app_sender_binding_list"
         );
-        workspace::with_runtime_snapshot(&pm, install, |_, _| {
-            let _release = self
-                .app_release_lock
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            // Reads prove the live context too: an unknown, archived
-            // or foreign context refuses before any file opens.
-            self.store.app_context_proof(install, context)?;
-            Ok(())
-        })?;
-        let records = RecordStore::open(&self.state_dir, install)?;
-        let result = match method {
-            "app_content_save" => {
-                let draft = content_save_draft(params)?;
-                if let Some(html) = &draft.html {
-                    // The host's own unsubscribe URL shapes: saved
-                    // bindings, the preview base and the configured
-                    // send origin (`{origin}/unsubscribe/<token>`).
-                    let mut endpoints = records.app_unsubscribe_endpoints(context)?;
-                    if let Ok(origin) = self.crm_send_origin() {
-                        endpoints.extend(crate::store::app_content_html::HostEndpoint::origin(
-                            &origin,
-                        ));
-                    }
-                    crate::store::app_content_html::refuse_host_unsubscribe(html, &endpoints)?;
-                }
-                records.app_content_save_as(
-                    context,
-                    required_str(params, "campaign_id")?,
-                    content_expected(params)?,
-                    &draft,
-                    human.as_ref(),
-                )
-            }
-            "app_content_show" => {
-                records.app_content_show(context, required_str(params, "campaign_id")?)
-            }
-            "app_content_clone" => {
-                let copy_audience = match params.get("copy_audience") {
-                    None => false,
-                    Some(Value::Bool(value)) => *value,
-                    Some(_) => {
-                        return Err(Error::rejected(
-                            "campaign clone audience flag must be boolean",
-                        ));
-                    }
-                };
-                let copy_sender = match params.get("copy_sender") {
-                    None => false,
-                    Some(Value::Bool(value)) => *value,
-                    Some(_) => {
-                        return Err(Error::rejected(
-                            "campaign clone sender flag must be boolean",
-                        ));
-                    }
-                };
-                let optional_id = |key: &str| -> Result<Option<&str>> {
-                    match params.get(key) {
-                        None => Ok(None),
-                        Some(Value::String(id)) => Ok(Some(id)),
-                        Some(_) => {
-                            Err(Error::rejected("campaign clone reference must be a string"))
+        let result = self.screen_service_scope(install, context, true, proof, || {
+            let records = RecordStore::open(&self.state_dir, install)?;
+            match method {
+                "app_content_save" => {
+                    let draft = content_save_draft(params)?;
+                    if let Some(html) = &draft.html {
+                        // The host's own unsubscribe URL shapes: saved
+                        // bindings, the preview base and the configured
+                        // send origin (`{origin}/unsubscribe/<token>`).
+                        let mut endpoints = records.app_unsubscribe_endpoints(context)?;
+                        if let Ok(origin) = self.crm_send_origin() {
+                            endpoints.extend(crate::store::app_content_html::HostEndpoint::origin(
+                                &origin,
+                            ));
                         }
+                        crate::store::app_content_html::refuse_host_unsubscribe(html, &endpoints)?;
                     }
-                };
-                records.app_content_clone(
+                    records.app_content_save_as(
+                        context,
+                        required_str(params, "campaign_id")?,
+                        content_expected(params)?,
+                        &draft,
+                        human.as_ref(),
+                    )
+                }
+                "app_content_show" => {
+                    records.app_content_show(context, required_str(params, "campaign_id")?)
+                }
+                "app_content_clone" => {
+                    let copy_audience = match params.get("copy_audience") {
+                        None => false,
+                        Some(Value::Bool(value)) => *value,
+                        Some(_) => {
+                            return Err(Error::rejected(
+                                "campaign clone audience flag must be boolean",
+                            ));
+                        }
+                    };
+                    let copy_sender = match params.get("copy_sender") {
+                        None => false,
+                        Some(Value::Bool(value)) => *value,
+                        Some(_) => {
+                            return Err(Error::rejected(
+                                "campaign clone sender flag must be boolean",
+                            ));
+                        }
+                    };
+                    let optional_id = |key: &str| -> Result<Option<&str>> {
+                        match params.get(key) {
+                            None => Ok(None),
+                            Some(Value::String(id)) => Ok(Some(id)),
+                            Some(_) => {
+                                Err(Error::rejected("campaign clone reference must be a string"))
+                            }
+                        }
+                    };
+                    records.app_content_clone(
+                        context,
+                        required_str(params, "campaign_id")?,
+                        &CloneOptions {
+                            expected_revision: content_revision(params)?,
+                            name: required_str(params, "name")?,
+                            copy_audience,
+                            source_freeze_id: optional_id("source_freeze_id")?,
+                            copy_sender,
+                            source_binding_id: optional_id("source_binding_id")?,
+                        },
+                    )
+                }
+                "app_content_list" => records.app_content_list(context),
+                "app_sender_binding_save" => {
+                    let admitted_connection;
+                    let connection = if proof.is_some() {
+                        // The screen cannot select custody through a preview
+                        // binding. Derive only the current admitted scoped link
+                        // while the screen scope holds custody + release locks.
+                        if params.get("connection_id").is_some() {
+                            return Err(Error::rejected("screen cannot select sender connection"));
+                        }
+                        admitted_connection = match self.store.crm_smtp_link(install, context)? {
+                            Some(link) if link.state == "live" => {
+                                self.crm_smtp_authority(&link.connection_id, link.auth_revision)?;
+                                Some(link.connection_id)
+                            }
+                            _ => None,
+                        };
+                        admitted_connection.as_deref()
+                    } else {
+                        match params.get("connection_id") {
+                            None => None,
+                            Some(Value::String(id)) => Some(id.as_str()),
+                            Some(_) => {
+                                return Err(Error::rejected(
+                                    "sender connection ID must be a string",
+                                ))
+                            }
+                        }
+                    };
+                    let draft = crate::store::app_content::BindingDraft {
+                        sender_name: required_str(params, "sender_name")?,
+                        sender_address: required_str(params, "sender_address")?,
+                        unsubscribe_base: required_str(params, "unsubscribe_base")?,
+                        connection_id: connection,
+                    };
+                    records.app_sender_binding_save(
+                        context,
+                        required_str(params, "binding_id")?,
+                        content_expected(params)?,
+                        &draft,
+                    )
+                }
+                "app_sender_binding_show" => {
+                    records.app_sender_binding_show(context, required_str(params, "binding_id")?)
+                }
+                "app_sender_binding_list" => records.app_sender_binding_list(context),
+                "app_content_render" => {
+                    let (revision, sample) = content_render_scope(params)?;
+                    records.app_content_render(
+                        context,
+                        required_str(params, "campaign_id")?,
+                        revision,
+                        sample.as_deref(),
+                        content_binding(params)?,
+                    )
+                }
+                "app_content_propose" => records.app_content_propose(
                     context,
                     required_str(params, "campaign_id")?,
-                    &CloneOptions {
-                        expected_revision: content_revision(params)?,
-                        name: required_str(params, "name")?,
-                        copy_audience,
-                        source_freeze_id: optional_id("source_freeze_id")?,
-                        copy_sender,
-                        source_binding_id: optional_id("source_binding_id")?,
-                    },
-                )
-            }
-            "app_content_list" => records.app_content_list(context),
-            "app_sender_binding_save" => {
-                let connection = match params.get("connection_id") {
-                    None => None,
-                    Some(Value::String(id)) => Some(id.as_str()),
-                    Some(_) => {
-                        return Err(Error::rejected("sender connection ID must be a string"));
+                    required_str(params, "proposal_id")?,
+                    &content_draft(params)?,
+                ),
+                // CAD-813: the operator mints a one-time proposal
+                // request against a chat message. The message must exist
+                // and carry the server-verified App binding for this
+                // installation and context — the stamp is host scope,
+                // never a browser value. Campaign and source revision
+                // are stamped here and re-proved at redemption.
+                "app_content_proposal_request" => {
+                    let message_id = required_str(params, "message")?;
+                    if message_id.is_empty()
+                        || message_id.len() > 128
+                        || message_id.chars().any(char::is_control)
+                    {
+                        return Err(Error::rejected("proposal message identity is malformed"));
                     }
-                };
-                let draft = crate::store::app_content::BindingDraft {
-                    sender_name: required_str(params, "sender_name")?,
-                    sender_address: required_str(params, "sender_address")?,
-                    unsubscribe_base: required_str(params, "unsubscribe_base")?,
-                    connection_id: connection,
-                };
-                records.app_sender_binding_save(
-                    context,
-                    required_str(params, "binding_id")?,
-                    content_expected(params)?,
-                    &draft,
-                )
-            }
-            "app_sender_binding_show" => {
-                records.app_sender_binding_show(context, required_str(params, "binding_id")?)
-            }
-            "app_sender_binding_list" => records.app_sender_binding_list(context),
-            "app_content_render" => {
-                let (revision, sample) = content_render_scope(params)?;
-                records.app_content_render(
-                    context,
-                    required_str(params, "campaign_id")?,
-                    revision,
-                    sample.as_deref(),
-                    content_binding(params)?,
-                )
-            }
-            "app_content_propose" => records.app_content_propose(
-                context,
-                required_str(params, "campaign_id")?,
-                required_str(params, "proposal_id")?,
-                &content_draft(params)?,
-            ),
-            // CAD-813: the operator mints a one-time proposal
-            // request against a chat message. The message must exist
-            // and carry the server-verified App binding for this
-            // installation and context — the stamp is host scope,
-            // never a browser value. Campaign and source revision
-            // are stamped here and re-proved at redemption.
-            "app_content_proposal_request" => {
-                let message_id = required_str(params, "message")?;
-                if message_id.is_empty()
-                    || message_id.len() > 128
-                    || message_id.chars().any(char::is_control)
-                {
-                    return Err(Error::rejected("proposal message identity is malformed"));
+                    self.store
+                        .message(message_id)?
+                        .ok_or_else(|| Error::rejected("proposal request message is unknown"))?;
+                    let hint = self.store.message_app(message_id)?.ok_or_else(|| {
+                        Error::rejected("proposal request message carries no verified App scope")
+                    })?;
+                    if hint.get("install_id").and_then(Value::as_str) != Some(install)
+                        || hint.get("context_id").and_then(Value::as_str) != Some(context)
+                    {
+                        return Err(Error::rejected(
+                            "proposal request scope does not match its verified chat message",
+                        ));
+                    }
+                    records.app_content_proposal_request(
+                        context,
+                        required_str(params, "campaign_id")?,
+                        message_id,
+                        content_request_id(params)?,
+                    )
                 }
-                self.store
-                    .message(message_id)?
-                    .ok_or_else(|| Error::rejected("proposal request message is unknown"))?;
-                let hint = self.store.message_app(message_id)?.ok_or_else(|| {
-                    Error::rejected("proposal request message carries no verified App scope")
-                })?;
-                if hint.get("install_id").and_then(Value::as_str) != Some(install)
-                    || hint.get("context_id").and_then(Value::as_str) != Some(context)
-                {
-                    return Err(Error::rejected(
-                        "proposal request scope does not match its verified chat message",
-                    ));
+                "app_content_proposal_show" => {
+                    records.app_content_proposal_show(context, required_str(params, "proposal_id")?)
                 }
-                records.app_content_proposal_request(
-                    context,
-                    required_str(params, "campaign_id")?,
-                    message_id,
-                    content_request_id(params)?,
-                )
-            }
-            "app_content_proposal_show" => {
-                records.app_content_proposal_show(context, required_str(params, "proposal_id")?)
-            }
-            // CAD-1014: the operator's before-Apply preview of a pending
-            // proposal — the SAME safe render_html/text the saved-content
-            // path uses, over the stored proposal draft. Pure read; no
-            // apply/save/approve/send, send_ready always false.
-            "app_content_proposal_render" => {
-                let (_, sample) = content_render_scope(params)?;
-                records.app_content_proposal_render(
+                // CAD-1014: the operator's before-Apply preview of a pending
+                // proposal — the SAME safe render_html/text the saved-content
+                // path uses, over the stored proposal draft. Pure read; no
+                // apply/save/approve/send, send_ready always false.
+                "app_content_proposal_render" => {
+                    let (_, sample) = content_render_scope(params)?;
+                    records.app_content_proposal_render(
+                        context,
+                        required_str(params, "proposal_id")?,
+                        sample.as_deref(),
+                        content_binding(params)?,
+                    )
+                }
+                "app_content_proposal_list" => {
+                    let campaign = match params.get("campaign_id") {
+                        None => None,
+                        Some(Value::String(id)) => Some(id.as_str()),
+                        Some(_) => {
+                            return Err(Error::rejected("campaign ID must be a string"));
+                        }
+                    };
+                    records.app_content_proposal_list(context, campaign)
+                }
+                "app_content_proposal_apply" => records.app_content_proposal_apply(
                     context,
                     required_str(params, "proposal_id")?,
-                    sample.as_deref(),
-                    content_binding(params)?,
-                )
-            }
-            "app_content_proposal_list" => {
-                let campaign = match params.get("campaign_id") {
-                    None => None,
-                    Some(Value::String(id)) => Some(id.as_str()),
-                    Some(_) => {
-                        return Err(Error::rejected("campaign ID must be a string"));
-                    }
-                };
-                records.app_content_proposal_list(context, campaign)
-            }
-            "app_content_proposal_apply" => records.app_content_proposal_apply(
-                context,
-                required_str(params, "proposal_id")?,
-                content_expected(params)?,
-            ),
-            "app_content_proposal_discard" => {
-                records.app_content_proposal_discard(context, required_str(params, "proposal_id")?)
-            }
-            "app_content_approve" => records.app_content_approve(
-                context,
-                required_str(params, "campaign_id")?,
-                content_revision(params)?,
-            ),
-            "app_content_test_prepare" => records.app_content_test_prepare(
-                context,
-                required_str(params, "campaign_id")?,
-                required_str(params, "to_email")?,
-                content_binding(params)?,
-            ),
-            "app_content_send_prepare" => {
-                let freeze = match params.get("audience_freeze_id") {
-                    None => None,
-                    Some(Value::String(id)) => {
-                        crate::proto::identifier(id, "freeze ID")?;
-                        Some(id.as_str())
-                    }
-                    Some(_) => {
-                        return Err(Error::rejected("audience freeze ID must be a string"));
-                    }
-                };
-                records.app_content_send_prepare(
+                    content_expected(params)?,
+                ),
+                "app_content_proposal_discard" => records
+                    .app_content_proposal_discard(context, required_str(params, "proposal_id")?),
+                "app_content_approve" => records.app_content_approve(
                     context,
                     required_str(params, "campaign_id")?,
-                    required_str(params, "binding_id")?,
-                    freeze,
-                )
+                    content_revision(params)?,
+                ),
+                "app_content_test_prepare" => records.app_content_test_prepare(
+                    context,
+                    required_str(params, "campaign_id")?,
+                    required_str(params, "to_email")?,
+                    content_binding(params)?,
+                ),
+                "app_content_send_prepare" => {
+                    let freeze = match params.get("audience_freeze_id") {
+                        None => None,
+                        Some(Value::String(id)) => {
+                            crate::proto::identifier(id, "freeze ID")?;
+                            Some(id.as_str())
+                        }
+                        Some(_) => {
+                            return Err(Error::rejected("audience freeze ID must be a string"));
+                        }
+                    };
+                    records.app_content_send_prepare(
+                        context,
+                        required_str(params, "campaign_id")?,
+                        required_str(params, "binding_id")?,
+                        freeze,
+                    )
+                }
+                _ => Err(Error::rejected("unknown app content method")),
             }
-            _ => Err(Error::rejected("unknown app content method")),
-        }?;
+        })?;
         if write {
             // Best-effort audit on core; digests only, never content.
             let digest = result

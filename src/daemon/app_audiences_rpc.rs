@@ -16,8 +16,8 @@
 //! `src/ui/app_audiences.rs` under this ticket; it follows the
 //! CAD-768 strict-peer contract (URL IDs are authority, exact
 //! transport grammar, POST-only writes).
+use super::app_screen_services_rpc::ScreenServiceProof;
 use super::*;
-use crate::issue::app_catalog::workspace;
 use crate::store::app_audiences::{AudienceBase, Predicate};
 use crate::store::app_records::RecordStore;
 
@@ -178,6 +178,17 @@ impl Shared {
         params: &Value,
         peer_pid: u32,
     ) -> Result<Value> {
+        self.rpc_app_audience_with_proof(method, params, peer_pid, None)
+    }
+
+    pub(super) fn rpc_app_audience_with_proof(
+        self: &Arc<Self>,
+        method: &str,
+        params: &Value,
+        peer_pid: u32,
+        proof: Option<&ScreenServiceProof>,
+    ) -> Result<Value> {
+        Self::screen_service_method(proof, method)?;
         self.operator_connection("app audience management", params, peer_pid)?;
         let allowed: &[&str] = match method {
             "app_segment_save" => &[
@@ -228,7 +239,6 @@ impl Shared {
         let install = required_str(params, "install_id")?;
         crate::proto::identifier(install, "installation ID")?;
         let context = required_str(params, "context_id")?;
-        let pm = self.pm_at(&self.pm_dir()?)?;
         let write = matches!(
             method,
             "app_segment_save"
@@ -237,71 +247,63 @@ impl Shared {
                 | "app_suppression_remove"
                 | "app_audience_prepare"
         );
-        workspace::with_runtime_snapshot(&pm, install, |_, _| {
-            let _release = self
-                .app_release_lock
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            // Reads prove the live context too: an unknown, archived
-            // or foreign context refuses before any file opens.
-            self.store.app_context_proof(install, context)?;
-            Ok(())
-        })?;
-        let records = RecordStore::open(&self.state_dir, install)?;
-        let result = match method {
-            "app_segment_save" => records.app_segment_save(
-                context,
-                required_str(params, "segment_id")?,
-                audience_expected(params)?,
-                &audience_name(params)?,
-                &audience_predicates(params)?,
-            ),
-            "app_segment_show" => {
-                records.app_segment_show(context, required_str(params, "segment_id")?)
-            }
-            "app_segment_list" => records.app_segment_list(context),
-            "app_exclusion_save" => records.app_exclusion_save(
-                context,
-                required_str(params, "list_id")?,
-                audience_expected(params)?,
-                &audience_name(params)?,
-                &audience_members(params)?,
-            ),
-            "app_exclusion_show" => {
-                records.app_exclusion_show(context, required_str(params, "list_id")?)
-            }
-            "app_exclusion_list" => records.app_exclusion_list(context),
-            "app_suppression_add" => {
-                let (email, customer) = audience_target(params)?;
-                records.app_suppression_add(
+        let result = self.screen_service_scope(install, context, true, proof, || {
+            let records = RecordStore::open(&self.state_dir, install)?;
+            match method {
+                "app_segment_save" => records.app_segment_save(
                     context,
-                    email.as_deref(),
-                    customer.as_deref(),
-                    &audience_reason(params)?,
-                )
+                    required_str(params, "segment_id")?,
+                    audience_expected(params)?,
+                    &audience_name(params)?,
+                    &audience_predicates(params)?,
+                ),
+                "app_segment_show" => {
+                    records.app_segment_show(context, required_str(params, "segment_id")?)
+                }
+                "app_segment_list" => records.app_segment_list(context),
+                "app_exclusion_save" => records.app_exclusion_save(
+                    context,
+                    required_str(params, "list_id")?,
+                    audience_expected(params)?,
+                    &audience_name(params)?,
+                    &audience_members(params)?,
+                ),
+                "app_exclusion_show" => {
+                    records.app_exclusion_show(context, required_str(params, "list_id")?)
+                }
+                "app_exclusion_list" => records.app_exclusion_list(context),
+                "app_suppression_add" => {
+                    let (email, customer) = audience_target(params)?;
+                    records.app_suppression_add(
+                        context,
+                        email.as_deref(),
+                        customer.as_deref(),
+                        &audience_reason(params)?,
+                    )
+                }
+                "app_suppression_remove" => {
+                    let (email, customer) = audience_target(params)?;
+                    records.app_suppression_remove(context, email.as_deref(), customer.as_deref())
+                }
+                "app_suppression_list" => records.app_suppression_list(context),
+                "app_audience_preview" => records.app_audience_preview(
+                    context,
+                    &audience_base(params)?,
+                    audience_exclusion(params)?.as_deref(),
+                ),
+                "app_audience_prepare" => records.app_audience_prepare(
+                    context,
+                    required_str(params, "freeze_id")?,
+                    &audience_base(params)?,
+                    audience_exclusion(params)?.as_deref(),
+                    audience_max(params)?,
+                ),
+                "app_audience_show" => {
+                    records.app_audience_show(context, required_str(params, "freeze_id")?)
+                }
+                _ => Err(Error::rejected("unknown app audience method")),
             }
-            "app_suppression_remove" => {
-                let (email, customer) = audience_target(params)?;
-                records.app_suppression_remove(context, email.as_deref(), customer.as_deref())
-            }
-            "app_suppression_list" => records.app_suppression_list(context),
-            "app_audience_preview" => records.app_audience_preview(
-                context,
-                &audience_base(params)?,
-                audience_exclusion(params)?.as_deref(),
-            ),
-            "app_audience_prepare" => records.app_audience_prepare(
-                context,
-                required_str(params, "freeze_id")?,
-                &audience_base(params)?,
-                audience_exclusion(params)?.as_deref(),
-                audience_max(params)?,
-            ),
-            "app_audience_show" => {
-                records.app_audience_show(context, required_str(params, "freeze_id")?)
-            }
-            _ => Err(Error::rejected("unknown app audience method")),
-        }?;
+        })?;
         if write {
             // Best-effort audit on core; counts and digests only.
             let digest = result

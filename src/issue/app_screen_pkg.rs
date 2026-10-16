@@ -57,6 +57,8 @@ pub struct ScreenPackage {
     pub host_contract: Option<String>,
     /// Declared logical tool alias → declared capability slot (v2 only).
     pub tools: BTreeMap<String, String>,
+    pub operations: Vec<app_screen_decl::ScreenOperation>,
+    pub navigation: Option<app_screen_decl::ScreenNavigation>,
 }
 
 /// `true` when `tag` is a legal screen tag (the bundle's tag grammar).
@@ -154,6 +156,27 @@ pub fn extract(files: &BTreeMap<String, String>, tag: &str) -> Result<ScreenPack
     }
     let checked = app_screen_decl::validate_map(&manifest, &assets)
         .map_err(|e| Error::rejected(format!("screen package '{tag}' failed integrity: {e}")))?;
+    // Only the new multi-script mode needs metadata. Legacy extraction
+    // fixtures without app.md retain their existing admission behavior.
+    if checked.startup().is_some() {
+        let metadata = crate::issue::app::parse_manifest(
+            files
+                .get("app.md")
+                .ok_or_else(|| Error::rejected("startup requires app.md metadata"))?,
+        )?;
+        if metadata.app != checked.app()
+            || metadata
+                .requires
+                .contracts
+                .get("screen-startup")
+                .map(Vec::as_slice)
+                != Some(&[1][..])
+        {
+            return Err(Error::rejected(
+                "startup requires matching app.md and needs.requires.contracts.screen-startup: [1]",
+            ));
+        }
+    }
     Ok(ScreenPackage {
         tag: tag.to_string(),
         manifest,
@@ -164,6 +187,8 @@ pub fn extract(files: &BTreeMap<String, String>, tag: &str) -> Result<ScreenPack
         may: checked.may().to_vec(),
         host_contract: checked.host_contract().map(str::to_string),
         tools: checked.tools().clone(),
+        operations: checked.operations().to_vec(),
+        navigation: checked.navigation().cloned(),
     })
 }
 

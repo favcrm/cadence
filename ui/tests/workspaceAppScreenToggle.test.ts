@@ -26,6 +26,7 @@ loader.prototype.require = function(this: unknown, id: string) {
 const React = require("react") as typeof import("react");
 const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
 const WorkspaceApp = (require("../src/features/workspace-apps/WorkspaceApp") as typeof import("../src/features/workspace-apps/WorkspaceApp")).default;
+const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
 const { navigate } = require("../src/lib/useLocation") as typeof import("../src/lib/useLocation");
 
 function assert(value: unknown, why: string): asserts value { if (!value) throw new Error(why); }
@@ -77,7 +78,7 @@ function noTabBar(why: string) {
   assert(!control("App view") && !control("Native controls"), `${why}: no App view / Native controls tabs`);
 }
 async function render(operator = true) {
-  await React.act(async () => root.render(React.createElement(WorkspaceApp, { installId: "install-a", viewer: { operator, readOnly: false } })));
+  await React.act(async () => root.render(React.createElement(LocaleProvider, null, React.createElement(WorkspaceApp, { installId: "install-a", viewer: { operator, readOnly: false } }))));
   await flush(); await flush();
 }
 

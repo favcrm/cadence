@@ -24,6 +24,8 @@ moduleLoader.prototype.require = function (this: unknown, id: string) {
 };
 const { createElement, act } = require("react");
 const { createRoot } = require("react-dom/client");
+const { NavigationProvider } = require("../screen-ui/src/navigation") as typeof import("../screen-ui/src/navigation");
+const { hostNavigation } = require("../src/ui/hostNavigation") as typeof import("../src/ui/hostNavigation");
 const { default: AccountMenu } = require("../src/ui/AccountMenu") as typeof import("../src/ui/AccountMenu");
 const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
 const { default: VersionLine } = require("../src/ui/VersionLine") as typeof import("../src/ui/VersionLine");
@@ -37,7 +39,8 @@ function mount(node: unknown) {
   const host = document.createElement("div");
   document.body.append(host);
   const root = createRoot(host);
-  act(() => root.render(createElement(LocaleProvider, null, node)));
+  act(() => root.render(createElement(LocaleProvider, null,
+    createElement(NavigationProvider, { adapter: hostNavigation, children: node }))));
   return { host, done: () => { act(() => root.unmount()); host.remove(); } };
 }
 const href = routePath({ screen: "settings", section: "update" });

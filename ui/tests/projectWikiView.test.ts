@@ -73,9 +73,14 @@ function assert(value: unknown, what: string): asserts value { if (!value) throw
 const host = document.createElement("div");
 document.body.append(host);
 const view = createRoot(host);
+const { NavigationProvider } = require("../screen-ui/src/navigation") as typeof import("../screen-ui/src/navigation");
+const { hostNavigation } = require("../src/ui/hostNavigation") as typeof import("../src/ui/hostNavigation");
+function renderWithNavigation(children: React.ReactNode) {
+  view.render(React.createElement(NavigationProvider, { adapter: hostNavigation, children }));
+}
 const props = { project: "cadence", readOnly: false, actor: "master", onToast: () => {}, navHref: () => "/" };
 const flush = async () => { await new Promise((resolve) => setTimeout(resolve, 10)); };
-async function render(extra: Partial<typeof props> = {}) { await React.act(async () => { view.render(React.createElement(Context, { ...props, ...extra })); await flush(); }); await React.act(flush); }
+async function render(extra: Partial<typeof props> = {}) { await React.act(async () => { renderWithNavigation(React.createElement(Context, { ...props, ...extra })); await flush(); }); await React.act(flush); }
 async function go(href: string) { await React.act(async () => { navigate(href); await flush(); }); await React.act(flush); }
 async function run() {
   await render();
@@ -213,7 +218,7 @@ async function run() {
   assert(location.search.includes("mode=search") && location.search.includes("q=kept"), "a completed save does not pull the operator away from a newer destination");
   assert(sessionStorage.getItem(draftKey(pagePath))?.includes("Newer draft in another editor"), "a late save does not erase a newer draft for the same page");
   await React.act(async () => {
-    view.render(React.createElement(Wiki, { route: { screen: "wiki", mode: "browse", path: pagePath, query: null }, navHref: (route) => route.screen === "wiki" ? `/wiki/${route.mode}/${route.path ?? ""}` : "/", readOnly: true, actor: "master", onToast: () => {} }));
+    renderWithNavigation(React.createElement(Wiki, { route: { screen: "wiki", mode: "browse", path: pagePath, query: null }, navHref: (route) => route.screen === "wiki" ? `/wiki/${route.mode}/${route.path ?? ""}` : "/", readOnly: true, actor: "master", onToast: () => {} }));
     await flush();
   });
   await React.act(flush);
@@ -226,7 +231,7 @@ async function run() {
   const uploads: string[] = [];
   apiModule.uploadFile = async (_dir: string, file: File) => { uploads.push(file.name); };
   await React.act(async () => {
-    view.render(React.createElement(UploadPane, { dir: "projects/cadence", navHref: () => "/", readOnly: true, onToast: () => {}, onUploaded: () => {} }));
+    renderWithNavigation(React.createElement(UploadPane, { dir: "projects/cadence", navHref: () => "/", readOnly: true, onToast: () => {}, onUploaded: () => {} }));
     await flush();
   });
   await React.act(async () => {
@@ -242,7 +247,7 @@ async function run() {
     uploads.push(file.name);
     if (uploads.length === 1) await new Promise<void>((resolve) => { releaseUpload = resolve; });
   };
-  await React.act(() => view.render(React.createElement(UploadPane, uploadProps)));
+  await React.act(() => renderWithNavigation(React.createElement(UploadPane, uploadProps)));
   const choose = Array.from(host.querySelectorAll("button")).find((button) => button.textContent === "Choose files");
   const picker = host.querySelector("input[type='file']");
   assert(choose && picker, "upload has a native Choose files button");
@@ -257,10 +262,10 @@ async function run() {
   });
   const clearUploads = Array.from(host.querySelectorAll("button")).find((button) => button.textContent === "Clear completed uploads");
   assert(Number(uploads.length) === 1 && clearUploads?.disabled, "uploads are sequential and an active queue cannot be cleared");
-  await React.act(() => view.render(React.createElement(UploadPane, { ...uploadProps, readOnly: true })));
+  await React.act(() => renderWithNavigation(React.createElement(UploadPane, { ...uploadProps, readOnly: true })));
   await React.act(async () => { releaseUpload?.(); await flush(); });
   assert(Number(uploads.length) === 1, "becoming read-only pauses remaining queued uploads");
-  await React.act(async () => { view.render(React.createElement(UploadPane, uploadProps)); await flush(); });
+  await React.act(async () => { renderWithNavigation(React.createElement(UploadPane, uploadProps)); await flush(); });
   await React.act(flush);
   assert(uploads.join(",") === "one.md,two.md" && host.querySelectorAll(".wk-uprow.done").length === 2 && !clearUploads.disabled, "the queue resumes without losing either completed row");
   await React.act(() => clearUploads.click());
@@ -270,7 +275,7 @@ async function run() {
   const folderErrors: string[] = [];
   const folderProps = { entries: [{ name: "README.md", path: pagePath, kind: "page" as const }], navHref: () => "/", readOnly: false, onRefresh: () => {}, onToast: () => {}, onFail: (error: unknown) => folderErrors.push(String(error)) };
   const renderFolder = async (readOnly = false) => {
-    await React.act(() => view.render(React.createElement(WikiScopeContext, { value: { root: "projects/cadence", label: "Cadence" } }, React.createElement(FolderPane, { ...folderProps, readOnly }))));
+    await React.act(() => renderWithNavigation(React.createElement(WikiScopeContext, { value: { root: "projects/cadence", label: "Cadence" } }, React.createElement(FolderPane, { ...folderProps, readOnly }))));
   };
   await renderFolder();
   assert(host.querySelector(".wk-flist") && host.querySelector("[aria-label='List view']")?.getAttribute("aria-pressed") === "true", "folder defaults to a compact list");

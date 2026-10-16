@@ -276,6 +276,10 @@ impl Shared {
             !(ctx.session == cap.session && ctx.install_id == cap.install_id)
                 || (ctx.tag == cap.tag && ctx.generation == cap.generation)
         });
+        self.screen_service_confirmations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, confirmation| confirmation.current_in(&map));
         for ctx in map.values_mut() {
             if ctx.session == cap.session
                 && ctx.install_id == cap.install_id
@@ -295,6 +299,10 @@ impl Shared {
     pub(crate) fn revoke_tool_context(&self, token: &str) {
         let mut map = self.tool_contexts.lock().unwrap_or_else(|e| e.into_inner());
         map.remove(token);
+        self.screen_service_confirmations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, confirmation| confirmation.current_in(&map));
     }
 
     /// `app_tool_invoke {action_token, tool_alias, input, request_id, token,

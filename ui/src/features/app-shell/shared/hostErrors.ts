@@ -1,4 +1,4 @@
-import { ApiError } from "../../../lib/api";
+import { ApiError } from "../../../lib/apiError";
 
 /**
  * The one error-to-message layer every CRM list shares (CAD-1009).

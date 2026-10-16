@@ -1,0 +1,16 @@
+@import "tailwindcss" source(none);
+@import "./theme.css";
+@import "./controls.css";
+@import "./base.css";
+@import "./primitives.css";
+@import "./drawer-base.css";
+@import "./drawer.css";
+
+/* Generate only the utility classes used by these actual shared controls. */
+@source "../../src/features/app-shell/shared/*.tsx";
+@source "../../src/ui/Button.tsx";
+@source "../../src/ui/Link.tsx";
+@source "../../src/ui/Select.tsx";
+
+/* Supported shared layout/status utilities for app-authored markup. */
+@source inline("align-middle bg-warn/10 border-warn/40 break-all cursor-pointer flex flex-1 flex-wrap gap-1 gap-2 items-center justify-end justify-self-start mb-1 mb-2 mb-4 mt-2 mt-3 mt-4 p-4 px-3 py-2 py-4 text-ok text-warn");
