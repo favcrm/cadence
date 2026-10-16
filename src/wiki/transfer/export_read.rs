@@ -734,15 +734,14 @@ mod tests {
         let new = "NEW-REVISION-TEXT";
         write(&pm, &Caller::Operator, path, old, None).unwrap();
         let abs = vault_dir(&pm).unwrap().join(path);
-        let ino = fs::metadata(&abs).unwrap().ino();
         let old_rev = export_text(&pm, path, None).unwrap().unwrap()["rev"]
             .as_str()
             .unwrap()
             .to_string();
 
-        fs::remove_file(&abs).unwrap();
-        fs::write(&abs, new).unwrap();
-        assert_ne!(fs::metadata(&abs).unwrap().ino(), ino);
+        let replacement = abs.with_extension("replacement");
+        fs::write(&replacement, new).unwrap();
+        fs::rename(&replacement, &abs).unwrap();
 
         let stale = export_text(&pm, path, Some(&old_rev)).unwrap_err();
         assert!(!stale.to_string().contains(new));
