@@ -171,6 +171,11 @@ custody while another subject or an unbound local caller cannot inherit it.
 Private staged inputs are discarded only after terminal outcomes are durable;
 unresolved publication retains them for reconciliation.
 
+Coordination-profile portable export omits transfer jobs and private staged
+inputs; it is not a backup of in-flight transfer custody. Export leaves the
+source jobs and stages unchanged. An inactive portable restore cannot resume
+those source jobs: admit a fresh transfer from the original inputs instead.
+
 Native admission caps are 256 entries, a 256 KiB manifest, 100 MiB per file
 (also subject to configured wiki caps), 256 MiB total, and 16 KiB decoded
 chunks. Status and directory metadata are byte-bounded pages, at most 32

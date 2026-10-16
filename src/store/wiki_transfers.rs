@@ -19,7 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::{Store, StoreConn};
 use crate::error::{Error, Result};
 
-/// Schema v48. New tables only; nothing sealed or witnessed is altered.
+/// Schema v49. New tables only; nothing sealed or witnessed is altered.
 /// `root_attempt` is the implicit-root fence: `fresh`, `unresolved`, or
 /// `proved`. Entry outcome `unresolved` is the per-entry publication fence.
 pub const SCHEMA: &str = "

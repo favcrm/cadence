@@ -889,6 +889,42 @@ const CATALOG: &[(&str, &[&str])] = &[
             "created", "verify",
         ],
     ),
+    (
+        "wiki_transfer_entries",
+        &[
+            "job_id",
+            "entry_id",
+            "ordinal",
+            "path",
+            "rel_path",
+            "kind",
+            "size",
+            "sha256",
+            "if_rev",
+            "received",
+            "outcome",
+            "rev",
+            "extraction",
+            "extraction_rev",
+            "source_hash",
+            "detail",
+        ],
+    ),
+    (
+        "wiki_transfer_jobs",
+        &[
+            "job_id",
+            "digest",
+            "manifest_json",
+            "source_id",
+            "root",
+            "owner_key",
+            "state",
+            "root_attempt",
+            "index_kicked",
+            "created_at",
+        ],
+    ),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
