@@ -1486,7 +1486,7 @@ jobs:
       - name: Run the CAD-1425 client update refusal acceptance
         env:
           CARGO_BUILD_JOBS: 4
-        run: cargo test --locked --test cad1425_client_update_refusal_acceptance -- --test-threads 2
+        run: cargo test --locked --features test-seam --test cad1425_client_update_refusal_acceptance -- --test-threads 2
 
   # CAD-109 backstop: gitleaks, an implementation independent of cadence's
   # in-process scanner, runs over the PR's own commits (base..head) with its
