@@ -128,8 +128,10 @@ operation changes the catalogue record's visibility only, and the
 publisher's immutable conditional writes are unchanged. The endpoint and
 bucket are the dedicated-store literals `87b59a40e130c425e35474687ad98a4f.r2.cloudflarestorage.com`
 / `agenticos-v2-release-artifacts`, pinned in both
-the workflow and the helper: configured `vars.RELEASES_R2_*` must equal
-them before any mutation, and the helper refuses any other store.
+the workflow and the helper. The exact copyable endpoint literal is
+`https://87b59a40e130c425e35474687ad98a4f.r2.cloudflarestorage.com`;
+configured `vars.RELEASES_R2_*` must equal the store values before any
+mutation, and the helper refuses any other store.
 Credentials stay in the job environment (`secrets.RELEASES_R2_*` as
 `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`); a missing credential fails
 closed.
