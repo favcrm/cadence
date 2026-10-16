@@ -620,7 +620,7 @@ sys.exit(1)
         ],
     ];
     for read_only in read_only_cases {
-        let output = fixture.cli_vars(&path, &update_env, &read_only);
+        let output = fixture.cli_vars(&path, &update_env, read_only);
         assert!(
             output.status.success(),
             "{read_only:?} stdout={} stderr={}",
