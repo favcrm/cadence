@@ -1409,6 +1409,13 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$AWS_ACCESS_KEY_ID" && test -n "$AWS_SECRET_ACCESS_KEY"
+          # upload-artifact keeps the bundles/ directory name. Extracting
+          # that archive into dist/bundles nests the attestations one
+          # level deeper. The receipt is uploaded beside that directory,
+          # so it is already in dist/bundles/.
+          if [ -f dist/bundles/bundles/build-attestation-x86_64-linux.jsonl ]; then
+            mv dist/bundles/bundles/*.jsonl dist/bundles/
+          fi
           args=()
           for target in x86_64-linux aarch64-linux aarch64-macos; do
             asset="cadence-$TAG-$target.tar.gz"
