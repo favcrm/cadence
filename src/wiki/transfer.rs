@@ -859,7 +859,7 @@ fn publish_entry(
         return publish_dir(pm, caller, entry);
     }
     match publication(pm, caller, entry)? {
-        Publication::Committed => return reconcile_match(pm, caller, entry),
+        Publication::Committed(rev) => return reconcile_match(pm, caller, entry, rev),
         Publication::Uncommitted => return Ok(unresolved(entry)),
         Publication::Absent => {}
     }
@@ -884,14 +884,14 @@ fn publish_entry(
         })?;
         let wrote = write(pm, caller, &entry.path, text, Some(&entry.if_rev))?;
         if wrote.get("conflict").is_some() {
-            return Ok(classify_publish_conflict(pm, caller, entry, &wrote)?);
+            return classify_publish_conflict(pm, caller, entry, &wrote);
         }
-        if !committed_content_matches(pm, entry)? {
+        let Some(rev) = committed_content_rev(pm, entry)? else {
             return Ok(unresolved(entry));
-        }
+        };
         return Ok(Published {
             outcome: "applied",
-            rev: wrote["rev"].as_str().map(str::to_string),
+            rev: Some(rev),
             extraction: "not_applicable",
             extraction_rev: None,
             source_hash: entry.sha256.clone(),
@@ -903,7 +903,7 @@ fn publish_entry(
 
 fn publish_dir(pm: &Pm, caller: &Caller, entry: &EntryRow) -> Result<Published> {
     match publication(pm, caller, entry)? {
-        Publication::Committed => {
+        Publication::Committed(_) => {
             return Ok(Published {
                 outcome: "skipped",
                 rev: None,
@@ -950,8 +950,9 @@ fn publish_dir(pm: &Pm, caller: &Caller, entry: &EntryRow) -> Result<Published> 
 }
 
 enum Publication {
-    /// HEAD contains the desired bytes or directory marker.
-    Committed,
+    /// Revision is computed from the same committed bytes that proved the
+    /// manifest hash; a later HEAD must not substitute another file's revision.
+    Committed(Option<String>),
     /// The worktree matches, but HEAD does not. Not publication.
     Uncommitted,
     /// Neither tree has the desired content.
@@ -977,7 +978,7 @@ fn unresolved(entry: &EntryRow) -> Published {
 fn publication(pm: &Pm, caller: &Caller, entry: &EntryRow) -> Result<Publication> {
     if entry.kind == "dir" {
         if committed_dir(pm, &entry.path)? {
-            return Ok(Publication::Committed);
+            return Ok(Publication::Committed(None));
         }
         return match read(pm, caller, &entry.path) {
             Ok(page) if page["kind"] == "dir" => Ok(Publication::Uncommitted),
@@ -986,8 +987,8 @@ fn publication(pm: &Pm, caller: &Caller, entry: &EntryRow) -> Result<Publication
             Err(error) => Err(error),
         };
     }
-    if committed_content_matches(pm, entry)? {
-        return Ok(Publication::Committed);
+    if let Some(rev) = committed_content_rev(pm, entry)? {
+        return Ok(Publication::Committed(Some(rev)));
     }
     if worktree_content_matches(pm, caller, entry)? {
         return Ok(Publication::Uncommitted);
@@ -1006,7 +1007,7 @@ fn classify_publish_conflict(
     wrote: &Value,
 ) -> Result<Published> {
     match publication(pm, caller, entry)? {
-        Publication::Committed => reconcile_match(pm, caller, entry),
+        Publication::Committed(rev) => reconcile_match(pm, caller, entry, rev),
         Publication::Uncommitted => Ok(unresolved(entry)),
         Publication::Absent => Ok(Published {
             outcome: "conflict",
@@ -1026,7 +1027,7 @@ fn classify_publish_error(
     error: &Error,
 ) -> Result<Published> {
     let detail = match publication(pm, caller, entry) {
-        Ok(Publication::Committed) => return reconcile_match(pm, caller, entry),
+        Ok(Publication::Committed(rev)) => return reconcile_match(pm, caller, entry, rev),
         Ok(Publication::Uncommitted | Publication::Absent) => format!(
             "wiki transfer publication could not be proved; staged bytes were kept ({error})"
         ),
@@ -1116,41 +1117,42 @@ fn committed_rev(pm: &Pm, entry: &EntryRow) -> Result<String> {
     })
 }
 
-fn committed_content_matches(pm: &Pm, entry: &EntryRow) -> Result<bool> {
+fn committed_content_rev(pm: &Pm, entry: &EntryRow) -> Result<Option<String>> {
     match entry.kind.as_str() {
         "text" => {
             let Some(bytes) = committed_blob(pm, &entry.path)? else {
-                return Ok(false);
+                return Ok(None);
             };
             let Ok(text) = std::str::from_utf8(&bytes) else {
-                return Ok(false);
+                return Ok(None);
             };
-            Ok(text.len() as u64 == entry.size
+            Ok((text.len() as u64 == entry.size
                 && Some(sha256_bytes(text.as_bytes()).as_str()) == entry.sha256.as_deref())
+            .then(|| super::rev_bytes(&bytes)))
         }
         "blob" => {
             let Some(bytes) = committed_blob(pm, &format!("{}.blob", entry.path))? else {
-                return Ok(false);
+                return Ok(None);
             };
             let Ok(text) = std::str::from_utf8(&bytes) else {
-                return Ok(false);
+                return Ok(None);
             };
             let Ok(meta) = serde_json::from_str::<Value>(text) else {
-                return Ok(false);
+                return Ok(None);
             };
             if meta["size"].as_u64() != Some(entry.size)
                 || meta["sha256"].as_str() != entry.sha256.as_deref()
             {
-                return Ok(false);
+                return Ok(None);
             }
             let hash = entry
                 .sha256
                 .as_deref()
                 .ok_or_else(|| reject("missing transfer hash"))?;
             verify_blob_custody(pm, hash, entry.size)?;
-            Ok(true)
+            Ok(Some(super::rev_bytes(&bytes)))
         }
-        _ => Ok(false),
+        _ => Ok(None),
     }
 }
 
@@ -1200,11 +1202,18 @@ fn page_matches(page: &Value, kind: &str, size: u64, hash: Option<&str>) -> bool
     }
 }
 
-fn reconcile_match(pm: &Pm, caller: &Caller, entry: &EntryRow) -> Result<Published> {
-    let rev = Some(committed_rev(pm, entry)?);
+fn reconcile_match(
+    pm: &Pm,
+    caller: &Caller,
+    entry: &EntryRow,
+    rev: Option<String>,
+) -> Result<Published> {
     if entry.kind == "blob" && is_pdf(&entry.path) {
-        let hash = entry.sha256.clone().unwrap_or_default();
-        let (extraction, extraction_rev, detail) = extraction_of(pm, caller, &entry.path, &hash);
+        let hash = entry
+            .sha256
+            .as_deref()
+            .ok_or_else(|| reject("missing transfer hash"))?;
+        let (extraction, extraction_rev, detail) = extraction_of(pm, caller, &entry.path, hash);
         return Ok(Published {
             outcome: "skipped",
             rev,
@@ -1331,23 +1340,26 @@ fn publish_blob(
         }
     };
     if wrote.get("conflict").is_some() {
-        return Ok(classify_publish_conflict(pm, caller, entry, &wrote)?);
+        return classify_publish_conflict(pm, caller, entry, &wrote);
     }
-    if !committed_content_matches(pm, entry)? {
+    let Some(rev) = committed_content_rev(pm, entry)? else {
         return Ok(unresolved(entry));
-    }
-    let hash = wrote["sha256"].as_str().unwrap_or("").to_string();
+    };
+    let hash = entry
+        .sha256
+        .as_deref()
+        .ok_or_else(|| reject("missing transfer hash"))?;
     let (extraction, extraction_rev, detail) = if is_pdf(&entry.path) {
-        extraction_of(pm, caller, &entry.path, &hash)
+        extraction_of(pm, caller, &entry.path, hash)
     } else {
         ("not_applicable", None, None)
     };
     Ok(Published {
         outcome: "applied",
-        rev: wrote["rev"].as_str().map(str::to_string),
+        rev: Some(rev),
         extraction,
         extraction_rev,
-        source_hash: Some(hash),
+        source_hash: entry.sha256.clone(),
         detail,
     })
 }
@@ -2508,6 +2520,92 @@ mod tests {
         assert_eq!(
             fs::read(blobs.join(sha256_bytes(second_bytes))).unwrap(),
             second_bytes
+        );
+    }
+
+    #[test]
+    fn committed_retry_receipt_uses_proved_revision_after_head_advances() {
+        let (_root, pm, store, _state) = fixture();
+        let path = "global/box/note.txt";
+        let expected = b"committed expected source";
+        let first = write(
+            &pm,
+            &Caller::Operator,
+            path,
+            std::str::from_utf8(expected).unwrap(),
+            Some(ABSENT),
+        )
+        .unwrap();
+        let manifest = text_manifest("note.txt", expected, ABSENT);
+        let started = begin(
+            &store,
+            &pm,
+            &Caller::Operator,
+            "revision-proof",
+            None,
+            &manifest,
+            128,
+        )
+        .unwrap();
+        let entry = store
+            .wiki_transfer_entry(started["job_id"].as_str().unwrap(), "note")
+            .unwrap()
+            .unwrap();
+        let Publication::Committed(proved_rev) =
+            publication(&pm, &Caller::Operator, &entry).unwrap()
+        else {
+            panic!("the expected source was committed");
+        };
+        let newer = write(
+            &pm,
+            &Caller::Operator,
+            path,
+            "newer committed source",
+            first["rev"].as_str(),
+        )
+        .unwrap();
+        let head = head_commit(&pm);
+        let receipt = reconcile_match(&pm, &Caller::Operator, &entry, proved_rev).unwrap();
+        assert_eq!(receipt.rev.as_deref(), first["rev"].as_str());
+        assert_ne!(receipt.rev.as_deref(), newer["rev"].as_str());
+        assert_eq!(
+            receipt.source_hash.as_deref(),
+            Some(sha256_bytes(expected).as_str())
+        );
+        assert_eq!(head_commit(&pm), head);
+        assert_eq!(
+            read(&pm, &Caller::Operator, path).unwrap()["text"],
+            "newer committed source"
+        );
+    }
+
+    #[test]
+    fn lagged_pdf_extraction_does_not_replace_newer_source_sidecar() {
+        let (_root, pm, store, state) = fixture();
+        let path = "global/box/lagged.pdf";
+        let first = b"%PDF-1.4\ninvalid older source\n";
+        let second = b"%PDF-1.4\ninvalid newer source\n";
+        transfer_blob(&store, &pm, &state, "lagged.pdf", "older", first, ABSENT);
+        let prior = read(&pm, &Caller::Operator, path).unwrap();
+        transfer_blob(
+            &store,
+            &pm,
+            &state,
+            "lagged.pdf",
+            "newer",
+            second,
+            prior["rev"].as_str().unwrap(),
+        );
+        let sidecar = "global/box/lagged.pdf.extracted.md";
+        let before = read(&pm, &Caller::Operator, sidecar).unwrap();
+        let head = head_commit(&pm);
+        let lagged = ingest::pdf(&pm, &Caller::Operator, path, &sha256_bytes(first)).unwrap();
+        assert_eq!(lagged["status"], "conflict");
+        assert_eq!(read(&pm, &Caller::Operator, sidecar).unwrap(), before);
+        assert_eq!(head_commit(&pm), head);
+        assert_eq!(
+            read(&pm, &Caller::Operator, path).unwrap()["sha256"].as_str(),
+            Some(sha256_bytes(second).as_str())
         );
     }
 }

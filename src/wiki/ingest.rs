@@ -72,6 +72,11 @@ fn pdf_text(source: &Path) -> std::result::Result<String, String> {
 /// A manually authored page at the reserved name is never overwritten.
 pub fn pdf(pm: &Pm, caller: &Caller, path: &str, sha256: &str) -> Result<Value> {
     let sidecar = format!("{path}.extracted.md");
+    let source = read(pm, caller, path)?;
+    if source["kind"] != "blob" || source["sha256"].as_str() != Some(sha256) {
+        return Ok(json!({"status":"conflict","path":sidecar,
+                         "reason":"the raw source changed before extraction"}));
+    }
     let quoted_path = serde_json::to_string(path)?;
     let current = read(pm, caller, &sidecar).ok();
     if let Some(page) = &current {
@@ -97,6 +102,12 @@ pub fn pdf(pm: &Pm, caller: &Caller, path: &str, sha256: &str) -> Result<Value> 
         Ok(text) => ("indexed", text, None),
         Err(why) => ("failed", String::new(), Some(why)),
     };
+    // A slow or resumed extraction must not replace a newer source's sidecar.
+    // The sidecar's own CAS below also protects concurrent derived-page writes.
+    if read(pm, caller, path)?["rev"] != source["rev"] {
+        return Ok(json!({"status":"conflict","path":sidecar,
+                         "reason":"the raw source changed during extraction"}));
+    }
     let name = path.rsplit('/').next().unwrap_or(path);
     let page = format!(
         "---\nkind: extracted-source\nsource_path: {quoted_path}\nsource_sha256: {sha256}\nextraction_status: {status}\n---\n\n# Source text: {name}\n\n{body}\n"
