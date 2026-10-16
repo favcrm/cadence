@@ -110,30 +110,3 @@ fn logged_out_every_web_action_refuses_with_no_auth_material() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
-
-// --- Remote-scope cases: AUTHORED, NOT EXECUTED (blocked on dependencies) ---
-//
-// These require, in order:
-//   1. the library-test `WebIssuerTls` hook (exact virtual issuer, loopback
-//      socket, explicit CA; wrong name and wrong CA must fail; other hosts
-//      unmapped; production guards untouched) - source-owned, not yet landed;
-//   2. a real device grant against the NodeHTTPS bridge in
-//      `apps/api/src/web-sites/integration.acceptance.test.ts`, minted via
-//      device/code, owner device/approve and device/token - no row inserts;
-//   3. a pinned `trusted-issuer` file (mode 600) under the disposable
-//      `--auth-dir`, the legitimate bootstrap trust file.
-//
-// Cases to enable once those land (exit codes asserted, envelopes read from
-// packages/contracts/src/web-sites.ts, never copied):
-//   a. web.read-only login refuses prepare, publish, rollback, unpublish before
-//      any upload request, with the --web re-consent message;
-//   b. web.prepare login uploads and requests a publish action; publish does
-//      not reach the owner approval path (no live URL printed);
-//   c. missing selected workspace or issuer mismatch fails closed;
-//   d. cross-workspace release id refused; changed digest or revision refused
-//      with no fresh request key;
-//   e. interrupted send reconciles the same durable key; timeout is pending,
-//      not success;
-//   f. symlink, traversal, dotfile, source map, node_modules and over-limit
-//      artifacts refused locally with no upload request;
-//   g. a source-only React project is refused with build-first guidance.

@@ -306,12 +306,6 @@ jobs:
         with:
           shared-key: gate-test
           save-if: false
-      # CAD-1480: 83 test binaries × N shards make linking the shard
-      # bottleneck; mold/lld halves it. Same enabling rule as build/ui —
-      # and cache-warm's test leg enables it too so fingerprints match.
-      - name: Enable fast linker (mold/lld; falls back to the default linker)
-        if: ${{ needs.change-scope.outputs.rust != 'false' }}
-        run: sh $GITHUB_WORKSPACE/scripts/ci-fast-linker enable
       # CAD-1124: no doctests exist; mandatory default-feature clippy and
       # build retain compilation coverage without a zero-test rebuild.
       # CAD-1090: every cargo test target (scripts/result-test-args), with
@@ -597,9 +591,11 @@ jobs:
       # and no gate reads clippy objects from it.
       # CAD-1103: the gates' linker flag is part of the cargo fingerprint, so
       # the release leg warms the cache with the same flag the gates use.
-      # CAD-1480: test-shards enable it too, so the test leg must as well.
-      - name: Enable fast linker (test and release legs; same flags as the gates)
-        if: matrix.profile == 'test' || matrix.profile == 'release'
+      # CAD-1480: NOT the test leg — test-shards link with the default linker
+      # so they keep restoring the existing gate-test cache; flipping the
+      # flag cold-misses every shard until a main push re-warms it.
+      - name: Enable fast linker (release leg; same flags as the gates)
+        if: matrix.profile == 'release'
         run: sh $GITHUB_WORKSPACE/scripts/ci-fast-linker enable
       - name: Enable shared sccache (read-write; no-op without credentials)
         id: sccache
