@@ -394,16 +394,14 @@ fn text_value(
     };
     let slice = text_slice(&mut file, abs, &before, &ident, offset, want)?;
     let end = offset + slice.len() as u64;
-    let next_offset = if end < ident.size { Some(end) } else { None };
     Ok(Some(slice_json(
         norm,
         "text",
         &ident.rev,
         ident.size,
         &ident.sha256,
-        offset,
+        offset..end,
         &slice,
-        next_offset,
     )))
 }
 
@@ -485,16 +483,14 @@ fn blob_value(
         ));
     }
     confirm(&file, pointer, &before)?;
-    let next_offset = if end < declared { Some(end) } else { None };
     Ok(slice_json(
         norm,
         "blob",
         &rev,
         declared,
         &sha,
-        offset,
+        offset..end,
         &data,
-        next_offset,
     ))
 }
 
@@ -514,17 +510,17 @@ fn slice_json(
     rev: &str,
     size: u64,
     sha256: &str,
-    offset: u64,
+    range: std::ops::Range<u64>,
     bytes: &[u8],
-    next_offset: Option<u64>,
 ) -> Value {
+    let next_offset = (range.end < size).then_some(range.end);
     json!({
         "path": path,
         "kind": kind,
         "rev": rev,
         "size": size,
         "sha256": sha256,
-        "offset": offset,
+        "offset": range.start,
         "data_base64": STANDARD.encode(bytes),
         "next_offset": next_offset,
     })
