@@ -2575,8 +2575,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(vault.join("global"));
         let _ = std::fs::remove_dir_all(vault.join("projects"));
 
-        let root_names: Vec<_> = ls(&pm, &Caller::Operator, "")
-            .unwrap()["entries"]
+        let root_names: Vec<_> = ls(&pm, &Caller::Operator, "").unwrap()["entries"]
             .as_array()
             .unwrap()
             .iter()
@@ -2588,7 +2587,10 @@ mod tests {
         for path in ["global", "global/", "projects", "projects/"] {
             let got = ls(&pm, &Caller::Operator, path).unwrap_or_else(|e| panic!("{path}: {e}"));
             assert_eq!(got["path"], path.trim_end_matches('/'), "{path}: {got}");
-            assert!(got["entries"].as_array().unwrap().is_empty(), "{path}: {got}");
+            assert!(
+                got["entries"].as_array().unwrap().is_empty(),
+                "{path}: {got}"
+            );
         }
         let missing = ls(&pm, &Caller::Operator, "global/missing").unwrap_err();
         assert!(
