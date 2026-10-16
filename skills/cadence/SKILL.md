@@ -619,6 +619,12 @@ Only when the operator asks to pin a specific commit, use
 `--to <full main sha>` on both lines. That skips the production-candidate
 receipt and runs the `upgrade --sha` checks instead.
 
+`cadence update` synchronizes bundled guidance from the build it leaves
+active, including an already-current binary and rollback. `--check` does
+not. `cadence skill install` is the manual repair, not a required follow-up.
+An existing session does not reload guidance; start a fresh session or
+reread the skill at a task boundary.
+
 Never relay `rollout claim|backup|handoff|grant` or `upgrade` recipes;
 those are recovery internals (docs/CLI.md). If `--check` refuses, report
 the refusal text and stop. If `--check` shows `available` older than
@@ -706,9 +712,10 @@ example fewer requirement-driven rework rounds, faster review, or fewer escaped
 defects), names an owner, and checks the result on subsequent comparable work.
 Intervals and thresholds belong to the project, not a universal fixed timer.
 
-For Cadence itself, edit the version-controlled `skill/cadence/SKILL.md` through
-the review process. `src/skill.rs` embeds it; `cadence skill install` and daemon
-startup synchronize the embedded copy to the installed skill. Verify source,
+For Cadence itself, edit the version-controlled `skills/cadence/SKILL.md` through
+the review process. `src/skill.rs` embeds it; daemon startup and native
+`cadence update` (including an already-current run and rollback) synchronize
+the embedded copy. `cadence skill install` is the manual repair. Verify source,
 installed and embedded versions when rolling out a change: a local-only edit
 can be overwritten by an older binary. Notify affected agents at their next
 task boundary; do not assume an already-running context reloads automatically.

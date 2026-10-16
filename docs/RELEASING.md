@@ -86,6 +86,19 @@ Report any remaining operator rollout work explicitly.
    intended target. Installation, drain, backup and health checks remain in
    the supported update flow, not a hand-built restart recipe.
 
+### Bundled guidance on native update (CAD-1472)
+
+`cadence update` is the normal path. It synchronizes bundled public guidance
+for the build it leaves active, including an already-current binary and both
+explicit and automatic rollback. `--check` and `update status` do not write,
+and they do not claim the target build's guidance is verified. `cadence skill
+install [name]` is only the manual repair. Updating the files does not reload
+an agent session that is already open; start a fresh session or reread the
+skill at a task boundary. Client-only update does not install guidance or
+start a daemon. There is no setup refresh flag. A guidance failure does not
+roll the binary back and does not restart a healthy daemon just to refresh
+skills.
+
 ### Owned release source (CAD-1455, opt-in)
 
 `staging.yml` retains the promoted release's evidence package

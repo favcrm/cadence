@@ -1472,7 +1472,16 @@ pub(crate) enum Commands {
     /// as the lease receipt, so no manual copy step. `--check` shows
     /// what would happen and changes nothing; `--rollback` returns to
     /// the previous release; `status` shows a pending update and what
-    /// it waits on. Operator-only: the same process proof as
+    /// it waits on. A native update also synchronizes bundled guidance
+    /// from the build that is active afterwards, including when the
+    /// binary is already current and after rollback. `--check` and
+    /// `status` do not write guidance, and they do not treat the
+    /// target build's guidance as verified. A guidance failure does
+    /// not roll back a healthy binary and does not restart the daemon
+    /// just to refresh skills. `cadence skill install` is the manual
+    /// repair. An existing agent session is not reloaded. Client-only
+    /// update does not install guidance or start a daemon.
+    /// Operator-only: the same process proof as
     /// `rollout claim` runs either way, never from inside a pane;
     /// `--as` is an optional audit label (a bare run labels itself
     /// from the proven native OS identity). An image-managed runtime

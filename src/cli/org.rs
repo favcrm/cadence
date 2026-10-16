@@ -135,6 +135,20 @@ impl RegistryFile {
     }
 }
 
+/// The saved default org, if the registry is already there. A missing
+/// file is "no saved org". This does not create the directory, the
+/// registry, or the lock, and it never changes the selection.
+pub(super) fn selected_org_readonly() -> Result<Option<String>> {
+    let path = match RegistryFile::path() {
+        Ok(path) => path,
+        Err(_) => return Ok(None),
+    };
+    if !path.exists() {
+        return Ok(None);
+    }
+    Ok(read_registry(&path)?.selected.map(|selected| selected.org))
+}
+
 /// Read and validate `orgs.json` at `path` — the body of
 /// `RegistryFile::read` split out so a read-only caller (`cadence
 /// update` routing) shares the exact shape checks without taking the
