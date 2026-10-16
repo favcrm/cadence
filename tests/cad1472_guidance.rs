@@ -652,6 +652,73 @@ sys.exit(1)
     );
     assert_eq!(fs::read(&reference).unwrap(), b"check must not repair\n");
 
+    // Overwriting an existing file does not need directory write
+    // permission. The file itself has to be unwritable.
+    let _restore_reference = Mode(&reference, 0o644);
+    fs::set_permissions(&reference, fs::Permissions::from_mode(0o444)).unwrap();
+    let write_failed = fixture.cli_vars(&path, &update_env, &args);
+    fs::set_permissions(&reference, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(
+        write_failed.status.success(),
+        "a guidance write failure must not fail the binary result: {}",
+        String::from_utf8_lossy(&write_failed.stderr)
+    );
+    let write_body: Value = serde_json::from_slice(&write_failed.stdout).unwrap();
+    assert_eq!(write_body["check"]["up_to_date"], true, "{write_body}");
+    assert!(write_body["restart"].is_null(), "{write_body}");
+    assert_eq!(write_body["guidance"]["wrote"], false, "{write_body}");
+    assert_eq!(
+        write_body["guidance"]["guidance"], "needs-attention",
+        "{write_body}"
+    );
+    let write_error = write_body["guidance"]["error"].as_str().unwrap_or("");
+    assert!(
+        write_error.contains("write"),
+        "write failure was not reported: {write_body}"
+    );
+    assert_eq!(fs::read(&reference).unwrap(), b"check must not repair\n");
+
+    let repaired = fixture.cli_vars(&path, &update_env, &args);
+    assert!(
+        repaired.status.success(),
+        "{}",
+        String::from_utf8_lossy(&repaired.stderr)
+    );
+    assert_eq!(fs::read(&reference).unwrap(), original);
+
+    // A repairable provider link whose parent cannot be updated stays
+    // wrong, and the report names the failure instead of claiming current.
+    let provider_link = link_parent.join("cadence");
+    fs::remove_file(&provider_link).unwrap();
+    symlink("/tmp/not-the-bundle", &provider_link).unwrap();
+    let _restore_link_parent = Mode(&link_parent, 0o755);
+    fs::set_permissions(&link_parent, fs::Permissions::from_mode(0o555)).unwrap();
+    let link_failed = fixture.cli_vars(&path, &update_env, &args);
+    fs::set_permissions(&link_parent, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        link_failed.status.success(),
+        "a guidance link failure must not fail the binary result: {}",
+        String::from_utf8_lossy(&link_failed.stderr)
+    );
+    let link_body: Value = serde_json::from_slice(&link_failed.stdout).unwrap();
+    assert_eq!(link_body["check"]["up_to_date"], true, "{link_body}");
+    assert!(link_body["restart"].is_null(), "{link_body}");
+    assert_eq!(link_body["guidance"]["wrote"], false, "{link_body}");
+    assert_eq!(
+        link_body["guidance"]["guidance"], "needs-attention",
+        "{link_body}"
+    );
+    let link_error = link_body["guidance"]["error"].as_str().unwrap_or("");
+    assert!(
+        link_error.contains("replace") || link_error.contains("link"),
+        "link failure was not reported: {link_body}"
+    );
+    assert_eq!(
+        fs::read_link(&provider_link).unwrap(),
+        Path::new("/tmp/not-the-bundle")
+    );
+
+    fs::write(&reference, "rollback must not repair\n").unwrap();
     let rollback = fixture.cli_vars(
         &path,
         &update_env,
@@ -675,6 +742,15 @@ sys.exit(1)
         rollback_err.contains("no previous release"),
         "{rollback_err}"
     );
-    assert_eq!(fs::read(&reference).unwrap(), b"check must not repair\n");
+    assert_eq!(fs::read(&reference).unwrap(), b"rollback must not repair\n");
     assert_eq!(fs::read_link(&link).unwrap(), release_bin);
+}
+
+/// Restores a path mode if an assertion fails before the test does.
+struct Mode<'a>(&'a Path, u32);
+
+impl Drop for Mode<'_> {
+    fn drop(&mut self) {
+        let _ = fs::set_permissions(self.0, fs::Permissions::from_mode(self.1));
+    }
 }
