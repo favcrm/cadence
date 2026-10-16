@@ -521,7 +521,7 @@ export default function Composer({
     }
   };
   const onKey = (e: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.nativeEvent.isComposing) return;
+    if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
     if (matches.length) {
       if (e.key === "ArrowDown") {
         e.preventDefault();
