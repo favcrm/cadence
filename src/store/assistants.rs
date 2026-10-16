@@ -260,11 +260,11 @@ impl Store {
                 // transaction refuses, never a silent adoption of a
                 // divergent binding.
                 if existing.assistant_id != assistant_id || existing.alias != alias {
-                    return Err(Error::rejected(format!(
+                    return Err(Error::rejected(
                         "assistant binding for this member already exists under a \
                          different assistant/alias — a conflicting tuple is refused, \
-                         never rewritten"
-                    )));
+                         never rewritten",
+                    ));
                 }
                 // Refresh the proven authority revision; idempotent.
                 tx.execute(
