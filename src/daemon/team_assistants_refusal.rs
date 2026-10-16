@@ -7631,3 +7631,570 @@ fn bootstrap_ack_by_foreign_caller_cannot_apply_with_valid_victim_turn() {
         "complete context carried the pending guide"
     );
 }
+
+// ============================================================================
+// CAD-1420 independent refusal acceptance — `platform_assistant_provision`,
+// the dedicated platform-authority projection, authored by a worker that is
+// NOT the implementer. The guard contract under test (from the ticket, not
+// the implementation): a genuinely absent `assistants` row may be projected
+// ONLY when (a) the caller is the proven operator/board relay, (b) the
+// signed `member_envelope` cryptographically re-verifies, (c) the daemon's
+// `hosted-board` `assist.revalidate` service credential is enrolled through
+// the NORMAL `platform_enroll` operator path for THIS board's configured
+// host, and (d) the live upstream pull re-allows the member's ORIGINAL
+// issuing credential for the exact operation + scope. A revoked/stale
+// original CID denies at the LIVE pull — before any binding row, agent,
+// thread or private-cwd file exists. The fixture platform is synthetic; it
+// proves the daemon honors the real guard, never a live product R1.
+// ============================================================================
+
+/// The native HTTP `assist_*` surface on a real owned daemon + real board.
+/// `state` is the daemon's own dir; `Fx` supplies ONLY the loopback
+/// platform (JWKS + revalidate), the signing key and member authority —
+/// the same two-server layout the route runs in production.
+struct ProvisionHttpRig {
+    _root: tempfile::TempDir,
+    state: PathBuf,
+    pm: PathBuf,
+    board_port: u16,
+    /// The board's public host — the platform's `localhost:<port>`,
+    /// carried so `call` names it in the Host header.
+    public_host: String,
+    stop: Arc<AtomicBool>,
+    _threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl ProvisionHttpRig {
+    /// Boot a REAL daemon (`serve_with`, test-seam armed) on its own temp
+    /// state + PM, then a REAL `crate::ui::serve` board whose public host
+    /// names the fixture platform. `fx`'s platform is the authority for
+    /// both the route's envelope verify and the daemon's live pull.
+    fn start(fx: &Fx) -> Self {
+        let root = tempfile::Builder::new()
+            .prefix("c1420-http")
+            .tempdir()
+            .unwrap();
+        let state = root.path().join("s");
+        let pm = root.path().join("pm");
+        crate::issue::Pm::init(&pm).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        // The same trust root `Fx` uses: the loopback platform's host/issuer.
+        crate::board_identity::write_config(
+            &state,
+            &crate::board_identity::Config {
+                host: fx.host.clone(),
+                issuer: fx.issuer.clone(),
+                company: ORG.to_string(),
+            },
+        )
+        .unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut threads = Vec::new();
+
+        // Real daemon on a real socket; the PM dir is the fixture's own.
+        {
+            let dir = state.clone();
+            let opts = ServeOptions {
+                test_seam: true,
+                stop: Some(stop.clone()),
+                ..ServeOptions::default()
+            };
+            opts.provider_env
+                .set("CADENCE_PM_DIR", pm.to_str().unwrap());
+            // `.expect` inside the thread keeps a daemon startup failure
+            // observable as a joinable panic rather than a dropped Result.
+            threads.push(std::thread::spawn(move || {
+                crate::daemon::serve_with(&dir, opts).expect("owned test daemon failed");
+            }));
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while !state.join("cadence.sock").exists()
+                || crate::test_seam::Seam::token_at(&state).is_none()
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "owned daemon never started"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        // Real board with a public identity so `/api/assist/*` diverts —
+        // the same surface the platform relay forwards to.
+        let platform_port: u16 = fx
+            .host
+            .rsplit(':')
+            .next()
+            .unwrap_or_default()
+            .parse()
+            .unwrap_or(0);
+        let mut board_port = 0u16;
+        for port in 3110..=3199u16 {
+            if port == platform_port {
+                continue;
+            }
+            let (startup, ready) = std::sync::mpsc::channel();
+            let board = crate::ui::ServeOpts {
+                host: "127.0.0.1".into(),
+                port,
+                stop: Some(stop.clone()),
+                startup: Some(startup),
+                test_seam: true,
+                allow_hosts: vec![fx.host.clone()],
+                public: Some(crate::ui::PublicBoard {
+                    host: fx.host.clone(),
+                    issuer: fx.issuer.clone(),
+                    company: ORG.into(),
+                    authorize_url: format!("{}/authorize", fx.issuer),
+                }),
+                ..crate::ui::ServeOpts::default()
+            };
+            let (s, p) = (state.clone(), pm.clone());
+            let thread = std::thread::spawn(move || drop(crate::ui::serve(&s, &p, &board)));
+            match ready.recv_timeout(Duration::from_secs(30)).unwrap() {
+                Ok(()) => {
+                    board_port = port;
+                    threads.push(thread);
+                    break;
+                }
+                Err(_) => {
+                    thread.join().unwrap();
+                }
+            }
+        }
+        assert!(board_port > 0, "board could not bind in 3110..=3199");
+        Self {
+            _root: root,
+            state,
+            pm,
+            board_port,
+            public_host: fx.host.clone(),
+            stop,
+            _threads: threads,
+        }
+    }
+
+    /// `POST /api/assist/<verb>` on the board's public host → (status, body).
+    fn call(&self, verb: &str, envelope: &str, args: &Value) -> (u16, Value) {
+        let body = serde_json::to_vec(args).unwrap();
+        let mut socket = std::net::TcpStream::connect(("127.0.0.1", self.board_port)).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        use std::io::Write as _;
+        write!(
+            socket,
+            "POST /api/assist/{verb} HTTP/1.1\r\nHost: {}\r\n\
+             Authorization: Bearer wikienv_{envelope}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n",
+            self.public_host,
+            body.len()
+        )
+        .unwrap();
+        socket.write_all(&body).unwrap();
+        let mut response = Vec::new();
+        std::io::Read::read_to_end(&mut socket, &mut response).unwrap();
+        let split = response
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("no http header/body split");
+        let header = std::str::from_utf8(&response[..split]).unwrap();
+        let status = header
+            .lines()
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let value = serde_json::from_slice(&response[split + 4..]).unwrap_or_else(
+            |_| json!({"_nonjson": String::from_utf8_lossy(&response[split+4..]).into_owned()}),
+        );
+        (status, value)
+    }
+
+    /// The daemon's own `client::rpc` on the real socket — the same path
+    /// the board's relay uses. `who` is asserted through the test seam.
+    fn rpc_as(&self, who: Asserted, method: &str, params: Value) -> Result<Value> {
+        crate::test_seam::scoped(who, || crate::client::rpc(&self.state, method, params))
+    }
+
+    /// A `Shared` opened alongside the live daemon — the second handle the
+    /// HTTP refusal module already uses for reads against the owned state.
+    fn store(&self) -> Arc<Shared> {
+        let opts = ServeOptions::default();
+        opts.provider_env
+            .set("CADENCE_PM_DIR", self.pm.to_str().unwrap());
+        crate::daemon::Shared::new(&self.state, &opts).unwrap()
+    }
+
+    /// Whole-PM-tree byte snapshot — the "no effect" probe for refused calls.
+    fn tree(&self) -> BTreeMap<String, Vec<u8>> {
+        fn walk(base: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
+            for e in std::fs::read_dir(dir).unwrap() {
+                let p = e.unwrap().path();
+                let rel = p.strip_prefix(base).unwrap().to_string_lossy().into_owned();
+                if rel == ".git" {
+                    continue;
+                }
+                if p.is_dir() {
+                    out.insert(format!("{rel}/"), vec![]);
+                    walk(base, &p, out);
+                } else {
+                    out.insert(rel, std::fs::read(&p).unwrap());
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        walk(&self.pm, &self.pm, &mut out);
+        out
+    }
+}
+
+impl Drop for ProvisionHttpRig {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Assert that NOTHING was projected for `sub`: no `assistants` row, no
+/// registered agent under the server-derived alias, no bound thread and no
+/// private-cwd directory under `state_dir/assistants/<digest>`.
+fn assert_nothing_projected(shared: &Shared, org: &str, sub: &str, case: &str) {
+    assert!(
+        shared.store.assistant_binding(org, sub).unwrap().is_none(),
+        "{case}: a refused projection left an assistants row"
+    );
+    let alias = shared.assistant_principal_alias(org, sub);
+    assert!(
+        shared.store.agent_opt(&alias).unwrap().is_none(),
+        "{case}: a refused projection registered agent '{alias}'"
+    );
+    assert!(
+        shared.store.thread(&alias).unwrap().is_none(),
+        "{case}: a refused projection bound a thread for '{alias}'"
+    );
+    assert!(
+        !shared.assistant_principal_cwd(org, sub).exists(),
+        "{case}: a refused projection created the member's private cwd"
+    );
+}
+
+/// CAD-1420 acceptance: a genuinely absent binding may be projected ONLY
+/// through the live-authority path. A fresh member whose ORIGINAL issuing
+/// credential is dead at the platform is denied at the LIVE pull on BOTH
+/// the direct `platform_assistant_provision` RPC and the real
+/// `/api/assist/<verb>` HTTP surface — with NO `assistants` row, NO
+/// registered agent, NO bound thread and NO private-cwd files. The
+/// enrolled `hosted-board` service credential goes through the NORMAL
+/// `platform_enroll` operator RPC — never a raw SQL/custody seed — so a
+/// missing or wrongly-scoped service cannot masquerade as a live denial.
+/// Every refused case pairs with an authorized control in the same
+/// fixture so a blanket-fail cannot pass. The fixture platform is
+/// synthetic — it exercises the real guard, never a live product R1.
+#[test]
+fn platform_provision_live_denial_creates_no_binding_or_files() {
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+
+    // ---- Enrollment guards: the new normal `hosted-board` enroll path
+    // must not be unguarded. A wrong host and a broadened scope each
+    // refuse BEFORE any custody record lands — the account is pinned to
+    // this board's configured host and the declared scope set is exactly
+    // `assist.revalidate`. `accept_same_uid_risk` is the test-only
+    // fixture operator's consent for same-uid custody (ADR 0006 P4), not
+    // a live human approval.
+    let service_token = format!("hcs_{}", "f".repeat(43));
+    for (label, params) in [
+        (
+            "wrong host",
+            json!({"platform": "hosted-board", "account": "other-board.example",
+                   "scopes": ["assist.revalidate"], "token": service_token,
+                   "accept_same_uid_risk": true}),
+        ),
+        (
+            "broadened scope",
+            json!({"platform": "hosted-board", "account": fx.host.clone(),
+                   "scopes": ["assist.revalidate", "results.submit"], "token": service_token,
+                   "accept_same_uid_risk": true}),
+        ),
+    ] {
+        let before = fx.tree();
+        let e = err_text(
+            fx.op_err("platform_enroll", params),
+            &format!("hosted-board enroll {label}"),
+        );
+        assert!(
+            !e.is_empty(),
+            "hosted-board enroll {label} produced an empty refusal"
+        );
+        assert_eq!(fx.tree(), before, "a refused {label} enroll had an effect");
+    }
+    // A refused enroll leaves no loadable record.
+    assert!(
+        fx.shared
+            .store
+            .platform_credential("hosted-board", &fx.host)
+            .unwrap()
+            .is_none(),
+        "a refused hosted-board enroll left a credential record"
+    );
+
+    // ---- NORMAL enrollment: the real `platform_enroll` operator RPC for
+    // THIS board's configured host with exactly `assist.revalidate`. ----
+    let enrolled = fx.op_err(
+        "platform_enroll",
+        json!({"platform": "hosted-board", "account": fx.host.clone(),
+               "scopes": ["assist.revalidate"], "token": service_token,
+               "accept_same_uid_risk": true}),
+    );
+    assert!(
+        enrolled.is_ok(),
+        "the normal hosted-board enroll refused: {enrolled:?}"
+    );
+    // The fixture platform recognizes the enrolled service bearer.
+    fx.authority
+        .lock()
+        .unwrap()
+        .services
+        .push(ServiceAuthority {
+            token: service_token.clone(),
+            org: ORG.to_string(),
+            audience: format!("http://{}", fx.host),
+            caps: vec!["assist.revalidate".into()],
+            live: true,
+        });
+
+    // ---- POSITIVE CONTROL (direct RPC): a live member with a live
+    // ORIGINAL credential projects exactly one server-derived binding. ----
+    let sub = "sub-new";
+    fx.authority
+        .lock()
+        .unwrap()
+        .members
+        .insert(sub.to_string(), MemberAuthority::live(sub));
+    let env = fx.envelope(sub, json!({}), json!({}));
+    let ok = fx
+        .op_err(
+            "platform_assistant_provision",
+            json!({"member_envelope": env, "operation": "assist_state"}),
+        )
+        .unwrap_or_else(|e| panic!("live member's projection refused: {e}"));
+    assert_eq!(
+        ok["provisioned"].as_bool(),
+        Some(true),
+        "live member was not projected: {ok}"
+    );
+    let binding = fx
+        .shared
+        .store
+        .assistant_binding(ORG, sub)
+        .unwrap()
+        .expect("live member produced no binding");
+    assert_eq!(binding.org, ORG);
+    assert_eq!(binding.sub, sub);
+    assert_eq!(binding.assistant_id, format!("assist_{sub}"));
+    assert!(
+        binding.alias.starts_with("assist-") && binding.alias.len() == 55,
+        "binding alias is not the server-derived digest form: {}",
+        binding.alias
+    );
+    assert!(
+        fx.shared.store.agent_opt(&binding.alias).unwrap().is_none(),
+        "the projection registered an agent"
+    );
+    assert!(
+        !fx.shared.assistant_principal_cwd(ORG, sub).exists(),
+        "the projection created the member's private cwd"
+    );
+
+    // ---- LIVE DENIAL (direct RPC): the ORIGINAL issuing credential is
+    // dead upstream. The member is still listed and the envelope still
+    // verifies, so ONLY the live pull's `credential_id` re-prove can
+    // refuse — this is never a missing-enrollment or envelope failure.
+    fx.authority
+        .lock()
+        .unwrap()
+        .members
+        .insert("sub-dead".to_string(), MemberAuthority::live("sub-dead"));
+    fx.set_member("sub-dead", |m| m.credential_live = false);
+    let dead_env = fx.envelope("sub-dead", json!({}), json!({}));
+    let before = fx.tree();
+    let e = err_text(
+        fx.op_err(
+            "platform_assistant_provision",
+            json!({"member_envelope": dead_env, "operation": "assist_state"}),
+        ),
+        "platform_assistant_provision with a dead original credential",
+    );
+    // The exact live-guard refusal — not a custody, scope, binding or
+    // envelope failure masquerading as revocation.
+    assert!(
+        e.contains("the platform revalidation did not allow"),
+        "dead-credential projection refused outside the live guard: {e}"
+    );
+    assert_nothing_projected(&fx.shared, ORG, "sub-dead", "direct RPC denial");
+    assert_eq!(
+        fx.tree(),
+        before,
+        "a refused projection changed the tracker"
+    );
+
+    // ---- LIVE DENIAL (HTTP): the real `/api/assist/*` surface on an
+    // owned daemon + board. The rig's daemon enrolls the same service
+    // credential through the NORMAL `platform_enroll` over its real
+    // socket, asserted through the test seam as the operator.
+    let http_fx = Fx::new();
+    let rig = ProvisionHttpRig::start(&http_fx);
+    let rig_token = format!("hcs_{}", "g".repeat(43));
+    let enrolled = rig.rpc_as(
+        Asserted::Operator,
+        "platform_enroll",
+        json!({"platform": "hosted-board", "account": http_fx.host.clone(),
+               "scopes": ["assist.revalidate"], "token": rig_token,
+               "accept_same_uid_risk": true}),
+    );
+    assert!(
+        enrolled.is_ok(),
+        "the rig daemon's normal hosted-board enroll refused: {enrolled:?}"
+    );
+    http_fx
+        .authority
+        .lock()
+        .unwrap()
+        .services
+        .push(ServiceAuthority {
+            token: rig_token,
+            org: ORG.to_string(),
+            audience: format!("http://{}", http_fx.host),
+            caps: vec!["assist.revalidate".into()],
+            live: true,
+        });
+
+    // Closed-arg guard with an otherwise-authorized LIVE member: an
+    // unknown POST field refuses BEFORE any projection — a malformed
+    // call never reaches the RPC. A fresh envelope each call: the HTTP
+    // route consumes the jti before arg validation, so reusing one would
+    // only re-test replay, not the guard under test.
+    http_fx.authority.lock().unwrap().members.insert(
+        "sub-httpok".to_string(),
+        MemberAuthority::live("sub-httpok"),
+    );
+    let http_before = rig.tree();
+    let (status, body) = rig.call(
+        "assist_state",
+        &http_fx.envelope("sub-httpok", json!({}), json!({})),
+        &json!({"bogus": true}),
+    );
+    assert_eq!(
+        status, 400,
+        "an unknown-arg assist_state was not refused at HTTP: {body}"
+    );
+    assert_nothing_projected(&rig.store(), ORG, "sub-httpok", "unknown-arg refusal");
+    assert_eq!(rig.tree(), http_before, "an unknown-arg call had an effect");
+
+    // Positive control: a FRESH envelope for the same live member admits —
+    // proving the route, the projection and the member verb all pass.
+    let (status, body) = rig.call(
+        "assist_state",
+        &http_fx.envelope("sub-httpok", json!({}), json!({})),
+        &json!({}),
+    );
+    assert_eq!(
+        status, 200,
+        "a live member's assist_state was refused at HTTP: {body}"
+    );
+    let binding = rig
+        .store()
+        .store
+        .assistant_binding(ORG, "sub-httpok")
+        .unwrap()
+        .expect("a live member's HTTP call created no binding");
+    assert_eq!(binding.assistant_id, "assist_sub-httpok");
+
+    // The live denial through the SAME HTTP surface: a fresh envelope for
+    // a member whose original credential is dead upstream must be refused
+    // at the live pull — before any binding, agent, thread or file.
+    http_fx.authority.lock().unwrap().members.insert(
+        "sub-httpdead".to_string(),
+        MemberAuthority::live("sub-httpdead"),
+    );
+    http_fx.set_member("sub-httpdead", |m| m.credential_live = false);
+    let http_before = rig.tree();
+    let (status, body) = rig.call(
+        "assist_state",
+        &http_fx.envelope("sub-httpdead", json!({}), json!({})),
+        &json!({}),
+    );
+    assert_eq!(
+        status, 403,
+        "a dead-credential assist_state was not refused 403 at HTTP: {body}"
+    );
+    // The HTTP refusal names the live-guard denial, not a bare 403.
+    let message = body["error"]["message"]
+        .as_str()
+        .or_else(|| body["message"].as_str())
+        .unwrap_or_default();
+    assert!(
+        message.contains("the platform revalidation did not allow"),
+        "the HTTP refusal did not name the live-guard denial: {body}"
+    );
+    assert_nothing_projected(&rig.store(), ORG, "sub-httpdead", "HTTP denial");
+    assert_eq!(rig.tree(), http_before, "a refused HTTP call had an effect");
+
+    // A valid-shape `assist_send` for a SECOND dead-credential member —
+    // the same live denial on the write operation's surface.
+    http_fx.authority.lock().unwrap().members.insert(
+        "sub-httpdead2".to_string(),
+        MemberAuthority::live("sub-httpdead2"),
+    );
+    http_fx.set_member("sub-httpdead2", |m| m.credential_live = false);
+    let http_before = rig.tree();
+    let (status, body) = rig.call(
+        "assist_send",
+        &http_fx.envelope("sub-httpdead2", json!({}), json!({})),
+        &json!({"text": "still refused"}),
+    );
+    assert_eq!(
+        status, 403,
+        "a dead-credential assist_send was not refused 403 at HTTP: {body}"
+    );
+    let message = body["error"]["message"]
+        .as_str()
+        .or_else(|| body["message"].as_str())
+        .unwrap_or_default();
+    assert!(
+        message.contains("the platform revalidation did not allow"),
+        "the HTTP send refusal did not name the live-guard denial: {body}"
+    );
+    assert_nothing_projected(&rig.store(), ORG, "sub-httpdead2", "HTTP send denial");
+    assert_eq!(rig.tree(), http_before, "a refused HTTP send had an effect");
+
+    // ---- Direct-RPC controls on the rig daemon: a non-operator caller
+    // and a read-scope-only envelope are refused before the live pull. ----
+    let rig_shared = rig.store();
+    let nonop = rig.rpc_as(
+        Asserted::Agent("writer".into()),
+        "platform_assistant_provision",
+        json!({"member_envelope": http_fx.envelope("sub-httpok", json!({}), json!({})),
+               "operation": "assist_state"}),
+    );
+    assert!(
+        nonop.is_err(),
+        "an agent caller reached platform_assistant_provision: {nonop:?}"
+    );
+    let readonly = http_fx.envelope("sub-httpok", json!({}), json!({"scope": ["assist.read"]}));
+    let e = err_text(
+        rig.rpc_as(
+            Asserted::Operator,
+            "platform_assistant_provision",
+            json!({"member_envelope": readonly, "operation": "assist_send"}),
+        ),
+        "read-scope projection of a write operation",
+    );
+    assert!(
+        e.contains("scope") || e.contains("refused") || e.contains("assist."),
+        "a read-scope projection of assist_send refused for another reason: {e}"
+    );
+    let _ = rig_shared;
+}

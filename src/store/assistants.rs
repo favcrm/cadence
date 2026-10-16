@@ -254,6 +254,18 @@ impl Store {
                         existing.state
                     )));
                 }
+                // CAD-1420 CAS: the stored tuple IS the member's canonical
+                // identity — a caller naming a different assistant_id or
+                // alias for the same (org, sub) is a conflict the
+                // transaction refuses, never a silent adoption of a
+                // divergent binding.
+                if existing.assistant_id != assistant_id || existing.alias != alias {
+                    return Err(Error::rejected(format!(
+                        "assistant binding for this member already exists under a \
+                         different assistant/alias — a conflicting tuple is refused, \
+                         never rewritten"
+                    )));
+                }
                 // Refresh the proven authority revision; idempotent.
                 tx.execute(
                     "UPDATE assistants SET authority_rev=COALESCE(?,authority_rev), \
@@ -261,6 +273,19 @@ impl Store {
                     params![authority_rev, now, org, sub],
                 )?;
                 return Ok(existing);
+            }
+            // CAD-1420: a NEW binding's daemon-derived alias must not collide
+            // with a row already registered as an ordinary agent — checked in
+            // this same transaction so a racing registration or a squatting
+            // worker is refused, never adopted as the member's assistant.
+            let alias_taken: bool = tx
+                .query_opt("SELECT 1 FROM agents WHERE alias=?", [alias], |_| Ok(()))?
+                .is_some();
+            if alias_taken {
+                return Err(Error::rejected(format!(
+                    "assistant alias '{alias}' is already registered — the binding \
+                     refuses rather than adopt an ordinary agent"
+                )));
             }
             tx.execute(
                 "INSERT INTO assistants(org, sub, assistant_id, alias, state, \

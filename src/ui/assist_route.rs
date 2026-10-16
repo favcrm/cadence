@@ -266,6 +266,21 @@ fn member_rpc(
     }
 }
 
+/// CAD-1420: invoke the dedicated `platform_assistant_provision` daemon
+/// RPC on the same proven relay before the member verb. Params are the
+/// closed pair — the signed `member_envelope` (daemon re-verifies it) and
+/// the server-derived `operation`; no caller field is forwarded. A refusal
+/// maps to the same 403 contract as a member_* refusal; a `provisioned:`
+/// false answer (existing active binding) is the idempotent no-op.
+fn provision(state_dir: &Path, operation: &str, envelope: &str) -> Result<(), HttpResp> {
+    let params = json!({"member_envelope": envelope, "operation": operation});
+    match client::rpc(state_dir, "platform_assistant_provision", params) {
+        Ok(_) => Ok(()),
+        Err(crate::error::Error::Rejected(m)) => Err(assist_fail(403, "forbidden", &m)),
+        Err(e) => Err(write_err(&e)),
+    }
+}
+
 fn json_ok(v: Value) -> HttpResp {
     let mut resp = Response::from_data(serde_json::to_vec(&v).unwrap_or_default())
         .with_status_code(StatusCode(200));
@@ -287,18 +302,100 @@ fn dispatch(
     _opts: &ServeOpts,
 ) -> HttpResp {
     match verb {
+        // CAD-1420: the three assist.* member verbs first re-validate their
+        // argument shape (unknown fields and a negative history cursor
+        // refuse here, before any projection can create a binding from
+        // malformed input), then invoke the dedicated platform-projection
+        // RPC on the same proven relay, then run the ordinary member_* RPC.
+        // The member verb's own binding check still runs — a member with no
+        // binding can never reach member_caller's ordinary path; only the
+        // verified-envelope + live-authority projection mints one.
         AssistVerb::AssistState => {
+            // The daemon accepts NO fields for state — any argument key
+            // refuses before the projection can create a binding.
+            if let Some(field) = args.as_object().and_then(|o| o.keys().next()) {
+                return assist_fail(
+                    400,
+                    "invalid_request",
+                    &format!("assist_state takes no arguments; field '{field}' is not accepted"),
+                );
+            }
+            if let Err(resp) = provision(state_dir, "assist_state", envelope) {
+                return resp;
+            }
             member_rpc(state_dir, "member_assist_state", actor, envelope, args)
         }
         AssistVerb::AssistHistory => {
+            // The daemon's own allowed fields: after,before,tail,limit. An
+            // unknown argument refuses BEFORE the projection so a malformed
+            // call never creates a binding. A negative `after` cursor is the
+            // existing daemon check, mirrored here so the refusal precedes
+            // any binding write.
+            if let Some(field) = args.as_object().and_then(|o| {
+                o.keys()
+                    .find(|k| !["after", "before", "tail", "limit"].contains(&k.as_str()))
+            }) {
+                return assist_fail(
+                    400,
+                    "invalid_request",
+                    &format!(
+                        "assist_history takes after, before, tail, limit only; \
+                         field '{field}' is not accepted"
+                    ),
+                );
+            }
+            for field in ["after", "before", "tail", "limit"] {
+                match args.get(field) {
+                    None | Some(Value::Null) => {}
+                    Some(Value::Number(n))
+                        if field == "after" || field == "before" || field == "limit" =>
+                    {
+                        if field == "after" && n.as_i64().map(|v| v < 0).unwrap_or(false) {
+                            return assist_fail(
+                                400,
+                                "invalid_request",
+                                "history cursor must be nonnegative",
+                            );
+                        }
+                    }
+                    Some(Value::Bool(_)) if field == "tail" => {}
+                    Some(_) => {
+                        return assist_fail(
+                            400,
+                            "invalid_request",
+                            &format!("assist argument '{field}' has an invalid shape"),
+                        )
+                    }
+                }
+            }
+            if let Err(resp) = provision(state_dir, "assist_history", envelope) {
+                return resp;
+            }
             member_rpc(state_dir, "member_assist_history", actor, envelope, args)
         }
-        AssistVerb::AssistSend => match arg_str(args, "text") {
-            Ok(Some(text)) if !text.trim().is_empty() => {
-                member_rpc(state_dir, "member_assist_send", actor, envelope, args)
+        AssistVerb::AssistSend => {
+            // The daemon accepts `text` only — any other argument key
+            // refuses before the projection can create a binding.
+            if let Some(field) = args
+                .as_object()
+                .and_then(|o| o.keys().find(|k| k.as_str() != "text"))
+            {
+                return assist_fail(
+                    400,
+                    "invalid_request",
+                    &format!("assist_send takes text only; field '{field}' is not accepted"),
+                );
             }
-            _ => assist_fail(400, "invalid_request", "assist_send needs arguments.text"),
-        },
+            match arg_str(args, "text") {
+                Ok(Some(text)) if !text.trim().is_empty() => {
+                    if let Err(resp) = provision(state_dir, "assist_send", envelope) {
+                        return resp;
+                    }
+                    member_rpc(state_dir, "member_assist_send", actor, envelope, args)
+                }
+                _ => assist_fail(400, "invalid_request", "assist_send needs arguments.text"),
+            }
+        }
         AssistVerb::JobRequest => match (arg_str(args, "title"), arg_str(args, "request_key")) {
             (Ok(Some(_)), Ok(Some(_))) => {
                 member_rpc(state_dir, "member_job_request", actor, envelope, args)

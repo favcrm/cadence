@@ -1422,6 +1422,207 @@ impl Shared {
         Ok(member_call)
     }
 
+    /// The member assistant's daemon-owned alias, derived server-side from
+    /// the canonical `(org, sub)` principal — the same length-prefixed digest
+    /// `assistant_principal_cwd` uses, so the alias and the confined cwd key
+    /// the same unambiguous principal. `assist-` + first 48 hex chars of the
+    /// digest is 55 chars, inside the 64-char identifier grammar, and is
+    /// deterministic across credential rotation. A request never names it.
+    pub(super) fn assistant_principal_alias(&self, org: &str, sub: &str) -> String {
+        let canonical = format!("{}:{org}|{}:{sub}", org.len(), sub.len());
+        let digest = crate::operator_auth::digest(&canonical);
+        format!("assist-{}", &digest[..48])
+    }
+
+    /// CAD-1420: `platform_assistant_provision` — the daemon's dedicated
+    /// platform-authority projection. The `/api/assist/<verb>` relay invokes
+    /// it BEFORE the ordinary `member_assist_state|history|send` verb so a
+    /// genuinely absent local binding can be projected from the platform's
+    /// already-verified signed assistant envelope — never from a request
+    /// field, a member self-claim or a SQLite seed.
+    ///
+    /// Closed params: `member_envelope` + `operation` only. `operation` is
+    /// allowlisted to the read/write member ops (`assist_state`,
+    /// `assist_history`, `assist_send`); every job operation and every other
+    /// field is refused — a job's provenance still comes from
+    /// `member_job_request` alone. The connection must be the proven
+    /// operator/board relay (`proven_operator`), and the envelope is
+    /// cryptographically re-verified (`member_envelope_actor`) exactly as
+    /// `member_caller` does: issuer, JWKS, audience, company, time, kind,
+    /// subject, assistant and scope pins all re-check here.
+    ///
+    /// An existing stored binding is NOT touched: a matching active tuple
+    /// returns `{"provisioned": false}` without any mutation (no freshness,
+    /// enrollment or runtime write — the existing member path keeps its
+    /// current behavior), and a mismatched tuple or a revoked/archived
+    /// binding is refused, never renamed, revived or reset.
+    ///
+    /// A genuinely ABSENT binding may be projected only when the board's own
+    /// enrolled `hosted-board` service credential is present and loadable —
+    /// the daemon's least-authority `assist.revalidate` custody — AND the
+    /// live `member_authority_live` pull (EMPTY envelope, so the service
+    /// bearer is the proof and the member-envelope fallback can never apply)
+    /// answers `allow` for the exact operation + scope, re-proving the
+    /// member's CURRENT issuing credential (`op_credential_id` = the verified
+    /// incoming envelope's credential). Then `store.assistant_bind` writes
+    /// the row inside its own transaction, which atomically refuses a
+    /// conflicting tuple and a pre-existing `agents.alias` collision.
+    /// Nothing here registers an agent, mints a runtime/thread/file, or
+    /// starts an endpoint — the lazy `ensure_assistant_runtime` inside the
+    /// subsequent member verb still owns that.
+    pub(super) fn rpc_platform_assistant_provision(
+        &self,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        let verb = "platform assistant provision";
+        reject_unknown_fields(params, &["member_envelope", "operation"], verb)?;
+        // The same trusted channel as every member_* verb — only the
+        // board's proven relay may carry a signed member envelope.
+        self.proven_operator(verb, peer_pid)?;
+        let envelope = optional_str(params, "member_envelope").ok_or_else(|| {
+            Error::rejected(format!(
+                "{verb} refused: no member_envelope proof — \
+                 projection requires a verified assistant envelope"
+            ))
+        })?;
+        let operation = required_str(params, "operation")?;
+        let want_scope = match operation {
+            "assist_state" | "assist_history" => "assist.read",
+            "assist_send" => "assist.write",
+            _ => {
+                return Err(Error::rejected(format!(
+                    "{verb} refused: operation '{operation}' is not provisionable — \
+                     only assist_state/assist_history/assist_send project a binding"
+                )))
+            }
+        };
+        let (org, sub, assistant_id, scopes, credential_id) =
+            self.member_envelope_actor(envelope, verb)?;
+        if !scopes.iter().any(|s| s == want_scope) {
+            return Err(Error::rejected(format!(
+                "{verb} refused: the member envelope's scopes do not cover {want_scope}"
+            )));
+        }
+        // Re-read the stored binding. An existing row is left alone: a
+        // matching active tuple is an idempotent no-op (the daemon does not
+        // re-enroll, re-stamp or re-fresh what already holds), a mismatched
+        // or dead tuple is refused.
+        if let Some(existing) = self.store.assistant_binding(&org, &sub)? {
+            if existing.assistant_id != assistant_id {
+                return Err(Error::rejected(format!(
+                    "{verb} refused: member envelope names assistant '{assistant_id}', not \
+                     the stored binding's '{}' — a conflicting tuple is never rewritten",
+                    existing.assistant_id
+                )));
+            }
+            if existing.org != org {
+                return Err(Error::rejected(format!(
+                    "{verb} refused: member envelope org '{org}' does not match the binding"
+                )));
+            }
+            if !existing.is_active() {
+                return Err(Error::rejected(format!(
+                    "{verb} refused: the member's assistant binding is {} — \
+                     revoked/archived membership is never revived by a projection",
+                    existing.state
+                )));
+            }
+            return Ok(json!({
+                "provisioned": false,
+                "org": org,
+                "sub": sub,
+                "assistant_id": assistant_id,
+                "alias": existing.alias,
+                "note": "an active binding already exists — nothing was projected",
+            }));
+        }
+        // Genuinely absent: project ONLY under the daemon's own enrolled
+        // hosted-board service credential. A missing or unloadable record
+        // refuses here — the member-envelope bearer fallback of
+        // `member_authority_live` must never substitute for a service
+        // credential at first projection (no token ingestion, no enrollment
+        // shortcut, no borrowed custody).
+        let config = board_identity::read_config(&self.state_dir).map_err(|_| {
+            Error::rejected(format!(
+                "{verb} refused: no board identity is configured for provisioning"
+            ))
+        })?;
+        let host = config.host.trim_end_matches('/').to_string();
+        match self.store.platform_credential("hosted-board", &host) {
+            Err(e) => {
+                return Err(Error::rejected(format!(
+                    "{verb} refused: the hosted-board service credential record \
+                     could not be read: {e}"
+                )));
+            }
+            Ok(None) => {
+                return Err(Error::rejected(format!(
+                    "{verb} refused: no enrolled hosted-board service credential for \
+                     '{host}' — projection requires the board's own enrolled authority"
+                )));
+            }
+            Ok(Some(record)) => {
+                let key = crate::platform::custody::Key {
+                    platform: "hosted-board",
+                    account: &host,
+                };
+                let loadable = self
+                    .platform_custody
+                    .load(&record.custody, &key)
+                    .ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok())
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty());
+                if loadable.is_none() {
+                    return Err(Error::rejected(format!(
+                        "{verb} refused: the enrolled hosted-board service credential \
+                         has no loadable custody material"
+                    )));
+                }
+            }
+        }
+        // Live pull BEFORE the new binding: the platform re-derives `allow`
+        // from the member's CURRENT role, membership, grants and active
+        // upstream binding — with the service credential as bearer (empty
+        // envelope) and the verified incoming credential as the re-proved
+        // provenance. A revoked/stale/dead credential, or a member the
+        // platform no longer serves, is refused before any row exists.
+        let member = MemberCaller {
+            org: org.clone(),
+            sub: sub.clone(),
+            assistant_id: assistant_id.clone(),
+            alias: self.assistant_principal_alias(&org, &sub),
+            conversation_id: None,
+            state: "active".to_string(),
+            credential_id: credential_id.clone(),
+        };
+        self.member_authority_live(
+            "",
+            &member,
+            MemberReprove {
+                operation,
+                scope: want_scope,
+                job_id: None,
+                op_credential_id: Some(&credential_id),
+            },
+            verb,
+        )?;
+        // The daemon-minted binding: `assistant_bind`'s own transaction is
+        // the CAS — a conflicting tuple or a colliding ordinary agent alias
+        // refuses inside it, never silently adopts.
+        let binding = self
+            .store
+            .assistant_bind(&org, &sub, &assistant_id, &member.alias, None)?;
+        Ok(json!({
+            "provisioned": true,
+            "org": org,
+            "sub": sub,
+            "assistant_id": assistant_id,
+            "alias": binding.alias,
+        }))
+    }
+
     /// `member_assist_state` — the member's own assistant surface state.
     pub(super) fn rpc_member_assist_state(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         reject_unknown_fields(params, &["member_envelope"], "member assist state")?;

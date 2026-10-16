@@ -2479,6 +2479,12 @@ impl Shared {
             "message_cancel" => self.rpc_cancel(params),
             "interrupt" => self.rpc_interrupt(params, peer_pid),
             "job_new" => self.rpc_job_new(params, peer_pid),
+            // CAD-1420: the dedicated platform-authority projection the
+            // trusted assist relay runs BEFORE member_assist_state|history|
+            // send — never a member entry point of its own.
+            "platform_assistant_provision" => {
+                self.rpc_platform_assistant_provision(params, peer_pid)
+            }
             "member_assist_state" => self.rpc_member_assist_state(params, peer_pid),
             "member_assist_history" => self.rpc_member_assist_history(params, peer_pid),
             "member_assist_send" => self.rpc_member_assist_send(params, peer_pid),
