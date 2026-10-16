@@ -24,11 +24,11 @@ pub(crate) struct UpdateTargetArgs {
     #[arg(long)]
     pub(super) releases_dir: Option<PathBuf>,
     /// Owned HTTPS release source (CAD-1455): the endpoint's https://
-    /// origin only. When set, updates consume the published release
-    /// through the AOS catalogue and its signed offline evidence instead
-    /// of live GitHub queries; an explicit source failure refuses —
-    /// there is no silent GitHub API fallback. Omit to keep the default
-    /// GitHub route.
+    /// origin only. The published release is consumed through the
+    /// catalogue and its signed offline evidence instead of live GitHub
+    /// queries; a source failure refuses — there is no silent GitHub
+    /// API fallback. Omit for the default owned catalogue
+    /// (https://api-v2.agenticos.hk, CAD-1479).
     #[arg(long, value_name = "https://host")]
     pub(super) release_source: Option<String>,
 }
@@ -84,12 +84,49 @@ pub(crate) struct UpdateArgs {
 /// The production [`cadence_agent::update::UpdateHost`]: the daemon for
 /// the drain, the waiters and the health answers; the filesystem for
 /// the releases and the marker.
-/// The update's release source: the default online GitHub route, or
-/// the configured owned HTTPS endpoint (CAD-1455). Both implement
-/// `ReleaseSource`; the field type dispatches between them.
+/// The update's release source: the owned HTTPS catalogue (the
+/// CAD-1479 default), or the online GitHub route for a non-default
+/// `--repo` — an owned source serves only the pinned default
+/// repository. Both implement `ReleaseSource`; the field type
+/// dispatches between them.
 pub(crate) enum UpdateSource {
     Gh(cadence_agent::upgrade::Gh),
     Http(Box<cadence_agent::releases::HttpGh>),
+}
+
+impl UpdateSource {
+    /// CAD-1479: the owned catalogue is the default release source;
+    /// `release_source` (`--release-source`) remains the advanced
+    /// https:// override. A source failure refuses downstream — there
+    /// is no GitHub API fallback. `--repo` keeps its meaning: it names
+    /// which repository's CI builds are trusted. The owned catalogue
+    /// publishes only the pinned default repository's releases, so a
+    /// non-default `--repo` still selects the GitHub route for that
+    /// repository — and combining it with `--release-source` refuses
+    /// rather than silently dropping one of two named trust
+    /// authorities.
+    pub(super) fn new(release_source: Option<&str>, repo: &str) -> Result<Self> {
+        let repo = repo.trim();
+        let default_repo = repo.is_empty() || repo == cadence_agent::upgrade::DEFAULT_REPO;
+        match (release_source, default_repo) {
+            (Some(base), true) => Ok(Self::Http(Box::new(cadence_agent::releases::HttpGh::new(
+                base,
+            )?))),
+            (Some(_), false) => Err(Error::rejected(format!(
+                "--repo {repo} cannot combine with --release-source: the owned catalogue's \
+                 signed evidence binds {} only — pass one trust authority",
+                cadence_agent::upgrade::DEFAULT_REPO
+            ))),
+            (None, true) => {
+                let base = cadence_agent::releases::resolve_base(None)?;
+                Ok(Self::Http(Box::new(cadence_agent::releases::source_for(
+                    &base,
+                    cadence_agent::releases::PROFILE_OPERATOR_HOST,
+                )?)))
+            }
+            (None, false) => Ok(Self::Gh(cadence_agent::upgrade::Gh::new(repo))),
+        }
+    }
 }
 
 impl cadence_agent::upgrade::ReleaseSource for UpdateSource {
