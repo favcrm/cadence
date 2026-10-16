@@ -109,6 +109,31 @@ recorded catalogue entry untouched; anything else conflicts. Withdrawal is
 not implemented by the publisher — a withdrawn record is an operator-owned
 lifecycle action through the data plane's own reviewed path.
 
+#### Making a published operator-host record public (CAD-1475)
+
+The publisher defaults every `operator-host` catalogue record to
+`visibility: private`. To expose an already-published record publicly
+without minting a new release, the operator dispatches
+`.github/workflows/release-visibility.yml` from `main` with the record's
+full source SHA, then approves the `production` environment. The job calls
+`scripts/make-release-public.py`, which reads the exact
+`catalogue/cadence/operator-host/<source-sha>.json` record, validates its
+closed schema, identity and `status: published`, flips ONLY `visibility`
+to `public` and writes the record back with `put-object --if-match
+<captured-ETag>` — a compare-and-swap that fails closed if anything
+changed the record between read and write. Already-public is an honest
+no-op; missing/malformed/withdrawn/foreign records and concurrent
+conflicts refuse with no write. Artifact objects are never touched — the
+operation changes the catalogue record's visibility only, and the
+publisher's immutable conditional writes are unchanged. The endpoint and
+bucket are the dedicated-store literals `87b59a40e130c425e35474687ad98a4f.r2
+cloudflarestorage.com` / `agenticos-v2-release-artifacts`, pinned in both
+the workflow and the helper: configured `vars.RELEASES_R2_*` must equal
+them before any mutation, and the helper refuses any other store.
+Credentials stay in the job environment (`secrets.RELEASES_R2_*` as
+`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`); a missing credential fails
+closed.
+
 `cadence update|upgrade --release-source https://<host>` then consumes the
 published release without any GitHub API call: the catalogue selects the
 subject (discovery only, never authority); the binary, receipt,

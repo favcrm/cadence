@@ -232,6 +232,10 @@ jobs:
       - run: python3 -m unittest scripts/test_enqueue_human_paths.py
       - run: python3 -m unittest scripts/test_enqueue_scope_approval.py
       - run: python3 scripts/test_operator_preflight.py
+      # CAD-1475: the operator-owned publicity lifecycle guard — the real
+      # helper driven through a stateful s3api boundary (conditional write,
+      # fixed-endpoint/bucket and bad-case refusals).
+      - run: python3 tests/cad1475_publicity_acceptance.py
       - run: scripts/design-kit --check
       - name: Check contributor documentation paths
         run: python3 scripts/check-doc-links.py
