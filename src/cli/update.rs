@@ -164,13 +164,11 @@ pub(super) fn run_update(state_dir: &Path, args: UpdateArgs) -> Result<i32> {
     refuse_managed_runtime()?;
     let layout =
         cadence_agent::upgrade::Layout::detect(args.link.clone(), args.releases_dir.clone())?;
-    // CAD-1455: an owned HTTPS source is opt-in; the default stays the
-    // GitHub route, and an explicit source failure refuses rather than
-    // silently falling back to the API.
-    let source = match &args.release_source {
-        Some(base) => UpdateSource::Http(Box::new(cadence_agent::releases::HttpGh::new(base)?)),
-        None => UpdateSource::Gh(cadence_agent::upgrade::Gh::new(&args.repo)),
-    };
+    // CAD-1479: the owned catalogue is the default release source;
+    // `--release-source` is the advanced https:// override, and a
+    // non-default `--repo` still selects the GitHub route — see
+    // `UpdateSource::new`.
+    let source = UpdateSource::new(args.release_source.as_deref(), &args.repo)?;
     let host = RealUpdateHost {
         state_dir,
         layout,

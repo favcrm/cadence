@@ -1409,11 +1409,16 @@ pub(crate) enum Commands {
         #[arg(long)]
         group: Option<String>,
     },
-    /// Install the exact build CI tested on main (CAD-334). Downloads
-    /// the `cadence-<sha>-x86_64-linux` artifact through `gh` and refuses
-    /// unless the sha is on main, CI's `test` job passed on that exact sha,
-    /// the sha256 matches, the manifest names the sha, and the GitHub
-    /// build-provenance attestation verifies for this repo. Installs to
+    /// Install the exact build the release source proves for a commit
+    /// (CAD-334). From the default owned catalogue
+    /// (https://api-v2.agenticos.hk, CAD-1479; `--release-source` is the
+    /// advanced https:// override) it installs the published, offline-
+    /// verified release package; a non-default `--repo` selects the
+    /// GitHub route that downloads the `cadence-<sha>-x86_64-linux`
+    /// artifact through `gh`. Refuses unless the sha is on main, CI's
+    /// `test` job passed on that exact sha, the sha256 matches, the
+    /// manifest names the sha, and the build-provenance attestation
+    /// verifies for the trusted repo. Installs to
     /// `<releases>/<sha>/cadence` and atomically repoints the `cadence`
     /// symlink. A release already on disk is reinstalled without a
     /// download (rollback). Never restarts the daemon unless `--restart`.
@@ -1457,21 +1462,24 @@ pub(crate) enum Commands {
         /// Owned HTTPS release source (CAD-1455): the endpoint's
         /// https:// origin only; consumes the published release through
         /// the catalogue and signed offline evidence instead of live
-        /// GitHub queries. An explicit source failure refuses — no
-        /// silent GitHub API fallback. Omit for the default GitHub route.
+        /// GitHub queries. A source failure refuses — no silent GitHub
+        /// API fallback. Omit for the default owned catalogue
+        /// (https://api-v2.agenticos.hk, CAD-1479).
         #[arg(long, value_name = "https://host")]
         release_source: Option<String>,
     },
     /// Upgrade a client-only installation (`install.sh --client-only`) to
     /// the newest public release (CAD-1425, CAD-1437). Its receipt alone
     /// selects this path, before any org or state work: a saved org default
-    /// never diverts it, it fetches only the fixed public release source,
-    /// and it accepts only `--check` and `--version TAG` (forward only).
-    /// Any other installation refuses `--version`; its native options and
-    /// subcommands are untouched.
+    /// never diverts it, it fetches only the owned public-client release
+    /// source, and it accepts only `--check` and `--version TAG` (forward
+    /// only). Any other installation refuses `--version`; its native
+    /// options and subcommands are untouched.
     ///
-    /// Update to the newest attested green main build in one command
-    /// (CAD-561): check → verify attestation + hash → backup → install
+    /// Update to the newest published release in the owned catalogue
+    /// (default https://api-v2.agenticos.hk, CAD-1479; `--release-source`
+    /// is the advanced https:// override, no GitHub API fallback) in one
+    /// command (CAD-561): check → verify attestation + hash → backup → install
     /// side by side → bounded drain → switch → health check → done.
     /// The rollout lease is auto-claimed and auto-released, and the
     /// pre-update backup (outside the state dir by default) is recorded

@@ -26,13 +26,11 @@ pub(super) fn run_upgrade(state_dir: &Path, args: UpgradeArgs) -> Result<i32> {
         }
     };
     let layout = upgrade::Layout::detect(args.link, args.releases_dir)?;
-    // CAD-1455: an owned HTTPS source is opt-in; the default stays the
-    // GitHub route, and an explicit source failure refuses rather than
-    // silently falling back to the API.
-    let source = match &args.release_source {
-        Some(base) => UpdateSource::Http(Box::new(cadence_agent::releases::HttpGh::new(base)?)),
-        None => UpdateSource::Gh(upgrade::Gh::new(&args.repo)),
-    };
+    // CAD-1479: the owned catalogue is the default release source;
+    // `--release-source` is the advanced https:// override, and a
+    // non-default `--repo` still selects the GitHub route — see
+    // `UpdateSource::new`.
+    let source = UpdateSource::new(args.release_source.as_deref(), &args.repo)?;
     let mut report = upgrade::run(
         &source,
         &layout,

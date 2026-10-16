@@ -236,6 +236,7 @@ jobs:
       # helper driven through a stateful s3api boundary (conditional write,
       # fixed-endpoint/bucket and bad-case refusals).
       - run: python3 tests/cad1475_publicity_acceptance.py
+      - run: python3 tests/cad1479_r2_publish_gate_acceptance.py
       - run: scripts/design-kit --check
       - name: Check contributor documentation paths
         run: python3 scripts/check-doc-links.py
@@ -1362,17 +1363,24 @@ jobs:
           retention-days: 90
           overwrite: true
 
-  # CAD-1455: publish the public-client release into the owned R2
-  # release namespace after the GitHub Release above is published (the
-  # existing public release gate). Runs only when the operator
-  # provisioned endpoint/bucket/credentials as vars/secrets — an absent
-  # configuration is an honest skip. Objects are copied byte-exact and
-  # written conditionally; the catalogue record is written last.
+  # CAD-1455/CAD-1479: publish the public-client release into the owned
+  # R2 release namespace after the GitHub Release above is published.
+  # `needs: release-publish` is the gate: that job already runs only
+  # after a human approves its protected `release` environment, so this
+  # job never runs for an unapproved or unpublished release. Runs only
+  # when the operator provisioned the endpoint/bucket/credentials as
+  # vars/secrets and they equal the dedicated release store literals —
+  # an absent or foreign configuration is an honest skip, never a
+  # guessed bucket. Objects are copied byte-exact and written
+  # conditionally; the catalogue record is written last. Visibility is
+  # `public` because the release approval already made these exact
+  # bytes public; operator-host records stay private by default under
+  # promotion-completion.yml's own separate gates.
   release-publish-r2:
     needs: [release-publish]
     if: >
-      vars.RELEASES_R2_ENDPOINT != '' &&
-      vars.RELEASES_R2_BUCKET != ''
+      vars.RELEASES_R2_ENDPOINT == 'https://87b59a40e130c425e35474687ad98a4f.r2.cloudflarestorage.com' &&
+      vars.RELEASES_R2_BUCKET == 'agenticos-v2-release-artifacts'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -1427,11 +1435,11 @@ jobs:
           extra=()
           test -n "$published_at" && extra=(--published-at "$published_at")
           python3 src/scripts/publish-release.py \
-            --endpoint "${{ vars.RELEASES_R2_ENDPOINT }}" \
-            --bucket "${{ vars.RELEASES_R2_BUCKET }}" \
+            --endpoint "https://87b59a40e130c425e35474687ad98a4f.r2.cloudflarestorage.com" \
+            --bucket "agenticos-v2-release-artifacts" \
             --product cadence --profile public-client \
             --version "$TAG" --source-sha "$SOURCE_SHA" \
-            --visibility "${{ vars.RELEASES_R2_PUBLIC_VISIBILITY || 'private' }}" \
+            --visibility public \
             "${extra[@]}" \
             "${args[@]}"
 

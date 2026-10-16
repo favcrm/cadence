@@ -86,7 +86,7 @@ Report any remaining operator rollout work explicitly.
    intended target. Installation, drain, backup and health checks remain in
    the supported update flow, not a hand-built restart recipe.
 
-### Owned release source (CAD-1455, opt-in)
+### Owned release source (CAD-1455; default under CAD-1479)
 
 `staging.yml` retains the promoted release's evidence package
 (`production-evidence-<sha>`) and packages the flat retained bundle as
@@ -126,45 +126,80 @@ no-op; missing/malformed/withdrawn/foreign records and concurrent
 conflicts refuse with no write. Artifact objects are never touched — the
 operation changes the catalogue record's visibility only, and the
 publisher's immutable conditional writes are unchanged. The endpoint and
-bucket are the dedicated-store literals `87b59a40e130c425e35474687ad98a4f.r2
-cloudflarestorage.com` / `agenticos-v2-release-artifacts`, pinned in both
+bucket are the dedicated-store literals `87b59a40e130c425e35474687ad98a4f.r2.cloudflarestorage.com`
+/ `agenticos-v2-release-artifacts`, pinned in both
 the workflow and the helper: configured `vars.RELEASES_R2_*` must equal
 them before any mutation, and the helper refuses any other store.
 Credentials stay in the job environment (`secrets.RELEASES_R2_*` as
 `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`); a missing credential fails
 closed.
 
-`cadence update|upgrade --release-source https://<host>` then consumes the
-published release without any GitHub API call: the catalogue selects the
+The operator-host visibility path is operationally proven. On 2026-10-16
+the operator dispatched `release-visibility.yml` (run 38862158365, main
+`c03c08a3`, `production` environment approval by the operator) for the
+approved staging candidate `84de8c0b5df9ddeac81b4e8bbe7e888b6494d36d`
+(staging promotion run 38824325073). The job flipped only
+`visibility: private -> public`. Anonymous HTTPS verification the same
+day showed detail, list and latest all resolving that one record, and the
+full archive GET returning exactly 20,474,099 bytes with SHA-256
+`7b25bf163cdb7bbe7699316c76bfd23889574e747775ab6a5439200448392c3f`,
+byte-for-byte identical to the retained original candidate bundle. Public
+URLs on the owned endpoint:
+
+```text
+https://api-v2.agenticos.hk/v1/cadence/releases/cadence/operator-host/84de8c0b5df9ddeac81b4e8bbe7e888b6494d36d
+https://api-v2.agenticos.hk/v1/cadence/artifacts/cadence/operator-host/84de8c0b5df9ddeac81b4e8bbe7e888b6494d36d/cadence-release.tar.gz
+```
+
+This proves anonymous public read of a published operator-host record and
+bundle only: no native updater consumed the endpoint, this verification
+performed no install or restart, and a public record grants no
+update/install/rollout authority by itself.
+
+Under CAD-1479, `cadence update`/`upgrade` built with the new default
+consumes the published release from `https://api-v2.agenticos.hk` without
+a source flag and without any GitHub API call: the catalogue selects the
 subject (discovery only, never authority); the binary, receipt,
 build/promotion/completion Sigstore bundles and the signed source-facts are
 verified offline against the embedded trusted-root snapshot, and the
 snapshot — never a live main lookup — answers on-main, ancestry and schema
 checks, and ancestry is proven only relative to the snapshot's own
 candidate (membership in its signed ancestor list), never between two
-sibling commits. The existing operator identity, lease, backup, schema,
-no-backward, atomic install, drain, health and rollback rules are
-unchanged. An explicit source failure refuses; there is no silent
-fallback to the GitHub API. Omit `--release-source` to keep the default
-GitHub route until the endpoint is qualified. A pinned `--to`/`--sha`
-resolves the published release named by that exact source SHA; a sha the
-catalogue does not publish refuses.
+sibling commits. Installed-profile detection is unchanged: a client-only
+receipt selects the `public-client` profile, an ordinary daemon
+installation the `operator-host` profile. The existing operator identity,
+lease, backup, schema, no-backward, atomic install, drain, health and
+rollback rules are unchanged. An explicit source failure refuses; there
+is no silent fallback to the GitHub API and no GitHub login is needed —
+offline verification needs only the `gh` binary for
+`attestation verify --bundle`. `--release-source https://<host>` remains
+as the advanced override to consume a different owned endpoint; it adds
+no routine knob. A pinned `--to`/`--sha` resolves the published release
+named by that exact source SHA; a sha the catalogue does not publish
+refuses. Binaries installed before this default shipped still select the
+GitHub route and keep working; they pick up the backend default only by
+updating to a build that carries it.
 
 The publication-time snapshot is an authenticated record of eligibility
 *observed at promotion*; it cannot know a later main rewrite. Offline
 verification needs `gh` installed (for `attestation verify --bundle`) but
 no GitHub login and no API access. Operator-host catalogue visibility
-defaults `private`; public serving stays closed until an operator-owned
-endpoint/policy explicitly authorizes it. Public-client release authority
-is distinct (below) — a `public-client` record never stands in for an
+defaults `private`; each record's public serving stays closed until the
+operator-owned visibility job above authorizes that exact record.
+Public-client release authority is distinct (below) — a `public-client` record never stands in for an
 operator-host promotion, and the shared catalogue grants no install or
 rollout authority by itself.
 
-Publication and consumption are not yet operationally qualified: no genuine
-new producer run has published into a real bucket, and the trusted-root
-snapshot is a proposed capture pending independent review. Treat the code
-path as implemented-but-unqualified until the operator runs the two
-commands on the documented path and reports results.
+Remaining qualification boundaries: the `operator-host` record above is
+live and publicly readable, but the `public-client` catalogue still has
+no published record — its `latest` endpoint returned HTTP 200 with an
+empty entry on 2026-10-16. No native updater has yet consumed the
+endpoint and no install against it is claimed; a default that points
+installed consumers at an empty profile must wait for a genuine
+public-client publication. The operator-host record never stands in for
+public-client authority. Publication, visibility, withdrawal, install
+and rollout stay separately gated operator actions; anonymous read opens
+none of them.
 
 **Scheduled and `workflow_run` staging cannot promote.** Their successful
 runs may have `promote: skipped`; that means staged, not production-approved.
@@ -258,15 +293,18 @@ attempt 1. Its nine published assets are `install.sh`, the three targets'
 `cadence-v0.1.0-<target>.tar.gz` plus matching `.sha256`, and the x86 leg's
 versioned `cadence-app-toolchain-v0.1.0.tar.gz` pair (CAD-1272). Its release
 notes were `--generate-notes` output only and are immutable with the release;
-this file, not those notes, records corrections. The public stable updater is
-still not implemented; `cadence update`/`upgrade` continue to use the
-authenticated internal channel.
+this file, not those notes, records corrections. At v0.1.0 publication the
+public stable updater was not implemented; the client-only `cadence update`
+updater (CAD-1425/CAD-1437) and the owned release source (CAD-1455; default
+under CAD-1479, above) supersede that note.
 
-For a client-only installation, `cadence update --release-source
-https://<host>` (CAD-1455) fetches the same tag's exact published archive,
+For a client-only installation, `cadence update` (CAD-1455; backend
+default under CAD-1479) fetches the same tag's exact published archive,
 checksum file and retained `ci.yml` build-provenance bundle through the
-owned `public-client` catalogue profile and verifies the signature offline
-against the embedded trusted root — the same repo/workflow/tag/digest/runner
+owned `public-client` catalogue profile at the default owned endpoint
+(`https://api-v2.agenticos.hk`; `--release-source` overrides it) and
+verifies the signature offline against the embedded trusted root —
+the same repo/workflow/tag/digest/runner
 policy as the live `gh` lookup. Because a build bundle attests the archive
 BEFORE `Publish the GitHub Release` ran, the publisher also retains a small
 closed post-publication receipt (`publication-receipt.json` +
@@ -286,7 +324,14 @@ and only when the operator provisioned the release bucket
 (`vars.RELEASES_R2_ENDPOINT`/`vars.RELEASES_R2_BUCKET`, credentials
 `secrets.RELEASES_R2_ACCESS_KEY_ID`/`secrets.RELEASES_R2_SECRET_ACCESS_KEY`);
 its `publishedAt` is the release's genuine GitHub `publishedAt`, never a
-mirror run's clock.
+mirror run's clock. Under CAD-1479 the published client record is public
+by construction: the same upstream protected `release` approval that
+publishes the GitHub Release authorizes public-client publicity — the
+R2 publish job adds no second environment approval and there is no
+separate client visibility workflow. Operator-host records stay
+private-by-default with their own visibility lifecycle (above), and a
+valid client publication receipt remains distinct from operator-host
+promotion authority.
 
 The first publication exposed an x86 artifact/verifier gap fixed under
 CAD-1400: `release-build` zips the toolchain pair into the x86 artifact but
@@ -399,8 +444,9 @@ Browser/token support is issuer-client preparation, not working public cloud
 login, enrollment or assignment delivery. Local offline outbox persistence is
 a foundation, not proof of remote transport, applied receipts or sleep-safe
 delivery. Hosted remote teams and local-to-cloud production migration remain
-separate acceptance work. The public stable-release updater is not implemented;
-current update/upgrade commands use the authenticated internal CI channel.
+separate acceptance work. At pilot time the public stable-release updater was
+not implemented and update/upgrade used the authenticated internal CI channel;
+the client-only updater and owned release source above supersede this.
 
 Stable v0.1.0 is now published, so `releases/latest` resolves to it; the beta
 prereleases remain installable only by explicit tag. Selecting another

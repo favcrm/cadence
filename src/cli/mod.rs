@@ -97,6 +97,10 @@ mod update_routing_acceptance;
 mod upgrade;
 mod util;
 mod web;
+
+// CAD-1479: independently owned backend-default refusal acceptance.
+#[cfg(all(test, feature = "test-seam"))]
+mod cad1479_backend_default_acceptance;
 mod wiki;
 mod workflow;
 
