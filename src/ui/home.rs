@@ -333,6 +333,14 @@ pub(super) fn prove_operator_peer(
     let peer = request
         .remote_addr()
         .ok_or_else(|| refuse("the request has no peer address".to_string()))?;
+    // A signed-in operator whose browser is reached through an ssh
+    // forward: the socket is still open, but its process is not in this
+    // pid namespace. A closed socket and every visible process still go
+    // through the positive proof below. Callers of this function already
+    // require the operator session.
+    if crate::peer::loopback_ownerless(opts.port, *peer) {
+        return Ok(());
+    }
     // SAFETY: geteuid has no preconditions and cannot fail.
     let uid = unsafe { libc::geteuid() };
     crate::peer::tcp_peer_operator_proof(opts.port, *peer, uid, daemon_pid, &roots).map_err(refuse)
