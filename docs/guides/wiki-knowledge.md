@@ -142,6 +142,13 @@ exits nonzero and names the job id. `--wait-index` polls that job's own
 status until the index is covered, the job fails, or the command deadline
 passes. It does not refresh the global index.
 
+Matching working-tree bytes alone are not proof of publication. If the desired
+revision cannot be proved in Git, the entry remains `unresolved`, retains its
+staged input, and cannot finish. The command reports the job instead of silently
+committing an unproved file. After an authorized publication resolves the target,
+resume the same job; an already committed matching revision is skipped without
+another commit.
+
 The reverse direction exports only the caller's tree, pins each file's
 revision and hash, stages the bytes privately, and publishes them with an
 atomic rename. It does not overwrite a local file unless `--update` is set.
@@ -151,7 +158,8 @@ extraction fails retains its downloadable original but exits nonzero; failed
 or empty extraction is never reported as index-covered. Ordinary empty text
 files remain valid copies. Finishing a job coalesces index work; startup
 rechecks completed-job cache freshness without republishing source files.
-Private staged inputs are discarded only after their outcomes are durable.
+Private staged inputs are discarded only after terminal outcomes are durable;
+unresolved publication retains them for reconciliation.
 
 Native admission caps are 256 entries, a 256 KiB manifest, 100 MiB per file
 (also subject to configured wiki caps), 256 MiB total, and 16 KiB decoded

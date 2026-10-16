@@ -7,9 +7,10 @@
 //! Crash boundaries:
 //! - staged bytes are fsynced before the Store `received` row moves forward;
 //!   a later call trusts the regular file when the row lags;
-//! - a wiki commit that lands without its outcome row is recognized by
-//!   comparing the live revision and bytes with the manifest, and is not
-//!   published again;
+//! - a wiki commit that lands without its outcome row is recognized from
+//!   the committed tree, not the worktree, and is not published again.
+//!   Desired bytes that are absent or different in HEAD stay `unresolved`
+//!   and keep their staged input; apply does not commit them itself;
 //! - index coverage is computed from the live page revisions and the
 //!   committed search snapshot. It is `pending` until those revisions are
 //!   in the current tree's index, `superseded` when a later write replaced
@@ -25,6 +26,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
@@ -793,7 +795,11 @@ pub fn apply(
             detail: outcome.detail.as_deref(),
         },
     )?;
-    discard_stage(state_dir, job_id, entry_id)?;
+    // An unproved publication stays restartable. Known terminal outcomes
+    // have already consumed the staged input.
+    if outcome.outcome != "unresolved" {
+        discard_stage(state_dir, job_id, entry_id)?;
+    }
     let mut body = json!({
         "job_id": job_id,
         "entry_id": entry_id,
@@ -852,10 +858,12 @@ fn publish_entry(
     if entry.kind == "dir" {
         return publish_dir(pm, caller, entry);
     }
-    if content_matches(pm, caller, entry)? {
-        return reconcile_match(pm, caller, entry);
+    match publication(pm, caller, entry)? {
+        Publication::Committed => return reconcile_match(pm, caller, entry),
+        Publication::Uncommitted => return Ok(unresolved(entry)),
+        Publication::Absent => {}
     }
-    let current = current_rev(pm, caller, &entry.path)?;
+    let current = committed_rev(pm, entry)?;
     if current != entry.if_rev {
         return Ok(Published {
             outcome: "conflict",
@@ -876,17 +884,10 @@ fn publish_entry(
         })?;
         let wrote = write(pm, caller, &entry.path, text, Some(&entry.if_rev))?;
         if wrote.get("conflict").is_some() {
-            if content_matches(pm, caller, entry)? {
-                return reconcile_match(pm, caller, entry);
-            }
-            return Ok(Published {
-                outcome: "conflict",
-                rev: wrote["current_rev"].as_str().map(str::to_string),
-                extraction: "not_applicable",
-                extraction_rev: None,
-                source_hash: entry.sha256.clone(),
-                detail: Some("the destination revision changed".into()),
-            });
+            return Ok(classify_publish_conflict(pm, caller, entry, &wrote)?);
+        }
+        if !committed_content_matches(pm, entry)? {
+            return Ok(unresolved(entry));
         }
         return Ok(Published {
             outcome: "applied",
@@ -901,8 +902,8 @@ fn publish_entry(
 }
 
 fn publish_dir(pm: &Pm, caller: &Caller, entry: &EntryRow) -> Result<Published> {
-    match read(pm, caller, &entry.path) {
-        Ok(page) if page["kind"] == "dir" => {
+    match publication(pm, caller, entry)? {
+        Publication::Committed => {
             return Ok(Published {
                 outcome: "skipped",
                 rev: None,
@@ -912,6 +913,11 @@ fn publish_dir(pm: &Pm, caller: &Caller, entry: &EntryRow) -> Result<Published> 
                 detail: None,
             });
         }
+        Publication::Uncommitted => return Ok(unresolved(entry)),
+        Publication::Absent => {}
+    }
+    match read(pm, caller, &entry.path) {
+        Ok(page) if page["kind"] == "dir" => return Ok(unresolved(entry)),
         Ok(_) => {
             return Ok(Published {
                 outcome: "conflict",
@@ -926,6 +932,9 @@ fn publish_dir(pm: &Pm, caller: &Caller, entry: &EntryRow) -> Result<Published> 
         Err(error) => return Err(error),
     }
     let made = mkdir(pm, caller, &entry.path)?;
+    if !committed_dir(pm, &entry.path)? {
+        return Ok(unresolved(entry));
+    }
     Ok(Published {
         outcome: if made["created"] == true {
             "applied"
@@ -940,7 +949,225 @@ fn publish_dir(pm: &Pm, caller: &Caller, entry: &EntryRow) -> Result<Published> 
     })
 }
 
-fn content_matches(pm: &Pm, caller: &Caller, entry: &EntryRow) -> Result<bool> {
+enum Publication {
+    /// HEAD contains the desired bytes or directory marker.
+    Committed,
+    /// The worktree matches, but HEAD does not. Not publication.
+    Uncommitted,
+    /// Neither tree has the desired content.
+    Absent,
+}
+
+fn unresolved(entry: &EntryRow) -> Published {
+    let detail = if entry.kind == "dir" {
+        "wiki transfer publication is not committed"
+    } else {
+        "wiki transfer publication is not committed; staged bytes were kept"
+    };
+    Published {
+        outcome: "unresolved",
+        rev: None,
+        extraction: "not_applicable",
+        extraction_rev: None,
+        source_hash: entry.sha256.clone(),
+        detail: Some(detail.into()),
+    }
+}
+
+fn publication(pm: &Pm, caller: &Caller, entry: &EntryRow) -> Result<Publication> {
+    if entry.kind == "dir" {
+        if committed_dir(pm, &entry.path)? {
+            return Ok(Publication::Committed);
+        }
+        return match read(pm, caller, &entry.path) {
+            Ok(page) if page["kind"] == "dir" => Ok(Publication::Uncommitted),
+            Ok(_) => Ok(Publication::Absent),
+            Err(error) if missing(&error) => Ok(Publication::Absent),
+            Err(error) => Err(error),
+        };
+    }
+    if committed_content_matches(pm, entry)? {
+        return Ok(Publication::Committed);
+    }
+    if worktree_content_matches(pm, caller, entry)? {
+        return Ok(Publication::Uncommitted);
+    }
+    Ok(Publication::Absent)
+}
+
+/// A returned `if_rev` conflict was decided before the pointer write. Absent
+/// content there is a real conflict. An `Err` is not: another authorized
+/// write can replace a commit before this probe, so absence is not proof
+/// the publish never landed.
+fn classify_publish_conflict(
+    pm: &Pm,
+    caller: &Caller,
+    entry: &EntryRow,
+    wrote: &Value,
+) -> Result<Published> {
+    match publication(pm, caller, entry)? {
+        Publication::Committed => reconcile_match(pm, caller, entry),
+        Publication::Uncommitted => Ok(unresolved(entry)),
+        Publication::Absent => Ok(Published {
+            outcome: "conflict",
+            rev: wrote["current_rev"].as_str().map(str::to_string),
+            extraction: "conflict",
+            extraction_rev: None,
+            source_hash: entry.sha256.clone(),
+            detail: Some("the destination revision changed".into()),
+        }),
+    }
+}
+
+fn classify_publish_error(
+    pm: &Pm,
+    caller: &Caller,
+    entry: &EntryRow,
+    error: &Error,
+) -> Result<Published> {
+    let detail = match publication(pm, caller, entry) {
+        Ok(Publication::Committed) => return reconcile_match(pm, caller, entry),
+        Ok(Publication::Uncommitted | Publication::Absent) => format!(
+            "wiki transfer publication could not be proved; staged bytes were kept ({error})"
+        ),
+        Err(probe) => format!(
+            "wiki transfer publication could not be proved; staged bytes were kept ({error}; {probe})"
+        ),
+    };
+    Ok(Published {
+        outcome: "unresolved",
+        rev: None,
+        extraction: "not_applicable",
+        extraction_rev: None,
+        source_hash: entry.sha256.clone(),
+        detail: Some(detail),
+    })
+}
+
+fn tracker_rel(pm: &Pm, vault_rel: &str) -> Result<String> {
+    let vault = vault_dir(pm)?;
+    let abs = vault.join(vault_rel);
+    let rel = abs.strip_prefix(&pm.dir).map_err(|_| {
+        Error::internal(format!(
+            "wiki path {} is outside tracker {}",
+            abs.display(),
+            pm.dir.display()
+        ))
+    })?;
+    Ok(rel.to_string_lossy().replace('\\', "/"))
+}
+
+fn git_output(pm: &Pm, args: &[&str]) -> Result<std::process::Output> {
+    crate::reaper::output(Command::new("git").arg("-C").arg(&pm.dir).args(args))
+        .map_err(|_| Error::rejected("`git` is required and was not found on PATH"))
+}
+
+fn git_path_missing(stderr: &str) -> bool {
+    stderr.contains("does not exist")
+        || stderr.contains("exists on disk, but not in")
+        || stderr.contains("Not a valid object name")
+}
+
+/// Bytes of one committed vault path. `Ok(None)` is a path absent from HEAD,
+/// including a crash that renamed the worktree file and never committed it.
+fn committed_blob(pm: &Pm, vault_rel: &str) -> Result<Option<Vec<u8>>> {
+    let spec = format!("HEAD:{}", tracker_rel(pm, vault_rel)?);
+    let out = git_output(pm, &["cat-file", "blob", &spec])?;
+    if out.status.success() {
+        return Ok(Some(out.stdout));
+    }
+    let err = String::from_utf8_lossy(&out.stderr);
+    if git_path_missing(&err) {
+        return Ok(None);
+    }
+    Err(Error::internal(format!(
+        "wiki transfer could not read committed '{vault_rel}': {}",
+        err.trim()
+    )))
+}
+
+/// A directory is committed when HEAD has a tree there, whether or not this
+/// transfer is the call that added `.gitkeep`.
+fn committed_dir(pm: &Pm, vault_rel: &str) -> Result<bool> {
+    let spec = format!("HEAD:{}", tracker_rel(pm, vault_rel)?);
+    let out = git_output(pm, &["cat-file", "-t", &spec])?;
+    if out.status.success() {
+        return Ok(String::from_utf8_lossy(&out.stdout).trim() == "tree");
+    }
+    let err = String::from_utf8_lossy(&out.stderr);
+    if git_path_missing(&err) {
+        return Ok(false);
+    }
+    Err(Error::internal(format!(
+        "wiki transfer could not read committed directory '{vault_rel}': {}",
+        err.trim()
+    )))
+}
+
+fn committed_rev(pm: &Pm, entry: &EntryRow) -> Result<String> {
+    let rel = if entry.kind == "blob" {
+        format!("{}.blob", entry.path)
+    } else {
+        entry.path.clone()
+    };
+    Ok(match committed_blob(pm, &rel)? {
+        Some(bytes) => super::rev_bytes(&bytes),
+        None => ABSENT.to_string(),
+    })
+}
+
+fn committed_content_matches(pm: &Pm, entry: &EntryRow) -> Result<bool> {
+    match entry.kind.as_str() {
+        "text" => {
+            let Some(bytes) = committed_blob(pm, &entry.path)? else {
+                return Ok(false);
+            };
+            let Ok(text) = std::str::from_utf8(&bytes) else {
+                return Ok(false);
+            };
+            Ok(text.len() as u64 == entry.size
+                && Some(sha256_bytes(text.as_bytes()).as_str()) == entry.sha256.as_deref())
+        }
+        "blob" => {
+            let Some(bytes) = committed_blob(pm, &format!("{}.blob", entry.path))? else {
+                return Ok(false);
+            };
+            let Ok(text) = std::str::from_utf8(&bytes) else {
+                return Ok(false);
+            };
+            let Ok(meta) = serde_json::from_str::<Value>(text) else {
+                return Ok(false);
+            };
+            if meta["size"].as_u64() != Some(entry.size)
+                || meta["sha256"].as_str() != entry.sha256.as_deref()
+            {
+                return Ok(false);
+            }
+            let hash = entry
+                .sha256
+                .as_deref()
+                .ok_or_else(|| reject("missing transfer hash"))?;
+            verify_blob_custody(pm, hash, entry.size)?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn verify_blob_custody(pm: &Pm, hash: &str, size: u64) -> Result<()> {
+    let blob = blobs_dir(&vault_dir(pm)?).join(hash);
+    let file = open_nofollow(&blob)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.len() != size {
+        return Err(reject("existing original has invalid custody or length"));
+    }
+    if sha256_file(&blob)? != hash {
+        return Err(reject("existing original bytes do not match their hash"));
+    }
+    Ok(())
+}
+
+fn worktree_content_matches(pm: &Pm, caller: &Caller, entry: &EntryRow) -> Result<bool> {
     let page = match read(pm, caller, &entry.path) {
         Ok(page) => page,
         Err(error) if missing(&error) => return Ok(false),
@@ -954,14 +1181,7 @@ fn content_matches(pm: &Pm, caller: &Caller, entry: &EntryRow) -> Result<bool> {
             .sha256
             .as_deref()
             .ok_or_else(|| reject("missing transfer hash"))?;
-        let blob = blobs_dir(&vault_dir(pm)?).join(hash);
-        let file = open_nofollow(&blob)?;
-        if !file.metadata()?.is_file() || file.metadata()?.len() != entry.size {
-            return Err(reject("existing original has invalid custody or length"));
-        }
-        if sha256_file(&blob)? != hash {
-            return Err(reject("existing original bytes do not match their hash"));
-        }
+        verify_blob_custody(pm, hash, entry.size)?;
     }
     Ok(true)
 }
@@ -981,7 +1201,7 @@ fn page_matches(page: &Value, kind: &str, size: u64, hash: Option<&str>) -> bool
 }
 
 fn reconcile_match(pm: &Pm, caller: &Caller, entry: &EntryRow) -> Result<Published> {
-    let rev = current_rev(pm, caller, &entry.path).ok();
+    let rev = Some(committed_rev(pm, entry)?);
     if entry.kind == "blob" && is_pdf(&entry.path) {
         let hash = entry.sha256.clone().unwrap_or_default();
         let (extraction, extraction_rev, detail) = extraction_of(pm, caller, &entry.path, &hash);
@@ -1012,29 +1232,18 @@ fn is_pdf(path: &str) -> bool {
         .ends_with(".pdf")
 }
 
-#[derive(Deserialize)]
-struct QuotedSourcePath<'a>(#[serde(borrow)] std::borrow::Cow<'a, str>);
-
 /// The generated extraction header is the only provenance. A matching body
 /// marker is not a source hash or status. `None` means this header does not
-/// name the source: apply then derives from the raw file, and index coverage
-/// stays unproved. An exact header whose status is not `indexed`, `empty`, or
-/// `failed` is `conflict` and is not retried.
+/// name the source at this hash: apply then derives from the raw file only
+/// when the header names that source, and index coverage stays unproved.
+/// An exact header whose status is not `indexed`, `empty`, or `failed` is
+/// `conflict` and is not retried.
 fn generated_extraction_status(text: &str, source_path: &str, sha: &str) -> Option<&'static str> {
-    let rest = text.strip_prefix("---\nkind: extracted-source\nsource_path: ")?;
-    let (quoted, rest) = rest.split_once('\n')?;
-    // Borrow ordinary paths; allocate only when JSON unescaping is necessary.
-    let quoted: QuotedSourcePath<'_> = serde_json::from_str(quoted).ok()?;
-    if quoted.0 != source_path {
+    let header = ingest::extraction_header(text)?;
+    if header.source_path != source_path || header.sha256 != sha {
         return None;
     }
-    let rest = rest.strip_prefix("source_sha256: ")?.strip_prefix(sha)?;
-    let rest = rest.strip_prefix("\nextraction_status: ")?;
-    let (status, rest) = rest.split_once('\n')?;
-    if !rest.starts_with("---\n") {
-        return None;
-    }
-    Some(match status {
+    Some(match header.status {
         "indexed" => "indexed",
         "empty" => "empty",
         "failed" => "failed",
@@ -1049,11 +1258,31 @@ fn extraction_of(
     sha: &str,
 ) -> (&'static str, Option<String>, Option<String>) {
     let sidecar = format!("{path}.extracted.md");
-    if let Ok(page) = read(pm, caller, &sidecar) {
-        let text = page["text"].as_str().unwrap_or("");
-        if let Some(status) = generated_extraction_status(text, path, sha) {
-            return (status, page["rev"].as_str().map(str::to_string), None);
+    match read(pm, caller, &sidecar) {
+        Ok(page) => {
+            let text = page["text"].as_str().unwrap_or("");
+            if let Some(status) = generated_extraction_status(text, path, sha) {
+                return (status, page["rev"].as_str().map(str::to_string), None);
+            }
+            // A complete header for this source with a different hash is a
+            // reimport. Anything else, including a foreign header whose body
+            // quotes this path, is not ours to replace.
+            match ingest::extraction_header(text) {
+                Some(header) if header.source_path == path => {}
+                _ => {
+                    return (
+                        "conflict",
+                        page["rev"].as_str().map(str::to_string),
+                        Some(
+                            "a page at the extraction path was not generated from this source"
+                                .into(),
+                        ),
+                    );
+                }
+            }
         }
+        Err(error) if missing(&error) => {}
+        Err(error) => return ("failed", None, Some(error.to_string())),
     }
     let result = ingest::pdf_result(pm, caller, path, sha);
     let status = match result["status"].as_str() {
@@ -1098,31 +1327,14 @@ fn publish_blob(
         Ok(value) => value,
         Err(error) => {
             let _ = fs::remove_file(&tmp);
-            if content_matches(pm, caller, entry)? {
-                return reconcile_match(pm, caller, entry);
-            }
-            return Ok(Published {
-                outcome: "failed",
-                rev: None,
-                extraction: "failed",
-                extraction_rev: None,
-                source_hash: entry.sha256.clone(),
-                detail: Some(error.to_string()),
-            });
+            return classify_publish_error(pm, caller, entry, &error);
         }
     };
     if wrote.get("conflict").is_some() {
-        if content_matches(pm, caller, entry)? {
-            return reconcile_match(pm, caller, entry);
-        }
-        return Ok(Published {
-            outcome: "conflict",
-            rev: wrote["current_rev"].as_str().map(str::to_string),
-            extraction: "conflict",
-            extraction_rev: None,
-            source_hash: entry.sha256.clone(),
-            detail: Some("the destination revision changed".into()),
-        });
+        return Ok(classify_publish_conflict(pm, caller, entry, &wrote)?);
+    }
+    if !committed_content_matches(pm, entry)? {
+        return Ok(unresolved(entry));
     }
     let hash = wrote["sha256"].as_str().unwrap_or("").to_string();
     let (extraction, extraction_rev, detail) = if is_pdf(&entry.path) {
@@ -1233,6 +1445,11 @@ pub fn finish(
     let job = require_job(store, request)?;
     let entries = store.wiki_transfer_entries(job_id)?;
     recheck_job_paths(caller, root, &entries, true)?;
+    if entries.iter().any(|entry| entry.outcome == "unresolved") {
+        return Err(reject(
+            "wiki transfer finish refused: publication is not committed",
+        ));
+    }
     if entries.iter().any(|entry| entry.outcome == "pending") {
         return Err(reject(
             "wiki transfer finish refused: entries are still pending",
@@ -1645,6 +1862,12 @@ fn checked_binding(value: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::{generated_extraction_status, sha256_bytes, stage_path, STANDARD};
+    use crate::issue::Pm;
+    use crate::store::Store;
+    use crate::wiki::{blobs_dir, read, vault_dir, write, Caller, ABSENT};
+    use base64::Engine;
+    use std::fs;
 
     #[test]
     fn digest_follows_path_order_not_input_order() {
@@ -1812,6 +2035,479 @@ mod tests {
                 &live
             ),
             Some("indexed")
+        );
+    }
+
+    fn fixture() -> (tempfile::TempDir, Pm, Store, std::path::PathBuf) {
+        let root = tempfile::TempDir::new().unwrap();
+        let pm = Pm::init(&root.path().join("pm")).unwrap();
+        let state = root.path().join("state");
+        fs::create_dir_all(&state).unwrap();
+        let store = Store::open(&state.join("cadence.sqlite3")).unwrap();
+        (root, pm, store, state)
+    }
+
+    fn head_commit(pm: &Pm) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&pm.dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    fn tracker_rel(pm: &Pm, vault_rel: &str) -> String {
+        let vault = vault_dir(pm).unwrap();
+        vault
+            .join(vault_rel)
+            .strip_prefix(&pm.dir)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .replace('\\', "/")
+    }
+
+    fn committed_bytes(pm: &Pm, vault_rel: &str) -> Option<Vec<u8>> {
+        let spec = format!("HEAD:{}", tracker_rel(pm, vault_rel));
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&pm.dir)
+            .args(["cat-file", "blob", &spec])
+            .output()
+            .unwrap();
+        if out.status.success() {
+            Some(out.stdout)
+        } else {
+            None
+        }
+    }
+
+    fn commit_paths(pm: &Pm, rels: &[&str]) {
+        let mut add = std::process::Command::new("git");
+        add.arg("-C").arg(&pm.dir).args(["add", "--"]);
+        add.args(rels);
+        assert!(add.status().unwrap().success());
+        let mut commit = std::process::Command::new("git");
+        commit.arg("-C").arg(&pm.dir).args([
+            "-c",
+            "user.name=cadence",
+            "-c",
+            "user.email=cadence@localhost",
+            "commit",
+            "-q",
+            "-m",
+            "fixture publication",
+            "--",
+        ]);
+        commit.args(rels);
+        let status = commit.status().unwrap();
+        assert!(status.success(), "fixture commit failed");
+    }
+
+    fn text_manifest(relative: &str, bytes: &[u8], if_rev: &str) -> Manifest {
+        Manifest {
+            version: 1,
+            source_id: "src".into(),
+            root: "global/box".into(),
+            entries: vec![ManifestEntry {
+                id: "note".into(),
+                path: relative.into(),
+                kind: "text".into(),
+                size: bytes.len() as u64,
+                sha256: Some(sha256_bytes(bytes)),
+                if_rev: if_rev.into(),
+            }],
+        }
+    }
+
+    fn stage_and_apply(
+        store: &Store,
+        pm: &Pm,
+        state: &std::path::Path,
+        manifest: &Manifest,
+        entry_id: &str,
+        bytes: &[u8],
+    ) -> Value {
+        let caller = Caller::Operator;
+        let owner = "transfer-reconcile";
+        let started = begin(store, pm, &caller, owner, None, manifest, 128).unwrap();
+        let job_id = started["job_id"].as_str().unwrap().to_string();
+        let request = JobRequest {
+            caller: &caller,
+            owner,
+            job_id: &job_id,
+            root: "global/box",
+        };
+        if !bytes.is_empty() || manifest.entries[0].kind != "dir" {
+            chunk(store, state, &request, entry_id, 0, &STANDARD.encode(bytes)).unwrap();
+        }
+        apply(store, pm, state, &request, entry_id).unwrap()
+    }
+
+    /// Desired bytes in the worktree, missing from HEAD, are not publication.
+    #[test]
+    fn uncommitted_text_match_is_unresolved_and_keeps_stage() {
+        let (_root, pm, store, state) = fixture();
+        let bytes = b"hello";
+        let manifest = text_manifest("note.txt", bytes, ABSENT);
+        let caller = Caller::Operator;
+        let owner = "transfer-reconcile";
+        let started = begin(&store, &pm, &caller, owner, None, &manifest, 128).unwrap();
+        let job_id = started["job_id"].as_str().unwrap().to_string();
+        let request = JobRequest {
+            caller: &caller,
+            owner,
+            job_id: &job_id,
+            root: "global/box",
+        };
+        chunk(&store, &state, &request, "note", 0, &STANDARD.encode(bytes)).unwrap();
+        let dest = vault_dir(&pm).unwrap().join("global/box/note.txt");
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        fs::write(&dest, bytes).unwrap();
+        let head = head_commit(&pm);
+        let body = apply(&store, &pm, &state, &request, "note").unwrap();
+        assert_eq!(body["outcome"], "unresolved", "{body}");
+        assert!(stage_path(&state, &job_id, "note").is_file());
+        assert_eq!(head_commit(&pm), head);
+        assert!(committed_bytes(&pm, "global/box/note.txt").is_none());
+        assert_eq!(fs::read(&dest).unwrap(), bytes);
+        let finished = finish(&store, &pm, &state, &request);
+        assert!(
+            finished.is_err(),
+            "unresolved publication must not finish: {finished:?}"
+        );
+
+        commit_paths(&pm, &[&tracker_rel(&pm, "global/box/note.txt")]);
+        let committed_head = head_commit(&pm);
+        let retry = apply(&store, &pm, &state, &request, "note").unwrap();
+        assert_eq!(retry["outcome"], "skipped", "{retry}");
+        assert_eq!(head_commit(&pm), committed_head);
+        assert!(!stage_path(&state, &job_id, "note").exists());
+        assert_eq!(
+            committed_bytes(&pm, "global/box/note.txt").as_deref(),
+            Some(bytes.as_slice())
+        );
+    }
+
+    /// A committed file whose worktree was replaced still needs HEAD, not the dirty bytes.
+    #[test]
+    fn dirty_worktree_matching_desired_bytes_is_not_committed() {
+        let (_root, pm, store, state) = fixture();
+        let committed = write(
+            &pm,
+            &Caller::Operator,
+            "global/box/note.txt",
+            "nope!!",
+            Some(ABSENT),
+        )
+        .unwrap();
+        let rev = committed["rev"].as_str().unwrap().to_string();
+        let bytes = b"hello";
+        let manifest = text_manifest("note.txt", bytes, &rev);
+        let caller = Caller::Operator;
+        let owner = "transfer-reconcile";
+        let started = begin(&store, &pm, &caller, owner, None, &manifest, 128).unwrap();
+        let job_id = started["job_id"].as_str().unwrap().to_string();
+        let request = JobRequest {
+            caller: &caller,
+            owner,
+            job_id: &job_id,
+            root: "global/box",
+        };
+        chunk(&store, &state, &request, "note", 0, &STANDARD.encode(bytes)).unwrap();
+        let dest = vault_dir(&pm).unwrap().join("global/box/note.txt");
+        fs::write(&dest, bytes).unwrap();
+        let head = head_commit(&pm);
+        let body = apply(&store, &pm, &state, &request, "note").unwrap();
+        assert_eq!(body["outcome"], "unresolved", "{body}");
+        assert_eq!(head_commit(&pm), head);
+        assert_eq!(
+            committed_bytes(&pm, "global/box/note.txt").as_deref(),
+            Some(b"nope!!".as_slice())
+        );
+        assert!(stage_path(&state, &job_id, "note").is_file());
+    }
+
+    /// An already committed match skips and must not add another wiki commit.
+    #[test]
+    fn committed_text_retry_skips_without_a_new_commit() {
+        let (_root, pm, store, state) = fixture();
+        let wrote = write(
+            &pm,
+            &Caller::Operator,
+            "global/box/note.txt",
+            "hello",
+            Some(ABSENT),
+        )
+        .unwrap();
+        let rev = wrote["rev"].as_str().unwrap();
+        let manifest = text_manifest("note.txt", b"hello", rev);
+        let head = head_commit(&pm);
+        let body = stage_and_apply(&store, &pm, &state, &manifest, "note", b"hello");
+        assert_eq!(body["outcome"], "skipped", "{body}");
+        assert_eq!(head_commit(&pm), head);
+        let job_id = body["job_id"].as_str().unwrap();
+        assert!(!stage_path(&state, job_id, "note").exists());
+        let caller = Caller::Operator;
+        let request = JobRequest {
+            caller: &caller,
+            owner: "transfer-reconcile",
+            job_id,
+            root: "global/box",
+        };
+        let retry = apply(&store, &pm, &state, &request, "note").unwrap();
+        assert_eq!(retry["outcome"], "skipped", "{retry}");
+        assert_eq!(head_commit(&pm), head);
+    }
+
+    #[test]
+    fn uncommitted_blob_pointer_is_not_committed_publication() {
+        let (_root, pm, store, state) = fixture();
+        let bytes = b"blob-bytes";
+        let hash = sha256_bytes(bytes);
+        let manifest = Manifest {
+            version: 1,
+            source_id: "src".into(),
+            root: "global/box".into(),
+            entries: vec![ManifestEntry {
+                id: "file".into(),
+                path: "file.bin".into(),
+                kind: "blob".into(),
+                size: bytes.len() as u64,
+                sha256: Some(hash.clone()),
+                if_rev: ABSENT.into(),
+            }],
+        };
+        let caller = Caller::Operator;
+        let owner = "transfer-reconcile";
+        let started = begin(&store, &pm, &caller, owner, None, &manifest, 128).unwrap();
+        let job_id = started["job_id"].as_str().unwrap().to_string();
+        let request = JobRequest {
+            caller: &caller,
+            owner,
+            job_id: &job_id,
+            root: "global/box",
+        };
+        chunk(&store, &state, &request, "file", 0, &STANDARD.encode(bytes)).unwrap();
+        let vault = vault_dir(&pm).unwrap();
+        let blob = blobs_dir(&vault).join(&hash);
+        fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        fs::write(&blob, bytes).unwrap();
+        let pointer = vault.join("global/box/file.bin.blob");
+        fs::create_dir_all(pointer.parent().unwrap()).unwrap();
+        fs::write(
+            &pointer,
+            serde_json::to_string_pretty(&json!({
+                "sha256": hash,
+                "size": bytes.len(),
+                "mime": "application/octet-stream",
+                "name": "file.bin",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let head = head_commit(&pm);
+        let body = apply(&store, &pm, &state, &request, "file").unwrap();
+        assert_eq!(body["outcome"], "unresolved", "{body}");
+        assert_eq!(head_commit(&pm), head);
+        assert!(committed_bytes(&pm, "global/box/file.bin.blob").is_none());
+        assert!(stage_path(&state, &job_id, "file").is_file());
+    }
+
+    #[test]
+    fn uncommitted_directory_is_not_skipped() {
+        let (_root, pm, store, state) = fixture();
+        let manifest = Manifest {
+            version: 1,
+            source_id: "src".into(),
+            root: "global/box".into(),
+            entries: vec![ManifestEntry {
+                id: "nested".into(),
+                path: "nested".into(),
+                kind: "dir".into(),
+                size: 0,
+                sha256: None,
+                if_rev: ABSENT.into(),
+            }],
+        };
+        let caller = Caller::Operator;
+        let owner = "transfer-reconcile";
+        let started = begin(&store, &pm, &caller, owner, None, &manifest, 128).unwrap();
+        let job_id = started["job_id"].as_str().unwrap().to_string();
+        let request = JobRequest {
+            caller: &caller,
+            owner,
+            job_id: &job_id,
+            root: "global/box",
+        };
+        let dir = vault_dir(&pm).unwrap().join("global/box/nested");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(".gitkeep"), b"").unwrap();
+        let head = head_commit(&pm);
+        let body = apply(&store, &pm, &state, &request, "nested").unwrap();
+        assert_eq!(body["outcome"], "unresolved", "{body}");
+        assert_eq!(head_commit(&pm), head);
+        assert!(committed_bytes(&pm, "global/box/nested/.gitkeep").is_none());
+    }
+
+    fn transfer_blob(
+        store: &Store,
+        pm: &Pm,
+        state: &std::path::Path,
+        relative: &str,
+        entry_id: &str,
+        bytes: &[u8],
+        if_rev: &str,
+    ) -> Value {
+        let manifest = Manifest {
+            version: 1,
+            source_id: "src".into(),
+            root: "global/box".into(),
+            entries: vec![ManifestEntry {
+                id: entry_id.into(),
+                path: relative.into(),
+                kind: "blob".into(),
+                size: bytes.len() as u64,
+                sha256: Some(sha256_bytes(bytes)),
+                if_rev: if_rev.into(),
+            }],
+        };
+        let caller = Caller::Operator;
+        let owner = "transfer-reconcile";
+        let started = begin(store, pm, &caller, owner, None, &manifest, 256).unwrap();
+        let job_id = started["job_id"].as_str().unwrap().to_string();
+        let request = JobRequest {
+            caller: &caller,
+            owner,
+            job_id: &job_id,
+            root: "global/box",
+        };
+        chunk(store, state, &request, entry_id, 0, &STANDARD.encode(bytes)).unwrap();
+        apply(store, pm, state, &request, entry_id).unwrap()
+    }
+
+    #[test]
+    fn foreign_and_manual_sidecar_markers_in_body_are_not_overwritten() {
+        let (_root, pm, store, state) = fixture();
+        let foreign_path = "global/box/doc.pdf.extracted.md";
+        let manual_path = "global/box/notes.pdf.extracted.md";
+        let doc_marker = serde_json::to_string("global/box/doc.pdf").unwrap();
+        let notes_marker = serde_json::to_string("global/box/notes.pdf").unwrap();
+        let foreign = format!(
+            "---\nkind: extracted-source\nsource_path: \"global/box/other.pdf\"\nsource_sha256: {}\nextraction_status: indexed\n---\n\n# kept\n\nsource_path: {doc_marker}\nextraction_status: indexed\n",
+            "a".repeat(64)
+        );
+        // Looks generated, but the frontmatter is not a source header. The
+        // target marker sits only in the body, which the old body scan accepted.
+        let manual = format!(
+            "---\nkind: extracted-source\nsource_path: \"global/box/other.pdf\"\nextraction_status: indexed\n---\n\n# kept\n\nsource_path: {notes_marker}\nextraction_status: indexed\n"
+        );
+        write(&pm, &Caller::Operator, foreign_path, &foreign, Some(ABSENT)).unwrap();
+        write(&pm, &Caller::Operator, manual_path, &manual, Some(ABSENT)).unwrap();
+        let foreign_before = committed_bytes(&pm, foreign_path);
+        let manual_before = committed_bytes(&pm, manual_path);
+        let pdf = b"%PDF-1.4\nforeign\n";
+        let doc = transfer_blob(&store, &pm, &state, "doc.pdf", "doc", pdf, ABSENT);
+        let notes = transfer_blob(&store, &pm, &state, "notes.pdf", "notes", pdf, ABSENT);
+        assert_eq!(doc["outcome"], "applied", "{doc}");
+        assert_eq!(notes["outcome"], "applied", "{notes}");
+        assert_eq!(doc["extraction"], "conflict", "{doc}");
+        assert_eq!(notes["extraction"], "conflict", "{notes}");
+        assert_eq!(committed_bytes(&pm, foreign_path), foreign_before);
+        assert_eq!(committed_bytes(&pm, manual_path), manual_before);
+        assert_eq!(
+            read(&pm, &Caller::Operator, foreign_path).unwrap()["text"].as_str(),
+            Some(foreign.as_str())
+        );
+        assert_eq!(
+            read(&pm, &Caller::Operator, manual_path).unwrap()["text"].as_str(),
+            Some(manual.as_str())
+        );
+        assert!(committed_bytes(&pm, "global/box/doc.pdf.blob").is_some());
+        assert!(committed_bytes(&pm, "global/box/notes.pdf.blob").is_some());
+    }
+
+    #[test]
+    fn same_source_old_sha_reimport_updates_generated_sidecar() {
+        let (_root, pm, store, state) = fixture();
+        let first_bytes = b"%PDF-1.4\nnot-a-real-pdf-v1\n";
+        let second_bytes = b"%PDF-1.4\nnot-a-real-pdf-v2\n";
+        let first = transfer_blob(
+            &store,
+            &pm,
+            &state,
+            "hello.pdf",
+            "hello",
+            first_bytes,
+            ABSENT,
+        );
+        assert_eq!(first["outcome"], "applied", "{first}");
+        assert_eq!(first["extraction"], "failed", "{first}");
+        let pointer_rev = read(&pm, &Caller::Operator, "global/box/hello.pdf").unwrap()["rev"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let sidecar = "global/box/hello.pdf.extracted.md";
+        let current = read(&pm, &Caller::Operator, sidecar).unwrap();
+        assert_eq!(
+            generated_extraction_status(
+                current["text"].as_str().unwrap(),
+                "global/box/hello.pdf",
+                &sha256_bytes(first_bytes)
+            ),
+            Some("failed")
+        );
+        let old_sha = "b".repeat(64);
+        let stale = generated_extraction_page(
+            "global/box/hello.pdf",
+            &old_sha,
+            "indexed",
+            "STALE-BODY\nsource_path: \"global/box/other.pdf\"\nextraction_status: failed\n",
+        );
+        write(
+            &pm,
+            &Caller::Operator,
+            sidecar,
+            &stale,
+            current["rev"].as_str(),
+        )
+        .unwrap();
+        let body = transfer_blob(
+            &store,
+            &pm,
+            &state,
+            "hello.pdf",
+            "hello",
+            second_bytes,
+            &pointer_rev,
+        );
+        assert_eq!(body["outcome"], "applied", "{body}");
+        assert_eq!(body["extraction"], "failed", "{body}");
+        let page = read(&pm, &Caller::Operator, sidecar).unwrap();
+        let text = page["text"].as_str().unwrap();
+        assert!(!text.contains("STALE-BODY"), "{text}");
+        assert_eq!(
+            generated_extraction_status(text, "global/box/hello.pdf", &sha256_bytes(second_bytes)),
+            Some("failed")
+        );
+        assert_eq!(
+            committed_bytes(&pm, sidecar).as_deref(),
+            Some(text.as_bytes())
+        );
+        let blobs = blobs_dir(&vault_dir(&pm).unwrap());
+        assert_eq!(
+            fs::read(blobs.join(sha256_bytes(first_bytes))).unwrap(),
+            first_bytes
+        );
+        assert_eq!(
+            fs::read(blobs.join(sha256_bytes(second_bytes))).unwrap(),
+            second_bytes
         );
     }
 }

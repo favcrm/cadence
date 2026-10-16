@@ -7,9 +7,10 @@
 //! envelope through [`crate::remote_cli::call_verb`]. The source tree is
 //! walked and the manifest checked before any mutating op.
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::ffi::CString;
+use std::fs::{self, File};
+use std::io::{Read, Seek, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -126,20 +127,22 @@ impl Channel for LocalChannel<'_> {
     }
 
     fn current_rev(&mut self, path: &str) -> Result<String> {
-        match self.read_page(path) {
+        // Same bounded original read as remote: a whole page can exceed the
+        // reply line, and only `rev` is needed to pin an update.
+        match self.read_page_bounded(path) {
             Ok(body) => rev_from_read(&body, path),
-            Err(error) if is_absent(&error) => Ok(ABSENT.to_string()),
+            Err(error) if is_absent(&error) || is_directory_range(&error) => Ok(ABSENT.to_string()),
             Err(error) => Err(error),
         }
     }
 }
 
 impl LocalChannel<'_> {
-    fn read_page(&self, path: &str) -> Result<Value> {
+    fn read_page_bounded(&self, path: &str) -> Result<Value> {
         crate::client::rpc_timeout(
             self.state_dir,
             "wiki_read",
-            json!({"path": path}),
+            json!({"path": path, "offset": 0, "bytes": 0}),
             remaining_time(self.deadline)?,
         )
     }
@@ -209,11 +212,18 @@ impl Channel for RemoteChannel<'_> {
     }
 
     fn current_rev(&mut self, path: &str) -> Result<String> {
+        // A whole-page `read` carries the original text. Remote replies stop
+        // at 8 MiB, while admitted text is up to 64 MiB, so pin `rev` from
+        // the existing bounded original read (offset 0, zero bytes).
         let mut args = Map::new();
         args.insert("path".into(), json!(path));
+        args.insert("offset".into(), json!(0));
+        args.insert("bytes".into(), json!(0));
         match self.guarded("read", args, true) {
             Ok(body) => rev_from_read(&body, path),
-            Err(error) if is_absent(&error) => Ok(ABSENT.to_string()),
+            // A directory has no original range. Create-only pins use ABSENT;
+            // file updates never target a directory entry.
+            Err(error) if is_absent(&error) || is_directory_range(&error) => Ok(ABSENT.to_string()),
             Err(error) => Err(error),
         }
     }
@@ -241,10 +251,9 @@ fn import_local(
         check_token(job, "job id")?;
     }
     let local = guard_local(Path::new(request.source), false)?;
-    let meta = symlink_meta(&local)?;
-    if meta.file_type().is_symlink() {
-        return Err(refused_path(&local, "symlink"));
-    }
+    // Refuse a symlinked ancestor before metadata, hashing, or discovery.
+    // `guard_local` is lexical; leaf `O_NOFOLLOW` does not confine `./link/child`.
+    let meta = contained_source_meta(&local)?;
     let (root, file_name) = if meta.is_dir() {
         if !request.recursive {
             return Err(Error::rejected(
@@ -345,6 +354,24 @@ fn import_local(
             true,
         ) {
             Ok(body) => {
+                // One apply. `unresolved` is not terminal: the stage stays,
+                // finish would be refused, and a later resume may apply again.
+                // Do not loop apply or recompute the admitted `if_rev` here.
+                if body["outcome"].as_str() == Some("unresolved") {
+                    let detail = body["error"]
+                        .as_str()
+                        .filter(|text| !text.is_empty())
+                        .unwrap_or("publication is not committed; staged bytes were kept");
+                    let mut notes = vec![detail.to_string()];
+                    notes.extend(failures);
+                    return Err(Error::rejected(format!(
+                        "wiki cp job {job_id} stopped on '{}': unresolved — {}; \
+                         finish was not called; this attempt was not retried — resume with \
+                         --resume {job_id}; admitted if_rev was not recomputed",
+                        item.rel,
+                        notes.join("; ")
+                    )));
+                }
                 if let Some(why) = entry_failure(&body, &item.rel) {
                     failures.push(why);
                 }
@@ -441,7 +468,8 @@ fn send_entry(
     } else {
         local_root.join(&item.rel)
     };
-    let mut file = open_nofollow(&path)?;
+    // Re-check the ancestor chain, then open only through no-follow fds.
+    let mut file = open_contained(&path)?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; CHUNK_BYTES];
     let mut hashed = 0u64;
@@ -552,7 +580,14 @@ fn export_wiki(
     }
     let mut failures = Vec::new();
     for entry in &listed {
-        if let Err(error) = write_export_entry(channel, &root_or_file, &dest, entry, &listed) {
+        if let Err(error) = write_export_entry(
+            channel,
+            &root_or_file,
+            &dest,
+            entry,
+            &listed,
+            request.update,
+        ) {
             failures.push(format!("{}: {error}", entry.path));
             break;
         }
@@ -569,6 +604,7 @@ fn export_wiki(
     }
 }
 
+#[derive(Clone)]
 struct ExportEntry {
     path: String,
     kind: String,
@@ -700,6 +736,7 @@ fn write_export_entry(
     dest_root: &Path,
     entry: &ExportEntry,
     all: &[ExportEntry],
+    update: bool,
 ) -> Result<()> {
     let single = all.len() == 1 && entry.path.is_empty();
     let dest = if single {
@@ -733,7 +770,6 @@ fn write_export_entry(
         .prefix(".cadence-transfer-")
         .tempfile_in(parent)
         .map_err(|e| Error::rejected(format!("cannot stage {}: {e}", dest.display())))?;
-    let tmp = staged.path().to_path_buf();
     let mut got = 0u64;
     while got < entry.size {
         let ask = (entry.size - got).min(CHUNK_BYTES as u64);
@@ -767,7 +803,7 @@ fn write_export_entry(
         return Err(Error::rejected("export length mismatch"));
     }
     staged.as_file().sync_all()?;
-    let file_hash = hash_file(&tmp)?.1;
+    let (_, file_hash) = hash_open_file(staged.as_file_mut())?;
     if let Some(want) = &entry.sha256 {
         if want != &file_hash {
             return Err(Error::rejected(format!(
@@ -777,7 +813,9 @@ fn write_export_entry(
         }
     }
     if entry.kind == "text" {
-        let text = fs::read(&tmp)?;
+        let mut text = Vec::new();
+        staged.as_file().rewind()?;
+        staged.as_file().read_to_end(&mut text)?;
         if std::str::from_utf8(&text).is_err() {
             return Err(Error::rejected(format!(
                 "export '{}' is not UTF-8 text",
@@ -785,9 +823,8 @@ fn write_export_entry(
             )));
         }
     }
-    staged.persist(&dest).map_err(|error| {
-        Error::rejected(format!("cannot commit {}: {}", dest.display(), error.error))
-    })?;
+    publish_export(staged, &dest, update)
+        .map_err(|error| Error::rejected(format!("cannot commit {}: {error}", dest.display())))?;
     File::open(parent)?.sync_all()?;
     Ok(())
 }
@@ -1094,6 +1131,19 @@ struct EntryProgress {
     decided: bool,
 }
 
+/// `pending` and `unresolved` still need apply. `unresolved` means the
+/// publication is not committed and the stage was kept; it is not a
+/// decision, so resume may apply once. Any other outcome is refused.
+fn outcome_is_decided(outcome: Option<&str>) -> Result<bool> {
+    match outcome {
+        Some("pending" | "unresolved") => Ok(false),
+        Some("applied" | "skipped" | "conflict" | "failed") => Ok(true),
+        _ => Err(Error::rejected(
+            "wiki cp progress has an unknown entry outcome",
+        )),
+    }
+}
+
 fn status_received(
     channel: &mut dyn Channel,
     root: &str,
@@ -1123,15 +1173,7 @@ fn status_received(
             let received = entry["received"]
                 .as_u64()
                 .ok_or_else(|| Error::rejected("wiki cp progress omitted acknowledged bytes"))?;
-            let decided = match entry["outcome"].as_str() {
-                Some("pending") => false,
-                Some("applied" | "skipped" | "conflict" | "failed") => true,
-                _ => {
-                    return Err(Error::rejected(
-                        "wiki cp progress has an unknown entry outcome",
-                    ))
-                }
-            };
+            let decided = outcome_is_decided(entry["outcome"].as_str())?;
             if out
                 .insert(id.to_string(), EntryProgress { received, decided })
                 .is_some()
@@ -1194,7 +1236,12 @@ fn walk_dir(root: &Path, rel: &Path, out: &mut Vec<Walked>) -> Result<()> {
     } else {
         root.join(rel)
     };
-    let meta = symlink_meta(&full)?;
+    // Open with O_NOFOLLOW on every component, then list that fd. A path
+    // listing would follow an ancestor swapped for a symlink after the check.
+    let opened = open_contained(&full)?;
+    let meta = opened
+        .metadata()
+        .map_err(|e| Error::rejected(format!("wiki cp cannot stat {}: {e}", full.display())))?;
     if meta.file_type().is_symlink() {
         return Err(refused_path(&full, "symlink"));
     }
@@ -1211,19 +1258,12 @@ fn walk_dir(root: &Path, rel: &Path, out: &mut Vec<Walked>) -> Result<()> {
             single_file: false,
         });
     }
-    let mut names = Vec::new();
-    for entry in fs::read_dir(&full)
-        .map_err(|e| Error::rejected(format!("wiki cp cannot read {}: {e}", full.display())))?
-    {
-        let entry =
-            entry.map_err(|e| Error::rejected(format!("wiki cp cannot read an entry: {e}")))?;
-        names.push(entry.file_name());
-    }
+    let mut names = list_nofollow_dir(opened, &full)?;
     names.sort();
     for name in names {
         let child = rel.join(name);
         let abs = root.join(&child);
-        let meta = symlink_meta(&abs)?;
+        let meta = contained_source_meta(&abs)?;
         let ft = meta.file_type();
         if ft.is_symlink() {
             return Err(refused_path(&abs, "symlink"));
@@ -1247,7 +1287,12 @@ fn push_file(out: &mut Vec<Walked>, path: &Path, rel: &str, single_file: bool) -
             "wiki cp refused internal path '{rel}' — nothing was sent"
         )));
     }
-    let meta = symlink_meta(path)?;
+    // Hash and UTF-8 checks read this fd. A second path open would follow
+    // an ancestor symlink planted after admission.
+    let mut file = open_contained(path)?;
+    let meta = file
+        .metadata()
+        .map_err(|e| Error::rejected(format!("wiki cp cannot stat {}: {e}", path.display())))?;
     if !meta.is_file() || meta.file_type().is_symlink() {
         return Err(refused_path(path, "not a regular file"));
     }
@@ -1262,8 +1307,15 @@ fn push_file(out: &mut Vec<Walked>, path: &Path, rel: &str, single_file: bool) -
         )));
     }
     let (size, sha) = if kind == "text" {
-        let bytes = fs::read(path)
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
             .map_err(|e| Error::rejected(format!("wiki cp cannot read {}: {e}", path.display())))?;
+        if bytes.len() as u64 > cap {
+            return Err(Error::rejected(format!(
+                "wiki cp refused '{rel}': {} bytes exceeds the {cap}-byte cap — nothing was sent",
+                bytes.len()
+            )));
+        }
         if std::str::from_utf8(&bytes).is_err() {
             return Err(Error::rejected(format!(
                 "wiki cp refused '{rel}': text is not UTF-8 — nothing was sent"
@@ -1271,7 +1323,14 @@ fn push_file(out: &mut Vec<Walked>, path: &Path, rel: &str, single_file: bool) -
         }
         (bytes.len() as u64, hex_encode(Sha256::digest(&bytes)))
     } else {
-        hash_file(path)?
+        let hashed = hash_open_file(&mut file)?;
+        if hashed.0 > cap {
+            return Err(Error::rejected(format!(
+                "wiki cp refused '{rel}': {} bytes exceeds the {cap}-byte cap — nothing was sent",
+                hashed.0
+            )));
+        }
+        hashed
     };
     out.push(Walked {
         rel: rel.to_string(),
@@ -1550,6 +1609,13 @@ fn is_absent(error: &Error) -> bool {
     text.contains("no such") || text.contains("not found") || text.contains("does not exist")
 }
 
+/// Bounded `read` refuses a directory (`a range read needs a text page`).
+/// That is the directory case of an update pin, not a missing file.
+fn is_directory_range(error: &Error) -> bool {
+    let text = error.to_string().to_ascii_lowercase();
+    text.contains("range") && text.contains("director")
+}
+
 fn refused_path(path: &Path, why: &str) -> Error {
     Error::rejected(format!(
         "wiki cp refused '{}': {why} — nothing was sent",
@@ -1615,22 +1681,213 @@ fn path_utf8(path: &Path) -> Result<String> {
         .ok_or_else(|| Error::rejected("wiki cp refused a non-UTF-8 path"))
 }
 
-fn open_nofollow(path: &Path) -> Result<File> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path);
-    file.map_err(|e| {
-        if e.raw_os_error() == Some(libc::ELOOP) {
-            refused_path(path, "symlink")
-        } else {
-            Error::rejected(format!("wiki cp cannot read {}: {e}", path.display()))
-        }
-    })
+/// Metadata of `path` after every existing ancestor, including the leaf,
+/// has been opened with `O_NOFOLLOW`. A missing path is an error. This
+/// is the import admission check: nothing is hashed or listed first.
+fn contained_source_meta(path: &Path) -> Result<fs::Metadata> {
+    let file = open_contained(path)?;
+    file.metadata()
+        .map_err(|e| Error::rejected(format!("wiki cp cannot stat {}: {e}", path.display())))
 }
 
-fn hash_file(path: &Path) -> Result<(u64, String)> {
-    let mut file = open_nofollow(path)?;
+/// Open `path` by walking from the filesystem root with `openat` and
+/// `O_NOFOLLOW` on every component. The returned fd is the only handle;
+/// a later path open is not used for source bytes.
+fn open_contained(path: &Path) -> Result<File> {
+    refuse_symlink_chain(path)?;
+    let mut current = open_root_dir()?;
+    let mut cur = PathBuf::new();
+    cur.push(Component::RootDir);
+    let abs = lexical_abs(path)?;
+    for component in abs.components() {
+        let Component::Normal(seg) = component else {
+            if matches!(component, Component::RootDir) {
+                continue;
+            }
+            return Err(refused_path(path, "unsupported path"));
+        };
+        cur.push(seg);
+        let is_last = cur == abs;
+        let name = CString::new(os_str_bytes(seg)).map_err(|_| {
+            Error::rejected(format!(
+                "wiki cp refused '{}': path contains an interior nul — nothing was sent",
+                path.display()
+            ))
+        })?;
+        // Ancestors are directories, so they must not use O_NONBLOCK
+        // (some kernels return ENOTSUP). The leaf uses O_NONBLOCK so a
+        // fifo cannot stall admission; a directory leaf that a kernel
+        // refuses that way is retried below. Symlinks stay ELOOP.
+        let flags = if is_last {
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK
+        } else {
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+        };
+        let mut next = unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), flags) };
+        if next < 0 && is_last {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ENOTSUP) {
+                let dir_flags =
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+                next = unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), dir_flags) };
+            }
+        }
+        if next < 0 {
+            let err = std::io::Error::last_os_error();
+            // Linux reports a symlink as ELOOP. A kernel that returns the
+            // link descriptor is still refused by fstat below.
+            if err.raw_os_error() == Some(libc::ELOOP) || is_symlink_at(current.as_raw_fd(), &name)
+            {
+                return Err(refused_path(&cur, "symlink"));
+            }
+            return Err(Error::rejected(format!(
+                "wiki cp cannot read {}: {err}",
+                cur.display()
+            )));
+        }
+        let opened = unsafe { OwnedFd::from_raw_fd(next) };
+        if is_symlink_fd(opened.as_raw_fd()) {
+            return Err(refused_path(&cur, "symlink"));
+        }
+        current = opened;
+    }
+    let file = File::from(current);
+    let meta = file
+        .metadata()
+        .map_err(|e| Error::rejected(format!("wiki cp cannot stat {}: {e}", path.display())))?;
+    if meta.file_type().is_symlink() {
+        return Err(refused_path(path, "symlink"));
+    }
+    if !meta.is_file() && !meta.is_dir() {
+        return Err(refused_path(path, "not a regular file or directory"));
+    }
+    Ok(file)
+}
+
+fn open_root_dir() -> Result<OwnedFd> {
+    let fd = unsafe {
+        libc::open(
+            c"/".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(Error::rejected(
+            "wiki cp cannot open the filesystem root — nothing was sent",
+        ));
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn os_str_bytes(seg: &std::ffi::OsStr) -> &[u8] {
+    use std::os::unix::ffi::OsStrExt;
+    seg.as_bytes()
+}
+
+fn is_symlink_fd(fd: std::os::fd::RawFd) -> bool {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::fstat(fd, &mut st) };
+    rc == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFLNK
+}
+
+fn is_symlink_at(dirfd: std::os::fd::RawFd, name: &std::ffi::CStr) -> bool {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::fstatat(dirfd, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
+    rc == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFLNK
+}
+
+/// Names in a directory fd from [`open_contained`]. `fdopendir` consumes
+/// `file`. `.` and `..` are omitted. The caller's path is not opened again.
+fn list_nofollow_dir(file: File, path: &Path) -> Result<Vec<std::ffi::OsString>> {
+    use std::ffi::{CStr, OsStr};
+    use std::os::fd::IntoRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    struct CloseDir(*mut libc::DIR);
+    impl Drop for CloseDir {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { libc::closedir(self.0) };
+            }
+        }
+    }
+
+    let fd = file.into_raw_fd();
+    let dir = unsafe { libc::fdopendir(fd) };
+    if dir.is_null() {
+        let err = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(Error::rejected(format!(
+            "wiki cp cannot read {}: {err}",
+            path.display()
+        )));
+    }
+    let dir = CloseDir(dir);
+    let mut names = Vec::new();
+    loop {
+        clear_errno();
+        let ent = unsafe { libc::readdir(dir.0) };
+        if ent.is_null() {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error().unwrap_or(0) != 0 {
+                return Err(Error::rejected(format!(
+                    "wiki cp cannot read {}: {err}",
+                    path.display()
+                )));
+            }
+            break;
+        }
+        let name = unsafe { CStr::from_ptr((*ent).d_name.as_ptr()) };
+        let bytes = name.to_bytes();
+        if bytes == b"." || bytes == b".." {
+            continue;
+        }
+        names.push(OsStr::from_bytes(bytes).to_os_string());
+    }
+    Ok(names)
+}
+
+fn clear_errno() {
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "redox"))]
+    unsafe {
+        *libc::__errno_location() = 0;
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+    unsafe {
+        *libc::__error() = 0;
+    }
+}
+
+/// Publish the staged export. Default is create-only: `persist_noclobber`
+/// refuses a destination that appeared after preflight and leaves those
+/// bytes untouched. `--update` replaces the destination. A failed persist
+/// drops the `NamedTempFile` (its `Drop` removes the private stage).
+fn publish_export(staged: tempfile::NamedTempFile, dest: &Path, update: bool) -> Result<()> {
+    if update {
+        staged.persist(dest).map_err(|error| {
+            let _ = error.file;
+            Error::rejected(error.error.to_string())
+        })?;
+    } else {
+        staged.persist_noclobber(dest).map_err(|error| {
+            let _ = error.file;
+            if error.error.kind() == std::io::ErrorKind::AlreadyExists
+                || error.error.raw_os_error() == Some(libc::EEXIST)
+            {
+                Error::rejected(format!(
+                    "wiki cp refused to overwrite '{}' — pass --update",
+                    dest.display()
+                ))
+            } else {
+                Error::rejected(error.error.to_string())
+            }
+        })?;
+    }
+    Ok(())
+}
+
+fn hash_open_file(file: &mut File) -> Result<(u64, String)> {
+    file.rewind()?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 8192];
     let mut size = 0u64;
@@ -1749,5 +2006,171 @@ mod tests {
             Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
         );
         assert_eq!(first[0].kind, "blob");
+    }
+
+    /// `./linked/subdir` must be refused before any child is hashed, even
+    /// when the leaf directory itself is a real directory outside cwd.
+    #[test]
+    fn source_ancestor_symlink_is_refused_before_discovery() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir(outside.path().join("subdir")).unwrap();
+        fs::write(outside.path().join("subdir/secret.txt"), b"outside-cwd").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("linked")).unwrap();
+        let linked = root.path().join("linked/subdir");
+
+        let err = match walk_local(&linked, None) {
+            Ok(_) => panic!("symlinked ancestor was walked"),
+            Err(error) => error.to_string(),
+        };
+        assert!(!err.contains("outside-cwd"), "{err}");
+
+        assert!(contained_source_meta(&linked).is_err());
+        let secret = linked.join("secret.txt");
+        let mut admitted = Vec::new();
+        let err = push_file(&mut admitted, &secret, "secret.txt", true)
+            .unwrap_err()
+            .to_string();
+        assert!(admitted.is_empty(), "{err}");
+        assert!(!err.contains("outside-cwd"), "{err}");
+
+        fs::create_dir(root.path().join("real")).unwrap();
+        fs::create_dir(root.path().join("real/empty")).unwrap();
+        fs::write(root.path().join("real/note.txt"), "café").unwrap();
+        let walked = walk_local(&root.path().join("real"), None).unwrap();
+        let rels: Vec<_> = walked.iter().map(|e| e.rel.as_str()).collect();
+        assert_eq!(rels, vec!["empty", "note.txt"]);
+        assert_eq!(walked[0].kind, "dir");
+        assert_eq!(walked[1].kind, "text");
+    }
+
+    /// A destination created after preflight keeps its bytes unless `--update`.
+    #[test]
+    fn export_create_only_refuses_a_destination_created_during_download() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("page.txt");
+        let raced = b"created-after-preflight";
+        let entry = ExportEntry {
+            path: "page.txt".to_string(),
+            kind: "text".to_string(),
+            size: 4,
+            sha256: Some(
+                "12a435ec8454c6d1c90a1d92812b09af11bee711fbe524d56a8f26ea7c5ccee8".to_string(),
+            ),
+            rev: "fnv1a:0123456789abcdef".to_string(),
+        };
+        let listed = [entry.clone(), empty_dir_entry()];
+        // Preflight sees no destination. The channel plants one on the first read.
+        check_export_dest(dir.path(), "global/docs", &listed, false).unwrap();
+        assert!(!dest.exists());
+        write_export_entry(
+            &mut RaceChannel {
+                dest: dest.clone(),
+                raced: raced.to_vec(),
+            },
+            "global/docs",
+            dir.path(),
+            &listed[0],
+            &listed,
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(fs::read(&dest).unwrap(), raced);
+
+        fs::remove_file(&dest).unwrap();
+        write_export_entry(
+            &mut RaceChannel {
+                dest: dest.clone(),
+                raced: raced.to_vec(),
+            },
+            "global/docs",
+            dir.path(),
+            &listed[0],
+            &listed,
+            true,
+        )
+        .unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"wiki");
+        assert!(
+            fs::read_dir(dir.path()).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".cadence-transfer-")),
+            "failed create-only persist left its private stage"
+        );
+    }
+
+    fn empty_dir_entry() -> ExportEntry {
+        ExportEntry {
+            path: "empty".to_string(),
+            kind: "dir".to_string(),
+            size: 0,
+            sha256: None,
+            rev: ABSENT.to_string(),
+        }
+    }
+
+    struct RaceChannel {
+        dest: PathBuf,
+        raced: Vec<u8>,
+    }
+
+    impl Channel for RaceChannel {
+        fn transfer(&mut self, _root: &str, _op: Value, _write: bool) -> Result<Value> {
+            if !self.dest.exists() {
+                fs::write(&self.dest, &self.raced).unwrap();
+            }
+            Ok(json!({
+                "kind": "text",
+                "rev": "fnv1a:0123456789abcdef",
+                "size": 4,
+                "sha256": "12a435ec8454c6d1c90a1d92812b09af11bee711fbe524d56a8f26ea7c5ccee8",
+                "data_base64": base64::engine::general_purpose::STANDARD.encode(b"wiki"),
+            }))
+        }
+        fn discover(&mut self, _path: &str) -> Result<()> {
+            Ok(())
+        }
+        fn current_rev(&mut self, _path: &str) -> Result<String> {
+            Ok(ABSENT.to_string())
+        }
+    }
+
+    #[test]
+    fn unresolved_status_is_retryable_and_unknown_outcome_is_refused() {
+        struct Page {
+            outcome: &'static str,
+        }
+        impl Channel for Page {
+            fn transfer(&mut self, root: &str, op: Value, _write: bool) -> Result<Value> {
+                assert_eq!(op["op"], "status");
+                Ok(json!({
+                    "root": root,
+                    "job_id": "job-unresolved",
+                    "entries": [{
+                        "entry_id": "note",
+                        "received": 5,
+                        "outcome": self.outcome,
+                    }],
+                    "next_offset": null,
+                }))
+            }
+            fn discover(&mut self, _path: &str) -> Result<()> {
+                Ok(())
+            }
+            fn current_rev(&mut self, _path: &str) -> Result<String> {
+                Err(Error::rejected(
+                    "current_rev recomputed an admitted revision",
+                ))
+            }
+        }
+        let mut unresolved = Page {
+            outcome: "unresolved",
+        };
+        let progress = status_received(&mut unresolved, "global/notes", "job-unresolved").unwrap();
+        assert!(!progress["note"].decided);
+        let mut unknown = Page { outcome: "guessed" };
+        assert!(status_received(&mut unknown, "global/notes", "job-unresolved").is_err());
     }
 }

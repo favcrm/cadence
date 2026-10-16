@@ -498,7 +498,15 @@ impl Shared {
                 "wiki transfer refused: manifest root does not match the request root",
             ));
         }
-        let job_id = optional_str(params, "job_id");
+        let job_id = match params.get("job_id") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(id)) => Some(id.as_str()),
+            Some(_) => {
+                return Err(Error::rejected(
+                    "wiki transfer begin refused: job_id must be a string",
+                ))
+            }
+        };
         wiki::transfer::begin(
             &self.store,
             &self.pm()?,

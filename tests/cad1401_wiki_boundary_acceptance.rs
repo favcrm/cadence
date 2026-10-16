@@ -789,6 +789,22 @@ fn transfer_effects(rig: &Rig) -> TransferEffects {
     (rig.page_snapshot(), staged_transfer_files(rig))
 }
 
+fn transfer_job_ids(rig: &Rig) -> Vec<String> {
+    let conn = rusqlite::Connection::open_with_flags(
+        rig.root.path().join("s/cadence.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    conn.busy_timeout(Duration::from_secs(5)).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT job_id FROM wiki_transfer_jobs ORDER BY job_id")
+        .unwrap();
+    stmt.query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
 fn rpc_transfer(rig: &Rig, params: Value) -> cadence_agent::Result<Value> {
     let state = rig.root.path().join("s");
     scoped(Asserted::Operator, || {
@@ -1785,6 +1801,31 @@ fn cad914_transfer_guard_creates_owned_job_and_refuses_invalid_manifest_retarget
             .as_ref()
             .is_ok_and(|value| status_receipt(value, &job_id, &digest, ROOT, "fresh.md")),
         &owned_still,
+    );
+
+    let jobs_before = transfer_job_ids(&rig);
+    let effects_before = transfer_effects(&rig);
+    let numeric_job = rig.call(
+        "PUT",
+        "/api/wiki/transfer",
+        Some(&rig.sign(&rig.claims("cad914-http-numeric-job"))),
+        &json!({
+            "path": ROOT,
+            "transfer": {"op": "begin", "job_id": 123, "manifest": http_manifest},
+        }),
+    );
+    check(
+        &mut failures,
+        "CAD914 signed HTTP begin refuses a numeric job id before any job or publication",
+        numeric_job.0 == 400
+            && numeric_job.2["job_id"].as_str().is_none()
+            && transfer_job_ids(&rig) == jobs_before
+            && transfer_effects(&rig) == effects_before
+            && hides(
+                &numeric_job.2.to_string(),
+                &[http_source, http_digest.as_str(), FRESH, KEEP_TEXT],
+            ),
+        &numeric_job,
     );
     assert!(
         failures.is_empty(),
