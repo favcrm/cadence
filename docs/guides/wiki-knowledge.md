@@ -81,6 +81,24 @@ character is refused and no partial character is returned. An unauthorized
 caller gets the same refusal as `cat`, with no body. The read uses the same
 caller allowlist as `cat`; it does not copy the page or change the text cap.
 
+A blob page is not text. `cadence wiki cat <path>` streams the original
+bytes: locally from the content-addressed object, and on a remote org by
+repeating the bounded read with the pointer `rev` pinned until `range.total`
+is covered. Each remote range is checked for `start`, `end`, `total`, `rev`,
+and `sha256`. The decoded bytes go to a private spool, and stdout is written
+only after that spool's SHA-256 matches the pointer. A server that returns
+only pointer metadata, or a short, stale, or hash-mismatched range, fails
+and writes nothing. `--meta` still prints the pointer and does not fetch
+bytes. `--offset`, `--bytes`, and `--rev` on a blob print one compact JSON
+line: the same pointer fields and `range` as a text range, plus `data_base64`
+(standard base64 of the original bytes `[start, end)`). That line stays under
+the native tool bound. An explicit range that would exceed the bound is
+refused. An omitted `--bytes` returns the longest fitting slice. Empty blobs
+return an empty slice. Text pages do not use `data_base64`.
+Remote `cat` refuses blobs larger than 100 MiB before fetching byte ranges.
+Discovery and continuation reads share one `--wake-timeout` deadline. Expiry
+keeps the existing retryable `busy`/`waking` exit 75 and releases no blob bytes.
+
 `--if-rev none` is create-only. For an update, read the current revision with
 `cat --meta`, then pass that value to `put --if-rev <rev>`; a conflict means
 another writer won and the caller must reread. The board editor does this
@@ -141,10 +159,13 @@ client uses `GET /api/wiki/search?q=<terms>&path=<scope>` and then
 full text and revision. The same route accepts optional `offset`, `bytes`,
 and `rev` query parameters and returns the bounded range read above; a bad
 integer or empty revision is refused before the page is read. Omit them to
-keep the whole-page reply. A verified `wikienv_` read of that same path is
-the hosted hop: it forwards those three query parameters only after the
-envelope's signed prefix check. A path outside that prefix is refused
-before the daemon reads the page, and the prefix ceiling is unchanged.
+keep the whole-page reply. A blob range query returns the compact JSON
+object above (`data_base64` included) instead of the file bytes. With no
+range query, the board session route still streams the blob, and a verified
+`wikienv_` read returns pointer metadata. A verified `wikienv_` read of that
+same path is the hosted hop: it forwards those three query parameters only
+after the envelope's signed prefix check. A path outside that prefix is
+refused before the daemon reads the page, and the prefix ceiling is unchanged.
 The board's existing session or attributed-agent identity is required; the
 permission-prompt MCP server is not a wiki API.
 

@@ -1578,25 +1578,36 @@ pub fn cli_material_until(
     })
 }
 
+/// Execute within the command-owned deadline. Continuations reuse it rather
+/// than starting a fresh wake budget for each range.
 pub fn call_verb(
     target: &RemoteTarget,
     verb: &str,
     arguments: Map<String, Value>,
+    deadline: Instant,
     wake_timeout: u64,
     note: impl Fn(&str),
 ) -> Result<RemoteAnswer> {
     let dir = auth_dir(None).map_err(|_| {
         reject("remote credential directory is unavailable — set HOME or XDG_CONFIG_HOME")
     })?;
-    call_verb_in(target, verb, arguments, wake_timeout, &dir, note, |d| {
-        std::thread::sleep(d)
-    })
+    call_verb_until(
+        target,
+        verb,
+        arguments,
+        deadline,
+        wake_timeout,
+        &dir,
+        note,
+        std::thread::sleep,
+    )
 }
 
 /// `call_verb` with the credential dir and the sleep injectable — tests
 /// drive the wake loop without wall-clock cost and point the credential
 /// dir at a fixture. The verb allowlist is checked *here*, on the shared
 /// path, so no caller can bypass it.
+#[cfg(test)]
 fn call_verb_in(
     target: &RemoteTarget,
     verb: &str,
@@ -4061,6 +4072,31 @@ mod tests {
         assert!(
             matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
             "a dead budget opened a socket"
+        );
+    }
+
+    #[test]
+    fn a_shared_expired_deadline_cannot_restart_the_wake_budget() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (target, _root, dir) = credentialed(&listener);
+        let deadline = Instant::now() - Duration::from_secs(1);
+        let error = call_verb_until(
+            &target,
+            "read",
+            Map::new(),
+            deadline,
+            60,
+            &dir,
+            |_| {},
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), "busy");
+        assert_eq!(error.code(), Some("waking"));
+        assert!(
+            matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "a continuation restarted its expired budget"
         );
     }
 

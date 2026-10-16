@@ -101,12 +101,14 @@ pub(super) fn read(
 /// `GET /api/wiki/file?path=` — text comes back as the daemon's JSON.
 /// Optional `offset`, `bytes`, and `rev` are the same bounded original
 /// read as `wiki_read`: absent, the reply is the whole page; present,
-/// the daemon returns one range or refuses with no body. A blob page
-/// streams `.blobs/<sha256>` itself when no range query is set: byte
-/// ranges for seeking, `attachment` + octet-stream for everything but
-/// the small inline allowlist (image/video/pdf), and a sandboxed CSP
-/// either way. SVG and HTML are NEVER inline — a rendered wiki
-/// attachment must not drive the board's write API.
+/// the daemon returns one range or refuses with no body. A blob range
+/// query returns that bounded JSON (`data_base64` plus the pointer),
+/// not the file bytes. With no range query, a blob page streams
+/// `.blobs/<sha256>`: byte ranges for seeking, `attachment` +
+/// octet-stream for everything but the small inline allowlist
+/// (image/video/pdf), and a sandboxed CSP either way. SVG and HTML
+/// are NEVER inline — a rendered wiki attachment must not drive the
+/// board's write API.
 fn file_response(
     request: &Request,
     query: &dyn Fn(&str) -> Option<String>,
@@ -140,12 +142,16 @@ fn file_response(
         }
         params["rev"] = json!(rev);
     }
+    let ranged = params.get("offset").is_some()
+        || params.get("bytes").is_some()
+        || params.get("rev").is_some();
     let page = match client::rpc(state_dir, "wiki_read", params) {
         Ok(v) => v,
         Err(e) => return write_err(&e),
     };
     match page["kind"].as_str() {
         Some("text") | Some("dir") => return json_response(page),
+        Some("blob") if ranged => return compact_wiki_json(page),
         Some("blob") => {}
         _ => return err_response(404, "no such wiki page"),
     }
@@ -254,6 +260,19 @@ fn file_response(
             .unwrap(),
         );
     }
+    resp
+}
+
+fn compact_wiki_json(page: Value) -> HttpResp {
+    let Ok(body) = serde_json::to_vec(&page) else {
+        return err_response(500, "wiki file range could not be encoded");
+    };
+    if body.len().saturating_add(1) >= crate::wiki::NATIVE_TOOL_LINE_BOUND {
+        return err_response(400, "wiki file range exceeds the native tool line bound");
+    }
+    let mut resp = Response::from_data(body).with_status_code(200);
+    resp.add_header(Header::from_bytes("Content-Type", "application/json").unwrap());
+    resp.add_header(Header::from_bytes("Cache-Control", "no-store").unwrap());
     resp
 }
 

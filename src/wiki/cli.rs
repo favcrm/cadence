@@ -26,19 +26,22 @@ pub enum WikiAction {
     },
     /// Print a page. A blob page streams its bytes; `--meta` prints
     /// its JSON metadata (including the text page's revision) instead.
-    /// `--offset` / `--bytes` / `--rev` read one original-text range as
-    /// a single JSON line under the native tool line bound.
+    /// `--offset` / `--bytes` / `--rev` read one bounded range as a
+    /// single JSON line under the native tool line bound. Text ranges
+    /// carry `text`; blob ranges carry `data_base64` of the original
+    /// bytes plus the pointer metadata.
     Cat {
         path: String,
         /// Show the blob pointer (sha256/size/mime) rather than bytes.
         #[arg(long)]
         meta: bool,
-        /// UTF-8 byte offset into the original text. With `--bytes` or
-        /// `--rev`, the reply is the bounded range, not the raw page.
+        /// Byte offset into the original. Text offsets must fall on a
+        /// UTF-8 boundary. With `--bytes` or `--rev`, the reply is the
+        /// bounded range, not the raw page.
         #[arg(long)]
         offset: Option<u64>,
-        /// Maximum original bytes to return. The end is exclusive and
-        /// must fall on a UTF-8 character boundary.
+        /// Maximum original bytes to return. For text, the end is
+        /// exclusive and must fall on a UTF-8 character boundary.
         #[arg(long)]
         bytes: Option<u64>,
         /// Original revision (`fnv1a:…` from a prior read). A different

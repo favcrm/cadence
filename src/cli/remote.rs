@@ -639,6 +639,253 @@ fn upload(
     Ok(0)
 }
 
+/// Remote blob cats stay under the default wiki upload cap. A larger
+/// pointer is refused before a range is fetched or a spool is created.
+const REMOTE_BLOB_SPOOL_BOUND: u64 = 100 * 1024 * 1024;
+
+/// Normal remote `wiki cat` of a blob (no `--meta`, no range flags).
+/// Discovery already returned pointer metadata. This fetches bounded
+/// ranges pinned to that revision, spools them privately, and writes
+/// stdout only after the spool matches the pointer SHA-256.
+fn remote_blob_cat(
+    target: &cadence_agent::remote_cli::RemoteTarget,
+    command: &Commands,
+    discovered: &Value,
+    deadline: std::time::Instant,
+    wake_timeout: u64,
+) -> Result<bool> {
+    let Commands::Wiki {
+        action:
+            WikiAction::Cat {
+                path,
+                meta,
+                offset,
+                bytes,
+                rev,
+            },
+    } = command
+    else {
+        return Ok(false);
+    };
+    if *meta || offset.is_some() || bytes.is_some() || rev.is_some() || discovered["kind"] != "blob"
+    {
+        return Ok(false);
+    }
+    stream_remote_blob(target, path, discovered, deadline, wake_timeout)?;
+    Ok(true)
+}
+
+fn stream_remote_blob(
+    target: &cadence_agent::remote_cli::RemoteTarget,
+    path: &str,
+    discovered: &Value,
+    deadline: std::time::Instant,
+    wake_timeout: u64,
+) -> Result<()> {
+    let mut spool = collect_remote_blob(discovered, |offset, rev| {
+        remote_blob_range(target, path, offset, rev, deadline, wake_timeout)
+    })?;
+    std::io::copy(&mut spool, &mut std::io::stdout())
+        .map_err(|e| Error::rejected(format!("remote wiki cat: cannot write stdout: {e}")))?;
+    Ok(())
+}
+
+fn collect_remote_blob(
+    discovered: &Value,
+    mut fetch: impl FnMut(u64, &str) -> Result<Value>,
+) -> Result<tempfile::NamedTempFile> {
+    use sha2::Digest;
+    use std::io::{Seek, SeekFrom, Write};
+    use std::os::unix::fs::PermissionsExt;
+
+    let sha = blob_meta_str(discovered, "sha256")?;
+    if sha.len() != 64 || !sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err(Error::rejected(
+            "remote wiki cat refused: blob sha256 is not 64 lowercase hex digits; nothing was written",
+        ));
+    }
+    let rev = blob_meta_str(discovered, "rev")?;
+    let canon = blob_meta_str(discovered, "path")?;
+    let size = discovered["size"].as_u64().ok_or_else(|| {
+        Error::rejected(
+            "remote wiki cat refused: blob size is not a non-negative integer; nothing was written",
+        )
+    })?;
+    if size > REMOTE_BLOB_SPOOL_BOUND {
+        return Err(Error::rejected(format!(
+            "remote wiki cat refused: blob is {size} bytes, over the {REMOTE_BLOB_SPOOL_BOUND}-byte spool bound; nothing was written"
+        )));
+    }
+    let mut spool = tempfile::Builder::new()
+        .prefix(".cadence-wiki-blob-")
+        .permissions(std::fs::Permissions::from_mode(0o600))
+        .tempfile()
+        .map_err(|e| {
+            Error::rejected(format!(
+                "remote wiki cat refused: cannot open a private spool: {e}; nothing was written"
+            ))
+        })?;
+    let mut offset = 0u64;
+    let mut hasher = sha2::Sha256::new();
+    loop {
+        let page = fetch(offset, rev)?;
+        if !blob_range_fits(&page) {
+            return Err(Error::rejected(
+                "remote wiki cat refused: complete blob range exceeds the native bound; nothing was written",
+            ));
+        }
+        if page.get("data_base64").is_none() {
+            return Err(Error::rejected(
+                "remote wiki cat refused: the server returned blob metadata without original bytes (data_base64); nothing was written",
+            ));
+        }
+        for key in ["kind", "mime", "name", "rev", "sha256", "size"] {
+            if page.get(key) != discovered.get(key) {
+                return Err(Error::rejected(format!(
+                    "remote wiki cat refused: blob range changed '{key}'; nothing was written"
+                )));
+            }
+        }
+        if page["path"].as_str() != Some(canon) {
+            return Err(Error::rejected(
+                "remote wiki cat refused: blob range path does not match the pointer; nothing was written",
+            ));
+        }
+        let start = page["range"]["start"].as_u64().ok_or_else(|| {
+            Error::rejected(
+                "remote wiki cat refused: blob range start is missing; nothing was written",
+            )
+        })?;
+        let end = page["range"]["end"].as_u64().ok_or_else(|| {
+            Error::rejected(
+                "remote wiki cat refused: blob range end is missing; nothing was written",
+            )
+        })?;
+        let total = page["range"]["total"].as_u64().ok_or_else(|| {
+            Error::rejected(
+                "remote wiki cat refused: blob range total is missing; nothing was written",
+            )
+        })?;
+        if start != offset || total != size || end < start || end > size {
+            return Err(Error::rejected(format!(
+                "remote wiki cat refused: blob range {start}..{end} of {total} does not continue offset {offset} of {size}; nothing was written"
+            )));
+        }
+        let encoded = page["data_base64"].as_str().ok_or_else(|| {
+            Error::rejected(
+                "remote wiki cat refused: data_base64 is not a string; nothing was written",
+            )
+        })?;
+        if encoded.len() >= cadence_agent::wiki::NATIVE_TOOL_LINE_BOUND {
+            return Err(Error::rejected(
+                "remote wiki cat refused: encoded blob range exceeds the native bound; nothing was written",
+            ));
+        }
+        use base64::Engine;
+        let chunk = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|_| {
+                Error::rejected(
+                    "remote wiki cat refused: data_base64 is not standard base64; nothing was written",
+                )
+            })?;
+        if chunk.len() as u64 != end - start
+            || chunk.len() >= cadence_agent::wiki::NATIVE_TOOL_LINE_BOUND
+        {
+            return Err(Error::rejected(
+                "remote wiki cat refused: blob range bytes do not match the declared slice; nothing was written",
+            ));
+        }
+        if end == offset && size != offset {
+            return Err(Error::rejected(
+                "remote wiki cat refused: blob range made no progress; nothing was written",
+            ));
+        }
+        spool.write_all(&chunk).map_err(|e| {
+            Error::rejected(format!(
+                "remote wiki cat refused: cannot spool blob bytes: {e}; nothing was written"
+            ))
+        })?;
+        hasher.update(&chunk);
+        offset = end;
+        if offset == size {
+            break;
+        }
+    }
+    let got: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    if got != sha || offset != size {
+        return Err(Error::rejected(
+            "remote wiki cat refused: spooled bytes do not match the pointer sha256; nothing was written",
+        ));
+    }
+    spool.seek(SeekFrom::Start(0)).map_err(|e| {
+        Error::rejected(format!(
+            "remote wiki cat refused: cannot read the blob spool: {e}; nothing was written"
+        ))
+    })?;
+    Ok(spool)
+}
+
+fn blob_range_fits(page: &Value) -> bool {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() >= cadence_agent::wiki::NATIVE_TOOL_LINE_BOUND - 1 - self.0 {
+                return Err(std::io::ErrorKind::InvalidData.into());
+            }
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    serde_json::to_writer(Count(0), page).is_ok()
+}
+
+fn blob_meta_str<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            Error::rejected(format!(
+                "remote wiki cat refused: blob metadata '{key}' is missing; nothing was written"
+            ))
+        })
+}
+
+fn remote_blob_range(
+    target: &cadence_agent::remote_cli::RemoteTarget,
+    path: &str,
+    offset: u64,
+    rev: &str,
+    deadline: std::time::Instant,
+    wake_timeout: u64,
+) -> Result<Value> {
+    let mut args = serde_json::Map::new();
+    args.insert("path".into(), json!(path));
+    args.insert("offset".into(), json!(offset));
+    args.insert("rev".into(), json!(rev));
+    match cadence_agent::remote_cli::call_verb(
+        target,
+        "read",
+        args,
+        deadline,
+        wake_timeout,
+        |line| eprintln!("{line}"),
+    )? {
+        cadence_agent::remote_cli::RemoteAnswer::Ok(body) => Ok(body),
+        cadence_agent::remote_cli::RemoteAnswer::Conflict(_) => Err(Error::rejected(
+            "remote wiki cat refused: blob range returned a conflict; nothing was written",
+        )),
+    }
+}
+
 /// `wiki ls|cat|search` answers print as the host prints them. The `--json`,
 /// `--meta` and `put` forms keep the JSON body. Returns whether it printed.
 /// A directory is refused for `cat` (with or without `--meta`), as the local
@@ -812,27 +1059,27 @@ pub(super) fn run(
         return upload(&target, file, path, *overwrite, wake_timeout);
     }
     let (verb, args) = verb_for(&command)?;
-    let out =
-        match cadence_agent::remote_cli::call_verb(&target, verb, args, wake_timeout, |line| {
-            eprintln!("{line}")
-        }) {
-            Ok(out) => out,
-            Err(error) => {
-                // The wake budget lapsed: the contract's exact payload on
-                // stderr, exit 75 — a retryable `busy`, never a silent hang.
-                if error.kind() == "busy" && error.code() == Some("waking") {
-                    eprintln!(
-                        "{}",
-                        serde_json::to_string(&json!({"kind": "busy", "state": "waking"}))
-                            .unwrap_or_default()
-                    );
-                    return Ok(75);
-                }
-                return Err(error);
-            }
-        };
+    let deadline = std::time::Instant::now()
+        .checked_add(std::time::Duration::from_secs(wake_timeout))
+        .ok_or_else(|| Error::rejected("invalid wake timeout"))?;
+    let out = match cadence_agent::remote_cli::call_verb(
+        &target,
+        verb,
+        args,
+        deadline,
+        wake_timeout,
+        |line| eprintln!("{line}"),
+    ) {
+        Ok(out) => out,
+        Err(error) => return remote_failure(error),
+    };
     match out {
         cadence_agent::remote_cli::RemoteAnswer::Ok(body) => {
+            match remote_blob_cat(&target, &command, &body, deadline, wake_timeout) {
+                Ok(true) => return Ok(0),
+                Ok(false) => {}
+                Err(error) => return remote_failure(error),
+            }
             if wiki_text(&command, &body)? {
                 return Ok(0);
             }
@@ -853,6 +1100,15 @@ pub(super) fn run(
             );
             Ok(5)
         }
+    }
+}
+
+fn remote_failure(error: Error) -> Result<i32> {
+    if error.kind() == "busy" && error.code() == Some("waking") {
+        eprintln!("{}", json!({"kind": "busy", "state": "waking"}));
+        Ok(75)
+    } else {
+        Err(error)
     }
 }
 
@@ -1294,5 +1550,133 @@ mod read_contract_tests {
         })
         .unwrap_err();
         assert!(err.contains("not available on a remote org"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod blob_download_tests {
+    use super::*;
+    use cadence_agent::{issue::Pm, wiki};
+    use std::io::Read;
+
+    fn plant(pm: &Pm, state: &std::path::Path, bytes: &[u8]) -> Value {
+        let uploads = state.join(wiki::UPLOAD_DIR);
+        std::fs::create_dir_all(&uploads).unwrap();
+        let tmp = uploads.join("blob");
+        std::fs::write(&tmp, bytes).unwrap();
+        wiki::put_blob(
+            pm,
+            state,
+            &wiki::Caller::Operator,
+            "global/proof.bin",
+            &tmp,
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn original_blob_bytes_are_assembled_and_verified_before_release() {
+        for bytes in [
+            Vec::new(),
+            b"%PDF-1.4\nsynthetic original\n%%EOF\n".to_vec(),
+            (0..100_000).map(|n| (n % 256) as u8).collect(),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let pm = Pm::init(&root.path().join("pm")).unwrap();
+            let meta = plant(&pm, &root.path().join("state"), &bytes);
+            let mut calls = 0;
+            let mut spool = collect_remote_blob(&meta, |offset, rev| {
+                calls += 1;
+                wiki::read_range(
+                    &pm,
+                    &wiki::Caller::Operator,
+                    "global/proof.bin",
+                    wiki::BodyRange {
+                        offset,
+                        bytes: None,
+                        rev: Some(rev),
+                    },
+                )
+            })
+            .unwrap();
+            let mut actual = Vec::new();
+            spool.read_to_end(&mut actual).unwrap();
+            assert_eq!(actual, bytes);
+            if bytes.len() == 100_000 {
+                assert!(calls > 1, "large binary must exercise continuation");
+            }
+        }
+    }
+
+    #[test]
+    fn corrupt_or_replaced_blob_cannot_be_released() {
+        for replace_pointer in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let pm = Pm::init(&root.path().join("pm")).unwrap();
+            let state = root.path().join("state");
+            let bytes = vec![0xff; 100_000];
+            let meta = plant(&pm, &state, &bytes);
+            if !replace_pointer {
+                let object = wiki::blobs_dir(&wiki::vault_dir(&pm).unwrap())
+                    .join(meta["sha256"].as_str().unwrap());
+                std::fs::write(object, vec![0xfe; bytes.len()]).unwrap();
+            }
+            let mut calls = 0;
+            let error = collect_remote_blob(&meta, |offset, rev| {
+                if replace_pointer && calls == 1 {
+                    plant(&pm, &state, b"replacement");
+                }
+                calls += 1;
+                wiki::read_range(
+                    &pm,
+                    &wiki::Caller::Operator,
+                    "global/proof.bin",
+                    wiki::BodyRange {
+                        offset,
+                        bytes: None,
+                        rev: Some(rev),
+                    },
+                )
+            })
+            .unwrap_err();
+            let message = error.to_string();
+            assert!(
+                message.contains(if replace_pointer {
+                    "revision"
+                } else {
+                    "sha256"
+                }),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_range_with_valid_bytes_is_not_released() {
+        use base64::Engine;
+        let root = tempfile::tempdir().unwrap();
+        let pm = Pm::init(&root.path().join("pm")).unwrap();
+        let bytes = vec![0xff; 37_497];
+        let meta = plant(&pm, &root.path().join("state"), &bytes);
+        let error = collect_remote_blob(&meta, |offset, rev| {
+            let mut page = wiki::read_range(
+                &pm,
+                &wiki::Caller::Operator,
+                "global/proof.bin",
+                wiki::BodyRange {
+                    offset,
+                    bytes: None,
+                    rev: Some(rev),
+                },
+            )?;
+            // A peer ignores the native bound, but keeps the bytes and hash valid.
+            page["data_base64"] = json!(base64::engine::general_purpose::STANDARD.encode(&bytes));
+            page["range"]["end"] = json!(bytes.len());
+            Ok(page)
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("complete blob range"), "{error}");
     }
 }

@@ -10,6 +10,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use cadence_agent::local_assignment::http::BoardHttp;
 use cadence_agent::local_assignment::{Coordinator, Kickoff};
@@ -379,10 +380,43 @@ fn issue_context(target: &RemoteTarget, kickoff: &Kickoff, wake_timeout: u64) ->
     history_args.insert("limit".into(), json!(20));
     let mut wiki_args = Map::new();
     wiki_args.insert("path".into(), json!(""));
-    let show = remote_cli::call_verb(target, "issue_show", show_args, wake_timeout, |_| {});
-    let history =
-        remote_cli::call_verb(target, "issue_history", history_args, wake_timeout, |_| {});
-    let wiki = remote_cli::call_verb(target, "enumerate", wiki_args, wake_timeout, |_| {});
+    // One budget covers the issue, its comments, and the wiki index. A later
+    // read cannot restart the wake clock after an earlier read used it up.
+    let Some(deadline) = Instant::now().checked_add(Duration::from_secs(wake_timeout)) else {
+        return json!({
+            "org": target.org,
+            "organization_id": kickoff.organization_id,
+            "audience": target.endpoint,
+            "assignment_id": kickoff.assignment_id,
+            "claim_id": kickoff.claim_id,
+            "generation": kickoff.generation,
+            "context_error": "invalid wake timeout; the local agent was not messaged"
+        });
+    };
+    let show = remote_cli::call_verb(
+        target,
+        "issue_show",
+        show_args,
+        deadline,
+        wake_timeout,
+        |_| {},
+    );
+    let history = remote_cli::call_verb(
+        target,
+        "issue_history",
+        history_args,
+        deadline,
+        wake_timeout,
+        |_| {},
+    );
+    let wiki = remote_cli::call_verb(
+        target,
+        "enumerate",
+        wiki_args,
+        deadline,
+        wake_timeout,
+        |_| {},
+    );
     let (show_ok, issue) = outcome(show);
     let (history_ok, history) = outcome(history);
     let (wiki_ok, wiki) = outcome(wiki);
