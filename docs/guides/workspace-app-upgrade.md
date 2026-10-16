@@ -127,8 +127,7 @@ generation, then review and approve that digest again.
 
 The built-in catalog is retired (CAD-1422): the Cadence binary embeds no app
 bundles or catalog index. Canonical apps live in their own repositories and
-release artifacts; discovery and marketplace installs happen on the AgenticOS
-Apps page (`https://app-v2.agenticos.hk/apps`). A new app version arrives as a
+release artifacts. The board lists them at `/apps/explore`. A new app version arrives as a
 detached release — update an installation from its trusted path or Git URL.
 The Explorer's operator-only `update_available` flag means a check for the installed
 app found a different bundle digest and cached that result; members do not see
