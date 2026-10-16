@@ -10,7 +10,7 @@ import { AppGlyph, TrustChip, InstallStateChip, useEscape } from "./shared";
 import { appErrorCopy, appLoadErrorCopy } from "./appErrors";
 import { displayUiNotice, type UiNotice } from "../app-shell/campaign/useEmailDraft";
 import InstallCheckPanel from "./InstallCheckPanel";
-import { Loading, Notice } from "../app-shell/shared/States";
+import { Notice } from "../app-shell/shared/States";
 import { useBackoffLoad } from "../workspace-apps/useBackoffLoad";
 import { navigate } from "../../lib/useLocation";
 import "./explorer.css";
