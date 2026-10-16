@@ -55,7 +55,10 @@ fn emit_scope(state_dir: &Path, json: bool) -> Result<()> {
         scope
     };
     if json {
-        print_json(&scope);
+        // The checks above print one compact object per line. `print_json`
+        // pretty-prints on a terminal or `CADENCE_JSON=pretty`, which would
+        // split this added row across lines.
+        println!("{}", serde_json::to_string(&scope).unwrap_or_default());
         return Ok(());
     }
     println!(

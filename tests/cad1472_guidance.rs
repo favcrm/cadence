@@ -285,6 +285,28 @@ fn fresh_setup_reports_scope_without_touching_a_non_git_cwd_or_snapshot() {
         .home
         .join(".agents/skills/business-documents/SKILL.md")
         .is_file());
+    let pretty = fixture.cli_vars(
+        "/usr/bin:/bin",
+        &[("CADENCE_JSON", "pretty")],
+        &["setup", "--json", "--port", &port.to_string()],
+    );
+    assert!(
+        pretty.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&pretty.stdout),
+        String::from_utf8_lossy(&pretty.stderr)
+    );
+    let pretty_text = String::from_utf8_lossy(&pretty.stdout);
+    let pretty_lines: Vec<Value> = pretty_text
+        .lines()
+        .map(|line| {
+            serde_json::from_str(line).unwrap_or_else(|error| {
+                panic!("setup --json must stay one object per line ({error}): {line}")
+            })
+        })
+        .collect();
+    assert!(pretty_lines.iter().any(|row| row["check"] == "scope"));
+
     let scope = lines.iter().find(|row| row["check"] == "scope").unwrap();
     assert_eq!(scope["project"]["resolved"], false);
     assert!(scope["project"]["detail"]
