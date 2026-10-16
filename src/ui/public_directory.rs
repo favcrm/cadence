@@ -80,4 +80,11 @@ mod tests {
         assert!(catalog_origin_from(Some("https://api.example/?x=1"), None).is_none());
         assert!(catalog_origin_from(None, Some("http://api.internal")).is_none());
     }
+
+    #[test]
+    fn board_csp_allows_only_configured_catalog_origin() {
+        assert_eq!(super::super::serve::board_csp(None), super::super::serve::CSP);
+        let with_origin = super::super::serve::board_csp(Some("http://127.0.0.1:8826"));
+        assert!(with_origin.ends_with("; connect-src 'self' http://127.0.0.1:8826"));
+    }
 }

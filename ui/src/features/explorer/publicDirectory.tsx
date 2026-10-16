@@ -7,11 +7,23 @@ import { notifyAppsChanged } from "../workspace-apps/workspaceApps";
 import type { Viewer } from "../projects/work";
 import "./explorer.css";
 
+export type PublicSetupItem = {
+  slot: string;
+  label: string;
+  help: string;
+};
+
 export type PublicListing = {
+  tagline?: string;
   category?: string;
+  tags?: string[];
   publisher?: string;
   description?: string;
   highlights?: string[];
+  setup?: PublicSetupItem[];
+  stores?: string[];
+  personalData?: boolean;
+  accessNotes?: string[];
 };
 
 export type PublicApp = {
@@ -36,14 +48,53 @@ const DIGEST = /^sha256:[0-9a-f]{64}$/;
 function listingOf(value: unknown): PublicListing {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   const row = value as Record<string, unknown>;
-  const highlights = Array.isArray(row.highlights)
-    ? row.highlights.filter((item): item is string => typeof item === "string")
+  const rawList = Array.isArray(row.can) ? row.can : Array.isArray(row.highlights) ? row.highlights : undefined;
+  const highlights = rawList
+    ? rawList.filter((item): item is string => typeof item === "string")
+    : undefined;
+  const tags = Array.isArray(row.tags)
+    ? row.tags.filter((item): item is string => typeof item === "string")
+    : undefined;
+  const pubObj = row.publisher && typeof row.publisher === "object" && !Array.isArray(row.publisher)
+    ? (row.publisher as Record<string, unknown>).name
+    : row.publisher;
+  const publisher = typeof pubObj === "string" && pubObj ? pubObj : undefined;
+  const description = typeof row.about === "string" && row.about
+    ? row.about
+    : typeof row.description === "string" && row.description
+      ? row.description
+      : undefined;
+  const tagline = typeof row.tagline === "string" && row.tagline ? row.tagline : undefined;
+  const setup = Array.isArray(row.setup)
+    ? row.setup
+        .filter((s): s is Record<string, unknown> => !!s && typeof s === "object" && !Array.isArray(s))
+        .filter((s) => typeof s.label === "string" && typeof s.help === "string")
+        .map((s) => ({ slot: typeof s.slot === "string" ? s.slot : s.label as string, label: s.label as string, help: s.help as string }))
+    : undefined;
+  const dataObj = row.data && typeof row.data === "object" && !Array.isArray(row.data)
+    ? (row.data as Record<string, unknown>)
+    : null;
+  const stores = dataObj && Array.isArray(dataObj.stores)
+    ? dataObj.stores.filter((item): item is string => typeof item === "string")
+    : undefined;
+  const personalData = dataObj && typeof dataObj.personal === "boolean" ? dataObj.personal : undefined;
+  const accessObj = row.access_notes && typeof row.access_notes === "object" && !Array.isArray(row.access_notes)
+    ? (row.access_notes as Record<string, unknown>)
+    : null;
+  const accessNotes = accessObj
+    ? Object.values(accessObj).filter((item): item is string => typeof item === "string" && !!item)
     : undefined;
   return {
+    tagline,
     category: typeof row.category === "string" ? row.category : undefined,
-    publisher: typeof row.publisher === "string" ? row.publisher : undefined,
-    description: typeof row.description === "string" ? row.description : undefined,
+    tags,
+    publisher,
+    description,
     highlights,
+    setup,
+    stores,
+    personalData,
+    accessNotes,
   };
 }
 
@@ -202,7 +253,17 @@ export function PublicDirectory({ viewer }: { viewer: Viewer }) {
     return [...set];
   }, [apps]);
   const shown = (apps ?? []).filter((app) => {
-    const hay = `${app.title} ${app.summary} ${app.app}`.toLowerCase();
+    const hay = [
+      app.title,
+      app.summary,
+      app.app,
+      app.listing.tagline,
+      app.listing.publisher,
+      ...(app.listing.tags ?? []),
+    ]
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase();
     if (query && !hay.includes(query.trim().toLowerCase())) return false;
     if (category !== "all" && app.listing.category !== category) return false;
     return true;
@@ -238,10 +299,11 @@ export function PublicDirectory({ viewer }: { viewer: Viewer }) {
               <strong>{app.title}</strong>
               <small className="block text-ink-500">{app.listing.publisher ?? app.app}</small>
             </span>
-            <span className="pubdir-summary">{app.summary}</span>
+            <span className="pubdir-summary">{app.listing.tagline ?? app.summary}</span>
             <span className="pubdir-meta">
               {app.listing.category && <span className="chip">{app.listing.category}</span>}
-              <span className="pubdir-ver">{app.version}</span>
+              {(app.listing.tags ?? []).map((tag) => <span key={tag} className="chip">{tag}</span>)}
+              <span className="pubdir-ver">v{app.version}</span>
             </span>
           </Link>
         ))}
@@ -295,9 +357,34 @@ export function PublicAppDetail({ id, viewer, onResolved }: { id: string; viewer
       <div className="pubdir-split">
         <div>
           <h2 className="text-section font-semibold text-ink-100">{app.title}</h2>
+          {app.listing.publisher && <p className="text-label text-ink-500 mb-2">by {app.listing.publisher}</p>}
           <p className="text-secondary text-ink-300">{app.listing.description ?? app.summary}</p>
-          {app.listing.highlights && (
-            <ul>{app.listing.highlights.map((item) => <li key={item}>{item}</li>)}</ul>
+          {app.listing.highlights && app.listing.highlights.length > 0 && (
+            <section className="mt-3">
+              <h3 className="text-label font-medium text-ink-200 mb-1">{t("What it can do")}</h3>
+              <ul>{app.listing.highlights.map((item) => <li key={item}>{item}</li>)}</ul>
+            </section>
+          )}
+          {app.listing.setup && app.listing.setup.length > 0 && (
+            <section className="mt-3">
+              <h3 className="text-label font-medium text-ink-200 mb-1">{t("What you approve")}</h3>
+              <ul>{app.listing.setup.map((item) => <li key={item.slot}><b>{item.label}</b> — {item.help}</li>)}</ul>
+            </section>
+          )}
+          {app.listing.stores && app.listing.stores.length > 0 && (
+            <section className="mt-3">
+              <h3 className="text-label font-medium text-ink-200 mb-1">{t("Your data")}</h3>
+              <ul>
+                {app.listing.stores.map((item) => <li key={item}>{item}</li>)}
+                {app.listing.personalData && <li><b>{t("Contains personal data.")}</b></li>}
+              </ul>
+            </section>
+          )}
+          {app.listing.accessNotes && app.listing.accessNotes.length > 0 && (
+            <section className="mt-3">
+              <h3 className="text-label font-medium text-ink-200 mb-1">{t("Access notes")}</h3>
+              <ul>{app.listing.accessNotes.map((item) => <li key={item}>{item}</li>)}</ul>
+            </section>
           )}
         </div>
         <aside className="card pubdir-side">
@@ -316,7 +403,7 @@ export function PublicAppDetail({ id, viewer, onResolved }: { id: string; viewer
             </p>
           )}
           {installed && (
-            <p role="status">
+            <p className="pubdir-receipt" role="status">
               {t("Installed")} {installed.installId} {installed.version} {installed.digest}. {t("Execution approval is separate")} ({installed.approval}).
             </p>
           )}

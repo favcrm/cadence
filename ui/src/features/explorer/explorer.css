@@ -118,11 +118,13 @@
 .pubdir-ver { margin-left: auto; font-family: var(--font-mono); color: var(--color-ink-500); font-size: var(--text-label); }
 .pubdir-empty { padding: 28px; text-align: center; color: var(--color-ink-500); }
 .pubdir-split { display: grid; grid-template-columns: minmax(0, 1fr) 280px; gap: 22px; }
+.pubdir-split > * { min-width: 0; }
 .pubdir-side { padding: 18px; }
-.pubdir-kv { display: grid; grid-template-columns: 92px 1fr; gap: 8px 12px; }
+.pubdir-kv { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 8px 12px; }
 .pubdir-digest { overflow-wrap: anywhere; font-family: var(--font-mono); font-size: var(--text-label); }
+.pubdir-receipt { overflow-wrap: anywhere; }
 .pubdir-dialog { max-width: min(460px, calc(100% - 32px)); padding: 24px; }
 .pubdir-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 18px; }
-@media (max-width: 820px) { .pubdir-split { grid-template-columns: 1fr; } }
+@media (max-width: 820px) { .pubdir-split { grid-template-columns: minmax(0, 1fr); } }
 @media (prefers-reduced-motion: reduce) { .pubdir-card { transition: none; } }
 

@@ -74,6 +74,13 @@ pub(crate) fn err_response(code: u16, message: &str) -> Response<std::io::Cursor
 /// image CDNs; the client checks the same host families before rendering.
 pub(crate) const CSP: &str = "default-src 'self'; img-src 'self' data: https://cdninstagram.com https://*.cdninstagram.com https://fbcdn.net https://*.fbcdn.net; frame-src 'self' blob:; media-src 'self' blob:; font-src 'self' data:; style-src 'self' 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'";
 
+pub(crate) fn board_csp(catalog_origin: Option<&str>) -> String {
+    match catalog_origin {
+        Some(origin) => format!("{CSP}; connect-src 'self' {origin}"),
+        None => CSP.to_string(),
+    }
+}
+
 /// Every response gets nosniff + no-referrer; HTML additionally gets
 /// the CSP. Returns whether the response is HTML.
 ///
@@ -95,7 +102,8 @@ pub(crate) fn add_security_headers(resp: &mut Response<std::io::Cursor<Vec<u8>>>
     resp.add_header(Header::from_bytes("X-Content-Type-Options", "nosniff").unwrap());
     resp.add_header(Header::from_bytes("Referrer-Policy", "no-referrer").unwrap());
     if is_html && !has_csp {
-        resp.add_header(Header::from_bytes("Content-Security-Policy", CSP).unwrap());
+        let csp = board_csp(super::public_directory::catalog_origin().as_deref());
+        resp.add_header(Header::from_bytes("Content-Security-Policy", csp).unwrap());
     }
     is_html
 }
