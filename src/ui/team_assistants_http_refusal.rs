@@ -973,66 +973,81 @@ fn assist_http_job_subscribe_needs_owner_share_not_membership() {
 }
 
 // ============================================================================
-// Rollout gate HTTP parity (CON-002 / R6-1) — the SAME
-// `HOSTED_CADENCE_ASSISTANT_ENABLED === "true"` env gate the daemon's
-// `member_caller` enforces is the FIRST refusal in `assist_route::post`:
-// disabled means 503 `capability_unavailable` BEFORE envelope verify,
-// jti consume, or daemon relay — a stale envelope or cached bearer can
-// never bypass it. The flag is PROCESS env: each enabled-path test above
-// arms it through the daemon refusal module's shared `AssistantFlagOn`
-// guard (one process-wide lock — a module-local lock could restore the
-// var while a parallel daemon-side positive still runs). The OFF cases
-// run in ISOLATED CHILD PROCESSES (the coordinator's scoped-isolation
-// requirement): this binary respawned with the flag absent/false/garbage.
+// HTTP authority parity (CAD-1420). The availability gate is retired, so the
+// flag is no longer a refusal expectation. The enabled-path tests above arm
+// `HOSTED_CADENCE_ASSISTANT_ENABLED` through the daemon refusal module's shared
+// `AssistantFlagOn` guard. The flag-unset child probes run in ISOLATED CHILD
+// PROCESSES: this binary respawned with the flag absent/false/garbage. They
+// assert forged-signature and wrong-org refusals, not a flag result.
 // ============================================================================
 
-/// The child-side flag-off probe — `#[ignore]`d so it never runs inside
-/// the enabled suite; the parent driver respawns it with the flag unset.
-/// Asserts the REAL socket-level gate: `POST /api/assist/<verb>` answers
-/// 503 `capability_unavailable` BEFORE the envelope is verified or any
-/// daemon member_* effect — a refused call consumes no jti, mints
-/// nothing, and changes nothing.
+/// Child-side probe, `#[ignore]`d so it never runs in the main suite; the
+/// parent driver respawns it with the flag absent / `"false"` / garbage. The
+/// availability gate is retired (CAD-1420), so the flag value is not an
+/// expectation. The HTTP AUTHORITY guards must refuse with the flag unset:
+/// a forged-signature envelope (signed by another key) and a wrong-org
+/// envelope are each refused 401 at `POST /api/assist/assist_state` with no
+/// tracker effect. A valid member
+/// envelope is the positive control and must be admitted (200).
 #[test]
 #[ignore]
-fn assist_http_flag_off_refuses_before_envelope_child() {
+fn assist_http_authority_refuses_with_flag_unset_child() {
     let rig = start(&["alice"]);
-    // A fully-valid signed envelope — the gate must refuse it anyway,
-    // before any verification: an old/valid envelope can never ride a
-    // disabled rollout.
-    let good = rig.envelope("alice", json!({}), json!({}));
     let before = tree(&rig.pm);
-    for verb in ["assist_state", "job_request", "job_reconcile"] {
-        let env = rig.envelope("alice", json!({}), json!({}));
-        let env = if verb == "assist_state" {
-            good.clone()
-        } else {
-            env
-        };
-        let (status, body) = rig.call(verb, &env, &json!({}));
-        assert_eq!(
-            status, 503,
-            "disabled feature did not refuse {verb} at HTTP: {body}"
+    let other_key = Ed25519KeyPair::from_seed_unchecked(&[9; 32]).unwrap();
+    let forged = {
+        let now = crate::issue::time::now_epoch();
+        let h = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(
+                &json!({"alg":"EdDSA","typ":"agenticos-assistant-actor/1","kid":KID}),
+            )
+            .unwrap(),
         );
-        assert_eq!(
-            body["error"]["code"].as_str(),
-            Some("capability_unavailable"),
-            "{verb} refused for a non-gate reason: {body}"
+        let c = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&json!({
+                "iss": rig.issuer, "aud": format!("http://{}", rig.public_host),
+                "sub":"alice","actor":"users/alice","principal_kind":"user",
+                "role_at_issue":"member","organization_id":ORG,
+                "assistant_id":"assist_alice","scope":["assist.read"],
+                "credential_id":"cred-alice","iat":now,"exp":now+120,"jti":"jti-forged-child"
+            }))
+            .unwrap(),
         );
-    }
+        let signed = format!("{h}.{c}");
+        format!(
+            "{signed}.{}",
+            URL_SAFE_NO_PAD.encode(other_key.sign(signed.as_bytes()).as_ref())
+        )
+    };
+    let (status, body) = rig.call("assist_state", &forged, &json!({}));
+    assert_eq!(status, 401, "forged-signature envelope admitted: {body}");
+    assert_eq!(tree(&rig.pm), before, "forged-signature call had an effect");
+
+    let wrong_org = rig.envelope("alice", json!({}), json!({"organization_id": "other-org"}));
+    let (status, body) = rig.call("assist_state", &wrong_org, &json!({}));
+    assert_eq!(
+        status, 401,
+        "wrong-org envelope admitted with flag unset: {body}"
+    );
     assert_eq!(
         tree(&rig.pm),
         before,
-        "a disabled-flag HTTP call had an effect"
+        "a refused HTTP call with the flag unset had an effect"
+    );
+    let good = rig.envelope("alice", json!({}), json!({}));
+    let (status, body) = rig.call("assist_state", &good, &json!({}));
+    assert_eq!(
+        status, 200,
+        "valid member envelope refused with flag unset: {body}"
     );
 }
 
-/// Parent driver — respawns THIS test binary with
-/// `HOSTED_CADENCE_ASSISTANT_ENABLED` absent / `"false"` / garbage and
-/// runs the ignored child probe in each; the child's exit code is the
-/// verdict. No in-process env mutation — the parallel enabled suite can
-/// never observe a torn flag.
+/// Parent driver: respawns THIS test binary with the flag absent / `"false"`
+/// / garbage and runs the ignored child probe in each; the child's exit code
+/// is the verdict. No in-process env mutation, so the enabled suite can never
+/// observe a torn flag.
 #[test]
-fn assist_http_flag_off_refuses_before_envelope() {
+fn assist_http_authority_refuses_any_flag() {
     for (label, flag) in [
         ("absent", None),
         ("false", Some("false")),
@@ -1040,7 +1055,7 @@ fn assist_http_flag_off_refuses_before_envelope() {
     ] {
         let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
         cmd.args([
-            "ui::team_assistants_http_refusal::assist_http_flag_off_refuses_before_envelope_child",
+            "ui::team_assistants_http_refusal::assist_http_authority_refuses_with_flag_unset_child",
             "--exact",
             "--include-ignored",
             "--test-threads",

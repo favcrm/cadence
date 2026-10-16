@@ -692,7 +692,7 @@
         }
         assert_eq!(
             crate::rollout::SCHEMA_VERSION,
-            47,
+            48,
             "bump? pin the new version and add its migration test"
         );
         // Half-applied: one table present, version rolled back — the
@@ -708,6 +708,101 @@
             let _ = Store::open_for_schema_tests(&db).unwrap();
         }
         assert!(has(&db, "platform_drafts"));
+    }
+
+    /// CAD-1420: v48 adds the bootstrap lifecycle columns to the
+    /// `assistants` binding row. A genuine main-47 preimage — media, the
+    /// v46 upload/account layout and the CAD-1423 notification tables all
+    /// present, only the three tail bootstrap columns absent — migrates in
+    /// place with the defaults, keeps its member binding, notification and
+    /// media rows, and a reopen is a no-op. `assistants` is created at v41
+    /// and no migration through v47 alters it, so dropping the three tail
+    /// ALTER-added columns reproduces the real main47 physical column
+    /// order.
+    #[test]
+    fn migration_v47_to_v48_adds_bootstrap_columns_and_keeps_binding() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("t.sqlite3");
+        let bound = {
+            let s = Store::open(&db).unwrap();
+            let b = s
+                .assistant_bind("org1", "sub1", "asst-1", "alias-1", Some("rev-1"))
+                .unwrap();
+            s.assistant_set_conversation("org1", "sub1", "conv-1")
+                .unwrap();
+            b
+        };
+        // A genuine main46 row in the media catalog the migration must not
+        // touch: valid v45 metadata, no locator/bytes columns.
+        Connection::open(&db)
+            .unwrap()
+            .execute(
+                "INSERT INTO app_media_assets(
+                    id,install_id,title,kind,lifecycle,revision,creator,created,updated)
+                 VALUES('med-0123456789abcdef0123456789abcdef','inst-1',
+                        'kept','image','draft',1,'test',1.0,1.0)",
+                [],
+            )
+            .unwrap();
+        // A genuine main47: one notification preference row the migration
+        // must not touch, then the binding row drops its three bootstrap
+        // columns and the store is stamped 47. The v45 media tables, the
+        // v46 upload/account layout and the v47 notification tables remain.
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO human_principals(id,org,issuer,subject,name,seen)
+                 VALUES('hum-1','org1','iss','subj','Test Human',1.0);
+                 INSERT INTO human_notification_prefs(human,dm,mention,sound,preview,quiet,zone,updated)
+                 VALUES('hum-1',1,1,0,0,'off','UTC',1.0);
+                 ALTER TABLE assistants DROP COLUMN bootstrap_state;
+                 ALTER TABLE assistants DROP COLUMN bootstrap_template_version;
+                 ALTER TABLE assistants DROP COLUMN bootstrap_revision;
+                 UPDATE schema_version SET version=47;",
+            )
+            .unwrap();
+        let media_before: i64 = Connection::open(&db)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM app_media_assets", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(media_before, 1, "preimage must carry the media row");
+        for _ in 0..2 {
+            // The first pass migrates; the second reopen must be a no-op.
+            let s = Store::open_for_schema_tests(&db).unwrap();
+            let after = s.assistant_binding("org1", "sub1").unwrap().unwrap();
+            assert_eq!(after.bootstrap_state, "pending");
+            assert_eq!(after.bootstrap_template_version, 1);
+            assert_eq!(after.bootstrap_revision, 0);
+            assert_eq!(after.assistant_id, bound.assistant_id);
+            assert_eq!(after.alias, bound.alias);
+            assert_eq!(after.authority_rev, bound.authority_rev);
+            assert_eq!(after.conversation_id.as_deref(), Some("conv-1"));
+            assert_eq!(after.created, bound.created);
+            // The main47 media and notification rows survive untouched.
+            let raw = Connection::open(&db).unwrap();
+            let media_after: i64 = raw
+                .query_row("SELECT COUNT(*) FROM app_media_assets", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(media_after, 1, "migration must keep the media row");
+            let notification_after: i64 = raw
+                .query_row(
+                    "SELECT COUNT(*) FROM human_notification_prefs",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                notification_after, 1,
+                "migration must keep the notification preference row"
+            );
+        }
+        assert_eq!(
+            Connection::open(&db)
+                .unwrap()
+                .query_row("SELECT version FROM schema_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            crate::rollout::SCHEMA_VERSION
+        );
     }
 
     #[test]
@@ -1681,7 +1776,7 @@
         assert!(columns("app_media_assets").is_empty());
         {
             let s = Store::open_for_schema_tests(&db).unwrap();
-            assert_eq!(version(), 47);
+            assert_eq!(version(), 48);
             assert_eq!(
                 columns("app_media_assets"),
                 ["id", "install_id", "title", "kind", "lifecycle", "revision", "creator", "created", "updated"]
@@ -1697,7 +1792,7 @@
         {
             Store::open_for_schema_tests(&db).unwrap();
         }
-        assert_eq!(version(), 47);
+        assert_eq!(version(), 48);
     }
 
     #[test]

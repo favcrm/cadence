@@ -65,10 +65,11 @@ fn raw_lease_refusal(reason: String) -> rusqlite::Error {
 /// tables; v45 (CAD-1365) adds only the metadata-only app_media_* tables.
 /// v46 (CAD-1337) adds nullable upload ownership/location metadata,
 /// the account registry and upload indexes. v47 (CAD-1423) adds notification
-/// preferences, push devices and private intents. None touch a sealed/witnessed
-/// surface, so the bound extends to 47.
+/// preferences, push devices and private intents. v48 (CAD-1420) adds only
+/// the three `assistants` bootstrap lifecycle columns on the binding row.
+/// None touch a sealed/witnessed surface, so the bound extends to 48.
 #[allow(dead_code)]
-const PROTECTED_SCHEMA_MAX: i64 = 47;
+const PROTECTED_SCHEMA_MAX: i64 = 48;
 
 /// Arm level + transaction-control phase, shared between the `Store` and
 /// the connection's authorizer. Atomic because the authorizer callback must
@@ -1455,6 +1456,16 @@ impl Store {
                     return Err(Error::rejected("owner witness database schema is unsupported"));
                 }
             }
+            if *db_schema >= 48 {
+                let bootstrap_columns: i64 = wtx.query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('assistants') WHERE name IN ('bootstrap_state','bootstrap_template_version','bootstrap_revision')",
+                    [],
+                    |r| r.get(0),
+                )?;
+                if bootstrap_columns != 3 {
+                    return Err(Error::rejected("owner witness database schema is unsupported"));
+                }
+            }
             wtx.execute(
                 "INSERT INTO owner_witness(challenge,attempt,artifact_identity,epoch,db_schema,committed_at)
                  VALUES(?,?,?,?,?,?)",
@@ -2509,12 +2520,12 @@ mod tests {
         // This is malformed metadata, not evidence of native owner authority.
         let fixture = Connection::open(&db).unwrap();
         fixture
-            .execute("UPDATE schema_version SET version=48", [])
+            .execute("UPDATE schema_version SET version=49", [])
             .unwrap();
         drop(fixture);
         store
             .propose_close(
-                &permit(&db, OwnerOp::Close, b"schema-48", "attempt-48", "art", 44),
+                &permit(&db, OwnerOp::Close, b"schema-49", "attempt-49", "art", 44),
                 "test",
             )
             .unwrap();
@@ -2538,8 +2549,8 @@ mod tests {
             .witness_commit(&permit(
                 &db,
                 OwnerOp::Witness,
-                b"schema-48",
-                "attempt-48",
+                b"schema-49",
+                "attempt-49",
                 "art",
                 44,
             ))
@@ -2577,8 +2588,8 @@ mod tests {
     }
 
     #[test]
-    fn current_schema47_owner_witness_refuses_future48() {
-        // Positive control: a real current (47) database is accepted by the real guard.
+    fn current_schema48_owner_witness_refuses_future49() {
+        // Positive control: a real current (48) database is accepted by the real guard.
         {
             let dir = TempDir::new().unwrap();
             let (db, store) = open_legacy(&dir);
@@ -2586,35 +2597,35 @@ mod tests {
                 .conn()
                 .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(actual, 47, "current contract schema must be 47");
+            assert_eq!(actual, 48, "current contract schema must be 48");
             store
                 .propose_close(
-                    &permit(&db, OwnerOp::Close, b"c47", "a47", "art", 1),
+                    &permit(&db, OwnerOp::Close, b"c48", "a48", "art", 1),
                     "test",
                 )
                 .unwrap();
             store
-                .witness_commit(&permit(&db, OwnerOp::Witness, b"c47", "a47", "art", 1))
-                .expect("schema 47 must be accepted by the real guard");
+                .witness_commit(&permit(&db, OwnerOp::Witness, b"c48", "a48", "art", 1))
+                .expect("schema 48 must be accepted by the real guard");
             let witnessed: i64 = store
                 .conn()
                 .query_row("SELECT db_schema FROM owner_witness", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(witnessed, 47, "positive control must record db_schema 47");
+            assert_eq!(witnessed, 48, "positive control must record db_schema 48");
         }
-        // Bad case: a separate store, forged schema_version 48 (above
+        // Bad case: a separate store, forged schema_version 49 (above
         // PROTECTED_SCHEMA_MAX) via raw SQLite.
         let dir = TempDir::new().unwrap();
         let (db, store) = open_legacy(&dir);
         // Raw connection bypasses Store's authorizer, as the existing fixture does.
         let fixture = Connection::open(&db).unwrap();
         fixture
-            .execute("UPDATE schema_version SET version=48", [])
+            .execute("UPDATE schema_version SET version=49", [])
             .unwrap();
         drop(fixture);
         store
             .propose_close(
-                &permit(&db, OwnerOp::Close, b"c47", "a47", "art", 1),
+                &permit(&db, OwnerOp::Close, b"c48", "a48", "art", 1),
                 "test",
             )
             .unwrap();
@@ -2633,11 +2644,161 @@ mod tests {
             .query_row("SELECT count(*) FROM events", [], |r| r.get(0))
             .unwrap();
         let err = store
-            .witness_commit(&permit(&db, OwnerOp::Witness, b"c47", "a47", "art", 1))
+            .witness_commit(&permit(&db, OwnerOp::Witness, b"c48", "a48", "art", 1))
             .unwrap_err();
         assert!(
             matches!(&err, Error::Rejected(message) if message == "owner witness database schema is unsupported"),
-            "forged schema 48 must fail at the actual schema guard, got: {err}"
+            "forged schema 49 must fail at the actual schema guard, got: {err}"
+        );
+        let latch_after: (i64, i64, Vec<u8>, String, Option<String>, i64) = store
+            .conn()
+            .query_row(
+                "SELECT closed,witness_done,challenge,attempt,artifact,epoch FROM closure_state WHERE id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            latch_after, latch_before,
+            "refusal must retain sealed latch"
+        );
+        let witness_rows: i64 = store
+            .conn()
+            .query_row("SELECT count(*) FROM owner_witness", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(witness_rows, 0, "refusal must not commit a witness row");
+        let events_after: i64 = store
+            .conn()
+            .query_row("SELECT count(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            events_after, events_before,
+            "refusal must leave business rows unchanged"
+        );
+    }
+
+    #[test]
+    fn owner_witness_accepts_genuine_main47_physical_store() {
+        // CAD-1420: a REAL main47 preimage — the fully migrated current 48
+        // store with ONLY the three `assistants` bootstrap columns dropped,
+        // the CAD-1423 notification tables still present, stamped 47 — must
+        // be accepted by the real guard and record db_schema 47. This
+        // pins the bootstrap shape check to >=48: a guard left at >=47
+        // would wrongly refuse this legitimate pre-1420 database. The store
+        // is already open, so no migration runs before the witness.
+        let dir = TempDir::new().unwrap();
+        let (db, store) = open_legacy(&dir);
+        {
+            let raw = Connection::open(&db).unwrap();
+            raw.execute_batch(
+                "ALTER TABLE assistants DROP COLUMN bootstrap_state;
+                 ALTER TABLE assistants DROP COLUMN bootstrap_template_version;
+                 ALTER TABLE assistants DROP COLUMN bootstrap_revision;
+                 UPDATE schema_version SET version=47;",
+            )
+            .unwrap();
+            let notification_tables: i64 = raw
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('human_notification_prefs','human_notification_reads','human_room_mutes','human_push_devices','human_push_deliveries','human_push_presence','human_notification_intents')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                notification_tables, 7,
+                "main47 preimage must keep the CAD-1423 notification tables"
+            );
+            let bootstrap_columns: i64 = raw
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('assistants') WHERE name IN ('bootstrap_state','bootstrap_template_version','bootstrap_revision')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                bootstrap_columns, 0,
+                "main47 preimage must carry no bootstrap column"
+            );
+        }
+        store
+            .propose_close(
+                &permit(&db, OwnerOp::Close, b"s47", "a47", "art", 1),
+                "test",
+            )
+            .unwrap();
+        store
+            .witness_commit(&permit(&db, OwnerOp::Witness, b"s47", "a47", "art", 1))
+            .expect("genuine main47 physical store must be accepted by the real guard");
+        let witnessed: i64 = store
+            .conn()
+            .query_row("SELECT db_schema FROM owner_witness", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(witnessed, 47, "witness must record actual schema 47");
+    }
+
+    #[test]
+    fn owner_witness_refuses_schema48_missing_bootstrap_column() {
+        // CAD-1420: an ACTUAL schema-48 database (in the supported range,
+        // media tables, v46 upload layout and v47 notification tables all
+        // present) that is missing one of the three `assistants` bootstrap
+        // lifecycle columns must be refused by the >=48 physical-shape
+        // guard before any witness row, latch or event effect. A forged
+        // future version would pass or fail for the wrong reason; this
+        // fixture stays a known 48 so only the physical column check can
+        // refuse it.
+        let dir = TempDir::new().unwrap();
+        let (db, store) = open_legacy(&dir);
+        let actual: i64 = store
+            .conn()
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(actual, 48, "fixture must be a real schema 48 store");
+        // Raw connection removes exactly one bootstrap column; media
+        // tables, the v46 upload/account layout and the v47 notification
+        // tables stay intact, so the range and media guards pass and only
+        // the >=48 guard refuses.
+        let fixture = Connection::open(&db).unwrap();
+        fixture
+            .execute("ALTER TABLE assistants DROP COLUMN bootstrap_revision", [])
+            .unwrap();
+        let remaining: i64 = fixture
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('assistants') WHERE name IN ('bootstrap_state','bootstrap_template_version','bootstrap_revision')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            remaining, 2,
+            "fixture must drop exactly one bootstrap column"
+        );
+        drop(fixture);
+        store
+            .propose_close(
+                &permit(&db, OwnerOp::Close, b"c48", "a48", "art", 1),
+                "test",
+            )
+            .unwrap();
+        let latch_before: (i64, i64, Vec<u8>, String, Option<String>, i64) = store
+            .conn()
+            .query_row(
+                "SELECT closed,witness_done,challenge,attempt,artifact,epoch FROM closure_state WHERE id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            )
+            .unwrap();
+        assert_eq!(latch_before.0, 1, "fixture must be sealed before witness");
+        assert_eq!(latch_before.1, 0, "fixture must not already have a witness");
+        let events_before: i64 = store
+            .conn()
+            .query_row("SELECT count(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        let err = store
+            .witness_commit(&permit(&db, OwnerOp::Witness, b"c48", "a48", "art", 1))
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Rejected(message) if message == "owner witness database schema is unsupported"),
+            "schema 48 missing a bootstrap column must fail the >=48 shape guard, got: {err}"
         );
         let latch_after: (i64, i64, Vec<u8>, String, Option<String>, i64) = store
             .conn()

@@ -113,36 +113,6 @@ impl AssistantFlagOn {
     }
 }
 
-/// Holds the rollout flag UNSET (feature OFF) under the same process lock as
-/// [`AssistantFlagOn`], restoring the prior value on drop.
-pub(crate) struct FlagOffGuard {
-    _lock: std::sync::MutexGuard<'static, ()>,
-    previous: Option<std::ffi::OsString>,
-}
-
-impl FlagOffGuard {
-    pub(crate) fn new() -> Self {
-        let lock = ASSISTANT_FLAG_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let previous = std::env::var_os("HOSTED_CADENCE_ASSISTANT_ENABLED");
-        std::env::remove_var("HOSTED_CADENCE_ASSISTANT_ENABLED");
-        Self {
-            _lock: lock,
-            previous,
-        }
-    }
-}
-
-impl Drop for FlagOffGuard {
-    fn drop(&mut self) {
-        match self.previous.take() {
-            Some(v) => std::env::set_var("HOSTED_CADENCE_ASSISTANT_ENABLED", v),
-            None => std::env::remove_var("HOSTED_CADENCE_ASSISTANT_ENABLED"),
-        }
-    }
-}
-
 impl Drop for AssistantFlagOn {
     fn drop(&mut self) {
         match self.previous.take() {
@@ -904,42 +874,59 @@ fn err_text(r: Result<Value>, case: &str) -> String {
 // unaffected by an armed parent because each child's env is its own.
 // ============================================================================
 
-/// The child-side flag-off probe — `#[ignore]`d so it never runs inside
-/// the enabled suite; the parent driver respawns it with the flag unset.
-/// Asserts the REAL `member_caller` guard: every `member_*` verb refuses
-/// with the not-enabled error BEFORE the envelope is read — and the
-/// operator surface the flag must NOT touch stays intact.
+/// Child-side probe, `#[ignore]`d so it never runs in the main suite; the
+/// parent driver respawns it with the flag absent, `"false"` and garbage.
+/// The availability gate is retired (CAD-1420), so the flag value is not an
+/// expectation. The AUTHORITY guard must refuse an envelope whose sub has no
+/// stored binding, on every `member_*` verb including `member_job_reconcile`,
+/// with the real binding refusal reason and no tracker effect. The bound
+/// member's own envelope is the positive control and must resolve to its own
+/// private binding.
 #[test]
 #[ignore]
-fn member_verbs_refuse_when_flag_off_child() {
+fn member_verbs_refuse_unbound_envelope_child() {
     let fx = Fx::new();
     let env = fx.provision("sub-alice");
+    let ghost = fx.envelope("sub-ghost", json!({}), json!({}));
     let before = fx.tree();
-    for (method, params) in member_verbs(&env) {
+    for (method, params) in member_verbs(&ghost) {
         let e = err_text(
-            fx.op_err(method, params.clone()),
-            &format!("{method} under disabled feature"),
+            fx.op_err(method, params),
+            &format!("{method} with an unbound member envelope"),
         );
         assert!(
-            e.contains("not enabled"),
-            "{method} under disabled feature refused for another reason: {e}"
+            e.contains("no assistant binding for this member"),
+            "{method} unbound envelope refused for another reason: {e}"
         );
     }
-    // An explicit `member_job_reconcile` — the param-shape check runs
-    // before `member_caller`, so a well-shaped call is what reaches the
-    // flag gate; it is refused there BEFORE the envelope is read.
     let e = err_text(
         fx.op_err(
             "member_job_reconcile",
-            json!({"member_envelope": env, "job": "j1", "expected_authority_rev": "1.0"}),
+            json!({"member_envelope": ghost, "job": "j1", "expected_authority_rev": "1.0"}),
         ),
-        "member_job_reconcile under disabled feature",
+        "member_job_reconcile with an unbound member envelope",
     );
-    assert!(e.contains("not enabled"), "reconcile refusal: {e}");
+    assert!(
+        e.contains("no assistant binding for this member"),
+        "member_job_reconcile unbound envelope refused for another reason: {e}"
+    );
     assert_eq!(
         fx.tree(),
         before,
-        "a disabled-flag member verb had an effect"
+        "an unbound member envelope had an effect"
+    );
+    let ok = fx
+        .op_err("member_assist_state", json!({"member_envelope": env}))
+        .unwrap_or_else(|e| panic!("bound member refused: {e}"));
+    assert_eq!(
+        ok["assistant"]["sub"].as_str(),
+        Some("sub-alice"),
+        "bound member did not resolve its own binding: {ok}"
+    );
+    assert_eq!(
+        ok["assistant"]["assistant_id"].as_str(),
+        Some("assist_sub-alice"),
+        "bound member resolved the wrong assistant: {ok}"
     );
     // Legacy non-assistant operator surface unaffected by the flag —
     // `daemon_info` is a proven-operator call that must still answer.
@@ -947,13 +934,12 @@ fn member_verbs_refuse_when_flag_off_child() {
     assert!(info.is_object(), "daemon_info broke under the flag: {info}");
 }
 
-/// Parent driver — respawns THIS test binary with
-/// `HOSTED_CADENCE_ASSISTANT_ENABLED` absent / `"false"` / garbage and
-/// runs the ignored child probe in each; the child's exit code is the
-/// verdict (a panic exits nonzero). No in-process env mutation — the
-/// parallel enabled suite can never observe a torn flag.
+/// Parent driver: respawns THIS test binary with the flag absent / `"false"`
+/// / garbage and runs the ignored child probe in each; the child's exit code
+/// is the verdict. No in-process env mutation, so the enabled suite can never
+/// observe a torn flag.
 #[test]
-fn member_verbs_refuse_when_flag_off() {
+fn member_verbs_refuse_unbound_envelope_any_flag() {
     for (label, flag) in [
         ("absent", None),
         ("false", Some("false")),
@@ -961,7 +947,7 @@ fn member_verbs_refuse_when_flag_off() {
     ] {
         let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
         cmd.args([
-            "daemon::team_assistants_refusal::member_verbs_refuse_when_flag_off_child",
+            "daemon::team_assistants_refusal::member_verbs_refuse_unbound_envelope_child",
             "--exact",
             "--include-ignored",
             "--test-threads",
@@ -2601,54 +2587,44 @@ fn pending_assist_intent_survives_daemon_stream_retention() {
     );
 }
 
-/// CAD-1380 acceptance 2c (feature-OFF drain must not alter pending intents).
-/// With the rollout flag unset, the real drain must return without dispatching,
-/// must leave the pending intent row byte-identical, and must never expose the
-/// private request body or the service custody token to any notice.
+/// CAD-1380 acceptance 2c, privacy half. A real drain of a pending job intent
+/// must return Ok and must not expose the private request body or the service
+/// custody token to any notice it delivers to the member's assistant.
 #[test]
-fn feature_off_drain_leaves_pending_intent_unchanged() {
+fn drain_delivers_no_private_body_or_custody_to_notices() {
+    let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
     with_deferred_service(&fx);
     fx.provision("sub-fay");
-    // Create the pending intent with the flag ON (a real canonical request).
-    {
-        let _flag = AssistantFlagOn::arm();
-        let _ = fx.op(
-            "member_job_request",
-            json!({"member_envelope": fx.member_envelope("sub-fay"), "title": "off drain", "request_key": "off-k1", "body": "PRIVATE_OFF_BODY"}),
-        );
-    }
-    let pending_before = fx
-        .shared
-        .store
-        .pending_assist_job_notifications(500)
-        .unwrap();
-    assert!(!pending_before.is_empty(), "no pending intent to probe");
-    let before = fx.tree();
-
-    // Flag unset: the drain must be a no-op. Held under the same process lock
-    // as every enabled fixture, so no sibling test observes the flipped flag.
-    let queued = {
-        let _off = FlagOffGuard::new();
-        fx.shared.route_assist_job_notifications()
-    };
-    assert_eq!(queued.unwrap(), 0, "feature-OFF drain dispatched work");
-
-    let pending_after = fx
-        .shared
-        .store
-        .pending_assist_job_notifications(500)
-        .unwrap();
-    assert_eq!(
-        pending_before.len(),
-        pending_after.len(),
-        "feature-OFF drain altered pending intents"
+    let _ = fx.op(
+        "member_job_request",
+        json!({"member_envelope": fx.member_envelope("sub-fay"), "title": "drain privacy", "request_key": "drain-k1", "body": "PRIVATE_DRAIN_BODY"}),
     );
-    assert_eq!(fx.tree(), before, "feature-OFF drain changed the tracker");
-    for m in fx.shared.store.messages("assist-agent-sub-fay").unwrap() {
+    assert!(
+        !fx.shared
+            .store
+            .pending_assist_job_notifications(500)
+            .unwrap()
+            .is_empty(),
+        "no pending intent to drain"
+    );
+    let queued = fx
+        .shared
+        .route_assist_job_notifications()
+        .expect("drain returned an error");
+    assert!(
+        queued >= 1,
+        "drain delivered no notice; privacy outcome unobserved"
+    );
+    let notices = fx.shared.store.messages("assist-agent-sub-fay").unwrap();
+    assert!(
+        notices.iter().any(|m| !m.body.is_empty()),
+        "drain queued a notice but no body is observable on the member assistant"
+    );
+    for m in notices {
         assert!(
-            !m.body.contains("PRIVATE_OFF_BODY"),
-            "private request body reached a notice while the feature is OFF"
+            !m.body.contains("PRIVATE_DRAIN_BODY"),
+            "private request body reached a notice"
         );
         assert!(
             !m.body.contains(&format!("hcs_{}", "d".repeat(43))),
@@ -6044,12 +6020,14 @@ fn assist_drain_notifies_only_live_entitled_subscribers() {
     assert_eq!(after.state, state_before, "refused notice state changed");
 }
 
-/// CAD-1380 R4 (drain gate + stall trigger) - the guarded drain delivers only
-/// under the exact `"true"` flag, and a real stall sweep queues a metadata-only
-/// owner notice through that same drain without dispatching the task.
+/// CAD-1380 R4 (drain routing + stall trigger). CAD-1420 retired the
+/// feature-enable gate, so the drain routes without any flag: the initial
+/// intent is delivered as metadata only, and a real stall sweep queues a
+/// metadata-only owner notice through the same drain without dispatching the
+/// task. Authority, body and custody privacy are still asserted on each notice.
 #[test]
-fn assist_drain_gate_is_exact_true_and_stall_notice_is_metadata_only() {
-    let flag = AssistantFlagOn::arm();
+fn assist_drain_routes_without_flag_and_stall_notice_is_metadata_only() {
+    let _flag = AssistantFlagOn::arm();
     let fx = Fx::new();
     with_deferred_service(&fx);
     let owner = fx.member_runtime("sub-ana");
@@ -6068,8 +6046,7 @@ fn assist_drain_gate_is_exact_true_and_stall_notice_is_metadata_only() {
         .next()
         .expect("job has no first task");
 
-    // ---- 1. Non-enabling flag values: the drain returns 0, leaves every
-    // pending intent and job/task state unchanged, and writes no message. ----
+    // ---- 1. Pending intents are durable: captured before the drain. ----
     let pending_before = fx
         .shared
         .store
@@ -6082,44 +6059,9 @@ fn assist_drain_gate_is_exact_true_and_stall_notice_is_metadata_only() {
     let owner_before_gate = r4d_ids(&fx, &owner.alias);
     let job_before = fx.shared.store.job(&job).unwrap();
     let task_before = fx.shared.store.task(&task.id).unwrap();
-    for value in [None, Some("false"), Some("TRUE"), Some("1")] {
-        match value {
-            Some(v) => std::env::set_var("HOSTED_CADENCE_ASSISTANT_ENABLED", v),
-            None => std::env::remove_var("HOSTED_CADENCE_ASSISTANT_ENABLED"),
-        }
-        let drained = fx
-            .shared
-            .route_assist_job_notifications()
-            .expect("gated drain returned an error");
-        assert_eq!(drained, 0, "the drain ran with flag {value:?}");
-        assert_eq!(
-            fx.shared
-                .store
-                .pending_assist_job_notifications(50)
-                .unwrap(),
-            pending_before,
-            "a gated drain changed a pending intent (flag {value:?})"
-        );
-        assert_eq!(
-            r4d_ids(&fx, &owner.alias),
-            owner_before_gate,
-            "a gated drain wrote a message (flag {value:?})"
-        );
-        assert_eq!(
-            fx.shared.store.job(&job).unwrap().state,
-            job_before.state,
-            "a gated drain changed the job state (flag {value:?})"
-        );
-        assert_eq!(
-            fx.shared.store.task(&task.id).unwrap().state,
-            task_before.state,
-            "a gated drain changed the task state (flag {value:?})"
-        );
-    }
-    std::env::set_var("HOSTED_CADENCE_ASSISTANT_ENABLED", "true");
 
-    // ---- 2. Exact "true": the drain delivers the legitimate initial metadata
-    // notice to the live owner and nothing private. ----
+    // ---- 2. The drain delivers the initial metadata notice to the live owner
+    // and nothing private. ----
     let initial = fx
         .shared
         .route_assist_job_notifications()
@@ -6129,6 +6071,16 @@ fn assist_drain_gate_is_exact_true_and_stall_notice_is_metadata_only() {
     assert!(
         owner_initial.len() > owner_before_gate.len(),
         "the owner gained no initial metadata notice"
+    );
+    assert_eq!(
+        fx.shared.store.job(&job).unwrap().state,
+        job_before.state,
+        "the initial drain changed the job state"
+    );
+    assert_eq!(
+        fx.shared.store.task(&task.id).unwrap().state,
+        task_before.state,
+        "the initial drain changed the task state"
     );
     for m in fx.shared.store.messages(&owner.alias).unwrap() {
         if m.source == "assist_job_event" {
@@ -6222,7 +6174,6 @@ fn assist_drain_gate_is_exact_true_and_stall_notice_is_metadata_only() {
         owner_stalled,
         "a repeated sweep or drain added message IDs"
     );
-    drop(flag);
 }
 
 /// The ordinary worker's upstream metadata, as the R5 fixture sets it, so the
@@ -7324,4 +7275,926 @@ mod cad1380_rereview_refusal {
             "forged foreign message_report not refused by ownership: {forged:?}"
         );
     }
+}
+
+// ============================================================================
+// CAD-1420 bootstrap ACK caller guard (independent acceptance, one bad case
+// plus one owner control). Authored by the acceptance maintainer from the
+// decision note, not by the source writer. Uses the REAL fixtures: a live
+// member's stamped `member_assist_send`, the real `take_app_aware`, a
+// registry-minted current turn token and `Asserted::Agent` callers.
+// ============================================================================
+
+/// Synthetic quiescent guard fixture (NOT a first-send or provider proof). The
+/// victim's stamped running turn is written by the production stamp writer
+/// `enqueue_sent` with `Sender::VerifiedMember` and the fixture's recorded
+/// original credential (`cred-<sub>`). No send RPC, no actor launch, no signed
+/// first-send admission. One registry-minted current token stays `running` for
+/// the whole sequence; `turn_token_current` is asserted before any ACK.
+///
+/// Bad case (first, against a pending rev 0 snapshot): a foreign member carrying
+/// the victim's exact running message and current token is refused as "not its
+/// own"; bootstrap DB state/revision, all five private files under the principal
+/// root and the PM tree are byte-identical before and after.
+///
+/// Owner lifecycle on the same turn (controlled revisions, not fixed numbers):
+/// defer at rev 0 -> deferred; resume at the returned rev -> pending with the
+/// original BOOTSTRAP body in context; complete with the agreed profile -> complete,
+/// profile values written, BOOTSTRAP removed. A user-owned note outside the
+/// managed `preferences` section survives completion. After completion the
+/// existing member_assist_state reuses the assistant without starting an actor,
+/// BOOTSTRAP is not recreated, and `member_profile_context` carries the agreed
+/// values with no pending guide.
+#[test]
+fn bootstrap_ack_by_foreign_caller_cannot_apply_with_valid_victim_turn() {
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+    with_deferred_service(&fx);
+    let victim_sub = "sub-boot-victim";
+    let victim = fx.member_runtime(victim_sub);
+    let thief = fx.member_runtime("sub-boot-thief");
+    let victim_binding = fx
+        .shared
+        .store
+        .assistant_binding(ORG, victim_sub)
+        .unwrap()
+        .expect("victim binding missing");
+    let cwd = fx.shared.assistant_principal_cwd(ORG, victim_sub);
+    const FILES: [&str; 5] = [
+        "BOOTSTRAP.md",
+        "IDENTITY.md",
+        "SOUL.md",
+        "USER.md",
+        "AGENTS.md",
+    ];
+    let files = |cwd: &Path| -> BTreeMap<String, Option<Vec<u8>>> {
+        FILES
+            .into_iter()
+            .map(|n| (n.to_string(), std::fs::read(cwd.join(n)).ok()))
+            .collect()
+    };
+    let db = |fx: &Fx| {
+        let b = fx
+            .shared
+            .store
+            .assistant_binding(ORG, victim_sub)
+            .unwrap()
+            .unwrap();
+        (b.bootstrap_state, b.bootstrap_revision)
+    };
+
+    // Synthetic stamped running turn (see the doc): production stamp writer,
+    // original fixture credential, generation and state set by fixture_write.
+    let gen = "0123456789abcdef0123456789abcdef";
+    let token = crate::adapter::registry::PI_MANAGED_TURN_TOKENS.mint(gen);
+    let msg_id = "boot-victim-msg-1";
+    fx.shared
+        .store
+        .enqueue_sent(
+            &victim.alias,
+            "boot turn",
+            None,
+            msg_id,
+            &format!("member-{victim_sub}"),
+            None,
+            &crate::store::Sender::VerifiedMember(crate::store::MemberAuthority {
+                org: ORG.to_string(),
+                sub: victim_sub.to_string(),
+                assistant_id: victim_binding.assistant_id.clone(),
+                credential_id: format!("cred-{victim_sub}"),
+            }),
+        )
+        .unwrap();
+    fx.shared
+        .store
+        .fixture_write(|tx| {
+            tx.execute(
+                "UPDATE agents SET generation=?, state='idle', params=? WHERE alias=?",
+                rusqlite::params![
+                    gen,
+                    json!({"report_timeout_secs": 3600}).to_string(),
+                    victim.alias
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    fx.shared.store.mark_running(msg_id, &token).unwrap();
+    let agent = fx.shared.store.agent(&victim.alias).unwrap();
+    assert!(
+        crate::adapter::registry::turn_token_current(
+            &agent.provider,
+            &agent.endpoint_kind,
+            agent.generation.as_deref(),
+            &token,
+        ),
+        "fixture token is not current for the stored provider/endpoint/generation"
+    );
+    let running = fx.shared.store.message(msg_id).unwrap().unwrap();
+    assert_eq!(running.state, "running", "victim turn is not running");
+    assert_eq!(running.turn_id.as_deref(), Some(token.as_str()));
+
+    // Pending rev 0 snapshot: BOOTSTRAP present, user-owned note outside the
+    // managed preferences section added before the snapshot.
+    let before_files = files(&cwd);
+    assert!(
+        before_files["BOOTSTRAP.md"].is_some(),
+        "fixture seeded no BOOTSTRAP.md"
+    );
+    let user_path = cwd.join("USER.md");
+    let user_note = "\nUser note: keep this line.\n";
+    let user_text = std::fs::read_to_string(&user_path).unwrap();
+    std::fs::write(&user_path, format!("{user_text}{user_note}")).unwrap();
+    let before_files = files(&cwd);
+    let before_db = db(&fx);
+    assert_eq!(before_db.0, "pending", "fixture binding is not pending");
+    let before_tree = fx.tree();
+
+    // Bad case: foreign connection, victim's exact running message and token.
+    let stolen = fx.as_assistant(
+        &thief.alias,
+        "message_report",
+        json!({"message": msg_id, "token": token, "kind": "ack",
+               "bootstrap": {"action": "complete", "expected_revision": before_db.1,
+                             "profile": {"name": "Stolen", "tone": "stolen", "preferences": "stolen"}}}),
+    );
+    let stolen_text = stolen
+        .as_ref()
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(
+        stolen.is_err() && stolen_text.contains("not its own"),
+        "foreign caller's bootstrap ACK refused for another reason: {stolen:?}"
+    );
+    assert_eq!(
+        db(&fx),
+        before_db,
+        "refused foreign ACK changed bootstrap DB fields"
+    );
+    assert_eq!(
+        files(&cwd),
+        before_files,
+        "refused foreign ACK changed private files"
+    );
+    assert_eq!(
+        fx.tree(),
+        before_tree,
+        "refused foreign ACK changed the PM tree"
+    );
+
+    // Wrong-derived caller: a proven operator connection carrying the victim's
+    // valid running message and current token is not the assistant's own
+    // connection, so the changed CAD-1420 caller branch refuses it with its
+    // exact reason. Nothing mutates.
+    let operator_ack = fx.op_err(
+        "message_report",
+        json!({"message": msg_id, "token": token, "kind": "ack",
+               "bootstrap": {"action": "complete", "expected_revision": before_db.1,
+                             "profile": {"name": "Operator", "tone": "operator", "preferences": "operator"}}}),
+    );
+    let operator_text = operator_ack
+        .as_ref()
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(
+        operator_ack.is_err()
+            && operator_text
+                .contains("bootstrap ack refused: it needs the assistant's own connection"),
+        "operator-derived bootstrap ACK refused for another reason: {operator_ack:?}"
+    );
+    assert_eq!(
+        db(&fx),
+        before_db,
+        "refused operator-derived ACK changed bootstrap DB fields"
+    );
+    assert_eq!(
+        files(&cwd),
+        before_files,
+        "refused operator-derived ACK changed private files"
+    );
+    assert_eq!(
+        fx.tree(),
+        before_tree,
+        "refused operator-derived ACK changed the PM tree"
+    );
+
+    let ack = |fx: &Fx, bootstrap: Value| {
+        fx.as_assistant(
+            &victim.alias,
+            "message_report",
+            json!({"message": msg_id, "token": token, "kind": "ack", "bootstrap": bootstrap}),
+        )
+    };
+    let rev0 = db(&fx).1;
+
+    // Owner: defer at the stored revision.
+    let deferred = ack(&fx, json!({"action": "defer", "expected_revision": rev0}))
+        .unwrap_or_else(|e| panic!("owner defer refused: {e}"));
+    assert!(deferred.is_object(), "defer not an answer: {deferred}");
+    let (state, rev1) = db(&fx);
+    assert_eq!(state, "deferred", "defer did not record deferred");
+    assert!(rev1 > rev0, "defer did not advance the revision");
+    let ctx = fx
+        .shared
+        .member_profile_context(&running)
+        .unwrap()
+        .unwrap_or_default();
+    assert!(
+        ctx.contains("state: deferred"),
+        "deferred context lacks state: {ctx}"
+    );
+    assert!(
+        ctx.contains(&format!("revision: {rev1}")),
+        "deferred context lacks revision: {ctx}"
+    );
+    assert!(
+        !ctx.contains("## Bootstrap (pending)"),
+        "deferred context carried the pending guide"
+    );
+
+    // Owner: resume at the returned revision.
+    let resumed = ack(&fx, json!({"action": "resume", "expected_revision": rev1}))
+        .unwrap_or_else(|e| panic!("owner resume refused: {e}"));
+    assert!(resumed.is_object(), "resume not an answer: {resumed}");
+    let (state, rev2) = db(&fx);
+    assert_eq!(state, "pending", "resume did not record pending");
+    assert!(rev2 > rev1, "resume did not advance the revision");
+    let ctx = fx
+        .shared
+        .member_profile_context(&running)
+        .unwrap()
+        .unwrap_or_default();
+    assert!(
+        ctx.contains("## Bootstrap (pending)"),
+        "resumed context lacks the pending guide"
+    );
+    assert!(
+        ctx.contains(&format!("revision: {rev2}")),
+        "resumed context lacks revision: {ctx}"
+    );
+
+    // Owner: complete with the agreed profile at the returned revision.
+    let completed = ack(
+        &fx,
+        json!({"action": "complete", "expected_revision": rev2,
+               "profile": {"name": "Agreed name", "tone": "concise", "preferences": "short answers"}}),
+    )
+    .unwrap_or_else(|e| panic!("owner complete refused (control broken): {e}"));
+    assert!(completed.is_object(), "complete not an answer: {completed}");
+    let (state, rev3) = db(&fx);
+    assert_eq!(
+        state, "complete",
+        "owner complete did not record completion"
+    );
+    assert!(rev3 > rev2, "complete did not advance the revision");
+
+    let after = files(&cwd);
+    let text = |name: &str| {
+        after
+            .get(name)
+            .and_then(|b| b.as_ref())
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .unwrap_or_default()
+    };
+    assert!(
+        text("IDENTITY.md").contains("Agreed name"),
+        "IDENTITY.md lacks the agreed name"
+    );
+    assert!(
+        text("SOUL.md").contains("concise"),
+        "SOUL.md lacks the agreed tone"
+    );
+    assert!(
+        text("USER.md").contains("short answers"),
+        "USER.md lacks the agreed preferences"
+    );
+    assert!(
+        text("USER.md").contains("User note: keep this line."),
+        "user-owned USER.md note was lost"
+    );
+    assert!(
+        after["BOOTSTRAP.md"].is_none(),
+        "BOOTSTRAP.md survived completion"
+    );
+
+    // Post-complete: a fresh signed member_assist_state reuses the bound
+    // assistant without an actor start, does not recreate BOOTSTRAP, and keeps
+    // the profile text.
+    let state_read = fx.op(
+        "member_assist_state",
+        json!({"member_envelope": fx.member_envelope(victim_sub)}),
+    );
+    assert_eq!(
+        state_read["assistant"]["alias"].as_str(),
+        Some(victim.alias.as_str()),
+        "post-complete state read did not reuse the assistant alias"
+    );
+    assert!(
+        files(&cwd)["BOOTSTRAP.md"].is_none(),
+        "BOOTSTRAP was reseeded after completion"
+    );
+    let after_read = files(&cwd);
+    assert_eq!(
+        after_read["IDENTITY.md"], after["IDENTITY.md"],
+        "IDENTITY changed on a read"
+    );
+    assert_eq!(
+        after_read["SOUL.md"], after["SOUL.md"],
+        "SOUL changed on a read"
+    );
+    assert_eq!(
+        after_read["USER.md"], after["USER.md"],
+        "USER changed on a read"
+    );
+
+    let ctx = fx
+        .shared
+        .member_profile_context(&running)
+        .unwrap()
+        .unwrap_or_default();
+    assert!(
+        ctx.contains("Agreed name") && ctx.contains("concise") && ctx.contains("short answers"),
+        "complete context lacks the agreed values: {ctx}"
+    );
+    assert!(
+        ctx.contains("state: complete"),
+        "complete context lacks state: {ctx}"
+    );
+    assert!(
+        ctx.contains(&format!("revision: {rev3}")),
+        "complete context lacks revision: {ctx}"
+    );
+    assert!(
+        !ctx.contains("## Bootstrap (pending)"),
+        "complete context carried the pending guide"
+    );
+}
+
+// ============================================================================
+// CAD-1420 independent refusal acceptance — `platform_assistant_provision`,
+// the dedicated platform-authority projection, authored by a worker that is
+// NOT the implementer. The guard contract under test (from the ticket, not
+// the implementation): a genuinely absent `assistants` row may be projected
+// ONLY when (a) the caller is the proven operator/board relay, (b) the
+// signed `member_envelope` cryptographically re-verifies, (c) the daemon's
+// `hosted-board` `assist.revalidate` service credential is enrolled through
+// the NORMAL `platform_enroll` operator path for THIS board's configured
+// host, and (d) the live upstream pull re-allows the member's ORIGINAL
+// issuing credential for the exact operation + scope. A revoked/stale
+// original CID denies at the LIVE pull — before any binding row, agent,
+// thread or private-cwd file exists. The fixture platform is synthetic; it
+// proves the daemon honors the real guard, never a live product R1.
+// ============================================================================
+
+/// The native HTTP `assist_*` surface on a real owned daemon + real board.
+/// `state` is the daemon's own dir; `Fx` supplies ONLY the loopback
+/// platform (JWKS + revalidate), the signing key and member authority —
+/// the same two-server layout the route runs in production.
+struct ProvisionHttpRig {
+    _root: tempfile::TempDir,
+    state: PathBuf,
+    pm: PathBuf,
+    board_port: u16,
+    /// The board's public host — the platform's `localhost:<port>`,
+    /// carried so `call` names it in the Host header.
+    public_host: String,
+    stop: Arc<AtomicBool>,
+    _threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl ProvisionHttpRig {
+    /// Boot a REAL daemon (`serve_with`, test-seam armed) on its own temp
+    /// state + PM, then a REAL `crate::ui::serve` board whose public host
+    /// names the fixture platform. `fx`'s platform is the authority for
+    /// both the route's envelope verify and the daemon's live pull.
+    fn start(fx: &Fx) -> Self {
+        let root = tempfile::Builder::new()
+            .prefix("c1420-http")
+            .tempdir()
+            .unwrap();
+        let state = root.path().join("s");
+        let pm = root.path().join("pm");
+        crate::issue::Pm::init(&pm).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        // The same trust root `Fx` uses: the loopback platform's host/issuer.
+        crate::board_identity::write_config(
+            &state,
+            &crate::board_identity::Config {
+                host: fx.host.clone(),
+                issuer: fx.issuer.clone(),
+                company: ORG.to_string(),
+            },
+        )
+        .unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut threads = Vec::new();
+
+        // Real daemon on a real socket; the PM dir is the fixture's own.
+        {
+            let dir = state.clone();
+            let opts = ServeOptions {
+                test_seam: true,
+                stop: Some(stop.clone()),
+                ..ServeOptions::default()
+            };
+            opts.provider_env
+                .set("CADENCE_PM_DIR", pm.to_str().unwrap());
+            // `.expect` inside the thread keeps a daemon startup failure
+            // observable as a joinable panic rather than a dropped Result.
+            threads.push(std::thread::spawn(move || {
+                crate::daemon::serve_with(&dir, opts).expect("owned test daemon failed");
+            }));
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while !state.join("cadence.sock").exists()
+                || crate::test_seam::Seam::token_at(&state).is_none()
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "owned daemon never started"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        // Real board with a public identity so `/api/assist/*` diverts —
+        // the same surface the platform relay forwards to.
+        let platform_port: u16 = fx
+            .host
+            .rsplit(':')
+            .next()
+            .unwrap_or_default()
+            .parse()
+            .unwrap_or(0);
+        let mut board_port = 0u16;
+        for port in 3110..=3199u16 {
+            if port == platform_port {
+                continue;
+            }
+            let (startup, ready) = std::sync::mpsc::channel();
+            let board = crate::ui::ServeOpts {
+                host: "127.0.0.1".into(),
+                port,
+                stop: Some(stop.clone()),
+                startup: Some(startup),
+                test_seam: true,
+                allow_hosts: vec![fx.host.clone()],
+                public: Some(crate::ui::PublicBoard {
+                    host: fx.host.clone(),
+                    issuer: fx.issuer.clone(),
+                    company: ORG.into(),
+                    authorize_url: format!("{}/authorize", fx.issuer),
+                }),
+                ..crate::ui::ServeOpts::default()
+            };
+            let (s, p) = (state.clone(), pm.clone());
+            let thread = std::thread::spawn(move || drop(crate::ui::serve(&s, &p, &board)));
+            match ready.recv_timeout(Duration::from_secs(30)).unwrap() {
+                Ok(()) => {
+                    board_port = port;
+                    threads.push(thread);
+                    break;
+                }
+                Err(_) => {
+                    thread.join().unwrap();
+                }
+            }
+        }
+        assert!(board_port > 0, "board could not bind in 3110..=3199");
+        Self {
+            _root: root,
+            state,
+            pm,
+            board_port,
+            public_host: fx.host.clone(),
+            stop,
+            _threads: threads,
+        }
+    }
+
+    /// `POST /api/assist/<verb>` on the board's public host → (status, body).
+    fn call(&self, verb: &str, envelope: &str, args: &Value) -> (u16, Value) {
+        let body = serde_json::to_vec(args).unwrap();
+        let mut socket = std::net::TcpStream::connect(("127.0.0.1", self.board_port)).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        use std::io::Write as _;
+        write!(
+            socket,
+            "POST /api/assist/{verb} HTTP/1.1\r\nHost: {}\r\n\
+             Authorization: Bearer wikienv_{envelope}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n",
+            self.public_host,
+            body.len()
+        )
+        .unwrap();
+        socket.write_all(&body).unwrap();
+        let mut response = Vec::new();
+        std::io::Read::read_to_end(&mut socket, &mut response).unwrap();
+        let split = response
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("no http header/body split");
+        let header = std::str::from_utf8(&response[..split]).unwrap();
+        let status = header
+            .lines()
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let value = serde_json::from_slice(&response[split + 4..]).unwrap_or_else(
+            |_| json!({"_nonjson": String::from_utf8_lossy(&response[split+4..]).into_owned()}),
+        );
+        (status, value)
+    }
+
+    /// The daemon's own `client::rpc` on the real socket — the same path
+    /// the board's relay uses. `who` is asserted through the test seam.
+    fn rpc_as(&self, who: Asserted, method: &str, params: Value) -> Result<Value> {
+        crate::test_seam::scoped(who, || crate::client::rpc(&self.state, method, params))
+    }
+
+    /// A `Shared` opened alongside the live daemon — the second handle the
+    /// HTTP refusal module already uses for reads against the owned state.
+    fn store(&self) -> Arc<Shared> {
+        let opts = ServeOptions::default();
+        opts.provider_env
+            .set("CADENCE_PM_DIR", self.pm.to_str().unwrap());
+        crate::daemon::Shared::new(&self.state, &opts).unwrap()
+    }
+
+    /// Whole-PM-tree byte snapshot — the "no effect" probe for refused calls.
+    fn tree(&self) -> BTreeMap<String, Vec<u8>> {
+        fn walk(base: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
+            for e in std::fs::read_dir(dir).unwrap() {
+                let p = e.unwrap().path();
+                let rel = p.strip_prefix(base).unwrap().to_string_lossy().into_owned();
+                if rel == ".git" {
+                    continue;
+                }
+                if p.is_dir() {
+                    out.insert(format!("{rel}/"), vec![]);
+                    walk(base, &p, out);
+                } else {
+                    out.insert(rel, std::fs::read(&p).unwrap());
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        walk(&self.pm, &self.pm, &mut out);
+        out
+    }
+}
+
+impl Drop for ProvisionHttpRig {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Assert that NOTHING was projected for `sub`: no `assistants` row, no
+/// registered agent under the server-derived alias, no bound thread and no
+/// private-cwd directory under `state_dir/assistants/<digest>`.
+fn assert_nothing_projected(shared: &Shared, org: &str, sub: &str, case: &str) {
+    assert!(
+        shared.store.assistant_binding(org, sub).unwrap().is_none(),
+        "{case}: a refused projection left an assistants row"
+    );
+    let alias = shared.assistant_principal_alias(org, sub);
+    assert!(
+        shared.store.agent_opt(&alias).unwrap().is_none(),
+        "{case}: a refused projection registered agent '{alias}'"
+    );
+    assert!(
+        shared.store.thread(&alias).unwrap().is_none(),
+        "{case}: a refused projection bound a thread for '{alias}'"
+    );
+    assert!(
+        !shared.assistant_principal_cwd(org, sub).exists(),
+        "{case}: a refused projection created the member's private cwd"
+    );
+}
+
+/// CAD-1420 acceptance: a genuinely absent binding may be projected ONLY
+/// through the live-authority path. A fresh member whose ORIGINAL issuing
+/// credential is dead at the platform is denied at the LIVE pull on BOTH
+/// the direct `platform_assistant_provision` RPC and the real
+/// `/api/assist/<verb>` HTTP surface — with NO `assistants` row, NO
+/// registered agent, NO bound thread and NO private-cwd files. The
+/// enrolled `hosted-board` service credential goes through the NORMAL
+/// `platform_enroll` operator RPC — never a raw SQL/custody seed — so a
+/// missing or wrongly-scoped service cannot masquerade as a live denial.
+/// Every refused case pairs with an authorized control in the same
+/// fixture so a blanket-fail cannot pass. The fixture platform is
+/// synthetic — it exercises the real guard, never a live product R1.
+#[test]
+fn platform_provision_live_denial_creates_no_binding_or_files() {
+    let _flag = AssistantFlagOn::arm();
+    let fx = Fx::new();
+
+    // ---- Enrollment guards: the new normal `hosted-board` enroll path
+    // must not be unguarded. A wrong host and a broadened scope each
+    // refuse BEFORE any custody record lands — the account is pinned to
+    // this board's configured host and the declared scope set is exactly
+    // `assist.revalidate`. `accept_same_uid_risk` is the test-only
+    // fixture operator's consent for same-uid custody (ADR 0006 P4), not
+    // a live human approval.
+    let service_token = format!("hcs_{}", "f".repeat(43));
+    for (label, params) in [
+        (
+            "wrong host",
+            json!({"platform": "hosted-board", "account": "other-board.example",
+                   "scopes": ["assist.revalidate"], "token": service_token,
+                   "accept_same_uid_risk": true}),
+        ),
+        (
+            "broadened scope",
+            json!({"platform": "hosted-board", "account": fx.host.clone(),
+                   "scopes": ["assist.revalidate", "results.submit"], "token": service_token,
+                   "accept_same_uid_risk": true}),
+        ),
+    ] {
+        let before = fx.tree();
+        let e = err_text(
+            fx.op_err("platform_enroll", params),
+            &format!("hosted-board enroll {label}"),
+        );
+        assert!(
+            !e.is_empty(),
+            "hosted-board enroll {label} produced an empty refusal"
+        );
+        assert_eq!(fx.tree(), before, "a refused {label} enroll had an effect");
+    }
+    // A refused enroll leaves no loadable record.
+    assert!(
+        fx.shared
+            .store
+            .platform_credential("hosted-board", &fx.host)
+            .unwrap()
+            .is_none(),
+        "a refused hosted-board enroll left a credential record"
+    );
+
+    // ---- NORMAL enrollment: the real `platform_enroll` operator RPC for
+    // THIS board's configured host with exactly `assist.revalidate`. ----
+    let enrolled = fx.op_err(
+        "platform_enroll",
+        json!({"platform": "hosted-board", "account": fx.host.clone(),
+               "scopes": ["assist.revalidate"], "token": service_token,
+               "accept_same_uid_risk": true}),
+    );
+    assert!(
+        enrolled.is_ok(),
+        "the normal hosted-board enroll refused: {enrolled:?}"
+    );
+    // The fixture platform recognizes the enrolled service bearer.
+    fx.authority
+        .lock()
+        .unwrap()
+        .services
+        .push(ServiceAuthority {
+            token: service_token.clone(),
+            org: ORG.to_string(),
+            audience: format!("http://{}", fx.host),
+            caps: vec!["assist.revalidate".into()],
+            live: true,
+        });
+
+    // ---- POSITIVE CONTROL (direct RPC): a live member with a live
+    // ORIGINAL credential projects exactly one server-derived binding. ----
+    let sub = "sub-new";
+    fx.authority
+        .lock()
+        .unwrap()
+        .members
+        .insert(sub.to_string(), MemberAuthority::live(sub));
+    let env = fx.envelope(sub, json!({}), json!({}));
+    let ok = fx
+        .op_err(
+            "platform_assistant_provision",
+            json!({"member_envelope": env, "operation": "assist_state"}),
+        )
+        .unwrap_or_else(|e| panic!("live member's projection refused: {e}"));
+    assert_eq!(
+        ok["provisioned"].as_bool(),
+        Some(true),
+        "live member was not projected: {ok}"
+    );
+    let binding = fx
+        .shared
+        .store
+        .assistant_binding(ORG, sub)
+        .unwrap()
+        .expect("live member produced no binding");
+    assert_eq!(binding.org, ORG);
+    assert_eq!(binding.sub, sub);
+    assert_eq!(binding.assistant_id, format!("assist_{sub}"));
+    assert!(
+        binding.alias.starts_with("assist-") && binding.alias.len() == 55,
+        "binding alias is not the server-derived digest form: {}",
+        binding.alias
+    );
+    assert!(
+        fx.shared.store.agent_opt(&binding.alias).unwrap().is_none(),
+        "the projection registered an agent"
+    );
+    assert!(
+        !fx.shared.assistant_principal_cwd(ORG, sub).exists(),
+        "the projection created the member's private cwd"
+    );
+
+    // ---- LIVE DENIAL (direct RPC): the ORIGINAL issuing credential is
+    // dead upstream. The member is still listed and the envelope still
+    // verifies, so ONLY the live pull's `credential_id` re-prove can
+    // refuse — this is never a missing-enrollment or envelope failure.
+    fx.authority
+        .lock()
+        .unwrap()
+        .members
+        .insert("sub-dead".to_string(), MemberAuthority::live("sub-dead"));
+    fx.set_member("sub-dead", |m| m.credential_live = false);
+    let dead_env = fx.envelope("sub-dead", json!({}), json!({}));
+    let before = fx.tree();
+    let e = err_text(
+        fx.op_err(
+            "platform_assistant_provision",
+            json!({"member_envelope": dead_env, "operation": "assist_state"}),
+        ),
+        "platform_assistant_provision with a dead original credential",
+    );
+    // The exact live-guard refusal — not a custody, scope, binding or
+    // envelope failure masquerading as revocation.
+    assert!(
+        e.contains("the platform revalidation did not allow"),
+        "dead-credential projection refused outside the live guard: {e}"
+    );
+    assert_nothing_projected(&fx.shared, ORG, "sub-dead", "direct RPC denial");
+    assert_eq!(
+        fx.tree(),
+        before,
+        "a refused projection changed the tracker"
+    );
+
+    // ---- LIVE DENIAL (HTTP): the real `/api/assist/*` surface on an
+    // owned daemon + board. The rig's daemon enrolls the same service
+    // credential through the NORMAL `platform_enroll` over its real
+    // socket, asserted through the test seam as the operator.
+    let http_fx = Fx::new();
+    let rig = ProvisionHttpRig::start(&http_fx);
+    let rig_token = format!("hcs_{}", "g".repeat(43));
+    let enrolled = rig.rpc_as(
+        Asserted::Operator,
+        "platform_enroll",
+        json!({"platform": "hosted-board", "account": http_fx.host.clone(),
+               "scopes": ["assist.revalidate"], "token": rig_token,
+               "accept_same_uid_risk": true}),
+    );
+    assert!(
+        enrolled.is_ok(),
+        "the rig daemon's normal hosted-board enroll refused: {enrolled:?}"
+    );
+    http_fx
+        .authority
+        .lock()
+        .unwrap()
+        .services
+        .push(ServiceAuthority {
+            token: rig_token,
+            org: ORG.to_string(),
+            audience: format!("http://{}", http_fx.host),
+            caps: vec!["assist.revalidate".into()],
+            live: true,
+        });
+
+    // Closed-arg guard with an otherwise-authorized LIVE member: an
+    // unknown POST field refuses BEFORE any projection — a malformed
+    // call never reaches the RPC. A fresh envelope each call: the HTTP
+    // route consumes the jti before arg validation, so reusing one would
+    // only re-test replay, not the guard under test.
+    http_fx.authority.lock().unwrap().members.insert(
+        "sub-httpok".to_string(),
+        MemberAuthority::live("sub-httpok"),
+    );
+    let http_before = rig.tree();
+    let (status, body) = rig.call(
+        "assist_state",
+        &http_fx.envelope("sub-httpok", json!({}), json!({})),
+        &json!({"bogus": true}),
+    );
+    assert_eq!(
+        status, 400,
+        "an unknown-arg assist_state was not refused at HTTP: {body}"
+    );
+    assert_nothing_projected(&rig.store(), ORG, "sub-httpok", "unknown-arg refusal");
+    assert_eq!(rig.tree(), http_before, "an unknown-arg call had an effect");
+
+    // Positive control: a FRESH envelope for the same live member admits —
+    // proving the route, the projection and the member verb all pass.
+    let (status, body) = rig.call(
+        "assist_state",
+        &http_fx.envelope("sub-httpok", json!({}), json!({})),
+        &json!({}),
+    );
+    assert_eq!(
+        status, 200,
+        "a live member's assist_state was refused at HTTP: {body}"
+    );
+    let binding = rig
+        .store()
+        .store
+        .assistant_binding(ORG, "sub-httpok")
+        .unwrap()
+        .expect("a live member's HTTP call created no binding");
+    assert_eq!(binding.assistant_id, "assist_sub-httpok");
+
+    // The live denial through the SAME HTTP surface: a fresh envelope for
+    // a member whose original credential is dead upstream must be refused
+    // at the live pull — before any binding, agent, thread or file.
+    http_fx.authority.lock().unwrap().members.insert(
+        "sub-httpdead".to_string(),
+        MemberAuthority::live("sub-httpdead"),
+    );
+    http_fx.set_member("sub-httpdead", |m| m.credential_live = false);
+    let http_before = rig.tree();
+    let (status, body) = rig.call(
+        "assist_state",
+        &http_fx.envelope("sub-httpdead", json!({}), json!({})),
+        &json!({}),
+    );
+    assert_eq!(
+        status, 403,
+        "a dead-credential assist_state was not refused 403 at HTTP: {body}"
+    );
+    // The HTTP refusal names the live-guard denial, not a bare 403.
+    let message = body["error"]["message"]
+        .as_str()
+        .or_else(|| body["message"].as_str())
+        .unwrap_or_default();
+    assert!(
+        message.contains("the platform revalidation did not allow"),
+        "the HTTP refusal did not name the live-guard denial: {body}"
+    );
+    assert_nothing_projected(&rig.store(), ORG, "sub-httpdead", "HTTP denial");
+    assert_eq!(rig.tree(), http_before, "a refused HTTP call had an effect");
+
+    // A valid-shape `assist_send` for a SECOND dead-credential member —
+    // the same live denial on the write operation's surface.
+    http_fx.authority.lock().unwrap().members.insert(
+        "sub-httpdead2".to_string(),
+        MemberAuthority::live("sub-httpdead2"),
+    );
+    http_fx.set_member("sub-httpdead2", |m| m.credential_live = false);
+    let http_before = rig.tree();
+    let (status, body) = rig.call(
+        "assist_send",
+        &http_fx.envelope("sub-httpdead2", json!({}), json!({})),
+        &json!({"text": "still refused"}),
+    );
+    assert_eq!(
+        status, 403,
+        "a dead-credential assist_send was not refused 403 at HTTP: {body}"
+    );
+    let message = body["error"]["message"]
+        .as_str()
+        .or_else(|| body["message"].as_str())
+        .unwrap_or_default();
+    assert!(
+        message.contains("the platform revalidation did not allow"),
+        "the HTTP send refusal did not name the live-guard denial: {body}"
+    );
+    assert_nothing_projected(&rig.store(), ORG, "sub-httpdead2", "HTTP send denial");
+    assert_eq!(rig.tree(), http_before, "a refused HTTP send had an effect");
+
+    // ---- Direct-RPC controls on the rig daemon: a non-operator caller
+    // and a read-scope-only envelope are refused before the live pull. ----
+    let rig_shared = rig.store();
+    let nonop = rig.rpc_as(
+        Asserted::Agent("writer".into()),
+        "platform_assistant_provision",
+        json!({"member_envelope": http_fx.envelope("sub-httpok", json!({}), json!({})),
+               "operation": "assist_state"}),
+    );
+    assert!(
+        nonop.is_err(),
+        "an agent caller reached platform_assistant_provision: {nonop:?}"
+    );
+    let readonly = http_fx.envelope("sub-httpok", json!({}), json!({"scope": ["assist.read"]}));
+    let e = err_text(
+        rig.rpc_as(
+            Asserted::Operator,
+            "platform_assistant_provision",
+            json!({"member_envelope": readonly, "operation": "assist_send"}),
+        ),
+        "read-scope projection of a write operation",
+    );
+    assert!(
+        e.contains("scope") || e.contains("refused") || e.contains("assist."),
+        "a read-scope projection of assist_send refused for another reason: {e}"
+    );
+    let _ = rig_shared;
 }

@@ -522,12 +522,20 @@ impl Shared {
                     let prompt = if nudge {
                         message.body.clone()
                     } else {
-                        self.continuity_prompt_slotted(
+                        let body = self.continuity_prompt_slotted(
                             alias,
                             &agent.endpoint_kind,
                             &message,
                             slot.as_deref(),
-                        )
+                        );
+                        // CAD-1420: the stamped member's profile context is
+                        // appended AFTER the turn's own body, so the user's
+                        // request leads. An unreadable or unknown profile fails
+                        // the turn closed rather than sending a silent empty one.
+                        match self.member_profile_context(&message)? {
+                            Some(context) => format!("{body}\n\n{context}"),
+                            None => body,
+                        }
                     };
                     adapter.set_unclaimed_ok(message.is_routed() || nudge);
                     // CAD-520: a nudge may also enter through a busy

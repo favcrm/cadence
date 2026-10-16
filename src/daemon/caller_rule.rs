@@ -308,6 +308,15 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     // `member_as` to a stored assistant row on a proven operator/board
     // connection only (members_rpc::member_caller); a request field, an
     // agent connection or an unproven one never mints a member identity.
+    // CAD-1420: the dedicated platform-projection verb the assist relay
+    // calls before state/history/send. Same channel as the member plane —
+    // a proven operator/board connection plus a re-verified signed
+    // envelope (`proven_operator` inside the handler); an agent or
+    // unproven connection never projects a binding.
+    (
+        "platform_assistant_provision",
+        Rule::Handler("proven_operator + re-verified member envelope (CAD-1420)"),
+    ),
     ("member_assist_state", Rule::Handler("member_caller: member_as on a proven board relay only")),
     ("member_assist_history", Rule::Handler("member_caller: member_as on a proven board relay only")),
     ("member_assist_send", Rule::Handler("member_caller: member_as on a proven board relay only")),
