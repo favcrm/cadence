@@ -293,7 +293,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+        shard: [1, 2, 3, 4, 5, 6]
     steps:
       - name: Not applicable — rust PR feedback gate
         if: ${{ needs.change-scope.outputs.rust == 'false' }}
@@ -306,6 +306,12 @@ jobs:
         with:
           shared-key: gate-test
           save-if: false
+      # CAD-1480: 83 test binaries × N shards make linking the shard
+      # bottleneck; mold/lld halves it. Same enabling rule as build/ui —
+      # and cache-warm's test leg enables it too so fingerprints match.
+      - name: Enable fast linker (mold/lld; falls back to the default linker)
+        if: ${{ needs.change-scope.outputs.rust != 'false' }}
+        run: sh $GITHUB_WORKSPACE/scripts/ci-fast-linker enable
       # CAD-1124: no doctests exist; mandatory default-feature clippy and
       # build retain compilation coverage without a zero-test rebuild.
       # CAD-1090: every cargo test target (scripts/result-test-args), with
@@ -345,9 +351,9 @@ jobs:
               exit 1
             fi
             echo "Running narrowed integration selection: $(tr '\n' ' ' < "$selection")"
-            scripts/run-result-tests --test-selection "$selection" --partition "${{ matrix.shard }}/8" --jobs 4
+            scripts/run-result-tests --test-selection "$selection" --partition "${{ matrix.shard }}/6" --jobs 4
           else
-            scripts/run-result-tests --partition "${{ matrix.shard }}/8" --jobs 4
+            scripts/run-result-tests --partition "${{ matrix.shard }}/6" --jobs 4
           fi
       # Artifacts always land (even on a red shard) so the aggregate can
       # prove where coverage stopped. junit.xml is required; the shard
@@ -394,11 +400,15 @@ jobs:
         run: |
           set -euo pipefail
           files=(junits/*/junit.xml)
-          if [ "${#files[@]}" -ne 8 ]; then
-            echo "::error::expected 8 shard junit reports, found ${#files[@]}: ${files[*]:-none}" >&2
+          if [ "${#files[@]}" -ne 6 ]; then
+            echo "::error::expected 6 shard junit reports, found ${#files[@]}: ${files[*]:-none}" >&2
             exit 1
           fi
           invs=(junits/*/expected-targets.txt)
+          if [ "${#invs[@]}" -ne 6 ]; then
+            echo "::error::expected 6 shard inventories, found ${#invs[@]}: ${invs[*]:-none}" >&2
+            exit 1
+          fi
           first=${invs[0]}
           for f in "${invs[@]}"; do
             if ! cmp -s "$first" "$f"; then
@@ -587,8 +597,9 @@ jobs:
       # and no gate reads clippy objects from it.
       # CAD-1103: the gates' linker flag is part of the cargo fingerprint, so
       # the release leg warms the cache with the same flag the gates use.
-      - name: Enable fast linker (release leg; same flags as the gates)
-        if: matrix.profile == 'release'
+      # CAD-1480: test-shards enable it too, so the test leg must as well.
+      - name: Enable fast linker (test and release legs; same flags as the gates)
+        if: matrix.profile == 'test' || matrix.profile == 'release'
         run: sh $GITHUB_WORKSPACE/scripts/ci-fast-linker enable
       - name: Enable shared sccache (read-write; no-op without credentials)
         id: sccache

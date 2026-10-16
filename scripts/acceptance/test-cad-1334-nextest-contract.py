@@ -283,11 +283,21 @@ def main() -> None:
             check=False)
         if merged.returncode != 0:
             fail(f"merged shard junit failed the coverage guard:\n{merged.stdout}")
-        for bad in ("0/2", "3/2", "2/0", "x/y", "1"):
+        # Malformed K/N refuses before any test — including the empty
+        # string (a no-op partition is never an unpartitioned run), a
+        # repeat flag, and oversized decimals that must not reach bash
+        # arithmetic.
+        for bad in ("0/2", "3/2", "2/0", "x/y", "1", "",
+                    "1/99999999999999999999"):
             refused = invoke(manifest, temp, nextest,
                              extra_args=["--partition", bad])
             if refused.returncode == 0:
                 fail(f"runner accepted malformed --partition {bad!r}")
+        for dup in (["--partition", "1/2", "--partition", "2/2"],
+                    ["--jobs", "2", "--jobs", "4"]):
+            refused = invoke(manifest, temp, nextest, extra_args=dup)
+            if refused.returncode == 0:
+                fail(f"runner accepted repeated flag {dup!r}")
 
     print("CAD-1334 nextest runner acceptance passed")
 

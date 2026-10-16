@@ -46,6 +46,8 @@ selection_file=
 partition=
 jobs=2
 runner_args=("$@")
+partition_seen=0
+jobs_seen=0
 while [ "$#" -gt 0 ]; do
   case $1 in
     --manifest-path|--test-selection|--partition|--jobs)
@@ -56,8 +58,13 @@ while [ "$#" -gt 0 ]; do
       case $1 in
         --manifest-path) manifest_path=$2 ;;
         --test-selection) selection_file=$2 ;;
-        --partition) partition=$2 ;;
-        --jobs) jobs=$2 ;;
+        --partition)
+          # repeat or empty flag is never a silent no-op
+          [ "$partition_seen" -eq 0 ] || { echo "::error::--partition given twice" >&2; exit 2; }
+          partition_seen=1; partition=$2 ;;
+        --jobs)
+          [ "$jobs_seen" -eq 0 ] || { echo "::error::--jobs given twice" >&2; exit 2; }
+          jobs_seen=1; jobs=$2 ;;
       esac
       shift 2 ;;
     *)
@@ -65,23 +72,24 @@ while [ "$#" -gt 0 ]; do
       exit 2 ;;
   esac
 done
-if [ -n "$partition" ]; then
+if [ "$partition_seen" -eq 1 ]; then
   # CAD-1480: CI shards split the whole selected suite with nextest's
   # deterministic test-name hash partition. Only the strict K/N shape
-  # reaches nextest — never a raw caller string — and the shard index
-  # must stay inside 1..N.
-  if ! [[ $partition =~ ^([0-9]+)/([0-9]+)$ ]]; then
+  # reaches nextest — never a raw caller string — the shard index must
+  # stay inside 1..N, and the length cap keeps oversized decimals out of
+  # arithmetic (bash -gt would misread or overflow them).
+  if ! [[ $partition =~ ^([0-9]{1,3})/([0-9]{1,3})$ ]]; then
     echo "::error::--partition wants K/N (e.g. 2/6), got: $partition" >&2
     exit 2
   fi
-  part_k=${BASH_REMATCH[1]}
-  part_n=${BASH_REMATCH[2]}
+  part_k=$((10#${BASH_REMATCH[1]}))
+  part_n=$((10#${BASH_REMATCH[2]}))
   if [ "$part_n" -lt 1 ] || [ "$part_k" -lt 1 ] || [ "$part_k" -gt "$part_n" ]; then
     echo "::error::--partition $partition is outside 1..N" >&2
     exit 2
   fi
 fi
-if ! [[ $jobs =~ ^[0-9]+$ ]] || [ "$jobs" -lt 1 ] || [ "$jobs" -gt 16 ]; then
+if ! [[ $jobs =~ ^[0-9]{1,2}$ ]] || [ "$((10#$jobs))" -lt 1 ] || [ "$((10#$jobs))" -gt 16 ]; then
   echo "::error::--jobs wants an integer in 1..16, got: $jobs" >&2
   exit 2
 fi

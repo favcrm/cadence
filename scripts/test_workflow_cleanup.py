@@ -133,6 +133,10 @@ class CleanupTests(unittest.TestCase):
         self.assertIn("download-artifact", agg)
         self.assertIn("check-test-junit.py", agg)
         self.assertIn("--targets-file", agg)
+        # CAD-1480: a shard that skips its junit OR its inventory fails
+        # here — both artifact counts are pinned to the matrix size.
+        self.assertIn("expected 6 shard junit", agg)
+        self.assertIn("expected 6 shard inventories", agg)
         shards = job(ci, "test-shards")
         # CAD-1124: retiring the empty doctest invocation must retain BOTH
         # default-feature compilation gates, not just feature-on tests.
@@ -182,6 +186,19 @@ class CleanupTests(unittest.TestCase):
                        'XDG_CONFIG_HOME=', 'CARGO_BUILD_TARGET_DIR',
                        'unset CARGO_TARGET_DIR'):
             self.assertIn(needle, runner)
+        # CAD-1480: shard partitions are hash-strict — an empty, repeated
+        # or oversized argument must refuse before touching nextest.
+        for needle in ('partition_seen', 'jobs_seen',
+                       '--partition given twice', '--jobs given twice',
+                       '[0-9]{1,3})/([0-9]{1,3}', '10#${BASH_REMATCH[1]}',
+                       '[0-9]{1,2}$', '10#$jobs'):
+            self.assertIn(needle, runner)
+        # CAD-1480: shards and the warm test leg link through mold/lld —
+        # the fingerprint must match or the warm cache is dead weight.
+        self.assertIn("ci-fast-linker enable", shards)
+        warm = job(ci, "cache-warm")
+        self.assertIn("ci-fast-linker enable", warm)
+        self.assertIn("matrix.profile == 'test' || matrix.profile == 'release'", warm)
         junit = (ROOT / "scripts/check-test-junit.py").read_text()
         for needle in ('no runnable tests', 'findall(".//testsuite")',
                        'failure', '--targets-file', 'skipped'):
