@@ -84,6 +84,8 @@ mod cad1415_app_actions_acceptance;
 mod cad1440_media_only_context_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1473_host_redispatch;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad1473_independent_redispatch;
 mod caller_rule;
 #[cfg(all(test, feature = "test-seam"))]
 mod campaign_clone_acceptance;
