@@ -223,7 +223,12 @@ fn daemon_scope(state_dir: &Path, cli_home: &Path) -> Value {
 }
 
 enum ScopeHome {
+    // Only Linux can read another process's account and home. On other
+    // targets `same_scope_home` always returns `Unreadable`, so these
+    // variants exist for the shared match and are never constructed.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Same(PathBuf),
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     OtherAccount,
     Unreadable,
 }
