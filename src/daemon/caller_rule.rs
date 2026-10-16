@@ -1237,6 +1237,10 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         Rule::Handler("wiki_caller: agent_caller + wiki_as (CAD-580)"),
     ),
     (
+        "wiki_transfer",
+        Rule::Handler("wiki_caller + transfer owner/target/authority binding (CAD-914)"),
+    ),
+    (
         "wiki_mkdir",
         Rule::Handler("wiki_caller: agent_caller + wiki_as (CAD-580)"),
     ),

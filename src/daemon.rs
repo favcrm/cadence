@@ -1043,6 +1043,11 @@ impl Shared {
         // events or relaunch effects, and in manual mode those rows stay
         // inert until the operator leaves the fence, so none of them run.
         if !shared.execution_mode.fenced() {
+            // Transfer completion is durable; its cache wake is not. Recover
+            // only the derived index request, never replay publication.
+            if shared.store.wiki_transfer_index_recovery_needed()? {
+                shared.wiki_index.kick();
+            }
             // CAD-230b: a runner in flight when the last daemon stopped is
             // `unknown` and incomplete — reported, never relaunched.
             for r in crate::runner::recover(state_dir, epoch_secs()) {
@@ -3048,6 +3053,7 @@ impl Shared {
             "wiki_read" => self.rpc_wiki_read(params, peer_pid),
             "wiki_write" => self.rpc_wiki_write(params, peer_pid),
             "wiki_put_blob" => self.rpc_wiki_put_blob(params, peer_pid),
+            "wiki_transfer" => self.rpc_wiki_transfer(params, peer_pid),
             "wiki_mkdir" => self.rpc_wiki_mkdir(params, peer_pid),
             "wiki_mv" => self.rpc_wiki_mv(params, peer_pid),
             "wiki_rm" => self.rpc_wiki_rm(params, peer_pid),

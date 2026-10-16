@@ -690,11 +690,6 @@
             // The migrated store keeps its pre-v18 rows.
             assert!(s.agent("a1").unwrap().alias == "a1");
         }
-        assert_eq!(
-            crate::rollout::SCHEMA_VERSION,
-            48,
-            "bump? pin the new version and add its migration test"
-        );
         // Half-applied: one table present, version rolled back — the
         // reopen converges.
         Connection::open(&db)
@@ -708,6 +703,39 @@
             let _ = Store::open_for_schema_tests(&db).unwrap();
         }
         assert!(has(&db, "platform_drafts"));
+    }
+
+    #[test]
+    fn migration_v48_to_v49_keeps_assistant_binding_and_bootstrap() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("t.sqlite3");
+        let before = {
+            let store = Store::open(&db).unwrap();
+            store.assistant_bind("org1", "sub1", "assistant-1", "alias-1", Some("rev-1")).unwrap();
+            store.assistant_set_conversation("org1", "sub1", "conversation-1").unwrap();
+            store.assistant_binding("org1", "sub1").unwrap().unwrap()
+        };
+        Connection::open(&db).unwrap().execute_batch(
+            "DROP TABLE wiki_transfer_entries;
+             DROP TABLE wiki_transfer_jobs;
+             UPDATE schema_version SET version=48;"
+        ).unwrap();
+        for _ in 0..2 {
+            let store = Store::open_for_schema_tests(&db).unwrap();
+            let after = store.assistant_binding("org1", "sub1").unwrap().unwrap();
+            assert_eq!(after.assistant_id, before.assistant_id);
+            assert_eq!(after.alias, before.alias);
+            assert_eq!(after.authority_rev, before.authority_rev);
+            assert_eq!(after.conversation_id, before.conversation_id);
+            assert_eq!(after.bootstrap_state, before.bootstrap_state);
+            assert_eq!(after.bootstrap_template_version, before.bootstrap_template_version);
+            assert_eq!(after.bootstrap_revision, before.bootstrap_revision);
+            assert_eq!(after.created, before.created);
+            let actual: i64 = store.conn().query_row(
+                "SELECT version FROM schema_version", [], |r| r.get(0)
+            ).unwrap();
+            assert_eq!(actual, crate::rollout::SCHEMA_VERSION);
+        }
     }
 
     /// CAD-1420: v48 adds the bootstrap lifecycle columns to the
@@ -1776,7 +1804,7 @@
         assert!(columns("app_media_assets").is_empty());
         {
             let s = Store::open_for_schema_tests(&db).unwrap();
-            assert_eq!(version(), 48);
+            assert_eq!(version(), crate::rollout::SCHEMA_VERSION);
             assert_eq!(
                 columns("app_media_assets"),
                 ["id", "install_id", "title", "kind", "lifecycle", "revision", "creator", "created", "updated"]
@@ -1792,7 +1820,7 @@
         {
             Store::open_for_schema_tests(&db).unwrap();
         }
-        assert_eq!(version(), 48);
+        assert_eq!(version(), crate::rollout::SCHEMA_VERSION);
     }
 
     #[test]

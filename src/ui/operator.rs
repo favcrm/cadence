@@ -557,6 +557,7 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     // attributed agent) writes, and the daemon's per-prefix allowlist
     // decides where. The board relays; it never widens a caller.
     route("PUT", "/api/wiki/file", RouteClass::AgentAllowed),
+    route("PUT", "/api/wiki/transfer", RouteClass::AgentAllowed),
     route("POST", "/api/wiki/upload", RouteClass::AgentAllowed),
     route("POST", "/api/wiki/mkdir", RouteClass::AgentAllowed),
     route("POST", "/api/wiki/mv", RouteClass::AgentAllowed),
@@ -634,6 +635,12 @@ pub(super) fn admit(
     state_dir: &std::path::Path,
     opts: &ServeOpts,
 ) -> Result<Option<Caller>, HttpResp> {
+    // Transfer status/export is a bounded authenticated read carried by POST.
+    // Keep the browser origin guard, without requiring write capability.
+    if method == "POST" && path == "/api/wiki/job_status" {
+        write_guard(request, "application/json", opts)?;
+        return board_caller(request, state_dir, opts, false, None).map(Some);
+    }
     let class = route_class(method, path);
     if matches!(
         class,

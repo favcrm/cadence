@@ -52,6 +52,8 @@ pub mod cli;
 pub mod envelope;
 pub mod index;
 pub mod ingest;
+pub mod transfer;
+pub mod transfer_client;
 pub mod upload;
 
 /// `if_rev` value meaning "the page does not exist yet" — a
@@ -432,7 +434,7 @@ fn rev_of(abs: &Path) -> Result<String> {
     }
 }
 
-fn rev_bytes(bytes: &[u8]) -> String {
+pub(crate) fn rev_bytes(bytes: &[u8]) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in bytes {
         h ^= u64::from(*b);

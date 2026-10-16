@@ -289,12 +289,11 @@ pub(super) fn write(
 ) -> HttpResp {
     let (state_dir, pm_dir) = dirs;
     let wiki_as = wiki_as(caller);
-    // CAD-1374: every write attaches the server-held public session
-    // bearer (or refuses 401 on a public host with none) before any staging
-    // or RPC. Reads never reach this function.
+    // Attach the server-held session to writes and caller-owned transfer reads.
+    // Neither a caller-selected identity nor an absent public proof is relayed.
     let proof = match relay_proof {
         operator::PublicRelay::Missing => {
-            return err_response(401, "board session required for this write");
+            return err_response(401, "board session required for this request");
         }
         operator::PublicRelay::NotPublic => None,
         operator::PublicRelay::Proven(p) => Some(p.token().to_string()),
@@ -306,6 +305,20 @@ pub(super) fn write(
         params
     };
     match (tail, method) {
+        ("transfer", Method::Put) | ("job_status", Method::Post) => {
+            let body = match read_body(request, JSON_CAP) {
+                Ok(body) => body,
+                Err(resp) => return resp,
+            };
+            let body: Value = match parse_json(&body) {
+                Ok(body) => body,
+                Err(resp) => return resp,
+            };
+            match transfer_params(&body, tail == "transfer") {
+                Ok(params) => relay(state_dir, "wiki_transfer", with_proof(params), &wiki_as),
+                Err(resp) => resp,
+            }
+        }
         ("file", Method::Put) => {
             let body = match read_body(request, JSON_CAP) {
                 Ok(b) => b,
@@ -370,9 +383,123 @@ pub(super) fn write(
             }
         }
         ("upload", Method::Post) => upload(request, query, state_dir, pm_dir, &wiki_as, proof),
-        ("file" | "upload" | "mkdir" | "mv" | "rm", _) => err_response(405, "method not allowed"),
+        ("file" | "upload" | "mkdir" | "mv" | "rm" | "transfer" | "job_status", _) => {
+            err_response(405, "method not allowed")
+        }
         _ => err_response(404, "no such wiki write route"),
     }
+}
+
+/// Parse the bounded transfer transport, never a caller-selected RPC method or
+/// authority relay. Both browser and signed-envelope adapters use this check.
+pub(super) fn transfer_params(body: &Value, writing: bool) -> Result<Value, HttpResp> {
+    let Some(outer) = body.as_object() else {
+        return Err(err_response(400, "wiki transfer needs an object"));
+    };
+    if outer
+        .keys()
+        .any(|key| !matches!(key.as_str(), "path" | "transfer"))
+    {
+        return Err(err_response(400, "wiki transfer has unsupported fields"));
+    }
+    let Some(path) = body["path"].as_str() else {
+        return Err(err_response(400, "wiki transfer needs a path"));
+    };
+    if path.is_empty()
+        || path.len() > 512
+        || !crate::wiki::normalize(path).is_ok_and(|normalized| normalized == path)
+    {
+        return Err(err_response(400, "wiki transfer path must be canonical"));
+    }
+    let Some(transfer) = body["transfer"].as_object() else {
+        return Err(err_response(
+            400,
+            "wiki transfer needs an explicit operation",
+        ));
+    };
+    if transfer.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "op" | "manifest"
+                | "job_id"
+                | "root"
+                | "entry_id"
+                | "offset"
+                | "data_base64"
+                | "limit"
+                | "path"
+                | "bytes"
+                | "rev"
+        )
+    }) {
+        return Err(err_response(
+            400,
+            "wiki transfer operation has unsupported fields",
+        ));
+    }
+    let op = transfer
+        .get("op")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !(if writing {
+        matches!(op, "begin" | "chunk" | "apply" | "finish")
+    } else {
+        matches!(op, "status" | "export")
+    }) {
+        return Err(err_response(
+            400,
+            "wiki transfer operation does not match this route",
+        ));
+    }
+    for key in ["root", "path"] {
+        if transfer
+            .get(key)
+            .is_some_and(|value| value.as_str() != Some(path))
+        {
+            return Err(err_response(
+                400,
+                "wiki transfer target does not match the route path",
+            ));
+        }
+    }
+    if op == "begin" {
+        let manifest = &body["transfer"]["manifest"];
+        if manifest["root"].as_str() != Some(path) {
+            return Err(err_response(
+                400,
+                "wiki transfer manifest root does not match the route",
+            ));
+        }
+        let Some(entries) = manifest["entries"]
+            .as_array()
+            .filter(|entries| entries.len() <= 256)
+        else {
+            return Err(err_response(400, "wiki transfer needs a bounded manifest"));
+        };
+        for entry in entries {
+            let Some(relative) = entry["path"].as_str() else {
+                return Err(err_response(
+                    400,
+                    "wiki transfer entry needs a relative path",
+                ));
+            };
+            if relative.is_empty()
+                || relative.len() > 512
+                || !crate::wiki::normalize(relative).is_ok_and(|normalized| normalized == relative)
+            {
+                return Err(err_response(
+                    400,
+                    "wiki transfer entry path must be canonical",
+                ));
+            }
+        }
+    }
+    let mut params = Value::Object(transfer.clone());
+    params["root"] = json!(path);
+    if op == "export" {
+        params["path"] = json!(path);
+    }
+    Ok(params)
 }
 
 /// `POST /api/wiki/upload?path=` — a multipart body whose single file

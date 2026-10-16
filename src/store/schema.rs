@@ -1338,6 +1338,14 @@ impl Store {
                 tx.execute("UPDATE schema_version SET version=48", [])?;
                 tx.commit()?;
             }
+            if version < 49 {
+                // CAD-914: resumable wiki transfer jobs and per-entry progress.
+                // New tables only; v48 assistant bootstrap remains unchanged.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(super::wiki_transfers::SCHEMA)?;
+                tx.execute("UPDATE schema_version SET version=49", [])?;
+                tx.commit()?;
+            }
             if let Some(crossing) = permit.crossing {
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 Self::event(
