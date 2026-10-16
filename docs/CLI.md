@@ -158,3 +158,36 @@ and scripts. Prefer `cadence update`; it does their steps in order.
 - `cadence upgrade --sha <sha> | --latest-main [--dry-run] [--restart]`: the
   low-level verified install that `update` calls. `--allow-unattested` rolls
   back to a hand-built release already on disk.
+
+## Finding a command
+
+`cadence commands` and `cadence schema` are offline. They do not open a
+daemon, tracker, login, or organization, and they do not authorize the
+command they describe. The live parser and handler stay authoritative.
+Neither command reads credentials or defaults, and neither has a `--json`
+flag: stdout is one JSON object.
+
+```
+cadence commands                         # core verbs
+cadence commands "comment issue"         # at most five paths
+cadence commands "issue comment" --limit 20
+cadence commands --all                   # every public path
+cadence schema issue comment
+cadence schema agent wait
+```
+
+`commands` with a query returns `{schema_version, commands, total, truncated}`.
+Each hit has `path`, `aliases`, and `summary`. No match exits 0 with an
+empty `commands` array. `--limit` is 1–20 and needs a query. `--all`
+conflicts with a query and with `--limit`. A bad combination exits 2 with
+the usual usage error on stderr.
+
+`schema` returns `{schema_version, path, usage, description, aliases, arguments}`
+for that one path. Argument entries are parser metadata (identifier,
+spelling, aliases, required, arity, action, possible values, help), not
+default values. A public alias resolves to the canonical path. An unknown
+or hidden path exits 2 and writes nothing to stdout.
+
+These streams stay raw and are not part of discovery: inbox and events
+NDJSON, logs and content bytes, a bare `build-slot acquire` token, and
+`build-slot run` child stdout.

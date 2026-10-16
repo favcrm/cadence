@@ -1587,4 +1587,32 @@ pub(crate) enum Commands {
     /// Stdio MCP tools for a managed Codex endpoint.
     #[command(hide = true)]
     McpAgent,
+    /// Search public commands offline. JSON only. This describes syntax;
+    /// it does not grant permission to run a command.
+    #[command(name = "commands")]
+    Search {
+        /// Words to match against the path, aliases, and help. Omit to
+        /// list the core commands.
+        #[arg(value_name = "QUERY")]
+        query: Option<String>,
+        /// Maximum matches, 1–20. Requires a query.
+        #[arg(
+            long,
+            value_parser = clap::value_parser!(u8).range(1..=20),
+            requires = "query",
+            conflicts_with = "all"
+        )]
+        limit: Option<u8>,
+        /// Every public command path. Conflicts with a query and `--limit`.
+        #[arg(long, conflicts_with = "query")]
+        all: bool,
+    },
+    /// Show one public command's input syntax as JSON. The parser and
+    /// handler remain authoritative; this is not a permission or readiness schema.
+    Schema {
+        /// Canonical path or a public alias, one word per argument
+        /// (`schema issue comment`).
+        #[arg(required = true, num_args = 1.., value_name = "COMMAND_PATH")]
+        path: Vec<String>,
+    },
 }

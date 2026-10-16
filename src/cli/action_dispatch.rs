@@ -113,6 +113,13 @@ fn command_line_ids(m: &clap::ArgMatches) -> Vec<String> {
 }
 
 pub(super) fn run_cli(cli: Cli) -> Result<i32> {
+    // Offline syntax discovery: no org, state, tracker, login, or daemon.
+    if matches!(
+        cli.command,
+        Commands::Search { .. } | Commands::Schema { .. }
+    ) {
+        return discovery::run(&cli.command);
+    }
     let client_only = client_update::client_only_mode()?;
     // CAD-1437: a valid client-only receipt selects the public updater before
     // any org, credential, tracker or state work. Native-only options refuse.
@@ -947,5 +954,8 @@ pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
         Commands::LocalAgent { .. } => Err(Error::usage(
             "local-agent coordinates a hosted org with this machine. Select that org, or switch back from `--org local`. Nothing was claimed.",
         )),
+        Commands::Search { .. } | Commands::Schema { .. } => unreachable!(
+            "commands and schema return before state resolution"
+        ),
     }
 }

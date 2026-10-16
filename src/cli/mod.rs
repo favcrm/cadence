@@ -29,6 +29,7 @@ mod cursor;
 mod daemon;
 mod delivery;
 mod devin;
+mod discovery;
 mod dispatch;
 mod doctor;
 mod events;
