@@ -2241,6 +2241,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn normalize_and_tail_helpers() {
+        assert_eq!(normalize_screen("a b\n  c"), "abc");
+        assert_eq!(tail_chars("abcdef", 3), "def");
+        // n past the end saturates to the whole input.
+        assert_eq!(tail_chars("ab", 9), "ab");
+        // A wrapped body still matches its own tail slice.
+        let body = "alpha beta gamma delta omega";
+        let rendered = "alpha beta\n    gamma delta\n    omega";
+        let slice = normalize_screen(&tail_chars(body, 12));
+        assert!(normalize_screen(rendered).contains(&slice));
+    }
+
     /// CAD-282: Claude echoes the raw body in its input box but renders
     /// the submitted transcript copy as markdown, dropping backticks.
     /// Both echoes must match the same probe slice, or every body with
