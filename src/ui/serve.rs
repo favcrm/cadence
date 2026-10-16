@@ -74,13 +74,6 @@ pub(crate) fn err_response(code: u16, message: &str) -> Response<std::io::Cursor
 /// image CDNs; the client checks the same host families before rendering.
 pub(crate) const CSP: &str = "default-src 'self'; img-src 'self' data: https://cdninstagram.com https://*.cdninstagram.com https://fbcdn.net https://*.fbcdn.net; frame-src 'self' blob:; media-src 'self' blob:; font-src 'self' data:; style-src 'self' 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'";
 
-pub(crate) fn board_csp(catalog_origin: Option<&str>) -> String {
-    match catalog_origin {
-        Some(origin) => format!("{CSP}; connect-src 'self' {origin}"),
-        None => CSP.to_string(),
-    }
-}
-
 /// Every response gets nosniff + no-referrer; HTML additionally gets
 /// the CSP. Returns whether the response is HTML.
 ///
@@ -102,8 +95,7 @@ pub(crate) fn add_security_headers(resp: &mut Response<std::io::Cursor<Vec<u8>>>
     resp.add_header(Header::from_bytes("X-Content-Type-Options", "nosniff").unwrap());
     resp.add_header(Header::from_bytes("Referrer-Policy", "no-referrer").unwrap());
     if is_html && !has_csp {
-        let csp = board_csp(super::public_directory::catalog_origin().as_deref());
-        resp.add_header(Header::from_bytes("Content-Security-Policy", csp).unwrap());
+        resp.add_header(Header::from_bytes("Content-Security-Policy", CSP).unwrap());
     }
     is_html
 }
@@ -1122,15 +1114,32 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
         send(request, resp);
         return;
     }
+    // The browser must not be sent at the catalog origin. Loopback is this
+    // board's machine, which a tunneled viewer cannot reach.
+    if super::public_directory::is_public_catalog_route(&path) {
+        if !matches!(method, Method::Get | Method::Head) {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let resp = super::public_directory::proxy_public_catalog(&path, raw_query);
+        send(request, resp);
+        return;
+    }
 
     // Every private API read is admitted before dispatch, including future
     // routes and streams. Local bootstrap/static files are public. The
     // screen document instead owns a one-use, live-session-bound capability.
     let private_api = path.starts_with("/api/")
-        && !matches!(path.as_str(), "/api/meta" | "/api/health" | "/api/version" | "/api/public-directory-config")
+        && !matches!(
+            path.as_str(),
+            "/api/meta" | "/api/health" | "/api/version" | "/api/public-directory-config"
+        )
         && app_screens::frame_route(&path).is_none();
     let public_read = public_host
-        && !matches!(path.as_str(), "/api/health" | "/api/version" | "/api/public-directory-config")
+        && !matches!(
+            path.as_str(),
+            "/api/health" | "/api/version" | "/api/public-directory-config"
+        )
         && !super::public_directory::directory_surface(&path);
     let read_admission = if private_api || public_read {
         match operator::admit_read(&request, state_dir, opts) {

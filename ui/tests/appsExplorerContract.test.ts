@@ -63,8 +63,7 @@ globalThis.fetch = async (input: any, init?: any) => {
   if (path === "/api/app-favorites") return json(favorites);
   if (path === "/api/app-catalog") return json(catalog);
   if (path === "/api/app-requests") return json({ requests: [] });
-  if (path === "/api/public-directory-config") return json({ origin: "https://catalog.test" });
-  if (path === "/public/apps") return json({ ok: true, data: { apps: [{ id: "social-content", app: "social-content", title: "Social Content", summary: "Draft posts", version: "0.9.7", listing: { tagline: "Draft a reviewed caption", category: "marketing", tags: ["social", "instagram"], publisher: { name: "Cadence" }, about: "Social Content turns a real source into a reviewed caption.", can: ["Pull one public Instagram post"], setup: [{ slot: "source", label: "Public Instagram read", help: "Reads public profile." }], data: { stores: ["Caption drafts"], personal: false }, access_notes: { source: "Reads public profile." } }, digest: "sha256:" + "ab".repeat(32), installable: true }] } });
+  if (path === "/api/public-apps") return json({ ok: true, data: { apps: [{ id: "social-content", app: "social-content", title: "Social Content", summary: "Draft posts", version: "0.9.7", listing: { tagline: "Draft a reviewed caption", category: "marketing", tags: ["social", "instagram"], publisher: { name: "Cadence" }, about: "Social Content turns a real source into a reviewed caption.", can: ["Pull one public Instagram post"], setup: [{ slot: "source", label: "Public Instagram read", help: "Reads public profile." }], data: { stores: ["Caption drafts"], personal: false }, access_notes: { source: "Reads public profile." } }, digest: "sha256:" + "ab".repeat(32), installable: true }] } });
   throw new Error(`Unexpected request ${path}`);
 }
 function assert(value: unknown, what: string): asserts value {
@@ -132,6 +131,8 @@ async function main() {
     await flush();
     await flush();
     assert(!host.querySelector("a[href='https://app-v2.agenticos.hk/apps']"), "no platform Apps hand-off");
+    assert(!host.querySelector("select"), "category uses the board dropdown, not a native select");
+    assert(host.querySelector("[role='combobox']"), "category dropdown is present");
     assert(host.textContent?.includes("Social Content"), "published app is listed");
     assert(host.textContent?.includes("Draft a reviewed caption"), "real listing tagline renders");
     assert(host.textContent?.includes("Cadence"), "nested publisher.name renders");

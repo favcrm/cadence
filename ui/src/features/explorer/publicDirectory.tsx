@@ -1,9 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
 import Link from "../../ui/Link";
 import Button from "../../ui/Button";
+import Select from "../../ui/Select";
 import { useTranslate } from "../../lib/locale";
 import { sessionHeaders } from "../../lib/sessionKey";
 import { notifyAppsChanged } from "../workspace-apps/workspaceApps";
+import { useInstallations } from "../workspace-apps/useInstallations";
+import { installedAppHref } from "../apps/appViewModel";
 import type { Viewer } from "../projects/work";
 import "./explorer.css";
 
@@ -124,33 +127,28 @@ export function parsePublicList(body: unknown): PublicApp[] {
   return apps.map(parsePublicApp).filter((app): app is PublicApp => app !== null);
 }
 
-async function catalogOrigin(signal: AbortSignal): Promise<string> {
-  const response = await fetch("/api/public-directory-config", {
-    credentials: "same-origin",
-    cache: "no-store",
-    signal,
-    headers: { "X-Cadence-Board": "1" },
-  });
-  if (!response.ok) throw new Error("This host has no public app directory.");
-  const body = await response.json() as { origin?: unknown };
-  if (typeof body.origin !== "string" || !body.origin) throw new Error("This host has no public app directory.");
-  return body.origin.replace(/\/$/, "");
-}
-
-async function publicGet(url: string, signal: AbortSignal): Promise<Response> {
-  return fetch(url, { credentials: "omit", cache: "no-store", signal });
+async function boardGet(path: string, signal: AbortSignal): Promise<Response> {
+  try {
+    return await fetch(path, {
+      credentials: "same-origin",
+      cache: "no-store",
+      signal,
+      headers: { "X-Cadence-Board": "1" },
+    });
+  } catch (error) {
+    if (signal.aborted) throw error;
+    throw new Error("The public directory didn't load.");
+  }
 }
 
 export async function loadPublicApps(signal: AbortSignal): Promise<PublicApp[]> {
-  const origin = await catalogOrigin(signal);
-  const response = await publicGet(`${origin}/public/apps`, signal);
+  const response = await boardGet("/api/public-apps", signal);
   if (!response.ok) throw new Error("The public directory didn't load.");
   return parsePublicList(await response.json());
 }
 
 export async function loadPublicApp(id: string, signal: AbortSignal): Promise<PublicApp | null> {
-  const origin = await catalogOrigin(signal);
-  const response = await publicGet(`${origin}/public/apps/${encodeURIComponent(id)}`, signal);
+  const response = await boardGet(`/api/public-apps/${encodeURIComponent(id)}`, signal);
   if (response.status === 404) return null;
   if (!response.ok) throw new Error("The public app didn't load.");
   const body = await response.json() as { data?: { app?: unknown } };
@@ -163,9 +161,8 @@ function textField(row: Record<string, unknown>, key: string): string | null {
 
 /** Confirm, fetch the pinned release with credentials omitted, then the existing upload route. */
 export async function installPublicApp(app: PublicApp, signal: AbortSignal): Promise<InstallOutcome> {
-  const origin = await catalogOrigin(signal);
-  const release = await publicGet(
-    `${origin}/public/apps/${encodeURIComponent(app.id)}/release?digest=${encodeURIComponent(app.digest)}`,
+  const release = await boardGet(
+    `/api/public-apps/${encodeURIComponent(app.id)}/release?digest=${encodeURIComponent(app.digest)}`,
     signal,
   );
   if (signal.aborted) return { state: "cancelled" };
@@ -250,7 +247,7 @@ export function PublicDirectory({ viewer }: { viewer: Viewer }) {
   const [category, setCategory] = useState("all");
   const categories = useMemo(() => {
     const set = new Set((apps ?? []).map((app) => app.listing.category).filter((c): c is string => !!c));
-    return [...set];
+    return [...set].sort((a, b) => a.localeCompare(b));
   }, [apps]);
   const shown = (apps ?? []).filter((app) => {
     const hay = [
@@ -279,11 +276,24 @@ export function PublicDirectory({ viewer }: { viewer: Viewer }) {
       )}
       <div className="pubdir-tools">
         <input className="field" value={query} onChange={(e) => setQuery(e.target.value)} placeholder={t("Search apps")} aria-label={t("Search apps")} />
-        <select className="field" value={category} onChange={(e) => setCategory(e.target.value)} aria-label={t("Category")}>
-          <option value="all">{t("All categories")}</option>
-          {categories.map((item) => <option key={item} value={item}>{item}</option>)}
-        </select>
+        <div className="pubdir-category">
+          <Select
+            full
+            value={category}
+            onChange={setCategory}
+            aria-label={t("Category")}
+            options={[
+              { value: "all", label: t("All categories") },
+              ...categories.map((item) => ({ value: item, label: item })),
+            ]}
+          />
+        </div>
       </div>
+      {apps && !error && (
+        <p className="pubdir-count text-label text-ink-500">
+          {shown.length === 1 ? t("1 app") : t("{count} apps").replace("{count}", String(shown.length))}
+        </p>
+      )}
       {error && (
         <div className="err card px-4 py-3 mb-4 text-label" role="alert">
           {t(error)} <Button onClick={retry}>{t("Try again")}</Button>
@@ -294,16 +304,18 @@ export function PublicDirectory({ viewer }: { viewer: Viewer }) {
       <div className="pubdir-grid">
         {shown.map((app) => (
           <Link key={app.id} href={`/apps/catalog/${encodeURIComponent(app.id)}`} className="card pubdir-card">
-            <span className="pubdir-tile" aria-hidden="true">{app.title.slice(0, 1)}</span>
-            <span>
-              <strong>{app.title}</strong>
-              <small className="block text-ink-500">{app.listing.publisher ?? app.app}</small>
+            <span className="pubdir-head">
+              <span className="pubdir-tile" aria-hidden="true">{app.title.slice(0, 1)}</span>
+              <span className="pubdir-id">
+                <strong>{app.title}</strong>
+                <small>{app.listing.publisher ?? app.app}</small>
+              </span>
+              <span className="pubdir-ver">v{app.version}</span>
             </span>
             <span className="pubdir-summary">{app.listing.tagline ?? app.summary}</span>
             <span className="pubdir-meta">
               {app.listing.category && <span className="chip">{app.listing.category}</span>}
               {(app.listing.tags ?? []).map((tag) => <span key={tag} className="chip">{tag}</span>)}
-              <span className="pubdir-ver">v{app.version}</span>
             </span>
           </Link>
         ))}
@@ -319,6 +331,8 @@ export function PublicAppDetail({ id, viewer, onResolved }: { id: string; viewer
   const [confirming, setConfirming] = useState(false);
   const [phase, setPhase] = useState<"idle" | "working" | InstallOutcome>("idle");
   const [abort, setAbort] = useState<AbortController | null>(null);
+  const canInstall = viewer.operator === true && !viewer.readOnly;
+  const installedState = useInstallations(canInstall, id);
   useEffect(() => {
     const controller = new AbortController();
     setApp(undefined); setError(null); setPhase("idle"); setConfirming(false);
@@ -335,7 +349,6 @@ export function PublicAppDetail({ id, viewer, onResolved }: { id: string; viewer
       });
     return () => controller.abort();
   }, [id]);
-  const canInstall = viewer.operator === true && !viewer.readOnly;
   const run = () => {
     if (!app) return;
     const controller = new AbortController();
@@ -351,29 +364,43 @@ export function PublicAppDetail({ id, viewer, onResolved }: { id: string; viewer
   if (app === undefined) return <p className="text-label text-ink-400">{t("Loading…")}</p>;
   if (app === null) return null;
   const installed = phase !== "idle" && phase !== "working" && phase.state === "installed" ? phase : null;
+  const existing = (installedState.list ?? []).find((row) => row.removed == null && row.name === app.app) ?? null;
+  const openHref = existing ? installedAppHref(existing.name) : null;
   return (
     <article className="pubdir-detail" aria-label={app.title}>
-      <p className="text-label mb-2"><Link href="/apps/explore">{t("All published apps")}</Link></p>
+      <p className="text-label mb-4"><Link href="/apps/explore">{t("All published apps")}</Link></p>
       <div className="pubdir-split">
         <div>
-          <h2 className="text-section font-semibold text-ink-100">{app.title}</h2>
-          {app.listing.publisher && <p className="text-label text-ink-500 mb-2">by {app.listing.publisher}</p>}
-          <p className="text-secondary text-ink-300">{app.listing.description ?? app.summary}</p>
+          <header className="pubdir-hero">
+            <span className="pubdir-tile" aria-hidden="true">{app.title.slice(0, 1)}</span>
+            <div className="pubdir-id">
+              <h2 className="text-section font-semibold text-ink-100">{app.title}</h2>
+              {app.listing.publisher && <p className="text-label text-ink-500">by {app.listing.publisher}</p>}
+              <p className="pubdir-summary">{app.listing.tagline ?? app.summary}</p>
+              <span className="pubdir-meta">
+                {app.listing.category && <span className="chip">{app.listing.category}</span>}
+                {(app.listing.tags ?? []).map((tag) => <span key={tag} className="chip">{tag}</span>)}
+                <span className="pubdir-ver">v{app.version}</span>
+              </span>
+            </div>
+          </header>
+          <p className="pubdir-about text-secondary text-ink-300">{app.listing.description ?? app.summary}</p>
+          <div className="pubdir-sections">
           {app.listing.highlights && app.listing.highlights.length > 0 && (
-            <section className="mt-3">
-              <h3 className="text-label font-medium text-ink-200 mb-1">{t("What it can do")}</h3>
+            <section>
+              <h3 className="text-label font-medium text-ink-200">{t("What it can do")}</h3>
               <ul>{app.listing.highlights.map((item) => <li key={item}>{item}</li>)}</ul>
             </section>
           )}
           {app.listing.setup && app.listing.setup.length > 0 && (
-            <section className="mt-3">
-              <h3 className="text-label font-medium text-ink-200 mb-1">{t("What you approve")}</h3>
+            <section>
+              <h3 className="text-label font-medium text-ink-200">{t("What you approve")}</h3>
               <ul>{app.listing.setup.map((item) => <li key={item.slot}><b>{item.label}</b> — {item.help}</li>)}</ul>
             </section>
           )}
           {app.listing.stores && app.listing.stores.length > 0 && (
-            <section className="mt-3">
-              <h3 className="text-label font-medium text-ink-200 mb-1">{t("Your data")}</h3>
+            <section>
+              <h3 className="text-label font-medium text-ink-200">{t("Your data")}</h3>
               <ul>
                 {app.listing.stores.map((item) => <li key={item}>{item}</li>)}
                 {app.listing.personalData && <li><b>{t("Contains personal data.")}</b></li>}
@@ -381,19 +408,34 @@ export function PublicAppDetail({ id, viewer, onResolved }: { id: string; viewer
             </section>
           )}
           {app.listing.accessNotes && app.listing.accessNotes.length > 0 && (
-            <section className="mt-3">
-              <h3 className="text-label font-medium text-ink-200 mb-1">{t("Access notes")}</h3>
+            <section>
+              <h3 className="text-label font-medium text-ink-200">{t("Access notes")}</h3>
               <ul>{app.listing.accessNotes.map((item) => <li key={item}>{item}</li>)}</ul>
             </section>
           )}
+          </div>
         </div>
         <aside className="card pubdir-side">
           <dl className="pubdir-kv">
             <dt>{t("Version")}</dt><dd>{app.version}</dd>
             <dt>{t("Digest")}</dt><dd className="pubdir-digest">{app.digest}</dd>
           </dl>
-          {!canInstall && <p className="text-label text-ink-400" role="status">{t("You can browse. Installing needs the host operator.")}</p>}
-          {canInstall && phase === "idle" && (
+          {!canInstall && phase === "idle" && (
+            <>
+              <Button className="btn-primary" disabled>{t("Install")}</Button>
+              <p className="text-label text-ink-400" role="status">{t("This browser is not the host operator, so install stays off.")}</p>
+            </>
+          )}
+          {canInstall && installedState.loading && !existing && phase === "idle" && (
+            <p className="text-label text-ink-400" role="status">{t("Checking this board…")}</p>
+          )}
+          {existing && phase === "idle" && (
+            <p className="pubdir-installed" role="status">{t("Installed on this board.")} {existing.version}</p>
+          )}
+          {existing && openHref && phase === "idle" && (
+            <Button className="btn-primary" href={openHref}>{t("Open")}</Button>
+          )}
+          {canInstall && !existing && !installedState.loading && phase === "idle" && (
             <Button className="btn-primary" onClick={() => setConfirming(true)}>{t("Install")}</Button>
           )}
           {phase === "working" && (
