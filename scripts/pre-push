@@ -94,7 +94,9 @@ def contract_scripts(root):
     for m in re.finditer(pattern, fmt, re.M):
         command = shlex.split(m.group(1), comments=True)
         test_script = len(command) > 1 and re.fullmatch(
-            r"(?:scripts/test[-_][\w.-]+|tests/scripts/test_\w+\.py)", command[1])
+            r"(?:scripts/test[-_][\w.-]+|tests/scripts/test_\w+\.py|tests/cad\w*_[\w.-]*\.py)",
+            command[1],
+        )
         unittest = command[1:3] == ["-m", "unittest"]
         if (test_script or unittest) and command not in seen:
             seen.append(command)
