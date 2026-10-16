@@ -37,6 +37,10 @@ impl Fixture {
     }
 
     fn cli_env(&self, path: &str, args: &[&str]) -> Output {
+        self.cli_vars(path, &[], args)
+    }
+
+    fn cli_vars(&self, path: &str, extra: &[(&str, &str)], args: &[&str]) -> Output {
         let mut command = Command::new(BIN);
         command
             .env_clear()
@@ -56,6 +60,9 @@ impl Fixture {
                 self.root.path().join("locks/suite.lock"),
             )
             .stdin(Stdio::null());
+        for (key, value) in extra {
+            command.env(key, value);
+        }
         for key in ["CARGO_HOME", "RUSTUP_HOME"] {
             if let Some(value) = std::env::var_os(key) {
                 command.env(key, value);
@@ -371,19 +378,303 @@ fn update_check_and_status_leave_guidance_bytes_untouched() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
         if output.status.success() {
-            let body: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
-                panic!(
-                    "{args:?} stdout={}",
-                    String::from_utf8_lossy(&output.stdout)
-                )
-            });
+            let body: Value = serde_json::from_slice(&output.stdout)
+                .unwrap_or_else(|_| panic!("{args:?} stdout={stdout}"));
             assert_eq!(body["guidance"]["wrote"], false, "{args:?}");
             assert_eq!(
                 body["guidance"]["target_guidance"], "not-verified",
                 "{args:?}"
             );
             assert_eq!(body["guidance"]["live_session"], "not-checked", "{args:?}");
+        } else {
+            assert!(
+                stderr.contains("not authenticated")
+                    || stderr.contains("operator")
+                    || stderr.contains("gh"),
+                "{args:?} stderr={stderr}"
+            );
+            assert!(
+                !stdout.contains("guidance: current"),
+                "{args:?} claimed current guidance: {stdout}"
+            );
         }
     }
+}
+
+/// Disposable already-current `cadence update`: the real CLI, a real
+/// daemon on this build, and the release copy's own bytes. `gh` answers
+/// only the candidate lookup, because an unmerged build is not an
+/// attested production install. No production state, link, or home.
+#[cfg(feature = "test-seam")]
+#[test]
+fn already_current_update_repairs_guidance_without_restarting_the_daemon() {
+    let fixture = Fixture::new();
+    let path = format!(
+        "{}:/usr/bin:/bin",
+        fixture.root.path().join("gh-bin").display()
+    );
+    fs::create_dir(fixture.root.path().join("gh-bin")).unwrap();
+    let gh = fixture.root.path().join("gh-bin/gh");
+    fs::write(
+        &gh,
+        r#"#!/usr/bin/env python3
+import json, os, pathlib, sys
+args = sys.argv[1:]
+sha = os.environ["CANDIDATE_SHA"]
+def flag(name):
+    if name in args:
+        return args[args.index(name) + 1]
+    return None
+if args[:2] == ["auth", "status"]:
+    sys.exit(0)
+if args[:2] == ["run", "list"] and "staging.yml" in args:
+    json.dump([{
+        "databaseId": 4242, "attempt": 1, "headSha": sha, "headBranch": "main",
+        "event": "workflow_dispatch", "status": "completed", "conclusion": "success",
+    }], sys.stdout)
+    sys.exit(0)
+if args[:2] == ["run", "view"]:
+    json.dump({"jobs": [
+        {"name": "stage", "status": "completed", "conclusion": "success"},
+        {"name": "promote", "status": "completed", "conclusion": "success"},
+    ]}, sys.stdout)
+    sys.exit(0)
+if args[:2] == ["run", "download"]:
+    dest = pathlib.Path(flag("--dir"))
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / "production-candidate.json").write_text(json.dumps({
+        "schema": 1, "source_sha": sha, "ci_run_id": 4343, "ci_run_attempt": 1,
+        "sha256": "ab" * 32, "promotion_run_id": 4242, "promotion_run_attempt": 1,
+    }))
+    sys.exit(0)
+if args[:1] == ["api"] and args[1].endswith("/actions/runs/4343"):
+    json.dump({
+        "id": 4343, "run_attempt": 1, "head_sha": sha, "head_branch": "main",
+        "event": "push", "path": ".github/workflows/ci.yml",
+        "status": "completed", "conclusion": "success",
+        "repository": {"full_name": "favcrm/cadence"},
+        "head_repository": {"full_name": "favcrm/cadence"},
+    }, sys.stdout)
+    sys.exit(0)
+sys.stderr.write("unexpected gh: %s\n" % " ".join(args))
+sys.exit(1)
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let version = fixture.cli_env(&path, &["--version"]);
+    assert!(
+        version.status.success(),
+        "{}",
+        String::from_utf8_lossy(&version.stderr)
+    );
+    let sha = String::from_utf8_lossy(&version.stdout)
+        .trim()
+        .rsplit_once('+')
+        .unwrap()
+        .1
+        .to_string();
+    assert_eq!(sha.len(), 40, "{sha}");
+
+    let releases = fixture.root.path().join("releases");
+    let release_bin = releases.join(&sha).join("cadence");
+    fs::create_dir_all(release_bin.parent().unwrap()).unwrap();
+    fs::copy(BIN, &release_bin).unwrap();
+    fs::set_permissions(&release_bin, fs::Permissions::from_mode(0o755)).unwrap();
+    let link = fixture.root.path().join("link/cadence");
+    fs::create_dir_all(link.parent().unwrap()).unwrap();
+    symlink(&release_bin, &link).unwrap();
+
+    // The seam refuses a state dir that is not under the process temp
+    // root. This fixture's default TMPDIR is a sibling of `state`.
+    let temp_root = fixture
+        .root
+        .path()
+        .to_str()
+        .expect("fixture path is utf-8")
+        .to_string();
+    let seam = [
+        ("CADENCE_TEST_SEAM", "1"),
+        ("CANDIDATE_SHA", sha.as_str()),
+        ("TMPDIR", temp_root.as_str()),
+    ];
+    let started = fixture.cli_vars(&path, &seam, &["daemon", "start"]);
+    assert!(
+        started.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&started.stdout),
+        String::from_utf8_lossy(&started.stderr)
+    );
+    struct Stop<'a>(&'a Fixture, String);
+    impl Drop for Stop<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.cli_env(&self.1, &["daemon", "stop"]);
+        }
+    }
+    let _stop = Stop(&fixture, path.clone());
+    let mut daemon_up = false;
+    for _ in 0..50 {
+        let status = fixture.cli_vars(&path, &seam, &["daemon", "status"]);
+        if status.status.success() {
+            daemon_up = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(daemon_up, "daemon did not answer");
+
+    let reference = fixture
+        .home
+        .join(".agents/skills/company-outputs/references/document-design.md");
+    let original = fs::read(&reference).unwrap();
+    fs::write(&reference, "stale reference\n").unwrap();
+    let missing = fixture
+        .home
+        .join(".agents/skills/company-outputs/references/workflow.md");
+    fs::remove_file(&missing).unwrap();
+    let link_parent = fixture.home.join(".claude/skills");
+    fs::remove_file(link_parent.join("cadence")).unwrap();
+    symlink("/tmp/not-the-bundle", link_parent.join("cadence")).unwrap();
+
+    let update_env = [
+        ("CADENCE_TEST_SEAM", "1"),
+        ("CADENCE_TEST_AS", "operator"),
+        ("CANDIDATE_SHA", sha.as_str()),
+        ("TMPDIR", temp_root.as_str()),
+    ];
+    let args = [
+        "update",
+        "--json",
+        "--link",
+        link.to_str().unwrap(),
+        "--releases-dir",
+        releases.to_str().unwrap(),
+        "--repo",
+        "favcrm/cadence",
+    ];
+    let output = fixture.cli_vars(&path, &update_env, &args);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stdout={stdout} stderr={stderr}");
+    let body: Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|_| serde_json::from_str(stdout.lines().last().unwrap()).unwrap());
+    assert_eq!(body["check"]["up_to_date"], true, "{body}");
+    assert!(body["restart"].is_null(), "{body}");
+    assert_eq!(body["guidance"]["wrote"], true, "{body}");
+    assert_eq!(body["guidance"]["source"], "activated-binary", "{body}");
+    assert_eq!(body["guidance"]["activated_sha"], sha, "{body}");
+    assert_eq!(
+        body["guidance"]["daemon_restarted_for_skills"], false,
+        "{body}"
+    );
+    assert_eq!(body["guidance"]["live_session"], "not-checked", "{body}");
+    assert_eq!(fs::read(&reference).unwrap(), original);
+    assert!(missing.is_file());
+    assert_eq!(
+        fs::read_link(link_parent.join("cadence")).unwrap(),
+        fixture.home.join(".agents/skills/cadence")
+    );
+
+    let unchanged = fs::metadata(&reference).unwrap().modified().unwrap();
+    let second = fixture.cli_vars(&path, &update_env, &args);
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let again: Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(again["guidance"]["wrote"], false, "{again}");
+    assert!(again["restart"].is_null(), "{again}");
+    assert_eq!(
+        fs::metadata(&reference).unwrap().modified().unwrap(),
+        unchanged
+    );
+
+    fs::write(&reference, "check must not repair\n").unwrap();
+    let link_arg = link.to_str().unwrap();
+    let releases_arg = releases.to_str().unwrap();
+    let read_only_cases: [&[&str]; 2] = [
+        &[
+            "update",
+            "--check",
+            "--json",
+            "--link",
+            link_arg,
+            "--releases-dir",
+            releases_arg,
+            "--repo",
+            "favcrm/cadence",
+        ],
+        &[
+            "update",
+            "--json",
+            "status",
+            "--link",
+            link_arg,
+            "--releases-dir",
+            releases_arg,
+        ],
+    ];
+    for read_only in read_only_cases {
+        let output = fixture.cli_vars(&path, &update_env, &read_only);
+        assert!(
+            output.status.success(),
+            "{read_only:?} stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let body: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(body["guidance"]["wrote"], false, "{read_only:?} {body}");
+        assert_eq!(fs::read(&reference).unwrap(), b"check must not repair\n");
+    }
+
+    fs::set_permissions(&release_bin, fs::Permissions::from_mode(0o000)).unwrap();
+    let unavailable = fixture.cli_vars(&path, &update_env, &args);
+    fs::set_permissions(&release_bin, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        unavailable.status.success(),
+        "a guidance miss must not fail the already-current binary result: {}",
+        String::from_utf8_lossy(&unavailable.stderr)
+    );
+    let unavailable_body: Value = serde_json::from_slice(&unavailable.stdout).unwrap();
+    assert_eq!(unavailable_body["check"]["up_to_date"], true);
+    assert_eq!(
+        unavailable_body["guidance"]["wrote"], false,
+        "{unavailable_body}"
+    );
+    assert_eq!(
+        unavailable_body["guidance"]["guidance"], "not-checked",
+        "{unavailable_body}"
+    );
+    assert_eq!(fs::read(&reference).unwrap(), b"check must not repair\n");
+
+    let rollback = fixture.cli_vars(
+        &path,
+        &update_env,
+        &[
+            "update",
+            "--rollback",
+            "--json",
+            "--link",
+            link.to_str().unwrap(),
+            "--releases-dir",
+            releases.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        !rollback.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rollback.stdout)
+    );
+    let rollback_err = String::from_utf8_lossy(&rollback.stderr);
+    assert!(
+        rollback_err.contains("no previous release"),
+        "{rollback_err}"
+    );
+    assert_eq!(fs::read(&reference).unwrap(), b"check must not repair\n");
+    assert_eq!(fs::read_link(&link).unwrap(), release_bin);
 }
