@@ -2,8 +2,12 @@
 //!
 //! `/apps/explore` and `/apps/catalog/<id>` are answered before the board
 //! session gate. The browser talks only to this board. The board reads the
-//! configured catalog origin itself, with no cookies and no caller-chosen
-//! URL. Installing stays on the existing sign-in path.
+//! catalog itself, with no cookies and no caller-chosen URL. Installing stays
+//! on the existing sign-in path.
+//!
+//! The catalog is the board's own API, or a catalog the operator names. It is
+//! never the signed-in web app: this directory is public, so the app origin the
+//! worker hands the board for its own callbacks is deliberately not read here.
 
 use serde_json::Value;
 use tiny_http::{Header, Response, StatusCode};
@@ -25,26 +29,26 @@ fn reachable_catalog(raw: &str) -> bool {
         || raw.starts_with("http://localhost")
 }
 
-/// Hosted boards have no internet. When the issuer is exactly
-/// `http://api.internal`, that outbound handler is the catalog: the public
-/// app origin is not reachable from the container. Otherwise
-/// `AGENTICOS_BOARD_API_ORIGIN` wins, then an https issuer. Loopback http is
-/// admitted so a disposable rig can point at a local catalog.
-pub(super) fn catalog_origin_from(api: Option<&str>, issuer: Option<&str>) -> Option<String> {
-    let api = clean_origin(api);
+/// A hosted board has no internet: when the issuer is exactly
+/// `http://api.internal`, that outbound handler is the catalog. Otherwise the
+/// catalog is whatever `AGENTICOS_BOARD_CATALOG_ORIGIN` names — an operator's
+/// own API, or a loopback rig. `AGENTICOS_BOARD_API_ORIGIN` is the signed-in
+/// web app the worker hands the board for its own callbacks; it is not a
+/// catalog, and reading it here is what once pointed the public directory at
+/// the private app.
+pub(super) fn catalog_origin_from(catalog: Option<&str>, issuer: Option<&str>) -> Option<String> {
     let issuer = clean_origin(issuer);
     if issuer.as_deref() == Some("http://api.internal") {
         return issuer;
     }
-    if let Some(api) = api.as_deref().filter(|raw| reachable_catalog(raw)) {
-        return Some(api.to_string());
-    }
-    issuer.filter(|raw| reachable_catalog(raw))
+    clean_origin(catalog).filter(|raw| reachable_catalog(raw))
 }
 
 fn catalog_origin() -> Option<String> {
     catalog_origin_from(
-        std::env::var("AGENTICOS_BOARD_API_ORIGIN").ok().as_deref(),
+        std::env::var("AGENTICOS_BOARD_CATALOG_ORIGIN")
+            .ok()
+            .as_deref(),
         std::env::var("AGENTICOS_BOARD_ISSUER").ok().as_deref(),
     )
 }
@@ -567,23 +571,33 @@ mod tests {
     }
 
     #[test]
-    fn origin_rejects_arbitrary_urls() {
+    fn the_catalog_is_the_board_api_or_a_named_catalog_never_the_web_app() {
+        // A hosted board reads its own API, whatever else is set.
         assert_eq!(
-            catalog_origin_from(Some("https://app-v2.agenticos.hk/"), None).as_deref(),
-            Some("https://app-v2.agenticos.hk")
+            catalog_origin_from(None, Some("http://api.internal")).as_deref(),
+            Some("http://api.internal")
         );
         assert_eq!(
             catalog_origin_from(
-                Some("https://app-v2.agenticos.hk/"),
+                Some("https://api-v2.agenticos.hk"),
                 Some("http://api.internal"),
             )
             .as_deref(),
             Some("http://api.internal")
         );
+        // A rig or a self-hosted board names its own catalog.
         assert_eq!(
-            catalog_origin_from(None, Some("http://api.internal")).as_deref(),
-            Some("http://api.internal")
+            catalog_origin_from(Some("https://api-v2.agenticos.hk/"), None).as_deref(),
+            Some("https://api-v2.agenticos.hk")
         );
+        assert_eq!(
+            catalog_origin_from(Some("http://127.0.0.1:8812"), None).as_deref(),
+            Some("http://127.0.0.1:8812")
+        );
+        // The signed-in web app is not a catalog, and an issuer alone is not one.
+        assert!(catalog_origin_from(None, Some("https://app-v2.agenticos.hk")).is_none());
+        assert!(catalog_origin_from(None, Some("https://app-v2.agenticos.hk/")).is_none());
+        // Still refused: plain http off loopback, query strings, lookalike hosts.
         assert!(catalog_origin_from(Some("http://evil.example"), None).is_none());
         assert!(catalog_origin_from(Some("https://api.example/?x=1"), None).is_none());
         assert!(catalog_origin_from(None, Some("http://api.internal.evil")).is_none());
