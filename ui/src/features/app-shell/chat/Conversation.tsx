@@ -17,6 +17,20 @@ import { useQuery, useResource } from "../../../lib/useResource";
 import Link from "../../../ui/Link";
 import type { ThreadRef } from "../../../lib/types";
 import { MASTER } from "../../home/master";
+import { atTail, jumpLabel, tailTop } from "../../home/dock";
+import {
+  initialFollow,
+  motionBehavior,
+  onOperatorScrollUp,
+  onPill,
+  onScrollSettled,
+  onSend,
+  onTailChange,
+  onViewportScroll,
+  reducedMotion,
+  type Follow,
+  type ScrollKind,
+} from "../../home/scrollFollow";
 import { ThreadItemView, type Density } from "../../home/ThreadView";
 import {
   addPending,
@@ -351,12 +365,16 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   // via `before`, instead of silently clipping to the newest eight.
   const [limit, setLimit] = useState(APP_WINDOW);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
-  // Scroll-follow (mock behaviour 5): new content is followed only while
-  // the reader sits at the tail; scrolled up, a jump-to-latest pill
-  // appears instead of dragging them down.
+  // Scroll-follow (CAD-1533): the pane runs the same pin/release/settle
+  // model as Home — the shared predicates in features/home/scrollFollow
+  // and dock.ts — instead of its own key-only copy. New rows are followed
+  // while the reader sits at the tail; scrolled up, a counted jump pill
+  // appears instead of dragging them down, and growth (a reply that
+  // grows, a block below the list that shrinks the scroller) keeps the
+  // newest line in view instead of hiding it.
   const listRef = useRef<HTMLOListElement>(null);
-  const atTail = useRef(true);
-  const [jump, setJump] = useState(false);
+  const follow = useRef<Follow>(initialFollow());
+  const [unseen, setUnseen] = useState(0);
   // The last tail item seen: the jump pill is driven by a new tail
   // identity — history prepending above the window never raises it.
   const tailKey = useRef<string | null>(null);
@@ -479,8 +497,8 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     setCreating(false);
     setLimit(APP_WINDOW);
     setLoadingEarlier(false);
-    atTail.current = true;
-    setJump(false);
+    follow.current = initialFollow();
+    setUnseen(0);
     tailKey.current = null;
     anchorRef.current = null;
   }, [installId, convId, frameToken]);
@@ -511,12 +529,108 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   // `moreBefore` unknown (an old daemon) still lets the button try one
   // backward read; a false answers the listing is complete.
   const moreBefore = thread.data?.moreBefore !== false;
+  const scrollPanel = useCallback((kind: ScrollKind) => {
+    const el = listRef.current;
+    if (!el) return;
+    el.scrollTo({
+      top: tailTop(el.scrollHeight, el.clientHeight),
+      behavior: motionBehavior(reducedMotion(), kind),
+    });
+  }, []);
+  const applyFollow = useCallback((next: Follow) => {
+    const prev = follow.current.unseen;
+    follow.current = next;
+    if (next.unseen !== prev) setUnseen(next.unseen);
+  }, []);
+  // A send pins before the pending row paints (CAD-610's rule, shared
+  // with Home): the row that lands right after is then followed.
+  const engage = useCallback(() => {
+    const next = onSend(follow.current);
+    follow.current = next.state;
+    setUnseen(0);
+    scrollPanel(next.scroll);
+  }, [scrollPanel]);
   const onListScroll = () => {
     const el = listRef.current;
     if (!el) return;
-    atTail.current = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
-    if (atTail.current) setJump(false);
+    applyFollow(onViewportScroll(follow.current, atTail(el.scrollTop, el.scrollHeight, el.clientHeight)));
   };
+  // A gesture that moves the reader up releases the pin, so the rest of
+  // the turn cannot yank the view back down.
+  useEffect(() => {
+    const el = listRef.current;
+    if (!el) return;
+    const leave = () => {
+      if (!follow.current.programmatic) return;
+      const next = onOperatorScrollUp(follow.current);
+      if (next === follow.current) return;
+      applyFollow(next);
+      el.scrollTo({ top: el.scrollTop, behavior: "auto" });
+    };
+    const onWheel = (e: WheelEvent) => {
+      if (e.deltaY < 0) leave();
+    };
+    let touchY = 0;
+    const onTouchStart = (e: TouchEvent) => {
+      touchY = e.touches[0]?.clientY ?? 0;
+    };
+    const onTouchMove = (e: TouchEvent) => {
+      const y = e.touches[0]?.clientY ?? touchY;
+      if (y > touchY + 12) leave();
+      touchY = y;
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "ArrowUp" && e.key !== "PageUp" && e.key !== "Home") return;
+      const target = e.target;
+      if (target instanceof Element && target.closest("textarea, input, [contenteditable='true']")) return;
+      leave();
+    };
+    const onScrollEnd = () => {
+      const settled = onScrollSettled(
+        follow.current,
+        atTail(el.scrollTop, el.scrollHeight, el.clientHeight),
+      );
+      applyFollow(settled.state);
+      if (settled.scroll === "jump") scrollPanel("jump");
+    };
+    el.addEventListener("scrollend", onScrollEnd);
+    el.addEventListener("wheel", onWheel, { passive: true });
+    el.addEventListener("touchstart", onTouchStart, { passive: true });
+    el.addEventListener("touchmove", onTouchMove, { passive: true });
+    addEventListener("keydown", onKey);
+    return () => {
+      el.removeEventListener("scrollend", onScrollEnd);
+      el.removeEventListener("wheel", onWheel);
+      el.removeEventListener("touchstart", onTouchStart);
+      el.removeEventListener("touchmove", onTouchMove);
+      removeEventListener("keydown", onKey);
+    };
+  }, [applyFollow, scrollPanel]);
+  // Growth in place: a reply row that grows, a tool group opening, or one
+  // of the pane's own blocks below the list — the CSV import panel, a
+  // notice, the outbox block — shrinking this scroller. The pane had no
+  // observer at all, so those blocks used to leave the newest line
+  // hidden behind them (CAD-1533).
+  useEffect(() => {
+    const el = listRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    let lastHeight = el.scrollHeight;
+    let lastBox = el.clientHeight;
+    const ro = new ResizeObserver(() => {
+      const height = el.scrollHeight;
+      const box = el.clientHeight;
+      const grew = height > lastHeight || box < lastBox;
+      lastHeight = height;
+      lastBox = box;
+      if (!grew || follow.current.programmatic) return;
+      if (follow.current.pinned) scrollPanel("jump");
+    });
+    // The scroller's own box catches a sibling below it growing; each
+    // child catches content growing inside an unchanged row.
+    ro.observe(el);
+    for (const child of Array.from(el.children)) ro.observe(child);
+    return () => ro.disconnect();
+  }, [scrollPanel, items.length]);
   // Older history does not change the tail identity and must not be
   // advertised as a new message. Reader-anchor restoration remains a
   // separate installed-app QA requirement.
@@ -525,18 +639,20 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     if (!el) return;
     const tail = items[items.length - 1]?.key ?? null;
     if (tail === tailKey.current) return;
-    if (atTail.current || tailKey.current === null) {
-      el.scrollTop = el.scrollHeight;
-    } else {
-      setJump(true);
-    }
+    const first = tailKey.current === null;
     tailKey.current = tail;
-  }, [items]);
+    if (first) {
+      scrollPanel("jump");
+      return;
+    }
+    const next = onTailChange(follow.current, 1);
+    applyFollow(next.state);
+    if (next.scroll === "jump") scrollPanel("jump");
+  }, [items, applyFollow, scrollPanel]);
   const jumpToLatest = () => {
-    const el = listRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-    atTail.current = true;
-    setJump(false);
+    const next = onPill(follow.current);
+    applyFollow(next.state);
+    scrollPanel(next.scroll);
   };
   const canSend = viewer.operator === true && !viewer.readOnly && usable;
   const canCreate =
@@ -1317,9 +1433,9 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         ))}
       </ol>
       <AssistantOperations key={`${installId}\u0000${mode.contextId}`} installId={installId} contextId={mode.contextId} appPath={mode.appPath ?? null} canDecide={viewer.operator === true && !viewer.readOnly} />
-      {jump && (
+      {unseen > 0 && (
         <button type="button" className="lnk text-label app-chat-jump" onClick={jumpToLatest} data-jump-to-latest>
-          ↓ {t("New messages")}
+          ↓ {jumpLabel(unseen, t)}
         </button>
       )}
       {sendError && (
@@ -1455,6 +1571,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         blockedPlaceholder={binding.error ?? sendBlockedReason}
         storeKey={composerKey}
         onSend={({ body, refs, attachments, mediaRefs }) => send(body, refs, attachments, mediaRefs)}
+        onSubmitted={engage}
         onCommand={(name) => {
           if (name === "new" || name === "clear") startNew();
           else setComposerNotice({ key: 'Unsupported command "/{name}" — it was not sent', slots: { name } });
