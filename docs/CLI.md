@@ -194,10 +194,17 @@ NDJSON, logs and content bytes, a bare `build-slot acquire` token, and
 
 ## Observation output
 
-`status`, `overview`, and `build-slot status` print a table on a terminal.
-A pipe, `CADENCE_JSON=pretty` or `compact`, or an explicit `--json` prints
-the same payload as JSON. `--json` wins over `CADENCE_JSON=table`.
-`CADENCE_JSON=table` keeps the table when stdout is a pipe.
+`status`, `overview`, `memory ls`, and `build-slot status` print a table
+on a terminal. A pipe, `CADENCE_JSON=pretty` or `compact`, or an explicit
+`--json` prints the same payload as JSON. `--json` wins over
+`CADENCE_JSON=table`. `CADENCE_JSON=table` keeps the table when stdout
+is a pipe. Any other `CADENCE_JSON` value warns once on stderr and is
+ignored.
+
+`issue ls --fields` and `--summary`, and `--fields` on `issue epic ls`,
+`milestone ls`, and `memory ls`, follow that decision. They do not need
+a separate `--json` when stdout is already JSON, and they are refused
+on a table.
 
 With `--watch`, machine mode writes one compact JSON value per line and
 no terminal-control bytes, including when `CADENCE_JSON=pretty`. A
