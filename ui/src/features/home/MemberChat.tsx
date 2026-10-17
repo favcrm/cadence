@@ -6,7 +6,7 @@ import type { ThreadRef } from "../../lib/types";
 import SharedComposer from "../app-shell/chat/Composer";
 import Conversation from "../app-shell/chat/Conversation";
 import { tailTop } from "./dock";
-import { memberThreadStore, sendToAssistant } from "./memberThread";
+import { memberHistory, memberThreadStore, memberWrite, sendToAssistant } from "./memberThread";
 import { initialFollow, motionBehavior, onSend, type Follow } from "./scrollFollow";
 import {
   applyEarlier,
@@ -49,6 +49,15 @@ export default function MemberChat({
   const t = useTranslate();
   const store = memberThreadStore(scope);
   const thread = useResource(store);
+  // The member scope is never named in stream-resource invalidations
+  // (`memberThread` is not in RESOURCE_NAMES) and `useResource` only
+  // subscribes — so nothing else starts the first `loadThread`. This
+  // mount revalidate is the same stale-while-revalidate entry the
+  // Master thread's `useQuery` uses; without it the store stays
+  // `loading` forever and no history truth can ever record.
+  useEffect(() => {
+    void store.revalidate();
+  }, [store]);
   const [state, setState] = useState<{ ok: boolean; bootstrap?: string | null; conversation?: string | null } | null>(null);
   const [limit, setLimit] = useState(WINDOW);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
@@ -59,7 +68,14 @@ export default function MemberChat({
   const liveAfter = useRef<number>(0);
 
   const items = useMemo(() => threadItems(thread.data), [thread.data]);
-  const loaded = thread.data !== null;
+  // History truth is carried in the member payload (round 3): a
+  // `Resource.write` stamps ok/error=null/asOf on every optimistic
+  // mutation, so `data !== null`/`status` can never prove a read
+  // succeeded. `memberHistory` reads the payload's loader-stamped
+  // `history` metadata plus the Resource's own retained `error` — a
+  // genuine accepted refresh is the only thing that flips `loaded`.
+  const history = memberHistory(thread);
+  const loaded = history.loaded;
   const moreBefore = thread.data?.moreBefore === true;
 
   // The assistant's surface state once — the bound conversation and
@@ -129,13 +145,13 @@ export default function MemberChat({
     }
     const page = fetchEarlier(memberThreadReader(), data);
     if (!page) {
-      store.write((s) => ({ ...(s ?? data), moreBefore: false }));
+      memberWrite(store, (s) => ({ ...(s ?? data), moreBefore: false }));
       return;
     }
     setLoadingEarlier(true);
     void page
       .then((older) => {
-        store.write((s) => applyEarlier(s, older));
+        memberWrite(store, (s) => applyEarlier(s, older));
         setLimit((l) => l + WINDOW);
       })
       .catch(() => undefined)
@@ -149,15 +165,17 @@ export default function MemberChat({
     [scope, engage],
   );
   const onDiscard = useCallback(
-    (message: string) => store.write((s) => ({ ...(s ?? { exists: true, entries: [], pending: [] }), pending: (s?.pending ?? []).filter((p) => p.message !== message) })),
+    (message: string) => memberWrite(store, (s) => ({ ...(s ?? { exists: true, entries: [], pending: [] }), pending: (s?.pending ?? []).filter((p) => p.message !== message) })),
     [store],
   );
 
   const { shown, hidden } = useMemo(() => visibleWindow(items, limit), [items, limit]);
-  // A confirmed-empty greeting only when the read is live: a stale or
-  // failed history is unknown, never "empty", so the empty card waits
-  // for a successful refresh.
-  const empty = loaded && thread.status !== "stale" && items.length === 0;
+  // A confirmed-empty greeting only when a real history read succeeded
+  // and the last read was clean: a failed first read or a stale refresh
+  // is unknown history, never "empty" — the greeting waits for an
+  // actual successful refresh, and a pending send/discard cannot
+  // produce it.
+  const empty = loaded && history.error === undefined && items.length === 0;
 
   return (
     <main className="home-workspace px-4 lg:px-8 pt-5 pb-3 w-full min-w-0 flex-1 min-h-0 grid gap-5 grid-rows-[minmax(0,1fr)]">
@@ -174,19 +192,19 @@ export default function MemberChat({
             )}
           </div>
 
-          {thread.status === "failed" && (
+          {history.error?.kind === "failed" && (
             <div className="card px-3.5 py-3 mt-3 text-label text-fail break-words" role="alert">
-              {t("The thread could not be read —")} {thread.error}{" "}
+              {t("The thread could not be read —")} {history.error.text}{" "}
               <button className="lnk" onClick={() => void store.refresh()}>{t("Retry")}</button>
             </div>
           )}
-          {thread.status === "stale" && (
+          {history.error?.kind === "stale" && (
             <div className="card px-3.5 py-3 mt-3 text-label text-warn break-words" role="alert">
-              {t("The latest refresh failed — showing the last history it read.")} {thread.error}{" "}
+              {t("The latest refresh failed — showing the last history it read.")} {history.error.text}{" "}
               <button className="lnk" onClick={() => void store.refresh()}>{t("Retry")}</button>
             </div>
           )}
-          {!loaded && thread.status !== "failed" && (
+          {!loaded && history.error?.kind !== "failed" && (
             <p className="text-label text-ink-500 pt-3">{t("Reading the thread…")}</p>
           )}
 
