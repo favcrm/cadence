@@ -60,6 +60,7 @@ const BEARER_CAP: usize = 8192;
 pub enum Verb {
     // cli.read
     Status,
+    MyWork,
     AgentList,
     AgentShow,
     IssueLs,
@@ -90,6 +91,7 @@ impl Verb {
     pub fn of(segment: &str) -> Option<Verb> {
         Some(match segment {
             "status" => Verb::Status,
+            "my_work" => Verb::MyWork,
             "agent_list" => Verb::AgentList,
             "agent_show" => Verb::AgentShow,
             "issue_ls" => Verb::IssueLs,
@@ -109,6 +111,7 @@ impl Verb {
     pub fn scope(self) -> Scope {
         match self {
             Verb::Status
+            | Verb::MyWork
             | Verb::AgentList
             | Verb::AgentShow
             | Verb::IssueLs

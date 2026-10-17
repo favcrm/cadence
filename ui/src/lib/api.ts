@@ -303,6 +303,12 @@ function refusedUpload(body: unknown, status: number, statusText: string): { mes
   return { message: fallback, code: topCode };
 }
 
+export interface MyWorkPayload {
+  owner: string;
+  issues: IssueCard[];
+}
+
+
 export const api = {
   health: () => get<Health>("/api/health"),
   /** `withOperator` asks the server to run the operator proof (CAD-432) — once per page load.
@@ -311,6 +317,7 @@ export const api = {
   meta: (withOperator = false, signal?: AbortSignal) =>
     get<Meta>(withOperator ? "/api/meta?operator=1" : "/api/meta", signal),
   overview: () => get<Overview>("/api/overview"),
+  myWork: (signal?: AbortSignal) => get<MyWorkPayload>("/api/my-work", signal),
   projects: () => get<{ projects: Project[] }>("/api/projects"),
   projectContext: (project: string, role: ContextRole = "pm", expectedRevision?: string) => {
     const query = new URLSearchParams({ role });

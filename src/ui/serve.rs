@@ -20,7 +20,7 @@ use super::write_path::{
 use super::{
     app_assistant, app_audiences, app_chat, app_content, app_contexts, app_explorer, app_records,
     app_release, app_runs, app_screens, approvals, apps, assist_route, business_templates,
-    cli_route, connections, crm_send, delivery_sync, home, lane, locale, operator,
+    cli_route, connections, crm_send, delivery_sync, home, lane, locale, my_work, operator,
     platform_account, read_model, social_publish, stages, threads, topics, updates, wiki,
     wiki_envelope, work_conversations, workflows,
 };
@@ -1175,6 +1175,10 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
     };
 
     match path.as_str() {
+        "/api/my-work" => {
+            let response = my_work::get(&request, state_dir, pm_dir, opts, raw_query);
+            send(request, response);
+        }
         "/api/locale" => {
             let response = locale::get(&request, state_dir, opts);
             send(request, response);
