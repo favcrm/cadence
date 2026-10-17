@@ -1507,6 +1507,14 @@ jobs:
       vars.RELEASES_R2_BUCKET == 'agenticos-v2-release-artifacts'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    # CAD-1506: the release-store write credentials live in the
+    # `release-store` environment (branch policy: main and v* tags), not
+    # at repository scope. A repository secret is readable by any run from
+    # a branch of this repo, including a PR run of the PR's own code; the
+    # environment's branch policy keeps the key off PR refs. The
+    # environment has no required reviewers, so this adds no approval
+    # click: `release-publish` above stays the only gate on a tag.
+    environment: release-store
     permissions:
       contents: read
       actions: read
