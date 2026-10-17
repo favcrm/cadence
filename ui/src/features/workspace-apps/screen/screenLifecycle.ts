@@ -8,6 +8,22 @@ import { SlotController, type Planner, type SlotView } from "./screenSlot";
 /** Resolves one pushed asset ref to a downscaled `data:` URL, or `null`
  *  when it cannot be loaded now. Supplied by the board; never by the frame. */
 export type AssetLoader = (ref: string) => Promise<string | null>;
+
+export interface MediaChatAttachArgs {
+  asset_id: string;
+  expected_revision: number;
+}
+export interface MediaChatAttached {
+  asset_id: string;
+  revision: number;
+}
+
+/** Private host handoff: the frame cannot choose a conversation or supply a pin. */
+export type MediaChatAttach = (
+  args: MediaChatAttachArgs,
+  actionToken: string,
+  isCurrent: () => boolean,
+) => Promise<MediaChatAttached>;
 /** Most asset requests one frame may have outstanding (the package's
  *  per-mount budget); one more closes it. At most ASSET_PARALLEL load at once. */
 export const ASSET_QUEUE_MAX = 256;
@@ -17,7 +33,12 @@ const ASSET_PARALLEL = 4;
  *  (a non-operator view, a chat frame) the `call` and `slot` ops close the port. */
 export interface ScreenActions {
   /** Run a non-spending verb as the board's operator session. */
-  call(verb: CallVerb, args: Record<string, unknown>, ui: { showLink(url: string): void; actionToken?: string; signal?: AbortSignal }): Promise<ActionResult>;
+  call(verb: CallVerb, args: Record<string, unknown>, ui: {
+    showLink(url: string): void;
+    actionToken?: string;
+    signal?: AbortSignal;
+    attachMedia?: (args: MediaChatAttachArgs, actionToken: string) => Promise<MediaChatAttached>;
+  }): Promise<ActionResult>;
   /** Validate a spend verb, fetch what the host must check, and name the work. */
   planner: Planner;
   /** The host-drawn slot to show (or hide, `null`). */
@@ -83,7 +104,7 @@ export function parseMount(value: unknown, tag: string): MountReceipt | null {
     (media as Record<string, unknown>).contract === SCREEN_MEDIA_V1 &&
     Array.isArray((media as Record<string, unknown>).may) &&
     ((media as Record<string, unknown>).may as unknown[]).length >= 1 &&
-    ((media as Record<string, unknown>).may as unknown[]).length <= 2 &&
+    ((media as Record<string, unknown>).may as unknown[]).length <= 3 &&
     new Set((media as Record<string, unknown>).may as unknown[]).size === ((media as Record<string, unknown>).may as unknown[]).length &&
     ((media as Record<string, unknown>).may as unknown[]).every(m => isMediaVerb(m as string)));
   const action = v.action_token;
@@ -271,8 +292,9 @@ export class ScreenChannel extends FrameChannel {
         if (csv) this.csvBusy = false;
         if (this.closed) return;
         if (!result.ok) { reply({ v: 2, op: "reply", id: request.id, ok: false, refusal: result.refusal }); return; }
+        const previewBytes = request.verb === "media.read" && request.args.kind === "preview" ? 2 * 1024 * 1024 * 4 / 3 + 1024 : 0;
         const size = jsonBytes(result.data ?? null);
-        if (size > (this.records ? RECORD_REPLY_BYTES_MAX : REPLY_BYTES_MAX)) reply({ v: 2, op: "reply", id: request.id, ok: false, refusal: { code: "too_large", text: "That is too large to show." } });
+        if (size > Math.max(this.records ? RECORD_REPLY_BYTES_MAX : REPLY_BYTES_MAX, previewBytes)) reply({ v: 2, op: "reply", id: request.id, ok: false, refusal: { code: "too_large", text: "That is too large to show." } });
         else {
           this.rememberDraftAssetRefs(result.data,request.args);
           reply({ v: 2, op: "reply", id: request.id, ok: true, data: result.data ?? null });
@@ -421,7 +443,11 @@ export class ScreenChannel extends FrameChannel {
     // CAD-1365: `original_downloads` is host-derived the same way, and only for
     // a v2 child whose mount may read media. It grants nothing by itself.
     delete projection.original_downloads;
+    delete projection.media_previews;
+    delete projection.media_chat_references;
     if (this.shape === "v2" && this.originalDownloadAdmits() && projection.actions?.length) projection.original_downloads = 1;
+    if (this.shape === "v2" && this.mediaAdmits("media.read")) projection.media_previews = 1;
+    if (this.shape === "v2" && this.mediaAdmits("media.chat.attach")) projection.media_chat_references = 1;
     const push = shapeFor(this.records ? projection : this.withMediaVerbs(this.withToolAliases(projection)), this.shape);
     if (!push) { this.close(true); return; }
     this.refs = this.shape === "v2" ? pushedAssetRefs(push) : new Set();

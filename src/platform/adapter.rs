@@ -339,6 +339,17 @@ pub trait PlatformAdapter: Send + Sync {
         Err("provider does not support app capability price discovery".into())
     }
 
+    /// Image-to-image rate for a reference edit. The default stays on the
+    /// text-to-image quote so a provider that has not reviewed the variant
+    /// cannot silently bill the wrong slug.
+    fn quote_reference_app_capability(
+        &self,
+        credential: &[u8],
+        binding: &Value,
+    ) -> std::result::Result<super::AppCapabilityQuote, String> {
+        self.quote_app_capability(credential, binding)
+    }
+
     /// Translate trusted persisted text into the provider's exact input.
     /// Unsupported providers refuse; this does not stage or publish anything.
     fn prepare_app_text(

@@ -20,7 +20,8 @@ const CAD1365_S41_CHALLENGE: &[u8] = b"cad1365-s41";
 const CAD1365_S41_ATTEMPT: &str = "attempt-s41";
 
 /// A physical schema 46 store: notification and transfer tables removed,
-/// bootstrap columns removed, stamped 46. The three media tables stay present.
+/// bootstrap columns removed, schema-50 image lineage removed, stamped 46.
+/// The three CAD-1365 media tables stay present.
 fn cad1365_s41_physical46_fixture(dir: &TempDir) -> (std::path::PathBuf, Store) {
     let (db, store) = open_legacy(dir);
     {
@@ -35,6 +36,7 @@ fn cad1365_s41_physical46_fixture(dir: &TempDir) -> (std::path::PathBuf, Store) 
              DROP TABLE human_notification_prefs;
              DROP TABLE wiki_transfer_entries;
              DROP TABLE wiki_transfer_jobs;
+             DROP TABLE app_media_lineage;
              ALTER TABLE assistants DROP COLUMN bootstrap_state;
              ALTER TABLE assistants DROP COLUMN bootstrap_template_version;
              ALTER TABLE assistants DROP COLUMN bootstrap_revision;

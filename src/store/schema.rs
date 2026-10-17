@@ -1346,6 +1346,14 @@ impl Store {
                 tx.execute("UPDATE schema_version SET version=49", [])?;
                 tx.commit()?;
             }
+            if version < 50 {
+                // CAD-1482: retained image lineage; existing catalog and
+                // original provenance remain unchanged.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(super::app_media::SCHEMA_V50)?;
+                tx.execute("UPDATE schema_version SET version=50", [])?;
+                tx.commit()?;
+            }
             if let Some(crossing) = permit.crossing {
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 Self::event(

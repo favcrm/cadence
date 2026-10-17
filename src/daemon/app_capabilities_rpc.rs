@@ -16,14 +16,24 @@ pub(super) struct CapabilityQuoteRequest {
     adapter: Arc<dyn crate::platform::PlatformAdapter>,
     credential: Vec<u8>,
     binding: Value,
+    reference_edit: bool,
 }
 
 impl CapabilityQuoteRequest {
+    pub(super) fn reference_edit(mut self) -> Self {
+        self.reference_edit = true;
+        self
+    }
+
     pub(super) fn fetch(self) -> Result<crate::platform::AppCapabilityQuote> {
-        let quote = self
-            .adapter
-            .quote_app_capability(&self.credential, &self.binding)
-            .map_err(|error| Error::rejected(price_refusal(&error)))?;
+        let quote = if self.reference_edit {
+            self.adapter
+                .quote_reference_app_capability(&self.credential, &self.binding)
+        } else {
+            self.adapter
+                .quote_app_capability(&self.credential, &self.binding)
+        }
+        .map_err(|error| Error::rejected(price_refusal(&error)))?;
         if !quote.valid() {
             return Err(Error::rejected("bound capability price quote is invalid"));
         }
@@ -154,6 +164,7 @@ impl Shared {
             adapter: Arc::clone(adapter),
             credential,
             binding: serde_json::to_value(proof)?,
+            reference_edit: false,
         })
     }
 
@@ -338,9 +349,21 @@ impl Shared {
         if human.is_object() {
             self.fresh_run_human(human)?;
         }
-        // Human checks may perform network I/O: re-prove the exact native
-        // authority after them and before sending, without carrying guards out.
-        workspace::with_runtime_snapshot(&pm, install, |bundle, files| {
+        let reference = if proof.config["mapping"]["capability"] == "media.generate"
+            && proof.config["mapping"]["effect"] == "draft"
+            && super::app_runs_rpc::library_reference_inputs_value(&expected["snapshot"]["inputs"])
+        {
+            Some(self.library_reference_pin(&expected["snapshot"]["inputs"])?)
+        } else {
+            None
+        };
+        // Human checks may perform network I/O: re-prove receiver and, for a
+        // reference edit, the original pin plus producing installation after
+        // them and before sending. Guards are not held across that I/O.
+        let admit = |bundle: &Value,
+                     files: &BTreeMap<String, String>,
+                     producer: Option<(&Value, &BTreeMap<String, String>)>|
+         -> Result<Option<Value>> {
             let _custody = self
                 .platform_custody_lock
                 .lock()
@@ -355,14 +378,40 @@ impl Shared {
                     "account capability authority changed before dispatch",
                 ));
             }
-            Ok(())
-        })?;
-        let authority = json!({
+            if let Some(original) = &reference {
+                let (producer_bundle, producer_files) = producer
+                    .ok_or_else(|| Error::rejected("reference producer snapshot is unavailable"))?;
+                return Ok(Some(self.library_reference_under(
+                    &expected["snapshot"]["inputs"],
+                    original,
+                    producer_bundle,
+                    producer_files,
+                )?));
+            }
+            Ok(None)
+        };
+        let edit = if let Some(original) = &reference {
+            workspace::with_runtime_snapshot_pair(
+                &pm,
+                install,
+                &original.install_id,
+                |(bundle, files), producer| admit(bundle, files, Some(producer)),
+            )?
+        } else {
+            workspace::with_runtime_snapshot(&pm, install, |bundle, files| {
+                admit(bundle, files, None)
+            })?
+        };
+        let mut authority = json!({
             "schema":1, "run_id":run_id, "run_snapshot_digest":expected["snapshot_digest"],
             "install_id":install, "context_id":expected["context_id"], "step_id":step,
             "slot":slot, "binding":proof, "inputs":expected["snapshot"]["inputs"],
             "source":expected["snapshot"]["source"], "quote":quote, "call_id":call_id,
         });
+        if let Some(edit) = edit {
+            authority["reference_edit"] = edit;
+            authority["frozen_prompt"] = expected["snapshot"]["inputs"]["instructions"].clone();
+        }
         let output = prepared.adapter.execute_app_capability_outcome(
             &prepared.credential, &authority, input, &call_id,
         ).map_err(|error| {
@@ -378,7 +427,10 @@ impl Shared {
             if human.is_object() {
                 self.fresh_run_human(human)?;
             }
-            workspace::with_runtime_snapshot(&pm, install, |bundle, files| {
+            let record = |bundle: &Value,
+                          files: &BTreeMap<String, String>,
+                          producer: Option<(&Value, &BTreeMap<String, String>)>|
+             -> Result<Value> {
                 let _custody = self
                     .platform_custody_lock
                     .lock()
@@ -392,6 +444,17 @@ impl Shared {
                     return Err(Error::rejected(
                         "account capability authority changed during dispatch",
                     ));
+                }
+                if let Some(original) = &reference {
+                    let (producer_bundle, producer_files) = producer.ok_or_else(|| {
+                        Error::rejected("reference producer snapshot is unavailable")
+                    })?;
+                    self.library_reference_under(
+                        &expected["snapshot"]["inputs"],
+                        original,
+                        producer_bundle,
+                        producer_files,
+                    )?;
                 }
                 crate::platform::refuse_leak(
                     "app capability result",
@@ -423,7 +486,19 @@ impl Shared {
                             .map(|asset| (asset.media_type.as_str(), asset.bytes.as_slice())),
                     },
                 )
-            })
+            };
+            if let Some(original) = &reference {
+                workspace::with_runtime_snapshot_pair(
+                    &pm,
+                    install,
+                    &original.install_id,
+                    |(bundle, files), producer| record(bundle, files, Some(producer)),
+                )
+            } else {
+                workspace::with_runtime_snapshot(&pm, install, |bundle, files| {
+                    record(bundle, files, None)
+                })
+            }
         };
         // Provider work already happened: failed freshness/retention is never
         // reported as known-not-executed, and the claim is never released.

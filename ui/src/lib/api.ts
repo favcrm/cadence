@@ -476,6 +476,7 @@ export const api = {
     conversation?: string,
     attachments?: { id: string }[],
     operation?: PrivateOperation,
+    mediaRefs?: { asset_id: string; revision: number; sha256: string }[],
   ) =>
     post<Record<string, unknown>>(
       `/api/threads/${encodeURIComponent(alias)}/messages`,
@@ -489,6 +490,7 @@ export const api = {
         // CAD-1168: `chf-…` ids of retained uploads — the daemon checks
         // grammar and existence, never the client's metadata.
         ...(attachments && attachments.length > 0 ? { attachments } : {}),
+        ...(mediaRefs && mediaRefs.length > 0 ? { media_refs: mediaRefs } : {}),
       },
       operation,
     ),

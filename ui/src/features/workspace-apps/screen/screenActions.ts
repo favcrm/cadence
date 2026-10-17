@@ -6,7 +6,8 @@ import { workspaceApps, type AppContext, type CapabilityQuote, type Installation
 import { contextDefaultKeys, instagramLink } from "./screenProjection";
 import { accountLabel, connectReturnTo, publicationBinding, sendSlot } from "../socialConnect";
 import { dueLabel } from "../socialPublish";
-import { TOOL_ALIAS, CALL_VERBS, SLOT_VERBS, mediaPublishArgs, mediaReadArgs, originalDownloadArgs, parseRunSlotReceipt, RUN_REQUEST_ID, type ActionRefusal, type ActionResult, type CallVerb, type SlotVerb } from "./screenProtocol";
+import { TOOL_ALIAS, CALL_VERBS, SLOT_VERBS, mediaChatAttachArgs, mediaPublishArgs, mediaReadArgs, originalDownloadArgs, parseRunSlotReceipt, RUN_REQUEST_ID, type ActionRefusal, type ActionResult, type CallVerb, type SlotVerb } from "./screenProtocol";
+import type { ScreenActions } from "./screenLifecycle";
 import { downscaleToDataUrl } from "./screenAssets";
 import type { Planner, SlotPlan } from "./screenSlot";
 
@@ -103,6 +104,24 @@ async function mediaRead(args: Record<string, unknown>, ui: { actionToken?: stri
   try {
     const out = await workspaceApps.mediaRead({ action_token: actionToken, input: checked });
     return { ok: true, data: out };
+  } catch (error) { return { ok: false, refusal: plainRefusal(error) }; }
+}
+
+/** A frame succeeds only after the real host draft accepts its image. */
+async function mediaChatAttach(args: Record<string, unknown>, ui: Pick<Parameters<ScreenActions["call"]>[2], "actionToken" | "attachMedia">): Promise<ActionResult> {
+  const checked = mediaChatAttachArgs(args);
+  const actionToken = ui.actionToken;
+  if (!checked || typeof actionToken !== "string" || !/^[a-f0-9]{64}$/.test(actionToken))
+    return refuse("bad_args", "That request is not valid.");
+  if (!ui.attachMedia) return refuse("unavailable", "The current chat draft is not ready for an image.");
+  try {
+    const out = await ui.attachMedia({
+      asset_id: checked.asset_id as string,
+      expected_revision: checked.expected_revision as number,
+    }, actionToken);
+    if (out.asset_id !== checked.asset_id || out.revision !== checked.expected_revision)
+      return refuse("failed", "The host did not accept that image.");
+    return { ok: true, data: { asset_id: out.asset_id, revision: out.revision } };
   } catch (error) { return { ok: false, refusal: plainRefusal(error) }; }
 }
 
@@ -368,7 +387,7 @@ function openLink(args: Record<string, unknown>, ui: { showLink(url: string): vo
 
 /** The direct (non-spending) verbs. The set is closed in `screenProtocol`. */
 export function runCall(ctx: ActionContext, verb: CallVerb, args: Record<string, unknown>,
-  ui: { showLink(url: string): void; navigate?: (path: string) => void; assign?: (url: string) => void; actionToken?: string; signal?: AbortSignal }): Promise<ActionResult> {
+  ui: Parameters<ScreenActions["call"]>[2] & { navigate?: (path: string) => void; assign?: (url: string) => void }): Promise<ActionResult> {
   if (!(CALL_VERBS as readonly string[]).includes(verb)) return Promise.resolve(refuse("forbidden", "This operation requires the records service."));
   const table: Record<(typeof CALL_VERBS)[number], () => Promise<ActionResult> | ActionResult> = {
     "read.run": () => readRun(ctx, args),
@@ -384,6 +403,7 @@ export function runCall(ctx: ActionContext, verb: CallVerb, args: Record<string,
     "social.sources.show": () => socialDraftCall(verb,args,ui),
     "social.sources.save": () => socialDraftCall(verb,args,ui),
     "media.read": () => mediaRead(args, ui),
+    "media.chat.attach": () => mediaChatAttach(args, ui),
     "media.publish": () => mediaPublish(args, ui),
   };
   return Promise.resolve().then(table[verb as (typeof CALL_VERBS)[number]]).catch((error: unknown): ActionResult => ({ ok: false, refusal: plainRefusal(error) }));

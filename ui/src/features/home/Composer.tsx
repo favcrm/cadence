@@ -42,8 +42,8 @@ export default function Composer({
       seed={seed}
       onCommand={onCommand}
       onSubmitted={onSent}
-      onSend={({ body, refs, attachments }) => {
-        void sendToMaster(body, newMessageId(), refs, attachments, attachDestination?.conversation);
+      onSend={({ body, refs, attachments, mediaRefs }) => {
+        void sendToMaster(body, newMessageId(), refs, attachments, attachDestination?.conversation, undefined, mediaRefs);
       }}
       refocusAfterSend
       attach={{

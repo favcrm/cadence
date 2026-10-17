@@ -29,6 +29,7 @@ import {
   settleReady,
   subscribeAttach,
   subscribeDraft,
+  removeLibraryImagePin,
 } from "./composerStore";
 
 /**
@@ -61,6 +62,8 @@ export interface ComposerSend {
   refs: ThreadRef[];
   /** CAD-1168: daemon-minted ids of the retained uploads that are `ready`. */
   attachments?: { id: string }[];
+  /** One host-resolved library image pin. Not a file upload. */
+  mediaRefs?: { asset_id: string; revision: number; sha256: string }[];
 }
 
 export type { AttachItem };
@@ -349,6 +352,8 @@ export default function Composer({
   const cell = useSyncExternalStore(subscribeDraftCell, readDraftCell);
   const draft = cell.text;
   const refs = cell.refs;
+  const libraryImage = cell.libraryImage;
+  const libraryPin = libraryImage?.state === "ready" ? libraryImage.pin : null;
   const setDraft = (next: string) => setComposerDraft(key, next);
   const setRefs = (next: ThreadRef[]) => setComposerRefs(key, next);
   // The queue lives in the store, keyed like the draft: a remount
@@ -427,6 +432,10 @@ export default function Composer({
       onResolveOriginal?.();
       return;
     }
+    if (libraryImage?.state === "pending") {
+      onNotice?.("Wait for the image reference to attach, or remove it before sending");
+      return;
+    }
     // A queued file that is still uploading or that failed is never
     // silently dropped: the send waits until every row is ready or
     // removed, and the notice says exactly why.
@@ -484,6 +493,9 @@ export default function Composer({
           // Only ready rows ride a send — gating above already withheld
           // it while anything unresolved remained.
           attachments: ready.ids,
+          mediaRefs: libraryPin
+            ? [{ asset_id: libraryPin.asset_id, revision: libraryPin.revision, sha256: libraryPin.sha256 }]
+            : undefined,
         });
       } catch {
         // A synchronous handoff failure must release the reservation,
@@ -565,6 +577,20 @@ export default function Composer({
     ) : null;
 
   const boxEl = (
+    <>
+    {libraryImage ? (
+      <div className="col-span-full flex items-center gap-2 text-label mb-2" data-library-image-chip="">
+        {libraryPin ? (
+          <>
+            <img src={libraryPin.preview} alt="" width={40} height={40} className="size-10 rounded object-cover" />
+            <span className="min-w-0 truncate">{libraryPin.title}</span>
+          </>
+        ) : <span role="status">{t("Attaching image reference…")}</span>}
+        <button type="button" className="lnk" disabled={!!block} onClick={() => removeLibraryImagePin(key, libraryImage)}>
+          {t("Remove")}
+        </button>
+      </div>
+    ) : null}
     <textarea
       ref={box}
       id={textareaId}
@@ -582,6 +608,7 @@ export default function Composer({
           : "app-chat-textarea w-full resize-none bg-transparent text-body text-ink-100 placeholder:text-ink-500 outline-none disabled:opacity-50 min-h-[2.75rem] max-h-40 overflow-y-auto"
       }
     />
+    </>
   );
 
   const attachInput = attachEnabled ? (
@@ -621,8 +648,9 @@ export default function Composer({
   // unresolved original submission holds Send too, until its explicit
   // Retry or Discard.
   const reserved = cell.reserved;
-  const sendBlocked = !!block || !draft.trim() || sendHeld !== null || reserved || originalUnresolved;
-  const sendTitle = sendHeld ?? (reserved ? "Sending…" : originalUnresolved ? "Retry or discard the previous message first" : null);
+  const imagePending = libraryImage?.state === "pending";
+  const sendBlocked = !!block || !draft.trim() || sendHeld !== null || reserved || originalUnresolved || imagePending;
+  const sendTitle = imagePending ? "Attaching image reference…" : sendHeld ?? (reserved ? "Sending…" : originalUnresolved ? "Retry or discard the previous message first" : null);
 
   // Drop handling is scoped to the composer surface itself — the same
   // selection path and limits as the picker; a drag that only crosses

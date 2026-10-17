@@ -1779,7 +1779,8 @@
         Connection::open(&db)
             .unwrap()
             .execute_batch(
-                "DROP TABLE app_media_asset_origins;
+                "DROP TABLE app_media_lineage;
+                 DROP TABLE app_media_asset_origins;
                  DROP TABLE app_media_publish_requests;
                  DROP TABLE app_media_assets;
                  UPDATE schema_version SET version=44;",

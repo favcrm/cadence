@@ -982,6 +982,11 @@ pub(crate) fn account_image_send(
     };
     let (path, submit, artifact) = match operation {
         Op::Quote => ("/__platform/media/price/image".to_owned(), None, false),
+        Op::QuoteReference => (
+            "/__platform/media/price/image?variant=image-to-image".to_owned(),
+            None,
+            false,
+        ),
         Op::Submit {
             input,
             idempotency_key,
@@ -989,10 +994,25 @@ pub(crate) fn account_image_send(
             let object = input
                 .as_object()
                 .ok_or_else(|| reject("account image input must be an object"))?;
-            if object.len() != 4
+            let reference_edit = object.contains_key("references");
+            let reference_ok = !reference_edit
+                || (object["references"].as_array().is_some_and(|refs| {
+                    refs.len() == 1
+                        && refs[0].as_str().is_some_and(|reference| {
+                            reference.split_once('.').is_some_and(|(job, digest)| {
+                                segment(job)
+                                    && digest.len() == 64
+                                    && digest
+                                        .bytes()
+                                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                            })
+                        })
+                }));
+            if object.len() != if reference_edit { 5 } else { 4 }
                 || !["model", "prompt", "aspectRatio", "max_charge_minor"]
                     .iter()
                     .all(|key| object.contains_key(*key))
+                || !reference_ok
                 || input["model"] != "openai/gpt-image-2.5"
                 || input["prompt"].as_str().is_none_or(|p| p.trim().is_empty())
                 || input["aspectRatio"] != "1:1"

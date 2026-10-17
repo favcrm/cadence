@@ -257,3 +257,50 @@ The board's two-permit atomic guard is process-local, acquired before multipart
 `read_body`, held through owned staging/RPC/removal, and returns HTTP 429 when
 full. It bounds this board's request bodies only. Existing auth, body limits,
 scope and native operator guards are unchanged.
+
+## Library image refine (CAD-1482)
+
+This is not a file upload. An admitted Library screen asks the trusted host to
+attach one existing image (`media.chat.attach`: asset id and expected revision).
+The host captures the current conversation and draft, resolves the original
+digest and queues a removable thumbnail. Selecting an image does not send a
+message or generate anything. Sending durably stores the exact
+`{asset_id, revision, sha256}` pin in that message's `media_refs`.
+
+The assigned Pi turn receives bounded retained image content as native prompt
+images, alongside the original pin metadata, not base64 pasted into text. The
+adapter checks the selected live model's reported input modalities before writing
+the prompt. Text-only or unknown image support refuses that message without
+changing the selected model/provider. Live use requires an operator-selected,
+admitted image-capable runtime; this feature does not change runtime policy.
+
+The assistant uses `media.refine.prepare` with the pinned asset id, revision,
+original digest and the user's instructions. An unpinned or different image
+refuses. The native host freezes the source, supported image model, instructions,
+reference-edit quote/revision and maximum spend for **Allow once** or **Deny**.
+Preparation never spends. Creation, approval and dispatch all recheck the same
+image-to-image pricing variant; changed pricing requires a new proposal.
+The producer request uses the retained artifact in `references` and the approved
+`max_charge_minor` ceiling, never a text-to-image fallback or invented source facts.
+An uncertain outcome keeps the same run/call identity, never a fresh paid retry.
+
+Result B is retained with lineage to source A; A and its original bytes stay
+unchanged. Returning to Library refreshes retained results. Original download
+remains a separate native operator-controlled operation.
+
+`app_media_inspect` is a private daemon stream, not an HTTP endpoint. It requires
+the assigned endpoint session, live turn and exact persisted image pin. Image
+delivery re-proves producing custody and any stamped receiving app/context.
+The delivered material may be a bounded custody derivative: its stream header
+digest identifies those delivered bytes, while the message pin retains the
+original producer digest. Neither credentials nor provider locations are image
+context. The installed app's short operating guide needs no separate agent or
+skill framework.
+
+**Rollout prerequisite:** the producer must accept retained references and enforce
+the approved ceiling before funding/dispatch. AgenticOS AOS-248/AOS-258 already
+provide the ceiling contract; native account/device reference edits additionally
+require the AOS-269 admission extension, a reference-capable published model and
+an enabled, priced image-to-image variant. Earlier native image audiences
+deliberately refuse editing. Do not remove the ceiling or treat source changes
+or an isolated loopback smoke as installation or paid operational verification.

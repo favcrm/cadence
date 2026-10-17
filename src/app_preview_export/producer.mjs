@@ -99,7 +99,8 @@ var CALL_VERBS = [
 	"social.sources.save",
 	"social.destinations.list",
 	"media.read",
-	"media.publish"
+	"media.publish",
+	"media.chat.attach"
 ];
 var SLOT_VERBS = [
 	"run.start",
@@ -118,7 +119,11 @@ var ORIGINAL_DOWNLOAD_VERB = "media.original.download";
 *  envelope but are NEVER in the generic advertised set: they are
 *  appended per-mount, only to a media-opted-in child whose minted
 *  receipt declares them. */
-var MEDIA_VERBS = ["media.read", "media.publish"];
+var MEDIA_VERBS = [
+	"media.read",
+	"media.publish",
+	"media.chat.attach"
+];
 /** The verbs a screen.v2 PUSH advertises in `actions` — media verbs are
 *  deliberately absent; the channel appends a mount's declared media
 *  rights itself. */
@@ -188,6 +193,8 @@ var V2_TOP = [
 	"actions",
 	"run_receipts",
 	"original_downloads",
+	"media_previews",
+	"media_chat_references",
 	"route",
 	"read_observations",
 	"presentation_locale"

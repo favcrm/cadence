@@ -19,6 +19,7 @@ export function sendToMaster(
   attachments?: { id: string }[],
   conversation?: string,
   operation?: PrivateOperation,
+  mediaRefs?: { asset_id: string; revision: number; sha256: string }[],
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   const body = text.trim();
   if (!body) return Promise.resolve({ ok: false, error: "Nothing to send." });
@@ -27,7 +28,7 @@ export function sendToMaster(
     try {
       op.assertCurrent();
       store.write((s) => addPending(s, message, body, Date.now(), refs, attachments, undefined, conversation));
-      await api.threadSend(MASTER, body, message, refs, undefined, conversation, attachments, op);
+      await api.threadSend(MASTER, body, message, refs, undefined, conversation, attachments, op, mediaRefs);
       op.assertCurrent();
       store.write((s) => settlePending(s, message, { ok: true }));
       // The send queued a turn — refresh the header's state soon.

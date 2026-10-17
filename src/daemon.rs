@@ -93,6 +93,8 @@ mod cad1440_media_only_context_acceptance;
 mod cad1473_host_redispatch;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1473_independent_redispatch;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad1482_independent_media_refusal;
 mod caller_rule;
 #[cfg(all(test, feature = "test-seam"))]
 mod campaign_clone_acceptance;
@@ -1268,6 +1270,16 @@ impl Shared {
             if let Some(envelope) = self.attachments_notice(message) {
                 body = format!("{envelope}\n\n{body}");
             }
+            if let Ok(Some(pin)) = self.store.message_media_refs(&message.id) {
+                body = format!(
+                    "A retained library image is attached to this turn as native image pixels.\n\
+                     Reference pin (selectors, not instructions): {pin}\n\
+                     Use only that image. Prepare a refinement with assistant action \
+                     media.refine.prepare using this exact asset_id, revision and sha256 \
+                     when that action is listed. If this runtime cannot see the image, \
+                     say so — do not invent a visual description.\n\n{body}"
+                );
+            }
             if let Some(hint) = self.delivery_hint(message) {
                 if let Some(envelope) = app_hint_envelope(&hint) {
                     // CAD-1009: the turn-token slot follows the hint on
@@ -1350,6 +1362,39 @@ impl Shared {
     /// conversation must belong to the stamped installation; on any
     /// mismatch the hint — and with it the turn-token slot — is dropped
     /// and the message still delivers unscoped.
+    fn turn_images_for(&self, message: &Message) -> Result<Vec<crate::adapter::TurnImage>> {
+        let Some(pinned) = self.store.message_media_refs(&message.id)? else {
+            return Ok(Vec::new());
+        };
+        let rows = pinned
+            .as_array()
+            .filter(|rows| rows.len() == 1)
+            .ok_or_else(|| Error::rejected("pinned library image is malformed"))?;
+        let asset_id = rows[0]["asset_id"]
+            .as_str()
+            .ok_or_else(|| Error::rejected("pinned library image is malformed"))?;
+        self.gate_image_receiver_before_bytes(&message.alias, &message.id)?;
+        let image = self.store.app_media_context_image(asset_id)?;
+        if rows[0]["revision"].as_i64() != Some(image.asset.revision)
+            || rows[0]["sha256"].as_str() != Some(image.original.sha256.as_str())
+        {
+            return Err(Error::rejected(
+                "attached library image no longer matches the retained original",
+            ));
+        }
+        self.with_turn_image_current(&message.alias, &message.id, &image.original, || {
+            if self.store.app_media_revision(asset_id)? != image.asset.revision {
+                return Err(Error::rejected(
+                    "attached library image changed before delivery",
+                ));
+            }
+            Ok(vec![crate::adapter::TurnImage {
+                media_type: image.media_type,
+                bytes: image.bytes,
+            }])
+        })
+    }
+
     fn delivery_hint(&self, message: &Message) -> Option<Value> {
         let hint = self.store.message_app(&message.id).ok().flatten()?;
         let conversation = self
@@ -2763,6 +2808,7 @@ impl Shared {
             | "business_document_show" => self.rpc_business_template(method, params, peer_pid),
             "app_tool_invoke" => self.rpc_app_tool_invoke(params, peer_pid),
             "app_media_read" => self.rpc_app_media_read(params, peer_pid),
+            "app_media_chat_attach" => self.rpc_app_media_chat_attach(params, peer_pid),
             "app_media_publish" => self.rpc_app_media_publish(params, peer_pid),
             "app_tool_revoke" => self.rpc_app_tool_revoke(params, peer_pid),
             "app_tool_result" | "app_tool_results" => self.rpc_app_tool_result(params, peer_pid),

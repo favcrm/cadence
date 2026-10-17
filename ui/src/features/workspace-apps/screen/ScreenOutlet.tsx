@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { sessionHeaders } from "../../../lib/sessionKey";
 import { beginPrivateOperation, onPrivateReadsPaused, privateFetch, privateReadsAllowed, privateSessionGeneration, type PrivateOperation } from "../../../lib/privateSession";
-import { parseMount, ScreenChannel, type AssetLoader, type ScreenActions } from "./screenLifecycle";
+import { parseMount, ScreenChannel, type AssetLoader, type MediaChatAttach, type ScreenActions } from "./screenLifecycle";
 import { invokeTool, revokeTool } from "./screenActions";
 import { type SlotView } from "./screenSlot";
 import ScreenSlotLayer from "./ScreenSlotLayer";
@@ -18,20 +18,21 @@ import { RECORD_CALL_VERBS, RECORD_SLOT_VERBS, type RecordCallVerb, type RecordS
 import type { MountReceipt } from "./screenLifecycle";
 
 /** App code lives in its independently installed bundle, never in the board. */
-export default function ScreenOutlet({ projection, fallback, loadAsset, actions, onRoute, onCommand, onNavigation }: {
+export default function ScreenOutlet({ projection, fallback, loadAsset, actions, onRoute, onCommand, onNavigation, onMediaAttach }: {
   projection: ScreenPush; fallback: ReactNode; loadAsset?: AssetLoader;
   /** The operator's verbs for this frame (HP3); absent for a non-operator, so every `call`/`slot` closes it. */
   actions?: Pick<ScreenActions, "call" | "planner">;
   onRoute?: (patch: RoutePatch, navigation: ScreenNavigation) => void;
   onCommand?: (command: HostCommand) => void;
   onNavigation?: (navigation: ScreenNavigation | null) => void;
+  onMediaAttach?: MediaChatAttach;
 }) {
   const { t, locale } = useLocale();
   const presentationLocale = useRef(locale);
   presentationLocale.current = locale;
   const href = useHref();
-  const navigationCallbacks = useRef({ onRoute, onCommand, onNavigation, href });
-  navigationCallbacks.current = { onRoute, onCommand, onNavigation, href };
+  const navigationCallbacks = useRef({ onRoute, onCommand, onNavigation, onMediaAttach, href });
+  navigationCallbacks.current = { onRoute, onCommand, onNavigation, onMediaAttach, href };
   const mounted = useRef<MountReceipt | null>(null);
   const decorate = (p: ScreenPush, receipt: MountReceipt): ScreenPush => receipt.host_contract === "screen-records.v1" ? withReadObservations({ ...p, ...(p.installation.name === "crm" && receipt.tag === "crm" ? { presentation_locale: presentationLocale.current } : {}), route: routeFromHref(receipt.navigation, receipt.tag, navigationCallbacks.current.href), actions: receipt.operations ?? [] }, receipt.display_scope_key!, receipt.operations ?? []) : p;
   const container = useRef<HTMLDivElement>(null);
@@ -152,7 +153,16 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions,
             return loader.current ? loader.current(ref) : null;
           },
           services || acting.current ? {
-            call: (verb, args, ui) => services ? (RECORD_CALL_VERBS as readonly string[]).includes(verb) ? services.call(verb as RecordCallVerb, args) : Promise.resolve({ ok: false as const, refusal: { code: "forbidden", text: "This operation is unavailable." } }) : acting.current!.call(verb, args, ui),
+            call: (verb, args, ui) => {
+              if (services) return (RECORD_CALL_VERBS as readonly string[]).includes(verb)
+                ? services.call(verb as RecordCallVerb, args)
+                : Promise.resolve({ ok: false as const, refusal: { code: "forbidden", text: "This operation is unavailable." } });
+              const attach = navigationCallbacks.current.onMediaAttach;
+              return acting.current!.call(verb, args, {
+                ...ui,
+                attachMedia: attach ? (selected, token) => attach(selected, token, isCurrent) : undefined,
+              });
+            },
             planner: (verb, args) => services ? (RECORD_SLOT_VERBS as readonly string[]).includes(verb) ? services.planner(verb as RecordSlotVerb, args) : Promise.resolve({ code: "forbidden", text: "This operation is unavailable." }) : acting.current!.planner(verb, args, actionToken ? { actionToken } : undefined),
             onSlot: view => { if (isCurrent()) setSlot(view); },
             onLink: url => { if (isCurrent()) setLink(url); },

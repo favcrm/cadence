@@ -59,7 +59,7 @@ export type ChildToHost =
  *  port. `call` verbs never spend or publish; every spend or publish verb is a
  *  `slot` verb and waits for a tap on a host-drawn button. The `publish.*` slot
  *  verbs arrive with HP4: add them here and in the host's dispatch table. */
-export const CALL_VERBS = ["read.run", "context.defaults.save", "open-link", "social.drafts.list", "social.drafts.show", "social.drafts.create", "social.drafts.update", "social.drafts.discard", "social.drafts.publish.stage", "social.sources.show", "social.sources.save", "social.destinations.list", "media.read", "media.publish"] as const;
+export const CALL_VERBS = ["read.run", "context.defaults.save", "open-link", "social.drafts.list", "social.drafts.show", "social.drafts.create", "social.drafts.update", "social.drafts.discard", "social.drafts.publish.stage", "social.sources.show", "social.sources.save", "social.destinations.list", "media.read", "media.publish", "media.chat.attach"] as const;
 export const SLOT_VERBS = ["run.start", "publish.destination.use", "publish.draft.confirm", "publish.draft.schedule", "publish.draft.reschedule", "publish.draft.cancel", "publish.settings.save", "media.original.download"] as const;
 /** CAD-1365 — the protected original download slot. Qualified per mount
  *  (screen-media.v1 + media.read + live token); never a generic action verb. */
@@ -68,7 +68,7 @@ export const ORIGINAL_DOWNLOAD_VERB = "media.original.download" as const;
  *  envelope but are NEVER in the generic advertised set: they are
  *  appended per-mount, only to a media-opted-in child whose minted
  *  receipt declares them. */
-export const MEDIA_VERBS = ["media.read", "media.publish"] as const;
+export const MEDIA_VERBS = ["media.read", "media.publish", "media.chat.attach"] as const;
 export type MediaVerb = (typeof MEDIA_VERBS)[number];
 export const isMediaVerb = (verb: string): verb is MediaVerb =>
   (MEDIA_VERBS as readonly string[]).includes(verb);
@@ -202,6 +202,12 @@ export function wantsMedia(accepts: readonly string[] | undefined): boolean {
  *  `limit` a safe integer 1..20 and `cursor` a string <= 160 chars. */
 export function mediaReadArgs(args: ActionArgs): ActionArgs | null {
   const keys = Object.keys(args).sort().join();
+  if (args.kind === "preview") {
+    if (Object.keys(args).sort().join() !== "asset_id,expected_revision,kind") return null;
+    if (typeof args.asset_id !== "string" || !MEDIA_ASSET_ID.test(args.asset_id)) return null;
+    if (typeof args.expected_revision !== "number" || !Number.isSafeInteger(args.expected_revision) || args.expected_revision < 1) return null;
+    return args;
+  }
   if (keys !== "kind" && keys !== "kind,limit" && keys !== "cursor,kind" && keys !== "cursor,kind,limit") return null;
   if (args.kind !== "catalog") return null;
   if ("limit" in args && (typeof args.limit !== "number" || !Number.isSafeInteger(args.limit) || args.limit < 1 || args.limit > 20)) return null;
@@ -211,6 +217,12 @@ export function mediaReadArgs(args: ActionArgs): ActionArgs | null {
 const MEDIA_ASSET_ID = /^med-[0-9a-f]{32}$/;
 const MEDIA_REQUEST_ID = /^[A-Za-z0-9_-]{1,128}$/;
 /** `media.original.download` args are EXACTLY `{asset_id}`, a canonical id. */
+export function mediaChatAttachArgs(args: ActionArgs): ActionArgs | null {
+  if (Object.keys(args).sort().join() !== "asset_id,expected_revision") return null;
+  if (typeof args.asset_id !== "string" || !MEDIA_ASSET_ID.test(args.asset_id)) return null;
+  if (typeof args.expected_revision !== "number" || !Number.isSafeInteger(args.expected_revision) || args.expected_revision < 1) return null;
+  return args;
+}
 export function originalDownloadArgs(args: ActionArgs): ActionArgs | null {
   if (Object.keys(args).join() !== "asset_id") return null;
   if (typeof args.asset_id !== "string" || !MEDIA_ASSET_ID.test(args.asset_id)) return null;
@@ -419,6 +431,10 @@ export interface ScreenPush {
   /** screen.v2 only, host-derived like `run_receipts`: `1` when this mount may
    *  use the original download slot. Support only, never permission. */
   original_downloads?: 1;
+  /** Host marker. 1 only when this mount's media.read preview is admitted. */
+  media_previews?: 1;
+  /** Host marker. 1 only when this mount may media.chat.attach. */
+  media_chat_references?: 1;
   /** Server epoch seconds for day-row alignment. */
   now: number;
   /** The child's own last `state` snapshot, replayed on remount. */
@@ -520,6 +536,10 @@ export function parseChild(data: unknown, records?: readonly string[]): ChildToH
       const checked = mediaReadArgs(args);
       return checked ? { v: 2, op: "call", id: d.id, verb: "media.read", args: checked } : null;
     }
+    if (d.verb === "media.chat.attach") {
+      const checked = mediaChatAttachArgs(args);
+      return checked ? { v: 2, op: "call", id: d.id, verb: "media.chat.attach", args: checked } : null;
+    }
     if (d.verb === "media.publish") {
       const checked = mediaPublishArgs(args);
       return checked ? { v: 2, op: "call", id: d.id, verb: "media.publish", args: checked } : null;
@@ -564,7 +584,7 @@ export function parseChild(data: unknown, records?: readonly string[]): ChildToH
   return null;
 }
 
-const V2_TOP = ["sources", "defaults", "readiness", "actions", "run_receipts", "original_downloads", "route", "read_observations", "presentation_locale"] as const;
+const V2_TOP = ["sources", "defaults", "readiness", "actions", "run_receipts", "original_downloads", "media_previews", "media_chat_references", "route", "read_observations", "presentation_locale"] as const;
 const V2_RUN = ["created", "closed", "phase", "steps", "inputs_used", "caption_excerpt", "artifact_id",
   "review", "approved", "source_post_id", "refusal", "image_ref"] as const;
 /** The publish-intents.v1 shape: every screen.v2 field is removed. */

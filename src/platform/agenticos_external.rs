@@ -44,6 +44,11 @@ const TEXT_TOOL: &str = "generate_text";
 /// The only model the image slot may run; the price read and every job must
 /// echo it back.
 const IMAGE_MODEL: &str = "openai/gpt-image-2.5";
+/// The reviewed image model a native price card may name. It is the same
+/// constant the price read and every submit must echo.
+pub(crate) fn reviewed_image_model() -> &'static str {
+    IMAGE_MODEL
+}
 const CALL_PATH: &str = "/v1/runtime/tools/call";
 const MEDIA_PRICE_PATH: &str = "/v1/runtime/media/price/image";
 const MEDIA_SUBMIT_PATH: &str = "/v1/runtime/media/image";
@@ -212,6 +217,12 @@ impl AgenticosExternalAdapter {
         match operation {
             Op::Quote => self.get_media(
                 &format!("{}{MEDIA_PRICE_PATH}", self.base),
+                token,
+                MEDIA_BODY_CAP,
+                "AgenticOS media price read could not reach the service",
+            ),
+            Op::QuoteReference => self.get_media(
+                &format!("{}{MEDIA_PRICE_PATH}?variant=image-to-image", self.base),
                 token,
                 MEDIA_BODY_CAP,
                 "AgenticOS media price read could not reach the service",
@@ -528,6 +539,24 @@ impl AgenticosExternalAdapter {
         credential: &[u8],
         binding: &Value,
     ) -> std::result::Result<AppCapabilityQuote, String> {
+        self.quote_image_kind(credential, binding, false)
+    }
+
+    /// Reference-edit rate. Text-to-image quoting stays on [`Self::quote_image`].
+    pub(crate) fn quote_reference_image(
+        &self,
+        credential: &[u8],
+        binding: &Value,
+    ) -> std::result::Result<AppCapabilityQuote, String> {
+        self.quote_image_kind(credential, binding, true)
+    }
+
+    fn quote_image_kind(
+        &self,
+        credential: &[u8],
+        binding: &Value,
+        reference_edit: bool,
+    ) -> std::result::Result<AppCapabilityQuote, String> {
         if !self.image_approved() {
             return Err("image generation has not been approved by this deployment".into());
         }
@@ -546,8 +575,12 @@ impl AgenticosExternalAdapter {
             return Err("provider quote names an unreviewed action".into());
         }
         let token = self.lease_token(credential, config)?;
-        let (status, envelope) =
-            self.image_json(token, crate::remote_cli::AccountImageOperation::Quote)?;
+        let operation = if reference_edit {
+            crate::remote_cli::AccountImageOperation::QuoteReference
+        } else {
+            crate::remote_cli::AccountImageOperation::Quote
+        };
+        let (status, envelope) = self.image_json(token, operation)?;
         match status {
             200 if envelope["ok"] == true => {}
             404 => return Err("AgenticOS media serving is not enabled for this deployment".into()),
@@ -583,14 +616,19 @@ impl AgenticosExternalAdapter {
                 )
             }
         };
+        let expected_slug = if reference_edit {
+            "generate_image.image-to-image"
+        } else {
+            IMAGE_TOOL
+        };
         if data["kind"] != "image"
             || data["model"] != IMAGE_MODEL
-            || price["slug"] != IMAGE_TOOL
+            || price["slug"] != expected_slug
             || price["currency"] != "USD"
         {
             return Err("AgenticOS media price view drifted from the reviewed image tool".into());
         }
-        let canonical = json!({"kind":"image","model":IMAGE_MODEL,"price":{"slug":IMAGE_TOOL,"chargeMinor":charge,"currency":"USD","version":version}});
+        let canonical = json!({"kind":"image","model":IMAGE_MODEL,"price":{"slug":expected_slug,"chargeMinor":charge,"currency":"USD","version":version}});
         let bytes = serde_json::to_vec(&canonical)
             .map_err(|_| "AgenticOS media price view cannot be serialized")?;
         Ok(AppCapabilityQuote {
@@ -721,12 +759,16 @@ impl AgenticosExternalAdapter {
             )
             .map_err(|detail| ImageFailure::refused(R::NotAuthorized, detail))?;
         }
-        // A job admitted by this daemon froze its exact prompt: a restart on a
-        // newer build must replay the byte-identical body under the same key.
-        let prompt = match authority["frozen_prompt"].as_str() {
-            Some(frozen) => frozen.to_owned(),
-            None => image::image_prompt_for(authority, input, self.image_provider())
-                .map_err(|detail| ImageFailure::refused(R::PlanInvalid, detail))?,
+        // Library reference edits submit the frozen instructions and the
+        // verified original ref. They never fall through to subject/source.
+        let prompt = match library_reference_prompt(authority) {
+            Ok(Some(prompt)) => prompt,
+            Ok(None) => match authority["frozen_prompt"].as_str() {
+                Some(frozen) => frozen.to_owned(),
+                None => image::image_prompt_for(authority, input, self.image_provider())
+                    .map_err(|detail| ImageFailure::refused(R::PlanInvalid, detail))?,
+            },
+            Err(detail) => return Err(ImageFailure::refused(R::PlanInvalid, detail)),
         };
         // The frozen approval maximum uses the same micro-USD units as
         // AgenticOS chargeMinor; submit it for enforcement before reservation.
@@ -741,10 +783,33 @@ impl AgenticosExternalAdapter {
                 "provider idempotency key is invalid",
             ));
         }
-        let (status, envelope) = self.image_json(token, crate::remote_cli::AccountImageOperation::Submit {
-            input: json!({"model":IMAGE_MODEL,"prompt":prompt,"aspectRatio":"1:1","max_charge_minor":quoted}),
-            idempotency_key: idempotency_key.to_owned(),
-        }).map_err(|_| uncertain_submit())?;
+        let reference = authority["reference_edit"]["ref"]
+            .as_str()
+            .filter(|reference| valid_media_ref(reference))
+            .map(str::to_string);
+        if authority
+            .get("reference_edit")
+            .is_some_and(|value| !value.is_null())
+            && reference.is_none()
+        {
+            return Err(ImageFailure::refused(
+                R::PlanInvalid,
+                "reference edit has no verified artifact reference",
+            ));
+        }
+        let mut submit_input = json!({"model":IMAGE_MODEL,"prompt":prompt,"aspectRatio":"1:1","max_charge_minor":quoted});
+        if let Some(reference) = &reference {
+            submit_input["references"] = json!([reference]);
+        }
+        let (status, envelope) = self
+            .image_json(
+                token,
+                crate::remote_cli::AccountImageOperation::Submit {
+                    input: submit_input,
+                    idempotency_key: idempotency_key.to_owned(),
+                },
+            )
+            .map_err(|_| uncertain_submit())?;
         match status {
             200 | 201 if envelope["ok"] == true => {}
             404 if envelope["ok"] == false => {
@@ -809,7 +874,7 @@ impl AgenticosExternalAdapter {
             _ => return Err(uncertain_submit()),
         }
         let mut job = envelope["data"]["job"].clone();
-        checked_media_job(&job, None)
+        checked_media_job(&job, None, reference.is_some())
             .map_err(|detail| ImageFailure::uncertain(R::JobMalformed, detail))?;
         let deadline = Instant::now() + self.poll_deadline();
         loop {
@@ -868,7 +933,7 @@ impl AgenticosExternalAdapter {
                 ));
             }
             job = envelope["data"]["job"].clone();
-            checked_media_job(&job, Some(&id))
+            checked_media_job(&job, Some(&id), reference.is_some())
                 .map_err(|detail| ImageFailure::uncertain(R::JobMalformed, detail))?;
         }
         let id = job["id"].as_str().unwrap_or_default().to_owned();
@@ -945,6 +1010,17 @@ impl AgenticosExternalAdapter {
             "asset_sha256":digest,"asset_media_type":media_type,
             "original_artifact":original_artifact,
         });
+        let mut result = result;
+        if let Some(edit) = authority
+            .get("reference_edit")
+            .filter(|value| value.is_object())
+        {
+            result["source_asset"] = json!({
+                "asset_id": edit["asset_id"],
+                "sha256": edit["sha256"],
+                "ref": edit["ref"],
+            });
+        }
         Ok(AppCapabilityOutput {
             result,
             asset: Some(AppCapabilityAsset {
@@ -1174,10 +1250,77 @@ fn valid_media_ref(reference: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
+fn library_reference_prompt(authority: &Value) -> std::result::Result<Option<String>, String> {
+    let inputs = &authority["inputs"];
+    let keys = [
+        "library_asset_id",
+        "library_revision",
+        "library_sha256",
+        "instructions",
+    ];
+    if keys.iter().all(|key| inputs.get(*key).is_none()) {
+        return Ok(None);
+    }
+    if keys.iter().any(|key| inputs.get(*key).is_none())
+        || inputs.get("subject").is_some()
+        || inputs.get("source").is_some()
+    {
+        return Err("reference edit inputs must be the four frozen library strings".into());
+    }
+    let asset_id = inputs["library_asset_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or("library asset id is not a string")?;
+    let revision = inputs["library_revision"]
+        .as_str()
+        .filter(|value| {
+            !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) && *value != "0"
+        })
+        .ok_or("library revision is not a decimal pin")?;
+    let sha256 = inputs["library_sha256"]
+        .as_str()
+        .filter(|value| {
+            value.len() == 71
+                && value.starts_with("sha256:")
+                && value[7..]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        })
+        .ok_or("library digest is not canonical")?;
+    let instructions = inputs["instructions"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("reference instructions are blank")?;
+    let edit = authority
+        .get("reference_edit")
+        .filter(|value| value.is_object())
+        .ok_or("reference edit has no verified artifact reference")?;
+    let reference = edit["ref"]
+        .as_str()
+        .filter(|reference| valid_media_ref(reference))
+        .ok_or("producer reference is not the retained original artifact")?;
+    if !reference.ends_with(&format!(".{}", &sha256[7..]))
+        || edit["asset_id"] != asset_id
+        || edit["sha256"] != sha256
+    {
+        return Err("producer reference does not match the frozen source pin".into());
+    }
+    if let Some(frozen) = authority["frozen_prompt"].as_str() {
+        if frozen != instructions {
+            return Err("frozen reference instructions do not match the library input".into());
+        }
+    }
+    let _ = revision;
+    Ok(Some(instructions.to_owned()))
+}
 
 /// Strict job validation, identical on submit and on every poll; a poll
 /// must echo the job the submit returned.
-fn checked_media_job(job: &Value, expected_id: Option<&str>) -> std::result::Result<(), String> {
+fn checked_media_job(
+    job: &Value,
+    expected_id: Option<&str>,
+    reference_edit: bool,
+) -> std::result::Result<(), String> {
     let id = job["id"]
         .as_str()
         .ok_or("AgenticOS media job is malformed")?;
@@ -1188,7 +1331,12 @@ fn checked_media_job(job: &Value, expected_id: Option<&str>) -> std::result::Res
         return Err("AgenticOS media job drifted from the reviewed image tool".into());
     }
     let price = &job["price"];
-    if price["slug"] != IMAGE_TOOL
+    let expected_slug = if reference_edit {
+        "generate_image.image-to-image"
+    } else {
+        IMAGE_TOOL
+    };
+    if price["slug"] != expected_slug
         || price["currency"] != "USD"
         || !price["chargeMinor"].is_u64()
         || price["version"]
@@ -1545,6 +1693,17 @@ pub fn attach(opts: &mut crate::daemon::ServeOptions) -> Result<()> {
 }
 
 impl PlatformAdapter for AgenticosExternalAdapter {
+    fn quote_reference_app_capability(
+        &self,
+        credential: &[u8],
+        binding: &Value,
+    ) -> std::result::Result<AppCapabilityQuote, String> {
+        if binding["config"]["mapping"]["capability"] == "media.generate" {
+            return self.quote_reference_image(credential, binding);
+        }
+        self.quote_app_capability(credential, binding)
+    }
+
     fn quote_app_capability(
         &self,
         credential: &[u8],

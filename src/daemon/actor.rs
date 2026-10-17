@@ -551,6 +551,16 @@ impl Shared {
                         .admit_app_submission(&message)
                         .and_then(|()| adapter.check_body(&message.body))
                         .and_then(|()| {
+                            if !nudge {
+                                let images =
+                                    self.turn_images_for(&message).map_err(
+                                        |error| match error {
+                                            Error::Rejected(reason) => Error::PreWrite(reason),
+                                            error => error,
+                                        },
+                                    )?;
+                                adapter.bind_turn_images(&images)?;
+                            }
                             let on_started = move |turn: &str| {
                                 // CAD-250: a nudge owns no turn — it never
                                 // becomes `running`, and its paste is not the

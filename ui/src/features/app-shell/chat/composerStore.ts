@@ -53,13 +53,14 @@ const EMPTY_SAVED: SavedIntent[] = [];
 export interface ComposerDraft {
   text: string;
   refs: ThreadRef[];
+  libraryImage: LibraryImageState | null;
   /** Bumped on every explicit edit; a settlement clears only its own. */
   version: number;
   /** True while an original envelope from this key awaits settlement. */
   reserved: boolean;
 }
 
-const EMPTY_DRAFT: ComposerDraft = { text: "", refs: EMPTY_REFS, version: 0, reserved: false };
+const EMPTY_DRAFT: ComposerDraft = { text: "", refs: EMPTY_REFS, libraryImage: null, version: 0, reserved: false };
 
 /** The app binding an intent was created under. `context_id` absent is
  *  the same explicit absence a send carried — never filled in later. */
@@ -87,6 +88,7 @@ interface DraftCell {
   frame?: ComposerScope | null;
   text: string;
   refs: ThreadRef[];
+  libraryImage: LibraryImageState | null;
   version: number;
   /** The version one in-flight handoff reserved, or null. */
   reserved: number | null;
@@ -141,6 +143,7 @@ function newCell(family: Family, frame: ComposerScope | null | undefined): Draft
     frame,
     text: "",
     refs: EMPTY_REFS,
+    libraryImage: null,
     version: 0,
     reserved: null,
     binding: undefined,
@@ -175,7 +178,7 @@ function activeOf(family: Family): DraftCell {
 /** Whether a cell holds any unsent intent: text, refs, a held handoff or
  *  queued rows. The whole bundle is the unit — halves never move apart. */
 function hasIntent(cell: DraftCell): boolean {
-  if (cell.text !== "" || cell.refs.length > 0 || cell.reserved !== null) return true;
+  if (cell.text !== "" || cell.refs.length > 0 || cell.libraryImage !== null || cell.reserved !== null) return true;
   const q = queues.get(cell.id);
   return q !== undefined && q.items.length > 0;
 }
@@ -202,7 +205,7 @@ function notifyFamily(family: Family): void {
 }
 
 function publish(cell: DraftCell): void {
-  cell.snapshot = { text: cell.text, refs: cell.refs, version: cell.version, reserved: cell.reserved !== null };
+  cell.snapshot = { text: cell.text, refs: cell.refs, libraryImage: cell.libraryImage, version: cell.version, reserved: cell.reserved !== null };
   const family = families.get(cell.family);
   if (family) notifyFamily(family);
 }
@@ -335,7 +338,7 @@ function sameRefs(a: readonly ThreadRef[], b: readonly ThreadRef[]): boolean {
  *  the scope or frame moves. */
 export type DraftReservation = number;
 
-const reservations = new Map<DraftReservation, { cell: DraftCell; version: number }>();
+const reservations = new Map<DraftReservation, { cell: DraftCell; version: number; libraryImage: LibraryImageState | null }>();
 let nextReservation = 0;
 
 /** Reserve the active slot's current draft for one handoff. Returns an
@@ -344,11 +347,11 @@ let nextReservation = 0;
  *  envelope. */
 export function reserveDraft(key: string): DraftReservation | null {
   const cell = activeOf(familyFor(key));
-  if (cell.reserved !== null) return null;
+  if (cell.reserved !== null || cell.libraryImage?.state === "pending") return null;
   cell.reserved = cell.version;
   publish(cell);
   const token = ++nextReservation;
-  reservations.set(token, { cell, version: cell.version });
+  reservations.set(token, { cell, version: cell.version, libraryImage: cell.libraryImage });
   return token;
 }
 
@@ -364,6 +367,7 @@ export function settleDraft(reservation: DraftReservation, accepted: boolean): v
   const cell = held.cell;
   if (cell.reserved !== held.version) return;
   cell.reserved = null;
+  if (accepted && cell.libraryImage === held.libraryImage) cell.libraryImage = null;
   if (accepted && cell.version === held.version) {
     cell.text = "";
     cell.refs = EMPTY_REFS;
@@ -841,20 +845,27 @@ export function moveComposerScope(from: string, to: string, subject?: string): b
 function swapBundles(a: DraftCell, b: DraftCell): void {
   const text = a.text;
   const refs = a.refs;
+  const libraryImage = a.libraryImage;
   const version = a.version;
   const reserved = a.reserved;
   const binding = a.binding;
   a.text = b.text;
   a.refs = b.refs;
+  a.libraryImage = b.libraryImage;
   a.version = b.version;
   a.reserved = b.reserved;
   a.binding = b.binding;
   b.text = text;
   b.refs = refs;
+  b.libraryImage = libraryImage;
   b.version = version;
   b.reserved = reserved;
   b.binding = binding;
   for (const held of reservations.values()) {
+    if (held.cell === a) held.cell = b;
+    else if (held.cell === b) held.cell = a;
+  }
+  for (const held of libraryImageRequests.values()) {
     if (held.cell === a) held.cell = b;
     else if (held.cell === b) held.cell = a;
   }
@@ -952,7 +963,69 @@ export function composerDraft(key: string, slot?: number): string {
   return slotOf(key, slot)?.text ?? "";
 }
 
+export interface LibraryImagePin {
+  asset_id: string;
+  revision: number;
+  sha256: string;
+  media_type: string;
+  title: string;
+  /** Bounded local preview supplied by the native host, never a remote URL. */
+  preview: string;
+}
+
+export type LibraryImageState =
+  | { state: "pending"; request: number }
+  | { state: "ready"; pin: LibraryImagePin };
+
+const libraryImageRequests = new Map<number, {
+  cell: DraftCell;
+  pending: Extract<LibraryImageState, { state: "pending" }>;
+  previous: LibraryImagePin | null;
+}>();
+let nextLibraryImageRequest = 0;
+
+/** Reserve the actual draft slot before the native image lookup starts. */
+export function beginLibraryImagePin(key: string): number | null {
+  const cell = activeOf(familyFor(key));
+  if (cell.reserved !== null) return null;
+  const old = cell.libraryImage;
+  const previous = old?.state === "ready" ? old.pin
+    : old?.state === "pending" ? libraryImageRequests.get(old.request)?.previous ?? null : null;
+  if (old?.state === "pending") libraryImageRequests.delete(old.request);
+  const pending = { state: "pending" as const, request: ++nextLibraryImageRequest };
+  libraryImageRequests.set(pending.request, { cell, pending, previous });
+  cell.libraryImage = pending;
+  cell.version += 1;
+  captureBinding(cell);
+  publish(cell);
+  return pending.request;
+}
+
+/** A late result follows its original slot, never the newly selected draft. */
+export function settleLibraryImagePin(request: number, pin: LibraryImagePin | null): boolean {
+  const held = libraryImageRequests.get(request);
+  if (!held) return false;
+  libraryImageRequests.delete(request);
+  const { cell } = held;
+  if (slotsById.get(cell.id) !== cell || cell.libraryImage !== held.pending) return false;
+  const ready = pin ?? held.previous;
+  cell.libraryImage = ready ? { state: "ready", pin: ready } : null;
+  captureBinding(cell);
+  publish(cell);
+  return true;
+}
+
+export function removeLibraryImagePin(key: string, expected: LibraryImageState): void {
+  const cell = activeOf(familyFor(key));
+  if (cell.libraryImage !== expected) return;
+  if (expected.state === "pending") libraryImageRequests.delete(expected.request);
+  cell.libraryImage = null;
+  captureBinding(cell);
+  publish(cell);
+}
+
 onPrivateSessionReset(() => {
+  libraryImageRequests.clear();
   for (const controller of controllers.values()) controller.abort();
   controllers.clear();
   const previous = [...families.values()];

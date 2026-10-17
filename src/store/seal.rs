@@ -67,10 +67,10 @@ fn raw_lease_refusal(reason: String) -> rusqlite::Error {
 /// the account registry and upload indexes. v47 (CAD-1423) adds notification
 /// preferences, push devices and private intents. v48 (CAD-1420) adds only
 /// the three `assistants` bootstrap lifecycle columns on the binding row.
-/// v49 (CAD-914) adds wiki transfer job tables. None touch a sealed/witnessed
-/// surface, so the bound extends to 49.
+/// v49 (CAD-914) adds wiki transfer job tables. v50 (CAD-1482) adds image
+/// lineage. None touch a sealed/witnessed surface, so the bound extends to 50.
 #[allow(dead_code)]
-const PROTECTED_SCHEMA_MAX: i64 = 49;
+const PROTECTED_SCHEMA_MAX: i64 = 50;
 
 /// Arm level + transaction-control phase, shared between the `Store` and
 /// the connection's authorizer. Atomic because the authorizer callback must
@@ -1464,6 +1464,15 @@ impl Store {
                     |r| r.get(0),
                 )?;
                 if bootstrap_columns != 3 {
+                    return Err(Error::rejected("owner witness database schema is unsupported"));
+                }
+            }
+            if *db_schema >= 50 {
+                let lineage_tables: i64 = wtx.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='app_media_lineage'",
+                    [], |row| row.get(0),
+                )?;
+                if lineage_tables != 1 {
                     return Err(Error::rejected("owner witness database schema is unsupported"));
                 }
             }

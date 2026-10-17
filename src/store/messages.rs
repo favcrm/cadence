@@ -677,6 +677,7 @@ impl Store {
             attachments,
             None,
             human,
+            None,
         )
     }
 
@@ -715,6 +716,7 @@ impl Store {
             attachments,
             conversation,
             None,
+            None,
         )
     }
 
@@ -737,6 +739,7 @@ impl Store {
         attachments: Option<&Value>,
         conversation: Option<&str>,
         human: Option<&Value>,
+        media_refs: Option<&Value>,
     ) -> Result<(bool, String)> {
         self.write_tx(|conn| {
             let tx = &mut *conn;
@@ -791,6 +794,7 @@ impl Store {
                 attachments,
                 human,
                 conversation,
+                media_refs,
             )?;
             for old in &superseded {
                 self.supersede_in(&tx, old, id, steer)?;
@@ -1394,6 +1398,7 @@ impl Store {
             attachments,
             None,
             None,
+            None,
         )
     }
 
@@ -1435,6 +1440,7 @@ impl Store {
             attachments,
             human,
             None,
+            None,
         )
     }
 
@@ -1459,6 +1465,7 @@ impl Store {
         attachments: Option<&Value>,
         human: Option<&Value>,
         conversation: Option<&str>,
+        media_refs: Option<&Value>,
     ) -> Result<(bool, String)> {
         if !daemon {
             crate::proto::caller_message(id, source)?;
@@ -1501,6 +1508,7 @@ impl Store {
                 && Self::entry_app_in(tx, id)? == app.cloned()
                 && Self::entry_attachments_in(tx, id)? == attachments.cloned()
                 && Self::entry_human_in(tx, id)? == human.cloned()
+                && Self::entry_media_refs_in(tx, id)? == media_refs.cloned()
                 && Self::entry_conversation_in(tx, id)?.as_deref() == conversation;
             if !same {
                 return Err(Error::rejected(
@@ -1571,6 +1579,7 @@ impl Store {
                 attachments,
                 human,
                 conversation,
+                media_refs,
             )?;
         }
         Ok((false, "queued".to_string()))
@@ -1641,6 +1650,7 @@ impl Store {
             app,
             attachments,
             human,
+            None,
             None,
         )
     }

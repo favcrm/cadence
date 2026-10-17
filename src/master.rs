@@ -382,6 +382,10 @@ pub fn scoped_verb_reference(
             "[{{\"field\": \"{field}\", \"op\": \"eq\", \"value\": \"{value}\"}}]\n"
         ));
     }
+    out.push_str(
+        "Inspect only the attached retained image. If media.refine.prepare is listed, \
+         prepare pinned asset_id, revision, sha256 and operator instructions; do not invent.\n",
+    );
     out.push_str("[end scoped chat turn]");
     out
 }

@@ -18,9 +18,9 @@
 //! credential this route relays. The frame itself never reaches this
 //! route (`connect-src 'none'`); the host-held action token is relayed
 //! only by the native parent. Daemon refusals map to their normal
-//! non-2xx reply — this handler never fabricates success. Asset
-//! detail, publish, download, preview and generation are not admitted
-//! here.
+//! non-2xx reply — this handler never fabricates success. Catalog reads
+//! and bounded local previews perform no provider fetch or generation.
+//! Publish, chat handoff and original download have separate relays below.
 
 use serde_json::Value;
 use tiny_http::Request;
@@ -35,6 +35,10 @@ const BODY_CAP: u64 = 4 * 1024;
 /// `POST /api/app-media/read` → `true` for exactly that path.
 pub(super) fn read_route(path: &str) -> bool {
     path == "/api/app-media/read"
+}
+
+pub(super) fn chat_attach_route(path: &str) -> bool {
+    path == "/api/app-media/chat-attach"
 }
 
 /// `POST /api/app-media/publish` → `true` for exactly that path.
@@ -248,5 +252,67 @@ pub(super) fn media_read(
     ) {
         Ok(v) => super::json_response(v),
         Err(e) => home::rpc_err(&e, "app_media_read"),
+    }
+}
+
+pub(super) fn media_chat_attach(
+    request: &mut Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+) -> HttpResp {
+    let bytes = match read_body(request, BODY_CAP) {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let body: Value = match serde_json::from_slice::<Value>(&bytes) {
+        Ok(v) if v.is_object() => v,
+        _ => return err_response(400, "media chat attach body must be a JSON object"),
+    };
+    if body.as_object().is_some_and(|o| {
+        o.keys().any(|k| {
+            !matches!(
+                k.as_str(),
+                "action_token" | "asset_id" | "expected_revision" | "conversation_id"
+            )
+        })
+    }) {
+        return err_response(400, "media chat attach body contains unsupported fields");
+    }
+    let action_token = body
+        .get("action_token")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let asset_id = body.get("asset_id").and_then(Value::as_str).unwrap_or("");
+    let revision = body.get("expected_revision").and_then(Value::as_i64);
+    let conversation_id = body.get("conversation_id");
+    if action_token.is_empty()
+        || asset_id.is_empty()
+        || !revision.is_some_and(|v| v > 0)
+        || !conversation_id.is_some_and(|v| {
+            v.is_null()
+                || v.as_str()
+                    .is_some_and(|id| !id.is_empty() && id.len() <= 128)
+        })
+    {
+        return err_response(400, "media chat attach needs action_token, asset_id, expected_revision and a host-selected conversation_id");
+    }
+    let Some((token, key, origin)) = app_screens::request_credentials(request, opts) else {
+        return err_response(403, "media chat attach needs a live operator session");
+    };
+    match client::rpc(
+        state_dir,
+        "app_media_chat_attach",
+        serde_json::json!({
+            "action_token": action_token,
+            "token": token,
+            "key": key,
+            "origin": origin,
+            "asset_id": asset_id,
+            "expected_revision": revision,
+            "conversation_id": conversation_id,
+        }),
+    ) {
+        Ok(v) => super::json_response(v),
+        Err(e) => home::rpc_err(&e, "app_media_chat_attach"),
     }
 }

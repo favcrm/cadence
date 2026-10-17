@@ -62,6 +62,10 @@ fn schema(id: &str) -> Option<Value> {
             &["post"],
         ),
         "social.drafts.status" => object(json!({}), &[]),
+        "media.refine.prepare" => object(
+            json!({"asset_id":{"type":"string","minLength":1,"maxLength":64},"revision":{"type":"integer","minimum":1},"sha256":{"type":"string","minLength":71,"maxLength":71},"instructions":{"type":"string","minLength":1,"maxLength":2000}}),
+            &["asset_id", "revision", "sha256", "instructions"],
+        ),
         _ => return None,
     })
 }
@@ -201,6 +205,7 @@ pub fn registered_action(id: &str) -> Option<RegisteredAction> {
         "social.posts.fetch" => ("read", "permission_required"),
         "social.draft.create" => ("draft", "permission_required"),
         "social.drafts.status" => ("read", "none"),
+        "media.refine.prepare" => ("draft", "permission_required"),
         _ => return None,
     };
     Some(RegisteredAction {
@@ -219,6 +224,7 @@ pub fn registered_action(id: &str) -> Option<RegisteredAction> {
             "social.posts.fetch" => "social.posts.fetch",
             "social.draft.create" => "social.draft.create",
             "social.drafts.status" => "social.drafts.status",
+            "media.refine.prepare" => "media.refine.prepare",
             _ => unreachable!(),
         },
         effect,
@@ -244,6 +250,7 @@ pub fn registered_ids() -> &'static [&'static str] {
         "social.posts.fetch",
         "social.draft.create",
         "social.drafts.status",
+        "media.refine.prepare",
     ]
 }
 

@@ -70,6 +70,20 @@ impl Shared {
     /// header for the full authority chain; every proof runs fresh on
     /// each call and no grant is ever cached into the tool context.
     pub(super) fn rpc_app_media_read(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        if params["input"]["kind"] == "preview" {
+            self.media_request_proven(
+                "media preview",
+                params,
+                peer_pid,
+                (
+                    &["action_token", "token", "key", "origin", "input"],
+                    app_screen_decl::MAY_MEDIA_READ,
+                ),
+                |_| Ok(()),
+                |_, (), _| Ok(Value::Null),
+            )?;
+            return self.media_read_preview(params);
+        }
         self.media_request_proven(
             "media read",
             params,
@@ -87,7 +101,7 @@ impl Shared {
                 }
                 Ok(input)
             },
-            |view, input| {
+            |view, input, _ctx| {
                 // The workspace is this daemon's own store — the mount
                 // proved it; no request field selects one. The catalog
                 // is store-wide: same-workspace collaborators read the
@@ -95,6 +109,378 @@ impl Shared {
                 self.media_read_input(view, &input)
             },
         )
+    }
+
+    fn media_read_preview(&self, params: &Value) -> Result<Value> {
+        use base64::Engine;
+        let input = &params["input"];
+        strict_fields(input, &["kind", "asset_id", "expected_revision"])?;
+        let asset_id = required_str(input, "asset_id")?;
+        let revision = input["expected_revision"]
+            .as_i64()
+            .filter(|revision| *revision > 0)
+            .ok_or_else(|| Error::rejected("media preview needs a positive revision"))?;
+        let image = self.store.app_media_context_image(asset_id)?;
+        if image.asset.revision != revision || image.asset.kind != "image" {
+            return Err(Error::rejected("media preview reference is stale"));
+        }
+        let preview = crate::platform::agenticos_external::image::preview_jpeg(
+            &image.bytes,
+            image.media_type,
+        )
+        .map_err(|(_, reason)| Error::rejected(reason))?;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(preview);
+        self.with_media_mount_current(params, &image.original, |_| {
+            if self.store.app_media_revision(asset_id)? != revision {
+                return Err(Error::rejected(
+                    "media preview reference changed during preparation",
+                ));
+            }
+            Ok(json!({
+                "asset_id": asset_id, "revision": revision,
+                "sha256": image.original.sha256,
+                "media_type": "image/jpeg", "base64": encoded,
+            }))
+        })
+    }
+
+    fn with_media_mount_current<T>(
+        &self,
+        params: &Value,
+        original: &crate::store::app_media::MediaOriginalProof,
+        read: impl FnOnce(&ToolContext) -> Result<T>,
+    ) -> Result<T> {
+        let token = required_str(params, "token")?;
+        let action_token = required_str(params, "action_token")?;
+        let key = match params.get("key") {
+            None => "",
+            Some(Value::String(key)) => key.as_str(),
+            _ => {
+                return Err(Error::rejected(
+                    "media image key must be a session key string",
+                ))
+            }
+        };
+        let origin = match params["origin"].as_str() {
+            Some("loopback") => Origin::Loopback,
+            Some("tailnet") => Origin::Tailnet,
+            Some("public") => Origin::Public,
+            _ => {
+                return Err(Error::rejected(
+                    "media image needs a classified session origin",
+                ))
+            }
+        };
+        let (session, _) = self
+            .tool_session(token, key, origin)
+            .ok_or_else(|| Error::rejected("media image needs a live operator session"))?;
+        let expected = self.tool_context_proven(action_token, &session)?;
+        let pm = self.pm_at(&self.pm_dir()?)?;
+        let delivery = OriginalDelivery {
+            shared: self,
+            pm: &pm,
+            action_token,
+            token,
+            key,
+            origin,
+            proven: original,
+            account_source: None,
+            expected,
+        };
+        delivery.with_current(|| read(&delivery.expected))?
+    }
+
+    /// Re-prove the producing binding, approval and custody under the
+    /// original transfer's pm -> custody -> release ordering.
+    pub(super) fn with_media_source_current<T>(
+        &self,
+        original: &crate::store::app_media::MediaOriginalProof,
+        read: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let pm = self.pm_at(&self.pm_dir()?)?;
+        workspace::with_runtime_snapshot(&pm, &original.install_id, |bundle, files| {
+            let _custody = self
+                .platform_custody_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let _release = self
+                .app_release_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            self.app_binding_receipt_current(
+                &original.install_id,
+                original.context_id.as_deref(),
+                &original.slot,
+                &original.proof,
+                bundle,
+                files,
+            )?;
+            if self
+                .store
+                .app_capability_status(&original.install_id, required_str(bundle, "digest")?)?
+                ["state"]
+                != "approved"
+            {
+                return Err(Error::rejected(
+                    "producing installation is not approved at its current digest",
+                ));
+            }
+            read()
+        })
+    }
+
+    /// Persisted app stamp for a turn image, never caller-supplied scope.
+    /// `None` is general native chat with no app stamp. A stamp that no
+    /// longer re-proves an active context, or whose conversation is not
+    /// owned by that installation, refuses.
+    fn image_receiver_scope(
+        &self,
+        caller: &str,
+        message_id: &str,
+    ) -> Result<Option<(String, String)>> {
+        let raw = self.store.message_app_stamp(message_id)?;
+        let Some(obj) = raw.as_ref().and_then(Value::as_object) else {
+            return Ok(None);
+        };
+        if obj.get("verified") != Some(&Value::Bool(true)) {
+            return Ok(None);
+        }
+        let install = obj.get("install_id").and_then(Value::as_str).unwrap_or("");
+        let context = obj.get("context_id").and_then(Value::as_str).unwrap_or("");
+        if install.is_empty() && context.is_empty() {
+            return Ok(None);
+        }
+        if install.is_empty() || context.is_empty() {
+            return Err(Error::rejected(
+                "app image receiver stamp does not name an active context",
+            ));
+        }
+        let hint = self
+            .store
+            .message_app(message_id)?
+            .ok_or_else(|| Error::rejected("app image receiver context is not active"))?;
+        if hint.get("install_id").and_then(Value::as_str) != Some(install)
+            || hint.get("context_id").and_then(Value::as_str) != Some(context)
+        {
+            return Err(Error::rejected(
+                "app image receiver stamp does not match the active context",
+            ));
+        }
+        let conversation = self
+            .store
+            .message_conversation(caller, message_id)?
+            .filter(|row| row.install_id.as_deref() == Some(install))
+            .ok_or_else(|| Error::rejected("app image receiver does not own this conversation"))?;
+        if conversation.subject.is_some() && conversation.context_id.as_deref() != Some(context) {
+            return Err(Error::rejected(
+                "app image receiver does not own this conversation",
+            ));
+        }
+        Ok(Some((install.to_string(), context.to_string())))
+    }
+
+    fn receiver_install_admitted(
+        &self,
+        caller: &str,
+        message_id: &str,
+        expected: &(String, String),
+        bundle: &Value,
+    ) -> Result<()> {
+        let again = self
+            .image_receiver_scope(caller, message_id)?
+            .ok_or_else(|| Error::rejected("app image receiver is no longer admitted"))?;
+        if again != *expected {
+            return Err(Error::rejected("app image receiver is no longer admitted"));
+        }
+        let digest = required_str(bundle, "digest")?;
+        if self.store.app_capability_status(&again.0, digest)?["state"] != "approved" {
+            return Err(Error::rejected(
+                "receiving installation is not approved at its current digest",
+            ));
+        }
+        let (_, proof) = self.store.app_context_proof(&again.0, &again.1)?;
+        if proof.install_id != again.0 || proof.id != again.1 {
+            return Err(Error::rejected("app image receiver context is not active"));
+        }
+        Ok(())
+    }
+
+    /// Refuse a revoked or stale app receiver before retained bytes are read.
+    /// Unstamped general chat stays on the persisted-pin path.
+    pub(super) fn gate_image_receiver_before_bytes(
+        &self,
+        caller: &str,
+        message_id: &str,
+    ) -> Result<()> {
+        let Some(receiver) = self.image_receiver_scope(caller, message_id)? else {
+            return Ok(());
+        };
+        let pm = self.pm_at(&self.pm_dir()?)?;
+        workspace::with_runtime_snapshot(&pm, &receiver.0, |bundle, _files| {
+            let _custody = self
+                .platform_custody_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let _release = self
+                .app_release_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            self.receiver_install_admitted(caller, message_id, &receiver, bundle)
+        })
+    }
+
+    /// Producing custody together with the persisted receiver, under one
+    /// pm → custody → release section. No app stamp keeps the producer-only
+    /// proof used by general pinned chat.
+    pub(super) fn with_turn_image_current<T>(
+        &self,
+        caller: &str,
+        message_id: &str,
+        original: &crate::store::app_media::MediaOriginalProof,
+        read: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let Some(receiver) = self.image_receiver_scope(caller, message_id)? else {
+            return self.with_media_source_current(original, read);
+        };
+        let pm = self.pm_at(&self.pm_dir()?)?;
+        workspace::with_runtime_snapshot_pair(
+            &pm,
+            &receiver.0,
+            &original.install_id,
+            |caller_snap, producer_snap| {
+                let _custody = self
+                    .platform_custody_lock
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let _release = self
+                    .app_release_lock
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                self.receiver_install_admitted(caller, message_id, &receiver, caller_snap.0)?;
+                self.app_binding_receipt_current(
+                    &original.install_id,
+                    original.context_id.as_deref(),
+                    &original.slot,
+                    &original.proof,
+                    producer_snap.0,
+                    producer_snap.1,
+                )?;
+                if self.store.app_capability_status(
+                    &original.install_id,
+                    required_str(producer_snap.0, "digest")?,
+                )?["state"]
+                    != "approved"
+                {
+                    return Err(Error::rejected(
+                        "producing installation is not approved at its current digest",
+                    ));
+                }
+                read()
+            },
+        )
+    }
+
+    /// Attach is a media-mount operation. The trusted host supplies the
+    /// captured conversation, never the opaque frame; a changed target refuses.
+    pub(super) fn rpc_app_media_chat_attach(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        use base64::Engine;
+        self.media_request_proven(
+            "media chat attach",
+            params,
+            peer_pid,
+            (
+                &[
+                    "action_token",
+                    "token",
+                    "key",
+                    "origin",
+                    "asset_id",
+                    "expected_revision",
+                    "conversation_id",
+                ],
+                app_screen_decl::MAY_MEDIA_CHAT_ATTACH,
+            ),
+            |_| Ok(()),
+            |_, (), _| Ok(Value::Null),
+        )?;
+        let asset_id = required_str(params, "asset_id")?;
+        if !crate::store::app_media::valid_id(asset_id) {
+            return Err(Error::rejected(
+                "media chat attach needs a catalog asset id",
+            ));
+        }
+        let revision = params["expected_revision"]
+            .as_i64()
+            .filter(|revision| *revision > 0)
+            .ok_or_else(|| Error::rejected("media chat attach needs a positive revision"))?;
+        let conversation_id = match params.get("conversation_id") {
+            Some(Value::Null) => None,
+            Some(Value::String(id)) if !id.is_empty() && id.len() <= 128 => Some(id.as_str()),
+            _ => {
+                return Err(Error::rejected(
+                    "media chat attach needs a captured host conversation",
+                ))
+            }
+        };
+        let image = self.store.app_media_context_image(asset_id)?;
+        if image.asset.revision != revision
+            || !matches!(
+                image.original.media_type.as_str(),
+                "image/png" | "image/jpeg"
+            )
+        {
+            return Err(Error::rejected(
+                "media chat attach needs a current PNG or JPEG original",
+            ));
+        }
+        let preview = crate::platform::agenticos_external::image::preview_jpeg(
+            &image.bytes,
+            image.media_type,
+        )
+        .map_err(|(_, reason)| Error::rejected(reason))?;
+        const PREFIX: &str = "data:image/jpeg;base64,";
+        let mut data_url = String::with_capacity(PREFIX.len() + preview.len().div_ceil(3) * 4);
+        data_url.push_str(PREFIX);
+        base64::engine::general_purpose::STANDARD.encode_string(preview, &mut data_url);
+        self.with_media_mount_current(params, &image.original, |ctx| {
+            if self.store.app_media_revision(asset_id)? != revision {
+                return Err(Error::rejected(
+                    "media chat attach reference changed during preparation",
+                ));
+            }
+            if let Some(id) = conversation_id {
+                let alias = self.resolve_alias("master")?;
+                if !self
+                    .store
+                    .conversation_list(&alias, &ctx.install_id)?
+                    .iter()
+                    .any(|row| {
+                        row.id == id && !row.archived
+                        // As on thread_send, only subject conversations bind
+                        // to their creation context; ordinary threads do not.
+                        && (row.subject.is_none()
+                            || (ctx.context_id.is_some()
+                                && row.context_id.as_deref() == ctx.context_id.as_deref()))
+                    })
+                {
+                    return Err(Error::rejected(
+                        "media chat attach conversation is outside this app context",
+                    ));
+                }
+            }
+            Ok(json!({
+                "asset_id": asset_id, "revision": revision,
+                "host_command": {
+                    "operation": "media.chat.attach", "conversation_id": conversation_id,
+                    "args": {
+                        "install_id": ctx.install_id, "context_id": ctx.context_id,
+                        "asset_id": asset_id, "revision": revision,
+                        "sha256": image.original.sha256, "media_type": image.media_type,
+                        "title": image.asset.title, "preview": data_url,
+                    }
+                }
+            }))
+        })
     }
 
     /// `app_media_publish {action_token, token, key, origin, asset_id,
@@ -159,7 +545,7 @@ impl Shared {
                     request_id.to_string(),
                 ))
             },
-            |_view, (asset_id, expected_revision, request_id)| {
+            |_view, (asset_id, expected_revision, request_id), _ctx| {
                 // The workspace is this daemon's own store — the mount
                 // proved it; the receipt namespace is the workspace
                 // catalog itself. Runs inside the runtime snapshot
@@ -790,7 +1176,7 @@ impl Shared {
         peer_pid: u32,
         (allowed, required_may): (&[&str], &str),
         parse: impl FnOnce(&Value) -> Result<T>,
-        execute: impl FnOnce(&crate::operator_auth::SessionView, T) -> Result<Value>,
+        execute: impl FnOnce(&crate::operator_auth::SessionView, T, &ToolContext) -> Result<Value>,
     ) -> Result<Value> {
         self.operator_connection(verb, params, peer_pid)?;
         strict_fields(params, allowed)?;
@@ -889,8 +1275,120 @@ impl Shared {
                     "{verb} context belongs to another installation",
                 )));
             }
-            execute(&view, terms)
+            execute(&view, terms, &ctx)
         })
+    }
+
+    /// Native image inspection sends verified retained display material;
+    /// the message's original digest remains the reference-edit pin.
+    pub(super) fn rpc_app_media_inspect_stream(
+        &self,
+        params: &Value,
+        peer_pid: u32,
+        deliver: impl FnOnce(&Value, &[u8], &MediaInspectionDelivery<'_>) -> Result<()>,
+    ) -> Result<()> {
+        let pin = self.media_inspect_turn(params, peer_pid)?;
+        let asset_id = required_str(params, "asset_id")?;
+        let message_id = required_str(params, "message")?;
+        let caller = match self.connection_caller(peer_pid)? {
+            crate::daemon::caller_rule::Who::Agent(alias) => alias,
+            _ => return Err(Error::rejected("media inspect is an agent turn's verb")),
+        };
+        // Receiver admission is persisted scope, proved before any retained
+        // byte read. Producer pairing repeats inside each currentness check.
+        self.gate_image_receiver_before_bytes(&caller, message_id)?;
+        let image = self.store.app_media_context_image(asset_id)?;
+        if pin["revision"].as_i64() != Some(image.asset.revision)
+            || pin["sha256"].as_str() != Some(image.original.sha256.as_str())
+        {
+            return Err(Error::rejected("media inspect reference is stale"));
+        }
+        let delivery = MediaInspectionDelivery {
+            shared: self,
+            params,
+            peer_pid,
+            original: &image.original,
+            asset_id,
+            revision: image.asset.revision,
+            pin: &pin,
+        };
+        delivery.with_current(|| ())?;
+        let header = json!({
+            "asset_id": asset_id, "revision": image.asset.revision,
+            "sha256": image.digest, "media_type": image.media_type,
+            "bytes": image.bytes.len(),
+        });
+        deliver(&header, &image.bytes, &delivery)
+    }
+
+    /// CAD-1482: re-prove the exact assigned turn and its one image pin.
+    /// The caller is the connection's agent. The token must be that
+    /// agent's current assigned turn, and the asset must be the single
+    /// library image pinned on that message. Bytes are the retained
+    /// receipt blob — this verb never submits or downloads from a provider.
+    fn media_inspect_turn(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+        strict_fields(params, &["asset_id", "message", "token"])?;
+        let asset_id = required_str(params, "asset_id")?;
+        let message_id = required_str(params, "message")?;
+        let token = required_str(params, "token")?;
+        if !crate::store::app_media::valid_id(asset_id) {
+            return Err(Error::rejected(
+                "media inspect asset_id is not a catalog asset id",
+            ));
+        }
+        let caller = match self.connection_caller(peer_pid)? {
+            crate::daemon::caller_rule::Who::Agent(alias) => alias,
+            _ => return Err(Error::rejected("media inspect is an agent turn's verb")),
+        };
+        self.assigned_agent_endpoint_session(peer_pid, &caller, "media inspect")?;
+        if message_id.is_empty() || message_id.len() > 128 || token.is_empty() || token.len() > 256
+        {
+            return Err(Error::rejected("media inspect turn identity is malformed"));
+        }
+        let stored = self
+            .store
+            .message(message_id)?
+            .ok_or_else(|| Error::rejected("media inspect turn is unknown"))?;
+        if stored.alias != caller
+            || stored.state != "running"
+            || stored.turn_id.as_deref() != Some(token)
+        {
+            return Err(Error::rejected(
+                "media inspect needs the active assigned chat turn",
+            ));
+        }
+        let agent = self.store.agent(&caller)?;
+        if !crate::adapter::registry::turn_token_current(
+            &agent.provider,
+            &agent.endpoint_kind,
+            agent.generation.as_deref(),
+            token,
+        ) {
+            return Err(Error::rejected(
+                "media inspect turn token is no longer current",
+            ));
+        }
+        let pinned = self.store.message_media_refs(message_id)?;
+        let matched = pinned
+            .as_ref()
+            .and_then(|refs| refs.as_array())
+            .is_some_and(|refs| {
+                refs.len() == 1
+                    && refs[0]["asset_id"].as_str() == Some(asset_id)
+                    && refs[0]["revision"].as_i64().is_some()
+                    && refs[0]["sha256"].as_str().is_some()
+            });
+        if !matched {
+            return Err(Error::rejected(
+                "media inspect asset is not attached to this turn",
+            ));
+        }
+        match pinned {
+            Some(Value::Array(mut refs)) => refs
+                .pop()
+                .ok_or_else(|| Error::rejected("media inspect image pin is absent")),
+            _ => Err(Error::rejected("media inspect image pin is absent")),
+        }
     }
 
     /// The closed media-read input union and the bounded catalog page.
@@ -938,7 +1436,7 @@ impl Shared {
                     }
                 };
                 let (page, next_cursor) = self.store.app_media_catalog(limit, cursor)?;
-                let assets: Vec<Value> = page.iter().map(|a| a.projection()).collect();
+                let assets: Vec<Value> = page.iter().map(|asset| asset.projection()).collect();
                 Ok(json!({
                     "assets": assets,
                     "next_cursor": next_cursor,
@@ -952,6 +1450,40 @@ impl Shared {
                 "media read input kind is not a recognized media read",
             )),
         }
+    }
+}
+
+/// Like original delivery, a turn image re-proves authority before every
+/// nonblocking send and holds no guard while waiting for socket capacity.
+pub(super) struct MediaInspectionDelivery<'a> {
+    shared: &'a Shared,
+    params: &'a Value,
+    peer_pid: u32,
+    original: &'a crate::store::app_media::MediaOriginalProof,
+    asset_id: &'a str,
+    revision: i64,
+    pin: &'a Value,
+}
+
+impl MediaInspectionDelivery<'_> {
+    pub(super) fn with_current<T>(&self, send: impl FnOnce() -> T) -> Result<T> {
+        let caller = match self.shared.connection_caller(self.peer_pid)? {
+            crate::daemon::caller_rule::Who::Agent(alias) => alias,
+            _ => return Err(Error::rejected("media inspect is an agent turn's verb")),
+        };
+        let message_id = required_str(self.params, "message")?;
+        self.shared
+            .with_turn_image_current(&caller, message_id, self.original, || {
+                let current = self.shared.media_inspect_turn(self.params, self.peer_pid)?;
+                if &current != self.pin
+                    || self.shared.store.app_media_revision(self.asset_id)? != self.revision
+                {
+                    return Err(Error::rejected(
+                        "media inspect authority ended during delivery",
+                    ));
+                }
+                Ok(send())
+            })
     }
 }
 

@@ -111,6 +111,38 @@ pub(super) fn local_execution_contract(
     Ok(manifest)
 }
 
+fn library_reference_inputs(inputs: &BTreeMap<String, String>) -> bool {
+    inputs.len() == 4
+        && [
+            "library_asset_id",
+            "library_revision",
+            "library_sha256",
+            "instructions",
+        ]
+        .iter()
+        .all(|key| inputs.get(*key).is_some_and(|value| !value.is_empty()))
+}
+
+pub(super) fn library_reference_inputs_value(inputs: &Value) -> bool {
+    let Some(object) = inputs.as_object() else {
+        return false;
+    };
+    object.len() == 4
+        && [
+            "library_asset_id",
+            "library_revision",
+            "library_sha256",
+            "instructions",
+        ]
+        .iter()
+        .all(|key| {
+            object
+                .get(*key)
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+        })
+}
+
 impl Shared {
     /// CAD-1123 HP2: create, approve and dispatch in one operator call. The
     /// operator proof was taken by the caller. The approval is the daemon's
@@ -486,7 +518,14 @@ impl Shared {
                     )?
                     .ok_or_else(|| Error::rejected("run capability binding is absent"))?;
                 self.app_account_binding_owned(&account_actor, &proof)?;
-                requests.insert(slot.clone(), self.prepare_app_capability_quote(&proof)?);
+                let mut request = self.prepare_app_capability_quote(&proof)?;
+                if library_reference_inputs(&inputs)
+                    && declared.capability == "media.generate"
+                    && declared.effect == "draft"
+                {
+                    request = request.reference_edit();
+                }
+                requests.insert(slot.clone(), request);
                 capabilities.insert(slot.clone(), proof);
             }
             Ok((
@@ -898,6 +937,7 @@ impl Shared {
                 .unwrap_or_else(|e| e.into_inner());
             self.app_run_binding_current(run, bundle, files)?;
             let mut requests = BTreeMap::new();
+            let reference_edit = library_reference_inputs_value(&run["snapshot"]["inputs"]);
             for (slot, binding) in run["snapshot"]["capabilities"]
                 .as_object()
                 .into_iter()
@@ -905,7 +945,17 @@ impl Shared {
             {
                 let proof = serde_json::from_value(binding.clone())
                     .map_err(|_| Error::rejected("run capability binding receipt is invalid"))?;
-                requests.insert(slot.clone(), self.prepare_app_capability_quote(&proof));
+                let request = self.prepare_app_capability_quote(&proof).map(|request| {
+                    if reference_edit
+                        && proof.config["declaration"]["capability"] == "media.generate"
+                        && proof.config["declaration"]["effect"] == "draft"
+                    {
+                        request.reference_edit()
+                    } else {
+                        request
+                    }
+                });
+                requests.insert(slot.clone(), request);
             }
             Ok(requests)
         })
@@ -1090,6 +1140,97 @@ impl Shared {
         Ok(result)
     }
 
+    /// Re-pin immutable image material before taking runtime snapshot locks.
+    /// The consumer must prove the producing authority under its own guards.
+    pub(super) fn library_reference_pin(
+        &self,
+        inputs: &Value,
+    ) -> Result<crate::store::app_media::MediaOriginalProof> {
+        let asset_id = inputs["library_asset_id"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| Error::rejected("library image id is not pinned"))?;
+        let revision = inputs["library_revision"]
+            .as_str()
+            .and_then(|raw| raw.parse::<i64>().ok())
+            .filter(|revision| *revision >= 1)
+            .ok_or_else(|| Error::rejected("library image revision is not pinned"))?;
+        let sha256 = inputs["library_sha256"]
+            .as_str()
+            .filter(|value| {
+                value.len() == 71
+                    && value.starts_with("sha256:")
+                    && value[7..]
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            })
+            .ok_or_else(|| Error::rejected("library image digest is not pinned"))?;
+        if inputs["instructions"]
+            .as_str()
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err(Error::rejected("reference instructions are blank"));
+        }
+        let original = self.store.app_media_pin(asset_id, revision, sha256)?;
+        let hex = &sha256[7..];
+        let reference_ok = original
+            .reference
+            .split_once('.')
+            .is_some_and(|(job, digest)| {
+                digest == hex && job.starts_with("med_") && !original.reference.contains("://")
+            });
+        if original.sha256 != sha256 || !reference_ok {
+            return Err(Error::rejected(
+                "producer reference is not the retained original artifact",
+            ));
+        }
+        Ok(original)
+    }
+
+    /// Producer plus original pin, for a caller already inside the paired
+    /// runtime snapshot with custody then release held. No remote I/O.
+    pub(super) fn library_reference_under(
+        &self,
+        inputs: &Value,
+        expected: &crate::store::app_media::MediaOriginalProof,
+        producer_bundle: &Value,
+        producer_files: &BTreeMap<String, String>,
+    ) -> Result<Value> {
+        self.app_binding_receipt_current(
+            &expected.install_id,
+            expected.context_id.as_deref(),
+            &expected.slot,
+            &expected.proof,
+            producer_bundle,
+            producer_files,
+        )?;
+        if self.store.app_capability_status(
+            &expected.install_id,
+            required_str(producer_bundle, "digest")?,
+        )?["state"]
+            != "approved"
+        {
+            return Err(Error::rejected(
+                "reference producing installation is not approved",
+            ));
+        }
+        let pinned = self.library_reference_pin(inputs)?;
+        if pinned.sha256 != expected.sha256
+            || pinned.reference != expected.reference
+            || pinned.install_id != expected.install_id
+            || pinned.slot != expected.slot
+        {
+            return Err(Error::rejected(
+                "producer reference changed before the reference edit",
+            ));
+        }
+        Ok(json!({
+            "asset_id": inputs["library_asset_id"],
+            "sha256": pinned.sha256,
+            "ref": pinned.reference,
+        }))
+    }
+
     /// CAD-1171: run a host-execution run's capability slots in-process.
     /// Mirrors the worker path (`app_run_capability_call`) minus the
     /// message/turn proof: the approved, dispatched step is the proof,
@@ -1121,11 +1262,23 @@ impl Shared {
                     == crate::platform::account_media::PLATFORM
             })
             .collect();
+        let reference_original = if account_slots.len() != slots.len()
+            && library_reference_inputs_value(&run["snapshot"]["inputs"])
+        {
+            Some(self.library_reference_pin(&run["snapshot"]["inputs"])?)
+        } else {
+            None
+        };
         let pm = self.pm_at(&self.pm_dir()?)?;
         // Preserve the entire legacy critical section for runs without account
         // slots. Mixed runs release only at the necessary account boundaries.
         let execute_legacy = |legacy_slots: &[String], finish: bool| {
-            workspace::with_runtime_snapshot(&pm, install, |bundle, files| {
+            let execute = |bundle: &Value,
+                           files: &std::collections::BTreeMap<String, String>,
+                           producer: Option<(
+                &Value,
+                &std::collections::BTreeMap<String, String>,
+            )>| {
                 let _custody = self
                     .platform_custody_lock
                     .lock()
@@ -1134,6 +1287,29 @@ impl Shared {
                     .app_release_lock
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
+                if let Some(original) = &reference_original {
+                    let (producer_bundle, producer_files) = producer.ok_or_else(|| {
+                        Error::rejected("reference producer snapshot is unavailable")
+                    })?;
+                    self.app_binding_receipt_current(
+                        &original.install_id,
+                        original.context_id.as_deref(),
+                        &original.slot,
+                        &original.proof,
+                        producer_bundle,
+                        producer_files,
+                    )?;
+                    if self.store.app_capability_status(
+                        &original.install_id,
+                        required_str(producer_bundle, "digest")?,
+                    )?["state"]
+                        != "approved"
+                    {
+                        return Err(Error::rejected(
+                            "reference producing installation is not approved",
+                        ));
+                    }
+                }
                 self.app_run_binding_current(run, bundle, files)?;
                 for slot in legacy_slots {
                     let proof = self
@@ -1182,7 +1358,7 @@ impl Shared {
                         )
                         .simple()
                     );
-                    let authority = json!({
+                    let mut authority = json!({
                         "schema":1,"run_id":run_id,"run_snapshot_digest":run["snapshot_digest"],
                         "install_id":install,"context_id":run["context_id"],
                         "step_id":step_id,"slot":slot,"binding":proof,
@@ -1190,6 +1366,43 @@ impl Shared {
                         "quote":run["snapshot"]["quotes"][slot],
                         "call_id":call_id,
                     });
+                    if effect == "draft"
+                        && config["mapping"]["capability"] == "media.generate"
+                        && library_reference_inputs_value(&run["snapshot"]["inputs"])
+                    {
+                        let asset_id = run["snapshot"]["inputs"]["library_asset_id"]
+                            .as_str()
+                            .unwrap_or("");
+                        let revision = run["snapshot"]["inputs"]["library_revision"]
+                            .as_str()
+                            .and_then(|raw| raw.parse::<i64>().ok())
+                            .filter(|n| *n >= 1)
+                            .ok_or_else(|| {
+                                Error::rejected("library image revision is not pinned")
+                            })?;
+                        let sha256 = run["snapshot"]["inputs"]["library_sha256"]
+                            .as_str()
+                            .ok_or_else(|| Error::rejected("library image digest is not pinned"))?;
+                        // The paired snapshot and these held custody/release guards
+                        // prove the producer as well as the consuming run.
+                        let original = self.store.app_media_pin(asset_id, revision, sha256)?;
+                        if original.sha256 != sha256
+                            || reference_original
+                                .as_ref()
+                                .is_none_or(|expected| original.reference != expected.reference)
+                        {
+                            return Err(Error::rejected(
+                                "producer reference changed before the reference edit",
+                            ));
+                        }
+                        authority["reference_edit"] = json!({
+                            "asset_id": asset_id,
+                            "sha256": sha256,
+                            "ref": original.reference,
+                        });
+                        authority["frozen_prompt"] =
+                            run["snapshot"]["inputs"]["instructions"].clone();
+                    }
                     if self
                         .store
                         .app_capability_result_for_slot(run_id, slot)?
@@ -1322,7 +1535,19 @@ impl Shared {
                     self.store.app_run_host_step_succeeded(run_id, &step_id)?;
                 }
                 Ok(())
-            })
+            };
+            if let Some(original) = &reference_original {
+                workspace::with_runtime_snapshot_pair(
+                    &pm,
+                    install,
+                    &original.install_id,
+                    |(bundle, files), producer| execute(bundle, files, Some(producer)),
+                )
+            } else {
+                workspace::with_runtime_snapshot(&pm, install, |bundle, files| {
+                    execute(bundle, files, None)
+                })
+            }
         };
         if account_slots.is_empty() {
             return execute_legacy(&slots, true);
