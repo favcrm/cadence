@@ -412,8 +412,16 @@ fn update_check_and_status_leave_guidance_bytes_untouched() {
             );
             assert_eq!(body["guidance"]["live_session"], "not-checked", "{args:?}");
         } else {
+            // The owned catalogue is the default source, so `--check` can
+            // refuse before `gh` login (no `tar`, no reachable catalogue).
+            // That refusal is not a guidance write; the byte checks above
+            // are the contract.
+            let rejected = serde_json::from_slice::<Value>(&output.stderr)
+                .ok()
+                .is_some_and(|body| body["kind"] == "rejected");
             assert!(
-                stderr.contains("not authenticated")
+                rejected
+                    || stderr.contains("not authenticated")
                     || stderr.contains("operator")
                     || stderr.contains("gh"),
                 "{args:?} stderr={stderr}"
@@ -430,6 +438,10 @@ fn update_check_and_status_leave_guidance_bytes_untouched() {
 /// daemon on this build, and the release copy's own bytes. `gh` answers
 /// only the candidate lookup, because an unmerged build is not an
 /// attested production install. No production state, link, or home.
+///
+/// The repo is not `favcrm/cadence`. That name selects the owned
+/// catalogue, which proves a published package before it will call the
+/// build current. This fixture stays on the live candidate route.
 #[cfg(feature = "test-seam")]
 #[test]
 fn already_current_update_repairs_guidance_without_restarting_the_daemon() {
@@ -477,8 +489,8 @@ if args[:1] == ["api"] and args[1].endswith("/actions/runs/4343"):
         "id": 4343, "run_attempt": 1, "head_sha": sha, "head_branch": "main",
         "event": "push", "path": ".github/workflows/ci.yml",
         "status": "completed", "conclusion": "success",
-        "repository": {"full_name": "favcrm/cadence"},
-        "head_repository": {"full_name": "favcrm/cadence"},
+        "repository": {"full_name": "favcrm/cadence-unmerged"},
+        "head_repository": {"full_name": "favcrm/cadence-unmerged"},
     }, sys.stdout)
     sys.exit(0)
 sys.stderr.write("unexpected gh: %s\n" % " ".join(args))
@@ -576,7 +588,7 @@ sys.exit(1)
         "--releases-dir",
         releases.to_str().unwrap(),
         "--repo",
-        "favcrm/cadence",
+        "favcrm/cadence-unmerged",
     ];
     let output = fixture.cli_vars(&path, &update_env, &args);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -629,7 +641,7 @@ sys.exit(1)
             "--releases-dir",
             releases_arg,
             "--repo",
-            "favcrm/cadence",
+            "favcrm/cadence-unmerged",
         ],
         &[
             "update",
