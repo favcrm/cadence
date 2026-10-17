@@ -70,9 +70,9 @@ fn catalog_id(id: &str) -> bool {
 }
 
 fn route(path: &str) -> Option<Route> {
-    // `/` and `/apps` are the signed-out front door. A live session never
-    // reaches this module for those paths; the board app keeps them.
-    if path == "/" || path == "/apps" || path == "/apps/explore" {
+    // The catalogue's public home is `/apps/explore`. `/` and `/apps` are the
+    // board's own front door and keep the session gate.
+    if path == "/apps/explore" {
         return Some(Route::List);
     }
     let id = path.strip_prefix("/apps/catalog/")?;
@@ -560,10 +560,11 @@ mod tests {
 
     #[test]
     fn only_the_directory_routes_are_public() {
-        assert!(route("/").is_some());
-        assert!(route("/apps").is_some());
         assert!(route("/apps/explore").is_some());
         assert!(route("/apps/catalog/social-content").is_some());
+        // The board front door is not the catalogue.
+        assert!(route("/").is_none());
+        assert!(route("/apps").is_none());
         assert!(route("/api/health").is_none());
         assert!(route("/apps/catalog/../admin").is_none());
         assert!(route("/apps/catalog/a/b").is_none());

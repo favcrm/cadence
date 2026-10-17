@@ -1069,9 +1069,10 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             );
             return;
         }
-        // A signed-out visit to the board, the apps list, or one catalog
-        // page sees the public directory. A live session keeps the board
-        // app, and every other read still needs that session.
+        // A signed-out visit to the explore list or one catalog page sees the
+        // public directory. `/` and `/apps` are the board's own front door and
+        // keep the session gate; a live session keeps the board app, and every
+        // other read still needs that session.
         if matches!(method, Method::Get | Method::Head)
             && super::public_directory::is_public_route(&path)
             && !matches!(
