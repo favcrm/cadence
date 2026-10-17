@@ -1144,6 +1144,31 @@ pub(super) struct ReadAdmission {
 }
 
 impl ReadAdmission {
+    /// True when `admit_read` admitted the request without a session — the
+    /// local bootstrap case, where the caller is the operator.
+    pub(super) fn is_anonymous(&self) -> bool {
+        self.proof.is_none()
+    }
+}
+
+/// The caller spelling for a read `admit_read` already admitted.
+///
+/// `operator` for an anonymous local read; otherwise the public session's
+/// `users/<handle>` via [`board_caller`]. A failure to resolve refuses —
+/// a project-scoped read is never served unfiltered.
+pub(super) fn read_actor(
+    admission: &ReadAdmission,
+    request: &Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+) -> Result<String, HttpResp> {
+    if admission.is_anonymous() {
+        return Ok("operator".to_string());
+    }
+    board_caller(request, state_dir, opts, false, None).map(|caller| caller.actor().to_string())
+}
+
+impl ReadAdmission {
     pub(super) const RECHECK: std::time::Duration = std::time::Duration::from_secs(5);
 
     pub(super) fn wait_timeout(&self) -> std::time::Duration {
