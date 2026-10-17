@@ -424,7 +424,7 @@ pub(super) fn run_build_slot(state_dir: &Path, action: &BuildSlotAction) -> Resu
                 "slot_release",
                 json!({"token": token, "lane": lane, "pid": pid}),
             )?;
-            println!("released {}", r["token"].as_str().unwrap_or(token));
+            print_json(&r);
             Ok(0)
         }
         BuildSlotAction::Launch {
@@ -473,7 +473,7 @@ pub(super) fn run_build_slot(state_dir: &Path, action: &BuildSlotAction) -> Resu
                 .clone()
                 .unwrap_or_else(cadence_agent::slots::default_lane);
             let s = client::rpc(state_dir, "slot_status", json!({"lane": lane}))?;
-            if *json_out {
+            if cadence_agent::output::json_selected(*json_out) {
                 print_json(&s);
             } else {
                 print_slot_status(&s);

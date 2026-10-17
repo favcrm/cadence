@@ -466,10 +466,14 @@ pub(super) fn run_status(
     watch: Option<u64>,
 ) -> Result<i32> {
     let tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let json = cadence_agent::output::json_selected(json_out);
     loop {
         let view = status_view(state_dir, group, all)?;
-        if json_out {
-            print_json(&view);
+        if json {
+            println!(
+                "{}",
+                cadence_agent::output::observation_body(&view, watch.is_some())?
+            );
         } else {
             print_status_table(&view);
         }
@@ -477,9 +481,9 @@ pub(super) fn run_status(
             return Ok(0);
         };
         std::thread::sleep(Duration::from_secs(secs));
-        if tty && !json_out {
+        if tty && !json {
             // In-place refresh — a watch is one screen, not a scroll.
-            // JSON output must stay a clean stream of documents.
+            // Machine watch is one compact JSON value per line.
             print!("\x1b[2J\x1b[H");
             let _ = std::io::Write::flush(&mut std::io::stdout());
         }
