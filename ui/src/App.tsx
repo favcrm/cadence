@@ -35,6 +35,7 @@ import Outbox from "./features/outbox/Outbox";
 import ThreadsPage from "./features/threads/ThreadsPage";
 import OverviewView from "./features/home/Overview";
 import Home from "./features/home/Home";
+import MyWork from "./features/home/MyWork";
 import { useHomeCount } from "./features/home/todoLocal";
 import Context from "./features/projects/Context";
 import { contextNavigationSearch } from "./features/projects/contextRoute";
@@ -122,6 +123,7 @@ const SCREEN_LABEL: Record<Screen, string> = {
   workspaceAppKey: "app",
   agents: "agents",
   threads: "threads",
+  myWork: "my work",
   wiki: "wiki",
   outbox: "outbox",
   setup: "setup",
@@ -881,6 +883,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             <ProjectFilter project={project} projects={projects} hrefFor={filterHref} />
           </div>
         )}
+        {screen === "myWork" && <MyWork />}
 
         {screen === "home" && (
           <Home

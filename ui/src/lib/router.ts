@@ -68,6 +68,7 @@ export type Route =
   | { screen: "workspaceAppKey"; appKey: string }
   | { screen: "agents"; alias: string | null }
   | { screen: "threads" }
+  | { screen: "myWork" }
   | { screen: "wiki"; mode: WikiMode; path: string | null; query: string | null; at?: string; section?: string; page?: number }
   | { screen: "outbox" }
   | { screen: "setup" }
@@ -80,6 +81,7 @@ export type Screen = Route["screen"];
 /** The main navigation — MVP screens only (Setup is reached from Home). */
 export const NAV: { screen: Screen; label: string; route: Route }[] = [
   { screen: "home", label: "Home", route: { screen: "home" } },
+  { screen: "myWork", label: "My work", route: { screen: "myWork" } },
   { screen: "threads", label: "Threads", route: { screen: "threads" } },
   { screen: "projects", label: "Projects", route: { screen: "projects", slug: null, section: "overview" } },
   { screen: "wiki", label: "Wiki", route: { screen: "wiki", mode: "browse", path: null, query: null } },
@@ -246,6 +248,7 @@ export function matchRoute(pathname: string): Route {
     if (head === "overview" && !a) return { screen: "overview" };
     // `?item=<effect_id>` deep-links one published item (CAD-546).
     if (head === "outbox" && !a) return { screen: "outbox" };
+    if (head === "my-work" && !a) return { screen: "myWork" };
     // `!b` keeps the original one-segment shape; the connections
     // section alone may carry its /new, /new/<provider> and
     // /account/<id> sub-pages (bounded to one extra segment above).
@@ -338,6 +341,8 @@ export function routePath(route: Route): string {
       return "/overview";
     case "outbox":
       return "/outbox";
+    case "myWork":
+      return "/my-work";
     case "settings":
       if (route.section === "account") return "/settings/account";
       if (route.section === "memory") return "/settings/memory";
