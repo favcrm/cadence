@@ -63,6 +63,8 @@ export interface WikiPage {
   size?: number;
   mime?: string | null;
   sha256?: string;
+  /** Set when this page was read with an explicit `at` selector. */
+  historical?: boolean;
 }
 
 export interface WikiSearchResponse {

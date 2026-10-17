@@ -13,7 +13,19 @@ export function contextRoute(project: string, href: string): WikiRoute | null {
   if (!withinScope(path, root) || file.startsWith("/")) return null;
   const mode = params.get("mode") ?? "browse";
   if (!MODES.includes(mode as typeof MODES[number])) return null;
-  return { screen: "wiki", mode: mode as WikiRoute["mode"], path, query: params.get("q") };
+  const at = params.get("at");
+  const section = params.get("section");
+  const page = params.get("page");
+  const parsedPage = page !== null && /^[1-9][0-9]{0,5}$/.test(page) ? Number(page) : undefined;
+  return {
+    screen: "wiki",
+    mode: mode as WikiRoute["mode"],
+    path,
+    query: params.get("q"),
+    ...(at !== null ? { at } : {}),
+    ...(section ? { section } : {}),
+    ...(parsedPage !== undefined ? { page: parsedPage } : {}),
+  };
 }
 
 export function contextHref(project: string, route: WikiRoute, currentHref = ""): string {
@@ -21,11 +33,14 @@ export function contextHref(project: string, route: WikiRoute, currentHref = "")
   const path = route.path || root;
   if (!withinScope(path, root)) throw new Error("This path is outside the project's context");
   const params = new URLSearchParams(currentHref.split("?")[1] ?? "");
-  for (const key of ["file", "mode", "q", "tab", "view", "project", "run"]) params.delete(key);
+  for (const key of ["file", "mode", "q", "tab", "view", "project", "run", "at", "section", "page"]) params.delete(key);
   const relative = path === root ? "" : path.slice(root.length + 1);
   if (relative) params.set("file", relative);
   if (route.mode !== "browse") params.set("mode", route.mode);
   if (route.mode === "search" && route.query) params.set("q", route.query);
+  if (route.at !== undefined) params.set("at", route.at);
+  if (route.section) params.set("section", route.section);
+  if (route.page !== undefined) params.set("page", String(route.page));
   const query = params.toString();
   return `/projects/${encodeURIComponent(project)}/context${query ? `?${query}` : ""}`;
 }

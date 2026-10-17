@@ -13,6 +13,8 @@ import {
   type WikiListing,
   type WikiPage,
 } from "./api";
+import { isCollectionRoot, readRevision } from "./knowledge";
+import CollectionPane from "./CollectionPane";
 import { treeRows } from "./tree";
 import { scopedAncestors, withinScope, type WikiScope } from "./scope";
 import { baseName, joinPath, parentPath } from "./paths";
@@ -195,6 +197,11 @@ export default function Wiki({ route, navHref, readOnly, actor, onToast, scope }
     };
     void (async () => {
       try {
+        if (route.at !== undefined) {
+          if (!path || !route.at) throw new WikiError("This revision is unavailable", 404);
+          land({ path, kind: "file", page: { ...(await readRevision(path, route.at)), historical: true } });
+          return;
+        }
         const known = path ? entryOf(path) : null;
         if (path === root || known?.kind === "dir") {
           land(await listing());
@@ -225,7 +232,7 @@ export default function Wiki({ route, navHref, readOnly, actor, onToast, scope }
     return () => {
       cancelled = true;
     };
-  }, [route.mode, current, root, validPath, entryOf, tick, scope]);
+  }, [route.mode, route.at, current, root, validPath, entryOf, tick, scope]);
 
   const toggle = (path: string) => {
     if (expanded.has(path)) {
@@ -305,6 +312,8 @@ export default function Wiki({ route, navHref, readOnly, actor, onToast, scope }
               dir={dir}
               navHref={navHref}
               readOnly={readOnly}
+              section={route.section}
+              page={route.page}
               onToast={onToast}
               onRefresh={refresh}
               onFail={fail}
@@ -326,6 +335,8 @@ function BrowsePane({
   dir,
   navHref,
   readOnly,
+  section,
+  page: citedPage,
   onToast,
   onRefresh,
   onFail,
@@ -338,6 +349,8 @@ function BrowsePane({
   dir: string;
   navHref: (route: Route) => string;
   readOnly: boolean;
+  section?: string;
+  page?: number;
   onToast: (kind: "ok" | "err" | "warn", text: string) => void;
   onRefresh: () => void;
   onFail: (error: unknown, verb: string) => void;
@@ -473,6 +486,7 @@ function BrowsePane({
         )}
         {readOnly && !locked && !missingRoot && <Note warn>{t("Sign in with editing access to add or edit pages.")}</Note>}
         {newRow}
+        {!missingRoot && isCollectionRoot(path) && <CollectionPane path={path} navHref={navHref} readOnly={readOnly} />}
         {!missingRoot && <FolderPane
           entries={open.listing.entries ?? []}
           navHref={navHref}
@@ -486,7 +500,7 @@ function BrowsePane({
   }
 
   const page = open.page;
-  if (page.kind === "page") return <PagePane page={page} navHref={navHref} readOnly={readOnly} />;
+  if (page.kind === "page" || page.historical) return <PagePane page={page} navHref={navHref} readOnly={readOnly || page.historical === true} section={section} citedPage={citedPage} />;
   return <BlobPane page={page} blob={previewKind(baseName(page.path), page.mime)} navHref={navHref} />;
 }
 
