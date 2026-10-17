@@ -373,8 +373,47 @@ fn rendered_acceptance(items: &[AcceptanceItem], newline: &str) -> Result<String
     Ok(out)
 }
 
-/// Replace the unique acceptance section, or append one when it is absent.
-/// The surrounding body and its line-ending style are preserved.
+/// Split a section body at its first checklist line: the byte offset of that
+/// line, and the text after it with every checklist line removed. `None` means
+/// the section has no checklist. Fenced code never counts as a checklist — the
+/// same rule `acceptance_items` reads by.
+fn split_checklist(text: &str) -> Option<(usize, String)> {
+    let mut first: Option<usize> = None;
+    let mut rest = String::new();
+    let mut in_fence: Option<(u8, usize)> = None;
+    for line in line_ranges(text) {
+        let content = &text[line.start..line.content_end];
+        if let Some((marker, count)) = fence(content) {
+            match in_fence {
+                Some((open_marker, open_count))
+                    if open_marker == marker && is_closing_fence(content, marker, open_count) =>
+                {
+                    in_fence = None;
+                }
+                None => in_fence = Some((marker, count)),
+                _ => {}
+            }
+            if first.is_some() {
+                rest.push_str(&text[line.start..line.end]);
+            }
+            continue;
+        }
+        if in_fence.is_none() && checkbox_item(content).is_some() {
+            first.get_or_insert(line.start);
+            continue;
+        }
+        if first.is_some() {
+            rest.push_str(&text[line.start..line.end]);
+        }
+    }
+    first.map(|start| (start, rest))
+}
+
+/// Replace the unique acceptance section's checklist, or append a section when
+/// it is absent. Only checklist lines are replaced: every other line inside the
+/// section stays in place, so a declaration such as `Risk: human (4)` — read by
+/// the scope-approval check — is never dropped silently (CAD-1516). The
+/// surrounding body and its line-ending style are preserved too.
 pub fn replace_acceptance(body: &str, items: &[AcceptanceItem]) -> Result<String> {
     let sections = acceptance_sections(body);
     if sections.len() > 1 {
@@ -385,11 +424,26 @@ pub fn replace_acceptance(body: &str, items: &[AcceptanceItem]) -> Result<String
     let newline = preferred_newline(body);
     let checklist = rendered_acceptance(items, newline)?;
     if let Some(section) = sections.first() {
+        let section_body = &body[section.heading_end..section.end];
         let mut out = String::with_capacity(body.len() + checklist.len());
         out.push_str(&body[..section.heading_end]);
-        out.push_str(newline);
-        out.push_str(&checklist);
-        out.push_str(newline);
+        match split_checklist(section_body) {
+            Some((start, rest)) => {
+                // The checklist takes the first item's place: text before it
+                // stays put, and every later non-checklist line keeps its order.
+                out.push_str(&section_body[..start]);
+                out.push_str(&checklist);
+                out.push_str(&rest);
+            }
+            None => {
+                // No checklist yet: write one after the heading, then the
+                // section's own text (its leading blank lines are not doubled).
+                out.push_str(newline);
+                out.push_str(&checklist);
+                out.push_str(newline);
+                out.push_str(section_body.trim_start_matches(['\r', '\n']));
+            }
+        }
         out.push_str(&body[section.end..]);
         return Ok(out);
     }
@@ -638,5 +692,38 @@ mod tests {
         )
         .unwrap();
         assert!(inserted.ends_with("## Acceptance\n\n- [ ] criterion\n"));
+    }
+
+    #[test]
+    fn acceptance_replacement_keeps_non_checklist_lines_in_the_section() {
+        // CAD-1516: `--acceptance` replaces the checklist, not the whole
+        // section. A declaration inside the section — `Risk: human (4)` is what
+        // the scope-approval check reads — must survive the replacement, or the
+        // tracker loses it without a word.
+        let body = concat!(
+            "Intro\n\n",
+            "## Acceptance\n",
+            "- [ ] old criterion\n",
+            "\n",
+            "Risk: human (4)\n",
+            "\n",
+            "## Notes\n",
+            "Keep this\n",
+        );
+        let changed = replace_acceptance(
+            body,
+            &[AcceptanceItem {
+                text: "new criterion".into(),
+                checked: false,
+            }],
+        )
+        .unwrap();
+        assert!(changed.contains("- [ ] new criterion\n"), "{changed}");
+        assert!(!changed.contains("old criterion"), "{changed}");
+        assert!(
+            changed.contains("Risk: human (4)\n"),
+            "a non-checklist line inside the section must survive: {changed}"
+        );
+        assert!(changed.contains("## Notes\nKeep this\n"), "{changed}");
     }
 }
