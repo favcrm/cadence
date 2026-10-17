@@ -282,6 +282,13 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         ),
     ),
     (
+        "message_list",
+        Rule::Handler(
+            "rpc_message_list: an agent lists only its own alias; an unproven \
+             caller is refused because listing enumerates ids",
+        ),
+    ),
+    (
         "message_report",
         Rule::Handler(
             "rpc_message_report: an explicit id+token reports by bearer possession, \
