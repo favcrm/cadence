@@ -561,6 +561,10 @@ pub enum IssueAction {
         /// `kind:target` (`pr:https://…`) or a bare http(s) URL. Repeatable.
         #[arg(long = "ref", value_name = "KIND:TARGET")]
         refs: Vec<String>,
+        /// A ref to remove, named as `--ref` names it. Repeatable.
+        /// Every one must already exist, or the whole edit refuses.
+        #[arg(long = "unref", value_name = "KIND:TARGET")]
+        unrefs: Vec<String>,
         /// Attach a file, as `issue attach`. Repeatable.
         #[arg(long = "attach", value_name = "FILE")]
         attach: Vec<PathBuf>,
@@ -1681,6 +1685,7 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             link,
             unlink,
             refs,
+            unrefs,
             attach,
             acceptance,
             comment_file,
@@ -1716,6 +1721,7 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                 link: link.clone(),
                 unlink: unlink.clone(),
                 refs: refs.clone(),
+                unrefs: unrefs.clone(),
                 attach: attach.clone(),
                 acceptance: read("--acceptance", acceptance)?,
                 comment: read("--comment-file", comment_file)?,
