@@ -44,17 +44,22 @@ To *force* a re-warm manually: delete the entry via
 `gh api -X DELETE repos/<owner>/<repo>/actions/caches/<id>` — find the id
 with `?key=v0-rust-<key>` — then let the next main push re-write it.
 
-## 3. sccache serves workspace objects, not deps
+## 3. sccache scope — build/ui only, not shards
 
-The split is deliberate: `cache-workspace-crates: false` on rust-cache,
-because workspace-source hashes change every merge (restoring them always
-misses). Workspace objects go through sccache instead:
+`cache-workspace-crates: false` on rust-cache, because workspace-source
+hashes change every merge (restoring them always misses). Workspace objects
+go through sccache instead — **but only where the job enables it**:
 
 - `cache-warm` legs run `READ_WRITE` under `sccache-writer` on main pushes.
-- Gate/shard jobs run `READ_ONLY` via `ci-sccache enable`.
-- sccache hits serve `cadence-agent` objects when the merge didn't touch
-  the crate; 183 Rust misses on a fresh-merge run is normal (nothing to
-  hit yet — the *next* main push warms them).
+- `build` and `ui` gate jobs run `READ_ONLY` via `ci-sccache enable`.
+- **`test-shards` do not enable sccache** — they restore rust-cache, enable
+  the linker, and invoke the test runner directly. Their ~2m19s
+  `cadence-agent` compile is the raw workspace-crate codegen+link floor.
+
+So the shard diagnostic is: if `cadence-agent` compiles once and takes
+~2min on a warm dep cache, that is expected — sccache never entered the
+shard path. Adding sccache to shards would help only for merges that don't
+touch the crate (rare); not worth the credential surface.
 
 Prefix is `v1/rustc-<toolchain>/` — a rustc bump re-zeros sccache too.
 
@@ -105,9 +110,9 @@ When a CI run is slow:
    compile / exec / overhead. The fix lives in exactly one.
 2. If deps recompile despite a cache hit → the cache is stale under a
    fingerprint flip → bump the `-ldN` epoch (or delete the key).
-3. If the workspace crate is the wall → sccache should have it warm; check
-   `Cache hits (Rust)` in the job log. Zero means the warm leg didn't run
-   since the merge, or the toolchain bumped the prefix.
+3. If the workspace crate is the wall → on `build`/`ui` check `Cache hits
+   (Rust)`; on `test-shards` that metric doesn't exist — the job has no
+   sccache, so ~2min workspace compile is the floor, not a cache miss.
 4. If exec is the wall and the suite is per-file serial → more shards.
    If it's serial-*spawn*-bound → more processes don't help.
 5. Never delete a check to speed up CI. The audit found zero true
