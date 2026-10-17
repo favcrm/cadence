@@ -226,6 +226,34 @@ export function memberThreadReader(): PageReader {
  * reason survive a pending send/discard/window change. A genuine
  * accepted refresh still overwrites `history` to `loaded:true` and the
  * Resource clears `error` on success — never fabricated.
+ *
+ * One asymmetry `Resource.write` cannot express (round 5): the
+ * Resource queues a trailing read only when a superseded request
+ * RESOLVES (cacheCore's success branch sets `trailing` before
+ * dropping); a superseded request that REJECTS returns early on the
+ * same generation check and schedules nothing. With no successful
+ * read yet (`data.history?.loaded !== true`), that dropped failure is
+ * the only thing that could record the read truth — the panel would
+ * sit on "Reading the thread…" forever behind an optimistic row:
+ * the poll effect is gated on `loaded`, the mount revalidate already
+ * ran, no stream invalidates `memberThread`, and no `Resource.error`
+ * survived the write to render a Retry. So after a pre-load write
+ * this helper queues exactly one real read behind the superseded
+ * flight (or starts one at once when none is flying): a member can
+ * send during the very first history fetch and the surface still
+ * converges — accepted read → `loaded:true`, rejected
+ * read → `Resource.error` → the existing failed banner whose Retry
+ * re-reads for real. Post-load writes need nothing: an accepted
+ * superseded read keeps the `trailing` refetch, and a rejected one
+ * leaves `data.history.loaded`/the carried observation true, so the
+ * poll keeps recovering. The call is `invalidate()`, never
+ * `refresh()`: `refresh()` (cacheCore.ts:113→120-122) would JOIN the
+ * superseded flight and set nothing, while `invalidate()`
+ * (cacheCore.ts:188-193) marks `trailing` on it — the Resource's
+ * finally then runs exactly one fresh read whatever the dropped
+ * flight did, or starts one at once when nothing was flying. Like
+ * `refresh()`, it no-ops while private reads are paused (the same
+ * `readsAllowed` guard sits inside `refreshUsing`).
  */
 export function memberWrite(
   store: Resource<MemberThreadState>,
@@ -245,6 +273,20 @@ export function memberWrite(
     const next = fn(cur);
     return carried === undefined ? next : { ...next, history: carried };
   });
+  // A local write bumps the Resource generation, so a history request
+  // already in flight is superseded either way — resolve or reject.
+  // Until one read has genuinely landed, no write may leave the store
+  // dependent on that superseded flight: `invalidate()` marks the
+  // flight `trailing` (cacheCore.ts:190), so the Resource's finally
+  // runs exactly one fresh read whether the dropped request resolved
+  // or rejected — `refresh()` would only join it and schedule
+  // nothing. With no read in flight `invalidate()` falls through to
+  // `refresh()` and starts one. After a successful read the poll and
+  // the Resource's own trailing path keep recovering, so the extra
+  // call stops being needed.
+  if (before.data?.history?.loaded !== true) {
+    void store.invalidate();
+  }
 }
 
 // ---------------------------------------------------------------------
