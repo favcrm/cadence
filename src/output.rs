@@ -42,10 +42,35 @@ pub fn json_text<T: Serialize + ?Sized>(value: &T) -> serde_json::Result<String>
 /// a terminal, unless `CADENCE_JSON` forces a JSON form.
 /// `CADENCE_JSON=table` forces the table for a pipe (tests, `less`).
 pub fn stdout_table() -> bool {
-    match std::env::var("CADENCE_JSON").ok().as_deref() {
+    table_for(
+        std::env::var("CADENCE_JSON").ok().as_deref(),
+        std::io::stdout().is_terminal(),
+    )
+}
+
+pub fn table_for(override_value: Option<&str>, stdout_is_tty: bool) -> bool {
+    match override_value {
         Some("pretty") | Some("compact") => false,
         Some("table") => true,
-        _ => std::io::stdout().is_terminal(),
+        _ => stdout_is_tty,
+    }
+}
+
+/// Explicit `--json` wins. Otherwise a non-table stdout is JSON.
+pub fn json_selected(explicit_json: bool) -> bool {
+    explicit_json || !stdout_table()
+}
+
+/// Body for one observation. Watch is always one compact line so a
+/// pipe can split records, even when `CADENCE_JSON=pretty`.
+pub fn observation_body<T: Serialize + ?Sized>(
+    value: &T,
+    watch: bool,
+) -> serde_json::Result<String> {
+    if watch {
+        serde_json::to_string(value)
+    } else {
+        json_text(value)
     }
 }
 
@@ -58,8 +83,24 @@ mod tests {
         assert!(pretty_for(None, true));
         assert!(!pretty_for(None, false));
         assert!(pretty_for(Some("pretty"), false));
+        assert!(table_for(None, true));
+        assert!(!table_for(None, false));
+        assert!(!table_for(Some("compact"), true));
+        assert!(table_for(Some("table"), false));
         assert!(!pretty_for(Some("compact"), true));
         assert!(pretty_for(Some("bogus"), true));
         assert!(!pretty_for(Some("bogus"), false));
+    }
+
+    #[test]
+    fn watch_observation_is_one_compact_line() {
+        #[derive(Serialize)]
+        struct Row {
+            a: u8,
+        }
+        let body = observation_body(&Row { a: 1 }, true).unwrap();
+        assert_eq!(body, "{\"a\":1}");
+        assert!(!body.contains('\n'));
+        assert!(!body.contains('\u{1b}'));
     }
 }

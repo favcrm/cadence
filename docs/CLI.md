@@ -191,3 +191,18 @@ or hidden path exits 2 and writes nothing to stdout.
 These streams stay raw and are not part of discovery: inbox and events
 NDJSON, logs and content bytes, a bare `build-slot acquire` token, and
 `build-slot run` child stdout.
+
+## Observation output
+
+`status`, `overview`, and `build-slot status` print a table on a terminal.
+A pipe, `CADENCE_JSON=pretty` or `compact`, or an explicit `--json` prints
+the same payload as JSON. `--json` wins over `CADENCE_JSON=table`.
+`CADENCE_JSON=table` keeps the table when stdout is a pipe.
+
+With `--watch`, machine mode writes one compact JSON value per line and
+no terminal-control bytes, including when `CADENCE_JSON=pretty`. A
+terminal watch without JSON still redraws the table in place.
+
+`build-slot release` prints the daemon receipt as JSON. `released: false`
+stays a failure receipt; it is not rewritten as a success sentence.
+`build-slot acquire` without `--json` is still the bare token.
