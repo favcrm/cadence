@@ -1173,7 +1173,7 @@ pub(super) fn read_actor(
 }
 
 /// The project-policy spelling for a resolved board caller.
-fn caller_spelling(caller: &Caller) -> String {
+pub(super) fn caller_spelling(caller: &Caller) -> String {
     match caller {
         Caller::Operator(_) => "operator".to_string(),
         Caller::Named(named) => format!("users/{}", named.author),
