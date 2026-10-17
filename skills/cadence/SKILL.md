@@ -96,8 +96,9 @@ cadence agent list    # your group: every row has "group" (its root);
 cadence agent show <alias>            # one agent + its message/event cursor
 cat <briefing path>   # your written briefing — the path printed in
                       # your bootstrap message, also in `agent show`'s
-                      # "briefing" field (under the daemon's state dir,
-                      # never your cwd repo)
+                      # "briefing" field. It is the state-dir copy, or, in a
+                      # pty pane on a store with an agent UID, the lane copy
+                      # .cadence/<group>/BRIEFING-<alias>.md under your cwd
 ```
 
 If your briefing names an `upstream` PM, your results are routed to it

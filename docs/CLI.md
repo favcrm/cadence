@@ -213,3 +213,12 @@ terminal watch without JSON still redraws the table in place.
 `build-slot release` prints the daemon receipt as JSON. `released: false`
 stays a failure receipt; it is not rewritten as a success sentence.
 `build-slot acquire` without `--json` is still the bare token.
+
+## Exit codes
+
+A failure prints one JSON object on stderr (`{"error", "kind"}`) and exits
+with the code for that kind. The table — code, kind, meaning and whether a
+retry is safe — lives in `skills/cadence/SKILL.md` under "Errors and exit
+codes"; it is the one copy, so this file does not repeat the numbers.
+Verbs that wrap another program pass its exit code through, and `--help`
+and `--version` exit 0.
