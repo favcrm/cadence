@@ -35,6 +35,15 @@ Record the supported grammar and distinguish proposed adaptations from source ob
 - **Page rhythm** — how a section opens and closes, where a new page starts, and how much of a page may stay empty.
 - **Dense and long output** — how the references keep a long table or narrative readable (continued headings, split points, notes). Compare the real output at that length, not only the cover.
 
+## Complete printed surfaces
+
+Every part of the printed or exported surface has to be readable on its page. Two defects survive every structural check and appear only on the rendered pages, so inspect them there:
+
+- **A block that has to be read as a unit.** A summary, totals, reconciliation or signature block that splits across pages loses its row labels, and with them its meaning, on the continuation page. Set that block's print area to fit one page wide and one page tall where the format supports it, keeping the text readable, so it prints on one page. When the governing form is mandatory and cannot be changed, report the limitation: a change to an approved template or a client-mandated form is its own revision, not a layout repair.
+- **A built index.** A document index (table of contents) exports as the template's field placeholder (`Right-click here and choose Update Field`) unless fields and indexes are refreshed as part of the export. Build it before export, and treat the placeholder reaching the reader as a defect.
+
+Reopening the file, counting pages or checking bounds shows neither one. Check the actual pages as the sections below require, and state which checks could not be run.
+
 ## Proposals and other authoring formats
 
 An authoring pack does not render DOCX, prices, or PDF. Author the confirmed format. The user prints or exports the final PDF.
