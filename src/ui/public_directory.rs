@@ -119,11 +119,11 @@ fn sign_in_href(page_url: &str) -> String {
     format!("/__platform/login?to={}", pct_encode(page_url))
 }
 
-fn text<'a>(value: Option<&'a Value>) -> &'a str {
+fn text(value: Option<&Value>) -> &str {
     value.and_then(Value::as_str).unwrap_or("")
 }
 
-fn listing<'a>(app: &'a Value) -> Option<&'a Value> {
+fn listing(app: &Value) -> Option<&Value> {
     app.get("listing").filter(|v| v.is_object())
 }
 
@@ -435,7 +435,17 @@ fn html_response(status: u16, body: String) -> HttpResp {
 
 const BODY_CAP: u64 = 1024 * 1024;
 
-fn fetch_json(url: &str) -> Result<Value, ()> {
+const TRANSIENT: &str = "The app directory didn't load. Try again in a moment.";
+
+/// One catalog read. The catalog answering 404 means that app does not exist,
+/// which is a different page from a catalog that is unreachable or unwell.
+enum Fetched {
+    Ok(Value),
+    NotFound,
+    Failed,
+}
+
+fn fetch_catalog(url: &str) -> Fetched {
     use std::time::Duration;
     let config = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(8)))
@@ -443,31 +453,79 @@ fn fetch_json(url: &str) -> Result<Value, ()> {
         .http_status_as_error(false)
         .build();
     let agent = ureq::Agent::new_with_config(config);
-    let mut response = agent.get(url).call().map_err(|_| ())?;
-    if response.status().as_u16() != 200 {
-        return Err(());
+    let Ok(mut response) = agent.get(url).call() else {
+        return Fetched::Failed;
+    };
+    match response.status().as_u16() {
+        200 => {}
+        404 => return Fetched::NotFound,
+        _ => return Fetched::Failed,
     }
-    let bytes = response
+    let Ok(bytes) = response
         .body_mut()
         .with_config()
         .limit(BODY_CAP)
         .read_to_vec()
-        .map_err(|_| ())?;
-    serde_json::from_slice(&bytes).map_err(|_| ())
+    else {
+        return Fetched::Failed;
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(body) => Fetched::Ok(body),
+        Err(_) => Fetched::Failed,
+    }
 }
 
-fn unavailable(page_url: &str, message: &str) -> HttpResp {
-    html_response(
-        200,
-        page(
-            "Apps",
-            &format!(
-                r#"{header}<main><h1>App directory</h1><p class="lede">{message}</p></main>"#,
-                header = header(page_url),
-                message = esc(message),
-            ),
+fn unavailable_html(page_url: &str, message: &str) -> String {
+    page(
+        "Apps",
+        &format!(
+            r#"{header}<main><h1>App directory</h1><p class="lede">{message}</p></main>"#,
+            header = header(page_url),
+            message = esc(message),
         ),
     )
+}
+
+fn no_such_app_html(page_url: &str) -> String {
+    page(
+        "App",
+        &format!(
+            r#"{header}<main><h1>No such app</h1><p><a href="/apps/explore">All apps</a></p></main>"#,
+            header = header(page_url),
+        ),
+    )
+}
+
+/// Status and body for one directory read. Pure: the fetch already happened.
+fn page_for(route: &Route, fetched: Fetched, raw_query: &str, page_url: &str) -> (u16, String) {
+    let body = match fetched {
+        Fetched::Ok(body) => body,
+        Fetched::NotFound => {
+            return match route {
+                Route::Detail(_) => (404, no_such_app_html(page_url)),
+                Route::List => (200, unavailable_html(page_url, TRANSIENT)),
+            };
+        }
+        Fetched::Failed => return (200, unavailable_html(page_url, TRANSIENT)),
+    };
+    match route {
+        Route::List => (
+            200,
+            render_list(
+                &body,
+                &query_value(raw_query, "q"),
+                &query_value(raw_query, "cat"),
+                page_url,
+            ),
+        ),
+        Route::Detail(id) => {
+            let app = body.get("data").and_then(|data| data.get("app"));
+            match app.filter(|app| text(app.get("id")) == id) {
+                Some(app) => (200, render_detail(app, page_url)),
+                None => (404, no_such_app_html(page_url)),
+            }
+        }
+    }
 }
 
 pub(super) fn is_public_route(path: &str) -> bool {
@@ -478,49 +536,17 @@ pub(super) fn is_public_route(path: &str) -> bool {
 pub(super) fn response(path: &str, raw_query: &str, page_url: &str) -> Option<HttpResp> {
     let route = route(path)?;
     let Some(origin) = catalog_origin() else {
-        return Some(unavailable(
-            page_url,
-            "This board has no public catalog configured.",
+        return Some(html_response(
+            200,
+            unavailable_html(page_url, "This board has no public catalog configured."),
         ));
     };
     let upstream = match &route {
         Route::List => format!("{origin}/public/apps"),
         Route::Detail(id) => format!("{origin}/public/apps/{id}"),
     };
-    let body = match fetch_json(&upstream) {
-        Ok(body) => body,
-        Err(()) => {
-            return Some(unavailable(
-                page_url,
-                "The app directory didn't load. Try again in a moment.",
-            ));
-        }
-    };
-    let html = match route {
-        Route::List => render_list(
-            &body,
-            &query_value(raw_query, "q"),
-            &query_value(raw_query, "cat"),
-            page_url,
-        ),
-        Route::Detail(id) => {
-            let app = body.get("data").and_then(|data| data.get("app"));
-            let Some(app) = app.filter(|app| text(app.get("id")) == id) else {
-                return Some(html_response(
-                    404,
-                    page(
-                        "App",
-                        &format!(
-                            r#"{header}<main><h1>No such app</h1><p><a href="/apps/explore">All apps</a></p></main>"#,
-                            header = header(page_url),
-                        ),
-                    ),
-                ));
-            };
-            render_detail(app, page_url)
-        }
-    };
-    Some(html_response(200, html))
+    let (status, html) = page_for(&route, fetch_catalog(&upstream), raw_query, page_url);
+    Some(html_response(status, html))
 }
 
 #[cfg(test)]
@@ -587,5 +613,107 @@ mod tests {
         );
         assert!(filtered.contains("social-content"));
         assert!(!filtered.contains("/apps/catalog/crm"));
+    }
+
+    /// One canned HTTP response on loopback, so the catalog read is exercised
+    /// against a real socket instead of a mock.
+    fn catalog_stub(status_line: &str, body: &str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (status_line, body) = (status_line.to_string(), body.to_string());
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        format!("http://{addr}/public/apps")
+    }
+
+    #[test]
+    fn the_catalog_status_decides_between_missing_and_broken() {
+        assert!(matches!(
+            fetch_catalog(&catalog_stub("404 Not Found", r#"{"ok":false}"#)),
+            Fetched::NotFound
+        ));
+        assert!(matches!(
+            fetch_catalog(&catalog_stub("500 Internal Server Error", "{}")),
+            Fetched::Failed
+        ));
+        assert!(matches!(
+            fetch_catalog(&catalog_stub("200 OK", "not json")),
+            Fetched::Failed
+        ));
+        assert!(matches!(
+            fetch_catalog(&catalog_stub("200 OK", r#"{"ok":true}"#)),
+            Fetched::Ok(_)
+        ));
+    }
+
+    #[test]
+    fn a_missing_app_is_a_404_page_while_a_broken_catalog_is_not() {
+        let page_url = "https://board.example/apps/catalog/nope";
+        let (status, html) = page_for(
+            &Route::Detail("nope".to_string()),
+            Fetched::NotFound,
+            "",
+            page_url,
+        );
+        assert_eq!(status, 404);
+        assert!(html.contains("No such app"));
+
+        // A catalog that never answered says nothing about the app.
+        let (status, html) = page_for(
+            &Route::Detail("nope".to_string()),
+            Fetched::Failed,
+            "",
+            page_url,
+        );
+        assert_eq!(status, 200);
+        assert!(html.contains("Try again"));
+
+        // A 404 from the list endpoint is not a claim about any app either.
+        let (status, html) = page_for(
+            &Route::List,
+            Fetched::NotFound,
+            "",
+            "https://board.example/apps/explore",
+        );
+        assert_eq!(status, 200);
+        assert!(html.contains("Try again"));
+    }
+
+    #[test]
+    fn a_listed_app_renders_its_detail_and_an_unknown_id_stays_not_found() {
+        let body = json!({"ok": true, "data": {"app": {
+            "id": "social-content",
+            "title": "Social Content",
+            "version": "0.9.7",
+            "listing": {"tagline": "Draft a caption", "publisher": {"name": "Cadence"}}
+        }}});
+        let (status, html) = page_for(
+            &Route::Detail("social-content".to_string()),
+            Fetched::Ok(body.clone()),
+            "",
+            "https://board.example/apps/catalog/social-content",
+        );
+        assert_eq!(status, 200);
+        assert!(html.contains("Social Content"));
+        assert!(html.contains("/__platform/login?to="));
+
+        let (status, html) = page_for(
+            &Route::Detail("crm".to_string()),
+            Fetched::Ok(body),
+            "",
+            "https://board.example/apps/catalog/crm",
+        );
+        assert_eq!(status, 404);
+        assert!(html.contains("No such app"));
     }
 }
