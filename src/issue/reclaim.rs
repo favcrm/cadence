@@ -943,6 +943,8 @@ mod tests {
             build: None,
             memory: None,
             intake: None,
+            id: None,
+            policy: None,
         };
         std::fs::write(
             project_dir.join("project.yaml"),

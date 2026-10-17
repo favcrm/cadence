@@ -526,6 +526,11 @@ pub fn project_add(
         build: None,
         memory: None,
         intake: None,
+        // AOS-274: identity is minted once, and every project records an
+        // explicit policy. Only workspace-visible is written until the
+        // isolation gate passes.
+        id: Some(project::new_id()),
+        policy: Some(project::ProjectPolicy::workspace_visible()),
     };
     let dir = pm.dir.join(key);
     if dir.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
