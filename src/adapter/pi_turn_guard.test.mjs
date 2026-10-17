@@ -130,6 +130,33 @@ test("a whole tool round keeps the assistant call that produced it", () => {
   assert.deepEqual(gateway(out), { status: 200, answer: "(answered)" });
 });
 
+test("the active objective survives a long tool run", () => {
+  // The turn's instruction is the newest user message, not the bootstrap: a
+  // long tool run must not window it out while it is still being worked on.
+  const messages = [system(), user("bootstrap"), { role: "assistant", content: [{ type: "text", text: "ok" }] }];
+  messages.push(user("the active objective"));
+  for (let i = 0; i < 50; i += 1) messages.push(...round(i, 1));
+  assert.ok(messages.length > MAX, "the fixture must cross the published maximum");
+  const out = project(messages);
+  const texts = out.map(message => message.content?.[0]?.text);
+  assert.ok(texts.includes("the active objective"), "the objective is kept");
+  assert.ok(texts.includes("bootstrap"), "the bootstrap is kept");
+  assert.ok(out.length <= MAX, `bounded to ${out.length}`);
+  assert.deepEqual(gateway(out), { status: 200, answer: "(answered)" });
+});
+
+test("a tool round larger than the budget still fits the published maximum", () => {
+  // One assistant message carrying more calls than the window can hold: the
+  // round cannot be kept whole, so its call and its newest results are kept.
+  const messages = [user("the objective"), ...round(0, 99)];
+  assert.ok(messages.length > MAX, "the fixture must cross the published maximum");
+  const out = project(messages);
+  assert.ok(out.length <= MAX, `bounded to ${out.length}`);
+  assert.equal(out.filter(message => message.role === "assistant").length, 1, "the call survives");
+  assert.deepEqual(out.at(-1), messages.at(-1), "the newest result is kept");
+  assert.deepEqual(gateway(out), { status: 200, answer: "(answered)" });
+});
+
 test("the objective survives the window", () => {
   const messages = [system(), user("the objective")];
   for (let i = 0; i < 200; i += 1) messages.push(user(`turn ${i}`));

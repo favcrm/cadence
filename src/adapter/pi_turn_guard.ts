@@ -31,43 +31,53 @@ const nonEmpty = messages => (Array.isArray(messages) ? messages : []).map(messa
 const MESSAGES_MAX = 100;
 const MESSAGES_KEEP = MESSAGES_MAX - 10;
 
-// Keep the leading system messages, the objective and the current turn's
+// Keep the opening messages, the newest user message and the current turn's
 // guidance, plus the newest window, dropping whole older messages. The window
-// never opens on a tool result: a retained result keeps the assistant call
-// that produced it, so the request carries whole call/result groups.
+// never opens on a tool result and never crosses the published maximum: a
+// retained result keeps the assistant call that produced it, and a round too
+// large to keep whole keeps its call and its newest results.
 const windowed = (messages, pinned = []) => {
   const list = Array.isArray(messages) ? messages : [];
   if (list.length <= MESSAGES_KEEP) return list;
   let head = 0;
   while (head < list.length && ["system", "developer"].includes(list[head]?.role)) head += 1;
-  // The objective is the message the session was started with: the master's
-  // bootstrap (its identity, and where its briefing lives) or a worker's task.
-  // It is authoritative, so it outlives the window instead of aging out of it
-  // and leaving the turn without the instruction it is answering.
-  const objective = list[head]?.role === "user" ? head : -1;
-  const keep = pinned.filter(message => !list.slice(0, head).includes(message));
-  const room = Math.max(MESSAGES_KEEP - head - (objective >= 0 ? 1 : 0) - keep.length, 1);
-  let start = Math.max(list.length - room, head);
-  if (list[start]?.role === "toolResult") {
-    // A window opening on a result would cut the call that produced it. Open
-    // on the next call instead; when the run reaches the newest message there
-    // is no next call, so take the run back with its call.
-    let next = start;
-    while (next < list.length && list[next]?.role === "toolResult") next += 1;
-    if (next < list.length) {
-      start = next;
-    } else {
-      while (start > head && list[start - 1]?.role === "toolResult") start -= 1;
-      if (start > head) start -= 1;
+  // The opening message (the master's bootstrap, a worker's task), the newest
+  // user message (the instruction this turn answers) and the current turn's
+  // guidance are authoritative: they are kept when a long tool run would
+  // otherwise window them out. Only what sits before the window is carried.
+  const anchored = new Set(pinned);
+  if (list[head]?.role === "user") anchored.add(list[head]);
+  for (let i = list.length - 1; i > head; i -= 1) {
+    if (list[i]?.role === "user") {
+      anchored.add(list[i]);
+      break;
     }
   }
-  const window = list.slice(start);
-  return [
-    ...list.slice(0, head),
-    ...(objective >= 0 && objective < start ? [list[objective]] : []),
-    ...keep.filter(message => !window.includes(message)),
-    ...window,
-  ];
+  const room = Math.max(MESSAGES_KEEP - head - anchored.size, 1);
+  const hard = Math.max(MESSAGES_MAX - head - anchored.size, 2);
+  let start = Math.max(list.length - room, head);
+  let producer = [];
+  if (list[start]?.role === "toolResult") {
+    let first = start;
+    while (first > head && list[first - 1]?.role === "toolResult") first -= 1;
+    const call = first - 1;
+    if (call >= head && list[call]?.role === "assistant" && list.length - call <= hard) {
+      // The whole round fits: open on the call that produced the run.
+      start = call;
+    } else if (call >= head && list[call]?.role === "assistant") {
+      // The round alone is larger than the budget: keep the call and the
+      // newest results, and drop the oldest of that one round.
+      producer = [list[call]];
+      start = Math.max(list.length - (hard - 1), first);
+    } else {
+      // No call to keep: drop the orphaned results and open on the next call.
+      while (start < list.length - 1 && list[start]?.role === "toolResult") start += 1;
+    }
+  }
+  const carried = [...anchored]
+    .filter(message => list.indexOf(message) >= head && list.indexOf(message) < start)
+    .sort((a, b) => list.indexOf(a) - list.indexOf(b));
+  return [...list.slice(0, head), ...carried, ...producer, ...list.slice(start)];
 };
 
 export default function install(pi) {
