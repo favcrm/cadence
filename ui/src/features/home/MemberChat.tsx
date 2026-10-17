@@ -50,7 +50,7 @@ export default function MemberChat({
   const store = memberThreadStore(scope);
   const thread = useResource(store);
   const [state, setState] = useState<{ ok: boolean; bootstrap?: string | null; conversation?: string | null } | null>(null);
-  const [limit] = useState(WINDOW);
+  const [limit, setLimit] = useState(WINDOW);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
   const [unseen, setUnseen] = useState(0);
   const [sendNote, setSendNote] = useState<string | null>(null);
@@ -114,16 +114,33 @@ export default function MemberChat({
     scrollPanel("glide");
   }, [glideTick, scrollPanel]);
 
+  // Mirrors the Master thread's earlier-history handler: reveal
+  // already-held hidden rows first by widening the bounded window; only
+  // then fetch and merge an older page (widening again so the merged
+  // rows actually render). An impossible page (the earliest seq is 1)
+  // clears `moreBefore` so the button stops offering unreachable history.
   const onEarlier = useCallback(() => {
     const data = store.get().data;
     if (!data) return;
+    const hidden = Math.max(0, threadItems(data).length - limit);
+    if (hidden > 0) {
+      setLimit((l) => l + WINDOW);
+      return;
+    }
     const page = fetchEarlier(memberThreadReader(), data);
-    if (!page) return;
+    if (!page) {
+      store.write((s) => ({ ...(s ?? data), moreBefore: false }));
+      return;
+    }
     setLoadingEarlier(true);
     void page
-      .then((older) => store.write((s) => applyEarlier(s, older)))
+      .then((older) => {
+        store.write((s) => applyEarlier(s, older));
+        setLimit((l) => l + WINDOW);
+      })
+      .catch(() => undefined)
       .finally(() => setLoadingEarlier(false));
-  }, [store]);
+  }, [store, limit]);
 
   const onRetry = useCallback(
     (message: string, text: string, _refs?: ThreadRef[], _attachments?: { id: string }[]) => {
@@ -137,7 +154,10 @@ export default function MemberChat({
   );
 
   const { shown, hidden } = useMemo(() => visibleWindow(items, limit), [items, limit]);
-  const empty = loaded && items.length === 0;
+  // A confirmed-empty greeting only when the read is live: a stale or
+  // failed history is unknown, never "empty", so the empty card waits
+  // for a successful refresh.
+  const empty = loaded && thread.status !== "stale" && items.length === 0;
 
   return (
     <main className="home-workspace px-4 lg:px-8 pt-5 pb-3 w-full min-w-0 flex-1 min-h-0 grid gap-5 grid-rows-[minmax(0,1fr)]">
@@ -157,6 +177,12 @@ export default function MemberChat({
           {thread.status === "failed" && (
             <div className="card px-3.5 py-3 mt-3 text-label text-fail break-words" role="alert">
               {t("The thread could not be read —")} {thread.error}{" "}
+              <button className="lnk" onClick={() => void store.refresh()}>{t("Retry")}</button>
+            </div>
+          )}
+          {thread.status === "stale" && (
+            <div className="card px-3.5 py-3 mt-3 text-label text-warn break-words" role="alert">
+              {t("The latest refresh failed — showing the last history it read.")} {thread.error}{" "}
               <button className="lnk" onClick={() => void store.refresh()}>{t("Retry")}</button>
             </div>
           )}

@@ -605,8 +605,9 @@ impl Shared {
     /// requirement that a ≤300 s JWT, a provisioning-time check, or a
     /// locally-cached/stored binding is NOT revocation proof). At every
     /// protected member read/effect/resume the daemon re-asks the
-    /// platform whether the member is STILL live, over the board's own
-    /// `POST https://{host}/__platform/assistant/revalidate`, presenting
+    /// platform whether the member is STILL live, over the board's pinned
+    /// `POST {issuer}/__platform/assistant/revalidate` (the configured
+    /// issuer origin, not a host-derived destination), presenting
     /// the member's signed envelope as the bearer (the member re-proves
     /// their own `(org, sub, assistant)` — no service credential, no
     /// repurposed `results.submit` enrollment, no user impersonation) and
@@ -620,8 +621,10 @@ impl Shared {
     /// `allow:false` because the live membership row is gone.
     ///
     /// `state_dir` is the daemon's own; `board_identity::Config` supplies
-    /// the board's public `host`. The pull is bounded (small timeout,
-    /// bounded body, https-for-public-host) and never logs the envelope.
+    /// the board's public `host` (the audience and the hosted-board
+    /// custody account) and the pinned `issuer` (the network
+    /// destination). The pull is bounded (small timeout, bounded body,
+    /// no redirect follow) and never logs the envelope.
     pub(super) fn member_authority_live(
         &self,
         envelope: &str,
@@ -643,24 +646,23 @@ impl Shared {
                 "{verb} refused: no board identity configured for member authority revalidation"
             ))
         })?;
-        // The board's public host — where the `__platform/*` worker serves.
-        // `public_scheme` mirrors the container route's aud derivation.
+        // The wire goes to the CONFIGURED pinned issuer origin — the
+        // platform that minted the session, not a destination derived
+        // from the public audience host (which may not serve the
+        // `__platform/*` worker directly). `config.host` remains the
+        // audience/custody key only; the network destination is
+        // `config.issuer`, pinned by the same `board-identity.json`
+        // trust root the signature check reads. The exact contract path
+        // is appended unchanged.
         let host = config.host.trim_end_matches('/');
-        let scheme = {
-            let name = host.split(':').next().unwrap_or_default();
-            if name == "localhost" || name.ends_with(".localhost") {
-                "http"
-            } else {
-                "https"
-            }
-        };
-        let url = format!("{scheme}://{host}/__platform/assistant/revalidate");
-        let agent_cfg = ureq::Agent::config_builder()
-            .timeout_global(Some(std::time::Duration::from_secs(8)))
-            .http_status_as_error(false)
-            .max_redirects(0)
-            .build();
-        let agent = ureq::Agent::new_with_config(agent_cfg);
+        let issuer = config.issuer.trim_end_matches('/');
+        let url = format!("{issuer}/__platform/assistant/revalidate");
+        let agent = crate::issuer_transport::agent(
+            ureq::Agent::config_builder()
+                .timeout_global(Some(std::time::Duration::from_secs(8)))
+                .http_status_as_error(false)
+                .max_redirects(0),
+        );
         // The daemon binds the operation + its required scope to the
         // protected verb itself — never caller-supplied — so the platform
         // re-derives `allow` from the member's CURRENT role, the live

@@ -4,12 +4,18 @@
 //! This is the cookie-facing twin of `/api/assist/<verb>`: the browser
 //! carries only its ordinary `__Host-aos-board-session` cookie plus the
 //! write guards (exact JSON type, `X-Cadence-Board`, same-origin
-//! Origin/Sec-Fetch-Site). The member's assistant authority never enters
+//! Origin/Sec-Fetch-Site) and the board's one write admission
+//! (`operator::board_caller(.., write=true)` — present exact own-Origin,
+//! no agent/unattributable peer, a live named session; member AND owner
+//! are admitted, an attributed agent presenting a session is refused as
+//! stolen). The member's assistant authority never enters
 //! the browser: the route resolves the live public session's verified
 //! `(sub, org)` server-side, asks AgenticOS's closed issuer endpoint for
 //! a fresh signed envelope bound to THAT session's original platform
-//! binding (`POST {origin}/__platform/assistant/board-authorize`,
-//! `Authorization: BoardSession <cookie>`), then relays the existing
+//! binding (`POST {issuer}/__platform/assistant/board-authorize` on the
+//! configured pinned issuer origin — never a redirect, never a host
+//! derived from the audience — `Authorization: BoardSession <cookie>`),
+//! then relays the existing
 //! `/api/assist` dispatch — envelope verification, single-use jti and
 //! the daemon's own re-verification all unchanged.
 //!
@@ -27,7 +33,7 @@ use tiny_http::{Header, Method, Request, Response, StatusCode};
 
 use super::assist_route;
 use super::operator;
-use super::write_path::{parse_json, read_body, write_guard, HttpResp, JSON_CAP};
+use super::write_path::{guard_fail, parse_json, read_body, write_guard, HttpResp, JSON_CAP};
 use super::ServeOpts;
 use crate::assistant_actor::AssistVerb;
 use crate::operator_auth::Origin;
@@ -222,15 +228,28 @@ fn issue_envelope(
     verb: MemberVerb,
     public: &super::PublicBoard,
 ) -> Result<String, HttpResp> {
-    let scheme = operator::public_scheme(&public.host);
+    // The authority endpoint rides the CONFIGURED pinned issuer origin,
+    // never a destination derived from the public audience host: the
+    // audience stays `public.host` (the board's own name the envelope is
+    // minted for), while the wire goes to `public.issuer` — the same pin
+    // `verify_envelope`/JWKS trust. The exact contract path is appended
+    // unchanged.
     let url = format!(
-        "{scheme}://{}/__platform/assistant/board-authorize",
-        public.host
+        "{}/__platform/assistant/board-authorize",
+        public.issuer.trim_end_matches('/')
     );
-    // The board's own public origin resolves to the AOS edge. jwks_agent
-    // pins the issuer transport (no redirect-follow, http-status-as-error
-    // off, global timeout) — the same agent the envelope's JWKS fetch uses.
-    let agent = crate::issuer_transport::jwks_agent(std::time::Duration::from_secs(10));
+    // `issuer_transport::agent` keeps the existing constructor's test
+    // TLS/resolver behavior; production adds no proxy and — because the
+    // request carries the session credential — explicit
+    // `max_redirects(0)` so a 3xx is a refusal, never a followed hop to a
+    // different destination (ureq's production default would follow 10).
+    // `http_status_as_error(false)` keeps the non-2xx body readable.
+    let agent = crate::issuer_transport::agent(
+        ureq::Agent::config_builder()
+            .timeout_global(Some(std::time::Duration::from_secs(10)))
+            .http_status_as_error(false)
+            .max_redirects(0),
+    );
     let body = json!({
         "version": "hosted-cadence-board-assistant.v1",
         "verb": verb.verb_segment(),
@@ -327,16 +346,45 @@ pub(super) fn post(
     let Some(verb) = MemberVerb::of(tail) else {
         return member_fail(404, "not_found", "no such member-assistant route");
     };
-    // The session/Origin/CSRF guards run on THIS request, before any
-    // issuer or daemon call — a cookie replayed cross-site, or a body
-    // carrying identity, refuses here.
+    // The JSON/CSRF body guards run first, then the board's one write
+    // admission — `board_caller(.., write=true)`: a cookie-bearing request
+    // must carry a PRESENT Origin equal to this request's own public
+    // origin, an attributed agent or agent-uid peer presenting a live
+    // session is refused as stolen (and the session revoked), an
+    // unattributable peer is refused, and the caller must be a live
+    // named public session (member OR owner) or an operator. Only a
+    // `Named` caller reaches the member surface; `Operator` is the
+    // loopback/tailnet owner on the same rule and is admitted, while an
+    // `Agent` can never reach a public-origin cookie route as its own
+    // member and is refused by the session-shape check below.
+    if opts.read_only {
+        return guard_fail("read_only", "board is read-only — writes are disabled");
+    }
     if let Err(resp) = write_guard(request, "application/json", opts) {
         return resp;
     }
+    let caller = match operator::board_caller(request, state_dir, opts, true, None) {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
     let (user, token) = match member_session(request, state_dir, opts) {
         Ok(v) => v,
         Err(resp) => return resp,
     };
+    // `board_caller` already refused an agent/foreign/unproven peer and
+    // a stolen session outright; a bare `Agent` caller (an agent's own
+    // write with no session) carries no public cookie — `member_session`
+    // refuses it below. This match only documents the admitted shapes.
+    match &caller {
+        operator::Caller::Named(_) | operator::Caller::Operator(_) => {}
+        operator::Caller::Agent(_) => {
+            return member_fail(
+                403,
+                "agent_caller",
+                "member assistant calls come from the member's own signed-in browser",
+            );
+        }
+    }
     let args = match read_member_args(request, verb) {
         Ok(a) => a,
         Err(resp) => return resp,

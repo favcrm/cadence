@@ -1,0 +1,29 @@
+[package]
+name = "cad1485-r2-native-acceptance"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Manual normal-library acceptance target, NOT root unit-test/CI registration.
+# Native dependency must remain outside cfg(test): issuer fixtures otherwise
+# force redirects to zero and mask the production behavior under acceptance.
+# Execution requires the separately admitted QA role and the test's unchanged
+# /tmp/c1485-r2q-99da1/native isolation/preflight; never a production state dir.
+[dependencies]
+cadence-agent = { path = "../../..", features = ["test-seam"] }
+serde_json = "1"
+ring = { version = "0.17", default-features = false }
+base64 = { version = "0.23", default-features = false, features = ["alloc"] }
+tiny_http = "0.12"
+ureq = { version = "3.4.2", default-features = false, features = ["json", "rustls"] }
+uuid = { version = "1", features = ["v4"] }
+tempfile = "3"
+rusqlite = { version = "0.32", features = ["bundled", "backup", "hooks"] }
+
+[[test]]
+name = "native-r2"
+path = "../cad1485_round2_native_acceptance.rs"
+
+[profile.dev]
+debug = 0
+incremental = false
