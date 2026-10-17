@@ -1165,7 +1165,20 @@ pub(super) fn read_actor(
     if admission.is_anonymous() {
         return Ok("operator".to_string());
     }
-    board_caller(request, state_dir, opts, false, None).map(|caller| caller.actor().to_string())
+    // `Caller::actor()` is display text (it can read "<name> via board"),
+    // so the policy spelling is built from the variant: the public
+    // session's attribution handle is the platform subject, which is what
+    // `users/<handle>` keys on everywhere else.
+    board_caller(request, state_dir, opts, false, None).map(|caller| caller_spelling(&caller))
+}
+
+/// The project-policy spelling for a resolved board caller.
+fn caller_spelling(caller: &Caller) -> String {
+    match caller {
+        Caller::Operator(_) => "operator".to_string(),
+        Caller::Named(named) => format!("users/{}", named.author),
+        Caller::Agent(alias) => format!("agents/{alias}"),
+    }
 }
 
 impl ReadAdmission {
@@ -2514,6 +2527,26 @@ pub(super) fn platform_session(
 
 #[cfg(test)]
 mod tests {
+    /// A board session's display actor is not the policy key: the named
+    /// handle is. Using `Caller::actor()` here made every project
+    /// unreadable for a real board session (cad1452).
+    #[test]
+    fn a_board_session_maps_to_the_user_spelling_not_the_display_actor() {
+        let named = Caller::Named(Named {
+            actor: "Fable Chen <fable@example.com> (board)".into(),
+            author: "usr_fable".into(),
+            operator: false,
+        });
+        assert_eq!(caller_spelling(&named), "users/usr_fable");
+        assert_eq!(
+            caller_spelling(&Caller::Operator("operator (ui)".into())),
+            "operator"
+        );
+        assert_eq!(
+            caller_spelling(&Caller::Agent("pane-3".into())),
+            "agents/pane-3"
+        );
+    }
     use super::*;
 
     #[test]
