@@ -691,3 +691,109 @@ fn cap_line(text: &str) -> String {
         out
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A report keeps its paragraphs and tabs; only unsafe controls are
+    /// refused, and an empty or oversized field still is.
+    #[test]
+    fn report_text_keeps_newlines_and_refuses_unsafe_controls() {
+        let paragraphs = json!({"answer": "first paragraph\n\nsecond paragraph"});
+        assert_eq!(
+            required_text(&paragraphs, "answer", "answer").unwrap(),
+            "first paragraph\n\nsecond paragraph"
+        );
+        let tabbed = json!({"answer": "a\tb"});
+        assert_eq!(required_text(&tabbed, "answer", "answer").unwrap(), "a\tb");
+        for bad in ["a\u{7}b", "\u{0}", "a\rb"] {
+            let body = json!({ "answer": bad });
+            assert!(
+                required_text(&body, "answer", "answer").is_err(),
+                "{bad:?} was accepted"
+            );
+        }
+        assert!(required_text(&json!({"answer": "   "}), "answer", "answer").is_err());
+        assert!(required_text(&json!({}), "answer", "answer").is_err());
+        assert!(required_text(
+            &json!({ "answer": "x".repeat(TEXT_CAP + 1) }),
+            "answer",
+            "answer"
+        )
+        .is_err());
+    }
+
+    /// A record only counts when this workflow wrote it: a copy dropped into
+    /// another ticket's `artifacts/` is not that ticket's correction.
+    #[test]
+    fn only_the_workflows_own_record_is_a_correction() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifacts = dir.path().join("artifacts");
+        fs::create_dir_all(&artifacts).unwrap();
+        let write_record = |value: &Value| {
+            fs::write(artifacts.join(ARTIFACT), serde_json::to_vec(value).unwrap()).unwrap();
+        };
+        let record = |id: &str, project: &str| {
+            json!({
+                "schema": RECORD_SCHEMA,
+                "kind": RECORD_KIND,
+                "claims": RECORD_CLAIMS,
+                "id": id,
+                "project": project,
+            })
+        };
+        write_record(&record("WID-1", "widgets"));
+        assert!(stored_record(dir.path(), "WID-1", "widgets").is_ok());
+        for (label, value) in [
+            ("another ticket's id", record("WID-9", "widgets")),
+            ("another project's record", record("WID-1", "other")),
+            ("a plain note", json!({"id": "WID-1", "project": "widgets"})),
+        ] {
+            write_record(&value);
+            assert!(
+                stored_record(dir.path(), "WID-1", "widgets").is_err(),
+                "{label} was read as a correction"
+            );
+        }
+    }
+
+    /// A refused review leaves no decision behind: when the comment cannot be
+    /// written, the record goes back to what it was.
+    #[test]
+    fn a_failed_review_step_restores_the_record() {
+        let root = tempfile::tempdir().unwrap();
+        let pm = Pm::init(&root.path().join("pm")).unwrap();
+        let dir = pm.dir.join("widgets").join("WID-1");
+        fs::create_dir_all(dir.join("artifacts")).unwrap();
+        let artifact_path = dir.join("artifacts").join(ARTIFACT);
+        fs::write(&artifact_path, br#"{"status":"pending"}"#).unwrap();
+        // `comments/` as a plain file: the comment write fails after the
+        // record has already been replaced.
+        fs::write(dir.join("comments"), b"not a directory").unwrap();
+        let lock = pm.lock_for_paths(std::slice::from_ref(&dir)).unwrap();
+        let human = Human {
+            sub: "usr-reviewer".to_string(),
+            display: "Reviewer".to_string(),
+        };
+        let reviewed = bytes_push_store(
+            &pm,
+            &lock,
+            ReviewCommit {
+                dir: &dir,
+                artifact_path: &artifact_path,
+                id: "WID-1",
+                reason: "checked the cited bytes",
+                human: &human,
+                status: "accepted",
+            },
+            br#"{"status":"accepted"}"#,
+        );
+        assert!(reviewed.is_err(), "the review reported success");
+        assert_eq!(
+            fs::read(&artifact_path).unwrap(),
+            br#"{"status":"pending"}"#,
+            "the refused decision stayed on disk"
+        );
+    }
+}

@@ -891,18 +891,21 @@ impl Shared {
                 ))
             }
         };
-        // Only an omitted `at` selects the live export. A present null or
-        // non-string is an invalid selector, never an implicit live read.
-        let at = match params.get("at") {
-            None => None,
-            Some(Value::String(at)) if !at.is_empty() => Some(at.as_str()),
-            Some(_) => {
-                return Err(Error::rejected(
-                    "wiki transfer export refused: at must be a non-empty revision selector",
-                ))
-            }
-        };
+        let at = export_at(params)?;
         wiki::transfer::export(&self.pm()?, caller, path, offset, bytes, rev, at)
+    }
+}
+
+/// The `at` historical selector for a transfer export. Only an omitted key
+/// selects the live export; a present value must be a non-empty revision
+/// selector, never an implicit live read.
+fn export_at(params: &Value) -> Result<Option<&str>> {
+    match params.get("at") {
+        None => Ok(None),
+        Some(Value::String(at)) if !at.is_empty() => Ok(Some(at.as_str())),
+        Some(_) => Err(Error::rejected(
+            "wiki transfer export refused: at must be a non-empty revision selector",
+        )),
     }
 }
 
@@ -914,4 +917,35 @@ fn valid_user_handle(handle: &str) -> bool {
         && handle
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only an omitted `at` selects the live export: a present null, empty
+    /// or non-string is refused rather than silently reading live bytes.
+    #[test]
+    fn export_selector_refuses_a_present_non_string() {
+        assert_eq!(
+            export_at(&serde_json::json!({})).unwrap(),
+            None,
+            "an omitted selector selects the live export"
+        );
+        assert_eq!(
+            export_at(&serde_json::json!({"at": "fnv1a:0123456789abcdef"})).unwrap(),
+            Some("fnv1a:0123456789abcdef")
+        );
+        for bad in [
+            serde_json::json!({"at": null}),
+            serde_json::json!({"at": ""}),
+            serde_json::json!({"at": 7}),
+            serde_json::json!({"at": ["a"]}),
+        ] {
+            assert!(
+                export_at(&bad).is_err(),
+                "{bad} was read as the live export"
+            );
+        }
+    }
 }

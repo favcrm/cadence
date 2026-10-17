@@ -756,3 +756,50 @@ fn sidecar_path(vault: &Path, root: &str) -> Result<PathBuf> {
     }
     Ok(abs.join(format!("{last}.json")))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A refusal must not leave a publication behind: an oversize collection
+    /// is validated before the sidecar is written or committed.
+    #[test]
+    fn an_oversize_collection_is_refused_before_the_publish() {
+        let root = tempfile::tempdir().unwrap();
+        let pm = Pm::init(&root.path().join("pm")).unwrap();
+        let vault = vault_dir(&pm).unwrap();
+        let big = vault.join("global/big");
+        fs::create_dir_all(&big).unwrap();
+        for index in 0..=DOC_CAP {
+            fs::write(big.join(format!("f{index}.md")), b"x").unwrap();
+        }
+        let state = root.path().join("state");
+        fs::create_dir_all(&state).unwrap();
+        let head = crate::issue::git(&pm.dir, &["rev-parse", "HEAD"]).ok();
+        let metadata = json!({
+            "publisher": null,
+            "reviewer": null,
+            "review_project": null,
+            "documents": [],
+        });
+        let refused = put(
+            &pm,
+            &state,
+            &Caller::Operator,
+            "global/big",
+            ABSENT,
+            &metadata,
+            "usr-publisher",
+        );
+        assert!(refused.is_err(), "an oversize collection was published");
+        assert!(
+            !vault.join(".knowledge").exists(),
+            "a refused publish wrote a sidecar"
+        );
+        assert_eq!(
+            crate::issue::git(&pm.dir, &["rev-parse", "HEAD"]).ok(),
+            head,
+            "a refused publish committed"
+        );
+    }
+}
