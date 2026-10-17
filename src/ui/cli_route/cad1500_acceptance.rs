@@ -11,7 +11,7 @@ use std::sync::{
 use std::time::Duration;
 
 #[test]
-fn cad1500_member_pm_work_is_self_scoped_and_changes_after_reassignment() {
+fn cad1500_owner_and_member_pm_work_is_self_scoped_and_changes_after_reassignment() {
     let root = tempfile::tempdir().unwrap();
     let pm = Pm::init(&root.path().join("pm")).unwrap();
     issue_write::project_add(&pm, "fixture", "PMT", &[], &[], &[], None).unwrap();
@@ -75,12 +75,18 @@ fn cad1500_member_pm_work_is_self_scoped_and_changes_after_reassignment() {
     let mut call = |actor: &str, scope: &str, verb: &str, args: Value| {
         serial += 1;
         let now = crate::issue::time::now_epoch();
+        // Match the existing Worker mint: Owners use operator, Members users/sub.
+        let (principal_actor, role) = if actor == "owner-human" {
+            ("operator".to_string(), "owner")
+        } else {
+            (format!("users/{actor}"), "member")
+        };
         let header = URL_SAFE_NO_PAD.encode(
             json!({"alg":"EdDSA", "typ":"agenticos-wiki-actor/1", "kid":"cad1500"}).to_string(),
         );
         let claims = URL_SAFE_NO_PAD.encode(json!({
             "iss":issuer, "aud":"http://cad1500.board.localhost", "sub":actor,
-            "actor":format!("users/{actor}"), "principal_kind":"user", "role_at_issue":"member",
+            "actor":principal_actor, "principal_kind":"user", "role_at_issue":role,
             "organization_id":"cad1500", "scope":[scope], "credential_id":format!("fixture-{actor}"),
             "iat":now, "exp":now+120, "jti":format!("cad1500-{serial}")
         }).to_string());
@@ -157,4 +163,16 @@ fn cad1500_member_pm_work_is_self_scoped_and_changes_after_reassignment() {
     let (status, arrived) = call("beta", "cli.read", "my_work", json!({}));
     assert_eq!(status, 200, "{arrived}");
     assert_eq!(arrived["issues"][0]["id"], id);
+    let (status, owner_created) = call(
+        "owner-human",
+        "cli.write",
+        "issue_new",
+        json!({"project":"fixture", "title":"Owner's personal requirement", "owner":"owner-human"}),
+    );
+    assert_eq!(status, 201, "{owner_created}");
+    let (status, owner_work) = call("owner-human", "cli.read", "my_work", json!({}));
+    assert_eq!(status, 200, "{owner_work}");
+    assert_eq!(owner_work["owner"], "owner-human");
+    assert_eq!(owner_work["issues"].as_array().unwrap().len(), 1);
+    assert_eq!(owner_work["issues"][0]["id"], owner_created["issue"]["id"]);
 }
