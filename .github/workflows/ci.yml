@@ -310,6 +310,7 @@ jobs:
           # bump -ldN when a flag flips so the warm leg writes fresh
           # artifacts instead of skipping an existing stale key.
           shared-key: gate-test-ld1
+          save-if: false
       # CAD-1487: 83 test binaries × N shards make linking the shard
       # bottleneck; mold/lld cuts it. cache-warm's test leg enables the
       # same flag so main keeps the gate-test cache hot for it — the one
