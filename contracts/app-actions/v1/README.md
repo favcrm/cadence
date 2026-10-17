@@ -3,11 +3,12 @@
 A **versioned, data-only** grammar for the record mutations a
 workspace app package may *describe* for the trusted host. This
 directory is the contract; `src/issue/app_action.rs` is its strict
-reference validator. This increment is **metadata only** — the parser
-admits well-formed bytes; nothing here installs, admits, dispatches or
-executes an action, and the manifest loader still refuses the
-`actions`/`needs.actions` keys outright (they remain `GATED_KEYS`/
-unknown, so a bundle carrying this file is still refused at install).
+reference validator. Since CAD-1415 a bundle may carry this file as
+`app-actions.json` at its root: the installer admits it under the
+stricter rules in "Admission and execution today" below, and the host
+runs a declared action only as an operator-approved, allow-once
+proposal. The manifest's `actions`/`needs.actions` frontmatter keys stay
+gated (`GATED_KEYS`) and are still refused.
 
 ## Contents
 
@@ -104,10 +105,9 @@ This contract deliberately separates **declaration** from **power**.
 - **The parser admits data, not authority.** `parse`/`parse_str` in
   `src/issue/app_action.rs` answer only "is this a well-formed v1
   descriptor?" They execute nothing, install nothing, and grant
-  nothing. Installs that carry this file are still refused — the
-  manifest's `actions`/`needs.actions` keys are gated — and the
-  verified-receipt digest seam that would one day carry a validated
-  descriptor is the open CAD-864 slice, deliberately not consumed here.
+  nothing. Admission and execution are separate host steps (next
+  section); the file is covered by the bundle digest the operator
+  approves, like every other bundle file.
 
 ## Versioning
 
@@ -129,25 +129,38 @@ mirrors the directory and the validator refuses any other tag.
   forged-authority, duplicate-id, wrong-tag, unsupported-operation,
   enum-coherence and bound cases. Running these tests is validation
   evidence, not supplied by this document.
-- A future package loader must run the validator (or an equivalent
-  schema check plus the consumer rules above) on descriptor bytes
-  *before* anything reads a descriptor — every consumer assumes
-  validated input.
+- Every consumer runs the validator on descriptor bytes *before* it
+  reads a descriptor; downstream code assumes validated input.
 
-## Remaining CAD-811 integration (not this increment)
+## Admission and execution today (CAD-1415)
 
-- **Admission**: `needs.actions` and an `actions/` bundle dir are
-  still refused by the manifest loader; admitting them is a later
-  slice that also pins the descriptor's digest onto a verified receipt.
+- **Admission** (`validate_customer_bundle`, `src/issue/app_action.rs`):
+  the descriptor's `app` must equal the manifest's app; every action must
+  use the `customer` record kind, the only kind the host storage holds;
+  every field must be one of the legacy customer fields with its exact
+  type (`display_name`, `email`, `phone`, `source`: `text`; `tags`:
+  `tags`); and no action id may collide with a host-registry assistant
+  id. Any violation refuses the install.
+- **Execution** (`src/daemon/app_record_actions_rpc.rs`): an agent
+  invocation in a scoped chat turn only validates the input and parks a
+  `pending_permission` operation with a host-drawn preview. The store
+  changes only on the operator's native `allow_once` decision, after the
+  operator proof, a re-derived operation digest, the same approved
+  declaration and the expected record revision. There is no standing
+  permission. Create refuses an existing id; update merges only the
+  declared fields and preserves consent.
+
+## Remaining CAD-811 integration
+
 - **Domain kinds**: `record` is a forward reference to a record kind
   declared in a future `domain/` contract. There is no domain registry
   yet, so the validator checks only that the name is well-formed — it
   performs no fake cross-validation against undeclared kinds.
   Cross-checking `record` against a declared `domain/` schema is a
   requirement of that future admission slice, not of this contract.
-- **Dispatch/execution**: no `app_action_call` RPC, no HTTP peer, no
-  interpreter exists; an action here is a *description* the host may
-  one day honor, behind operator approval and the guard floor.
+- **More kinds and operations**: kinds beyond `customer`, and any
+  operation beyond `record.create`/`record.update`, need that domain
+  contract and a new host handler first.
 - **Effect verbs**: no declared action can carry an outward effect in
   v1 — publication/send stays on the `CapabilityNeed`/`needs.
   capabilities` seam and its own gate.
