@@ -29,6 +29,8 @@ import NeedsRail from "./NeedsRail";
 import { askDraft, readRailCollapsed, writeRailCollapsed, type HomeNeed } from "./needs";
 import PlanCard from "./PlanCard";
 import Conversation from "../app-shell/chat/Conversation";
+import MemberChat from "./MemberChat";
+import { memberScope } from "./memberThread";
 import { time } from "./ThreadView";
 import {
   initialFollow,
@@ -538,7 +540,89 @@ const ThreadList = memo(function ThreadList({
  * floating dock at its bottom, and the empty/not-started states sit
  * centred in it with the dock disabled.
  */
+/**
+ * CAD-1485: the outer Home owns the mode decision only. A signed-in
+ * member (or an explicit `?chat=assistant` on a hosted board) gets the
+ * private-assistant surface; everyone else gets the Master workspace.
+ * The two are siblings — MemberChat never mounts MasterHome's hooks,
+ * so a member never subscribes, reads or sends on any Master resource.
+ */
 export default function Home({
+  readOnly,
+  hosted = null,
+  viewerSub = null,
+  viewerIsMember = false,
+  sessionId = null,
+  overview,
+  onOpenIssue,
+  overviewHref,
+  permissionsHref,
+  resolveAppPath,
+  setupNotice = null,
+}: {
+  readOnly: boolean;
+  hosted?: boolean | null;
+  /** CAD-1485: the verified public session's subject — member or
+   *  operator/owner — when the session names one. `?chat=assistant`
+   *  keys the owner's private chat on it; a member's default view is
+   *  already private. */
+  viewerSub?: string | null;
+  /** The verified session's `role === "member"`. Members always land on
+   *  their own private assistant; owners/operators keep Master unless
+   *  they explicitly ask for their own assistant. */
+  viewerIsMember?: boolean;
+  /** The verified session's id — scopes the member-chat store so a
+   *  re-login as another member never reads the previous chat. */
+  sessionId?: string | null;
+  overview: ResourceState<Overview>;
+  onOpenIssue: (id: string) => void;
+  overviewHref: string;
+  /** Settings → Master permissions (the standing "Always" rules). */
+  permissionsHref: string;
+  /** CAD-1438: resolves an install id to its unique canonical `/apps/<key>` path, or null. */
+  resolveAppPath: (installId: string) => string | null;
+  /** The first-run setup strip (CAD-1312): rendered inside the chat
+   *  panel below the Assistant heading so the Needs-you rail beside it
+   *  keeps the workspace's top edge. */
+  setupNotice?: ReactNode;
+}) {
+  // `?chat=assistant` is a UI-mode selector only — it names the signed-in
+  // user's OWN private assistant, never another actor. It changes no actor
+  // and no authority. The private surface is a HOSTED-board feature: a
+  // local or tailnet board's named session (device grant, unsigned local
+  // sign-in) never enters it — those keep the Master workspace, exactly
+  // like a standalone board. On a hosted board a member lands on their own
+  // assistant by default; an owner reaches theirs only through the query.
+  const chatParam = new URLSearchParams(window.location.search).get("chat") === "assistant";
+  const memberChat = hosted === true && viewerSub !== null && (viewerIsMember || chatParam);
+  if (memberChat && viewerSub !== null) {
+    const scope = memberScope(sessionId, viewerSub);
+    return (
+      <MemberChat
+        key={scope}
+        scope={scope}
+        readOnly={readOnly}
+        onOpenIssue={onOpenIssue}
+      />
+    );
+  }
+  return (
+    <MasterHome
+      readOnly={readOnly}
+      hosted={hosted}
+      overview={overview}
+      onOpenIssue={onOpenIssue}
+      overviewHref={overviewHref}
+      permissionsHref={permissionsHref}
+      resolveAppPath={resolveAppPath}
+      setupNotice={setupNotice}
+    />
+  );
+}
+
+/** The Master workspace — unchanged, mounted only when the outer Home
+ *  did NOT route to the member's private assistant. */
+function MasterHome({
   readOnly,
   hosted = null,
   overview,
@@ -553,13 +637,8 @@ export default function Home({
   overview: ResourceState<Overview>;
   onOpenIssue: (id: string) => void;
   overviewHref: string;
-  /** Settings → Master permissions (the standing "Always" rules). */
   permissionsHref: string;
-  /** CAD-1438: resolves an install id to its unique canonical `/apps/<key>` path, or null. */
   resolveAppPath: (installId: string) => string | null;
-  /** The first-run setup strip (CAD-1312): rendered inside the chat
-   *  panel below the Assistant heading so the Needs-you rail beside it
-   *  keeps the workspace's top edge. */
   setupNotice?: ReactNode;
 }) {
   const t = useTranslate();

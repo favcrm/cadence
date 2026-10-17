@@ -56,6 +56,11 @@ use tiny_http::{Header, Response, Server};
 const ORG: &str = "c1380-org";
 const KID: &str = "c1380-http-fixture";
 
+// Child placement reuses private fixture helpers without exporting them or
+// changing production module registration. The parent file is test-seam only.
+#[path = "cad1485_member_chat_refusal.rs"]
+mod cad1485_member_chat_refusal;
+
 fn loopback_server() -> Server {
     (3110..=3199)
         .find_map(|port| Server::http(("127.0.0.1", port)).ok())
@@ -95,6 +100,8 @@ struct Authority {
     members: BTreeMap<String, MemberAuthority>,
     /// Serve a non-200 status (platform failure — fail closed).
     status: u16,
+    /// Opt-in response recorder for CAD-1485 only. None preserves the old rig.
+    board_authorize: Option<cad1485_member_chat_refusal::BoardAuthorize>,
 }
 
 #[derive(serde::Deserialize)]
@@ -158,6 +165,13 @@ fn answer_platform(
             json!({"keys":[{"kty":"OKP","crv":"Ed25519","kid":KID,"x":jwks_public}]}),
         );
         return;
+    }
+    if path == "/__platform/assistant/board-authorize" {
+        let mut guard = authority.lock().unwrap();
+        if let Some(reply) = guard.board_authorize.as_mut() {
+            reply.answer(request);
+            return;
+        }
     }
     if path != "/__platform/assistant/revalidate" {
         respond(request, 404, json!({"ok":false,"code":"not_found"}));

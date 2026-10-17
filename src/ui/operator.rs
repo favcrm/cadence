@@ -2446,7 +2446,19 @@ pub(super) fn platform_session(
     ) {
         Ok(opened) => {
             let token = opened["token"].as_str().unwrap_or_default();
-            let body = serde_json::to_vec(&json!({"ok": true})).unwrap_or_default();
+            // The server's own session expiry rides the success body so
+            // the AgenticOS edge binds its custody digest to the ACTUAL
+            // session lifetime — never an approximation. The value comes
+            // only from the daemon's opened row; a missing or malformed
+            // expiry is an internal fault, not a sign-in with a guessed
+            // or extended lifetime.
+            let expires_at = opened["session"]["expires_at"].as_i64();
+            let body = match expires_at {
+                Some(at) if at > 0 => {
+                    serde_json::to_vec(&json!({"ok": true, "expires_at": at})).unwrap_or_default()
+                }
+                _ => return platform_fail(500, "internal", "session expiry unavailable"),
+            };
             let mut resp = Response::from_data(body).with_status_code(StatusCode(200));
             resp.add_header(Header::from_bytes("Content-Type", "application/json").unwrap());
             set_cookie(

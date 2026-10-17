@@ -36,6 +36,13 @@ export interface PendingMessage {
   text: string;
   state: "sending" | "sent" | "failed";
   error?: string;
+  /** CAD-1485 round-3 (member surface only): set when the send's
+   *  delivery is genuinely unknown — a lost response, a transport/5xx
+   *  failure, or a malformed/mismatching 2xx receipt. The member chat
+   *  renders "Delivery unconfirmed" (opt-in label) with the same
+   *  manual same-id retry/discard affordances; absent, every existing
+   *  surface keeps the Master "not sent" reading unchanged. */
+  delivery?: "unconfirmed";
   /** Epoch ms when it was first sent. */
   at: number;
   /** CAD-574: the cited needs subjects the send carried — a retry must

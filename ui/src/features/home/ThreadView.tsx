@@ -167,11 +167,24 @@ export function ThreadItemView({
           <RefChips refs={entryRefs(item.entry.payload)} />
         </Bubble>
       );
-    case "pending":
+    case "pending": {
+      // CAD-1485 round 3 (member surface only): a `delivery:
+      // "unconfirmed"` pending row opted into the honest unknown-
+      // delivery label — never "not sent", since the daemon may have
+      // committed. Absent the marker every surface keeps the Master
+      // "not sent" reading unchanged.
+      const pendingAt =
+        item.pending.state === "failed"
+          ? item.pending.delivery === "unconfirmed"
+            ? t("Delivery unconfirmed")
+            : t("not sent")
+          : item.pending.state === "sent"
+            ? t("queued")
+            : t("sending…");
       return (
         <Bubble
           who={t("You")}
-          at={item.pending.state === "failed" ? t("not sent") : item.pending.state === "sent" ? t("queued") : t("sending…")}
+          at={pendingAt}
           me
           density={density}
         >
@@ -186,7 +199,7 @@ export function ThreadItemView({
           <RefChips refs={item.pending.refs ?? []} />
           {item.pending.state === "failed" && (
             <div className="text-micro text-fail mt-1 break-words">
-              {item.pending.error}{" "}
+              {item.pending.delivery === "unconfirmed" ? t("The send may still have been delivered — retry sends the same message once.") : item.pending.error}{" "}
               <button
                 className="lnk"
                 onClick={() =>
@@ -209,6 +222,7 @@ export function ThreadItemView({
           )}
         </Bubble>
       );
+    }
     case "commentary":
       return (
         <div
