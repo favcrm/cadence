@@ -107,9 +107,12 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: staging-pr-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          # CAD-1511: CI-local rehearsal output only, for the same reason as
+          # the stage job's evidence upload — a public repository publishes
+          # every artifact to anyone with a GitHub account. The retired
+          # journey's `staging-e2e` dir was listed here too.
           path: |
             ${{ runner.temp }}/rehearsal
-            ${{ runner.temp }}/staging-e2e
           if-no-files-found: warn
           retention-days: 14
 
@@ -281,13 +284,18 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: staging-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          # CAD-1511: on a public repository every Actions artifact is
+          # downloadable by any GitHub account, and artifact bytes are never
+          # redacted, so this upload carries CI-local evidence only (the
+          # rehearsal ran on this runner). The stage job runs no e2e journey —
+          # CAD-1073 retired it — and the `staging-e2e/*` paths previously
+          # listed here were leftovers: the moment a future journey wrote board
+          # screenshots or staging daemon logs into that shared temp dir, they
+          # would have been published verbatim.
           path: |
             ${{ runner.temp }}/candidate/candidate.json
             ${{ runner.temp }}/baseline/candidate.json
             ${{ runner.temp }}/rehearsal
-            ${{ runner.temp }}/staging-e2e/acceptance.json
-            ${{ runner.temp }}/staging-e2e/screens
-            ${{ runner.temp }}/staging-e2e/logs
           if-no-files-found: warn
           retention-days: 90
 
