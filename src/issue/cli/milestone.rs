@@ -38,8 +38,9 @@ pub enum MilestoneAction {
         /// Keep only the first N rows.
         #[arg(long)]
         limit: Option<usize>,
-        /// Keep only these keys in each --json row (comma-joined).
-        #[arg(long, value_delimiter = ',', requires = "json")]
+        /// Keep only these keys in each JSON row (comma-joined).
+        /// Refused when stdout is a table; a pipe or `--json` is enough.
+        #[arg(long, value_delimiter = ',')]
         fields: Vec<String>,
         #[arg(long)]
         json: bool,

@@ -108,7 +108,10 @@ so do not report on them — they carry no `turn_id` for you.
 ## Listing things
 
 Every `ls`/`list` command shares one filter grammar — filter instead of
-grepping, and pass `--json` when consuming the output:
+grepping. Pass `--json` for commands that still print a table into a
+pipe (`agent list`, `job list`, `plan ls`, `delivery ls`, `report ls`).
+`issue ls`, `issue epic ls|show`, `milestone ls|show`, `memory ls`,
+`status`, `overview`, and `build-slot status` print JSON when piped:
 
 ```bash
 cadence issue ls --status doing,review --owner <you> --json
@@ -131,13 +134,14 @@ cadence milestone ls --json
   flags AND. An unknown value is an error naming the valid set.
 - `--sort KEY` orders (`-KEY` descending), `--limit N` caps, `--fields a,b`
   keeps only those JSON row keys, `--since/--until` take `24h`/`7d`, an ISO
-  date, or an epoch.
+  date, or an epoch. `--fields` and `issue ls --summary` do not need a
+  separate `--json` when stdout is already JSON. On a terminal table,
+  pass `--json`.
 - Output policy: JSON on stdout is one compact line per document when
   stdout is not a terminal (your case), pretty on a TTY.
-  `CADENCE_JSON=pretty|compact` overrides. `issue ls`, `issue epic
-  ls|show` and `milestone ls|show` print JSON when piped, a table only
-  on a TTY (`CADENCE_JSON=table` forces the table). Field names and
-  order never change.
+  `CADENCE_JSON=pretty|compact|table` overrides (`table` forces the
+  table). Any other value warns once on stderr and is ignored.
+  Field names and order never change.
 - `issue ls --tag` is the one exception: every named tag must be present.
 - `agent list` from your pane still shows only your group — filters narrow
   it, `--all` widens past it.

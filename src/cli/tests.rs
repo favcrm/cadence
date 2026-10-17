@@ -1421,6 +1421,18 @@ fn cad800_single_id_sweep_flags_rejected() {
     assert!(Cli::try_parse_from(["cadence", "issue", "finish", "CAD-1"]).is_ok());
 }
 
+/// Piped list output is already JSON, so `--fields` and `--summary` do
+/// not require a redundant `--json` at parse time. Table mode still
+/// refuses them in the handler.
+#[test]
+fn list_fields_parse_without_an_explicit_json_flag() {
+    assert!(Cli::try_parse_from(["cadence", "issue", "ls", "--fields", "id"]).is_ok());
+    assert!(Cli::try_parse_from(["cadence", "issue", "ls", "--summary"]).is_ok());
+    assert!(Cli::try_parse_from(["cadence", "issue", "epic", "ls", "--fields", "id"]).is_ok());
+    assert!(Cli::try_parse_from(["cadence", "milestone", "ls", "--fields", "id"]).is_ok());
+    assert!(Cli::try_parse_from(["cadence", "memory", "ls", "--fields", "slug"]).is_ok());
+}
+
 /// CAD-879: `cadence self` asks the daemon for running turns only.
 #[test]
 fn cad879_self_requests_no_history() {
