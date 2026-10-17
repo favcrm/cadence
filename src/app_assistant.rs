@@ -1,4 +1,6 @@
 //! Host-owned registry for the first generic app assistant action set.
+use std::collections::BTreeSet;
+
 use serde_json::{json, Value};
 
 #[derive(Clone)]
@@ -254,25 +256,59 @@ pub fn registered_ids() -> &'static [&'static str] {
     ]
 }
 
-/// The installed app a registered action belongs to. The registry is the
-/// allow-list: the Social Content app may use exactly its own three actions
-/// and no other app may use them (CAD-1327).
-pub const SOCIAL_APP: &str = "social-content";
-pub const SOCIAL_ACTIONS: [&str; 3] = [
-    "social.posts.fetch",
-    "social.draft.create",
-    "social.drafts.status",
-];
-
-pub fn is_social(id: &str) -> bool {
-    SOCIAL_ACTIONS.contains(&id)
+/// CAD-1518: what one installation's consented bundle declares. This is the
+/// only allow-list for assistant actions and scoped chat verbs: an install
+/// reaches exactly what it declared, and nothing is decided by app name.
+/// `app` and `title` come from the installed manifest and only label the
+/// chat turn.
+#[derive(Clone, Debug, Default)]
+pub struct Declared {
+    pub app: String,
+    pub title: String,
+    pub actions: BTreeSet<String>,
+    pub attachments: BTreeSet<String>,
 }
 
-/// `true` when `id` may run for an installation whose manifest app is `app`.
-pub fn allowed_for_app(app: &str, id: &str) -> bool {
-    if app == SOCIAL_APP {
-        is_social(id)
-    } else {
-        !is_social(id)
+/// What a scoped-chat RPC requires the installation to have declared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScopedNeed {
+    /// At least one registered action in `app-assistant.json`.
+    AnyAction,
+    /// This registered action in `app-assistant.json`.
+    Action(&'static str),
+    /// This host attachment in `app-chat.json`.
+    Attachment(&'static str),
+}
+
+impl Declared {
+    pub fn admits(&self, need: ScopedNeed) -> bool {
+        match need {
+            ScopedNeed::AnyAction => !self.actions.is_empty(),
+            ScopedNeed::Action(id) => self.actions.contains(id),
+            ScopedNeed::Attachment(id) => self.attachments.contains(id),
+        }
     }
+}
+
+/// The declaration each scoped-chat RPC needs. A method with no row is not
+/// a scoped verb and is refused.
+pub fn scoped_need(method: &str) -> Option<ScopedNeed> {
+    use ScopedNeed::{Action, AnyAction, Attachment};
+    Some(match method {
+        "app_assistant_actions" | "app_assistant_invoke" | "app_assistant_operation_show" => {
+            AnyAction
+        }
+        "app_segment_assistant_list" => Action("segments.list"),
+        "app_segment_assistant_show" => Action("segments.show"),
+        "app_segment_assistant_preview" => Action("segments.preview"),
+        "app_segment_assistant_save" => Action("segments.save"),
+        "app_content_assistant_draft"
+        | "app_content_assistant_propose"
+        | "app_content_assistant_proposals"
+        | "app_content_assistant_proposal_show" => Action("email.draft"),
+        "app_record_csv_assistant_preview" | "app_record_csv_assistant_import" => {
+            Attachment("csv-import")
+        }
+        _ => return None,
+    })
 }

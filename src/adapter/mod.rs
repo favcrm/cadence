@@ -1047,8 +1047,18 @@ mod tests {
     #[test]
     fn turn_slot_fills_every_token_position_or_drops_the_block() {
         let slot = "<<cadence-turn-slot:abc>>";
-        let block =
-            crate::master::scoped_verb_reference("i", "c", "m1", slot, std::path::Path::new("/t"));
+        let block = crate::master::scoped_verb_reference(
+            "i",
+            "c",
+            "m1",
+            slot,
+            std::path::Path::new("/t"),
+            &crate::app_assistant::Declared {
+                actions: ["segments.save".to_string()].into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let prompt = format!("[App context]\n{block}\n\nhello");
         assert!(prompt.matches(slot).count() >= 2);
         let filled = with_turn_token(&prompt, Some(slot), "pi-1-ff");
