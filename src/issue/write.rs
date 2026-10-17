@@ -2662,6 +2662,73 @@ mod tests {
         crate::issue::edit::edit(&pm, "CAD-1", &spec, "t", None).unwrap();
     }
 
+    /// CAD-1522: `--unref` removes exactly the named ref, and an
+    /// `--unref` whose target is not there refuses the whole edit — the
+    /// caller asked for a correction that cannot be made, and the other
+    /// parts of the same call must not land either. Before this, a ref
+    /// added by mistake could not be removed at all, and a stale `pr:`
+    /// ref pointing at another open PR makes `issue reconcile` return
+    /// `held(open-pr)` forever (observed on ticket CAD-1514).
+    #[test]
+    fn edit_unref_removes_one_ref_and_refuses_an_absent_target() {
+        let (_tmp, pm) = tracker();
+        let url = |n: u32| format!("https://github.com/favcrm/cadence/pull/{n}");
+        let edit = |spec: crate::issue::edit::EditSpec| {
+            crate::issue::edit::edit(&pm, "CAD-1", &spec, "t", None)
+        };
+        let refs = || -> Vec<String> {
+            let (front, _) = load_front(&pm.dir.join("cadence/CAD-1")).unwrap();
+            front.refs.iter().filter_map(|r| r.url.clone()).collect()
+        };
+        let commits = || -> u32 {
+            crate::issue::git(&pm.dir, &["rev-list", "--count", "HEAD"])
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap()
+        };
+
+        edit(crate::issue::edit::EditSpec {
+            refs: vec![format!("pr:{}", url(1)), format!("pr:{}", url(2))],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(refs(), vec![url(1), url(2)]);
+
+        let before = std::fs::read(pm.dir.join("cadence/CAD-1/issue.md")).unwrap();
+        let err = edit(crate::issue::edit::EditSpec {
+            unrefs: vec![format!("pr:{}", url(9))],
+            set: vec!["priority=P0".to_string()],
+            ..Default::default()
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("has no pr ref"), "{err}");
+        assert_eq!(
+            refs(),
+            vec![url(1), url(2)],
+            "a refused --unref removed a ref"
+        );
+        assert_eq!(
+            std::fs::read(pm.dir.join("cadence/CAD-1/issue.md")).unwrap(),
+            before,
+            "a refused --unref still wrote the rest of the edit"
+        );
+
+        let commits_before = commits();
+        edit(crate::issue::edit::EditSpec {
+            unrefs: vec![format!("pr:{}", url(1))],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(refs(), vec![url(2)], "the wrong ref was removed");
+        assert_eq!(
+            commits(),
+            commits_before + 1,
+            "removal lands as exactly one tracker commit"
+        );
+    }
+
     #[test]
     fn lint_reports_duplicate_ids_across_project_folders() {
         let (_tmp, pm) = tracker();
