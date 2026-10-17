@@ -2,7 +2,10 @@
 """CAD-1479 INDEPENDENT workflow bad-case acceptance — release-publish-r2 gate.
 
 Authored independently of the implementer; the implementer may not edit
-or weaken this file.
+or weaken this file. Amended once, by operator decision: CAD-1506
+(2026-10-17) relaxed section 3's absolute "no `environment:`" clause to
+"no environment that requires reviewers" — the reasoning is in that
+section, and the refusal is preserved.
 
 What the ticket needs: the existing `release-publish-r2` job (the only
 writer to the dedicated public-client release store) stays gated so that
@@ -42,9 +45,13 @@ twice, at the actual gate and the actual run block — not a re-typed copy:
 
 3. Dependency gate: the job must declare `needs: release-publish` (the
    upstream job carries the protected `release` environment approval);
-   the downstream job must NOT declare its own `environment:` (a second
-   environment would demand a second, redundant approval — the upstream
-   approval is the gate).
+   the downstream job may declare only an APPROVAL-FREE environment.
+   CAD-1506 (operator decision, 2026-10-17) relaxed the original "no
+   `environment:` at all" clause: `release-store` carries a branch policy
+   (main and v* tags) with no required reviewers, so it withholds the
+   release-store credentials from PR refs without adding a second
+   approval. An environment that requires reviewers — the redundant
+   approval this clause exists to refuse — still fails here.
 
 4. Preservation: the fixed endpoint/bucket literals are exactly the
    dedicated store CAD-1475 pins (`EXPECTED_ENDPOINT`/`EXPECTED_BUCKET`
@@ -204,11 +211,25 @@ class R2PublishGate(unittest.TestCase):
                 f"{name}: gate evaluated {got}, expected {want} (cond: {self.cond!r})",
             )
 
-    def test_job_needs_the_protected_release_and_no_own_environment(self):
+    # CAD-1506 (operator decision, 2026-10-17): the original clause refused any
+    # `environment:` on the publisher, because a protected environment demands a
+    # second, redundant approval. The publisher may now declare an APPROVAL-FREE
+    # environment: `release-store` has a branch policy (main and v* tags) and no
+    # required reviewers, which is what keeps the release-store credentials off
+    # PR refs without a second approval on a release. Any other environment is
+    # still refused — it would either require reviewers (the redundant approval)
+    # or not carry the key.
+    APPROVAL_FREE_ENVIRONMENTS = ("release-store",)
+
+    def test_job_needs_the_protected_release_and_no_redundant_approval(self):
         assert re.search(r"^    needs: \[?release-publish\]?[,\]]", self.job, re.M), \
             "the publisher must depend on the release-publish job (the protected release environment's gate)"
-        assert "environment:" not in self.job, \
-            "the publisher must not declare its own environment — the upstream release approval is the one gate, a second environment would demand a redundant approval"
+        environment = re.search(r"(?m)^    environment: (\S+)$", self.job)
+        if environment:
+            assert environment.group(1) in self.APPROVAL_FREE_ENVIRONMENTS, (
+                "the publisher may declare only an approval-free environment; "
+                f"{environment.group(1)!r} would demand a second, redundant approval "
+                "or does not carry the release-store credentials")
 
     def rendered_run(self):
         """The real run block with every ${{ }} expression substituted

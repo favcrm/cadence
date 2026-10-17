@@ -22,6 +22,10 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    # CAD-1506: the release-store write credentials are environment-scoped
+    # (branch policy: main and v* tags). This job only ever runs from
+    # refs/heads/main, so the policy admits it; no approval click is added.
+    environment: release-store
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
