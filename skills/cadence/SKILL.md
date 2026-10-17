@@ -117,6 +117,9 @@ cadence agent list --state idle,busy --json
 cadence job list --state open --json
 cadence delivery ls --open --json
 cadence plan ls --state proposed --json
+cadence message ls --to <alias> --state queued,running
+                      # ids and state only — no body, no turn token.
+                      # `message read <id>` fetches the text.
 cadence report ls --kind question --open --json
 cadence memory ls --type gotcha --project <key> --json
 cadence issue epic ls --health at_risk --json

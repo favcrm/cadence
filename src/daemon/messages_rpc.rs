@@ -12,6 +12,42 @@ use crate::peer::PeerTies;
 /// anything a pane could.
 pub(super) const MESSAGE_READ_LIMIT: usize = 4_000;
 
+const MESSAGE_LIST_LIMIT_DEFAULT: usize = 20;
+const MESSAGE_LIST_LIMIT_MAX: u64 = 50;
+const KNOWN_MESSAGE_STATES: &[&str] = &[
+    "queued",
+    "submitting",
+    "running",
+    "completed",
+    "failed",
+    "interrupted",
+    "cancelled",
+    "unknown",
+    "available",
+    "refused",
+];
+
+fn known_message_state(state: &str) -> bool {
+    KNOWN_MESSAGE_STATES.contains(&state)
+}
+
+/// Who may list `target`. Stricter than `message_read` for an unproven
+/// caller: listing enumerates ids, so an unproven connection is refused
+/// even when it could read a body it already named.
+pub(super) fn admit_message_list(who: &caller_rule::Who, target: &str) -> Result<()> {
+    match who {
+        caller_rule::Who::Operator => Ok(()),
+        caller_rule::Who::Agent(caller) if caller == target => Ok(()),
+        caller_rule::Who::Agent(caller) => Err(Error::rejected(format!(
+            "message_list refused: agent '{caller}' cannot list another \
+             agent's mail (caller rule)"
+        ))),
+        caller_rule::Who::Unproven(why) => Err(Error::rejected(format!(
+            "message_list refused: an unproven caller cannot list mail ({why})"
+        ))),
+    }
+}
+
 impl Shared {
     /// `agent_send` without a connection to attribute (unit tests):
     /// a threaded agent records the message as unattributed, and a
@@ -617,6 +653,78 @@ impl Shared {
             "chars_total": total,
             "truncated": offset + text.chars().count() < total,
             "app_context": app_context,
+        }))
+    }
+
+    /// `message list` — ids and state for one recipient. No body, result,
+    /// error, or turn token. An agent lists only its own alias. An
+    /// unproven caller is refused. App-owned rows are included only for
+    /// an operator, and still without their body.
+    pub(super) fn rpc_message_list(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        reject_identity_fields(params, "message_list")?;
+        let to = required_str(params, "to")?;
+        let alias = self.resolve_alias(to)?;
+        let who = self.connection_caller(peer_pid)?;
+        admit_message_list(&who, &alias)?;
+        let states = match params.get("state") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(items)) => items
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .filter(|state| known_message_state(state))
+                        .map(str::to_string)
+                        .ok_or_else(|| {
+                            Error::rejected(format!(
+                                "state must be one of {}",
+                                KNOWN_MESSAGE_STATES.join(", ")
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?,
+            Some(_) => return Err(Error::rejected("state must be an array of message states")),
+        };
+        let from = optional_str(params, "from");
+        let source = optional_str(params, "source");
+        if from.is_some_and(|value| value.is_empty())
+            || source.is_some_and(|value| value.is_empty())
+        {
+            return Err(Error::rejected(
+                "from and source, when set, must be nonempty",
+            ));
+        }
+        let since = optional_str(params, "since").map(str::to_string);
+        let limit = match optional_u64(params, "limit") {
+            None => MESSAGE_LIST_LIMIT_DEFAULT,
+            Some(n) if (1..=MESSAGE_LIST_LIMIT_MAX).contains(&n) => n as usize,
+            Some(_) => {
+                return Err(Error::rejected(format!(
+                    "limit must be 1 to {MESSAGE_LIST_LIMIT_MAX}"
+                )))
+            }
+        };
+        let include_app = matches!(who, caller_rule::Who::Operator);
+        let page = self.store.message_index(
+            &alias,
+            &store::MessageIndexQuery {
+                states: &states,
+                from,
+                source,
+                since: since.as_deref(),
+                limit,
+                include_app,
+            },
+        )?;
+        Ok(json!({
+            "alias": alias,
+            "messages": page.rows.iter().map(store::MessageIndex::to_json).collect::<Vec<_>>(),
+            "limit": limit,
+            "omitted": page.omitted,
+            "truncated": page.omitted > 0,
         }))
     }
 
@@ -1776,5 +1884,21 @@ impl Shared {
             "turn_id": turn_id,
             "state": settled.map(|m| m.state),
         }))
+    }
+}
+
+#[cfg(test)]
+mod message_list_admit {
+    use super::admit_message_list;
+    use crate::daemon::caller_rule::Who;
+
+    #[test]
+    fn only_the_operator_or_the_recipient_may_list() {
+        assert!(admit_message_list(&Who::Operator, "worker").is_ok());
+        assert!(admit_message_list(&Who::Agent("worker".into()), "worker").is_ok());
+        let other = admit_message_list(&Who::Agent("peer".into()), "worker").unwrap_err();
+        assert!(other.to_string().contains("cannot list another"), "{other}");
+        let unproven = admit_message_list(&Who::Unproven("no pane".into()), "worker").unwrap_err();
+        assert!(unproven.to_string().contains("unproven"), "{unproven}");
     }
 }

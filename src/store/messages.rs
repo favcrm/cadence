@@ -327,6 +327,140 @@ pub(super) const FENCING_UNKNOWN_SQL: &str = "state='unknown' AND source != 'nud
 /// `state NOT IN (terminal)` classification.
 const NOTICE_ENDED_SQL: &str = "(source = 'topic_notice' AND state IN ('available','refused'))";
 
+/// Columns for [`Store::message_index`]. Body, result, error, and
+/// `turn_id` are not selected.
+const INDEX_COLS: &str = "seq, id, alias, state, source, sender, reply_to, task_id, issue, \
+     priority, created, started, completed, length(body), \
+     CASE WHEN state='running' \
+          AND source NOT IN ('worker_result','worker_notice','job_event','nudge','topic_notice') \
+          AND json_valid(result) AND json_extract(result,'$.status')='submitted' \
+          THEN 1 ELSE 0 END";
+
+/// One index row. `body_chars` is SQLite's character length of the stored
+/// body; the text itself is not loaded.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MessageIndex {
+    pub seq: i64,
+    pub id: String,
+    pub alias: String,
+    pub state: String,
+    pub source: String,
+    pub sender: Option<String>,
+    pub reply_to: Option<String>,
+    pub task_id: Option<String>,
+    pub issue: Option<String>,
+    pub priority: Priority,
+    pub created: f64,
+    pub started: Option<f64>,
+    pub completed: Option<f64>,
+    pub body_chars: i64,
+    pub awaiting_report: bool,
+}
+
+impl MessageIndex {
+    pub fn to_json(&self) -> Value {
+        let mut row = json!({
+            "seq": self.seq,
+            "id": self.id,
+            "alias": self.alias,
+            "state": self.state,
+            "source": self.source,
+            "reply_to": self.reply_to,
+            "task_id": self.task_id,
+            "issue": self.issue,
+            "created": self.created,
+            "started": self.started,
+            "completed": self.completed,
+            "body_chars": self.body_chars,
+        });
+        if let Some(sender) = &self.sender {
+            row["from"] = json!(sender);
+        }
+        if self.priority != Priority::Normal {
+            row["priority"] = json!(self.priority.as_str());
+        }
+        if self.awaiting_report {
+            row["awaiting_report"] = json!(true);
+        }
+        if self.source == NUDGE_SOURCE {
+            row["nudge"] = json!(true);
+        }
+        row
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MessageIndexPage {
+    pub rows: Vec<MessageIndex>,
+    pub omitted: usize,
+}
+
+/// Filters for [`Store::message_index`]. An empty `states` list matches
+/// every state. `since` is a message id of this alias or a unix timestamp.
+#[derive(Debug, Clone, Copy)]
+pub struct MessageIndexQuery<'a> {
+    pub states: &'a [String],
+    pub from: Option<&'a str>,
+    pub source: Option<&'a str>,
+    pub since: Option<&'a str>,
+    pub limit: usize,
+    /// Operator listings include app-dispatch rows. Agent listings do not.
+    pub include_app: bool,
+}
+
+#[derive(Clone)]
+enum Bind {
+    Text(String),
+    Real(f64),
+    Int(i64),
+}
+
+impl rusqlite::types::ToSql for Bind {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        match self {
+            Bind::Text(value) => value.to_sql(),
+            Bind::Real(value) => value.to_sql(),
+            Bind::Int(value) => value.to_sql(),
+        }
+    }
+}
+
+fn index_query(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    binds: &[Bind],
+) -> Result<Vec<MessageIndex>> {
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(binds), row_index)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+fn count_query(conn: &rusqlite::Connection, sql: &str, binds: &[Bind]) -> Result<i64> {
+    Ok(conn.query_row(sql, rusqlite::params_from_iter(binds), |row| row.get(0))?)
+}
+
+fn row_index(row: &rusqlite::Row) -> rusqlite::Result<MessageIndex> {
+    let rank: i64 = row.get(9)?;
+    let awaiting: i64 = row.get(14)?;
+    Ok(MessageIndex {
+        seq: row.get(0)?,
+        id: row.get(1)?,
+        alias: row.get(2)?,
+        state: row.get(3)?,
+        source: row.get(4)?,
+        sender: row.get(5)?,
+        reply_to: row.get(6)?,
+        task_id: row.get(7)?,
+        issue: row.get(8)?,
+        priority: Priority::from_rank(rank),
+        created: row.get(10)?,
+        started: row.get(11)?,
+        completed: row.get(12)?,
+        body_chars: row.get(13)?,
+        awaiting_report: awaiting == 1,
+    })
+}
+
 /// Enqueue rejects a body over 48_000 bytes. The inlined spec is cut in
 /// bytes, on a char boundary, so a multibyte spec cannot blow that limit.
 pub const ENQUEUE_BYTES: usize = 48_000;
@@ -2133,6 +2267,122 @@ impl Store {
         Ok((rows, omitted))
     }
 
+    /// Bounded index of one alias's messages. Rows carry no body, result,
+    /// error, or turn token — those stay on `message read` and the
+    /// owner's own report path. Same registration window as
+    /// [`Self::messages_window`]: every matching non-terminal row, plus
+    /// the newest `limit` matching terminal rows. `since` is a message
+    /// id of this alias (rows after it) or a unix timestamp.
+    pub fn message_index(
+        &self,
+        alias: &str,
+        query: &MessageIndexQuery<'_>,
+    ) -> Result<MessageIndexPage> {
+        let MessageIndexQuery {
+            states,
+            from,
+            source,
+            since,
+            limit,
+            include_app,
+        } = *query;
+        let conn = self.conn();
+        let agent = self.agent_in(&conn, alias)?;
+        let (mut after_seq, mut after_ts) = (0i64, f64::MIN);
+        if let Some(since) = since {
+            let by_id = conn
+                .query_row(
+                    "SELECT seq FROM messages WHERE alias=?1 AND id=?2",
+                    params![alias, since],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()?;
+            match (by_id, since.parse::<f64>()) {
+                (Some(seq), _) => after_seq = seq,
+                (None, Ok(ts)) if ts.is_finite() => after_ts = ts,
+                _ => {
+                    return Err(Error::rejected(format!(
+                        "since '{since}' is neither a message id of '{alias}' nor a timestamp"
+                    )));
+                }
+            }
+        }
+        let mut filter = String::new();
+        let mut filter_binds: Vec<Bind> = Vec::new();
+        if let Some(from) = from {
+            filter.push_str(" AND sender=?");
+            filter_binds.push(Bind::Text(from.to_string()));
+        }
+        if let Some(source) = source {
+            filter.push_str(" AND source=?");
+            filter_binds.push(Bind::Text(source.to_string()));
+        }
+        if !states.is_empty() {
+            filter.push_str(" AND state IN (");
+            for (i, state) in states.iter().enumerate() {
+                if i > 0 {
+                    filter.push(',');
+                }
+                filter.push('?');
+                filter_binds.push(Bind::Text(state.clone()));
+            }
+            filter.push(')');
+        }
+        if !include_app {
+            filter.push_str(" AND source!='app_run_dispatch'");
+        }
+        let live = format!(
+            "state NOT IN ('completed','failed','interrupted','cancelled') AND NOT {NOTICE_ENDED_SQL}"
+        );
+        let cols = INDEX_COLS;
+        let mut live_binds = vec![Bind::Text(alias.to_string())];
+        live_binds.extend(filter_binds.iter().cloned());
+        let live_rows = index_query(
+            &conn,
+            &format!("SELECT {cols} FROM messages WHERE alias=? AND ({live}){filter} ORDER BY seq"),
+            &live_binds,
+        )?;
+        let mut terminal_binds = vec![
+            Bind::Text(alias.to_string()),
+            Bind::Real(agent.created),
+            Bind::Real(after_ts),
+            Bind::Int(after_seq),
+        ];
+        terminal_binds.extend(filter_binds.iter().cloned());
+        terminal_binds.push(Bind::Int(limit as i64));
+        let mut rows = live_rows;
+        rows.extend(index_query(
+            &conn,
+            &format!(
+                "SELECT {cols} FROM messages WHERE alias=? AND NOT ({live})
+                 AND created >= ? AND created >= ? AND seq > ?{filter}
+                 ORDER BY seq DESC LIMIT ?"
+            ),
+            &terminal_binds,
+        )?);
+        rows.sort_by_key(|row| row.seq);
+        // Count the same set the two queries can return: every matching
+        // live row, plus terminal rows after the cursor. Older terminal
+        // mail is not "omitted" from a cursor page.
+        let mut count_binds = vec![
+            Bind::Text(alias.to_string()),
+            Bind::Real(agent.created),
+            Bind::Real(after_ts),
+            Bind::Int(after_seq),
+        ];
+        count_binds.extend(filter_binds);
+        let total: i64 = count_query(
+            &conn,
+            &format!(
+                "SELECT COUNT(*) FROM messages WHERE alias=? AND (({live})
+                 OR (NOT ({live}) AND created >= ? AND created >= ? AND seq > ?)){filter}"
+            ),
+            &count_binds,
+        )?;
+        let omitted = (total as usize).saturating_sub(rows.len());
+        Ok(MessageIndexPage { rows, omitted })
+    }
+
     /// Current work and unresolved outcomes for overview probes. Terminal
     /// history stays available through `messages`; unknowns remain visible
     /// even after a clock step or alias re-registration, as there too.
@@ -2477,5 +2727,98 @@ impl Store {
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod index_tests {
+    use super::*;
+    use crate::store::agents::NewAgent;
+
+    fn open() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("cadence.sqlite3")).unwrap();
+        (dir, store)
+    }
+
+    fn register(store: &Store, alias: &str, dir: &std::path::Path) {
+        store
+            .register_agent(&NewAgent {
+                alias,
+                provider: "fake",
+                endpoint_kind: "managed",
+                role: "worker",
+                cwd: dir.to_str().unwrap(),
+                sandbox: "read-only",
+                instructions: None,
+                params: None,
+                team_role: None,
+                model_policy: None,
+            })
+            .unwrap();
+    }
+
+    fn index<'a>(
+        store: &Store,
+        alias: &str,
+        states: &'a [String],
+        from: Option<&'a str>,
+    ) -> MessageIndexPage {
+        store
+            .message_index(
+                alias,
+                &MessageIndexQuery {
+                    states,
+                    from,
+                    source: None,
+                    since: None,
+                    limit: 20,
+                    include_app: false,
+                },
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn index_omits_body_result_and_turn_token() {
+        let (dir, store) = open();
+        register(&store, "worker", dir.path());
+        register(&store, "pm", dir.path());
+        let secret = "turn-token-secret-body";
+        store
+            .enqueue("worker", secret, None, "m-run", "user")
+            .unwrap();
+        store.mark_running("m-run", "pty-secret-token").unwrap();
+        store
+            .enqueue_sent(
+                "worker",
+                "from-pm-body",
+                None,
+                "m-pm",
+                "user",
+                None,
+                &Sender::Agent("pm".into()),
+            )
+            .unwrap();
+        let page = index(&store, "worker", &[], None);
+        assert_eq!(page.rows.len(), 2);
+        let running = page.rows.iter().find(|row| row.id == "m-run").unwrap();
+        assert!(running.awaiting_report || running.state == "running");
+        assert_eq!(running.body_chars, secret.chars().count() as i64);
+        let encoded = serde_json::to_string(&running.to_json()).unwrap();
+        for leaked in [secret, "pty-secret-token", "from-pm-body"] {
+            assert!(!encoded.contains(leaked), "{encoded}");
+        }
+        for key in ["body", "turn_id", "result", "error", "sender_uid"] {
+            assert!(running.to_json().get(key).is_none(), "{key}");
+        }
+        let from_pm = index(&store, "worker", &[], Some("pm"));
+        assert_eq!(from_pm.rows.len(), 1);
+        assert_eq!(from_pm.rows[0].id, "m-pm");
+        assert_eq!(from_pm.rows[0].to_json()["from"], "pm");
+        let queued_states = ["queued".to_string()];
+        let queued = index(&store, "worker", &queued_states, None);
+        assert_eq!(queued.rows.len(), 1);
+        assert_eq!(queued.rows[0].id, "m-pm");
     }
 }

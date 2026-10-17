@@ -238,6 +238,16 @@ impl Shared {
                     )));
                 }
             }
+            // Own recipient only. `to` is required; there is no implicit self.
+            "message_list" => {
+                let target = params.get("to").and_then(Value::as_str).unwrap_or("");
+                if target != alias {
+                    return Err(Error::rejected(format!(
+                        "assist agent '{alias}' may not {method} '{target}' — only its own \
+                         mail (CAD-1380)"
+                    )));
+                }
+            }
             // `message_read` names an id; bound to this alias's message row.
             "message_read" => {
                 let id = params
@@ -341,7 +351,9 @@ impl Shared {
         // credential, because this connection carries no member envelope.
         let (operation, scope) = match method {
             "agent_show" | "agent_events" => ("assist_state", "assist.read"),
-            "thread_read" | "message_read" | "message_report" => ("assist_history", "assist.read"),
+            "thread_read" | "message_read" | "message_report" | "message_list" => {
+                ("assist_history", "assist.read")
+            }
             "job_show" | "task_show" => ("job_evidence", "assist.jobs"),
             "job_events" => ("job_events", "assist.jobs"),
             _ => ("assist_send", "assist.write"),
@@ -380,6 +392,7 @@ impl Shared {
             "thread_read" | "agent_show" | "agent_events" | "agent_wait" => {
                 (params.get("alias").and_then(Value::as_str), None, None)
             }
+            "message_list" => (params.get("to").and_then(Value::as_str), None, None),
             "job_show" | "job_events" => (None, params.get("job").and_then(Value::as_str), None),
             "task_show" => (None, None, params.get("task").and_then(Value::as_str)),
             _ => return Ok(()),

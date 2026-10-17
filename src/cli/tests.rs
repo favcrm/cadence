@@ -776,6 +776,63 @@ fn send_steering_flags_parse() {
 }
 
 #[test]
+fn message_list_parses_both_spellings_and_rejects_a_bad_filter() {
+    let cli = Cli::try_parse_from([
+        "cadence",
+        "message",
+        "ls",
+        "--to",
+        "worker",
+        "--state",
+        "queued,running",
+        "--limit",
+        "5",
+    ])
+    .unwrap();
+    match cli.command {
+        Commands::Message {
+            action: MessageAction::List {
+                to, state, limit, ..
+            },
+        } => {
+            assert_eq!(to.as_deref(), Some("worker"));
+            assert_eq!(state, ["queued", "running"]);
+            assert_eq!(limit, Some(5));
+        }
+        _ => panic!("expected message list"),
+    }
+    assert!(Cli::try_parse_from(["cadence", "message", "list", "worker"]).is_ok());
+    let missing = super::message::list_params(None, None, None, None, vec![], None, None)
+        .unwrap_err()
+        .to_string();
+    assert!(missing.contains("recipient"), "{missing}");
+    let bad = super::message::list_params(
+        Some("worker".into()),
+        None,
+        None,
+        None,
+        vec!["nope".into()],
+        None,
+        None,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(bad.contains("unknown"), "{bad}");
+    let wide = super::message::list_params(
+        Some("worker".into()),
+        None,
+        None,
+        None,
+        vec![],
+        Some(51),
+        None,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(wide.contains("1 to 50"), "{wide}");
+}
+
+#[test]
 fn message_cancel_parses() {
     let cli = Cli::try_parse_from([
         "cadence",

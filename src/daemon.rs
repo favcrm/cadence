@@ -2501,6 +2501,7 @@ impl Shared {
             "agent_inbox" => self.rpc_inbox(params, peer_pid),
             "agent_inbox_ack" => self.rpc_inbox_ack(params, peer_pid),
             "message_read" => self.rpc_message_read(params, peer_pid),
+            "message_list" => self.rpc_message_list(params, peer_pid),
             "message_report" => self.rpc_message_report(params, peer_pid),
             "message_reconcile" => self.rpc_reconcile(params, peer_pid),
             "message_cancel" => self.rpc_cancel(params),
