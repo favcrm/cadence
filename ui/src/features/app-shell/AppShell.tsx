@@ -1089,13 +1089,15 @@ export default function AppShell({
                   key={`${installId}:${contextId}`}
                   scope={scope}
                   installationTitle={title}
-                  appKind={installation.name === "crm" ? "crm" : "generic"}
+                  appKind={installation.name === "crm" ? "crm" : installation.name === "meeting-minutes" ? "meeting-minutes" : "generic"}
                   view={view}
                   recordId={recordId}
                   section={crmSection}
                   viewer={viewer}
                   onView={(v) => writeQuery({ appview: v === "list" ? null : v })}
                   onSelect={(id) => writeQuery({ record: id })}
+                  onStarted={(id) => writeQuery({ appview: null, record: id })}
+                  onEdit={() => writeQuery({ appview: "new", record: null })}
                   // Section moves ride real submenu links (CrmOutlet):
                   // their hrefs already clear the record view and
                   // drafts, so no callback is needed here.

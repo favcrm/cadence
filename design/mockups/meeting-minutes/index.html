@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>Meeting minutes — cadence mockup</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../tokens.css">
+<link rel="stylesheet" href="../../kit.css">
+<link rel="stylesheet" href="minutes.css">
+<script>
+(function () {
+  try {
+    var p = localStorage.getItem("cadence-theme");
+    if (p === "light" || p === "dark") document.documentElement.setAttribute("data-theme", p);
+  } catch (e) {}
+})();
+</script>
+</head>
+<body>
+<div class="shell">
+
+  <aside class="side">
+    <div class="brand">
+      <svg width="25" height="25" viewBox="0 0 1024 1024" fill="none" role="img" aria-label="cadence">
+        <defs><linearGradient id="cadence-lit" x1="0" y1="0" x2="0.574" y2="0.819"><stop offset="0" stop-color="#2DD4BF"/><stop offset="1" stop-color="#22D3EE"/></linearGradient></defs>
+        <rect x="20" y="20" width="984" height="984" rx="214" fill="#0B0B0C" stroke="#2e3136" stroke-width="40"/>
+        <path d="M 280 336 L 512 512 L 280 688" stroke="url(#cadence-lit)" stroke-width="160" stroke-linecap="round" stroke-linejoin="round"/>
+        <rect x="640" y="656" width="176" height="80" rx="40" fill="#2DD4BF" fill-opacity="0.8"/>
+      </svg>
+      <span>cadence<small>&nbsp;board</small></span>
+    </div>
+    <nav class="nav" aria-label="Primary">
+      <a class="navlink" href="#/"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3 7.2L8 3.2l5 4V13H3z"/></svg>Home</a>
+      <a class="navlink" href="#/"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2.2" y="2.2" width="4.6" height="4.6" rx=".6"/><rect x="9.2" y="2.2" width="4.6" height="4.6" rx=".6"/><rect x="2.2" y="9.2" width="4.6" height="4.6" rx=".6"/><rect x="9.2" y="9.2" width="4.6" height="4.6" rx=".6"/></svg>Projects</a>
+      <a class="navlink" href="#/"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3.5 2.2h6.2L12.5 5v8.8h-9z"/></svg>Wiki</a>
+      <a class="navlink" href="#/" aria-current="true" data-parent-current><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2.2" y="2.2" width="11.6" height="11.6" rx="2"/><path d="M6 8h4M8 6v4"/></svg>Apps</a>
+      <div class="nav-nest">
+        <a class="navlink navlink-sub" href="#/" aria-current="page">Meeting minutes</a>
+      </div>
+      <a class="navlink" href="#/"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="6" r="2.2"/><path d="M3.5 13.2c.6-2 2.3-3 4.5-3s3.9 1 4.5 3"/></svg>Agents</a>
+    </nav>
+    <div class="side-foot">
+      <div class="slabel">session</div>
+      owner<br><span class="num" style="font-size:var(--text-micro)">design preview</span>
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <div class="crumb"><span>Workspace</span> / <b>Apps</b></div>
+      <div class="spacer">
+        <span class="chip" style="background:color-mix(in srgb, var(--color-warn) 10%, transparent);color:var(--color-warn)">MOCKUP</span>
+        <span class="chip" style="background:var(--color-ink-800);color:var(--color-ink-400)">you: owner</span>
+        <button class="tg" id="theme-toggle" title="theme" aria-label="theme"></button>
+      </div>
+    </header>
+
+    <div class="mm-shell">
+      <div class="mm-crumb">
+        <a class="lnk" href="#/">← All apps</a>
+        <b id="crumb">Meeting minutes</b>
+      </div>
+      <div class="mm-grid">
+        <aside class="mm-chat" aria-label="Assistant chat">
+          <div class="slabel">Assistant</div>
+          <p class="mm-chat-scope">Meeting minutes</p>
+          <div class="mm-sugg">
+            <a class="mm-sugg-row" href="#/record">Record a meeting</a>
+            <a class="mm-sugg-row" href="#/m/catalog">Open the latest minutes</a>
+          </div>
+          <form class="mm-composer" id="composer">
+            <input class="field" name="q" placeholder="Ask about a meeting" aria-label="Ask about a meeting">
+            <button class="btn" type="submit">Send</button>
+          </form>
+        </aside>
+
+        <div class="body no-rail">
+          <main class="content">
+
+            <section data-view="list">
+              <div class="mm-head">
+                <h1>Meeting minutes</h1>
+                <a class="btn btn-acc" href="#/record">Record</a>
+              </div>
+              <p class="mm-lead">Record a meeting, then read the minutes.</p>
+              <table class="tbl">
+                <thead>
+                  <tr><th>Meeting</th><th>When</th><th></th></tr>
+                </thead>
+                <tbody>
+                  <tr data-goto="#/m/catalog">
+                    <td><a class="rowlink" href="#/m/catalog">App catalog</a></td>
+                    <td class="num">16 Oct · 42 min</td>
+                    <td><span class="badge plain">your title</span></td>
+                  </tr>
+                  <tr data-goto="#/m/sprint" id="sprint-row">
+                    <td><a class="rowlink" href="#/m/sprint">Sprint plan</a></td>
+                    <td class="num">9 Oct · 31 min</td>
+                    <td><span class="badge b-info">from the discussion</span></td>
+                  </tr>
+                  <tr data-goto="#/m/new" id="new-row" hidden>
+                    <td><a class="rowlink" href="#/m/new">New recording</a></td>
+                    <td class="num" id="new-when">Just now</td>
+                    <td><span class="badge" id="new-origin">from the discussion</span></td>
+                  </tr>
+                </tbody>
+              </table>
+            </section>
+
+            <section data-view="record" hidden>
+              <div class="mm-head">
+                <a class="back" href="#/">Meetings</a>
+                <h1 id="rec-heading">New meeting</h1>
+              </div>
+              <div class="stage">
+                <div class="deck" id="deck" data-state="ready">
+                  <div class="rec" id="rec-state"><i></i><span id="rec-label">Ready</span></div>
+                  <div class="rec-time num" id="rec-time">00:00</div>
+                  <div class="wave" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span></div>
+                  <label class="rec-title">Title
+                    <input class="field" id="rec-title" placeholder="Leave blank to name it later" autocomplete="off">
+                  </label>
+                  <p class="rec-hint" id="title-hint">Blank is fine. After you stop, the minutes are named from what was said. A name you type is kept.</p>
+                  <label class="rec-title">Who was there
+                    <input class="field" id="rec-people" placeholder="Optional" autocomplete="off">
+                  </label>
+                  <p class="rec-note" id="rec-note">Press record when the room is ready. Text appears every 8 seconds. Minutes are written when you stop.</p>
+                  <div class="rec-actions">
+                    <button class="btn btn-acc" type="button" id="toggle">Record</button>
+                    <button class="btn" type="button" id="stop" disabled>Stop and write minutes</button>
+                  </div>
+                </div>
+                <div class="transcript card">
+                  <div class="transcript-head">
+                    <h2>Transcript</h2>
+                    <span class="kicker" id="uploaded">Waiting</span>
+                  </div>
+                  <p class="muted" id="live-empty">Lines show up here as each batch is written.</p>
+                  <ol class="decisions" id="live-lines" hidden></ol>
+                </div>
+              </div>
+            </section>
+
+            <section data-view="process" hidden>
+              <div class="mm-head">
+                <h1 id="process-title">Meeting</h1>
+                <span class="badge b-info">Consolidating</span>
+              </div>
+              <ol class="steps">
+                <li><span class="badge b-ok">Done</span><span>Transcript is in. Speech was written to text in batches.</span></li>
+                <li><span class="badge b-info">Now</span><span>GLM 5.3 Flash consolidates those lines into the minutes.</span></li>
+              </ol>
+              <p class="mm-lead" id="process-status">Consolidating the transcript.</p>
+              <ol class="decisions" id="batches"></ol>
+            </section>
+
+            <section data-view="catalog" hidden>
+              <div class="mm-head">
+                <a class="back" href="#/">Meetings</a>
+                <h1>App catalog</h1>
+                <span class="badge plain">your title</span>
+                <span class="kicker">16 Oct · 42 min</span>
+              </div>
+              <div class="stack">
+                <div class="block card pad">
+                  <h2>Summary</h2>
+                  <p class="prose">The group agreed to ship meeting minutes as a simple app: record the meeting, then read the minutes. The minutes are the summary, the decisions, and the follow-ups.</p>
+                </div>
+                <div class="block">
+                  <h2>Decisions</h2>
+                  <ul class="decisions">
+                    <li><span class="badge b-info">decision</span><span>Record first. Minutes are the result, not a separate workflow.</span></li>
+                    <li><span class="badge b-info">decision</span><span>Keep the screen to the meeting list, the recording, and the minutes.</span></li>
+                  </ul>
+                </div>
+                <div class="block card pad">
+                  <h2>Follow-ups</h2>
+                  <ul class="decisions">
+                    <li><span class="badge plain">owner</span><span>Review the minutes after the next recording.</span></li>
+                    <li><span class="badge plain">design</span><span>Keep the record button on the meeting list.</span></li>
+                  </ul>
+                </div>
+              </div>
+            </section>
+
+            <section data-view="sprint" hidden>
+              <div class="mm-head">
+                <a class="back" href="#/">Meetings</a>
+                <h1>Sprint plan</h1>
+                <span class="badge b-info">from the discussion</span>
+                <span class="kicker">9 Oct · 31 min</span>
+              </div>
+              <div class="stack">
+                <div class="block card pad">
+                  <h2>Summary</h2>
+                  <p class="prose">Sprint scope is the minutes draft. The next step is to try it on a real recording.</p>
+                </div>
+                <div class="block">
+                  <h2>Decisions</h2>
+                  <ul class="decisions">
+                    <li><span class="badge b-info">decision</span><span>One meeting produces one minutes page.</span></li>
+                  </ul>
+                </div>
+                <div class="block card pad">
+                  <h2>Follow-ups</h2>
+                  <ul class="decisions">
+                    <li><span class="badge plain">ops</span><span>Record the next planning meeting.</span></li>
+                  </ul>
+                </div>
+              </div>
+            </section>
+
+            <section data-view="new" hidden>
+              <div class="mm-head">
+                <a class="back" href="#/">Meetings</a>
+                <h1 id="new-title">Meeting</h1>
+                <span class="badge" id="title-origin">from the discussion</span>
+                <button class="btn btn-sm" type="button" id="rename">Rename</button>
+                <span class="kicker" id="new-kicker">Just now</span>
+              </div>
+              <form class="rename" id="rename-form" hidden>
+                <input class="field" id="rename-input" aria-label="Meeting title" required>
+                <button class="btn btn-acc" type="submit">Save</button>
+                <button class="btn" type="button" id="rename-cancel">Cancel</button>
+              </form>
+              <p class="mm-lead" id="title-note"></p>
+              <div class="people" id="new-people" hidden></div>
+              <div class="stack">
+                <div class="block card pad">
+                  <h2>Summary</h2>
+                  <p class="prose" id="new-summary"></p>
+                </div>
+                <div class="block">
+                  <h2>Decisions</h2>
+                  <ul class="decisions" id="new-decisions"></ul>
+                </div>
+                <div class="block">
+                  <h2>Follow-ups</h2>
+                  <ul class="decisions" id="new-followups"></ul>
+                </div>
+                <div class="block card pad">
+                  <h2>Transcript</h2>
+                  <ol class="decisions" id="new-transcript"></ol>
+                </div>
+              </div>
+            </section>
+
+          </main>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="toast card" id="toast" hidden></div>
+
+<script src="minutes.js"></script>
+<script>
+(function () {
+  var KEY = "cadence-theme";
+  var icons = {
+    system: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="5.5"/><path d="M8 2.5v11a5.5 5.5 0 0 0 0-11z" fill="currentColor"/></svg>',
+    light: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="3"/><path d="M8 1.5v1.8M8 12.7v1.8M1.5 8h1.8M12.7 8h1.8M3.4 3.4l1.3 1.3M11.3 11.3l1.3 1.3M12.6 3.4l-1.3 1.3M4.7 11.3l-1.3 1.3"/></svg>',
+    dark: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M13.5 9.6A5.8 5.8 0 0 1 6.4 2.5a5.8 5.8 0 1 0 7.1 7.1z"/></svg>'
+  };
+  function pref() {
+    try { var v = localStorage.getItem(KEY); return v === "light" || v === "dark" ? v : "system"; }
+    catch (e) { return "system"; }
+  }
+  var next = { system: "light", light: "dark", dark: "system" };
+  var btn = document.getElementById("theme-toggle");
+  function paint(p) {
+    btn.innerHTML = icons[p];
+    btn.title = "theme: " + p + " — switch to " + next[p];
+    btn.setAttribute("aria-label", btn.title);
+  }
+  paint(pref());
+  btn.addEventListener("click", function () {
+    var p = next[pref()];
+    try { if (p === "system") localStorage.removeItem(KEY); else localStorage.setItem(KEY, p); } catch (e) {}
+    if (p === "system") document.documentElement.removeAttribute("data-theme");
+    else document.documentElement.setAttribute("data-theme", p);
+    paint(p);
+  });
+})();
+</script>
+</body>
+</html>

@@ -4,6 +4,7 @@ import Link from "../../ui/Link";
 import { useLocale } from "../../lib/locale";
 import type { Viewer } from "../projects/work";
 import CrmShell from "./CrmCustomers";
+import MeetingMinutesOutlet from "./MeetingMinutesOutlet";
 import type { HostScope } from "./hostActions";
 /* CAD-1013 drawer motion is CRM-owned — kept off the Social-authored
    app-shell.css. The .crm-drawer geometry lives there; this adds only
@@ -86,6 +87,8 @@ export default function CrmOutlet({
   onView,
   onSelect,
   onRecordCreated,
+  onStarted,
+  onEdit,
 }: {
   scope: HostScope;
   /** CAD-813: the operator's newest left-chat message daemon-stamped
@@ -93,7 +96,7 @@ export default function CrmOutlet({
    *  exists; generic Apps ignore it. */
   installationTitle: string;
   /** CRM names its records; every other App stays neutral. */
-  appKind: "crm" | "generic";
+  appKind: "crm" | "generic" | "meeting-minutes";
   view: OutletView;
   recordId: string | null;
   /** Nested CRM section from the route; generic Apps ignore it. */
@@ -103,6 +106,10 @@ export default function CrmOutlet({
   onSelect: (recordId: string | null) => void;
   /** Atomic created-record landing (list + details in one URL write). */
   onRecordCreated?: (recordId: string) => void;
+  /** Meeting minutes: list plus the run that just started, in one query write. */
+  onStarted?: (runId: string) => void;
+  /** Meeting minutes: open Record and clear the selected meeting, in one query write. */
+  onEdit?: () => void;
 }) {
   // CRM pages use the host sidebar and mobile menu as their navigation.
   // Their URLs keep the installation/context and the single chat mounted.
@@ -117,6 +124,21 @@ export default function CrmOutlet({
         onView={onView}
         onSelect={onSelect}
         onRecordCreated={onRecordCreated}
+      />
+    );
+  }
+  if (appKind === "meeting-minutes") {
+    return (
+      <MeetingMinutesOutlet
+        scope={scope}
+        installationTitle={installationTitle}
+        view={view}
+        recordId={recordId}
+        viewer={viewer}
+        onView={onView}
+        onSelect={onSelect}
+        onStarted={onStarted}
+        onEdit={onEdit}
       />
     );
   }

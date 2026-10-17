@@ -3,6 +3,8 @@ import {
   hostActions,
 } from "../src/features/app-shell/hostActions";
 import { ApiError } from "../src/lib/api";
+import { recordAction } from "../src/features/app-shell/meetingCapture";
+import { failureReason, meetingLength, meetingListOpen, meetingStatus, meetingTitle, minutesGap, minutesGapNote, needsMinutesPage, rewriteDraft, rewriteNote, rewriteOffer, sentTranscriptLines } from "../src/features/app-shell/meetingMinutes";
 
 export {};
 /** CAD-802 corrections: grammar + single-pane shell + scoped links. */
@@ -27,6 +29,61 @@ async function rejected(action: () => Promise<unknown>, check: (error: unknown) 
 }
 
 async function main() {
+const minutesPage = "# Thursday launch\n\n## Summary\nLaunch is Thursday.\n\n## Decisions\n- Launch moves to Thursday.\n\n## Follow-ups\n- Design: Finish the checklist.\n\n## Transcript\n00:00 Launch moves to Thursday.\n";
+equal(meetingLength("00:00 Launch.\n00:08 Design owns it."), "8 sec", "the last stamp is the length");
+equal(meetingLength("00:00 Launch.\n42:00 Design owns it."), "42 min", "a full minute stamp stays in minutes");
+equal(meetingLength("01:05 Still going."), "1 min 5 sec", "minutes and seconds both stay");
+equal(meetingLength("00:00 Only the opening."), null, "a zero stamp is not a length");
+equal(meetingLength("Launch moves to Thursday."), null, "unstamped text has no length");
+equal(meetingLength(undefined), null, "a missing transcript has no length");
+equal(sentTranscriptLines("00:08 Design owns the checklist.\n\n00:16 No other blockers."), ["00:08 Design owns the checklist.", "00:16 No other blockers."], "sent lines drop blanks");
+equal(sentTranscriptLines("  "), [], "a blank transcript has no sent lines");
+equal(sentTranscriptLines(undefined), [], "a missing transcript has no sent lines");
+equal(meetingTitle("Sprint plan", minutesPage), { title: "Sprint plan", origin: "Your title" }, "a typed title is kept");
+equal(meetingTitle("Untitled meeting", minutesPage), { title: "Thursday launch", origin: "From the discussion" }, "a blank title uses the page heading");
+equal(meetingTitle("", null), { title: "Untitled meeting", origin: null }, "a blank title with no page is not yet from the discussion");
+equal(needsMinutesPage("Untitled meeting", false, true), true, "a blank title reads the page for the list");
+equal(needsMinutesPage("Sprint plan", false, true), false, "a typed title does not need the page on the list");
+equal(meetingListOpen(["succeeded", "running"]), true, "one consolidating run keeps the list refreshing");
+equal(meetingListOpen(["succeeded"]), false, "settled runs do not keep the list refreshing");
+equal(recordAction(false, false), "record", "a quiet screen offers recording");
+equal(recordAction(true, true), "write", "stopping a recording with words writes the minutes");
+equal(recordAction(true, false), "stop", "stopping a silent recording does not write minutes");
+equal(rewriteOffer("failed", "revise", "00:08 Design owns the checklist."), true, "a revision with a transcript can be written again");
+equal(rewriteOffer("succeeded", "approve", "00:08 Design owns the checklist."), false, "an approved page is not copied back onto Record");
+equal(rewriteOffer("running", undefined, "00:08 Design owns the checklist."), false, "a running meeting is not offered as a rewrite");
+equal(rewriteOffer("failed", undefined, "  "), false, "a failure with no transcript is not copied");
+equal(rewriteDraft("Supplier call", "Design", "00:08 Design owns the checklist."), { title: "Supplier call", people: "Design", transcript: "00:08 Design owns the checklist." }, "a typed title is copied onto Record");
+equal(rewriteDraft("Untitled meeting", undefined, "00:08 Design owns the checklist."), { title: "", people: "", transcript: "00:08 Design owns the checklist." }, "an untitled subject stays blank");
+equal(rewriteNote("The follow-up owner is not in the transcript.", "The review sent the minutes back."), "The follow-up owner is not in the transcript.\nThe review sent the minutes back.", "a review reason and a failure both stay on the draft");
+equal(rewriteNote("Same reason.", "Same reason."), "Same reason.", "one reason is not repeated");
+equal(rewriteNote(undefined, "The run failed."), "The run failed.", "a failure with no review is kept");
+equal(rewriteNote("  ", undefined), null, "a blank reason is not shown");
+equal(failureReason("The review sent the minutes back."), "The review sent the minutes back.", "a recorded failure stays on the list");
+equal(failureReason("  "), null, "a blank failure is not listed");
+equal(failureReason(undefined), null, "a run with no failure has nothing to add");
+equal(minutesGap("running", false, undefined), "unready", "a running meeting with no page is still waiting");
+equal(minutesGap("failed", false, undefined), "unwritten", "a failed run did not write minutes");
+equal(minutesGap("cancelled", false, undefined), "unwritten", "a cancelled run did not write minutes");
+equal(minutesGap("succeeded", false, undefined), "absent", "a ready run with no artifact has no page");
+equal(minutesGap("succeeded", true, undefined), "loading", "an artifact that has not arrived is still loading");
+equal(minutesGap("succeeded", true, null), "unloadable", "a failed page load is not an empty meeting");
+equal(minutesGap("succeeded", true, "# Thursday launch\n"), "unshaped", "a heading alone is not a minutes page");
+equal(minutesGap("succeeded", true, minutesPage), null, "a minutes page is not a gap");
+equal(minutesGapNote("unready", true), "Minutes are not ready yet. These are the lines that were sent.", "a waiting meeting keeps the sent lines apart from the minutes");
+equal(minutesGapNote("unwritten", true), "Minutes were not written. These are the lines that were sent.", "a failed meeting does not say the minutes are still coming");
+equal(minutesGapNote("absent", false), "This run has no minutes page.", "a ready run without a page says so");
+equal(minutesGapNote("unloadable", true), "The minutes page could not be loaded. These are the lines that were sent.", "a failed load names the page, not the run");
+equal(minutesGapNote("unshaped", false), "This page is not minutes.", "a page of the wrong shape says so");
+equal(meetingStatus("succeeded", false, undefined), "No minutes page", "a finished run with no page is not called ready");
+equal(meetingStatus("succeeded", true, undefined), "Ready", "a page that is still loading keeps the run state");
+equal(meetingStatus("succeeded", true, minutesPage), "Ready", "a minutes page is ready");
+equal(meetingStatus("succeeded", true, "# Thursday launch\n"), "Not a minutes page", "text that is not minutes is not called ready");
+equal(meetingStatus("failed", true, "# Thursday launch\n"), "Failed", "a failed run stays failed when the page is not minutes");
+equal(meetingStatus("succeeded", true, null), "Minutes unavailable", "a page that failed to load is not called ready");
+equal(meetingStatus("failed", false, undefined), "Failed", "a failed run keeps its state");
+equal(meetingStatus("running", false, undefined), "Consolidating", "a running meeting stays consolidating");
+
 // The host client derives identity from the trusted route/scope only,
 // and its bodies carry exactly the operator-checked grammar.
 equal(
@@ -161,6 +218,47 @@ const crm = { ...generic, install_id: "install-crm", title: "CRM", name: "crm" }
 // A CRM install with two active scopes — proves the bound scope still
 // hides every switch link (CAD-1008) while the unbound state keeps them.
 const crmMulti = { ...generic, install_id: "install-crm-multi", title: "CRM Multi", name: "crm" };
+const minutesInstall = { ...generic, install_id: "install-minutes", title: "Meeting minutes", name: "meeting-minutes" };
+const minutesRuns = [
+  {
+    id: "run-sprint", install_id: "install-minutes", context_id: "ctx-m", state: "succeeded",
+    snapshot_digest: "s", approved_digest: null,
+    snapshot: { workflow: { title: "Minutes", steps: [] }, inputs: { subject: "Sprint plan", people: "Design; Ops", transcript: "00:00 Launch moves to Thursday.\n42:00 Design owns the checklist." }, owner_pm: "pm", assignments: {} },
+    steps: [], created: Date.UTC(2026, 9, 16) / 1000, artifacts: [], reviews: [
+      { step_id: "review", artifact_digest: "a", reviewer: "reviewer", decision: "approve", rationale: "All six items passed." },
+    ],
+  },
+  {
+    id: "run-blank", install_id: "install-minutes", context_id: "ctx-m", state: "succeeded",
+    snapshot_digest: "s2", approved_digest: null,
+    snapshot: { workflow: { title: "Minutes", steps: [] }, inputs: { subject: "Untitled meeting", transcript: "00:00 Only the opening." }, owner_pm: "pm", assignments: {} },
+    steps: [], created: Date.UTC(2026, 9, 16) / 1000,
+    artifacts: [{ id: "art-thursday", step_id: "draft", digest: "d", media_type: "text/markdown", size: 80 }],
+    reviews: [],
+  },
+  {
+    id: "run-open", install_id: "install-minutes", context_id: "ctx-m", state: "running",
+    snapshot_digest: "s3", approved_digest: null,
+    snapshot: { workflow: { title: "Minutes", steps: [] }, inputs: { subject: "Untitled meeting", transcript: "00:08 Design owns the checklist.\n00:16 No other blockers." }, owner_pm: "pm", assignments: {} },
+    steps: [], created: Date.UTC(2026, 9, 16) / 1000, artifacts: [], reviews: [],
+  },
+  {
+    id: "run-revise", install_id: "install-minutes", context_id: "ctx-m", state: "failed",
+    snapshot_digest: "s4", approved_digest: null,
+    snapshot: { workflow: { title: "Minutes", steps: [] }, inputs: { subject: "Supplier call", people: "Design", transcript: "00:08 Design owns the checklist." }, owner_pm: "pm", assignments: {} },
+    steps: [], created: Date.UTC(2026, 9, 16) / 1000, artifacts: [],
+    reviews: [{ step_id: "review", artifact_digest: "a", reviewer: "reviewer", decision: "revise", rationale: "The follow-up owner is not in the transcript." }],
+    failure: { kind: "refused", reason: "The review sent the minutes back.", step_id: "review" },
+  },
+  {
+    id: "run-notes", install_id: "install-minutes", context_id: "ctx-m", state: "succeeded",
+    snapshot_digest: "s5", approved_digest: null,
+    snapshot: { workflow: { title: "Minutes", steps: [] }, inputs: { subject: "Notes dump", transcript: "00:08 Just a paragraph." }, owner_pm: "pm", assignments: {} },
+    steps: [], created: Date.UTC(2026, 9, 16) / 1000,
+    artifacts: [{ id: "art-notes", step_id: "draft", digest: "e", media_type: "text/markdown", size: 18 }],
+    reviews: [],
+  },
+];
 const contextsFor: Record<string, unknown> = {
   "install-shell": { contexts: [
     { id: "ctx-a", install_id: "install-shell", revision: 1, state: "active", digest: "ca", config: { schema: 1, label: "Acme", input_defaults: {} } },
@@ -179,6 +277,9 @@ const contextsFor: Record<string, unknown> = {
   "install-crm-multi": { contexts: [
     { id: "ctx-a", install_id: "install-crm-multi", revision: 1, state: "active", digest: "ca", config: { schema: 1, label: "Acme", input_defaults: {} } },
     { id: "ctx-b", install_id: "install-crm-multi", revision: 1, state: "active", digest: "cb", config: { schema: 1, label: "Beta", input_defaults: {} } },
+  ] },
+  "install-minutes": { contexts: [
+    { id: "ctx-m", install_id: "install-minutes", revision: 1, state: "active", digest: "cm", config: { schema: 1, label: "Room", input_defaults: {} } },
   ] },
 };
 const thread = {
@@ -213,6 +314,11 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   if (path === "/api/app-installations/install-crm/contexts") return json(contextsFor["install-crm"]);
   if (path === "/api/app-installations/install-crm-multi") return json(crmMulti);
   if (path === "/api/app-installations/install-crm-multi/contexts") return json(contextsFor["install-crm-multi"]);
+  if (path === "/api/app-installations/install-minutes") return json(minutesInstall);
+  if (path === "/api/app-installations/install-minutes/contexts") return json(contextsFor["install-minutes"]);
+  if (path.startsWith("/api/app-runs?") && path.includes("install-minutes")) return json({ runs: minutesRuns });
+  if (path === "/api/app-run-artifacts/art-thursday") return json({ id: "art-thursday", digest: "d", media_type: "text/markdown", size: minutesPage.length, text: minutesPage });
+  if (path === "/api/app-run-artifacts/art-notes") return json({ id: "art-notes", digest: "e", media_type: "text/markdown", size: 18, text: "Just a paragraph." });
   // Daemon without conversations: the chat keeps the home thread (legacy).
   if (path.endsWith("/conversations")) return new Response("{}", { status: 404 });
   if (path.startsWith("/api/threads/master")) return json(thread);
@@ -905,6 +1011,69 @@ const appsLinks = (hostEl: HTMLElement) =>
 // context ID is a 400 on every poll).
 assert(reads.some((p) => p.includes("/assistant/")), "the assistant panel did read with a context");
 assert(!reads.some((p) => /\/assistant\/[a-z]+\?context_id=(&|$)/.test(p)), "no assistant read is sent with an empty context");
+
+const minutesHost = document.createElement("div");
+document.body.append(minutesHost);
+const minutesRoot = createRoot(minutesHost);
+history.pushState(null, "", "/app-installations/install-minutes?ctx=ctx-m");
+await React.act(async () => {
+  minutesRoot.render(React.createElement(LocaleProvider, null, React.createElement(AppShell, { installId: "install-minutes", viewer: { operator: true, readOnly: false } })));
+});
+await settle(() => assert((minutesHost.textContent ?? "").includes("Sprint plan"), "typed meeting is listed"));
+const sprintRow = Array.from(minutesHost.querySelectorAll("button")).find((el) => (el.textContent ?? "").includes("Sprint plan"));
+assert((sprintRow?.textContent ?? "").includes("16 Oct"), "the meeting row shows its date");
+assert((sprintRow?.textContent ?? "").includes("42 min"), "the meeting row shows the transcript length");
+assert((sprintRow?.textContent ?? "").includes("Your title"), "a typed title says where it came from");
+assert((sprintRow?.textContent ?? "").includes("Approved"), "an approved meeting says so on the list");
+assert((sprintRow?.textContent ?? "").includes("No minutes page"), "a finished run with no page is not listed as ready");
+assert(!(sprintRow?.textContent ?? "").includes("Ready"), "the list does not call a missing page ready");
+await settle(() => assert((minutesHost.textContent ?? "").includes("Thursday launch"), "a finished blank title takes its name from the minutes page"));
+const namedRow = Array.from(minutesHost.querySelectorAll("button")).find((el) => (el.textContent ?? "").includes("Thursday launch"));
+assert((namedRow?.textContent ?? "").includes("From the discussion"), "the list says the title came from the discussion");
+assert(!(namedRow?.textContent ?? "").includes("min") && !(namedRow?.textContent ?? "").includes("sec"), "a 00:00 opening is not shown as a length");
+const pendingRow = Array.from(minutesHost.querySelectorAll("button")).find((el) => (el.textContent ?? "").includes("Untitled meeting"));
+assert((pendingRow?.textContent ?? "").includes("Consolidating"), "a meeting with no page stays untitled");
+await click(sprintRow);
+assert((minutesHost.textContent ?? "").includes("42 min"), "the open meeting shows the transcript length");
+assert((minutesHost.textContent ?? "").includes("Who was there: Design; Ops"), "recorded attendance stays on the meeting");
+assert((minutesHost.textContent ?? "").includes("This run has no minutes page."), "a ready meeting with no page does not pretend the minutes are still coming");
+assert(!(minutesHost.textContent ?? "").includes("Minutes are not ready yet"), "a ready meeting is not described as waiting");
+await click(Array.from(minutesHost.querySelectorAll("button")).find((el) => (el.textContent ?? "").includes("Untitled meeting")));
+await settle(() => assert((minutesHost.textContent ?? "").includes("Transcript sent"), "a meeting with no page shows the transcript that was sent"));
+assert((minutesHost.textContent ?? "").includes("Minutes are not ready yet. These are the lines that were sent."), "sent lines are not presented as the minutes");
+assert((minutesHost.textContent ?? "").includes("00:16 No other blockers."), "the sent line stays stamped");
+assert(!(minutesHost.querySelector("[aria-label='Transcript sent']")?.textContent ?? "").includes("Summary"), "the sent transcript is not a minutes page");
+await click(Array.from(minutesHost.querySelectorAll(".app-outlet-tab")).find((el) => el.textContent === "Record"));
+const recordSpeech = minutesHost.querySelector("#mm-record") as HTMLButtonElement | null;
+assert(recordSpeech?.textContent === "Record speech", "recording has not started");
+assert(recordSpeech?.disabled, "speech recording stays off when the browser has no recognizer");
+await click(Array.from(minutesHost.querySelectorAll(".app-outlet-tab")).find((el) => el.textContent === "Meetings"));
+const reviseRow = Array.from(minutesHost.querySelectorAll("button")).find((el) => (el.textContent ?? "").includes("Supplier call"));
+assert((reviseRow?.textContent ?? "").includes("Needs revision"), "a revision shows on the list");
+assert((reviseRow?.textContent ?? "").includes("The review sent the minutes back."), "a failed meeting shows why on the list");
+const postsBefore = posts.length;
+await click(reviseRow);
+await settle(() => assert((minutesHost.textContent ?? "").includes("The follow-up owner is not in the transcript."), "the review reason is on the meeting"));
+assert((minutesHost.textContent ?? "").includes("Minutes were not written."), "a failed meeting says the minutes were not written");
+assert(!(minutesHost.textContent ?? "").includes("Minutes are not ready yet"), "a failed meeting is not described as waiting");
+await click(minutesHost.querySelector("#mm-rewrite"));
+assert((minutesHost.querySelector("#mm-transcript") as HTMLTextAreaElement | null)?.value === "00:08 Design owns the checklist.", "Write again copies the transcript onto Record");
+assert((minutesHost.querySelector("#mm-title") as HTMLInputElement | null)?.value === "Supplier call", "Write again keeps the typed title");
+assert((minutesHost.querySelector("#mm-people") as HTMLInputElement | null)?.value === "Design", "Write again keeps who was there");
+assert((minutesHost.querySelector("#mm-rewrite-why")?.textContent ?? "").includes("The follow-up owner is not in the transcript."), "Write again keeps the review reason on Record");
+assert((minutesHost.querySelector("#mm-rewrite-why")?.textContent ?? "").includes("The review sent the minutes back."), "Write again keeps the failure on Record");
+assert(!posts.slice(postsBefore).some((post) => post.path.includes("/api/app-runs/start")), "Write again does not start a run");
+await click(Array.from(minutesHost.querySelectorAll(".app-outlet-tab")).find((el) => el.textContent === "Meetings"));
+const notesRow = Array.from(minutesHost.querySelectorAll("button")).find((el) => (el.textContent ?? "").includes("Notes dump"));
+await click(notesRow);
+await settle(() => assert((minutesHost.querySelector("[aria-label='Meeting']")?.textContent ?? "").includes("This page is not minutes."), "a finished page of the wrong shape says it is not minutes"));
+assert((minutesHost.querySelector("[aria-label='Meeting']")?.textContent ?? "").includes("Just a paragraph."), "the page text stays visible");
+assert(!(minutesHost.querySelector("[aria-label='Meeting']")?.textContent ?? "").includes("Summary"), "a page of the wrong shape is not split into minutes sections");
+const notesAfter = Array.from(minutesHost.querySelectorAll("button")).find((el) => (el.textContent ?? "").includes("Notes dump"));
+assert((notesAfter?.textContent ?? "").includes("Not a minutes page"), "the list does not call that page ready");
+assert(!(notesAfter?.textContent ?? "").includes("Ready"), "Ready is not used for a page that is not minutes");
+await React.act(async () => { minutesRoot.unmount(); });
+minutesHost.remove();
 console.log("app shell checks passed");
 }
 void main();
