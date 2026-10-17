@@ -456,9 +456,10 @@ fn state_value(
     rev: Option<String>,
 ) -> Result<Value> {
     let paths = collection_paths(pm, root, meta)?;
+    let coverage = index_coverage(pm, state_dir);
     let mut documents = Vec::new();
     for path in &paths {
-        documents.push(document_value(pm, state_dir, caller, meta, path)?);
+        documents.push(document_value(pm, caller, meta, path, coverage.as_ref())?);
     }
     let owner = matches!(caller, Caller::Operator);
     Ok(json!({
@@ -510,10 +511,10 @@ fn doc_meta(doc: &Doc) -> Value {
 
 fn document_value(
     pm: &Pm,
-    state_dir: &Path,
     caller: &Caller,
     meta: &Meta,
     path: &str,
+    coverage: Option<&rusqlite::Connection>,
 ) -> Result<Value> {
     let stored = meta.documents.iter().find(|doc| doc.path == path);
     let page = super::read(pm, caller, path).ok();
@@ -524,7 +525,7 @@ fn document_value(
     let rev = page.as_ref().and_then(|page| page["rev"].as_str());
     let sha256 = page.as_ref().and_then(live_sha);
     let processing = match &page {
-        Some(page) => processing(pm, state_dir, caller, path, page),
+        Some(page) => processing(pm, caller, path, page, coverage),
         None => "unsupported".to_string(),
     };
     let approval_current =
@@ -574,7 +575,13 @@ fn approval_current(pm: &Pm, caller: &Caller, doc: &Doc, live_sha: Option<&str>)
         .is_ok_and(|pinned| pinned.git == git && pinned.sha256 == want)
 }
 
-fn processing(pm: &Pm, state_dir: &Path, caller: &Caller, path: &str, page: &Value) -> String {
+fn processing(
+    pm: &Pm,
+    caller: &Caller,
+    path: &str,
+    page: &Value,
+    coverage: Option<&rusqlite::Connection>,
+) -> String {
     match page["kind"].as_str() {
         Some("text") => {
             let text = page["text"].as_str().unwrap_or("");
@@ -585,16 +592,14 @@ fn processing(pm: &Pm, state_dir: &Path, caller: &Caller, path: &str, page: &Val
                 return match header.status {
                     "empty" => "empty".to_string(),
                     "failed" => "failed".to_string(),
-                    "indexed"
-                        if indexed(pm, state_dir, path, page["rev"].as_str().unwrap_or("")) =>
-                    {
+                    "indexed" if indexed(coverage, path, page["rev"].as_str().unwrap_or("")) => {
                         "covered".to_string()
                     }
                     "indexed" => "pending".to_string(),
                     _ => "unsupported".to_string(),
                 };
             }
-            if indexed(pm, state_dir, path, page["rev"].as_str().unwrap_or("")) {
+            if indexed(coverage, path, page["rev"].as_str().unwrap_or("")) {
                 "covered".to_string()
             } else {
                 "pending".to_string()
@@ -621,12 +626,7 @@ fn processing(pm: &Pm, state_dir: &Path, caller: &Caller, path: &str, page: &Val
                 "empty" => "empty".to_string(),
                 "failed" => "failed".to_string(),
                 "indexed"
-                    if indexed(
-                        pm,
-                        state_dir,
-                        &sidecar,
-                        extracted["rev"].as_str().unwrap_or(""),
-                    ) =>
+                    if indexed(coverage, &sidecar, extracted["rev"].as_str().unwrap_or("")) =>
                 {
                     "covered".to_string()
                 }
@@ -638,26 +638,16 @@ fn processing(pm: &Pm, state_dir: &Path, caller: &Caller, path: &str, page: &Val
     }
 }
 
-fn indexed(pm: &Pm, state_dir: &Path, path: &str, rev: &str) -> bool {
-    if rev.is_empty() {
-        return false;
-    }
-    let Ok(vault) = vault_dir(pm) else {
-        return false;
-    };
-    let Ok(rel) = vault.strip_prefix(&pm.dir) else {
-        return false;
-    };
+fn index_coverage(pm: &Pm, state_dir: &Path) -> Option<rusqlite::Connection> {
+    let vault = vault_dir(pm).ok()?;
+    let rel = vault.strip_prefix(&pm.dir).ok()?;
     let tree = format!("HEAD:{}", rel.to_string_lossy().replace('\\', "/"));
-    let Ok(oid) = crate::issue::git(&pm.dir, &["rev-parse", "--verify", &tree]) else {
-        return false;
-    };
-    let Ok(conn) = rusqlite::Connection::open_with_flags(
+    let oid = crate::issue::git(&pm.dir, &["rev-parse", "--verify", &tree]).ok()?;
+    let conn = rusqlite::Connection::open_with_flags(
         super::index::db_path(state_dir),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    ) else {
-        return false;
-    };
+    )
+    .ok()?;
     let stored: String = conn
         .query_row(
             "SELECT value FROM wiki_index_meta WHERE key='revision'",
@@ -665,7 +655,14 @@ fn indexed(pm: &Pm, state_dir: &Path, path: &str, rev: &str) -> bool {
             |row| row.get(0),
         )
         .unwrap_or_default();
-    if stored != oid {
+    (stored == oid).then_some(conn)
+}
+
+fn indexed(conn: Option<&rusqlite::Connection>, path: &str, rev: &str) -> bool {
+    let Some(conn) = conn else {
+        return false;
+    };
+    if rev.is_empty() {
         return false;
     }
     conn.query_row(

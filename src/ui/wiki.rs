@@ -129,6 +129,37 @@ pub(super) fn read(
     }
 }
 
+/// Judge raw `at` pairs before the decoded query helper. That helper drops a
+/// value percent-decode cannot finish and keeps only the first `at`, so a
+/// bad or repeated selector has to be refused here.
+pub(super) fn historical_at(raw_url: &str) -> std::result::Result<Option<String>, &'static str> {
+    let raw_query = raw_url
+        .split_once('?')
+        .map(|(_, query)| query)
+        .unwrap_or("");
+    let mut selector = None;
+    for pair in raw_query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (key, raw) = pair.split_once('=').unwrap_or((pair, ""));
+        if key != "at" {
+            continue;
+        }
+        if selector.is_some() {
+            return Err("wiki file at is repeated");
+        }
+        let Some(decoded) = super::pct_decode(raw) else {
+            return Err("wiki file at is malformed");
+        };
+        if decoded.is_empty() {
+            return Err("wiki file at must be a non-empty revision");
+        }
+        selector = Some(decoded);
+    }
+    Ok(selector)
+}
+
 /// `GET /api/wiki/file?path=` — text comes back as the daemon's JSON.
 /// Optional `offset`, `bytes`, and `rev` are the same bounded original
 /// read as `wiki_read`: absent, the reply is the whole page; present,
@@ -173,17 +204,18 @@ fn file_response(
         }
         params["rev"] = json!(rev);
     }
-    if let Some(at) = query("at") {
-        if at.is_empty() {
-            return err_response(400, "wiki file at must be a non-empty revision");
+    match historical_at(request.url()) {
+        Ok(Some(at)) => {
+            if params.get("rev").is_some() {
+                return err_response(
+                    400,
+                    "wiki file at is a historical selector and cannot combine with rev",
+                );
+            }
+            params["at"] = json!(at);
         }
-        if params.get("rev").is_some() {
-            return err_response(
-                400,
-                "wiki file at is a historical selector and cannot combine with rev",
-            );
-        }
-        params["at"] = json!(at);
+        Ok(None) => {}
+        Err(message) => return err_response(400, message),
     }
     let historical = params.get("at").is_some();
     let ranged = params.get("offset").is_some()
@@ -385,6 +417,15 @@ pub(super) fn write(
                 Ok(req) => req,
                 Err(resp) => return resp,
             };
+            let Some(body) = req.as_object() else {
+                return err_response(400, "wiki collection needs {path}");
+            };
+            if body
+                .keys()
+                .any(|key| !matches!(key.as_str(), "path" | "if_rev" | "metadata"))
+            {
+                return err_response(400, "wiki collection has unsupported fields");
+            }
             let Some(path) = req["path"].as_str() else {
                 return err_response(400, "wiki collection needs {path}");
             };
@@ -924,5 +965,36 @@ mod upload_tests {
             assert!(store_upload(root.path(), "users/u/source.md", bytes, None, "user:u").is_err());
             assert!(!root.path().join(crate::wiki::UPLOAD_DIR).exists());
         }
+    }
+}
+
+#[cfg(test)]
+mod selector_tests {
+    use super::historical_at;
+
+    /// The selector is read from the raw query, so a present `at` that cannot
+    /// be decoded, is empty, or appears twice is refused instead of quietly
+    /// reading the live page.
+    #[test]
+    fn a_malformed_empty_or_repeated_at_is_refused() {
+        assert_eq!(historical_at("/api/wiki/file?path=a.md"), Ok(None));
+        assert_eq!(
+            historical_at("/api/wiki/file?path=a.md&at=fnv1a%3A0123456789abcdef"),
+            Ok(Some("fnv1a:0123456789abcdef".to_string()))
+        );
+        assert_eq!(
+            historical_at("/api/wiki/file?path=a.md&at="),
+            Err("wiki file at must be a non-empty revision")
+        );
+        for malformed in ["%ZZ", "%FF"] {
+            assert_eq!(
+                historical_at(&format!("/api/wiki/file?path=a.md&at={malformed}")),
+                Err("wiki file at is malformed")
+            );
+        }
+        assert_eq!(
+            historical_at("/api/wiki/file?at=a&at=0123456789abcdef0123456789abcdef01234567"),
+            Err("wiki file at is repeated")
+        );
     }
 }

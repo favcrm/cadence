@@ -530,8 +530,19 @@ impl Shared {
             &["path", "wiki_as", "public_session"],
             "wiki correction",
         )?;
-        let (caller, _) = self.knowledge_actor(params, peer_pid, "wiki correction")?;
-        wiki::correction::list(&self.pm()?, &caller, Self::wiki_path(params)?)
+        let (caller, human) = self.knowledge_actor(params, peer_pid, "wiki correction")?;
+        let mut listed = wiki::correction::list(&self.pm()?, &caller, Self::wiki_path(params)?)?;
+        // Permissions must describe what the review path will actually allow:
+        // without a verified human subject both are refused, so do not offer
+        // the form.
+        if !Self::correction_subject(human.as_ref()) {
+            if let Some(permissions) = listed.get_mut("permissions").and_then(Value::as_object_mut)
+            {
+                permissions.insert("submit".to_string(), Value::Bool(false));
+                permissions.insert("review".to_string(), Value::Bool(false));
+            }
+        }
+        Ok(listed)
     }
 
     pub(super) fn rpc_wiki_corrections_submit(
@@ -578,6 +589,21 @@ impl Shared {
             })?,
             &human,
         )
+    }
+
+    /// Same subject grammar as `wiki::correction`'s review gate: absent, empty,
+    /// or the `operator` alias is not a human the review path will accept.
+    fn correction_subject(human: Option<&WikiHuman>) -> bool {
+        let Some(human) = human else {
+            return false;
+        };
+        let sub = human.sub.as_str();
+        !sub.is_empty()
+            && sub.len() <= 64
+            && !sub.eq_ignore_ascii_case("operator")
+            && sub
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
     }
 
     fn correction_human(human: Option<WikiHuman>, verb: &str) -> Result<wiki::correction::Human> {

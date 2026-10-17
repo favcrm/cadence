@@ -6,12 +6,17 @@
 //! Differing bytes are refused rather than answered with the newest commit.
 //! A full Git commit name is loaded from that commit alone.
 
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
+use std::time::SystemTime;
 
 use base64::Engine;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use super::{allowed, git_rel, normalize, resolve, vault_dir, Caller, Op, HISTORY_CAP, TEXT_CAP};
 use crate::error::{Error, Result};
@@ -78,7 +83,7 @@ fn resolve_pin(pm: &Pm, caller: &Caller, path: &str, at: &str) -> Result<Pinned>
     let file_rel = git_rel(pm, &resolve(&vault, &norm)?)?;
     let pointer_rel = git_rel(pm, &vault.join(format!("{norm}.blob")))?;
     let hits = if let Some(git) = commit_name(at) {
-        match load_commit(pm, &vault, &file_rel, &pointer_rel, &git)? {
+        match load_commit(pm, &file_rel, &pointer_rel, &git)? {
             Some(hit) => vec![hit],
             None => {
                 return Err(unavailable(
@@ -87,7 +92,7 @@ fn resolve_pin(pm: &Pm, caller: &Caller, path: &str, at: &str) -> Result<Pinned>
             }
         }
     } else if fnv_name(at) {
-        fnv_hits(pm, &vault, &file_rel, &pointer_rel, at)?
+        fnv_hits(pm, &file_rel, &pointer_rel, at)?
     } else {
         return Err(unavailable(
             "revision selector must be a 40-digit commit or an fnv1a: content token",
@@ -104,7 +109,12 @@ fn resolve_pin(pm: &Pm, caller: &Caller, path: &str, at: &str) -> Result<Pinned>
         ));
     }
     // Same digest: keep the oldest retained commit, never the newest alias.
+    // Only that hit's object is checked. An older commit that does not match
+    // the selector must not abort resolution when its blob is missing.
     let hit = hits.into_iter().last().expect("hit");
+    if let Body::Blob(blob) = &hit.body {
+        confirm_selected_blob(&vault, blob)?;
+    }
     Ok(Pinned {
         path: norm,
         git: hit.git,
@@ -124,8 +134,8 @@ pub(crate) fn export_slice(
     offset: u64,
     want: u64,
 ) -> Result<Value> {
-    // Objects are immutable and content-addressed. Check the bounded slice and
-    // carry its strong digest; do not hash a whole 100MiB object per 16KiB slice.
+    // A repeated slice reuses the stamp for this blob's identity. The whole
+    // object is hashed only when that stamp misses.
     let pinned = resolve_pin(pm, caller, path, at)?;
     match pinned.body {
         Body::Dir => Err(unavailable("a directory has no original byte slice")),
@@ -144,19 +154,7 @@ pub(crate) fn export_slice(
             )
         }
         Body::Blob(blob) => {
-            let object = super::blobs_dir(&vault_dir(pm)?).join(&blob.sha256);
-            let mut file = std::fs::File::open(&object).map_err(|_| {
-                unavailable("historical blob bytes are not in the content-addressed store")
-            })?;
-            let on_disk = file
-                .metadata()
-                .map(|meta| meta.len())
-                .map_err(|_| unavailable("historical blob bytes could not be read"))?;
-            if on_disk != blob.size {
-                return Err(unavailable(
-                    "historical blob size does not match the pointer",
-                ));
-            }
+            let mut file = open_historical_blob(&vault_dir(pm)?, &blob)?;
             bounded_slice(
                 Original {
                     path: &pinned.path,
@@ -178,6 +176,154 @@ pub(crate) fn export_slice(
             )
         }
     }
+}
+
+/// On-disk custody for the single hit [`resolve_pin`] kept.
+fn confirm_selected_blob(vault: &Path, blob: &BlobBody) -> Result<()> {
+    let object = super::blobs_dir(vault).join(&blob.sha256);
+    let metadata = object
+        .symlink_metadata()
+        .map_err(|_| unavailable("historical blob bytes are not in the content-addressed store"))?;
+    if !metadata.is_file() {
+        return Err(unavailable("historical blob object is not a regular file"));
+    }
+    if metadata.len() != blob.size {
+        return Err(unavailable(
+            "historical blob size does not match the pointer",
+        ));
+    }
+    Ok(())
+}
+
+const BLOB_STAMP_CAP: usize = 32;
+
+struct BlobStamp {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime: SystemTime,
+    sha256: String,
+}
+
+static BLOB_STAMPS: Mutex<Vec<BlobStamp>> = Mutex::new(Vec::new());
+
+fn stamp_lock() -> std::sync::MutexGuard<'static, Vec<BlobStamp>> {
+    BLOB_STAMPS.lock().unwrap_or_else(|err| err.into_inner())
+}
+
+fn stamp_matches(path: &Path, meta: &std::fs::Metadata, expected: &str) -> bool {
+    let Ok(mtime) = meta.modified() else {
+        return false;
+    };
+    stamp_lock().iter().any(|stamp| {
+        stamp.path == path
+            && stamp.dev == meta.dev()
+            && stamp.ino == meta.ino()
+            && stamp.len == meta.len()
+            && stamp.mtime == mtime
+            && stamp.sha256 == expected
+    })
+}
+
+fn remember_stamp(path: &Path, meta: &std::fs::Metadata, sha256: &str) {
+    let Ok(mtime) = meta.modified() else {
+        return;
+    };
+    let mut stamps = stamp_lock();
+    if let Some(stamp) = stamps.iter_mut().find(|stamp| stamp.path == path) {
+        stamp.dev = meta.dev();
+        stamp.ino = meta.ino();
+        stamp.len = meta.len();
+        stamp.mtime = mtime;
+        stamp.sha256 = sha256.to_string();
+        return;
+    }
+    if stamps.len() == BLOB_STAMP_CAP {
+        stamps.remove(0);
+    }
+    stamps.push(BlobStamp {
+        path: path.to_path_buf(),
+        dev: meta.dev(),
+        ino: meta.ino(),
+        len: meta.len(),
+        mtime,
+        sha256: sha256.to_string(),
+    });
+}
+
+fn sha256_open(file: &mut File) -> Result<String> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| unavailable("historical blob bytes could not be read"))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|_| unavailable("historical blob bytes could not be read"))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn whole_blob_matches(
+    path: &Path,
+    file: &mut File,
+    meta: &std::fs::Metadata,
+    expected: &str,
+) -> Result<()> {
+    if stamp_matches(path, meta, expected) {
+        return Ok(());
+    }
+    let actual = sha256_open(file)?;
+    if actual != expected {
+        return Err(unavailable(
+            "historical blob bytes do not match the pointer digest",
+        ));
+    }
+    remember_stamp(path, meta, expected);
+    Ok(())
+}
+
+fn open_historical_blob(vault: &Path, blob: &BlobBody) -> Result<File> {
+    let blobs = super::blobs_dir(vault);
+    match blobs.symlink_metadata() {
+        Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {}
+        Ok(_) => return Err(unavailable("historical blob store is not a real directory")),
+        Err(_) => {
+            return Err(unavailable(
+                "historical blob bytes are not in the content-addressed store",
+            ))
+        }
+    }
+    let object = blobs.join(&blob.sha256);
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&object)
+        .map_err(|error| {
+            if error.raw_os_error() == Some(libc::ELOOP) {
+                unavailable("historical blob object is not a regular file")
+            } else {
+                unavailable("historical blob bytes are not in the content-addressed store")
+            }
+        })?;
+    let meta = file
+        .metadata()
+        .map_err(|_| unavailable("historical blob bytes could not be read"))?;
+    if !meta.is_file() || meta.file_type().is_symlink() {
+        return Err(unavailable("historical blob object is not a regular file"));
+    }
+    if meta.len() != blob.size {
+        return Err(unavailable(
+            "historical blob size does not match the pointer",
+        ));
+    }
+    whole_blob_matches(&object, &mut file, &meta, &blob.sha256)?;
+    Ok(file)
 }
 
 /// The historical original one slice belongs to: its path, its kind, the
@@ -228,13 +374,7 @@ fn bounded_slice(
     }))
 }
 
-fn fnv_hits(
-    pm: &Pm,
-    vault: &Path,
-    file_rel: &Path,
-    pointer_rel: &Path,
-    token: &str,
-) -> Result<Vec<Hit>> {
+fn fnv_hits(pm: &Pm, file_rel: &Path, pointer_rel: &Path, token: &str) -> Result<Vec<Hit>> {
     let limit = format!("-{}", HISTORY_CAP);
     let out = git_text(
         &pm.dir,
@@ -260,7 +400,7 @@ fn fnv_hits(
     let mut hit: Option<Hit> = None;
     let mut digest: Option<String> = None;
     for git in commits {
-        let Some(candidate) = load_commit(pm, vault, file_rel, pointer_rel, &git)? else {
+        let Some(candidate) = load_commit(pm, file_rel, pointer_rel, &git)? else {
             continue;
         };
         if candidate.rev != token {
@@ -281,13 +421,7 @@ fn fnv_hits(
     Ok(hit.into_iter().collect())
 }
 
-fn load_commit(
-    pm: &Pm,
-    vault: &Path,
-    file_rel: &Path,
-    pointer_rel: &Path,
-    git: &str,
-) -> Result<Option<Hit>> {
+fn load_commit(pm: &Pm, file_rel: &Path, pointer_rel: &Path, git: &str) -> Result<Option<Hit>> {
     if object_type(pm, git)? != "commit" {
         return Err(unavailable("revision selector is not a commit"));
     }
@@ -327,22 +461,10 @@ fn load_commit(
     let pointer: Value = serde_json::from_slice(&bytes)
         .map_err(|_| unavailable("historical blob pointer is not the stored JSON"))?;
     let sha = pointer_sha(&pointer)?;
-    let object = super::blobs_dir(vault).join(&sha);
-    let metadata = object
-        .symlink_metadata()
-        .map_err(|_| unavailable("historical blob bytes are not in the content-addressed store"))?;
-    if !metadata.is_file() {
-        return Err(unavailable("historical blob object is not a regular file"));
-    }
     let size = pointer
         .get("size")
         .and_then(Value::as_u64)
         .ok_or_else(|| unavailable("historical blob pointer has no size"))?;
-    if metadata.len() != size {
-        return Err(unavailable(
-            "historical blob size does not match the pointer",
-        ));
-    }
     Ok(Some(Hit {
         git: git.to_string(),
         rev: super::rev_bytes(&bytes),

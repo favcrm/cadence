@@ -158,10 +158,13 @@ export async function importFile(
   if (file.size > cap) throw new WikiError(`over ${Math.round(cap / (1024 * 1024))} MB — rejected`, 400);
   const sha256 = await sha256File(file);
   operation.assertCurrent();
-  const ifRev = await destinationRev(root, file.name, update);
-  operation.assertCurrent();
   const id = entryId(file.name, 0);
-  const saved = readResume(root).find((item) => item.sha256 === sha256 && item.path === file.name && item.size === file.size && item.if_rev === ifRev && item.update === update);
+  // Match an interrupted import before re-reading the destination: an
+  // interrupted update must resume against the revision it started with,
+  // not whatever the file's rev has become since (possibly another editor's).
+  const saved = readResume(root).find((item) => item.sha256 === sha256 && item.path === file.name && item.size === file.size && item.update === update);
+  const ifRev = saved?.if_rev ?? (await destinationRev(root, file.name, update));
+  operation.assertCurrent();
   let jobId = saved?.job_id;
   let digest = saved?.digest;
   if (!jobId) {
@@ -208,9 +211,11 @@ export async function importFile(
     const extraction = text(applied.extraction) ?? "not_applicable";
     const rev = text(applied.rev) ?? undefined;
     const error = text(applied.error) ?? undefined;
-    if (outcome === "pending" || outcome === "unresolved") throw new WikiError(error ?? "Publication is not committed", 502);
     const finished = await transferCall(root, { op: "finish", root, job_id: jobId }, true, operation);
     forgetResume(root, sha256);
+    // Only an applied or unchanged file is a success. A conflict or failure
+    // must never surface as a done row with "was saved".
+    if (outcome !== "applied" && outcome !== "skipped") throw new WikiError(error ?? `The import was not applied (${outcome})`, 502);
     return { outcome, extraction, index: text(finished.index) ?? "pending", ...(rev ? { rev } : {}), ...(error ? { error } : {}) };
   }
   const extraction = text(entry?.extraction) ?? "not_applicable";
@@ -219,9 +224,11 @@ export async function importFile(
   if (text(status.state) === "open") {
     const finished = await transferCall(root, { op: "finish", root, job_id: jobId }, true, operation);
     forgetResume(root, sha256);
+    if (outcome !== "applied" && outcome !== "skipped") throw new WikiError(error ?? `The import was not applied (${outcome})`, 502);
     return { outcome, extraction, index: text(finished.index) ?? "pending", ...(rev ? { rev } : {}), ...(error ? { error } : {}) };
   }
   forgetResume(root, sha256);
+  if (outcome !== "applied" && outcome !== "skipped") throw new WikiError(error ?? `The import was not applied (${outcome})`, 502);
   return { outcome, extraction, index: text(status.index) ?? "pending", ...(rev ? { rev } : {}), ...(error ? { error } : {}) };
 }
 

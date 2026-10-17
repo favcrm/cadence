@@ -144,6 +144,11 @@ pub fn edit(
                     "bad artifact name '{name}' — [A-Za-z0-9._-]{{1,120}}, no leading dot"
                 )));
             }
+            if model::reserved_artifact_name(&name) {
+                return Err(Error::rejected(format!(
+                    "{name} is a tracker-owned record and cannot be attached: only its own workflow writes it"
+                )));
+            }
             attachments.push((name, std::fs::read(file)?));
             Ok(())
         })?;
