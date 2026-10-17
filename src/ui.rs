@@ -61,6 +61,7 @@ mod member_assist;
 mod notify_service;
 mod operator;
 mod platform_account;
+mod project_policy;
 mod public_directory;
 mod read_model;
 mod serve;

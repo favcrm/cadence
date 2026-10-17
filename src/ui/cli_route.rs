@@ -43,7 +43,7 @@ use super::ServeOpts;
 use crate::board_identity;
 use crate::cli_actor::{self, CliActor, Verb};
 use crate::client;
-use crate::issue::{board, history, model, project, write as issue_write, Pm};
+use crate::issue::{board, history, model, write as issue_write, Pm};
 
 /// One process-wide JWKS cache for this route family (the daemon keeps
 /// its own for sign-in assertions; the board's verify is in-process).
@@ -320,43 +320,16 @@ fn pm_at(pm_dir: &Path) -> Result<Pm, HttpResp> {
     Pm::at(pm_dir).map_err(|e| cli_fail(503, "tracker_unavailable", &e.to_string()))
 }
 
-/// The project caller a verified cli actor presents, in the daemon's own
-/// spelling. `None` for any spelling outside the known forms — such a
-/// caller is refused rather than guessed at (AOS-274).
-fn project_caller(actor: &CliActor) -> Option<project::ProjectCaller<'_>> {
-    use project::ProjectCaller;
-    let raw = actor.actor.as_str();
-    if raw == "operator" {
-        return Some(ProjectCaller::Operator);
-    }
-    if let Some(handle) = raw.strip_prefix("users/") {
-        return Some(ProjectCaller::User(handle));
-    }
-    if let Some(id) = raw.strip_prefix("agents/") {
-        return Some(ProjectCaller::Agent(id));
-    }
-    if let Some(sub) = raw.strip_prefix("service/") {
-        return Some(ProjectCaller::Service(sub));
-    }
-    None
-}
-
 /// `Some(refusal)` when this project exists but does not admit the
 /// verified caller. The answer is the one an absent project gives, so a
 /// restricted project cannot be told apart from a missing one
 /// (AOS-274 / SEC-003). A project that does not exist is left to the
 /// verb's own unknown-project answer; an unreadable tracker refuses.
 fn restricted(pm: &Pm, key: &str, actor: &CliActor) -> Option<HttpResp> {
-    let projects = match project::list(&pm.dir) {
-        Ok(projects) => projects,
-        Err(_) => return Some(cli_fail(404, "not_found", "unknown project")),
-    };
-    let found = projects.iter().find(|p| p.key == key)?;
-    let caller = project_caller(actor);
-    if caller.is_some_and(|caller| found.allows(caller)) {
-        None
-    } else {
+    if super::project_policy::refused(pm, key, &actor.actor) {
         Some(cli_fail(404, "not_found", "unknown project"))
+    } else {
+        None
     }
 }
 
@@ -375,15 +348,7 @@ fn restricted_issue(pm: &Pm, id: &str, actor: &CliActor) -> Option<HttpResp> {
 /// so a listing contributes no row, count or placeholder for a project
 /// the caller may not see.
 fn readable_projects(pm: &Pm, actor: &CliActor) -> std::collections::BTreeSet<String> {
-    let Some(caller) = project_caller(actor) else {
-        return std::collections::BTreeSet::new();
-    };
-    project::list(&pm.dir)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|p| p.allows(caller))
-        .map(|p| p.key)
-        .collect()
+    super::project_policy::readable(pm, &actor.actor)
 }
 
 /// The verb → the same call the CLI/board makes for it. `actor` is the
