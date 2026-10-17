@@ -284,7 +284,8 @@ export interface MemberSendReceipt {
  * route every refusal (strict body/field/scope rejection at the edge,
  * or a daemon `Rejected` mapped to 403) happens BEFORE the
  * `send_as`/`enqueue_steered_for_with_conversation` commit, so a 4xx
- * proves no message row exists.
+ * proves THAT attempt was refused — the prior same-id attempt's
+ * outcome it cannot establish.
  *
  * Everything else is UNCONFIRMED, never "not sent": `ApiError`
  * `status===0` means no usable server answer — the request may already
@@ -333,7 +334,11 @@ function settleMemberPending(
  *  error, 5xx, status-0 (no usable answer), or a malformed/mismatching
  *  2xx settles `failed` with `delivery:"unconfirmed"` so the row reads
  *  "Delivery unconfirmed" — same id, same text, manual same-id retry —
- *  never "not sent" and never an auto-replay/new-id retry. */
+ *  never "not sent" and never an auto-replay/new-id retry. The retry
+ *  carries the earlier same-id unconfirmed observation forward while
+ *  in flight and after a retry-only failure: a 4xx proves ONLY that
+ *  the retry was refused, so it can never downgrade a prior
+ *  unconfirmed attempt to "not sent". */
 export function sendToAssistant(
   scope: string,
   text: string,
@@ -343,10 +348,22 @@ export function sendToAssistant(
   const body = text.trim();
   if (!body) return Promise.resolve({ ok: false, error: "Nothing to send." });
   const store = memberThreadStore(scope);
+  // The same-message pending row THIS scope already holds may carry an
+  // earlier attempt's `delivery` observation (member-local; the shared
+  // `addPending` would drop it when it replaces the row). Capture it
+  // now — only ever `"unconfirmed"` today — so the retry keeps the
+  // prior attempt's unknown outcome while it flies and the refusal
+  // branch below can distinguish "first-ever 4xx" (not sent) from
+  // "retry of an already-unconfirmed send" (still unconfirmed: a 4xx
+  // proves only THIS attempt was refused, not the earlier one).
+  const previousDelivery = store
+    .get()
+    .data?.pending.find((p) => p.message === message)?.delivery;
+  const hadUnconfirmed = previousDelivery === "unconfirmed";
   /** Settle the pending row from an outcome `e`: proven refusal or unknown. */
   const settleOutcome = (e: unknown): MemberSendReceipt => {
     const text = e instanceof Error ? (e.message || "The private session changed") : String(e);
-    if (provenRefusal(e)) {
+    if (provenRefusal(e) && !hadUnconfirmed) {
       memberWrite(store, (s) => settleMemberPending(s, message, { ok: false, error: text }));
       return { ok: false, error: text };
     }
@@ -358,7 +375,17 @@ export function sendToAssistant(
   return usingPrivateOperation(operation, async (op) => {
     try {
       op.assertCurrent();
-      memberWrite(store, (s) => addPending(s, message, body, Date.now()));
+      memberWrite(store, (s) => {
+        const added = addPending(s, message, body, Date.now()) as MemberThreadState;
+        return previousDelivery === undefined
+          ? added
+          : {
+              ...added,
+              pending: added.pending.map((p) =>
+                p.message === message ? { ...p, delivery: previousDelivery } : p,
+              ),
+            };
+      });
       const receipt: MemberAssistSend = await api.memberAssistSend(body, message);
       op.assertCurrent();
       const receiptScope = receiptScopeOf(receipt, message);
