@@ -413,7 +413,9 @@ fn dispatch(
             if !args.as_object().is_some_and(|args| args.is_empty()) {
                 return cli_fail(400, "invalid_request", "my_work accepts no arguments");
             }
-            if !actor.actor.starts_with("users/") {
+            // Envelope verification permits `operator` only for an Owner user;
+            // its attribution handle is still derived from that user's sub.
+            if actor.actor != "operator" && !actor.actor.starts_with("users/") {
                 return cli_fail(403, "human_session_required", "my_work requires a user");
             }
             match super::my_work::payload(state_dir, pm_dir, &actor.handle) {
