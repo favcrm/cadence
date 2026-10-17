@@ -656,8 +656,8 @@ the `Issue: <ID>` trailer — as JSON.
   else — an operator's own link — is refused, not silently
   half-shared.
 - The worktree gets a `.env` with `CARGO_BUILD_JOBS` and
-  `CADENCE_BUILD_SLOT` for the slot service (docs/PROTOCOL.md). To
-  keep `issue finish`'s clean-tree guard green, `issue start` appends
+  `CADENCE_BUILD_SLOT` for the slot service. To keep `issue finish`'s
+  clean-tree guard green, `issue start` appends
   the root-anchored patterns `/.env` and `/.env.tmp` to the repo's
   `info/exclude` — under flock, idempotent — which for a linked
   worktree is the COMMON git dir: the entries are permanent and cover
