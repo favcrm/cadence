@@ -557,6 +557,13 @@ pub const WRITE_ROUTES: &[WriteRoute] = &[
     // attributed agent) writes, and the daemon's per-prefix allowlist
     // decides where. The board relays; it never widens a caller.
     route("PUT", "/api/wiki/file", RouteClass::AgentAllowed),
+    route("PUT", "/api/wiki/collection", RouteClass::AgentAllowed),
+    route("POST", "/api/wiki/corrections", RouteClass::AgentAllowed),
+    route(
+        "POST",
+        "/api/wiki/corrections/review",
+        RouteClass::AgentAllowed,
+    ),
     route("PUT", "/api/wiki/transfer", RouteClass::AgentAllowed),
     route("POST", "/api/wiki/upload", RouteClass::AgentAllowed),
     route("POST", "/api/wiki/mkdir", RouteClass::AgentAllowed),

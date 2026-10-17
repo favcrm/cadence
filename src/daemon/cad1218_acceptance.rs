@@ -118,7 +118,7 @@ pub(super) struct Board {
     pub(super) state: std::path::PathBuf,
     live_head: std::path::PathBuf,
     agent: ureq::Agent,
-    base: String,
+    pub(super) base: String,
     host: String,
     token: String,
     pub(super) issuer: String,

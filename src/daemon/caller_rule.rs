@@ -1268,6 +1268,36 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         "wiki_history",
         Rule::Handler("wiki_caller: agent_caller + wiki_as (CAD-580)"),
     ),
+    (
+        "wiki_collection_get",
+        Rule::Handler("wiki_caller: agent_caller + wiki_as (CAD-1470)"),
+    ),
+    (
+        "wiki_collection_put",
+        Rule::Handler(
+            "wiki_caller: owner connection only; metadata labels are not authority (CAD-1470)",
+        ),
+    ),
+    (
+        "wiki_read_revision",
+        Rule::Handler("wiki_caller: agent_caller + wiki_as; historical selector never falls back to live (CAD-1470)"),
+    ),
+    (
+        "wiki_corrections_list",
+        Rule::Handler("wiki_caller: agent_caller + wiki_as (CAD-1470)"),
+    ),
+    (
+        "wiki_corrections_submit",
+        Rule::Handler(
+            "wiki_caller plus verified human subject; not issue_created and not an operator alias (CAD-1470)",
+        ),
+    ),
+    (
+        "wiki_corrections_review",
+        Rule::Handler(
+            "wiki_caller owner plus a different verified human subject; session id is not identity (CAD-1470)",
+        ),
+    ),
     // CAD-719: index health is operator-only — a read-only status and
     // an explicit rebuild. These do not bind `wiki_caller`: they gate
     // on `operator_connection` like the other operator actions, and an

@@ -1,5 +1,7 @@
 import Markdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { citationSpans, isWikiRevisionHref, wikiRevisionHref } from "../features/wiki/citations";
+import Link from "./Link";
 import SafeLink from "./SafeLink";
 
 // Bare issue ids become `issue:` links as a remark pass over `text` nodes
@@ -38,6 +40,38 @@ function linkifyChildren(node: MdNode): void {
   node.children = out;
 }
 
+function linkifyCitations(node: MdNode): void {
+  const kids = node.children;
+  if (!kids || node.type === "link" || node.type === "linkReference") return;
+  const out: MdNode[] = [];
+  for (const kid of kids) {
+    if (kid.type !== "text" || !kid.value) {
+      linkifyCitations(kid);
+      out.push(kid);
+      continue;
+    }
+    const spans = citationSpans(kid.value);
+    if (spans.length === 0) {
+      out.push(kid);
+      continue;
+    }
+    let last = 0;
+    for (const span of spans) {
+      if (span.start > last) out.push({ type: "text", value: kid.value.slice(last, span.start) });
+      const href = wikiRevisionHref(span.citation.path, {
+        at: span.citation.revision,
+        ...(span.citation.section ? { section: span.citation.section } : {}),
+        ...(span.citation.page !== undefined ? { page: span.citation.page } : {}),
+      });
+      out.push({ type: "link", url: `wiki-rev:${href}`, children: [{ type: "text", value: span.label }] });
+      last = span.end;
+    }
+    if (last < kid.value.length) out.push({ type: "text", value: kid.value.slice(last) });
+  }
+  node.children = out;
+}
+
+const remarkWikiCitations = () => (tree: MdNode) => linkifyCitations(tree);
 const remarkIssueLinks = () => (tree: MdNode) => linkifyChildren(tree);
 
 // Agent-written Markdown must not initiate third-party image requests. The
@@ -67,10 +101,10 @@ export default function Md({
     <Markdown
       // GFM (CAD-551): tables, task lists, strikethrough, autolinks —
       // the providers' answers lean on them.
-      remarkPlugins={[remarkGfm, remarkIssueLinks]}
-      // `issue:` ids are ours; everything else takes react-markdown's
-      // safe transform (no `javascript:` and friends).
-      urlTransform={(url) => (url.startsWith("issue:") ? url : defaultUrlTransform(url))}
+      remarkPlugins={[remarkGfm, remarkWikiCitations, remarkIssueLinks]}
+      // `issue:` ids and pinned wiki revisions are ours; everything else
+      // takes react-markdown's safe transform (no `javascript:` and friends).
+      urlTransform={(url) => (url.startsWith("issue:") || url.startsWith("wiki-rev:") ? url : defaultUrlTransform(url))}
       components={{
         img: ({ src, alt }) => {
           const safe = markdownImageSrc(src);
@@ -78,6 +112,14 @@ export default function Md({
         },
         a: ({ href, children }) => {
           const issueId = href?.startsWith("issue:") ? href.slice(6) : null;
+          const revisionHref = href?.startsWith("wiki-rev:") ? href.slice("wiki-rev:".length) : null;
+          if (revisionHref !== null) {
+            return isWikiRevisionHref(revisionHref) ? (
+              <Link className="lnk" href={revisionHref}>{children}</Link>
+            ) : (
+              <>{children}</>
+            );
+          }
           return !href ? (
             // react-markdown blanked an unsafe target: show text, not an
             // anchor that would reopen the board in a new tab.

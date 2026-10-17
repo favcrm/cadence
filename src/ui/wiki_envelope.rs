@@ -202,7 +202,7 @@ pub(crate) fn handle(
             transfer(request, state_dir, &grant, &attribution, true)
         }
         WikiAction::Enumerate => enumerate(query, state_dir, &grant, &attribution),
-        WikiAction::Read => read(query, state_dir, &grant, &attribution),
+        WikiAction::Read => read(request.url(), query, state_dir, &grant, &attribution),
         WikiAction::Write if tail == "upload" => {
             upload(request, query, state_dir, pm_dir, &grant, &attribution)
         }
@@ -332,6 +332,7 @@ fn enumerate(
 /// the daemon's compact JSON (`data_base64` and `range`), never the
 /// raw blob and never a line past the native tool bound.
 fn read(
+    raw_url: &str,
     query: &dyn Fn(&str) -> Option<String>,
     state_dir: &std::path::Path,
     grant: &WikiGrant,
@@ -382,7 +383,26 @@ fn read(
         }
         params["rev"] = json!(rev);
     }
-    match client::rpc(state_dir, "wiki_read", params) {
+    match super::wiki::historical_at(raw_url) {
+        Ok(Some(at)) => {
+            if params.get("rev").is_some() {
+                return refuse(
+                    400,
+                    "invalid_request",
+                    "wiki file at is a historical selector and cannot combine with rev",
+                );
+            }
+            params["at"] = json!(at);
+        }
+        Ok(None) => {}
+        Err(message) => return refuse(400, "invalid_request", message),
+    }
+    let method = if params.get("at").is_some() {
+        "wiki_read_revision"
+    } else {
+        "wiki_read"
+    };
+    match client::rpc(state_dir, method, params) {
         Ok(v) => bounded_range_json(v),
         Err(e) => write_err(&e),
     }

@@ -90,6 +90,8 @@ mod cad1415_app_actions_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1440_media_only_context_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
+mod cad1470_knowledge_refusal_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
 mod cad1473_host_redispatch;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1473_independent_redispatch;
@@ -3133,6 +3135,12 @@ impl Shared {
             "wiki_rm" => self.rpc_wiki_rm(params, peer_pid),
             "wiki_search" => self.rpc_wiki_search(params, peer_pid),
             "wiki_history" => self.rpc_wiki_history(params, peer_pid),
+            "wiki_collection_get" => self.rpc_wiki_collection_get(params, peer_pid),
+            "wiki_collection_put" => self.rpc_wiki_collection_put(params, peer_pid),
+            "wiki_read_revision" => self.rpc_wiki_read_revision(params, peer_pid),
+            "wiki_corrections_list" => self.rpc_wiki_corrections_list(params, peer_pid),
+            "wiki_corrections_submit" => self.rpc_wiki_corrections_submit(params, peer_pid),
+            "wiki_corrections_review" => self.rpc_wiki_corrections_review(params, peer_pid),
             // CAD-719: operator-scoped index health + the explicit
             // refresh; the wiki allowlist does not apply — these gate
             // on `operator_connection`, never `wiki_caller`/`wiki_as`.

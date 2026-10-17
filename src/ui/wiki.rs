@@ -47,6 +47,23 @@ fn relay(state_dir: &Path, method: &str, mut params: Value, caller: &str) -> Htt
     }
 }
 
+/// A stored compare-and-swap or stale-source answer is HTTP 409. The body
+/// is the daemon's conflict object, not a success page.
+fn relay_conflict(state_dir: &Path, method: &str, mut params: Value, caller: &str) -> HttpResp {
+    params["wiki_as"] = json!(caller);
+    match client::rpc(state_dir, method, params) {
+        Ok(v) if v.get("conflict").is_some() => {
+            let mut resp = Response::from_data(serde_json::to_vec(&v).unwrap_or_default())
+                .with_status_code(409);
+            resp.add_header(Header::from_bytes("Content-Type", "application/json").unwrap());
+            resp.add_header(Header::from_bytes("Cache-Control", "no-store").unwrap());
+            resp
+        }
+        Ok(v) => json_response(v),
+        Err(e) => write_err(&e),
+    }
+}
+
 fn board_caller(
     request: &Request,
     state_dir: &Path,
@@ -94,8 +111,53 @@ pub(super) fn read(
             }
             relay(state_dir, "wiki_history", params, &wiki_as)
         }
+        "collection" | "corrections" => {
+            let mut params = json!({"path": query("path").unwrap_or_default()});
+            if let Err(resp) =
+                operator::relay_owner_proof(&mut params, operator::public_relay(request, opts))
+            {
+                return resp;
+            }
+            let method = if tail == "collection" {
+                "wiki_collection_get"
+            } else {
+                "wiki_corrections_list"
+            };
+            relay(state_dir, method, params, &wiki_as)
+        }
         _ => err_response(404, "no such wiki route"),
     }
+}
+
+/// Judge raw `at` pairs before the decoded query helper. That helper drops a
+/// value percent-decode cannot finish and keeps only the first `at`, so a
+/// bad or repeated selector has to be refused here.
+pub(super) fn historical_at(raw_url: &str) -> std::result::Result<Option<String>, &'static str> {
+    let raw_query = raw_url
+        .split_once('?')
+        .map(|(_, query)| query)
+        .unwrap_or("");
+    let mut selector = None;
+    for pair in raw_query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (key, raw) = pair.split_once('=').unwrap_or((pair, ""));
+        if key != "at" {
+            continue;
+        }
+        if selector.is_some() {
+            return Err("wiki file at is repeated");
+        }
+        let Some(decoded) = super::pct_decode(raw) else {
+            return Err("wiki file at is malformed");
+        };
+        if decoded.is_empty() {
+            return Err("wiki file at must be a non-empty revision");
+        }
+        selector = Some(decoded);
+    }
+    Ok(selector)
 }
 
 /// `GET /api/wiki/file?path=` — text comes back as the daemon's JSON.
@@ -142,13 +204,40 @@ fn file_response(
         }
         params["rev"] = json!(rev);
     }
+    match historical_at(request.url()) {
+        Ok(Some(at)) => {
+            if params.get("rev").is_some() {
+                return err_response(
+                    400,
+                    "wiki file at is a historical selector and cannot combine with rev",
+                );
+            }
+            params["at"] = json!(at);
+        }
+        Ok(None) => {}
+        Err(message) => return err_response(400, message),
+    }
+    let historical = params.get("at").is_some();
     let ranged = params.get("offset").is_some()
         || params.get("bytes").is_some()
         || params.get("rev").is_some();
-    let page = match client::rpc(state_dir, "wiki_read", params) {
+    let method = if historical {
+        "wiki_read_revision"
+    } else {
+        "wiki_read"
+    };
+    let page = match client::rpc(state_dir, method, params) {
         Ok(v) => v,
         Err(e) => return write_err(&e),
     };
+    // A historical read that asks for JSON returns the page document,
+    // including a blob pointer. Raw bytes stay the default for a live
+    // attachment and for a historical blob that did not ask for JSON.
+    let wants_json = header_value(request, "Accept")
+        .is_some_and(|value| value.to_ascii_lowercase().contains("application/json"));
+    if historical && wants_json {
+        return json_response(page);
+    }
     match page["kind"].as_str() {
         Some("text") | Some("dir") => return json_response(page),
         Some("blob") if ranged => return compact_wiki_json(page),
@@ -319,6 +408,65 @@ pub(super) fn write(
                 Err(resp) => resp,
             }
         }
+        ("collection", Method::Put) => {
+            let body = match read_body(request, JSON_CAP) {
+                Ok(body) => body,
+                Err(resp) => return resp,
+            };
+            let req: Value = match parse_json(&body) {
+                Ok(req) => req,
+                Err(resp) => return resp,
+            };
+            let Some(body) = req.as_object() else {
+                return err_response(400, "wiki collection needs {path}");
+            };
+            if body
+                .keys()
+                .any(|key| !matches!(key.as_str(), "path" | "if_rev" | "metadata"))
+            {
+                return err_response(400, "wiki collection has unsupported fields");
+            }
+            let Some(path) = req["path"].as_str() else {
+                return err_response(400, "wiki collection needs {path}");
+            };
+            let Some(if_rev) = req["if_rev"].as_str() else {
+                return err_response(400, "wiki collection needs {if_rev}");
+            };
+            let Some(metadata) = req.get("metadata") else {
+                return err_response(400, "wiki collection needs {metadata}");
+            };
+            relay_conflict(
+                state_dir,
+                "wiki_collection_put",
+                with_proof(json!({"path": path, "if_rev": if_rev, "metadata": metadata})),
+                &wiki_as,
+            )
+        }
+        ("corrections" | "corrections/review", Method::Post) => {
+            let body = match read_body(request, JSON_CAP) {
+                Ok(body) => body,
+                Err(resp) => return resp,
+            };
+            let mut req: Value = match parse_json(&body) {
+                Ok(req) => req,
+                Err(resp) => return resp,
+            };
+            let Some(path) = req.as_object_mut().and_then(|body| body.remove("path")) else {
+                return err_response(400, "wiki correction needs a path");
+            };
+            // Keep user-reported data separate from the trusted session envelope.
+            // Move the report rather than copying the potentially large answer.
+            let params = Value::Object(serde_json::Map::from_iter([
+                ("path".to_string(), path),
+                ("correction".to_string(), req),
+            ]));
+            let method = if tail == "corrections" {
+                "wiki_corrections_submit"
+            } else {
+                "wiki_corrections_review"
+            };
+            relay_conflict(state_dir, method, with_proof(params), &wiki_as)
+        }
         ("file", Method::Put) => {
             let body = match read_body(request, JSON_CAP) {
                 Ok(b) => b,
@@ -383,9 +531,11 @@ pub(super) fn write(
             }
         }
         ("upload", Method::Post) => upload(request, query, state_dir, pm_dir, &wiki_as, proof),
-        ("file" | "upload" | "mkdir" | "mv" | "rm" | "transfer" | "job_status", _) => {
-            err_response(405, "method not allowed")
-        }
+        (
+            "file" | "upload" | "mkdir" | "mv" | "rm" | "transfer" | "job_status" | "collection"
+            | "corrections" | "corrections/review",
+            _,
+        ) => err_response(405, "method not allowed"),
         _ => err_response(404, "no such wiki write route"),
     }
 }
@@ -430,6 +580,7 @@ pub(super) fn transfer_params(body: &Value, writing: bool) -> Result<Value, Http
                 | "path"
                 | "bytes"
                 | "rev"
+                | "at"
         )
     }) {
         return Err(err_response(
@@ -814,5 +965,36 @@ mod upload_tests {
             assert!(store_upload(root.path(), "users/u/source.md", bytes, None, "user:u").is_err());
             assert!(!root.path().join(crate::wiki::UPLOAD_DIR).exists());
         }
+    }
+}
+
+#[cfg(test)]
+mod selector_tests {
+    use super::historical_at;
+
+    /// The selector is read from the raw query, so a present `at` that cannot
+    /// be decoded, is empty, or appears twice is refused instead of quietly
+    /// reading the live page.
+    #[test]
+    fn a_malformed_empty_or_repeated_at_is_refused() {
+        assert_eq!(historical_at("/api/wiki/file?path=a.md"), Ok(None));
+        assert_eq!(
+            historical_at("/api/wiki/file?path=a.md&at=fnv1a%3A0123456789abcdef"),
+            Ok(Some("fnv1a:0123456789abcdef".to_string()))
+        );
+        assert_eq!(
+            historical_at("/api/wiki/file?path=a.md&at="),
+            Err("wiki file at must be a non-empty revision")
+        );
+        for malformed in ["%ZZ", "%FF"] {
+            assert_eq!(
+                historical_at(&format!("/api/wiki/file?path=a.md&at={malformed}")),
+                Err("wiki file at is malformed")
+            );
+        }
+        assert_eq!(
+            historical_at("/api/wiki/file?at=a&at=0123456789abcdef0123456789abcdef01234567"),
+            Err("wiki file at is repeated")
+        );
     }
 }
