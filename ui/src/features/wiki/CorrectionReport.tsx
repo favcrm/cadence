@@ -25,8 +25,11 @@ export default function CorrectionReport({ question, answer }: { question: strin
     setDone(null);
   }), []);
   const cited = sharedCollectionCitations(answer);
+  // Nothing to correct without a cited shared-collection revision: a plain
+  // answer, a private path and a cross-collection citation all offer no action.
+  if ("error" in cited) return null;
   const submit = async () => {
-    if ("error" in cited || busy || expected.trim() === "" || reason.trim() === "") return;
+    if (busy || expected.trim() === "" || reason.trim() === "") return;
     setBusy(true);
     setError(null);
     try {
@@ -59,16 +62,14 @@ export default function CorrectionReport({ question, answer }: { question: strin
           <pre className="wk-report-text">{question || t("Unknown")}</pre>
           <p><span className="slabel">{t("Reported answer")}</span></p>
           <pre className="wk-report-text">{answer}</pre>
-          {"error" in cited ? <Note warn>{t(cited.error)}</Note> : (
-            <ul>{cited.citations.map((cite) => <li key={`${cite.path}@${cite.revision}`}>{cite.path} @ {cite.revision}{cite.section ? ` #${cite.section}` : ""}{cite.page ? ` page ${cite.page}` : ""}</li>)}</ul>
-          )}
+          <ul>{cited.citations.map((cite) => <li key={`${cite.path}@${cite.revision}`}>{cite.path} @ {cite.revision}{cite.section ? ` #${cite.section}` : ""}{cite.page ? ` page ${cite.page}` : ""}</li>)}</ul>
           <label htmlFor={expectedId}>{t("Expected answer")}</label>
           <textarea id={expectedId} className="field" required rows={3} value={expected} onChange={(event) => setExpected(event.target.value)} />
           <label htmlFor={reasonId}>{t("Member reason")}</label>
           <textarea id={reasonId} className="field" required rows={3} value={reason} onChange={(event) => setReason(event.target.value)} />
           {error && <p className="text-fail" role="alert">{error}</p>}
           <div className="wk-tools">
-            <Button type="submit" variant="primary" loading={busy} disabled={"error" in cited}>{t("Submit correction")}</Button>
+            <Button type="submit" variant="primary" loading={busy}>{t("Submit correction")}</Button>
             <Button type="button" disabled={busy} onClick={() => setOpen(false)}>{t("Cancel")}</Button>
           </div>
         </form>

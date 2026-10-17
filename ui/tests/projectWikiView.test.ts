@@ -226,10 +226,12 @@ async function run() {
   assert(Array.from(host.querySelectorAll("button")).some((button) => button.textContent?.trim() === "Files"), "global Wiki uses the same collapsible explorer");
   assert(Array.from(host.querySelectorAll("button")).find((button) => button.textContent === "Edit")?.disabled, "shared reader respects read-only access in Wiki");
 
-  const apiModule = require("../src/features/wiki/api");
-  const originalUpload = apiModule.uploadFile;
+  // The pane now drives the durable transfer import; the queue contract
+  // below is unchanged, so it is asserted at that seam.
+  const transferModule = require("../src/features/wiki/transfer");
+  const originalImport = transferModule.importFile;
   const uploads: string[] = [];
-  apiModule.uploadFile = async (_dir: string, file: File) => { uploads.push(file.name); };
+  transferModule.importFile = async (_dir: string, file: File) => { uploads.push(file.name); return { outcome: "applied", extraction: "indexed", index: "covered" }; };
   await React.act(async () => {
     renderWithNavigation(React.createElement(UploadPane, { dir: "projects/cadence", navHref: () => "/", readOnly: true, onToast: () => {}, onUploaded: () => {} }));
     await flush();
@@ -243,9 +245,10 @@ async function run() {
   assert(uploads.length === 0 && !host.querySelector(".wk-uprow"), "a read-only file drop neither queues nor starts an upload");
   const uploadProps = { dir: "projects/cadence", navHref: () => "/", readOnly: false, onToast: () => {}, onUploaded: () => {} };
   let releaseUpload: (() => void) | null = null;
-  apiModule.uploadFile = async (_dir: string, file: File) => {
+  transferModule.importFile = async (_dir: string, file: File) => {
     uploads.push(file.name);
     if (uploads.length === 1) await new Promise<void>((resolve) => { releaseUpload = resolve; });
+    return { outcome: "applied", extraction: "indexed", index: "covered" };
   };
   await React.act(() => renderWithNavigation(React.createElement(UploadPane, uploadProps)));
   const choose = Array.from(host.querySelectorAll("button")).find((button) => button.textContent === "Choose files");
@@ -270,7 +273,7 @@ async function run() {
   assert(uploads.join(",") === "one.md,two.md" && host.querySelectorAll(".wk-uprow.done").length === 2 && !clearUploads.disabled, "the queue resumes without losing either completed row");
   await React.act(() => clearUploads.click());
   assert(!host.querySelector(".wk-uprow"), "completed uploads can be cleared");
-  apiModule.uploadFile = originalUpload;
+  transferModule.importFile = originalImport;
 
   const folderErrors: string[] = [];
   const folderProps = { entries: [{ name: "README.md", path: pagePath, kind: "page" as const }], navHref: () => "/", readOnly: false, onRefresh: () => {}, onToast: () => {}, onFail: (error: unknown) => folderErrors.push(String(error)) };
