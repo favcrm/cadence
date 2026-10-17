@@ -272,6 +272,42 @@ class CleanupTests(unittest.TestCase):
                     self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
 
 
+    def test_public_artifacts_and_store_bindings_stay_pinned(self):
+        # CAD-1511: on a public repository every Actions artifact is
+        # downloadable by any GitHub account, and artifact bytes are never
+        # redacted. A staging upload must therefore not carry a shared temp dir
+        # whose writer it does not control, and a publisher that spends the
+        # release-store key must write the dedicated literals, never a
+        # repository variable.
+        staging = workflow("staging.yml")
+        uploads = [step for step in re.split(r"(?=^      - )", staging, flags=re.M)
+                   if "actions/upload-artifact@" in step]
+        self.assertGreaterEqual(len(uploads), 3, "staging.yml artifact uploads")
+        path_lines = 0
+        for step in uploads:
+            for line in step.splitlines():
+                if "runner.temp" not in line:
+                    continue
+                path_lines += 1
+                self.assertNotIn(
+                    "staging-e2e", line,
+                    "a staging artifact declares the retired journey's shared temp dir")
+        self.assertGreaterEqual(path_lines, len(uploads),
+                                "each artifact upload carries a path entry")
+
+        mirror = workflow("release-mirror.yml")
+        self.assertIn(
+            'RELEASES_ENDPOINT="https://87b59a40e130c425e35474687ad98a4f.r2.cloudflarestorage.com"',
+            mirror)
+        self.assertIn('--endpoint "$RELEASES_ENDPOINT"', mirror)
+        self.assertIn('--bucket "$RELEASES_BUCKET"', mirror)
+        self.assertNotIn("RELEASES_R2_PUBLIC_VISIBILITY", mirror)
+        # Asserted so that changing it is deliberate: the retry keeps the
+        # private record, and the production-gated release-visibility workflow
+        # owns the public flip.
+        self.assertIn("--visibility private", mirror)
+
+
 # The provider-refusal case uses a stub cargo only to keep metadata lookup
 # local; every runner behavior (selection, isolation, lock, and zero-test
 # refusal) is exercised by the independent real-nextest acceptance below.
