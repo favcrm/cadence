@@ -440,6 +440,16 @@ pub fn valid_artifact_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
+/// Artifact basenames the tracker itself writes. A caller upload can never
+/// write one of these: the module that owns the name writes the file
+/// directly, so a copy of a record onto another issue is not a record there.
+pub const RESERVED_ARTIFACT_NAMES: [&str; 1] = ["knowledge-correction.json"];
+
+/// True when `name` is an artifact the tracker owns rather than a caller's.
+pub fn reserved_artifact_name(name: &str) -> bool {
+    RESERVED_ARTIFACT_NAMES.contains(&name)
+}
+
 pub fn check_link_kind(kind: &str) -> Result<()> {
     if LINK_KINDS.contains(&kind) {
         Ok(())

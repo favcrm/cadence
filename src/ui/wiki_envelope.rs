@@ -382,7 +382,29 @@ fn read(
         }
         params["rev"] = json!(rev);
     }
-    match client::rpc(state_dir, "wiki_read", params) {
+    if let Some(at) = query("at") {
+        if at.is_empty() {
+            return refuse(
+                400,
+                "invalid_request",
+                "wiki file at must be a non-empty revision",
+            );
+        }
+        if params.get("rev").is_some() {
+            return refuse(
+                400,
+                "invalid_request",
+                "wiki file at is a historical selector and cannot combine with rev",
+            );
+        }
+        params["at"] = json!(at);
+    }
+    let method = if params.get("at").is_some() {
+        "wiki_read_revision"
+    } else {
+        "wiki_read"
+    };
+    match client::rpc(state_dir, method, params) {
         Ok(v) => bounded_range_json(v),
         Err(e) => write_err(&e),
     }

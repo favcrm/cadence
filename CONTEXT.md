@@ -27,3 +27,11 @@ Cadence coordinates people and agents doing work through apps and projects.
 **Hosted coordination**: Shared tickets, assignments, messages, knowledge and results maintained for a workspace. The location of this coordination does not determine where an agent executes.
 
 **Assignment**: A delegation of work to a workspace member and their chosen agent. An assignment can wait for a local agent; assignment alone does not prove execution or process termination.
+
+**Global Wiki**: The team's shared knowledge bucket. Authorized team members collaborate there; shared does not mean anonymously or internet-publicly accessible.
+
+**Published collection**: An owner-controlled selection of knowledge revisions with source, applicability and accountability metadata. Publishing does not grant access, and a later collaborative edit does not inherit an earlier revision's approval.
+
+**Knowledge correction**: A member's reported question, answer, cited revisions, expected answer and reason awaiting source-checked review. A report is not source authority.
+
+**Reviewed regression**: A correction accepted by an independent authorized reviewer and bound to the checked source revisions. Changed sources do not silently change the accepted case or make it current.

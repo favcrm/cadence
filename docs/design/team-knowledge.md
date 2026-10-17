@@ -75,6 +75,38 @@ reuses the existing issue mechanism:
 4. Shared-memory lessons (`cadence memory propose`) remain a separate reviewed
    workflow for dispatch guidance. They are not company-policy evidence.
 
+## Owner-published collections and pinned revisions (CAD-1470)
+
+`global/<collection>` and `projects/<project>/<collection>` are shared
+collections; the private `users/`, profile and memory views are not.
+
+- Collection metadata is a hidden `.knowledge/` sidecar inside the existing
+  tracker Git — no second store, index or registry — and the path grammar
+  never addresses it.
+- `GET /api/wiki/collection` returns the documents, their metadata and
+  `permissions`. Absent metadata is a `200` with null fields, not a `404`.
+- Publication is owner-only: a verified board session whose live role is
+  owner. Publisher/reviewer/review-project labels never grant authority, and
+  a member keeps ordinary shared edits and imports.
+- An approval names one Git commit plus the SHA-256 of that commit's source
+  bytes; a later edit keeps neither, even when the FNV token collides. `rev`
+  stays the live compare-and-swap token and `at` is the historical selector.
+- `GET /api/wiki/file?path=…&at=…` reads one historical original through Git
+  and the content-addressed blob store: text as page JSON, blobs as their
+  stored bytes (metadata-only JSON under `Accept: application/json`). An
+  unknown, ambiguous or out-of-window selector is unavailable; it is never
+  the latest revision. Transfer `export` takes the same explicit `at` and
+  echoes that selector with the verified whole-original `sha256`.
+- Corrections reuse the existing issue mechanism. Submit is a verified board
+  user reporting untrusted text; review is owner-only, requires an explicit
+  `source_checked`, must not be the submitter, and binds the cited revisions
+  and collection state. Once the source or metadata moves on, an accepted
+  record reports `current: false` and a re-accept is a `409`.
+
+Live hosted activation, tenant rollout and independent product acceptance of
+the hosted member experience remain held; this section describes the code
+contract only.
+
 ## Acceptance layers (kept separate)
 
 1. **Raw lexical tool probe.** `scripts/verify-pms-knowledge.py` measures
@@ -130,13 +162,18 @@ reuses the existing issue mechanism:
 - Production answering-agent evaluation and security fixtures: not run.
 - Live blue-pin: not used. Production daemon, PM and credentials: not touched.
 
-## Remaining product roadmap (not in this increment)
+## Remaining product roadmap
 
 - Independent review of the answers that the grader leaves ungraded.
 - Expanding gold beyond the frozen 30 as more originals are reviewed.
-- Correction intake through the existing issue mechanism, with acceptance
-  review.
-- Phase 2 collection/import UI and optional hybrid retrieval, each measured
-  against frozen cases. Not part of this ticket.
+- Optional hybrid retrieval, measured against frozen cases.
+- Live hosted activation and tenant rollout of the CAD-1470 collection,
+  import and correction surfaces, and independent product acceptance of the
+  hosted member experience. Both remain held.
 
 This increment does not claim that a shared-library or UI product ships.
+
+Implemented in CAD-1470 (code contract above, not a live rollout): owner
+publication of collection metadata and the approved revision, revision-bound
+citations with pinned-original downloads, browser import over the existing
+transfer job, and correction intake with owner source-checked review.
