@@ -407,9 +407,11 @@ fn dispatch(
             // The daemon accepts `text` and the optional idempotent `message`
             // id — any other argument key refuses before the projection can
             // create a binding. `message` is validated here (identifier
-            // grammar, never a `sys-` daemon id) so a malformed send is
-            // refused BEFORE the envelope's jti is spent and BEFORE any
-            // binding write — the same order as every other field check.
+            // grammar, never a `sys-` daemon id). The shared verb path
+            // (`run_member_verb`) spends the envelope's jti BEFORE calling
+            // `dispatch`, so a malformed send is refused before any binding
+            // write or effect but costs that jti — the same as every other
+            // field check on this path.
             if let Some(field) = args.as_object().and_then(|o| {
                 o.keys()
                     .find(|k| !["text", "message"].contains(&k.as_str()))

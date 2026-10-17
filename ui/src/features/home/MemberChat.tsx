@@ -61,7 +61,6 @@ export default function MemberChat({
   const [state, setState] = useState<{ ok: boolean; bootstrap?: string | null; conversation?: string | null } | null>(null);
   const [limit, setLimit] = useState(WINDOW);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
-  const [unseen, setUnseen] = useState(0);
   const [sendNote, setSendNote] = useState<string | null>(null);
   const follow = useRef<Follow>(initialFollow());
   const scrollRef = useRef<HTMLDivElement | null>(null);
@@ -122,7 +121,6 @@ export default function MemberChat({
   const engage = useCallback(() => {
     const next = onSend(follow.current);
     follow.current = next.state;
-    setUnseen(0);
     setGlide((n) => n + 1);
   }, []);
   useEffect(() => {
@@ -237,12 +235,6 @@ export default function MemberChat({
           {sendNote !== null && (
             <div className="text-micro text-ink-500 px-1 pb-1" role="status">{sendNote}</div>
           )}
-          {unseen > 0 && (
-            <button type="button" className="newpill num" onClick={() => { setUnseen(0); scrollPanel("jump"); }} data-jump-to-latest>
-              ↓ {unseen}
-            </button>
-          )}
-
           <div className="chatdock" data-chat-dock>
             <SharedComposer
               density="full"
