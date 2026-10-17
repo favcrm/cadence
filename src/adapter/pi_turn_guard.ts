@@ -31,18 +31,43 @@ const nonEmpty = messages => (Array.isArray(messages) ? messages : []).map(messa
 const MESSAGES_MAX = 100;
 const MESSAGES_KEEP = MESSAGES_MAX - 10;
 
-// Keep the leading system messages and the newest window, dropping whole
-// older messages. A window that would open on a tool result is advanced past
-// it, so a retained result never loses the assistant call that produced it.
-const windowed = messages => {
+// Keep the leading system messages, the objective and the current turn's
+// guidance, plus the newest window, dropping whole older messages. The window
+// never opens on a tool result: a retained result keeps the assistant call
+// that produced it, so the request carries whole call/result groups.
+const windowed = (messages, pinned = []) => {
   const list = Array.isArray(messages) ? messages : [];
   if (list.length <= MESSAGES_KEEP) return list;
   let head = 0;
   while (head < list.length && ["system", "developer"].includes(list[head]?.role)) head += 1;
-  let start = Math.max(list.length - Math.max(MESSAGES_KEEP - head, 0), head);
-  // The newest message is always kept: it opens the turn.
-  while (start < list.length - 1 && list[start]?.role === "toolResult") start += 1;
-  return [...list.slice(0, head), ...list.slice(start)];
+  // The objective is the message the session was started with: the master's
+  // bootstrap (its identity, and where its briefing lives) or a worker's task.
+  // It is authoritative, so it outlives the window instead of aging out of it
+  // and leaving the turn without the instruction it is answering.
+  const objective = list[head]?.role === "user" ? head : -1;
+  const keep = pinned.filter(message => !list.slice(0, head).includes(message));
+  const room = Math.max(MESSAGES_KEEP - head - (objective >= 0 ? 1 : 0) - keep.length, 1);
+  let start = Math.max(list.length - room, head);
+  if (list[start]?.role === "toolResult") {
+    // A window opening on a result would cut the call that produced it. Open
+    // on the next call instead; when the run reaches the newest message there
+    // is no next call, so take the run back with its call.
+    let next = start;
+    while (next < list.length && list[next]?.role === "toolResult") next += 1;
+    if (next < list.length) {
+      start = next;
+    } else {
+      while (start > head && list[start - 1]?.role === "toolResult") start -= 1;
+      if (start > head) start -= 1;
+    }
+  }
+  const window = list.slice(start);
+  return [
+    ...list.slice(0, head),
+    ...(objective >= 0 && objective < start ? [list[objective]] : []),
+    ...keep.filter(message => !window.includes(message)),
+    ...window,
+  ];
 };
 
 export default function install(pi) {
@@ -85,11 +110,17 @@ export default function install(pi) {
   // Cancellation may leave an accepted message unconsumed in the core queue
   // or history. The adapter clears the queue before dispatching a successor;
   // this projection also excludes old guidance from every later model input.
-  pi.on("context", event => ({
-    messages: windowed(nonEmpty(Array.isArray(event.messages) ? event.messages.filter(message =>
+  pi.on("context", event => {
+    const projected = nonEmpty(Array.isArray(event.messages) ? event.messages.filter(message =>
       message.role !== "custom" || message.customType !== "cadence-turn-guidance"
-      || (current !== null && message.details?.turn === current)) : [])),
-  }));
+      || (current !== null && message.details?.turn === current)) : []);
+    // The current turn's guidance is authoritative too: pin it, so a turn
+    // longer than the window cannot drop the constraints the operator set for
+    // work that is still running. Nothing stale is pinned — the filter above
+    // admits only this turn's guidance.
+    return { messages: windowed(projected, projected.filter(message =>
+      message.role === "custom" && message.customType === "cadence-turn-guidance")) };
+  });
 
   const receipt = (operation, request, turn, outcome, reason = null) => {
     pi.appendEntry("cadence-turn-input", {

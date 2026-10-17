@@ -48,6 +48,35 @@ install(pi);
 const project = messages => handlers.get("context").at(-1)({ messages }).messages;
 const user = value => ({ role: "user", content: [{ type: "text", text: value }] });
 const system = () => ({ role: "system", content: [{ type: "text", text: "system" }] });
+const round = (i, results) => [
+  { role: "assistant", content: [{ type: "text", text: `call ${i}` }] },
+  ...Array.from({ length: results }, (_, r) => ({
+    role: "toolResult", content: [{ type: "text", text: `r${i}.${r}` }],
+  })),
+];
+
+// The gateway's published request shape: at most 100 `messages` per request
+// (AgenticOS `packages/contracts/src/inference.ts`), and every tool result
+// carried with the assistant call that produced it. A request that breaks
+// either is refused the way the live gateway refuses it, so a request that is
+// merely shorter is not mistaken for an answered turn.
+const MAX = 100;
+const gateway = messages => {
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return { status: 400, message: 'Field "messages" must not be empty.' };
+  }
+  if (messages.length > MAX) {
+    return { status: 400, message: 'Field "messages" exceeds the published maximum.' };
+  }
+  let produced = false;
+  for (const [i, message] of messages.entries()) {
+    if (message?.role === "assistant") produced = true;
+    else if (message?.role === "toolResult") {
+      if (!produced) return { status: 400, message: `Field "messages.${i}" is a result whose call was dropped.` };
+    } else if (["user", "system", "developer"].includes(message?.role)) produced = false;
+  }
+  return { status: 200, answer: "(answered)" };
+};
 
 test("the guard registers a context hook", () => {
   assert.equal(typeof handlers.get("context")?.at(-1), "function");
@@ -81,6 +110,35 @@ test("the window never opens on an orphaned tool result", () => {
   assert.deepEqual(out.at(-1), messages.at(-1));
 });
 
+test("a thread past the failure point is answered, not refused", () => {
+  // CAD-1526 acceptance: drive a thread past the published maximum and assert
+  // an answer, not the 400 every later turn of that session returned.
+  const messages = [system(), user("the objective"), ...round(0, 1)];
+  for (let i = 1; i <= 60; i += 1) messages.push(...round(i, 1));
+  assert.equal(gateway(messages).status, 400, "the fixture must cross the published maximum");
+  assert.deepEqual(gateway(project(messages)), { status: 200, answer: "(answered)" });
+});
+
+test("a whole tool round keeps the assistant call that produced it", () => {
+  // One assistant message carrying a round of calls: the run of results
+  // reaches the newest message, whose call is the first message of the round.
+  const messages = [system(), user("the objective"), ...round(0, 95)];
+  assert.ok(messages.length > KEEP, "the fixture must exceed the kept window");
+  const out = project(messages);
+  assert.equal(out[2]?.role, "assistant", "the round keeps its call");
+  assert.ok(out.length <= MAX, `bounded to ${out.length}`);
+  assert.deepEqual(gateway(out), { status: 200, answer: "(answered)" });
+});
+
+test("the objective survives the window", () => {
+  const messages = [system(), user("the objective")];
+  for (let i = 0; i < 200; i += 1) messages.push(user(`turn ${i}`));
+  const out = project(messages);
+  assert.ok(out.length <= KEEP);
+  assert.equal(out[1]?.content[0]?.text, "the objective", "the instruction survives");
+  assert.deepEqual(out.at(-1), messages.at(-1));
+});
+
 test("a blank text block still becomes the stable placeholder", () => {
   const out = project([{ role: "user", content: [{ type: "text", text: "   " }] }]);
   assert.deepEqual(out[0].content, [{ type: "text", text: "(no output)" }]);
@@ -108,4 +166,13 @@ test("guidance filtering follows the runtime branch", async () => {
   const kept = out.filter(message => message.customType === "cadence-turn-guidance");
   assert.equal(kept.length, 1, "stale guidance is dropped");
   assert.equal(kept[0].details.turn, "t1", "the current turn's guidance survives");
+
+  // The current turn's guidance is pinned rather than left to the window: a
+  // turn with more messages than the window cannot drop the constraints set
+  // for work that is still running.
+  const long = [user("a"), guidance("t0"), guidance("t1")];
+  for (let i = 0; i < 120; i += 1) long.push(user(`turn ${i}`));
+  const pinned = project(long).filter(message => message.customType === "cadence-turn-guidance");
+  assert.equal(pinned.length, 1, "only the current turn's guidance is kept");
+  assert.equal(pinned[0].details.turn, "t1", "the current turn's guidance is pinned");
 });

@@ -6,7 +6,10 @@
 //! the published maximum`, and compaction cannot recover it because
 //! compaction is a size bound. The guard's context projection keeps the
 //! request under the maximum; this test drives a history past the failure
-//! point through the real guard source and asserts the projection, not a 400.
+//! point through the real guard source and asserts an answered request — the
+//! fixture refuses anything over the published maximum, or a tool result
+//! whose assistant call was dropped — rather than the 400 that ended every
+//! later turn of the session in the ticket's evidence.
 
 use std::path::PathBuf;
 use std::process::Command;
