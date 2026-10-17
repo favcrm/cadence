@@ -128,7 +128,9 @@ pub fn sync(home: &Path, force: bool, target: Option<&str>) -> Result<Value> {
 /// Write one bundle's `files` into `home` and repair its provider links.
 /// Non-force unless `force`: a file whose bytes already match is left
 /// untouched, so a second run writes nothing and keeps its timestamp.
-/// Returns that bundle's report and whether anything was written.
+/// Returns that bundle's report and whether any file was written — a
+/// repaired link alone is reported in `linked` and is not a file write,
+/// which is the rule `sync` has always had.
 fn write_bundle<'a, I>(
     home: &Path,
     root: &Path,
@@ -188,7 +190,7 @@ where
             .map_err(|e| Error::provider(format!("link {}: {e}", link.display())))?;
         linked.push(link);
     }
-    let wrote = !written.is_empty() || !linked.is_empty();
+    let wrote = !written.is_empty();
     Ok((
         json!({
             "name": name, "path": dir, "written": written,
