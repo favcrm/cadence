@@ -193,14 +193,11 @@ class CleanupTests(unittest.TestCase):
                        '[0-9]{1,3})/([0-9]{1,3}', '10#${BASH_REMATCH[1]}',
                        '[0-9]{1,2}$', '10#$jobs'):
             self.assertIn(needle, runner)
-        # CAD-1480: shards deliberately do NOT enable the fast linker —
-        # -fuse-ld is part of the cargo fingerprint and flipping it would
-        # cold-miss every shard on the existing gate-test cache.
-        self.assertNotIn("ci-fast-linker", shards)
+        # CAD-1487: shards link with mold/lld, and the warm test leg enables
+        # the identical flag — fingerprints must match or gate-test misses.
+        self.assertIn("ci-fast-linker enable", shards)
         warm = job(ci, "cache-warm")
-        # the warm linker leg is release-only; test-leg fingerprints stay default
-        self.assertIn("Enable fast linker (release leg; same flags as the gates)", warm)
-        self.assertNotIn("test and release legs", warm)
+        self.assertIn("test and release legs", warm)
         junit = (ROOT / "scripts/check-test-junit.py").read_text()
         for needle in ('no runnable tests', 'findall(".//testsuite")',
                        'failure', '--targets-file', 'skipped'):
