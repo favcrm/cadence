@@ -783,7 +783,12 @@ pub fn ls(pm: &Pm, caller: &Caller, path: &str) -> Result<Value> {
             // created. `global/` and `projects/` must do the same, or
             // an assistant copies the root listing, gets a tool error,
             // and cannot tell "nothing filed here" from a broken wiki.
-            if matches!(segs[..], ["global"] | ["projects"]) {
+            // `agents/<alias>` likewise always advertises `knowledge`,
+            // which may not exist in the vault yet.
+            if matches!(
+                segs[..],
+                ["global"] | ["projects"] | ["agents", _, "knowledge"]
+            ) {
                 return Ok(json!({"path": norm, "entries": []}));
             }
             Err(Error::rejected(format!(
@@ -2111,6 +2116,42 @@ mod tests {
         assert!(
             missing.to_string().contains("no such directory"),
             "{missing}"
+        );
+
+        std::fs::create_dir_all(pm.dir.join("agents/master")).unwrap();
+        let layout: Vec<_> = ls(&pm, &Caller::Operator, "agents/master").unwrap()["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(layout.iter().any(|n| n == "knowledge"), "{layout:?}");
+        for path in ["agents/master/knowledge", "agents/master/knowledge/"] {
+            let got = ls(&pm, &Caller::Operator, path).unwrap_or_else(|e| panic!("{path}: {e}"));
+            assert_eq!(got["path"], "agents/master/knowledge", "{path}: {got}");
+            assert!(
+                got["entries"].as_array().unwrap().is_empty(),
+                "{path}: {got}"
+            );
+        }
+        let missing_knowledge =
+            ls(&pm, &Caller::Operator, "agents/master/knowledge/missing").unwrap_err();
+        assert!(
+            missing_knowledge.to_string().contains("no such directory"),
+            "{missing_knowledge}"
+        );
+        std::fs::create_dir_all(vault.join("agents/master/knowledge")).unwrap();
+        std::fs::write(vault.join("agents/master/knowledge/notes.md"), b"hello\n").unwrap();
+        let filed = ls(&pm, &Caller::Operator, "agents/master/knowledge/").unwrap();
+        let filed_names: Vec<_> = filed["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            filed_names.iter().any(|n| n == "notes.md"),
+            "{filed_names:?}"
         );
 
         std::fs::create_dir_all(vault.join("global")).unwrap();
