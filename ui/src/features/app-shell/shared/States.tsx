@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { SESSION_EXPIRED_TEXT } from "./hostErrors";
-import { useTranslate } from "../../../lib/locale";
+import { useTranslate } from "../../../lib/localeText";
 
 /**
  * Shared record/form state blocks (CAD-866): the loading, error,

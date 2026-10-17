@@ -20,10 +20,68 @@ pub fn provider_identifier(value: &str, what: &str) -> Result<String> {
     }
 }
 
+/// A hosted-board account is a bare DNS hostname plus an optional
+/// `:port` — the same `host` field `board_identity::Config::host`
+/// carries and `member_authority_live` trims (`trim_end_matches('/')`).
+/// Lowercase ASCII labels only (`a-z`, `0-9`, `-`, `.` separators),
+/// `localhost` allowed, an optional nonzero u16 port, total ≤255 bytes.
+/// No scheme, userinfo, slash, query, fragment, whitespace, traversal
+/// or empty label is admitted — the account names a host, never a URL.
+fn hosted_board_host_account(value: &str) -> Result<String> {
+    let refuse = || {
+        Error::rejected(
+            "hosted-board account must be a DNS hostname with an optional :port \
+             (lowercase ASCII labels, no scheme, path, userinfo, query or fragment)",
+        )
+    };
+    if value.is_empty()
+        || value.len() > 255
+        || !value.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'.' | b':')
+        })
+    {
+        return Err(refuse());
+    }
+    let (host, port) = match value.split_once(':') {
+        Some((h, p)) => {
+            let port: u16 = p.parse().map_err(|_| refuse())?;
+            if port == 0 || p.len() > 5 || !p.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(refuse());
+            }
+            (h, Some(port))
+        }
+        None => (value, None),
+    };
+    // A second colon (IPv6 or junk) was already refused by the byte
+    // grammar; the host itself must be nonempty dotted labels.
+    if host.is_empty() {
+        return Err(refuse());
+    }
+    for label in host.split('.') {
+        if label.is_empty() || label.len() > 63 || label.starts_with('-') || label.ends_with('-') {
+            return Err(refuse());
+        }
+    }
+    let _ = port;
+    Ok(value.to_string())
+}
+
 /// AgenticOS workspace records are minted as `ws_<UUID>`. The generic
 /// issuer ID schema is broader, but this connection account is a workspace,
 /// not an arbitrary hosted actor ID.
+///
+/// CAD-1420: `hosted-board` is the one platform whose `account` is a
+/// board HOST, not an operator-chosen handle — the daemon's enrolled
+/// `hosted-board` revalidation custody (`assist.revalidate`). The
+/// generic `proto::identifier` grammar (`[a-z0-9-]`, ≤64) cannot spell
+/// a DNS name with dots or a `localhost:port`, so `hosted-board` gets
+/// its own narrow account parser shared by store re-validation and the
+/// daemon's enroll/rotate/revoke path; every other platform keeps the
+/// generic grammar unchanged.
 pub fn provider_account_identifier(provider: &str, value: &str) -> Result<String> {
+    if provider == "hosted-board" {
+        return hosted_board_host_account(value);
+    }
     if provider != crate::platform::agenticos_external::PLATFORM {
         return crate::proto::identifier(value, "Account");
     }

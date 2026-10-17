@@ -107,7 +107,8 @@ pub enum MemoryAction {
         #[arg(long)]
         project: Option<String>,
     },
-    /// List memories — a compact table on a TTY, `--json` for agents.
+    /// List memories — a compact table on a TTY, JSON when piped or
+    /// `--json` is set.
     /// Value flags repeat and comma-join and match ANY of their values;
     /// different flags AND.
     #[command(after_long_help = crate::filter::GRAMMAR)]
@@ -352,7 +353,8 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
             json: as_json,
         } => {
             let pm = open_pm()?;
-            crate::filter::fields_need_json(fields, *as_json)?;
+            let as_json = crate::output::json_selected(*as_json);
+            crate::filter::fields_need_json(fields, as_json)?;
             crate::filter::check_set("status", status, memory::STATUSES)?;
             crate::filter::check_set("type", kind, memory::TYPES)?;
             if *stale {
@@ -384,7 +386,7 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
                     )?;
                 }
                 crate::filter::apply_limit(&mut hits, *limit);
-                if *as_json {
+                if as_json {
                     crate::filter::apply_fields(&mut hits, fields)?;
                     crate::issue::cli::print_json(&json!({"stale": hits, "load_errors": errors}));
                 } else if hits.is_empty() {
@@ -480,7 +482,7 @@ pub fn run(action: &MemoryAction, state_dir: &std::path::Path) -> Result<i32> {
                 )?;
             }
             crate::filter::apply_limit(&mut rows, *limit);
-            if *as_json {
+            if as_json {
                 crate::filter::apply_fields(&mut rows, fields)?;
                 crate::issue::cli::print_json(&json!({
                     "memories": rows,

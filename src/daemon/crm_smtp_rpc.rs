@@ -25,6 +25,7 @@
 //! over mandatory authenticated TLS, and a receipt recording SMTP
 //! acceptance/refusal only — never delivery, never reads. No bulk
 //! path exists in this ticket.
+use super::app_screen_services_rpc::ScreenServiceProof;
 use super::*;
 use crate::issue::app_catalog::workspace;
 use crate::store::app_records::{email_shape_valid, RecordStore};
@@ -141,6 +142,23 @@ impl Shared {
         action()
     }
 
+    /// Screen calls execute under one runtime/custody/release/mount fence;
+    /// native callers retain their existing scope and custody acquisition.
+    pub(super) fn crm_smtp_scope_with_proof<R>(
+        self: &Arc<Self>,
+        install: &str,
+        context: &str,
+        proof: Option<&ScreenServiceProof>,
+        action: impl FnOnce() -> Result<R>,
+    ) -> Result<R> {
+        if proof.is_some() {
+            crate::proto::identifier(install, "installation ID")?;
+            self.screen_service_scope(install, context, true, proof, action)
+        } else {
+            self.crm_smtp_scope(install, context, action)
+        }
+    }
+
     /// The live verified connection behind one link: enrolled SMTP
     /// custody, reviewed registration matched, authorization revision
     /// exactly the link's. Anything else — missing, revoked,
@@ -221,7 +239,7 @@ impl Shared {
     /// The authorization revision a bind or rebind pins: the hosted
     /// platform sender has none to rotate; an SMTP sender pins its
     /// custody record's.
-    fn crm_sender_revision(&self, connection: &str) -> Result<i64> {
+    pub(super) fn crm_sender_revision(&self, connection: &str) -> Result<i64> {
         if self.hosted_sender(connection)?.is_some() {
             return Ok(crate::platform::hosted_email::AUTH_REVISION);
         }
@@ -244,6 +262,17 @@ impl Shared {
         params: &Value,
         peer_pid: u32,
     ) -> Result<Value> {
+        self.rpc_crm_smtp_with_proof(method, params, peer_pid, None)
+    }
+
+    pub(super) fn rpc_crm_smtp_with_proof(
+        self: &Arc<Self>,
+        method: &str,
+        params: &Value,
+        peer_pid: u32,
+        proof: Option<&ScreenServiceProof>,
+    ) -> Result<Value> {
+        Self::screen_service_method(proof, method)?;
         self.operator_connection("CRM SMTP sender management", params, peer_pid)?;
         // Receipt-shaped fields are refused everywhere: no assistant
         // attribution exists on this path, so any present receipt is
@@ -291,11 +320,11 @@ impl Shared {
             "crm_smtp_bind" => {
                 let connection = required_str(params, "connection_id")?;
                 let request = request_id(params)?;
-                self.crm_smtp_scope(install, context, || {
-                    let _custody = self
+                self.crm_smtp_scope_with_proof(install, context, proof, || {
+                    let _custody = proof.is_none().then(|| self
                         .platform_custody_lock
                         .lock()
-                        .unwrap_or_else(|e| e.into_inner());
+                        .unwrap_or_else(|e| e.into_inner()));
                     let revision = self.crm_sender_revision(connection)?;
                     // Bind through the same reviewed-registration and
                     // custody gate the send path enforces, so a bind
@@ -314,11 +343,11 @@ impl Shared {
             "crm_smtp_rebind" => {
                 let connection = required_str(params, "connection_id")?;
                 let expected = link_revision(params)?;
-                self.crm_smtp_scope(install, context, || {
-                    let _custody = self
+                self.crm_smtp_scope_with_proof(install, context, proof, || {
+                    let _custody = proof.is_none().then(|| self
                         .platform_custody_lock
                         .lock()
-                        .unwrap_or_else(|e| e.into_inner());
+                        .unwrap_or_else(|e| e.into_inner()));
                     let revision = self.crm_sender_revision(connection)?;
                     let (_, projection) = self.crm_smtp_authority(connection, revision)?;
                     self.store.crm_smtp_rebind(
@@ -333,29 +362,31 @@ impl Shared {
             }
             "crm_smtp_revoke" => {
                 let expected = link_revision(params)?;
-                self.crm_smtp_scope(install, context, || {
-                    let _custody = self
+                self.crm_smtp_scope_with_proof(install, context, proof, || {
+                    let _custody = proof.is_none().then(|| self
                         .platform_custody_lock
                         .lock()
-                        .unwrap_or_else(|e| e.into_inner());
+                        .unwrap_or_else(|e| e.into_inner()));
                     self.store.crm_smtp_revoke(install, context, expected)
                 })
             }
-            "crm_smtp_show" => self.crm_smtp_scope(install, context, || {
-                let _custody = self
+            "crm_smtp_show" => self.crm_smtp_scope_with_proof(install, context, proof, || {
+                let _custody = proof.is_none().then(|| self
                     .platform_custody_lock
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                    .unwrap_or_else(|e| e.into_inner()));
                 let link = self
                     .store
                     .crm_smtp_link(install, context)?
                     .ok_or_else(|| {
-                        Error::rejected(
+                        Error::invalid(
+                            "smtp_sender_unbound",
                             "no SMTP sender is bound to this installation and context",
                         )
                     })?;
                 if link.state != "live" {
-                    return Err(Error::rejected(
+                    return Err(Error::invalid(
+                        "smtp_sender_revoked",
                         "SMTP sender binding is revoked; bind it again instead",
                     ));
                 }
@@ -412,7 +443,7 @@ impl Shared {
                 crate::proto::identifier(campaign, "campaign ID")?;
                 let to = required_str(params, "to_email")?;
                 test_recipient(to)?;
-                self.crm_smtp_scope(install, context, || {
+                self.crm_smtp_scope_with_proof(install, context, proof, || {
                     // Frozen bytes first: the exact current revision
                     // through the CAD-782 renderer. Reads observe the
                     // live context proof above; an unknown campaign
@@ -434,10 +465,10 @@ impl Shared {
                     // Authority, custody bytes and the submission hold
                     // one lock: a concurrent rotate, revoke or rebind
                     // cannot interleave this send.
-                    let _custody = self
+                    let _custody = proof.is_none().then(|| self
                         .platform_custody_lock
                         .lock()
-                        .unwrap_or_else(|e| e.into_inner());
+                        .unwrap_or_else(|e| e.into_inner()));
                     let live = self
                         .store
                         .crm_smtp_link(install, context)?

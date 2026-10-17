@@ -216,11 +216,14 @@ async function mountedFlow() {
 
   const React = require("react") as typeof import("react");
   const { createRoot } = require("react-dom/client") as typeof import("react-dom/client");
+  const { NavigationProvider } = require("../screen-ui/src/navigation") as typeof import("../screen-ui/src/navigation");
+  const { hostNavigation } = require("../src/ui/hostNavigation") as typeof import("../src/ui/hostNavigation");
   const { LocaleProvider } = require("../src/lib/locale") as typeof import("../src/lib/locale");
   const AppShellComponent = (require("../src/features/app-shell/AppShell") as typeof import(
     "../src/features/app-shell/AppShell"
   )).default;
-  const AppShell = (props: React.ComponentProps<typeof AppShellComponent>) => React.createElement(LocaleProvider, null, React.createElement(AppShellComponent, props));
+  const AppShell = (props: React.ComponentProps<typeof AppShellComponent>) => React.createElement(LocaleProvider, null,
+      React.createElement(NavigationProvider, { adapter: hostNavigation, children: React.createElement(AppShellComponent, props) }));
   const { sendTerminal, DELIVERY_CLAIM } = require("../src/features/app-shell/sendClient") as typeof import(
     "../src/features/app-shell/sendClient"
   );

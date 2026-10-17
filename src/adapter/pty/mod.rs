@@ -2245,6 +2245,7 @@ mod tests {
     fn normalize_and_tail_helpers() {
         assert_eq!(normalize_screen("a b\n  c"), "abc");
         assert_eq!(tail_chars("abcdef", 3), "def");
+        // n past the end saturates to the whole input.
         assert_eq!(tail_chars("ab", 9), "ab");
         // A wrapped body still matches its own tail slice.
         let body = "alpha beta gamma delta omega";

@@ -282,6 +282,13 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         ),
     ),
     (
+        "message_list",
+        Rule::Handler(
+            "rpc_message_list: an agent lists only its own alias; an unproven \
+             caller is refused because listing enumerates ids",
+        ),
+    ),
+    (
         "message_report",
         Rule::Handler(
             "rpc_message_report: an explicit id+token reports by bearer possession, \
@@ -308,6 +315,15 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     // `member_as` to a stored assistant row on a proven operator/board
     // connection only (members_rpc::member_caller); a request field, an
     // agent connection or an unproven one never mints a member identity.
+    // CAD-1420: the dedicated platform-projection verb the assist relay
+    // calls before state/history/send. Same channel as the member plane —
+    // a proven operator/board connection plus a re-verified signed
+    // envelope (`proven_operator` inside the handler); an agent or
+    // unproven connection never projects a binding.
+    (
+        "platform_assistant_provision",
+        Rule::Handler("proven_operator + re-verified member envelope (CAD-1420)"),
+    ),
     ("member_assist_state", Rule::Handler("member_caller: member_as on a proven board relay only")),
     ("member_assist_history", Rule::Handler("member_caller: member_as on a proven board relay only")),
     ("member_assist_send", Rule::Handler("member_caller: member_as on a proven board relay only")),
@@ -571,6 +587,9 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     ("app_assistant_permissions", Rule::Handler("operator_connection (CAD-1184)")),
     ("app_assistant_permission_revoke", Rule::Handler("operator_connection (CAD-1184)")),
     ("app_assistant_permission_block", Rule::Handler("operator_connection (CAD-1184)")),
+    ("app_screen_service_call", Rule::Handler("operator_connection + live scoped screen capability + governed native handler (CAD-811)")),
+    ("app_screen_service_slot_prepare", Rule::Handler("operator_connection + live scoped screen capability + native confirmation custody (CAD-811)")),
+    ("app_screen_service_slot_confirm", Rule::Handler("operator_connection + live scoped screen capability + bound native confirmation (CAD-811)")),
     ("app_screen_mint", Rule::Handler("operator_connection (CAD-1006)")),
     ("app_media_read", Rule::Handler("operator_connection + consumed live mount + declared media.read (CAD-1365)")),
     ("app_media_publish", Rule::Handler("operator_connection + consumed live mount + declared media.publish (CAD-1365)")),
@@ -1223,6 +1242,10 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
     (
         "wiki_put_blob",
         Rule::Handler("wiki_caller: agent_caller + wiki_as (CAD-580)"),
+    ),
+    (
+        "wiki_transfer",
+        Rule::Handler("wiki_caller + transfer owner/target/authority binding (CAD-914)"),
     ),
     (
         "wiki_mkdir",

@@ -1,23 +1,18 @@
-//! CAD-1429 Publish Web: independent CLI refusal acceptance (driver skeleton).
+//! CAD-1429 Publish Web: independent CLI refusal acceptance.
 //!
-//! Independent acceptance author, not the source implementer.
+//! Proves the local logged-out gate: every `cadence web` action refuses
+//! before any request is built, with no auth material on disk. Needs no
+//! network and no credential.
 //!
-//! Status: SKELETON. The remote-scope cases are authored but are NOT executed
-//! here. They depend on the library-test TLS hook (`WebIssuerTls`, the exact
-//! virtual issuer plus loopback socket and explicit CA) and on the stable
-//! `cli/web.rs` / `web_cli_test_harness` module graph. Until the parent freezes
-//! those, this file records what it needs and proves only the local
-//! logged-out gate, which needs no network and no credential.
+//! Remote-scope cases (live device grant, TLS hook) are planned on
+//! CAD-1429 and depend on the library-test `WebIssuerTls` seam — when they
+//! land they belong beside this file.
 //!
 //! Binding boundary (stated plainly): this file compiles only into the
 //! library unit-test path, where `cfg!(test)` admits the loopback issuer pin.
 //! It is NOT evidence about the production `cadence` binary, which rejects
 //! loopback http and trusts only webpki roots. Production binary TLS is not
 //! proved here.
-//!
-//! No credential is fabricated: no `cli-<org>.json`, no `web-<org>.json`, no
-//! hand-written `hct_`. The only remote grant a remote-scope case may use is one
-//! minted through the real device flow, which this skeleton does not perform.
 #![cfg(all(unix, feature = "test-seam"))]
 
 use std::path::{Path, PathBuf};
@@ -110,30 +105,3 @@ fn logged_out_every_web_action_refuses_with_no_auth_material() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
-
-// --- Remote-scope cases: AUTHORED, NOT EXECUTED (blocked on dependencies) ---
-//
-// These require, in order:
-//   1. the library-test `WebIssuerTls` hook (exact virtual issuer, loopback
-//      socket, explicit CA; wrong name and wrong CA must fail; other hosts
-//      unmapped; production guards untouched) - source-owned, not yet landed;
-//   2. a real device grant against the NodeHTTPS bridge in
-//      `apps/api/src/web-sites/integration.acceptance.test.ts`, minted via
-//      device/code, owner device/approve and device/token - no row inserts;
-//   3. a pinned `trusted-issuer` file (mode 600) under the disposable
-//      `--auth-dir`, the legitimate bootstrap trust file.
-//
-// Cases to enable once those land (exit codes asserted, envelopes read from
-// packages/contracts/src/web-sites.ts, never copied):
-//   a. web.read-only login refuses prepare, publish, rollback, unpublish before
-//      any upload request, with the --web re-consent message;
-//   b. web.prepare login uploads and requests a publish action; publish does
-//      not reach the owner approval path (no live URL printed);
-//   c. missing selected workspace or issuer mismatch fails closed;
-//   d. cross-workspace release id refused; changed digest or revision refused
-//      with no fresh request key;
-//   e. interrupted send reconciles the same durable key; timeout is pending,
-//      not success;
-//   f. symlink, traversal, dotfile, source map, node_modules and over-limit
-//      artifacts refused locally with no upload request;
-//   g. a source-only React project is refused with build-first guidance.

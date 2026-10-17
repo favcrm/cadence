@@ -20,11 +20,17 @@ your pane environment has `CADENCE_ALIAS` and `CADENCE_STATE_DIR` set.
 - Fleet: `status`, `doctor`
 - Knowledge: `memory`, `wiki`
 
+Find a command without loading the tree: `cadence commands "comment issue"`
+returns JSON, at most five public paths. `cadence commands` lists the core
+verbs. `cadence schema issue comment` is that one command's flags and
+positionals, including how a body is passed on stdin (`--file -`).
+`cadence schema agent wait` is how to wait instead of polling. Search
+describes a command; it does not authorize it. Listers answer to both
+`ls` and `list`; `send` takes the recipient positionally or as `--to <alias>`.
+
 Everything else stays callable: `cadence help operator` lists the operator
 and advanced verbs, `cadence help all` lists every verb with its
-subcommands, and `cadence help <verb>` is one verb's own help. Listers
-answer to both `ls` and `list`; `send` takes the recipient positionally or
-as `--to <alias>`.
+subcommands, and `cadence help <verb>` is one verb's own help.
 
 `issue` is the one public unit of work. A plan is an epic in the
 `proposed` stage; the operator approves it before its tickets dispatch.
@@ -102,7 +108,10 @@ so do not report on them — they carry no `turn_id` for you.
 ## Listing things
 
 Every `ls`/`list` command shares one filter grammar — filter instead of
-grepping, and pass `--json` when consuming the output:
+grepping. Pass `--json` for commands that still print a table into a
+pipe (`agent list`, `job list`, `plan ls`, `delivery ls`, `report ls`).
+`issue ls`, `issue epic ls|show`, `milestone ls|show`, `memory ls`,
+`status`, `overview`, and `build-slot status` print JSON when piped:
 
 ```bash
 cadence issue ls --status doing,review --owner <you> --json
@@ -111,6 +120,9 @@ cadence agent list --state idle,busy --json
 cadence job list --state open --json
 cadence delivery ls --open --json
 cadence plan ls --state proposed --json
+cadence message ls --to <alias> --state queued,running
+                      # ids and state only — no body, no turn token.
+                      # `message read <id>` fetches the text.
 cadence report ls --kind question --open --json
 cadence memory ls --type gotcha --project <key> --json
 cadence issue epic ls --health at_risk --json
@@ -122,13 +134,14 @@ cadence milestone ls --json
   flags AND. An unknown value is an error naming the valid set.
 - `--sort KEY` orders (`-KEY` descending), `--limit N` caps, `--fields a,b`
   keeps only those JSON row keys, `--since/--until` take `24h`/`7d`, an ISO
-  date, or an epoch.
+  date, or an epoch. `--fields` and `issue ls --summary` do not need a
+  separate `--json` when stdout is already JSON. On a terminal table,
+  pass `--json`.
 - Output policy: JSON on stdout is one compact line per document when
   stdout is not a terminal (your case), pretty on a TTY.
-  `CADENCE_JSON=pretty|compact` overrides. `issue ls`, `issue epic
-  ls|show` and `milestone ls|show` print JSON when piped, a table only
-  on a TTY (`CADENCE_JSON=table` forces the table). Field names and
-  order never change.
+  `CADENCE_JSON=pretty|compact|table` overrides (`table` forces the
+  table). Any other value warns once on stderr and is ignored.
+  Field names and order never change.
 - `issue ls --tag` is the one exception: every named tag must be present.
 - `agent list` from your pane still shows only your group — filters narrow
   it, `--all` widens past it.

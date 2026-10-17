@@ -667,9 +667,10 @@ impl Shared {
     /// grant re-check → custody load → `executing` → the platform call
     /// under the `effect_id` idempotency key and expected hash →
     /// adapter read-back → the recorded outcome → the delivered
-    /// message. A source change, a lost grant or a credential that no
-    /// longer loads closes the row instead of firing; a platform error
-    /// lands `failed`, never `closed`.
+    /// message. A source change, a lost grant or a missing enrollment
+    /// closes the row instead of firing. A custody fingerprint mismatch
+    /// stays that error and does not borrow another workspace. A
+    /// platform error lands `failed`, never `closed`.
     fn execute_effect(&self, row: &EffectRow) -> Result<EffectRow> {
         if self.store.app_effect_is_child(&row.effect_id)? {
             return Err(Error::rejected(
@@ -726,8 +727,8 @@ impl Shared {
             &row.platform,
             &row.account,
         ) {
-            Ok(b) => b,
-            Err(_) => {
+            Ok(bytes) => bytes,
+            Err(err) if platform::credential_enrollment_missing(&err) => {
                 let row = self
                     .store
                     .effect_close_decided(&row.effect_id, "credential_revoked")?
@@ -737,6 +738,7 @@ impl Shared {
                 self.wake();
                 return Ok(row);
             }
+            Err(err) => return Err(err),
         };
         self.store.effect_executing(&row.effect_id)?;
         let outcome = adapter.execute(

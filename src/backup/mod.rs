@@ -114,6 +114,9 @@ mod portable_acceptance;
 mod cad1365_media_catalog_acceptance;
 
 #[cfg(test)]
+mod cad914_transfer_catalog_acceptance;
+
+#[cfg(test)]
 mod portable_selftest;
 
 #[cfg(test)]

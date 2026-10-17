@@ -59,6 +59,8 @@ impl Drop for EnvRestore {
     }
 }
 
+static FIXTURE_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 struct Fx {
     root: TempDir,
     _env: EnvRestore,
@@ -70,10 +72,12 @@ struct Fx {
     board: Option<std::thread::JoinHandle<()>>,
     port: u16,
     jwks: Option<(Arc<tiny_http::Server>, std::thread::JoinHandle<()>)>,
+    _serial: std::sync::MutexGuard<'static, ()>,
 }
 
 impl Fx {
-    fn new() -> Self {
+    fn new(start_master: bool) -> Self {
+        let serial = FIXTURE_ENV.lock().unwrap_or_else(|e| e.into_inner());
         let root = Builder::new()
             .prefix("c1374iw-")
             .tempdir_in("/tmp")
@@ -223,14 +227,16 @@ impl Fx {
             );
             std::thread::sleep(Duration::from_millis(50));
         }
-        scoped(Asserted::Operator, || {
-            client::rpc(
-                &state,
-                "master_start",
-                json!({"provider":"pi","unconfined":true}),
-            )
-        })
-        .unwrap();
+        if start_master {
+            scoped(Asserted::Operator, || {
+                client::rpc(
+                    &state,
+                    "master_start",
+                    json!({"provider":"pi","unconfined":true}),
+                )
+            })
+            .unwrap();
+        }
         let (tx, rx) = std::sync::mpsc::channel();
         let board_stop = Arc::new(AtomicBool::new(false));
         let board_opts = cadence_agent::ui::ServeOpts {
@@ -265,6 +271,7 @@ impl Fx {
             board: Some(board),
             port,
             jwks: Some((jwks_server, jwks_thread)),
+            _serial: serial,
         }
     }
 
@@ -316,7 +323,10 @@ impl Fx {
         )
     }
     fn login(&self, sub: &str, role: &str) -> Session {
-        let assertion = self.assertion(sub, role, &format!("jti-{sub}"));
+        self.login_with_jti(sub, role, &format!("jti-{sub}"))
+    }
+    fn login_with_jti(&self, sub: &str, role: &str, jti: &str) -> Session {
+        let assertion = self.assertion(sub, role, jti);
         let (status, response) = self.http(
             "POST",
             "/__platform/session",
@@ -345,6 +355,23 @@ impl Fx {
         );
         assert_eq!(status, 200, "owner activity query: {response}");
         serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap()
+    }
+    fn transfer(&self, cookie: &str, writing: bool, path: &str, transfer: Value) -> (u16, Value) {
+        let (status, response) = self.http(
+            if writing { "PUT" } else { "POST" },
+            if writing {
+                "/api/wiki/transfer"
+            } else {
+                "/api/wiki/job_status"
+            },
+            Some(cookie),
+            &json!({"path": path, "transfer": transfer}).to_string(),
+        );
+        let body = response.split_once("\r\n\r\n").unwrap().1;
+        (
+            status,
+            serde_json::from_str(body).expect("transfer JSON response"),
+        )
     }
 }
 
@@ -444,7 +471,7 @@ fn assert_commit_receipt(fx: &Fx, revision: &str, sub: &str, path: &str, action:
 
 #[test]
 fn issue_and_wiki_http_mutations_have_prepared_intent_and_same_commit_receipts() {
-    let fx = Fx::new();
+    let fx = Fx::new(true);
     let owner_a = fx.login("user-owner-a", "owner");
     let owner_b = fx.login("user-owner-b", "owner");
     let member = fx.login("user-member", "member");
@@ -594,8 +621,8 @@ fn issue_and_wiki_http_mutations_have_prepared_intent_and_same_commit_receipts()
         "existing member comment permission regressed: {member_response}"
     );
 
-    // A verified member may write only its own wiki prefix. The named claim
-    // must equal the live signed handle; no operator/agent may be substituted.
+    // A verified member may write shared wiki and its own private prefix.
+    // The named claim must still equal the live signed handle.
     let (status, response) = fx.http(
         "PUT",
         "/api/wiki/file",
@@ -624,12 +651,29 @@ fn issue_and_wiki_http_mutations_have_prepared_intent_and_same_commit_receipts()
         "member proof wrote as another live handle: {wrong_reply}"
     );
     let (shared_write, shared_reply) = fx.http("PUT", "/api/wiki/file", Some(&member), &json!({
-        "path":"global/member-must-not-write.md", "text":"must not land", "wiki_as":"user:user-member"
+        "path":"global/cad1374-member.md", "text":"shared-wiki-canary", "wiki_as":"user:user-member"
+    }).to_string());
+    assert_eq!(
+        shared_write, 200,
+        "signed member shared wiki write: {shared_reply}"
+    );
+    let shared_head = git(&fx.pm(), &["rev-parse", "HEAD"]);
+    assert_ne!(
+        shared_head, wiki_head,
+        "member shared wiki write did not commit"
+    );
+    let (private_denied, private_reply) = fx.http("PUT", "/api/wiki/file", Some(&member), &json!({
+        "path":"users/user-owner-a/cross-member.md", "text":"must not land", "wiki_as":"user:user-member"
     }).to_string());
     assert_ne!(
-        shared_write, 200,
-        "member bypassed existing global wiki ACL: {shared_reply}"
+        private_denied, 200,
+        "member wrote another user's private prefix: {private_reply}"
     );
+    assert_eq!(git(&fx.pm(), &["rev-parse", "HEAD"]), shared_head);
+    assert!(!fx
+        .pm()
+        .join("wiki/users/user-owner-a/cross-member.md")
+        .exists());
 
     // Verify durable prepared intents through the daemon store and their
     // fail-closed ordering at the real issue and wiki HTTP guards.
@@ -650,6 +694,12 @@ fn issue_and_wiki_http_mutations_have_prepared_intent_and_same_commit_receipts()
         .as_str()
         .unwrap_or_default()
         .contains("users/user-member/cad1374.md")));
+    assert!(events
+        .iter()
+        .any(|event| event["human"]["sub"] == "user-member"
+            && event["resource"]
+                .as_str()
+                .is_some_and(|path| path.contains("global/cad1374-member.md"))));
     for (action, sub) in [
         ("issue_updated", "user-owner-a"),
         ("issue_comment_added", "user-owner-b"),
@@ -678,6 +728,7 @@ fn issue_and_wiki_http_mutations_have_prepared_intent_and_same_commit_receipts()
         assert!(
             !event.to_string().contains("private-issue-canary")
                 && !event.to_string().contains("private-wiki-canary")
+                && !event.to_string().contains("shared-wiki-canary")
         );
     }
     assert_commit_receipt(
@@ -699,6 +750,13 @@ fn issue_and_wiki_http_mutations_have_prepared_intent_and_same_commit_receipts()
         &wiki_head,
         "user-member",
         "wiki/users/user-member/cad1374.md",
+        "wiki_",
+    );
+    assert_commit_receipt(
+        &fx,
+        &shared_head,
+        "user-member",
+        "wiki/global/cad1374-member.md",
         "wiki_",
     );
 
@@ -922,4 +980,160 @@ fn issue_and_wiki_http_mutations_have_prepared_intent_and_same_commit_receipts()
         agent.is_err(),
         "managed agent became a human mutation caller using a valid hosted proof"
     );
+}
+
+#[test]
+fn cad914_public_session_transfer_has_subject_custody_and_canonical_receipts() {
+    use sha2::Digest;
+    let fx = Fx::new(false);
+    let sub = "transfer-owner-a";
+    let owner_a = fx.login(sub, "owner");
+    let owner_b = fx.login("transfer-owner-b", "owner");
+    let root = "global/public-transfer";
+    let text = b"synthetic source revision\n";
+    let blob = b"\x00\x01\xfe\xffsynthetic original";
+    let manifest = json!({
+        "version": 1, "source_id": "synthetic-public-transfer", "root": root,
+        "entries": [
+            {"id":"text","path":"page.md","kind":"text","size":text.len(),
+             "sha256":format!("{:x}",sha2::Sha256::digest(text)),"if_rev":"none"},
+            {"id":"blob","path":"original.bin","kind":"blob","size":blob.len(),
+             "sha256":format!("{:x}",sha2::Sha256::digest(blob)),"if_rev":"none"},
+            {"id":"dir","path":"empty","kind":"dir","size":0,"sha256":null,"if_rev":"none"}
+        ]
+    });
+    let (status, begun) = fx.transfer(
+        &owner_a,
+        true,
+        root,
+        json!({"op":"begin","manifest":manifest}),
+    );
+    assert_eq!(status, 200, "{begun}");
+    let job = begun["job_id"].as_str().expect("durable job id");
+    let (status, denied) = fx.transfer(&owner_b, false, root, json!({"op":"status","job_id":job}));
+    assert_eq!(status, 400, "{denied}");
+    assert!(
+        denied["job_id"].is_null(),
+        "another subject received a job receipt"
+    );
+    assert!(
+        fx.rpc(
+            "wiki_transfer",
+            json!({"op":"status","job_id":job,"root":root})
+        )
+        .is_err(),
+        "unbound local operator inherited a public subject's job"
+    );
+    let owner_a = fx.login_with_jti(sub, "owner", "transfer-owner-a-renewed");
+    let (status, resumed) = fx.transfer(&owner_a, false, root, json!({"op":"status","job_id":job}));
+    assert_eq!(status, 200, "{resumed}");
+    assert_eq!(
+        resumed["digest"], begun["digest"],
+        "session renewal changed job custody"
+    );
+    for (id, bytes, relative, action) in [
+        ("text", text.as_slice(), "page.md", "wiki_written"),
+        (
+            "blob",
+            blob.as_slice(),
+            "original.bin",
+            "wiki_blob_uploaded",
+        ),
+        ("dir", &[][..], "empty", "wiki_directory_created"),
+    ] {
+        if id != "dir" {
+            let (status, receipt) = fx.transfer(
+                &owner_a,
+                true,
+                root,
+                json!({
+                    "op":"chunk","job_id":job,"entry_id":id,"offset":0,
+                    "data_base64":base64::engine::general_purpose::STANDARD.encode(bytes)
+                }),
+            );
+            assert_eq!(status, 200, "{receipt}");
+        }
+        let (status, applied) = fx.transfer(
+            &owner_a,
+            true,
+            root,
+            json!({"op":"apply","job_id":job,"entry_id":id}),
+        );
+        assert_eq!(status, 200, "{applied}");
+        let revision = git(&fx.pm(), &["rev-parse", "HEAD"]);
+        assert_commit_receipt(
+            &fx,
+            revision.trim(),
+            sub,
+            &format!("wiki/{root}/{relative}"),
+            action,
+        );
+        if id != "dir" {
+            let path = format!("{root}/{relative}");
+            let (status, exported) = fx.transfer(
+                &owner_a,
+                false,
+                &path,
+                json!({"op":"export","path":path,"offset":0,"bytes":16384}),
+            );
+            assert_eq!(status, 200, "{exported}");
+            let actual = base64::engine::general_purpose::STANDARD
+                .decode(exported["data_base64"].as_str().expect("original bytes"))
+                .unwrap();
+            assert_eq!(actual, bytes, "public-session original changed");
+        }
+    }
+    let (status, finished) = fx.transfer(&owner_a, true, root, json!({"op":"finish","job_id":job}));
+    assert_eq!(status, 200, "{finished}");
+    assert_eq!(finished["state"], "complete");
+    let empty_root = "global/public-transfer-empty";
+    let (status, empty) = fx.transfer(
+        &owner_a,
+        true,
+        empty_root,
+        json!({
+            "op":"begin","manifest":{"version":1,"source_id":"synthetic-empty",
+                "root":empty_root,"entries":[]}
+        }),
+    );
+    assert_eq!(status, 200, "{empty}");
+    let (status, finished) = fx.transfer(
+        &owner_a,
+        true,
+        empty_root,
+        json!({"op":"finish","job_id":empty["job_id"]}),
+    );
+    assert_eq!(status, 200, "{finished}");
+    assert_eq!(finished["state"], "complete");
+    let revision = git(&fx.pm(), &["rev-parse", "HEAD"]);
+    assert_commit_receipt(
+        &fx,
+        revision.trim(),
+        sub,
+        &format!("wiki/{empty_root}/.gitkeep"),
+        "wiki_directory_created",
+    );
+    let (status, removed) = fx.http(
+        "POST",
+        "/api/wiki/rm",
+        Some(&owner_a),
+        &json!({"path":empty_root}).to_string(),
+    );
+    assert_eq!(status, 200, "{removed}");
+    let removed_head = git(&fx.pm(), &["rev-parse", "HEAD"]);
+    let (status, stale) = fx.transfer(
+        &owner_a,
+        false,
+        empty_root,
+        json!({"op":"status","job_id":empty["job_id"]}),
+    );
+    assert_eq!(status, 200, "{stale}");
+    assert_eq!(stale["state"], "complete", "{stale}");
+    assert_eq!(stale["index"], "superseded", "{stale}");
+    assert_eq!(
+        git(&fx.pm(), &["rev-parse", "HEAD"]),
+        removed_head,
+        "reading a completed receipt recreated a removed root"
+    );
+    println!("OBSERVED_OK completed empty-root HTTP receipt after authorized removal: {stale}");
 }

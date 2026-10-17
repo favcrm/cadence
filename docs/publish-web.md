@@ -15,9 +15,10 @@ login:
 cadence login --web
 ```
 
-Without `--web` the login is unchanged and grants no web authority. The
-scopes requested are `cli.read`, `cli.write`, `web.read` and
-`web.prepare`. No `wiki.*` scopes are requested. A `web.prepare` credential can prepare releases and
+Without `--web` the login requests `cli.read`, `cli.write`, `wiki.read`, and
+`wiki.write`, and grants no web authority. With `--web` the scopes requested
+are `cli.read`, `cli.write`, `web.read` and `web.prepare`. No `wiki.*` scopes
+are requested by `--web`. A `web.prepare` credential can prepare releases and
 request publication, rollback or unpublish, but it cannot promote a release or
 change the public pointer. Only browser-owner approval does so.
 

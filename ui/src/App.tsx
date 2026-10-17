@@ -88,6 +88,8 @@ import {
   type Screen,
 } from "./lib/router";
 import { navigate, useHref } from "./lib/useLocation";
+import { NavigationProvider } from "../screen-ui/src/navigation";
+import { hostNavigation } from "./ui/hostNavigation";
 import { requestIsCurrent, responseBelongsToRequest, visibleContext } from "./features/projects/projectContextGuard";
 import {
   browserStoredProjectView,
@@ -134,7 +136,7 @@ const overviewOn = (s: Screen) => s === "home" || s === "overview";
 
 export default function App() {
   // Private room alerts share the admitted workspace's concealment and reset lifecycle.
-  return <AuthBoundary>{(meta, recheck) => <NotificationToastProvider><Workspace meta={meta} recheck={recheck} /></NotificationToastProvider>}</AuthBoundary>;
+  return <NavigationProvider adapter={hostNavigation}><AuthBoundary>{(meta, recheck) => <NotificationToastProvider><Workspace meta={meta} recheck={recheck} /></NotificationToastProvider>}</AuthBoundary></NavigationProvider>;
 }
 
 /** All private routes, subscriptions and effects live below read admission. */
@@ -616,7 +618,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
       if (prev === null && info === null) return prev;
       if (
         prev !== null && info !== null &&
-        prev.installId === info.installId && prev.kind === info.kind && prev.title === info.title
+        prev.installId === info.installId && prev.kind === info.kind && prev.title === info.title &&
+        JSON.stringify(prev.navigation) === JSON.stringify(info.navigation)
       ) {
         return prev;
       }
@@ -656,10 +659,10 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   );
   const onAppScreen = route.screen === "workspaceApp" || route.screen === "workspaceAppKey";
   const receipt = onAppScreen && activeApp !== null && activeApp.installId === routeInstallId ? activeApp : null;
-  const menuApps =
-    receipt !== null && !installed.some((a) => a.installId === receipt.installId)
-      ? [...installed, { installId: receipt.installId, kind: receipt.kind, title: receipt.title }]
-      : installed;
+  const menuApps = receipt === null ? installed
+    : installed.some((a) => a.installId === receipt.installId)
+      ? installed.map((app) => app.installId === receipt.installId ? { ...app, navigation: receipt.navigation } : app)
+      : [...installed, receipt];
   const activeId = onAppScreen && routeInstallId !== null
     ? menuApps.find((a) => a.installId === routeInstallId)?.installId ?? null
     : null;
@@ -676,7 +679,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     onRetryAccess: retryAccess,
   };
   const [last, setLast] = useState<LastApp | null>(() => readLastApp());
-  const activeSection = activeId === null ? null : sectionFromSearch(menuApps.find((a) => a.installId === activeId)!.kind, search);
+  const selectedMenuApp = menuApps.find((app) => app.installId === activeId);
+  const activeSection = selectedMenuApp ? sectionFromSearch(selectedMenuApp.kind, search, selectedMenuApp.navigation) : null;
   useEffect(() => {
     if (activeId === null) return;
     setLast((prev) => {

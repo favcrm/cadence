@@ -776,6 +776,63 @@ fn send_steering_flags_parse() {
 }
 
 #[test]
+fn message_list_parses_both_spellings_and_rejects_a_bad_filter() {
+    let cli = Cli::try_parse_from([
+        "cadence",
+        "message",
+        "ls",
+        "--to",
+        "worker",
+        "--state",
+        "queued,running",
+        "--limit",
+        "5",
+    ])
+    .unwrap();
+    match cli.command {
+        Commands::Message {
+            action: MessageAction::List {
+                to, state, limit, ..
+            },
+        } => {
+            assert_eq!(to.as_deref(), Some("worker"));
+            assert_eq!(state, ["queued", "running"]);
+            assert_eq!(limit, Some(5));
+        }
+        _ => panic!("expected message list"),
+    }
+    assert!(Cli::try_parse_from(["cadence", "message", "list", "worker"]).is_ok());
+    let missing = super::message::list_params(None, None, None, None, vec![], None, None)
+        .unwrap_err()
+        .to_string();
+    assert!(missing.contains("recipient"), "{missing}");
+    let bad = super::message::list_params(
+        Some("worker".into()),
+        None,
+        None,
+        None,
+        vec!["nope".into()],
+        None,
+        None,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(bad.contains("unknown"), "{bad}");
+    let wide = super::message::list_params(
+        Some("worker".into()),
+        None,
+        None,
+        None,
+        vec![],
+        Some(51),
+        None,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(wide.contains("1 to 50"), "{wide}");
+}
+
+#[test]
 fn message_cancel_parses() {
     let cli = Cli::try_parse_from([
         "cadence",
@@ -1362,6 +1419,18 @@ fn cad800_single_id_sweep_flags_rejected() {
     .is_ok());
     // A plain single-ID finish still parses.
     assert!(Cli::try_parse_from(["cadence", "issue", "finish", "CAD-1"]).is_ok());
+}
+
+/// Piped list output is already JSON, so `--fields` and `--summary` do
+/// not require a redundant `--json` at parse time. Table mode still
+/// refuses them in the handler.
+#[test]
+fn list_fields_parse_without_an_explicit_json_flag() {
+    assert!(Cli::try_parse_from(["cadence", "issue", "ls", "--fields", "id"]).is_ok());
+    assert!(Cli::try_parse_from(["cadence", "issue", "ls", "--summary"]).is_ok());
+    assert!(Cli::try_parse_from(["cadence", "issue", "epic", "ls", "--fields", "id"]).is_ok());
+    assert!(Cli::try_parse_from(["cadence", "milestone", "ls", "--fields", "id"]).is_ok());
+    assert!(Cli::try_parse_from(["cadence", "memory", "ls", "--fields", "slug"]).is_ok());
 }
 
 /// CAD-879: `cadence self` asks the daemon for running turns only.

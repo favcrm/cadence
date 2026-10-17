@@ -4,6 +4,22 @@ use crate::issue::app_catalog::workspace;
 use crate::store::app_runs::{self, LocalRunProvenance, LocalRunRequest, LocalWorkflow};
 use std::collections::BTreeMap;
 
+/// Release live dispatch ownership on every exit, including provider failure.
+/// The mutex protects only membership, never provider I/O.
+struct HostRunInFlight<'a> {
+    runs: &'a Mutex<HashSet<String>>,
+    id: &'a str,
+}
+
+impl Drop for HostRunInFlight<'_> {
+    fn drop(&mut self) {
+        self.runs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(self.id);
+    }
+}
+
 /// Resolve app, context and per-run content in that order. A blank prompt
 /// field is a reset request, so it cannot erase a saved or app default.
 fn freeze_content_inputs(
@@ -985,6 +1001,24 @@ impl Shared {
     /// run whose approver is no longer a live owner refuses here.
     pub(super) fn dispatch_app_run_as(&self, id: &str, human: Option<&Value>) -> Result<Value> {
         let run = self.store.app_run_show(id)?;
+        // Check and take ownership atomically BEFORE dispatch can publish a
+        // running host step. A monitor/replay observing that commit must leave
+        // the live executor alone, not mistake its claim for a crashed call.
+        let _host_run = if run["snapshot"]["workflow"]["execution"] == "host" {
+            let mut runs = self
+                .host_runs_in_flight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !runs.insert(id.to_string()) {
+                return self.store.app_run_show(id);
+            }
+            Some(HostRunInFlight {
+                runs: &self.host_runs_in_flight,
+                id,
+            })
+        } else {
+            None
+        };
         let approved_by = run["approval"]["human"]
             .as_object()
             .map(|_| run["approval"]["human"].clone());

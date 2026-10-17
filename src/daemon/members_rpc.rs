@@ -238,6 +238,16 @@ impl Shared {
                     )));
                 }
             }
+            // Own recipient only. `to` is required; there is no implicit self.
+            "message_list" => {
+                let target = params.get("to").and_then(Value::as_str).unwrap_or("");
+                if target != alias {
+                    return Err(Error::rejected(format!(
+                        "assist agent '{alias}' may not {method} '{target}' — only its own \
+                         mail (CAD-1380)"
+                    )));
+                }
+            }
             // `message_read` names an id; bound to this alias's message row.
             "message_read" => {
                 let id = params
@@ -341,7 +351,9 @@ impl Shared {
         // credential, because this connection carries no member envelope.
         let (operation, scope) = match method {
             "agent_show" | "agent_events" => ("assist_state", "assist.read"),
-            "thread_read" | "message_read" | "message_report" => ("assist_history", "assist.read"),
+            "thread_read" | "message_read" | "message_report" | "message_list" => {
+                ("assist_history", "assist.read")
+            }
             "job_show" | "task_show" => ("job_evidence", "assist.jobs"),
             "job_events" => ("job_events", "assist.jobs"),
             _ => ("assist_send", "assist.write"),
@@ -380,6 +392,7 @@ impl Shared {
             "thread_read" | "agent_show" | "agent_events" | "agent_wait" => {
                 (params.get("alias").and_then(Value::as_str), None, None)
             }
+            "message_list" => (params.get("to").and_then(Value::as_str), None, None),
             "job_show" | "job_events" => (None, params.get("job").and_then(Value::as_str), None),
             "task_show" => (None, None, params.get("task").and_then(Value::as_str)),
             _ => return Ok(()),
@@ -800,7 +813,7 @@ impl Shared {
     /// The digest covers the canonical `(org, sub)` pair, length-prefixed so
     /// `("a|b", "c")` and `("a", "b|c")` can never encode alike. Distinct
     /// principals therefore never share one confined read/write directory.
-    fn assistant_principal_cwd(&self, org: &str, sub: &str) -> std::path::PathBuf {
+    pub(super) fn assistant_principal_cwd(&self, org: &str, sub: &str) -> std::path::PathBuf {
         let canonical = format!("{}:{org}|{}:{sub}", org.len(), sub.len());
         self.state_dir
             .join("assistants")
@@ -874,6 +887,8 @@ impl Shared {
         let principal_cwd = self.assistant_principal_cwd(&binding.org, &binding.sub);
         if self.store.agent_opt(&binding.alias)?.is_some() {
             self.assistant_runtime_cwd_guard(binding)?;
+            // CAD-1420: seed missing files; BOOTSTRAP only while pending.
+            super::bootstrap_files::seed(&principal_cwd, binding.bootstrap_state == "pending")?;
         } else {
             // The registered alias is the STORED binding alias — derived
             // at mint from the member, never a caller field. The agent-
@@ -886,6 +901,7 @@ impl Shared {
                     "member assist refused: the assistant's principal cwd cannot be created: {e}"
                 ))
             })?;
+            super::bootstrap_files::seed(&cwd, binding.bootstrap_state == "pending")?;
             let params = json!({"confine": true, "assist": binding.sub});
             self.store.register_agent(&crate::store::NewAgent {
                 alias: &binding.alias,
@@ -1034,9 +1050,6 @@ impl Shared {
     /// `finish_assist_job_notification`; a store failure returns an error and
     /// the intent stays pending (never silently claimed).
     pub(super) fn route_assist_job_notifications(self: &Arc<Self>) -> Result<usize> {
-        if std::env::var("HOSTED_CADENCE_ASSISTANT_ENABLED").as_deref() != Ok("true") {
-            return Ok(0);
-        }
         let pending = self
             .store
             .pending_assist_job_notifications(ASSIST_NOTICE_BATCH)?;
@@ -1330,18 +1343,6 @@ impl Shared {
         need: crate::assistant_actor::AssistScope,
         job_id: Option<&str>,
     ) -> Result<MemberCaller> {
-        // The rollout gate (CON-002): the platform injects
-        // `HOSTED_CADENCE_ASSISTANT_ENABLED=true` into the container env
-        // only when the feature is enabled — absent/false/unknown is
-        // OFF. Checked BEFORE the envelope is read: a stale envelope, a
-        // cached service bearer or a replayed member op can never reach
-        // a member effect while the feature is off. The live platform
-        // pull below is the authoritative second check.
-        if std::env::var("HOSTED_CADENCE_ASSISTANT_ENABLED").as_deref() != Ok("true") {
-            return Err(Error::rejected(format!(
-                "{verb} refused: member assistant integration is not enabled"
-            )));
-        }
         // The connection itself must be the operator/board relay — the
         // only channel allowed to carry a relayed member envelope. An
         // agent or unproven connection is refused outright, before the
@@ -1432,6 +1433,207 @@ impl Shared {
             ..member_call
         };
         Ok(member_call)
+    }
+
+    /// The member assistant's daemon-owned alias, derived server-side from
+    /// the canonical `(org, sub)` principal — the same length-prefixed digest
+    /// `assistant_principal_cwd` uses, so the alias and the confined cwd key
+    /// the same unambiguous principal. `assist-` + first 48 hex chars of the
+    /// digest is 55 chars, inside the 64-char identifier grammar, and is
+    /// deterministic across credential rotation. A request never names it.
+    pub(super) fn assistant_principal_alias(&self, org: &str, sub: &str) -> String {
+        let canonical = format!("{}:{org}|{}:{sub}", org.len(), sub.len());
+        let digest = crate::operator_auth::digest(&canonical);
+        format!("assist-{}", &digest[..48])
+    }
+
+    /// CAD-1420: `platform_assistant_provision` — the daemon's dedicated
+    /// platform-authority projection. The `/api/assist/<verb>` relay invokes
+    /// it BEFORE the ordinary `member_assist_state|history|send` verb so a
+    /// genuinely absent local binding can be projected from the platform's
+    /// already-verified signed assistant envelope — never from a request
+    /// field, a member self-claim or a SQLite seed.
+    ///
+    /// Closed params: `member_envelope` + `operation` only. `operation` is
+    /// allowlisted to the read/write member ops (`assist_state`,
+    /// `assist_history`, `assist_send`); every job operation and every other
+    /// field is refused — a job's provenance still comes from
+    /// `member_job_request` alone. The connection must be the proven
+    /// operator/board relay (`proven_operator`), and the envelope is
+    /// cryptographically re-verified (`member_envelope_actor`) exactly as
+    /// `member_caller` does: issuer, JWKS, audience, company, time, kind,
+    /// subject, assistant and scope pins all re-check here.
+    ///
+    /// An existing stored binding is NOT touched: a matching active tuple
+    /// returns `{"provisioned": false}` without any mutation (no freshness,
+    /// enrollment or runtime write — the existing member path keeps its
+    /// current behavior), and a mismatched tuple or a revoked/archived
+    /// binding is refused, never renamed, revived or reset.
+    ///
+    /// A genuinely ABSENT binding may be projected only when the board's own
+    /// enrolled `hosted-board` service credential is present and loadable —
+    /// the daemon's least-authority `assist.revalidate` custody — AND the
+    /// live `member_authority_live` pull (EMPTY envelope, so the service
+    /// bearer is the proof and the member-envelope fallback can never apply)
+    /// answers `allow` for the exact operation + scope, re-proving the
+    /// member's CURRENT issuing credential (`op_credential_id` = the verified
+    /// incoming envelope's credential). Then `store.assistant_bind` writes
+    /// the row inside its own transaction, which atomically refuses a
+    /// conflicting tuple and a pre-existing `agents.alias` collision.
+    /// Nothing here registers an agent, mints a runtime/thread/file, or
+    /// starts an endpoint — the lazy `ensure_assistant_runtime` inside the
+    /// subsequent member verb still owns that.
+    pub(super) fn rpc_platform_assistant_provision(
+        &self,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
+        let verb = "platform assistant provision";
+        reject_unknown_fields(params, &["member_envelope", "operation"], verb)?;
+        // The same trusted channel as every member_* verb — only the
+        // board's proven relay may carry a signed member envelope.
+        self.proven_operator(verb, peer_pid)?;
+        let envelope = optional_str(params, "member_envelope").ok_or_else(|| {
+            Error::rejected(format!(
+                "{verb} refused: no member_envelope proof — \
+                 projection requires a verified assistant envelope"
+            ))
+        })?;
+        let operation = required_str(params, "operation")?;
+        let want_scope = match operation {
+            "assist_state" | "assist_history" => "assist.read",
+            "assist_send" => "assist.write",
+            _ => {
+                return Err(Error::rejected(format!(
+                    "{verb} refused: operation '{operation}' is not provisionable — \
+                     only assist_state/assist_history/assist_send project a binding"
+                )))
+            }
+        };
+        let (org, sub, assistant_id, scopes, credential_id) =
+            self.member_envelope_actor(envelope, verb)?;
+        if !scopes.iter().any(|s| s == want_scope) {
+            return Err(Error::rejected(format!(
+                "{verb} refused: the member envelope's scopes do not cover {want_scope}"
+            )));
+        }
+        // Re-read the stored binding. An existing row is left alone: a
+        // matching active tuple is an idempotent no-op (the daemon does not
+        // re-enroll, re-stamp or re-fresh what already holds), a mismatched
+        // or dead tuple is refused.
+        if let Some(existing) = self.store.assistant_binding(&org, &sub)? {
+            if existing.assistant_id != assistant_id {
+                return Err(Error::rejected(format!(
+                    "{verb} refused: member envelope names assistant '{assistant_id}', not \
+                     the stored binding's '{}' — a conflicting tuple is never rewritten",
+                    existing.assistant_id
+                )));
+            }
+            if existing.org != org {
+                return Err(Error::rejected(format!(
+                    "{verb} refused: member envelope org '{org}' does not match the binding"
+                )));
+            }
+            if !existing.is_active() {
+                return Err(Error::rejected(format!(
+                    "{verb} refused: the member's assistant binding is {} — \
+                     revoked/archived membership is never revived by a projection",
+                    existing.state
+                )));
+            }
+            return Ok(json!({
+                "provisioned": false,
+                "org": org,
+                "sub": sub,
+                "assistant_id": assistant_id,
+                "alias": existing.alias,
+                "note": "an active binding already exists — nothing was projected",
+            }));
+        }
+        // Genuinely absent: project ONLY under the daemon's own enrolled
+        // hosted-board service credential. A missing or unloadable record
+        // refuses here — the member-envelope bearer fallback of
+        // `member_authority_live` must never substitute for a service
+        // credential at first projection (no token ingestion, no enrollment
+        // shortcut, no borrowed custody).
+        let config = board_identity::read_config(&self.state_dir).map_err(|_| {
+            Error::rejected(format!(
+                "{verb} refused: no board identity is configured for provisioning"
+            ))
+        })?;
+        let host = config.host.trim_end_matches('/').to_string();
+        match self.store.platform_credential("hosted-board", &host) {
+            Err(e) => {
+                return Err(Error::rejected(format!(
+                    "{verb} refused: the hosted-board service credential record \
+                     could not be read: {e}"
+                )));
+            }
+            Ok(None) => {
+                return Err(Error::rejected(format!(
+                    "{verb} refused: no enrolled hosted-board service credential for \
+                     '{host}' — projection requires the board's own enrolled authority"
+                )));
+            }
+            Ok(Some(record)) => {
+                let key = crate::platform::custody::Key {
+                    platform: "hosted-board",
+                    account: &host,
+                };
+                let loadable = self
+                    .platform_custody
+                    .load(&record.custody, &key)
+                    .ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok())
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty());
+                if loadable.is_none() {
+                    return Err(Error::rejected(format!(
+                        "{verb} refused: the enrolled hosted-board service credential \
+                         has no loadable custody material"
+                    )));
+                }
+            }
+        }
+        // Live pull BEFORE the new binding: the platform re-derives `allow`
+        // from the member's CURRENT role, membership, grants and active
+        // upstream binding — with the service credential as bearer (empty
+        // envelope) and the verified incoming credential as the re-proved
+        // provenance. A revoked/stale/dead credential, or a member the
+        // platform no longer serves, is refused before any row exists.
+        let member = MemberCaller {
+            org: org.clone(),
+            sub: sub.clone(),
+            assistant_id: assistant_id.clone(),
+            alias: self.assistant_principal_alias(&org, &sub),
+            conversation_id: None,
+            state: "active".to_string(),
+            credential_id: credential_id.clone(),
+        };
+        self.member_authority_live(
+            "",
+            &member,
+            MemberReprove {
+                operation,
+                scope: want_scope,
+                job_id: None,
+                op_credential_id: Some(&credential_id),
+            },
+            verb,
+        )?;
+        // The daemon-minted binding: `assistant_bind`'s own transaction is
+        // the CAS — a conflicting tuple or a colliding ordinary agent alias
+        // refuses inside it, never silently adopts.
+        let binding = self
+            .store
+            .assistant_bind(&org, &sub, &assistant_id, &member.alias, None)?;
+        Ok(json!({
+            "provisioned": true,
+            "org": org,
+            "sub": sub,
+            "assistant_id": assistant_id,
+            "alias": binding.alias,
+        }))
     }
 
     /// `member_assist_state` — the member's own assistant surface state.
@@ -2287,5 +2489,73 @@ impl Shared {
             "note": "the member now follows this shared job — evidence and \
                      events bind to it; no private conversation is shared",
         }))
+    }
+
+    /// CAD-1420: the private profile context for a stamped, interactive member
+    /// turn. Returns `Ok(None)` for ordinary agents, Master, job notices, nudges,
+    /// unstamped work and inactive bindings. An unknown stored state or an
+    /// unreadable profile file is an error, never a silent empty profile. The
+    /// BOOTSTRAP body is included only while the stored state is `pending`. The
+    /// ACK contract is shown in every valid state, so a deferred or completed
+    /// member can still resume or update through the same closed object.
+    pub(super) fn member_profile_context(
+        &self,
+        message: &store::Message,
+    ) -> Result<Option<String>> {
+        if message.source == "assist_job_event" || message.is_nudge() {
+            return Ok(None);
+        }
+        let Some(stamp) = self.store.message_member_authority(&message.id)? else {
+            return Ok(None);
+        };
+        let Some(binding) = self.store.assistant_for_alias(&message.alias)? else {
+            return Ok(None);
+        };
+        if !binding.is_active()
+            || binding.org != stamp.org
+            || binding.sub != stamp.sub
+            || binding.assistant_id != stamp.assistant_id
+        {
+            return Ok(None);
+        }
+        let state = binding.bootstrap_state.as_str();
+        let allowed: &str = match state {
+            "pending" => "\"update\", \"complete\", \"skip\", \"defer\"",
+            "deferred" => "\"update\", \"resume\"",
+            "complete" | "skipped" => "\"update\"",
+            other => {
+                return Err(Error::rejected(format!(
+                "stored bootstrap state '{other}' is unknown; the assistant profile is not loaded"
+            )))
+            }
+        };
+        let root = self.assistant_principal_cwd(&binding.org, &binding.sub);
+        let mut out = String::from("## Your private assistant profile\n\n");
+        for name in [
+            super::bootstrap_files::IDENTITY,
+            super::bootstrap_files::SOUL,
+            super::bootstrap_files::USER,
+        ] {
+            out.push_str(&super::bootstrap_files::read_profile_file(&root, name)?);
+            out.push_str("\n\n");
+        }
+        out.push_str(&format!(
+            "## Profile state\n\nstate: {state}\nrevision: {rev}\n\n\
+             Your reply already answers the user's request above. Setup is optional.\n\n\
+             To record an agreed change on this turn, ACK with a JSON object on stdin, \
+             for example: `cadence message ack --bootstrap-file -` with \
+             {{\"action\":\"update\",\"expected_revision\":{rev},\"profile\":{{\"name\":\"Ana\"}}}}\n\
+             Allowed actions in this state: {allowed}. Profile keys: name, tone, preferences.\n\n",
+            rev = binding.bootstrap_revision,
+        ));
+        if state == "pending" {
+            out.push_str("## Bootstrap (pending)\n\n");
+            out.push_str(&super::bootstrap_files::read_profile_file(
+                &root,
+                super::bootstrap_files::BOOTSTRAP,
+            )?);
+            out.push_str("\n\n");
+        }
+        Ok(Some(out))
     }
 }

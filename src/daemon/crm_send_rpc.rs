@@ -18,6 +18,7 @@
 //! 256-bit token is the credential — and reveals nothing but a
 //! constant `{"unsubscribed": true}`.
 
+use super::app_screen_services_rpc::ScreenServiceProof;
 use super::crm_smtp_rpc::SenderTransport;
 use super::*;
 use crate::store::app_records::RecordStore;
@@ -111,6 +112,17 @@ impl Shared {
         params: &Value,
         peer_pid: u32,
     ) -> Result<Value> {
+        self.rpc_crm_send_with_proof(method, params, peer_pid, None)
+    }
+
+    pub(super) fn rpc_crm_send_with_proof(
+        self: &Arc<Self>,
+        method: &str,
+        params: &Value,
+        peer_pid: u32,
+        proof: Option<&ScreenServiceProof>,
+    ) -> Result<Value> {
+        Self::screen_service_method(proof, method)?;
         self.operator_connection(method, params, peer_pid)?;
         let allowed: &[&str] = match method {
             "crm_send_prepare" => &[
@@ -152,7 +164,7 @@ impl Shared {
         // The origin verbs are daemon-global — no installation or
         // context on the wire.
         if method == "crm_send_origin_set" || method == "crm_send_origin_show" {
-            return match method {
+            let execute = || match method {
                 "crm_send_origin_set" => {
                     let origin = match params.get("unsubscribe_origin") {
                         Some(Value::Null) | None => None,
@@ -167,6 +179,23 @@ impl Shared {
                 }
                 _ => self.crm_send_origin_show(),
             };
+            return if let Some(proof) = proof {
+                self.screen_service_scope(
+                    proof.install(),
+                    proof.context()?,
+                    true,
+                    Some(proof),
+                    execute,
+                )
+            } else {
+                // Serialize native global edits with the screen confirmation
+                // fence; native callers retain the same fields and result.
+                let _custody = self
+                    .platform_custody_lock
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                execute()
+            };
         }
         let install = required_str(params, "install_id")?;
         let context = required_str(params, "context_id")?;
@@ -177,25 +206,25 @@ impl Shared {
                 let request = send_request_id(params)?;
                 crate::proto::identifier(campaign, "campaign ID")?;
                 crate::proto::identifier(freeze, "audience freeze ID")?;
-                self.crm_send_prepare(install, context, campaign, freeze, &request)
+                self.crm_send_prepare(install, context, campaign, freeze, &request, proof)
             }
             "crm_send_approve" => {
                 let send_id = required_str(params, "send_id")?;
                 let digest = required_str(params, "send_digest")?;
                 crate::proto::identifier(send_id, "send ID")?;
-                self.crm_send_approve(install, context, send_id, digest)
+                self.crm_send_approve(install, context, send_id, digest, proof)
             }
             "crm_send_show" => {
                 let send_id = required_str(params, "send_id")?;
                 crate::proto::identifier(send_id, "send ID")?;
-                self.crm_send_show(install, context, send_id)
+                self.crm_send_show(install, context, send_id, proof)
             }
             "crm_send_list" => {
                 let campaign = params.get("campaign_id").and_then(Value::as_str);
                 if let Some(c) = campaign {
                     crate::proto::identifier(c, "campaign ID")?;
                 }
-                self.crm_send_list(install, context, campaign)
+                self.crm_send_list(install, context, campaign, proof)
             }
             "crm_send_resolve" => {
                 let send_id = required_str(params, "send_id")?;
@@ -206,7 +235,7 @@ impl Shared {
                 if !matches!(resolution, "accepted" | "failed") {
                     return Err(Error::rejected("resolution must be 'accepted' or 'failed'"));
                 }
-                self.crm_send_resolve(install, context, send_id, customer, resolution)
+                self.crm_send_resolve(install, context, send_id, customer, resolution, proof)
             }
             _ => unreachable!(),
         }
@@ -327,6 +356,7 @@ impl Shared {
         records: &RecordStore,
         campaign: &str,
         freeze: &str,
+        custody_held: bool,
     ) -> Result<SendFacts> {
         let origin = self.crm_send_origin()?;
         let (content_revision, content_digest) = records.app_content_approved(context, campaign)?;
@@ -337,10 +367,11 @@ impl Shared {
             ));
         }
         let frozen = records.app_audience_frozen(context, freeze)?;
-        let _custody = self
-            .platform_custody_lock
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _custody = (!custody_held).then(|| {
+            self.platform_custody_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+        });
         let link = self.store.crm_smtp_link(install, context)?.ok_or_else(|| {
             Error::rejected("no SMTP sender is bound to this installation and context")
         })?;
@@ -368,10 +399,11 @@ impl Shared {
         campaign: &str,
         freeze: &str,
         request_id: &str,
+        proof: Option<&ScreenServiceProof>,
     ) -> Result<Value> {
-        self.crm_smtp_scope(install, context, || {
+        self.crm_smtp_scope_with_proof(install, context, proof, || {
             let records = RecordStore::open(&self.state_dir, install)?;
-            let facts = self.crm_send_facts(install, context, &records, campaign, freeze)?;
+            let facts = self.crm_send_facts(install, context, &records, campaign, freeze, proof.is_some())?;
             if (facts.frozen_member_ids.len() as i64) > facts.max_recipients {
                 return Err(Error::rejected(
                     "frozen audience exceeds its max_recipients ceiling",
@@ -473,8 +505,9 @@ impl Shared {
         context: &str,
         send_id: &str,
         given_digest: &str,
+        proof: Option<&ScreenServiceProof>,
     ) -> Result<Value> {
-        self.crm_smtp_scope(install, context, || {
+        self.crm_smtp_scope_with_proof(install, context, proof, || {
             let records = RecordStore::open(&self.state_dir, install)?;
             let send = records
                 .app_campaign_send(context, send_id)?
@@ -504,6 +537,7 @@ impl Shared {
                 &records,
                 &send.campaign_id,
                 &send.audience_freeze_id,
+                proof.is_some(),
             )?;
             if facts.content_revision != send.content_revision
                 || facts.content_digest != send.content_digest
@@ -593,8 +627,9 @@ impl Shared {
         install: &str,
         context: &str,
         send_id: &str,
+        proof: Option<&ScreenServiceProof>,
     ) -> Result<Value> {
-        self.crm_smtp_scope(install, context, || {
+        self.crm_smtp_scope_with_proof(install, context, proof, || {
             let records = RecordStore::open(&self.state_dir, install)?;
             let send = records
                 .app_campaign_send(context, send_id)?
@@ -614,8 +649,9 @@ impl Shared {
         install: &str,
         context: &str,
         campaign: Option<&str>,
+        proof: Option<&ScreenServiceProof>,
     ) -> Result<Value> {
-        self.crm_smtp_scope(install, context, || {
+        self.crm_smtp_scope_with_proof(install, context, proof, || {
             let records = RecordStore::open(&self.state_dir, install)?;
             let sends = records.app_campaign_sends(context, campaign)?;
             let mut out = Vec::with_capacity(sends.len());
@@ -643,8 +679,9 @@ impl Shared {
         send_id: &str,
         customer_id: &str,
         resolution: &str,
+        proof: Option<&ScreenServiceProof>,
     ) -> Result<Value> {
-        self.crm_smtp_scope(install, context, || {
+        self.crm_smtp_scope_with_proof(install, context, proof, || {
             let records = RecordStore::open(&self.state_dir, install)?;
             if records.app_campaign_send(context, send_id)?.is_none() {
                 return Err(Error::rejected(

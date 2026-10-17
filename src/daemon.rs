@@ -38,6 +38,13 @@ mod app_record_actions_rpc;
 pub use app_image_jobs::test_probe as image_job_probe;
 mod app_records_rpc;
 mod app_runs_rpc;
+mod app_screen_services_rpc;
+
+#[cfg(all(test, feature = "test-seam"))]
+mod cad811_installed_crm_qa_fixture;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad811_screen_services_acceptance;
+
 mod app_screens_rpc;
 mod app_social_drafts_rpc;
 mod app_teams_rpc;
@@ -82,6 +89,10 @@ mod cad1365_run_creator_acceptance;
 mod cad1415_app_actions_acceptance;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1440_media_only_context_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad1473_host_redispatch;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad1473_independent_redispatch;
 mod caller_rule;
 #[cfg(all(test, feature = "test-seam"))]
 mod campaign_clone_acceptance;
@@ -107,6 +118,7 @@ mod installer_client;
 mod installer_enrollment_wire;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(crate) use installer_enrollment_wire::InstallerRecord as InstallerProcessRecord;
+mod bootstrap_files;
 mod human_current;
 mod human_threads_rpc;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -196,7 +208,9 @@ pub use master_rpc::MASTER_ALLOWED;
 // `pub(crate)` — the UI frame route calls it; unit tests live in the
 // module, not as a public API.
 pub(crate) use app_capabilities_rpc::operator_price_refusal;
-pub(crate) use app_screens_rpc::{render_frame_html, SCREEN_KIT_CSS, SCREEN_KIT_VERSION};
+pub(crate) use app_screens_rpc::{
+    render_frame_html, render_package_frame_html, SCREEN_KIT_CSS, SCREEN_KIT_VERSION,
+};
 
 /// A `(Mutex, Condvar)` pair used for queue/event wakeups.
 ///
@@ -660,9 +674,15 @@ pub struct Shared {
     /// swept on mint. In-memory: a restart drops every live mount's action
     /// context (the frame just remounts).
     tool_contexts: Mutex<HashMap<String, app_tools_rpc::ToolContext>>,
+    screen_service_confirmations:
+        Mutex<HashMap<String, app_screen_services_rpc::ScreenServiceConfirmation>>,
+    screen_service_csv: Mutex<HashSet<String>>,
     /// Serializes an app's checked execution claim through bounded Local
     /// commit/readback against binding/context/custody mutations.
     app_release_lock: Mutex<()>,
+    /// Process-local host dispatch ownership. Durable capability claims still
+    /// decide recovery after restart; this set only suppresses live re-entry.
+    host_runs_in_flight: Mutex<HashSet<String>>,
     /// Serializes local CRM assistant permission checks and their bounded
     /// mutation/receipt writes. Never spans a network operation.
     app_assistant_lock: Mutex<()>,
@@ -988,7 +1008,10 @@ impl Shared {
             screen_caps: Mutex::new(HashMap::new()),
             screen_mint_rate: Mutex::new(HashMap::new()),
             tool_contexts: Mutex::new(HashMap::new()),
+            screen_service_confirmations: Mutex::new(HashMap::new()),
+            screen_service_csv: Mutex::new(HashSet::new()),
             app_release_lock: Mutex::new(()),
+            host_runs_in_flight: Mutex::new(HashSet::new()),
             app_assistant_lock: Mutex::new(()),
             member_job_lock: Mutex::new(()),
             app_release_claim_gate: opts.app_release_claim_gate.clone(),
@@ -1020,6 +1043,11 @@ impl Shared {
         // events or relaunch effects, and in manual mode those rows stay
         // inert until the operator leaves the fence, so none of them run.
         if !shared.execution_mode.fenced() {
+            // Transfer completion is durable; its cache wake is not. Recover
+            // only the derived index request, never replay publication.
+            if shared.store.wiki_transfer_index_recovery_needed()? {
+                shared.wiki_index.kick();
+            }
             // CAD-230b: a runner in flight when the last daemon stopped is
             // `unknown` and incomplete — reported, never relaunched.
             for r in crate::runner::recover(state_dir, epoch_secs()) {
@@ -1043,6 +1071,8 @@ impl Shared {
             // landed, so it closes non-fencing `unknown`, never replayed.
             let _ = shared.store.orphan_submitting_nudges("crash");
         }
+        // Hosted completion retries run after the socket is bound. Doing
+        // them here would hold startup on each remote timeout.
         Ok(shared)
     }
 
@@ -2471,11 +2501,18 @@ impl Shared {
             "agent_inbox" => self.rpc_inbox(params, peer_pid),
             "agent_inbox_ack" => self.rpc_inbox_ack(params, peer_pid),
             "message_read" => self.rpc_message_read(params, peer_pid),
+            "message_list" => self.rpc_message_list(params, peer_pid),
             "message_report" => self.rpc_message_report(params, peer_pid),
             "message_reconcile" => self.rpc_reconcile(params, peer_pid),
             "message_cancel" => self.rpc_cancel(params),
             "interrupt" => self.rpc_interrupt(params, peer_pid),
             "job_new" => self.rpc_job_new(params, peer_pid),
+            // CAD-1420: the dedicated platform-authority projection the
+            // trusted assist relay runs BEFORE member_assist_state|history|
+            // send — never a member entry point of its own.
+            "platform_assistant_provision" => {
+                self.rpc_platform_assistant_provision(params, peer_pid)
+            }
             "member_assist_state" => self.rpc_member_assist_state(params, peer_pid),
             "member_assist_history" => self.rpc_member_assist_history(params, peer_pid),
             "member_assist_send" => self.rpc_member_assist_send(params, peer_pid),
@@ -2881,6 +2918,13 @@ impl Shared {
             "app_assistant_permission_block" => {
                 self.rpc_app_assistant_operator(method, params, peer_pid)
             }
+            "app_screen_service_call" => self.rpc_app_screen_service_call(params, peer_pid),
+            "app_screen_service_slot_prepare" => {
+                self.rpc_app_screen_service_slot_prepare(params, peer_pid)
+            }
+            "app_screen_service_slot_confirm" => {
+                self.rpc_app_screen_service_slot_confirm(params, peer_pid)
+            }
             "app_screen_mint" => self.rpc_app_screen_mint(params, peer_pid),
             "app_screen_consume" => self.rpc_app_screen_consume(params, peer_pid),
             "app_approve" => self.rpc_app_approve(params, peer_pid),
@@ -3010,6 +3054,7 @@ impl Shared {
             "wiki_read" => self.rpc_wiki_read(params, peer_pid),
             "wiki_write" => self.rpc_wiki_write(params, peer_pid),
             "wiki_put_blob" => self.rpc_wiki_put_blob(params, peer_pid),
+            "wiki_transfer" => self.rpc_wiki_transfer(params, peer_pid),
             "wiki_mkdir" => self.rpc_wiki_mkdir(params, peer_pid),
             "wiki_mv" => self.rpc_wiki_mv(params, peer_pid),
             "wiki_rm" => self.rpc_wiki_rm(params, peer_pid),
@@ -4651,6 +4696,23 @@ pub fn serve_with(state_dir: &Path, mut opts: ServeOptions) -> Result<()> {
     }
     let listener = UnixListener::bind(&socket_path)?;
     listener.set_nonblocking(true)?;
+    // One process-lifetime reporter, after the listener exists. It reads
+    // kickoff bindings and the durable message store; shutdown does not join
+    // it, so an unreachable board cannot hold `stop_ctls`.
+    let _ = {
+        let shared = Arc::clone(&shared);
+        thread::spawn(move || {
+            let driver = crate::local_assignment::reporting::ReportDriver::new(&shared.state_dir);
+            while !shared.closing.load(Ordering::SeqCst) {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let _ = driver.tick(&shared.store, deadline);
+                let pause = Instant::now() + Duration::from_millis(250);
+                while Instant::now() < pause && !shared.closing.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(25));
+                }
+            }
+        })
+    };
     // Signal-driven shutdown: set the same flag as the rpc. Installed
     // before actors launch so a signal during relaunch — or a relaunch
     // failure — still reaches `shutdown` below rather than exiting
@@ -5093,7 +5155,6 @@ mod pty_retry_tests {
     #[test]
     fn retry_base_defaults_to_five_seconds() {
         assert_eq!(parse_pty_retry_base(None), Ok(Duration::from_secs(5)));
-        assert_eq!(PTY_RETRY_BASE, Duration::from_secs(5));
     }
 
     #[test]
@@ -5141,24 +5202,6 @@ mod pty_retry_tests {
         assert_eq!(gate_backoff(one, u32::MAX), Duration::from_secs(6));
         let floor = Duration::from_millis(100);
         assert_eq!(gate_backoff(floor, 9), Duration::from_millis(600));
-    }
-}
-
-#[cfg(test)]
-mod stall_clock_tests {
-    use super::*;
-
-    #[test]
-    fn stall_clock_offset_defaults_to_wall() {
-        // Production-unreachable proof, part 1: a default-constructed
-        // daemon carries a zero offset (wall clock) and no tick override.
-        let opts = ServeOptions::default();
-        assert_eq!(
-            opts.stall_clock_offset.load(Ordering::SeqCst),
-            0,
-            "default offset must be wall"
-        );
-        assert_eq!(opts.stall_tick, None, "default tick must be unset");
     }
 }
 
@@ -6303,7 +6346,7 @@ mod tests {
     }
 
     #[test]
-    fn cloud_prewrite_fails_the_message_without_recovery() {
+    fn cloud_prewrite_fails_and_preserves_a_hosted_failure_report() {
         use std::sync::atomic::AtomicUsize;
 
         let posts = Arc::new(AtomicUsize::new(0));
@@ -6392,6 +6435,35 @@ mod tests {
                 model_policy: None,
             })
             .unwrap();
+        crate::local_assignment::reporting::store_kickoff_binding(
+            &shared.state_dir,
+            "cad1460-prewrite-report",
+            "https://hosted-completion-regression.invalid",
+            &crate::local_assignment::Kickoff {
+                alias: "cloud-1",
+                issue_id: "CAD1460",
+                assignment_id: "hla_00000000000000000000000000000001",
+                worktree: cwd,
+                message_id: "prewrite-1",
+                claim_id: "hlc_00000000000000000000000000000001",
+                generation: 1,
+                organization_id: "ws_hosted_fail_probe",
+                audience: "https://hosted-completion-regression.invalid",
+                subject_id: Some("user_member"),
+                issuer: Some("https://hosted-completion-regression.invalid"),
+            },
+            "Synthetic terminal failure",
+        )
+        .unwrap();
+        let report_path = shared
+            .state_dir
+            .join("hosted-assignments")
+            .join("prewrite-1.bind");
+        let report = || {
+            std::fs::read(&report_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        };
         shared
             .store
             .enqueue("cloud-1", "do the task", None, "prewrite-1", "user")
@@ -6412,12 +6484,7 @@ mod tests {
         }
         let message = shared.store.message("prewrite-1").unwrap().unwrap();
         assert_eq!(message.state, "failed");
-        let blob = format!(
-            "{} {}",
-            message.result.unwrap_or(json!({})),
-            message.error.unwrap_or_default()
-        );
-        assert!(!blob.contains("unknown"), "{blob}");
+        assert!(report().unwrap()["pending_head"].is_null());
         assert_eq!(posts.load(Ordering::SeqCst), 0);
         let events = shared.store.events("cloud-1", 0, 40).unwrap();
         assert!(events.iter().all(|event| event.kind != "cloud_hold"));

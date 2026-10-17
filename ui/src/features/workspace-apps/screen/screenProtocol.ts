@@ -64,8 +64,6 @@ export const SLOT_VERBS = ["run.start", "publish.destination.use", "publish.draf
 /** CAD-1365 — the protected original download slot. Qualified per mount
  *  (screen-media.v1 + media.read + live token); never a generic action verb. */
 export const ORIGINAL_DOWNLOAD_VERB = "media.original.download" as const;
-export type CallVerb = (typeof CALL_VERBS)[number];
-export type SlotVerb = (typeof SLOT_VERBS)[number];
 /** CAD-1365 — the media contract's verbs parse on the closed call
  *  envelope but are NEVER in the generic advertised set: they are
  *  appended per-mount, only to a media-opted-in child whose minted
@@ -78,6 +76,24 @@ export const isMediaVerb = (verb: string): verb is MediaVerb =>
  *  deliberately absent; the channel appends a mount's declared media
  *  rights itself. */
 export const ACTION_VERBS: string[] = [...CALL_VERBS.filter(v => !(MEDIA_VERBS as readonly string[]).includes(v)), ...SLOT_VERBS.filter(v => v !== ORIGINAL_DOWNLOAD_VERB)];
+export const RECORD_CALL_VERBS = ["records.list", "records.show", "records.create", "records.update", "records.csv.preview", "segments.list", "segments.show", "segments.save", "exclusions.list", "exclusions.show", "exclusions.save", "suppressions.list", "suppressions.add", "audience.preview", "audience.prepare", "audience.show", "content.list", "content.show", "content.save", "content.clone", "content.render", "proposals.list", "proposals.show", "proposals.render", "proposals.apply", "proposals.discard", "sender-bindings.list", "sender-bindings.show", "sender-bindings.save", "content.test-prepare", "content.send-prepare", "sends.prepare", "sends.show", "sends.list", "smtp.show", "origin.show", "screen.preview.show", "screen.preview.clear", "screen.route.patch"] as const;
+export const RECORD_SLOT_VERBS = ["records.csv.import", "records.csv.confirm", "content.approve", "smtp.manage", "smtp.bind", "smtp.rebind", "smtp.revoke", "smtp.test-send", "sends.approve", "sends.resolve", "origin.manage", "chat.campaign.open", "chat.campaign.brief"] as const;
+export const RECORD_OPERATIONS: readonly string[] = [...RECORD_CALL_VERBS, ...RECORD_SLOT_VERBS];
+export type RecordCallVerb = (typeof RECORD_CALL_VERBS)[number];
+export type RecordSlotVerb = (typeof RECORD_SLOT_VERBS)[number];
+export type CallVerb = (typeof CALL_VERBS)[number] | RecordCallVerb;
+export type SlotVerb = (typeof SLOT_VERBS)[number] | RecordSlotVerb;
+export interface ScreenNavigation { section_query: string; default_section: string; sections: { id: string; label: string }[] }
+export interface ScreenRoute { section: string; view: "list" | "new"; record_id: string | null; segment_id: string | null }
+export interface ReadObservation { operation: string; args: ActionArgs; data: unknown }
+export const SCREEN_RECORDS_V1 = "screen-records.v1";
+/** CRM presentation data only; never an operation or permission. */
+export const CRM_LOCALE_V1 = "crm-locale.v1";
+/** Larger envelopes are admitted only after verified records negotiation and rights. */
+export function recordArgsLimit(verb: string): number {
+  return ["records.csv.preview", "records.csv.import", "records.csv.confirm"].includes(verb) ? 327680
+    : ["records.create", "records.update", "content.save", "screen.preview.show"].includes(verb) ? 49152 : ACTION_ARGS_BYTES;
+}
 export const ACTION_ID = /^[A-Za-z0-9_-]{1,64}$/;
 /** A v2 tool alias grammar: lowercase words joined by dots (matches the
  *  declaration). The alias is app vocabulary, never a route/provider name. */
@@ -135,7 +151,8 @@ export type ReplyMessage =
   | { v: 2; op: "reply"; id: string; ok: false; refusal: ActionRefusal }
   | { v: 2; op: "tool-reply"; id: string; ok: true; data: unknown }
   | { v: 2; op: "tool-reply"; id: string; ok: false; refusal: ActionRefusal }
-  | { v: 2; op: "slot-state"; id: string; state: "done"; receipt?: RunSlotReceipt }
+  | { v: 2; op: "slot-state"; id: string; state: "done"; receipt?: RunSlotReceipt; data?: never }
+  | { v: 2; op: "slot-state"; id: string; state: "done"; data: unknown; receipt?: never }
   | { v: 2; op: "slot-state"; id: string; state: "pending" | "refused"; refusal?: ActionRefusal };
 
 /** CAD-1123 HP1 — the generic read projection v2. A child opts in with
@@ -153,7 +170,7 @@ export const SCREEN_ACTIONS_V1 = "screen-actions.v1";
  *  nothing: dispatch still needs the minted receipt's declared
  *  `media.may` permission and its action token. */
 export const SCREEN_MEDIA_V1 = "screen-media.v1";
-export type Accept = typeof PUBLISH_INTENTS_V1 | typeof SCREEN_V2 | typeof SCREEN_ACTIONS_V1 | typeof SCREEN_MEDIA_V1;
+export type Accept = typeof PUBLISH_INTENTS_V1 | typeof SCREEN_V2 | typeof SCREEN_ACTIONS_V1 | typeof SCREEN_MEDIA_V1 | typeof SCREEN_RECORDS_V1 | typeof CRM_LOCALE_V1;
 /** The negotiated PUSH shape: the exact CAD-1006 v1, v1 plus
  *  publish-intents.v1, or the v2 projection. */
 export type Shape = "v1" | "intents" | "v2";
@@ -406,6 +423,11 @@ export interface ScreenPush {
   now: number;
   /** The child's own last `state` snapshot, replayed on remount. */
   resume?: string;
+  /** Records-negotiated display only, never authority. */
+  route?: ScreenRoute;
+  read_observations?: ReadObservation[];
+  /** Host-selected presentation only, for CRM records peers opting into crm-locale.v1. */
+  presentation_locale?: "en" | "zh-TW";
 }
 
 export type HostToChild = ScreenPush | AssetReply | ReplyMessage;
@@ -446,11 +468,11 @@ function generationScope(value:unknown):GenerationScope|null {
   if(typeof s.draft_id!=="string"||!ACTION_ID.test(s.draft_id)||typeof s.revision!=="number"||!Number.isSafeInteger(s.revision)||s.revision<1)return null;
   return s as unknown as GenerationScope;
 }
-function actionArgs(value: unknown): ActionArgs | null {
+function actionArgs(value: unknown, limit = ACTION_ARGS_BYTES): ActionArgs | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   try {
     const text = JSON.stringify(value);
-    return text !== undefined && new TextEncoder().encode(text).byteLength <= ACTION_ARGS_BYTES ? value as ActionArgs : null;
+    return text !== undefined && new TextEncoder().encode(text).byteLength <= limit ? value as ActionArgs : null;
   } catch { return null; }
 }
 const COORD_MAX = 16384;
@@ -468,7 +490,7 @@ function slotAnchor(value: unknown): SlotAnchor | null {
 /** Parse a port message into a `ChildToHost`, or `null` (caller closes
  *  the port). `state.data` is bounded at ≤ 32 KiB here so a hostile or
  *  buggy child cannot push an unbounded snapshot. */
-export function parseChild(data: unknown): ChildToHost | null {
+export function parseChild(data: unknown, records?: readonly string[]): ChildToHost | null {
   if (typeof data !== "object" || data === null || Array.isArray(data)) return null;
   const d = data as Record<string, unknown>;
   if (Object.keys(d).sort().join() === "op,v" && d.v === 1 && d.op === "ready") {
@@ -478,7 +500,7 @@ export function parseChild(data: unknown): ChildToHost | null {
     Object.keys(d).sort().join() === "accepts,op,v" && d.v === 1 && d.op === "ready" &&
     Array.isArray(d.accepts) && d.accepts.length >= 1 && d.accepts.length <= 3 &&
     new Set(d.accepts).size === d.accepts.length &&
-    d.accepts.every(a => a === PUBLISH_INTENTS_V1 || a === SCREEN_V2 || a === SCREEN_ACTIONS_V1 || a === SCREEN_MEDIA_V1)
+    d.accepts.every(a => a === PUBLISH_INTENTS_V1 || a === SCREEN_V2 || a === SCREEN_ACTIONS_V1 || a === SCREEN_MEDIA_V1 || a === SCREEN_RECORDS_V1 || a === CRM_LOCALE_V1)
   ) {
     return { v: 1, op: "ready", accepts: [...d.accepts] as Accept[] };
   }
@@ -487,9 +509,10 @@ export function parseChild(data: unknown): ChildToHost | null {
     return { v: 2, op: "asset", ref: d.ref };
   }
   if (d.v === 2 && d.op === "call" && Object.keys(d).sort().join() === "args,id,op,v,verb") {
-    const args = actionArgs(d.args);
-    if (typeof d.id !== "string" || !ACTION_ID.test(d.id) || !args ||
-        !(CALL_VERBS as readonly unknown[]).includes(d.verb)) return null;
+    const allowed = records ? RECORD_CALL_VERBS.filter(v => records.includes(v)) : CALL_VERBS;
+    const admitted = (allowed as readonly unknown[]).includes(d.verb);
+    const args = actionArgs(d.args, records && admitted ? recordArgsLimit(d.verb as string) : ACTION_ARGS_BYTES);
+    if (typeof d.id !== "string" || !ACTION_ID.test(d.id) || !admitted || !args) return null;
     // Media verbs carry their own CLOSED arg shapes — parsed exactly,
     // refused outright otherwise (unadmitted kinds, unbounded values and
     // forged authority fields never reach the channel's call path).
@@ -504,9 +527,11 @@ export function parseChild(data: unknown): ChildToHost | null {
     return { v: 2, op: "call", id: d.id, verb: d.verb as CallVerb, args };
   }
   if (d.v === 2 && d.op === "slot" && Object.keys(d).sort().join() === "anchor,args,id,op,v,verb") {
-    const args = actionArgs(d.args);
+    const allowed = records ? RECORD_SLOT_VERBS.filter(v => records.includes(v)) : SLOT_VERBS;
+    const admitted = (allowed as readonly unknown[]).includes(d.verb);
+    const args = actionArgs(d.args, records && admitted ? recordArgsLimit(d.verb as string) : ACTION_ARGS_BYTES);
     const anchor = slotAnchor(d.anchor);
-    if (typeof d.id === "string" && ACTION_ID.test(d.id) && (SLOT_VERBS as readonly unknown[]).includes(d.verb) && args && anchor &&
+    if (typeof d.id === "string" && ACTION_ID.test(d.id) && admitted && args && anchor &&
         (d.verb !== ORIGINAL_DOWNLOAD_VERB || originalDownloadArgs(args)))
       return { v: 2, op: "slot", id: d.id, verb: d.verb as SlotVerb, args, anchor };
     return null;
@@ -539,7 +564,7 @@ export function parseChild(data: unknown): ChildToHost | null {
   return null;
 }
 
-const V2_TOP = ["sources", "defaults", "readiness", "actions", "run_receipts", "original_downloads"] as const;
+const V2_TOP = ["sources", "defaults", "readiness", "actions", "run_receipts", "original_downloads", "route", "read_observations", "presentation_locale"] as const;
 const V2_RUN = ["created", "closed", "phase", "steps", "inputs_used", "caption_excerpt", "artifact_id",
   "review", "approved", "source_post_id", "refusal", "image_ref"] as const;
 /** The publish-intents.v1 shape: every screen.v2 field is removed. */

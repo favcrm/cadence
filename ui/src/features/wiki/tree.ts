@@ -25,14 +25,13 @@ export interface TreeRow {
 }
 
 /**
- * Folders the rules keep operator-only (CAD-580): `global/`, and every
- * agent's `profile/` and `memory/` — the read-only views over the agent's
- * own files. The server sends the truth per entry (`locked`); this is the
- * badge's fallback when it does not.
+ * Folders the rules keep read-only in the badge: every agent's `profile/`
+ * and `memory/` views. `global/` and `projects/<key>/` are writable by a
+ * board member, so they are not badged here. The server sends the truth
+ * per entry (`locked`); this is the badge's fallback when it does not.
  */
 export function operatorOnly(path: string): boolean {
   const parts = path.split("/").filter(Boolean);
-  if (parts[0] === "global") return true;
   if (parts[0] === "agents" && (parts[2] === "profile" || parts[2] === "memory")) return true;
   return false;
 }

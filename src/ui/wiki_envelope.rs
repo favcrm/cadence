@@ -63,6 +63,8 @@ fn action_of(method: &Method, tail: &str) -> Option<WikiAction> {
     match (method, tail) {
         (Method::Get, "ls") | (Method::Get, "search") => Some(WikiAction::Enumerate),
         (Method::Get, "file") => Some(WikiAction::Read),
+        (Method::Post, "job_status") => Some(WikiAction::Read),
+        (Method::Put, "transfer") => Some(WikiAction::Write),
         (Method::Put, "file") | (Method::Post, "upload") => Some(WikiAction::Write),
         _ => None,
     }
@@ -193,12 +195,77 @@ pub(crate) fn handle(
         return refuse(403, "read_only", "board is read-only — writes are disabled");
     }
     match action {
+        WikiAction::Read if tail == "job_status" => {
+            transfer(request, state_dir, &grant, &attribution, false)
+        }
+        WikiAction::Write if tail == "transfer" => {
+            transfer(request, state_dir, &grant, &attribution, true)
+        }
         WikiAction::Enumerate => enumerate(query, state_dir, &grant, &attribution),
         WikiAction::Read => read(query, state_dir, &grant, &attribution),
         WikiAction::Write if tail == "upload" => {
             upload(request, query, state_dir, pm_dir, &grant, &attribution)
         }
         WikiAction::Write => write(request, state_dir, &grant, &attribution),
+    }
+}
+
+/// The transport's existing write/read scopes cover only the explicit transfer
+/// operations. All manifest paths are checked before the daemon sees a write.
+fn transfer(
+    request: &mut Request,
+    state_dir: &std::path::Path,
+    grant: &WikiGrant,
+    attribution: &str,
+    writing: bool,
+) -> HttpResp {
+    let body = match read_body(request, super::JSON_CAP) {
+        Ok(body) => body,
+        Err(resp) => return resp,
+    };
+    let body: Value = match parse_json(&body) {
+        Ok(body) => body,
+        Err(resp) => return resp,
+    };
+    let mut params = match super::wiki::transfer_params(&body, writing) {
+        Ok(params) => params,
+        Err(resp) => return resp,
+    };
+    let action = if writing {
+        WikiAction::Write
+    } else {
+        WikiAction::Read
+    };
+    let root = body["path"].as_str().unwrap_or_default();
+    if !grant.contains(action, root) {
+        return refuse(
+            403,
+            "insufficient_scope",
+            "transfer path is outside the signed prefix",
+        );
+    }
+    if let Some(entries) = params["manifest"]["entries"].as_array() {
+        for entry in entries {
+            let path = format!("{root}/{}", entry["path"].as_str().unwrap_or_default());
+            if !grant.contains_file(action, &path) {
+                return refuse(
+                    403,
+                    "insufficient_scope",
+                    "transfer entry is outside the signed prefix",
+                );
+            }
+        }
+    }
+    params["wiki_as"] = json!(attribution);
+    params["_transfer_binding"] = json!({
+        "issuer": grant.issuer,
+        "organization_id": grant.organization_id,
+        "audience": grant.audience,
+        "subject": grant.sub,
+    });
+    match client::rpc(state_dir, "wiki_transfer", params) {
+        Ok(value) => json_ok(value),
+        Err(error) => write_err(&error),
     }
 }
 

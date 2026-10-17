@@ -103,8 +103,18 @@ login. Two consequences:
   org. A `503` waking reply with `Retry-After` is waited on per AOS-128's
   rule — bounded, counted, and still fails closed after the bound.
 - I4: Destination resolution is pinned once per command; `org switch` during
-  a running command cannot move it; `CADENCE_ALIAS`-bound callers keep
-  CAD-657's rule (inherited pins win; `--org` conflicts, never overrides).
+  a running command cannot move it. A `CADENCE_ALIAS` caller keeps its
+  inherited local daemon when `--org` is omitted and never consults the
+  registry default. An explicit `--org` is accepted only when the live local
+  daemon shows exactly one running message whose immutable kickoff binding
+  names that org and records an original member and issuer; the endpoint
+  and organization id come from the binding, and the saved login must still
+  name that same member and issuer on every credential load, including a
+  post-resolution reload or renewal. Audience, scope, and renewal checks
+  otherwise run unchanged. A binding without both original pins is not
+  eligible. A different org, no binding, queued, terminal, or unresolved
+  work, more than one running message, and an explicit `--state-dir` or
+  tracker pin stay refused. `org switch` stays refused.
 - I5: Login never changes an existing default org without `--use`; a second
   workspace login adds an org and leaves the default untouched; concurrent
   logins for different orgs cannot clobber each other's records (existing
@@ -137,15 +147,57 @@ Refused remotely (default-deny): every operator-only daemon verb
 (`agent join/stop/resume`, `daemon *`, `operator_*`, `rollout`, `master/*`,
 `approve`, `merge`, secrets), verbs naming local paths (`issue init`,
 `attach`, chunked wiki `put` — CAD-913's own envelope contract), and
-`issue start`/`dispatch` (worktree + ownership semantics are local).
+`issue start`/`dispatch` are not container verbs. On a selected remote org
+they coordinate this user's local agent through
+`/__platform/hosted-cadence/:organizationId/local-assignments`
+(`hosted-cadence-local-assignment.v1`). Local completion, including
+`cadence message result`, keeps the claim stored with that message, not a
+newer reclaim, and does not take `--org`. While that message is the alias's
+single running assignment, hosted ticket, wiki, and tool commands pass the
+binding's `--org` under its original member and issuer. A later login is not
+adopted. A managed worker is not instructed to `org switch` or to unset
+`CADENCE_ALIAS`. A worktree alone is not execution.
 Operator-only verbs need the remote operator proof tied to CAD-657's
 source-authority decision — out of scope for v1.
+
+`local-agent connect --alias <alias> --repo <checkout>` configures this
+machine and picks up current assignments once. Run `local-agent watch` for
+ongoing pickup, with a five-second poll and the org pinned for that process.
+Background pickup leaves blocked work alone; after resolving its blocker,
+explicitly reconnect or start that issue again. State-filtered reads prevent a
+recent terminal history page from hiding older queued work.
+Disconnect clears the saved alias and ends pickup; it neither stops existing
+actors nor cancels their claims. Each assignment generation has a separate
+worktree, and reconnect reuses its reserved actor message rather than starting
+the issue twice. A blocked claim resumes before handoff, so a fast result is
+never overwritten by a later `running` report.
+
+Completion is local-first: the durable message result is committed before
+the background reporter contacts the board. A held or unavailable report
+does not block actor completion, local pickup, daemon readiness or shutdown.
+The next daemon startup recovers a terminal result even if it finished before
+the pending-report record was written, and delivers its original claim.
+An unknown outcome is not converted into a success or failure. A fenced
+claim stops retrying without being recorded as an accepted result.
+
+The complete provider result remains in the local message. Automatic hosted
+summaries fit both 4,000 Unicode codepoints and 8,192 bytes for the complete
+pretty-serialized JSON request, retaining the reported revision when present.
+An oversized manual report is refused before HTTP. A durable `result.sha`
+takes precedence; managed endpoints may instead report the final `SHA: <hex>`
+line in their durable result text. Missing or invalid reported revisions make
+the hosted completion fail, even when the checkout has a HEAD or advances
+before recovery. Neither path infers a revision from that mutable checkout.
 
 ## Auth chain
 
 `cadence login --issuer <api-origin> --org <workspace-id>` →
-`/v1/hosted-cadence/device/code` (PKCE, `requested_capabilities` = the CLI
-set) → owner approves on the app → `/v1/hosted-cadence/device/token` → `hct_`
+`/v1/hosted-cadence/device/code` (PKCE; ordinary portal login and
+`--org` login request `cli.read`, `cli.write`, `wiki.read`, and
+`wiki.write`; `cadence login --web` requests `cli.read`, `cli.write`,
+`web.read`, and `web.prepare` and no wiki scopes; renewal resends the
+stored set and does not widen it) → a current workspace member approves on the app →
+`/v1/hosted-cadence/device/token` → `hct_`
 bridge + minted cli-actor enrollment record (locally sealed) → each command:
 `POST https://<slug>.cadencecloud.app/__platform/cli/authorize` (bridge
 bearer → envelope, ≤300 s, `aud` = board host, `organization_id` = slug's

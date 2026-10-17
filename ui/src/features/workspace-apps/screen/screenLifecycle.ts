@@ -1,5 +1,6 @@
 import { ASSET_BYTES_MAX, ASSET_DATA_URL, ORIGINAL_DOWNLOAD_VERB, parseChild, parseInit, pushedAssetRefs, shapeFor, shapeOf,
-  wantsActions, wantsMedia, isMediaVerb, SCREEN_MEDIA_V1, TOOL_ALIAS, ASSET_REF,
+  wantsActions, wantsMedia, isMediaVerb, SCREEN_MEDIA_V1, TOOL_ALIAS, ASSET_REF, SCREEN_RECORDS_V1, CRM_LOCALE_V1, SCREEN_V2, RECORD_OPERATIONS, RECORD_CALL_VERBS, RECORD_SLOT_VERBS, CALL_VERBS, SLOT_VERBS,
+  type ScreenNavigation,
   type ActionResult, type AssetReply, type CallRequest, type CallVerb, type ChildToHost, type MediaVerb, type ReplyMessage, type ScreenPush,
   type Shape, type SlotRequest, type ToolRequest } from "./screenProtocol";
 import { SlotController, type Planner, type SlotView } from "./screenSlot";
@@ -31,6 +32,9 @@ export interface ScreenActions {
 export const CALL_QUEUE_MAX = 8;
 /** A reply's data is at most this many bytes of JSON. */
 const REPLY_BYTES_MAX = 64 * 1024;
+const RECORD_REPLY_BYTES_MAX = 1048576;
+const RECORD_REPLY_WIRE_BYTES_MAX = RECORD_REPLY_BYTES_MAX + 1024;
+const jsonBytes = (value: unknown): number => new TextEncoder().encode(JSON.stringify(value)).byteLength;
 
 export type MountReceipt = { mount: string; bridge_nonce: string; generation: number; tag: string;
   /** CAD-1177: the mount's server-bound action context token, held by the
@@ -47,13 +51,27 @@ export type MountReceipt = { mount: string; bridge_nonce: string; generation: nu
    *  wider). Declaration metadata only: dispatch still requires the
    *  mount's action token and the child's `screen-media.v1` opt-in, and
    *  the daemon re-proves the declaration natively on every call. */
-  media?: { contract: "screen-media.v1"; may: MediaVerb[] } };
+  media?: { contract: "screen-media.v1"; may: MediaVerb[] };
+  host_contract?: typeof SCREEN_RECORDS_V1;
+  operations?: string[];
+  navigation?: ScreenNavigation | null;
+  display_scope_key?: string | null;
+  display_session_key?: string;
+  install_id?: string; context_id?: string | null; digest?: string;
+  remote_images?: string[] };
+export function parseNavigation(value: unknown): ScreenNavigation | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const nav = value as ScreenNavigation;
+  const reserved = new Set(["app", "install", "install_id", "context", "context_id", "ctx", "actor", "identity", "auth", "token", "key", "session", "session_key", "origin", "project", "workspace", "conversation", "thread", "message", "view", "appview", "record", "record_id", "segment", "segment_id", "screen", "contract-preview", "nonce", "generation", "digest"]);
+  if (Object.keys(nav).sort().join() !== "default_section,section_query,sections" || typeof nav.section_query !== "string" || !/^[a-z][a-z0-9_-]{0,31}$/.test(nav.section_query) || reserved.has(nav.section_query) || !Array.isArray(nav.sections) || nav.sections.length < 1 || nav.sections.length > 8 || new Set(nav.sections.map(s => s?.id)).size !== nav.sections.length || !nav.sections.every(s => s && Object.keys(s).sort().join() === "id,label" && typeof s.id === "string" && /^[a-z0-9][a-z0-9-]{0,31}$/.test(s.id) && typeof s.label === "string" && s.label.trim().length > 0 && s.label.length <= 40) || !nav.sections.some(s => s.id === nav.default_section)) return null;
+  return nav;
+}
 export function parseMount(value: unknown, tag: string): MountReceipt | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const v = value as Record<string, unknown>;
   const keySet = Object.keys(v);
   const keysOk = ["bridge_nonce", "generation", "mount", "tag"].every(k => keySet.includes(k)) &&
-    keySet.every(k => ["bridge_nonce", "generation", "mount", "tag", "action_token", "tools", "media"].includes(k));
+    keySet.every(k => ["bridge_nonce", "generation", "mount", "tag", "action_token", "tools", "media", "host_contract", "operations", "navigation", "display_scope_key", "display_session_key", "install_id", "context_id", "digest", "remote_images"].includes(k));
   const tools = v.tools;
   const toolsOk = tools === undefined || (Array.isArray(tools) && tools.length <= 32 &&
     new Set(tools).size === tools.length && tools.every(a => typeof a === "string" && TOOL_ALIAS.test(a)));
@@ -71,7 +89,15 @@ export function parseMount(value: unknown, tag: string): MountReceipt | null {
   const action = v.action_token;
   const actionOk = action === null || action === undefined ||
     (typeof action === "string" && /^[a-f0-9]{64}$/.test(action) && !v.mount?.toString().endsWith(action));
-  if (!keysOk || !toolsOk || !mediaOk ||
+  const records = v.host_contract === SCREEN_RECORDS_V1;
+  const recordsKeys = ["operations", "navigation", "display_scope_key", "display_session_key", "install_id", "context_id", "digest", "remote_images"];
+  const recordsOk = records ?
+    media === undefined && typeof action === "string" && Array.isArray(tools) && tools.length === 0 && Array.isArray(v.operations) && v.operations.length > 0 && v.operations.length <= 64 && new Set(v.operations).size === v.operations.length && v.operations.every(op => typeof op === "string" && RECORD_OPERATIONS.includes(op)) &&
+    (v.navigation === null || parseNavigation(v.navigation) !== null) && typeof v.display_session_key === "string" && /^[a-f0-9]{64}$/.test(v.display_session_key) &&
+    typeof v.install_id === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(v.install_id) && typeof v.context_id === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(v.context_id) && typeof v.digest === "string" && /^sha256:[a-f0-9]{64}$/.test(v.digest) && typeof v.display_scope_key === "string" && /^[a-f0-9]{64}$/.test(v.display_scope_key) &&
+    Array.isArray(v.remote_images) && v.remote_images.length <= 1 && v.remote_images.every(x => x === "instagram-cdn")
+    : v.host_contract === undefined && recordsKeys.every(k => v[k] === undefined);
+  if (!keysOk || !toolsOk || !mediaOk || !recordsOk ||
       typeof v.mount !== "string" || !/^\/api\/app-screen\/[a-f0-9]{64}$/.test(v.mount) ||
       typeof v.bridge_nonce !== "string" || !/^[a-f0-9]{64}$/.test(v.bridge_nonce) ||
       v.mount.endsWith(v.bridge_nonce) || v.tag !== tag || !actionOk ||
@@ -106,6 +132,9 @@ export abstract class FrameChannel {
   protected call(_request: CallRequest): void { this.close(true); }
   protected slot(_request: SlotRequest): void { this.close(true); }
   protected tool(_request: ToolRequest): void { this.close(true); }
+  protected recordsRights(): readonly string[] | undefined { return undefined; }
+  /** Opaque state is ignored unless this frame kind explicitly understands it. */
+  protected state(_data: string): void {}
   receive(event: Pick<MessageEvent, "origin" | "source" | "data" | "ports">): void {
     if (this.closed || event.source !== this.source) return;
     if (event.origin !== "null") {
@@ -120,7 +149,7 @@ export abstract class FrameChannel {
     this.port = event.ports[0];
     this.port.onmessage = event => {
       if (this.closed) return;
-      const child = parseChild(event.data);
+      const child = parseChild(event.data, this.recordsRights());
       if (!child || child.op === "state" && !this.ready) { this.close(true); return; }
       if (child.op === "ready") {
         if (this.ready || !this.accept(child)) { this.close(true); return; }
@@ -138,7 +167,8 @@ export abstract class FrameChannel {
         else if (child.op === "slot") this.slot(child);
         else this.tool(child);
       }
-      // Opaque local draft state is deliberately not persisted in the first release.
+      if (child.op === "state") this.state(child.data);
+      // No local draft content is persisted.
     };
     this.port.onmessageerror = () => this.close(true);
     this.port.start();
@@ -169,9 +199,31 @@ export class ScreenChannel extends FrameChannel {
   constructor(source: Window, receipt: MountReceipt, private projection: ScreenPush,
     removeFrame: () => void, failed: () => void, onReady: () => void,
     private loadAsset: AssetLoader = async () => null, private actions?: ScreenActions,
-    private clock?: () => number) {
+    private clock?: () => number, private onUnsaved?: (unsaved: boolean) => void) {
     super(source, receipt, removeFrame, failed, onReady);
   }
+  private records = false;
+  private crmLocale = false;
+  protected state(data: string): void {
+    const nav = this.receipt.navigation;
+    if (!this.ready || this.closed || !this.records || this.receipt.tag !== "crm" ||
+        this.projection.installation.name !== "crm" || nav?.section_query !== "crm" ||
+        !nav.sections.some(s => s.id === "campaigns") || data.length > 128 ||
+        new TextEncoder().encode(data).byteLength > 128) return;
+    // This closed boolean is a warning hint, never navigation/effect authority.
+    // Unknown or malformed opaque state must not clear an existing warning.
+    try {
+      const value: unknown = JSON.parse(data);
+      if (!value || typeof value !== "object" || Array.isArray(value)) return;
+      const state = value as Record<string, unknown>;
+      if (Object.keys(state).sort().join() !== "contract,unsaved" ||
+          state.contract !== "crm-leave.v1" || typeof state.unsaved !== "boolean") return;
+      this.onUnsaved?.(state.unsaved);
+    } catch { /* Ignore other opaque state, without changing the warning. */ }
+  }
+  private csvBusy = false;
+  private csvSlot: string | null = null;
+  protected recordsRights(): readonly string[] | undefined { return this.records ? this.receipt.operations ?? [] : undefined; }
   private calls = 0;
   /** In-flight call continuations. Close aborts them; resume does not restart them. */
   private callRetire: AbortController[] = [];
@@ -183,7 +235,7 @@ export class ScreenChannel extends FrameChannel {
    *  host-held metadata — the frame's own fields never widen it, and a
    *  denied verb closes before any dispatch. */
   private mediaAdmits(verb: MediaVerb): boolean {
-    return this.shape === "v2" && this.wantsMedia && !!this.actions &&
+    return !this.records && this.shape === "v2" && this.wantsMedia && !!this.actions &&
       !!this.projection.actions?.length && !!this.receipt.action_token &&
       this.receipt.media?.contract === SCREEN_MEDIA_V1 &&
       this.receipt.media.may.includes(verb);
@@ -196,19 +248,31 @@ export class ScreenChannel extends FrameChannel {
   /** Only a v2 child with an action host; the verb set was closed by the parser. */
   protected call(request: CallRequest): void {
     const actions = this.actions;
+    if (this.crmLocale && Object.hasOwn(request.args, "presentation_locale")) { this.close(true); return; }
     if (this.shape !== "v2" || !actions || this.calls >= CALL_QUEUE_MAX) { this.close(true); return; }
+    const csv = this.records && request.verb === "records.csv.preview";
+    if (csv && (this.csvBusy || this.csvSlot)) { this.close(true); return; }
+    if (csv) this.csvBusy = true;
+    if (this.records ? !this.receipt.operations?.includes(request.verb) || !(RECORD_CALL_VERBS as readonly string[]).includes(request.verb) : !(CALL_VERBS as readonly string[]).includes(request.verb)) { this.close(true); return; }
     if (isMediaVerb(request.verb) && !this.mediaAdmits(request.verb)) { this.close(true); return; }
     this.calls++;
     const retire = new AbortController();
     this.callRetire.push(retire);
-    const reply = (message: ReplyMessage) => { if (!this.closed) this.port?.postMessage(message); };
+    const reply = (message: ReplyMessage) => {
+      if (this.closed) return;
+      if (this.records && jsonBytes(message) > RECORD_REPLY_WIRE_BYTES_MAX) {
+        this.port?.postMessage({ v: 2, op: "reply", id: request.id, ok: false, refusal: { code: "too_large", text: "That is too large to show." } });
+      } else this.port?.postMessage(message);
+    };
     void actions.call(request.verb, request.args, { showLink: url => actions.onLink(url), actionToken: this.receipt.action_token ?? undefined, signal: retire.signal })
       .catch((): ActionResult => ({ ok: false, refusal: { code: "failed", text: "That didn't work." } }))
       .then(result => {
         this.calls--;
+        if (csv) this.csvBusy = false;
+        if (this.closed) return;
         if (!result.ok) { reply({ v: 2, op: "reply", id: request.id, ok: false, refusal: result.refusal }); return; }
-        const size = new TextEncoder().encode(JSON.stringify(result.data ?? null)).byteLength;
-        if (size > REPLY_BYTES_MAX) reply({ v: 2, op: "reply", id: request.id, ok: false, refusal: { code: "too_large", text: "That is too large to show." } });
+        const size = jsonBytes(result.data ?? null);
+        if (size > (this.records ? RECORD_REPLY_BYTES_MAX : REPLY_BYTES_MAX)) reply({ v: 2, op: "reply", id: request.id, ok: false, refusal: { code: "too_large", text: "That is too large to show." } });
         else {
           this.rememberDraftAssetRefs(result.data,request.args);
           reply({ v: 2, op: "reply", id: request.id, ok: true, data: result.data ?? null });
@@ -222,14 +286,23 @@ export class ScreenChannel extends FrameChannel {
   /** Only a v2 child with an action host. At most one live slot per frame. */
   protected slot(request: SlotRequest): void {
     const actions = this.actions;
-    if (this.shape !== "v2" || !actions) { this.close(true); return; }
+    if (this.crmLocale && Object.hasOwn(request.args, "presentation_locale")) { this.close(true); return; }
+    if (this.shape !== "v2" || !actions || (this.records ? !this.receipt.operations?.includes(request.verb) || !(RECORD_SLOT_VERBS as readonly string[]).includes(request.verb) : !(SLOT_VERBS as readonly string[]).includes(request.verb))) { this.close(true); return; }
+    const csv = this.records && (request.verb === "records.csv.import" || request.verb === "records.csv.confirm");
+    if (csv && (this.csvBusy || this.csvSlot !== null && this.csvSlot !== request.id)) { this.close(true); return; }
+    if (csv) this.csvSlot = request.id;
     if (request.verb === ORIGINAL_DOWNLOAD_VERB && !this.originalDownloadAdmits()) { this.close(true); return; }
     // The download token comes only from the consumed receipt, never from the frame's args.
     const token = this.receipt.action_token ?? undefined;
     const planner: Planner = (verb, args) => actions.planner(verb, args, verb === ORIGINAL_DOWNLOAD_VERB
       ? { actionToken: token, isCurrent: () => !this.closed && this.receipt.action_token === token } : undefined);
-    this.slots ??= new SlotController(message => { if (!this.closed) this.port?.postMessage(message); },
-      view => actions.onSlot(view), planner, this.clock);
+    this.slots ??= new SlotController(message => {
+      if (message.op === "slot-state" && message.state !== "pending" && this.csvSlot === message.id) this.csvSlot = null;
+      if (this.closed) return;
+      if (this.records && (jsonBytes(message) > RECORD_REPLY_WIRE_BYTES_MAX || "data" in message && jsonBytes(message.data ?? null) > RECORD_REPLY_BYTES_MAX)) {
+        this.port?.postMessage({ v: 2, op: "slot-state", id: message.id, state: "refused", refusal: { code: "too_large", text: "That receipt is too large to show." } });
+      } else this.port?.postMessage(message);
+    }, view => actions.onSlot(view), planner, this.clock);
     void this.slots.request(request);
   }
   /** Only a v2 child that opted into `screen-actions.v1` AND whose host
@@ -257,8 +330,8 @@ export class ScreenChannel extends FrameChannel {
       });
   }
   /** A press on the host-drawn button (the board component calls this). */
-  tapSlot(token: string, trusted: boolean, pressedAt: number): boolean {
-    return !this.closed && (this.slots?.tap(token, trusted, pressedAt) ?? false);
+  tapSlot(token: string, trusted: boolean, pressedAt: number, input?: string): boolean {
+    return !this.closed && (this.slots?.tap(token, trusted, pressedAt, input) ?? false);
   }
   /** The person closed the host-drawn confirm card. */
   cancelSlot(token: string): void {
@@ -274,6 +347,11 @@ export class ScreenChannel extends FrameChannel {
     // Only the opt-ins a workspace screen can honour; the chat opt-in closes it.
     const shape = shapeOf(ready.accepts);
     if (!shape) return false;
+    const accepts: readonly string[] = ready.accepts ?? [];
+    const records = accepts.includes(SCREEN_RECORDS_V1);
+    if (records !== (this.receipt.host_contract === SCREEN_RECORDS_V1) || records && (shape !== "v2" || !accepts.includes(SCREEN_V2) || wantsActions(ready.accepts) || !this.receipt.action_token || !this.actions)) return false;
+    this.records = records;
+    this.crmLocale = records && this.receipt.tag === "crm" && this.projection.installation.name === "crm" && accepts.includes(CRM_LOCALE_V1);
     this.shape = shape;
     // Record the tool/action opt-in: the child may then send `tool` ops,
     // which only run when the host holds a live mount action context.
@@ -333,16 +411,18 @@ export class ScreenChannel extends FrameChannel {
     // the slot path still validates, plans and confirms natively.
     // CAD-1447: the marker also requires the child's `screen-media.v1` opt-in —
     // the released `screen-actions.v1` SDK rejects the unknown root field.
-    const projection: ScreenPush = { ...this.projection };
+    const projection: ScreenPush = this.records ? { ...this.projection, actions: [...(this.receipt.operations ?? [])] } : { ...this.projection };
+    // Presentation negotiation grants no actions. Older/other peers retain their exact shape.
+    if (!this.crmLocale || projection.tag !== "crm" || projection.installation.name !== "crm" || !["en", "zh-TW"].includes(projection.presentation_locale ?? "")) delete projection.presentation_locale;
     delete projection.run_receipts;
-    if (this.shape === "v2" && this.wantsMedia && this.actions?.planner && projection.actions?.includes("run.start")) {
+    if (!this.records && this.shape === "v2" && this.wantsMedia && this.actions?.planner && projection.actions?.includes("run.start")) {
       projection.run_receipts = 1;
     }
     // CAD-1365: `original_downloads` is host-derived the same way, and only for
     // a v2 child whose mount may read media. It grants nothing by itself.
     delete projection.original_downloads;
     if (this.shape === "v2" && this.originalDownloadAdmits() && projection.actions?.length) projection.original_downloads = 1;
-    const push = shapeFor(this.withMediaVerbs(this.withToolAliases(projection)), this.shape);
+    const push = shapeFor(this.records ? projection : this.withMediaVerbs(this.withToolAliases(projection)), this.shape);
     if (!push) { this.close(true); return; }
     this.refs = this.shape === "v2" ? pushedAssetRefs(push) : new Set();
     if(this.shape==="v2") for(const ref of this.dynamicDraftRefs) this.refs.add(ref);

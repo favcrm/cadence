@@ -63,13 +63,14 @@ pub use topics::{
 };
 mod inbox;
 mod kickoff;
+pub(crate) use kickoff::last_sha_line;
 pub use kickoff::{check_commit_sha, job_kickoff, kickoff_ceiling, omit_host_paths};
 mod messages;
 #[cfg(test)]
 pub(crate) use messages::take_decoded_messages;
 pub use messages::{
-    report_timeout_secs, Message, Priority, Steer, DEFAULT_REPORT_TIMEOUT_SECS, ENQUEUE_BYTES,
-    NUDGE_SOURCE,
+    report_timeout_secs, Message, MessageIndex, MessageIndexQuery, Priority, Steer,
+    DEFAULT_REPORT_TIMEOUT_SECS, ENQUEUE_BYTES, NUDGE_SOURCE,
 };
 mod monitors;
 pub use monitors::{Monitor, MonitorAlert, MonitorCheck};
@@ -108,6 +109,7 @@ pub use plans::{current_verdict, AssigneeTask, Job, Task, Verdict, JOB_STATES};
 mod quota;
 mod schema;
 mod seal;
+pub(crate) mod wiki_transfers;
 pub(crate) use schema::open_read_only;
 pub use schema::{AdoptEntry, ConsumedMarker, RecoveryOutcome, Take};
 pub use seal::OpenMode;
@@ -120,8 +122,6 @@ pub use seal::WriteTxn;
 pub(crate) use seal::{preflight_writer_guard, require_legacy_writer_tx, StoreConn};
 #[cfg(test)]
 mod tests;
-#[cfg(test)]
-mod writer_census;
 
 /// How long a connection waits on another process's lock before
 /// SQLITE_BUSY (CAD-256). The daemon's writer and every out-of-process

@@ -1,3 +1,6 @@
+@import "../../../screen-ui/src/primitives.css";
+@import "../../../screen-ui/src/drawer-base.css";
+
 /* CAD-802 trusted shared App shell. Canonical board tokens only.
  *
  * One chat node serves both panes: the desktop left column and the
@@ -649,42 +652,6 @@
 }
 
 /* Generic outlet tabs + detail drawer. */
-.app-outlet {
-  display: grid;
-  gap: 0.75rem;
-  align-content: start;
-  /* A grid item defaults to min-width: auto: without this, a wide
-     descendant (e.g. a customer table) forces the whole document
-     past narrow viewports instead of scrolling internally (CAD-781 F2). */
-  min-width: 0;
-}
-
-.app-outlet-tabs {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.25rem;
-  border-bottom: 1px solid var(--color-ink-700);
-}
-
-.app-outlet-tab {
-  padding: 0.5rem 0.9rem;
-  font-size: var(--text-label);
-  color: var(--color-ink-400);
-  border-bottom: 2px solid transparent;
-  margin-bottom: -1px;
-}
-
-.app-outlet-tab:focus-visible {
-  outline: 2px solid var(--color-accent);
-  outline-offset: 2px;
-}
-
-.app-outlet-tab[data-on] {
-  color: var(--color-accent);
-  border-bottom-color: var(--color-accent);
-  font-weight: 600;
-}
-
 .app-outlet-drawer {
   border: 1px solid var(--color-ink-700);
   border-radius: 0.5rem;
@@ -698,18 +665,6 @@
   justify-content: space-between;
   gap: 0.75rem;
   margin-bottom: 0.5rem;
-}
-
-.sr-only {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  padding: 0;
-  margin: -1px;
-  overflow: hidden;
-  clip: rect(0, 0, 0, 0);
-  white-space: nowrap;
-  border: 0;
 }
 
 /* CRM Customers inside the trusted shell (CAD-781). Canonical board
@@ -733,13 +688,6 @@
   min-width: 0;
 }
 
-.crm-toolbar {
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-  flex-wrap: wrap;
-  min-width: 0;
-}
 
 /* The lede takes the free width and wraps; the header action stays on
    the same row, right-aligned, in every CRM section. */
@@ -818,16 +766,6 @@
   min-width: 0;
 }
 
-.crm-field {
-  display: grid;
-  gap: 0.3rem;
-  min-width: 0;
-}
-
-.crm-field .field {
-  width: 100%;
-  max-width: 100%;
-}
 
 .crm-field-row {
   display: grid;
@@ -841,20 +779,6 @@
   }
 }
 
-/* Right detail drawer: a fixed sheet on desktop, a full overlay at
-   narrow widths. Non-modal — the list stays usable behind it. */
-.crm-drawer {
-  position: fixed;
-  top: 0;
-  bottom: 0;
-  right: 0;
-  width: min(30rem, 100dvw);
-  z-index: 30;
-  background: var(--color-ink-875);
-  border-left: 1px solid var(--color-ink-700);
-  padding: 1rem 1.1rem 2rem;
-  overflow-y: auto;
-}
 
 .crm-drawer-head {
   display: flex;
@@ -958,31 +882,6 @@
   color: var(--color-fail);
 }
 
-/* The typed-count confirm dialog: modal over the campaign, compact,
-   centred. The count input is the gate — Cancel/Approve stay paired. */
-.crm-confirm-wrap {
-  position: fixed;
-  inset: 0;
-  z-index: 40;
-  display: grid;
-  place-items: center;
-  padding: 1rem;
-}
-.crm-confirm-scrim {
-  position: absolute;
-  inset: 0;
-  background: var(--color-scrim);
-}
-.crm-confirm {
-  position: relative;
-  width: min(26rem, 100%);
-  max-height: calc(100dvh - 2rem);
-  overflow-y: auto;
-  padding: 1rem;
-}
-.crm-confirm .field {
-  max-width: 10rem;
-}
 
 /* CAD-861 app-views/v1 dev preview: the contract renderer reuses the
    board's own tokens and the CRM table's overflow shape; the banner
@@ -1215,135 +1114,6 @@
   .app-shell-scope-list .lnk {
     min-height: 2.75rem;
   }
-}
-/* CAD-866 shared host primitives. These generic classes carry the same
-   canonical tokens the CRM (`crm-*`) and app-views (`av-*`) shapes used;
-   consumers keep their legacy class as an extra hook for tests/QA while
-   the field/table/detail/state chrome now lives here once. */
-.sfield {
-  display: grid;
-  /* Label/hint/error sit as one unit (8px spacing scale); control
-     heights, rows-driven textareas and required/error/readonly
-     semantics are untouched (CAD-910). */
-  gap: 0.5rem;
-  min-width: 0;
-}
-
-.sfield .field,
-.sfield > input:not([type="file"]),
-.sfield > textarea,
-.sfield > select {
-  width: 100%;
-  max-width: 100%;
-}
-
-.sfield-label {
-  /* Mid weight lifts the label above its hint without reaching the
-     semibold reserved for selected tabs/headings (CAD-910). */
-  font-weight: 500;
-}
-
-/* Shared hint typography overrides the compact utilities emitted by Field. */
-p.sfield-hint {
-  margin: 0;
-  font-size: var(--text-label);
-  line-height: 1.5;
-  color: var(--color-ink-400);
-}
-
-.sfield-error {
-  margin: 0;
-}
-
-.stable-wrap {
-  overflow: auto;
-  max-width: 100%;
-  /* Inside a bounded flex column this is the only flex-growing region:
-     it fills the leftover height and scrolls the table internally
-     instead of letting the document grow past the fold. */
-  flex: 1;
-  min-height: 0;
-  contain: layout paint;
-  border: 1px solid var(--color-ink-700);
-  border-radius: 0.5rem;
-  background: var(--color-ink-850);
-}
-
-.stable-wrap:focus-visible {
-  outline: 2px solid var(--color-accent);
-  outline-offset: 2px;
-}
-
-.stable {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: var(--text-table);
-}
-
-.stable th,
-.stable td {
-  text-align: left;
-  /* Same 12px block/inline padding as .crm-table: both owners read
-     identically wherever DataTable or a bare table renders (CAD-910). */
-  padding: 0.75rem;
-  border-bottom: 1px solid var(--color-ink-700);
-  vertical-align: top;
-  /* Long unbreakable tokens wrap; horizontal scrolling stays inside
-     `.stable-wrap`, never the document. */
-  overflow-wrap: anywhere;
-}
-
-.stable thead th {
-  font-size: var(--text-label);
-  font-weight: 500;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--color-ink-400);
-  background: var(--color-ink-875);
-}
-
-.stable tbody tr:hover {
-  background: var(--color-ink-875);
-}
-
-.stable tbody tr:last-child td,
-.stable tbody tr:last-child th {
-  border-bottom: 0;
-}
-
-.sdetail {
-  display: grid;
-  gap: 0.5rem;
-  margin: 0;
-}
-
-.sdetail > div {
-  display: grid;
-  grid-template-columns: 8rem minmax(0, 1fr);
-  gap: 0.5rem;
-  align-items: baseline;
-}
-
-.sdetail dt {
-  font-size: var(--text-label);
-  color: var(--color-ink-500);
-}
-
-.sdetail dd {
-  margin: 0;
-  font-size: var(--text-secondary);
-  color: var(--color-ink-200);
-  overflow-wrap: anywhere;
-}
-
-.snotice,
-.sempty,
-.serror {
-  margin: 0;
-}
-
-.sloading {
-  margin: 0;
 }
 /* CAD-1051: collapsible chat rail (desktop). The pane stays on the
    left; collapsed it is a thin rail with a waiting dot. */

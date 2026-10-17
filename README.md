@@ -47,7 +47,9 @@ CAD-315. Full clean-platform setup/backup acceptance remains open under CAD-317.
 See [native installation](docs/INSTALL-AGENT.md) for supported platforms,
 explicit pilot versions and provenance verification. The
 [release record](docs/RELEASING.md) records the exact source, publication gates
-and three-target anonymous installation evidence.
+and three-target anonymous installation evidence. New CLI builds default
+`cadence update` to `https://api-v2.agenticos.hk`, without GitHub API access;
+see the release record for advanced source overrides and verification requirements.
 
 ## Quick start
 

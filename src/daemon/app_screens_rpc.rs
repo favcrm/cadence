@@ -335,7 +335,7 @@ impl Shared {
         // never enters the frame bootstrap or a child message. It only
         // becomes invocable when `app_screen_consume` activates it — a
         // mint that is never consumed, or is superseded, stays refused.
-        // No tools and no media contract → no token (read-only screen).
+        // No tools, records permissions or media contract → no token (read-only screen).
         // A media-only screen (screen-media.v1 with media.read/publish)
         // still mints a context with empty tools, so media actions work.
         let action_token = self.mint_tool_context(
@@ -350,6 +350,24 @@ impl Shared {
             },
             &pkg,
         );
+        // Stable display partition, never service authorization. The full
+        // session hash stays private; cache keys survive same-scope remounts.
+        let display_scope_key = context_id.as_ref().map(|context| {
+            use sha2::{Digest, Sha256};
+            format!(
+                "{:x}",
+                Sha256::digest(
+                    serde_json::to_vec(&json!([
+                        "screen-display/v1",
+                        session,
+                        install_id,
+                        context,
+                        digest
+                    ]))
+                    .expect("display scope serialization")
+                )
+            )
+        });
         caps.insert(
             nonce.clone(),
             ScreenCap {
@@ -404,6 +422,30 @@ impl Shared {
         });
         if !media.is_null() {
             receipt["media"] = media;
+        }
+        if pkg.host_contract.as_deref()
+            == Some(crate::issue::app_screen_decl::HOST_CONTRACT_RECORDS)
+        {
+            receipt["host_contract"] = json!(pkg.host_contract);
+            receipt["operations"] = json!(pkg.operations);
+            receipt["navigation"] = json!(pkg.navigation);
+            receipt["display_scope_key"] = json!(display_scope_key);
+            // Non-authorizing trusted-host metadata; never bootstrap/PUSH.
+            use sha2::{Digest, Sha256};
+            receipt["display_session_key"] = json!(format!(
+                "{:x}",
+                Sha256::digest(
+                    serde_json::to_vec(&json!([
+                        "screen-display-session/v1",
+                        caps.get(&nonce).expect("just inserted cap").session
+                    ]))
+                    .expect("display session serialization")
+                )
+            ));
+            receipt["install_id"] = json!(install_id);
+            receipt["context_id"] = json!(context_id);
+            receipt["digest"] = json!(caps.get(&nonce).expect("just inserted cap").digest);
+            receipt["remote_images"] = json!(pkg.remote_images);
         }
         Ok(receipt)
     }
@@ -468,7 +510,7 @@ impl Shared {
         // context the session holds for this install (a remount
         // supersedes the stale action handle).
         self.activate_tool_context(&cap);
-        Ok(json!({
+        let mut result = json!({
             "tag": pkg.tag,
             "app": pkg.app,
             "digest": live_digest,
@@ -481,7 +523,15 @@ impl Shared {
             "manifest": pkg.manifest,
             "assets": pkg.assets,
             "remote_images": pkg.remote_images,
-        }))
+        });
+        if pkg.host_contract.as_deref()
+            == Some(crate::issue::app_screen_decl::HOST_CONTRACT_RECORDS)
+        {
+            result["host_contract"] = json!(pkg.host_contract);
+            result["operations"] = json!(pkg.operations);
+            result["navigation"] = json!(pkg.navigation);
+        }
+        Ok(result)
     }
 
     /// Mint one PENDING in-memory action context for a freshly minted
@@ -512,7 +562,7 @@ impl Shared {
                 m.as_str() == crate::issue::app_screen_decl::MAY_MEDIA_READ
                     || m.as_str() == crate::issue::app_screen_decl::MAY_MEDIA_PUBLISH
             });
-        if pkg.tools.is_empty() && !media_only {
+        if pkg.tools.is_empty() && pkg.operations.is_empty() && !media_only {
             return Value::Null;
         }
         let token = mint_nonce();
@@ -631,6 +681,67 @@ pub fn render_frame_html(
     js: &str,
     parent_origin: &str,
 ) -> Result<String> {
+    render_frame_document(
+        csp_nonce,
+        tag,
+        bridge_nonce,
+        generation,
+        (&[css], &[js]),
+        parent_origin,
+    )
+}
+
+/// Revalidate public, caller-constructible package bytes before selecting
+/// scripts. The declaration alone supplies explicit order; absent startup
+/// retains entry-only execution, regardless of the map's file order.
+pub fn render_package_frame_html(
+    csp_nonce: &str,
+    tag: &str,
+    bridge_nonce: &str,
+    generation: u64,
+    package: &crate::issue::app_screen_pkg::ScreenPackage,
+    parent_origin: &str,
+) -> Result<String> {
+    let checked = crate::issue::app_screen_decl::validate_map(&package.manifest, &package.assets)?;
+    let mut styles = Vec::new();
+    for (name, body) in &package.assets {
+        if name.ends_with(".js") {
+            check_script_text(body)?;
+        } else if name.ends_with(".css") {
+            let css = check_style_text(body)?;
+            // Preserve the legacy first-stylesheet selection while checking
+            // every supplied stylesheet, including inert leaves.
+            if styles.is_empty() {
+                styles.push(css);
+            }
+        }
+    }
+    let scripts: Vec<&str> = match checked.startup() {
+        Some(order) => order
+            .iter()
+            .map(|name| package.assets[name].as_str())
+            .collect(),
+        None => vec![package.assets[checked.entry()].as_str()],
+    };
+    render_frame_document(
+        csp_nonce,
+        tag,
+        bridge_nonce,
+        generation,
+        (&styles, &scripts),
+        parent_origin,
+    )
+}
+
+fn render_frame_document(
+    csp_nonce: &str,
+    tag: &str,
+    bridge_nonce: &str,
+    generation: u64,
+    assets: (&[&str], &[&str]),
+    parent_origin: &str,
+) -> Result<String> {
+    let (styles, scripts) = assets;
     let boot = json!({
         "tag": tag,
         "bridge_nonce": bridge_nonce,
@@ -642,25 +753,39 @@ pub fn render_frame_html(
     // The kit version lives in its own block: the CAD-1006 boot block is
     // a closed shape that shipped packages validate key by key.
     let kit_boot = escape_json_script(&json!({ "kit": SCREEN_KIT_VERSION }).to_string());
-    let js = check_script_text(js)?;
-    let css = check_style_text(css)?;
+    let csp_nonce = csp_nonce
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    let mut style_blocks = String::new();
+    for css in styles {
+        style_blocks.push_str(&format!("<style>{}</style>", check_style_text(css)?));
+    }
+    let mut script_blocks = String::new();
+    for js in scripts {
+        script_blocks.push_str(&format!(
+            "<script nonce=\"{csp_nonce}\">{}</script>",
+            check_script_text(js)?
+        ));
+    }
     let html = format!(
         "<!doctype html><html data-cadence-kit=\"{kit}\"><head><meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
 <script nonce=\"{csp}\" type=\"application/json\" id=\"cadence-screen-boot\">{boot}</script>\
 <script nonce=\"{csp}\" type=\"application/json\" id=\"cadence-screen-kit\">{kit_boot}</script>\
 <style id=\"cadence-kit\">{kit_css}</style>\
-<style>{css}</style>\
+{style_blocks}\
 </head><body><div id=\"root\"></div>\
-<script nonce=\"{csp}\">{js}</script>\
+{script_blocks}\
 </body></html>",
         csp = csp_nonce,
         boot = boot,
         kit = SCREEN_KIT_VERSION,
         kit_boot = kit_boot,
         kit_css = SCREEN_KIT_CSS,
-        css = css,
-        js = js,
+        style_blocks = style_blocks,
+        script_blocks = script_blocks,
     );
     if html.len() > 768 * 1024 {
         return Err(Error::rejected(
@@ -699,26 +824,26 @@ fn escape_json_script(text: &str) -> String {
 /// backslash-escape would corrupt operators/regex/React `</tag>`).
 /// Preserving the exact approved source is what makes the approved
 /// bytes' sha256 the executed bytes.
-fn check_script_text(text: &str) -> Result<String> {
+fn check_script_text(text: &str) -> Result<&str> {
     let lower = text.to_ascii_lowercase();
     if lower.contains("</script") || lower.contains("<!--") || lower.contains("-->") {
         return Err(Error::rejected(
             "screen entry contains a forbidden HTML-script end token",
         ));
     }
-    Ok(text.to_string())
+    Ok(text)
 }
 
 /// Emit the approved CSS EXACTLY — a `<style>` raw-text block cannot
 /// contain a case-insensitive `</style` end token; fail closed instead
 /// of rewriting (a rewritten stylesheet is not the approved bytes).
-fn check_style_text(text: &str) -> Result<String> {
+fn check_style_text(text: &str) -> Result<&str> {
     if text.to_ascii_lowercase().contains("</style") {
         return Err(Error::rejected(
             "screen stylesheet contains a forbidden </style end token",
         ));
     }
-    Ok(text.to_string())
+    Ok(text)
 }
 
 #[cfg(test)]

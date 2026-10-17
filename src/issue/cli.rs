@@ -210,14 +210,16 @@ pub enum IssueAction {
         /// Keep only the first N rows.
         #[arg(long)]
         limit: Option<usize>,
-        /// Keep only these keys in each --json row (comma-joined).
-        #[arg(long, value_delimiter = ',', requires = "json")]
+        /// Keep only these keys in each JSON row (comma-joined).
+        /// Refused when stdout is a table; a pipe or `--json` is enough.
+        #[arg(long, value_delimiter = ',')]
         fields: Vec<String>,
         /// Per-project rollup instead of rows: status counts plus the
         /// P0/P1 issues in doing|review — the master's one-call
         /// cross-project status (CAD-552). Filters still apply;
-        /// `--sort`, `--limit` and `--fields` do not.
-        #[arg(long, requires = "json")]
+        /// `--sort`, `--limit` and `--fields` do not. Same JSON
+        /// decision as `--fields`.
+        #[arg(long)]
         summary: bool,
         #[arg(long)]
         json: bool,
@@ -1063,6 +1065,11 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
             // CAD-877: a table only on a TTY; piped output is JSON.
             let json_flag = &(*json_flag || !crate::output::stdout_table());
             crate::filter::fields_need_json(fields, *json_flag)?;
+            if *summary && !*json_flag {
+                return Err(Error::rejected(
+                    "--summary applies to JSON output — add --json",
+                ));
+            }
             if *summary && !fields.is_empty() {
                 return Err(Error::rejected(
                     "--fields selects row keys — there are no rows under --summary",

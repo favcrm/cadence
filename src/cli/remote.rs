@@ -526,6 +526,9 @@ fn wiki_for(action: &WikiAction) -> Result<(&'static str, serde_json::Map<String
         WikiAction::Upload { .. } => {
             return Err(Error::rejected("wiki upload is sent by its own path"));
         }
+        WikiAction::Cp { .. } => {
+            return Err(Error::rejected("wiki cp is sent by its own path"));
+        }
         WikiAction::Ls { path } => {
             args.insert("path".into(), json!(path.clone().unwrap_or_default()));
             "enumerate"
@@ -593,7 +596,7 @@ fn wiki_for(action: &WikiAction) -> Result<(&'static str, serde_json::Map<String
             return Err(Error::rejected(
                 "`cadence wiki` this subcommand is not available on a remote org in this \
                  build — remote wiki verbs are: wiki ls, wiki search, wiki cat, wiki put \
-                 (text). Use `--org local` or `cadence org switch` to run locally.",
+                 (text), wiki cp. Use `--org local` or `cadence org switch` to run locally.",
             ))
         }
     };
@@ -939,7 +942,7 @@ fn unavailable(command: &Commands) -> Error {
          remote verbs are: status, agent list, agent show, issue ls, \
          issue show, issue log, issue new, issue comment, issue set, \
          message read, inbox (peek), wiki ls, wiki search, wiki cat, \
-         wiki put (text). \
+         wiki put (text), wiki cp. \
          Use `--org local` or `cadence org switch` to run locally.",
         name(command)
     ))
@@ -990,9 +993,62 @@ pub(super) fn run(
     target: cadence_agent::remote_cli::RemoteTarget,
     command: Commands,
     wake_timeout: u64,
+    local_state: Option<std::path::PathBuf>,
 ) -> Result<i32> {
     if let Commands::Org { action } = command {
         return org::run(action);
+    }
+    if let Commands::LocalAgent { action } = &command {
+        return local_agent::run(&target, action, wake_timeout, local_state);
+    }
+    if let Commands::Dispatch { issue, to, job, .. } = &command {
+        if *job {
+            return Err(Error::usage(
+                "hosted dispatch does not open a job. Nothing was sent.",
+            ));
+        }
+        return local_agent::dispatch(&target, issue, to);
+    }
+    if let Commands::Issue {
+        action:
+            cadence_agent::issue::cli::IssueAction::Start {
+                id,
+                repo,
+                name,
+                base,
+                owner,
+                job,
+                pm,
+                spec,
+                assignee,
+                force,
+                by,
+                take_over,
+            },
+    } = &command
+    {
+        if *job
+            || base.is_some()
+            || owner.is_some()
+            || pm.is_some()
+            || spec.is_some()
+            || assignee.is_some()
+            || *force
+            || by.is_some()
+            || take_over.is_some()
+        {
+            return Err(Error::usage(
+                "hosted issue start accepts --repo and --name only. It claims this machine's local agent and does not open a job. Nothing was sent.",
+            ));
+        }
+        return local_agent::start(
+            &target,
+            id,
+            repo.as_deref(),
+            name.as_deref(),
+            wake_timeout,
+            local_state,
+        );
     }
     if let Commands::Wiki {
         action:
@@ -1004,6 +1060,31 @@ pub(super) fn run(
     } = &command
     {
         return upload(&target, file, path, *overwrite, wake_timeout);
+    }
+    if let Commands::Wiki {
+        action:
+            WikiAction::Cp {
+                source,
+                dest,
+                recursive,
+                update,
+                resume,
+                wait_index,
+            },
+    } = &command
+    {
+        return cadence_agent::wiki::transfer_client::copy_remote(
+            &target,
+            wake_timeout,
+            &cadence_agent::wiki::transfer_client::CopyRequest {
+                source,
+                dest,
+                recursive: *recursive,
+                update: *update,
+                resume: resume.as_deref(),
+                wait_index: *wait_index,
+            },
+        );
     }
     let (verb, args) = verb_for(&command)?;
     let deadline = std::time::Instant::now()

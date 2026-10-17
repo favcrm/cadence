@@ -1,5 +1,6 @@
 import type { LanePayload } from "../features/issues/lane";
 import { ConditionalGet } from "./conditionalGet";
+import { ApiError } from "./apiError";
 import { sessionKey, sessionHeaders } from "./sessionKey";
 import {
   bindPrivateAbort,
@@ -115,33 +116,7 @@ export interface ThreadPage {
   more_before?: boolean;
 }
 
-export class ApiError extends Error {
-  status: number;
-  conflict?: string;
-  check?: string;
-  code?: string;
-  revision?: number | null;
-  card?: IssueCard;
-  constructor(
-    message: string,
-    status: number,
-    opts?: {
-      conflict?: string;
-      check?: string;
-      code?: string;
-      revision?: number | null;
-      card?: IssueCard;
-    },
-  ) {
-    super(message);
-    this.status = status;
-    this.conflict = opts?.conflict;
-    this.check = opts?.check;
-    this.code = opts?.code;
-    this.revision = opts?.revision;
-    this.card = opts?.card;
-  }
-}
+export { ApiError } from "./apiError";
 
 const conditional = new ConditionalGet(
   (input, init) => fetch(input, init),

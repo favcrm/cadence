@@ -1,0 +1,11 @@
+@import "./foundation.css";
+
+body {
+  background: var(--color-ink-950);
+  color: var(--color-ink-300);
+  font-family: var(--font-sans);
+  font-size: var(--text-body);
+  line-height: 1.4;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}

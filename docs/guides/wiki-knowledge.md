@@ -26,10 +26,13 @@ Use three durable layers, following the LLM wiki pattern:
    and records `failed` or `empty` without keeping text from an older PDF.
    OCR is not provided. The index ignores a generated page when its source
    pointer is missing or names different bytes.
-3. **Curated wiki.** An authorized agent or operator writes concise Markdown
+3. **Curated wiki.** An authorized agent, board member or operator writes concise Markdown
    pages that summarize one durable topic, link to the source pages, name
    uncertainty, and update existing pages when evidence changes. For company
-   knowledge, the operator publishes under `global/`. The master may draft in
+   knowledge, board members and the operator may create, edit, move and delete
+   pages under `global/` and `projects/<key>/`. Members also control their own
+   `users/<handle>/`. Other users' private pages, agent-owned areas and the
+   namespace roots remain protected. The master may draft in
    `agents/master/knowledge/`; its current permission does not let it publish
    into `global/`.
 
@@ -116,6 +119,70 @@ only (symlinks and FIFOs are refused), no chunking yet.
 Without `--overwrite`, the parent folder is listed first and an existing name is
 refused. That check is not atomic: a file created between the listing and the
 upload can still be replaced. Use `--overwrite` only for files you control.
+
+### Recursive copy (`wiki cp`)
+
+`cadence wiki cp SOURCE DEST --recursive [--update] [--resume JOB_ID] [--wait-index]`
+copies a tree. Exactly one operand is `wiki:<canonical-path>`; the other is
+local. `--org` selects the remote workspace once. Local and remote copies use
+the same transfer operations (`begin`, `chunk`, `apply`, `finish`, `status`,
+`export`). A directory source requires `--recursive`. Empty directories and
+empty files are kept. `.md`, `.markdown`, and `.txt` are text pages; other
+regular files are attachments.
+
+The command hashes the source and refuses symlinks, special files, and
+internal paths before it mutates the wiki. It prints the job id and digest
+before entry writes. Repeat the same source and `--resume JOB_ID` after an
+interruption. Resume reuses the admitted manifest and its destination revisions;
+it does not read those revisions again. An empty directory is admitted with no
+entries, and finish creates that root. `--update` pins the destination's
+current revisions and replaces changed bytes. Without it, identical content
+can be skipped, but changed existing pages are create-only. A partial job
+exits nonzero and names the job id. `--wait-index` polls that job's own
+status until the index is covered, the job fails, or the command deadline
+passes. It does not refresh the global index.
+
+Matching working-tree bytes alone are not proof of publication. If the desired
+revision cannot be proved in Git, the entry remains `unresolved`, retains its
+staged input, and cannot finish. The command reports the job instead of silently
+committing an unproved file. After an authorized publication resolves the target,
+resume the same job; an already committed matching revision is skipped without
+another commit.
+An interrupted tracker write may also leave staged paths fenced against normal
+Wiki writes. An authorized operator must explicitly resolve those exact paths
+using the tracker's documented recovery procedure before resuming. Transfer
+resume does not repair the Git index or replay an uncertain publication.
+
+The reverse direction exports only the caller's tree, pins each file's
+revision and hash, stages bytes privately, and publishes relative to held
+no-follow directory handles. Default publication is atomic and create-only;
+`--update` explicitly permits atomic replacement. A concurrently planted
+destination file is not overwritten without `--update`.
+
+Storage, extraction and search readiness are separate receipts. A PDF whose
+extraction fails retains its downloadable original but exits nonzero; failed
+or empty extraction is never reported as index-covered. Ordinary empty text
+files remain valid copies. Finishing a job coalesces index work; startup
+rechecks completed-job cache freshness without republishing source files.
+A completed empty-root job becomes `superseded` if its directory is removed
+or moved; status never recreates the root. Public-board jobs bind to the
+verified subject and realm, not a particular session token, so renewal keeps
+custody while another subject or an unbound local caller cannot inherit it.
+Private staged inputs are discarded only after terminal outcomes are durable;
+unresolved publication retains them for reconciliation.
+
+Coordination-profile portable export omits transfer jobs and private staged
+inputs; it is not a backup of in-flight transfer custody. Export leaves the
+source jobs and stages unchanged. An inactive portable restore cannot resume
+those source jobs: admit a fresh transfer from the original inputs instead.
+
+Native admission caps are 256 entries, a 256 KiB manifest, 100 MiB per file
+(also subject to configured wiki caps), 256 MiB total, and 16 KiB decoded
+chunks. Status and directory metadata are byte-bounded pages, at most 32
+entries each. Hosted forwarding retains its stricter **64 KiB whole-request**
+cap: a manifest accepted locally may be refused before hosted admission.
+Use a matching native/hosted release; local proof does not authorize an image
+repin, schema migration, or production write.
 
 ## Index health and repair
 

@@ -6,7 +6,7 @@
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use cadence_agent::{
-    board_identity, client, daemon,
+    client, daemon,
     test_seam::{Asserted, Seam, AS_HEADER, TOKEN_HEADER},
     ui,
 };
@@ -58,20 +58,6 @@ impl Fixture {
             }
         }));
 
-        let public_port = (3110..=3199)
-            .find(|port| std::net::TcpListener::bind(("127.0.0.1", *port)).is_ok())
-            .expect("no free hosted-board test port in 3110..3199");
-        let public_host = format!("{HOST_BASE}:{public_port}");
-        board_identity::write_config(
-            &state_dir,
-            &board_identity::Config {
-                host: public_host.clone(),
-                issuer: issuer.clone(),
-                company: COMPANY.into(),
-            },
-        )
-        .unwrap();
-
         let daemon_dir = state_dir.clone();
         let env = cadence_agent::adapter::ProviderEnv::refusing_providers();
         env.set("CADENCE_PM_DIR", state_dir.join("no-pm").to_str().unwrap());
@@ -97,32 +83,50 @@ impl Fixture {
         threads.push(daemon_thread);
         let token = Seam::token_at(&state_dir).expect("daemon test-seam token");
 
-        let (startup, ready) = std::sync::mpsc::channel();
+        // `serve` binds its own port and writes the board identity config
+        // before each bind, so a port taken by a competing test between
+        // probe and bind is handled here: only AddrInUse moves on to the
+        // next port; any other startup outcome fails the test.
         let board_dir = state_dir.clone();
         let board_pm = state_dir.join("no-pm");
-        let opts = ui::ServeOpts {
-            host: "127.0.0.1".into(),
-            port: public_port,
-            stop: Some(stop.clone()),
-            startup: Some(startup),
-            test_seam: true,
-            public: Some(ui::PublicBoard {
-                host: public_host.clone(),
-                issuer: issuer.clone(),
-                company: COMPANY.into(),
-                authorize_url: "http://platform.invalid/authorize".into(),
-            }),
-            allow_hosts: vec![public_host.clone()],
-            allow_origins: vec![format!("http://{public_host}")],
-            ..Default::default()
-        };
-        threads.push(std::thread::spawn(move || {
-            let _ = ui::serve(&board_dir, &board_pm, &opts);
-        }));
-        ready
-            .recv_timeout(Duration::from_secs(10))
-            .unwrap()
-            .unwrap();
+        let (public_port, public_host, board) = (3110..=3199)
+            .find_map(|port| {
+                let host = format!("{HOST_BASE}:{port}");
+                let (startup, ready) = std::sync::mpsc::channel();
+                let opts = ui::ServeOpts {
+                    host: "127.0.0.1".into(),
+                    port,
+                    stop: Some(stop.clone()),
+                    startup: Some(startup),
+                    test_seam: true,
+                    public: Some(ui::PublicBoard {
+                        host: host.clone(),
+                        issuer: issuer.clone(),
+                        company: COMPANY.into(),
+                        authorize_url: "http://platform.invalid/authorize".into(),
+                    }),
+                    allow_hosts: vec![host.clone()],
+                    allow_origins: vec![format!("http://{host}")],
+                    ..Default::default()
+                };
+                let (dir, pm) = (board_dir.clone(), board_pm.clone());
+                let board = std::thread::spawn(move || {
+                    let _ = ui::serve(&dir, &pm, &opts);
+                });
+                match ready.recv_timeout(Duration::from_secs(10)) {
+                    Ok(Ok(())) => Some((port, host, board)),
+                    Ok(Err(std::io::ErrorKind::AddrInUse)) => {
+                        let _ = board.join();
+                        None
+                    }
+                    Ok(Err(kind)) => panic!("board startup failed on port {port}: {kind:?}"),
+                    Err(error) => {
+                        panic!("board startup gave no bind result on port {port}: {error}")
+                    }
+                }
+            })
+            .expect("no free hosted-board test port in 3110..3199");
+        threads.push(board);
 
         Self {
             state,

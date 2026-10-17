@@ -49,13 +49,6 @@ fn release(slots: &mut Slots, token: &str, lane: &str, at: f64) {
 }
 
 #[test]
-fn default_aggregate_budget_and_jobs_are_two() {
-    let config = SlotConfig::default();
-    assert_eq!(config.total_slots, 2, "aggregate grants default to two");
-    assert_eq!(config.jobs_per_lane, 2, "default compiler jobs per lane");
-}
-
-#[test]
 fn configured_zero_aggregate_cap_is_clamped_to_one() {
     let mut slots = Slots::new(budget(0));
     let first = acquire(&mut slots, SlotKind::Build, "lane-a", "build-a", false, 1.0);

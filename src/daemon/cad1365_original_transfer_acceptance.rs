@@ -224,6 +224,7 @@ fn media_door(
     original: Vec<u8>,
     descriptor: Option<Value>,
     get_override: ArtifactOverride,
+    stop: Arc<AtomicBool>,
 ) -> (
     String,
     Arc<Mutex<Vec<DoorRecord>>>,
@@ -239,12 +240,12 @@ fn media_door(
             "bytes": original.len(), "mime": "image/png"})
     });
     let worker = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            if Instant::now() > deadline {
-                break;
-            }
-            let request = match server.recv_timeout(Duration::from_millis(500)) {
+        // Serve until the fixture drops: `stop` is checked every poll
+        // round, so teardown costs one recv_timeout instead of a fixed
+        // lifetime. No fixed-duration wait — the door ends when the test
+        // is done, not on a clock.
+        while !stop.load(Ordering::SeqCst) {
+            let request = match server.recv_timeout(Duration::from_millis(100)) {
                 Ok(Some(request)) => request,
                 Ok(None) => continue,
                 Err(_) => break,
@@ -434,13 +435,18 @@ impl Fx {
             })
             .unwrap();
         let get_override = Arc::new(Mutex::new(None));
+        let stop = Arc::new(AtomicBool::new(false));
         let (base, seen, door) = if trust.is_some() {
             (String::new(), Arc::new(Mutex::new(Vec::new())), None)
         } else {
-            let (base, seen, door) = media_door(original.clone(), descriptor, get_override.clone());
+            let (base, seen, door) = media_door(
+                original.clone(),
+                descriptor,
+                get_override.clone(),
+                stop.clone(),
+            );
             (base, seen, Some(door))
         };
-        let stop = Arc::new(AtomicBool::new(false));
         let mut opts = ServeOptions {
             test_seam: true,
             stop: Some(stop.clone()),

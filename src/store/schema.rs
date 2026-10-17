@@ -1301,6 +1301,51 @@ impl Store {
                 tx.execute("UPDATE schema_version SET version=47", [])?;
                 tx.commit()?;
             }
+            if version < 48 {
+                // CAD-1420: one-time assistant bootstrap lifecycle on the
+                // binding row itself. `bootstrap_revision` is the
+                // compare-and-set counter the ACK write checks; the state
+                // and template version are authoritative, so file presence
+                // never drives injection. Column-checked like v42 so a
+                // half-applied store converges. Runs after the v47
+                // notification tables so a main47 store migrates forward.
+                let assistant_columns: Vec<String> = conn
+                    .prepare("PRAGMA table_info(assistants)")?
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(std::result::Result::ok)
+                    .collect();
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                for (column, definition) in [
+                    (
+                        "bootstrap_state",
+                        "bootstrap_state TEXT NOT NULL DEFAULT 'pending'",
+                    ),
+                    (
+                        "bootstrap_template_version",
+                        "bootstrap_template_version INTEGER NOT NULL DEFAULT 1",
+                    ),
+                    (
+                        "bootstrap_revision",
+                        "bootstrap_revision INTEGER NOT NULL DEFAULT 0",
+                    ),
+                ] {
+                    if !assistant_columns.iter().any(|c| c == column) {
+                        tx.execute_batch(&format!(
+                            "ALTER TABLE assistants ADD COLUMN {definition}"
+                        ))?;
+                    }
+                }
+                tx.execute("UPDATE schema_version SET version=48", [])?;
+                tx.commit()?;
+            }
+            if version < 49 {
+                // CAD-914: resumable wiki transfer jobs and per-entry progress.
+                // New tables only; v48 assistant bootstrap remains unchanged.
+                let tx = super::seal::begin_legacy_migration_tx(&conn)?;
+                tx.execute_batch(super::wiki_transfers::SCHEMA)?;
+                tx.execute("UPDATE schema_version SET version=49", [])?;
+                tx.commit()?;
+            }
             if let Some(crossing) = permit.crossing {
                 let tx = super::seal::begin_legacy_migration_tx(&conn)?;
                 Self::event(

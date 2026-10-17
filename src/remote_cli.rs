@@ -90,11 +90,12 @@ pub const REMOTE_VERBS: &[&str] = &[
     "issue_set",
 ];
 
-/// The wiki actions this build sends over `/__platform/wiki/call` (CAD-1401):
-/// `enumerate` is `wiki ls` or `wiki search`, `read` is `wiki cat`, `write` is
-/// a text `wiki put`. No delete/job_status/history and no blob upload. Any
-/// other verb is refused locally, before a request.
-pub const WIKI_ACTIONS: &[&str] = &["enumerate", "read", "write"];
+/// The wiki actions this build sends over `/__platform/wiki/call` (CAD-1401,
+/// CAD-914): `enumerate` is `wiki ls` or `wiki search`, `read` is `wiki cat`,
+/// `write` is a text `wiki put` or a `wiki cp` transfer (`begin`/`chunk`/
+/// `apply`/`finish`), and `job_status` is transfer `status`/`export`.
+/// Any other verb is refused locally, before a request.
+pub const WIKI_ACTIONS: &[&str] = &["enumerate", "read", "write", "job_status"];
 
 /// The argument keys each wiki action may send (CAD-1401). Any other key —
 /// an authority-shaped one such as `actor` or `as` included — is refused
@@ -103,9 +104,112 @@ fn wiki_argument_keys(action: &str) -> &'static [&'static str] {
     match action {
         "enumerate" => &["path", "q"],
         "read" => &["path", "offset", "bytes", "rev"],
-        "write" => &["path", "text", "if_rev"],
+        "write" => &["path", "text", "if_rev", "transfer"],
+        "job_status" => &["path", "transfer"],
         _ => &[],
     }
+}
+
+/// `write` is either the existing text put or a transfer object, never both.
+/// `job_status` carries only status/export. Transfer keys are the native
+/// adapter allowlist. The outer `path` is the op target: manifest root,
+/// `root`, or export `path`. A client cannot supply `_transfer_binding`.
+fn wiki_transfer_shape(action: &str, arguments: &Map<String, Value>) -> Result<()> {
+    const KEYS: &[&str] = &[
+        "op",
+        "manifest",
+        "job_id",
+        "root",
+        "entry_id",
+        "offset",
+        "data_base64",
+        "limit",
+        "path",
+        "bytes",
+        "rev",
+    ];
+    let Some(transfer) = arguments.get("transfer") else {
+        if action == "job_status" {
+            return Err(reject(
+                "wiki job_status requires a transfer object — never sent",
+            ));
+        }
+        return Ok(());
+    };
+    if action == "write" && (arguments.contains_key("text") || arguments.contains_key("if_rev")) {
+        return Err(reject(
+            "wiki write transfer cannot be combined with text — never sent",
+        ));
+    }
+    let object = transfer
+        .as_object()
+        .ok_or_else(|| reject("wiki transfer must be an object — never sent"))?;
+    if let Some(key) = object.keys().find(|key| !KEYS.contains(&key.as_str())) {
+        return Err(reject(format!(
+            "wiki {action} transfer field '{key}' is not allowed — never sent"
+        )));
+    }
+    let op = object.get("op").and_then(Value::as_str).unwrap_or("");
+    let allowed: &[&str] = match action {
+        "write" => &["begin", "chunk", "apply", "finish"],
+        "job_status" => &["status", "export"],
+        _ => &[],
+    };
+    if !allowed.contains(&op) {
+        return Err(reject(format!(
+            "wiki {action} transfer op '{op}' is not allowed — never sent"
+        )));
+    }
+    let path = arguments.get("path").and_then(Value::as_str).unwrap_or("");
+    if crate::wiki::normalize(path).ok().as_deref() != Some(path) || path.is_empty() {
+        return Err(reject(
+            "wiki transfer path must be a canonical nonempty wiki path — never sent",
+        ));
+    }
+    match op {
+        "begin" => {
+            let root = object
+                .get("manifest")
+                .and_then(|manifest| manifest.get("root"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if root != path {
+                return Err(reject(
+                    "wiki transfer manifest root must match path — never sent",
+                ));
+            }
+            let entries = object
+                .get("manifest")
+                .and_then(|manifest| manifest.get("entries"))
+                .and_then(Value::as_array);
+            let Some(entries) = entries else {
+                return Err(reject("wiki transfer begin requires entries — never sent"));
+            };
+            for entry in entries {
+                let relative = entry.get("path").and_then(Value::as_str).unwrap_or("");
+                if relative.is_empty()
+                    || relative.starts_with('/')
+                    || crate::wiki::normalize(relative).ok().as_deref() != Some(relative)
+                {
+                    return Err(reject(
+                        "wiki transfer entry path must be canonical and relative — never sent",
+                    ));
+                }
+            }
+        }
+        "chunk" | "apply" | "finish" | "status" => {
+            if object.get("root").and_then(Value::as_str) != Some(path) {
+                return Err(reject("wiki transfer root must match path — never sent"));
+            }
+        }
+        "export" if object.get("path").and_then(Value::as_str) != Some(path) => {
+            return Err(reject(
+                "wiki export path must match the outer path — never sent",
+            ));
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// The hosted relay a verb rides: the cli envelope or the wiki envelope. It is
@@ -127,15 +231,27 @@ impl Surface {
     }
 }
 
-/// A resolved remote org destination — pinned once per invocation from the
-/// registry (`cli::org::resolve`). `org` is the registry name (the
-/// issuer-verified slug); `endpoint`/`org_id` came only from the verified
-/// grant at login. Nothing here is caller-mutable mid-command.
+/// A resolved remote org destination, pinned once per invocation.
+/// Ordinary selection reads the registry (`cli::org::resolve`): `org` is
+/// the issuer-verified slug, and `endpoint`/`org_id` come from the grant
+/// recorded at login. A managed caller with one live kickoff copies those
+/// three fields from that binding instead, then still requires the saved
+/// credential for this destination to name the original member and issuer.
+/// Nothing here is caller-mutable mid-command.
 #[derive(Clone, Debug)]
 pub struct RemoteTarget {
     pub org: String,
     pub endpoint: String,
     pub org_id: String,
+    /// Original actor identity for assignment-bound calls; checked on every
+    /// credential load, including renewal and post-resolution reloads.
+    pub identity: Option<CliIdentityPin>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CliIdentityPin {
+    pub subject_id: String,
+    pub issuer: String,
 }
 
 const SESSION_VERSION: &str = "hosted-cadence-cli-session.v1";
@@ -349,6 +465,17 @@ fn read_credential_metadata(dir: &Path, target: &RemoteTarget) -> Result<Credent
             "the stored credential belongs to a different workspace or host; \
              it is never sent to another destination — run `cadence login` again",
         ));
+    }
+    if let Some(identity) = &target.identity {
+        if identity.subject_id.is_empty()
+            || identity.issuer.is_empty()
+            || cred.subject_id.as_deref() != Some(identity.subject_id.as_str())
+            || cred.issuer.as_deref() != Some(identity.issuer.as_str())
+        {
+            return Err(reject(
+                "saved login changed member or issuer; the original assignment identity was retained",
+            ));
+        }
     }
     if !valid_token(&cred.access_token, "hct_") {
         return Err(reject("invalid remote credential"));
@@ -656,7 +783,9 @@ fn validate_renewal_response(
         || body["audience"] != target.endpoint
         || !exact_object(&body["principal"], &["kind", "current_role", "subject_id"])
         || body["principal"]["kind"] != "user"
-        || body["principal"]["current_role"] != "owner"
+        || body["principal"]["current_role"]
+            .as_str()
+            .is_none_or(|role| !crate::remote_enrollment::human_workspace_role(role))
         || body["principal"]["subject_id"].as_str() != prior.subject_id.as_deref()
         || !same_capabilities_json(&body["capabilities"], &prior.capabilities)
         || !exact_object(
@@ -1522,6 +1651,37 @@ pub fn logout(dir: &Path, target: &RemoteTarget) -> Result<i32> {
     Ok(0)
 }
 
+pub struct CliMaterial {
+    pub access_token: String,
+    pub subject_id: Option<String>,
+    pub issuer: Option<String>,
+}
+
+/// The live hosted CLI bearer for `target`, renewed when it is due.
+/// The subject and issuer come from the stored login, not from the caller.
+pub fn cli_material(dir: &Path, target: &RemoteTarget) -> Result<CliMaterial> {
+    cli_material_until(dir, target, Instant::now() + Duration::from_secs(20))
+}
+
+/// Same saved-login renewal as [`cli_material`], bounded by the caller's
+/// total deadline. The deadline covers lock, refresh, and return; it does
+/// not start a second clock.
+pub fn cli_material_until(
+    dir: &Path,
+    target: &RemoteTarget,
+    deadline: Instant,
+) -> Result<CliMaterial> {
+    let cred = renewed_credential(dir, target, deadline)?;
+    if !valid_token(&cred.access_token, "hct_") {
+        return Err(reject("invalid remote credential"));
+    }
+    Ok(CliMaterial {
+        access_token: cred.access_token,
+        subject_id: cred.subject_id,
+        issuer: cred.issuer,
+    })
+}
+
 /// Execute within the command-owned deadline. Continuations reuse it rather
 /// than starting a fresh wake budget for each range.
 pub fn call_verb(
@@ -1588,6 +1748,60 @@ fn call_verb_until(
     note: impl Fn(&str),
     sleep: impl Fn(Duration),
 ) -> Result<RemoteAnswer> {
+    call_verb_until_retry(
+        target,
+        verb,
+        arguments,
+        deadline,
+        wake_timeout,
+        dir,
+        true,
+        note,
+        sleep,
+    )
+}
+
+/// One remote verb under an existing deadline. `retry_wake` is false for
+/// wiki transfer writes and `job_status`: a busy or unknown result is not
+/// replayed. Reads and enumerates keep the existing wake loop.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn call_bounded(
+    target: &RemoteTarget,
+    verb: &str,
+    arguments: Map<String, Value>,
+    deadline: Instant,
+    wake_timeout: u64,
+    retry_wake: bool,
+    note: impl Fn(&str),
+) -> Result<RemoteAnswer> {
+    let dir = auth_dir(None).map_err(|_| {
+        reject("remote credential directory is unavailable — set HOME or XDG_CONFIG_HOME")
+    })?;
+    call_verb_until_retry(
+        target,
+        verb,
+        arguments,
+        deadline,
+        wake_timeout,
+        &dir,
+        retry_wake,
+        note,
+        std::thread::sleep,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn call_verb_until_retry(
+    target: &RemoteTarget,
+    verb: &str,
+    arguments: Map<String, Value>,
+    deadline: Instant,
+    wake_timeout: u64,
+    dir: &Path,
+    retry_wake: bool,
+    note: impl Fn(&str),
+    sleep: impl Fn(Duration),
+) -> Result<RemoteAnswer> {
     // I2: an unlisted verb is refused before a credential is even loaded.
     let surface = if REMOTE_VERBS.contains(&verb) {
         Surface::Cli
@@ -1605,6 +1819,7 @@ fn call_verb_until(
                 "wiki {verb} argument '{key}' is not in the allowlist — never sent"
             )));
         }
+        wiki_transfer_shape(verb, &arguments)?;
     }
     let budget_over = || -> Error {
         Error::busy_coded(
@@ -1651,6 +1866,9 @@ fn call_verb_until(
             Verdict::Done(result) => return result.map(RemoteAnswer::Ok),
             Verdict::Conflict(body) => return Ok(RemoteAnswer::Conflict(body)),
             Verdict::Waking(wait) => {
+                if !retry_wake {
+                    return Err(budget_over());
+                }
                 let now = Instant::now();
                 let remaining = deadline
                     .checked_duration_since(now)
@@ -1710,6 +1928,7 @@ pub struct AccountImageResponse {
 impl AccountImageIdentity {
     pub fn target(&self) -> RemoteTarget {
         RemoteTarget {
+            identity: None,
             org: self.org.clone(),
             endpoint: self.audience.clone(),
             org_id: self.organization_id.clone(),
@@ -1845,6 +2064,7 @@ pub fn account_image_targets() -> Result<Vec<RemoteTarget>> {
             .filter(|id| valid_id(id))
             .ok_or_else(|| reject("saved org workspace is missing"))?;
         targets.push(RemoteTarget {
+            identity: None,
             org: org.to_owned(),
             endpoint: endpoint.to_owned(),
             org_id: org_id.to_owned(),
@@ -2062,6 +2282,7 @@ mod tests {
 
     fn target(listener: &TcpListener) -> RemoteTarget {
         RemoteTarget {
+            identity: None,
             org: ORG.into(),
             endpoint: format!("http://{}", listener.local_addr().unwrap()),
             org_id: ORG_ID.into(),
@@ -2086,6 +2307,51 @@ mod tests {
     }
     fn store_credential(dir: &Path, endpoint: &str) {
         store_credential_at(dir, ORG, ORG_ID, endpoint, now().unwrap() + 300);
+    }
+
+    #[test]
+    fn assignment_identity_survives_saved_login_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut frozen = target(&listener);
+        frozen.identity = Some(CliIdentityPin {
+            subject_id: "user_original".into(),
+            issuer: "https://original.invalid".into(),
+        });
+        store_credential(dir.path(), &frozen.endpoint);
+        let path = dir.path().join(format!("cli-{ORG}.json"));
+        let mut original: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        original["subject_id"] = json!("user_original");
+        original["issuer"] = json!("https://original.invalid");
+        fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+        assert_eq!(
+            cli_material(dir.path(), &frozen).unwrap().access_token,
+            BRIDGE
+        );
+
+        for (subject, issuer) in [
+            (json!("user_replacement"), json!("https://original.invalid")),
+            (json!("user_original"), json!("https://replacement.invalid")),
+            (Value::Null, Value::Null),
+            (json!("user_original"), Value::Null),
+        ] {
+            let mut replacement = original.clone();
+            replacement["subject_id"] = subject;
+            replacement["issuer"] = issuer;
+            fs::write(&path, serde_json::to_vec(&replacement).unwrap()).unwrap();
+            assert!(cli_material(dir.path(), &frozen).is_err());
+            assert_eq!(
+                listener.accept().err().unwrap().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+        fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+        assert_eq!(
+            cli_material(dir.path(), &frozen).unwrap().access_token,
+            BRIDGE
+        );
     }
 
     fn read_request(socket: std::net::TcpStream) -> (std::net::TcpStream, Request) {
@@ -2661,6 +2927,7 @@ mod tests {
             .unwrap();
         store_credential(&dir, "https://acme.cadencecloud.app");
         let foreign = RemoteTarget {
+            identity: None,
             org: ORG.into(),
             endpoint: format!("http://{}", listener.local_addr().unwrap()),
             org_id: "ws_other".into(),
@@ -2853,6 +3120,7 @@ mod tests {
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         store_credential(dir, &endpoint);
         let target = RemoteTarget {
+            identity: None,
             org: ORG.into(),
             endpoint,
             org_id: ORG_ID.into(),
@@ -3103,6 +3371,7 @@ mod tests {
             .unwrap();
         let endpoint = "https://acme.cadencecloud.app";
         let target = RemoteTarget {
+            identity: None,
             org: ORG.into(),
             endpoint: endpoint.into(),
             org_id: ORG_ID.into(),
@@ -3227,6 +3496,7 @@ mod tests {
         std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o000))
             .unwrap();
         let target = RemoteTarget {
+            identity: None,
             org: ORG.into(),
             endpoint: "https://acme.cadencecloud.app".into(),
             org_id: ORG_ID.into(),
@@ -3256,6 +3526,7 @@ mod tests {
             .unwrap();
         let endpoint = "https://acme.cadencecloud.app";
         let target = RemoteTarget {
+            identity: None,
             org: ORG.into(),
             endpoint: endpoint.into(),
             org_id: ORG_ID.into(),
@@ -3315,6 +3586,7 @@ mod tests {
         )
         .unwrap();
         let target = RemoteTarget {
+            identity: None,
             org: ORG.into(),
             endpoint: "http://127.0.0.1:9".into(),
             org_id: ORG_ID.into(),
@@ -3432,6 +3704,7 @@ mod tests {
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         store_credential(dir, &endpoint);
         let target = RemoteTarget {
+            identity: None,
             org: ORG.into(),
             endpoint,
             org_id: ORG_ID.into(),
@@ -3607,6 +3880,7 @@ mod tests {
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         store_credential(dir, &endpoint);
         let target = RemoteTarget {
+            identity: None,
             org: ORG.into(),
             endpoint,
             org_id: ORG_ID.into(),
@@ -4002,6 +4276,53 @@ mod tests {
         let err = out.unwrap_err();
         assert_eq!(err.kind(), "busy");
         assert_eq!(err.code(), Some("waking"));
+    }
+
+    #[test]
+    fn transfer_ops_stay_on_write_or_job_status_and_refuse_authority() {
+        let begin = json!({
+            "path": "projects/example",
+            "transfer": {
+                "op": "begin",
+                "manifest": {"version": 1, "root": "projects/example", "entries": []}
+            }
+        });
+        assert!(wiki_transfer_shape("write", begin.as_object().unwrap()).is_ok());
+        let mut mixed = begin.as_object().unwrap().clone();
+        mixed.insert("text".into(), json!("no"));
+        let err = wiki_transfer_shape("write", &mixed).unwrap_err();
+        assert!(err.to_string().contains("never sent"), "{err}");
+        let export = json!({
+            "path": "projects/example/a.md",
+            "transfer": {"op": "export", "path": "projects/example/a.md"}
+        });
+        assert!(wiki_transfer_shape("job_status", export.as_object().unwrap()).is_ok());
+        let outside = json!({
+            "path": "projects/example",
+            "transfer": {"op": "export", "path": "projects/example/a.md"}
+        });
+        let err = wiki_transfer_shape("job_status", outside.as_object().unwrap()).unwrap_err();
+        assert!(err.to_string().contains("outer path"), "{err}");
+        let binding = json!({
+            "path": "projects/example",
+            "transfer": {"op": "status", "root": "projects/example", "_transfer_binding": {}}
+        });
+        let err = wiki_transfer_shape("job_status", binding.as_object().unwrap()).unwrap_err();
+        assert!(err.to_string().contains("never sent"), "{err}");
+        let forged = json!({
+            "path": "projects/example",
+            "transfer": {"op": "status", "actor": "operator"}
+        });
+        let err = wiki_transfer_shape("job_status", forged.as_object().unwrap()).unwrap_err();
+        assert!(err.to_string().contains("never sent"), "{err}");
+        let err = wiki_transfer_shape(
+            "job_status",
+            json!({"path": "projects/example", "transfer": {"op": "begin"}})
+                .as_object()
+                .unwrap(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not allowed"), "{err}");
     }
 }
 

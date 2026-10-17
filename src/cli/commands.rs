@@ -662,6 +662,12 @@ pub(crate) enum Commands {
         #[command(flatten)]
         steer: SteerArgs,
     },
+    /// Hosted coordination for this user's local agent (CAD-1460).
+    /// Requires a selected remote org. It does not run in the container.
+    LocalAgent {
+        #[command(subcommand)]
+        action: local_agent::LocalAgentAction,
+    },
     /// One-step issue dispatch: `issue start` (idempotent, owner =
     /// the worker) then exactly one templated kickoff message, a
     /// tracker comment and a `message` ref on the issue. With `--job`
@@ -1403,11 +1409,16 @@ pub(crate) enum Commands {
         #[arg(long)]
         group: Option<String>,
     },
-    /// Install the exact build CI tested on main (CAD-334). Downloads
-    /// the `cadence-<sha>-x86_64-linux` artifact through `gh` and refuses
-    /// unless the sha is on main, CI's `test` job passed on that exact sha,
-    /// the sha256 matches, the manifest names the sha, and the GitHub
-    /// build-provenance attestation verifies for this repo. Installs to
+    /// Install the exact build the release source proves for a commit
+    /// (CAD-334). From the default owned catalogue
+    /// (https://api-v2.agenticos.hk, CAD-1479; `--release-source` is the
+    /// advanced https:// override) it installs the published, offline-
+    /// verified release package; a non-default `--repo` selects the
+    /// GitHub route that downloads the `cadence-<sha>-x86_64-linux`
+    /// artifact through `gh`. Refuses unless the sha is on main, CI's
+    /// `test` job passed on that exact sha, the sha256 matches, the
+    /// manifest names the sha, and the build-provenance attestation
+    /// verifies for the trusted repo. Installs to
     /// `<releases>/<sha>/cadence` and atomically repoints the `cadence`
     /// symlink. A release already on disk is reinstalled without a
     /// download (rollback). Never restarts the daemon unless `--restart`.
@@ -1451,21 +1462,24 @@ pub(crate) enum Commands {
         /// Owned HTTPS release source (CAD-1455): the endpoint's
         /// https:// origin only; consumes the published release through
         /// the catalogue and signed offline evidence instead of live
-        /// GitHub queries. An explicit source failure refuses — no
-        /// silent GitHub API fallback. Omit for the default GitHub route.
+        /// GitHub queries. A source failure refuses — no silent GitHub
+        /// API fallback. Omit for the default owned catalogue
+        /// (https://api-v2.agenticos.hk, CAD-1479).
         #[arg(long, value_name = "https://host")]
         release_source: Option<String>,
     },
     /// Upgrade a client-only installation (`install.sh --client-only`) to
     /// the newest public release (CAD-1425, CAD-1437). Its receipt alone
     /// selects this path, before any org or state work: a saved org default
-    /// never diverts it, it fetches only the fixed public release source,
-    /// and it accepts only `--check` and `--version TAG` (forward only).
-    /// Any other installation refuses `--version`; its native options and
-    /// subcommands are untouched.
+    /// never diverts it, it fetches only the owned public-client release
+    /// source, and it accepts only `--check` and `--version TAG` (forward
+    /// only). Any other installation refuses `--version`; its native
+    /// options and subcommands are untouched.
     ///
-    /// Update to the newest attested green main build in one command
-    /// (CAD-561): check → verify attestation + hash → backup → install
+    /// Update to the newest published release in the owned catalogue
+    /// (default https://api-v2.agenticos.hk, CAD-1479; `--release-source`
+    /// is the advanced https:// override, no GitHub API fallback) in one
+    /// command (CAD-561): check → verify attestation + hash → backup → install
     /// side by side → bounded drain → switch → health check → done.
     /// The rollout lease is auto-claimed and auto-released, and the
     /// pre-update backup (outside the state dir by default) is recorded
@@ -1582,4 +1596,32 @@ pub(crate) enum Commands {
     /// Stdio MCP tools for a managed Codex endpoint.
     #[command(hide = true)]
     McpAgent,
+    /// Search public commands offline. JSON only. This describes syntax;
+    /// it does not grant permission to run a command.
+    #[command(name = "commands")]
+    Search {
+        /// Words to match against the path, aliases, and help. Omit to
+        /// list the core commands.
+        #[arg(value_name = "QUERY")]
+        query: Option<String>,
+        /// Maximum matches, 1–20. Requires a query.
+        #[arg(
+            long,
+            value_parser = clap::value_parser!(u8).range(1..=20),
+            requires = "query",
+            conflicts_with = "all"
+        )]
+        limit: Option<u8>,
+        /// Every public command path. Conflicts with a query and `--limit`.
+        #[arg(long, conflicts_with = "query")]
+        all: bool,
+    },
+    /// Show one public command's input syntax as JSON. The parser and
+    /// handler remain authoritative; this is not a permission or readiness schema.
+    Schema {
+        /// Canonical path or a public alias, one word per argument
+        /// (`schema issue comment`).
+        #[arg(required = true, num_args = 1.., value_name = "COMMAND_PATH")]
+        path: Vec<String>,
+    },
 }

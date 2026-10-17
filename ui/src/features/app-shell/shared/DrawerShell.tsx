@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import Button from "../../../ui/Button";
-import { useTranslate } from "../../../lib/locale";
+import { useTranslate } from "../../../lib/localeText";
 import { useDrawerClose } from "./useDrawerClose";
 
 /**
@@ -60,12 +60,15 @@ export interface DrawerShellProps {
   /** Replaces the footer's menu / note / secondary / primary slots. */
   foot?: ReactNode;
   onClose: () => void;
+  /** Frame-local scrim edge. When supplied, no host outlet is measured. */
+  geometry?: { left: number };
 }
 
 /** Left edge of the outlet, so the scrim never dims the chat pane. */
-function useScrimLeft(): number {
+function useScrimLeft(explicitLeft: number | undefined): number {
   const [left, setLeft] = useState(0);
   useLayoutEffect(() => {
+    if (explicitLeft !== undefined) return;
     const measure = () => {
       const outlet = document.querySelector(".app-shell-outlet");
       // Below 1024px the chat is a closed sheet, so the scrim spans all.
@@ -74,8 +77,8 @@ function useScrimLeft(): number {
     measure();
     window.addEventListener("resize", measure);
     return () => window.removeEventListener("resize", measure);
-  }, []);
-  return left;
+  }, [explicitLeft]);
+  return explicitLeft ?? left;
 }
 
 function OverflowMenu({ items, open, setOpen }: { items: DrawerMenuItem[]; open: boolean; setOpen: (v: boolean) => void }) {
@@ -150,7 +153,7 @@ export default function DrawerShell(props: DrawerShellProps) {
   const [menuOpen, setMenuOpen] = useState(false);
   const { closing, requestClose, onTransitionEnd } = useDrawerClose(onClose);
   const t = useTranslate();
-  const scrimLeft = useScrimLeft();
+  const scrimLeft = useScrimLeft(props.geometry?.left);
   const editing = edit != null;
 
   // Land on the heading so a deep link (no opener) still has a place.

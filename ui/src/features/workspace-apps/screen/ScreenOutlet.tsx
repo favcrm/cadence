@@ -7,16 +7,33 @@ import { type SlotView } from "./screenSlot";
 import ScreenSlotLayer from "./ScreenSlotLayer";
 import { parseDraftImageRef, type ScreenPush } from "./screenProtocol";
 import { workspaceApps } from "../workspaceApps";
-import { useTranslate } from "../../../lib/locale";
+import { useLocale } from "../../../lib/locale";
 import { downscaleToDataUrl } from "./screenAssets";
+import { registerNavigationGuard, useHref } from "../../../lib/useLocation";
+import { recordServices, object, exact, type HostCommand } from "./screenServices";
+import { admitDisplaySession, purgeDisplayCache, withReadObservations } from "./screenDisplayCache";
+import InertPreviewLayer, { type InertPreview } from "./InertPreviewLayer";
+import { parseRoutePatch, routeFromHref, type RoutePatch } from "./screenRoute";
+import { RECORD_CALL_VERBS, RECORD_SLOT_VERBS, type RecordCallVerb, type RecordSlotVerb, type ScreenNavigation } from "./screenProtocol";
+import type { MountReceipt } from "./screenLifecycle";
 
 /** App code lives in its independently installed bundle, never in the board. */
-export default function ScreenOutlet({ projection, fallback, loadAsset, actions }: {
+export default function ScreenOutlet({ projection, fallback, loadAsset, actions, onRoute, onCommand, onNavigation }: {
   projection: ScreenPush; fallback: ReactNode; loadAsset?: AssetLoader;
   /** The operator's verbs for this frame (HP3); absent for a non-operator, so every `call`/`slot` closes it. */
   actions?: Pick<ScreenActions, "call" | "planner">;
+  onRoute?: (patch: RoutePatch, navigation: ScreenNavigation) => void;
+  onCommand?: (command: HostCommand) => void;
+  onNavigation?: (navigation: ScreenNavigation | null) => void;
 }) {
-  const t = useTranslate();
+  const { t, locale } = useLocale();
+  const presentationLocale = useRef(locale);
+  presentationLocale.current = locale;
+  const href = useHref();
+  const navigationCallbacks = useRef({ onRoute, onCommand, onNavigation, href });
+  navigationCallbacks.current = { onRoute, onCommand, onNavigation, href };
+  const mounted = useRef<MountReceipt | null>(null);
+  const decorate = (p: ScreenPush, receipt: MountReceipt): ScreenPush => receipt.host_contract === "screen-records.v1" ? withReadObservations({ ...p, ...(p.installation.name === "crm" && receipt.tag === "crm" ? { presentation_locale: presentationLocale.current } : {}), route: routeFromHref(receipt.navigation, receipt.tag, navigationCallbacks.current.href), actions: receipt.operations ?? [] }, receipt.display_scope_key!, receipt.operations ?? []) : p;
   const container = useRef<HTMLDivElement>(null);
   const channel = useRef<ScreenChannel | null>(null);
   const latest = useRef(projection);
@@ -25,6 +42,8 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions 
   loader.current = loadAsset;
   const acting = useRef(actions);
   acting.current = actions;
+  const [preview, setPreview] = useState<InertPreview | null>(null);
+  const [remoteImages, setRemoteImages] = useState<string[]>([]);
   const [slot, setSlot] = useState<SlotView | null>(null);
   const [link, setLink] = useState<string | null>(null);
   const [state, setState] = useState<"loading" | "ready" | "fallback">("loading");
@@ -48,9 +67,42 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions 
     // The live mount's action token, held host-side for invoke relay and
     // revoked on teardown so a stale mount's handle cannot be reused.
     let actionToken: string | null = null;
+    let services: ReturnType<typeof recordServices> | null = null;
+    const isCurrent = () => !retired && !controller.signal.aborted && !session.signal.aborted && privateReadsAllowed() && generation === privateSessionGeneration() && JSON.stringify([latest.current.install_id, latest.current.digest, latest.current.tag, latest.current.context_id]) === scope;
+    let releaseLeaveGuard: (() => void) | null = null;
+    const warnBeforeUnload = (event: BeforeUnloadEvent) => {
+      if (!releaseLeaveGuard || !isCurrent() || owned !== channel.current) return;
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    const clearLeaveGuard = () => {
+      releaseLeaveGuard?.();
+      releaseLeaveGuard = null;
+      window.removeEventListener("beforeunload", warnBeforeUnload);
+    };
+    const command = (c: HostCommand) => {
+      if (!isCurrent() || !mounted.current) return;
+      if (c.operation === "screen.route.patch") {
+        const nav = mounted.current.navigation;
+        const patch = nav ? parseRoutePatch(c.args, nav) : null;
+        if (!nav || !patch || !navigationCallbacks.current.onRoute) throw new Error("Unsupported screen route");
+        navigationCallbacks.current.onRoute(patch, nav);
+      } else if (c.operation === "screen.preview.show") {
+        const a = c.args;
+        const anchor = a.anchor;
+        if (!exact(a, ["preview_id", "document", "anchor", "mode"]) || typeof a.preview_id !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(a.preview_id) || typeof a.document !== "string" || new TextEncoder().encode(a.document).byteLength > 49152 || a.mode !== "draft" && a.mode !== "saved" || anchor !== "footer" && (!object(anchor) || Object.keys(anchor).sort().join() !== "h,w,x,y" || ![anchor.x, anchor.y].every(n => typeof n === "number" && Number.isFinite(n) && Math.abs(n) <= 16384) || ![anchor.w, anchor.h].every(n => typeof n === "number" && Number.isFinite(n) && n >= 0 && n <= 16384))) throw new Error("Invalid preview command");
+        setPreview({ id: a.preview_id, document: a.document, anchor: anchor as InertPreview["anchor"], mode: a.mode });
+      } else if (c.operation === "screen.preview.clear") {
+        if (!exact(c.args, ["preview_id"]) || typeof c.args.preview_id !== "string") throw new Error("Invalid preview clear");
+        setPreview(p => p?.id === c.args.preview_id ? null : p);
+      } else if (["smtp.manage", "chat.campaign.open", "chat.campaign.brief"].includes(c.operation)) {
+        if (!navigationCallbacks.current.onCommand) throw new Error("Host command unavailable");
+        navigationCallbacks.current.onCommand(c);
+      } else throw new Error("Unsupported host command");
+    };
     setState("loading");
-    setSlot(null); setLink(null);
-    const fail = () => { if (!retired) setState("fallback"); };
+    setSlot(null); setLink(null); setPreview(null); setRemoteImages([]);
+    const fail = () => { clearLeaveGuard(); if (isCurrent()) { services?.retire(); mounted.current = null; navigationCallbacks.current.onNavigation?.(null); setPreview(null); setSlot(null); setState("fallback"); } };
     const onMessage = (event: MessageEvent) => owned?.receive(event);
     window.addEventListener("message", onMessage);
     void (async () => {
@@ -61,11 +113,18 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions 
           headers: { "Content-Type": "application/json", "X-Cadence-Board": "1", ...sessionHeaders() },
           body: JSON.stringify(current.context_id ? { context_id: current.context_id } : {}),
         }, session);
-        if (!response.ok) throw new Error("Screen mount refused");
+        if (!response.ok) { if ([401, 403].includes(response.status)) purgeDisplayCache(); throw new Error("Screen mount refused"); }
         const receipt = parseMount(await response.json(), current.tag);
         if (!receipt) throw new Error("Invalid screen mount receipt");
         session.assertCurrent();
-        if (retired || controller.signal.aborted || !privateReadsAllowed() || generation !== privateSessionGeneration() || !container.current) return;
+        if (receipt.host_contract === "screen-records.v1" && (receipt.install_id !== current.install_id || receipt.context_id !== current.context_id || receipt.digest !== current.digest)) throw new Error("Screen receipt scope changed");
+        if (!isCurrent() || !container.current) return;
+        mounted.current = receipt;
+        if (receipt.host_contract === "screen-records.v1") {
+          admitDisplaySession(receipt.display_session_key!);
+          setRemoteImages(receipt.remote_images ?? []);
+          services = recordServices(receipt, JSON.stringify([current.install_id, current.context_id]), { current: isCurrent, command, refused: () => { owned?.close(true); } });
+        }
         const frame = document.createElement("iframe");
         frame.title = current.installation.title;
         frame.setAttribute("sandbox", "allow-scripts");
@@ -80,8 +139,8 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions 
         // `tool` op only carries alias/input/request_id, and the host
         // appends this token on the invoke relay.
         actionToken = receipt.action_token ?? null;
-        owned = new ScreenChannel(frame.contentWindow, receipt, latest.current,
-          () => frame.remove(), fail, () => { if (!retired) { clearTimeout(timer); setState("ready"); } },
+        owned = new ScreenChannel(frame.contentWindow, receipt, decorate(latest.current, receipt),
+          () => { clearLeaveGuard(); frame.remove(); }, fail, () => { if (isCurrent()) { clearTimeout(timer); setState("ready"); navigationCallbacks.current.onNavigation?.(receipt.navigation ?? null); } },
           async ref => {
             const draft=parseDraftImageRef(ref);
             if(draft&&actionToken){
@@ -92,14 +151,21 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions 
             }
             return loader.current ? loader.current(ref) : null;
           },
-          acting.current ? {
-            call: (verb, args, ui) => acting.current!.call(verb, args, ui),
-            planner: (verb, args) => acting.current!.planner(verb, args, actionToken ? { actionToken } : undefined),
-            onSlot: view => { if (!retired) setSlot(view); },
-            onLink: url => { if (!retired) setLink(url); },
+          services || acting.current ? {
+            call: (verb, args, ui) => services ? (RECORD_CALL_VERBS as readonly string[]).includes(verb) ? services.call(verb as RecordCallVerb, args) : Promise.resolve({ ok: false as const, refusal: { code: "forbidden", text: "This operation is unavailable." } }) : acting.current!.call(verb, args, ui),
+            planner: (verb, args) => services ? (RECORD_SLOT_VERBS as readonly string[]).includes(verb) ? services.planner(verb as RecordSlotVerb, args) : Promise.resolve({ code: "forbidden", text: "This operation is unavailable." }) : acting.current!.planner(verb, args, actionToken ? { actionToken } : undefined),
+            onSlot: view => { if (isCurrent()) setSlot(view); },
+            onLink: url => { if (isCurrent()) setLink(url); },
             ...(actionToken ? { invoke: (alias: string, input: Record<string, unknown>, requestId: string, scope?:import("./screenProtocol").GenerationScope) =>
               invokeTool(actionToken!, alias, input, requestId, scope) } : {}),
-          } : undefined);
+          } : undefined, undefined, unsaved => {
+            if (!isCurrent() || mounted.current !== receipt || channel.current !== owned) return;
+            clearLeaveGuard();
+            if (!unsaved) return;
+            releaseLeaveGuard = registerNavigationGuard(() => !isCurrent() || channel.current !== owned ||
+              window.confirm("Your email draft has not been saved. Leave this page and discard those local edits?"));
+            window.addEventListener("beforeunload", warnBeforeUnload);
+          });
         channel.current = owned;
         frame.addEventListener("load", () => owned?.load());
         timer = setTimeout(() => { owned?.close(true); }, 10000);
@@ -113,12 +179,16 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions 
       retired = true;
       unsubscribe();
       session.dispose();
+      clearLeaveGuard();
+      services?.retire();
+      mounted.current = null;
+      navigationCallbacks.current.onNavigation?.(null);
       controller.abort();
       clearTimeout(timer);
       window.removeEventListener("message", onMessage);
       owned?.close();
       channel.current = null;
-      setSlot(null); setLink(null);
+      setSlot(null); setLink(null); setPreview(null);
       container.current?.replaceChildren();
       // Retire the mount's action handle server-side so a torn-down or
       // remounted screen's token cannot be replayed. Best-effort — the
@@ -130,12 +200,13 @@ export default function ScreenOutlet({ projection, fallback, loadAsset, actions 
       }
     };
   }, [scope]);
-  useEffect(() => { channel.current?.update(projection); }, [projection]);
+  useEffect(() => { if (mounted.current) channel.current?.update(decorate(projection, mounted.current)); }, [projection, href, locale]);
   return <>
     <div aria-label={t("Installed app screen")} style={{ position: "relative", flex: "1 1 0%", minHeight: 0, height: "100%", display: state === "ready" ? "block" : "none" }}>
       <div ref={container} style={{ position: "absolute", inset: 0 }} />
+      <InertPreviewLayer preview={preview} remoteImages={remoteImages} />
       <ScreenSlotLayer view={slot} link={link} onDismissLink={() => setLink(null)}
-        onTap={(token, trusted, at) => { channel.current?.tapSlot(token, trusted, at); }}
+        onTap={(token, trusted, at, input) => { channel.current?.tapSlot(token, trusted, at, input); }}
         onCancel={token => channel.current?.cancelSlot(token)} />
     </div>
     {/* CAD-1137: a quiet first-mount skeleton, with the blank frame hidden until handshake readiness. */}

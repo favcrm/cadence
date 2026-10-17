@@ -58,9 +58,9 @@ use crate::store::StoreConn;
 use crate::test_seam::{scoped, Asserted};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// The Designer-like installed package: one host-execution
 /// `create-image` workflow declaring the `image` capability slot
@@ -169,6 +169,7 @@ struct DoorRecord {
 /// door shape.
 fn media_door(
     charge: Arc<std::sync::atomic::AtomicU64>,
+    stop: Arc<AtomicBool>,
 ) -> (
     String,
     Arc<Mutex<Vec<DoorRecord>>>,
@@ -181,15 +182,12 @@ fn media_door(
     let original = png_1x1();
     let digest = format!("{:x}", Sha256::digest(&original));
     let worker = std::thread::spawn(move || {
-        // The door stays open long enough for a full happy-path run
-        // (two price reads, submit, artifact fetch) then closes so the
-        // join in `Fx::drop` never idles the suite.
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            if Instant::now() > deadline {
-                break;
-            }
-            let mut request = match server.recv_timeout(Duration::from_millis(500)) {
+        // Serve until the fixture drops: `stop` is checked every poll
+        // round, so teardown costs one recv_timeout instead of a fixed
+        // lifetime. No fixed-duration wait — the door ends when the test
+        // is done, not on a clock.
+        while !stop.load(Ordering::SeqCst) {
+            let mut request = match server.recv_timeout(Duration::from_millis(100)) {
                 Ok(Some(request)) => request,
                 Ok(None) => continue,
                 Err(_) => break,
@@ -254,6 +252,7 @@ struct Fx {
     install: String,
     seen: Arc<Mutex<Vec<DoorRecord>>>,
     charge: Arc<std::sync::atomic::AtomicU64>,
+    stop: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -266,7 +265,8 @@ impl Fx {
         let pm = dir.path().join("pm");
         crate::issue::Pm::init(&pm).unwrap();
         let charge = Arc::new(std::sync::atomic::AtomicU64::new(CHARGE));
-        let (base, seen, worker) = media_door(charge.clone());
+        let stop = Arc::new(AtomicBool::new(false));
+        let (base, seen, worker) = media_door(charge.clone(), stop.clone());
         let mut opts = ServeOptions::default();
         opts.provider_env
             .set("CADENCE_PM_DIR", pm.to_str().unwrap());
@@ -355,6 +355,7 @@ impl Fx {
             install,
             seen,
             charge,
+            stop,
             worker: Some(worker),
             _dir: dir,
         }
@@ -452,6 +453,7 @@ impl Fx {
 
 impl Drop for Fx {
     fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }

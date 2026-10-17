@@ -591,8 +591,13 @@ pub const SUPPORTED_CONTRACTS: &[(&str, &[u64], ContractStage)] = &[
     // board's rendered chat surface.
     ("app-chat", &[1], ContractStage::Sandboxed),
     // src/issue/app_screen_decl.rs — the screens/<tag>/ package runs in
-    // the board's sandbox, no live data bridge.
+    // the board's sandbox; legacy declarations retain their read-only bridge.
     ("app-screens", &[1], ContractStage::Sandboxed),
+    // Closed screen service operations with current native scope proof and
+    // host-owned confirmation, route and inert-preview consumers.
+    ("screen-records", &[1], ContractStage::Sandboxed),
+    // Opt-in, integrity-checked script order consumed by the frame renderer.
+    ("screen-startup", &[1], ContractStage::Sandboxed),
     // contracts/app-views/v1 — schema + the board's strict consumer.
     ("app-views", &[1], ContractStage::Sandboxed),
 ];

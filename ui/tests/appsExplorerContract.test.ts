@@ -63,8 +63,9 @@ globalThis.fetch = async (input: any, init?: any) => {
   if (path === "/api/app-favorites") return json(favorites);
   if (path === "/api/app-catalog") return json(catalog);
   if (path === "/api/app-requests") return json({ requests: [] });
+  if (path === "/api/public-apps") return json({ ok: true, data: { apps: [{ id: "social-content", app: "social-content", title: "Social Content", summary: "Draft posts", version: "0.9.7", listing: { tagline: "Draft a reviewed caption", category: "marketing", tags: ["social", "instagram"], publisher: { name: "Cadence" }, about: "Social Content turns a real source into a reviewed caption.", can: ["Pull one public Instagram post"], setup: [{ slot: "source", label: "Public Instagram read", help: "Reads public profile." }], data: { stores: ["Caption drafts"], personal: false }, access_notes: { source: "Reads public profile." } }, digest: "sha256:" + "ab".repeat(32), installable: true }] } });
   throw new Error(`Unexpected request ${path}`);
-};
+}
 function assert(value: unknown, what: string): asserts value {
   if (!value) throw new Error(what);
 }
@@ -125,15 +126,17 @@ async function main() {
       `clicking a catalog card opens /apps/catalog/crm; location is ${location.pathname}${location.hash}`,
     );
   });
-  // 4. Retired catalog discovery hands off to the verified AgenticOS marketplace.
-  await check("retired catalog marketplace handoff", async () => {
+  await check("public directory replaces marketplace handoff", async () => {
     await React.act(() => root.render(React.createElement(Explorer, { viewer: operator })));
     await flush();
-    const handoff = host.querySelector("a[href='https://app-v2.agenticos.hk/apps']") as HTMLAnchorElement | null;
-    assert(handoff instanceof HTMLElement, "the exact AgenticOS Apps marketplace URL is linked");
-    assert(handoff.target === "_blank", `marketplace opens in a new tab; target is ${handoff.target}`);
-    assert(handoff.rel.split(/\s+/).includes("noopener") && handoff.rel.split(/\s+/).includes("noreferrer"),
-      `new-tab marketplace link is protected with noopener noreferrer; rel is ${handoff.rel}`);
+    await flush();
+    assert(!host.querySelector("a[href='https://app-v2.agenticos.hk/apps']"), "no platform Apps hand-off");
+    assert(!host.querySelector("select"), "category uses the board dropdown, not a native select");
+    assert(host.querySelector("[role='combobox']"), "category dropdown is present");
+    assert(host.textContent?.includes("Social Content"), "published app is listed");
+    assert(host.textContent?.includes("Draft a reviewed caption"), "real listing tagline renders");
+    assert(host.textContent?.includes("Cadence"), "nested publisher.name renders");
+    assert(host.textContent?.includes("instagram"), "listing tags render");
     assert(!host.querySelector(".feat, .fcard"), "the retired catalog has no featured row");
     assert(!Array.from(host.querySelectorAll("button, a")).some((action) => action.textContent?.trim() === "Install"),
       "a retired tombstone offers no Install action");

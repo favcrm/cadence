@@ -60,6 +60,7 @@ mod login;
 mod notify_service;
 mod operator;
 mod platform_account;
+mod public_directory;
 mod read_model;
 mod serve;
 mod setup;

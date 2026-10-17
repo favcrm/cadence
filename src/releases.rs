@@ -51,6 +51,50 @@ pub const PROFILE_OPERATOR_HOST: &str = "operator-host";
 /// authority that never substitutes for operator-host approval).
 pub const PROFILE_PUBLIC_CLIENT: &str = "public-client";
 
+/// The default owned release source (CAD-1479): ordinary
+/// `cadence update`/`upgrade` and the client-only updater consume the
+/// published release through this catalogue's signed offline evidence
+/// instead of live GitHub API queries. `--release-source` remains the
+/// advanced https:// override; a source failure refuses — there is no
+/// GitHub API fallback.
+pub const DEFAULT_BASE: &str = "https://api-v2.agenticos.hk";
+
+/// Resolve the release-source base: an explicit `--release-source`
+/// wins, else the [`DEFAULT_BASE`] catalogue. Under `test-seam` only,
+/// a `CADENCE_RELEASE_SOURCE` env names the seam default — an
+/// `http://127.0.0.1:<port>` origin takes the same loopback
+/// constructor the acceptance fixtures use, every other value the
+/// production https-origin path. The feature compiles out of every
+/// release build, so no env can redirect a production binary's
+/// default source.
+pub fn resolve_base(explicit: Option<&str>) -> Result<String> {
+    if let Some(base) = explicit {
+        return parse_origin(base);
+    }
+    #[cfg(feature = "test-seam")]
+    if let Ok(env_base) = std::env::var("CADENCE_RELEASE_SOURCE") {
+        let env_base = env_base.trim().to_string();
+        if !env_base.is_empty() {
+            if env_base.starts_with("http://127.0.0.1:") {
+                return Ok(env_base);
+            }
+            return parse_origin(&env_base);
+        }
+    }
+    Ok(DEFAULT_BASE.to_string())
+}
+
+/// Construct the source for a resolved base: the loopback seam
+/// constructor for a `http://127.0.0.1:<port>` default under
+/// `test-seam` (refused in production), `for_profile` otherwise.
+pub fn source_for(base: &str, profile: &'static str) -> Result<HttpGh> {
+    #[cfg(feature = "test-seam")]
+    if base.starts_with("http://127.0.0.1:") {
+        return HttpGh::for_profile_loopback(base, profile);
+    }
+    HttpGh::for_profile(base, profile)
+}
+
 /// Metadata responses are small closed documents; larger bodies are
 /// refused unread.
 const METADATA_MAX_BYTES: u64 = 256 * 1024;

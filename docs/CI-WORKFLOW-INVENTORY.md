@@ -31,8 +31,10 @@ indefinitely. `cadence-nextest` itself is still live in the review recipe.
   compilation, including no cross-builds. Isolated UI source: UI validation
   and embedded build; unrelated default Rust clippy/floor/build commands are
   not applicable. Edits confined to pre-existing independent top-level
-  `tests/<name>.rs` targets narrow the `test` job's integration selection
-  only (lib/bins suites and every zero-target guard unchanged). All
+  `tests/<name>.rs` targets narrow the `test-shards` matrix's integration
+  selection only (lib/bins suites and every zero-target guard unchanged).
+  The required `test` check is the aggregate: it merges every shard's
+  junit and re-runs the coverage guard (CAD-1480). All
   shared/config/workflow/script/mixed/unknown changes: full validation.
   Classifier missing or failing: full validation. Required contexts remain
   and say when commands were not run; merge-group, main, tags and dispatch

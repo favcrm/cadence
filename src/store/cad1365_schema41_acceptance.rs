@@ -1,15 +1,17 @@
-// Independent CAD-1365 acceptance: historical schema-45 media compatibility at current schema 47.
+// Independent CAD-1365 acceptance: historical schema-45 media compatibility.
 //
 // Included inside `seal::tests` (`include!`). Scope: the real
-// `witness_commit` schema guard must accept an ACTUAL current schema 47 database
-// only when the three CAD-1365 media TABLES are present in sqlite_master,
-// must keep accepting a genuine schema 40 database and a genuine physical
-// schema 44 database (the three media tables absent), and must keep
-// refusing a forged schema 45 stamp on a physical 44 database, a current
-// schema 47 database missing a media table, and a future schema 48 with the
-// exact existing message, leaving the sealed latch, owner_witness rows and
-// business events unchanged. Schema-46 fixtures omit the CAD-1423 notification
-// tables so the historical media-table cases retain their intended scope.
+// `witness_commit` schema guard must accept an ACTUAL current schema
+// database only when the three CAD-1365 media TABLES (introduced at schema
+// 45) are present in sqlite_master, must keep accepting a genuine schema 40
+// database and a genuine physical schema 44 database (the three media tables
+// absent), and must keep refusing a forged schema 45 stamp on a physical 44
+// database, a current database missing a media table, and a future schema
+// above the supported bound with the exact existing message, leaving the sealed latch,
+// owner_witness rows and business events unchanged. Schema-46 fixtures omit
+// the CAD-1423 notification tables so the historical media-table cases retain
+// their intended scope; bootstrap columns and transfer tables are likewise
+// dropped so the stamped 46 preimage matches a real main46 store.
 // Synthetic permits come from the existing test-only factory; no runtime
 // authority is minted and no HTTP or native path is exercised.
 
@@ -17,9 +19,8 @@ const CAD1365_S41_MSG: &str = "owner witness database schema is unsupported";
 const CAD1365_S41_CHALLENGE: &[u8] = b"cad1365-s41";
 const CAD1365_S41_ATTEMPT: &str = "attempt-s41";
 
-/// A physical schema 46 store: the current (47) store with ONLY the seven
-/// CAD-1423 notification tables dropped in reverse-reference order, stamped
-/// 46. The three CAD-1365 media tables stay present.
+/// A physical schema 46 store: notification and transfer tables removed,
+/// bootstrap columns removed, stamped 46. The three media tables stay present.
 fn cad1365_s41_physical46_fixture(dir: &TempDir) -> (std::path::PathBuf, Store) {
     let (db, store) = open_legacy(dir);
     {
@@ -32,6 +33,11 @@ fn cad1365_s41_physical46_fixture(dir: &TempDir) -> (std::path::PathBuf, Store) 
              DROP TABLE human_room_mutes;
              DROP TABLE human_notification_reads;
              DROP TABLE human_notification_prefs;
+             DROP TABLE wiki_transfer_entries;
+             DROP TABLE wiki_transfer_jobs;
+             ALTER TABLE assistants DROP COLUMN bootstrap_state;
+             ALTER TABLE assistants DROP COLUMN bootstrap_template_version;
+             ALTER TABLE assistants DROP COLUMN bootstrap_revision;
              UPDATE schema_version SET version=46;",
         )
         .unwrap();
@@ -131,8 +137,7 @@ fn cad1365_s41_witness(db: &std::path::Path, store: &Store) -> Result<u64> {
 
 #[test]
 fn cad1365_schema45_owner_witness_acceptance() {
-    // 1. Actual current schema 47 with all three media tables is accepted
-    //    and records db_schema 47.
+    // 1. The actual current store is accepted and its schema is witnessed.
     {
         let dir = TempDir::new().unwrap();
         let (db, store) = open_legacy(&dir);
@@ -140,15 +145,15 @@ fn cad1365_schema45_owner_witness_acceptance() {
             .conn()
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(actual, 47, "fresh store must migrate to schema 47");
+        assert_eq!(actual, crate::rollout::SCHEMA_VERSION);
         cad1365_s41_seal(&db, &store);
         cad1365_s41_witness(&db, &store)
-            .expect("actual schema 47 with media tables must be accepted");
+            .expect("actual current schema with media tables must be accepted");
         let witnessed: i64 = store
             .conn()
             .query_row("SELECT db_schema FROM owner_witness", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(witnessed, 47, "witness must record actual schema 47");
+        assert_eq!(witnessed, actual, "witness must record the actual schema");
     }
 
     // 2. Genuine schema 40 (media tables absent, stamped 40) is still accepted.
@@ -199,7 +204,7 @@ fn cad1365_schema45_owner_witness_acceptance() {
         assert_eq!(cad1365_s41_snapshot(&store), before, "refusal changed state");
     }
 
-    // 5. Current schema 47 with one media table missing refuses with the
+    // 5. Current schema with one media table missing refuses with the
     //    same exact message and no state change.
     {
         let dir = TempDir::new().unwrap();
@@ -213,26 +218,26 @@ fn cad1365_schema45_owner_witness_acceptance() {
         let err = cad1365_s41_witness(&db, &store).unwrap_err();
         assert!(
             matches!(&err, Error::Rejected(message) if message == CAD1365_S41_MSG),
-            "schema 47 missing a media table must fail at the actual guard, got: {err}"
+            "current schema missing a media table must fail at the actual guard, got: {err}"
         );
         assert_eq!(cad1365_s41_snapshot(&store), before, "refusal changed state");
     }
 
-    // 6. Unknown future schema 48 above the fully migrated current 47 store is
+    // 6. Unknown future schema above the supported bound is
     //    refused with the same exact message.
     {
         let dir = TempDir::new().unwrap();
         let (db, store) = open_legacy(&dir);
         Connection::open(&db)
             .unwrap()
-            .execute("UPDATE schema_version SET version=48", [])
+            .execute("UPDATE schema_version SET version=?1", [PROTECTED_SCHEMA_MAX + 1])
             .unwrap();
         cad1365_s41_seal(&db, &store);
         let before = cad1365_s41_snapshot(&store);
         let err = cad1365_s41_witness(&db, &store).unwrap_err();
         assert!(
             matches!(&err, Error::Rejected(message) if message == CAD1365_S41_MSG),
-            "future schema 48 must fail at the actual guard, got: {err}"
+            "future schema must fail at the actual guard, got: {err}"
         );
         assert_eq!(cad1365_s41_snapshot(&store), before, "refusal changed state");
     }

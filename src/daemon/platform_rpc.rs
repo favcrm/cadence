@@ -27,6 +27,60 @@ use crate::store::{scope_list, scope_name, CredentialRecord, Grant};
 /// first, so the only `by` these rows can carry is the operator.
 const OPERATOR: &str = "operator";
 
+/// CAD-1420: the one platform whose `account` is a board HOST, not an
+/// operator-chosen handle — the daemon's enrolled `hosted-board`
+/// revalidation custody (`assist.revalidate`). The generic
+/// `proto::identifier` grammar (`[a-z0-9-]`, ≤64) cannot spell a DNS
+/// name with dots or a `localhost:port`, so `hosted-board` keeps its
+/// own narrow account parser in `platform::connections`, shared with
+/// store re-validation; every other platform keeps the generic grammar
+/// unchanged.
+const HOSTED_BOARD_PLATFORM: &str = "hosted-board";
+
+/// The account parse for enroll/rotate/revoke: `hosted-board` admits
+/// its board-host spelling via the shared
+/// `platform::connections::provider_account_identifier`; every other
+/// platform — and every other verb — takes the existing parser
+/// unchanged.
+fn enroll_account_identifier(platform: &str, value: &str) -> Result<String> {
+    if platform == HOSTED_BOARD_PLATFORM {
+        platform::connections::provider_account_identifier(platform, value)
+    } else {
+        identifier(value, "Account")
+    }
+}
+
+/// CAD-1420: enroll/rotate of `hosted-board` binds the account to THIS
+/// daemon's configured board host (`board-identity.json`), the same
+/// trim the live pull applies. A hosted-board credential is
+/// revalidation custody for the configured board only — an operator
+/// can never enroll a foreign host's service token under it. Refuses
+/// before custody or any record when the board identity is unconfigured
+/// or the supplied host differs.
+fn hosted_board_account_matches_config(
+    state_dir: &std::path::Path,
+    account: &str,
+    verb: &str,
+) -> Result<()> {
+    let configured = crate::board_identity::read_config(state_dir)
+        .map_err(|_| {
+            Error::rejected(format!(
+                "{verb} refused: no board identity is configured — there is no \
+                 hosted-board host to enroll"
+            ))
+        })?
+        .host;
+    let configured = configured.trim_end_matches('/');
+    if account != configured {
+        return Err(Error::rejected(format!(
+            "{verb} refused: hosted-board account '{account}' is not this board's \
+             configured host '{configured}' — service custody enrolls only for \
+             the board this daemon serves"
+        )));
+    }
+    Ok(())
+}
+
 type CredentialMetadataProjection<'a> = dyn Fn(&CredentialRecord) -> Result<Value> + 'a;
 
 impl Shared {
@@ -92,8 +146,25 @@ impl Shared {
                 required_str(params, "account")?,
             )?
         } else {
-            identifier(required_str(params, "account")?, "Account")?
+            enroll_account_identifier(&platform, required_str(params, "account")?)?
         };
+        // CAD-1420: a `hosted-board` account IS this board's public
+        // host — enroll/rotate refuses any other spelling, before
+        // custody or a record. The declared scopes for that custody
+        // are exactly `assist.revalidate`; no arbitrary service
+        // capability enrolls under it. Revoke stays unbound to the
+        // CURRENT host so a stale host's credential can still drop.
+        if platform == HOSTED_BOARD_PLATFORM {
+            hosted_board_account_matches_config(
+                &self.state_dir,
+                &account,
+                if rotate {
+                    "platform rotate"
+                } else {
+                    "platform enroll"
+                },
+            )?;
+        }
         let accept_risk = params
             .get("accept_same_uid_risk")
             .and_then(Value::as_bool)
@@ -136,6 +207,14 @@ impl Shared {
         {
             return Err(Error::rejected(
                 "connection scopes are not declared by reviewed capabilities",
+            ));
+        }
+        // `hosted-board` custody is the daemon's `assist.revalidate`
+        // service proof and nothing else: the declared scope set is
+        // exactly that one scope, on enroll and on rotate alike.
+        if platform == HOSTED_BOARD_PLATFORM && declared != ["assist.revalidate"] {
+            return Err(Error::rejected(
+                "hosted-board enrollment carries exactly the assist.revalidate scope",
             ));
         }
         if !rotate && existing.is_some() {
@@ -297,7 +376,11 @@ impl Shared {
                 required_str(params, "account")?,
             )?
         } else {
-            identifier(required_str(params, "account")?, "Account")?
+            // CAD-1420: the `hosted-board` account is the board's host
+            // spelling. Revoke validates the grammar only — it must NOT
+            // pin the CURRENT configured host, or a credential enrolled
+            // under a previous host could never be revoked.
+            enroll_account_identifier(&platform, required_str(params, "account")?)?
         };
         let reason = optional_str(params, "reason");
         // Same lock the enroll path serializes on: a revoke racing a
