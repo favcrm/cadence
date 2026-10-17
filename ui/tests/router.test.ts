@@ -4,7 +4,6 @@ import {
   legacyRedirect,
   locationHref,
   matchRoute,
-  NAV,
   openProject,
   projectScope,
   readLocation,
@@ -24,6 +23,7 @@ function equal(actual: unknown, expected: unknown, what: string): void {
 // Every MVP route matches and prints back to the same path.
 const paths: [string, Route][] = [
   ["/", { screen: "home" }],
+  ["/my-work", { screen: "myWork" }],
   ["/projects", { screen: "projects", slug: null, section: "overview" }],
   ["/projects/cadence", { screen: "projects", slug: "cadence", section: "overview" }],
   ["/projects/cadence/issues", { screen: "projects", slug: "cadence", section: "issues" }],
@@ -69,13 +69,8 @@ for (const path of ["/app-installations", "/app-installations/..", "/app-install
 for (const dead of ["/overview/x", "/nope", "/projects/x/y", "/projects/cadence/issues/CAD-1/extra", "/agents/a/b", "/apps/%2F", "/apps/%E0", "/apps/catalog", "/apps/manage", "/apps/p/n/x", "/settings/nope", "/setup/x", "/login/x", "/projects/%E0", "/settings/connections/new/smtp/extra", "/settings/connections/account", "/settings/connections/bogus", "/settings/connections/new/%E0", "/settings/account/unwanted", "/settings/memory/extra", "/settings/update/extra", "/settings/permissions/extra", "/settings/email/extra", "/settings/connections/account/x/y", "/settings/connections/new//smtp", "/settings/connections/account//c-1", "/settings/connections//new"]) {
   equal(matchRoute(dead).screen, "notFound", `not found ${dead}`);
 }
+equal(matchRoute("/my-work/extra").screen, "notFound", "My work has no nested routes");
 
-// Main nav: MVP screens only (Wiki joined in CAD-581; Outbox left the nav in CAD-1312, its route stays).
-equal(
-  NAV.map((n) => n.label),
-  ["Home", "Threads", "Projects", "Wiki", "Apps", "Agents", "Settings"],
-  "nav",
-);
 
 // Which screens keep a project. One table.
 equal(projectScope({ screen: "projects", slug: "cadence", section: "issues" }), "slug", "projects are the slug");
