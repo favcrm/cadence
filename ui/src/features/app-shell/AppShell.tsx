@@ -1079,7 +1079,17 @@ export default function AppShell({
                   exampleKey={previewKey}
                   installationKind={installation.name}
                 />
-              ) : screenOutlet && children ? (
+              ) : isSocial && children ? (
+                // Social keeps its legacy native workspace (and its
+                // `?screen=native` back door). Every other app mounts the
+                // screen its own package ships, through
+                // InstalledScreenOutlet below — which is exactly what
+                // `hasPortableScreen` detects. `screenOutlet` is the union
+                // of the two and only drives the chrome above, so keying
+                // this branch on it sent any other screen-shipping app to
+                // the social-only workspace, which then rendered its
+                // "no supported board workspace" guide instead of the
+                // screen the package declared.
                 children(attachMediaReference)
               ) : (
                 <InstalledScreenOutlet installation={installation} contexts={contexts} contextId={scope.contextId}
