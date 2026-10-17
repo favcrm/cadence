@@ -1,128 +1,76 @@
-import { useCallback, useEffect, useState } from "react";
-import { api, ApiError, type MyWorkItem, type MyWorkPayload } from "../../lib/api";
+import { useEffect, useState } from "react";
+import { api, type MyWorkPayload } from "../../lib/api";
 import { issuePath } from "../issues/model";
 import { useTranslate } from "../../lib/locale";
 import Button from "../../ui/Button";
 import Link from "../../ui/Link";
 import PageState from "../../ui/PageState";
 
-const STATE_LABEL: Record<MyWorkItem["state"], string> = {
-  queued: "Queued",
-  running: "Running",
-  blocked: "Blocked",
-  result: "Result",
-  failed: "Failed",
-  cancelled: "Cancelled",
-};
-
-function messageOf(error: unknown): string {
-  if (error instanceof ApiError) return error.message;
-  if (error instanceof Error && error.message) return error.message;
-  return "Hosted work could not be confirmed.";
-}
-
-function Row({ item }: { item: MyWorkItem }) {
-  const t = useTranslate();
-  const label = STATE_LABEL[item.state] ?? item.state;
-  const attribution = item.assigned_to_you && item.created_by_you
-    ? "Assigned to you · created by you"
-    : item.assigned_to_you
-      ? "Assigned to you"
-      : "Created by you";
-  return (
-    <li className="flex flex-col gap-1 border-b border-line py-3 sm:flex-row sm:items-baseline sm:justify-between">
-      <div className="min-w-0">
-        <Link href={issuePath(item.project, item.issue_id)}>{item.issue_id}</Link>
-        <p className="text-sm text-ink-300">{t(attribution)} · {item.action}</p>
-      </div>
-      <p className="text-sm text-ink-200">{t(label)}</p>
-    </li>
-  );
-}
-
-function Section({ title, items }: { title: string; items: MyWorkItem[] }) {
-  const t = useTranslate();
-  if (items.length === 0) return null;
-  return (
-    <section className="mt-6">
-      <h2 className="text-section font-semibold text-ink-100">{t(title)}</h2>
-      <ul>
-        {items.map((item) => (
-          <Row key={`${title}-${item.id}`} item={item} />
-        ))}
-      </ul>
-    </section>
-  );
-}
-
-/** The signed-in member's hosted assignments. Claim is not shown as execution. */
+/** Personal PM work. No local agent, repository or provider is required. */
 export default function MyWork() {
   const t = useTranslate();
+  const [refresh, setRefresh] = useState(0);
   const [payload, setPayload] = useState<MyWorkPayload | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
-  const load = useCallback(() => {
-    setLoading(true);
-    setError(null);
-    api.myWork()
-      .then((body) => {
-        setPayload(body);
-        setLoading(false);
-      })
-      .catch((err: unknown) => {
-        setPayload(null);
-        setError(messageOf(err));
-        setLoading(false);
-      });
-  }, []);
-
   useEffect(() => {
-    load();
-  }, [load]);
+    const controller = new AbortController();
+    setLoading(true);
+    setPayload(null);
+    setError(null);
+    api.myWork(controller.signal).then((body) => {
+      if (controller.signal.aborted) return;
+      setPayload(body);
+      setLoading(false);
+    }).catch((error: unknown) => {
+      if (controller.signal.aborted) return;
+      setError(error instanceof Error ? error.message : t("Could not load your work."));
+      setLoading(false);
+    });
+    return () => controller.abort();
+  }, [refresh, t]);
 
-  const refresh = (
-    <Button type="button" onClick={load} loading={loading}>
-      {t("Refresh")}
-    </Button>
-  );
-
-  if (loading && !payload && !error) {
-    return (
-      <div className="px-4 py-6 lg:px-8">
-        <PageState title={t("My work")}>{t("Loading your assignments.")}</PageState>
-      </div>
-    );
-  }
-  if (error) {
-    return (
-      <div className="px-4 py-6 lg:px-8">
-        <PageState title={t("My work unavailable")} actions={refresh}>{error}</PageState>
-      </div>
-    );
-  }
-  const assigned = payload?.assigned ?? [];
-  const created = payload?.created ?? [];
-  if (assigned.length === 0 && created.length === 0) {
-    return (
-      <div className="px-4 py-6 lg:px-8">
-        <PageState title={t("My work")} actions={refresh}>
-          {t("Nothing is assigned to you or created by you.")}
-        </PageState>
-      </div>
-    );
-  }
   return (
     <div className="px-4 py-6 lg:px-8">
       <div className="flex items-center justify-between gap-3">
         <h1 className="text-section font-semibold text-ink-100">{t("My work")}</h1>
-        {refresh}
+        <Button type="button" onClick={() => setRefresh((value) => value + 1)} loading={loading}>
+          {t("Refresh")}
+        </Button>
       </div>
       <p className="mt-2 text-sm text-ink-300">
-        {t("Queued, blocked, result, failed and cancelled describe stored custody. A claim is not running work.")}
+        {t("Issues assigned to you. Open an issue for requirements, comments and progress.")}
       </p>
-      <Section title="Assigned to me" items={assigned} />
-      <Section title="Created by me" items={created} />
+      {loading ? (
+        <PageState title={t("Loading your work")} />
+      ) : error ? (
+        <PageState title={t("My work unavailable")}>{error}</PageState>
+      ) : payload?.issues.length === 0 ? (
+        <PageState title={t("No issues assigned to you")}>
+          <Link href="/projects">{t("Browse projects")}</Link>
+        </PageState>
+      ) : (
+        <ul className="mt-6 space-y-3">
+          {payload?.issues.map((issue) => (
+            <li key={issue.id} className="card p-3">
+              <div className="flex flex-wrap items-center gap-2 text-label">
+                <Link href={issuePath(issue.project, issue.id)} className="num text-ink-300">{issue.id}</Link>
+                <span className="chip">{t(issue.status)}</span>
+                <span className="text-ink-400">{issue.priority} · {issue.project}</span>
+                {issue.blocked && <span className="chip text-warn">{t("Blocked")}</span>}
+              </div>
+              <h2 className="mt-2 text-secondary break-words">
+                <Link href={issuePath(issue.project, issue.id)}>{issue.title}</Link>
+              </h2>
+              <p className="mt-2 text-label text-ink-400">
+                {issue.counts.comments} {t("comments")} · {issue.checks.done}/{issue.checks.total} {t("checks")}
+              </p>
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }
+

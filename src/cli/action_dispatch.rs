@@ -838,6 +838,9 @@ pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
         Commands::Template { action } => business_templates::run_template(state_dir, action),
         Commands::Document { action } => business_templates::run_document(state_dir, action),
         Commands::Ui { action } => ui::run(state_dir, action),
+        Commands::MyWork => Err(Error::usage(
+            "my-work requires a hosted org; run cadence login, then cadence --org <org> my-work",
+        )),
         Commands::Status {
             group,
             all,

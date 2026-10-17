@@ -22,6 +22,7 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
     }
     let mut args = serde_json::Map::new();
     let verb = match command {
+        Commands::MyWork => "my_work",
         Commands::Status {
             group,
             all,
