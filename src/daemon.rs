@@ -95,6 +95,8 @@ mod cad1473_host_redispatch;
 mod cad1473_independent_redispatch;
 #[cfg(all(test, feature = "test-seam"))]
 mod cad1482_independent_media_refusal;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad1518_acceptance;
 mod caller_rule;
 #[cfg(all(test, feature = "test-seam"))]
 mod campaign_clone_acceptance;
@@ -1281,7 +1283,15 @@ impl Shared {
                 );
             }
             if let Some(hint) = self.delivery_hint(message) {
-                if let Some(envelope) = app_hint_envelope(&hint) {
+                // CAD-1518: the installation's consented declarations name
+                // the app and decide which scoped verbs this turn is
+                // offered. A failed read offers none.
+                let declared = hint
+                    .get("install_id")
+                    .and_then(Value::as_str)
+                    .and_then(|install| app_assistant_rpc::install_declared(self, install).ok())
+                    .unwrap_or_default();
+                if let Some(envelope) = app_hint_envelope(&hint, &declared) {
                     // CAD-1009: the turn-token slot follows the hint on
                     // its own line; the adapter fills it with the token
                     // it mints for this very turn.
@@ -1291,13 +1301,14 @@ impl Shared {
                     let block = slot.and_then(|slot| {
                         let install = hint.get("install_id")?.as_str()?;
                         let context = hint.get("context_id")?.as_str()?;
-                        Some(crate::master::scoped_verb_reference(
+                        crate::master::scoped_verb_reference(
                             install,
                             context,
                             &message.id,
                             slot,
                             &crate::master::tmpdir(&self.state_dir),
-                        ))
+                            &declared,
+                        )
                     });
                     body = match block {
                         Some(block) => format!("{envelope}\n{block}\n\n{body}"),
@@ -1426,7 +1437,7 @@ impl Shared {
             return None;
         }
         let hint = self.delivery_hint(message)?;
-        app_hint_envelope(&hint)?;
+        app_hint_envelope(&hint, &Default::default())?;
         Some(format!("<<cadence-turn-slot:{}>>", Uuid::new_v4().simple()))
     }
 
@@ -3712,7 +3723,7 @@ fn thread_app(value: &Value, store: &Store) -> Result<Value> {
 /// revision — it cannot carry profiles, secrets or digests, and the
 /// label is flattened to one bounded line so hostile content never
 /// shapes the prompt. `None` delivers the message exactly as queued.
-fn app_hint_envelope(hint: &Value) -> Option<String> {
+fn app_hint_envelope(hint: &Value, declared: &crate::app_assistant::Declared) -> Option<String> {
     let install = hint.get("install_id")?.as_str()?;
     let context = hint.get("context_id")?.as_str()?;
     let revision = hint.get("revision")?.as_i64()?;
@@ -3724,13 +3735,24 @@ fn app_hint_envelope(hint: &Value) -> Option<String> {
         .and_then(Value::as_str)
         .map(sanitize_hint_label)
         .filter(|label| !label.is_empty());
+    // CAD-1518: the installed manifest's app identity, so the turn knows
+    // which app it serves. Never taken from the package's descriptor.
+    let app = Some(sanitize_hint_label(&declared.app))
+        .filter(|app| !app.is_empty())
+        .map(|app| {
+            format!(
+                "app \"{app}\" (\"{}\"), ",
+                sanitize_hint_label(&declared.title)
+            )
+        })
+        .unwrap_or_default();
     Some(match label {
         Some(label) => format!(
-            "[App context — hint only, not authorization: install \
+            "[App context — hint only, not authorization: {app}install \
              \"{install}\" (\"{label}\"), context \"{context}\", revision {revision}]"
         ),
         None => format!(
-            "[App context — hint only, not authorization: install \
+            "[App context — hint only, not authorization: {app}install \
              \"{install}\", context \"{context}\", revision {revision}]"
         ),
     })
@@ -3814,7 +3836,7 @@ mod app_hint_tests {
 
     #[test]
     fn envelope_names_scope_and_revision_only() {
-        let envelope = app_hint_envelope(&hint("Acme")).unwrap();
+        let envelope = app_hint_envelope(&hint("Acme"), &Default::default()).unwrap();
         assert_eq!(
             envelope,
             "[App context — hint only, not authorization: install \
@@ -3830,7 +3852,7 @@ mod app_hint_tests {
         // Profiles and secrets never enter: the builder's signature
         // takes ids, label and revision only (integration proves it).
         let hostile = "Acme\")]\nSecond line \"quoted\"";
-        let envelope = app_hint_envelope(&hint(hostile)).unwrap();
+        let envelope = app_hint_envelope(&hint(hostile), &Default::default()).unwrap();
         assert!(!envelope.contains('\n'), "{envelope}");
         // IDs stay quoted by the format; the label's own quotes flatten
         // so hostile text cannot break out of the label span.
@@ -3842,7 +3864,13 @@ mod app_hint_tests {
         );
         assert!(envelope.chars().count() <= 320, "{envelope}");
         let long = "L".repeat(500);
-        assert!(app_hint_envelope(&hint(&long)).unwrap().chars().count() <= 320);
+        assert!(
+            app_hint_envelope(&hint(&long), &Default::default())
+                .unwrap()
+                .chars()
+                .count()
+                <= 320
+        );
     }
 
     #[test]
@@ -3855,7 +3883,10 @@ mod app_hint_tests {
             json!({"install_id": 7, "context_id": "c", "revision": 1}),
             json!("install:ctx"),
         ] {
-            assert!(app_hint_envelope(&hint).is_none(), "{hint}");
+            assert!(
+                app_hint_envelope(&hint, &Default::default()).is_none(),
+                "{hint}"
+            );
             assert!(app_hint_notice(&hint).is_none(), "{hint}");
         }
     }
@@ -3871,26 +3902,46 @@ mod app_hint_tests {
         use crate::store::app_contexts::ContextConfig;
         use crate::store::NewAgent;
         use crate::store::Steer;
+        use crate::test_seam::{scoped, Asserted};
         use std::collections::BTreeMap;
         let dir = tempfile::tempdir().unwrap();
         let opts = ServeOptions::default();
-        let no_pm = dir.path().join("no-pm");
+        let pm = dir.path().join("pm");
+        crate::issue::Pm::init(&pm).unwrap();
         opts.provider_env
-            .set("CADENCE_PM_DIR", no_pm.to_str().unwrap());
+            .set("CADENCE_PM_DIR", pm.to_str().unwrap());
         let shared = Shared::new(dir.path(), &opts).unwrap();
         let cwd = dir.path().to_str().unwrap().to_string();
+        // CAD-1518: the scoped verbs a turn is offered come from the
+        // installation's consented declarations, so the turn needs a real
+        // approved install (the CRM fixture declares the segment verbs).
+        let pid = std::process::id();
+        let source = format!("{}/tests/fixtures/apps/crm", env!("CARGO_MANIFEST_DIR"));
+        let installed = scoped(Asserted::Operator, || {
+            shared.dispatch("app_workspace_install", &json!({ "source": source }), pid)
+        })
+        .unwrap();
+        let install = installed["install_id"].as_str().unwrap().to_string();
+        let approved = scoped(Asserted::Operator, || {
+            shared.dispatch(
+                "app_local_install_approve",
+                &json!({"install_id": install, "digest": installed["digest"]}),
+                pid,
+            )
+        });
+        if let Err(error) = approved {
+            // An app without capabilities may already be approved.
+            assert!(!error.to_string().contains("operator"), "{error}");
+        }
         let config = ContextConfig::new("Client", BTreeMap::new()).unwrap();
         let created = shared
             .store
-            .app_context_create("install-1", &config, "req-1")
+            .app_context_create(&install, &config, "req-1")
             .unwrap();
         let context = created["context"]["id"].as_str().unwrap().to_string();
-        let (_, proof) = shared
-            .store
-            .app_context_proof("install-1", &context)
-            .unwrap();
+        let (_, proof) = shared.store.app_context_proof(&install, &context).unwrap();
         let stamp = json!({
-            "install_id": "install-1", "context_id": context, "verified": true,
+            "install_id": install, "context_id": context, "verified": true,
             "context_revision": proof.revision, "context_digest": proof.digest,
         });
         let mut n = 0;
@@ -3958,9 +4009,10 @@ mod app_hint_tests {
             );
             assert!(prompt.contains("--message m-"), "{alias}: {prompt}");
             assert!(
-                prompt.contains("install-1 --context-id"),
+                prompt.contains(&format!("{install} --context-id")),
                 "{alias}: {prompt}"
             );
+            assert!(prompt.contains("app \"crm\" (\""), "{alias}: {prompt}");
             // The message body (stored, durable) never holds the slot.
             assert!(!message.body.contains(&slot));
             // A fresh slot per call: no value to replay between turns.
@@ -3989,7 +4041,7 @@ mod app_hint_tests {
         let renamed = ContextConfig::new("Renamed", BTreeMap::new()).unwrap();
         shared
             .store
-            .app_context_update("install-1", &context, proof.revision, &renamed)
+            .app_context_update(&install, &context, proof.revision, &renamed)
             .unwrap();
         assert_eq!(shared.turn_slot(&agent, &message), None);
     }

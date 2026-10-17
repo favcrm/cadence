@@ -1,9 +1,11 @@
 //! CAD-1184 generic CRM assistant RPCs. Agent calls use only the existing
 //! live-turn verifier; operator decision calls prove the operator connection.
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use super::{required_str, Shared};
+use crate::app_assistant::Declared;
 use crate::error::{Error, Result};
 use crate::issue::app_catalog::workspace;
 use crate::store::app_records::{AssistantOperationUpdate, AssistantPermissionWrite, RecordStore};
@@ -20,32 +22,77 @@ fn exact(params: &Value, allowed: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn install_descriptor(shared: &Shared, install: &str) -> Result<(String, String, Value)> {
+/// The installation's runtime digest, refused unless the operator approved
+/// exactly that digest.
+fn consented_digest(shared: &Shared, install: &str, row: &Value) -> Result<String> {
+    let digest = row
+        .get("digest")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::rejected("installation digest unavailable"))?;
+    let state = shared.store.app_capability_status(install, digest)?;
+    if state.get("state").and_then(Value::as_str) != Some("approved") {
+        return Err(Error::rejected("app assistant descriptor is not consented"));
+    }
+    Ok(digest.to_string())
+}
+
+fn install_descriptor(shared: &Shared, install: &str) -> Result<(String, Value)> {
     let pm = shared.pm_at(&shared.pm_dir()?)?;
     workspace::with_runtime_read(&pm, install, |row, files| {
-        let digest = row
-            .get("digest")
-            .and_then(Value::as_str)
-            .ok_or_else(|| Error::rejected("installation digest unavailable"))?
-            .to_string();
-        let state = shared.store.app_capability_status(install, &digest)?;
-        if state.get("state").and_then(Value::as_str) != Some("approved") {
-            return Err(Error::rejected("app assistant descriptor is not consented"));
-        }
+        let digest = consented_digest(shared, install, row)?;
         let text = files
             .get(crate::issue::app_assistant::FILE)
             .ok_or_else(|| Error::rejected("installation has no assistant actions"))?;
-        let descriptor = crate::issue::app_assistant::size_and_json(text)?;
-        Ok((
-            digest,
-            descriptor
-                .get("app")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            descriptor,
-        ))
+        Ok((digest, crate::issue::app_assistant::size_and_json(text)?))
     })
+}
+
+/// CAD-1518: what the installation's consented bundle declares — its
+/// registered assistant actions and its host chat attachments. A missing
+/// file declares nothing; an unconsented digest refuses.
+pub(super) fn install_declared(shared: &Shared, install: &str) -> Result<Declared> {
+    let pm = shared.pm_at(&shared.pm_dir()?)?;
+    workspace::with_runtime_read(&pm, install, |row, files| {
+        consented_digest(shared, install, row)?;
+        let manifest = crate::issue::app::parse_manifest(
+            files
+                .get("app.md")
+                .ok_or_else(|| Error::rejected("installation manifest unavailable"))?,
+        )?;
+        let ids = |text: Option<&String>, parse: fn(&str) -> Result<Value>, key: &str| {
+            let Some(text) = text else {
+                return Ok(BTreeSet::new());
+            };
+            Ok::<_, Error>(
+                parse(text)?[key]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|row| row["id"].as_str().map(str::to_string))
+                    .collect(),
+            )
+        };
+        Ok(Declared {
+            actions: ids(
+                files.get(crate::issue::app_assistant::FILE),
+                crate::issue::app_assistant::size_and_json,
+                "actions",
+            )?,
+            attachments: ids(
+                files.get(crate::issue::app_chat::FILE),
+                crate::issue::app_chat::size_and_json,
+                "attachments",
+            )?,
+            app: manifest.app,
+            title: manifest.title,
+        })
+    })
+}
+
+/// The registered Social actions that run a paid provider call behind a
+/// one-time operator permission.
+fn is_paid_social(action: &str) -> bool {
+    matches!(action, "social.posts.fetch" | "social.draft.create")
 }
 
 pub(super) fn assistant_error_is_definite_refusal(error: &Error) -> bool {
@@ -142,7 +189,8 @@ impl Shared {
             None
         };
         // The live-turn proof is re-read only after serialization is acquired.
-        let scoped = self.scoped_chat_assistant(params, peer_pid, "app assistant action")?;
+        let scoped =
+            self.scoped_chat_assistant(params, peer_pid, method, "app assistant action")?;
         let records = RecordStore::open(&self.state_dir, &scoped.install)?;
         if method == "app_assistant_operation_show" {
             let op = records.app_assistant_operation_get(
@@ -152,10 +200,9 @@ impl Shared {
             let op = normalize_interrupted_operation(&records, &scoped.context, op)?;
             return Ok(json!({"operation":op}));
         }
-        let (descriptor_digest, _app, descriptor) = install_descriptor(self, &scoped.install)?;
-        // The registry binds actions to the installed manifest's app (an
-        // allow-list); the descriptor's own `app` claim is not trusted.
-        let app = self.install_app_slug(&scoped.install)?;
+        // The consented descriptor is the allow-list (CAD-1518): only the
+        // registered actions it declares are listed or invoked.
+        let (descriptor_digest, descriptor) = install_descriptor(self, &scoped.install)?;
         if method == "app_assistant_actions" {
             let declared = descriptor
                 .get("actions")
@@ -169,9 +216,6 @@ impl Shared {
                 let Some(meta) = crate::app_assistant::registered_action(id) else {
                     continue;
                 };
-                if !crate::app_assistant::allowed_for_app(&app, id) {
-                    continue;
-                }
                 actions.push(json!({"id":id,"description":row["description"],"input_schema":meta.input_schema,"effect":meta.effect,"confirmation":meta.confirmation,"availability":"available"}));
             }
             actions.extend(super::app_record_actions_rpc::declared_record_actions(
@@ -208,11 +252,6 @@ impl Shared {
         {
             return Err(Error::rejected(
                 "action is not declared by this consented installation",
-            ));
-        }
-        if !crate::app_assistant::allowed_for_app(&app, action_id) {
-            return Err(Error::rejected(
-                "action is not available for this installation's app",
             ));
         }
         crate::app_assistant::validate_input(&meta.input_schema, input)?;
@@ -263,7 +302,7 @@ impl Shared {
                     input,
                 );
             }
-            if matches!(action_id, "social.posts.fetch" | "social.draft.create") {
+            if is_paid_social(action_id) {
                 return self.social_request_permission(
                     &records,
                     &scoped.install,
@@ -576,14 +615,11 @@ impl Shared {
         let records = RecordStore::open(&self.state_dir, install)?;
         match method {
             "app_assistant_actions_operator" => {
-                let (digest, _, descriptor) = install_descriptor(self, install)?;
-                let app = self.install_app_slug(install)?;
+                let (digest, descriptor) = install_descriptor(self, install)?;
                 let mut actions = Vec::new();
                 for row in descriptor["actions"].as_array().into_iter().flatten() {
                     if let Some(id) = row["id"].as_str() {
-                        if let Some(meta) = crate::app_assistant::registered_action(id)
-                            .filter(|_| crate::app_assistant::allowed_for_app(&app, id))
-                        {
+                        if let Some(meta) = crate::app_assistant::registered_action(id) {
                             actions.push(json!({"id":id,"description":row["description"],"input_schema":meta.input_schema,"effect":meta.effect,"confirmation":meta.confirmation,"availability":"available"}));
                         }
                     }
@@ -633,7 +669,7 @@ impl Shared {
                     ));
                 }
                 records.app_record_show(context, resource)?;
-                let (descriptor_digest, _, descriptor) = install_descriptor(self, install)?;
+                let (descriptor_digest, descriptor) = install_descriptor(self, install)?;
                 if !descriptor["actions"]
                     .as_array()
                     .is_some_and(|actions| actions.iter().any(|a| a["id"].as_str() == Some(action)))
@@ -732,26 +768,18 @@ impl Shared {
         }
         if action != "customer.tags.update"
             && action != "media.refine.prepare"
-            && !crate::app_assistant::is_social(action)
+            && !is_paid_social(action)
         {
             return Err(Error::rejected(
                 "no operator decision handler is registered for this action",
             ));
         }
-        if crate::app_assistant::is_social(action) {
-            if decision != "allow_once" {
-                return Err(Error::rejected(
-                    "paid social actions are allowed one time only",
-                ));
-            }
-            let app = self.install_app_slug(install)?;
-            if !crate::app_assistant::allowed_for_app(&app, action) {
-                return Err(Error::rejected(
-                    "action is not available for this installation's app",
-                ));
-            }
+        if is_paid_social(action) && decision != "allow_once" {
+            return Err(Error::rejected(
+                "paid social actions are allowed one time only",
+            ));
         }
-        let (descriptor_digest, _, descriptor) = install_descriptor(self, install)?;
+        let (descriptor_digest, descriptor) = install_descriptor(self, install)?;
         if !descriptor["actions"]
             .as_array()
             .is_some_and(|actions| actions.iter().any(|a| a["id"].as_str() == Some(action)))
@@ -790,7 +818,7 @@ impl Shared {
                 params.get("public_session").and_then(Value::as_str),
             );
         }
-        if crate::app_assistant::is_social(action) {
+        if is_paid_social(action) {
             return self.social_run(records, install, context, &op, &input);
         }
         let customer = required_str(&input, "customer_id")?;

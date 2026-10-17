@@ -631,7 +631,12 @@ impl Shared {
                 "app content payload has unsupported fields",
             ));
         }
-        let scoped = self.scoped_chat_assistant(params, peer_pid, "assistant proposal")?;
+        let scoped = self.scoped_chat_assistant(
+            params,
+            peer_pid,
+            "app_content_assistant_propose",
+            "assistant proposal",
+        )?;
         let ScopedChat {
             caller,
             install,
@@ -702,7 +707,12 @@ impl Shared {
         if fields.keys().any(|key| !ALLOWED.contains(&key.as_str())) {
             return Err(Error::rejected("app record payload has unsupported fields"));
         }
-        let scoped = self.scoped_chat_assistant(params, peer_pid, "assistant CSV import")?;
+        let scoped = self.scoped_chat_assistant(
+            params,
+            peer_pid,
+            "app_record_csv_assistant_import",
+            "assistant CSV import",
+        )?;
         let records = RecordStore::open(&self.state_dir, &scoped.install)?;
         let request_id = required_str(params, "request_id")?;
         let confirm_token = required_str(params, "confirm_token")?;
@@ -802,7 +812,12 @@ impl Shared {
                 "app audience payload has unsupported fields",
             ));
         }
-        let scoped = self.scoped_chat_assistant(params, peer_pid, "assistant segment save")?;
+        let scoped = self.scoped_chat_assistant(
+            params,
+            peer_pid,
+            "app_segment_assistant_save",
+            "assistant segment save",
+        )?;
         let records = RecordStore::open(&self.state_dir, &scoped.install)?;
         // One stamped message redeems one action across all ids
         // (CAD-1014); `expected_revision` is the CAS on the named
@@ -877,7 +892,7 @@ impl Shared {
                 "app assistant read payload has unsupported fields",
             ));
         }
-        let scoped = self.scoped_chat_assistant(params, peer_pid, "assistant read")?;
+        let scoped = self.scoped_chat_assistant(params, peer_pid, method, "assistant read")?;
         let records = RecordStore::open(&self.state_dir, &scoped.install)?;
         // Reads only — no claim, no mutation, no audit write.
         match method {
@@ -966,7 +981,12 @@ impl Shared {
                 "app content payload has unsupported fields",
             ));
         }
-        let scoped = self.scoped_chat_assistant(params, peer_pid, "assistant email draft")?;
+        let scoped = self.scoped_chat_assistant(
+            params,
+            peer_pid,
+            "app_content_assistant_draft",
+            "assistant email draft",
+        )?;
         scoped.require_campaign(required_str(params, "campaign_id")?)?;
         let draft = content_draft(params)?;
         let records = RecordStore::open(&self.state_dir, &scoped.install)?;
@@ -1092,6 +1112,7 @@ impl Shared {
         self: &Arc<Self>,
         params: &Value,
         peer_pid: u32,
+        method: &str,
         desc: &str,
     ) -> Result<ScopedChat> {
         // The caller is the connection's alone: identity-shaped,
@@ -1205,6 +1226,15 @@ impl Shared {
             self.store.app_context_proof(install, context)?;
             Ok(())
         })?;
+        // CAD-1518: the verb runs only when the installation's consented
+        // bundle declares what it serves — never decided by app name.
+        let need = crate::app_assistant::scoped_need(method)
+            .ok_or_else(|| Error::rejected(format!("{desc} is not a scoped chat verb")))?;
+        if !super::app_assistant_rpc::install_declared(self, install)?.admits(need) {
+            return Err(Error::rejected(format!(
+                "{desc} is not declared by this installation"
+            )));
+        }
         Ok(ScopedChat {
             subject: conversation.subject,
             caller,
