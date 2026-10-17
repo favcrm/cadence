@@ -1069,6 +1069,22 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
             );
             return;
         }
+        // A signed-out visit to the board, the apps list, or one catalog
+        // page sees the public directory. A live session keeps the board
+        // app, and every other read still needs that session.
+        if matches!(method, Method::Get | Method::Head)
+            && super::public_directory::is_public_route(&path)
+            && !matches!(
+                operator::public_session(&request, state_dir, opts),
+                Ok(Some(_))
+            )
+        {
+            let page_url = format!("{}://{}{}", operator::public_scheme(&host), host, raw_url);
+            if let Some(resp) = super::public_directory::response(&path, raw_query, &page_url) {
+                send(request, resp);
+                return;
+            }
+        }
         // A read on the public host needs a live board session —
         // `/api/health` and `/api/version` stay open so a probe can see
         // the board is up, and a signed-out tab can still learn the
