@@ -34,8 +34,8 @@ const MESSAGES_KEEP = MESSAGES_MAX - 10;
 // Keep the opening messages, the newest user message and the current turn's
 // guidance, plus the newest window, dropping whole older messages. The window
 // never opens on a tool result and never crosses the published maximum: a
-// retained result keeps the assistant call that produced it, and a round too
-// large to keep whole keeps its call and its newest results.
+// result is kept with the assistant call that produced it, and a round the
+// maximum cannot carry is left out whole rather than sent in part.
 const windowed = (messages, pinned = []) => {
   const list = Array.isArray(messages) ? messages : [];
   if (list.length <= MESSAGES_KEEP) return list;
@@ -55,29 +55,39 @@ const windowed = (messages, pinned = []) => {
   }
   const room = Math.max(MESSAGES_KEEP - head - anchored.size, 1);
   const hard = Math.max(MESSAGES_MAX - head - anchored.size, 2);
-  let start = Math.max(list.length - room, head);
-  let producer = [];
-  if (list[start]?.role === "toolResult") {
-    let first = start;
-    while (first > head && list[first - 1]?.role === "toolResult") first -= 1;
-    const call = first - 1;
-    if (call >= head && list[call]?.role === "assistant" && list.length - call <= hard) {
-      // The whole round fits: open on the call that produced the run.
-      start = call;
-    } else if (call >= head && list[call]?.role === "assistant") {
-      // The round alone is larger than the budget: keep the call and the
-      // newest results, and drop the oldest of that one round.
-      producer = [list[call]];
-      start = Math.max(list.length - (hard - 1), first);
-    } else {
-      // No call to keep: drop the orphaned results and open on the next call.
-      while (start < list.length - 1 && list[start]?.role === "toolResult") start += 1;
+  // The unit that ends at `end`: a run of results comes with the call that
+  // produced it, and a run whose call is gone is not whole and never kept.
+  const unitEndingAt = end => {
+    let start = end - 1;
+    if (list[start]?.role !== "toolResult") return { start, whole: true };
+    while (start > head && list[start - 1]?.role === "toolResult") start -= 1;
+    const call = start - 1;
+    return call >= head && list[call]?.role === "assistant"
+      ? { start: call, whole: true }
+      : { start, whole: false };
+  };
+  let start = list.length;
+  let end = list.length;
+  let used = 0;
+  while (start > head) {
+    const unit = unitEndingAt(start);
+    const size = start - unit.start;
+    // The newest unit may spend the margin up to the published maximum; the
+    // older ones stay inside the window.
+    if (unit.whole && used + size <= (used === 0 ? hard : room)) {
+      start = unit.start;
+      used += size;
+      continue;
     }
+    if (used > 0) break;
+    // Nothing is kept yet and this unit cannot be sent: leave it out whole.
+    end = unit.start;
+    start = unit.start;
   }
   const carried = [...anchored]
     .filter(message => list.indexOf(message) >= head && list.indexOf(message) < start)
     .sort((a, b) => list.indexOf(a) - list.indexOf(b));
-  return [...list.slice(0, head), ...carried, ...producer, ...list.slice(start)];
+  return [...list.slice(0, head), ...carried, ...list.slice(start, end)];
 };
 
 export default function install(pi) {

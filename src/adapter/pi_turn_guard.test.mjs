@@ -49,17 +49,21 @@ const project = messages => handlers.get("context").at(-1)({ messages }).message
 const user = value => ({ role: "user", content: [{ type: "text", text: value }] });
 const system = () => ({ role: "system", content: [{ type: "text", text: "system" }] });
 const round = (i, results) => [
-  { role: "assistant", content: [{ type: "text", text: `call ${i}` }] },
+  {
+    role: "assistant",
+    content: [{ type: "text", text: `call ${i}` }],
+    toolCalls: Array.from({ length: results }, (_, r) => ({ id: `c${i}-${r}`, name: "bash" })),
+  },
   ...Array.from({ length: results }, (_, r) => ({
-    role: "toolResult", content: [{ type: "text", text: `r${i}.${r}` }],
+    role: "toolResult", toolCallId: `c${i}-${r}`, content: [{ type: "text", text: `r${i}.${r}` }],
   })),
 ];
 
 // The gateway's published request shape: at most 100 `messages` per request
-// (AgenticOS `packages/contracts/src/inference.ts`), and every tool result
-// carried with the assistant call that produced it. A request that breaks
-// either is refused the way the live gateway refuses it, so a request that is
-// merely shorter is not mistaken for an answered turn.
+// (AgenticOS `packages/contracts/src/inference.ts`), and every tool call
+// answered by its own result — a round cannot be sent in part. A request that
+// breaks either is refused the way the live gateway refuses it, so a request
+// that is merely shorter is not mistaken for an answered turn.
 const MAX = 100;
 const gateway = messages => {
   if (!Array.isArray(messages) || messages.length === 0) {
@@ -68,14 +72,28 @@ const gateway = messages => {
   if (messages.length > MAX) {
     return { status: 400, message: 'Field "messages" exceeds the published maximum.' };
   }
-  let produced = false;
-  for (const [i, message] of messages.entries()) {
-    if (message?.role === "assistant") produced = true;
-    else if (message?.role === "toolResult") {
-      if (!produced) return { status: 400, message: `Field "messages.${i}" is a result whose call was dropped.` };
-    } else if (["user", "system", "developer"].includes(message?.role)) produced = false;
+  let pending = [];
+  const unanswered = () => (pending.length === 0 ? null : {
+    status: 400,
+    message: `Field "messages" leaves ${pending.length} tool call(s) unanswered.`,
+  });
+  for (const message of messages) {
+    if (message?.role === "assistant") {
+      const settled = unanswered();
+      if (settled) return settled;
+      pending = (message.toolCalls ?? []).map(call => call.id);
+    } else if (message?.role === "toolResult") {
+      const at = pending.indexOf(message.toolCallId);
+      if (at < 0) {
+        return { status: 400, message: `Field "messages" carries a result for an unknown call ${message.toolCallId}.` };
+      }
+      pending.splice(at, 1);
+    } else if (["user", "system", "developer"].includes(message?.role)) {
+      const settled = unanswered();
+      if (settled) return settled;
+    }
   }
-  return { status: 200, answer: "(answered)" };
+  return unanswered() ?? { status: 200, answer: "(answered)" };
 };
 
 test("the guard registers a context hook", () => {
@@ -99,15 +117,13 @@ test("a long history is bounded below the published maximum", () => {
 
 test("the window never opens on an orphaned tool result", () => {
   const messages = [system()];
-  for (let i = 0; i < 100; i += 1) {
-    messages.push({ role: "assistant", content: [{ type: "text", text: `call ${i}` }] });
-    messages.push({ role: "toolResult", content: [{ type: "text", text: `r${i}` }] });
-  }
+  for (let i = 0; i < 100; i += 1) messages.push(...round(i, 1));
   messages.push(user("newest"));
   const out = project(messages);
   assert.ok(out.length <= KEEP);
   assert.notEqual(out[1]?.role, "toolResult", "a retained result keeps its call in front");
   assert.deepEqual(out.at(-1), messages.at(-1));
+  assert.deepEqual(gateway(out), { status: 200, answer: "(answered)" });
 });
 
 test("a thread past the failure point is answered, not refused", () => {
@@ -145,15 +161,15 @@ test("the active objective survives a long tool run", () => {
   assert.deepEqual(gateway(out), { status: 200, answer: "(answered)" });
 });
 
-test("a tool round larger than the budget still fits the published maximum", () => {
-  // One assistant message carrying more calls than the window can hold: the
-  // round cannot be kept whole, so its call and its newest results are kept.
+test("a tool round larger than the maximum is left out whole, never in part", () => {
+  // One assistant message carrying more calls than the window can hold: a round
+  // cannot be sent in part, so it is left out rather than crossing the
+  // published maximum or leaving some of its calls unanswered.
   const messages = [user("the objective"), ...round(0, 99)];
   assert.ok(messages.length > MAX, "the fixture must cross the published maximum");
   const out = project(messages);
   assert.ok(out.length <= MAX, `bounded to ${out.length}`);
-  assert.equal(out.filter(message => message.role === "assistant").length, 1, "the call survives");
-  assert.deepEqual(out.at(-1), messages.at(-1), "the newest result is kept");
+  assert.equal(out.filter(message => message.role === "toolResult").length, 0, "no result arrives without its round");
   assert.deepEqual(gateway(out), { status: 200, answer: "(answered)" });
 });
 
