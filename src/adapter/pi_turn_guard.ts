@@ -18,12 +18,39 @@ const nonEmpty = messages => (Array.isArray(messages) ? messages : []).map(messa
   ["user", "toolResult", "custom"].includes(message?.role)
     ? { ...message, content: filled(message.content) } : message);
 
+// CAD-1526: the gateway publishes a maximum message count per request — the
+// inference contract caps `messages` at 100 (AgenticOS
+// `packages/contracts/src/inference.ts`, and the provider registry declares
+// the same bound), answered with `400 Field "messages" exceeds the
+// published maximum`. A session that grows past it fails on every later
+// turn, and compaction cannot recover it: compaction is a size bound, not a
+// count bound, so it refuses with "session too small" while the request is
+// still over the maximum. Bound the count here, where the projection already
+// runs, and keep a margin so a tool round inside one turn cannot cross the
+// published maximum between two hooks.
+const MESSAGES_MAX = 100;
+const MESSAGES_KEEP = MESSAGES_MAX - 10;
+
+// Keep the leading system messages and the newest window, dropping whole
+// older messages. A window that would open on a tool result is advanced past
+// it, so a retained result never loses the assistant call that produced it.
+const windowed = messages => {
+  const list = Array.isArray(messages) ? messages : [];
+  if (list.length <= MESSAGES_KEEP) return list;
+  let head = 0;
+  while (head < list.length && ["system", "developer"].includes(list[head]?.role)) head += 1;
+  let start = Math.max(list.length - Math.max(MESSAGES_KEEP - head, 0), head);
+  // The newest message is always kept: it opens the turn.
+  while (start < list.length - 1 && list[start]?.role === "toolResult") start += 1;
+  return [...list.slice(0, head), ...list.slice(start)];
+};
+
 export default function install(pi) {
   // These semantics were verified on this exact runtime: awaited lifecycle
   // boundaries and synchronous streaming custom-message queue admission.
   // An upgrade must be validated, not silently granted this capability.
   if (VERSION !== "1.0.0") {
-    pi.on("context", event => ({ messages: nonEmpty(event.messages) }));
+    pi.on("context", event => ({ messages: windowed(nonEmpty(event.messages)) }));
     return;
   }
   let pending = null;
@@ -59,9 +86,9 @@ export default function install(pi) {
   // or history. The adapter clears the queue before dispatching a successor;
   // this projection also excludes old guidance from every later model input.
   pi.on("context", event => ({
-    messages: nonEmpty(Array.isArray(event.messages) ? event.messages.filter(message =>
+    messages: windowed(nonEmpty(Array.isArray(event.messages) ? event.messages.filter(message =>
       message.role !== "custom" || message.customType !== "cadence-turn-guidance"
-      || (current !== null && message.details?.turn === current)) : []),
+      || (current !== null && message.details?.turn === current)) : [])),
   }));
 
   const receipt = (operation, request, turn, outcome, reason = null) => {
