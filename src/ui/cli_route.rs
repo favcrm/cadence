@@ -409,6 +409,18 @@ fn dispatch(
 ) -> HttpResp {
     match verb {
         // ---- cli.read ----
+        Verb::MyWork => {
+            if !args.as_object().is_some_and(|args| args.is_empty()) {
+                return cli_fail(400, "invalid_request", "my_work accepts no arguments");
+            }
+            if !actor.actor.starts_with("users/") {
+                return cli_fail(403, "human_session_required", "my_work requires a user");
+            }
+            match super::my_work::payload(state_dir, pm_dir, &actor.handle) {
+                Ok(body) => json_ok(body),
+                Err(error) => write_err(&error),
+            }
+        }
         Verb::Status => {
             // `cadence status` is daemon health plus the agent list —
             // the same pair the board's own header reads.
@@ -1191,3 +1203,6 @@ mod cad1179_acceptance;
 
 #[cfg(test)]
 mod aos274_policy_http;
+
+#[cfg(test)]
+mod cad1500_acceptance;

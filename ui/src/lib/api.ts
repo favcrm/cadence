@@ -346,22 +346,10 @@ function refusedUpload(body: unknown, status: number, statusText: string): { mes
   }
   return { message: fallback, code: topCode };
 }
-export interface MyWorkItem {
-  id: string;
-  issue_id: string;
-  project: string;
-  action: string;
-  state: "queued" | "running" | "blocked" | "result" | "failed" | "cancelled";
-  generation: number;
-  created_by_you: boolean;
-  assigned_to_you: boolean;
-}
 
 export interface MyWorkPayload {
-  ok: true;
-  role: "owner" | "member";
-  assigned: MyWorkItem[];
-  created: MyWorkItem[];
+  owner: string;
+  issues: IssueCard[];
 }
 
 
@@ -373,7 +361,7 @@ export const api = {
   meta: (withOperator = false, signal?: AbortSignal) =>
     get<Meta>(withOperator ? "/api/meta?operator=1" : "/api/meta", signal),
   overview: () => get<Overview>("/api/overview"),
-  myWork: () => get<MyWorkPayload>("/api/my-work"),
+  myWork: (signal?: AbortSignal) => get<MyWorkPayload>("/api/my-work", signal),
   projects: () => get<{ projects: Project[] }>("/api/projects"),
   projectContext: (project: string, role: ContextRole = "pm", expectedRevision?: string) => {
     const query = new URLSearchParams({ role });

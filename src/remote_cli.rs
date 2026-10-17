@@ -84,6 +84,7 @@ const WAKE_WAIT_MAX: Duration = Duration::from_secs(30);
 pub const REMOTE_VERBS: &[&str] = &[
     // cli.read
     "status",
+    "my_work",
     "agent_list",
     "agent_show",
     "issue_ls",

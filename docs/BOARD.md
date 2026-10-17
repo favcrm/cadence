@@ -38,7 +38,23 @@ local surface.
 
 ## My work
 
-My work (`/my-work`) lists hosted assignments for the signed-in board session: assigned to you, and created by you. Each row links to the existing issue page. Status is stored custody — queued, running, blocked, result, failed, or cancelled. A claim is not running work. Refresh asks again. A board without hosted placement, or a proof the board cannot verify, says hosted work is unavailable. A missing or revoked session is refused. The screen does not accept a subject, role, or bearer in the query.
+My work (`/my-work`) lists PM issues assigned to the signed-in human. It reuses
+the current issue read model and links to the existing Issue page for requirements,
+comments, references and progress. Refresh rereads the tracker; reassignment removes
+the issue from the previous owner's personal result. Loading, empty and unavailable
+states do not invent work. No local agent, model provider or Git repository is needed.
+
+The board derives the owner from its live session and rechecks the caller after
+the read. Query selectors are refused. Local board sessions use the existing
+`operator` attribution; named hosted Owners and Members retain their own user handles.
+This is a personal filter, **not** a new project-visibility or authorization boundary.
+
+`cadence --org <org> my-work` provides the same PM read for a signed-in hosted org
+through the existing `cli.read` actor-envelope protocol. The native server derives
+the owner from the verified user actor and accepts no arguments. A local-org CLI
+invocation explains that a hosted org is required. Existing project, issue, setup,
+membership and local-agent commands remain their current interfaces; this feature
+adds no setup/access screens, work-proof format or agent-execution dashboard.
 
 
 ## Issue folder

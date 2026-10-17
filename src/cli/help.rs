@@ -16,6 +16,10 @@ const CORE: &[(&str, &[(&str, &str)])] = &[
         "Me",
         &[
             ("self", "Your alias, running message and report token"),
+            (
+                "my-work",
+                "Issues assigned to your signed-in hosted identity",
+            ),
             ("done", "Report your running turn's result"),
             ("inbox", "Read an inbox agent's durable queue"),
         ],

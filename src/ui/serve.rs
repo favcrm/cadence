@@ -1196,7 +1196,7 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
 
     match path.as_str() {
         "/api/my-work" => {
-            let response = my_work::get(&request, state_dir, opts, raw_query);
+            let response = my_work::get(&request, state_dir, pm_dir, opts, raw_query);
             send(request, response);
         }
         "/api/locale" => {
