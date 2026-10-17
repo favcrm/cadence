@@ -43,6 +43,9 @@ the current issue read model and links to the existing Issue page for requiremen
 comments, references and progress. Refresh rereads the tracker; reassignment removes
 the issue from the previous owner's personal result. Loading, empty and unavailable
 states do not invent work. No local agent, model provider or Git repository is needed.
+Refresh retains keyboard focus while its read is pending and announces the busy
+state on the page. Refreshing again cancels the previous read; a late response
+cannot replace the newer result.
 
 The board derives the owner from its live session and rechecks the caller after
 the read. Query selectors are refused. Local board sessions use the existing

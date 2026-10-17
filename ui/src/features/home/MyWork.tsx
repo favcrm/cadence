@@ -32,10 +32,10 @@ export default function MyWork() {
   }, [refresh, t]);
 
   return (
-    <div className="px-4 py-6 lg:px-8">
+    <div className="px-4 py-6 lg:px-8" aria-busy={loading}>
       <div className="flex items-center justify-between gap-3">
         <h1 className="text-section font-semibold text-ink-100">{t("My work")}</h1>
-        <Button type="button" onClick={() => setRefresh((value) => value + 1)} loading={loading}>
+        <Button type="button" onClick={() => setRefresh((value) => value + 1)}>
           {t("Refresh")}
         </Button>
       </div>
