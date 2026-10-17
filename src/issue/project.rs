@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
 
@@ -305,6 +306,57 @@ pub fn resolve(pm_dir: &Path, flag: Option<&str>, cwd: &Path) -> Result<Project>
     ))
 }
 
+/// Read-only project scope for setup. Never creates a git repo, a
+/// tracker, or a project registration. `named` is `CADENCE_PROJECT`
+/// when the caller has one.
+pub fn observe(pm_dir: &Path, cwd: &Path, named: Option<&str>) -> Value {
+    let register = "cadence issue project add <key> --prefix <P> --repo <path>";
+    if let Some(name) = named.map(str::trim).filter(|name| !name.is_empty()) {
+        let projects = list(pm_dir).unwrap_or_default();
+        if let Some(project) = projects.iter().find(|project| project.key == name) {
+            return json!({
+                "resolved": true,
+                "source": "CADENCE_PROJECT",
+                "key": project.key,
+                "register": Value::Null,
+            });
+        }
+        return json!({
+            "resolved": false,
+            "source": "CADENCE_PROJECT",
+            "key": name,
+            "detail": format!("CADENCE_PROJECT={name} is not a registered project"),
+            "register": register,
+        });
+    }
+    let Some((root, remote)) = repo_identity(cwd) else {
+        return json!({
+            "resolved": false,
+            "source": "cwd",
+            "detail": "cwd is not a git checkout; it was not initialized or registered",
+            "register": register,
+        });
+    };
+    if let Some(key) = key_for_cwd(pm_dir, cwd) {
+        return json!({
+            "resolved": true,
+            "source": "cwd",
+            "key": key,
+            "repo": root,
+            "remote": remote,
+            "register": Value::Null,
+        });
+    }
+    json!({
+        "resolved": false,
+        "source": "cwd",
+        "repo": root,
+        "remote": remote,
+        "detail": "cwd git identity matched no registered project",
+        "register": register,
+    })
+}
+
 pub(crate) fn unknown_project(name: &str, pm_dir: &Path) -> Error {
     let known = list(pm_dir)
         .map(|ps| ps.iter().map(|p| p.key.clone()).collect::<Vec<_>>())
@@ -324,6 +376,24 @@ pub(crate) fn unknown_project(name: &str, pm_dir: &Path) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observe_does_not_initialize_a_non_git_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "keep\n").unwrap();
+        let scope = observe(dir.path(), dir.path(), None);
+        assert_eq!(scope["resolved"], false);
+        assert!(scope["detail"]
+            .as_str()
+            .unwrap()
+            .contains("not a git checkout"));
+        assert!(!dir.path().join(".git").exists());
+        assert_eq!(
+            std::fs::read(dir.path().join("notes.txt")).unwrap(),
+            b"keep\n"
+        );
+        assert!(scope["register"].as_str().unwrap().contains("project add"));
+    }
 
     #[test]
     fn project_yaml_refuses_unknown_keys() {

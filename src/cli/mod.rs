@@ -34,6 +34,7 @@ mod dispatch;
 mod doctor;
 mod events;
 mod export;
+mod guidance;
 mod help;
 mod idea;
 mod inbox;

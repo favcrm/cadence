@@ -467,7 +467,11 @@ fn skill_check() -> Check {
                     differs.push(format!("{name} content"));
                 }
                 for (dir, state) in skill["links"].as_object().into_iter().flatten() {
-                    if state != "ok" && state != "foreign" {
+                    if state == "foreign" {
+                        differs.push(format!(
+                            "{name} {dir} link is a foreign entry and was left unchanged"
+                        ));
+                    } else if state != "ok" {
                         differs.push(format!(
                             "{name} {dir} link {}",
                             state.as_str().unwrap_or("?")
@@ -475,8 +479,24 @@ fn skill_check() -> Check {
                     }
                 }
             }
+            // A foreign provider entry must stay visible. Returning
+            // `Unknown` here would also make a first install `failed`:
+            // apply re-detects, and only `Present` counts as created.
+            // The detail carries the conflict, and scope prints
+            // `provider_discovery`, so the skill line is not a silent ok.
+            if status["provider_discovery"] != "current" {
+                if let Some(note) = status["attention"].as_str() {
+                    if !differs.iter().any(|item| item.contains("foreign")) {
+                        differs.push(note.to_string());
+                    }
+                }
+            }
             if differs.is_empty() {
                 Found::Present(path)
+            } else if status["content_match"] == true
+                && differs.iter().all(|item| item.contains("foreign"))
+            {
+                Found::Present(format!("{path}; {}", differs.join("; ")))
             } else {
                 Found::Unknown(format!(
                     "{path} differs from this binary ({}) — left as is",
@@ -1617,6 +1637,31 @@ mod tests {
         let check =
             Check::new("a", |_| Found::Present("x".into()), |_| String::new()).needs(&["nope"]);
         run_checks(&ctx(dir.path()), &[check], |_| {});
+    }
+
+    #[test]
+    fn a_foreign_provider_entry_is_named_and_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx(dir.path());
+        let first = run_checks(&ctx, &[skill_check()], |_| {});
+        assert_eq!(first[0].status, Status::Created, "{:?}", first[0]);
+        let foreign = ctx.home.join(".claude/skills/cadence");
+        std::fs::remove_file(&foreign).unwrap();
+        std::fs::create_dir(&foreign).unwrap();
+        std::fs::write(foreign.join("keep.txt"), "foreign\n").unwrap();
+        let out = run_checks(&ctx, &[skill_check()], |_| {});
+        assert_eq!(out[0].status, Status::Ok, "{:?}", out[0]);
+        assert!(
+            out[0].detail.contains("foreign"),
+            "setup must show the conflict: {:?}",
+            out[0]
+        );
+        assert!(out[0].detail.contains("left unchanged"), "{:?}", out[0]);
+        assert_eq!(
+            std::fs::read(foreign.join("keep.txt")).unwrap(),
+            b"foreign\n"
+        );
+        assert!(foreign.is_dir());
     }
 
     #[test]

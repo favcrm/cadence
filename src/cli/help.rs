@@ -631,7 +631,9 @@ mod tests {
     #[test]
     fn deliberately_hidden_commands_appear_in_no_help_view() {
         let hidden = originally_hidden();
-        assert_eq!(hidden.len(), 8, "{hidden:?}");
+        // `skill sync` is the hidden implementation `cadence update` calls.
+        // `cadence skill install` stays the visible manual repair.
+        assert_eq!(hidden.len(), 9, "{hidden:?}");
         for view in [
             render_root(false),
             render_root(true),

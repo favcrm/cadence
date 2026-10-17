@@ -45,6 +45,26 @@ talks to AgenticOS still self-updates. Updating an image-managed
 deployment means shipping a new image, not running `cadence update`
 inside it.
 
+A native update also synchronizes bundled public guidance
+(`~/.agents/skills`, plus provider links) from the build that is active
+when the command finishes. That includes a run that is already up to date
+and both explicit and automatic rollback. The sync is the existing
+non-force install: missing or stale managed files and repairable links are
+written from that build's embedded bytes, and a second run with matching
+files writes nothing. A build that predates `cadence skill sync` exposes
+only a forced manual install, so its bytes are first staged outside the
+home and then applied with the same non-force rules — a repeat run still
+writes nothing and matching files keep their timestamps. It does not
+restart a healthy daemon only to refresh
+skills. `--check` and `update status` stay read-only; the target build's
+guidance is not claimed verified before activation. `cadence skill install
+[name]` remains the manual repair. A guidance failure is reported as
+needs-attention and does not roll back a healthy binary or change the
+update's exit status. File match and provider links do not mean an agent
+session has reloaded the guidance — start a fresh session or reread it at
+a task boundary. Client-only update does not install guidance or start a
+daemon. A sandbox profile still does not write the shared home.
+
 `--to` runs the same checks as `upgrade --sha`: the sha is on main, CI's
 `test` job passed on that exact sha, the sha256 and manifest match, and the
 build-provenance attestation verifies for the repository. A sha that is not
