@@ -483,23 +483,27 @@ fn agents_region(text: &str) -> Option<&str> {
 }
 
 /// Ensure `<repo>/AGENTS.md` carries the cadence block between the
-/// marker pair. No markers → the block appends at the end; no file →
-/// created. A block this build wrote is left alone, and one an earlier
-/// build wrote — matched verbatim — is replaced, so a repository that
-/// installed an old copy is repaired (CAD-1530). Anything else,
-/// including a block a repository edited, is left exactly as found, as
-/// is every byte outside the markers.
+/// marker pair. No begin marker → the block appends at the end; no file
+/// → created. A block this build wrote is left alone, and one an
+/// earlier build wrote — matched verbatim — is replaced, so a
+/// repository that installed an old copy is repaired (CAD-1530).
+/// Anything else is left exactly as found, as is every byte outside the
+/// markers: another repository's file, and a begin marker with no end
+/// marker, are both left alone rather than appended to.
 pub(crate) fn ensure_agents_block(repo: &Path) -> Result<()> {
     let path = repo.join("AGENTS.md");
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     let block = agents_block();
-    if let Some(region) = agents_region(&existing) {
-        if region == block.as_str() {
-            return Ok(());
-        }
-        // Only a block we can prove is ours, unedited, is refreshed.
-        if SUPERSEDED_AGENTS_BLOCKS.contains(&region) {
-            std::fs::write(&path, existing.replacen(region, &block, 1))?;
+    // The begin marker decides. An unclosed pair is left alone, exactly
+    // as this function refused every marked file before CAD-1530:
+    // appending beside a stray begin marker would add a second block to
+    // someone else's repository.
+    if existing.contains(AGENTS_BEGIN) {
+        if let Some(region) = agents_region(&existing) {
+            // Only a block we can prove is ours, unedited, is refreshed.
+            if region != block.as_str() && SUPERSEDED_AGENTS_BLOCKS.contains(&region) {
+                std::fs::write(&path, existing.replacen(region, &block, 1))?;
+            }
         }
         return Ok(());
     }

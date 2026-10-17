@@ -1060,6 +1060,15 @@ fn agents_block_repairs_only_a_block_it_recognises_as_its_own() {
     std::fs::write(&path, &edited).unwrap();
     ensure_agents_block(dir.path()).unwrap();
     assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+
+    // A begin marker with no end marker is not an invitation to append a
+    // second block: the file is left alone, as it was before CAD-1530.
+    // The review caught this — the first version of this change appended
+    // here, widening what cadence will write into someone else's repo.
+    let unclosed = "# My repo\n\n<!-- cadence:begin -->\nstray\n";
+    std::fs::write(&path, unclosed).unwrap();
+    ensure_agents_block(dir.path()).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), unclosed);
 }
 
 #[test]
