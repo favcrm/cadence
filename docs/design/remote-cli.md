@@ -134,6 +134,23 @@ handle, never "operator") stays in the server verb table but has no
 client mapping in this build — the milestone sends the three `issue_*`
 write verbs only.
 
+Platform team administration shipped by CAD-1504: `team list` (`cli.read`),
+`team invites`, `team invite`, `team revoke-invite`, `team set-role` and
+`team remove` (`cli.write` plus a current Owner). These are **platform-owned
+verbs**: the Worker answers them from the workspace membership directory after
+the same `checkCliCall` gate and before runtime resolution, so they never wake
+or forward to a container. `team list` returns a privacy-minimized directory
+(user id, name, role) and never an email, invitation token or credential;
+`team invites` and the invite responses never carry the accept token. The
+`role` argument on `team invite`/`team set-role` is the requested **target**
+role; caller authority comes only from the verified envelope, and authority-
+shaped argument keys stay refused. Client-side refusals before any bytes leave
+the process: a managed `CADENCE_ALIAS` (including an empty one) and a
+local-org destination, neither of which becomes a hosted or fallback call.
+An explicit post-effect `mutation_outcome_uncertain` / `invite_email_uncertain`
+is reported as an unknown outcome to reconcile with a read, never as a
+retryable availability error (see `docs/REMOTE-AUTH.md`).
+
 Client-side refusals (CAD-1179 — refused before any bytes leave the
 process): `issue new` without `--project`, or with `--id`/`--status`;
 `issue comment` with `--author`/`--kind` (authorship is the envelope
