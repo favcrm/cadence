@@ -25,10 +25,19 @@ pub(super) fn directory_surface(path: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
-/// `AGENTICOS_BOARD_API_ORIGIN` wins; otherwise an https board issuer.
-/// Loopback http is admitted so a disposable rig can point at a local catalog.
-pub(super) fn catalog_origin_from(api: Option<&str>, issuer: Option<&str>) -> Option<String> {
-    let raw = api.filter(|v| !v.trim().is_empty()).or(issuer)?;
+/// A hosted board has no internet: when the issuer is exactly
+/// `http://api.internal`, that outbound handler is the catalog. Otherwise the
+/// catalog is whatever `AGENTICOS_BOARD_CATALOG_ORIGIN` names — an operator's
+/// own API, or a loopback rig. `AGENTICOS_BOARD_API_ORIGIN` is the signed-in
+/// web app this board talks back to; it is not a catalog, and reading it here
+/// pointed the public directory at the private app.
+pub(super) fn catalog_origin_from(catalog: Option<&str>, issuer: Option<&str>) -> Option<String> {
+    if let Some(issuer) = issuer.map(str::trim).filter(|v| !v.is_empty()) {
+        if issuer.trim_end_matches('/') == "http://api.internal" {
+            return Some("http://api.internal".to_string());
+        }
+    }
+    let raw = catalog.filter(|v| !v.trim().is_empty())?;
     let raw = raw.trim().trim_end_matches('/');
     if raw.contains(['?', '#', '@', ' ']) {
         return None;
@@ -42,7 +51,9 @@ pub(super) fn catalog_origin_from(api: Option<&str>, issuer: Option<&str>) -> Op
 
 pub(super) fn catalog_origin() -> Option<String> {
     catalog_origin_from(
-        std::env::var("AGENTICOS_BOARD_API_ORIGIN").ok().as_deref(),
+        std::env::var("AGENTICOS_BOARD_CATALOG_ORIGIN")
+            .ok()
+            .as_deref(),
         std::env::var("AGENTICOS_BOARD_ISSUER").ok().as_deref(),
     )
 }
@@ -168,7 +179,21 @@ mod tests {
     }
 
     #[test]
-    fn origin_rejects_arbitrary_urls() {
+    fn the_catalog_is_the_board_api_or_a_named_catalog_never_the_web_app() {
+        // A hosted board reads its own API, whatever else is set.
+        assert_eq!(
+            catalog_origin_from(None, Some("http://api.internal")).as_deref(),
+            Some("http://api.internal")
+        );
+        assert_eq!(
+            catalog_origin_from(
+                Some("https://api-v2.agenticos.hk"),
+                Some("http://api.internal")
+            )
+            .as_deref(),
+            Some("http://api.internal")
+        );
+        // A rig or a self-hosted board names its own catalog.
         assert_eq!(
             catalog_origin_from(Some("https://api-v2.agenticos.hk/"), None).as_deref(),
             Some("https://api-v2.agenticos.hk")
@@ -181,9 +206,13 @@ mod tests {
             .as_deref(),
             Some("http://127.0.0.1:8787")
         );
+        // The signed-in web app is not a catalog, and an issuer alone is not one.
+        assert!(catalog_origin_from(None, Some("https://app-v2.agenticos.hk")).is_none());
+        assert!(catalog_origin_from(None, Some("https://ignored.example")).is_none());
+        // Still refused: plain http off loopback and query strings.
         assert!(catalog_origin_from(Some("http://evil.example"), None).is_none());
         assert!(catalog_origin_from(Some("https://api.example/?x=1"), None).is_none());
-        assert!(catalog_origin_from(None, Some("http://api.internal")).is_none());
+        assert!(catalog_origin_from(None, Some("http://api.internal.evil")).is_none());
     }
 
     #[test]
