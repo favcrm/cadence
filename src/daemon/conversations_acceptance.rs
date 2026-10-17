@@ -748,7 +748,7 @@ fn dispatch_methods() -> Vec<String> {
 
 /// The ONLY daemon methods a master turn in an app conversation may call,
 /// written out from the ticket's answer 1 (scoped app verbs plus
-/// read-only status for its own turn): the twelve scoped verbs,
+/// read-only status for its own turn): the scoped app verbs,
 /// `message_report` and `thread_read` of its own conversation.
 const APP_TURN_MAY_CALL: &[&str] = &[
     "app_assistant_actions",
@@ -789,7 +789,7 @@ impl Gx {
 
 /// Gate 2: while the master's running message is in an APP conversation,
 /// `master_policy` is an allowlist over EVERY dispatch method: exactly the
-/// fourteen in `APP_TURN_MAY_CALL` pass, so the admin RPCs, the permission
+/// methods in `APP_TURN_MAY_CALL` pass, so the admin RPCs, the permission
 /// verbs (`master_ask_permission`, `master_peek_grant`,
 /// `master_permission_use`), `wiki_write`, `agent_*`, `job_*` and
 /// `monitor_*` are refused. A running message that cannot be resolved

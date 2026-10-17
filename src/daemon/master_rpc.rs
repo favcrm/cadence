@@ -1792,6 +1792,26 @@ mod tests {
         out
     }
 
+    /// Framed byte streams served in `serve.rs` before `dispatch_method`.
+    /// They are real methods, so an allowlist entry may name one, but they
+    /// never appear in the JSON dispatch match.
+    fn framed_stream_methods() -> Vec<String> {
+        let src = include_str!("serve.rs");
+        let marker = "framed_method.as_deref() == Some(\"";
+        let mut out = Vec::new();
+        for line in src.lines() {
+            let Some(start) = line.find(marker) else {
+                continue;
+            };
+            let rest = &line[start + marker.len()..];
+            let Some(end) = rest.find('"') else {
+                continue;
+            };
+            out.push(rest[..end].to_string());
+        }
+        out
+    }
+
     /// Review round 1, C2: the master policy is an allowlist over the
     /// daemon's method table — every method of `Shared::dispatch` not
     /// in [`MASTER_ALLOWED`] is refused, so a method added later is
@@ -1802,10 +1822,15 @@ mod tests {
     #[test]
     fn master_policy_allowlists_the_method_table() {
         let table = dispatch_methods();
+        let streams = framed_stream_methods();
         assert!(table.len() > 50, "method table parse: {table:?}");
+        assert!(
+            streams.contains(&"app_media_inspect".to_string()),
+            "retained image inspect must stay a framed stream"
+        );
         for allowed in MASTER_ALLOWED {
             assert!(
-                table.contains(&allowed.to_string()),
+                table.contains(&allowed.to_string()) || streams.contains(&allowed.to_string()),
                 "{allowed} not a method"
             );
         }
@@ -1903,6 +1928,7 @@ mod tests {
                 "app_content_assistant_draft",
                 "app_content_assistant_proposal_show",
                 "app_content_assistant_proposals",
+                "app_media_inspect",
                 "app_record_csv_assistant_import",
                 "app_record_csv_assistant_preview",
                 "app_segment_assistant_list",
