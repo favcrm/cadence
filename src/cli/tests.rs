@@ -1563,3 +1563,122 @@ fn started_instance_binds_only_to_a_spawned_daemon() {
     assert_eq!(super::started_instance(&json!({"health": health})), None);
     assert_eq!(super::started_instance(&json!({"state": "started"})), None);
 }
+
+/// Every `"key":` token in `text`, tagged with the JSON nesting depth it
+/// sits at (1 is the outermost object).
+fn doc_keys(text: &str) -> Vec<(usize, String)> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '{' | '[' => depth += 1,
+            '}' | ']' => depth = depth.saturating_sub(1),
+            '"' => {
+                let start = i + 1;
+                let mut j = start;
+                while j < chars.len() && chars[j] != '"' {
+                    j += 1;
+                }
+                let mut k = j + 1;
+                while k < chars.len() && chars[k] == ' ' {
+                    k += 1;
+                }
+                if k < chars.len() && chars[k] == ':' && depth > 0 {
+                    out.push((depth, chars[start..j].iter().collect::<String>()));
+                }
+                i = j;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The distinct keys a document records at one nesting depth.
+fn keys_at_depth(keys: &[(usize, String)], depth: usize) -> Vec<String> {
+    let mut v: Vec<String> = keys
+        .iter()
+        .filter(|(d, _)| *d == depth)
+        .map(|(_, k)| k.clone())
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// The sorted keys of a payload object.
+fn payload_keys(value: &serde_json::Value) -> Vec<String> {
+    let mut v: Vec<String> = value
+        .as_object()
+        .expect("a payload object")
+        .keys()
+        .cloned()
+        .collect();
+    v.sort();
+    v
+}
+
+/// CAD-1514: the two `cadence self` shapes documented in
+/// `skills/cadence/SKILL.md` must be the shapes the CLI builds. The inbox
+/// half drifted once — it said `{"queued": N}` while the CLI emitted five
+/// keys — and nothing caught it (CAD-884). Re-wording either example out
+/// of recognition fails this test on purpose: the documents are the
+/// contract an agent reads.
+#[test]
+fn documented_self_payload_keys_match_the_builders() {
+    let doc = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/skills/cadence/SKILL.md"
+    ))
+    .expect("skills/cadence/SKILL.md");
+
+    let actor_line = doc
+        .lines()
+        .find(|l| l.contains("cadence self") && l.contains("\"running\""))
+        .expect("the actor `cadence self` example is gone from SKILL.md");
+    let inbox_span = doc
+        .split("answers `")
+        .nth(1)
+        .and_then(|rest| rest.split('`').next())
+        .filter(|s| s.contains("oldest_unread_age_secs"))
+        .expect("the inbox `cadence self` example is gone from SKILL.md");
+
+    let show = json!({
+        "agent": {"alias": "worker-a", "provider": "claude", "endpoint_kind": "pty"},
+        "queued": 3,
+        "inbox": {"queued": 2, "oldest_age_secs": 12.5},
+        "messages": [
+            {"id": "m1", "turn_id": "t1", "task_id": "job-a", "state": "running"},
+            {"id": "m2", "turn_id": "t2", "task_id": null, "state": "running"},
+            {"id": "m3", "turn_id": "t3", "task_id": null, "state": "done"}
+        ]
+    });
+
+    let actor = super::action_dispatch::self_actor_payload("worker-a", &show);
+    let actor_keys = doc_keys(actor_line);
+    assert_eq!(
+        keys_at_depth(&actor_keys, 1),
+        payload_keys(&actor),
+        "the documented actor keys and the built ones disagree"
+    );
+    assert_eq!(
+        keys_at_depth(&actor_keys, 3),
+        payload_keys(&actor["running"][0]),
+        "the documented running-entry keys and the built ones disagree"
+    );
+    assert_eq!(
+        actor["running"].as_array().map(Vec::len),
+        Some(2),
+        "only running turns belong in the actor payload"
+    );
+
+    let inbox = super::action_dispatch::self_inbox_payload(&show, "inbox");
+    assert_eq!(
+        keys_at_depth(&doc_keys(inbox_span), 1),
+        payload_keys(&inbox),
+        "the documented inbox keys and the built ones disagree"
+    );
+}
