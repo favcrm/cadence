@@ -40,7 +40,7 @@ writeFileSync(
 );
 writeFileSync(join(pkg, "index.js"), `export const VERSION = ${JSON.stringify(VERSION)};\n`);
 
-const staged = join(root, "pi_turn_guard.ts");
+const staged = join(root, "pi_turn_guard.mjs");
 writeFileSync(staged, readFileSync(join(dirname(fileURLToPath(import.meta.url)), "pi_turn_guard.ts")));
 const { default: install } = await import(pathToFileURL(staged).href);
 install(pi);

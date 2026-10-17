@@ -40,7 +40,6 @@ fn the_guard_bounds_messages_below_the_gateway_maximum() {
     // 1.0.0 the guidance-filtering path. The count bound applies to both.
     for version in ["0.87.1", "1.0.0"] {
         let output = Command::new(&node)
-            .arg("--experimental-strip-types")
             .arg("--test")
             .arg(&fixture)
             .env("PI_STUB_VERSION", version)
