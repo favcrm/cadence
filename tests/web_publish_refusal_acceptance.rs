@@ -1,23 +1,18 @@
-//! CAD-1429 Publish Web: independent CLI refusal acceptance (driver skeleton).
+//! CAD-1429 Publish Web: independent CLI refusal acceptance.
 //!
-//! Independent acceptance author, not the source implementer.
+//! Proves the local logged-out gate: every `cadence web` action refuses
+//! before any request is built, with no auth material on disk. Needs no
+//! network and no credential.
 //!
-//! Status: SKELETON. The remote-scope cases are authored but are NOT executed
-//! here. They depend on the library-test TLS hook (`WebIssuerTls`, the exact
-//! virtual issuer plus loopback socket and explicit CA) and on the stable
-//! `cli/web.rs` / `web_cli_test_harness` module graph. Until the parent freezes
-//! those, this file records what it needs and proves only the local
-//! logged-out gate, which needs no network and no credential.
+//! Remote-scope cases (live device grant, TLS hook) are planned on
+//! CAD-1429 and depend on the library-test `WebIssuerTls` seam — when they
+//! land they belong beside this file.
 //!
 //! Binding boundary (stated plainly): this file compiles only into the
 //! library unit-test path, where `cfg!(test)` admits the loopback issuer pin.
 //! It is NOT evidence about the production `cadence` binary, which rejects
 //! loopback http and trusts only webpki roots. Production binary TLS is not
 //! proved here.
-//!
-//! No credential is fabricated: no `cli-<org>.json`, no `web-<org>.json`, no
-//! hand-written `hct_`. The only remote grant a remote-scope case may use is one
-//! minted through the real device flow, which this skeleton does not perform.
 #![cfg(all(unix, feature = "test-seam"))]
 
 use std::path::{Path, PathBuf};
