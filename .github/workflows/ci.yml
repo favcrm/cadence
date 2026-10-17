@@ -56,10 +56,12 @@ env:
 
 jobs:
   # CAD-926: rust-cache scope. Only `cache-warm` (push to main) SAVES the gate
-  # profiles' caches, under the shared keys gate-test, gate-release and
-  # gate-clippy. Every pull_request / merge_group gate job restores the same
-  # key and passes `save-if: false`: a queue ref saved ~1.4 GB per run that no
-  # other ref could read, and the repo sat at 12.7 GB against a 10 GB limit.
+  # profiles' caches, under the shared keys gate-test-ld1, gate-release and
+  # gate-clippy (CAD-1493: -ldN is the linker/fingerprint epoch — bump it when
+  # a flag flips; rust-cache never overwrites an existing key). Every
+  # pull_request / merge_group gate job restores the same key and passes
+  # `save-if: false`: a queue ref saved ~1.4 GB per run that no other ref
+  # could read, and the repo sat at 12.7 GB against a 10 GB limit.
   # release-artifact and release-build keep their own default-keyed caches
   # (they run on main pushes and tags only). cross-build restores the
   # per-target cross-* keys its own cache-warm legs write — restore-only
@@ -304,7 +306,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: ${{ needs.change-scope.outputs.rust != 'false' }}
         with:
-          shared-key: gate-test
+          # CAD-1493: key version carries the linker/fingerprint epoch —
+          # bump -ldN when a flag flips so the warm leg writes fresh
+          # artifacts instead of skipping an existing stale key.
+          shared-key: gate-test-ld1
           save-if: false
       # CAD-1487: 83 test binaries × N shards make linking the shard
       # bottleneck; mold/lld cuts it. cache-warm's test leg enables the
@@ -569,7 +574,7 @@ jobs:
   # Nothing `needs` it and it never fails the run.
   # CAD-926: it is also the ONLY saver of the gate jobs' rust-cache. One leg
   # per profile, each with its own target dir and the shared key the gates
-  # restore (gate-test: test; gate-release: build + ui;
+  # restore (gate-test-ld1: test; gate-release: build + ui;
   # gate-clippy: clippy). The rust-cache step precedes `ci-sccache enable`
   # exactly as in the gates, because the cache key hashes RUST* env vars and
   # enable exports RUSTC_WRAPPER. The builds run without sccache too (the saved
@@ -591,7 +596,9 @@ jobs:
       - id: cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: gate-${{ matrix.profile }}
+          # CAD-1493: the test leg's key carries the fingerprint epoch that
+          # the gate reads (gate-test-ld1); release/clippy stay unversioned.
+          shared-key: gate-${{ matrix.profile }}${{ matrix.profile == 'test' && '-ld1' || '' }}
           # A lint or test failure on main must not freeze the refresh.
           cache-on-failure: true
       # The clippy leg has no sccache: clippy-driver calls are not cacheable
