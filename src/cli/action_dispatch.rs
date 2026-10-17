@@ -112,6 +112,38 @@ fn command_line_ids(m: &clap::ArgMatches) -> Vec<String> {
     typed.chain(nested).collect()
 }
 
+/// The `cadence self` payload for a mailbox with no actor: the inbound
+/// backlog a consumer owes it (CAD-480). Extracted so a test can compare
+/// its shape with the example in `skills/cadence/SKILL.md` (CAD-1514).
+pub(super) fn self_inbox_payload(show: &Value, kind: &str) -> Value {
+    json!({
+        "alias": show["agent"]["alias"],
+        "endpoint_kind": kind,
+        "queued": show["queued"],
+        "unread": show["inbox"]["queued"],
+        "oldest_unread_age_secs": show["inbox"]["oldest_age_secs"],
+    })
+}
+
+/// The `cadence self` payload for an actor: only the running turns
+/// (CAD-879), never history. Extracted for the same reason as
+/// [`self_inbox_payload`].
+pub(super) fn self_actor_payload(alias: &str, show: &Value) -> Value {
+    let running = show["messages"]
+        .as_array()
+        .map(|ms| {
+            ms.iter()
+                .filter(|m| m["state"].as_str() == Some("running"))
+                .map(|m| {
+                    json!({"id": m["id"], "turn_id": m["turn_id"],
+                           "task": m["task_id"]})
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    json!({"alias": alias, "running": running})
+}
+
 pub(super) fn run_cli(cli: Cli) -> Result<i32> {
     // Offline syntax discovery: no org, state, tracker, login, or daemon.
     if matches!(
@@ -720,41 +752,27 @@ pub(crate) fn dispatch(state_dir: PathBuf, command: Commands) -> Result<i32> {
                 show["agent"]["endpoint_kind"].as_str().unwrap_or_default(),
             );
             if !registry::has_actor(provider, kind) {
-                print_json(&json!({
-                    "alias": show["agent"]["alias"],
-                    "endpoint_kind": kind,
-                    "queued": show["queued"],
-                    // CAD-480: the unread backlog and its age — what a
-                    // consumer owes this mailbox.
-                    "unread": show["inbox"]["queued"],
-                    "oldest_unread_age_secs": show["inbox"]["oldest_age_secs"],
-                }));
+                // CAD-1514: the shape lives in `self_inbox_payload`, which
+                // a test compares against the SKILL.md example.
+                print_json(&self_inbox_payload(&show, kind));
                 return Ok(0);
             }
-            let running = show["messages"]
-                .as_array()
-                .map(|ms| {
-                    ms.iter()
-                        .filter(|m| m["state"].as_str() == Some("running"))
-                        .map(|m| {
-                            json!({"id": m["id"], "turn_id": m["turn_id"],
-                                   "task": m["task_id"]})
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
+            let payload = self_actor_payload(&alias, &show);
             // CAD-375: the daemon shows a running turn's token only to
             // the agent's own pane or endpoint. A `null` here means this
             // process is not in it — say so rather than print a report
             // instruction that cannot work.
-            if running.iter().any(|m| m["turn_id"].is_null()) {
+            if payload["running"]
+                .as_array()
+                .is_some_and(|ms| ms.iter().any(|m| m["turn_id"].is_null()))
+            {
                 return Err(Error::rejected(format!(
                     "turn tokens for '{alias}' are shown only to that agent's own pane \
                      or managed endpoint, and this process does not descend from it — \
                      run `cadence self` inside the agent's pane (CAD-375)"
                 )));
             }
-            print_json(&json!({"alias": alias, "running": running}));
+            print_json(&payload);
             Ok(0)
         }
         Commands::Done {
