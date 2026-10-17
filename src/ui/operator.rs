@@ -1144,6 +1144,44 @@ pub(super) struct ReadAdmission {
 }
 
 impl ReadAdmission {
+    /// True when `admit_read` admitted the request without a session — the
+    /// local bootstrap case, where the caller is the operator.
+    pub(super) fn is_anonymous(&self) -> bool {
+        self.proof.is_none()
+    }
+}
+
+/// The caller spelling for a read `admit_read` already admitted.
+///
+/// `operator` for an anonymous local read; otherwise the public session's
+/// `users/<handle>` via [`board_caller`]. A failure to resolve refuses —
+/// a project-scoped read is never served unfiltered.
+pub(super) fn read_actor(
+    admission: &ReadAdmission,
+    request: &Request,
+    state_dir: &std::path::Path,
+    opts: &ServeOpts,
+) -> Result<String, HttpResp> {
+    if admission.is_anonymous() {
+        return Ok("operator".to_string());
+    }
+    // `Caller::actor()` is display text (it can read "<name> via board"),
+    // so the policy spelling is built from the variant: the public
+    // session's attribution handle is the platform subject, which is what
+    // `users/<handle>` keys on everywhere else.
+    board_caller(request, state_dir, opts, false, None).map(|caller| caller_spelling(&caller))
+}
+
+/// The project-policy spelling for a resolved board caller.
+pub(super) fn caller_spelling(caller: &Caller) -> String {
+    match caller {
+        Caller::Operator(_) => "operator".to_string(),
+        Caller::Named(named) => format!("users/{}", named.author),
+        Caller::Agent(alias) => format!("agents/{alias}"),
+    }
+}
+
+impl ReadAdmission {
     pub(super) const RECHECK: std::time::Duration = std::time::Duration::from_secs(5);
 
     pub(super) fn wait_timeout(&self) -> std::time::Duration {
@@ -2489,6 +2527,26 @@ pub(super) fn platform_session(
 
 #[cfg(test)]
 mod tests {
+    /// A board session's display actor is not the policy key: the named
+    /// handle is. Using `Caller::actor()` here made every project
+    /// unreadable for a real board session (cad1452).
+    #[test]
+    fn a_board_session_maps_to_the_user_spelling_not_the_display_actor() {
+        let named = Caller::Named(Named {
+            actor: "Fable Chen <fable@example.com> (board)".into(),
+            author: "usr_fable".into(),
+            operator: false,
+        });
+        assert_eq!(caller_spelling(&named), "users/usr_fable");
+        assert_eq!(
+            caller_spelling(&Caller::Operator("operator (ui)".into())),
+            "operator"
+        );
+        assert_eq!(
+            caller_spelling(&Caller::Agent("pane-3".into())),
+            "agents/pane-3"
+        );
+    }
     use super::*;
 
     #[test]

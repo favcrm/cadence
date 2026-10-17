@@ -933,6 +933,8 @@ mod tests {
             build,
             memory: None,
             intake: None,
+            id: None,
+            policy: None,
         }
     }
 

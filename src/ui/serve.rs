@@ -1428,10 +1428,32 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
         }
         "/api/projects" => match Pm::at(pm_dir) {
             Ok(pm) => {
-                send(
-                    request,
-                    json_response(read_model::get(state_dir, pm_dir).projects(&pm)),
-                );
+                let actor = match read_admission
+                    .as_ref()
+                    .map(|a| operator::read_actor(a, &request, state_dir, opts))
+                {
+                    Some(Ok(actor)) => actor,
+                    Some(Err(resp)) => {
+                        send(request, resp);
+                        return;
+                    }
+                    None => {
+                        send(request, err_response(503, "read admission is missing"));
+                        return;
+                    }
+                };
+                // AOS-274: a project this caller may not read contributes
+                // no row, and no issue count, to the listing.
+                let readable = super::project_policy::readable(&pm, &actor);
+                let mut payload = read_model::get(state_dir, pm_dir).projects(&pm);
+                if let Some(rows) = payload.get_mut("projects").and_then(|v| v.as_array_mut()) {
+                    rows.retain(|row| {
+                        row.get("key")
+                            .and_then(|k| k.as_str())
+                            .is_some_and(|key| readable.contains(key))
+                    });
+                }
+                send(request, json_response(payload));
             }
             Err(e) => send(request, err_response(503, &e.to_string())),
         },
@@ -1467,11 +1489,28 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                 // CAD-405: each card carries its `work` block.
                 let by_id = read.by_id();
                 let ctx = read.ctx(&by_id);
+                let actor = match read_admission
+                    .as_ref()
+                    .map(|a| operator::read_actor(a, &request, state_dir, opts))
+                {
+                    Some(Ok(actor)) => actor,
+                    Some(Err(resp)) => {
+                        send(request, resp);
+                        return;
+                    }
+                    None => {
+                        send(request, err_response(503, "read admission is missing"));
+                        return;
+                    }
+                };
+                // AOS-274: filter before the slice and the card, so a
+                // restricted project contributes no row or count.
+                let readable = super::project_policy::readable(&pm, &actor);
                 let mut body = json!({
                     "issues": read
                         .views
                         .iter()
-                        .filter(|v| slice.matches(v))
+                        .filter(|v| slice.matches(v) && readable.contains(&v.issue.project))
                         .map(|v| read.card(&ctx, v))
                         .collect::<Vec<_>>(),
                 });
@@ -1612,15 +1651,40 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     match Pm::at(pm_dir) {
                         Ok(pm) => match project::list(&pm.dir) {
                             Ok(projects) => match projects.iter().find(|p| p.key == key) {
-                                Some(selected) => send(
-                                    request,
-                                    json_response(context::bundle(
-                                        &pm,
-                                        selected,
-                                        role.as_deref(),
-                                        expected_revision.as_deref(),
-                                    )),
-                                ),
+                                Some(selected) => {
+                                    let actor = match read_admission
+                                        .as_ref()
+                                        .map(|a| operator::read_actor(a, &request, state_dir, opts))
+                                    {
+                                        Some(Ok(actor)) => actor,
+                                        Some(Err(resp)) => {
+                                            send(request, resp);
+                                            return;
+                                        }
+                                        None => {
+                                            send(
+                                                request,
+                                                err_response(503, "read admission is missing"),
+                                            );
+                                            return;
+                                        }
+                                    };
+                                    // AOS-274: a restricted project answers
+                                    // like an absent one, with no bundle.
+                                    if super::project_policy::refused(&pm, &selected.key, &actor) {
+                                        send(request, err_response(404, "unknown project"));
+                                        return;
+                                    }
+                                    send(
+                                        request,
+                                        json_response(context::bundle(
+                                            &pm,
+                                            selected,
+                                            role.as_deref(),
+                                            expected_revision.as_deref(),
+                                        )),
+                                    )
+                                }
                                 None => send(request, err_response(404, "unknown project")),
                             },
                             Err(error) => send(request, err_response(503, &error.to_string())),
@@ -2021,6 +2085,26 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                             send(request, err_response(404, "unknown issue"));
                             return;
                         };
+                        // AOS-274: a restricted project answers like an
+                        // absent issue, without naming the project.
+                        let actor = match read_admission
+                            .as_ref()
+                            .map(|a| operator::read_actor(a, &request, state_dir, opts))
+                        {
+                            Some(Ok(actor)) => actor,
+                            Some(Err(resp)) => {
+                                send(request, resp);
+                                return;
+                            }
+                            None => {
+                                send(request, err_response(503, "read admission is missing"));
+                                return;
+                            }
+                        };
+                        if super::project_policy::refused(&pm, &view.issue.project, &actor) {
+                            send(request, err_response(404, "unknown issue"));
+                            return;
+                        }
                         match sub {
                             Some("kickoff") => {
                                 let resp = home::kickoff_options(&request, state_dir, opts, &id);

@@ -1765,6 +1765,9 @@ pub(crate) fn write_route(
         return;
     };
     let actor = caller.actor().to_string();
+    // AOS-274: the policy key, built from the variant — `actor()` above is
+    // display text for attribution.
+    let spelling = operator::caller_spelling(&caller);
     let pm = match Pm::at(pm_dir) {
         Ok(pm) => pm,
         Err(e) => {
@@ -1805,6 +1808,12 @@ pub(crate) fn write_route(
             send(request, err_response(400, "bad project key"));
             return;
         };
+        // AOS-274: a caller may only file work into a project it can use;
+        // a restricted project answers exactly like an absent one.
+        if super::project_policy::refused(&pm, &project, &spelling) {
+            send(request, err_response(404, "unknown project"));
+            return;
+        }
         let pm = match activity_pm(
             pm,
             &request,
@@ -1848,6 +1857,15 @@ pub(crate) fn write_route(
         send(request, err_response(400, "bad issue id"));
         return;
     };
+    // AOS-274: every write against an existing issue must pass the same
+    // project decision, and a restricted project answers like an absent
+    // issue. An unknown id keeps each verb's own not-found answer.
+    if let Ok(issue) = crate::issue::board::find_issue(&pm.dir, &id) {
+        if super::project_policy::refused(&pm, &issue.project, &spelling) {
+            send(request, err_response(404, "unknown issue"));
+            return;
+        }
+    }
     if sub == Some("artifacts") {
         // POST /api/issues/:id/artifacts?name=<basename> — raw bytes.
         let name = query("name").unwrap_or_default();
