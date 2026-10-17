@@ -1651,15 +1651,40 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     match Pm::at(pm_dir) {
                         Ok(pm) => match project::list(&pm.dir) {
                             Ok(projects) => match projects.iter().find(|p| p.key == key) {
-                                Some(selected) => send(
-                                    request,
-                                    json_response(context::bundle(
-                                        &pm,
-                                        selected,
-                                        role.as_deref(),
-                                        expected_revision.as_deref(),
-                                    )),
-                                ),
+                                Some(selected) => {
+                                    let actor = match read_admission
+                                        .as_ref()
+                                        .map(|a| operator::read_actor(a, &request, state_dir, opts))
+                                    {
+                                        Some(Ok(actor)) => actor,
+                                        Some(Err(resp)) => {
+                                            send(request, resp);
+                                            return;
+                                        }
+                                        None => {
+                                            send(
+                                                request,
+                                                err_response(503, "read admission is missing"),
+                                            );
+                                            return;
+                                        }
+                                    };
+                                    // AOS-274: a restricted project answers
+                                    // like an absent one, with no bundle.
+                                    if super::project_policy::refused(&pm, &selected.key, &actor) {
+                                        send(request, err_response(404, "unknown project"));
+                                        return;
+                                    }
+                                    send(
+                                        request,
+                                        json_response(context::bundle(
+                                            &pm,
+                                            selected,
+                                            role.as_deref(),
+                                            expected_revision.as_deref(),
+                                        )),
+                                    )
+                                }
                                 None => send(request, err_response(404, "unknown project")),
                             },
                             Err(error) => send(request, err_response(503, &error.to_string())),
