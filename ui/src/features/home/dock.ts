@@ -29,7 +29,11 @@ export function tailTop(scrollHeight: number, clientHeight: number): number {
   return Math.max(0, scrollHeight - clientHeight);
 }
 
-/** The jump pill's words: the count rides along while there is one. */
-export function jumpLabel(unseen: number): string {
-  return unseen > 0 ? `Jump to latest · ${unseen} new` : "Jump to latest";
+/** The jump pill's words: the count rides along while there is one.
+ *  `t` translates each phrase (default: English), so the two surfaces
+ *  that show this pill — Home and the app-pane chat — share one wording
+ *  and neither is English-only in a translated locale (CAD-1533). */
+export function jumpLabel(unseen: number, t: (english: string) => string = (english) => english): string {
+  const base = t("Jump to latest");
+  return unseen > 0 ? `${base} · ${unseen} ${t("new")}` : base;
 }
