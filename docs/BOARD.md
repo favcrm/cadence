@@ -36,6 +36,11 @@ Activation needs an operator-reviewed image/configuration backup and restore
 runbook; a failed guard must not automatically fall back to the sessionless
 local surface.
 
+## My work
+
+My work (`/my-work`) lists hosted assignments for the signed-in board session: assigned to you, and created by you. Each row links to the existing issue page. Status is stored custody — queued, running, blocked, result, failed, or cancelled. A claim is not running work. Refresh asks again. A board without hosted placement, or a proof the board cannot verify, says hosted work is unavailable. A missing or revoked session is refused. The screen does not accept a subject, role, or bearer in the query.
+
+
 ## Issue folder
 
 ```
