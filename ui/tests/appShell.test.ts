@@ -541,7 +541,7 @@ await React.act(async () => {
   root.render(React.createElement(LocaleProvider, null, React.createElement(AppShell, {
     installId: "install-social",
     viewer: { operator: true, readOnly: false },
-    children: React.createElement(StubPicker, { installId: "install-social" }),
+    children: () => React.createElement(StubPicker, { installId: "install-social" }),
   })));
 });
 await flush(); await flush(); await flush();

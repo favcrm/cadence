@@ -1174,7 +1174,9 @@ pub(crate) fn write_route(
         let context = query("context_id")
             .map(|value| format!("context_id={value}"))
             .unwrap_or_default();
-        let response = app_assistant::handle(&mut request, state_dir, route, &context);
+        let relay = operator::public_relay(&request, opts);
+        let response =
+            app_assistant::handle_with_relay(&mut request, state_dir, route, &context, relay);
         send(request, response);
         return;
     }
@@ -1451,6 +1453,15 @@ pub(crate) fn write_route(
             return;
         }
         let response = app_media::media_read(&mut request, state_dir, opts);
+        send(request, response);
+        return;
+    }
+    if app_media::chat_attach_route(path) {
+        if *method != Method::Post {
+            send(request, err_response(405, "method not allowed"));
+            return;
+        }
+        let response = app_media::media_chat_attach(&mut request, state_dir, opts);
         send(request, response);
         return;
     }

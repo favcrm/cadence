@@ -406,6 +406,13 @@ pub type EventHook = Box<dyn Fn(&str, Value) + Send + Sync>;
 pub type RequestHook = Box<dyn Fn(ProviderRequest) + Send + Sync>;
 
 /// Callbacks the adapter uses to surface provider traffic.
+/// One retained image the provider prompt may see natively.
+/// `media_type` is a static MIME the catalog already proved.
+pub struct TurnImage {
+    pub media_type: &'static str,
+    pub bytes: Vec<u8>,
+}
+
 pub struct AdapterHooks {
     /// Notification events worth recording (turn lifecycle, message items).
     pub on_event: EventHook,
@@ -445,6 +452,19 @@ pub trait ProviderAdapter: Send + Sync {
         client_message_id: &str,
         on_started: &dyn Fn(&str),
     ) -> Result<TurnResult>;
+    /// Native image parts for the next prompt. Empty is a no-op.
+    /// Runtimes without a native image prompt refuse before any prompt
+    /// is sent. The refusal is pre-write: the message fails and the
+    /// endpoint stays up. Bytes are never pasted into the text.
+    fn bind_turn_images(&self, images: &[TurnImage]) -> Result<()> {
+        if images.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::pre_write(
+                "this runtime has no native image prompt, so the attached library image was not sent. Use an image-capable Pi session; the selected model was left unchanged.",
+            ))
+        }
+    }
     /// CAD-1009: [`Self::run_turn`] for a prompt that may carry a
     /// scoped-turn token `slot` (a unique marker the daemon left after
     /// the App hint). An adapter that mints its turn token inside

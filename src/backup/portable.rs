@@ -146,6 +146,10 @@ const CATALOG: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "app_media_lineage",
+        &["asset_id", "source_asset_id", "source_sha256"],
+    ),
+    (
         "app_bindings",
         &[
             "id",

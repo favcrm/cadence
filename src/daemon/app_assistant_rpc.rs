@@ -235,12 +235,34 @@ impl Shared {
         )?;
         if !is_new {
             let op = normalize_interrupted_operation(&records, &scoped.context, op)?;
+            if action_id == "media.refine.prepare" && op["result"]["run_id"].as_str().is_some() {
+                // Normalization strips `_input` for the wire. Resume reloads
+                // the stored private record and keeps that same run.
+                let private = records.app_assistant_operation_get(operation_id, &scoped.context)?;
+                return self.refine_resume(
+                    &records,
+                    &scoped.install,
+                    &scoped.context,
+                    &scoped.message_id,
+                    &private,
+                );
+            }
             return Ok(json!({"operation":op}));
         }
         if op.get("status").and_then(Value::as_str) != Some("running") {
             return Ok(json!({"operation":public_operation(op)}));
         }
         let execution = (|| -> Result<Value> {
+            if action_id == "media.refine.prepare" {
+                return self.refine_request_permission(
+                    &records,
+                    &scoped.install,
+                    &scoped.context,
+                    &scoped.message_id,
+                    operation_id,
+                    input,
+                );
+            }
             if matches!(action_id, "social.posts.fetch" | "social.draft.create") {
                 return self.social_request_permission(
                     &records,
@@ -534,6 +556,7 @@ impl Shared {
                 "operation_id",
                 "decision",
                 "expected_revision",
+                "public_session",
             ],
             "app_assistant_permission_revoke" => &[
                 "install_id",
@@ -638,7 +661,8 @@ impl Shared {
                 Ok(json!({"permission":permission}))
             }
             "app_assistant_decision" => {
-                self.decide_assistant_operation(&records, install, context, params)
+                let human = decision_human(self, params, peer_pid)?;
+                self.decide_assistant_operation(&records, install, context, params, human.as_ref())
             }
             _ => Err(Error::rejected("unknown assistant operator method")),
         }
@@ -650,6 +674,7 @@ impl Shared {
         install: &str,
         context: &str,
         params: &Value,
+        human: Option<&Value>,
     ) -> Result<Value> {
         let operation_id = required_str(params, "operation_id")?;
         let decision = required_str(params, "decision")?;
@@ -677,7 +702,11 @@ impl Shared {
                 context,
                 expected_revision: expected,
                 status: "denied",
-                summary: "Denied; no customer change was made",
+                summary: if op["action_id"] == "media.refine.prepare" {
+                    "Denied; no image edit was started"
+                } else {
+                    "Denied; no customer change was made"
+                },
                 result: &Value::Null,
                 resource_refs: &Value::Array(vec![]),
                 permission_request: &Value::Null,
@@ -701,7 +730,10 @@ impl Shared {
                 expected,
             );
         }
-        if action != "customer.tags.update" && !crate::app_assistant::is_social(action) {
+        if action != "customer.tags.update"
+            && action != "media.refine.prepare"
+            && !crate::app_assistant::is_social(action)
+        {
             return Err(Error::rejected(
                 "no operator decision handler is registered for this action",
             ));
@@ -742,6 +774,21 @@ impl Shared {
             return Err(Error::rejected(
                 "assistant action semantics changed; permission must be requested again",
             ));
+        }
+        if action == "media.refine.prepare" {
+            if decision != "allow_once" {
+                return Err(Error::rejected(
+                    "a library image refinement is allowed one time only",
+                ));
+            }
+            return self.refine_run(
+                records,
+                install,
+                context,
+                &op,
+                human,
+                params.get("public_session").and_then(Value::as_str),
+            );
         }
         if crate::app_assistant::is_social(action) {
             return self.social_run(records, install, context, &op, &input);
@@ -808,6 +855,484 @@ impl Shared {
         })?;
         Ok(json!({"operation":result}))
     }
+
+    /// Park a reference-edit quote. No provider submit happens here.
+    fn refine_request_permission(
+        &self,
+        records: &RecordStore,
+        install: &str,
+        context: &str,
+        message_id: &str,
+        operation_id: &str,
+        input: &Value,
+    ) -> Result<Value> {
+        let (asset_id, revision, sha256, instructions) = refine_input(input)?;
+        self.refine_turn_pin(message_id, asset_id, revision, sha256)?;
+        let (original, title) = self.refine_source_current(asset_id, revision, sha256)?;
+        let (slot, quote) = self.refine_quote(install, context, asset_id, revision, sha256)?;
+        let micros = quote["total_price_micros"]
+            .as_u64()
+            .ok_or_else(|| Error::rejected("reference-edit quote is missing its exact price"))?;
+        let model = crate::platform::agenticos_external::reviewed_image_model();
+        let reason = "Review one library image reference edit. The card freezes the source pin, instructions, model, exact price, and maximum spend. Charged once. The source stays unchanged.";
+        records
+            .app_assistant_operation_set(crate::store::app_records::AssistantOperationUpdate {
+                operation_id,
+                context,
+                expected_revision: 1,
+                status: "pending_permission",
+                summary: "Review this reference edit before it costs anything",
+                result: &Value::Null,
+                resource_refs: &json!([{"kind":"media","id":asset_id,"label":"Library image"}]),
+                permission_request: &json!({
+                    "reason": reason,
+                    "scope": {"install_id":install,"context_id":context,"action_id":"media.refine.prepare","resource_id":asset_id},
+                    "allow_always": false,
+                    "preview_kind": "media_refine",
+                    "preview": {
+                        "asset_id": asset_id,
+                        "revision": revision,
+                        "sha256": sha256,
+                        "title": title,
+                        "artifact_ref": original.reference,
+                        "instructions": instructions,
+                        "workflow": "refine-image",
+                        "slot": slot,
+                        "model": model,
+                        "quote": quote,
+                        "estimate_micros": micros,
+                        "currency": "USD",
+                        "ceiling_micros": micros,
+                        "allow_once": true,
+                    },
+                }),
+                error: None,
+            })
+            .map(|op| json!({"operation": public_operation(op)}))
+    }
+
+    fn refine_source_current(
+        &self,
+        asset_id: &str,
+        revision: i64,
+        sha256: &str,
+    ) -> Result<(crate::store::app_media::MediaOriginalProof, String)> {
+        let image = self.store.app_media_context_image(asset_id)?;
+        let original = image.original;
+        let hex = sha256
+            .strip_prefix("sha256:")
+            .filter(|hex| hex.len() == 64)
+            .ok_or_else(|| Error::rejected("library image digest is not canonical"))?;
+        let reference_ok = original
+            .reference
+            .split_once('.')
+            .is_some_and(|(job, digest)| {
+                digest == hex && job.starts_with("med_") && !original.reference.contains("://")
+            });
+        if image.asset.revision != revision || original.sha256 != sha256 || !reference_ok {
+            return Err(Error::rejected(
+                "producer reference is not the retained original artifact",
+            ));
+        }
+        self.with_media_source_current(&original, || Ok(()))?;
+        Ok((original, image.asset.title))
+    }
+
+    fn refine_quote(
+        &self,
+        install: &str,
+        context: &str,
+        asset_id: &str,
+        revision: i64,
+        sha256: &str,
+    ) -> Result<(String, Value)> {
+        let _ = (asset_id, revision, sha256);
+        let pm = self.pm_at(&self.pm_dir()?)?;
+        let (slot, request) = workspace::with_runtime_snapshot(&pm, install, |row, files| {
+            let _custody = self
+                .platform_custody_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let _release = self
+                .app_release_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let manifest = crate::issue::app::parse_manifest(
+                files
+                    .get("app.md")
+                    .ok_or_else(|| Error::rejected("installation manifest unavailable"))?,
+            )?;
+            let text = files
+                .get("workflows/refine-image.md")
+                .ok_or_else(|| Error::rejected("this installation has no refine-image workflow"))?;
+            let template = crate::issue::workflow::parse_template(text)
+                .map_err(|_| Error::rejected("refine-image declarations refused"))?;
+            if template.execution != crate::issue::workflow::Execution::Host {
+                return Err(Error::rejected("refine-image must run on the host"));
+            }
+            let expected = [
+                "library_asset_id",
+                "library_revision",
+                "library_sha256",
+                "instructions",
+            ];
+            let inputs_ok = template.input_order.len() == expected.len()
+                && template.inputs.len() == expected.len()
+                && template
+                    .input_order
+                    .iter()
+                    .zip(expected)
+                    .all(|(got, want)| got == want)
+                && expected.iter().all(|name| {
+                    template.inputs.get(*name).is_some_and(|spec| {
+                        !spec.optional
+                            && spec.kind.is_none()
+                            && spec.default.is_none()
+                            && !spec.context_default
+                    })
+                });
+            if !inputs_ok {
+                return Err(Error::rejected(
+                    "refine-image inputs must be the four required strings library_asset_id, library_revision, library_sha256, instructions",
+                ));
+            }
+            let slots: Vec<&str> = template
+                .capability_slots
+                .iter()
+                .filter(|slot| {
+                    manifest.capabilities.get(*slot).is_some_and(|need| {
+                        need.capability == "media.generate" && need.effect == "draft"
+                    })
+                })
+                .map(String::as_str)
+                .collect();
+            let [slot] = slots.as_slice() else {
+                return Err(Error::rejected(
+                    "refine-image must declare one media.generate draft slot",
+                ));
+            };
+            let proof = self
+                .app_binding_live(install, Some(context), slot, row, files)?
+                .ok_or_else(|| Error::rejected("capability binding is absent — finish setup"))?;
+            Ok((
+                (*slot).to_owned(),
+                self.prepare_app_capability_quote(&proof)?.reference_edit(),
+            ))
+        })?;
+        let quote = request.fetch()?;
+        if !quote.valid() || quote.currency != "USD" || quote.units != 1 {
+            return Err(Error::rejected(
+                "reference-edit quote is outside the reviewed price bound",
+            ));
+        }
+        Ok((slot, json!(quote)))
+    }
+
+    fn refine_run(
+        self: &Arc<Self>,
+        records: &RecordStore,
+        install: &str,
+        context: &str,
+        op: &Value,
+        human: Option<&Value>,
+        public_session: Option<&str>,
+    ) -> Result<Value> {
+        let operation_id = required_str(op, "id")?;
+        let input = op
+            .get("_input")
+            .ok_or_else(|| Error::rejected("assistant operation input is unavailable"))?;
+        let expected = op["revision"]
+            .as_i64()
+            .ok_or_else(|| Error::rejected("assistant operation revision is unavailable"))?;
+        let preview = op
+            .pointer("/permission_request/preview")
+            .ok_or_else(|| Error::rejected("assistant permission preview is unavailable"))?;
+        let (asset_id, revision, sha256, instructions) = refine_input(input)?;
+        if op.pointer("/permission_request/preview_kind") != Some(&json!("media_refine"))
+            || op.pointer("/permission_request/allow_always") != Some(&json!(false))
+            || preview["asset_id"] != asset_id
+            || preview["revision"] != revision
+            || preview["sha256"] != sha256
+            || preview["instructions"] != instructions
+            || preview["workflow"] != "refine-image"
+            || preview["model"] != crate::platform::agenticos_external::reviewed_image_model()
+            || preview["currency"] != "USD"
+            || preview["allow_once"] != true
+        {
+            return Err(Error::rejected(
+                "the library image changed since the price was shown",
+            ));
+        }
+        let (original, title) = self.refine_source_current(asset_id, revision, sha256)?;
+        if preview["title"] != title || preview["artifact_ref"] != original.reference {
+            return Err(Error::rejected(
+                "producer reference changed since the price was shown",
+            ));
+        }
+        let (slot, live) = self.refine_quote(install, context, asset_id, revision, sha256)?;
+        let confirmed = preview["ceiling_micros"]
+            .as_u64()
+            .ok_or_else(|| Error::rejected("the confirmed reference-edit ceiling is missing"))?;
+        let live_micros = live["total_price_micros"].as_u64().unwrap_or(u64::MAX);
+        if slot != preview["slot"].as_str().unwrap_or("") || live_micros > confirmed {
+            return Err(Error::rejected(
+                "price_changed: the live reference-edit price is above the confirmed price",
+            ));
+        }
+        if live != preview["quote"] || preview["estimate_micros"] != live["total_price_micros"] {
+            return Err(Error::rejected(
+                "price_changed: the confirmed reference-edit quote is no longer current",
+            ));
+        }
+        let mut params = json!({
+            "install_id": install,
+            "context_id": context,
+            "workflow": "refine-image",
+            "request_id": operation_id,
+            "inputs": {
+                "library_asset_id": asset_id,
+                "library_revision": revision.to_string(),
+                "library_sha256": sha256,
+                "instructions": instructions,
+            }
+        });
+        // Reuse the verified public approver's native session for creator
+        // attribution and saved-account ownership, not the local operator fallback.
+        if let Some(token) = public_session {
+            params["token"] = json!(token);
+            params["origin"] = json!("public");
+        }
+        let expected_quote = json!({slot: live});
+        let created = self.create_app_run_as(&params, None, Some(&expected_quote), human)?;
+        let run_id = created["id"]
+            .as_str()
+            .ok_or_else(|| Error::rejected("image run id is missing"))?
+            .to_owned();
+        let digest = created["snapshot_digest"]
+            .as_str()
+            .ok_or_else(|| Error::rejected("image run digest is missing"))?
+            .to_owned();
+        if created["state"] == "awaiting_approval" {
+            self.with_app_run_current(&run_id, |bundle| {
+                self.store
+                    .app_run_decide_as(&run_id, Some(&digest), false, Some(bundle), human)
+            })?;
+        }
+        let pinned = json!({"run_id": run_id, "source_asset_id": asset_id});
+        records.app_assistant_operation_set(
+            crate::store::app_records::AssistantOperationUpdate {
+                operation_id,
+                context,
+                expected_revision: expected,
+                status: "running",
+                summary: "Submitting the reference edit",
+                result: &pinned,
+                resource_refs: &json!([{"kind":"media","id":asset_id,"label":"Library image"}]),
+                permission_request: &Value::Null,
+                error: None,
+            },
+        )?;
+        let outcome = self.refine_dispatch(&run_id, human);
+        self.refine_finish(records, context, op, expected + 1, &run_id, outcome)
+    }
+
+    fn refine_resume(
+        self: &Arc<Self>,
+        records: &RecordStore,
+        _install: &str,
+        context: &str,
+        message_id: &str,
+        op: &Value,
+    ) -> Result<Value> {
+        let run_id = op["result"]["run_id"]
+            .as_str()
+            .ok_or_else(|| Error::rejected("reference edit run is not pinned"))?
+            .to_owned();
+        let input = op
+            .get("_input")
+            .ok_or_else(|| Error::rejected("assistant operation input is unavailable"))?;
+        let (asset_id, revision, sha256, _) = refine_input(input)?;
+        self.refine_turn_pin(message_id, asset_id, revision, sha256)?;
+        self.refine_source_current(asset_id, revision, sha256)?;
+        let expected = op["revision"]
+            .as_i64()
+            .ok_or_else(|| Error::rejected("assistant operation revision is unavailable"))?;
+        // Acting human stays unset: dispatch re-reads the sealed approver.
+        let outcome = self.refine_dispatch(&run_id, None);
+        self.refine_finish(records, context, op, expected, &run_id, outcome)
+    }
+
+    fn refine_dispatch(&self, run_id: &str, acting: Option<&Value>) -> Result<Value> {
+        let shown = self.store.app_run_show(run_id)?;
+        if shown["state"] == "succeeded" {
+            return Ok(shown);
+        }
+        self.dispatch_app_run_as(run_id, acting)
+    }
+
+    /// The invoking message's one durable library pin. Caller image fields
+    /// are not authority; they must equal this stored selector.
+    fn refine_turn_pin(
+        &self,
+        message_id: &str,
+        asset_id: &str,
+        revision: i64,
+        sha256: &str,
+    ) -> Result<()> {
+        let pinned = self.store.message_media_refs(message_id)?;
+        let rows = pinned
+            .as_ref()
+            .and_then(Value::as_array)
+            .filter(|rows| rows.len() == 1)
+            .ok_or_else(|| {
+                Error::rejected(
+                    "refinement needs exactly one library image on the invoking message",
+                )
+            })?;
+        let row = rows[0].as_object().filter(|row| {
+            row.len() == 3
+                && row.contains_key("asset_id")
+                && row.contains_key("revision")
+                && row.contains_key("sha256")
+        });
+        let Some(row) = row else {
+            return Err(Error::rejected(
+                "refinement image pin is not a durable library reference",
+            ));
+        };
+        if row["asset_id"].as_str() != Some(asset_id)
+            || row["revision"].as_i64() != Some(revision)
+            || row["sha256"].as_str() != Some(sha256)
+        {
+            return Err(Error::rejected(
+                "refinement source is not the library image pinned to this turn",
+            ));
+        }
+        Ok(())
+    }
+
+    fn refine_finish(
+        &self,
+        records: &RecordStore,
+        context: &str,
+        op: &Value,
+        expected: i64,
+        run_id: &str,
+        outcome: Result<Value>,
+    ) -> Result<Value> {
+        use crate::store::app_records::AssistantOperationUpdate as Update;
+        let operation_id = required_str(op, "id")?;
+        let input = op
+            .get("_input")
+            .ok_or_else(|| Error::rejected("assistant operation input is unavailable"))?;
+        let asset_id = required_str(input, "asset_id")?;
+        let sha256 = required_str(input, "sha256")?;
+        let failure = outcome.as_ref().err().map(ToString::to_string);
+        let (status, summary, result, error) = match outcome {
+            Ok(run) => {
+                let linked = self.store.app_media_lineage_for_run(run_id)?;
+                let matched = linked.as_ref().is_some_and(|row| {
+                    row["source_asset_id"] == asset_id && row["source_sha256"] == sha256
+                });
+                let body = json!({
+                    "run_id": run_id,
+                    "run_state": run["state"],
+                    "source_asset_id": asset_id,
+                    "result_asset_id": linked.as_ref().and_then(|row| row["asset_id"].as_str()),
+                    "result_revision": linked.as_ref().and_then(|row| row["revision"].as_i64()),
+                    "lineage": linked,
+                });
+                if run["state"] == "succeeded" && matched {
+                    (
+                        "succeeded",
+                        "Retained a new image linked to the source".to_owned(),
+                        body,
+                        None,
+                    )
+                } else {
+                    (
+                        "unknown",
+                        "The reference edit did not retain this run's linked image".to_owned(),
+                        body,
+                        Some("linked catalog image was not recorded for this run"),
+                    )
+                }
+            }
+            Err(error) => {
+                let unknown = error.kind() != "rejected";
+                (
+                    if unknown { "unknown" } else { "failed" },
+                    if unknown {
+                        "Reference edit outcome is uncertain; retry reuses the same run".to_owned()
+                    } else {
+                        "Reference edit was refused".to_owned()
+                    },
+                    json!({"run_id": run_id, "source_asset_id": asset_id}),
+                    failure.as_deref(),
+                )
+            }
+        };
+        let done = records.app_assistant_operation_set(Update {
+            operation_id,
+            context,
+            expected_revision: expected,
+            status,
+            summary: &summary,
+            result: &result,
+            resource_refs: &json!([{"kind":"media","id":asset_id,"label":"Library image"}]),
+            permission_request: &Value::Null,
+            error,
+        })?;
+        Ok(json!({"operation": public_operation(done)}))
+    }
+}
+
+/// Canonical owner for a decision. Absent `public_session` is the
+/// credential-less local operator. A present proof is re-read from the
+/// daemon's own session row; frame human fields are not accepted.
+fn decision_human(shared: &Shared, params: &Value, peer_pid: u32) -> Result<Option<Value>> {
+    match params.get("public_session") {
+        None => Ok(None),
+        Some(_) => {
+            if shared.slot_identity(peer_pid)?.is_some() {
+                return Err(Error::rejected(
+                    "agent connections cannot carry a board owner's proof",
+                ));
+            }
+            Ok(shared.verified_owner_human(params)?.map(|human| {
+                json!({
+                    "sub": human["sub"],
+                    "company": human["company"],
+                    "session": human["session"],
+                    "role": human["role"],
+                    "display": human["display"],
+                })
+            }))
+        }
+    }
+}
+
+fn refine_input(input: &Value) -> Result<(&str, i64, &str, &str)> {
+    let asset_id = required_str(input, "asset_id")?;
+    let revision = input["revision"]
+        .as_i64()
+        .filter(|revision| *revision >= 1)
+        .ok_or_else(|| Error::rejected("library image revision must be positive"))?;
+    let sha256 = required_str(input, "sha256")?;
+    let hex = sha256.strip_prefix("sha256:").unwrap_or("");
+    if sha256.len() != 71
+        || hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(Error::rejected("library image digest is not canonical"));
+    }
+    let instructions = required_str(input, "instructions")?;
+    if instructions.trim().is_empty() {
+        return Err(Error::rejected("reference instructions are blank"));
+    }
+    Ok((asset_id, revision, sha256, instructions))
 }
 
 fn resource_refs(action: &str, result: &Value) -> Value {

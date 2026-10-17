@@ -28,7 +28,7 @@
 //! malformed stored row refuses the page rather than surfacing forged
 //! fields to a frame.
 
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
 
 use super::{Store, StoreConn, WriteTxn};
@@ -64,6 +64,14 @@ CREATE TABLE IF NOT EXISTS app_media_asset_origins(
     receipt_id TEXT NOT NULL UNIQUE REFERENCES app_capability_results(id));
 ";
 
+/// Additive lineage belongs to a new migration, not the shipped v45 catalog.
+pub(super) const SCHEMA_V50: &str = "
+CREATE TABLE IF NOT EXISTS app_media_lineage(
+    asset_id TEXT PRIMARY KEY REFERENCES app_media_assets(id),
+    source_asset_id TEXT NOT NULL REFERENCES app_media_assets(id),
+    source_sha256 TEXT NOT NULL);
+";
+
 /// The daemon-minted id grammar — `med-` + 32 lowercase hex. A stored
 /// row carrying anything else is refused rather than projected.
 pub fn valid_id(id: &str) -> bool {
@@ -85,6 +93,7 @@ pub struct MediaAsset {
     pub creator: String,
     pub created: f64,
     pub updated: f64,
+    pub source_asset_id: Option<String>,
 }
 
 const TITLE_MAX: usize = 200;
@@ -306,6 +315,10 @@ impl MediaAsset {
             || !matches!(self.kind.as_str(), "image" | "video")
             || !matches!(self.lifecycle.as_str(), "draft" | "published")
             || self.revision <= 0
+            || self
+                .source_asset_id
+                .as_deref()
+                .is_some_and(|id| !valid_id(id))
             || !self.created.is_finite()
             || !self.updated.is_finite()
         {
@@ -320,7 +333,7 @@ impl MediaAsset {
     /// The bounded catalog projection — the fields `app_media_read` may
     /// emit. No locator, secret, prompt or byte ever appears here.
     pub fn projection(&self) -> Value {
-        json!({
+        let mut out = json!({
             "id": self.id,
             "title": self.title,
             "kind": self.kind,
@@ -331,7 +344,11 @@ impl MediaAsset {
                 .unwrap_or_else(|_| json!({"kind": "unknown"})),
             "created": self.created,
             "updated": self.updated,
-        })
+        });
+        if let Some(source) = &self.source_asset_id {
+            out["lineage"] = json!([source]);
+        }
+        out
     }
 }
 
@@ -390,19 +407,19 @@ impl Store {
         let conn = self.conn();
         let rows = match after {
             Some((created, id)) => conn.query_vec(
-                "SELECT id,install_id,title,kind,lifecycle,revision,creator,created,updated
-                 FROM app_media_assets
-                 WHERE created < ?1 OR (created = ?1 AND id > ?2)
-                 ORDER BY created DESC, id ASC LIMIT ?3",
+                "SELECT a.id,a.install_id,a.title,a.kind,a.lifecycle,a.revision,a.creator,a.created,a.updated,l.source_asset_id
+                 FROM app_media_assets a LEFT JOIN app_media_lineage l ON l.asset_id=a.id
+                 WHERE a.created < ?1 OR (a.created = ?1 AND a.id > ?2)
+                 ORDER BY a.created DESC, a.id ASC LIMIT ?3",
                 params![created, id, limit + 1],
-                row_media_asset,
+                row_media_catalog,
             )?,
             None => conn.query_vec(
-                "SELECT id,install_id,title,kind,lifecycle,revision,creator,created,updated
-                 FROM app_media_assets
-                 ORDER BY created DESC, id ASC LIMIT ?1",
+                "SELECT a.id,a.install_id,a.title,a.kind,a.lifecycle,a.revision,a.creator,a.created,a.updated,l.source_asset_id
+                 FROM app_media_assets a LEFT JOIN app_media_lineage l ON l.asset_id=a.id
+                 ORDER BY a.created DESC, a.id ASC LIMIT ?1",
                 params![limit + 1],
-                row_media_asset,
+                row_media_catalog,
             )?,
         };
         let mut page = Vec::new();
@@ -485,6 +502,7 @@ impl Store {
             creator,
             created: at,
             updated: at,
+            source_asset_id: None,
         }
         .checked()?;
         tx.execute(
@@ -508,6 +526,64 @@ impl Store {
              VALUES(?1,?2)",
             params![asset.id, record.id],
         )?;
+        if record.result.get("source_asset").is_some() {
+            let malformed =
+                || Error::rejected("claimed image lineage is malformed — refusing the receipt");
+            let source = record
+                .result
+                .get("source_asset")
+                .and_then(Value::as_object)
+                .ok_or_else(malformed)?;
+            if source.len() != 3
+                || !source.contains_key("asset_id")
+                || !source.contains_key("sha256")
+                || !source.contains_key("ref")
+            {
+                return Err(malformed());
+            }
+            let source_id = source
+                .get("asset_id")
+                .and_then(Value::as_str)
+                .ok_or_else(malformed)?;
+            let source_sha = source
+                .get("sha256")
+                .and_then(Value::as_str)
+                .ok_or_else(malformed)?;
+            let source_ref = source
+                .get("ref")
+                .and_then(Value::as_str)
+                .ok_or_else(malformed)?;
+            let source_hex = canonical_sha256(source_sha).ok_or_else(malformed)?;
+            let reference_ok = source_ref.split_once('.').is_some_and(|(job, digest)| {
+                valid_media_job_id(job) && digest == source_hex && !source_ref.contains("://")
+            });
+            if !valid_id(source_id) || source_id == asset.id || !reference_ok {
+                return Err(malformed());
+            }
+            let source_revision: i64 = tx
+                .query_opt(
+                    "SELECT revision FROM app_media_assets WHERE id=?1",
+                    params![source_id],
+                    |row| row.get(0),
+                )?
+                .ok_or_else(malformed)?;
+            if source_revision <= 0 {
+                return Err(malformed());
+            }
+            tx.execute(
+                "INSERT INTO app_media_lineage(asset_id,source_asset_id,source_sha256)
+                 VALUES(?1,?2,?3)",
+                params![asset.id, source_id, source_sha],
+            )?;
+            let unchanged: i64 = tx.query_row(
+                "SELECT revision FROM app_media_assets WHERE id=?1",
+                params![source_id],
+                |row| row.get(0),
+            )?;
+            if unchanged != source_revision {
+                return Err(malformed());
+            }
+        }
         Ok(())
     }
 
@@ -555,7 +631,81 @@ impl Store {
     ///
     /// No creator or mount-install partition applies here: the catalog
     /// is store-wide and the caller-side proof lives in the mount.
+    /// CAD-1482: catalog revision plus the stored original digest, with no
+    /// provider traffic. A missing asset, a stale revision or a digest that
+    /// is not the retained original refuses.
+    pub(crate) fn app_media_pin(
+        &self,
+        asset_id: &str,
+        revision: i64,
+        sha256: &str,
+    ) -> Result<MediaOriginalProof> {
+        let image = self.app_media_context_image(asset_id)?;
+        if image.asset.revision != revision || image.original.sha256 != sha256 {
+            return Err(Error::rejected(
+                "media reference does not match the retained original",
+            ));
+        }
+        Ok(image.original)
+    }
+
+    pub(crate) fn app_media_revision(&self, asset_id: &str) -> Result<i64> {
+        self.read_tx(|conn| {
+            conn.query_row(
+                "SELECT revision FROM app_media_assets WHERE id=?1",
+                params![asset_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| Error::rejected("media asset is not in the workspace catalog"))
+        })
+    }
+
+    /// The catalog child recorded for this run's receipt, not the newest
+    /// child of the same source.
+    pub(crate) fn app_media_lineage_for_run(&self, run_id: &str) -> Result<Option<Value>> {
+        self.read_tx(|conn| {
+            let row = conn
+                .query_row(
+                    "SELECT a.id, a.revision, l.source_asset_id, l.source_sha256
+                     FROM app_capability_results r
+                     JOIN app_media_asset_origins o ON o.receipt_id = r.id
+                     JOIN app_media_assets a ON a.id = o.asset_id
+                     LEFT JOIN app_media_lineage l ON l.asset_id = a.id
+                     WHERE r.run_id=?1",
+                    params![run_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            Ok(
+                row.map(|(asset_id, revision, source_asset_id, source_sha256)| {
+                    json!({
+                        "asset_id": asset_id,
+                        "revision": revision,
+                        "source_asset_id": source_asset_id,
+                        "source_sha256": source_sha256,
+                    })
+                }),
+            )
+        })
+    }
+
     pub(crate) fn app_media_original(&self, asset_id: &str) -> Result<MediaOriginalProof> {
+        self.app_media_context_image(asset_id)
+            .map(|image| image.original)
+    }
+
+    /// One verified receipt read supplies the original pin and its retained
+    /// display material. A custody derivative need not hash to the original:
+    /// `asset_material_in` proves both through the immutable receipt instead.
+    pub(crate) fn app_media_context_image(&self, asset_id: &str) -> Result<MediaContextImage> {
         self.read_tx(|conn| {
             let row: Option<MediaAsset> = conn.query_opt(
                 "SELECT id,install_id,title,kind,lifecycle,revision,creator,created,updated
@@ -581,8 +731,17 @@ impl Store {
             };
             // Re-proves the receipt's material digest over result AND
             // derivative before a byte is trusted.
-            let (receipt, _derivative) =
+            let (mut receipt, derivative) =
                 super::app_capabilities::asset_material_in(&conn, &receipt_id)?;
+            let Value::String(material_digest) = receipt["asset"]["digest"].take() else {
+                return Err(Error::rejected("retained image digest is malformed"));
+            };
+            let media_type = match receipt["asset"]["media_type"].as_str() {
+                Some("image/png") => "image/png",
+                Some("image/jpeg") => "image/jpeg",
+                Some("image/webp") => "image/webp",
+                _ => return Err(Error::rejected("retained image MIME is malformed")),
+            };
             let result_text: String = conn.query_row(
                 "SELECT result FROM app_capability_results WHERE id=?1",
                 params![receipt_id],
@@ -650,15 +809,21 @@ impl Store {
             let binding: crate::store::app_bindings::BindingProof =
                 serde_json::from_value(frozen.clone())
                     .map_err(|_| Error::rejected("media origin capability binding is malformed"))?;
-            Ok(MediaOriginalProof {
-                install_id: asset.install_id.clone(),
-                context_id: run["context_id"].as_str().map(str::to_string),
-                slot: slot.to_string(),
-                proof: binding,
-                reference: descriptor.reference,
-                sha256: descriptor.sha256,
-                bytes: descriptor.bytes,
-                media_type: descriptor.media_type,
+            Ok(MediaContextImage {
+                original: MediaOriginalProof {
+                    install_id: asset.install_id.clone(),
+                    context_id: run["context_id"].as_str().map(str::to_string),
+                    slot: slot.to_string(),
+                    proof: binding,
+                    reference: descriptor.reference,
+                    sha256: descriptor.sha256,
+                    bytes: descriptor.bytes,
+                    media_type: descriptor.media_type,
+                },
+                asset,
+                media_type,
+                bytes: derivative,
+                digest: material_digest,
             })
         })
     }
@@ -799,6 +964,15 @@ pub(crate) struct MediaOriginalProof {
     pub media_type: String,
 }
 
+/// Authorized display material and its immutable original provenance.
+pub(crate) struct MediaContextImage {
+    pub original: MediaOriginalProof,
+    pub asset: MediaAsset,
+    pub media_type: &'static str,
+    pub bytes: Vec<u8>,
+    pub digest: String,
+}
+
 fn row_media_asset(r: &rusqlite::Row<'_>) -> rusqlite::Result<MediaAsset> {
     Ok(MediaAsset {
         id: r.get(0)?,
@@ -810,5 +984,12 @@ fn row_media_asset(r: &rusqlite::Row<'_>) -> rusqlite::Result<MediaAsset> {
         creator: r.get(6)?,
         created: r.get(7)?,
         updated: r.get(8)?,
+        source_asset_id: None,
     })
+}
+
+fn row_media_catalog(r: &rusqlite::Row<'_>) -> rusqlite::Result<MediaAsset> {
+    let mut asset = row_media_asset(r)?;
+    asset.source_asset_id = r.get(9)?;
+    Ok(asset)
 }

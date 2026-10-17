@@ -13,6 +13,55 @@ use crate::peer::PeerTies;
 pub(super) const MESSAGE_READ_LIMIT: usize = 4_000;
 
 impl Shared {
+    /// One retained library image: `{asset_id, revision, sha256}` proved
+    /// against the catalog and the stored original digest. No bytes move.
+    fn prove_media_refs(&self, value: &Value) -> Result<Value> {
+        let rows = value
+            .as_array()
+            .filter(|rows| rows.len() == 1)
+            .ok_or_else(|| Error::rejected("media_refs takes exactly one library image"))?;
+        let row = rows[0]
+            .as_object()
+            .ok_or_else(|| Error::rejected("media_refs entry must be an object"))?;
+        if row.len() != 3
+            || !row.contains_key("asset_id")
+            || !row.contains_key("revision")
+            || !row.contains_key("sha256")
+        {
+            return Err(Error::rejected("media_refs entry fields are closed"));
+        }
+        let asset_id = row["asset_id"]
+            .as_str()
+            .filter(|id| crate::store::app_media::valid_id(id))
+            .ok_or_else(|| Error::rejected("media_refs asset_id is not a catalog asset id"))?;
+        let revision = row["revision"]
+            .as_i64()
+            .filter(|n| *n > 0)
+            .ok_or_else(|| Error::rejected("media_refs revision must be a positive integer"))?;
+        let sha256 = row["sha256"]
+            .as_str()
+            .filter(|s| {
+                s.strip_prefix("sha256:").is_some_and(|hex| {
+                    hex.len() == 64
+                        && hex
+                            .bytes()
+                            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+                })
+            })
+            .ok_or_else(|| Error::rejected("media_refs sha256 is not a retained digest"))?;
+        let original = self.store.app_media_pin(asset_id, revision, sha256)?;
+        self.with_media_source_current(&original, || {
+            if self.store.app_media_revision(asset_id)? != revision {
+                return Err(Error::rejected("media reference changed before send"));
+            }
+            Ok(json!([{
+                "asset_id": asset_id,
+                "revision": revision,
+                "sha256": sha256,
+            }]))
+        })
+    }
+
     /// `agent_send` without a connection to attribute (unit tests):
     /// a threaded agent records the message as unattributed, and a
     /// steering send is the operator's.
@@ -450,6 +499,15 @@ impl Shared {
                 )?)
             }
         };
+        let media_refs = match params.get("media_refs") {
+            None | Some(Value::Null) => None,
+            Some(_) if sender != store::Sender::OperatorChat => {
+                return Err(Error::rejected(
+                    "media_refs is a thread_send field — only the operator's chat pins a library image",
+                ));
+            }
+            Some(value) => Some(self.prove_media_refs(value)?),
+        };
         // CAD-1098: app conversations are the master's. Another agent has
         // no per-conversation session, so an app binding to it is refused.
         if home_conversation.is_some() && sender != store::Sender::OperatorChat {
@@ -525,6 +583,7 @@ impl Shared {
             attachments.as_ref(),
             home_conversation.as_deref(),
             human,
+            media_refs.as_ref(),
         )?;
         // Each superseded row's `reply_to` got a notice in the same
         // transaction — wake those recipients like `message cancel` does.

@@ -370,7 +370,7 @@ await React.act(async () => {
   navigate(`/app-installations/install-b?${menuQuery}`);
   shellRoot.render(React.createElement(AppShell, {
     installId: "install-b", viewer: { operator: true, readOnly: false },
-    children: React.createElement("p", null, "Social operational outlet"),
+    children: () => React.createElement("p", null, "Social operational outlet"),
   }));
 });
 await flush(); await flush(); await flush();

@@ -170,6 +170,25 @@ pub(super) fn handle(
     route: Route<'_>,
     query: &str,
 ) -> HttpResp {
+    handle_with_relay(
+        request,
+        state,
+        route,
+        query,
+        super::operator::PublicRelay::NotPublic,
+    )
+}
+
+/// CAD-1374: decisions on the public host relay the request's own session
+/// bearer. Local operator connections stay credential-less. The frame body
+/// cannot name a human.
+pub(super) fn handle_with_relay(
+    request: &mut Request,
+    state: &Path,
+    route: Route<'_>,
+    query: &str,
+    relay: super::operator::PublicRelay,
+) -> HttpResp {
     match route {
         Route::Actions(install) | Route::Operations(install) | Route::Permissions(install) => {
             if request.method().as_str() != "GET" {
@@ -210,13 +229,13 @@ pub(super) fn handle(
                 Err(response) => return response,
             };
             match stored_context(state, install, true, id) {
-                Ok(context) => call(
-                    state,
-                    install,
-                    &context,
-                    "app_assistant_decision",
-                    json!({"operation_id":id,"decision":value.decision,"expected_revision":value.expected_revision}),
-                ),
+                Ok(context) => {
+                    let mut params = json!({"operation_id":id,"decision":value.decision,"expected_revision":value.expected_revision});
+                    if let Err(response) = super::operator::relay_owner_proof(&mut params, relay) {
+                        return response;
+                    }
+                    call(state, install, &context, "app_assistant_decision", params)
+                }
                 Err(response) => response,
             }
         }

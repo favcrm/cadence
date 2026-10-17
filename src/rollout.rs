@@ -64,7 +64,8 @@ use crate::store::{self, Store};
 /// bootstrap state, template version and revision columns on the `assistants`
 /// binding row.
 /// v49 (CAD-914) adds resumable wiki transfer jobs and entry progress.
-pub const SCHEMA_VERSION: i64 = 49;
+/// v50 (CAD-1482) adds retained image source lineage.
+pub const SCHEMA_VERSION: i64 = 50;
 
 /// Last schema that has no lease table. The bootstrap opt-in covers
 /// only this version.

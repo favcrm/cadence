@@ -49,6 +49,7 @@ import { forgetContext, initialContext, rememberedContext, rememberContext, scre
 import { promptError } from "./promptFields";
 import "./workspace-apps.css";
 import ScreenHost from "./screen/ScreenHost";
+import type { MediaChatAttach } from "./screen/screenLifecycle";
 import { makePlanner, runCall, type ActionContext } from "./screen/screenActions";
 import { useScreenExtras } from "./screen/useScreenExtras";
 import { screenTag, screenProjection, settleIntentRead, type IntentRead } from "./screen/screenProjection";
@@ -229,11 +230,13 @@ export default function WorkspaceApp({
   viewer,
   onBack,
   appKey,
+  onMediaAttach,
 }: {
   installId: string;
   viewer: Viewer;
   onBack?: () => void;
   appKey?: string;
+  onMediaAttach?: MediaChatAttach;
 }) {
   const t = useTranslate();
   // CAD-1137: a revisit mounts with the last session's snapshot already
@@ -1040,7 +1043,7 @@ export default function WorkspaceApp({
     />
   );
   const screen = (fallback: React.ReactNode) => projection
-    ? <><ScreenHost projection={projection} fallback={fallback} loadAsset={screenExtras.loadAsset} actions={screenActions} /><Toast msg={connectToastMsg} /></> : <>{fallback}<Toast msg={connectToastMsg} /></>;
+    ? <><ScreenHost projection={projection} fallback={fallback} loadAsset={screenExtras.loadAsset} actions={screenActions} onMediaAttach={onMediaAttach} /><Toast msg={connectToastMsg} /></> : <>{fallback}<Toast msg={connectToastMsg} /></>;
   if (data && !supportsSocialContentWorkspace(data.installation)) {
     return screen(<main className="workspace-app" aria-label="Workspace app">
       <header className="wa-header"><h1>{data.installation.title || data.installation.name}</h1><Button href="/apps">All apps</Button></header>

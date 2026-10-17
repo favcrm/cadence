@@ -1028,6 +1028,61 @@ impl ScopedChat {
 }
 
 impl Shared {
+    /// Endpoint-session bind shared with media inspection. Pane ancestry
+    /// alone also derives a `setsid`-detached child that kept the pane on
+    /// its ancestry, so the caller must live in the endpoint's own session.
+    /// Pi's bash tool is the one proved exception: a direct child session
+    /// of the managed endpoint, never a further detached descendant.
+    /// Under a test-seam agent assertion the seam stands in for ancestry.
+    pub(super) fn assigned_agent_endpoint_session(
+        &self,
+        peer_pid: u32,
+        caller: &str,
+        desc: &str,
+    ) -> Result<()> {
+        let seam_agent = matches!(
+            crate::test_seam::asserted(),
+            Some(crate::test_seam::Asserted::Agent(ref alias)) if alias == caller
+        );
+        if seam_agent {
+            return Ok(());
+        }
+        let caller_session = crate::peer::proc_session(peer_pid)
+            .map_err(|_| Error::rejected(format!("{desc} caller session is unreadable")))?;
+        let inside = match self.slot_identity(peer_pid)? {
+            Some(SlotWho::Strict(proof)) => {
+                let root = *proof
+                    .segment
+                    .last()
+                    .ok_or_else(|| Error::rejected(format!("{desc} endpoint ancestry is empty")))?;
+                let endpoint_session = crate::peer::proc_session(root).map_err(|_| {
+                    Error::rejected(format!("{desc} endpoint session is unreadable"))
+                })?;
+                proof.lane == caller
+                    && (caller_session == endpoint_session
+                        || self.pi_bash_tool_session(caller, &proof, caller_session)?)
+            }
+            Some(SlotWho::Pane { lane, .. }) => {
+                if lane != caller {
+                    false
+                } else {
+                    let row = self.store.agent(caller)?;
+                    match row.pid.and_then(|pid| u32::try_from(pid).ok()) {
+                        Some(pane) => crate::peer::proc_session(pane).ok() == Some(caller_session),
+                        None => false,
+                    }
+                }
+            }
+            None => false,
+        };
+        if !inside {
+            return Err(Error::rejected(
+                "detached child is outside the assigned agent endpoint session",
+            ));
+        }
+        Ok(())
+    }
+
     /// The shared CAD-813/CAD-1014(b) scoped-chat redeem gate. `desc`
     /// names the verb in refusal text. Returns the connection-derived
     /// caller and the stamped install/context; a detached child, an
@@ -1064,46 +1119,7 @@ impl Shared {
         // a test-seam agent assertion the seam stands in for ancestry
         // (production builds carry no seam) and only the turn proofs
         // below decide.
-        let seam_agent = matches!(
-            crate::test_seam::asserted(),
-            Some(crate::test_seam::Asserted::Agent(ref alias)) if alias == &caller
-        );
-        if !seam_agent {
-            let caller_session = crate::peer::proc_session(peer_pid)
-                .map_err(|_| Error::rejected(format!("{desc} caller session is unreadable")))?;
-            let inside = match self.slot_identity(peer_pid)? {
-                Some(SlotWho::Strict(proof)) => {
-                    let root = *proof.segment.last().ok_or_else(|| {
-                        Error::rejected(format!("{desc} endpoint ancestry is empty"))
-                    })?;
-                    let endpoint_session = crate::peer::proc_session(root).map_err(|_| {
-                        Error::rejected(format!("{desc} endpoint session is unreadable"))
-                    })?;
-                    proof.lane == caller
-                        && (caller_session == endpoint_session
-                            || self.pi_bash_tool_session(&caller, &proof, caller_session)?)
-                }
-                Some(SlotWho::Pane { lane, .. }) => {
-                    if lane != caller {
-                        false
-                    } else {
-                        let row = self.store.agent(&caller)?;
-                        match row.pid.and_then(|pid| u32::try_from(pid).ok()) {
-                            Some(pane) => {
-                                crate::peer::proc_session(pane).ok() == Some(caller_session)
-                            }
-                            None => false,
-                        }
-                    }
-                }
-                None => false,
-            };
-            if !inside {
-                return Err(Error::rejected(
-                    "detached child is outside the assigned agent endpoint session",
-                ));
-            }
-        }
+        self.assigned_agent_endpoint_session(peer_pid, &caller, desc)?;
         let install = required_str(params, "install_id")?;
         crate::proto::identifier(install, "installation ID")?;
         let context = required_str(params, "context_id")?;

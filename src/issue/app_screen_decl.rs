@@ -85,6 +85,8 @@ pub const MAY_TOOLS_INVOKE: &str = "tools.invoke";
 /// CAD-1365: the workspace media-catalog read permission a
 /// `screen-media.v1` screen may declare.
 pub const MAY_MEDIA_READ: &str = "media.read";
+/// Composer handoff for one retained library image. Media contract only.
+pub const MAY_MEDIA_CHAT_ATTACH: &str = "media.chat.attach";
 /// CAD-1365: the workspace media-catalog publish permission a
 /// `screen-media.v1` screen may declare — the draft→published
 /// metadata mutation `app_media_publish` serves. Read rights alone
@@ -739,7 +741,11 @@ fn check_declaration(decl: &RawDecl) -> Result<()> {
                 matches!(name, MAY_RECORDS_CALL | MAY_RECORDS_SLOT)
             } else {
                 name == MAY_TOOLS_INVOKE
-                    || (media_contract && matches!(name, MAY_MEDIA_READ | MAY_MEDIA_PUBLISH))
+                    || (media_contract
+                        && matches!(
+                            name,
+                            MAY_MEDIA_READ | MAY_MEDIA_PUBLISH | MAY_MEDIA_CHAT_ATTACH
+                        ))
             };
         if !granted {
             return Err(Error::rejected(format!(

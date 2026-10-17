@@ -1314,7 +1314,7 @@ function WorkspaceAppEntry({
       viewer={viewer}
       onInstallation={onInstallation}
     >
-      <WorkspaceApp installId={installation.install_id} appKey={appKey} viewer={viewer} onBack={onBack} />
+      {(onMediaAttach) => <WorkspaceApp installId={installation.install_id} appKey={appKey} viewer={viewer} onBack={onBack} onMediaAttach={onMediaAttach} />}
     </AppShell>
   );
 }

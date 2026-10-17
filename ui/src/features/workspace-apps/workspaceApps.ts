@@ -340,8 +340,13 @@ export const workspaceApps = {
    *  `{action_token, input}`; the route refuses any scope/credential
    *  field and adds the proven session itself. */
   mediaRead: (body: { action_token: string; input: Record<string, unknown> }) =>
-    request<{ assets: Record<string, unknown>[]; next_cursor: string | null; current_actor: Record<string, unknown> }>(
+    request<Record<string, unknown>>(
       "/api/app-media/read", undefined, body),
+  mediaChatAttach: (body: { action_token: string; asset_id: string; expected_revision: number; conversation_id: string | null }) =>
+    request<{ asset_id: string; revision: number; host_command: {
+      operation: "media.chat.attach"; conversation_id: string | null;
+      args: { install_id: string; context_id: string; asset_id: string; revision: number; sha256: string; media_type: string; title: string; preview: string };
+    } }>("/api/app-media/chat-attach", undefined, body),
   /** CAD-1365: `media.publish` relay — the frozen curation intent
    *  `{action_token, asset_id, expected_revision, request_id}` only. */
   mediaPublish: (body: { action_token: string; asset_id: string; expected_revision: number; request_id: string }) =>

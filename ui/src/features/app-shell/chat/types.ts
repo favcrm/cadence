@@ -9,3 +9,10 @@ export interface ChatBinding {
   scope: ChatScope | null;
   error: string | null;
 }
+
+/** Private host target registered by the pane that owns the real draft. */
+export interface MediaComposerTarget {
+  composerKey: string;
+  conversationId: string | null;
+  scope: ChatScope;
+}

@@ -4,7 +4,6 @@ pub(super) mod accept_wait;
 
 use super::*;
 
-use super::app_media_rpc::OriginalDelivery;
 use std::cell::Cell;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write};
@@ -281,12 +280,70 @@ pub(super) fn handle_conn(shared: Arc<Shared>, stream: UnixStream) {
         // header is an ordinary `proto::err` line with no binary tail,
         // and once the header has started a write failure closes the
         // connection — a JSON error is never appended to partial bytes.
-        let is_original = serde_json::from_str::<Value>(&line)
+        let framed_method = serde_json::from_str::<Value>(&line)
             .ok()
             .as_ref()
             .and_then(|frame| frame.get("method"))
             .and_then(Value::as_str)
-            == Some("app_media_original");
+            .map(str::to_string);
+        if framed_method.as_deref() == Some("app_media_inspect") {
+            let mut header_started = false;
+            if writer.get_ref().set_nonblocking(true).is_err() {
+                break;
+            }
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let outcome = serde_json::from_str::<Value>(&line)
+                .map_err(|_| Error::rejected("Request must be one JSON object per line"))
+                .and_then(|frame| {
+                    let params = frame.get("params").cloned().unwrap_or(json!({}));
+                    let _scope = crate::test_seam::scope_frame(shared.seam.as_ref(), &frame)?;
+                    shared.master_policy("app_media_inspect", &params, peer.pid)?;
+                    if shared.execution_mode.fenced()
+                        && !crate::backup::portable_fence::allows("app_media_inspect")
+                    {
+                        return Err(crate::backup::portable_fence::fence_refusal(
+                            "app_media_inspect",
+                        ));
+                    }
+                    shared.rpc_app_media_inspect_stream(
+                        &params,
+                        peer.pid,
+                        |header, bytes, delivery| {
+                            let mut line = proto::ok(header.clone()).to_string();
+                            line.push('\n');
+                            write_media_guarded(
+                                |socket, chunk| delivery.with_current(|| socket.write(chunk)),
+                                writer.get_mut(),
+                                line.as_bytes(),
+                                deadline,
+                                &mut header_started,
+                            )?;
+                            write_media_guarded(
+                                |socket, chunk| delivery.with_current(|| socket.write(chunk)),
+                                writer.get_mut(),
+                                bytes,
+                                deadline,
+                                &mut header_started,
+                            )
+                        },
+                    )
+                });
+            match outcome {
+                Ok(()) => break,
+                Err(_) if header_started => break,
+                Err(error) => {
+                    let mut frame = proto::err(&error).to_string();
+                    frame.push('\n');
+                    let _ = client::write_bounded(
+                        writer.get_ref().as_raw_fd(),
+                        frame.as_bytes(),
+                        deadline,
+                    );
+                    break;
+                }
+            }
+        }
+        let is_original = framed_method.as_deref() == Some("app_media_original");
         if is_original {
             let mut header_started = false;
             // This connection ends with the reply and no further request
@@ -319,15 +376,15 @@ pub(super) fn handle_conn(shared: Arc<Shared>, stream: UnixStream) {
                         |header, bytes, delivery| {
                             let mut line = proto::ok(header.clone()).to_string();
                             line.push('\n');
-                            write_original_guarded(
-                                delivery,
+                            write_media_guarded(
+                                |socket, chunk| delivery.with_current(|| socket.write(chunk)),
                                 writer.get_mut(),
                                 line.as_bytes(),
                                 deadline,
                                 &mut header_started,
                             )?;
-                            write_original_guarded(
-                                delivery,
+                            write_media_guarded(
+                                |socket, chunk| delivery.with_current(|| socket.write(chunk)),
                                 writer.get_mut(),
                                 bytes,
                                 deadline,
@@ -386,13 +443,13 @@ pub(super) fn handle_conn(shared: Arc<Shared>, stream: UnixStream) {
     }
 }
 
-/// CAD-1365: one original reply segment on a nonblocking socket. Each
-/// chunk is a single `delivery.with_current` send, so authority is
+/// One governed image reply segment on a nonblocking socket. Each
+/// chunk passes its authority guard, so authority is
 /// re-proven before every write. `WouldBlock` waits outside every guard
 /// for at most 100ms (a cancellation point) under the absolute deadline,
 /// then the authority is checked again. `sent` is set on the first byte.
-fn write_original_guarded(
-    delivery: &OriginalDelivery<'_>,
+fn write_media_guarded(
+    mut send: impl FnMut(&mut UnixStream, &[u8]) -> Result<std::io::Result<usize>>,
     writer: &mut UnixStream,
     mut bytes: &[u8],
     deadline: Instant,
@@ -405,7 +462,7 @@ fn write_original_guarded(
             return Err(Error::internal("media original delivery deadline reached"));
         }
         let chunk = &bytes[..bytes.len().min(CHUNK)];
-        match delivery.with_current(|| writer.write(chunk))? {
+        match send(writer, chunk)? {
             Ok(0) => return Err(Error::internal("media original socket closed mid-write")),
             Ok(n) => {
                 *sent = true;

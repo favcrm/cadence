@@ -81,7 +81,7 @@ import { hideIds, matchDirective, type Directive } from "./directive";
 import { planFrames, type FrameRow } from "./frames";
 import type { FileUploadProjection } from "./descriptorClient";
 import type { AttachDestination } from "./attach";
-import type { ChatBinding } from "./types";
+import type { ChatBinding, MediaComposerTarget } from "./types";
 
 /**
  * The host's ONE Conversation (CAD-1108): Home and every installed app render
@@ -170,6 +170,7 @@ export interface AppPaneProps {
   onCollapsed: (next: boolean) => void;
   /** The shell's own navigation for the `open-view` card action. */
   onOpenView: (view: string) => void;
+  onMediaTarget?: (target: MediaComposerTarget) => () => void;
 }
 
 export default function Conversation(props: HomeListProps | AppPaneProps) {
@@ -319,7 +320,7 @@ function AppRow({
  * carry the route's installation and context; the daemon proves both and
  * stamps the verified binding on the entry.
  */
-function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, collapsed, onCollapsed, onOpenView }: AppPaneProps) {
+function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, collapsed, onCollapsed, onOpenView, onMediaTarget }: AppPaneProps) {
   const { t, formatNumber } = useLocale();
   const { installId, descriptor } = mode;
   const fileUpload = mode.fileUpload ?? { declared: false, available: false };
@@ -545,6 +546,17 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     active.requestError === null &&
     !active.requestPending &&
     binding.error === null;
+  const mediaTargetReady = canCreate && usable;
+  const mediaInstallId = binding.scope?.install_id ?? null;
+  const mediaContextId = binding.scope?.context_id ?? null;
+  useLayoutEffect(() => {
+    if (!mediaTargetReady || !mediaInstallId || !mediaContextId || !onMediaTarget) return;
+    return onMediaTarget({
+      composerKey,
+      conversationId: convId,
+      scope: { install_id: mediaInstallId, context_id: mediaContextId },
+    });
+  }, [onMediaTarget, mediaTargetReady, composerKey, convId, mediaInstallId, mediaContextId]);
   const capturedBinding = composerScope(composerKey);
   const uploadScope = capturedBinding === undefined ? frameScope : capturedBinding;
   const attachEnabled =
@@ -704,6 +716,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       attachments?: { id: string }[],
       app?: { install_id: string; context_id?: string },
       operation?: PrivateOperation,
+      mediaRefs?: { asset_id: string; revision: number; sha256: string }[],
     ) => {
       const origin = { key: composerKeyRef.current, visit: visitRef.current, frame: frameRef.current };
       const ownedAt = dest.get().data?.pending.find((row) => row.message === message)?.at;
@@ -717,7 +730,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         const onAbort = () => releaseAbandoned();
         op.signal.addEventListener("abort", onAbort);
         try {
-          await api.threadSend(MASTER, body, message, refs, app, id ?? undefined, attachments, op);
+          await api.threadSend(MASTER, body, message, refs, app, id ?? undefined, attachments, op, mediaRefs);
           op.assertCurrent();
           dest.write((s) => settlePending(s, message, { ok: true }));
           void resources.masterState.refresh();
@@ -777,6 +790,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         envelope.attachments,
         envelope.app,
         operation,
+        envelope.mediaRefs,
       );
     },
     [deliver],
@@ -863,7 +877,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     });
   };
 
-  const send = (body: string, refs: ThreadRef[], attachments?: { id: string }[]): Promise<void> => {
+  const send = (body: string, refs: ThreadRef[], attachments?: { id: string }[], mediaRefs?: { asset_id: string; revision: number; sha256: string }[]): Promise<void> => {
     if (!canSend) return Promise.reject(new Error("sending is unavailable"));
     if (parseSlash(body) === "new") {
       // A command, never a message: nothing is sent to the assistant.
@@ -899,6 +913,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
       text: body,
       refs,
       attachments,
+      mediaRefs,
       app: captured === undefined ? sendApp : (captured ?? undefined),
       subject: draftSubject ?? undefined,
       at: Date.now(),
@@ -1439,7 +1454,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
         block={canSend && binding.error === null ? null : "read-only"}
         blockedPlaceholder={binding.error ?? sendBlockedReason}
         storeKey={composerKey}
-        onSend={({ body, refs, attachments }) => send(body, refs, attachments)}
+        onSend={({ body, refs, attachments, mediaRefs }) => send(body, refs, attachments, mediaRefs)}
         onCommand={(name) => {
           if (name === "new" || name === "clear") startNew();
           else setComposerNotice({ key: 'Unsupported command "/{name}" — it was not sent', slots: { name } });

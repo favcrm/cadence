@@ -12,8 +12,9 @@ import { screenTag } from "../workspace-apps/screen/screenProjection";
 import { initialContext, rememberedContext, rememberContext, subscribeContext } from "../workspace-apps/contextSelection";
 import CrmOutlet, { type CrmSection, type OutletView } from "./CrmOutlet";
 import Conversation from "./chat/Conversation";
+import { beginLibraryImagePin, composerScope, settleLibraryImagePin } from "./chat/composerStore";
 import { useAppChatProjection } from "./chat/descriptorClient";
-import type { ChatBinding, ChatScope } from "./chat/types";
+import type { ChatBinding, ChatScope, MediaComposerTarget } from "./chat/types";
 import { assertRecordId, type HostScope } from "./hostActions";
 import { isDev } from "../../env";
 import AppViewContractPreview, { contractPreviewHref, contractPreviewKey } from "./app-views/AppViewContractPreview";
@@ -22,6 +23,7 @@ import { installedAppHref } from "../apps/appViewModel";
 import { useLocale } from "../../lib/locale";
 import { InstalledScreenOutlet } from "../workspace-apps/screen/ScreenHost";
 import type { ScreenNavigation } from "../workspace-apps/screen/screenProtocol";
+import type { MediaChatAttach } from "../workspace-apps/screen/screenLifecycle";
 import { parseRoutePatch, type RoutePatch } from "../workspace-apps/screen/screenRoute";
 import type { HostCommand } from "../workspace-apps/screen/screenServices";
 import { purgeDisplayCache } from "../workspace-apps/screen/screenDisplayCache";
@@ -139,8 +141,8 @@ export default function AppShell({
 }: {
   installId: string;
   viewer: Viewer;
-  /** Social-content's existing screen; other Apps use the generic outlet. */
-  children?: React.ReactNode;
+  /** Installed screen receives only the trusted native chat handoff. */
+  children?: (onMediaAttach: MediaChatAttach) => React.ReactNode;
   /** Board menu wiring: receives the verified installation (or null
    *  while loading, failed, or switched away). The parent matches
    *  installId to its route and compares values before storing. */
@@ -244,6 +246,11 @@ export default function AppShell({
   // Assistant | Workspace switch). Both stay mounted — only CSS hides the
   // other — so draft, stream and workspace state survive switching.
   const [panel, setPanel] = useState<"chat" | "work">("chat");
+  const mediaTarget = useRef<MediaComposerTarget | null>(null);
+  const registerMediaTarget = useCallback((target: MediaComposerTarget) => {
+    mediaTarget.current = target;
+    return () => { if (mediaTarget.current === target) mediaTarget.current = null; };
+  }, []);
   // CAD-1051: desktop rail. Narrow widths keep the drawer above.
   // CAD-1098: collapse state is per app installation.
   const [chatCollapsed, setChatCollapsed] = useChatCollapsed(installId);
@@ -686,6 +693,51 @@ export default function AppShell({
   const screenRoute = (patch: RoutePatch, navigation: ScreenNavigation) => {
     if (receiptReady && contextAdoptionReady && scope.contextId && viewer.operator === true && !viewer.readOnly) writeQuery({ screenRoute: { patch, navigation } }, { replace: patch.replace });
   };
+  const attachMediaReference: MediaChatAttach = async (selected, actionToken, isCurrent) => {
+    const target = mediaTarget.current;
+    if (!isCurrent() || !receiptReady || !contextAdoptionReady || !scope.contextId ||
+        viewer.operator !== true || viewer.readOnly || !target ||
+        target.scope.install_id !== scope.installId || target.scope.context_id !== scope.contextId)
+      throw new Error("The current chat draft is not ready for an image.");
+    const owner = composerScope(target.composerKey);
+    if (owner !== undefined && (owner === null || owner.install_id !== target.scope.install_id ||
+        owner.context_id !== target.scope.context_id))
+      throw new Error("Return to this draft's original app context before attaching an image.");
+    const request = beginLibraryImagePin(target.composerKey);
+    if (request === null) throw new Error("Wait for the current message to finish before attaching an image.");
+    setPanel("chat");
+    setChatCollapsed(false);
+    try {
+      const out = await workspaceApps.mediaChatAttach({
+        action_token: actionToken,
+        asset_id: selected.asset_id,
+        expected_revision: selected.expected_revision,
+        conversation_id: target.conversationId,
+      });
+      const command = out.host_command;
+      const pin = command?.args;
+      if (!isCurrent() || Object.keys(out).sort().join() !== "asset_id,host_command,revision" ||
+          out.asset_id !== selected.asset_id || out.revision !== selected.expected_revision ||
+          !command || Object.keys(command).sort().join() !== "args,conversation_id,operation" ||
+          command.operation !== "media.chat.attach" || command.conversation_id !== target.conversationId ||
+          !pin || Object.keys(pin).sort().join() !== "asset_id,context_id,install_id,media_type,preview,revision,sha256,title" ||
+          pin.install_id !== target.scope.install_id || pin.context_id !== target.scope.context_id ||
+          pin.asset_id !== selected.asset_id || pin.revision !== selected.expected_revision ||
+          typeof pin.sha256 !== "string" || !/^sha256:[a-f0-9]{64}$/.test(pin.sha256) ||
+          !["image/png", "image/jpeg", "image/webp"].includes(pin.media_type) ||
+          typeof pin.title !== "string" || typeof pin.preview !== "string" || pin.preview.length > 131100 ||
+          !/^data:image\/jpeg;base64,[A-Za-z0-9+/]+={0,2}$/.test(pin.preview))
+        throw new Error("The host did not accept that image for this chat.");
+      if (!settleLibraryImagePin(request, {
+        asset_id: pin.asset_id, revision: pin.revision, sha256: pin.sha256,
+        media_type: pin.media_type, title: pin.title || "Library image", preview: pin.preview,
+      })) throw new Error("That image attachment was replaced or removed.");
+      return { asset_id: out.asset_id, revision: out.revision };
+    } catch (error) {
+      settleLibraryImagePin(request, null);
+      throw error;
+    }
+  };
   const screenCommand = (command: HostCommand) => {
     if (!receiptReady || !contextAdoptionReady || !scope.contextId || viewer.operator !== true || viewer.readOnly) return;
     if (command.operation === "smtp.manage") { navigate("/settings/email"); return; }
@@ -849,6 +901,7 @@ export default function AppShell({
             viewer={viewer}
             binding={binding}
             onFileUploadUnavailable={() => void chatProjection.refresh()}
+            onMediaTarget={registerMediaTarget}
             collapsed={chatCollapsed}
             onCollapsed={setChatCollapsed}
             onOpenView={openView}
@@ -1027,11 +1080,11 @@ export default function AppShell({
                   installationKind={installation.name}
                 />
               ) : screenOutlet && children ? (
-                children
+                children(attachMediaReference)
               ) : (
                 <InstalledScreenOutlet installation={installation} contexts={contexts} contextId={scope.contextId}
                   admitted={receiptReady && contextAdoptionReady && viewer.operator === true && !viewer.readOnly}
-                  onRoute={screenRoute} onCommand={screenCommand} onNavigation={setScreenNavigation}
+                  onRoute={screenRoute} onCommand={screenCommand} onNavigation={setScreenNavigation} onMediaAttach={attachMediaReference}
                   fallback={<CrmOutlet
                   key={`${installId}:${contextId}`}
                   scope={scope}

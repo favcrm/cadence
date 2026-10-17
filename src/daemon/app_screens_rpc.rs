@@ -401,6 +401,7 @@ impl Shared {
             .filter(|m| {
                 m.as_str() == crate::issue::app_screen_decl::MAY_MEDIA_READ
                     || m.as_str() == crate::issue::app_screen_decl::MAY_MEDIA_PUBLISH
+                    || m.as_str() == crate::issue::app_screen_decl::MAY_MEDIA_CHAT_ATTACH
             })
             .collect();
         let media = if pkg.host_contract.as_deref()
@@ -561,6 +562,7 @@ impl Shared {
             && pkg.may.iter().any(|m| {
                 m.as_str() == crate::issue::app_screen_decl::MAY_MEDIA_READ
                     || m.as_str() == crate::issue::app_screen_decl::MAY_MEDIA_PUBLISH
+                    || m.as_str() == crate::issue::app_screen_decl::MAY_MEDIA_CHAT_ATTACH
             });
         if pkg.tools.is_empty() && pkg.operations.is_empty() && !media_only {
             return Value::Null;

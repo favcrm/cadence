@@ -382,6 +382,11 @@ pub fn scoped_verb_reference(
             "[{{\"field\": \"{field}\", \"op\": \"eq\", \"value\": \"{value}\"}}]\n"
         ));
     }
+    out.push_str(
+        "Library image: if the turn says a retained image is attached, inspect that image only. \
+         When media.refine.prepare is listed, prepare it with the pinned asset_id, revision, sha256 and the operator's instructions. \
+         Do not invent a description if the runtime cannot see the image.\n",
+    );
     out.push_str("[end scoped chat turn]");
     out
 }

@@ -455,6 +455,7 @@ fn message_entry<'a>(
     app: Option<&Value>,
     attachments: Option<&Value>,
     human: Option<&Value>,
+    media_refs: Option<&Value>,
 ) -> NewEntry<'a> {
     let (role, mut payload) = match sender {
         Sender::Operator | Sender::OperatorChat => (ROLE_OPERATOR, json!({"source": source})),
@@ -491,6 +492,9 @@ fn message_entry<'a>(
     // and recorded only when present.
     if let Some(human) = human {
         payload["human"] = human.clone();
+    }
+    if let Some(media_refs) = media_refs {
+        payload["media_refs"] = media_refs.clone();
     }
     NewEntry {
         role,
@@ -1078,8 +1082,19 @@ impl Store {
         attachments: Option<&Value>,
         human: Option<&Value>,
         conversation: Option<&str>,
+        media_refs: Option<&Value>,
     ) -> Result<()> {
-        let mut entry = message_entry(sender, source, body, id, refs, app, attachments, human);
+        let mut entry = message_entry(
+            sender,
+            source,
+            body,
+            id,
+            refs,
+            app,
+            attachments,
+            human,
+            media_refs,
+        );
         if let Some(conversation) = conversation {
             entry
                 .payload
@@ -1229,6 +1244,19 @@ impl Store {
         id: &str,
     ) -> Result<Option<Value>> {
         Self::entry_payload_field_in(tx, id, "attachments")
+    }
+
+    /// CAD-1481: the library-image selectors pinned on the enqueue note.
+    pub fn message_media_refs(&self, message_id: &str) -> Result<Option<Value>> {
+        let conn = self.conn();
+        Self::entry_payload_field_in(&conn, message_id, "media_refs")
+    }
+
+    pub(super) fn entry_media_refs_in(
+        tx: &impl super::StoreConn,
+        id: &str,
+    ) -> Result<Option<Value>> {
+        Self::entry_payload_field_in(tx, id, "media_refs")
     }
 
     pub(super) fn entry_conversation_in(

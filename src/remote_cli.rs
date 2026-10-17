@@ -1904,6 +1904,8 @@ pub struct AccountImageIdentity {
 #[derive(Debug, Clone)]
 pub enum AccountImageOperation {
     Quote,
+    /// Image-to-image rate. Text-to-image stays `Quote`.
+    QuoteReference,
     Submit {
         input: Value,
         idempotency_key: String,

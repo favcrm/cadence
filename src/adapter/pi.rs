@@ -2080,6 +2080,8 @@ struct Shared {
     /// may reset for. A serialized-body refusal after a tool is never
     /// stored here.
     rejected_turn: Mutex<Option<String>>,
+    /// Native Pi `images` for the next prompt, then cleared.
+    turn_images: Mutex<Vec<Value>>,
 }
 
 struct GuardReceipt {
@@ -2106,7 +2108,7 @@ pub struct PiAdapter {
 
 /// Identity evidence must include an actual namespace and model id;
 /// a display name or a full requested id cannot replace that namespace.
-fn resolved_pi_model(state: &Value) -> Option<(String, &str)> {
+fn pi_model_identity(state: &Value) -> Option<(&str, &str)> {
     let model = state.get("model")?;
     let provider = model.get("provider")?.as_str()?;
     let id = model.get("id")?.as_str()?;
@@ -2118,7 +2120,35 @@ fn resolved_pi_model(state: &Value) -> Option<(String, &str)> {
     {
         return None;
     }
+    Some((provider, id))
+}
+
+fn resolved_pi_model(state: &Value) -> Option<(String, &str)> {
+    let (provider, id) = pi_model_identity(state)?;
     Some((format!("{provider}/{id}"), id))
+}
+
+/// Pi's live model object is the modality contract (`input` contains
+/// `"image"`). A missing list is not vision, and the model id is not a
+/// substitute for that list.
+fn selected_model_admits_image(state: &Value) -> Result<()> {
+    let Some((provider, id)) = pi_model_identity(state) else {
+        return Err(Error::pre_write(
+            "Pi did not identify its selected model, so the attached library image was not sent. The model was left unchanged.",
+        ));
+    };
+    let model = &state["model"];
+    let Some(input) = model.get("input").and_then(Value::as_array) else {
+        return Err(Error::pre_write(
+            "Pi did not report input modalities for the selected model, so the attached library image was not sent. The model was left unchanged.",
+        ));
+    };
+    if input.iter().any(|item| item.as_str() == Some("image")) {
+        return Ok(());
+    }
+    Err(Error::pre_write(format!(
+        "selected model {provider}/{id} admits no image input, so the attached library image was not sent. Choose a model whose reported input modalities include image; this model was left unchanged."
+    )))
 }
 
 impl PiAdapter {
@@ -2146,6 +2176,7 @@ impl PiAdapter {
             guard_ready: AtomicBool::new(false),
             guard_receipts: Mutex::new(HashMap::new()),
             rejected_turn: Mutex::new(None),
+            turn_images: Mutex::new(Vec::new()),
         });
         let routed = Arc::clone(&shared);
         let disconnected = Arc::clone(&shared);
@@ -3112,6 +3143,33 @@ impl ProviderAdapter for PiAdapter {
         initialized
     }
 
+    fn bind_turn_images(&self, images: &[super::TurnImage]) -> Result<()> {
+        if images.is_empty() {
+            self.shared.turn_images.lock().unwrap().clear();
+            return Ok(());
+        }
+        let mut encoded = Vec::with_capacity(images.len());
+        for image in images {
+            if image.bytes.len() > 4 * 1024 * 1024
+                || !matches!(image.media_type, "image/png" | "image/jpeg" | "image/webp")
+            {
+                return Err(Error::pre_write(
+                    "retained image is outside the native prompt bound, so it was not sent",
+                ));
+            }
+            encoded.push(json!({
+                "type": "image",
+                "mimeType": image.media_type,
+                "data": base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    &image.bytes,
+                ),
+            }));
+        }
+        *self.shared.turn_images.lock().unwrap() = encoded;
+        Ok(())
+    }
+
     /// One durable message → one `prompt` command → `agent_settled`.
     /// The response gates acceptance; the settle carries the outcome.
     fn run_turn(
@@ -3133,6 +3191,19 @@ impl ProviderAdapter for PiAdapter {
         _client_message_id: &str,
         on_started: &dyn Fn(&str),
     ) -> Result<TurnResult> {
+        if !self.shared.turn_images.lock().unwrap().is_empty() {
+            let state = match self.checked("get_state", json!({})) {
+                Ok(state) => state,
+                Err(error) => {
+                    self.shared.turn_images.lock().unwrap().clear();
+                    return Err(error);
+                }
+            };
+            if let Err(error) = selected_model_admits_image(&state) {
+                self.shared.turn_images.lock().unwrap().clear();
+                return Err(error);
+            }
+        }
         let generation = self.shared.generation.lock().unwrap().clone();
         let turn_id = registry::PI_MANAGED_TURN_TOKENS.mint(&generation);
         let prompt = &super::with_turn_token(prompt, slot, &turn_id);
@@ -3149,8 +3220,16 @@ impl ProviderAdapter for PiAdapter {
         *self.shared.turn.lock().unwrap() = TurnAcc::default();
         let guarded = self.native_turn_steering();
         if guarded {
-            let binding = self.guard_command("bind", &turn_id, &format!("bind-{turn_id}"), None)?;
+            let binding =
+                match self.guard_command("bind", &turn_id, &format!("bind-{turn_id}"), None) {
+                    Ok(binding) => binding,
+                    Err(error) => {
+                        self.shared.turn_images.lock().unwrap().clear();
+                        return Err(error);
+                    }
+                };
             if binding.get("outcome").and_then(Value::as_str) != Some("bound") {
+                self.shared.turn_images.lock().unwrap().clear();
                 return Err(Error::rejected("Pi runtime refused the new turn binding"));
             }
         }
@@ -3161,8 +3240,28 @@ impl ProviderAdapter for PiAdapter {
         } else {
             prompt.to_string()
         };
-        let resp = self.request("prompt", json!({"message": submitted}))?;
+        let master = self.shared.master.load(Ordering::SeqCst);
+        let mut held = self.shared.turn_images.lock().unwrap();
+        let payload = if held.is_empty() {
+            json!({"message": submitted})
+        } else if master {
+            // A pre-tool history refusal retries this same prompt. Keep the
+            // blocks for that one retry; the worker path cannot retry.
+            json!({"message": submitted, "images": held.clone()})
+        } else {
+            let images = std::mem::take(&mut *held);
+            json!({"message": submitted, "images": images})
+        };
+        drop(held);
+        let resp = match self.request("prompt", payload) {
+            Ok(resp) => resp,
+            Err(error) => {
+                self.shared.turn_images.lock().unwrap().clear();
+                return Err(error);
+            }
+        };
         if resp.get("success").and_then(Value::as_bool) != Some(true) {
+            self.shared.turn_images.lock().unwrap().clear();
             if guarded {
                 // Definite prompt refusal can leave an unused pending binding.
                 // Clear only that exact unused binding, never an active run.
@@ -3233,17 +3332,24 @@ impl ProviderAdapter for PiAdapter {
             }
         })();
         *self.shared.active_turn.lock().unwrap() = None;
-        let mut acc = waited?;
+        let mut acc = match waited {
+            Ok(acc) => acc,
+            Err(error) => {
+                self.shared.turn_images.lock().unwrap().clear();
+                return Err(error);
+            }
+        };
         if guarded {
             // The actor cannot dispatch its next kickoff until this returns.
             // Settlement has closed runtime admission. Clear any accepted but
             // unconsumed native input left by cancellation before a successor.
             // An uncertain cleanup fences the kickoff rather than risking replay.
-            self.checked("clear_queue", json!({})).map_err(|error| {
-                Error::unknown(format!(
+            if let Err(error) = self.checked("clear_queue", json!({})) {
+                self.shared.turn_images.lock().unwrap().clear();
+                return Err(Error::unknown(format!(
                     "Pi native input cleanup was not confirmed: {error}"
-                ))
-            })?;
+                )));
+            }
         }
         let interrupted_here = self.shared.interrupt_at.lock().unwrap().take().is_some();
         let master = self.shared.master.load(Ordering::SeqCst);
@@ -3258,6 +3364,9 @@ impl ProviderAdapter for PiAdapter {
             );
         }
         *self.shared.rejected_turn.lock().unwrap() = settled.reset_session.then(|| turn_id.clone());
+        if !settled.reset_session {
+            self.shared.turn_images.lock().unwrap().clear();
+        }
         Ok(TurnResult {
             turn_id,
             status: settled.status.to_string(),
@@ -3393,6 +3502,7 @@ impl ProviderAdapter for PiAdapter {
         // A reset that did not happen is no reset: the turn keeps the
         // provider's own error, and the daemon does not retry.
         if let Err(e) = self.checked("new_session", json!({})) {
+            self.shared.turn_images.lock().unwrap().clear();
             self.shared.emit(
                 "cadence/pi_session_reset_failed",
                 &json!({"turn": result.turn_id, "error": e.to_string()}),

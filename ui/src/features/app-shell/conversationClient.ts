@@ -322,6 +322,7 @@ export interface OutboxEnvelope {
   text: string;
   refs?: ThreadRef[];
   attachments?: { id: string }[];
+  mediaRefs?: { asset_id: string; revision: number; sha256: string }[];
   app?: { install_id: string; context_id?: string };
   /** The unsaved subject this envelope was submitted under — a retry
    *  creates/opens THIS subject, never the route's current one. */

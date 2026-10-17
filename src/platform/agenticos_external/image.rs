@@ -253,6 +253,47 @@ fn decode_limits() -> image::Limits {
     limits
 }
 
+/// A small, local display derivative of already-proven retained image material.
+/// Reuse custody decode limits; never fetch or expose an original locator.
+pub(crate) fn preview_jpeg(bytes: &[u8], media_type: &str) -> Result<Vec<u8>, Fault> {
+    if bytes.len() > ASSET_LIMIT {
+        return Err((
+            ImageFault::TooLarge,
+            "retained preview exceeds custody limits",
+        ));
+    }
+    let format = match media_type {
+        "image/png" => image::ImageFormat::Png,
+        "image/jpeg" => image::ImageFormat::Jpeg,
+        _ => return Err((ImageFault::Decode, "preview requires a PNG or JPEG image")),
+    };
+    let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
+    reader.limits(decode_limits());
+    let decoded = reader.decode().map_err(|_| {
+        (
+            ImageFault::Decode,
+            "retained preview cannot be decoded within custody limits",
+        )
+    })?;
+    let rgb = if decoded.width() > 320 || decoded.height() > 320 {
+        decoded.thumbnail(320, 320).into_rgb8()
+    } else {
+        decoded.into_rgb8()
+    };
+    const PREVIEW_MAX: usize = 96 * 1024;
+    let mut out = Vec::with_capacity(PREVIEW_MAX);
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 80)
+        .encode_image(&rgb)
+        .map_err(|_| (ImageFault::Decode, "retained preview cannot be encoded"))?;
+    if out.len() > PREVIEW_MAX {
+        return Err((
+            ImageFault::TooLarge,
+            "retained preview exceeds the display bound",
+        ));
+    }
+    Ok(out)
+}
+
 /// An artifact above the custody bound is re-encoded as a JPEG that fits it
 /// (quality steps down until it does), inside the same decode limits. The
 /// caller has already proven the ORIGINAL bytes against the AgenticOS

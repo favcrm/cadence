@@ -25,15 +25,43 @@ interface RecordPreview {
   after: Record<string, unknown>;
   expected_revision: number;
 }
+interface MediaQuote {
+  schema: 1;
+  currency: "USD";
+  unit_price_micros: number;
+  units: 1;
+  total_price_micros: number;
+  price_revision: string;
+}
+/** Frozen reference-edit card. `artifact_ref` is retained for approval
+ *  equality and is never rendered as a link or as source facts. */
+interface MediaRefinePreview {
+  asset_id: string;
+  revision: number;
+  sha256: string;
+  title: string;
+  artifact_ref: string;
+  instructions: string;
+  workflow: "refine-image";
+  slot: string;
+  model: string;
+  quote: MediaQuote;
+  estimate_micros: number;
+  currency: "USD";
+  ceiling_micros: number;
+  allow_once: true;
+}
 interface PermissionRequest {
   reason: string;
   scope: { install_id: string; context_id: string; action_id: string; resource_id: string };
   allow_always: boolean;
   preview: TagPreview | null;
   recordPreview: RecordPreview | null;
-  // Host-owned discriminator: "record" for a declared record change; absent
-  // or null is legacy. Any other value is rejected at parse time.
-  previewKind: "record" | "legacy";
+  mediaPreview: MediaRefinePreview | null;
+  // Host-owned discriminator: "record" for a declared record change,
+  // "media_refine" for one frozen library reference edit; absent or null
+  // is legacy. Any other value is rejected at parse time.
+  previewKind: "record" | "legacy" | "media_refine";
 }
 interface Operation {
   id: string;
@@ -143,15 +171,73 @@ function parseRecordPreview(value: unknown): RecordPreview | null {
     expected_revision: preview.expected_revision as number,
   };
 }
+const MEDIA_PREVIEW_KEYS = ["asset_id", "revision", "sha256", "title", "artifact_ref", "instructions", "workflow", "slot", "model", "quote", "estimate_micros", "currency", "ceiling_micros", "allow_once"] as const;
+const MEDIA_QUOTE_KEYS = ["schema", "currency", "unit_price_micros", "units", "total_price_micros", "price_revision"] as const;
+function closedKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  const seen = Object.keys(value);
+  return seen.length === keys.length && keys.every((key) => seen.includes(key));
+}
+function usdMicros(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 1 && value <= 1_000_000_000 ? value : null;
+}
+function formatUsdMicros(micros: number): string {
+  const whole = Math.floor(micros / 1_000_000);
+  const fraction = String(micros % 1_000_000).padStart(6, "0");
+  return `USD ${whole}.${fraction}`;
+}
+function parseMediaRefinePreview(value: unknown): MediaRefinePreview | null {
+  const preview = record(value);
+  const quote = record(preview?.quote);
+  if (!preview || !quote || !closedKeys(preview, MEDIA_PREVIEW_KEYS) || !closedKeys(quote, MEDIA_QUOTE_KEYS)) return null;
+  const assetId = text(preview.asset_id, 64);
+  const sha = text(preview.sha256, 71);
+  const title = text(preview.title, 200);
+  const artifact = text(preview.artifact_ref, 256);
+  const instructions = text(preview.instructions, 2000);
+  const slot = text(preview.slot, 64);
+  const model = text(preview.model, 80);
+  const revision = preview.revision;
+  const estimate = usdMicros(preview.estimate_micros);
+  const ceiling = usdMicros(preview.ceiling_micros);
+  const unit = usdMicros(quote.unit_price_micros);
+  const total = usdMicros(quote.total_price_micros);
+  const priceRevision = text(quote.price_revision, 128);
+  if (assetId === null || sha === null || sha.length !== 71 || !sha.startsWith("sha256:") ||
+      title === null || artifact === null || instructions === null || slot === null || model === null ||
+      preview.workflow !== "refine-image" || preview.currency !== "USD" || preview.allow_once !== true ||
+      !Number.isSafeInteger(revision) || (revision as number) < 1 ||
+      estimate === null || ceiling === null || unit === null || total === null || priceRevision === null ||
+      quote.schema !== 1 || quote.currency !== "USD" || quote.units !== 1 ||
+      estimate !== total || ceiling !== total || unit !== total) return null;
+  return {
+    asset_id: assetId,
+    revision: revision as number,
+    sha256: sha,
+    title,
+    artifact_ref: artifact,
+    instructions,
+    workflow: "refine-image",
+    slot,
+    model,
+    quote: { schema: 1, currency: "USD", unit_price_micros: unit, units: 1, total_price_micros: total, price_revision: priceRevision },
+    estimate_micros: estimate,
+    currency: "USD",
+    ceiling_micros: ceiling,
+    allow_once: true,
+  };
+}
 function parsePermissionRequest(value: unknown): PermissionRequest | null {
   const v = record(value);
   const scope = record(v?.scope);
   if (!v || !scope || typeof v.allow_always !== "boolean") return null;
-  if (v.preview_kind !== undefined && v.preview_kind !== null && v.preview_kind !== "record") return null;
+  if (v.preview_kind !== undefined && v.preview_kind !== null && v.preview_kind !== "record" && v.preview_kind !== "media_refine") return null;
+  if (v.preview_kind === "media_refine" && v.allow_always !== false) return null;
   const fields = [scope.install_id, scope.context_id, scope.action_id, scope.resource_id];
   if (!fields.every((field) => typeof field === "string" && field.length > 0 && field.length <= 128)) return null;
   const reason = text(v.reason, 300);
   if (reason === null) return null;
+  const mediaPreview = v.preview_kind === "media_refine" ? parseMediaRefinePreview(v.preview) : null;
+  if (v.preview_kind === "media_refine" && mediaPreview === null) return null;
   return {
     reason,
     scope: {
@@ -161,9 +247,10 @@ function parsePermissionRequest(value: unknown): PermissionRequest | null {
       resource_id: scope.resource_id as string,
     },
     allow_always: v.allow_always,
-    preview: parseTagPreview(v.preview),
-    recordPreview: parseRecordPreview(v.preview),
-    previewKind: v.preview_kind === "record" ? "record" : "legacy",
+    preview: v.preview_kind === "media_refine" ? null : parseTagPreview(v.preview),
+    recordPreview: v.preview_kind === "media_refine" ? null : parseRecordPreview(v.preview),
+    mediaPreview,
+    previewKind: v.preview_kind === "record" ? "record" : v.preview_kind === "media_refine" ? "media_refine" : "legacy",
   };
 }
 function parseOperation(value: unknown): Operation | null {
@@ -251,10 +338,15 @@ function AssistantOperationCard({ operation, installId, contextId, busy, decide,
   // Only a host-declared record request needs a valid record preview. Any
   // other request keeps its legacy gate (exact tag preview or none).
   const recordKind = request?.previewKind === "record";
+  const mediaKind = request?.previewKind === "media_refine";
+  const mediaPreview = request?.mediaPreview ?? null;
+  const mediaPreviewReady = mediaKind && mediaPreview !== null && request !== null &&
+    mediaPreview.asset_id === request.scope.resource_id && mediaPreview.allow_once === true &&
+    request.allow_always === false && operation.action_id === "media.refine.prepare";
   const recordPreviewMissing = recordKind && !recordPreviewReady;
   const previewReady = requiresTagPreview
     ? request?.preview !== null && request?.preview !== undefined
-    : !recordKind || recordPreviewReady;
+    : mediaKind ? mediaPreviewReady : !recordKind || recordPreviewReady;
   const title = operation.action_id.replaceAll(".", " · ");
   const resultRows = resultValues(operation.result);
   return (
@@ -287,6 +379,22 @@ function AssistantOperationCard({ operation, installId, contextId, busy, decide,
                 </dl>
               </div>
             )}
+            {mediaKind && mediaPreview === null && <p className="text-micro text-fail" role="alert">{t("The required image refinement preview is missing or invalid. No permission decision is available.")}</p>}
+            {mediaPreview !== null && (
+              <div className="app-assistant-tag-preview" aria-label={t("Library image refinement preview")}>
+                <strong className="text-label text-ink-100">{mediaPreview.title}</strong>
+                {!mediaPreviewReady && <p className="text-micro text-fail" role="alert">{t("This preview does not match the requested library image. No permission decision is available.")}</p>}
+                <dl>
+                  <div><dt>{t("Source")}</dt><dd>{mediaPreview.asset_id}</dd></div>
+                  <div><dt>{t("Revision")}</dt><dd>{mediaPreview.revision}</dd></div>
+                  <div><dt>{t("Original")}</dt><dd>{mediaPreview.sha256}</dd></div>
+                  <div><dt>{t("Instructions")}</dt><dd>{mediaPreview.instructions}</dd></div>
+                  <div><dt>{t("Model")}</dt><dd>{mediaPreview.model}</dd></div>
+                  <div><dt>{t("Price")}</dt><dd>{formatUsdMicros(mediaPreview.quote.total_price_micros)}</dd></div>
+                  <div><dt>{t("Maximum spend")}</dt><dd>{formatUsdMicros(mediaPreview.ceiling_micros)}</dd></div>
+                </dl>
+              </div>
+            )}
             {requiresTagPreview && request.preview !== null && (
               <div className="app-assistant-tag-preview" aria-label={t("Customer tag change preview")}>
                 <strong className="text-label text-ink-100">{request.preview.customer_label}</strong>
@@ -299,7 +407,7 @@ function AssistantOperationCard({ operation, installId, contextId, busy, decide,
             )}
             <div className="app-assistant-controls">
               <Button size="sm" variant="primary" disabled={busy || !previewReady} onClick={() => decide(operation, "allow_once")}>{t("Allow once")}</Button>
-              {request.allow_always && <Button size="sm" disabled={busy || !previewReady} onClick={() => decide(operation, "allow_always")}>{t("Always allow for this customer")}</Button>}
+              {request.allow_always && !mediaKind && <Button size="sm" disabled={busy || !previewReady} onClick={() => decide(operation, "allow_always")}>{t("Always allow for this customer")}</Button>}
               <Button size="sm" variant="danger" disabled={busy || !previewReady} onClick={() => decide(operation, "deny")}>{t("Deny this request")}</Button>
             </div>
           </>}

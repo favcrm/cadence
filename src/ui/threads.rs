@@ -114,6 +114,16 @@ struct ThreadMessageReq {
     /// daemon's `thread_attachments` resolves them — this relay only
     /// carries `{id}` handles through, never names or paths.
     attachments: Option<Vec<ThreadAttachment>>,
+    /// One retained library image. The daemon re-proves id, revision and digest.
+    media_refs: Option<Vec<ThreadMediaRef>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ThreadMediaRef {
+    asset_id: String,
+    revision: i64,
+    sha256: String,
 }
 
 /// A retained chat-file handle — the daemon re-validates the grammar
@@ -406,6 +416,12 @@ pub(super) fn post_message(
     }
     if let Some(conversation) = req.conversation {
         params["conversation"] = Value::String(conversation);
+    }
+    if let Some(media_refs) = req.media_refs {
+        params["media_refs"] = json!(media_refs
+            .iter()
+            .map(|r| json!({"asset_id": r.asset_id, "revision": r.revision, "sha256": r.sha256}))
+            .collect::<Vec<_>>());
     }
     if let Some(attachments) = req.attachments {
         params["attachments"] = json!(attachments

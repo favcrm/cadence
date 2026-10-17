@@ -114,6 +114,8 @@ pub const MASTER_ALLOWED: &[&str] = &[
     // CAD-1168: read a retained chat attachment — the daemon still
     // checks the turn is the master's live one inside the handler.
     "chat_file_read",
+    // Retained Library image bytes, still exact-turn and source/receiver scoped.
+    "app_media_inspect",
 ];
 
 /// Most reports one router pass queues to the master; the rest wait for
@@ -244,6 +246,7 @@ pub const MASTER_APP_ALLOWED: &[&str] = &[
     // assigned turn (message + current token), and an id is only ever
     // learned from that turn's own envelope.
     "chat_file_read",
+    "app_media_inspect",
     "message_report",
     "thread_read",
 ];
