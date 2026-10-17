@@ -1,0 +1,129 @@
+# CI wall-time: the measured budget and the levers
+
+Learned 2026-10-17 on `favcrm/cadence` (merge-group ~14.6m → ~4.5m) and
+`agenticos-stack/agenticos-v2` (~7.5m → ~5m). Every number below is from a
+real run log, not an estimate.
+
+## 1. Measure before touching
+
+Shard wall decomposes into three disjoint costs — the fix lives in exactly
+one of them, and guessing wrong wastes a review cycle:
+
+| Cost | Symptom | Tool |
+|---|---|---|
+| Dep compile | many `Compiling <dep>` lines despite a cache hit | job log grep `Compiling` |
+| Workspace compile | `Compiling cadence-agent` once, multi-minute | same |
+| Test exec | `Summary [ Ns ]` in the test line | same |
+
+Real numbers on cadence's shard 2 (warm run 39014481055):
+
+- workspace compile: **2m19s** (`Compiling cadence-agent` once)
+- test exec: **73s** (599 tests)
+- total shard wall: **~4min**
+
+On the *stale-cache* run the same shard compiled **239 units** — the entire
+dep graph rebuilt because restored artifacts fingerprint-missed.
+
+## 2. The rust-cache staleness trap (the real bug)
+
+`Swatinem/rust-cache` **never overwrites an existing key**. The post-action
+logs `Cache up-to-date` and moves on. Consequence:
+
+> Flip a fingerprint-bearing flag (linker `-C link-arg`, `RUSTFLAGS`,
+> toolchain bump, feature set) and the warm leg builds fresh artifacts that
+> never save — every consumer then restores *stale* artifacts and rebuilds
+> the dep graph from scratch. The cache-hit line lies.
+
+The fix, shipped as CAD-1493: **version the shared key with an epoch
+suffix** (`gate-test` → `gate-test-ld1`). Bump `-ldN` whenever a
+fingerprint-bearing flag changes, so the warm leg writes a fresh entry
+instead of skipping a stale one. The comment in `ci.yml` (around the
+`shared-key` lines) states the rule.
+
+To *force* a re-warm manually: delete the entry via
+`gh api -X DELETE repos/<owner>/<repo>/actions/caches/<id>` — find the id
+with `?key=v0-rust-<key>` — then let the next main push re-write it.
+
+## 3. sccache scope — build/ui only, not shards
+
+`cache-workspace-crates: false` on rust-cache, because workspace-source
+hashes change every merge (restoring them always misses). Workspace objects
+go through sccache instead — **but only where the job enables it**:
+
+- `cache-warm` legs run `READ_WRITE` under `sccache-writer` on main pushes.
+- `build` and `ui` gate jobs run `READ_ONLY` via `ci-sccache enable`.
+- **`test-shards` do not enable sccache** — they restore rust-cache, enable
+  the linker, and invoke the test runner directly. Their ~2m19s
+  `cadence-agent` compile is the raw workspace-crate codegen+link floor.
+
+So the shard diagnostic is: if `cadence-agent` compiles once and takes
+~2min on a warm dep cache, that is expected — sccache never entered the
+shard path. Adding sccache to shards would help only for merges that don't
+touch the crate (rare); not worth the credential surface.
+
+Prefix is `v1/rustc-<toolchain>/` — a rustc bump re-zeros sccache too.
+
+## 4. Shard count vs. isolate serialism
+
+More shards help **only** when the suite is embarrassingly parallel at the
+file level and the parallelism limit is the leg count, not per-process
+constraint.
+
+- **cadence**: 6 nextest shards — won ~4m per run (the shard already had
+  `--test-threads`; more legs split the wall).
+- **agenticos-v2 api**: vitest with `--maxWorkers=1 --no-file-parallelism`
+  because each file owns a Miniflare isolate — the *files* are still
+  parallelizable, so 4→8 shards halved the leg (405s → ~200s).
+- **agenticos-v2 tooling**: 24 `node --test` files serially. Splitting into
+  two concurrent processes gained **~15s** — the suite is serial-`spawn`-bound
+  (each file waits on its own child), so process-count isn't the bound.
+  Reverted. This is the failure mode to remember: *parallel processes only
+  help when the work is CPU- or file-count-bound, not when each test blocks
+  on its own child.*
+
+## 5. Fixed waits vs. deadline bounds
+
+`thread::sleep(30s)` inside a poll loop with a deadline is a contract proof,
+not a fixed wait. The clean-ups were:
+
+- CAD-1480: replaced `sleep(until some state)` loops with condition-signals
+  where the state was observable.
+- What stayed: bounded poll-loops (`while Instant::now() < deadline { sleep;
+  check }`) and interval-proofs like `cad1119:1021` `sleep(2300)` — waiting
+  two monitor ticks *is* the contract. Deleting it weakens the proof.
+
+## 6. agenticos-v2 specifics
+
+- Merge protocol: staging → main via a promotion PR gated on `staging-proof`.
+  Solo-operator: the gate is the merge requirement.
+- `tools/ci/select.mjs` decides which jobs run per diff; `gate` needs the
+  union, job names not counts. A matrix fan-out inside `api` is safe.
+- `runtime-image-state-bridge.test.mjs` asserts a heartbeat *late* by
+  ≥1000ms — flakes under shared-CPU. Not a port issue; a timing tolerance.
+  Running it in a parallel half surfaced the flake.
+
+## 7. The checklist
+
+When a CI run is slow:
+
+1. Pull the slowest job's log; split its wall into dep compile / workspace
+   compile / exec / overhead. The fix lives in exactly one.
+2. If deps recompile despite a cache hit → the cache is stale under a
+   fingerprint flip → bump the `-ldN` epoch (or delete the key).
+3. If the workspace crate is the wall → on `build`/`ui` check `Cache hits
+   (Rust)`; on `test-shards` that metric doesn't exist — the job has no
+   sccache, so ~2min workspace compile is the floor, not a cache miss.
+4. If exec is the wall and the suite is per-file serial → more shards.
+   If it's serial-*spawn*-bound → more processes don't help.
+5. Never delete a check to speed up CI. The audit found zero true
+   duplicates — every literal-assert was a contract string.
+
+## 8. What's left (deliberately not pursued)
+
+- cadence's crate split: ~30-90s/shard only on merges that don't touch
+  `src/daemon/`. Most merges do, so the split pays little for its churn.
+  Revisit if a clean boundary (platform/adapter out of daemon) emerges.
+- agenticos-v2 `toolchain` (163s): one lint+format+tests step; a split
+  buys ~30s net of a second pnpm install.
+- agenticos-v2 `tooling` serial-spawn bound: parallelize *within* test
+  files (faster spawn loops), not across processes.

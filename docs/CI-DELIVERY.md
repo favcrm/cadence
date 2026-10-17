@@ -28,6 +28,9 @@ historical full-gate design, not current measurements or restored coverage.
 See [development-loop simplification](DEV-CYCLE.md) for the #738 reflection,
 current local check recipe and approval handoff.
 
+For diagnosing slow shards and the rust-cache/sccache split, see
+[CI wall-time](guides/ci-performance.md).
+
 ## Full-gate delivery design (historical, before CAD-1073)
 
 PRs continue to target main. The merge queue keeps the full fmt, clippy,
