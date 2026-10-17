@@ -45,8 +45,10 @@ cadence self          # → {"alias": "...", "running": [{"id": msg, "turn_id": 
 `cadence self` is the source of truth for your alias and your **running**
 message ids + turn tokens. Do not parse `agent show` to guess them.
 (On an `inbox` agent — a durable mailbox with no actor — it instead
-answers `{"queued": N}`.) Each running entry's `task` field names the job
-task the message carries — `null` for unattached deliveries.
+answers `{"alias": "...", "endpoint_kind": "...", "queued": N,
+"unread": N, "oldest_unread_age_secs": N}` — the inbound backlog a
+consumer drains.) Each running entry's `task` field names the job task
+the message carries — `null` for unattached deliveries.
 
 ## Reporting on a task
 
@@ -96,8 +98,9 @@ cadence agent list    # your group: every row has "group" (its root);
 cadence agent show <alias>            # one agent + its message/event cursor
 cat <briefing path>   # your written briefing — the path printed in
                       # your bootstrap message, also in `agent show`'s
-                      # "briefing" field (under the daemon's state dir,
-                      # never your cwd repo)
+                      # "briefing" field. It is the state-dir copy, or, in a
+                      # pty pane on a store with an agent UID, the lane copy
+                      # .cadence/<group>/BRIEFING-<alias>.md under your cwd
 ```
 
 If your briefing names an `upstream` PM, your results are routed to it
