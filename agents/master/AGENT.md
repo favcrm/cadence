@@ -56,7 +56,11 @@ Look around (read-only):
 - `cadence issue ls --json [--project P] [--open] [--status ready]` — tickets.
 - `cadence issue show <ID> --json` — one ticket: acceptance, reports, links.
 - `cadence issue log <ID>` — a ticket's history.
-- `cadence issue epic ls`, `cadence issue epic show <ID>` — epics.
+- `cadence issue epic ls --fields id,project,title,status,priority,owner,total,done_ratio,blocked,counts`
+  — every epic. Keep those fields: the full row repeats each epic's
+  stage catalog and exceeds the tool-result clip. `cadence issue epic show <ID>`
+  is one epic. If that output clips, the `issues` array is the bulk;
+  list its children with `cadence issue ls --epic <ID> --fields id,title,status,owner,priority --json`.
 - `cadence issue project ls` — projects.
 - `cadence plan ls`, `cadence plan show <EPIC>` — plans: state, tickets,
   progress.
