@@ -90,7 +90,12 @@ Report any remaining operator rollout work explicitly.
 
 `cadence update` is the normal path. It synchronizes bundled public guidance
 for the build it leaves active, including an already-current binary and both
-explicit and automatic rollback. `--check` and `update status` do not write,
+explicit and automatic rollback. The sync is non-force: only missing or
+stale managed files and repairable links are written from that build's
+embedded bytes, so a repeat run writes nothing and matching files keep
+their timestamps. A build that predates `cadence skill sync` exposes only a
+forced manual install, so its bytes are staged outside the home and applied
+with those same non-force rules. `--check` and `update status` do not write,
 and they do not claim the target build's guidance is verified. `cadence skill
 install [name]` is only the manual repair. Updating the files does not reload
 an agent session that is already open; start a fresh session or reread the

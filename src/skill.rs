@@ -4,7 +4,10 @@
 //! `daemon run` and a native `cadence update` (including an already-current
 //! run and rollback) refresh this guidance with the same non-force sync.
 //! The bytes written are the bytes embedded in the build that is active
-//! after that step, never an updater process left behind by a switch.
+//! after that step, never an updater process left behind by a switch. A
+//! build that predates `cadence skill sync` offers only a forced manual
+//! install, so its bytes are staged out of the way and then applied here
+//! with the same non-force policy: a repeat run still writes nothing.
 //! Sandbox startup never writes to the shared home. File match and provider
 //! links are not evidence that a running agent session has reloaded them.
 
@@ -114,62 +117,85 @@ pub fn sync(home: &Path, force: bool, target: Option<&str>) -> Result<Value> {
     let mut reports = Vec::with_capacity(selected.len());
     let mut wrote = false;
     for skill in selected {
-        let dir = root.join(skill.name);
-        let mut written = Vec::new();
-        for &(relative, content) in skill.files {
-            let file = dir.join(relative);
-            if file
-                .symlink_metadata()
-                .is_ok_and(|meta| meta.file_type().is_symlink())
-            {
-                return Err(Error::rejected(format!(
-                    "refusing to write canonical skill-file symlink {}",
-                    file.display()
-                )));
-            }
-            let stale = force
-                || std::fs::read(&file)
-                    .map(|bytes| bytes != content.as_bytes())
-                    .unwrap_or(true);
-            if stale {
-                std::fs::create_dir_all(file.parent().expect("bundled file has a parent"))
-                    .map_err(|e| Error::provider(format!("create {}: {e}", dir.display())))?;
-                std::fs::write(&file, content)
-                    .map_err(|e| Error::provider(format!("write {}: {e}", file.display())))?;
-                written.push(file);
-            }
-        }
-        wrote |= !written.is_empty();
-        let mut linked = Vec::new();
-        let mut skipped = Vec::new();
-        for parent in LINK_PARENTS {
-            let skills = home.join(parent);
-            let link = skills.join(skill.name);
-            match link_state(&link, &dir) {
-                "ok" => continue,
-                "foreign" => {
-                    skipped.push(json!({
-                        "path": link, "reason": "real entry exists — left alone"}));
-                    continue;
-                }
-                _ => {}
-            }
-            std::fs::create_dir_all(&skills)
-                .map_err(|e| Error::provider(format!("create {}: {e}", skills.display())))?;
-            if link.symlink_metadata().is_ok() {
-                std::fs::remove_file(&link)
-                    .map_err(|e| Error::provider(format!("replace {}: {e}", link.display())))?;
-            }
-            std::os::unix::fs::symlink(&dir, &link)
-                .map_err(|e| Error::provider(format!("link {}: {e}", link.display())))?;
-            linked.push(link);
-        }
-        reports.push(json!({
-            "name": skill.name, "path": dir, "written": written,
-            "linked": linked, "skipped": skipped,
-        }));
+        let (report, bundle_wrote) =
+            write_bundle(home, &root, skill.name, skill.files.iter().copied(), force)?;
+        wrote |= bundle_wrote;
+        reports.push(report);
     }
     Ok(json!({"root": root, "wrote": wrote, "skills": reports}))
+}
+
+/// Write one bundle's `files` into `home` and repair its provider links.
+/// Non-force unless `force`: a file whose bytes already match is left
+/// untouched, so a second run writes nothing and keeps its timestamp.
+/// Returns that bundle's report and whether anything was written.
+fn write_bundle<'a, I>(
+    home: &Path,
+    root: &Path,
+    name: &str,
+    files: I,
+    force: bool,
+) -> Result<(Value, bool)>
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    let dir = root.join(name);
+    let mut written = Vec::new();
+    for (relative, content) in files {
+        let file = dir.join(relative);
+        if file
+            .symlink_metadata()
+            .is_ok_and(|meta| meta.file_type().is_symlink())
+        {
+            return Err(Error::rejected(format!(
+                "refusing to write canonical skill-file symlink {}",
+                file.display()
+            )));
+        }
+        let stale = force
+            || std::fs::read(&file)
+                .map(|bytes| bytes != content.as_bytes())
+                .unwrap_or(true);
+        if stale {
+            std::fs::create_dir_all(file.parent().expect("bundled file has a parent"))
+                .map_err(|e| Error::provider(format!("create {}: {e}", dir.display())))?;
+            std::fs::write(&file, content)
+                .map_err(|e| Error::provider(format!("write {}: {e}", file.display())))?;
+            written.push(file);
+        }
+    }
+    let mut linked = Vec::new();
+    let mut skipped = Vec::new();
+    for parent in LINK_PARENTS {
+        let skills = home.join(parent);
+        let link = skills.join(name);
+        match link_state(&link, &dir) {
+            "ok" => continue,
+            "foreign" => {
+                skipped.push(json!({
+                    "path": link, "reason": "real entry exists — left alone"}));
+                continue;
+            }
+            _ => {}
+        }
+        std::fs::create_dir_all(&skills)
+            .map_err(|e| Error::provider(format!("create {}: {e}", skills.display())))?;
+        if link.symlink_metadata().is_ok() {
+            std::fs::remove_file(&link)
+                .map_err(|e| Error::provider(format!("replace {}: {e}", link.display())))?;
+        }
+        std::os::unix::fs::symlink(&dir, &link)
+            .map_err(|e| Error::provider(format!("link {}: {e}", link.display())))?;
+        linked.push(link);
+    }
+    let wrote = !written.is_empty() || !linked.is_empty();
+    Ok((
+        json!({
+            "name": name, "path": dir, "written": written,
+            "linked": linked, "skipped": skipped,
+        }),
+        wrote,
+    ))
 }
 
 /// Inspect every expected file and provider link without changing anything.
@@ -324,11 +350,17 @@ pub fn unmanaged_snapshots(cwd: &Path) -> Vec<Value> {
     found
 }
 
-/// Run non-force sync inside `binary` (`cadence skill sync`). The parent
-/// does not write guidance itself: a different build's embedded bytes
-/// stay in that build. A restored build from before `skill sync` existed
-/// is asked for `cadence skill install` instead, which writes that
-/// binary's own bytes. Stdout is that process's JSON report.
+/// Synchronize guidance for the activated build. A build that has
+/// `skill sync` runs it there — that build's own non-force sync over its
+/// own bytes.
+///
+/// A build from before `skill sync` existed offers only its forced manual
+/// install, which rewrites every file it ships. It is asked for its bytes
+/// in a private staging home, and this process then applies those bytes
+/// here with the non-force policy every other path uses: only a missing or
+/// differing file is written, so a second unchanged run writes nothing.
+/// The bytes are always the activated build's, never this process's, and
+/// nothing the child writes in the staging home reaches this home.
 pub fn invoke_activated_sync(binary: &Path, home: &Path, state_dir: &Path) -> Value {
     if !binary.is_file() {
         return json!({
@@ -341,15 +373,66 @@ pub fn invoke_activated_sync(binary: &Path, home: &Path, state_dir: &Path) -> Va
     if let Some(report) = run_skill_json(binary, home, state_dir, &["skill", "sync"]) {
         return normalize_sync_report(report, binary);
     }
-    if let Some(report) = run_skill_json(binary, home, state_dir, &["skill", "install"]) {
-        return normalize_legacy_install(report, binary);
+    legacy_activated_sync(binary, home)
+}
+
+/// The compatibility path for an activated build that predates
+/// `skill sync`. The child runs against a staging home and a staging state
+/// dir, so nothing it does can reach this home or this runtime state.
+fn legacy_activated_sync(binary: &Path, home: &Path) -> Value {
+    let not_checked = |reason: String| {
+        json!({
+            "guidance": "not-checked",
+            "wrote": false,
+            "reason": reason,
+            "repair": "cadence skill install",
+            "live_session": "not-checked",
+            "activated_binary": binary,
+        })
+    };
+    let staged = match tempfile::tempdir() {
+        Ok(dir) => dir,
+        Err(e) => return not_checked(format!("staging home was not created: {e}")),
+    };
+    let staged_home = staged.path().join("home");
+    let staged_state = staged.path().join("state");
+    if let Err(e) =
+        std::fs::create_dir_all(&staged_home).and_then(|()| std::fs::create_dir_all(&staged_state))
+    {
+        return not_checked(format!("staging home was not created: {e}"));
     }
+    let Some(sync) = run_skill_json(binary, &staged_home, &staged_state, &["skill", "install"])
+    else {
+        return not_checked(
+            "activated binary did not report guidance; this process did not write it".into(),
+        );
+    };
+    let applied = apply_staged_bundle(&staged_home, home);
+    let foreign = applied["skills"].as_array().is_some_and(|skills| {
+        skills.iter().any(|skill| {
+            skill["skipped"]
+                .as_array()
+                .is_some_and(|skipped| !skipped.is_empty())
+        })
+    });
+    let error = applied["error"].clone();
+    let clean = !foreign && error.is_null();
     json!({
-        "guidance": "not-checked",
-        "wrote": false,
-        "reason": "activated binary did not report guidance; this process did not write it",
-        "repair": "cadence skill install",
+        "guidance": if clean { "current" } else { "needs-attention" },
+        "wrote": applied["wrote"],
+        "repair": if clean { Value::Null } else { json!("cadence skill install") },
+        "attention": if foreign {
+            json!("a foreign provider entry was left alone; remove it by hand if this install should own the link")
+        } else {
+            Value::Null
+        },
+        "error": error,
+        "applied": applied,
+        "sync": sync,
+        "source_command": "skill install",
+        "staged": true,
         "live_session": "not-checked",
+        "live_session_note": "File match and provider links do not show that an agent loaded this guidance. An existing session keeps what it already read; start a fresh session or reread the skill at a task boundary.",
         "activated_binary": binary,
     })
 }
@@ -403,44 +486,52 @@ fn normalize_sync_report(mut parsed: Value, binary: &Path) -> Value {
     parsed
 }
 
-/// `cadence skill install` on a build that predates `skill sync`.
-/// `skipped` entries are foreign provider paths that install left alone.
-fn normalize_legacy_install(report: Value, binary: &Path) -> Value {
-    let Some(wrote) = report["wrote"].as_bool() else {
-        return json!({
-            "guidance": "not-checked",
-            "wrote": false,
-            "reason": "activated binary did not report guidance; this process did not write it",
-            "repair": "cadence skill install",
-            "live_session": "not-checked",
-            "activated_binary": binary,
-        });
-    };
-    let foreign = report["skills"].as_array().is_some_and(|skills| {
-        skills.iter().any(|skill| {
-            skill["skipped"]
-                .as_array()
-                .is_some_and(|skipped| !skipped.is_empty())
-        })
-    });
-    json!({
-        "guidance": if foreign { "needs-attention" } else { "current" },
-        "wrote": wrote,
-        "repair": Value::Null,
-        "attention": if foreign {
-            Value::String(
-                "a foreign provider entry was left alone; remove it by hand if this install should own the link"
-                    .into(),
-            )
-        } else {
-            Value::Null
-        },
-        "sync": report,
-        "source_command": "skill install",
-        "live_session": "not-checked",
-        "live_session_note": "File match and provider links do not show that an agent loaded this guidance. An existing session keeps what it already read; start a fresh session or reread the skill at a task boundary.",
-        "activated_binary": binary,
-    })
+/// Apply a staged activated build's bytes to `home` with the non-force
+/// policy: only a missing or differing file is written, and only a missing
+/// or ours-wrong provider link is repaired. The managed path list is this
+/// build's, so no path the activated build never shipped is invented here,
+/// and a file this build no longer ships is never deleted. A write or link
+/// failure is reported, not hidden, and stops the remaining bundles.
+fn apply_staged_bundle(staged_home: &Path, home: &Path) -> Value {
+    let root = canonical_root(home);
+    let staged_root = canonical_root(staged_home);
+    let mut reports = Vec::new();
+    let mut wrote = false;
+    let mut error = Value::Null;
+    for skill in selected(None).expect("the complete bundled set is valid") {
+        let staged_dir = staged_root.join(skill.name);
+        let files: Vec<(&str, String)> = skill
+            .files
+            .iter()
+            .filter_map(|&(relative, _)| {
+                std::fs::read_to_string(staged_dir.join(relative))
+                    .ok()
+                    .map(|content| (relative, content))
+            })
+            .collect();
+        if files.is_empty() {
+            continue;
+        }
+        match write_bundle(
+            home,
+            &root,
+            skill.name,
+            files
+                .iter()
+                .map(|(relative, content)| (*relative, content.as_str())),
+            false,
+        ) {
+            Ok((report, bundle_wrote)) => {
+                wrote |= bundle_wrote;
+                reports.push(report);
+            }
+            Err(e) => {
+                error = json!(e.to_string());
+                break;
+            }
+        }
+    }
+    json!({"root": root, "wrote": wrote, "skills": reports, "error": error})
 }
 
 #[cfg(test)]

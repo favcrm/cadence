@@ -205,28 +205,67 @@ fn activated_binary_writes_its_own_report_and_a_missing_binary_writes_nothing() 
 }
 
 #[test]
-fn a_build_without_skill_sync_installs_its_own_bytes() {
+fn a_build_without_skill_sync_takes_its_bytes_non_force() {
     let fixture = Fixture::new();
     let stub = fixture.root.path().join("legacy");
+    // A build that predates `skill sync`: it refuses `sync`, and its
+    // `install` rewrites every file it ships, as the real older releases do.
     fs::write(
         &stub,
-        "#!/bin/sh\nset -- \"$@\"\nlast=\nfor arg in \"$@\"; do last=\"$arg\"; done\nif [ \"$last\" = sync ]; then exit 2; fi\nmkdir -p \"$HOME/.agents/skills/legacy-stub\"\nprintf 'legacy\\n' > \"$HOME/.agents/skills/legacy-stub/WHO\"\nprintf '%s\\n' '{\"wrote\":true,\"skills\":[]}'\n",
+        "#!/bin/sh\nfor arg in \"$@\"; do last=\"$arg\"; done\nif [ \"$last\" = sync ]; then exit 2; fi\n\
+         mkdir -p \"$HOME/.agents/skills/cadence\" \"$HOME/.agents/skills/business-documents\"\n\
+         printf 'legacy skill\\n' > \"$HOME/.agents/skills/cadence/SKILL.md\"\n\
+         printf 'legacy operator\\n' > \"$HOME/.agents/skills/business-documents/OPERATOR.md\"\n\
+         printf '%s\\n' '{\"wrote\":true,\"skills\":[]}'\n",
     )
     .unwrap();
     fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
-    let report =
-        skill::invoke_activated_sync(&stub, &fixture.home, &fixture.root.path().join("state"));
+    let state = fixture.root.path().join("state");
+    let reference = fixture.home.join(".agents/skills/cadence/SKILL.md");
+    let other = fixture
+        .home
+        .join(".agents/skills/business-documents/OPERATOR.md");
+
+    let report = skill::invoke_activated_sync(&stub, &fixture.home, &state);
     assert_eq!(report["guidance"], "current");
     assert_eq!(report["wrote"], true);
     assert_eq!(report["source_command"], "skill install");
-    assert_eq!(
-        fs::read(fixture.home.join(".agents/skills/legacy-stub/WHO")).unwrap(),
-        b"legacy\n"
+    assert_eq!(report["staged"], true);
+    assert_eq!(fs::read(&reference).unwrap(), b"legacy skill\n");
+    assert_eq!(fs::read(&other).unwrap(), b"legacy operator\n");
+    // The bytes are the activated build's, never this process's.
+    assert_ne!(fs::read(&reference).unwrap(), skill::SKILL_MD.as_bytes());
+    assert!(
+        !fixture
+            .home
+            .join(".agents/skills/company-outputs/SKILL.md")
+            .exists(),
+        "a bundle the activated build never shipped is not invented here"
     );
-    assert!(!fixture
-        .home
-        .join(".agents/skills/cadence/SKILL.md")
-        .exists());
+
+    // The compatibility path must not rewrite a file whose bytes already
+    // match: age the timestamps, make one file stale, and only that one is
+    // written. This is the repeat-run promise for a legacy active build.
+    let aged = fs::metadata(&reference).unwrap().modified().unwrap();
+    fs::write(&other, "stale operator\n").unwrap();
+    let stale_at = fs::metadata(&other).unwrap().modified().unwrap();
+    let second = skill::invoke_activated_sync(&stub, &fixture.home, &state);
+    assert_eq!(second["guidance"], "current");
+    assert_eq!(second["wrote"], true);
+    assert_eq!(fs::read(&other).unwrap(), b"legacy operator\n");
+    assert!(fs::metadata(&other).unwrap().modified().unwrap() != stale_at);
+    assert_eq!(
+        fs::metadata(&reference).unwrap().modified().unwrap(),
+        aged,
+        "a matching file keeps its timestamp"
+    );
+
+    // A third run with nothing stale writes nothing at all.
+    let quiet = fs::metadata(&reference).unwrap().modified().unwrap();
+    let third = skill::invoke_activated_sync(&stub, &fixture.home, &state);
+    assert_eq!(third["wrote"], false);
+    assert_eq!(third["guidance"], "current");
+    assert_eq!(fs::metadata(&reference).unwrap().modified().unwrap(), quiet);
 }
 
 #[test]
@@ -789,4 +828,183 @@ impl Drop for Mode<'_> {
     fn drop(&mut self) {
         let _ = fs::set_permissions(self.0, fs::Permissions::from_mode(self.1));
     }
+}
+
+/// The already-current update again, but its activated release is a build
+/// that predates `skill sync`: it refuses `sync` and its `install` rewrites
+/// every file it ships, exactly like the real older releases. The
+/// compatibility path must still keep the non-force promise at update
+/// level — only the stale file is written, a matching file keeps its
+/// timestamp, and a second update writes nothing at all.
+#[cfg(feature = "test-seam")]
+#[test]
+fn already_current_update_with_a_pre_sync_release_keeps_the_non_force_promise() {
+    let fixture = Fixture::new();
+    let path = format!(
+        "{}:/usr/bin:/bin",
+        fixture.root.path().join("gh-bin").display()
+    );
+    fs::create_dir(fixture.root.path().join("gh-bin")).unwrap();
+    let gh = fixture.root.path().join("gh-bin/gh");
+    fs::write(
+        &gh,
+        "#!/usr/bin/env python3\n\
+         import json, os, pathlib, sys\n\
+         a = sys.argv[1:]\n\
+         sha = os.environ[\"CANDIDATE_SHA\"]\n\
+         if a[:2] == [\"auth\", \"status\"]: sys.exit(0)\n\
+         if a[:2] == [\"run\", \"list\"]:\n\
+         \x20   print(json.dumps([{\"databaseId\": 4242, \"attempt\": 1, \"headSha\": sha,\n\
+         \x20       \"headBranch\": \"main\", \"event\": \"workflow_dispatch\",\n\
+         \x20       \"status\": \"completed\", \"conclusion\": \"success\"}])); sys.exit(0)\n\
+         if a[:2] == [\"run\", \"view\"]:\n\
+         \x20   print(json.dumps({\"jobs\": [\n\
+         \x20       {\"name\": \"stage\", \"status\": \"completed\", \"conclusion\": \"success\"},\n\
+         \x20       {\"name\": \"promote\", \"status\": \"completed\", \"conclusion\": \"success\"}]})); sys.exit(0)\n\
+         if a[:2] == [\"run\", \"download\"]:\n\
+         \x20   d = pathlib.Path(a[a.index(\"--dir\") + 1]); d.mkdir(parents=True, exist_ok=True)\n\
+         \x20   (d / \"production-candidate.json\").write_text(json.dumps({\"schema\": 1,\n\
+         \x20       \"source_sha\": sha, \"ci_run_id\": 4343, \"ci_run_attempt\": 1,\n\
+         \x20       \"sha256\": \"ab\" * 32, \"promotion_run_id\": 4242, \"promotion_run_attempt\": 1}))\n\
+         \x20   sys.exit(0)\n\
+         if a[:1] == [\"api\"]:\n\
+         \x20   print(json.dumps({\"id\": 4343, \"run_attempt\": 1, \"head_sha\": sha,\n\
+         \x20       \"head_branch\": \"main\", \"event\": \"push\", \"path\": \".github/workflows/ci.yml\",\n\
+         \x20       \"status\": \"completed\", \"conclusion\": \"success\",\n\
+         \x20       \"repository\": {\"full_name\": \"favcrm/cadence-unmerged\"},\n\
+         \x20       \"head_repository\": {\"full_name\": \"favcrm/cadence-unmerged\"}})); sys.exit(0)\n\
+         sys.stderr.write(\"unexpected gh: %s\\n\" % \" \".join(a)); sys.exit(1)\n",
+    )
+    .unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let version = fixture.cli_env(&path, &["--version"]);
+    assert!(version.status.success());
+    let sha = String::from_utf8_lossy(&version.stdout)
+        .trim()
+        .rsplit_once('+')
+        .unwrap()
+        .1
+        .to_string();
+
+    let releases = fixture.root.path().join("releases");
+    let release_bin = releases.join(&sha).join("cadence");
+    fs::create_dir_all(release_bin.parent().unwrap()).unwrap();
+    fs::write(
+        &release_bin,
+        format!(
+            "#!/bin/sh\nfor arg in \"$@\"; do last=\"$arg\"; done\n\
+             if [ \"$last\" = sync ]; then exit 2; fi\nexec {BIN} \"$@\"\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&release_bin, fs::Permissions::from_mode(0o755)).unwrap();
+    let link = fixture.root.path().join("link/cadence");
+    fs::create_dir_all(link.parent().unwrap()).unwrap();
+    symlink(&release_bin, &link).unwrap();
+
+    let temp_root = fixture
+        .root
+        .path()
+        .to_str()
+        .expect("fixture path is utf-8")
+        .to_string();
+    let seam = [
+        ("CADENCE_TEST_SEAM", "1"),
+        ("CANDIDATE_SHA", sha.as_str()),
+        ("TMPDIR", temp_root.as_str()),
+    ];
+    let started = fixture.cli_vars(&path, &seam, &["daemon", "start"]);
+    assert!(
+        started.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&started.stdout),
+        String::from_utf8_lossy(&started.stderr)
+    );
+    struct Stop<'a>(&'a Fixture, String);
+    impl Drop for Stop<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.cli_env(&self.1, &["daemon", "stop"]);
+        }
+    }
+    let _stop = Stop(&fixture, path.clone());
+    let mut daemon_up = false;
+    for _ in 0..50 {
+        if fixture
+            .cli_vars(&path, &seam, &["daemon", "status"])
+            .status
+            .success()
+        {
+            daemon_up = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(daemon_up, "daemon did not answer");
+
+    let reference = fixture
+        .home
+        .join(".agents/skills/company-outputs/references/document-design.md");
+    let stale = fixture.home.join(".agents/skills/cadence/SKILL.md");
+    let untouched = fixture
+        .home
+        .join(".agents/skills/business-documents/SKILL.md");
+    fs::remove_file(&reference).unwrap();
+    fs::write(&stale, "stale skill\n").unwrap();
+    let quiet = age(&untouched);
+
+    let update_env = [
+        ("CADENCE_TEST_SEAM", "1"),
+        ("CADENCE_TEST_AS", "operator"),
+        ("CANDIDATE_SHA", sha.as_str()),
+        ("TMPDIR", temp_root.as_str()),
+    ];
+    let args = [
+        "update",
+        "--json",
+        "--link",
+        link.to_str().unwrap(),
+        "--releases-dir",
+        releases.to_str().unwrap(),
+        "--repo",
+        "favcrm/cadence-unmerged",
+    ];
+    let output = fixture.cli_vars(&path, &update_env, &args);
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(body["check"]["up_to_date"], true, "{body}");
+    assert_eq!(body["guidance"]["source"], "activated-binary", "{body}");
+    assert_eq!(body["guidance"]["activated_sha"], sha, "{body}");
+    assert_eq!(
+        body["guidance"]["source_command"], "skill install",
+        "{body}"
+    );
+    assert_eq!(body["guidance"]["staged"], true, "{body}");
+    assert_eq!(body["guidance"]["wrote"], true, "{body}");
+    assert_eq!(body["guidance"]["guidance"], "current", "{body}");
+    assert!(reference.is_file(), "the missing reference is restored");
+    assert_eq!(fs::read(&stale).unwrap(), skill::SKILL_MD.as_bytes());
+    assert_eq!(
+        fs::metadata(&untouched).unwrap().modified().unwrap(),
+        quiet,
+        "a matching file keeps its timestamp through the compatibility path"
+    );
+
+    // Nothing is stale now: a second update writes nothing at all.
+    let settled = fs::metadata(&stale).unwrap().modified().unwrap();
+    let second = fixture.cli_vars(&path, &update_env, &args);
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let again: Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(again["guidance"]["wrote"], false, "{again}");
+    assert_eq!(fs::metadata(&stale).unwrap().modified().unwrap(), settled);
+    assert_eq!(fs::metadata(&untouched).unwrap().modified().unwrap(), quiet);
 }

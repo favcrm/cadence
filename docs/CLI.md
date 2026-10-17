@@ -51,7 +51,11 @@ when the command finishes. That includes a run that is already up to date
 and both explicit and automatic rollback. The sync is the existing
 non-force install: missing or stale managed files and repairable links are
 written from that build's embedded bytes, and a second run with matching
-files writes nothing. It does not restart a healthy daemon only to refresh
+files writes nothing. A build that predates `cadence skill sync` exposes
+only a forced manual install, so its bytes are first staged outside the
+home and then applied with the same non-force rules — a repeat run still
+writes nothing and matching files keep their timestamps. It does not
+restart a healthy daemon only to refresh
 skills. `--check` and `update status` stay read-only; the target build's
 guidance is not claimed verified before activation. `cadence skill install
 [name]` remains the manual repair. A guidance failure is reported as
