@@ -511,6 +511,7 @@ fn verb_for(command: &Commands) -> Result<(&'static str, serde_json::Map<String,
             }
             "message_inbox"
         }
+        Commands::Team { action } => team_for(action, &mut args),
         _ => return Err(unavailable(command)),
     };
     Ok((verb, args))
@@ -934,15 +935,45 @@ fn wiki_text(command: &Commands, body: &Value) -> Result<bool> {
     })
 }
 
+fn team_for(
+    action: &super::commands::TeamAction,
+    args: &mut serde_json::Map<String, Value>,
+) -> &'static str {
+    use super::commands::TeamAction;
+    match action {
+        TeamAction::List => "team_list",
+        TeamAction::Invites => "team_invites",
+        TeamAction::Invite { email, role } => {
+            args.insert("email".into(), json!(email));
+            args.insert("role".into(), json!(role.as_str()));
+            "team_invite"
+        }
+        TeamAction::RevokeInvite { invite_id } => {
+            args.insert("invite_id".into(), json!(invite_id));
+            "team_revoke_invite"
+        }
+        TeamAction::SetRole { user_id, role } => {
+            args.insert("user_id".into(), json!(user_id));
+            args.insert("role".into(), json!(role.as_str()));
+            "team_set_role"
+        }
+        TeamAction::Remove { user_id } => {
+            args.insert("user_id".into(), json!(user_id));
+            "team_remove"
+        }
+    }
+}
+
 fn unavailable(command: &Commands) -> Error {
     // The refusal names the command so an agent can branch on it; the
     // allowlisted alternatives are the only remote surface.
     Error::rejected(format!(
-        "`cadence {}` is not available on a remote org in this build — \
+        "`cadence {}` is not available on a remote org in this build - \
          remote verbs are: status, agent list, agent show, issue ls, \
          issue show, issue log, issue new, issue comment, issue set, \
          message read, inbox (peek), wiki ls, wiki search, wiki cat, \
-         wiki put (text), wiki cp. \
+         wiki put (text), wiki cp, team list, team invites, team invite, \
+         team revoke-invite, team set-role, team remove. \
          Use `--org local` or `cadence org switch` to run locally.",
         name(command)
     ))
@@ -980,6 +1011,7 @@ fn name(command: &Commands) -> &'static str {
         Commands::Send { .. } => "send",
         Commands::Inbox { .. } => "inbox",
         Commands::Status { .. } => "status",
+        Commands::Team { .. } => "team <verb>",
         _ => "<command>",
     }
 }

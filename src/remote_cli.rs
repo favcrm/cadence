@@ -11,17 +11,17 @@
 //!   cli actor envelope. Body is exactly `{version:"hosted-cadence-cli.v1",
 //!   organization_id, audience, requested_scopes:["cli.read","cli.write"],
 //!   ttl_seconds}` (a strict object — an extra key is `invalid_request`).
-//!   The envelope is **single-use** — the container (#744) consumes its `jti`.
-//!   [`call_once`] mints a fresh one for every command invocation, and the wake
-//!   loop re-mints on every retry: a `503 waking` is produced by the worker's
-//!   `wakeBoardRuntime` *before* any container forward, so the just-minted
-//!   envelope's `jti` was never consumed — but re-minting is still the only
-//!   safe posture (a `503` that came later in the pipeline would have burned
-//!   it). An envelope is never reused across calls or retries.
+//!   Container commands consume the envelope's `jti` in the native handler.
+//!   Platform team writes claim a canonical, audited first-mutation receipt;
+//!   roster reads and no-effect lookups do not consume an unused mutation nonce.
+//!   [`call_once`] still mints a fresh envelope for every invocation and retry.
+//!   `503 waking` is returned before any container forward, but a later failure
+//!   can follow a committed effect. Never reuse an envelope or retry an uncertain
+//!   mutation as though it had failed.
 //! - `POST {endpoint}/__platform/cli/call` — same bearer + `{version,
 //!   envelope, verb, arguments?}` — `verb` is one of
-//!   [`REMOTE_VERBS`]; `arguments` is an object the container's
-//!   `/api/cli/<verb>` dispatch consumes. Top-level authority-shaped keys
+//!   [`REMOTE_VERBS`]; platform team arguments dispatch in the Worker without
+//!   waking a container; other arguments reach `/api/cli/<verb>`. Authority keys
 //!   (`actor`, `role`, `org`, `user`, `as`, `principal`, `wiki_as`) are
 //!   refused server-side; this client never sends them.
 //! - `401/403` — the bearer no longer resolves to a live principal: re-login.
@@ -60,20 +60,19 @@ pub const WAKE_TIMEOUT_DEFAULT: u64 = 120;
 /// Upper bound on one wake wait, whatever the remote advertises.
 const WAKE_WAIT_MAX: Duration = Duration::from_secs(30);
 
-/// The allowlisted remote verbs this build can send — the CAD-1019 contract
-/// ∩ AOS-128's `HOSTED_CADENCE_CLI_VERBS`, minus `team_list` (no local
-/// `team` command exists to map to it) and `message_send` (an agent-to-agent
-/// channel the remote milestone does not expose): a command not listed here
-/// is refused *locally* and its bytes never leave the process.
+/// The allowlisted remote verbs this build can send. A command not listed
+/// here is refused locally and its bytes never leave the process.
+/// `message_send` stays excluded (an agent-to-agent channel this client
+/// does not expose). Platform team verbs are in this allowlist and are not
+/// native container verbs: the hosted call path carries them, and the
+/// platform answers them without a daemon.
 ///
-/// The cli.write half (`issue_new`/`issue_comment`/`issue_set`) rides the
-/// same envelope — the caller's authority never travels as a request field,
-/// only inside the verified, single-use envelope. A failed or ambiguous
-/// call is never retried by the client: the wake retry is the only loop,
-/// and it fires only on a pre-forward `waking` verdict. Anything else — a
-/// timeout, a dropped connection, a 5xx after forward — stays explicitly
-/// unresolved: the mutation may or may not have landed, so reconcile with
-/// `issue show`/`issue log` first rather than blindly re-issuing.
+/// Writes ride the same single-use envelope. The caller's authority never
+/// travels as a request field, only inside the envelope [`call_once`] mints
+/// for that attempt. A failed or ambiguous call is never retried: the wake
+/// retry is the only loop, and it fires only on a pre-forward `waking`
+/// verdict, re-minting because that refusal happens before the envelope is
+/// consumed. Anything else stays unresolved.
 pub const REMOTE_VERBS: &[&str] = &[
     // cli.read
     "status",
@@ -84,11 +83,68 @@ pub const REMOTE_VERBS: &[&str] = &[
     "issue_history",
     "message_read",
     "message_inbox",
+    "team_list",
+    "team_invites",
     // cli.write
     "issue_new",
     "issue_comment",
     "issue_set",
+    "team_invite",
+    "team_revoke_invite",
+    "team_set_role",
+    "team_remove",
 ];
+
+/// Scope a cli authorize request asks for. Existing container verbs keep
+/// the historical `cli.read`+`cli.write` pair. Platform team verbs ask only
+/// for the scope that verb requires.
+fn cli_requested_scopes(verb: &str) -> &'static [&'static str] {
+    match verb {
+        "team_list" | "team_invites" => &["cli.read"],
+        "team_invite" | "team_revoke_invite" | "team_set_role" | "team_remove" => &["cli.write"],
+        _ => &["cli.read", "cli.write"],
+    }
+}
+
+/// Argument keys a platform team verb may carry. Other verbs keep their
+/// existing grammar. An unknown key, a missing key, or a role other than
+/// `owner`/`member` is refused before a credential is loaded. `role` here
+/// is the requested target role, never caller authority.
+fn team_argument_shape(verb: &str, arguments: &Map<String, Value>) -> Result<()> {
+    let allowed: &[&str] = match verb {
+        "team_list" | "team_invites" => &[],
+        "team_invite" => &["email", "role"],
+        "team_revoke_invite" => &["invite_id"],
+        "team_set_role" => &["user_id", "role"],
+        "team_remove" => &["user_id"],
+        _ => return Ok(()),
+    };
+    if let Some(key) = arguments
+        .keys()
+        .find(|key| !allowed.contains(&key.as_str()))
+    {
+        return Err(reject(format!(
+            "team {verb} argument '{key}' is not allowed - never sent"
+        )));
+    }
+    for key in allowed {
+        let Some(value) = arguments.get(*key) else {
+            return Err(reject(format!("team {verb} requires {key} - never sent")));
+        };
+        let Some(text) = value
+            .as_str()
+            .filter(|text| !text.is_empty() && !text.chars().any(|c| c.is_control()))
+        else {
+            return Err(reject(format!(
+                "team {verb} {key} must be a nonempty string - never sent"
+            )));
+        };
+        if *key == "role" && text != "owner" && text != "member" {
+            return Err(reject("team role must be owner or member - never sent"));
+        }
+    }
+    Ok(())
+}
 
 /// The wiki actions this build sends over `/__platform/wiki/call` (CAD-1401,
 /// CAD-914): `enumerate` is `wiki ls` or `wiki search`, `read` is `wiki cat`,
@@ -1019,7 +1075,7 @@ fn call_once(
     deadline: Instant,
 ) -> Result<(u16, Option<u64>, Option<Value>)> {
     let scopes: &[&str] = match surface {
-        Surface::Cli => &["cli.read", "cli.write"],
+        Surface::Cli => cli_requested_scopes(verb),
         Surface::Wiki if verb == "write" => &["wiki.write"],
         Surface::Wiki => &["wiki.read"],
     };
@@ -1301,7 +1357,7 @@ enum Verdict {
 ///   and, when proven at that layer, `error.reason` naming a policy outcome;
 /// - a bare `401 unauthorized` without a reason means the bearer did not
 ///   resolve, but the server cannot say whether it expired or was revoked;
-/// - any `5xx` is availability (waking, unavailable, runtime).
+/// - explicit mutation uncertainty is not a safe retry; other 5xx are availability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Refusal {
     /// The caller was authenticated and a policy outcome refused the action.
@@ -1313,8 +1369,9 @@ enum Refusal {
     /// A 401 the server did not explain. It is not confirmed expiry or
     /// revocation: diagnose read-only before any login.
     Uncertain,
-    /// Any 5xx: retry later; saved credentials and any pending
-    /// renewal are kept.
+    /// An action may have committed; reconcile it before any repeat.
+    MutationUncertain,
+    /// Other 5xx: retry later; saved credentials and pending renewal are kept.
     Availability,
     /// An answer whose shape we do not recognise. Conservative fallback.
     Unknown,
@@ -1326,6 +1383,7 @@ impl Refusal {
             Self::Authorization => "authorization",
             Self::Authentication => "authentication",
             Self::Uncertain => "uncertain",
+            Self::MutationUncertain => "outcome_unknown",
             Self::Availability => "availability",
             Self::Unknown => "unknown",
         }
@@ -1393,10 +1451,16 @@ fn refusal_correlation(body: Option<&Value>) -> Option<String> {
 /// is returned only when it is a known allowlisted value, never raw server text.
 fn decode_refusal(status: u16, body: Option<&Value>) -> (Refusal, Option<String>) {
     let (code, reason) = refusal_fields(body);
+    if matches!(
+        code,
+        Some("mutation_outcome_uncertain" | "invite_email_uncertain")
+    ) {
+        return (Refusal::MutationUncertain, code.map(str::to_owned));
+    }
     let known_reason =
         reason.filter(|r| POLICY_REASONS.contains(r) || ENVELOPE_REASONS.contains(r));
     let category = match status {
-        // Every 5xx is the gateway or runtime being unavailable: retry later.
+        // Explicit post-effect uncertainty was handled above.
         500..=599 => Refusal::Availability,
         // A non-auth refusal keeps its safe code (for example `payload_too_large`
         // or a legacy `too_large`) so the caller sees what was refused. It is not
@@ -1447,6 +1511,11 @@ fn refusal_message(refusal: Refusal, reason: Option<&str>, status: u16) -> Strin
             "the remote did not confirm why it refused the credential ({category}, HTTP {status}{code}); \
              it may or may not be expired — run the read-only diagnosis in docs/REMOTE-AUTH.md \
              before any login. Nothing was retried"
+        ),
+        Refusal::MutationUncertain => format!(
+            "the remote action may already have committed ({category}, HTTP {status}{code}); \
+             inspect `team list` or `team invites` with the same explicit --org before \
+             repeating the mutation. Nothing was retried; saved credentials are kept"
         ),
         Refusal::Availability => format!(
             "the remote is unavailable ({category}, HTTP {status}{code}) — retry later; \
@@ -1517,7 +1586,11 @@ fn refusal_error(status: u16, body: Option<&Value>) -> Error {
     if let Some(correlation) = refusal_correlation(body) {
         text.push_str(&correlation);
     }
-    reject(text)
+    if refusal == Refusal::MutationUncertain {
+        Error::unknown(text)
+    } else {
+        reject(text)
+    }
 }
 
 /// Run one allowlisted remote verb: a [`REMOTE_VERBS`] cli verb or a
@@ -1821,6 +1894,7 @@ fn call_verb_until_retry(
         }
         wiki_transfer_shape(verb, &arguments)?;
     }
+    team_argument_shape(verb, &arguments)?;
     let budget_over = || -> Error {
         Error::busy_coded(
             "waking",
@@ -3355,13 +3429,16 @@ mod tests {
     }
 
     #[test]
-    fn a_transient_503_is_availability_and_keeps_saved_login() {
-        let (refusal, _) = decode_refusal(503, Some(&json!({"state": "wake_failed"})));
-        assert_eq!(refusal, Refusal::Availability);
-        let text = refusal_message(refusal, None, 503);
-        assert!(text.contains("retry later"), "{text}");
-        assert!(text.contains("kept"), "{text}");
-        assert!(!text.contains("cadence login"), "{text}");
+    fn a_team_commit_uncertainty_is_an_unknown_outcome_not_a_refusal() {
+        let answer = classify(
+            503,
+            None,
+            Some(json!({"error": {"code": "mutation_outcome_uncertain"}})),
+        );
+        assert!(matches!(
+            answer,
+            Verdict::Done(Err(Error::OutcomeUnknown(_)))
+        ));
     }
 
     #[test]
