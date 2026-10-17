@@ -78,27 +78,55 @@ pub(super) fn after_update(
     }
 }
 
-/// An already-current update has not switched builds. Write the linked
-/// release's bytes when that binary is a different file; otherwise this
-/// process is the active build and its embedded copy is the right one.
+/// An already-current update has not switched builds. This process may
+/// write only when it is the active release file. A different release
+/// file is invoked so that build's bytes are used. A missing release is
+/// left unwritten and reported `not-checked`: a deleted binary can still
+/// be the running daemon, and this process must not substitute its own.
 fn sync_already_current(
     layout: &Layout,
     report: &RunReport,
     home: &Path,
     state_dir: &Path,
 ) -> Value {
-    if report.check.up_to_date {
-        let binary = layout.binary(&report.check.target);
-        if binary.is_file() && !same_executable(&binary) {
-            let mut body = cadence_agent::skill::invoke_activated_sync(&binary, home, state_dir);
-            body["source"] = json!("activated-binary");
-            body["activated_sha"] = json!(report.check.target);
-            return body;
-        }
+    if !report.check.up_to_date {
+        return unavailable_guidance(
+            "activated build was not identified; guidance was not written",
+        );
     }
-    let mut body = reconcile_current(home);
-    body["source"] = json!("current-process");
-    body
+    let binary = layout.binary(&report.check.target);
+    if same_executable(&binary) {
+        let mut body = reconcile_current(home);
+        body["source"] = json!("current-process");
+        return body;
+    }
+    if binary.is_file() {
+        let mut body = cadence_agent::skill::invoke_activated_sync(&binary, home, state_dir);
+        body["source"] = json!("activated-binary");
+        body["activated_sha"] = json!(report.check.target);
+        return body;
+    }
+    json!({
+        "guidance": "not-checked",
+        "wrote": false,
+        "reason": format!(
+            "activated binary {} is not a file; guidance was not written",
+            binary.display()
+        ),
+        "repair": "cadence skill install",
+        "live_session": "not-checked",
+        "activated_sha": report.check.target,
+    })
+}
+
+fn unavailable_guidance(reason: &str) -> Value {
+    json!({
+        "guidance": "not-checked",
+        "wrote": false,
+        "reason": reason,
+        "repair": "cadence skill install",
+        "live_session": "not-checked",
+    })
 }
 
 fn same_executable(binary: &Path) -> bool {
@@ -375,8 +403,14 @@ mod tests {
         );
 
         let target = "dddddddddddddddddddddddddddddddddddddddd";
+        let places = layout(root.path());
+        let binary = places.binary(target);
+        std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        // This process is the active release, so its embedded bytes are
+        // the right ones. A symlink keeps that identity check honest.
+        std::os::unix::fs::symlink(std::env::current_exe().unwrap(), &binary).unwrap();
         let report = report(target, true, false, Value::Null, Value::Null);
-        let first = after_update(&state, &layout(root.path()), &report, &home);
+        let first = after_update(&state, &places, &report, &home);
         assert_eq!(first["source"], "current-process");
         assert_eq!(first["wrote"], true);
         assert_eq!(first["daemon_restarted_for_skills"], false);
@@ -388,13 +422,40 @@ mod tests {
         assert_eq!(first["status"]["provider_discovery"], "current");
 
         let unchanged = std::fs::metadata(&reference).unwrap().modified().unwrap();
-        let second = after_update(&state, &layout(root.path()), &report, &home);
+        let second = after_update(&state, &places, &report, &home);
         assert_eq!(second["wrote"], false);
         assert_eq!(second["daemon_restarted_for_skills"], false);
         assert_eq!(
             std::fs::metadata(&reference).unwrap().modified().unwrap(),
             unchanged
         );
+    }
+
+    #[test]
+    fn missing_active_release_does_not_write_this_process_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let state = root.path().join("state");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&state).unwrap();
+        cadence_agent::skill::sync(&home, false, None).unwrap();
+        let reference = home.join(".agents/skills/company-outputs/references/workflow.md");
+        std::fs::write(&reference, "stale reference\n").unwrap();
+        let target = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let report = report(target, true, false, Value::Null, Value::Null);
+        let body = after_update(&state, &layout(root.path()), &report, &home);
+        assert_eq!(body["guidance"], "not-checked");
+        assert_eq!(body["wrote"], false);
+        assert_eq!(body["repair"], "cadence skill install");
+        assert_eq!(body["activated_sha"], target);
+        assert!(body.get("source").is_none());
+        assert_eq!(std::fs::read(&reference).unwrap(), b"stale reference\n");
+        assert!(lines(&body)
+            .iter()
+            .any(|line| line == "guidance: not-checked"));
+        assert!(!lines(&body)
+            .iter()
+            .any(|line| line.contains("file match current")));
     }
 
     #[test]
