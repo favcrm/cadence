@@ -1030,6 +1030,47 @@ fn agents_block_is_idempotent() {
     assert_eq!(text.matches(AGENTS_BEGIN).count(), 1);
 }
 
+/// CAD-1530: a block an earlier build wrote is repaired, because a
+/// repository carrying it verbatim never edited it. Anything else —
+/// including a block a repository did edit — is left exactly as found.
+#[test]
+fn agents_block_repairs_only_a_block_it_recognises_as_its_own() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("AGENTS.md");
+    let old = super::briefing::SUPERSEDED_AGENTS_BLOCKS[0];
+    let current = super::briefing::agents_block();
+    assert_ne!(old, current, "the superseded block is the current one");
+
+    // The known older block, with repository text on both sides.
+    std::fs::write(&path, format!("# My repo\n\n{old}\n## Notes\nafter\n")).unwrap();
+    ensure_agents_block(dir.path()).unwrap();
+    let repaired = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        repaired,
+        format!("# My repo\n\n{current}\n## Notes\nafter\n")
+    );
+
+    // Repairing is idempotent.
+    ensure_agents_block(dir.path()).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), repaired);
+
+    // A block that is neither the current one nor a superseded one is an
+    // edit: markers present, and still nothing is touched.
+    let edited = repaired.replacen("and discover peers", "and also discover peers", 1);
+    std::fs::write(&path, &edited).unwrap();
+    ensure_agents_block(dir.path()).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+
+    // A begin marker with no end marker is not an invitation to append a
+    // second block: the file is left alone, as it was before CAD-1530.
+    // The review caught this — the first version of this change appended
+    // here, widening what cadence will write into someone else's repo.
+    let unclosed = "# My repo\n\n<!-- cadence:begin -->\nstray\n";
+    std::fs::write(&path, unclosed).unwrap();
+    ensure_agents_block(dir.path()).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), unclosed);
+}
+
 #[test]
 fn group_lifecycle_commands_parse() {
     let cli = Cli::try_parse_from(["cadence", "resume", "pm1"]).unwrap();
