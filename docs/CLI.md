@@ -312,6 +312,11 @@ deferred until commit so removing human-room topics and metadata does not
 fail on an intermediate state. A foreign-key failure at commit refuses the
 export without publishing a package. The source database is unchanged.
 
+Credential scanning treats the exact CLI flag `--author` as attribution,
+not an authentication argument. Sensitive argument names and `AUTHOR=...`
+assignments retain their credential checks. Recognizable provider tokens
+still refuse, including when supplied as `--author` values.
+
 Portable `pm.yaml` validation accepts tracker metadata plus the native closed
 `pi`, `host`, and `hosted` configuration sections. Files are copied byte for
 byte, including comments; settings are not stripped or reserialized. Unknown
