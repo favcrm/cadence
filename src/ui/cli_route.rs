@@ -714,8 +714,8 @@ fn dispatch(
             #[serde(deny_unknown_fields)]
             struct PolicyReq {
                 project: String,
-                visibility: Option<String>,
-                grants: Option<Vec<String>>,
+                visibility: String,
+                grants: Vec<String>,
             }
             let req: PolicyReq = match serde_json::from_value(args.clone()) {
                 Ok(r) => r,
@@ -723,12 +723,10 @@ fn dispatch(
                     return cli_fail(400, "invalid_request", &format!("project_policy: {e}"));
                 }
             };
-            let visibility = match req.visibility.as_deref() {
-                None | Some("workspace-visible") => {
-                    crate::issue::project::Visibility::WorkspaceVisible
-                }
-                Some("private") => crate::issue::project::Visibility::Private,
-                Some(other) => {
+            let visibility = match req.visibility.as_str() {
+                "workspace-visible" => crate::issue::project::Visibility::WorkspaceVisible,
+                "private" => crate::issue::project::Visibility::Private,
+                other => {
                     return cli_fail(
                         400,
                         "invalid_request",
@@ -745,7 +743,7 @@ fn dispatch(
                     &pm,
                     &req.project,
                     visibility,
-                    &req.grants.unwrap_or_default(),
+                    &req.grants,
                     &format!("users/{}", actor.handle),
                 ) {
                     Ok(out) => json_ok(out),
@@ -928,7 +926,7 @@ mod policy_tests {
         assert_eq!(
             call(
                 &actor_with_role("users/owner", "owner"),
-                json!({"project": "../aos274-escape", "grants": ["users/mia"]})
+                json!({"project": "../aos274-escape", "visibility": "workspace-visible", "grants": ["users/mia"]})
             ),
             400
         );
@@ -945,7 +943,10 @@ mod policy_tests {
         // stale projection relies on to refuse the previous policy.
         let owner = actor_with_role("users/owner", "owner");
         assert_eq!(
-            call(&owner, json!({"project": "demo", "grants": ["users/mia"]})),
+            call(
+                &owner,
+                json!({"project": "demo", "visibility": "workspace-visible", "grants": ["users/mia"]})
+            ),
             200
         );
         let first = policy_of().expect("policy recorded");
@@ -966,7 +967,7 @@ mod policy_tests {
         assert_eq!(
             call(
                 &owner,
-                json!({"project": "demo", "grants": ["users/mia", "users/dev"]})
+                json!({"project": "demo", "visibility": "workspace-visible", "grants": ["users/mia", "users/dev"]})
             ),
             200
         );
@@ -984,14 +985,16 @@ mod policy_tests {
         // The isolation gate holds for the Owner too, and a refused
         // activation leaves the recorded policy exactly as it was.
         assert_eq!(
-            call(&owner, json!({"project": "demo", "visibility": "private"})),
+            call(
+                &owner,
+                json!({"project": "demo", "visibility": "private", "grants": []})
+            ),
             400
         );
         assert_eq!(policy_of().expect("policy recorded"), second);
     }
 
-    /// A malformed call is refused before any write, and the two spellings
-    /// of "no change to visibility" are the only ones accepted.
+    /// A malformed call is refused before any write.
     #[test]
     fn a_policy_call_naming_an_unknown_field_or_visibility_is_refused() {
         let (_dir, pm) = pm_with("");
@@ -999,10 +1002,10 @@ mod policy_tests {
         let opts = ServeOpts::default();
         let owner = actor_with_role("operator", "owner");
         for args in [
-            json!({"project": "demo", "visibility": "public"}),
-            json!({"project": "demo", "member": "users/mia"}),
-            json!({"project": "demo", "grants": ["everyone"]}),
-            json!({"grants": ["users/mia"]}),
+            json!({"project": "demo", "visibility": "public", "grants": []}),
+            json!({"project": "demo", "visibility": "workspace-visible", "grants": [], "member": "users/mia"}),
+            json!({"project": "demo", "visibility": "workspace-visible", "grants": ["everyone"]}),
+            json!({"visibility": "workspace-visible", "grants": ["users/mia"]}),
         ] {
             let refusal = dispatch(
                 Verb::ProjectPolicy,

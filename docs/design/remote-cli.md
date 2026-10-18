@@ -133,7 +133,9 @@ type/milestone/size; body edits are not part of the field vocabulary).
 exactly `{project, visibility, grants}`: `visibility` is `workspace-visible`
 or `private` (canonical spellings; `private` stays refused until the
 isolation gate passes), and `grants` is the full replacement member list
-(`users/<handle>` or `operator`), not a merge. The success body is
+(`users/<handle>` or `operator`), not a merge. All three fields are required;
+missing or null values are refused without a write. An explicit empty
+`grants` array clears the recorded list. The success body is
 `{project, policy, committed}` — a policy record, not an issue card.
 Human Owner only (`role_at_issue=owner` and `principal_kind=user`); a
 member or an owner-role agent is refused before a write. The native policy

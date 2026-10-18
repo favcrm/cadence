@@ -154,6 +154,14 @@ fn signed_project_policy_admits_a_human_owner_and_refuses_the_rest() {
         request.respond(response).unwrap();
     });
 
+    let incomplete_requests = [
+        json!({"project": "cadence"}),
+        json!({"project": "cadence", "grants": []}),
+        json!({"project": "cadence", "visibility": "workspace-visible"}),
+        json!({"project": "cadence", "visibility": null, "grants": []}),
+        json!({"project": "cadence", "visibility": "workspace-visible", "grants": null}),
+    ];
+    let request_count = 6 + incomplete_requests.len();
     let server = loopback_server();
     let port = server.server_addr().to_ip().unwrap().port();
     let opts = ServeOpts {
@@ -167,7 +175,7 @@ fn signed_project_policy_admits_a_human_owner_and_refuses_the_rest() {
     };
     let pm_dir = pm.dir.clone();
     let route_thread = thread::spawn(move || {
-        for _ in 0..6 {
+        for _ in 0..request_count {
             let mut request = server
                 .recv_timeout(Duration::from_secs(20))
                 .unwrap()
@@ -276,19 +284,40 @@ fn signed_project_policy_admits_a_human_owner_and_refuses_the_rest() {
     assert_eq!(body["policy"]["members"], json!(["users/mia", "operator"]));
     assert!(body.get("issue").is_none());
     assert!(body.get("card").is_none());
+    let granted = tree_bytes(&project_dir);
+    let committed = crate::issue::git(&pm.dir, &["rev-parse", "HEAD"]).unwrap();
+    for (index, args) in incomplete_requests.iter().enumerate() {
+        let invalid = assertion(
+            &key,
+            &issuer,
+            "operator",
+            "user",
+            "owner",
+            &format!("aos274-incomplete-{index}"),
+        );
+        let (status, body) = call(port, &invalid, args);
+        assert_eq!(status, 400, "{args}: {body}");
+        assert_eq!(body["error"]["code"], "invalid_request");
+        assert_eq!(tree_bytes(&project_dir), granted, "{args}");
+        assert_eq!(
+            crate::issue::git(&pm.dir, &["rev-parse", "HEAD"]).unwrap(),
+            committed,
+            "invalid arguments committed a policy change: {args}"
+        );
+    }
 
     let owner_replace = assertion(&key, &issuer, "operator", "user", "owner", "aos274-replace");
     let (status, body) = call(
         port,
         &owner_replace,
-        &json!({"project": "cadence", "visibility": "workspace-visible", "grants": ["operator"]}),
+        &json!({"project": "cadence", "visibility": "workspace-visible", "grants": []}),
     );
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["policy"]["version"], first_version + 1);
-    assert_eq!(
-        body["policy"]["members"],
-        json!(["operator"]),
-        "grants replace the recorded list"
+    let cleared = crate::issue::project::load(&project_dir.join("project.yaml")).unwrap();
+    assert!(
+        cleared.policy.unwrap().members.is_empty(),
+        "explicit empty grants did not clear the recorded list"
     );
     let journal = crate::issue::git(&pm.dir, &["log", "-1", "--format=%B"]).unwrap();
     assert!(
