@@ -479,6 +479,14 @@ const CADENCE_RULES: &[CadenceRule] = &[
 ];
 
 fn argv_confirm(caps: &Captures) -> bool {
+    // Author attribution is not authentication. Exclude only this exact flag
+    // from the argv heuristic; provider-token rules still inspect its value.
+    if caps
+        .get(1)
+        .is_some_and(|flag| flag.as_bytes() == b"--author")
+    {
+        return false;
+    }
     let text = |i: usize| caps.get(i).map(|m| String::from_utf8_lossy(m.as_bytes()));
     let Some(value) = text(3) else {
         return false;
