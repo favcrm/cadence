@@ -131,7 +131,9 @@ pub(super) fn read(
 
 /// Judge raw `at` pairs before the decoded query helper. That helper drops a
 /// value percent-decode cannot finish and keeps only the first `at`, so a
-/// bad or repeated selector has to be refused here.
+/// bad or repeated selector has to be refused here. The name is compared
+/// after percent-decoding, so `%61t` and `a%74` are the selector rather than
+/// an unknown parameter that quietly reads the live page.
 pub(super) fn historical_at(raw_url: &str) -> std::result::Result<Option<String>, &'static str> {
     let raw_query = raw_url
         .split_once('?')
@@ -143,6 +145,13 @@ pub(super) fn historical_at(raw_url: &str) -> std::result::Result<Option<String>
             continue;
         }
         let (key, raw) = pair.split_once('=').unwrap_or((pair, ""));
+        // The name is judged decoded as well: a selector spelled `%61t` asks
+        // for a pinned revision exactly as `at` does, and must not fall
+        // through to a live read as if the parameter were something else. A
+        // key that cannot be decoded cannot be a spelling of `at`.
+        let Some(key) = super::pct_decode(key) else {
+            continue;
+        };
         if key != "at" {
             continue;
         }
@@ -995,6 +1004,36 @@ mod selector_tests {
         assert_eq!(
             historical_at("/api/wiki/file?at=a&at=0123456789abcdef0123456789abcdef01234567"),
             Err("wiki file at is repeated")
+        );
+    }
+
+    /// An encoded spelling of the selector name is the selector. Compared
+    /// literally, `%61t=…` was an unknown parameter, so the request fell
+    /// through and read the live page instead of the revision asked for.
+    #[test]
+    fn an_encoded_at_spelling_is_the_selector_not_a_live_read() {
+        for spelling in ["at", "%61t", "a%74", "%61%74"] {
+            assert_eq!(
+                historical_at(&format!(
+                    "/api/wiki/file?path=a.md&{spelling}=fnv1a%3A0123456789abcdef"
+                )),
+                Ok(Some("fnv1a:0123456789abcdef".to_string())),
+                "{spelling} names the selector"
+            );
+        }
+        assert_eq!(
+            historical_at(
+                "/api/wiki/file?path=a.md&at=fnv1a%3A0123456789abcdef&%61t=fnv1a%3A0123456789abcdef"
+            ),
+            Err("wiki file at is repeated")
+        );
+        assert_eq!(
+            historical_at("/api/wiki/file?path=a.md&%61t="),
+            Err("wiki file at must be a non-empty revision")
+        );
+        assert_eq!(
+            historical_at("/api/wiki/file?path=a.md&%61t=%ZZ"),
+            Err("wiki file at is malformed")
         );
     }
 }

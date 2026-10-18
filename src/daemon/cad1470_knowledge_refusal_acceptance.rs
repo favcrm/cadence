@@ -711,3 +711,114 @@ fn cad1470_member_cannot_publish_or_inherit_owner_approval() {
     drop(board);
     drop(root);
 }
+
+/// A request that names the historical selector in an encoded spelling asks
+/// for a pinned revision. Compared literally, `%61t=…` was an unknown
+/// parameter, so the request fell through and read the live page instead.
+/// The signed-envelope route shares `historical_at`, so it shares this
+/// refusal.
+#[test]
+fn cad1470_encoded_historical_selector_never_reads_the_live_page() {
+    let root = tempfile::Builder::new()
+        .prefix("cad1470-encoded-at")
+        .tempdir()
+        .unwrap();
+    let board = Board::start(root.path());
+    let http = Http::from_board(&board);
+    let owner = open_session(
+        &board,
+        "usr-cad1470-encoded-owner",
+        "owner",
+        "encoded@example.com",
+        "Encoding Owner",
+    );
+
+    let (status, written) = http.call(
+        "PUT",
+        "/api/wiki/file",
+        &owner,
+        Some(&json!({"path": POLICY, "text": POLICY_V1, "if_rev": "none"}).to_string()),
+    );
+    ok(status, &written, "owner writes the first revision");
+    let first = written["rev"].as_str().expect("file rev").to_string();
+    let v1_sha = sha256_hex(POLICY_V1.as_bytes());
+
+    let (status, edited) = http.call(
+        "PUT",
+        "/api/wiki/file",
+        &owner,
+        Some(&json!({"path": POLICY, "text": POLICY_V2, "if_rev": first}).to_string()),
+    );
+    ok(status, &edited, "owner writes the second revision");
+
+    // The live page is the second revision, so a selector that degraded to a
+    // live read would show these bytes instead of the pinned ones.
+    let (status, live) = http.call(
+        "GET",
+        &format!("/api/wiki/file?path={}", enc(POLICY)),
+        &owner,
+        None,
+    );
+    ok(status, &live, "live read");
+    assert_eq!(
+        page_bytes(&live),
+        POLICY_V2,
+        "the live page is the second revision"
+    );
+
+    for spelling in ["%61t", "a%74", "%61%74"] {
+        let (status, page) = http.call(
+            "GET",
+            &format!(
+                "/api/wiki/file?path={}&{spelling}={}",
+                enc(POLICY),
+                enc(&first)
+            ),
+            &owner,
+            None,
+        );
+        ok(status, &page, "encoded historical selector read");
+        assert_eq!(
+            page_bytes(&page),
+            POLICY_V1,
+            "{spelling} reads the pinned revision, not the live page"
+        );
+        assert_eq!(
+            page["sha256"].as_str(),
+            Some(v1_sha.as_str()),
+            "{spelling} carries the pinned digest: {page}"
+        );
+    }
+
+    // An encoded alias is a second selector, not a different parameter, and
+    // an encoded empty or undecodable selector is still refused.
+    let (status, repeated) = http.call(
+        "GET",
+        &format!(
+            "/api/wiki/file?path={}&at={}&%61t={}",
+            enc(POLICY),
+            enc(&first),
+            enc(&first)
+        ),
+        &owner,
+        None,
+    );
+    refused(status, &repeated, "an encoded alias is a repeated selector");
+
+    for (query, what) in [
+        (
+            format!("/api/wiki/file?path={}&%61t=", enc(POLICY)),
+            "empty",
+        ),
+        (
+            format!("/api/wiki/file?path={}&%61t=%ZZ", enc(POLICY)),
+            "undecodable",
+        ),
+    ] {
+        let (status, body) = http.call("GET", &query, &owner, None);
+        refused(status, &body, what);
+    }
+
+    drop(board);
+    drop(root);
+}

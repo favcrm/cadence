@@ -95,7 +95,12 @@ export default function UploadPane({
     setItems(next);
   };
 
+  // An import in flight records itself as soon as `begin` answers, so reading
+  // here would present the running transfer as an interrupted one. Refresh
+  // only while nothing is running: every completion path sets `items` after
+  // it clears the flag, which re-runs this effect.
   useEffect(() => {
+    if (running.current) return;
     setResumes(readResume(dir));
   }, [dir, items]);
 
