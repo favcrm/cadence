@@ -327,11 +327,19 @@ function useBoardInstalls(viewer: Viewer): {
   const refresh = useCallback(async (): Promise<InstallRef[] | null> => {
     const controller = new AbortController();
     const gen = ++generation.current;
-    const list = await read(controller.signal);
-    if (!mounted.current || generation.current !== gen) return list;
-    setRows(list);
-    setError(null);
-    return list;
+    setLoading(true);
+    try {
+      const list = await read(controller.signal);
+      if (!mounted.current || generation.current !== gen) return null;
+      setRows(list);
+      setError(null);
+      return list;
+    } catch (cause: unknown) {
+      if (mounted.current && generation.current === gen) setError(loadFailureMessage(cause));
+      return null;
+    } finally {
+      if (mounted.current && generation.current === gen) setLoading(false);
+    }
   }, [read]);
   const accept = (row: Installation) => {
     const confirmed: InstallRef = {

@@ -324,20 +324,30 @@ refused. Nothing is deleted. The app leaves Open and the sidebar and is listed
 under "Recently removed" for 30 days. Within that window
 `POST /api/app-installations/<id>/restore` clears the mark and re-records
 consent for the same bytes. After the window it refuses: the install can only
-stay removed, and the page no longer offers Restore. A removed app's Explorer
-card and detail page offer Restore (never Install) while the window is open.
+stay removed, and the page no longer offers Restore. Open a recently removed
+card to manage that exact installation and restore it; cards contain no nested
+action buttons. Historical Explorer details retain their existing Restore action.
 
 ## Explorer routes
 
-In the board, `/apps` is the installed-app home. Its **Explore apps** button
-opens `/apps/explore`; attention rows offer **Review update**, **Finish setup**,
-or **Manage access** to the operator. `/apps/explore` hands discovery and
-marketplace installs to the AgenticOS Apps page (CAD-1422 — the built-in
-catalog is retired); the operator's **More ▾ → Add from Git URL…** remains for
-a custom bundle, checked and digest-pinned as before. Catalog ids a historical
-install or an open request still names show as retired tombstones with their
-real install state (Open / Restore), never an Install control. These install
-controls are operator-only.
+In the board, `/apps` is the installed-app home, including Favorites and project
+apps. **Explore apps** opens the native directory at `/apps/explore`. Each whole
+card opens `/apps/catalog/<id>` with its overview, features, releases and workspace
+panel; installed cards carry the exact installation ID.
+
+A verified operator selects an immutable published release, chooses **Review
+installation** or **Review update**, reviews the checked package and access
+changes, then explicitly confirms Apply. Fresh installs may choose an older
+eligible release. Updates may skip the recommendation for an eligible intermediate
+version, but never downgrade or run automatically. Apply rechecks publication,
+digest and the checked installation/catalogue generation. A withdrawn release
+is refused without changing the installed copy. An uncertain result instead
+shows **Not confirmed** and requires **Check installation** before another apply;
+leaving or reloading the page does not retry it.
+
+Git and local package sources remain on the existing operator-managed path,
+including **More ▾ → Add from Git URL…** and `/apps/manage/<id>`. Historical
+embedded-catalogue IDs remain retired tombstones, not a second install source.
 
 A verified operator in a writable session can check and apply updates for any
 installed app at `/apps/manage/<id>`. Enter a package source, choose **Check

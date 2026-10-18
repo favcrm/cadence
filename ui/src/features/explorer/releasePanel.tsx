@@ -45,7 +45,8 @@ import "./publicDirectory.css";
 export type PanelNote = {
   text: string;
   tone: "status" | "alert";
-  observed?: { installId: string; version: string };
+  /** Mutation notices follow their selected release; readback notices follow the record. */
+  observed?: { installId: string; version: string; selectionVersion?: string };
 };
 
 export type Receipt = {
@@ -385,7 +386,8 @@ class CheckedMismatch extends Error {
 
 /** The daemon answers a vanished release as 404; a moved workspace as 409.
  * The message heuristics backstop the same refusal on older daemons. */
-const WITHDRAWN = /withdrawn|no longer (available|published)|not available/i;
+const WITHDRAWN =
+  /withdrawn|no longer (available|published)|not available|not installable/i;
 const STALE = /stale|generation|precondition/i;
 
 /** Access lines the reviewed access_diff reports, in plain words. */
@@ -514,11 +516,13 @@ export default function ReleasePanel({
     setFlow({ kind: "none" });
     setNote((current) =>
       current?.observed?.installId === installKey &&
-      current.observed.version === selected
+      current.observed.version === install?.version &&
+      (current.observed.selectionVersion === undefined ||
+        current.observed.selectionVersion === selected)
         ? current
         : null,
     );
-  }, [app.id, selected, installKey]);
+  }, [app.id, selected, installKey, install?.version]);
 
   useEffect(() => {
     mounted.current = true;
@@ -863,7 +867,11 @@ export default function ReleasePanel({
       setFlow({ kind: "none" });
       setNote({
         tone: "status",
-        observed: { installId: row.install_id, version: row.version },
+        observed: {
+          installId: row.install_id,
+          version: row.version,
+          selectionVersion: release.version,
+        },
         text: t(
           receipt.kind === "install"
             ? "Installed package {version}. Connections and execution keep their own approval checks."
@@ -1018,14 +1026,16 @@ export default function ReleasePanel({
         <div>
           <dt>{t("Installed")}</dt>
           <dd>
-            {install
-              ? (install.version ?? "—")
-              : installsReady &&
-                  !installsError &&
-                  !chooser &&
-                  !installParamMissing
-                ? t("Not installed")
-                : "—"}
+            {isLocked
+              ? t("Not confirmed")
+              : install
+                ? (install.version ?? "—")
+                : installsReady &&
+                    !installsError &&
+                    !chooser &&
+                    !installParamMissing
+                  ? t("Not installed")
+                  : "—"}
           </dd>
         </div>
         <div>
@@ -1135,7 +1145,7 @@ export default function ReleasePanel({
           ).replace("{version}", release.version)}
         </p>
       )}
-      {isLocked && (
+      {isLocked && !note && (
         <p className="pub-note" data-tone="alert">
           {t(
             applying

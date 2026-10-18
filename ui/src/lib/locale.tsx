@@ -1262,6 +1262,7 @@ Object.assign(zhTW, {
   "Use Choose favorites to keep everyday apps here and in the sidebar.": "在「選擇我的最愛」釘選日常使用的應用程式，便會顯示在此處及側邊欄。",
   "Manage installation": "管理安裝",
   "Installed app": "已安裝的應用程式",
+  "Not confirmed": "尚未確認",
   "This app is not listed in the public directory.": "此應用程式未列於公開目錄。",
   "The installed copy stays usable. Published versions and update checks return when the catalogue answers.": "已安裝的版本仍可使用。目錄恢復回應後，便可查看已發佈版本及檢查更新。",
   "Some installed-app records could not be fully read — check again before assuming this app is absent.": "部分安裝記錄未能完整讀取，請先重新核對，不能據此判定此應用程式尚未安裝。",
