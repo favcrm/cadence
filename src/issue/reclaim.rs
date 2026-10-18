@@ -936,6 +936,7 @@ mod tests {
             repos: vec![crate::issue::project::Repo {
                 path: Some(repo.display().to_string()),
                 remote: None,
+                base: None,
             }],
             components: Vec::new(),
             tags: Vec::new(),

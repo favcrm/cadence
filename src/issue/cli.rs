@@ -285,8 +285,11 @@ pub enum IssueAction {
         /// Worktree slug — default: the slugified title (≤32 chars).
         #[arg(long)]
         name: Option<String>,
-        /// Base ref — else refresh and use the repo's origin/HEAD;
-        /// repositories without a remote default use the current branch.
+        /// Integration ref to cut the lane from. Default: the repo's
+        /// configured `base`, else the remote HEAD (`origin/HEAD`, else
+        /// the remote's symbolic HEAD). A checkout with no `origin`
+        /// uses its current branch. A resolved remote ref is never
+        /// replaced by the main checkout's current branch.
         #[arg(long)]
         base: Option<String>,
         /// Owner to record when the issue has none — default: the

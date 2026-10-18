@@ -379,6 +379,7 @@ pub fn run(pm: &Pm, req: &Request, actor: &str, guarded: &[(&str, &Path)]) -> Re
                         vec![project::Repo {
                             path: Some(root.to_string_lossy().to_string()),
                             remote: remote.clone(),
+                            base: None,
                         }]
                     })
                     .unwrap_or_default(),

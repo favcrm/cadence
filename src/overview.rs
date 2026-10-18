@@ -2801,6 +2801,7 @@ mod tests {
             repos: vec![project::Repo {
                 path: Some(repo.to_string_lossy().into()),
                 remote: Some("git@github.com:favcrm/cadence.git".into()),
+                base: None,
             }],
             components: vec![],
             tags: vec![],
@@ -2828,6 +2829,7 @@ mod tests {
             repos: vec![project::Repo {
                 path: Some("/definitely/not/the/build".into()),
                 remote: Some("git@example.com:other/repo.git".into()),
+                base: None,
             }],
             components: vec![],
             tags: vec![],

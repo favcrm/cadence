@@ -159,7 +159,11 @@ pub fn create_worktree(base: &Path, name: &str) -> Result<PathBuf> {
                 "Branch '{branch}' already exists without matching lifecycle ownership — refusing reuse"
             )));
         }
-        (crate::issue::start::resolve_base(&root, None)?.1, actor)
+        let resolved = crate::issue::start::resolve_base(&root, None, None)?;
+        if let Some(warning) = &resolved.warning {
+            eprintln!("cadence: {warning}");
+        }
+        (resolved.sha, actor)
     };
     ensure_cadence_ignored(&root)?;
     // The recovery branches below add a checkout without `begin`; refuse a

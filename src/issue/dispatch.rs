@@ -552,7 +552,12 @@ pub fn run(
     // the daemon's own kickoff (`check_job_kickoff`).
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let root = start::resolve_repo(&project, args.repo.as_deref(), &cwd)?;
-    let (_base, base_sha) = start::resolve_base(&root, args.base.as_deref())?;
+    let base_sha = start::resolve_base(
+        &root,
+        args.base.as_deref(),
+        start::configured_integration(&project, &root),
+    )?
+    .sha;
     let (wt_dir, branch) = start::resolve_lane(&front, args.name.as_deref(), &root)?;
     let body = if args.job_spec.is_none() {
         let summary = args.summary.as_deref().unwrap_or(&front.title);
