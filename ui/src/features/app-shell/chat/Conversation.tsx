@@ -375,9 +375,12 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const listRef = useRef<HTMLOListElement>(null);
   const follow = useRef<Follow>(initialFollow());
   const [unseen, setUnseen] = useState(0);
-  // The last tail item seen: the jump pill is driven by a new tail
-  // identity — history prepending above the window never raises it.
-  const tailKey = useRef<string | null>(null);
+  // The last STORED row seen. Pending rows are appended after every stored
+  // one (`threadItems`), so a failed pending row can own the end of the
+  // list and hide arrivals behind it; the stored tail changes exactly when
+  // a stored row arrives — never for a history prepend, and never for the
+  // reader's own pending row (CAD-1533 spec/security round 3).
+  const storedTailKey = useRef<string | null>(null);
   // Rows seen at the previous tail change, so a batch of arrivals counts
   // as a batch instead of one (CAD-1533 review, finding 3).
   const prevItems = useRef(0);
@@ -502,7 +505,7 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     setLoadingEarlier(false);
     follow.current = initialFollow();
     setUnseen(0);
-    tailKey.current = null;
+    storedTailKey.current = null;
     anchorRef.current = null;
   }, [installId, convId, frameToken]);
   useEffect(() => {
@@ -648,16 +651,26 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   useEffect(() => {
     const el = listRef.current;
     if (!el) return;
-    const tail = items[items.length - 1]?.key ?? null;
+    // The arrival anchor is the last STORED row, not the last row: pending
+    // rows trail every stored one, so a failed pending row at the end would
+    // otherwise freeze the anchor and swallow real arrivals (CAD-1533
+    // spec/security round 3, blocking).
+    let stored: string | null = null;
+    for (let i = items.length - 1; i >= 0; i--) {
+      if (items[i].type !== "pending") {
+        stored = items[i].key;
+        break;
+      }
+    }
     // The baseline is refreshed on EVERY row-set change, including a
-    // history prepend that leaves the tail key alone — otherwise the next
+    // history prepend that leaves the anchor alone — otherwise the next
     // real arrival counts those prepended rows too and one message is
-    // announced as "21 new" (CAD-1533 spec/security review, blocking).
+    // announced as "21 new" (CAD-1533 spec/security round 2, blocking).
     const arrivals = Math.max(1, items.length - prevItems.current);
     prevItems.current = items.length;
-    if (tail === tailKey.current) return;
-    const first = tailKey.current === null;
-    tailKey.current = tail;
+    if (stored === storedTailKey.current) return;
+    const first = storedTailKey.current === null;
+    storedTailKey.current = stored;
     if (first) {
       scrollPanel("jump");
       return;
