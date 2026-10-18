@@ -460,6 +460,9 @@ that target, including slashed branch names. Retargeting invalidates the
 evidence even when both branches share an OID; old readiness records without
 `base_ref` need fresh binding. Enqueue comments include an exact
 `Base branch: <name>` line. Omitting the option preserves existing policy digests.
+Native merge approval and legacy merge check/enqueued phases enforce the same
+target admission for every policy activation, including custom and fallback
+policies. Operator merge approval does not approve a project integration target.
 
 ```yaml
 delivery:

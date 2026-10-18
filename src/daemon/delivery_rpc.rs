@@ -1392,6 +1392,21 @@ impl Shared {
                         "{id} is not ready to merge: {why}"
                     )));
                 }
+                // CAD-1561: the retained check/enqueued phases share the
+                // requirements classifier's authoritative current-target
+                // admission — a standing PASS on a base that is neither
+                // the repository default nor the approved
+                // `integration_branch` refuses here exactly as
+                // `delivery_approve` refuses it.
+                delivery_requirements_rpc::classify(
+                    self,
+                    &json!({"issue": id, "pr": pr, "head": sha}),
+                )
+                .map_err(|_| {
+                    Error::rejected(
+                        "current profile requirements could not be verified; the merge was not enqueued",
+                    )
+                })?;
                 if phase == "check" {
                     return Ok(json!({"issue": id, "sha": sha, "pr": pr}));
                 }
@@ -1563,27 +1578,25 @@ impl Shared {
             }
         }
         if !routine {
-            let pm = self.pm()?;
-            let approved = self.store.work_approvals()?;
-            let effective = crate::issue::delivery_policy::effective(
-                &rec.project,
-                crate::issue::delivery_policy::load(&pm.dir, &rec.project),
-                approved
-                    .get(&rec.project)
-                    .and_then(crate::issue::delivery_policy::approved_from)
-                    .as_ref(),
-            );
-            if crate::issue::delivery_requirements::activation_of(&effective)
-                == crate::issue::delivery_requirements::Activation::Active
-            {
-                let request = json!({"issue": id, "pr": pr_url, "head": live});
-                let current = delivery_requirements_rpc::classify(self, &request)
-                    .map_err(|_| Error::rejected("current profile requirements could not be verified; no merge was approved"))?;
-                let requirements = &current["requirements"];
-                if requirements["activation"] != "active"
-                    || requirements["reviews"]
-                        .as_u64()
-                        .is_none_or(|count| count > 1)
+            // CAD-1561: the requirements classifier is the authoritative
+            // admission of the CURRENT target under the CURRENT approved
+            // policy. It runs for EVERY activation here — an
+            // unapproved/removed/malformed policy or a base that is
+            // neither the repository default nor the approved
+            // `integration_branch` refuses even when no profile floor
+            // applies — before the approval is recorded and before `gh`
+            // enqueues.
+            let request = json!({"issue": id, "pr": pr_url, "head": live});
+            let current = delivery_requirements_rpc::classify(self, &request).map_err(|_| {
+                Error::rejected(
+                    "current profile requirements could not be verified; no merge was approved",
+                )
+            })?;
+            let requirements = &current["requirements"];
+            if requirements["activation"] == "active" {
+                if requirements["reviews"]
+                    .as_u64()
+                    .is_none_or(|count| count > 1)
                     || requirements["browser_qa"] == true
                 {
                     return Err(Error::rejected(
@@ -1603,22 +1616,26 @@ impl Shared {
                         return Err(Error::rejected("current required checks or canonical ci.yml run are not green; no merge was approved"));
                     }
                 }
-                let confirmed =
-                    delivery_requirements_rpc::classify(self, &request).map_err(|_| {
-                        Error::rejected(
-                            "profile requirements changed during approval; no merge was approved",
-                        )
-                    })?;
-                if confirmed["head"] != current["head"]
-                    || confirmed["base"] != current["base"]
-                    || confirmed["base_ref"] != current["base_ref"]
-                    || confirmed["policy_digest"] != current["policy_digest"]
-                    || confirmed["requirements"] != current["requirements"]
-                {
-                    return Err(Error::rejected(
-                        "profile requirements changed during approval; no merge was approved",
-                    ));
-                }
+            }
+            // Freshness through the side effects below: the same
+            // classification is re-collected and every admission input —
+            // head, base commit, base branch, policy digest,
+            // requirements — must be identical, so a target or policy
+            // that changed while the floors ran still refuses.
+            let confirmed = delivery_requirements_rpc::classify(self, &request).map_err(|_| {
+                Error::rejected(
+                    "profile requirements changed during approval; no merge was approved",
+                )
+            })?;
+            if confirmed["head"] != current["head"]
+                || confirmed["base"] != current["base"]
+                || confirmed["base_ref"] != current["base_ref"]
+                || confirmed["policy_digest"] != current["policy_digest"]
+                || confirmed["requirements"] != current["requirements"]
+            {
+                return Err(Error::rejected(
+                    "profile requirements changed during approval; no merge was approved",
+                ));
             }
         }
         if !rec.merge_ready() {
