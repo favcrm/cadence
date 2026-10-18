@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { resources } from "../../lib/resources";
 import { useTranslate } from "../../lib/locale";
-import { appExplorer, notifyAppsChanged, prefetchWorkspaceApp, type HomeInstallation, type FavoritesPayload, type Installation } from "../workspace-apps/workspaceApps";
+import { appExplorer, notifyAppsChanged, type HomeInstallation, type FavoritesPayload, type Installation } from "../workspace-apps/workspaceApps";
 import { useQuery, useResource } from "../../lib/useResource";
 import type { AppRow } from "../../lib/types";
 import { homeNeeds, type HomeNeed } from "../home/needs";
@@ -446,9 +446,7 @@ function InstalledCard({ h, href, onOpen }: { h: HomeInstallation; href: string 
       ) : (
         <Link className="app-card-link" href={href}
           aria-labelledby={nameId} aria-describedby={statusId}
-          onClick={onOpen}
-          onMouseEnter={() => prefetchWorkspaceApp(h.install_id)}
-          onFocus={() => prefetchWorkspaceApp(h.install_id)}>
+          onClick={onOpen}>
           {body}
         </Link>
       )}

@@ -122,11 +122,14 @@ the board reads catalogue JSON. `/versions` accepts no query. A release
 document is `/api/public-apps/<id>/release?version=<exact>&digest=<sha256:…>`
 with both keys required, in either order, and no extra or duplicate keys.
 Hosted boards use `http://api.internal` for listing, detail, and versions
-metadata only. The board does not read `/release` bytes from that internal
-directory. A self-hosted catalog origin (`https` or loopback) still proxies
-the pinned release document. The directory install pins that version and
-digest and uploads the same locator; readback must show it. The locator is
-provenance after that match, not a publisher grant.
+metadata only — that host never serves the release document. The board
+proxies the pinned release fetch to `http://catalogue-packages.internal`, a
+closed outbound broker that answers exactly `GET /public/apps/<id>/release`
+with `version` and `digest`. A self-hosted catalog origin (`https` or
+loopback) still proxies the pinned release document itself. The directory
+install pins that version and digest and uploads the same locator; readback
+must show it. The locator is provenance after that match, not a publisher
+grant.
 
 Browse-only releases remain visible with their description and availability;
 they never acquire an Install action merely because their listing is valid.

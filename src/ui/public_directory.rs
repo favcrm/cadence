@@ -66,6 +66,11 @@ pub(super) fn is_public_catalog_route(path: &str) -> bool {
     path == "/api/public-apps" || path.starts_with("/api/public-apps/")
 }
 
+/// The fixed hosted package broker the platform answers inside the
+/// container. It serves only the pinned release document — never metadata,
+/// never another path — so `api.internal` stays a metadata door.
+const HOSTED_PACKAGE_ORIGIN: &str = "http://catalogue-packages.internal";
+
 pub(super) fn proxy_public_catalog(path: &str, raw_query: &str) -> super::write_path::HttpResp {
     let Some(upstream) = catalog_upstream(path, raw_query) else {
         return super::serve::err_response(404, "No such app.");
@@ -73,16 +78,14 @@ pub(super) fn proxy_public_catalog(path: &str, raw_query: &str) -> super::write_
     let Some(origin) = catalog_origin() else {
         return super::serve::err_response(503, "public directory is not configured");
     };
-    // Hosted containers reach api.internal for list, detail, and versions
-    // metadata only. That door does not serve release bytes; refusing here
-    // keeps the board from opening a binary fetch on it.
-    if origin == "http://api.internal" && upstream.contains("/release?") {
-        return super::serve::err_response(
-            502,
-            "Release bytes are not read from the internal directory.",
-        );
-    }
-    fetch_public_catalog(&format!("{origin}{upstream}"))
+    // Only the exact, already-validated package read uses the closed broker.
+    // Metadata stays on api.internal; self-hosted origins serve their own bytes.
+    let fetch_origin = if origin == "http://api.internal" && upstream.contains("/release?") {
+        HOSTED_PACKAGE_ORIGIN
+    } else {
+        &origin
+    };
+    fetch_public_catalog(&format!("{fetch_origin}{upstream}"))
 }
 
 fn catalog_id(id: &str) -> bool {

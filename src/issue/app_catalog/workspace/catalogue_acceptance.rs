@@ -170,29 +170,10 @@ fn install_at(
     )
 }
 
-fn apply(
-    pm: &Pm,
-    id: &str,
-    source: &str,
-    old_digest: &str,
-    generation: &str,
-    new_digest: &str,
-    request: &str,
-    claim: &CatalogueClaim,
-    origin: &str,
-) -> Result<Value> {
+fn apply(pm: &Pm, request: &UpgradeRequest<'_>) -> Result<Value> {
     upgrade(
         pm,
-        &UpgradeRequest {
-            id,
-            source,
-            expected_digest: old_digest,
-            expected_generation: generation,
-            expected_new_digest: new_digest,
-            request_id: request,
-            catalogue: claim,
-            directory: CatalogueDirectory::Origin(origin),
-        },
+        request,
         |_, _| Ok((json!({}), Default::default())),
         |_| Ok(Vec::new()),
     )
@@ -300,14 +281,16 @@ fn catalogue_upgrade_keeps_the_install_id_and_moves_bytes_only_on_apply() {
 
     let applied = apply(
         &pm,
-        &id,
-        &next,
-        &old_digest,
-        &generation,
-        &new_digest,
-        "catalogue-apply",
-        &next_claim,
-        &directory.origin,
+        &UpgradeRequest {
+            id: &id,
+            source: &next,
+            expected_digest: &old_digest,
+            expected_generation: &generation,
+            expected_new_digest: &new_digest,
+            request_id: "catalogue-apply",
+            catalogue: &next_claim,
+            directory: CatalogueDirectory::Origin(&directory.origin),
+        },
     )
     .unwrap();
     assert_eq!(applied["committed"], json!(true));
@@ -492,14 +475,16 @@ fn catalogue_mismatches_and_unavailable_metadata_leave_bytes_uninstalled() {
     refused(
         apply(
             &pm,
-            &id,
-            &next,
-            &digest,
-            &generation,
-            &other,
-            "catalogue-pin",
-            &locator(APP, "2.0.0", &new_digest),
-            &directory.origin,
+            &UpgradeRequest {
+                id: &id,
+                source: &next,
+                expected_digest: &digest,
+                expected_generation: &generation,
+                expected_new_digest: &other,
+                request_id: "catalogue-pin",
+                catalogue: &locator(APP, "2.0.0", &new_digest),
+                directory: CatalogueDirectory::Origin(&directory.origin),
+            },
         ),
         "expected new digest",
     );
@@ -608,14 +593,16 @@ fn catalogue_manual_resolution_clears_origin_without_replacing_the_install() {
         .to_string();
     let applied = apply(
         &pm,
-        &id,
-        &next,
-        &digest,
-        &generation,
-        &new_digest,
-        "catalogue-manual",
-        &CatalogueClaim::Manual,
-        &directory.origin,
+        &UpgradeRequest {
+            id: &id,
+            source: &next,
+            expected_digest: &digest,
+            expected_generation: &generation,
+            expected_new_digest: &new_digest,
+            request_id: "catalogue-manual",
+            catalogue: &CatalogueClaim::Manual,
+            directory: CatalogueDirectory::Origin(&directory.origin),
+        },
     )
     .unwrap();
     assert_row(&applied, &id, "2.0.0", &new_digest, None);
@@ -659,14 +646,16 @@ fn catalogue_path_install_stays_unlabelled_until_a_later_release_matches() {
         .to_string();
     apply(
         &pm,
-        &id,
-        &second,
-        &first_digest,
-        &generation,
-        &second_digest,
-        "path-update",
-        &CatalogueClaim::Absent,
-        &directory.origin,
+        &UpgradeRequest {
+            id: &id,
+            source: &second,
+            expected_digest: &first_digest,
+            expected_generation: &generation,
+            expected_new_digest: &second_digest,
+            request_id: "path-update",
+            catalogue: &CatalogueClaim::Absent,
+            directory: CatalogueDirectory::Origin(&directory.origin),
+        },
     )
     .unwrap();
     assert_row(&show(&pm, &id).unwrap(), &id, "2.0.0", &second_digest, None);
@@ -676,14 +665,16 @@ fn catalogue_path_install_stays_unlabelled_until_a_later_release_matches() {
         .to_string();
     apply(
         &pm,
-        &id,
-        &third,
-        &second_digest,
-        &generation,
-        &third_digest,
-        "matched-release",
-        &locator(APP, "3.0.0", &third_digest),
-        &directory.origin,
+        &UpgradeRequest {
+            id: &id,
+            source: &third,
+            expected_digest: &second_digest,
+            expected_generation: &generation,
+            expected_new_digest: &third_digest,
+            request_id: "matched-release",
+            catalogue: &locator(APP, "3.0.0", &third_digest),
+            directory: CatalogueDirectory::Origin(&directory.origin),
+        },
     )
     .unwrap();
     assert_row(

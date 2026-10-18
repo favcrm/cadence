@@ -1,6 +1,7 @@
 import type * as HappyDom from "happy-dom";
 import type * as Directory from "../src/features/explorer/publicDirectory";
 import type * as ReleasePanel from "../src/features/explorer/releasePanel";
+import type * as PrivateSession from "../src/lib/privateSession";
 declare function require<T = unknown>(name: string): T;
 function assert(value: unknown, why: string): asserts value {
   if (!value) throw new Error(why);
@@ -20,6 +21,7 @@ async function main() {
   };
   const directory = require<typeof Directory>("../src/features/explorer/publicDirectory");
   const panel = require<typeof ReleasePanel>("../src/features/explorer/releasePanel");
+  const session = require<typeof PrivateSession>("../src/lib/privateSession");
   const app = { id: "example-notes", app: "example-notes", title: "Example Notes", summary: "Synthetic notes", version: "1.2.3", listing: {}, digest: null, installable: false };
   const apps = directory.parsePublicList({ ok: true, data: { apps: [app] } });
   assert(apps.length === 1 && apps[0].id === app.id && apps[0].installable === false, "browse-only releases remain visible rather than disappearing from discovery");
@@ -80,6 +82,7 @@ async function main() {
   // when the committed row and a readback both name the release.
   const receipt: ReleasePanel.Receipt = {
     kind: "install",
+    sessionGeneration: session.privateSessionGeneration(),
     release: selectedRelease,
     files: { "app.md": "guide" },
     install: null,
@@ -104,6 +107,7 @@ async function main() {
       assert(body.catalogue?.id === installableApp.id && body.catalogue.version === "1.2.3" && body.catalogue.digest === digest, "the upload names the catalogue release");
       return new Response(JSON.stringify({
         ...installedFields,
+        committed: true,
         install_id: "install-1", name: app.app, version: "1.2.3", digest,
         catalogue: { id: app.id, version: "1.2.3", digest },
       }), { status: 200, headers: { "Content-Type": "application/json" } });
@@ -121,6 +125,23 @@ async function main() {
   assert(row.install_id === "install-1", "a pinned catalogue apply returns the committed row");
   assert(seen.filter((line) => line.includes("/upload")).length === 1, "a successful catalogue apply uploads once");
 
+  // Identity readback cannot replace the mutation's own commit acknowledgement.
+  for (const committed of [false, undefined]) {
+    let attempts = 0;
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === "POST") attempts += 1;
+      return new Response(JSON.stringify({
+        ...installedFields, committed,
+        install_id: "unconfirmed", name: app.app, version: "1.2.3", digest,
+        catalogue: { id: app.id, version: "1.2.3", digest },
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }) as typeof fetch;
+    let rejected = false;
+    try { await panel.applyCheckedRelease(installableApp, selectedRelease, receipt); } catch { rejected = true; }
+    assert(rejected, "missing or negative commit acknowledgement is not an installation success");
+    assert(attempts === 1, "an unconfirmed commit is never retried");
+  }
+
   // A committed row that does not name the catalogue release is refused
   // and the apply is never retried.
   let posted = 0;
@@ -128,7 +149,7 @@ async function main() {
     const url = String(input);
     if (init?.method === "POST") posted += 1;
     if (url.endsWith("/api/app-installations/upload")) {
-      return new Response(JSON.stringify({ ...installedFields, install_id: "install-2", name: app.app, version: "1.2.3", digest }), { status: 200, headers: { "Content-Type": "application/json" } });
+      return new Response(JSON.stringify({ ...installedFields, committed: true, install_id: "install-2", name: app.app, version: "1.2.3", digest }), { status: 200, headers: { "Content-Type": "application/json" } });
     }
     if (url.endsWith("/api/app-installations/install-2")) {
       return new Response(JSON.stringify({ ...installedFields, install_id: "install-2", name: app.app, version: "1.2.3", digest }), { status: 200, headers: { "Content-Type": "application/json" } });
@@ -148,6 +169,7 @@ async function main() {
     if (url.endsWith("/api/app-installations/upload")) {
       return new Response(JSON.stringify({
         ...installedFields,
+        committed: true,
         install_id: "install-3", name: app.app, version: "1.2.3", digest,
         catalogue: { id: app.id, version: "1.2.3", digest },
       }), { status: 200, headers: { "Content-Type": "application/json" } });
@@ -161,6 +183,22 @@ async function main() {
   try { await panel.applyCheckedRelease(installableApp, selectedRelease, receipt); } catch { refused = true; }
   assert(refused, "a readback without the catalogue locator is not treated as applied");
   assert(posted === 1, "a mismatched readback is never retried");
+  // A completed review belongs to the private session that performed it.
+  session.resetPrivateSession();
+  session.allowPrivateReads();
+  let staleWrites = 0;
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    if (init?.method === "POST") staleWrites += 1;
+    return new Response(JSON.stringify({
+      ...installedFields, committed: true,
+      install_id: "stale-session", name: app.app, version: "1.2.3", digest,
+      catalogue: { id: app.id, version: "1.2.3", digest },
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+  }) as typeof fetch;
+  refused = false;
+  try { await panel.applyCheckedRelease(installableApp, selectedRelease, receipt); } catch { refused = true; }
+  assert(refused && staleWrites === 0, "a previous session's review never authorizes a new session's write");
+
 
   globalThis.fetch = (async () => new Response(JSON.stringify({ ok: true, data: { app: { ...app, id: "another-app" } } }), { status: 200 })) as typeof fetch;
   refused = false;

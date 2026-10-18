@@ -41,6 +41,9 @@ export interface Installation {
    */
   workflows?: { name: string; source_digest?: string; label?: string | null; capability_slots?: string[]; distinct?: string[]; execution?: "agent" | "host"; inputs: { name: string; ask?: string | null; optional?: boolean; kind?: string | null; example?: string | null; default?: string | null; context_default?: boolean }[] }[];
 }
+/** A write acknowledgement, distinct from a later installation read. */
+export type CommittedInstallation = Installation & { committed: true };
+
 /** One declared `needs.capabilities` slot: the result the app needs. Reviewed providers own the matching tools. */
 export interface SlotDeclaration {
   schema: number; capability: string; version: number;
@@ -317,7 +320,7 @@ export const workspaceApps = {
   upgradeCheck: (id: string, body: UpgradeCheckBody, signal?: AbortSignal) =>
     request<UpgradeProposal>(`${installation(id)}/upgrade/check`, signal, body),
   upgrade: (id: string, body: UpgradeApplyBody, signal?: AbortSignal) =>
-    request<Installation>(`${installation(id)}/upgrade`, signal, body),
+    request<CommittedInstallation>(`${installation(id)}/upgrade`, signal, body),
   contexts: async (id: string, signal?: AbortSignal) => (await request<{ contexts: AppContext[] }>(`${installation(id)}/contexts`, signal)).contexts,
   bindings: async (id: string, contextId?: string, signal?: AbortSignal) => (await request<{ bindings: AppBinding[] }>(contextId ? `${installation(id)}/contexts/${part(contextId)}/bindings` : `${installation(id)}/bindings`, signal)).bindings,
   connections: async (signal?: AbortSignal) => (await request<{ connections: Connection[] }>("/api/connections", signal)).connections,
@@ -584,7 +587,7 @@ export const appExplorer = {
    * to the checked `expected_digest` and the catalogue locator. The
    * reply is the committed installation record. */
   upload: (body: FilesUploadBody, signal?: AbortSignal) =>
-    request<Installation>("/api/app-installations/upload", signal, body),
+    request<CommittedInstallation>("/api/app-installations/upload", signal, body),
   gitCheck: (url: string) => request<CatalogCard>("/api/app-catalog/git-check", undefined, { url }),
   putFavorites: async (installIds: string[]) => favoritesFromDaemon(await request<DaemonFavorites>("/api/app-favorites", undefined, { install_ids: installIds })),
   putFavoritesDefault: async (installIds: string[]) => favoritesFromDaemon(await request<DaemonFavorites>("/api/app-favorites/default", undefined, { install_ids: installIds })),

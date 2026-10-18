@@ -128,6 +128,22 @@ memory, not browser storage: closing it, losing authorization or changing its
 installation/context ends that draft. Recording and speech-to-text are not part
 of this flow.
 
+### Browse and update apps
+
+On a configured host, open **Apps → Explore apps**. Each card opens its full
+details; installed apps keep local Open and operator Manage links even when
+the public catalogue is unavailable. **Choose favorites** keeps quick links
+on the Apps page and in the sidebar.
+
+An operator selects a published version, chooses **Review installation** or
+**Review update**, inspects access and compatibility, then confirms the exact
+package. **Other versions** permits an eligible older fresh install or an
+intermediate update; existing installations never downgrade or auto-update.
+Changing the selection discards the check. An unconfirmed result stays blocked
+across navigation until **Check installation** reads it back; it is not retried.
+Package installation does not approve connections or execution. Manual-source
+operations remain on the installation's Manage page.
+
 ## What it gives you
 
 - **Durable messaging** — every assignment, acknowledgement and result is a

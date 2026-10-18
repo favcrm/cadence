@@ -4,12 +4,12 @@ import Button from "../../ui/Button";
 import Select from "../../ui/Select";
 import { useTranslate } from "../../lib/locale";
 import { useHref, navigate } from "../../lib/useLocation";
-import { appExplorer, workspaceApps, type HomeInstallation, type Installation } from "../workspace-apps/workspaceApps";
+import { appExplorer, workspaceApps, APPS_CHANGED_EVENT, type HomeInstallation, type Installation } from "../workspace-apps/workspaceApps";
 import { loadFailureMessage, loadWithBackoff } from "../workspace-apps/installationsLoad";
-import { onPrivateReadsPaused, onPrivateSessionReset, privateReadsAllowed } from "../../lib/privateSession";
+import { onPrivateReadsPaused, onPrivateSessionReset, privateReadsAllowed, privateSessionGeneration } from "../../lib/privateSession";
 import { installationAppHref } from "../apps/appViewModel";
 import AppCover from "./AppCover";
-import ReleasePanel from "./releasePanel";
+import ReleasePanel, { InstalledActions } from "./releasePanel";
 import type { Viewer } from "../projects/work";
 import "./publicDirectory.css";
 
@@ -274,6 +274,21 @@ function useBoardInstalls(viewer: Viewer): {
     return () => { stopReset(); stopPause(); };
   }, []);
 
+  // A committed install elsewhere in this session re-reads the private
+  // rows — never while reads are paused, never for a guest, and never in a
+  // session older than the listener (reset re-subscribes on the tick it
+  // bumps; each settled read is guarded by `generation` on commit).
+  useEffect(() => {
+    if (!signedIn) return;
+    const epoch = privateSessionGeneration();
+    const bump = () => {
+      if (!privateReadsAllowed() || privateSessionGeneration() !== epoch) return;
+      setTick((n) => n + 1);
+    };
+    window.addEventListener(APPS_CHANGED_EVENT, bump);
+    return () => window.removeEventListener(APPS_CHANGED_EVENT, bump);
+  }, [signedIn, tick]);
+
   const read = useCallback((signal: AbortSignal): Promise<InstallRef[]> => {
     const fromOperator = (list: Installation[]): InstallRef[] => list
       .filter((row) => row.removed == null)
@@ -473,10 +488,126 @@ function selectedRelease(versions: PublicVersions | null, requested: string | nu
   return { release: null, missing: false };
 }
 
+/** What an install row claims for its catalogue locator: an id, nothing, or
+ * an unreadable shape. A malformed locator is neither a match nor proof the
+ * id is absent — it defers the miss verdict rather than inventing one. */
+type RowCatalogue = { kind: "id"; id: string } | { kind: "none" } | { kind: "malformed" };
+function rowCatalogue(row: InstallRef): RowCatalogue {
+  const locator = row.catalogue;
+  if (locator === null || locator === undefined) return { kind: "none" };
+  if (typeof locator !== "object" || Array.isArray(locator) || typeof locator.id !== "string") return { kind: "malformed" };
+  return { kind: "id", id: locator.id };
+}
+
+/** The catalogue record a failed public lookup may still stand for: only
+ * installations whose recorded `catalogue.id` names this page's id (an exact
+ * `?installation=` picks inside them — never another install). It carries no
+ * published metadata, so no release/version check is offered. */
+function LocalInstallPanel({ id, appError, onRetry, rows, installsError, onRetryInstalls, recordsUnreadable, installationParam, operator }: {
+  id: string;
+  appError: string | null;
+  onRetry: () => void;
+  rows: InstallRef[] | null;
+  installsError: string | null;
+  onRetryInstalls: () => void;
+  recordsUnreadable: boolean;
+  installationParam: string | null;
+  operator: boolean;
+}) {
+  const t = useTranslate();
+  const catalogued = (rows ?? []).filter((row) => {
+    const claim = rowCatalogue(row);
+    return claim.kind === "id" && claim.id === id;
+  });
+  const named = installationParam !== null ? catalogued.find((row) => row.install_id === installationParam) ?? null : null;
+  const installParamMissing = installationParam !== null && rows !== null && named === null;
+  // Only a claimant with a readable install_id may be chosen or linked.
+  const chooser = installationParam === null && catalogued.length > 1
+    ? catalogued.filter((row) => typeof row.install_id === "string")
+    : null;
+  const install = installationParam !== null ? named : catalogued.length === 1 ? catalogued[0] : null;
+  // A claimant without a readable install_id stays a fact row — no Open,
+  // Manage or chooser link can name it.
+  const addressable = install !== null && typeof install.install_id === "string" ? install : null;
+  const openHref = addressable ? installationAppHref(rows, addressable.install_id) : null;
+  const title = install?.title ?? catalogued[0]?.title ?? id;
+  return (
+    <article className="pub-detail" aria-label={title}>
+      <p className="pub-back"><Link href="/apps/explore">{t("All published apps")}</Link></p>
+      {appError !== null ? (
+        <div className="err card px-4 py-3 mb-4 text-label" role="alert">
+          {t(appError)} <Button onClick={onRetry}>{t("Try again")}</Button>
+        </div>
+      ) : (
+        <p className="pub-note" role="status">{t("This app is not listed in the public directory.")}</p>
+      )}
+      {catalogued.length > 0 && (
+        <aside className="pub-install-panel" aria-label={t("Installed app")}>
+          <h2 className="pub-panel-title">{title}</h2>
+          {installParamMissing && (
+            <p className="pub-note" role="status">
+              {t("The linked installation is not in this workspace.")}
+            </p>
+          )}
+          {chooser && (
+            <div className="pub-note" role="status">
+              <p>
+                {t("This app has more than one installation. Choose which one to review — none is picked for you.")}
+              </p>
+              <ul className="pub-chooser">
+                {chooser.map((row) => (
+                  <li key={row.install_id}>
+                    <Link
+                      replace
+                      href={`/apps/catalog/${encodeURIComponent(id)}?${new URLSearchParams({ installation: row.install_id })}`}
+                    >
+                      {row.title} · {row.version ?? "—"}
+                      {row.project ? ` · ${row.project}` : ""}
+                    </Link>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {addressable && (
+            <>
+              <dl className="pub-facts">
+                <div>
+                  <dt>{t("Installed")}</dt>
+                  <dd>{addressable.version ?? "—"}</dd>
+                </div>
+              </dl>
+              <div className="pub-actions">
+                <InstalledActions install={addressable} openHref={openHref} operator={operator} />
+              </div>
+            </>
+          )}
+          <p className="pub-caption">
+            {t("The installed copy stays usable. Published versions and update checks return when the catalogue answers.")}
+          </p>
+        </aside>
+      )}
+      {recordsUnreadable && (
+        <p className="pub-note" role="status">
+          {t("Some installed-app records could not be fully read — check again before assuming this app is absent.")}{" "}
+          <Button size="sm" onClick={onRetryInstalls}>{t("Retry")}</Button>
+        </p>
+      )}
+      {installsError && (
+        <p className="pub-note" role="alert">
+          {t("Installed apps could not be checked. Retry before installing.")}{" "}
+          <Button size="sm" onClick={onRetryInstalls}>{t("Retry")}</Button>
+        </p>
+      )}
+    </article>
+  );
+}
+
 export function PublicAppDetail({ id, viewer, onResolved }: { id: string; viewer: Viewer; onResolved?: (found: boolean) => void }) {
   const t = useTranslate();
   const [app, setApp] = useState<PublicApp | null | undefined>(undefined);
   const [appError, setAppError] = useState<string | null>(null);
+  const [appTick, setAppTick] = useState(0);
   const [versions, setVersions] = useState<PublicVersions | null>(null);
   const [versionsError, setVersionsError] = useState<string | null>(null);
   const [versionsTick, setVersionsTick] = useState(0);
@@ -485,23 +616,34 @@ export function PublicAppDetail({ id, viewer, onResolved }: { id: string; viewer
   const params = new URLSearchParams(href.includes("?") ? href.slice(href.indexOf("?") + 1) : "");
   const versionParam = params.get("version");
   const installationParam = params.get("installation");
+  const signedIn = viewer.operator !== null;
   const operator = viewer.operator === true && !viewer.readOnly;
+
+  // A new catalogue id restarts the lookup; `appTick` is only the explicit
+  // retry and keeps the failed answer (with any local install) on screen.
+  useEffect(() => {
+    setApp(undefined); setAppError(null);
+    setVersions(null); setVersionsError(null);
+  }, [id]);
 
   useEffect(() => {
     const controller = new AbortController();
-    setApp(undefined); setAppError(null); setVersions(null); setVersionsError(null);
     loadPublicApp(id, controller.signal)
       .then((row) => {
         if (controller.signal.aborted) return;
+        setAppError(null);
         setApp(row);
-        onResolved?.(row !== null);
+        // A miss is not yet a verdict: a signed-in workspace may still hold
+        // an install recorded against this catalogue id. The effect below
+        // hands off to the retired-catalog detail only when it does not.
+        if (row !== null) onResolved?.(true);
       })
       .catch((e: unknown) => {
         if (controller.signal.aborted) return;
         setAppError(e instanceof Error ? e.message : "Could not load the app.");
       });
     return () => controller.abort();
-  }, [id]);
+  }, [id, appTick]);
 
   useEffect(() => {
     if (!app) return;
@@ -513,11 +655,66 @@ export function PublicAppDetail({ id, viewer, onResolved }: { id: string; viewer
     return () => controller.abort();
   }, [app, versionsTick]);
 
-  if (appError) return <p className="err" role="alert">{t(appError)}</p>;
-  if (app === undefined) return <p className="text-label text-ink-400">{t("Loading…")}</p>;
-  if (app === null) return <p role="status">{t("No such app.")}</p>;
+  /** Installations recorded against this catalogue id — the only records a
+   * failed lookup may stand for. An install that never claimed this
+   * catalogue entry is not offered in its place. */
+  const catalogued = useMemo(
+    () => (installs.rows ?? []).filter((row) => {
+      const claim = rowCatalogue(row);
+      return claim.kind === "id" && claim.id === id;
+    }),
+    [installs.rows, id],
+  );
+  /** Any unreadable locator defers the miss verdict: a malformed record
+   * could be this app, so it is never counted as confirmed absence. */
+  const recordsUnreadable = useMemo(
+    () => (installs.rows ?? []).some((row) => rowCatalogue(row).kind === "malformed"),
+    [installs.rows],
+  );
+  /** The workspace answer is still unread (first private read in flight). */
+  const installsPending = signedIn && installs.rows === null && installs.error === null;
+  /** Absence is confirmed only by a complete, readable private answer — a
+   * guest's empty set, an errored read or a malformed record never counts. */
+  const confirmedMiss =
+    app === null &&
+    !installsPending &&
+    installs.error === null &&
+    catalogued.length === 0 &&
+    (!signedIn || (installs.rows !== null && !recordsUnreadable));
 
-  const matching = (installs.rows ?? []).filter((row) => row.name === app.app);
+  // A public 404 hands off to the retired-catalog detail only once the
+  // workspace's own records are settled and none claims this catalogue id;
+  // a matching install keeps the page instead of being swallowed.
+  useEffect(() => {
+    if (confirmedMiss) onResolved?.(false);
+  }, [confirmedMiss, onResolved]);
+
+  if (app === null && installsPending) return <p className="text-label text-ink-400" role="status">{t("Checking this board…")}</p>;
+  if (app === null || appError !== null) {
+    if (confirmedMiss) return <p role="status">{t("No such app.")}</p>;
+    return (
+      <LocalInstallPanel
+        id={id}
+        appError={appError}
+        onRetry={() => setAppTick((n) => n + 1)}
+        rows={installs.rows}
+        installsError={installs.error}
+        onRetryInstalls={installs.retry}
+        recordsUnreadable={recordsUnreadable}
+        installationParam={installationParam}
+        operator={operator}
+      />
+    );
+  }
+  if (app === undefined) return <p className="text-label text-ink-400">{t("Loading…")}</p>;
+
+  // The same name, or the catalogue id recorded on the install — an
+  // installation that claims neither is never treated as this app.
+  const matching = (installs.rows ?? []).filter((row) => {
+    if (row.name === app.app) return true;
+    const claim = rowCatalogue(row);
+    return claim.kind === "id" && claim.id === app.id;
+  });
   const named = installationParam !== null ? matching.find((row) => row.install_id === installationParam) ?? null : null;
   const installParamMissing = installationParam !== null && installs.rows !== null && named === null;
   const chooser = installationParam === null && matching.length > 1 ? matching : null;

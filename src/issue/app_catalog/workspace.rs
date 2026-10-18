@@ -70,9 +70,8 @@ fn catalogue_decision(
     claim: &CatalogueClaim,
     updating: bool,
     old_version: Option<&str>,
-    new_version: &str,
+    new_manifest: &app::Manifest,
     new_digest: &str,
-    package_app: &str,
     directory: CatalogueDirectory<'_>,
 ) -> Result<Provenance> {
     let decision = resolve_provenance(
@@ -80,11 +79,17 @@ fn catalogue_decision(
         claim,
         updating,
         old_version,
-        new_version,
+        &new_manifest.version,
         new_digest,
     )?;
     if let Some(origin) = &decision.origin {
-        authorize(directory, origin, package_app, new_version, new_digest)?;
+        authorize(
+            directory,
+            origin,
+            &new_manifest.app,
+            &new_manifest.version,
+            new_digest,
+        )?;
     }
     Ok(decision)
 }
@@ -682,9 +687,8 @@ pub(super) fn install_check_from(
         catalogue,
         false,
         None,
-        &validated.manifest.version,
+        &validated.manifest,
         &digest,
-        &validated.manifest.app,
         directory,
     )?;
     Ok(json!({"schema":1,"name":validated.manifest.app,
@@ -927,9 +931,8 @@ pub(super) fn install_from(
         catalogue,
         false,
         None,
-        &validated.manifest.version,
+        &validated.manifest,
         &digest,
-        &validated.manifest.app,
         directory,
     )?;
     install_resolved(
@@ -1096,9 +1099,8 @@ pub(super) fn upgrade_check_from(
         catalogue,
         true,
         Some(&old_manifest.version),
-        &validated.manifest.version,
+        &validated.manifest,
         &new_digest,
-        &validated.manifest.app,
         directory,
     )?;
     Ok(json!({"schema":1,"install_id":&*id,"name":entry_name,
@@ -1187,9 +1189,8 @@ pub(crate) fn upgrade(
         request.catalogue,
         true,
         Some(&seen_version),
-        &validated.manifest.version,
+        &validated.manifest,
         &new_digest,
-        &validated.manifest.app,
         request.directory,
     )?;
     let _lock = pm.lock()?;

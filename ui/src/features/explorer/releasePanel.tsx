@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import Link from "../../ui/Link";
 import Button from "../../ui/Button";
 import { useModal } from "./shared";
@@ -9,6 +9,7 @@ import {
   onPrivateSessionReset,
   privateReadsAllowed,
   privateSessionGeneration,
+  withPrivateOperation,
 } from "../../lib/privateSession";
 import {
   appExplorer,
@@ -16,6 +17,7 @@ import {
   workspaceApps,
   type AccessDiff,
   type CatalogueLocator,
+  type CommittedInstallation,
   type InstallCheck,
   type Installation,
   type UpgradeProposal,
@@ -48,6 +50,8 @@ export type PanelNote = {
 
 export type Receipt = {
   kind: "install" | "update";
+  /** A review cannot be carried into a different signed-in session. */
+  sessionGeneration: number;
   release: PublicRelease;
   files: Record<string, string>;
   /** The install this check ran against (null = fresh install). */
@@ -61,9 +65,75 @@ export type Receipt = {
 
 type Flow = { kind: "none" } | { kind: "checked"; receipt: Receipt };
 
-/** A finished request whose outcome the workspace never confirmed. It
- * blocks further catalogue actions until an explicit readback. */
-type OutcomeLock = { installId: string | null };
+/** Host-scoped unresolved writes outlive routes. Session storage keeps an
+ * interrupted document uncertain; it contains identifiers, never package data
+ * or credentials. Only operators see this state. */
+type OutcomeLock = {
+  installId: string | null;
+  phase: "applying" | "uncertain";
+  target: { version: string; digest: string };
+};
+const OUTCOME_STORAGE = "cadence:catalogue-unconfirmed";
+const outcomeLocks = new Map<string, OutcomeLock>();
+const outcomeListeners = new Set<() => void>();
+try {
+  const saved: unknown = JSON.parse(
+    sessionStorage.getItem(OUTCOME_STORAGE) ?? "[]",
+  );
+  if (Array.isArray(saved)) {
+    for (const entry of saved) {
+      if (!Array.isArray(entry) || entry.length !== 2) continue;
+      const [id, lock] = entry;
+      if (
+        typeof id !== "string" ||
+        !lock ||
+        !(lock.installId === null || typeof lock.installId === "string") ||
+        typeof lock.target?.version !== "string" ||
+        typeof lock.target?.digest !== "string"
+      )
+        continue;
+      outcomeLocks.set(id, {
+        installId: lock.installId,
+        target: lock.target,
+        phase: "uncertain",
+      });
+    }
+  }
+} catch {
+  /* Storage may be unavailable; in-memory navigation guards still hold. */
+}
+
+function subscribeOutcomes(listener: () => void): () => void {
+  outcomeListeners.add(listener);
+  return () => {
+    outcomeListeners.delete(listener);
+  };
+}
+
+function publishOutcome(id: string, value: OutcomeLock | null): void {
+  if (value) outcomeLocks.set(id, value);
+  else outcomeLocks.delete(id);
+  try {
+    if (outcomeLocks.size)
+      sessionStorage.setItem(
+        OUTCOME_STORAGE,
+        JSON.stringify([...outcomeLocks]),
+      );
+    else sessionStorage.removeItem(OUTCOME_STORAGE);
+  } catch {
+    /* See the in-memory fallback above. */
+  }
+  for (const listener of outcomeListeners) listener();
+}
+
+function settleOutcome(
+  id: string,
+  pending: OutcomeLock,
+  uncertain: boolean,
+): void {
+  if (outcomeLocks.get(id) !== pending) return;
+  publishOutcome(id, uncertain ? { ...pending, phase: "uncertain" } : null);
+}
 
 /** Numeric semver compare; `null` when either side is not `X.Y.Z` —
  * an unordered pair is refused rather than guessed. */
@@ -238,61 +308,72 @@ export async function loadReleaseFiles(
  * unless the committed row and an explicit readback both name the selected
  * release and its catalogue provenance. Throws `CheckedMismatch` when the
  * daemon's records do not match; throws the transport error otherwise. */
-export async function applyCheckedRelease(
+export function applyCheckedRelease(
   app: PublicApp,
   release: PublicRelease,
   receipt: Receipt,
 ): Promise<Installation> {
-  const locator: CatalogueLocator = {
-    id: app.id,
-    version: release.version,
-    digest: release.digest,
-  };
-  let row: Installation;
-  if (receipt.kind === "install") {
-    row = await appExplorer.upload({
-      files: receipt.files,
-      expected_digest: release.digest,
-      catalogue: locator,
-    });
-  } else {
-    row = await workspaceApps.upgrade(receipt.install?.install_id as string, {
-      files: receipt.files,
-      expected_digest: receipt.expectedDigest as string,
-      expected_generation: receipt.expectedGeneration as string,
-      expected_new_digest: release.digest,
-      request_id: `catalogue-${crypto.randomUUID()}`,
-      catalogue: locator,
-    });
-  }
-  const matches = (record: Installation) =>
-    !!record &&
-    typeof record.install_id === "string" &&
-    record.install_id.length > 0 &&
-    typeof record.catalog_generation === "string" &&
-    record.catalog_generation.length > 0 &&
-    record.storage_kind === "workspace" &&
-    !!record.approval &&
-    typeof record.approval.state === "string" &&
-    record.approval.state.length > 0 &&
-    typeof record.approved === "boolean" &&
-    typeof record.executable === "boolean" &&
-    record.install_id === row.install_id &&
-    record.name === app.app &&
-    record.version === release.version &&
-    record.digest === release.digest &&
-    locatorEq(record.catalogue, locator) &&
-    (receipt.kind === "install" ||
-      record.install_id === receipt.install?.install_id);
-  if (!matches(row)) throw new CheckedMismatch();
-  let back: Installation;
-  try {
-    back = await workspaceApps.detail(row.install_id);
-  } catch {
-    throw new CheckedMismatch();
-  }
-  if (!matches(back)) throw new CheckedMismatch();
-  return back;
+  return withPrivateOperation(async (operation) => {
+    if (receipt.sessionGeneration !== operation.generation)
+      throw new CheckedMismatch();
+    const locator: CatalogueLocator = {
+      id: app.id,
+      version: release.version,
+      digest: release.digest,
+    };
+    let row: CommittedInstallation;
+    if (receipt.kind === "install") {
+      row = await appExplorer.upload(
+        {
+          files: receipt.files,
+          expected_digest: release.digest,
+          catalogue: locator,
+        },
+        operation.signal,
+      );
+    } else {
+      row = await workspaceApps.upgrade(
+        receipt.install?.install_id as string,
+        {
+          files: receipt.files,
+          expected_digest: receipt.expectedDigest as string,
+          expected_generation: receipt.expectedGeneration as string,
+          expected_new_digest: release.digest,
+          request_id: `catalogue-${crypto.randomUUID()}`,
+          catalogue: locator,
+        },
+        operation.signal,
+      );
+    }
+    const matches = (record: Installation) =>
+      !!record &&
+      typeof record.install_id === "string" &&
+      record.install_id.length > 0 &&
+      typeof record.catalog_generation === "string" &&
+      record.catalog_generation.length > 0 &&
+      record.storage_kind === "workspace" &&
+      !!record.approval &&
+      typeof record.approval.state === "string" &&
+      record.approval.state.length > 0 &&
+      typeof record.approved === "boolean" &&
+      typeof record.executable === "boolean" &&
+      record.install_id === row.install_id &&
+      record.name === app.app &&
+      record.version === release.version &&
+      record.digest === release.digest &&
+      locatorEq(record.catalogue, locator) &&
+      (receipt.kind === "install" ||
+        record.install_id === receipt.install?.install_id);
+    if (row?.committed !== true || !matches(row)) throw new CheckedMismatch();
+    let back: Installation;
+    try {
+      back = await workspaceApps.detail(row.install_id, operation.signal);
+    } catch {
+      throw new CheckedMismatch();
+    }
+    if (!matches(back)) throw new CheckedMismatch();
+    return back;
+  });
 }
 
 /** A receipt that does not name the selected release: refuse, never install. */
@@ -322,6 +403,40 @@ function accessLines(diff: AccessDiff | undefined): {
     else changed.push(slot);
   }
   return { added, removed, changed };
+}
+/** Installed access is local: directory availability never gates these links. */
+export function InstalledActions({
+  install,
+  openHref,
+  operator,
+}: {
+  install: InstallRef;
+  openHref: string | null;
+  operator: boolean;
+}) {
+  const t = useTranslate();
+  return (
+    <>
+      {openHref ? (
+        <Link className="pub-open" href={openHref}>
+          {t("Open the installed app")}
+          <span aria-hidden="true"> ↗</span>
+        </Link>
+      ) : (
+        <p className="pub-caption">
+          {t("This installation cannot be opened from a link here.")}
+        </p>
+      )}
+      {operator && (
+        <Link
+          className="pub-open"
+          href={`/apps/manage/${encodeURIComponent(install.install_id)}`}
+        >
+          {t("Manage installation")}
+        </Link>
+      )}
+    </>
+  );
 }
 
 export default function ReleasePanel({
@@ -368,13 +483,16 @@ export default function ReleasePanel({
   const t = useTranslate();
   const serial = useRef(0);
   const mounted = useRef(true);
-  const mutation = useRef<OutcomeLock | null>(null);
   const [checking, setChecking] = useState(false);
-  const [applying, setApplying] = useState(false);
   const [reconciling, setReconciling] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [flow, setFlow] = useState<Flow>({ kind: "none" });
-  const [lock, setLock] = useState<OutcomeLock | null>(null);
+  const retainedLock = useSyncExternalStore(
+    subscribeOutcomes,
+    () => outcomeLocks.get(app.id) ?? null,
+  );
+  const lock = operator ? retainedLock : null;
+  const applying = lock?.phase === "applying";
   const [note, setNote] = useState<PanelNote | null>(null);
   const dialogRef = useModal<HTMLDivElement>(confirming, () => {
     if (!applying) setConfirming(false);
@@ -390,9 +508,7 @@ export default function ReleasePanel({
   // an explicit readback.
   useEffect(() => {
     serial.current += 1;
-    if (mutation.current) setLock(mutation.current);
     setChecking(false);
-    setApplying(false);
     setReconciling(false);
     setConfirming(false);
     setFlow({ kind: "none" });
@@ -420,8 +536,6 @@ export default function ReleasePanel({
       setChecking(false);
       setReconciling(false);
       setNote(null);
-      if (mutation.current) setLock(mutation.current);
-      setApplying(false);
     };
     const stopReset = onPrivateSessionReset(invalidate);
     const stopPause = onPrivateReadsPaused(invalidate);
@@ -466,6 +580,9 @@ export default function ReleasePanel({
   const proposalMatches =
     flow.kind === "checked" &&
     !!release &&
+    flow.receipt.sessionGeneration === privateSessionGeneration() &&
+    flow.receipt.proposal.catalogue?.id === app.id &&
+    flow.receipt.proposal.name === app.app &&
     flow.receipt.release.version === release.version &&
     flow.receipt.release.digest === release.digest &&
     (flow.receipt.install?.install_id ?? null) === installKey &&
@@ -505,7 +622,12 @@ export default function ReleasePanel({
         ? compareVersions(recommended, install.version)
         : null;
     if (isLocked)
-      return { key: "statusLocked", text: t("Check the installation") };
+      return {
+        key: "statusLocked",
+        text: applying
+          ? t(lock.installId ? "Updating…" : "Installing…")
+          : t("Check the installation"),
+      };
     if (!installsReady || installsError)
       return {
         key: "",
@@ -546,7 +668,13 @@ export default function ReleasePanel({
   }, [note]);
 
   const startCheck = () => {
-    if (!checkable || !release || !privateReadsAllowed()) return;
+    if (
+      !checkable ||
+      !release ||
+      !privateReadsAllowed() ||
+      outcomeLocks.has(app.id)
+    )
+      return;
     const ticket = ++serial.current;
     const epoch = privateSessionGeneration();
     const live = () =>
@@ -566,6 +694,7 @@ export default function ReleasePanel({
     setNote(null);
     void (async () => {
       const files = await loadReleaseFiles(app.id, release, controller.signal);
+      if (!live()) return;
       let proposal: InstallCheck | UpgradeProposal;
       let kind: Receipt["kind"];
       if (!checkedInstall) {
@@ -614,6 +743,7 @@ export default function ReleasePanel({
         kind: "checked",
         receipt: {
           kind,
+          sessionGeneration: epoch,
           release,
           files,
           install: checkedInstall,
@@ -699,161 +829,120 @@ export default function ReleasePanel({
       !offered ||
       flow.kind !== "checked" ||
       !release ||
-      !privateReadsAllowed()
+      !privateReadsAllowed() ||
+      outcomeLocks.has(app.id) ||
+      flow.receipt.sessionGeneration !== privateSessionGeneration()
     )
       return;
     const receipt = flow.receipt;
     const ticket = ++serial.current;
     const epoch = privateSessionGeneration();
+    const currentSession = () =>
+      privateReadsAllowed() && privateSessionGeneration() === epoch;
     const live = () =>
-      mounted.current &&
-      serial.current === ticket &&
-      privateReadsAllowed() &&
-      privateSessionGeneration() === epoch;
-    setApplying(true);
+      mounted.current && serial.current === ticket && currentSession();
+    const pending: OutcomeLock = {
+      installId: receipt.install?.install_id ?? null,
+      phase: "applying",
+      target: { version: release.version, digest: release.digest },
+    };
+    publishOutcome(app.id, pending);
     setConfirming(false);
     setNote(null);
-    const lockKey = receipt.install?.install_id ?? null;
-    const pending = { installId: lockKey };
-    mutation.current = pending;
-    const fail = (next: {
-      lock: boolean;
-      text: string;
-      tone?: PanelNote["tone"];
-    }) => {
-      if (!live()) return;
-      if (next.lock) setLock({ installId: lockKey });
+    const fail = (text: string) => {
       setFlow({ kind: "none" });
-      setNote({ tone: next.tone ?? "alert", text: next.text });
+      setNote({ tone: "alert", text });
     };
     void (async () => {
       const row = await applyCheckedRelease(app, release, receipt);
+      settleOutcome(app.id, pending, false);
+      // The destination/sidebar must refresh even if this route unmounted.
+      // Never publish old-session installation data into a new private session.
+      if (currentSession()) notifyAppsChanged();
       if (!live()) return;
-      if (mutation.current === pending) mutation.current = null;
       setFlow({ kind: "none" });
-      notifyAppsChanged();
       setNote({
         tone: "status",
         observed: { installId: row.install_id, version: row.version },
-        text:
+        text: t(
           receipt.kind === "install"
-            ? t(
-                "Installed package {version}. Connections and execution keep their own approval checks.",
-              ).replace("{version}", row.version)
-            : t(
-                "Updated package to {version}. Connections and execution keep their own approval checks.",
-              ).replace("{version}", row.version),
+            ? "Installed package {version}. Connections and execution keep their own approval checks."
+            : "Updated package to {version}. Connections and execution keep their own approval checks.",
+        ).replace("{version}", row.version),
       });
       onApplied(row);
     })()
       .catch((cause: unknown) => {
+        const busy =
+          cause instanceof ApiError && cause.code === "resource_busy";
+        const withdrawn =
+          cause instanceof ApiError &&
+          ((WITHDRAWN.test(cause.message) && cause.status < 500) ||
+            cause.status === 404);
+        const stale =
+          cause instanceof ApiError &&
+          (cause.status === 409 ||
+            (STALE.test(cause.message) && cause.status < 500));
+        settleOutcome(app.id, pending, !(busy || withdrawn || stale));
         if (!live()) return;
-        const fromVersion = receipt.install?.version ?? null;
-        if (cause instanceof ApiError && cause.code === "resource_busy") {
-          // A busy daemon never staged the apply; the checked proposal stays.
+        if (busy) {
+          // Admission refused before staging; the checked proposal stays.
           setNote({
             tone: "alert",
             text: t(
-              "The update was not applied because the workspace is busy. {title} stays on {version} and can still be opened.",
-            )
-              .replace("{title}", app.title)
-              .replace("{version}", fromVersion ?? app.version),
+              "The workspace is busy. This apply did not start. Try again when it is ready.",
+            ),
           });
         } else if (
           cause instanceof ApiError &&
           (cause.status === 401 || cause.status === 403)
         ) {
-          fail({
-            lock: true,
-            text: fromVersion
-              ? t(
-                  "The update was refused. An operator has to apply it. {title} is still on {version}.",
-                )
-                  .replace("{title}", app.title)
-                  .replace("{version}", fromVersion)
-              : t(
-                  "The install was refused. An operator has to install it. {title} was not installed.",
-                ).replace("{title}", app.title),
-          });
-        } else if (
-          cause instanceof ApiError &&
-          ((WITHDRAWN.test(cause.message) && cause.status < 500) ||
-            cause.status === 404)
-        ) {
+          fail(
+            t(
+              "Only a host operator can apply this package. Check the installation before trying again.",
+            ),
+          );
+        } else if (withdrawn) {
           onRetryVersions();
-          fail({
-            lock: false,
-            text: fromVersion
-              ? t(
-                  "{version} is not available anymore. It was not applied. {title} is still on {installed}.",
-                )
-                  .replace("{version}", release.version)
-                  .replace("{title}", app.title)
-                  .replace("{installed}", fromVersion)
-              : t(
-                  "{version} is not available anymore. {title} was not installed.",
-                )
-                  .replace("{version}", release.version)
-                  .replace("{title}", app.title),
-          });
-        } else if (
-          cause instanceof ApiError &&
-          (cause.status === 409 ||
-            (STALE.test(cause.message) && cause.status < 500))
-        ) {
+          fail(
+            t(
+              "This release is no longer available. It was not applied. Review another release.",
+            ),
+          );
+        } else if (stale) {
           void refreshInstalls();
-          fail({
-            lock: false,
-            text: fromVersion
-              ? t(
-                  "This check no longer matches the installation. Nothing was updated. {title} is still on {version}. Check the selected release again.",
-                )
-                  .replace("{title}", app.title)
-                  .replace("{version}", fromVersion)
-              : t(
-                  "This check is no longer valid. {title} was not installed. Check the selected release again.",
-                ).replace("{title}", app.title),
-          });
+          fail(
+            t(
+              "This check no longer matches the installation. Review the selected release again.",
+            ),
+          );
         } else if (
           cause instanceof ApiError &&
           cause.status < 500 &&
           cause.code !== "daemon_unavailable"
         ) {
-          fail({
-            lock: true,
-            text: fromVersion
-              ? t(
-                  "The update was refused. {title} is still on {version}. Check the installation before trying again.",
-                )
-                  .replace("{title}", app.title)
-                  .replace("{version}", fromVersion)
-              : t(
-                  "The install was refused. {title} was not installed. Check before trying again.",
-                ).replace("{title}", app.title),
-          });
+          fail(
+            t(
+              "The workspace refused this apply. Check the installation before trying again.",
+            ),
+          );
         } else {
-          fail({
-            lock: true,
-            text: fromVersion
-              ? t(
-                  "The workspace did not confirm the result. {title} is not shown as updated. It may still be on {version}. Check the installation before trying again.",
-                )
-                  .replace("{title}", app.title)
-                  .replace("{version}", fromVersion)
-              : t(
-                  "The workspace did not confirm the result. {title} is not shown as installed. Check the installation before trying again.",
-                ).replace("{title}", app.title),
-          });
+          fail(
+            t(
+              "The workspace did not confirm the result. Check the installation before trying again; this page will not retry.",
+            ),
+          );
         }
       })
       .finally(() => {
-        if (mutation.current === pending) mutation.current = null;
-        if (live()) setApplying(false);
+        // A lost continuation must not silently release a pending write.
+        settleOutcome(app.id, pending, true);
       });
   };
 
   const reconcile = () => {
-    if (!isLocked || reconciling) return;
+    if (!lock || applying || reconciling || !operator || !privateReadsAllowed())
+      return;
     const ticket = ++serial.current;
     const epoch = privateSessionGeneration();
     const live = () =>
@@ -866,12 +955,19 @@ export default function ReleasePanel({
     void (async () => {
       const rows = await refreshInstalls();
       if (rows === null) throw new CheckedMismatch();
-      if (!live()) return;
-      setLock(null);
+      if (!live() || outcomeLocks.get(app.id) !== lock) return;
+      const locator = { id: app.id, ...lock.target };
+      const matches = lock.installId
+        ? rows.filter((row) => row.install_id === lock.installId)
+        : rows.filter(
+            (row) => row.name === app.app && locatorEq(row.catalogue, locator),
+          );
+      if (matches.length > 1) throw new CheckedMismatch();
+      const found = matches[0];
+      if (found && (found.name !== app.app || !found.version))
+        throw new CheckedMismatch();
+      publishOutcome(app.id, null);
       setFlow({ kind: "none" });
-      const found = lock?.installId
-        ? rows?.find((i) => i.install_id === lock.installId)
-        : rows?.find((i) => i.name === app.app);
       setNote({
         tone: "status",
         ...(found?.version
@@ -884,8 +980,8 @@ export default function ReleasePanel({
               "The installation record shows {version}. You can review another release when ready.",
             ).replace("{version}", found.version)
           : t(
-              "No installation of {title} was recorded. You can check a release again.",
-            ).replace("{title}", app.title),
+              "No matching installation was found. Review the workspace before trying again.",
+            ),
       });
     })()
       .catch(() => {
@@ -1042,7 +1138,9 @@ export default function ReleasePanel({
       {isLocked && (
         <p className="pub-note" data-tone="alert">
           {t(
-            "The result has not been confirmed. Check the installation before trying again; this page will not guess or retry.",
+            applying
+              ? "The package is being applied. Another apply stays blocked even if you leave this page."
+              : "The result has not been confirmed. Check the installation before trying again; this page will not guess or retry.",
           )}
         </p>
       )}
@@ -1189,30 +1287,18 @@ export default function ReleasePanel({
               </Button>
             )}
           {isLocked && operator && (
-            <Button onClick={reconcile} disabled={reconciling}>
+            <Button onClick={reconcile} disabled={reconciling || applying}>
               {reconciling
                 ? t("Checking the installation…")
                 : t("Check installation")}
             </Button>
           )}
-          {install && openHref && (
-            <Link className="pub-open" href={openHref}>
-              {t("Open the installed app")}
-              <span aria-hidden="true"> ↗</span>
-            </Link>
-          )}
-          {install && !openHref && (
-            <p className="pub-caption">
-              {t("This installation cannot be opened from a link here.")}
-            </p>
-          )}
-          {operator && install && (
-            <Link
-              className="pub-open"
-              href={`/apps/manage/${encodeURIComponent(install.install_id)}`}
-            >
-              {t("Manage installation")}
-            </Link>
+          {install && (
+            <InstalledActions
+              install={install}
+              openHref={openHref}
+              operator={operator}
+            />
           )}
         </div>
       )}
