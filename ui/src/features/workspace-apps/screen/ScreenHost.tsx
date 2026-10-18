@@ -45,24 +45,43 @@ export function InstalledScreenOutlet({ installation, contexts, contextId, admit
   // Runs progress and reviewers approve out of band, so the screen follows its
   // scope the way the native workspace does: a fresh read now, another every
   // five seconds while the tab is visible, and one straight after an action.
-  const reread = useRef<() => void>(() => undefined);
+  const activeRead = useRef<AbortController | null>(null);
+  const reread = useRef<(fresh: boolean) => void>(() => undefined);
   useEffect(() => {
-    let controller = new AbortController();
-    const read = () => {
-      controller.abort();
-      controller = new AbortController();
+    // A viewer the frame would not admit is not polled for at all, and a read that
+    // is no longer wanted must not be started by a late action callback.
+    reread.current = () => undefined;
+    if (!admitted || tag === null) return;
+    let live = true;
+    const read = (fresh: boolean) => {
+      if (!live) return;
+      // A periodic tick leaves a read already in flight alone: the reader drops a
+      // superseded call, so cancelling it on every tick would starve any read
+      // slower than the interval and the screen would never gain its rows. The
+      // native workspace skips an in-flight periodic refresh for the same reason,
+      // and only supersedes it for a read that follows a write — which is what a
+      // fresh call here is.
+      if (activeRead.current && !fresh) return;
+      activeRead.current?.abort();
+      const controller = new AbortController();
+      activeRead.current = controller;
       readWorkspaceAppSnapshotFresh(installation.install_id, controller.signal).then(
         (next) => { if (!controller.signal.aborted) setSnapshot(next); },
         () => undefined,
-      );
+      ).finally(() => { if (activeRead.current === controller) activeRead.current = null; });
     };
     reread.current = read;
-    read();
+    read(true);
     const timer = window.setInterval(() => {
-      if (document.visibilityState !== "hidden") read();
+      if (document.visibilityState !== "hidden") read(false);
     }, 5000);
-    return () => { window.clearInterval(timer); controller.abort(); };
-  }, [installation.install_id]);
+    return () => {
+      live = false;
+      reread.current = () => undefined;
+      window.clearInterval(timer);
+      activeRead.current?.abort();
+    };
+  }, [installation.install_id, admitted, tag]);
   // Approved text for the pushed runs, resolved the way `read.run` resolves it: the
   // run's reviewer-approved text artifact, read by id. Bindings come from the same
   // read the native path uses; `workers` stays null — "unknown", as the type states —
@@ -108,7 +127,7 @@ export function InstalledScreenOutlet({ installation, contexts, contextId, admit
     }
   }, [snapshot, installation, contexts, contextId, tag, extras]);
   const actions = useMemo(() => {
-    const ctx = () => ({ installation, installId: installation.install_id, contextId, runs: snapshot?.runs ?? [], onChanged: () => reread.current() });
+    const ctx = () => ({ installation, installId: installation.install_id, contextId, runs: snapshot?.runs ?? [], onChanged: () => reread.current(true) });
     return { call: (verb: Parameters<typeof runCall>[1], args: Parameters<typeof runCall>[2], ui: Parameters<typeof runCall>[3]) => runCall(ctx(), verb, args, ui), planner: makePlanner(ctx) };
   }, [installation, contextId, snapshot]);
   return admitted && liveContext && tag && installation.executable && installation.approval.state === "approved" && installation.removed == null
