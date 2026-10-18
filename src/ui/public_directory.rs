@@ -247,18 +247,52 @@ fn page(title: &str, body: &str) -> String {
     )
 }
 
-fn header(page_url: &str) -> String {
+/// Who is reading the directory. Both see the same catalog; only the action
+/// differs, because installing happens on the board's own apps page.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Viewer {
+    Anonymous,
+    SignedIn,
+}
+
+impl Viewer {
+    /// The action: sign in for a visitor, their own apps for a live session.
+    fn cta(self, page_url: &str) -> String {
+        match self {
+            Viewer::Anonymous => format!(
+                r#"<a class="btn" href="{sign}">Sign in to install</a>"#,
+                sign = esc(&sign_in_href(page_url)),
+            ),
+            Viewer::SignedIn => {
+                r#"<a class="btn" href="/apps">Install from your apps</a>"#.to_string()
+            }
+        }
+    }
+
+    fn lede(self) -> &'static str {
+        match self {
+            Viewer::Anonymous => {
+                "Published apps. Browse with no account. Installing needs a sign-in on this board."
+            }
+            Viewer::SignedIn => {
+                "Published apps. Browse the catalog; installing happens from your apps page."
+            }
+        }
+    }
+}
+
+fn header(page_url: &str, viewer: Viewer) -> String {
     format!(
         r#"<header>
 <a href="/apps/explore"><strong>Apps</strong></a>
 <span class="grow"></span>
-<a class="btn" href="{sign}">Sign in to install</a>
+{cta}
 </header>"#,
-        sign = esc(&sign_in_href(page_url)),
+        cta = viewer.cta(page_url),
     )
 }
 
-fn render_list(body: &Value, q: &str, cat: &str, page_url: &str) -> String {
+fn render_list(body: &Value, q: &str, cat: &str, page_url: &str, viewer: Viewer) -> String {
     let apps = apps_of(body);
     let mut categories: Vec<&str> = apps
         .iter()
@@ -341,7 +375,7 @@ fn render_list(body: &Value, q: &str, cat: &str, page_url: &str) -> String {
         &format!(
             r#"{header}<main>
 <h1>App directory</h1>
-<p class="lede">Published apps. Browse with no account. Installing needs a sign-in on this board.</p>
+<p class="lede">{lede}</p>
 <form method="get" action="/apps/explore">
 <input type="search" name="q" value="{q}" placeholder="Search apps" aria-label="Search apps">
 {hidden}
@@ -350,7 +384,8 @@ fn render_list(body: &Value, q: &str, cat: &str, page_url: &str) -> String {
 {cats}
 {cards}
 </main>"#,
-            header = header(page_url),
+            header = header(page_url, viewer),
+            lede = viewer.lede(),
             q = esc(q),
             hidden = if cat.is_empty() {
                 String::new()
@@ -370,13 +405,10 @@ fn strings(value: Option<&Value>) -> Vec<&str> {
         .unwrap_or_default()
 }
 
-fn render_detail(app: &Value, page_url: &str) -> String {
+fn render_detail(app: &Value, page_url: &str, viewer: Viewer) -> String {
     let installable = app.get("installable").and_then(Value::as_bool) == Some(true);
     let action = if installable {
-        format!(
-            r#"<a class="btn" href="{}">Sign in to install</a>"#,
-            esc(&sign_in_href(page_url))
-        )
+        viewer.cta(page_url)
     } else {
         let reason = text(app.get("unavailableReason"));
         if reason.is_empty() {
@@ -415,7 +447,7 @@ fn render_detail(app: &Value, page_url: &str) -> String {
 {can}
 <p>{action}</p>
 </main>"#,
-            header = header(page_url),
+            header = header(page_url, viewer),
             title = esc(text(app.get("title"))),
             meta = esc(&format!(
                 "{} · {}",
@@ -479,38 +511,44 @@ fn fetch_catalog(url: &str) -> Fetched {
     }
 }
 
-fn unavailable_html(page_url: &str, message: &str) -> String {
+fn unavailable_html(page_url: &str, message: &str, viewer: Viewer) -> String {
     page(
         "Apps",
         &format!(
             r#"{header}<main><h1>App directory</h1><p class="lede">{message}</p></main>"#,
-            header = header(page_url),
+            header = header(page_url, viewer),
             message = esc(message),
         ),
     )
 }
 
-fn no_such_app_html(page_url: &str) -> String {
+fn no_such_app_html(page_url: &str, viewer: Viewer) -> String {
     page(
         "App",
         &format!(
             r#"{header}<main><h1>No such app</h1><p><a href="/apps/explore">All apps</a></p></main>"#,
-            header = header(page_url),
+            header = header(page_url, viewer),
         ),
     )
 }
 
 /// Status and body for one directory read. Pure: the fetch already happened.
-fn page_for(route: &Route, fetched: Fetched, raw_query: &str, page_url: &str) -> (u16, String) {
+fn page_for(
+    route: &Route,
+    fetched: Fetched,
+    raw_query: &str,
+    page_url: &str,
+    viewer: Viewer,
+) -> (u16, String) {
     let body = match fetched {
         Fetched::Ok(body) => body,
         Fetched::NotFound => {
             return match route {
-                Route::Detail(_) => (404, no_such_app_html(page_url)),
-                Route::List => (200, unavailable_html(page_url, TRANSIENT)),
+                Route::Detail(_) => (404, no_such_app_html(page_url, viewer)),
+                Route::List => (200, unavailable_html(page_url, TRANSIENT, viewer)),
             };
         }
-        Fetched::Failed => return (200, unavailable_html(page_url, TRANSIENT)),
+        Fetched::Failed => return (200, unavailable_html(page_url, TRANSIENT, viewer)),
     };
     match route {
         Route::List => (
@@ -520,13 +558,14 @@ fn page_for(route: &Route, fetched: Fetched, raw_query: &str, page_url: &str) ->
                 &query_value(raw_query, "q"),
                 &query_value(raw_query, "cat"),
                 page_url,
+                viewer,
             ),
         ),
         Route::Detail(id) => {
             let app = body.get("data").and_then(|data| data.get("app"));
             match app.filter(|app| text(app.get("id")) == id) {
-                Some(app) => (200, render_detail(app, page_url)),
-                None => (404, no_such_app_html(page_url)),
+                Some(app) => (200, render_detail(app, page_url, viewer)),
+                None => (404, no_such_app_html(page_url, viewer)),
             }
         }
     }
@@ -537,19 +576,29 @@ pub(super) fn is_public_route(path: &str) -> bool {
 }
 
 /// `Some` when this path is the public directory. Other board routes stay gated.
-pub(super) fn response(path: &str, raw_query: &str, page_url: &str) -> Option<HttpResp> {
+/// The catalog is the same for a visitor and for a live session.
+pub(super) fn response(
+    path: &str,
+    raw_query: &str,
+    page_url: &str,
+    viewer: Viewer,
+) -> Option<HttpResp> {
     let route = route(path)?;
     let Some(origin) = catalog_origin() else {
         return Some(html_response(
             200,
-            unavailable_html(page_url, "This board has no public catalog configured."),
+            unavailable_html(
+                page_url,
+                "This board has no public catalog configured.",
+                viewer,
+            ),
         ));
     };
     let upstream = match &route {
         Route::List => format!("{origin}/public/apps"),
         Route::Detail(id) => format!("{origin}/public/apps/{id}"),
     };
-    let (status, html) = page_for(&route, fetch_catalog(&upstream), raw_query, page_url);
+    let (status, html) = page_for(&route, fetch_catalog(&upstream), raw_query, page_url, viewer);
     Some(html_response(status, html))
 }
 
@@ -613,7 +662,13 @@ mod tests {
             {"id": "crm", "title": "CRM", "summary": "Customers", "version": "0.1.0",
              "installable": false, "listing": {"category": "sales", "publisher": {"name": "Cadence"}}}
         ]}});
-        let html = render_list(&body, "", "", "https://board.example/apps/explore");
+        let html = render_list(
+            &body,
+            "",
+            "",
+            "https://board.example/apps/explore",
+            Viewer::Anonymous,
+        );
         assert!(html.contains("Social &lt;Content&gt;"));
         assert!(html.contains("Listed, not installable yet"));
         assert!(html.contains("Can be installed"));
@@ -625,6 +680,7 @@ mod tests {
             "caption",
             "marketing",
             "https://board.example/apps/explore",
+            Viewer::Anonymous,
         );
         assert!(filtered.contains("social-content"));
         assert!(!filtered.contains("/apps/catalog/crm"));
@@ -679,6 +735,7 @@ mod tests {
             Fetched::NotFound,
             "",
             page_url,
+            Viewer::Anonymous,
         );
         assert_eq!(status, 404);
         assert!(html.contains("No such app"));
@@ -689,6 +746,7 @@ mod tests {
             Fetched::Failed,
             "",
             page_url,
+            Viewer::Anonymous,
         );
         assert_eq!(status, 200);
         assert!(html.contains("Try again"));
@@ -699,6 +757,7 @@ mod tests {
             Fetched::NotFound,
             "",
             "https://board.example/apps/explore",
+            Viewer::Anonymous,
         );
         assert_eq!(status, 200);
         assert!(html.contains("Try again"));
@@ -717,6 +776,7 @@ mod tests {
             Fetched::Ok(body.clone()),
             "",
             "https://board.example/apps/catalog/social-content",
+            Viewer::Anonymous,
         );
         assert_eq!(status, 200);
         assert!(html.contains("Social Content"));
@@ -727,8 +787,46 @@ mod tests {
             Fetched::Ok(body),
             "",
             "https://board.example/apps/catalog/crm",
+            Viewer::Anonymous,
         );
         assert_eq!(status, 404);
         assert!(html.contains("No such app"));
+    }
+
+    #[test]
+    fn a_live_session_browses_the_same_catalog_with_its_own_action() {
+        let body = json!({"ok": true, "data": {"apps": [
+            {"id": "social-content", "title": "Social Content", "summary": "Drafts",
+             "version": "0.9.7", "installable": true,
+             "listing": {"tagline": "Draft a caption", "category": "marketing",
+                         "publisher": {"name": "Cadence"}}}
+        ]}});
+        let html = render_list(
+            &body,
+            "",
+            "",
+            "https://board.example/apps/explore",
+            Viewer::SignedIn,
+        );
+        // The catalog is the same; installing points at the board's own page.
+        assert!(html.contains("social-content"));
+        assert!(html.contains(r#"<a class="btn" href="/apps">"#));
+        assert!(!html.contains("/__platform/login?to="));
+        assert!(!html.contains("Installing needs a sign-in"));
+
+        let (status, html) = page_for(
+            &Route::Detail("social-content".to_string()),
+            Fetched::Ok(json!({"ok": true, "data": {"app": {
+                "id": "social-content", "title": "Social Content", "version": "0.9.7",
+                "installable": true,
+                "listing": {"publisher": {"name": "Cadence"}}
+            }}})),
+            "",
+            "https://board.example/apps/catalog/social-content",
+            Viewer::SignedIn,
+        );
+        assert_eq!(status, 200);
+        assert!(html.contains(r#"<a class="btn" href="/apps">"#));
+        assert!(!html.contains("/__platform/login?to="));
     }
 }
