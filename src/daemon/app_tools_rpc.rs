@@ -90,6 +90,9 @@ pub(crate) struct ToolContext {
     /// Declared alias → capability slot, copied from the integrity-
     /// checked package at mint. The closed invocable set.
     pub tools: std::collections::BTreeMap<String, String>,
+    /// CAD-1537: minted for a member or a `--read-only` board — only
+    /// read operations (`ScreenOperation::is_screen_read`), no tools.
+    pub read_only: bool,
     pub issued: Instant,
 }
 
@@ -376,6 +379,11 @@ impl Shared {
             }
         }
         let ctx = self.tool_context_proven(action_token, &session)?;
+        // CAD-1537: a read-only mount (member or `--read-only` board) never
+        // invokes a tool.
+        if ctx.read_only {
+            return Err(Error::rejected("a read-only screen mount invokes no tools"));
+        }
 
         // The alias must be one the mount's own approved package declared,
         // resolving to its declared capability slot — before any broker work.

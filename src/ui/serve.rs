@@ -983,18 +983,25 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
         }
         return;
     }
-    // Closed screen services use the SAME admitted OperatorOnly HTTP peer
-    // proof as the ordinary write dispatcher, on local and public surfaces.
+    // Closed screen services use the SAME admitted HTTP peer proof as the
+    // ordinary write dispatcher, on local and public surfaces. CAD-1537:
+    // `call` is `ScreenRead` — a member or `--read-only` board caller is
+    // held to the read allowlist; the SLOT routes stay OperatorOnly.
     if let Some(rpc) = app_screens::service_route(&path) {
         if method != Method::Post {
             send(request, err_response(405, "method not allowed"));
             return;
         }
-        if let Err(response) = operator::admit(&request, method.as_str(), &path, state_dir, opts) {
-            send(request, response);
-            return;
-        }
-        let response = app_screens::service(&mut request, state_dir, opts, rpc);
+        let caller = match operator::admit(&request, method.as_str(), &path, state_dir, opts) {
+            Ok(caller) => caller,
+            Err(response) => {
+                send(request, response);
+                return;
+            }
+        };
+        let read_only = opts.read_only
+            || matches!(&caller, Some(operator::Caller::Named(named)) if !named.operator);
+        let response = app_screens::service(&mut request, state_dir, opts, rpc, read_only);
         read_model::get(state_dir, pm_dir).invalidate();
         send(request, response);
         return;
@@ -1694,7 +1701,8 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     send(request, err_response(405, "method not allowed"));
                     return;
                 }
-                if let Err(response) = operator::admit_operator_read(&request, state_dir, opts) {
+                // CAD-1537: a member's screen needs the context receipt.
+                if let Err(response) = operator::admit_screen_read(&request, state_dir, opts) {
                     send(request, response);
                     return;
                 }
@@ -1849,11 +1857,18 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     .strip_prefix("/api/app-installations/")
                     .is_some_and(|id| !id.is_empty() && !id.contains('/'))
             {
-                if let Err(response) = operator::admit_operator_read(&request, state_dir, opts) {
+                let id = path.strip_prefix("/api/app-installations/");
+                // CAD-1537: one installation's receipt is a screen read a
+                // member may make; the list stays the operator's.
+                let admitted = if id.is_some() {
+                    operator::admit_screen_read(&request, state_dir, opts).map(|_| ())
+                } else {
+                    operator::admit_operator_read(&request, state_dir, opts)
+                };
+                if let Err(response) = admitted {
                     send(request, response);
                     return;
                 }
-                let id = path.strip_prefix("/api/app-installations/");
                 let method = if id.is_some() {
                     "app_workspace_show"
                 } else {

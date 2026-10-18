@@ -677,6 +677,8 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     operator: meta?.operator ?? null,
     access: metaUnavailable ? ("unavailable" as const) : ("checking" as const),
     onRetryAccess: retryAccess,
+    screenReader: meta?.operator === false && meta.signed_in === true &&
+      (meta.session?.user?.role === "member" || readOnly),
   };
   const [last, setLast] = useState<LastApp | null>(() => readLastApp());
   const selectedMenuApp = menuApps.find((app) => app.installId === activeId);
