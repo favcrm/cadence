@@ -44,6 +44,26 @@ To *force* a re-warm manually: delete the entry via
 `gh api -X DELETE repos/<owner>/<repo>/actions/caches/<id>` — find the id
 with `?key=v0-rust-<key>` — then let the next main push re-write it.
 
+### Native cross-build: warm both profiles (CAD-1551)
+
+`cache-warm-cross` prepares both the CAD-1425 acceptance with `test-seam`
+and the default `cargo build --locked`. The test profile's dependency
+optimization differs from dev, so a test-only warm cache does not cover the
+second build. Producer and restore-only consumers share
+`cross-dual1-${{ matrix.target }}`; bump that epoch together when changing
+the warm inputs. Failed warm jobs do not save partial entries under the new
+immutable key. Main remains the only writer; native tests and builds still
+run on PRs and merge groups.
+
+On 2026-10-18, 25 successful PR/merge-group runs showed the cross-build
+aggregate finishing last in 22 cases. The macOS acceptance and default-build
+steps had medians of 147s and 138s respectively. In
+[run 39098521591](https://github.com/favcrm/cadence/actions/runs/39098521591),
+the default build recompiled third-party dependencies despite a full cache
+hit and took 2m10s. This is the baseline, not a claimed improvement.
+The introducing PR uses a cold epoch; assess the benefit only after main
+has saved both profiles and a later native consumer restores that entry.
+
 ## 3. sccache scope — build/ui only, not shards
 
 `cache-workspace-crates: false` on rust-cache, because workspace-source

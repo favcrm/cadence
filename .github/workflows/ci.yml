@@ -659,11 +659,11 @@ jobs:
         if: ${{ !cancelled() }}
         run: sh $GITHUB_WORKSPACE/scripts/ci-sccache stats
 
-  # CAD-1480: warms the cross-build gates' per-target caches on merged
-  # code only — the same save-on-main-only rule as cache-warm. One leg
-  # per cross-build matrix row; `cargo test --no-run` covers the binary
-  # and the acceptance's dev-dependency tree in a single compile, and
-  # the gate's later `cargo build` sees a warm target dir either way.
+  # CAD-1551: warm both cross-build dependency profiles on merged code only.
+  # The test profile optimizes dependencies differently from dev, so test
+  # artifacts alone do not warm the gate's default production-feature build.
+  # Bump the shared epoch in producer and consumer when warm inputs change:
+  # an existing immutable cache entry would otherwise skip the new work.
   cache-warm-cross:
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     strategy:
@@ -683,13 +683,14 @@ jobs:
       - id: cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: cross-${{ matrix.target }}
-          cache-on-failure: true
-      - name: Warm the cross-build test profile
+          shared-key: cross-dual1-${{ matrix.target }}
+      - name: Warm the cross-build test and dev profiles
         if: steps.cache.outputs.cache-hit != 'true'
         env:
           CARGO_BUILD_JOBS: 4
-        run: cargo test --no-run --locked --test cad1425_client_update_refusal_acceptance
+        run: |
+          cargo test --no-run --locked --features test-seam --test cad1425_client_update_refusal_acceptance
+          cargo build --locked
 
   # CAD-1131: build the release binary once per git TREE. A queue entry's
   # merge_group run builds the shipping binary in parallel with the gates
@@ -1621,11 +1622,11 @@ jobs:
         if: matrix.target == 'aarch64-macos'
         working-directory: ui
       - run: scripts/ci-rust-toolchain --profile minimal
-      # CAD-1480: restore-only cache, warmed by cache-warm's cross legs on
-      # main pushes — gate jobs still never save a cache.
+      # Restore-only cache with both test-seam/test and default/dev dependencies.
+      # Keep the epoch aligned with cache-warm-cross; only main saves it.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: cross-${{ matrix.target }}
+          shared-key: cross-dual1-${{ matrix.target }}
           save-if: false
       # The acceptance links CARGO_BIN_EXE_cadence, so `cargo test` builds
       # the binary too; run it first and let `cargo build` verify the
