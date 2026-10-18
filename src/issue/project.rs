@@ -18,6 +18,13 @@ pub struct Repo {
     pub path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<String>,
+    /// Integration branch `issue start` cuts a new lane from, when it
+    /// is not the remote's default HEAD. `staging` and `origin/staging`
+    /// both fetch `refs/heads/staging` and pin that commit. Absent:
+    /// `origin/HEAD` when it is a symbolic ref, else the remote's
+    /// symbolic HEAD. Never the main checkout's current branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
 }
 
 /// `[build]` — per-project build knobs. `target_dir` picks how issue

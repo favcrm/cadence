@@ -605,10 +605,17 @@ the `Issue: <ID>` trailer — as JSON.
   else it refuses naming the candidates. An explicit `--repo` must be
   one of the declared repos (code-commit discovery only walks those);
   an undeclared path is refused with the declared list and a pointer
-  to `repos` in `project.yaml`. **Base** resolves `--base`, else fetches
-  the branch named by `origin/HEAD` and pins its exact commit SHA; a
-  repository without a remote default falls back to its current branch.
-  A fetch failure refuses setup with a retry/explicit `--base` remedy.
+  to `repos` in `project.yaml`. **Base** resolves `--base`, else the
+  repo's configured integration branch (`repos[].base`, for example
+  `staging`), else fetches the branch named by `origin/HEAD`, else the
+  remote's symbolic HEAD (`git ls-remote --symref origin HEAD`), and
+  pins that commit. A repository with no `origin` remote uses its
+  current branch. When `origin` exists but its integration branch
+  cannot be resolved, start refuses — it does not adopt the main
+  checkout's current branch. When that checkout's tip is not contained
+  in the integration commit, the lane is still cut from the integration
+  commit and the output's `base.warning` names the mismatch. A fetch
+  failure refuses setup with a retry/explicit `--base` remedy.
 - The worktree is minted through the same helper as
   `cadence devin --worktree` (shared `src/worktree.rs`), including the
   `.gitignore` `.cadence/` rule — added only when missing.

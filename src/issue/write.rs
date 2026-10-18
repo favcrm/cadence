@@ -514,6 +514,7 @@ pub fn project_add(
         repo_entries.push(project::Repo {
             path: Some(repo.clone()),
             remote,
+            base: None,
         });
     }
     let project = project::Project {

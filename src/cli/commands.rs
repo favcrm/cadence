@@ -685,7 +685,9 @@ pub(crate) enum Commands {
         /// Worktree slug — default: the slugified issue title.
         #[arg(long)]
         name: Option<String>,
-        /// Base ref — else the repo's origin/HEAD, else current branch.
+        /// Integration ref to cut the lane from. Default: the repo's
+        /// configured base, else the remote HEAD. Never the main
+        /// checkout's current branch when that remote ref resolves.
         #[arg(long)]
         base: Option<String>,
         /// Repo path — same resolution as `issue start`.
