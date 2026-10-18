@@ -787,6 +787,38 @@ pub enum ProjectAction {
         /// Project key.
         key: String,
     },
+    /// Record a project's access policy: visibility and, for a private
+    /// project, the callers it admits. Private is unavailable until the
+    /// isolation gate passes; workspace-visible is the only visibility
+    /// this build can write.
+    Policy {
+        /// Project key.
+        key: String,
+        /// Visibility to record.
+        #[arg(long, value_enum, default_value = "workspace-visible")]
+        visibility: PolicyVisibility,
+        /// Grant a caller access (`users/<handle>` or `operator`);
+        /// repeatable.
+        #[arg(long = "grant")]
+        grants: Vec<String>,
+    },
+}
+
+/// `--visibility` for `project policy`: the recorded vocabulary, before it
+/// is mapped to the project policy type.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum PolicyVisibility {
+    WorkspaceVisible,
+    Private,
+}
+
+impl PolicyVisibility {
+    fn recorded(self) -> crate::issue::project::Visibility {
+        match self {
+            Self::WorkspaceVisible => crate::issue::project::Visibility::WorkspaceVisible,
+            Self::Private => crate::issue::project::Visibility::Private,
+        }
+    }
 }
 
 pub(crate) fn print_json(value: &Value) {
@@ -842,6 +874,16 @@ pub fn run(action: &IssueAction, state_dir: &std::path::Path) -> Result<i32> {
                     tags,
                     owner.as_deref(),
                 )?;
+                print_json(&out);
+                Ok(0)
+            }
+            ProjectAction::Policy {
+                key,
+                visibility,
+                grants,
+            } => {
+                let pm = open_pm()?;
+                let out = write::set_project_policy(&pm, key, visibility.recorded(), grants)?;
                 print_json(&out);
                 Ok(0)
             }
