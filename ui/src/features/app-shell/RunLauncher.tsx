@@ -118,17 +118,12 @@ export default function RunLauncher({
   const workers = agents === null ? [] : localWorkers(agents).filter((agent) => agent.group === ownerPm);
   const managers = agents === null ? [] : agents.filter((agent) => agent.role === "pm" && !agent.dead && !agent.fenced);
 
-  /** Values the run request may carry: declared inputs only, trimmed, and
-   *  never a key the install team injects (the daemon refuses those). */
+  /** Preserve declared input text; never send a role the app team injects. */
   const collectedInputs = () => {
     const inputs: Record<string, string> = {};
     for (const input of workflow.inputs) {
       if (team !== null && team !== undefined && teamCovered(team, input.name)) continue;
-      const value = input.optional === true
-        ? (values[input.name] ?? "").trim() || (picked[input.name] ?? "")
-        : input.name in picked
-          ? (picked[input.name] ?? "")
-          : (values[input.name] ?? "");
+      const value = input.name in picked ? (picked[input.name] ?? "") : (values[input.name] ?? "");
       if (value !== "") inputs[input.name] = value;
     }
     return inputs;
@@ -242,6 +237,10 @@ export default function RunLauncher({
               await work();
               const next = await workspaceApps.team(installId);
               setTeam(next);
+            } catch (reason: unknown) {
+              if (denied(reason)) { onClose(); return; }
+              setReadError(reason instanceof Error ? reason.message : "The app team could not be confirmed.");
+              setTeam(undefined);
             } finally {
               setBusy(false);
             }
