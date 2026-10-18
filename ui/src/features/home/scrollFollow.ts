@@ -42,6 +42,12 @@ export function motionBehavior(reduced: boolean, kind: ScrollKind): ScrollBehavi
   return "smooth";
 }
 
+/** The OS `prefers-reduced-motion` preference, guarded so a plain node
+ *  test run can import this module. Home and the app-pane chat both read
+ *  it here rather than keeping a copy each (CAD-1533). */
+export const reducedMotion = (): boolean =>
+  typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
+
 /** Enter or the send button — a chat line, a slash command, or an
  *  Ask-master draft. Pins even when the operator was reading history. */
 export function onSend(_state: Follow): { state: Follow; scroll: ScrollKind } {
