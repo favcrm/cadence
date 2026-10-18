@@ -884,7 +884,12 @@ impl Shared {
             .and_then(|metadata| metadata.hosted_business_documents());
         let provider_env = opts
             .provider_env
-            .with_workspace(upload_workspace_dir.clone());
+            .with_workspace(upload_workspace_dir.clone())
+            .with_company_master(
+                opts.provider_deployments
+                    .as_ref()
+                    .and_then(|metadata| metadata.hosted_company_master()),
+            );
         // Actors consume Store candidates at open; retain an independent
         // copy until adoption succeeds, refuses, or is skipped entirely.
         let adoptions_pending = store
