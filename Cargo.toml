@@ -49,6 +49,9 @@ e2e = []
 # and review tests can inject proc roots. The compile_error! in
 # src/test_seam.rs keeps these seams out of every release build.
 test-seam = []
+# CAD-1568: manual cross-repository CLI/runtime acceptance. Borrowing the
+# binary's CLI into lib tests must not duplicate its tests in ordinary CI.
+cli-runtime-test = ["test-seam"]
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }

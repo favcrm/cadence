@@ -108,7 +108,7 @@ mod wiki;
 mod workflow;
 
 pub(crate) use action_dispatch::run;
-#[cfg(all(test, feature = "test-seam"))]
+#[cfg(all(test, feature = "cli-runtime-test"))]
 #[allow(unused_imports)] // Only the library's runtime fixture invokes this entry.
 pub(crate) use action_dispatch::run_acceptance_argv;
 use agent::AgentAction;

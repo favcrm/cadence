@@ -1409,4 +1409,5 @@ fn native_chain_automatic_renewal_and_real_wiki_mutation() {
     }
 }
 
+#[cfg(feature = "cli-runtime-test")]
 include!("cad1568_native_messages_acceptance.rs");

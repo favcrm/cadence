@@ -57,7 +57,7 @@ use crate::issue::{board, history, model, write as issue_write, Pm};
 /// refetches, so per-fixture issuers in tests stay honest.
 static CLI_JWKS: Mutex<board_identity::JwksCache> = Mutex::new(board_identity::JwksCache::new());
 
-#[cfg(all(test, feature = "test-seam"))]
+#[cfg(all(test, feature = "cli-runtime-test"))]
 pub(crate) fn prime_jwks_for_test(issuer: &str, kid: &str, now: i64) -> crate::Result<()> {
     CLI_JWKS
         .lock()

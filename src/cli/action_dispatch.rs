@@ -2,7 +2,7 @@
 
 use super::*;
 
-#[cfg(all(test, feature = "test-seam"))]
+#[cfg(all(test, feature = "cli-runtime-test"))]
 #[allow(dead_code)] // Binary tests compile this library-fixture entry too.
 pub(crate) fn run_acceptance_argv(argv: &[&str]) -> Result<i32> {
     let matches = help::root_command(help::in_pane())

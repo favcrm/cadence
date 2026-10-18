@@ -400,11 +400,15 @@ hosted handlers and durable stores, and the synthetic provider. Point at
 an API checkout containing the native-forwarder and TLS-bridge test helpers
 with its dependencies installed:
 
+The `cli-runtime-test` feature is an explicit manual-harness opt-in.
+Ordinary `test-seam` CI retains the CLI tests in their original binary
+target and still runs the new daemon ownership/refusal acceptance checks.
+
 ```sh
 CAD1568_AOS_API_DIR=/absolute/path/to/agenticos-v2/apps/api \
   CARGO_BUILD_JOBS=2 CARGO_PROFILE_TEST_DEBUG=0 \
   cadence --state-dir "$HOME/.local/state/cadence" build-slot run test -- \
-  cargo test --features test-seam --lib \
+  cargo test --features cli-runtime-test --lib \
     cad1568_real_hosted_message_roundtrip_and_refusals \
     -- --ignored --test-threads 1 --nocapture
 ```

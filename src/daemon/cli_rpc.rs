@@ -38,7 +38,7 @@ static CLI_JWKS: Mutex<board_identity::JwksCache> = Mutex::new(board_identity::J
 /// The controlled cross-repo rig fetches the real fixture issuer's JWKS
 /// through its disposable TLS trust before worker threads handle requests.
 /// Signature and claim verification remain on the production request path.
-#[cfg(all(test, feature = "test-seam"))]
+#[cfg(all(test, feature = "cli-runtime-test"))]
 pub(crate) fn prime_jwks_for_test(issuer: &str, kid: &str, now: i64) -> Result<()> {
     CLI_JWKS
         .lock()

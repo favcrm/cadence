@@ -107,7 +107,7 @@ mod campaign_clone_acceptance;
 mod chat_files_rpc;
 mod checkup;
 mod cli_rpc;
-#[cfg(all(test, feature = "test-seam"))]
+#[cfg(all(test, feature = "cli-runtime-test"))]
 pub(crate) use cli_rpc::prime_jwks_for_test as prime_cli_jwks_for_test;
 mod connection_test;
 mod connections_rpc;
