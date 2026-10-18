@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { resources } from "../../lib/resources";
 import { useTranslate } from "../../lib/locale";
-import { appExplorer, notifyAppsChanged, type HomeInstallation, type FavoritesPayload, type Installation } from "../workspace-apps/workspaceApps";
+import { appExplorer, notifyAppsChanged, APPS_CHANGED_EVENT, type HomeInstallation, type FavoritesPayload, type Installation } from "../workspace-apps/workspaceApps";
 import { useQuery, useResource } from "../../lib/useResource";
 import type { AppRow } from "../../lib/types";
 import { homeNeeds, type HomeNeed } from "../home/needs";
@@ -39,6 +39,12 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
   const [actionError, setActionError] = useState<string | null>(null);
 
   const isOp = viewer.operator === true && !viewer.readOnly;
+
+  useEffect(() => {
+    const bump = () => setRevision((r) => r + 1);
+    window.addEventListener(APPS_CHANGED_EVENT, bump);
+    return () => window.removeEventListener(APPS_CHANGED_EVENT, bump);
+  }, []);
 
   // CAD-1189: every list here loads with the shared busy backoff, keeps
   // its last good answer on a failed refresh, and never reads an error as
@@ -126,7 +132,7 @@ export default function Apps({ project, viewer }: { project: string; viewer: Vie
   const restore = (id: string) => {
     setBusy(id);
     void appExplorer.restore(id)
-      .then(() => { setRevision((r) => r + 1); notifyAppsChanged(); })
+      .then(notifyAppsChanged)
       .catch((e: unknown) => setActionError(t(appErrorCopy(e, "Restore didn't finish. Try again in a moment."))))
       .finally(() => setBusy(null));
   };

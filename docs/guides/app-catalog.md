@@ -324,9 +324,9 @@ refused. Nothing is deleted. The app leaves Open and the sidebar and is listed
 under "Recently removed" for 30 days. Within that window
 `POST /api/app-installations/<id>/restore` clears the mark and re-records
 consent for the same bytes. After the window it refuses: the install can only
-stay removed, and the page no longer offers Restore. Open a recently removed
-card to manage that exact installation and restore it; cards contain no nested
-action buttons. Historical Explorer details retain their existing Restore action.
+stay removed, and the page no longer offers Restore. Restore remains available
+in **Recently removed** on the Apps page and in historical Explorer details.
+Directory and installed-gallery cards are whole links without nested actions.
 
 ## Explorer routes
 
