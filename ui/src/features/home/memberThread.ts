@@ -228,32 +228,18 @@ export function memberThreadReader(): PageReader {
  * Resource clears `error` on success — never fabricated.
  *
  * One asymmetry `Resource.write` cannot express (round 5): the
- * Resource queues a trailing read only when a superseded request
- * RESOLVES (cacheCore's success branch sets `trailing` before
- * dropping); a superseded request that REJECTS returns early on the
- * same generation check and schedules nothing. With no successful
- * read yet (`data.history?.loaded !== true`), that dropped failure is
- * the only thing that could record the read truth — the panel would
- * sit on "Reading the thread…" forever behind an optimistic row:
- * the poll effect is gated on `loaded`, the mount revalidate already
- * ran, no stream invalidates `memberThread`, and no `Resource.error`
- * survived the write to render a Retry. So after a pre-load write
- * this helper queues exactly one real read behind the superseded
- * flight (or starts one at once when none is flying): a member can
- * send during the very first history fetch and the surface still
- * converges — accepted read → `loaded:true`, rejected
- * read → `Resource.error` → the existing failed banner whose Retry
- * re-reads for real. Post-load writes need nothing: an accepted
- * superseded read keeps the `trailing` refetch, and a rejected one
- * leaves `data.history.loaded`/the carried observation true, so the
- * poll keeps recovering. The call is `invalidate()`, never
- * `refresh()`: `refresh()` (cacheCore.ts:113→120-122) would JOIN the
- * superseded flight and set nothing, while `invalidate()`
- * (cacheCore.ts:188-193) marks `trailing` on it — the Resource's
- * finally then runs exactly one fresh read whatever the dropped
- * flight did, or starts one at once when nothing was flying. Like
- * `refresh()`, it no-ops while private reads are paused (the same
- * `readsAllowed` guard sits inside `refreshUsing`).
+ * Resource queues a trailing read when a superseded request RESOLVES
+ * but drops a superseded REJECTION without scheduling one (both drop
+ * on the same generation check; only the success branch sets
+ * `trailing`). With no successful read yet a pre-load write would
+ * leave the surface on "Reading the thread…" forever — the dropped
+ * failure records nothing and nothing else re-reads — so this helper
+ * calls `invalidate()`: cacheCore.ts:190 marks the flight `trailing`
+ * and the finally at 163-168 runs exactly one fresh read (or starts
+ * one at once when nothing is flying). `refresh()` would only join
+ * the superseded flight and schedule nothing. After a successful read
+ * the Resource's own trailing path and the poll keep recovering, so
+ * the extra call stops being needed.
  */
 export function memberWrite(
   store: Resource<MemberThreadState>,
