@@ -92,6 +92,12 @@ outside its limits while the form retains the entered text. Unseen/uncertain
 responses retain their request ID. Retrying first inspects the stored run
 state; only explicitly dismissing a displayed result retires that replay ID.
 
+Workflow inputs, including a transcript, currently require a single visible
+line. Newlines, control characters and leading/trailing whitespace refuse to
+protect the approved plan structure. The form preserves rejected text; it
+does not flatten it. Multiline source needs a separately reviewed input path,
+not removal of that guard.
+
 The app's read-only screen displays the resulting run and reviewed artifact
 when its declared projection supports them. Neither the screen nor ordinary
 assistant chat starts a run. This flow adds no recording, speech-to-text,

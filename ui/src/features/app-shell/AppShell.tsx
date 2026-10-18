@@ -1147,22 +1147,22 @@ export default function AppShell({
                         admitted={viewer.operator === true && !viewer.readOnly} operator={viewer.operator === true} />
                     : <Loading>{t("Loading this app…")}</Loading>} />
               )}
-              {launcherIsCurrent && launchFlow !== null && launcherRun !== null && (
-                <RunLauncher
-                  key={`${installId}:${launcherRun.name}:${launcherRun.contextId}:${launcherRun.installDigest}:${launcherRun.contextRevision}`}
-                  installation={installation}
-                  workflow={launchFlow}
-                  contextId={launcherRun.contextId}
-                  context={contexts.find((c) => c.id === launcherRun.contextId) ?? null}
-                  viewer={viewer}
-                  stillCurrent={() => launcherOwnership.current.intent === launcherRun && launcherOwnership.current.current}
-                  onClose={() => setLauncherRun((open) => open === launcherRun ? null : open)}
-                />
-              )}
             </>
           )}
         </section>
       </div>
+      {receiptReady && installation && !needsSetup && launcherIsCurrent && launchFlow !== null && launcherRun !== null && (
+        <RunLauncher
+          key={`${installId}:${launcherRun.name}:${launcherRun.contextId}:${launcherRun.installDigest}:${launcherRun.contextRevision}`}
+          installation={installation}
+          workflow={launchFlow}
+          contextId={launcherRun.contextId}
+          context={contexts.find((c) => c.id === launcherRun.contextId) ?? null}
+          viewer={viewer}
+          stillCurrent={() => launcherOwnership.current.intent === launcherRun && launcherOwnership.current.current}
+          onClose={() => setLauncherRun((open) => open === launcherRun ? null : open)}
+        />
+      )}
     </div>
   );
 }
