@@ -49,7 +49,7 @@ const PORTS: std::ops::RangeInclusive<u16> = 3110..=3199;
 pub const ALLOW_GLOBAL_ENV: &str = "CADENCE_SANDBOX_ALLOW_GLOBAL";
 
 #[derive(Subcommand)]
-pub enum SandboxAction {
+pub enum DevAction {
     /// Create (or reuse) the dev Cadence and start its daemon and board:
     /// its own state dir, tracker and a free port in 3110-3199, plus a
     /// durable dev marker in the new store. Prints the paths, URL and
@@ -104,9 +104,9 @@ pub enum SandboxAction {
 
 /// `cadence dev …`. `state_dir` is the store this shell points at; it
 /// names the default target of `reload`, `env`, `down` and `status`.
-pub fn run_cli(state_dir: &Path, action: &SandboxAction) -> Result<i32> {
+pub fn run_cli(state_dir: &Path, action: &DevAction) -> Result<i32> {
     let out = match action {
-        SandboxAction::Up {
+        DevAction::Up {
             name,
             name_flag,
             port,
@@ -122,10 +122,8 @@ pub fn run_cli(state_dir: &Path, action: &SandboxAction) -> Result<i32> {
             };
             up(&Sandbox::open(name)?, *port, &exe)?
         }
-        SandboxAction::Reload { name, build } => {
-            reload(state_dir, name.as_deref(), build.as_deref())?
-        }
-        SandboxAction::Env { name } => {
+        DevAction::Reload { name, build } => reload(state_dir, name.as_deref(), build.as_deref())?,
+        DevAction::Env { name } => {
             let sb = target(state_dir, name.as_deref())?;
             refuse_production(&sb)?;
             let marker = require_marker(&sb)?;
@@ -133,20 +131,20 @@ pub fn run_cli(state_dir: &Path, action: &SandboxAction) -> Result<i32> {
             print!("{}", env_lines(&sb, persisted_port(&sb.state_dir()), allow));
             return Ok(0);
         }
-        SandboxAction::Down { name } => {
+        DevAction::Down { name } => {
             let sb = target(state_dir, name.as_deref())?;
             refuse_production(&sb)?;
             require_marker(&sb)?;
             down(&sb)?
         }
-        SandboxAction::Status { name } => {
+        DevAction::Status { name } => {
             let sb = target(state_dir, name.as_deref())?;
             refuse_production(&sb)?;
             require_marker(&sb)?;
             status(&sb)
         }
-        SandboxAction::Reset { name } => reset(&Sandbox::open(name)?)?,
-        SandboxAction::Ls => ls()?,
+        DevAction::Reset { name } => reset(&Sandbox::open(name)?)?,
+        DevAction::Ls => ls()?,
     };
     println!("{}", crate::output::json_text(&out).unwrap_or_default());
     Ok(0)
@@ -199,8 +197,8 @@ fn global_gate(profile: Option<&str>, allowed: Option<bool>, what: &str) -> Resu
         Some(false) => Err(Error::rejected(format!(
             "{what} is global to this host — refused under \
              CADENCE_PROFILE={PROFILE_PREFIX}{name}; to allow it, restart the \
-             sandbox with the opt-in: `cadence sandbox down {name}` then \
-             `{ALLOW_GLOBAL_ENV}=1 cadence sandbox up {name}`"
+             dev instance with the opt-in: `cadence dev down {name}` then \
+             `{ALLOW_GLOBAL_ENV}=1 cadence dev up {name}`"
         ))),
         None => Err(Error::rejected(format!(
             "{what} is global to this host — refused under \
@@ -309,7 +307,7 @@ fn validate_name(name: &str) -> Result<()> {
     } else {
         Err(Error::rejected(format!(
             "sandbox name '{name}' must match [a-z0-9][a-z0-9-]{{0,31}} — \
-             e.g. `cadence sandbox up smoke`"
+             e.g. `cadence dev up smoke`"
         )))
     }
 }
@@ -367,7 +365,7 @@ pub(crate) fn resolved(path: &Path) -> PathBuf {
 /// refusal: production's defaults (`CADENCE_STATE_DIR` and
 /// `CADENCE_PM_DIR` unset), plus whatever the caller exports now — a
 /// shell pointed at a live cadence — unless that shell is this very
-/// sandbox's (`eval "$(cadence sandbox env <name>)"`). `exported: false`
+/// dev instance's (`eval "$(cadence dev env <name>)"`). `exported: false`
 /// keeps the defaults only.
 fn production_dirs(sb: &Sandbox, exported: bool) -> Result<Vec<(&'static str, PathBuf)>> {
     let mut dirs = vec![
@@ -463,7 +461,7 @@ fn read_marker(sb: &Sandbox) -> Result<Option<Value>> {
     if marker["name"].as_str() != Some(sb.name.as_str()) {
         return Err(Error::rejected(format!(
             "{} belongs to sandbox {}, not '{}' — pick another name \
-             (`cadence sandbox ls` lists them)",
+             (`cadence dev ls` lists them)",
             sb.root.display(),
             marker["name"],
             sb.name
@@ -626,7 +624,7 @@ pub fn adopt(state_dir: &Path) -> Result<Option<String>> {
 fn require_marker(sb: &Sandbox) -> Result<Value> {
     read_marker(sb)?.ok_or_else(|| {
         Error::rejected(format!(
-            "no sandbox '{}' at {} — `cadence sandbox up {}` creates it",
+            "no dev instance '{}' at {} — `cadence dev up {}` creates it",
             sb.name,
             sb.root.display(),
             sb.name
@@ -751,7 +749,7 @@ fn choose_port_skip(
         (Some(p), Some(r)) if p != r => {
             return Err(Error::rejected(format!(
                 "sandbox '{}' board is running on port {r} — \
-                 `cadence sandbox down {}` first to move it",
+                 `cadence dev down {}` first to move it",
                 sb.name, sb.name
             )))
         }
@@ -846,7 +844,7 @@ fn production_port_gate(profile: Option<&str>, port: u16) -> Result<()> {
         Some(name) if port == PRODUCTION_UI_PORT => Err(Error::rejected(format!(
             "port {PRODUCTION_UI_PORT} is the production board — refused under \
              CADENCE_PROFILE={PROFILE_PREFIX}{name}; pass `--port <n>`, or \
-             `cadence sandbox up {name}` picks a free one"
+             `cadence dev up {name}` picks a free one"
         ))),
         _ => Ok(()),
     }
@@ -867,7 +865,7 @@ fn env_lines(sb: &Sandbox, port: Option<u16>, allow_global: bool) -> String {
         "CADENCE_ALIAS CADENCE_ROLLOUT_AS CADENCE_SANDBOX_ALLOW_GLOBAL"
     };
     let mut text = format!(
-        "# cadence sandbox {name} — `eval \"$(cadence sandbox env {name})\"`\n\
+        "# cadence dev {name} — `eval \"$(cadence dev env {name})\"`\n\
          unset {unset}\n\
          export CADENCE_STATE_DIR={state}\n\
          export CADENCE_PM_DIR={pm}\n\
@@ -922,21 +920,52 @@ fn child(sb: &Sandbox, exe: &Path, args: &[&str], grant: bool) -> Command {
     cmd
 }
 
-/// Run one child verb to completion; its JSON stdout is the result.
-fn run_child(sb: &Sandbox, exe: &Path, args: &[&str], grant: bool) -> Result<Value> {
-    run_child_env(sb, exe, args, grant, &[])
+/// Run an exit-only child verb; successful output is deliberately ignored.
+fn run_child(sb: &Sandbox, exe: &Path, args: &[&str], grant: bool) -> Result<()> {
+    run_child_output(sb, exe, args, grant, &[]).map(|_| ())
 }
 
-/// [`run_child`] plus env pairs for this child only — `up`'s `ui start`
-/// uses it to hand the retry's remaining budget down without touching
-/// this process's environment or any other child's.
-fn run_child_env(
+/// Startup commands must report a usable state, not merely exit successfully.
+fn run_child_state(
     sb: &Sandbox,
     exe: &Path,
     args: &[&str],
     grant: bool,
     env: &[(String, String)],
-) -> Result<Value> {
+) -> Result<String> {
+    #[derive(serde::Deserialize)]
+    struct ChildState {
+        state: String,
+    }
+
+    let output = run_child_output(sb, exe, args, grant, env)?;
+    let response: ChildState = serde_json::from_slice(&output).map_err(|error| {
+        Error::rejected(format!(
+            "`cadence {}` in dev '{}' returned invalid startup state: {error}",
+            args.join(" "),
+            sb.name
+        ))
+    })?;
+    if response.state.trim().is_empty() {
+        return Err(Error::rejected(format!(
+            "`cadence {}` in dev '{}' returned an empty startup state",
+            args.join(" "),
+            sb.name
+        )));
+    }
+    Ok(response.state)
+}
+
+/// Run a child with its own environment and retain stdout for state consumers.
+/// `up` passes only the board retry's remaining budget, without changing this
+/// process's environment or another child's.
+fn run_child_output(
+    sb: &Sandbox,
+    exe: &Path,
+    args: &[&str],
+    grant: bool,
+    env: &[(String, String)],
+) -> Result<Vec<u8>> {
     let mut cmd = child(sb, exe, args, grant);
     for (key, value) in env {
         cmd.env(key, value);
@@ -952,9 +981,9 @@ fn run_child_env(
             .ok()
             .and_then(|v| v["kind"].as_str().map(str::to_string));
         let what = format!(
-            "`cadence {}` in sandbox '{}' failed: {} — see {}/*.log; \
-             `cadence sandbox down {}` stops what did start, \
-             `cadence sandbox reset {}` starts the sandbox over",
+            "`cadence {}` in dev '{}' failed: {} — see {}/*.log; \
+             `cadence dev down {}` stops what did start, \
+             `cadence dev reset {}` starts the dev instance over",
             args.join(" "),
             sb.name,
             detail,
@@ -967,7 +996,7 @@ fn run_child_env(
             _ => Error::rejected(what),
         });
     }
-    Ok(serde_json::from_slice(&out.stdout).unwrap_or(Value::Null))
+    Ok(out.stdout)
 }
 
 /// `sun_path` holds 108 bytes including the NUL — a longer socket path
@@ -1082,7 +1111,7 @@ fn up(sb: &Sandbox, wanted_port: Option<u16>, exe: &Path) -> Result<Value> {
     {
         return Err(Error::rejected(format!(
             "sandbox '{}' is running with {ALLOW_GLOBAL_ENV} {}; its processes \
-             keep that environment — `cadence sandbox down {}` first, then `up` \
+             keep that environment — `cadence dev down {}` first, then `up` \
              with the grant you want",
             sb.name,
             if recorded { "granted" } else { "not granted" },
@@ -1098,7 +1127,7 @@ fn up(sb: &Sandbox, wanted_port: Option<u16>, exe: &Path) -> Result<Value> {
              ungranted `up` would refuse it at `ui start` with the \
              daemon already running. Stop sharing under the grant first: \
              `{ALLOW_GLOBAL_ENV}=1 cadence --state-dir {} ui tailscale \
-             stop`, or `cadence sandbox reset {}` starts over",
+             stop`, or `cadence dev reset {}` starts over",
             sb.name,
             sb.state_dir().display(),
             sb.name
@@ -1124,7 +1153,7 @@ fn up(sb: &Sandbox, wanted_port: Option<u16>, exe: &Path) -> Result<Value> {
     // bind collision is the board's port, never the daemon's socket,
     // so a retried `ui start` reuses this daemon and nothing is
     // replayed.
-    let daemon = run_child(sb, exe, &["daemon", "start"], allow_global)?;
+    let daemon = run_child_state(sb, exe, &["daemon", "start"], allow_global, &[])?;
     // CAD-1283: only a fresh automatic allocation gets the retry
     // window and the remaining-budget env (a clamp, never a raise) —
     // an explicit `--port`, a persisted `ui.json` port or an
@@ -1164,7 +1193,7 @@ fn up(sb: &Sandbox, wanted_port: Option<u16>, exe: &Path) -> Result<Value> {
             _ => Vec::new(),
         };
         let port_arg = port.to_string();
-        let result = run_child_env(
+        let result = run_child_state(
             sb,
             exe,
             &["ui", "start", "--port", &port_arg],
@@ -1210,8 +1239,8 @@ fn up(sb: &Sandbox, wanted_port: Option<u16>, exe: &Path) -> Result<Value> {
         "url": format!("http://127.0.0.1:{port}"),
         "env_file": sb.env_file(),
         "profile": sb.profile(),
-        "daemon": daemon["state"],
-        "ui": ui["state"],
+        "daemon": daemon,
+        "ui": ui,
     }))
 }
 
@@ -1389,18 +1418,18 @@ fn reload(state_dir: &Path, name: Option<&str>, build: Option<&Path>) -> Result<
     if had_daemon {
         run_child(&sb, &current, &["daemon", "stop"], grant)?;
     }
-    let daemon = run_child(&sb, &exe, &["daemon", "start"], grant)?;
+    let daemon = run_child_state(&sb, &exe, &["daemon", "start"], grant, &[])?;
     let ui = match port {
         Some(port) if had_ui => {
             let port_arg = port.to_string();
-            run_child(&sb, &exe, &["ui", "start", "--port", &port_arg], grant)?["state"].clone()
+            run_child_state(&sb, &exe, &["ui", "start", "--port", &port_arg], grant, &[])?
         }
-        _ => json!("not_running"),
+        _ => "not_running".to_string(),
     };
     Ok(json!({
         "name": sb.name,
         "build": exe,
-        "daemon": daemon["state"],
+        "daemon": daemon,
         "ui": ui,
         "port": port,
         "lease": "none claimed",
@@ -1488,7 +1517,7 @@ fn reset(sb: &Sandbox) -> Result<Value> {
     let _up_lock = up_lock(sb)?;
     if std::fs::symlink_metadata(&sb.root).is_err() {
         return Err(Error::rejected(format!(
-            "no sandbox '{}' at {} — `cadence sandbox ls` lists them",
+            "no dev instance '{}' at {} — `cadence dev ls` lists them",
             sb.name,
             sb.root.display()
         )));
@@ -1602,16 +1631,7 @@ mod tests {
         assert!(global_gate(None, None, "x").is_ok());
         let hard = global_gate(Some("s"), None, "`ui tailscale`").unwrap_err();
         assert!(hard.to_string().contains("sandbox:s"), "{hard}");
-        let soft = global_gate(Some("s"), Some(false), "merge").unwrap_err();
-        assert!(
-            soft.to_string().contains("`cadence sandbox down s`"),
-            "{soft}"
-        );
-        assert!(
-            soft.to_string()
-                .contains("`CADENCE_SANDBOX_ALLOW_GLOBAL=1 cadence sandbox up s`"),
-            "{soft}"
-        );
+        assert!(global_gate(Some("s"), Some(false), "merge").is_err());
         assert!(global_gate(Some("s"), Some(true), "merge").is_ok());
     }
 

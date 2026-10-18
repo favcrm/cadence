@@ -195,11 +195,13 @@ runtime lease before startup. The supported runtime seam is
 holds the lease; 409 means lost and must fence. There is no container acquire,
 release or epoch endpoint. Unknown/failed renewal cannot authorize writes.
 
-The current Cadence HTTP lease provider is a fail-closed stub. AgenticOS's
-state bridge currently owns renewal/fencing with Cadence hosted hooks off.
-Switch ownership in one reviewed integration change: **never run both heartbeat
-owners**. A local `file:` lease is useful for tests on one filesystem but does
-not fence a writer on another host. Cloud handoff must prove the actual
+Cadence implements the HTTP renewal provider and fences writes when its
+admitted lease is lost or expires. Source code alone does not establish
+whether the deployed Cadence daemon or AgenticOS state bridge currently owns
+renewal. Verify the deployed lifecycle and bridge configuration before any
+handoff: **never run both heartbeat owners**. Switch ownership in one reviewed
+integration change. A local `file:` lease is useful for tests on one filesystem
+but does not fence a writer on another host. Cloud handoff must prove the actual
 CompanyControl/gateway authority, stale-instance rejection and all store/tracker
 writer surfaces; this rehearsal does not claim that proof.
 
@@ -256,10 +258,16 @@ and record which accepted commands survive before cutover is approved.
 
 ## Local development after migration
 
-Use a separate temp state, tracker clone, non-production credentials and board
-port 3110–3199. Pin local workers to their org/connection; switching an operator's
-active org must not reroute running results. Keep the local daemon for dev and
-tests with UI hot reload and a documented backend watch/restart loop. Never reuse
+Use `cadence dev` for disposable local development, independently of the saved
+hosted org selection. Dev commands remain local without switching that org;
+explicitly remote selectors refuse. Use separate state, a tracker clone,
+non-production credentials and board port 3110–3199. AgenticOS owns production
+container images; local dev reload is not a production update or cutover.
+
+Pin local workers to their org/connection; switching an operator's active org
+must not reroute running results. Keep the local daemon for dev and tests with
+UI hot reload and a documented backend watch/restart loop. Never reuse
 production state, port 3010, installed binary or cloud credentials for dev.
-Full development-loop evidence is a separate CAD-525 gate, not a consequence of
-this store rehearsal.
+Agent confinement and hosted single-writer fencing remain necessary controls,
+separate from development-instance isolation. Full development-loop evidence
+is a separate CAD-525 gate, not a consequence of this store rehearsal.
