@@ -803,8 +803,8 @@ fn read_legacy_profiles(pm_dir: &Path) -> Result<Vec<ProfileBody>> {
                 )))
             }
             AtKind::Dir => {}
-            AtKind::Missing => continue,
-            AtKind::File | AtKind::Other => {
+            AtKind::Missing | AtKind::File => continue,
+            AtKind::Other => {
                 return Err(import_refused(format!(
                     "agents/{slug} is not a profile directory; import refused"
                 )))

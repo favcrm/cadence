@@ -2250,7 +2250,10 @@ impl Shared {
             "agent_register" => self.rpc_register(params, peer_pid),
             "model_defaults_get" => self.rpc_model_defaults_get(),
             "model_defaults_set" => self.rpc_model_defaults_set(params, peer_pid),
-            "agent_settings_get" => self.rpc_agent_settings_get(),
+            "agent_settings_get" => {
+                self.operator_connection("agent settings get", params, peer_pid)?;
+                self.rpc_agent_settings_get()
+            }
             "agent_settings_set" => self.rpc_agent_settings_set(params, peer_pid),
             "agent_settings_catalog" => self.rpc_agent_settings_catalog(params, peer_pid),
             "agent_settings_sync" => self.rpc_agent_settings_sync(params, peer_pid),

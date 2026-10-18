@@ -109,7 +109,10 @@ pub(crate) const RULES: &[(&str, Rule)] = &[
         "model_defaults_set",
         Rule::Handler("operator_connection (CAD-337)"),
     ),
-    ("agent_settings_get", Rule::Read),
+    (
+        "agent_settings_get",
+        Rule::Handler("operator_connection (CAD-1548)"),
+    ),
     (
         "agent_settings_set",
         Rule::Handler("operator_connection (CAD-1548)"),

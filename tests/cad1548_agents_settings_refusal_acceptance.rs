@@ -88,6 +88,11 @@ mod acceptance {
     const LEGACY_PROFILE: &str = "legacy-lane";
     const LEGACY_TEXT: &str =
         "---\nrole: pm\nmodel: inherit\n---\ncadence-1548 legacy profile body\n";
+    const LEGACY_NON_PROFILES: &[(&str, &[u8])] = &[
+        (".gitkeep", b""),
+        ("README.md", b"# Legacy profile definitions\n"),
+        (".DS_Store", b"\0\0\0\x01Bud1"),
+    ];
     const FORGED_PROFILE: &str = "forged-lane";
     const STALE_PROFILE: &str = "stale-lane";
     const ESCAPE_PROFILE: &str = "../outside";
@@ -147,6 +152,9 @@ mod acceptance {
             let legacy = fx.pm().join("agents").join(LEGACY_PROFILE).join("AGENT.md");
             std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
             std::fs::write(&legacy, LEGACY_TEXT).unwrap();
+            for (name, bytes) in LEGACY_NON_PROFILES {
+                std::fs::write(fx.pm().join("agents").join(name), bytes).unwrap();
+            }
             let env = cadence_agent::adapter::ProviderEnv::refusing_providers();
             env.set("CADENCE_PM_DIR", fx.pm().to_str().unwrap());
             let opts = daemon::ServeOptions {
@@ -1829,7 +1837,7 @@ mod acceptance {
 
     #[test]
     fn unauthorized_forged_and_invalid_agent_settings_refuse_without_partial_persistence() {
-        let fx = Fx::start();
+        let mut fx = Fx::start();
         assert_eq!(
             fx.live_agents(),
             0,
@@ -1851,6 +1859,20 @@ mod acceptance {
             Some(LEGACY_TEXT),
             "startup import did not copy agents/{LEGACY_PROFILE}/AGENT.md"
         );
+        let imported_ids = authority_profile_ids(&imported);
+        for (name, bytes) in LEGACY_NON_PROFILES {
+            assert_eq!(
+                std::fs::read(fx.pm().join("agents").join(name))
+                    .unwrap()
+                    .as_slice(),
+                *bytes,
+                "startup changed non-profile sibling {name}"
+            );
+            assert!(
+                !imported_ids.iter().any(|id| id.as_str() == *name),
+                "non-profile sibling {name} became a canonical profile"
+            );
+        }
         let sources = source_files(&fx.pm());
 
         let first = fx.op(GET, json!({}));
@@ -1970,6 +1992,141 @@ mod acceptance {
                 "settings_authority stored refused profile {refused}: {stored_ids:?}"
             );
         }
+        // Profile definitions contain instruction bodies. A valid board
+        // session does not turn an agent or unproven peer into the operator.
+        let private_jobs: Vec<&str> = held.config["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|profile| profile["job"].as_str())
+            .filter(|job| !job.is_empty())
+            .collect();
+        assert!(private_jobs
+            .iter()
+            .any(|job| job.contains("cadence-1548 legacy profile body")));
+        let operator_get = fx.op(GET, json!({}));
+        assert_eq!(operator_get["revision"], held.revision);
+        assert_eq!(operator_get["config"], held.config);
+        for who in [
+            Asserted::Agent("cad1548-profile-reader".into()),
+            Asserted::Unproven,
+        ] {
+            let err = fx
+                .rpc(who.clone(), GET, json!({}))
+                .expect_err("a non-operator RPC read disclosed profile definitions");
+            assert!(
+                is_operator_gate(&err.to_string()),
+                "settings GET refusal: {err}"
+            );
+            for job in &private_jobs {
+                assert!(
+                    !err.to_string().contains(job),
+                    "RPC refusal disclosed a profile job"
+                );
+            }
+            let private_session = fx.operator_session();
+            let (status, reply, _) =
+                fx.http_get(&Asserted::Operator, ROUTE, Some(&private_session));
+            assert_eq!(
+                status, 200,
+                "fresh credential positive before privacy refusal: {reply}"
+            );
+            assert_eq!(parse_json(&reply)["config"], held.config);
+            let (status, reply, _) = fx.http_get(&who, ROUTE, Some(&private_session));
+            assert!(
+                matches!(status, 401 | 403),
+                "non-operator HTTP GET: {status} {reply}"
+            );
+            for job in &private_jobs {
+                assert!(!reply.contains(job), "HTTP refusal disclosed a profile job");
+            }
+            assert_held(&fx, &held);
+        }
+        let positive_session = fx.operator_session();
+        let (status, reply, _) = fx.http_get(&Asserted::Operator, ROUTE, Some(&positive_session));
+        assert_eq!(status, 200, "operator settings GET: {reply}");
+        let operator_get = parse_json(&reply);
+        assert_eq!(operator_get["config"], held.config);
+        assert_eq!(operator_get["read_only"], json!(false));
+        assert_held(&fx, &held);
+
+        // Exercise a real read-only board, not a fabricated response flag.
+        // Keep the existing daemon and restore the normal listener afterward.
+        let normal_port = fx.port;
+        let mut read_only_port = None;
+        for port in 3110..3200 {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let opts = cadence_agent::ui::ServeOpts {
+                host: "127.0.0.1".into(),
+                port,
+                read_only: true,
+                stop: Some(fx.stop.clone()),
+                startup: Some(tx),
+                test_seam: true,
+                ..Default::default()
+            };
+            let (state, pm) = (fx.state(), fx.pm());
+            let thread = std::thread::spawn(move || {
+                let _ = cadence_agent::ui::serve(&state, &pm, &opts);
+            });
+            match rx.recv_timeout(Duration::from_secs(20)).unwrap() {
+                Ok(()) => {
+                    read_only_port = Some(port);
+                    fx.threads.push(thread);
+                    break;
+                }
+                Err(_) => thread.join().unwrap(),
+            }
+        }
+        fx.port = read_only_port.expect("no read-only board port in 3110-3199");
+        let read_only_session = fx.operator_session();
+        let (status, reply, _) = fx.http_get(&Asserted::Operator, ROUTE, Some(&read_only_session));
+        assert_eq!(status, 200, "read-only operator settings GET: {reply}");
+        let read_only_get = parse_json(&reply);
+        assert_eq!(read_only_get["revision"], held.revision);
+        assert_eq!(read_only_get["config"], held.config);
+        assert_eq!(read_only_get["read_only"], json!(true));
+        for who in [
+            Asserted::Agent("cad1548-profile-reader".into()),
+            Asserted::Unproven,
+        ] {
+            let read_only_session = fx.operator_session();
+            let (status, reply, _) =
+                fx.http_get(&Asserted::Operator, ROUTE, Some(&read_only_session));
+            assert_eq!(
+                status, 200,
+                "fresh read-only credential positive before privacy refusal: {reply}"
+            );
+            let positive = parse_json(&reply);
+            assert_eq!(positive["config"], held.config);
+            assert_eq!(positive["read_only"], json!(true));
+            let (status, reply, _) = fx.http_get(&who, ROUTE, Some(&read_only_session));
+            assert!(
+                matches!(status, 401 | 403),
+                "read-only non-operator GET: {status} {reply}"
+            );
+            for job in &private_jobs {
+                assert!(
+                    !reply.contains(job),
+                    "read-only refusal disclosed a profile job"
+                );
+            }
+        }
+        let (status, reply, _) = fx.http_get(&Asserted::Operator, ROUTE, None);
+        assert!(
+            matches!(status, 401 | 403),
+            "unsigned read-only GET: {status} {reply}"
+        );
+        for job in &private_jobs {
+            assert!(
+                !reply.contains(job),
+                "unsigned refusal disclosed a profile job"
+            );
+        }
+        assert_held(&fx, &held);
+        fx.port = normal_port;
+        assert_held(&fx, &held);
+
         let sync_one = json!({"expected_revision": held.revision, "profile": PROFILE});
         fx.op(SYNC, sync_one);
         assert_held(&fx, &held);

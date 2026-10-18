@@ -2064,8 +2064,9 @@ model details, file targets and actions remain reachable without clipping.
 Save commits harness/provider/model declarations, role defaults, Pi policy,
 pins and profile definitions in one revision-bound SQLite transaction.
 Conflicts and validation failures retain the draft; Discard restores the saved
-revision. Sync and Preview require saved state. Read-only sessions can inspect
-but cannot mutate settings. Catalog Refresh reads the supported
+revision. Sync and Preview require saved state. Full settings reads include
+profile job bodies, so RPC and HTTP both require operator proof. Read-only
+operator sessions can inspect but cannot mutate settings. Catalog Refresh reads the supported
 `omp models <provider> --json --no-extensions` listing and shows its actual
 source and fetch time; discovered models are not launch permission. Import
 adds missing rows to the draft with Pi permission off. Picking a combobox row
@@ -2079,6 +2080,9 @@ At daemon startup, legacy `pm.yaml [pi]` and non-master
 authority is then used by CLI, daemon and adapter launch paths; subsequent
 file edits do not replace it. Retired-source drift is informational. The
 master's own instructions and integrity protections remain separate.
+Regular files directly under `agents/` are not profile definitions and are
+left untouched. Symlinks, special files and invalid actual profiles still
+refuse import rather than being followed or silently discarded.
 
 Portable coordination exports omit settings authority alongside model defaults.
 An execution-disabled portable restore does not import legacy settings or

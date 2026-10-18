@@ -1291,9 +1291,10 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
         "/api/settings/model-defaults" => {
             send(request, model_defaults_get(state_dir, opts.read_only));
         }
-        "/api/settings/agents" => {
-            send(request, agent_settings_get(state_dir, opts.read_only));
-        }
+        "/api/settings/agents" => match operator::admit_operator_read(&request, state_dir, opts) {
+            Ok(()) => send(request, agent_settings_get(state_dir, opts.read_only)),
+            Err(resp) => send(request, resp),
+        },
         "/api/platform-account" => send(request, platform_account::get(opts)),
         // CAD-1393: operator-only reads of company templates and drafts.
         "/api/templates/show"
