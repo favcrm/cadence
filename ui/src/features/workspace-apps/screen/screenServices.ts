@@ -151,6 +151,15 @@ function recordCard(operation: RecordSlotVerb, facts: ActionArgs): RecordCard {
   const outer = object(facts.binding) ? facts.binding : null;
   const binding = outer && object(outer.binding) ? outer.binding : outer;
   if (binding) for (const [label, key] of [["SMTP connection", "connection_id"], ["Binding revision", "link_revision"], ["Binding state", "state"], ["Binding digest", "digest"]]) show(label, binding[key]);
+  if (operation === "whatsapp.reply.send") {
+    // CAD-1562: recipient, window and text come from the daemon's
+    // host-computed card for the prepared digest, never from the frame.
+    const recipient = object(facts.recipient) ? facts.recipient : null;
+    if (!recipient || typeof facts.text !== "string" || typeof facts.digest !== "string" || typeof facts.conversation_id !== "string") throw new ApiError("Incomplete reply facts", 502);
+    show("To", [recipient.name, recipient.phone].filter(v => typeof v === "string" && v).join(" · ") || facts.conversation_id);
+    show("Conversation", facts.conversation_id); show("Message", facts.text); show("Reply to message", facts.reply_to_message_id);
+    show("Free-text window open until", facts.freeform_until); show("Reply digest", facts.digest);
+  }
   show("Scope", facts.scope); show("Unsubscribe origin", facts.unsubscribe_origin ?? (operation === "origin.manage" ? "Not configured" : undefined));
   const card: RecordCard = { operation, facts: rows };
   if (operation === "smtp.test-send") card.input = { field: "to_email", label: "Test recipient (one email address)" };

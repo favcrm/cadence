@@ -177,10 +177,25 @@ impl Shared {
                 "this WhatsApp reply is not awaiting approval",
             ));
         }
+        // The recipient and window the human approves come from the door's
+        // live conversation, never from the frame. Only stable fields are
+        // drawn, so a confirm refuses only if one of them changed.
+        let conversation = self.whatsapp_door()?.conversation(&reply.conversation_id)?;
+        if conversation["replyMode"] != "freeform" {
+            return Err(Error::rejected(
+                "the WhatsApp 24-hour window is closed; free text cannot be sent",
+            ));
+        }
         Ok(json!({
             "effect_id": effect_id,
             "key": door::reply_key(effect_id),
             "conversation_id": reply.conversation_id,
+            "recipient": {
+                "name": conversation["contact"]["name"],
+                "phone": conversation["contact"]["phone"],
+            },
+            "reply_mode": conversation["replyMode"],
+            "freeform_until": conversation["freeformUntil"],
             "text": reply.text,
             "reply_to_message_id": reply.reply_to_message_id,
             "digest": digest,

@@ -12,6 +12,7 @@ function RecordConfirmation({ view, card, onTap, onCancel }: {
     "smtp.manage": "Open email sending settings?", "smtp.bind": "Bind this SMTP connection?", "smtp.rebind": "Replace this SMTP binding?", "smtp.revoke": "Revoke this SMTP binding?",
     "smtp.test-send": "Send one test email?", "sends.approve": "Approve this frozen send?", "sends.resolve": "Resolve this uncertain delivery?",
     "origin.manage": "Change the daemon-global unsubscribe origin?", "chat.campaign.open": "Open this campaign's assistant?", "chat.campaign.brief": "Send this campaign brief?",
+    "whatsapp.reply.send": "Send this WhatsApp reply?",
   };
   const field = card.input;
   const invalid = field?.choices ? !field.choices.some(c => c.value === input) : field?.field === "to_email" ? !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(input) : false;

@@ -76,8 +76,8 @@ export const isMediaVerb = (verb: string): verb is MediaVerb =>
  *  deliberately absent; the channel appends a mount's declared media
  *  rights itself. */
 export const ACTION_VERBS: string[] = [...CALL_VERBS.filter(v => !(MEDIA_VERBS as readonly string[]).includes(v)), ...SLOT_VERBS.filter(v => v !== ORIGINAL_DOWNLOAD_VERB)];
-export const RECORD_CALL_VERBS = ["records.list", "records.show", "records.create", "records.update", "records.csv.preview", "segments.list", "segments.show", "segments.save", "exclusions.list", "exclusions.show", "exclusions.save", "suppressions.list", "suppressions.add", "audience.preview", "audience.prepare", "audience.show", "content.list", "content.show", "content.save", "content.clone", "content.render", "proposals.list", "proposals.show", "proposals.render", "proposals.apply", "proposals.discard", "sender-bindings.list", "sender-bindings.show", "sender-bindings.save", "content.test-prepare", "content.send-prepare", "sends.prepare", "sends.show", "sends.list", "smtp.show", "origin.show", "screen.preview.show", "screen.preview.clear", "screen.route.patch"] as const;
-export const RECORD_SLOT_VERBS = ["records.csv.import", "records.csv.confirm", "content.approve", "smtp.manage", "smtp.bind", "smtp.rebind", "smtp.revoke", "smtp.test-send", "sends.approve", "sends.resolve", "origin.manage", "chat.campaign.open", "chat.campaign.brief"] as const;
+export const RECORD_CALL_VERBS = ["records.list", "records.show", "records.create", "records.update", "records.csv.preview", "segments.list", "segments.show", "segments.save", "exclusions.list", "exclusions.show", "exclusions.save", "suppressions.list", "suppressions.add", "audience.preview", "audience.prepare", "audience.show", "content.list", "content.show", "content.save", "content.clone", "content.render", "proposals.list", "proposals.show", "proposals.render", "proposals.apply", "proposals.discard", "sender-bindings.list", "sender-bindings.show", "sender-bindings.save", "content.test-prepare", "content.send-prepare", "sends.prepare", "sends.show", "sends.list", "smtp.show", "origin.show", "screen.preview.show", "screen.preview.clear", "screen.route.patch", "whatsapp.status", "whatsapp.connect_session", "whatsapp.conversations.list", "whatsapp.conversations.show", "whatsapp.messages", "whatsapp.reply.prepare", "whatsapp.reply.status"] as const;
+export const RECORD_SLOT_VERBS = ["records.csv.import", "records.csv.confirm", "content.approve", "smtp.manage", "smtp.bind", "smtp.rebind", "smtp.revoke", "smtp.test-send", "sends.approve", "sends.resolve", "origin.manage", "chat.campaign.open", "chat.campaign.brief", "whatsapp.reply.send"] as const;
 export const RECORD_OPERATIONS: readonly string[] = [...RECORD_CALL_VERBS, ...RECORD_SLOT_VERBS];
 export type RecordCallVerb = (typeof RECORD_CALL_VERBS)[number];
 export type RecordSlotVerb = (typeof RECORD_SLOT_VERBS)[number];
@@ -92,7 +92,7 @@ export const CRM_LOCALE_V1 = "crm-locale.v1";
 /** Larger envelopes are admitted only after verified records negotiation and rights. */
 export function recordArgsLimit(verb: string): number {
   return ["records.csv.preview", "records.csv.import", "records.csv.confirm"].includes(verb) ? 327680
-    : ["records.create", "records.update", "content.save", "screen.preview.show"].includes(verb) ? 49152 : ACTION_ARGS_BYTES;
+    : ["records.create", "records.update", "content.save", "screen.preview.show", "whatsapp.reply.prepare", "whatsapp.reply.send"].includes(verb) ? 49152 : ACTION_ARGS_BYTES;
 }
 export const ACTION_ID = /^[A-Za-z0-9_-]{1,64}$/;
 /** A v2 tool alias grammar: lowercase words joined by dots (matches the
