@@ -24,7 +24,27 @@ impl Peer {
             .unwrap();
         let pid = child.id();
         std::mem::forget(child); // killed (and reaped by init) in drop
-        Peer(pid)
+        let peer = Peer(pid);
+        // CAD-1535: spawn returns once the child has switched images, but
+        // the kernel fills its environ a moment later; until then the
+        // ancestry walk sees no alias and names another reason. Wait for
+        // the forged alias, as `detached` does, so every read sees one peer.
+        let alias_ok = || {
+            std::fs::read(format!("/proc/{pid}/environ"))
+                .unwrap_or_default()
+                .split(|b| *b == 0)
+                .any(|e| e == b"CADENCE_ALIAS=cc13-pm")
+        };
+        let mut ready = alias_ok();
+        for _ in 0..100 {
+            if ready {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            ready = alias_ok();
+        }
+        assert!(ready, "forged sleep {pid} environ not readable within 2s");
+        peer
     }
 
     /// The same, detached the way an agent's `setsid` child is: its

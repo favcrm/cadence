@@ -1852,7 +1852,7 @@ impl Shared {
             thread::sleep(Duration::from_millis(ms));
         }
         // Every call past the caller rule leaves one `interrupt_requested`
-        // — a refusal included (PROTOCOL.md).
+        // — a refusal included.
         let record = |outcome: &str, error: Option<&str>| -> Result<()> {
             let mut payload = json!({"outcome": outcome, "message": message.id,
                                      "turn_id": turn_id});

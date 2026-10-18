@@ -24,7 +24,7 @@ import {
 } from "./socialPublish";
 import { workspaceApps } from "./workspaceApps";
 import { useTranslate } from "../../lib/locale";
-import { displayUiNotice, type UiNotice } from "../app-shell/campaign/useEmailDraft";
+import { displayUiNotice, type UiNotice } from "../../lib/uiNotice";
 
 export interface PublishCandidate {
   run_id: string;

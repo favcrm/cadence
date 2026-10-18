@@ -16,7 +16,7 @@ import {
   type CsvRowChoice,
 } from "./csvClient";
 import { csvDecisionsDigest, toWireDecisions } from "./csvDigest";
-import { displayUiNotice, type UiNotice } from "./campaign/useEmailDraft";
+import { displayUiNotice, type UiNotice } from "../../lib/uiNotice";
 import { friendlyError, viewProfile } from "./customerProfile";
 import type { HostScope } from "./hostActions";
 

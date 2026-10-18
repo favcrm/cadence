@@ -18,12 +18,84 @@ const nonEmpty = messages => (Array.isArray(messages) ? messages : []).map(messa
   ["user", "toolResult", "custom"].includes(message?.role)
     ? { ...message, content: filled(message.content) } : message);
 
+// CAD-1526: the gateway publishes a maximum message count per request — the
+// inference contract caps `messages` at 100 (AgenticOS
+// `packages/contracts/src/inference.ts`, and the provider registry declares
+// the same bound), answered with `400 Field "messages" exceeds the
+// published maximum`. A session that grows past it fails on every later
+// turn, and compaction cannot recover it: compaction is a size bound, not a
+// count bound, so it refuses with "session too small" while the request is
+// still over the maximum. Bound the count here, where the projection already
+// runs, and keep a margin so a tool round inside one turn cannot cross the
+// published maximum between two hooks.
+const MESSAGES_MAX = 100;
+const MESSAGES_KEEP = MESSAGES_MAX - 10;
+
+// Keep the opening messages, the newest user message and the current turn's
+// guidance, plus the newest window, dropping whole older messages. The window
+// never opens on a tool result and never crosses the published maximum: a
+// result is kept with the assistant call that produced it, and a round the
+// maximum cannot carry is left out whole rather than sent in part.
+const windowed = (messages, pinned = []) => {
+  const list = Array.isArray(messages) ? messages : [];
+  if (list.length <= MESSAGES_KEEP) return list;
+  let head = 0;
+  while (head < list.length && ["system", "developer"].includes(list[head]?.role)) head += 1;
+  // The opening message (the master's bootstrap, a worker's task), the newest
+  // user message (the instruction this turn answers) and the current turn's
+  // guidance are authoritative: they are kept when a long tool run would
+  // otherwise window them out. Only what sits before the window is carried.
+  const anchored = new Set(pinned);
+  if (list[head]?.role === "user") anchored.add(list[head]);
+  for (let i = list.length - 1; i > head; i -= 1) {
+    if (list[i]?.role === "user") {
+      anchored.add(list[i]);
+      break;
+    }
+  }
+  const room = Math.max(MESSAGES_KEEP - head - anchored.size, 1);
+  const hard = Math.max(MESSAGES_MAX - head - anchored.size, 2);
+  // The unit that ends at `end`: a run of results comes with the call that
+  // produced it, and a run whose call is gone is not whole and never kept.
+  const unitEndingAt = end => {
+    let start = end - 1;
+    if (list[start]?.role !== "toolResult") return { start, whole: true };
+    while (start > head && list[start - 1]?.role === "toolResult") start -= 1;
+    const call = start - 1;
+    return call >= head && list[call]?.role === "assistant"
+      ? { start: call, whole: true }
+      : { start, whole: false };
+  };
+  let start = list.length;
+  let end = list.length;
+  let used = 0;
+  while (start > head) {
+    const unit = unitEndingAt(start);
+    const size = start - unit.start;
+    // The newest unit may spend the margin up to the published maximum; the
+    // older ones stay inside the window.
+    if (unit.whole && used + size <= (used === 0 ? hard : room)) {
+      start = unit.start;
+      used += size;
+      continue;
+    }
+    if (used > 0) break;
+    // Nothing is kept yet and this unit cannot be sent: leave it out whole.
+    end = unit.start;
+    start = unit.start;
+  }
+  const carried = [...anchored]
+    .filter(message => list.indexOf(message) >= head && list.indexOf(message) < start)
+    .sort((a, b) => list.indexOf(a) - list.indexOf(b));
+  return [...list.slice(0, head), ...carried, ...list.slice(start, end)];
+};
+
 export default function install(pi) {
   // These semantics were verified on this exact runtime: awaited lifecycle
   // boundaries and synchronous streaming custom-message queue admission.
   // An upgrade must be validated, not silently granted this capability.
   if (VERSION !== "1.0.0") {
-    pi.on("context", event => ({ messages: nonEmpty(event.messages) }));
+    pi.on("context", event => ({ messages: windowed(nonEmpty(event.messages)) }));
     return;
   }
   let pending = null;
@@ -58,11 +130,17 @@ export default function install(pi) {
   // Cancellation may leave an accepted message unconsumed in the core queue
   // or history. The adapter clears the queue before dispatching a successor;
   // this projection also excludes old guidance from every later model input.
-  pi.on("context", event => ({
-    messages: nonEmpty(Array.isArray(event.messages) ? event.messages.filter(message =>
+  pi.on("context", event => {
+    const projected = nonEmpty(Array.isArray(event.messages) ? event.messages.filter(message =>
       message.role !== "custom" || message.customType !== "cadence-turn-guidance"
-      || (current !== null && message.details?.turn === current)) : []),
-  }));
+      || (current !== null && message.details?.turn === current)) : []);
+    // The current turn's guidance is authoritative too: pin it, so a turn
+    // longer than the window cannot drop the constraints the operator set for
+    // work that is still running. Nothing stale is pinned — the filter above
+    // admits only this turn's guidance.
+    return { messages: windowed(projected, projected.filter(message =>
+      message.role === "custom" && message.customType === "cadence-turn-guidance")) };
+  });
 
   const receipt = (operation, request, turn, outcome, reason = null) => {
     pi.appendEntry("cadence-turn-input", {

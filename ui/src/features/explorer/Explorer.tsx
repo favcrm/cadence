@@ -8,7 +8,7 @@ import { installationAppHref, installedAppHref } from "../apps/appViewModel";
 import type { Viewer } from "../projects/work";
 import { AppGlyph, TrustChip, InstallStateChip, useEscape } from "./shared";
 import { appErrorCopy, appLoadErrorCopy } from "./appErrors";
-import { displayUiNotice, type UiNotice } from "../app-shell/campaign/useEmailDraft";
+import { displayUiNotice, type UiNotice } from "../../lib/uiNotice";
 import InstallCheckPanel from "./InstallCheckPanel";
 import { Notice } from "../app-shell/shared/States";
 import { useBackoffLoad } from "../workspace-apps/useBackoffLoad";

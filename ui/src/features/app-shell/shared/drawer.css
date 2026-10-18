@@ -1,4 +1,4 @@
-@import "../../../screen-ui/src/drawer.css";
+@import "../../../../screen-ui/src/drawer.css";
 
 /* Form rows: controls share a baseline even when one field carries a
    hint, and the consent selects shrink to their column instead of
@@ -11,99 +11,6 @@
   min-width: 0;
 }
 
-
-/* Segment drawer (CAD-1054): rule sentence, eligibility funnel. */
-.chip[data-tone="warn"] {
-  color: var(--color-warn);
-  border-color: color-mix(in srgb, var(--color-warn) 45%, var(--color-ink-700));
-}
-.chip[data-tone="ok"] {
-  color: var(--color-ok);
-}
-.crm-rule-sentence {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 0.3rem;
-  font-size: var(--text-secondary);
-  color: var(--color-ink-300);
-}
-.crm-funnel {
-  display: grid;
-  gap: 0.35rem;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-.crm-funnel li {
-  display: grid;
-  grid-template-columns: 8rem 1fr 3rem;
-  align-items: center;
-  gap: 0.5rem;
-  font-size: var(--text-label);
-  color: var(--color-ink-300);
-}
-.crm-funnel-bar {
-  height: 0.4rem;
-  border-radius: 0.2rem;
-  background: var(--color-ink-800);
-  overflow: hidden;
-}
-.crm-funnel-bar > span {
-  display: block;
-  height: 100%;
-  background: var(--color-accent);
-}
-
-/* CAD-1053 customer drawer content and list chips. Tokens only. */
-.crm-sect {
-  margin-top: 1rem;
-}
-.crm-sect:first-child {
-  margin-top: 0;
-}
-.crm-sect h4 {
-  margin: 0 0 0.4rem;
-  font-size: var(--text-label);
-  font-weight: 500;
-  color: var(--color-ink-200);
-}
-.crm-consent-cards {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0.5rem;
-}
-.crm-consent-cards .chip {
-  margin: 0.25rem 0;
-  background: var(--color-ink-800);
-  color: var(--color-ink-300);
-}
-.crm-consent-ok {
-  background: color-mix(in srgb, var(--color-ok) 14%, transparent);
-  color: var(--color-ok);
-}
-.crm-timeline {
-  display: grid;
-  gap: 0.75rem;
-  list-style: none;
-  margin: 0;
-  padding: 0 0 0 0.9rem;
-  border-left: 1px solid var(--color-ink-700);
-  font-size: var(--text-secondary);
-  color: var(--color-ink-200);
-}
-.crm-filters {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 0.5rem;
-  margin-bottom: 0.5rem;
-}
-.crm-chips {
-  display: inline-flex;
-  flex-wrap: wrap;
-  gap: 0.25rem;
-}
 button.chip {
   border: 0;
   cursor: pointer;
@@ -113,24 +20,6 @@ button.chip {
 button.chip:hover,
 button.chip:focus-visible {
   color: var(--color-ink-100);
-}
-.crm-chip-on {
-  background: color-mix(in srgb, var(--color-accent) 16%, transparent);
-  color: var(--color-ink-100);
-}
-.crm-row-open {
-  cursor: pointer;
-}
-.crm-row-open:hover {
-  background: var(--color-ink-850);
-}
-.crm-selection {
-  margin: 0 0 0.4rem;
-}
-@media (max-width: 480px) {
-  .crm-consent-cards {
-    grid-template-columns: minmax(0, 1fr);
-  }
 }
 
 .rv-lead {

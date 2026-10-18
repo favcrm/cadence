@@ -137,7 +137,7 @@ pub enum IssueAction {
     /// List issues — a compact table on a TTY, JSON when piped (or `--json`).
     /// Value flags repeat and comma-join and match ANY of their values;
     /// different flags AND; `--tag` is the exception — all must be
-    /// present. See PROTOCOL.md "List grammar".
+    /// present. The grammar prints from `crate::filter::GRAMMAR`.
     #[command(after_long_help = crate::filter::GRAMMAR)]
     #[command(visible_alias = "list")]
     Ls {

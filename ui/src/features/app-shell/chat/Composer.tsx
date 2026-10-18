@@ -11,7 +11,7 @@ import type { ThreadRef } from "../../../lib/types";
 import { useLocale } from "../../../lib/locale";
 import { parseSlash, SLASH_COMMANDS, slashMatches, type SlashCommand } from "../../home/master";
 import { ATTACH_ACCEPT, attachMeta, displayAttachError, unresolvedHint, unresolvedHintNotice, type AttachDestination, type AttachItem } from "./attach";
-import type { UiNotice } from "../campaign/useEmailDraft";
+import type { UiNotice } from "../../../lib/uiNotice";
 import {
   addFiles,
   attachHold,

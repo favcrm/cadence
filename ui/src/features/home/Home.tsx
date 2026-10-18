@@ -41,6 +41,7 @@ import {
   onSend,
   onTailChange,
   onViewportScroll,
+  reducedMotion,
   type Follow,
 } from "./scrollFollow";
 import { sendToMaster } from "./send";
@@ -74,9 +75,6 @@ function fmtElapsed(secs: number): string {
   if (m < 60) return `${m}m ${secs % 60}s`;
   return `${Math.floor(m / 60)}h ${m % 60}m`;
 }
-
-const reducedMotion = () =>
-  typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
 
 /**
  * The in-flight turn line (CAD-551): the pulse and elapsed clock while a
@@ -470,24 +468,16 @@ const ThreadList = memo(function ThreadList({
           ? null
           : anchorItem.entry;
   // A daemon that cannot name its running turn's message still owes an
-  // honest Working signal: bounded fallback on the tail item only while
-  // the tail is not an answer — once the reply lands, `turn.state`
-  // clears too. An answer tail keeps its own header slot instead.
+  // honest Working signal, and so does a named turn whose first stored
+  // entry has not landed yet: the bounded fallback rides the tail item —
+  // including an answer tail that belongs to an EARLIER turn (a stale or
+  // failed reply). That answer keeps its own header slot, and the
+  // running turn gets a standalone row after it, so a turn is never
+  // invisible in the transcript while the dock counts it working
+  // (CAD-1533).
   const fallbackItem =
-    working && anchorItem === null && shown.length > 0 && shown[shown.length - 1].type !== "answer"
-      ? shown[shown.length - 1]
-      : null;
+    working && anchorItem === null && shown.length > 0 ? shown[shown.length - 1] : null;
   const activityItem = anchorItem ?? fallbackItem;
-  const activityEntry =
-    anchorItem !== null
-      ? anchorEntry
-      : fallbackItem === null
-        ? null
-        : fallbackItem.type === "tools"
-          ? fallbackItem.entries[fallbackItem.entries.length - 1] ?? null
-          : fallbackItem.type === "pending"
-            ? null
-            : fallbackItem.entry;
   if (items.length === 0) return null;
   return (
     <>
@@ -509,12 +499,32 @@ const ThreadList = memo(function ThreadList({
         activity={(item) => {
           if (!working || activityItem === null || item.key !== activityItem.key) return null;
           const live = <AssistantActivity since={working.since} />;
+          // The anchored row shows this turn's own newest entry time. A
+          // fallback row rides the tail item, which may belong to an
+          // EARLIER turn (a stale or failed reply), so it is stamped with
+          // the running turn's start — never with that foreign time
+          // (CAD-1533 review, finding 1).
+          const at =
+            anchorItem !== null
+              ? anchorEntry
+                ? time(anchorEntry.created)
+                : undefined
+              : working.since !== null
+                ? time(new Date(working.since * 1000).toISOString())
+                : undefined;
           // The answer bubble carries the indicator on its own name row;
           // a standalone row covers in-flight steps/commentary that have
-          // none of their own.
-          if (item.type === "answer") return { kind: "header", node: live };
-          if (item.type === "operator") return { kind: "row", node: <AssistantNameRow at={activityEntry ? time(activityEntry.created) : undefined} live={live} />, position: "after" };
-          return { kind: "row", node: <AssistantNameRow at={activityEntry ? time(activityEntry.created) : undefined} live={live} />, position: "before" };
+          // none of their own, and the running turn when the row it would
+          // anchor to is another turn's reply (CAD-1533). A row that IS
+          // this turn's own — the operator's just-sent message, or the
+          // reply itself — keeps the indicator below it.
+          if (item.type === "answer" && anchorItem !== null) return { kind: "header", node: live };
+          const below = item.type === "operator" || item.type === "pending" || item.type === "answer";
+          return {
+            kind: "row",
+            node: <AssistantNameRow at={at} live={live} />,
+            position: below ? "after" : "before",
+          };
         }}
         after={(item) =>
           anchors.has(item.key) ? (
@@ -721,13 +731,12 @@ function MasterHome({
     turn.kind === "working"
       ? { message: turn.message, since: typeof turn.since === "number" ? turn.since : null }
       : null;
-  // Same-row growth the ResizeObserver follows re-subscribes when the
-  // name-row indicator appears or clears (its content lives inside the
-  // observed list).
-  const nameRowShown =
-    workingActivity !== null &&
-    (activityAnchor(items, workingActivity.message) !== null ||
-      (items.length > 0 && items[items.length - 1].type !== "answer"));
+  // The ResizeObserver re-subscribes when the name-row indicator appears
+  // or clears (its content lives inside the observed list): a running
+  // turn with any row to ride, whether it anchors to its own entry or
+  // falls back to any tail item — answers included (CAD-1533 review,
+  // finding 2).
+  const nameRowShown = workingActivity !== null && items.length > 0;
 
   // Live entries: the store opened on the newest page, so the stream
   // resumes after its last seq — never a replay of the history. On a
@@ -1161,7 +1170,7 @@ function MasterHome({
 
           {(unseen > 0 || activity) && (
             <button type="button" className="newpill num" onClick={jumpToLatest} data-jump-to-latest>
-              ↓ {jumpLabel(unseen)}
+              ↓ {jumpLabel(unseen, t)}
             </button>
           )}
 
