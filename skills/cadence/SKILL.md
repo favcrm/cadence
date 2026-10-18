@@ -601,6 +601,19 @@ During implementation and handoff:
   standards. Bind the verdict to the actual revision and list checks run,
   skipped and limitations. QA tests the behavior and relevant failure
   paths, not just the author's report.
+- Make review converge. First inspect the complete change against acceptance;
+  verify each blocking finding with a concrete failure scenario and source
+  evidence before sending it to the author. Report the class of bug and all
+  known affected instances together, not one instance per round.
+- Send fixes to the same reviewer with the previously reviewed head, new head,
+  prior findings and fix evidence in the existing handoff. Re-review the delta
+  and affected dependencies; widen for changed assumptions or new risks. If
+  the prior review is unavailable, do a complete first pass. Do not repeat
+  resolved findings unless new evidence shows the fix is incomplete. Issue a
+  fresh verdict on the actual head; reuse only evidence still valid for it.
+- After a third blocked review round, escalate the remaining failure scenarios
+  and the proposed approach to the PM or operator instead of looping blindly.
+  Escalation is not PASS and never waives required checks or approvals.
 - Acceptance maps each promised outcome to evidence. Keep implemented,
   reviewed, merged, installed and operationally verified distinct. A moving
   head or changed integration tree needs evidence revalidation; passing CI
