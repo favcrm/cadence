@@ -243,5 +243,4 @@ mod tests {
         );
         assert!(catalog_upstream("/api/other", "").is_none());
     }
-
 }
