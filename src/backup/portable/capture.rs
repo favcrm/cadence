@@ -472,6 +472,12 @@ fn commit_snapshot(repo: &Path, records: &[Rec]) -> Result<String> {
     let mut read = git_repo(repo);
     read.args(["read-tree", "HEAD"]);
     run(&mut read, "read-tree")?;
+    // Pack only this generated repository before ordinary metadata admission.
+    // Loose objects otherwise exhaust its entry cap on large worktrees. This
+    // temporary pack needs neither delta search nor parallel compression.
+    let mut pack = git_repo(repo);
+    pack.args(["-c", "pack.threads=1", "repack", "-a", "-d", "--window=0"]);
+    run(&mut pack, "repack")?;
     Ok(commit)
 }
 

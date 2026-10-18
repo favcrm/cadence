@@ -296,6 +296,9 @@ tracker, including through symlinked parents. Without the flag, the existing
 clean-tracker export is unchanged.
 
 The capture is a private clean Git snapshot, not a change to the source.
+The generated snapshot's Git objects are packed before metadata admission,
+so distinct captured files do not each consume a loose-object metadata entry.
+This does not run maintenance on the source or raise its metadata limits.
 The existing exporter takes its online database snapshot, applies the
 coordination projection and credential scrub/scan, and builds the package.
 Independent package validation, comparison with the captured tracker inventory,
