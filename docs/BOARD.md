@@ -2058,6 +2058,8 @@ alter running sessions. Installation, versions and fleet usage are observed
 separately from editable declarations. Native CLI models do not use Pi
 allowlists; Pi scopes distinguish master and worker runtime permissions.
 A profile's team role selects model preferences, never runtime authority.
+Drawers scroll vertically on short or narrow screens so job descriptions,
+model details, file targets and actions remain reachable without clipping.
 
 Save commits harness/provider/model declarations, role defaults, Pi policy,
 pins and profile definitions in one revision-bound SQLite transaction.
