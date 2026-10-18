@@ -309,6 +309,18 @@ deferred until commit so removing human-room topics and metadata does not
 fail on an intermediate state. A foreign-key failure at commit refuses the
 export without publishing a package. The source database is unchanged.
 
+Portable `pm.yaml` validation accepts tracker metadata plus the native closed
+`pi`, `host`, and `hosted` configuration sections. Files are copied byte for
+byte, including comments; settings are not stripped or reserialized. Unknown
+fields and non-mapping runtime sections refuse. Blocking credential findings
+in raw configuration text or decoded runtime string values refuse export,
+inspection, and inactive restore without echoing the values.
+
+These sections remain configuration data, not credentials or permission to
+start executors or acquire a lease. Inactive guards remain in force. Receivers
+must include this configuration decoder: older builds can reject these keys
+even when the portable format and database schema versions match.
+
 Success prints JSON with `manifest_sha256`, `exporter_revision`, schema,
 tracker revision, member count/bytes, exclusions, and `source_capture`
 (original HEAD, snapshot HEAD, file/byte counts, inventory SHA-256 and capture

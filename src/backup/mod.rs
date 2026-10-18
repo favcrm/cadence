@@ -117,6 +117,9 @@ mod cad1365_media_catalog_acceptance;
 mod cad1554_foreign_key_acceptance;
 
 #[cfg(test)]
+mod cad1559_config_acceptance;
+
+#[cfg(test)]
 mod cad914_transfer_catalog_acceptance;
 
 #[cfg(test)]
