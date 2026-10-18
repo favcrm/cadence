@@ -68,6 +68,35 @@ pub(super) fn refused(pm: &Pm, key: &str, actor: &str) -> bool {
     }
 }
 
+/// Drop project-scoped rows the caller may not read from an overview
+/// payload.
+///
+/// `needs_me` rows name their project; `projects` rows name it by `key`.
+/// Any other array element that names a `project` is filtered too, so a
+/// section added later fails closed instead of leaking. A row with no
+/// project identity is not project-scoped and stays — except in
+/// `projects`, where an unnamed row is dropped.
+pub(super) fn retain_overview(payload: &mut serde_json::Value, readable: &BTreeSet<String>) {
+    let Some(root) = payload.as_object_mut() else {
+        return;
+    };
+    for (name, value) in root.iter_mut() {
+        let Some(rows) = value.as_array_mut() else {
+            continue;
+        };
+        rows.retain(|row| {
+            let named = row
+                .get("project")
+                .and_then(|v| v.as_str())
+                .or_else(|| row.get("key").and_then(|v| v.as_str()));
+            match named {
+                Some(project) => readable.contains(project),
+                None => name != "projects",
+            }
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,5 +176,26 @@ mod tests {
         let (_dir, pm) = pm_with(&[("demo", "")]);
         assert!(!refused(&pm, "demo", "users/anyone"));
         assert!(readable(&pm, "users/anyone").contains("demo"));
+    }
+
+    #[test]
+    fn an_overview_drops_rows_for_unreadable_projects() {
+        let readable: BTreeSet<String> = ["open".to_string()].into_iter().collect();
+        let mut payload = serde_json::json!({
+            "needs_me": [
+                {"project": "demo", "title": "hidden"},
+                {"project": "open", "title": "visible"},
+                {"title": "not project-scoped"},
+            ],
+            "projects": [{"key": "demo"}, {"key": "open"}, {"label": "unnamed"}],
+            "drift": [{"project": "demo"}, {"note": "no project"}],
+            "scope": {"project": null},
+        });
+        retain_overview(&mut payload, &readable);
+        assert_eq!(payload["needs_me"].as_array().unwrap().len(), 2);
+        assert_eq!(payload["projects"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["projects"][0]["key"], "open");
+        assert_eq!(payload["drift"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["scope"]["project"], serde_json::Value::Null);
     }
 }

@@ -1424,7 +1424,28 @@ fn handle(mut request: Request, state_dir: &Path, pm_dir: &Path, opts: &ServeOpt
                     }
                 }
             }
-            send(request, json_response(overview))
+            let actor = match read_admission
+                .as_ref()
+                .map(|a| operator::read_actor(a, &request, state_dir, opts))
+            {
+                Some(Ok(actor)) => actor,
+                Some(Err(resp)) => {
+                    send(request, resp);
+                    return;
+                }
+                None => {
+                    send(request, err_response(503, "read admission is missing"));
+                    return;
+                }
+            };
+            match Pm::at(pm_dir) {
+                Ok(pm) => {
+                    let readable = super::project_policy::readable(&pm, &actor);
+                    super::project_policy::retain_overview(&mut overview, &readable);
+                    send(request, json_response(overview));
+                }
+                Err(e) => send(request, err_response(503, &e.to_string())),
+            }
         }
         "/api/projects" => match Pm::at(pm_dir) {
             Ok(pm) => {
