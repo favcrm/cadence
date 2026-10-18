@@ -370,16 +370,16 @@ export function reportView(reports: readonly TaskReport[]): ReportView {
 }
 
 /**
- * Prefer explicit revision identity. Without both heads, a newer
- * record makes coverage uncertain; its timestamp does not prove new code.
+ * Matching report heads resolve report-time ambiguity, not independently
+ * recorded newer commits. Missing revision proof leaves coverage uncertain.
  */
 export function verdictStale(verdict: TaskReport, detail: IssueDetail): boolean {
   const newer = reportView(detail.reports ?? []).latest;
-  if (newer?.sha && verdict.sha) return newer.sha !== verdict.sha;
   const at = timeKey(verdict.at ?? null);
-  if (at === Number.NEGATIVE_INFINITY) return false;
-  if (newer && timeKey(newer.at ?? null) > at) return true;
-  return (detail.commits ?? []).some((c) => timeKey(c.at) > at);
+  if (at !== Number.NEGATIVE_INFINITY &&
+      (detail.commits ?? []).some((c) => c.sha !== verdict.sha && timeKey(c.at) > at)) return true;
+  if (newer?.sha && verdict.sha) return newer.sha !== verdict.sha;
+  return at !== Number.NEGATIVE_INFINITY && !!newer && timeKey(newer.at ?? null) > at;
 }
 
 export interface MergeState {
