@@ -1777,15 +1777,13 @@ fn check_tracker_path(path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Closed decoder for a portable `pm.yaml`. It mirrors the native `PmConfig`
-/// tree in `src/issue/mod.rs` (and `ReviewRules` in `src/delivery`): the same
-/// field names and value types at every level, with `deny_unknown_fields` so an
-/// extra key at any depth refuses. Native serde ignores unknown keys, so this
-/// mirror is the only place they are rejected. Values are never copied into an
+/// Closed decoder for a portable `pm.yaml`. Tracker metadata mirrors the
+/// native `PmConfig` tree; runtime sections reuse their closed native types.
+/// Unknown fields refuse at every level. Values are never copied into an
 /// error: a mismatch reports only the generic reason.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-#[allow(dead_code)] // validation-only: the fields close the schema, they are not read
+#[allow(dead_code)] // metadata fields close the schema; runtime strings are scanned
 struct PortablePmConfig {
     schema: u32,
     #[serde(default)]
@@ -1802,6 +1800,12 @@ struct PortablePmConfig {
     review: PortableReview,
     #[serde(default)]
     approvals: PortableApprovals,
+    #[serde(default)]
+    pi: crate::pi_policy::PiPolicy,
+    #[serde(default)]
+    host: crate::doctor::host::HostOverrides,
+    #[serde(default)]
+    hosted: crate::lease::Hosted,
 }
 
 #[derive(Deserialize, Default)]
@@ -1841,6 +1845,9 @@ const PM_CONFIG_KEYS: &[&str] = &[
     "wiki",
     "review",
     "approvals",
+    "pi",
+    "host",
+    "hosted",
 ];
 
 fn check_tracker_content(path: &str, bytes: &[u8]) -> Result<()> {
@@ -1848,20 +1855,57 @@ fn check_tracker_content(path: &str, bytes: &[u8]) -> Result<()> {
         return Ok(());
     }
     let refuse = |why: &str| Error::rejected(format!("tracker file {path} refused: {why}"));
+    let text = std::str::from_utf8(bytes).map_err(|_| refuse("not valid YAML"))?;
     let value: serde_yaml::Value =
-        serde_yaml::from_slice(bytes).map_err(|_| refuse("not valid YAML"))?;
+        serde_yaml::from_str(text).map_err(|_| refuse("not valid YAML"))?;
     let map = value.as_mapping().ok_or_else(|| refuse("not a mapping"))?;
-    for key in map.keys() {
+    for (key, section) in map {
         let name = key.as_str().ok_or_else(|| refuse("non-string key"))?;
         if !PM_CONFIG_KEYS.contains(&name) {
             return Err(refuse(&format!(
                 "unknown top-level key {name}; credential-bearing config is not portable"
             )));
         }
+        if matches!(name, "pi" | "host" | "hosted") && !section.is_mapping() {
+            return Err(refuse(&format!("runtime section {name} must be a mapping")));
+        }
     }
-    serde_yaml::from_value::<PortablePmConfig>(value).map_err(|_| {
+    let config = serde_yaml::from_value::<PortablePmConfig>(value).map_err(|_| {
         refuse("does not match the pm.yaml schema (unknown or mistyped key at some level)")
     })?;
+    let check_text = |text: &str| -> Result<()> {
+        if crate::secret::scan(text, Some(path))?
+            .iter()
+            .any(|finding| finding.severity == crate::secret::Severity::Block)
+        {
+            return Err(refuse("credential-shaped config content is not portable"));
+        }
+        Ok(())
+    };
+    // Raw text covers comments; decoded runtime strings cover YAML escapes.
+    check_text(text)?;
+    for value in config
+        .pi
+        .providers
+        .iter()
+        .chain(&config.pi.agentic_providers)
+        .chain(&config.pi.models.allow)
+        .chain(config.pi.models.master_allow.iter().flatten())
+        .chain(config.pi.models.worker_allow.iter().flatten())
+        .chain(config.pi.models.default.master.iter())
+        .chain(config.pi.models.default.worker.iter())
+        .chain(config.host.priority_lanes.iter().flatten())
+        .chain(
+            config
+                .host
+                .auto_stop_idle_secs_by_provider
+                .iter()
+                .flat_map(|providers| providers.keys()),
+        )
+        .chain(config.hosted.lease.iter())
+    {
+        check_text(value)?;
+    }
     Ok(())
 }
 
