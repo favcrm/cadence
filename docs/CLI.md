@@ -9,6 +9,14 @@ backs up the store, records the backup as the lease receipt, installs the
 attested build side by side, drains, switches, health-checks and releases
 the lease.
 
+An already-linked release is not necessarily active. If the daemon still
+answers with another build or is down, `update` finishes activation without
+reinstalling the release. It still reads the target's schema and takes a
+fresh backup under the current rollout lease before switching. A linked
+target whose schema is older than the store refuses before any update
+side effect. When the target daemon is already running, the update remains
+a no-op.
+
 ```
 cadence update --check                                   # what would happen
 cadence update                                           # newest approved candidate
