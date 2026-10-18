@@ -241,6 +241,9 @@ jobs:
       # fixed-endpoint/bucket and bad-case refusals).
       - run: python3 tests/cad1475_publicity_acceptance.py
       - run: python3 tests/cad1479_r2_publish_gate_acceptance.py
+      # CAD-1540: the cross-build required-check gate — the real gate script is
+      # driven through all four matrix outcomes and must refuse failure/cancelled.
+      - run: python3 tests/cad1540_cross_build_gate_acceptance.py
       - run: scripts/design-kit --check
       - name: Check contributor documentation paths
         run: python3 scripts/check-doc-links.py
@@ -1635,6 +1638,24 @@ jobs:
         run: cargo test --locked --features test-seam --test cad1425_client_update_refusal_acceptance -- --test-threads 2
       - run: cargo build --locked
       - run: target/debug/cadence --version
+
+  # CAD-1540: `cross-build` cannot be a required check itself — `change-scope`
+  # skips it on docs-only changes, and a skipped or absent context blocks merges
+  # instead of guarding them. This job always runs and reports the matrix's real
+  # outcome, so its check name is the one to require. Operator step, after this
+  # merges: add `cross-build (required)` to the required status checks.
+  cross-build-required:
+    name: cross-build (required)
+    needs: [cross-build]
+    if: ${{ always() && (github.event_name == 'pull_request' || github.event_name == 'merge_group') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Gate on the cross-build matrix result
+        env:
+          CROSS_BUILD_RESULT: ${{ needs.cross-build.result }}
+        run: scripts/cross-build-gate.sh
 
   # CAD-109 backstop: gitleaks, an implementation independent of cadence's
   # in-process scanner, runs over the PR's own commits (base..head) with its
