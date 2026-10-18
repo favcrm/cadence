@@ -375,15 +375,16 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   const listRef = useRef<HTMLOListElement>(null);
   const follow = useRef<Follow>(initialFollow());
   const [unseen, setUnseen] = useState(0);
-  // The last STORED row seen. Pending rows are appended after every stored
-  // one (`threadItems`), so a failed pending row can own the end of the
-  // list and hide arrivals behind it; the stored tail changes exactly when
-  // a stored row arrives — never for a history prepend, and never for the
-  // reader's own pending row (CAD-1533 spec/security round 3).
-  const storedTailKey = useRef<string | null>(null);
-  // Rows seen at the previous tail change, so a batch of arrivals counts
-  // as a batch instead of one (CAD-1533 review, finding 3).
-  const prevItems = useRef(0);
+  // Follow bookkeeping (CAD-1533 spec/security round 5): `visited` is the
+  // one-shot that means "this visit has not landed at the tail yet" — it is
+  // NOT the same as "no stored row exists", which is why a pending-only
+  // conversation used to jump on every change. `seenStoredSeq` is the
+  // highest stored `e<seq>` counted so far, so arrivals are counted by
+  // sequence rather than by net list length (a retiring pending row made
+  // the net delta undercount, and a prepend made it overcount).
+  const visited = useRef(false);
+  const seenStoredSeq = useRef(0);
+  const prevLen = useRef(0);
   // The reader's anchor for a prepend: captured before older rows are
   // inserted, restored in the layout pass after they render.
   const anchorRef = useRef<{ key: string; top: number } | null>(null);
@@ -505,7 +506,9 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
     setLoadingEarlier(false);
     follow.current = initialFollow();
     setUnseen(0);
-    storedTailKey.current = null;
+    visited.current = false;
+    seenStoredSeq.current = 0;
+    prevLen.current = 0;
     anchorRef.current = null;
   }, [installId, convId, frameToken]);
   useEffect(() => {
@@ -651,32 +654,42 @@ function AppPane({ mode, density, viewer, binding, onFileUploadUnavailable, coll
   useEffect(() => {
     const el = listRef.current;
     if (!el) return;
-    // The arrival anchor is the last STORED row, not the last row: pending
-    // rows trail every stored one, so a failed pending row at the end would
-    // otherwise freeze the anchor and swallow real arrivals (CAD-1533
-    // spec/security round 3, blocking).
-    let stored: string | null = null;
+    // Stored rows are `e<seq>` in ascending order and pending rows trail
+    // them, so a retained failed pending row never owns the arrival anchor.
+    let storedSeq = 0;
     for (let i = items.length - 1; i >= 0; i--) {
-      if (items[i].type !== "pending") {
-        stored = items[i].key;
-        break;
-      }
+      if (items[i].type === "pending") continue;
+      const seq = Number(items[i].key.slice(1));
+      if (Number.isFinite(seq)) storedSeq = seq;
+      break;
     }
-    // The baseline is refreshed on EVERY row-set change, including a
-    // history prepend that leaves the anchor alone — otherwise the next
-    // real arrival counts those prepended rows too and one message is
-    // announced as "21 new" (CAD-1533 spec/security round 2, blocking).
-    const arrivals = Math.max(1, items.length - prevItems.current);
-    const grew = items.length > prevItems.current;
-    const anchorMoved = stored !== storedTailKey.current;
-    const first = storedTailKey.current === null;
-    prevItems.current = items.length;
-    storedTailKey.current = stored;
-    if (first) {
+    // Arrivals are counted by SEQUENCE, not by net list length: a batch can
+    // retire the operator's pending row while adding three stored ones (net
+    // +2), and a history prepend adds rows with older sequences (net +20).
+    // The delta lies in both directions; the sequence count does not
+    // (CAD-1533 spec/security round 5).
+    let arrivals = 0;
+    for (let i = items.length - 1; i >= 0; i--) {
+      const row = items[i];
+      if (row.type === "pending") continue;
+      const seq = Number(row.key.slice(1));
+      if (!Number.isFinite(seq) || seq <= seenStoredSeq.current) break;
+      arrivals += 1;
+    }
+    const grew = items.length > prevLen.current;
+    prevLen.current = items.length;
+    if (storedSeq > seenStoredSeq.current) seenStoredSeq.current = storedSeq;
+    // The first row-set of a visit lands at the tail. This is a one-shot —
+    // a conversation with no stored rows yet still has a pending row to
+    // follow and arrivals to count, which is why it is not keyed on "no
+    // stored row exists" (CAD-1533 spec/security round 5).
+    if (!visited.current) {
+      if (items.length === 0) return;
+      visited.current = true;
       scrollPanel("jump");
       return;
     }
-    if (!anchorMoved) {
+    if (arrivals === 0) {
       // A pending-only change is never an unseen arrival — the operator's
       // own message is not "new" — but while pinned its row still has to
       // stay in view, and the early return used to skip exactly that
