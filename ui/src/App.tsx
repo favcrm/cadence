@@ -629,14 +629,18 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
   // Loading, error and ready stay separate: a failed refresh keeps the last
   // good list and says so; a busy daemon is retried before it does.
   // Only the operator may read the list; member and agent sessions would get a
-  // 403 and a permanent notice, so they do not ask.
+  // 403 and a permanent notice, so they do not ask. CAD-1537: a signed-in
+  // viewer of a `--read-only` board reads it as the operator's session does.
+  const screenReader = meta?.operator === false && meta.signed_in === true &&
+    (meta.session?.user?.role === "member" || boardReadOnly);
   const [appsTick, setAppsTick] = useState(0);
   useEffect(() => {
     const bump = () => setAppsTick((n) => n + 1);
     window.addEventListener(APPS_CHANGED_EVENT, bump);
     return () => window.removeEventListener(APPS_CHANGED_EVENT, bump);
   }, []);
-  const installations = useInstallations(meta?.operator === true, `${route.screen}:${appsTick}`);
+  const listReader = meta?.operator === true || (boardReadOnly && screenReader);
+  const installations = useInstallations(listReader, `${route.screen}:${appsTick}`);
   // A soft-removed app is not an app to open: drop it from the menu.
   const installed: VerifiedApp[] = useMemo(
     () => (installations.list ?? []).filter((i) => i.removed == null).map((i) => ({ installId: i.install_id, kind: i.name, title: i.title || i.name })),
@@ -677,8 +681,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
     operator: meta?.operator ?? null,
     access: metaUnavailable ? ("unavailable" as const) : ("checking" as const),
     onRetryAccess: retryAccess,
-    screenReader: meta?.operator === false && meta.signed_in === true &&
-      (meta.session?.user?.role === "member" || readOnly),
+    screenReader,
   };
   const [last, setLast] = useState<LastApp | null>(() => readLastApp());
   const selectedMenuApp = menuApps.find((app) => app.installId === activeId);
@@ -1063,6 +1066,7 @@ function Workspace({ meta, recheck }: { meta: Meta; recheck: () => Promise<boole
             search={search}
             installations={installations}
             viewer={viewer}
+            listReader={listReader}
             recheckFinished={recheckFinished}
             onRetryWorkspace={reload}
             onInstallation={reportInstallation}
@@ -1181,6 +1185,7 @@ function WorkspaceAppEntry({
   search,
   installations,
   viewer,
+  listReader,
   recheckFinished,
   onRetryWorkspace,
   onInstallation,
@@ -1191,6 +1196,9 @@ function WorkspaceAppEntry({
   search: string;
   installations: InstallationsState;
   viewer: Viewer;
+  /** CAD-1537: this viewer may read the installed-app list (the operator,
+   *  or a signed-in `--read-only` board viewer). */
+  listReader: boolean;
   recheckFinished: boolean;
   onRetryWorkspace: () => void;
   onInstallation: (installation: ActiveInstallation | null) => void;
@@ -1209,7 +1217,7 @@ function WorkspaceAppEntry({
       </main>
     );
   }
-  if (viewer.operator !== true) {
+  if (!listReader) {
     return (
       <main className="px-4 lg:px-8 pt-10 pb-9">
         <h1 className="text-section font-semibold text-ink-100">{t(route.screen === "workspaceApp" ? "App link unavailable" : "App unavailable")}</h1>
