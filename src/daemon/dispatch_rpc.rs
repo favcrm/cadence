@@ -68,6 +68,17 @@ impl Shared {
             )));
         }
         let caller = self.agent_caller(peer_pid, VERB)?;
+        // Native automatic dispatchers hold the outer read guard across
+        // their self-RPC. Explicit operator hand-dispatch retains its own
+        // authority; an agent caller must consume the live workflow scope.
+        let _grant = match &caller {
+            AgentCaller::Agent(_) => Some(
+                self.unattended_lock
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner()),
+            ),
+            AgentCaller::Operator => None,
+        };
         let alias = self.resolve_alias(required_str(params, "alias")?)?;
         let id = issue::model::check_id(required_str(params, "issue")?)?;
         let text = required_str(params, "text")?;
@@ -100,6 +111,16 @@ impl Shared {
         let pm = self.pm()?;
         let (project, dir) = issue::write::issue_dir(&pm, &id)?;
         let (front, _) = issue::write::load_front(&dir)?;
+        let grant_repo = if matches!(&caller, AgentCaller::Agent(_)) {
+            self.unattended_dispatch_repo(&id)?
+        } else {
+            None
+        };
+        if grant_repo.is_some() && front.owner.as_deref() != Some(alias.as_str()) {
+            return Err(Error::rejected(
+                "an unattended kickoff must target the workflow's authorized worker",
+            ));
+        }
         // The dispatch-side claim check `dispatch::run` runs before
         // `issue start`, repeated here against the connection-bound
         // caller (never `reply_to`, which is a request field): an issue
@@ -116,6 +137,16 @@ impl Shared {
             claim::since(&pm.dir, &project.key, &front, Duration::from_secs(2))
         })?;
         let worktree = self.dispatch_lane(VERB, &project, &front)?;
+        if let Some(root) = grant_repo.as_deref() {
+            let actual = issue::project::repo_identity(&worktree).ok_or_else(|| {
+                Error::rejected("the unattended worktree has no proven repository identity")
+            })?;
+            if actual.0.as_path() != Path::new(root) {
+                return Err(Error::rejected(
+                    "the unattended worktree is outside the workflow's authorized repository",
+                ));
+            }
+        }
         if let Some(claimed) = optional_str(params, "worktree") {
             let want = Path::new(claimed)
                 .canonicalize()

@@ -1746,7 +1746,7 @@ payload at read time — nothing is stored; `cadence overview [--json]
 
 **Needs me** — one row per subject, ranked by urgency then age, each with
 `{kind, title, age, project, link, command, audience, audience_reason}`.
-Plan, question, merge-decision and master-permission rows may also carry
+Plan, question, merge-decision, unattended-hold and master-permission rows may also carry
 display-only `short_title` (about 50 characters) and `why` (one sentence),
 sanitized server-side and omitted when the source is empty or reads as a
 command (the word `cadence` anywhere, a backtick, `${` or `$(`); nothing reads them back
@@ -1761,6 +1761,7 @@ agent text as a title on its own, and shows a permission's whole reason
 | Rank | Kind | Class | Owner | Command |
 |---|---|---|---|---|
 | 10 | `merge` — open PR with `qa-verdict=success` and green checks | team | the issue owner (`cadence/<id>-…` head branch) | `gh pr merge <n> --repo <slug> --squash --admin --match-head-commit <sha>` |
+| 17 | `unattended_held` — bounded workflow work cannot safely continue | operator | operator; Details contain the reason and next inspection step | `cadence delivery ls` |
 | 20 | `approval` — a brokered permission request is open | operator | — | `cadence agent respond <a> --request <h> --decision accept` (provider input requests: `--answers-file <f>`) |
 | 20 | `idea_plan` — an idea in `review` tagged `plan-ready` (CAD-139). A `parked` or `idea-stale` review does not raise `review_no_pr` | operator | — | `cadence idea decide <id> approve` |
 | 20 | `idea_duplicate` — a backlog idea linked `duplicate_of` another open issue | operator | — | `cadence issue show <id>` |
@@ -1827,6 +1828,14 @@ minutes):
 A row whose `since` is null escalates only when its owner cannot act,
 and its reason never says `unhandled`. `age` is unchanged — it still
 orders rows inside a rank.
+
+An unattended hold and a worker fence coalesce only when the native queue proves
+the same owned unknown or failed turn. The held turn determines the project;
+the worker's registered cwd may belong to another project. The fenced recovery
+row stays primary and retains both causes; unrelated fences remain visible.
+A failed provider turn is not an unknown outcome that can be reconciled as
+completed. Acknowledging either observation does not resolve its underlying
+condition.
 
 Both CI rows share one subject, `ci:<slug>@<branch>`, so a red and
 unverified main is one row with two causes. They come from the

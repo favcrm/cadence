@@ -156,6 +156,9 @@ struct Row {
     /// CAD-918: a designated agent's delegated approval, bound the same
     /// way and reported apart — it never stands in for `approval`.
     delegated: ApprovalView,
+    /// Native workflow consumption is separate from a per-head approval.
+    workflow_authorization: Option<Value>,
+    native_workflow_review: bool,
     /// `(field, reason)` pairs for every `unknown` rendered.
     unknowns: Vec<(String, String)>,
 }
@@ -211,7 +214,7 @@ pub fn run(opts: &AuditOptions) -> Result<i32> {
     let notes = note_index(&notes_dir);
 
     // 4. Daemon store, opened read-only — events + the verdicts table.
-    let store = store_evidence(&opts.state_dir.join(STORE_FILE));
+    let store = store_evidence(&opts.state_dir.join(STORE_FILE), true);
 
     // 5. Tracker: issue id → project folder, for --project scoping.
     let pm = issue::default_dir().ok();
@@ -260,6 +263,9 @@ pub fn run(opts: &AuditOptions) -> Result<i32> {
         enrich_status(&mut gh, row);
         contains_head(&repo, row);
         post_merge(&branch_log, &store, row);
+    }
+    enrich_workflow_authorizations(&store, approval_slug.as_deref(), &mut rows);
+    for row in &mut rows {
         enrich_approval(&store, approval_slug.as_deref(), row);
         finalize_unknowns(row);
         flag_row(row);
@@ -1313,6 +1319,10 @@ struct StoreEvidence {
     /// Why the approval stream could not be read — approval state is
     /// then `unknown`, never `missing`. `None` when it answered.
     approvals_gap: Option<String>,
+    workflow_intents: Vec<(Value, f64)>,
+    workflow_enqueues: Vec<(Value, f64)>,
+    native_reviews: Vec<(Value, f64)>,
+    workflow_gap: Option<String>,
 }
 
 /// One operator approval record (CAD-217) — `store::NewApproval` as
@@ -1381,7 +1391,7 @@ struct ApprovalView {
 /// reported as `operator-claimed`, never as a verified approval.
 const APPROVAL_UNVERIFIED: &str = "unverified until CAD-280";
 
-fn store_evidence(path: &Path) -> StoreEvidence {
+fn store_evidence(path: &Path, workflow: bool) -> StoreEvidence {
     let mut ev = StoreEvidence::default();
     if !path.exists() {
         // A host that never ran the daemon has no store — the table
@@ -1418,22 +1428,59 @@ fn store_evidence(path: &Path) -> StoreEvidence {
             .map(|rows| rows.flatten().collect())
             .unwrap_or_default();
     }
-    read_approvals(&conn, &mut ev);
+    read_approvals(&conn, &mut ev, workflow);
+    if workflow {
+        let native: rusqlite::Result<Vec<(String, f64)>> = conn.prepare(
+        "SELECT payload,at FROM events WHERE alias=?1 AND kind=?2 ORDER BY seq DESC LIMIT 5000",
+    ).and_then(|mut statement| {
+        statement.query_map(
+            [crate::store::VERDICT_STREAM, crate::store::VERDICT_RECORDED_EVENT],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?.collect()
+    });
+        match native {
+            Ok(rows) => {
+                for (raw, at) in rows {
+                    match serde_json::from_str(&raw) {
+                        Ok(value) => ev.native_reviews.push((value, at)),
+                        Err(_) => {
+                            ev.workflow_gap =
+                                Some("native review evidence is malformed".to_string())
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                ev.workflow_gap = Some(format!("native review evidence is unreadable: {error}"))
+            }
+        }
+    }
     ev
 }
 
 /// The approval stream, read-only. Malformed payloads are skipped —
 /// only the store's validated writer puts rows on this stream, so a
 /// row that does not parse proves nothing either way.
-fn read_approvals(conn: &rusqlite::Connection, ev: &mut StoreEvidence) {
+fn read_approvals(conn: &rusqlite::Connection, ev: &mut StoreEvidence, workflow: bool) {
     use crate::store::{APPROVAL_RECORDED_EVENT, APPROVAL_REVOKED_EVENT, APPROVAL_STREAM};
     let rows: rusqlite::Result<Vec<(String, String, f64)>> = conn
         .prepare(
-            "SELECT kind, payload, at FROM events WHERE alias=? ORDER BY seq DESC LIMIT 100000",
+            "SELECT kind,payload,at FROM events WHERE alias=?1 \
+             AND (kind IN (?2,?3) OR (?4 AND kind IN (?5,?6))) ORDER BY seq DESC LIMIT 100000",
         )
         .and_then(|mut st| {
-            st.query_map([APPROVAL_STREAM], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-                .collect()
+            st.query_map(
+                rusqlite::params![
+                    APPROVAL_STREAM,
+                    APPROVAL_RECORDED_EVENT,
+                    APPROVAL_REVOKED_EVENT,
+                    workflow,
+                    crate::store::UNATTENDED_MERGE_INTENT_EVENT,
+                    crate::store::UNATTENDED_MERGE_ENQUEUED_EVENT,
+                ],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?
+            .collect()
         });
     // Newest-first so the row cap can only drop the oldest history, never
     // a recent revocation; replayed oldest-first below.
@@ -1451,6 +1498,14 @@ fn read_approvals(conn: &rusqlite::Connection, ev: &mut StoreEvidence) {
         let Ok(p) = serde_json::from_str::<Value>(&raw) else {
             continue;
         };
+        if kind == crate::store::UNATTENDED_MERGE_INTENT_EVENT {
+            ev.workflow_intents.push((p, at));
+            continue;
+        }
+        if kind == crate::store::UNATTENDED_MERGE_ENQUEUED_EVENT {
+            ev.workflow_enqueues.push((p, at));
+            continue;
+        }
         let text = |k: &str| p[k].as_str().map(str::to_string);
         let Some(id) = text("approval_id") else {
             continue;
@@ -1505,6 +1560,159 @@ fn read_approvals(conn: &rusqlite::Connection, ev: &mut StoreEvidence) {
     }
 }
 
+/// Reconstruct native scope consumption without inventing an operator
+/// per-head approval or a GitHub status. The same local-store trust limit
+/// as the existing verdict table and approval records remains explicit.
+fn enrich_workflow_authorizations(ev: &StoreEvidence, slug: Option<&str>, rows: &mut [Row]) {
+    let intents: HashMap<_, _> = ev
+        .workflow_intents
+        .iter()
+        .filter_map(|(value, at)| {
+            Some((
+                (value["issue"].as_str()?, value["head"].as_str()?),
+                (value, *at),
+            ))
+        })
+        .collect();
+    let enqueued: HashMap<_, _> = ev
+        .workflow_enqueues
+        .iter()
+        .filter_map(|(value, at)| {
+            Some((
+                (
+                    value["issue"].as_str()?,
+                    value["head"].as_str()?,
+                    value["grant_id"].as_str()?,
+                ),
+                *at,
+            ))
+        })
+        .collect();
+    let mut reviews: HashMap<&str, Vec<(&Value, f64)>> = HashMap::new();
+    for (value, at) in &ev.native_reviews {
+        if let Some(issue) = value["issue"].as_str() {
+            reviews.entry(issue).or_default().push((value, *at));
+        }
+    }
+    for row in rows {
+        let (Some(head), Some(number), Some(merged_at)) =
+            (row.landed_head.as_deref(), row.pr, row.merged_at)
+        else {
+            continue;
+        };
+        let Some((intent, at)) = row
+            .issues
+            .iter()
+            .find_map(|issue| intents.get(&(issue.as_str(), head)).copied())
+        else {
+            continue;
+        };
+        let issue = intent["issue"].as_str().unwrap_or_default();
+        let grant = intent["grant_id"].as_str().unwrap_or_default();
+        let enqueue_at = enqueued.get(&(issue, head, grant)).copied();
+        let mut evidence = json!({
+            "state": if enqueue_at.is_some() { "enqueue-recorded" } else { "intent-recorded" },
+            "grant_id": grant, "issue": issue, "head": head,
+            "project": intent["project"], "repo": intent["repo"], "pr": intent["pr"],
+            "worker": intent["worker"], "reviewer": intent["reviewer"], "report": intent["report"],
+            "policy_digest": intent["policy_digest"], "classification": intent["class"],
+            "authorized_at": at, "grant_expires_at": intent["grant_expires_at"],
+            "enqueue_recorded_at": enqueue_at, "native_review_at_merge": false,
+            "per_head_operator_approval": false, "verified": false,
+            "note": "native workflow evidence, not a per-head operator approval or a GitHub status",
+        });
+        let consistent = slug.is_some_and(|slug| {
+            intent["repo"]
+                .as_str()
+                .is_some_and(|repo| repo.eq_ignore_ascii_case(slug))
+        }) && intent["pr"].as_u64() == Some(number)
+            && !issue.is_empty()
+            && grant
+                .strip_prefix("grant-")
+                .is_some_and(|id| id.len() == 32 && id.bytes().all(|c| c.is_ascii_hexdigit()))
+            && intent["grant_expires_at"]
+                .as_f64()
+                .is_some_and(|expiry| expiry.is_finite() && expiry > at)
+            && matches!(intent["class"].as_str(), Some("routine" | "consequential"))
+            && intent["risk"] == "auto"
+            && row
+                .project
+                .as_deref()
+                .is_none_or(|project| intent["project"] == project);
+        if !consistent {
+            evidence["state"] = json!("unknown");
+            evidence["reason"] =
+                json!("native workflow evidence does not bind this repository, head and scope");
+            row.workflow_authorization = Some(evidence);
+            continue;
+        }
+        if let Some(gap) = &ev.workflow_gap {
+            evidence["state"] = json!("unknown");
+            evidence["reason"] = json!(gap);
+            row.evidence_gaps.push(gap.clone());
+            row.workflow_authorization = Some(evidence);
+            continue;
+        }
+        let scope_matches = |review: &Value| {
+            review["issue"] == intent["issue"]
+                && review["sha"].as_str() == Some(head)
+                && review["verdict"] == "pass"
+                && review["risk"] == "auto"
+                && review["reviewer"] == intent["reviewer"]
+                && review["report"] == intent["report"]
+                && review["project"] == intent["project"]
+                && review["worker"] == intent["worker"]
+                && review["reviewer"].as_str().is_some_and(|reviewer| {
+                    !reviewer.is_empty()
+                        && review["worker"]
+                            .as_str()
+                            .is_some_and(|worker| !worker.is_empty() && worker != reviewer)
+                })
+                && review["pr"]
+                    .as_str()
+                    .and_then(|pr| crate::issue::task_report::parse_pr_url(pr).ok())
+                    .is_some_and(|(repo, pr)| {
+                        pr == number && slug.is_some_and(|slug| repo.eq_ignore_ascii_case(slug))
+                    })
+        };
+        let history = reviews.get(issue);
+        let latest = history.and_then(|history| {
+            history
+                .iter()
+                .find(|(_, review_at)| *review_at <= merged_at)
+        });
+        let independent = latest
+            .is_some_and(|(review, review_at)| *review_at <= at && scope_matches(review))
+            && !matches!(row.class.as_deref(), Some("human" | "delegated"));
+        evidence["native_review_at_merge"] = json!(independent);
+        evidence["authorization_before_merge"] = if at <= merged_at {
+            json!(true)
+        } else if at.floor() == merged_at.floor() {
+            Value::Null
+        } else {
+            json!(false)
+        };
+        if independent {
+            row.native_workflow_review = true;
+            if row.class.is_none() {
+                row.class = Some("auto".to_string());
+            }
+        } else if history.is_some_and(|history| {
+            history.iter().any(|(review, review_at)| {
+                review_at.floor() == merged_at.floor()
+                    && *review_at > merged_at
+                    && scope_matches(review)
+            })
+        }) {
+            let reason = "native review and merge share a timestamp second; their order is unknown";
+            row.evidence_gaps.push(reason.to_string());
+            evidence["native_review_at_merge"] = Value::Null;
+            evidence["reason"] = json!(reason);
+        }
+        row.workflow_authorization = Some(evidence);
+    }
+}
+
 fn enrich_store(ev: &StoreEvidence, path: &Path, row: &mut Row) {
     if path.exists() && !ev.opened {
         let reason = format!("store {} unreadable", path.display());
@@ -1540,7 +1748,7 @@ fn is_delegated(a: &ApprovalRec) -> bool {
 /// and revert the merge if it landed. Read-only over the daemon store.
 pub fn digest(state_dir: &Path, since: Option<&str>) -> Result<Value> {
     let since = parse_since(since.unwrap_or("24h"))?;
-    let ev = store_evidence(&state_dir.join(STORE_FILE));
+    let ev = store_evidence(&state_dir.join(STORE_FILE), false);
     if let Some(gap) = &ev.approvals_gap {
         return Err(Error::rejected(format!(
             "approval records unreadable: {gap}"
@@ -1934,7 +2142,7 @@ fn approval_in_force(ev: &StoreEvidence, repo: &str, pr: u64, head: &str) -> Val
 /// `cadence audit approval`: read-only, no daemon. Exit 0 only when an
 /// approval is in force for exactly this head.
 pub fn approval_check(state_dir: &Path, repo: &str, pr: u64, head: &str) -> (Value, i32) {
-    let ev = store_evidence(&state_dir.join(STORE_FILE));
+    let ev = store_evidence(&state_dir.join(STORE_FILE), false);
     let v = approval_in_force(&ev, repo, pr, head);
     let code = i32::from(v["state"] != "in-force");
     (v, code)
@@ -1965,7 +2173,7 @@ fn scope_approvals(ev: &StoreEvidence, issue: &str) -> Value {
 /// `cadence audit scope --issue X`: read-only, no daemon. Exit 0 when the
 /// store answered (an empty list is an answer), 1 when it could not.
 pub fn scope_check(state_dir: &Path, issue: &str) -> (Value, i32) {
-    let ev = store_evidence(&state_dir.join(STORE_FILE));
+    let ev = store_evidence(&state_dir.join(STORE_FILE), false);
     let v = scope_approvals(&ev, issue);
     let code = i32::from(v["state"] != "ok");
     (v, code)
@@ -2182,7 +2390,8 @@ fn flag_row(row: &mut Row) {
         .verdict
         .as_deref()
         .is_some_and(|v| v.eq_ignore_ascii_case("pass"))
-        && !row.verdict_post_hoc;
+        && !row.verdict_post_hoc
+        || row.native_workflow_review;
     // Heads "agree" when the strings match — or when the merge-content
     // check proved the reviewed change landed anyway (`headRefOid`
     // moves if an undeleted branch is pushed; the patch-id is the
@@ -2197,7 +2406,8 @@ fn flag_row(row: &mut Row) {
         // the merge_sha is what a note would name.
         (None, _) => true,
         _ => false,
-    } || row.contains_head.starts_with("yes");
+    } || row.contains_head.starts_with("yes")
+        || row.native_workflow_review;
     let status_ok = row
         .qa_verdict_status
         .as_deref()
@@ -2457,6 +2667,7 @@ fn row_json(row: &Row) -> Value {
         "flags": row.flags,
         "structural": row.structural,
         "approval": approval_json(row),
+        "workflow_authorization": row.workflow_authorization,
         // CAD-918: apart from the operator's; null when not in play.
         "delegated_approval": (!row.delegated.state.is_empty()).then(|| json!({
             "state": row.delegated.state, "reason": row.delegated.reason,
@@ -2641,6 +2852,14 @@ fn render_text(
         );
         if let Some(line) = approval_line(row) {
             let _ = writeln!(out, "    {line}");
+        }
+        if let Some(workflow) = &row.workflow_authorization {
+            let _ = writeln!(
+                out, "    workflow grant {}: {} · native review at merge={} · not a per-head operator approval",
+                workflow["grant_id"].as_str().unwrap_or("?"),
+                workflow["state"].as_str().unwrap_or("unknown"),
+                workflow["native_review_at_merge"],
+            );
         }
         if !row.delegated.state.is_empty() {
             let v = &row.delegated;

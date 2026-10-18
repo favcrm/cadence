@@ -183,6 +183,10 @@ pub struct Front {
     /// `verdict` only: pass or revise (CAD-431).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verdict: Option<Verdict>,
+    /// `verdict` only: the reviewer's risk declaration. Unattended landing
+    /// requires an explicit `auto`; missing or other values confer no authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk: Option<String>,
 }
 
 /// A GitHub pull request named by URL: `(owner/repo, number)`. Only
@@ -448,6 +452,16 @@ pub fn validate(
             )))
         }
         (_, None) => {}
+    }
+    if let Some(risk) = front.risk.as_deref() {
+        if k != Kind::Verdict {
+            return Err(Error::rejected("`risk` belongs to a verdict report"));
+        }
+        if risk.is_empty() || risk.len() > 200 || risk.chars().any(char::is_control) {
+            return Err(Error::rejected(
+                "verdict risk must be one nonempty line of at most 200 bytes",
+            ));
+        }
     }
     // An answer is a reply and a verdict is findings, not a reflection
     // — each needs a body, not the six headings.
@@ -754,7 +768,7 @@ pub fn list(issue_dir: &Path, id: &str) -> Vec<Value> {
                     "context_feedback": f.context_feedback,
                     "options": f.options, "impact": f.impact,
                     "answers": f.answers, "pr": f.pr,
-                    "verdict": f.verdict.map(Verdict::as_str), "body": body,
+                    "verdict": f.verdict.map(Verdict::as_str), "risk": f.risk, "body": body,
                 }),
                 Err(e) => json!({"name": name, "path": path, "at": at, "error": e.to_string()}),
             }

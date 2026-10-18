@@ -1,6 +1,37 @@
 //! CAD-534: `cadence daemon` plans RPC handlers — moved verbatim from src/daemon.rs.
 
 use super::*;
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+/// `plan propose` `inputs` → the `{k: v}` map both the render and the
+/// grant's bounds check use. Absent means an empty map — a grant bound
+/// to defaults admits a propose with no `inputs`; explicit `""` entries
+/// still differ from a template default and refuse there.
+fn proposal_inputs(inputs: Option<&Value>) -> Result<BTreeMap<String, String>> {
+    match inputs {
+        None | Some(Value::Null) => Ok(BTreeMap::new()),
+        Some(Value::Object(m)) => {
+            let mut out = BTreeMap::new();
+            for (k, v) in m {
+                match v.as_str() {
+                    Some(s) => {
+                        out.insert(k.clone(), s.to_string());
+                    }
+                    None => {
+                        return Err(Error::rejected(format!(
+                            "input '{k}' must be a string — `--input {k}=<value>`"
+                        )));
+                    }
+                }
+            }
+            Ok(out)
+        }
+        Some(_) => Err(Error::rejected(
+            "'inputs' must be an object of string values — `--input k=v`",
+        )),
+    }
+}
 
 impl Shared {
     /// CAD-360: the plan gate for every daemon dispatch of a task —
@@ -26,7 +57,18 @@ impl Shared {
                 format!("tracker dir for {issue} cannot be resolved ({e}) — refused"),
             )
         })?;
-        crate::issue::plan::gate_id(&pm_dir, &issue)
+        crate::issue::plan::gate_id(&pm_dir, &issue)?;
+        // The exact standalone render authorizes canonical issue dispatch,
+        // not a second, caller-authored job spec/assignee/worktree. Those
+        // alternate task semantics have no native grant binding.
+        if self.unattended_authorization_for_issue(&issue)?.is_some() {
+            return Err(Error::invalid(
+                "unattended_job_scope",
+                "bounded workflow grants authorize canonical issue dispatch, not job tasks; \
+                 send this issue to the master or use an ordinarily approved job",
+            ));
+        }
+        Ok(())
     }
 
     /// CAD-359 `plan_propose` — write a plan (epic + tickets, one
@@ -34,7 +76,11 @@ impl Shared {
     /// a UI's plan card. The proposer is the connection's: a pane or
     /// managed endpoint's lane, else the proven operator; anything
     /// unattributable is refused, as is an identity-shaped field.
-    pub(super) fn rpc_plan_propose(&self, params: &Value, peer_pid: u32) -> Result<Value> {
+    pub(super) fn rpc_plan_propose(
+        self: &Arc<Self>,
+        params: &Value,
+        peer_pid: u32,
+    ) -> Result<Value> {
         for field in [
             "by",
             "actor",
@@ -44,6 +90,29 @@ impl Shared {
             "pid",
             "operator",
             "proposed_by",
+            // CAD-225: grant/approval-shaped fields are refused, never
+            // read — a caller cannot vote its own plan approved, widen
+            // a grant's scope or replay a grant id. Admission comes
+            // only from the daemon-side live grant below.
+            "unattended",
+            "grant",
+            "grant_id",
+            "approve",
+            "approved",
+            "auto_approve",
+            "decided_by",
+            "decided_at",
+            "state",
+            "template_sha256",
+            "render_sha256",
+            "ttl",
+            "ttl_secs",
+            "expires_at",
+            "repo",
+            "paths",
+            "allow_path",
+            "allow_paths",
+            "renew",
         ] {
             if params.get(field).is_some() {
                 return Err(Error::rejected(format!(
@@ -91,7 +160,26 @@ impl Shared {
                 }
                 t.to_string()
             }
-            (None, Some(name)) => self.workflow_plan_text(project, name, inputs)?,
+            (None, Some(name)) => {
+                let provided = proposal_inputs(inputs)?;
+                // CAD-225: ANY attributable caller's propose of a stored
+                // standalone workflow checks the live grant — operator
+                // proof gates only the grant's issue/revoke/renew, never
+                // consumption of an already-issued exact grant. A live
+                // grant OWNS the workflow's proposals: a mismatched
+                // gate/template/render or a malformed/expired/held grant
+                // is a refusal (`Err`), never an ordinary backlog plan
+                // beside bound work; only a truly absent grant takes the
+                // ordinary path. `text`/`app` proposals never reach here.
+                if crate::issue::app::split_ref(name).is_none() && !name.contains('/') {
+                    if let Some(out) =
+                        self.admit_unattended_workflow(project, name, &provided, &actor)?
+                    {
+                        return self.finish_plan_proposed(out, workflow);
+                    }
+                }
+                self.workflow_plan_text(project, name, &provided)?
+            }
             _ => {
                 return Err(Error::rejected(
                     "plan propose needs exactly one of 'text' or 'workflow' — \
@@ -101,7 +189,19 @@ impl Shared {
         };
         let pm = self.pm()?;
         let allow = crate::secret::Allowlist::load(&self.state_dir)?;
-        let out = crate::issue::plan::propose(&pm, project, &text, workflow, &allow, &actor)?;
+        let out =
+            crate::issue::plan::propose(&pm, project, &text, workflow, &allow, &actor, &|| {
+                self.store.unattended_reserved_ids()
+            })?;
+        self.finish_plan_proposed(out, workflow)
+    }
+
+    /// Emit `plan_proposed` and wake — shared by the ordinary proposed
+    /// path and a grant admission. An admitted (`approved`) plan's
+    /// tickets are already `ready`, so the plan-approved wake and the
+    /// run's own resume kick now, identically to an operator's
+    /// `plan approve` (bounded — dedupe uses `decided_at`).
+    fn finish_plan_proposed(self: &Arc<Self>, out: Value, workflow: Option<&str>) -> Result<Value> {
         let _ = self.store.event_public(
             DAEMON_ALIAS,
             "plan_proposed",
@@ -117,6 +217,15 @@ impl Shared {
             }),
         );
         self.wake();
+        // CAD-225: only an admitted (approved) plan wakes the master as
+        // `plan_approved` and resumes the run's team — an ordinary
+        // `proposed` plan must not.
+        if out["state"].as_str() == Some("approved") {
+            self.wake_on_plan_approved(&out);
+            let epic = out["epic"].as_str().unwrap_or_default().to_string();
+            self.resume_run_team(&epic);
+            self.wake();
+        }
         Ok(out)
     }
 
@@ -131,32 +240,8 @@ impl Shared {
         &self,
         project: &str,
         name: &str,
-        inputs: Option<&Value>,
+        provided: &BTreeMap<String, String>,
     ) -> Result<String> {
-        let provided: std::collections::BTreeMap<String, String> = match inputs {
-            None | Some(Value::Null) => Default::default(),
-            Some(Value::Object(m)) => {
-                let mut out = std::collections::BTreeMap::new();
-                for (k, v) in m {
-                    match v.as_str() {
-                        Some(s) => {
-                            out.insert(k.clone(), s.to_string());
-                        }
-                        None => {
-                            return Err(Error::rejected(format!(
-                                "input '{k}' must be a string — `--input {k}=<value>`"
-                            )));
-                        }
-                    }
-                }
-                out
-            }
-            Some(_) => {
-                return Err(Error::rejected(
-                    "'inputs' must be an object of string values — `--input k=v`",
-                ));
-            }
-        };
         let pm_dir = self.pm_dir()?;
         // `<app>/<workflow>` names an installed app's workflow (CAD-547):
         // the app's whole-bundle digest — slots and bindings included —
@@ -164,7 +249,7 @@ impl Shared {
         // stays the stored-workflow path.
         if let Some((app, wf)) = crate::issue::app::split_ref(name) {
             let approvals = self.store.app_approvals()?;
-            return crate::issue::app::plan_text(&pm_dir, &approvals, project, app, wf, &provided);
+            return crate::issue::app::plan_text(&pm_dir, &approvals, project, app, wf, provided);
         }
         if name.contains('/') {
             return Err(Error::rejected(format!(
@@ -191,7 +276,7 @@ impl Shared {
                 ),
             ));
         }
-        crate::issue::workflow::render(&text, &provided)
+        crate::issue::workflow::render(&text, provided)
     }
 
     /// CAD-360 `plan_approve` / `plan_reject` — operator only, exactly
@@ -444,47 +529,12 @@ impl Shared {
     /// on the audit stream keyed `"<project>/<name>"`; `plan propose
     /// --workflow` matches the file's digest against it. Operator only,
     /// connection-bound like `plan approve`. A workflow that fails
-    /// `workflow check` cannot be approved.
+    /// `workflow check` cannot be approved. CAD-225 adds the optional
+    /// `unattended`/`renew` grant fields — the whole rule lives in
+    /// [`Self::write_workflow_approval`].
     pub(super) fn rpc_workflow_approve(&self, params: &Value, peer_pid: u32) -> Result<Value> {
         self.operator_connection("workflow approve", params, peer_pid)?;
-        let project = required_str(params, "project")?;
-        crate::issue::model::check_key(project)?;
-        let name = required_str(params, "name")?;
-        let pm_dir = self.pm_dir()?;
-        if !crate::issue::project::list(&pm_dir)?
-            .iter()
-            .any(|p| p.key == project)
-        {
-            return Err(crate::issue::project::unknown_project(project, &pm_dir));
-        }
-        let text = crate::issue::workflow::read_for(&pm_dir, project, name)?;
-        let aliases: Vec<String> = self
-            .store
-            .agents()?
-            .iter()
-            .map(|a| a.alias.clone())
-            .collect();
-        let (agents, sources) =
-            crate::issue::workflow::known_agents(&pm_dir, Some(project), &aliases);
-        let (errors, notes, _) = crate::issue::workflow::check_text(&text, &agents, &sources);
-        if !errors.is_empty() {
-            return Err(Error::rejected(format!(
-                "workflow '{name}' fails `workflow check` — approve it only after these \
-                 are fixed: {}",
-                errors.join("; ")
-            )));
-        }
-        let payload = json!({
-            "project": project,
-            "name": name,
-            "digest": crate::issue::workflow::gate_digest(&text)?,
-            "by": "operator",
-            "at": crate::issue::time::iso(crate::issue::time::now_epoch()),
-            "notes": notes,
-        });
-        self.store.record_workflow_approval(payload.clone())?;
-        self.wake();
-        Ok(payload)
+        self.write_workflow_approval(params)
     }
 
     /// CAD-667 interim catalog surfaces are operator-only, including reads.

@@ -41,7 +41,7 @@ use crate::error::{Error, Result};
 use crate::issue::board::{self, Issue};
 use crate::issue::{self, areas, Pm};
 use crate::master;
-use crate::store::{self, Agent};
+use crate::store::Agent;
 
 /// A `done` report one agent filed — the lane's claim on the issue —
 /// collected by the checkup's report walk.
@@ -255,7 +255,44 @@ impl Shared {
         r: &delivery::Record,
         revise: bool,
     ) -> Result<(Outcome, String)> {
-        let head = r.head.clone().unwrap_or_default();
+        let _grant = self
+            .unattended_lock
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        let _serial = self.delivery_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut all = delivery::load(&self.state_dir)?;
+        let expected = r;
+        let r = all
+            .get_mut(&expected.issue)
+            .ok_or_else(|| Error::rejected("the delivery binding disappeared before repair"))?;
+        if r.worker != agent.alias
+            || r.head != expected.head
+            || r.pr != expected.pr
+            || r.state != expected.state
+            || r.verdict != expected.verdict
+            || r.dispatched_at != expected.dispatched_at
+        {
+            return Ok((
+                Outcome::Leave,
+                "delivery changed before repair; recheck its current state".to_string(),
+            ));
+        }
+        let head = r.head.as_deref().unwrap_or_default();
+        let applicable = if revise {
+            r.verdict
+                .as_ref()
+                .is_some_and(|v| v.verdict == "revise" && v.sha == head)
+        } else {
+            r.observed
+                .as_ref()
+                .is_some_and(|view| view.pr_state == "OPEN" && !view.ci_green && view.head == head)
+        };
+        if !applicable || head.is_empty() {
+            return Ok((
+                Outcome::Leave,
+                "the repair is no longer applicable".to_string(),
+            ));
+        }
         // Message ids are lowercase-only — the issue id is not.
         let mid = format!(
             "checkup-fix-{}-{}",
@@ -292,16 +329,43 @@ impl Shared {
                 r.issue, pr, head, r.issue, pr
             ),
         };
-        self.send_as(
-            &json!({"alias": agent.alias, "text": text, "message": mid,
-                    "source": "review"}),
-            &|_| Ok(store::Sender::Unattributed),
-        )?;
+        // Keep grant→delivery locks through clearance proof, native queue
+        // write and state save. The enqueuer independently checks the latest
+        // owned turn, so a crash before this save cannot reuse the old PASS.
+        let bound = match self.send_issue_followup(r, &mid, &text) {
+            Ok(bound) => bound,
+            Err(e) => {
+                let reason = format!("the fix turn was refused — {e}");
+                if !matches!(self.unattended_authorization_for_issue(&r.issue), Ok(None)) {
+                    // One operator-owned ticket hold, not a second PM
+                    // escalation for the same blocked follow-up.
+                    r.unattended_hold = true;
+                    r.note = Some(reason.clone());
+                    delivery::save(&self.state_dir, &all)?;
+                } else {
+                    self.flag_lane(agent, &r.issue, &reason)?;
+                }
+                return Ok((Outcome::Escalate, reason));
+            }
+        };
+        if bound {
+            r.verdict = None;
+            r.ready_evidence = None;
+            r.ready_binding = None;
+            r.unattended_hold = false;
+            r.unattended_pending = false;
+            r.unattended_turn = None;
+            r.note = None;
+            r.enter(State::Working, issue::time::now_epoch());
+        }
         let why = match (revise, r.observed.as_ref().is_some_and(|o| !o.ci_green)) {
             (true, true) => "a revise verdict and red CI on the head",
             (true, false) => "a revise verdict on the head",
             _ => "red CI on the head",
         };
+        if bound {
+            delivery::save(&self.state_dir, &all)?;
+        }
         Ok((Outcome::Fix, format!("one fix turn sent — {why}")))
     }
 
@@ -467,6 +531,10 @@ impl Shared {
         id: &str,
         project: &str,
     ) -> Result<(Outcome, String)> {
+        let _grant = self
+            .unattended_lock
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         let _serial = self.dispatch_lock.lock().unwrap_or_else(|e| e.into_inner());
         delivery::load(&self.state_dir).map_err(|e| {
             Error::invalid(
@@ -523,6 +591,7 @@ impl Shared {
                 format!("{} went busy between the check and the lock", agent.alias),
             ));
         }
+        let repo = self.unattended_dispatch_repo(id)?;
         let upstream = agent_upstream(agent).unwrap_or(DAEMON_ALIAS);
         let out = match &self.checkup_dispatch {
             Some(dispatch) => dispatch(self, &pm.dir, id, &agent.alias)?,
@@ -534,7 +603,7 @@ impl Shared {
                     note: None,
                     name: None,
                     base: None,
-                    repo: None,
+                    repo: repo.map(Into::into),
                     reply_to: Some(upstream.to_string()),
                     summary: None,
                     job_spec: None,

@@ -18,6 +18,63 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// The ticket hold and the lane fence can describe the same owned unknown
+/// turn. Keep the fence's recovery control and both causes, not two prompts.
+fn coalesce_unattended_fences(needs: &mut [Item], state_dir: &Path) -> Result<(), String> {
+    if !needs
+        .iter()
+        .any(|row| row.json["unattended_turn"].is_string())
+    {
+        return Ok(());
+    }
+    use rusqlite::OptionalExtension;
+    let conn = crate::store::open_read_only(&state_dir.join("cadence.sqlite3"))
+        .map_err(|error| error.to_string())?;
+    for index in 0..needs.len() {
+        if needs[index].json["kind"] != "unattended_held" {
+            continue;
+        }
+        let (Some(turn), Some(worker)) = (
+            needs[index].json["unattended_turn"].as_str(),
+            needs[index].agents.first(),
+        ) else {
+            continue;
+        };
+        let unknown = conn
+            .query_row(
+                "SELECT 1 FROM messages WHERE id=?1 AND alias=?2 AND state IN ('unknown','failed') \
+                 AND ((source='dispatch' AND issue=?3 AND worktree IS NOT NULL) \
+                      OR (source='review' AND sender_uid IS NULL AND (issue IS NULL OR issue=?3)))",
+                rusqlite::params![turn, worker, needs[index].subject.1],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if unknown != Some(1) {
+            continue;
+        }
+        let Some(fence) = needs.iter().position(|row| {
+            row.json["kind"] == "fenced" && row.subject.0 == "agent" && row.subject.1 == *worker
+        }) else {
+            continue;
+        };
+        let (held, fenced) = if index < fence {
+            let (before, after) = needs.split_at_mut(fence);
+            (&mut before[index], &mut after[0])
+        } else {
+            let (before, after) = needs.split_at_mut(index);
+            (&mut after[0], &mut before[fence])
+        };
+        // The owned turn identifies the affected project. The lane's
+        // registration cwd can still name its previous project.
+        fenced.json["project"] = held.json["project"].clone();
+        held.subject = fenced.subject.clone();
+        held.json["subject"] = fenced.json["subject"].clone();
+        held.rank = fenced.rank.saturating_add(1);
+    }
+    Ok(())
+}
+
 pub(super) fn assemble(
     state_dir: &Path,
     opts: &Options,
@@ -821,6 +878,10 @@ pub(super) fn assemble(
         row.json["permission"] = crate::master_perm::request_json(&req);
         row.json["reason"] = json!(req.reason);
         needs.push(row);
+    }
+
+    if let Err(error) = coalesce_unattended_fences(&mut needs, state_dir) {
+        degraded_notes.push(degraded("unattended_escalation", "", error));
     }
 
     classify_needs(

@@ -85,7 +85,10 @@ fn kickoff_body(
          {branch}, base {sha7}). Commit trailer: Issue: {issue}. PR to \
          main; reply to {reply_to}. Company questions: read the \
          \"Business knowledge\" section of \
-         $HOME/.agents/skills/cadence/SKILL.md.{report}",
+         $HOME/.agents/skills/cadence/SKILL.md.{report} For implementation completion, \
+         file `cadence report file --task {issue} --kind done --file <f>` with frontmatter \
+         `sha: <full committed head>` and `pr: <PR URL>`. End your returned result \
+         (or explicit message result text) with a final `SHA: <same full head>` line.",
         note.display(),
         wt_dir.display()
     )
