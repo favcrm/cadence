@@ -123,15 +123,31 @@ impl Shared {
     /// Resolve the live installation/context, then run `action`.
     /// Unknown or diverted installations and unknown, archived or
     /// foreign contexts refuse before any file or socket opens.
+    ///
+    /// `custody` (CAD-1543): the verb binds or uses host SMTP custody, so
+    /// the live bundle must declare it (`smtp.bind` on a screen package
+    /// for this app); an undeclared install refuses before any file or
+    /// socket opens. Read and revoke verbs pass `false`.
     pub(super) fn crm_smtp_scope<R>(
         self: &Arc<Self>,
         install: &str,
         context: &str,
+        custody: bool,
         action: impl FnOnce() -> Result<R>,
     ) -> Result<R> {
         crate::proto::identifier(install, "installation ID")?;
         let pm = self.pm_at(&self.pm_dir()?)?;
-        workspace::with_runtime_snapshot(&pm, install, |_, _| {
+        workspace::with_runtime_snapshot(&pm, install, |description, files| {
+            if custody
+                && !crate::issue::app_screen_pkg::declares_smtp_custody(
+                    files,
+                    description["name"].as_str().unwrap_or_default(),
+                )
+            {
+                return Err(Error::rejected(
+                    "this app does not declare SMTP sending (smtp.bind)",
+                ));
+            }
             let _release = self
                 .app_release_lock
                 .lock()
@@ -144,10 +160,13 @@ impl Shared {
 
     /// Screen calls execute under one runtime/custody/release/mount fence;
     /// native callers retain their existing scope and custody acquisition.
+    /// A screen call is already limited to the operations its current
+    /// package declares; a native `custody` call proves the declaration here.
     pub(super) fn crm_smtp_scope_with_proof<R>(
         self: &Arc<Self>,
         install: &str,
         context: &str,
+        custody: bool,
         proof: Option<&ScreenServiceProof>,
         action: impl FnOnce() -> Result<R>,
     ) -> Result<R> {
@@ -155,7 +174,7 @@ impl Shared {
             crate::proto::identifier(install, "installation ID")?;
             self.screen_service_scope(install, context, true, proof, action)
         } else {
-            self.crm_smtp_scope(install, context, action)
+            self.crm_smtp_scope(install, context, custody, action)
         }
     }
 
@@ -320,7 +339,7 @@ impl Shared {
             "crm_smtp_bind" => {
                 let connection = required_str(params, "connection_id")?;
                 let request = request_id(params)?;
-                self.crm_smtp_scope_with_proof(install, context, proof, || {
+                self.crm_smtp_scope_with_proof(install, context, true, proof, || {
                     let _custody = proof.is_none().then(|| self
                         .platform_custody_lock
                         .lock()
@@ -343,7 +362,7 @@ impl Shared {
             "crm_smtp_rebind" => {
                 let connection = required_str(params, "connection_id")?;
                 let expected = link_revision(params)?;
-                self.crm_smtp_scope_with_proof(install, context, proof, || {
+                self.crm_smtp_scope_with_proof(install, context, true, proof, || {
                     let _custody = proof.is_none().then(|| self
                         .platform_custody_lock
                         .lock()
@@ -362,7 +381,7 @@ impl Shared {
             }
             "crm_smtp_revoke" => {
                 let expected = link_revision(params)?;
-                self.crm_smtp_scope_with_proof(install, context, proof, || {
+                self.crm_smtp_scope_with_proof(install, context, false, proof, || {
                     let _custody = proof.is_none().then(|| self
                         .platform_custody_lock
                         .lock()
@@ -370,7 +389,7 @@ impl Shared {
                     self.store.crm_smtp_revoke(install, context, expected)
                 })
             }
-            "crm_smtp_show" => self.crm_smtp_scope_with_proof(install, context, proof, || {
+            "crm_smtp_show" => self.crm_smtp_scope_with_proof(install, context, false, proof, || {
                 let _custody = proof.is_none().then(|| self
                     .platform_custody_lock
                     .lock()
@@ -443,7 +462,7 @@ impl Shared {
                 crate::proto::identifier(campaign, "campaign ID")?;
                 let to = required_str(params, "to_email")?;
                 test_recipient(to)?;
-                self.crm_smtp_scope_with_proof(install, context, proof, || {
+                self.crm_smtp_scope_with_proof(install, context, true, proof, || {
                     // Frozen bytes first: the exact current revision
                     // through the CAD-782 renderer. Reads observe the
                     // live context proof above; an unknown campaign

@@ -191,6 +191,25 @@ impl Fx {
             )
             .unwrap();
         }
+        // CAD-1543: host SMTP custody is offered only to an app that
+        // declares it, so the fixture app carries a minimal screen
+        // package listing `smtp.bind`.
+        let screen = root.path().join("source/screens/main");
+        std::fs::create_dir_all(&screen).unwrap();
+        let js = "(()=>{})();";
+        std::fs::write(screen.join("client.js"), js).unwrap();
+        let sha = |bytes: &[u8]| {
+            use sha2::{Digest, Sha256};
+            format!("sha256:{:x}", Sha256::digest(bytes))
+        };
+        let declaration = json!({
+            "contract": "app-screens/v2", "app": "blog-post", "entry": "client.js",
+            "host_contract": "screen-records.v1", "may": ["records.call", "records.slot"],
+            "operations": ["smtp.bind"], "tools": {},
+            "assets": [{"name": "client.js", "media_type": "text/javascript", "size": js.len(), "sha256": sha(js.as_bytes())}],
+            "provenance": {"source_digest": sha(b"c1126-source"), "sdk_digest": sha(b"c1126-sdk"), "toolchain_digest": sha(b"c1126-toolchain")}
+        });
+        std::fs::write(screen.join("screens.json"), declaration.to_string()).unwrap();
         let env = cadence_agent::adapter::ProviderEnv::refusing_providers();
         env.set("CADENCE_PM_DIR", pm.to_str().unwrap());
         let stop = Arc::new(AtomicBool::new(false));

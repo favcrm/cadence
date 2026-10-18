@@ -24,6 +24,8 @@ export interface Installation {
   capabilities: Record<string, SlotDeclaration> | null;
   /** Untyped legacy slots from `needs.connections`, kept working as before. */
   connection_slots: string[];
+  /** CAD-1543: the live bundle declares host SMTP custody (a screen lists `smtp.bind`). */
+  smtp_custody?: boolean;
   /**
    * CAD-1171: `execution: "host"` runs the workflow's capability step
    * in-process for the operator's own click — no worker, no owner PM and
