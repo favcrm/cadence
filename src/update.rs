@@ -849,11 +849,7 @@ pub fn check(host: &dyn UpdateHost) -> Result<CheckReport> {
         }
     }
     let schema_current = rollout::store_schema(state_dir)?;
-    let schema_target = if up_to_date {
-        schema_current
-    } else {
-        src.schema_version(&target).unwrap_or(None)
-    };
+    let schema_target = src.schema_version(&target).unwrap_or(None);
     // CAD-1235: `update` only moves forward. With target as base and
     // current as head, "behind" means the target is newer; "ahead" means
     // it is older. Unproven ancestry fails closed when current is known.
@@ -888,7 +884,7 @@ pub fn check(host: &dyn UpdateHost) -> Result<CheckReport> {
             )),
         }
     }
-    if let (Some(from), Some(to), false) = (schema_current, schema_target, up_to_date) {
+    if let (Some(from), Some(to)) = (schema_current, schema_target) {
         if to < from {
             older = true;
             refusals.push(format!(
@@ -1334,10 +1330,9 @@ fn run_locked(host: &dyn UpdateHost, opts: &Options) -> Result<RunReport> {
     Ok(report)
 }
 
-/// `install`: false when the release is already linked (a previous run
-/// installed it and the restart did not happen) — the backup and the
-/// install are skipped and the run goes straight to the drain and the
-/// switch, with the previous release as the rollback target.
+/// `install`: false when the release is already linked but activation
+/// did not finish. A fresh backup receipt is still required for the
+/// new lease before switching; only installation is skipped.
 fn run_inner(
     host: &dyn UpdateHost,
     opts: &Options,
@@ -1365,17 +1360,16 @@ fn run_inner(
     //    lease receipt, then the install: `upgrade::run` stages the
     //    attested build side by side and moves the link. The daemon
     //    keeps running the old build until the switch below.
-    let mut backup = Value::Null;
+    let backup = take_backup(host, opts)?;
+    progress(
+        host,
+        format!(
+            "backup: {} (recorded as the lease receipt)",
+            backup["backup"]["db"].as_str().unwrap_or("?")
+        ),
+    );
     let mut install_report = Value::Null;
     if install {
-        backup = take_backup(host, opts)?;
-        progress(
-            host,
-            format!(
-                "backup: {} (recorded as the lease receipt)",
-                backup["backup"]["db"].as_str().unwrap_or("?")
-            ),
-        );
         install_report = upgrade::run(
             host.source(),
             host.layout(),
@@ -2039,8 +2033,18 @@ mod tests {
     }
 
     #[test]
+    fn already_linked_target_still_reports_its_schema_crossing() {
+        let host = Host::new(src(CUR, "unknown", 52), 51);
+        let report = check(&host).unwrap();
+        assert!(report.up_to_date);
+        assert_eq!(report.schema_current, Some(51));
+        assert_eq!(report.schema_target, Some(52));
+        assert!(report.migration);
+    }
+
+    #[test]
     fn current_target_is_a_noop_without_ancestry() {
-        let host = Host::new(src(CUR, "unknown", 32), 33);
+        let host = Host::new(src(CUR, "unknown", 33), 33);
         let report = run(&host, &Options::default()).unwrap();
         assert!(report.check.up_to_date);
         assert!(report.check.refusals.is_empty());
@@ -2051,7 +2055,7 @@ mod tests {
 
     #[test]
     fn the_update_lock_is_held_until_the_report_is_dropped() {
-        let host = Host::new(src(CUR, "unknown", 32), 33);
+        let host = Host::new(src(CUR, "unknown", 33), 33);
         let report = run(&host, &Options::default()).unwrap();
         assert!(report.report.check.up_to_date);
         let held = RunLock::acquire(host.state_dir()).unwrap_err().to_string();

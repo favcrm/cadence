@@ -305,3 +305,71 @@ fn schema_compatible_descendant_remains_available_in_both_selection_modes() {
         );
     }
 }
+
+#[test]
+fn already_linked_older_schema_target_is_refused_before_any_update_side_effect_for_both_selection_modes(
+) {
+    for selection in [Selection::LatestApproved, Selection::Pinned] {
+        let host = SyntheticHost::new(selection, CURRENT, "identical", 32);
+        let linked_before = std::fs::read_link(&host.layout.link).unwrap();
+        let binary_before = std::fs::read(&linked_before).unwrap();
+
+        let report = update::check(&host).unwrap();
+        let outcome = update::run(&host, &Options::default());
+        assert!(
+            outcome.is_err(),
+            "an already-linked schema-32 release must refuse the schema-33 store"
+        );
+        assert!(
+            report.up_to_date,
+            "fixture must exercise an already-linked target"
+        );
+        assert_eq!(report.schema_current, Some(33));
+        assert_eq!(report.schema_target, Some(32));
+        assert!(
+            !report.refusals.is_empty(),
+            "check must refuse the already-linked older-schema target"
+        );
+
+        assert_eq!(
+            std::fs::read_link(&host.layout.link).unwrap(),
+            linked_before,
+            "release link changed"
+        );
+        assert_eq!(
+            std::fs::read(&linked_before).unwrap(),
+            binary_before,
+            "already-installed release was replaced or removed"
+        );
+        assert_eq!(
+            host.source.downloads.get(),
+            0,
+            "artifact download/install path ran"
+        );
+        assert_eq!(host.pending_calls.get(), 0, "update marker was written");
+        assert_eq!(host.drain_calls.get(), 0, "daemon drain was changed");
+        assert_eq!(host.restart_calls.get(), 0, "daemon restart ran");
+        assert_eq!(host.start_board_calls.get(), 0, "board start ran");
+        assert!(
+            !host._dir.path().join("cadence-backups").exists(),
+            "pre-update backup was taken"
+        );
+        assert_eq!(rollout::store_schema(&host.state).unwrap(), Some(33));
+        let db = rusqlite::Connection::open_with_flags(
+            rollout::db_file(&host.state),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let lease_tables: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'rollout_leases'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            lease_tables, 0,
+            "lease acquisition must not run, even if it would later release the lease"
+        );
+    }
+}
