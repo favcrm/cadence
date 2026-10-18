@@ -42,6 +42,7 @@ globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
   const json = (v: unknown) => new Response(JSON.stringify(v), { status: 200, headers: { "Content-Type": "application/json" } });
   if (url.pathname.endsWith("/stream")) return new Response(new ReadableStream(), { headers: { "Content-Type": "text/event-stream" } });
   if (url.pathname.endsWith("/restore") && init?.method === "POST") return json({ restored: true, digest: "sha256:x" });
+  if (url.pathname === "/api/public-apps/crm") return new Response(JSON.stringify({ ok: false, error: { code: "not_found" } }), { status: 404, headers: { "Content-Type": "application/json" } });
   if (url.pathname === "/api/app-catalog/crm") return json(card);
   return json({});
 }) as typeof fetch;

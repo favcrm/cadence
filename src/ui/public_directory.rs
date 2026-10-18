@@ -71,7 +71,7 @@ pub(super) fn proxy_public_catalog(path: &str, raw_query: &str) -> super::write_
         return super::serve::err_response(404, "No such app.");
     };
     let Some(origin) = catalog_origin() else {
-        return super::serve::err_response(404, "public directory is not configured");
+        return super::serve::err_response(503, "public directory is not configured");
     };
     fetch_public_catalog(&format!("{origin}{upstream}"))
 }

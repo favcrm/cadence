@@ -4,7 +4,7 @@ import Button from "../../ui/Button";
 import Select from "../../ui/Select";
 import { useTranslate } from "../../lib/locale";
 import { sessionHeaders } from "../../lib/sessionKey";
-import { appExplorer, notifyAppsChanged, type HomeInstallation } from "../workspace-apps/workspaceApps";
+import { notifyAppsChanged } from "../workspace-apps/workspaceApps";
 import { useInstallations } from "../workspace-apps/useInstallations";
 import { installedAppHref } from "../apps/appViewModel";
 import type { Viewer } from "../projects/work";
@@ -36,8 +36,8 @@ export type PublicApp = {
   summary: string;
   version: string;
   listing: PublicListing;
-  digest: string;
-  installable: true;
+  digest: string | null;
+  installable: boolean;
 };
 
 export type InstallOutcome =
@@ -104,9 +104,11 @@ function listingOf(value: unknown): PublicListing {
 export function parsePublicApp(value: unknown): PublicApp | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const row = value as Record<string, unknown>;
-  if (row.installable !== true) return null;
-  if (typeof row.id !== "string" || typeof row.app !== "string" || typeof row.title !== "string") return null;
-  if (typeof row.summary !== "string" || typeof row.version !== "string" || !DIGEST.test(String(row.digest))) return null;
+  if (typeof row.installable !== "boolean") return null;
+  if (typeof row.id !== "string" || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(row.id) || typeof row.app !== "string" || typeof row.title !== "string") return null;
+  if (typeof row.summary !== "string" || typeof row.version !== "string") return null;
+  if (row.digest !== null && (typeof row.digest !== "string" || !DIGEST.test(row.digest))) return null;
+  if (row.installable && row.digest === null) return null;
   if ("price" in row || "artifact" in row || "path" in row) return null;
   return {
     id: row.id,
@@ -115,16 +117,25 @@ export function parsePublicApp(value: unknown): PublicApp | null {
     summary: row.summary,
     version: row.version,
     listing: listingOf(row.listing),
-    digest: String(row.digest),
-    installable: true,
+    digest: row.digest as string | null,
+    installable: row.installable,
   };
 }
 
 export function parsePublicList(body: unknown): PublicApp[] {
-  if (!body || typeof body !== "object") return [];
-  const data = (body as { data?: { apps?: unknown } }).data;
-  const apps = data && Array.isArray(data.apps) ? data.apps : [];
-  return apps.map(parsePublicApp).filter((app): app is PublicApp => app !== null);
+  if (!body || typeof body !== "object" || !("ok" in body) || body.ok !== true || !("data" in body)) throw new Error("The catalogue returned an invalid response.");
+  const data = body.data;
+  if (!data || typeof data !== "object" || !("apps" in data) || !Array.isArray(data.apps)) throw new Error("The catalogue returned an invalid response.");
+  const apps: PublicApp[] = [];
+  const ids = new Set<string>();
+  for (const value of data.apps) {
+    const app = parsePublicApp(value);
+    if (!app) throw new Error("The catalogue returned an invalid app.");
+    if (ids.has(app.id)) throw new Error("The catalogue returned duplicate apps.");
+    ids.add(app.id);
+    apps.push(app);
+  }
+  return apps;
 }
 
 async function boardGet(path: string, signal: AbortSignal): Promise<Response> {
@@ -151,8 +162,10 @@ export async function loadPublicApp(id: string, signal: AbortSignal): Promise<Pu
   const response = await boardGet(`/api/public-apps/${encodeURIComponent(id)}`, signal);
   if (response.status === 404) return null;
   if (!response.ok) throw new Error("The public app didn't load.");
-  const body = await response.json() as { data?: { app?: unknown } };
-  return parsePublicApp(body?.data?.app);
+  const body = await response.json() as { ok?: unknown; data?: { app?: unknown } };
+  const app = body.ok === true ? parsePublicApp(body.data?.app) : null;
+  if (!app || app.id !== id) throw new Error("The catalogue returned an invalid app.");
+  return app;
 }
 
 function textField(row: Record<string, unknown>, key: string): string | null {
@@ -161,6 +174,9 @@ function textField(row: Record<string, unknown>, key: string): string | null {
 
 /** Confirm, fetch the pinned release with credentials omitted, then the existing upload route. */
 export async function installPublicApp(app: PublicApp, signal: AbortSignal): Promise<InstallOutcome> {
+  if (!app.installable || !app.digest || !DIGEST.test(app.digest)) {
+    return { state: "refused", message: "This release is listed for browsing only." };
+  }
   const release = await boardGet(
     `/api/public-apps/${encodeURIComponent(app.id)}/release?digest=${encodeURIComponent(app.digest)}`,
     signal,
@@ -269,10 +285,13 @@ export function PublicDirectory({ viewer }: { viewer: Viewer }) {
   return (
     <section className="pubdir" aria-label={t("Public apps")}>
       <p className="text-secondary text-ink-400 mb-3">
-        {t("Published free apps. Installing uses this host's operator and does not approve the app to run.")}
+        {t("Browse published apps. Sign in to install; execution approval stays separate.")}
       </p>
       {!canInstall && viewer.operator !== null && (
         <p className="text-label text-ink-400 mb-3" role="status">{t("You can browse. Installing needs the host operator.")}</p>
+      )}
+      {viewer.operator === null && (
+        <p className="mb-3"><a className="btn btn-primary btn-sm" href={`/__platform/login?to=${encodeURIComponent(window.location.href)}`}>{t("Sign in to install")}</a></p>
       )}
       <div className="pubdir-tools">
         <input className="field" value={query} onChange={(e) => setQuery(e.target.value)} placeholder={t("Search apps")} aria-label={t("Search apps")} />
@@ -333,22 +352,6 @@ export function PublicAppDetail({ id, viewer, onResolved }: { id: string; viewer
   const [abort, setAbort] = useState<AbortController | null>(null);
   const canInstall = viewer.operator === true && !viewer.readOnly;
   const installedState = useInstallations(canInstall, id);
-  const [homeInstall, setHomeInstall] = useState<HomeInstallation | null | undefined>(undefined);
-  useEffect(() => {
-    const controller = new AbortController();
-    setHomeInstall(undefined);
-    const packageKey = app?.app ?? id;
-    appExplorer.home(controller.signal)
-      .then((body) => {
-        if (controller.signal.aborted) return;
-        const found = body.installations.find((row) => row.name === packageKey && row.attention.state !== "removed") ?? null;
-        setHomeInstall(found);
-      })
-      .catch(() => {
-        if (!controller.signal.aborted) setHomeInstall(null);
-      });
-    return () => controller.abort();
-  }, [id, app?.app]);
   useEffect(() => {
     const controller = new AbortController();
     setApp(undefined); setError(null); setPhase("idle"); setConfirming(false);
@@ -361,7 +364,6 @@ export function PublicAppDetail({ id, viewer, onResolved }: { id: string; viewer
       .catch((e: unknown) => {
         if (controller.signal.aborted) return;
         setError(e instanceof Error ? e.message : "Could not load the app.");
-        onResolved?.(false);
       });
     return () => controller.abort();
   }, [id]);
@@ -378,7 +380,7 @@ export function PublicAppDetail({ id, viewer, onResolved }: { id: string; viewer
   };
   if (error) return <p className="err" role="alert">{t(error)}</p>;
   if (app === undefined) return <p className="text-label text-ink-400">{t("Loading…")}</p>;
-  if (app === null) return null;
+  if (app === null) return <p role="status">{t("No such app.")}</p>;
   const installed = phase !== "idle" && phase !== "working" && phase.state === "installed" ? phase : null;
   const existing = (installedState.list ?? []).find((row) => row.removed == null && row.name === app.app) ?? null;
   const openHref = existing ? installedAppHref(existing.name) : null;
@@ -434,23 +436,14 @@ export function PublicAppDetail({ id, viewer, onResolved }: { id: string; viewer
         <aside className="card pubdir-side">
           <dl className="pubdir-kv">
             <dt>{t("Version")}</dt><dd>{app.version}</dd>
-            <dt>{t("Digest")}</dt><dd className="pubdir-digest">{app.digest}</dd>
+            <dt>{t("Digest")}</dt><dd className="pubdir-digest">{app.digest ?? t("Not published")}</dd>
           </dl>
-          {!canInstall && phase === "idle" && homeInstall === undefined && (
-            <p className="text-label text-ink-400" role="status">{t("Checking this board…")}</p>
+          {!app.installable && <p className="text-label text-ink-400" role="status">{t("Listed for browsing. This release is not available to install.")}</p>}
+          {viewer.operator === null && (
+            <a className="btn btn-primary" href={`/__platform/login?to=${encodeURIComponent(window.location.href)}`}>{t("Sign in to install")}</a>
           )}
-          {!canInstall && phase === "idle" && homeInstall && (
-            <>
-              <p className="pubdir-installed" role="status">{t("Installed on this board.")}</p>
-              <p className="text-label text-ink-400">{t("This connection cannot prove it is the host operator, so opening and installing stay on a browser running on this computer.")}</p>
-            </>
-          )}
-          {!canInstall && phase === "idle" && homeInstall === null && (
-            <>
-              <Button className="btn-primary" disabled>{t("Install")}</Button>
-              <p className="text-label text-ink-400" role="status">{t("This browser is not the host operator, so install stays off.")}</p>
-            </>
-          )}
+          {viewer.operator === false && <p className="text-label text-ink-400">{t("Installing needs the host operator. You can keep browsing.")}</p>}
+          {canInstall && installedState.error && <p role="alert">{t("Installed apps could not be checked. Retry before installing.")} <Button onClick={installedState.retry}>{t("Retry")}</Button></p>}
           {canInstall && installedState.loading && !existing && phase === "idle" && (
             <p className="text-label text-ink-400" role="status">{t("Checking this board…")}</p>
           )}
@@ -460,7 +453,7 @@ export function PublicAppDetail({ id, viewer, onResolved }: { id: string; viewer
           {existing && openHref && phase === "idle" && (
             <Button className="btn-primary" href={openHref}>{t("Open")}</Button>
           )}
-          {canInstall && !existing && !installedState.loading && phase === "idle" && (
+          {canInstall && app.installable && !existing && installedState.list !== null && !installedState.error && !installedState.loading && phase === "idle" && (
             <Button className="btn-primary" onClick={() => setConfirming(true)}>{t("Install")}</Button>
           )}
           {phase === "working" && (
