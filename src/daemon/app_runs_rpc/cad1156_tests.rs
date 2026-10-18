@@ -243,6 +243,17 @@ impl Fx {
             );
             let taken = checked(store.message(&taken.id), "turn reread failed")
                 .unwrap_or_else(|| panic!("claimed turn missing"));
+            if step == 1 {
+                let artifact = run["artifacts"][0]["id"].as_str().unwrap();
+                checked(
+                    store.app_artifact_with_digest(
+                        artifact,
+                        Some((&taken.id, taken.turn_id.as_deref().unwrap())),
+                        bundle,
+                    ),
+                    "guarded dependency fetch failed",
+                );
+            }
             let reply = json!({"turn_id": taken.turn_id, "text": reply.to_string()});
             checked(
                 store.finish(&taken, "completed", &reply, None),

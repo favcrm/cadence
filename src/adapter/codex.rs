@@ -57,13 +57,14 @@ fn agent_mcp_config(agent: &Agent, log_path: &Path) -> Result<Value> {
         // model-initiated call before the daemon can apply its own scope.
         // Keep future tools undiscoverable and subject to a prompt, which
         // the unattended worker cannot grant.
-        "enabled_tools": ["self", "wiki_search", "wiki_read", "issue_show"],
+        "enabled_tools": ["self", "wiki_search", "wiki_read", "issue_show", "app_run_artifact"],
         "default_tools_approval_mode": "prompt",
         "tools": {
             "self": {"approval_mode": "approve"},
             "wiki_search": {"approval_mode": "approve"},
             "wiki_read": {"approval_mode": "approve"},
             "issue_show": {"approval_mode": "approve"},
+            "app_run_artifact": {"approval_mode": "approve"},
         },
     }))
 }
@@ -90,9 +91,15 @@ fn check_agent_mcp(transport: &Transport, thread_id: &str, alias: &str) -> Resul
         })?;
         if let Some(server) = servers.iter().find(|server| server["name"] == "cadence") {
             if server["runtimeStatus"] != "connected"
-                || !["self", "wiki_search", "wiki_read", "issue_show"]
-                    .iter()
-                    .all(|name| server["tools"].get(*name).is_some())
+                || ![
+                    "self",
+                    "wiki_search",
+                    "wiki_read",
+                    "issue_show",
+                    "app_run_artifact",
+                ]
+                .iter()
+                .all(|name| server["tools"].get(*name).is_some())
             {
                 return Err(Error::provider(format!(
                     "Codex Cadence MCP readiness failed: status {}, tools {}",
@@ -1087,14 +1094,17 @@ impl ProviderAdapter for CodexAdapter {
                 instructions.push_str("\n\n");
             }
             instructions.push_str(
-                "Use the cadence MCP tools for Cadence identity, wiki search/read, and issue reads. \
-                 wiki_search is lexical AND over at most 12 tokens: send scoped keywords (vendor, \
-                 operation or field, exact version or identifier) in the collection the question is \
-                 authorized for, at most 3 variants and 20 merged candidates per question, then \
-                 wiki_read at most 8 sources and cite path and revision. Stop and state the \
-                 evidence limit when nothing authoritative is found. The command sandbox cannot \
-                 reach Cadence's RPC socket. Your final answer is the managed turn result; do not \
-                 call cadence message result from a shell.",
+                "Use the cadence MCP tools for Cadence identity, wiki search/read, issue reads, \
+                 and an assigned app dependency artifact. wiki_search is lexical AND over at most \
+                 12 tokens: send scoped keywords (vendor, operation or field, exact version or \
+                 identifier) in the collection the question is authorized for, at most 3 variants \
+                 and 20 merged candidates per question, then wiki_read at most 8 sources and cite \
+                 path and revision. Stop and state the evidence limit when nothing authoritative \
+                 is found. The command sandbox cannot reach Cadence's RPC socket. For an app \
+                 dependency, call self and then app_run_artifact with the kickoff artifact_id and \
+                 that turn's id and turn_id; do not pass an alias or fetch it from a shell. Your \
+                 final answer is the managed turn result; do not call cadence message result from \
+                 a shell.",
             );
             params["developerInstructions"] = json!(instructions);
             if let Some(thread) = &agent.thread_id {

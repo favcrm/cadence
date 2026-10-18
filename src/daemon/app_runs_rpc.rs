@@ -1783,6 +1783,8 @@ mod cad1123_acceptance;
 mod cad1123_tests;
 #[cfg(test)]
 mod cad1230_acceptance;
+#[cfg(all(test, feature = "test-seam"))]
+mod cad792_acceptance;
 
 #[cfg(test)]
 mod cad742_tests {
