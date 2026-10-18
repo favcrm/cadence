@@ -40,13 +40,13 @@ def producer_result(case, klass, *, readiness=None, reviews=None, review_kind=No
            "reasons": ["fixture: synthetic requirements response"],
            "policy_digest": digest, "activation": activation}
     return {"issue": ISSUE, "project": case.project, "repo": REPO, "pr": 5,
-            "head": HEAD, "base": BASE, "merge_base": "c" * 40,
+            "head": HEAD, "base": BASE, "base_ref": case.base_ref, "merge_base": "c" * 40,
             "policy_digest": digest, "requirements": req,
             "readiness": readiness}
 
 
 def readiness():
-    return {"repo": REPO, "pr": 5, "head": HEAD, "base": BASE,
+    return {"repo": REPO, "pr": 5, "head": HEAD, "base": BASE, "base_ref": "main",
             "policy_digest": "sha256:" + "e" * 64, "ci_run_id": evidence.RUN_ID,
             "ci_run_url": evidence.CI_URL,
             "outcome_report": f"{ISSUE}/reports/worker-done.md"}
@@ -92,6 +92,7 @@ class RequirementsConsumer(evidence.EvidencePosting):
             "foreign PR": {"pr": 6},
             "foreign head": {"head": "f" * 40},
             "foreign base": {"base": "f" * 40},
+            "foreign target": {"base_ref": "other"},
             "malformed digest": {"policy_digest": "bad"},
         }
         for label, changes in mutations.items():

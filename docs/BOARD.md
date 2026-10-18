@@ -447,9 +447,24 @@ digest is canonical across reordered keys and defaults written out or
 left implicit — but `risk` rule order is significant, so reordering
 rules changes it and needs re-approval.
 
+`integration_branch` optionally permits one additional PR target beside the
+repository default branch (CAD-1561). It must be a canonical branch name, not
+a `refs/` path or revision expression, and match the current, exactly approved
+policy. An unapproved, removed or malformed section cannot enable it through
+the last-approved fallback. Re-approve through the operator connection after
+changing the target; this option does not replace any CI, review or approval
+requirements and is compatible with the supported `solo_operator` profile.
+Requirements and readiness bind the actual target as `base_ref`, alongside
+the head/base OIDs and policy digest. Protection and required checks come from
+that target, including slashed branch names. Retargeting invalidates the
+evidence even when both branches share an OID; old readiness records without
+`base_ref` need fresh binding. Enqueue comments include an exact
+`Base branch: <name>` line. Omitting the option preserves existing policy digests.
+
 ```yaml
 delivery:
   merge: {method: squash, queue: true}    # optional; method: squash|merge|rebase
+  integration_branch: staging              # optional; operator-approved extra target
   max_revise: 2                           # optional; 1..=10
   reviews:                                # required, non-empty: the names
     standards: {kind: agent, focus: standards}      # focus: general|standards|

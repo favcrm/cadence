@@ -62,6 +62,7 @@ fn apply_routine_ready_observation(
         pr: evidence.pr,
         head: evidence.head.clone(),
         base: evidence.base.clone(),
+        base_ref: evidence.base_ref.clone(),
         policy_digest: evidence.policy_digest.clone(),
         ci_run_id: evidence.ci_run_id,
         ci_run_url: evidence.ci_run_url.clone(),
@@ -424,6 +425,7 @@ impl Shared {
                         pr: evidence.pr,
                         head: evidence.head.clone(),
                         base: evidence.base.clone(),
+                        base_ref: evidence.base_ref.clone(),
                         policy_digest: evidence.policy_digest.clone(),
                         ci_run_id: evidence.ci_run_id,
                         ci_run_url: evidence.ci_run_url.clone(),
@@ -1527,6 +1529,7 @@ impl Shared {
                         pr: evidence.pr,
                         head: evidence.head.clone(),
                         base: evidence.base.clone(),
+                        base_ref: evidence.base_ref.clone(),
                         policy_digest: evidence.policy_digest.clone(),
                         ci_run_id: evidence.ci_run_id,
                         ci_run_url: evidence.ci_run_url.clone(),
@@ -1591,7 +1594,10 @@ impl Shared {
                     let base = current["base"].as_str().ok_or_else(|| {
                         Error::rejected("current profile requirements have no base SHA")
                     })?;
-                    if !delivery_requirements_rpc::full_ci_green(self, &slug, number, &live, base)
+                    let base_ref = current["base_ref"].as_str().ok_or_else(|| {
+                        Error::rejected("current profile requirements have no base branch name")
+                    })?;
+                    if !delivery_requirements_rpc::full_ci_green(self, &slug, number, &live, base, base_ref)
                         .map_err(|_| Error::rejected("current full CI requirements could not be verified; no merge was approved"))?
                     {
                         return Err(Error::rejected("current required checks or canonical ci.yml run are not green; no merge was approved"));
@@ -1605,6 +1611,7 @@ impl Shared {
                     })?;
                 if confirmed["head"] != current["head"]
                     || confirmed["base"] != current["base"]
+                    || confirmed["base_ref"] != current["base_ref"]
                     || confirmed["policy_digest"] != current["policy_digest"]
                     || confirmed["requirements"] != current["requirements"]
                 {

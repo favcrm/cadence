@@ -8,6 +8,7 @@ const REPO: &str = "acme/cadence";
 const PR: u64 = 42;
 const HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const BASE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const BASE_REF: &str = "main";
 const POLICY: &str = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 const RUN_ID: u64 = 123456;
 const REPORT: &str = "CAD-1298/reports/worker-done.md";
@@ -18,6 +19,7 @@ fn evidence() -> ReadyEvidence {
         pr: PR,
         head: HEAD.into(),
         base: BASE.into(),
+        base_ref: BASE_REF.into(),
         policy_digest: POLICY.into(),
         ci_run_id: RUN_ID,
         ci_run_url: format!("https://github.com/{REPO}/actions/runs/{RUN_ID}"),
@@ -32,6 +34,7 @@ fn binding() -> ReadyBinding {
         pr: e.pr,
         head: e.head,
         base: e.base,
+        base_ref: e.base_ref,
         policy_digest: e.policy_digest,
         ci_run_id: e.ci_run_id,
         ci_run_url: e.ci_run_url,
@@ -87,6 +90,7 @@ fn cad1298_ready_acceptance_native_receipt_is_distinct_from_a_verdict() {
         pr: next.pr,
         head: next.head.clone(),
         base: next.base.clone(),
+        base_ref: next.base_ref.clone(),
         policy_digest: next.policy_digest.clone(),
         ci_run_id: next.ci_run_id,
         ci_run_url: next.ci_run_url.clone(),

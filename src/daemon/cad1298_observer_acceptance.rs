@@ -16,6 +16,7 @@ const REPO: &str = "favcrm/cadence";
 const PR_URL: &str = "https://github.com/favcrm/cadence/pull/42";
 const HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const BASE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const BASE_REF: &str = "main";
 const POLICY_DIGEST: &str =
     "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 const REPORT: &str = "CAD-1298/reports/outcome.md";
@@ -28,6 +29,7 @@ fn evidence() -> ReadyEvidence {
         pr: 42,
         head: HEAD.to_string(),
         base: BASE.to_string(),
+        base_ref: BASE_REF.to_string(),
         policy_digest: POLICY_DIGEST.to_string(),
         ci_run_id: CI_RUN_ID,
         ci_run_url: CI_RUN_URL.to_string(),
@@ -41,6 +43,7 @@ fn binding(evidence: &ReadyEvidence) -> ReadyBinding {
         pr: evidence.pr,
         head: evidence.head.clone(),
         base: evidence.base.clone(),
+        base_ref: evidence.base_ref.clone(),
         policy_digest: evidence.policy_digest.clone(),
         ci_run_id: evidence.ci_run_id,
         ci_run_url: evidence.ci_run_url.clone(),
@@ -148,6 +151,7 @@ fn changed_binding_invalidates_an_existing_routine_enqueue() {
                 pr: b.pr,
                 head: b.head.clone(),
                 base: b.base.clone(),
+                base_ref: b.base_ref.clone(),
                 policy_digest: b.policy_digest.clone(),
                 ci_run_id: b.ci_run_id,
                 ci_run_url: b.ci_run_url.clone(),
