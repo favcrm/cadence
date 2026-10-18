@@ -484,6 +484,7 @@ export default function ReleasePanel({
 }) {
   const t = useTranslate();
   const serial = useRef(0);
+  const reconciliationSerial = useRef(0);
   const mounted = useRef(true);
   const [checking, setChecking] = useState(false);
   const [reconciling, setReconciling] = useState(false);
@@ -511,7 +512,6 @@ export default function ReleasePanel({
   useEffect(() => {
     serial.current += 1;
     setChecking(false);
-    setReconciling(false);
     setConfirming(false);
     setFlow({ kind: "none" });
     setNote((current) =>
@@ -524,17 +524,25 @@ export default function ReleasePanel({
     );
   }, [app.id, selected, installKey, install?.version]);
 
+  // Readback follows the app/session, not the selection or the rows it replaces.
+  useEffect(() => {
+    reconciliationSerial.current += 1;
+    setReconciling(false);
+  }, [app.id]);
+
   useEffect(() => {
     mounted.current = true;
     return () => {
       mounted.current = false;
       serial.current += 1;
+      reconciliationSerial.current += 1;
     };
   }, []);
 
   useEffect(() => {
     const invalidate = () => {
       serial.current += 1;
+      reconciliationSerial.current += 1;
       setFlow({ kind: "none" });
       setConfirming(false);
       setChecking(false);
@@ -951,11 +959,11 @@ export default function ReleasePanel({
   const reconcile = () => {
     if (!lock || applying || reconciling || !operator || !privateReadsAllowed())
       return;
-    const ticket = ++serial.current;
+    const ticket = ++reconciliationSerial.current;
     const epoch = privateSessionGeneration();
     const live = () =>
       mounted.current &&
-      serial.current === ticket &&
+      reconciliationSerial.current === ticket &&
       privateReadsAllowed() &&
       privateSessionGeneration() === epoch;
     setReconciling(true);
