@@ -423,12 +423,12 @@ impl Shared {
     }
 
     /// For a full-hash cap: `None` when the hash is not a public row (the
-    /// caller keeps its keyed check). `Some(true)` only when the row is
-    /// currently an owner by a fresh central decision. Every other public
-    /// outcome, including a member, a removed or revoked row, a standalone
+    /// caller keeps its keyed check). `Some(true)` when the row is currently
+    /// an owner by a fresh central decision, or a current member and the
+    /// caller passed `allow_member` (CAD-1537: only for a read-only screen
+    /// cap or context). Every other public outcome, including a member
+    /// without `allow_member`, a removed or revoked row, a standalone
     /// refusal, and an outage, is `Some(false)`, with no local fallback.
-    /// CAD-1537: `allow_member` (only for a read-only screen cap or
-    /// context) also accepts a current member.
     pub(super) fn public_row_hash(&self, hash: &str, allow_member: bool) -> Option<bool> {
         self.operator_auth()
             .public_snapshot_by_hash(hash, self.operator_now())?;
